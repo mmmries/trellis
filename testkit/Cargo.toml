@@ -1,0 +1,10 @@
+[package]
+name = "testkit"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+engine = { path = "../engine" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-postgres = "0.7.13"

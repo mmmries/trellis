@@ -1,0 +1,1189 @@
+//! Validator for the 1-1 transform-definition subset (issue #23).
+//!
+//! Operates on the parsed [`TransformDef`] AST, independent of whether it
+//! came from [`super::parse`] or was hand-built (e.g. in tests), per the
+//! issue's requirement that the validator itself — not just the parser —
+//! guards against invalid definitions. Two of the ticket's rejection
+//! categories (aggregate/cross-join key-spaces, general predicates) are
+//! actually unrepresentable in the AST today: [`super::ast::KeySpace`] and
+//! [`super::ast::Predicate`] are closed enums with only the 1-1/`TRUE`
+//! variant, so the exhaustive matches below are the "guard" — adding a
+//! variant to either enum without updating this module fails to compile.
+//! What genuinely needs runtime validation, because the AST *can* encode
+//! it, is column resolution, cycle detection, and (issue #63) type-checking.
+
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+
+use regex::Regex;
+
+use super::ast::{Expr, KeySpace, Predicate, TransformDef, ValueType};
+
+/// Why a [`TransformDef`] was rejected by the validator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationError {
+    /// Two calculated fields on the same target share a name.
+    DuplicateFieldName { name: String },
+    /// A field's expression references a name that is neither a known
+    /// source column nor another calculated field on the same target.
+    UnresolvedColumn { field: String, column: String },
+    /// The calculated-column dependency graph contains a cycle.
+    Cycle { cycle: Vec<String> },
+    /// The target table is the same as the source table. Calculated columns
+    /// must live on a separate neighbor table — writing them back onto the
+    /// source would feed our own WAL into ingestion (see `docs/data-flow.md`).
+    TargetEqualsSource { table: String },
+    /// An operator was applied to an operand of the wrong [`ValueType`] —
+    /// e.g. `+` given a `Text` operand (issue #63: `+` stays Numeric-only,
+    /// no implicit string concatenation).
+    TypeMismatch {
+        field: String,
+        expected: ValueType,
+        found: ValueType,
+    },
+    /// A function call's argument had the wrong [`ValueType`] for its
+    /// position (issue #64) — e.g. `octet_length(1)`. Distinct from
+    /// [`ValidationError::TypeMismatch`] so the message can name the
+    /// function and argument position; arity itself is a parser-time
+    /// [`super::error::ParseError::FunctionArityMismatch`], since it needs
+    /// no type information.
+    FunctionArgTypeMismatch {
+        field: String,
+        function: String,
+        arg_index: usize,
+        expected: ValueType,
+        found: ValueType,
+    },
+    /// `regexp_count`'s pattern argument was not a string literal (issue
+    /// #64/#65 follow-up). The pattern must be known at validate time so it
+    /// can be compiled and checked here, once, rather than re-parsed on
+    /// every row at eval time — a column-sourced pattern is out of scope.
+    NonLiteralRegexPattern { field: String },
+    /// `regexp_count`'s pattern literal does not compile as a regular
+    /// expression, per the `regex` crate.
+    InvalidRegexPattern {
+        field: String,
+        pattern: String,
+        error: String,
+    },
+    /// An [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY` names a
+    /// column that isn't a real source column.
+    UnresolvedGroupByColumn { column: String },
+    /// An [`super::ast::KeySpace::Aggregate`] definition's field references a
+    /// source column that is neither a grouping key nor wrapped in exactly
+    /// one of `SUM`/`MIN`/`MAX`/`AVG` — every row in a group must be folded
+    /// down to one value before it can appear in the target, and a bare
+    /// reference to a non-grouping-key source column doesn't do that.
+    UngroupedColumnReference { field: String, column: String },
+    /// An [`super::ast::KeySpace::Aggregate`] definition has a calculated
+    /// field whose name matches one of its grouping columns, but whose
+    /// expression isn't a bare passthrough of that same column (e.g.
+    /// `GROUP BY order_id SELECT SUM(order_id) AS order_id`). DDL generation
+    /// treats a grouping-column-named field as that column's passthrough and
+    /// gives it no separate target column, so a different expression under
+    /// that name would compute a value with nowhere to go — silently
+    /// dropped by DDL while eval still computed it. Rejecting this here
+    /// keeps that assumption enforced at validation, not a silent DDL-time
+    /// skip.
+    GroupingColumnFieldMustBePassthrough { field: String },
+}
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValidationError::DuplicateFieldName { name } => {
+                write!(f, "duplicate calculated field name '{name}'")
+            }
+            ValidationError::UnresolvedColumn { field, column } => write!(
+                f,
+                "calculated field '{field}' references '{column}', which is neither a \
+                 source column nor another calculated field on this target"
+            ),
+            ValidationError::Cycle { cycle } => {
+                write!(f, "cycle among calculated columns: {}", cycle.join(" -> "))
+            }
+            ValidationError::TargetEqualsSource { table } => write!(
+                f,
+                "target table '{table}' is the same as the source table; calculated \
+                 columns must live on a separate neighbor table"
+            ),
+            ValidationError::TypeMismatch {
+                field,
+                expected,
+                found,
+            } => write!(
+                f,
+                "calculated field '{field}' expects a {expected} value here, found {found}"
+            ),
+            ValidationError::FunctionArgTypeMismatch {
+                field,
+                function,
+                arg_index,
+                expected,
+                found,
+            } => write!(
+                f,
+                "calculated field '{field}': argument {} of '{function}' expects a {expected} \
+                 value, found {found}",
+                arg_index + 1
+            ),
+            ValidationError::NonLiteralRegexPattern { field } => write!(
+                f,
+                "calculated field '{field}': regexp_count's pattern argument must be a string \
+                 literal, not a column reference or expression"
+            ),
+            ValidationError::InvalidRegexPattern {
+                field,
+                pattern,
+                error,
+            } => write!(
+                f,
+                "calculated field '{field}': regexp_count's pattern '{pattern}' is not a valid \
+                 regular expression: {error}"
+            ),
+            ValidationError::UnresolvedGroupByColumn { column } => write!(
+                f,
+                "GROUP BY references '{column}', which is not a source column"
+            ),
+            ValidationError::UngroupedColumnReference { field, column } => write!(
+                f,
+                "calculated field '{field}' references source column '{column}' outside of \
+                 SUM/MIN/MAX/AVG; a non-grouping-key column must be aggregated, not referenced \
+                 bare"
+            ),
+            ValidationError::GroupingColumnFieldMustBePassthrough { field } => write!(
+                f,
+                "calculated field '{field}' shares its name with a GROUP BY column, so it must \
+                 be a bare passthrough of that column (e.g. `{field}`), not another expression"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+/// Validates `def` against the 1-1 subset. `source_columns` maps each
+/// column name known to exist on `def.source` to its [`ValueType`];
+/// resolving it against a real Postgres schema is intake's job (out of
+/// scope here — see issue #23's report), so callers supply it explicitly.
+pub fn validate(
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+) -> Result<(), ValidationError> {
+    if def.target == def.source {
+        return Err(ValidationError::TargetEqualsSource {
+            table: def.target.clone(),
+        });
+    }
+
+    // Exhaustive matches: these are the "re-verify at this layer" guard for
+    // #22's already-enforced 1-1/TRUE-only constructs (see module docs).
+    // `Aggregate` has real runtime checks (below), since — unlike the other
+    // arm here — the AST can encode an invalid one.
+    match &def.key_space {
+        KeySpace::OneToOne => {}
+        KeySpace::Aggregate { group_by } => {
+            for column in group_by {
+                if !source_columns.contains_key(column) {
+                    return Err(ValidationError::UnresolvedGroupByColumn {
+                        column: column.clone(),
+                    });
+                }
+            }
+            let group_by: HashSet<&str> = group_by.iter().map(|s| s.as_str()).collect();
+            for field in &def.fields {
+                // DDL generation (`ddl::create_aggregate_target_table`)
+                // treats a field named after a grouping column as that
+                // column's passthrough and gives it no target column of its
+                // own. Any other expression under that name would compute a
+                // value with nowhere to go — enforce the passthrough shape
+                // here rather than let DDL silently drop it.
+                if group_by.contains(field.name.as_str())
+                    && !matches!(&field.expr, Expr::Column(name) if name == &field.name)
+                {
+                    return Err(ValidationError::GroupingColumnFieldMustBePassthrough {
+                        field: field.name.clone(),
+                    });
+                }
+                validate_aggregate_field_expr(
+                    &field.expr,
+                    &field.name,
+                    &group_by,
+                    source_columns,
+                    false,
+                )?;
+            }
+        }
+    }
+    match def.predicate {
+        Predicate::True => {}
+    }
+
+    let mut field_names = HashSet::with_capacity(def.fields.len());
+    for field in &def.fields {
+        if !field_names.insert(field.name.clone()) {
+            return Err(ValidationError::DuplicateFieldName {
+                name: field.name.clone(),
+            });
+        }
+    }
+
+    let mut deps: HashMap<&str, Vec<String>> = HashMap::with_capacity(def.fields.len());
+    for field in &def.fields {
+        let mut refs = Vec::new();
+        collect_columns(&field.expr, &mut refs);
+
+        let mut calc_deps = Vec::new();
+        for column in refs {
+            let is_source_column = source_columns.contains_key(&column);
+            // A field referencing a source column of its own name (a plain
+            // rename, e.g. `SELECT order_id AS order_id`) is not a
+            // self-dependency — it's a passthrough of the source column.
+            // Without this, `field_names.contains(&column)` would treat it
+            // as the field depending on itself and report a spurious cycle.
+            let is_self_passthrough = column == field.name && is_source_column;
+            // A field referencing its own name that ISN'T a source column
+            // (e.g. a passthrough of a column whose type isn't representable
+            // by `ValueType`, or a plain typo) must not be treated as a
+            // reference to a *different* calculated field of the same name —
+            // `field_names` was built from `def.fields` before this loop, so
+            // it always contains `field.name` itself. Without this check,
+            // `field_names.contains(&column)` would be true purely because
+            // `column == field.name`, misclassifying an unresolvable column
+            // as a self-dependency and producing a spurious cycle instead of
+            // `UnresolvedColumn` (issue #78).
+            let is_a_different_calc_field = column != field.name && field_names.contains(&column);
+            let is_calc_field = !is_self_passthrough && is_a_different_calc_field;
+            if !is_source_column && !is_calc_field {
+                return Err(ValidationError::UnresolvedColumn {
+                    field: field.name.clone(),
+                    column,
+                });
+            }
+            if is_calc_field {
+                calc_deps.push(column);
+            }
+        }
+        deps.insert(field.name.as_str(), calc_deps);
+    }
+
+    detect_cycle(&deps)?;
+
+    infer_field_types(def, source_columns)?;
+
+    Ok(())
+}
+
+/// Walks a [`KeySpace::Aggregate`] field's expression, rejecting a bare
+/// (not wrapped in `SUM`/`MIN`/`MAX`/`AVG`) reference to a source column
+/// that isn't a grouping key. `in_aggregate_call` tracks whether the current
+/// position is already inside such a call; only a real source column
+/// reference is checked — a reference to another calculated field (already
+/// a single value per group by the time it's used) is unaffected, the same
+/// as inter-field composition in a 1-1 definition.
+fn validate_aggregate_field_expr(
+    expr: &Expr,
+    field_name: &str,
+    group_by: &HashSet<&str>,
+    source_columns: &HashMap<String, ValueType>,
+    in_aggregate_call: bool,
+) -> Result<(), ValidationError> {
+    match expr {
+        Expr::Column(name) => {
+            if source_columns.contains_key(name)
+                && !group_by.contains(name.as_str())
+                && !in_aggregate_call
+            {
+                return Err(ValidationError::UngroupedColumnReference {
+                    field: field_name.to_string(),
+                    column: name.clone(),
+                });
+            }
+            Ok(())
+        }
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => Ok(()),
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            validate_aggregate_field_expr(
+                lhs,
+                field_name,
+                group_by,
+                source_columns,
+                in_aggregate_call,
+            )?;
+            validate_aggregate_field_expr(
+                rhs,
+                field_name,
+                group_by,
+                source_columns,
+                in_aggregate_call,
+            )
+        }
+        Expr::FunctionCall { name, args } => {
+            let is_aggregate_call = super::registry::lookup_aggregate_function(name).is_some();
+            for arg in args {
+                validate_aggregate_field_expr(
+                    arg,
+                    field_name,
+                    group_by,
+                    source_columns,
+                    in_aggregate_call || is_aggregate_call,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Column(name) => out.push(name.clone()),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            collect_columns(lhs, out);
+            collect_columns(rhs, out);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_columns(arg, out);
+            }
+        }
+    }
+}
+
+/// Infers every calculated field's [`ValueType`], type-checking each
+/// operator's operands along the way. Reused by [`super::ddl`] to pick each
+/// target column's Postgres type, since a field's inferred type *is* its
+/// target column's declared type — this grammar has no separate "declare a
+/// target column's type" syntax (see issue #63's report).
+///
+/// Assumes `def`'s column references already resolved (this module's own
+/// [`validate`] checks that first) and that `def` is acyclic; a definition
+/// that reaches this function without either guarantee having been checked
+/// gets the same `Cycle`/defense-in-depth treatment [`super::eval`] gives
+/// its own recursion, rather than overflowing the stack.
+pub(crate) fn infer_field_types(
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+) -> Result<HashMap<String, ValueType>, ValidationError> {
+    let fields_by_name: HashMap<&str, &super::ast::FieldDef> =
+        def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+
+    let mut types: HashMap<String, ValueType> = HashMap::with_capacity(def.fields.len());
+    let mut in_progress: HashSet<String> = HashSet::new();
+    for field in &def.fields {
+        if !types.contains_key(&field.name) {
+            let t = infer_field(
+                field,
+                source_columns,
+                &fields_by_name,
+                &mut types,
+                &mut in_progress,
+            )?;
+            types.insert(field.name.clone(), t);
+        }
+    }
+    Ok(types)
+}
+
+fn infer_field(
+    field: &super::ast::FieldDef,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+    types: &mut HashMap<String, ValueType>,
+    in_progress: &mut HashSet<String>,
+) -> Result<ValueType, ValidationError> {
+    if let Some(t) = types.get(&field.name) {
+        return Ok(*t);
+    }
+    if !in_progress.insert(field.name.clone()) {
+        return Err(ValidationError::Cycle {
+            cycle: vec![field.name.clone()],
+        });
+    }
+    let t = infer_expr(
+        &field.expr,
+        &field.name,
+        source_columns,
+        fields_by_name,
+        types,
+        in_progress,
+    );
+    in_progress.remove(&field.name);
+    let t = t?;
+    types.insert(field.name.clone(), t);
+    Ok(t)
+}
+
+fn infer_expr(
+    expr: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+    types: &mut HashMap<String, ValueType>,
+    in_progress: &mut HashSet<String>,
+) -> Result<ValueType, ValidationError> {
+    match expr {
+        Expr::Column(name) => {
+            // See the matching comment in `validate`: a field referencing a
+            // source column of its own name is a passthrough, not a
+            // self-dependency, so it's resolved via `source_columns` below
+            // rather than recursing into its own (in-progress) inference.
+            let is_self_passthrough = name == field_name && source_columns.contains_key(name);
+            if !is_self_passthrough && let Some(calc_field) = fields_by_name.get(name.as_str()) {
+                return infer_field(
+                    calc_field,
+                    source_columns,
+                    fields_by_name,
+                    types,
+                    in_progress,
+                );
+            }
+            // Column resolution against `source_columns` already happened
+            // in `validate`; a name absent here (standalone use, e.g. tests
+            // calling `infer_field_types` directly) defaults to Numeric,
+            // matching `eval`'s same fallback.
+            Ok(source_columns
+                .get(name)
+                .copied()
+                .unwrap_or(ValueType::Numeric))
+        }
+        Expr::NumberLiteral(_) => Ok(ValueType::Numeric),
+        Expr::StringLiteral(_) => Ok(ValueType::Text),
+        Expr::BinaryOp { op, lhs, rhs } => {
+            let lhs_t = infer_expr(
+                lhs,
+                field_name,
+                source_columns,
+                fields_by_name,
+                types,
+                in_progress,
+            )?;
+            let rhs_t = infer_expr(
+                rhs,
+                field_name,
+                source_columns,
+                fields_by_name,
+                types,
+                in_progress,
+            )?;
+            let spec = super::registry::operator_spec(*op);
+            if lhs_t != spec.arg_types.0 {
+                return Err(ValidationError::TypeMismatch {
+                    field: field_name.to_string(),
+                    expected: spec.arg_types.0,
+                    found: lhs_t,
+                });
+            }
+            if rhs_t != spec.arg_types.1 {
+                return Err(ValidationError::TypeMismatch {
+                    field: field_name.to_string(),
+                    expected: spec.arg_types.1,
+                    found: rhs_t,
+                });
+            }
+            Ok(spec.return_type)
+        }
+        Expr::FunctionCall { name, args } => {
+            // The parser only ever builds a `FunctionCall` node for a name
+            // it already looked up in `registry::FUNCTIONS` and checked
+            // arity against; a name absent from the registry here (a
+            // hand-built AST bypassing the parser) has no argument types to
+            // check against, so it type-checks as Numeric, matching this
+            // function's own fallback for an unresolved column reference
+            // just above.
+            let spec = super::registry::lookup_function(name)
+                .or_else(|| super::registry::lookup_aggregate_function(name));
+            let Some(spec) = spec else {
+                for arg in args {
+                    infer_expr(
+                        arg,
+                        field_name,
+                        source_columns,
+                        fields_by_name,
+                        types,
+                        in_progress,
+                    )?;
+                }
+                return Ok(ValueType::Numeric);
+            };
+            for (i, (arg, expected)) in args.iter().zip(spec.arg_types).enumerate() {
+                let arg_t = infer_expr(
+                    arg,
+                    field_name,
+                    source_columns,
+                    fields_by_name,
+                    types,
+                    in_progress,
+                )?;
+                if arg_t != *expected {
+                    return Err(ValidationError::FunctionArgTypeMismatch {
+                        field: field_name.to_string(),
+                        function: name.clone(),
+                        arg_index: i,
+                        expected: *expected,
+                        found: arg_t,
+                    });
+                }
+            }
+            if name == "REGEXP_COUNT"
+                && let Some(pattern_arg) = args.get(1)
+            {
+                validate_regexp_pattern(field_name, pattern_arg)?;
+            }
+            Ok(spec.return_type)
+        }
+    }
+}
+
+/// Checks `regexp_count`'s pattern argument is a string literal that
+/// compiles as a regular expression. Validating once here, rather than at
+/// eval time on every row, is why the pattern must be a literal at all —
+/// see [`ValidationError::NonLiteralRegexPattern`].
+fn validate_regexp_pattern(field_name: &str, pattern_arg: &Expr) -> Result<(), ValidationError> {
+    let Expr::StringLiteral(pattern) = pattern_arg else {
+        return Err(ValidationError::NonLiteralRegexPattern {
+            field: field_name.to_string(),
+        });
+    };
+    Regex::new(pattern).map_err(|error| ValidationError::InvalidRegexPattern {
+        field: field_name.to_string(),
+        pattern: pattern.clone(),
+        error: error.to_string(),
+    })?;
+    Ok(())
+}
+
+#[derive(PartialEq, Eq)]
+enum Mark {
+    Visiting,
+    Done,
+}
+
+/// DFS with a visiting/done mark set, hand-rolled per the repo's convention
+/// of avoiding a graph crate for a problem this small.
+fn detect_cycle(deps: &HashMap<&str, Vec<String>>) -> Result<(), ValidationError> {
+    let mut marks: HashMap<&str, Mark> = HashMap::with_capacity(deps.len());
+    let names: Vec<&str> = deps.keys().copied().collect();
+    for name in names {
+        if !marks.contains_key(name) {
+            let mut stack = Vec::new();
+            visit(name, deps, &mut marks, &mut stack)?;
+        }
+    }
+    Ok(())
+}
+
+fn visit<'a>(
+    name: &'a str,
+    deps: &'a HashMap<&'a str, Vec<String>>,
+    marks: &mut HashMap<&'a str, Mark>,
+    stack: &mut Vec<String>,
+) -> Result<(), ValidationError> {
+    match marks.get(name) {
+        Some(Mark::Done) => return Ok(()),
+        Some(Mark::Visiting) => {
+            stack.push(name.to_string());
+            return Err(ValidationError::Cycle {
+                cycle: stack.clone(),
+            });
+        }
+        None => {}
+    }
+
+    marks.insert(name, Mark::Visiting);
+    stack.push(name.to_string());
+
+    if let Some(children) = deps.get(name) {
+        for child in children {
+            visit(child.as_str(), deps, marks, stack)?;
+        }
+    }
+
+    stack.pop();
+    marks.insert(name, Mark::Done);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::defs::ast::{FieldDef, Operator};
+
+    fn def(fields: Vec<FieldDef>) -> TransformDef {
+        TransformDef {
+            target: "t".to_string(),
+            source: "s".to_string(),
+            key_space: KeySpace::OneToOne,
+            fields,
+            predicate: Predicate::True,
+        }
+    }
+
+    fn col(name: &str) -> Expr {
+        Expr::Column(name.to_string())
+    }
+
+    fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), ValueType::Numeric))
+            .collect()
+    }
+
+    #[test]
+    fn valid_definition_passes() {
+        let d = def(vec![
+            FieldDef {
+                name: "double_price".to_string(),
+                expr: Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(col("price")),
+                    rhs: Box::new(col("price")),
+                },
+            },
+            FieldDef {
+                name: "total".to_string(),
+                expr: Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(col("double_price")),
+                    rhs: Box::new(Expr::NumberLiteral("1".to_string())),
+                },
+            },
+        ]);
+        let source_columns = numeric_columns(&["price"]);
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
+    fn unresolved_column_is_rejected() {
+        let d = def(vec![FieldDef {
+            name: "x".to_string(),
+            expr: col("mystery"),
+        }]);
+        let err = validate(&d, &HashMap::new()).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::UnresolvedColumn {
+                field: "x".to_string(),
+                column: "mystery".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn two_node_cycle_is_rejected() {
+        // Hand-built AST, bypassing the parser entirely: field `x` is
+        // defined in terms of `y` and vice versa.
+        let d = def(vec![
+            FieldDef {
+                name: "x".to_string(),
+                expr: col("y"),
+            },
+            FieldDef {
+                name: "y".to_string(),
+                expr: col("x"),
+            },
+        ]);
+        let err = validate(&d, &HashMap::new()).unwrap_err();
+        match err {
+            ValidationError::Cycle { .. } => {}
+            other => panic!("expected Cycle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_reference_to_a_nonexistent_column_is_unresolved_not_a_cycle() {
+        // `x`'s only reference is to `x` itself, and `x` is not a source
+        // column — the field's own name matching the referenced name is
+        // coincidental (the bare-passthrough idiom), not evidence that this
+        // is "another calculated field" to depend on (issue #78): a field
+        // is never "another" calculated field relative to itself, so this
+        // must resolve as an unknown column rather than a self-cycle.
+        let d = def(vec![FieldDef {
+            name: "x".to_string(),
+            expr: col("x"),
+        }]);
+        let err = validate(&d, &HashMap::new()).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::UnresolvedColumn {
+                field: "x".to_string(),
+                column: "x".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn diamond_dependency_is_not_a_false_positive_cycle() {
+        // D depends on A and B; A depends on C; B depends on C. C is a plain
+        // source column, so the DFS revisits it via both branches — this
+        // proves the Done mark (not just Visiting) is checked, or the second
+        // branch would wrongly report a cycle.
+        let d = def(vec![
+            FieldDef {
+                name: "a".to_string(),
+                expr: col("c"),
+            },
+            FieldDef {
+                name: "b".to_string(),
+                expr: col("c"),
+            },
+            FieldDef {
+                name: "d".to_string(),
+                expr: Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(col("a")),
+                    rhs: Box::new(col("b")),
+                },
+            },
+        ]);
+        let source_columns = numeric_columns(&["c"]);
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
+    fn target_equals_source_is_rejected() {
+        let mut d = def(vec![FieldDef {
+            name: "x".to_string(),
+            expr: Expr::NumberLiteral("1".to_string()),
+        }]);
+        d.target = "s".to_string();
+        d.source = "s".to_string();
+        let err = validate(&d, &HashMap::new()).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::TargetEqualsSource {
+                table: "s".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_field_name_is_rejected() {
+        let d = def(vec![
+            FieldDef {
+                name: "x".to_string(),
+                expr: Expr::NumberLiteral("1".to_string()),
+            },
+            FieldDef {
+                name: "x".to_string(),
+                expr: Expr::NumberLiteral("2".to_string()),
+            },
+        ]);
+        let err = validate(&d, &HashMap::new()).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::DuplicateFieldName {
+                name: "x".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn text_column_passthrough_is_accepted() {
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: col("text_col"),
+        }]);
+        let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
+    fn uuid_column_passthrough_is_accepted() {
+        let d = def(vec![FieldDef {
+            name: "author".to_string(),
+            expr: col("author"),
+        }]);
+        let source_columns = HashMap::from([("author".to_string(), ValueType::Uuid)]);
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
+    fn uuid_column_works_as_an_aggregate_group_by_key() {
+        let d = aggregate_def(
+            &["author"],
+            vec![
+                FieldDef {
+                    name: "author".to_string(),
+                    expr: col("author"),
+                },
+                FieldDef {
+                    name: "total_words".to_string(),
+                    expr: Expr::FunctionCall {
+                        name: "SUM".to_string(),
+                        args: vec![col("word_count")],
+                    },
+                },
+            ],
+        );
+        let source_columns = HashMap::from([
+            ("author".to_string(), ValueType::Uuid),
+            ("word_count".to_string(), ValueType::Numeric),
+        ]);
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
+    fn boolean_column_passthrough_is_accepted() {
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: col("flag"),
+        }]);
+        let source_columns = HashMap::from([("flag".to_string(), ValueType::Boolean)]);
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
+    fn adding_a_text_column_is_a_type_mismatch() {
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(col("text_col")),
+                rhs: Box::new(Expr::NumberLiteral("1".to_string())),
+            },
+        }]);
+        let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
+        let err = validate(&d, &source_columns).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::TypeMismatch {
+                field: "out".to_string(),
+                expected: ValueType::Numeric,
+                found: ValueType::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn string_literal_type_checks_as_text() {
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: Expr::StringLiteral("hi".to_string()),
+        }]);
+        assert_eq!(validate(&d, &HashMap::new()), Ok(()));
+    }
+
+    #[test]
+    fn function_call_over_a_text_column_type_checks_as_numeric() {
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: Expr::FunctionCall {
+                name: "OCTET_LENGTH".to_string(),
+                args: vec![col("text_col")],
+            },
+        }]);
+        let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
+    fn function_call_with_a_numeric_argument_is_a_type_mismatch() {
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: Expr::FunctionCall {
+                name: "OCTET_LENGTH".to_string(),
+                args: vec![col("number_col")],
+            },
+        }]);
+        let source_columns = HashMap::from([("number_col".to_string(), ValueType::Numeric)]);
+        let err = validate(&d, &source_columns).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::FunctionArgTypeMismatch {
+                field: "out".to_string(),
+                function: "OCTET_LENGTH".to_string(),
+                arg_index: 0,
+                expected: ValueType::Text,
+                found: ValueType::Numeric,
+            }
+        );
+    }
+
+    #[test]
+    fn greater_than_over_numeric_operands_type_checks_as_boolean() {
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::GreaterThan,
+                lhs: Box::new(col("number_col")),
+                rhs: Box::new(Expr::NumberLiteral("0".to_string())),
+            },
+        }]);
+        let source_columns = numeric_columns(&["number_col"]);
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
+    fn greater_than_over_a_text_operand_is_a_type_mismatch() {
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::GreaterThan,
+                lhs: Box::new(col("text_col")),
+                rhs: Box::new(Expr::NumberLiteral("0".to_string())),
+            },
+        }]);
+        let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
+        let err = validate(&d, &source_columns).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::TypeMismatch {
+                field: "out".to_string(),
+                expected: ValueType::Numeric,
+                found: ValueType::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn function_call_composed_with_greater_than_type_checks_as_boolean() {
+        let d = def(vec![FieldDef {
+            name: "has_foo".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::GreaterThan,
+                lhs: Box::new(Expr::FunctionCall {
+                    name: "STRPOS".to_string(),
+                    args: vec![col("name"), Expr::StringLiteral("foo".to_string())],
+                }),
+                rhs: Box::new(Expr::NumberLiteral("0".to_string())),
+            },
+        }]);
+        let source_columns = HashMap::from([("name".to_string(), ValueType::Text)]);
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+        let types = infer_field_types(&d, &source_columns).unwrap();
+        assert_eq!(types["has_foo"], ValueType::Boolean);
+    }
+
+    #[test]
+    fn boolean_target_field_from_greater_than_is_accepted() {
+        // A calculated field whose final expression type is Boolean must be
+        // storable, not just intermediate — issue #65's "boolean target
+        // column" requirement.
+        let d = def(vec![FieldDef {
+            name: "is_positive".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::GreaterThan,
+                lhs: Box::new(col("number_col")),
+                rhs: Box::new(Expr::NumberLiteral("0".to_string())),
+            },
+        }]);
+        let source_columns = numeric_columns(&["number_col"]);
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
+    fn regexp_count_with_a_literal_pattern_is_accepted() {
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: Expr::FunctionCall {
+                name: "REGEXP_COUNT".to_string(),
+                args: vec![col("text_col"), Expr::StringLiteral("a.c".to_string())],
+            },
+        }]);
+        let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
+    fn regexp_count_with_a_column_sourced_pattern_is_rejected() {
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: Expr::FunctionCall {
+                name: "REGEXP_COUNT".to_string(),
+                args: vec![col("text_col"), col("pattern_col")],
+            },
+        }]);
+        let source_columns = HashMap::from([
+            ("text_col".to_string(), ValueType::Text),
+            ("pattern_col".to_string(), ValueType::Text),
+        ]);
+        let err = validate(&d, &source_columns).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::NonLiteralRegexPattern {
+                field: "out".to_string(),
+            }
+        );
+    }
+
+    fn aggregate_def(group_by: &[&str], fields: Vec<FieldDef>) -> TransformDef {
+        TransformDef {
+            target: "t".to_string(),
+            source: "s".to_string(),
+            key_space: KeySpace::Aggregate {
+                group_by: group_by.iter().map(|s| s.to_string()).collect(),
+            },
+            fields,
+            predicate: Predicate::True,
+        }
+    }
+
+    #[test]
+    fn a_valid_aggregate_definition_passes() {
+        let d = aggregate_def(
+            &["order_id"],
+            vec![
+                FieldDef {
+                    name: "order_id".to_string(),
+                    expr: col("order_id"),
+                },
+                FieldDef {
+                    name: "total".to_string(),
+                    expr: Expr::FunctionCall {
+                        name: "SUM".to_string(),
+                        args: vec![col("amount")],
+                    },
+                },
+                FieldDef {
+                    name: "avg_amount".to_string(),
+                    expr: Expr::FunctionCall {
+                        name: "AVG".to_string(),
+                        args: vec![col("amount")],
+                    },
+                },
+            ],
+        );
+        let source_columns = numeric_columns(&["order_id", "amount"]);
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
+    fn group_by_on_a_nonexistent_column_is_rejected() {
+        let d = aggregate_def(
+            &["missing"],
+            vec![FieldDef {
+                name: "missing".to_string(),
+                expr: col("missing"),
+            }],
+        );
+        let err = validate(&d, &HashMap::new()).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::UnresolvedGroupByColumn {
+                column: "missing".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_a_bare_non_grouping_column_reference() {
+        let d = aggregate_def(
+            &["order_id"],
+            vec![FieldDef {
+                name: "amount".to_string(),
+                expr: col("amount"),
+            }],
+        );
+        let source_columns = numeric_columns(&["order_id", "amount"]);
+        let err = validate(&d, &source_columns).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::UngroupedColumnReference {
+                field: "amount".to_string(),
+                column: "amount".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn aggregating_over_the_grouping_key_itself_is_allowed() {
+        let d = aggregate_def(
+            &["order_id"],
+            vec![FieldDef {
+                name: "order_id_sum".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![col("order_id")],
+                },
+            }],
+        );
+        let source_columns = numeric_columns(&["order_id"]);
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
+    fn a_field_named_after_the_grouping_column_must_be_a_bare_passthrough() {
+        let d = aggregate_def(
+            &["order_id"],
+            vec![FieldDef {
+                name: "order_id".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![col("order_id")],
+                },
+            }],
+        );
+        let source_columns = numeric_columns(&["order_id"]);
+        let err = validate(&d, &source_columns).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::GroupingColumnFieldMustBePassthrough {
+                field: "order_id".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_field_named_after_the_grouping_column_as_a_bare_passthrough_is_allowed() {
+        let d = aggregate_def(
+            &["order_id"],
+            vec![FieldDef {
+                name: "order_id".to_string(),
+                expr: col("order_id"),
+            }],
+        );
+        let source_columns = numeric_columns(&["order_id"]);
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
+    fn aggregate_function_argument_must_be_numeric() {
+        let d = aggregate_def(
+            &["id"],
+            vec![FieldDef {
+                name: "total".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![col("label")],
+                },
+            }],
+        );
+        let source_columns = HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("label".to_string(), ValueType::Text),
+        ]);
+        let err = validate(&d, &source_columns).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::FunctionArgTypeMismatch {
+                field: "total".to_string(),
+                function: "SUM".to_string(),
+                arg_index: 0,
+                expected: ValueType::Numeric,
+                found: ValueType::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn regexp_count_with_an_uncompilable_pattern_literal_is_rejected() {
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: Expr::FunctionCall {
+                name: "REGEXP_COUNT".to_string(),
+                args: vec![col("text_col"), Expr::StringLiteral("(".to_string())],
+            },
+        }]);
+        let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
+        let err = validate(&d, &source_columns).unwrap_err();
+        match err {
+            ValidationError::InvalidRegexPattern { field, pattern, .. } => {
+                assert_eq!(field, "out");
+                assert_eq!(pattern, "(");
+            }
+            other => panic!("expected InvalidRegexPattern, got {other:?}"),
+        }
+    }
+}

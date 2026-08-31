@@ -1,0 +1,468 @@
+//! Transform-definition grammar and parser (issue #22).
+//!
+//! Parses the concrete syntax documented in [`parser`] into the typed
+//! [`ast::TransformDef`] the validator (issue #23) and evaluator (issue #24)
+//! consume. Per ADR-0004, only constructs this crate can actually evaluate
+//! are accepted:
+//!
+//! - **Key-space**: 1-1 ([`ast::KeySpace::OneToOne`]) or aggregate
+//!   ([`ast::KeySpace::Aggregate`], a `GROUP BY <cols>` clause, issue #11's
+//!   groundwork) — no joins, no relationship paths.
+//! - **Calculated fields**: column references, numeric and string literals,
+//!   the `+` operator (Numeric-only), the `>` comparison operator (issue
+//!   #65, `Numeric, Numeric -> Boolean`), and `name(args)` function calls,
+//!   all via the shared [`registry`]. Values carry a [`ast::ValueType`]
+//!   (`Numeric`/`Text`/`Boolean`, issue #63). Issue #64 adds general
+//!   function-call syntax plus four Text-argument functions
+//!   (`strpos`, `octet_length`, `char_length`, `regexp_count`). In an
+//!   aggregate definition, a non-grouping-key column must be wrapped in
+//!   exactly one of `SUM`/`MIN`/`MAX`/`AVG` (Numeric-only), or a field may be
+//!   the row-counting `COUNT(*)` (no column argument; `COUNT(<column>)` is
+//!   not implemented).
+//! - **Partial-data predicate**: a trivially-true predicate only.
+//!
+//! Everything else is rejected at parse time with an error naming the
+//! specific unsupported construct (see [`error::ParseError`]).
+
+pub mod ast;
+pub mod catalog;
+pub mod ddl;
+pub mod error;
+pub mod eval;
+pub mod invertibility;
+mod lexer;
+pub mod model;
+pub mod oracle;
+mod parser;
+pub mod registry;
+pub mod validate;
+
+pub use ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
+pub use catalog::{CatalogError, create_definition, source_table_version, transforms_for_source};
+pub use ddl::{
+    DdlError, PrimaryKeyColumn, create_aggregate_target_table, create_target_table,
+    neighbor_table_name, source_primary_key,
+};
+pub use error::ParseError;
+pub use eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
+pub use invertibility::{AggregateArg, CountArg, Invertibility, PartialField, Verdict, classify};
+pub use model::Definition;
+pub use oracle::{
+    OracleError, Recomputed, recompute, recompute_aggregate, render_aggregate_select_sql,
+    render_expr_sql,
+};
+pub use parser::parse;
+pub use validate::{ValidationError, validate};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_binary_add_expression() {
+        let def = parse("TRANSFORM order_totals FROM orders SELECT a + b AS total").unwrap();
+
+        assert_eq!(def.target, "order_totals");
+        assert_eq!(def.source, "orders");
+        assert_eq!(def.key_space, KeySpace::OneToOne);
+        assert_eq!(def.predicate, Predicate::True);
+        assert_eq!(
+            def.fields,
+            vec![FieldDef {
+                name: "total".to_string(),
+                expr: Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(Expr::Column("a".to_string())),
+                    rhs: Box::new(Expr::Column("b".to_string())),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_numeric_literals_and_multiple_fields() {
+        let def = parse("TRANSFORM t FROM s SELECT 1 + 2 AS literal_sum, price + 5 AS with_column")
+            .unwrap();
+
+        assert_eq!(
+            def.fields,
+            vec![
+                FieldDef {
+                    name: "literal_sum".to_string(),
+                    expr: Expr::BinaryOp {
+                        op: Operator::Add,
+                        lhs: Box::new(Expr::NumberLiteral("1".to_string())),
+                        rhs: Box::new(Expr::NumberLiteral("2".to_string())),
+                    },
+                },
+                FieldDef {
+                    name: "with_column".to_string(),
+                    expr: Expr::BinaryOp {
+                        op: Operator::Add,
+                        lhs: Box::new(Expr::Column("price".to_string())),
+                        rhs: Box::new(Expr::NumberLiteral("5".to_string())),
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_a_decimal_literal() {
+        let def = parse("TRANSFORM t FROM s SELECT price + 0.5 AS total").unwrap();
+        assert_eq!(
+            def.fields[0].expr,
+            Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::Column("price".to_string())),
+                rhs: Box::new(Expr::NumberLiteral("0.5".to_string())),
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_an_explicit_true_predicate() {
+        let def = parse("TRANSFORM t FROM s SELECT a AS x WHERE TRUE").unwrap();
+        assert_eq!(def.predicate, Predicate::True);
+    }
+
+    #[test]
+    fn parses_a_single_column_group_by_into_aggregate_key_space() {
+        let def = parse(
+            "TRANSFORM order_totals FROM order_line_items GROUP BY order_id \
+             SELECT order_id AS order_id, SUM(amount) AS total_amount",
+        )
+        .unwrap();
+        assert_eq!(
+            def.key_space,
+            KeySpace::Aggregate {
+                group_by: vec!["order_id".to_string()]
+            }
+        );
+        assert_eq!(
+            def.fields[1].expr,
+            Expr::FunctionCall {
+                name: "SUM".to_string(),
+                args: vec![Expr::Column("amount".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_multi_column_group_by() {
+        let def = parse("TRANSFORM t FROM s GROUP BY a, b SELECT a AS a, b AS b, SUM(c) AS total")
+            .unwrap();
+        assert_eq!(
+            def.key_space,
+            KeySpace::Aggregate {
+                group_by: vec!["a".to_string(), "b".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn parses_min_max_avg_calls_in_an_aggregate_definition() {
+        let def = parse(
+            "TRANSFORM t FROM s GROUP BY id \
+             SELECT MIN(x) AS lo, MAX(x) AS hi, AVG(x) AS avg_x",
+        )
+        .unwrap();
+        assert_eq!(
+            def.fields
+                .iter()
+                .map(|f| match &f.expr {
+                    Expr::FunctionCall { name, .. } => name.as_str(),
+                    _ => panic!("expected FunctionCall"),
+                })
+                .collect::<Vec<_>>(),
+            vec!["MIN", "MAX", "AVG"]
+        );
+    }
+
+    #[test]
+    fn rejects_a_bare_non_grouping_column_reference_at_parse_time_is_not_the_job_here() {
+        // Bare non-grouping-key column references parse successfully (the
+        // parser has no source-column knowledge to reject them with) and are
+        // caught by the validator instead — see
+        // `validate::tests::rejects_a_bare_non_grouping_column_reference`.
+        let def = parse("TRANSFORM t FROM s GROUP BY a SELECT b AS x").unwrap();
+        assert_eq!(def.fields[0].expr, Expr::Column("b".to_string()));
+    }
+
+    #[test]
+    fn parses_count_star_in_an_aggregate_definition() {
+        let def = parse("TRANSFORM t FROM s GROUP BY a SELECT COUNT(*) AS x").unwrap();
+        assert_eq!(
+            def.fields[0].expr,
+            Expr::FunctionCall {
+                name: "COUNT".to_string(),
+                args: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_count_of_a_column_in_an_aggregate_definition() {
+        let err = parse("TRANSFORM t FROM s GROUP BY a SELECT COUNT(a) AS x").unwrap_err();
+        match err {
+            ParseError::UnsupportedAggregateFunction { name } => assert_eq!(name, "COUNT"),
+            other => panic!("expected UnsupportedAggregateFunction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_count_star_outside_an_aggregate_definition_too() {
+        let err = parse("TRANSFORM t FROM s SELECT COUNT(*) AS x").unwrap_err();
+        match err {
+            ParseError::UnsupportedKeySpace { construct, .. } => {
+                assert_eq!(construct, "COUNT(...)");
+            }
+            other => panic!("expected UnsupportedKeySpace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_join() {
+        let err =
+            parse("TRANSFORM t FROM s JOIN other ON s.id = other.id SELECT a AS x").unwrap_err();
+        match err {
+            ParseError::UnsupportedKeySpace { construct, .. } => {
+                assert_eq!(construct, "JOIN");
+            }
+            other => panic!("expected UnsupportedKeySpace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_group_by_trailing_after_select() {
+        let err = parse("TRANSFORM t FROM s SELECT a AS x GROUP BY b").unwrap_err();
+        match &err {
+            ParseError::UnsupportedKeySpace { construct, .. } => {
+                assert_eq!(construct, "GROUP BY");
+            }
+            other => panic!("expected UnsupportedKeySpace, got {other:?}"),
+        }
+        assert!(err.to_string().contains("GROUP BY"));
+        assert!(err.to_string().contains("FROM <source>"));
+    }
+
+    #[test]
+    fn rejects_join_trailing_after_select() {
+        let err =
+            parse("TRANSFORM t FROM s SELECT a AS x JOIN other ON s.id = other.id").unwrap_err();
+        match err {
+            ParseError::UnsupportedKeySpace { construct, .. } => {
+                assert_eq!(construct, "JOIN");
+            }
+            other => panic!("expected UnsupportedKeySpace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_relationship_path() {
+        let err = parse("TRANSFORM t FROM s SELECT product.category_name AS x").unwrap_err();
+        match err {
+            ParseError::UnsupportedRelationshipPath { path } => {
+                assert_eq!(path, "product.category_name");
+            }
+            other => panic!("expected UnsupportedRelationshipPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_non_plus_operator() {
+        let err = parse("TRANSFORM t FROM s SELECT a - b AS x").unwrap_err();
+        match err {
+            ParseError::UnsupportedOperator { operator } => assert_eq!(operator, "-"),
+            other => panic!("expected UnsupportedOperator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_less_than_operator_as_unsupported_operator() {
+        let err = parse("TRANSFORM t FROM s SELECT a < b AS x").unwrap_err();
+        match err {
+            ParseError::UnsupportedOperator { operator } => assert_eq!(operator, "<"),
+            other => panic!("expected UnsupportedOperator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_equals_operator_as_unsupported_operator() {
+        let err = parse("TRANSFORM t FROM s SELECT a = b AS x").unwrap_err();
+        match err {
+            ParseError::UnsupportedOperator { operator } => assert_eq!(operator, "="),
+            other => panic!("expected UnsupportedOperator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_aggregate_function_call_with_key_space_specific_message() {
+        let err = parse("TRANSFORM t FROM s SELECT SUM(a) AS x").unwrap_err();
+        match err {
+            ParseError::UnsupportedKeySpace { construct, .. } => {
+                assert_eq!(construct, "SUM(...)");
+            }
+            other => panic!("expected UnsupportedKeySpace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unregistered_function_call() {
+        // Rejected via a `registry::lookup_function` lookup, not a
+        // hardcoded parser branch — see ADR-0004's registry-sharing goal.
+        assert!(registry::lookup_function("ROUND").is_none());
+        let err = parse("TRANSFORM t FROM s SELECT ROUND(a) AS x").unwrap_err();
+        match err {
+            ParseError::UnsupportedFunction { name } => assert_eq!(name, "ROUND"),
+            other => panic!("expected UnsupportedFunction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_non_immutable_construct() {
+        let err = parse("TRANSFORM t FROM s SELECT a + NOW() AS x").unwrap_err();
+        match err {
+            ParseError::NonImmutableConstruct { name } => assert_eq!(name, "NOW"),
+            other => panic!("expected NonImmutableConstruct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_a_registered_function_call() {
+        let def = parse("TRANSFORM t FROM s SELECT octet_length(name) AS len").unwrap();
+        assert_eq!(
+            def.fields,
+            vec![FieldDef {
+                name: "len".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "OCTET_LENGTH".to_string(),
+                    args: vec![Expr::Column("name".to_string())],
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_a_two_argument_function_call() {
+        let def = parse("TRANSFORM t FROM s SELECT strpos(name, 'x') AS pos").unwrap();
+        assert_eq!(
+            def.fields,
+            vec![FieldDef {
+                name: "pos".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "STRPOS".to_string(),
+                    args: vec![
+                        Expr::Column("name".to_string()),
+                        Expr::StringLiteral("x".to_string()),
+                    ],
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_function_call_with_wrong_arity() {
+        let err = parse("TRANSFORM t FROM s SELECT octet_length(a, b) AS x").unwrap_err();
+        match err {
+            ParseError::FunctionArityMismatch {
+                name,
+                expected,
+                found,
+            } => {
+                assert_eq!(name, "octet_length");
+                assert_eq!(expected, 1);
+                assert_eq!(found, 2);
+            }
+            other => panic!("expected FunctionArityMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_a_greater_than_expression() {
+        let def = parse("TRANSFORM t FROM s SELECT a > 0 AS positive").unwrap();
+        assert_eq!(
+            def.fields,
+            vec![FieldDef {
+                name: "positive".to_string(),
+                expr: Expr::BinaryOp {
+                    op: Operator::GreaterThan,
+                    lhs: Box::new(Expr::Column("a".to_string())),
+                    rhs: Box::new(Expr::NumberLiteral("0".to_string())),
+                },
+            }]
+        );
+    }
+
+    /// Pins the safety net documented on [`registry::OPERATORS`] (issue
+    /// #67): `a > b + c` flat-parses left-associatively as `(a > b) + c`,
+    /// not Postgres's `a > (b + c)`. `+`'s spec requires a Numeric lhs, but
+    /// `a > b` evaluates to Boolean, so the divergent regrouping is caught
+    /// as a type mismatch rather than silently computing a wrong answer.
+    #[test]
+    fn flat_parse_of_mixed_operators_is_caught_by_type_checking() {
+        let def = parse("TRANSFORM t FROM s SELECT a > b + c AS result").unwrap();
+        assert_eq!(
+            def.fields[0].expr,
+            Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::BinaryOp {
+                    op: Operator::GreaterThan,
+                    lhs: Box::new(Expr::Column("a".to_string())),
+                    rhs: Box::new(Expr::Column("b".to_string())),
+                }),
+                rhs: Box::new(Expr::Column("c".to_string())),
+            }
+        );
+
+        let source_columns: std::collections::HashMap<String, ValueType> = [
+            ("a".to_string(), ValueType::Numeric),
+            ("b".to_string(), ValueType::Numeric),
+            ("c".to_string(), ValueType::Numeric),
+        ]
+        .into_iter()
+        .collect();
+        let err = validate(&def, &source_columns).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::TypeMismatch {
+                field: "result".to_string(),
+                expected: ValueType::Numeric,
+                found: ValueType::Boolean,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_function_call_composed_with_greater_than() {
+        let def = parse("TRANSFORM t FROM s SELECT strpos(name, 'foo') > 0 AS has_foo").unwrap();
+        assert_eq!(
+            def.fields,
+            vec![FieldDef {
+                name: "has_foo".to_string(),
+                expr: Expr::BinaryOp {
+                    op: Operator::GreaterThan,
+                    lhs: Box::new(Expr::FunctionCall {
+                        name: "STRPOS".to_string(),
+                        args: vec![
+                            Expr::Column("name".to_string()),
+                            Expr::StringLiteral("foo".to_string()),
+                        ],
+                    }),
+                    rhs: Box::new(Expr::NumberLiteral("0".to_string())),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_general_predicates() {
+        let err = parse("TRANSFORM t FROM s SELECT a AS x WHERE a = b").unwrap_err();
+        match err {
+            ParseError::UnsupportedPredicate { detail } => {
+                assert!(detail.contains("TRUE"));
+            }
+            other => panic!("expected UnsupportedPredicate, got {other:?}"),
+        }
+    }
+}

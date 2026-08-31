@@ -1,0 +1,392 @@
+//! End-to-end tests for the [`engine::Client`] runtime (issue #11's runtime
+//! increment): drive the *whole* pipeline — publication/slot setup, CDC
+//! intake, ring maintenance, and application workers — through the public
+//! `Client` API against a real, ephemeral Postgres instance
+//! (`testkit::TestCluster`), rather than staging changes into the ring by
+//! hand the way `apply.rs`/`intake_core.rs` do.
+//!
+//! Two things this file exists to prove:
+//!
+//! - The full pipeline, started with one `Client::start` call, converges a
+//!   real source table's inserts/updates/deletes into its target table, and
+//!   that target is byte-exact against an independent oracle
+//!   (`defs::oracle::recompute`) at every step.
+//! - `staging_worker` and `application_threads` are genuinely independent
+//!   knobs: a staging-only client (no app workers) stages and seals but
+//!   drains nothing, leaving the target empty.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use engine::Pool;
+use engine::config::DEFAULT_SCHEMA;
+use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use engine::defs::{create_definition, create_target_table, recompute, source_primary_key};
+use engine::{Client as TrellisClient, ClientOptions};
+use testkit::TestCluster;
+use tokio_postgres::{Client, NoTls};
+
+/// Connects directly to `dsn` (bypassing `engine::Pool`) and pins
+/// `search_path`, matching `apply.rs`/`intake_core.rs`'s helper of the same
+/// name.
+async fn connect_raw(dsn: &str) -> Client {
+    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
+        .await
+        .expect("set search_path");
+    client
+}
+
+/// Polls `predicate` on `interval` until it returns `true`, or panics with
+/// `message` once `timeout` elapses. Every wait in this file goes through
+/// here rather than a bare `sleep` — real logical-replication intake can
+/// take a few seconds to first-stage a change, but no wait here is
+/// unbounded.
+async fn poll_until<F>(timeout: Duration, interval: Duration, message: &str, mut predicate: F)
+where
+    F: AsyncFnMut() -> bool,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if predicate().await {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("poll_until timed out after {timeout:?}: {message}");
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
+    names
+        .iter()
+        .map(|n| (n.to_string(), ValueType::Numeric))
+        .collect()
+}
+
+/// The transform this file exercises throughout: a 1-1 sum of two source
+/// columns, mirroring `apply.rs`'s `order_totals_def` convention.
+fn totals_def() -> TransformDef {
+    TransformDef {
+        target: "totals".to_string(),
+        source: "orders".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "total".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::Column("a".to_string())),
+                rhs: Box::new(Expr::Column("b".to_string())),
+            },
+        }],
+        predicate: Predicate::True,
+    }
+}
+
+/// Creates `orders` plus `totals`'s definition and target table. `orders`
+/// keeps Postgres's default replica identity (its primary key) rather than
+/// `REPLICA IDENTITY FULL`: this scalar sum never needs an old image (a
+/// delete only needs the key, which the primary-key-only default identity
+/// already sends) — setting `FULL` would mark *every* column as a key
+/// column in pgoutput's `Relation` message, and `intake::extract_key`
+/// joins every `is_key` column, so the row's "key" would become every
+/// column's value concatenated rather than just its primary key. Returns
+/// the primary key column intake's caller needs for both the target DDL
+/// and the oracle recompute.
+async fn setup_source_and_target(pool: &Pool, raw: &Client) -> engine::defs::PrimaryKeyColumn {
+    raw.batch_execute("create table orders (id integer primary key, a numeric, b numeric)")
+        .await
+        .expect("create source table");
+
+    let source_columns = HashMap::from([
+        ("id".to_string(), ValueType::Numeric),
+        ("a".to_string(), ValueType::Numeric),
+        ("b".to_string(), ValueType::Numeric),
+    ]);
+    create_definition(
+        pool,
+        "TRANSFORM totals FROM orders SELECT a + b AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create definition");
+
+    let pk = source_primary_key(pool, "orders")
+        .await
+        .expect("introspect source primary key");
+    create_target_table(pool, &totals_def(), &pk, &source_columns)
+        .await
+        .expect("create target table");
+    pk
+}
+
+/// The target table's current contents, keyed by id (as text) to its
+/// `total` (as text) — order-independent so it can be compared directly
+/// against [`oracle_snapshot`].
+async fn target_snapshot(client: &Client) -> HashMap<String, Option<String>> {
+    client
+        .query("select id::text, total::text from totals", &[])
+        .await
+        .expect("read target table")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect()
+}
+
+/// An independent, from-scratch recompute of `totals` from `orders`'s
+/// current contents (see `defs::oracle::recompute`'s own doc comment) — the
+/// authority every convergence check in this file compares the live target
+/// against.
+async fn oracle_snapshot(
+    pool: &Pool,
+    def: &TransformDef,
+    pk_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+) -> HashMap<String, Option<String>> {
+    recompute(pool, def, pk_name, source_columns)
+        .await
+        .expect("oracle recompute")
+        .into_iter()
+        .map(|(id, fields)| {
+            let total = fields
+                .get("total")
+                .cloned()
+                .flatten()
+                .map(|n| n.to_string());
+            (id, total)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_full_pipeline_converges_inserts_updates_and_deletes_to_the_oracle() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+
+    setup_source_and_target(&db.pool, &raw).await;
+    let def = totals_def();
+
+    let options = ClientOptions {
+        staging_worker: true,
+        application_threads: 2,
+        source_tables: vec![format!("{DEFAULT_SCHEMA}.orders")],
+        ..Default::default()
+    };
+    let client = TrellisClient::start(db.dsn(), options).expect("client start");
+
+    raw.batch_execute(
+        "insert into orders (id, a, b) values \
+         (1, 10.00, 1.50), (2, 20.00, 2.00), (3, 5.00, 0.50)",
+    )
+    .await
+    .expect("insert source rows");
+
+    poll_until(
+        Duration::from_secs(20),
+        Duration::from_millis(200),
+        "target never converged with the oracle after the inserts",
+        async || {
+            target_snapshot(&raw).await
+                == oracle_snapshot(&db.pool, &def, "id", &numeric_columns(&["a", "b"])).await
+        },
+    )
+    .await;
+    assert_eq!(
+        target_snapshot(&raw).await.len(),
+        3,
+        "all three inserted rows must have drained"
+    );
+
+    raw.execute("update orders set a = 15.00, b = 1.00 where id = 2", &[])
+        .await
+        .expect("update source row");
+
+    poll_until(
+        Duration::from_secs(20),
+        Duration::from_millis(200),
+        "target never converged with the oracle after the update",
+        async || {
+            target_snapshot(&raw).await
+                == oracle_snapshot(&db.pool, &def, "id", &numeric_columns(&["a", "b"])).await
+        },
+    )
+    .await;
+    let total_after_update: Option<String> = raw
+        .query_one("select total::text from totals where id = 2", &[])
+        .await
+        .expect("read updated row")
+        .get(0);
+    assert_eq!(total_after_update, Some("16.00".to_string()));
+
+    raw.execute("delete from orders where id = 3", &[])
+        .await
+        .expect("delete source row");
+
+    poll_until(
+        Duration::from_secs(20),
+        Duration::from_millis(200),
+        "target never converged with the oracle after the delete",
+        async || {
+            target_snapshot(&raw).await
+                == oracle_snapshot(&db.pool, &def, "id", &numeric_columns(&["a", "b"])).await
+        },
+    )
+    .await;
+    let remaining = target_snapshot(&raw).await;
+    assert_eq!(remaining.len(), 2, "the deleted row must be gone");
+    assert!(
+        !remaining.contains_key("3"),
+        "id 3's target row must have been deleted"
+    );
+
+    client.shutdown().await.expect("clean shutdown");
+}
+
+/// Issue #60's end-to-end contract: load rows, derive them, `TRUNCATE` the
+/// source, insert new rows, and let the pipeline converge — the target must
+/// end up matching a from-scratch oracle computed against `orders`'s
+/// current (post-truncate) contents, with no trace of the truncated rows.
+/// Also covers the ordering case directly: a row inserted in the very same
+/// transaction as the `TRUNCATE` (so it shares one commit `lsn` with it,
+/// distinguishable only by intake's append order) must survive, proving the
+/// fold's `change_id` tie-break (not just `lsn`) governs the void filter
+/// through the real intake path, not just the hand-staged fold tests.
+#[tokio::test]
+async fn a_truncate_clears_the_target_then_post_truncate_inserts_converge_to_the_oracle() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+
+    setup_source_and_target(&db.pool, &raw).await;
+    let def = totals_def();
+
+    let options = ClientOptions {
+        staging_worker: true,
+        application_threads: 2,
+        source_tables: vec![format!("{DEFAULT_SCHEMA}.orders")],
+        ..Default::default()
+    };
+    let client = TrellisClient::start(db.dsn(), options).expect("client start");
+
+    raw.batch_execute(
+        "insert into orders (id, a, b) values \
+         (1, 10.00, 1.50), (2, 20.00, 2.00), (3, 5.00, 0.50)",
+    )
+    .await
+    .expect("insert source rows");
+
+    poll_until(
+        Duration::from_secs(20),
+        Duration::from_millis(200),
+        "target never converged with the oracle after the inserts",
+        async || {
+            target_snapshot(&raw).await
+                == oracle_snapshot(&db.pool, &def, "id", &numeric_columns(&["a", "b"])).await
+        },
+    )
+    .await;
+    assert_eq!(target_snapshot(&raw).await.len(), 3);
+
+    // The truncate itself, plus a same-transaction post-truncate insert
+    // (id 4) — both commit under one `lsn`, so surviving this correctly
+    // depends on intake's append order (`change_id`), not `lsn` alone. A
+    // separate, later transaction adds id 5, exercising the ordinary
+    // cross-transaction case too.
+    let mut txn_conn = connect_raw(db.dsn()).await;
+    let txn = txn_conn.transaction().await.expect("begin truncate txn");
+    txn.execute("truncate orders", &[])
+        .await
+        .expect("truncate source table");
+    txn.execute("insert into orders (id, a, b) values (4, 40.00, 4.00)", &[])
+        .await
+        .expect("insert a same-transaction post-truncate row");
+    txn.commit().await.expect("commit truncate txn");
+
+    raw.execute("insert into orders (id, a, b) values (5, 50.00, 5.00)", &[])
+        .await
+        .expect("insert a later, separate-transaction post-truncate row");
+
+    poll_until(
+        Duration::from_secs(20),
+        Duration::from_millis(200),
+        "target never converged with the oracle after the truncate",
+        async || {
+            target_snapshot(&raw).await
+                == oracle_snapshot(&db.pool, &def, "id", &numeric_columns(&["a", "b"])).await
+        },
+    )
+    .await;
+
+    let remaining = target_snapshot(&raw).await;
+    assert_eq!(
+        remaining.len(),
+        2,
+        "only the two post-truncate rows must remain: {remaining:?}"
+    );
+    assert!(
+        !remaining.contains_key("1")
+            && !remaining.contains_key("2")
+            && !remaining.contains_key("3"),
+        "every pre-truncate row must be gone: {remaining:?}"
+    );
+    assert_eq!(remaining.get("4"), Some(&Some("44.00".to_string())));
+    assert_eq!(remaining.get("5"), Some(&Some("55.00".to_string())));
+
+    client.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn staging_and_application_threads_are_independent_knobs() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+
+    setup_source_and_target(&db.pool, &raw).await;
+
+    // No app workers: staging (intake + sealing) must still run, but nothing
+    // drains the sealed batch into the target.
+    let options = ClientOptions {
+        staging_worker: true,
+        application_threads: 0,
+        source_tables: vec![format!("{DEFAULT_SCHEMA}.orders")],
+        ..Default::default()
+    };
+    let client = TrellisClient::start(db.dsn(), options).expect("client start");
+
+    raw.batch_execute("insert into orders (id, a, b) values (1, 10.00, 1.50), (2, 20.00, 2.00)")
+        .await
+        .expect("insert source rows");
+
+    poll_until(
+        Duration::from_secs(20),
+        Duration::from_millis(200),
+        "the staged insert never sealed into a batch",
+        async || {
+            let sealed: i64 = raw
+                .query_one("select count(*) from segments where state = 'sealed'", &[])
+                .await
+                .expect("count sealed segments")
+                .get(0);
+            sealed >= 1
+        },
+    )
+    .await;
+
+    let target_count: i64 = raw
+        .query_one("select count(*) from totals", &[])
+        .await
+        .expect("count target rows")
+        .get(0);
+    assert_eq!(
+        target_count, 0,
+        "with zero application threads nothing should have drained into the target"
+    );
+
+    client.shutdown().await.expect("clean shutdown");
+}

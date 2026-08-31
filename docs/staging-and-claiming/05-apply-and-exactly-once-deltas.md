@@ -1,0 +1,296 @@
+# Stage 5 — Applying, and why a delta lands exactly once
+
+← [Claiming and the fold](04-claiming-and-the-fold.md) · next → [Cleanup and reclaim](06-cleanup-and-reclaim.md)
+
+**What this stage owns:** turning folded records into derived writes, and doing
+it in a way that survives crashes, duplicate execution, concurrent workers, and
+concurrent definition changes.
+
+**The guarantee:** *a non-idempotent effect — an aggregate delta — is applied
+exactly once. Never twice, never zero times.* And it is guaranteed
+**structurally**, with no per-key applied-marker to keep in sync.
+
+## The three phases
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant DB as Postgres
+
+    rect rgb(31,111,235,0.10)
+    Note over W,DB: Phase 1 — claim + fold (one short txn)
+    W->>DB: claim a bucket share (1 statement)
+    W->>DB: fold the fenced window → one record per (table, key)
+    end
+
+    rect rgb(160,160,160,0.12)
+    Note over W,DB: Phase 2 — compute (NO transaction, NO locks held)
+    W->>DB: read source rows, prefetch related rows
+    W->>W: evaluate derivations in dependency order
+    W->>DB: heartbeat the claim, per source table
+    end
+
+    rect rgb(46,160,67,0.12)
+    Note over W,DB: Phase 3 — apply ∪ mark (ONE transaction)
+    W->>DB: BEGIN
+    W->>DB: 1. version fence (FOR SHARE on each computed source)
+    W->>DB: 2. derived writes, gone-key deletes, truncate handling
+    W->>DB: 3. aggregate + join maintenance (delta arithmetic)
+    W->>DB: 4. downstream staging — into the ACTIVE batch
+    W->>DB: 5. mark this claim's buckets drained
+    W->>DB: 6. pg_notify
+    W->>DB: COMMIT
+    end
+```
+
+**Phase 2 holds no locks and no transaction.** Deliberate: it lets compute be
+arbitrarily expensive — a long recompute never blocks intake, never blocks another
+worker, and never holds a snapshot open (which would block the seal gate and the
+cleanup pass). The price is that the world can move under you during Phase 2, which
+is what the version fence and the immutable batch exist to handle.
+
+## The exactly-once argument
+
+Three properties give it, and **all three are structural** — there is no
+bookkeeping to keep in sync, no "applied" flag, no per-key watermark.
+
+### 1. The claimed batch is immutable
+
+A worker folds a *sealed* batch. No concurrent change can land in it: a source
+change arriving mid-compute appends to the **active** batch and is a different
+batch. There is no "a row changed under me" case to reconcile.
+
+This includes the worker's own downstream staging: Step 4 appends into the
+**active** batch, never onto the one being drained. A design where a worker can
+stage into its own claimed batch loses the property immediately.
+
+### 2. Apply ∪ mark-drained are one transaction
+
+The derived writes, the aggregate maintenance, the downstream appends, and the
+batch's `draining → drained` mark all commit together. This is why the target
+store and the staging store are the same Postgres database: without a shared
+transaction there is no exactly-once for non-idempotent effects.
+
+- A crash **before** the commit rolls back the delta *and* the mark. The claim
+  expires, the batch returns to `sealed`, and it re-drains from scratch.
+- A crash **after** commits both.
+
+Under a bucket claim the unit is the claimed *bucket set*: its apply, the deletion
+of its claim rows, and the OR of its bits into the batch's coverage mask are the
+same commit. The batch becomes `drained` exactly when the mask fills.
+
+The completion statement does two jobs at once:
+
+```sql
+-- (1) the claim check and the mask are one act
+DELETE FROM seg_claims WHERE seg_seq = :s AND claimed_by = :me RETURNING bucket;
+-- an EMPTY result means "my claim was lost mid-drain" → raise → the whole
+-- Phase-3 transaction rolls back → the current claimant re-drains it exactly once
+
+-- (2) OR my buckets in; complete iff that fills every bucket
+UPDATE segments
+   SET drained_mask = drained_mask | :mask,
+       state = CASE WHEN (drained_mask | :mask) = ((1::int8 << bucket_count) - 1)
+                    THEN 'drained' ELSE state END
+ WHERE seg_seq = :s AND state = 'draining';
+```
+
+### 3. The per-key fold telescopes
+
+Within one batch, N changes to a key fold to one record whose old side is the
+*earliest* pre-image and whose new side is the *latest* post-image. Across
+batches, each batch's net delta chains onto the last: **batch *k*'s old side is
+exactly the state batch *k−1*'s new side left.**
+
+Because the deltas are invertible they also **commute**, so an out-of-order drain
+converges to the same total.
+
+## What this replaced
+
+The old, mutable-worklist design needed two extra mechanisms, and both are gone:
+
+- An **`lsn` compare-and-delete**: clear a claimed key only if its `lsn` is
+  unchanged since the claim, so anything re-staged concurrently survives.
+- A **survivor rewrite**: when a re-stage *did* land on a claimed row mid-compute,
+  advance that survivor's `old_image` to the image just applied, or the re-drain
+  double-subtracts.
+
+Both existed *only* because the worklist was mutable. Property 1 removes the race
+they addressed. **A patch that reintroduces a mutable claimed batch must
+reintroduce them both** — that is the tell for whether a proposed change is
+actually equivalent.
+
+## The delta model
+
+For a row with key `pk`, maintaining a measure `f` over group `g` in one Phase-3
+transaction:
+
+| Op | Effect |
+|---|---|
+| INSERT | `g(new) += f(new)` |
+| DELETE | `g(old) -= f(old_image)` |
+| UPDATE, grain unchanged | `g -= f(old_image)` and `g += f(new)` — one group, net delta |
+| UPDATE, grain changed | **grain migration**: `g(old) -= f(old_image)` *and* `g(new) += f(new)` — two groups |
+
+The drain needs exactly two facts per folded record: the **old-side image** (to
+subtract; present iff `old_image IS NOT NULL`) and the **new-side image** (to
+add; present iff the key is still live).
+
+Folding the new side from the **staged post-image at the claimed position** — not
+from a live source read — is what keeps the delta scan-free *and* closes a
+read-ahead window: a live read at apply time can see a *later* state than the
+batch is accounting for, and then the next batch subtracts an old image that was
+never added.
+
+Composite measures fold their hidden partials, never themselves: `avg` maintains
+`{m}__sum` and `{m}__count` and recomputes the visible ratio from them.
+
+**Not every measure is delta-able**, and the gate is explicit: only exact,
+invertible folds qualify. `count(*)`, `count(col)`, and `sum`/`avg` over
+int/numeric are in. `min`/`max` are not invertible (removing the current maximum
+tells you nothing about the next one) and take a probe-assisted recompute path
+instead. Floats need care: naïve float deltas drift unboundedly because IEEE-754
+addition is non-associative, so the accumulator is kept in exact decimal and only
+rendered to float — and `Inf`/`NaN` are tracked as counts because they are not
+delta-invertible at all (`Inf − Inf = NaN`).
+
+**The north star for the exact types is byte-identical convergence to a
+from-scratch `GROUP BY` oracle after every op and every drain interleaving** — far
+stronger than "eventually approximately right", and what makes the path auditable:
+you can always recompute and compare.
+
+## The version fence: the one failure idempotency cannot fix
+
+Idempotent recompute self-heals almost everything. It does not heal **permanent
+staleness**: a stale in-flight write landing *after* a definition change's
+re-derivation completes, with nothing left staged to correct it.
+
+The design:
+
+- **The definition applied is always the current one.** A staged change is pure
+  identity ("recompute me"); logic is looked up fresh at compute time. Version the
+  *catalog*, not the pending changes.
+- **Per-source-table versions.** One monotonic version per source table. A
+  definition change is one transaction scoped to the edited table: bump its
+  version, write the new definitions, stage its affected keys, commit, notify.
+- **The fence:** Phase 3 asserts every table it *evaluated* is still at the version
+  it loaded — `FOR SHARE` on that table's meta row, which serializes against the
+  definition change's `FOR UPDATE`. Mismatch → roll back, reload, recompute. No
+  worker can commit values computed under a superseded definition, and an edit to
+  one table never fences batches working on other tables.
+- **Backstop:** the edit's re-derivation stages its rows at a higher position, so
+  they land in a **later** batch than any in-flight drain's and cannot be swallowed
+  by a batch already claimed.
+
+**The fence runs first in Phase 3**, so a superseded batch rolls back before
+touching a derived row. The fence set must include tables that are *evaluated* but
+absent from the one-to-one write plan — an aggregate-only source, an equi-join
+parent — or a grain change mid-batch slips through.
+
+## Lock ordering, because parallel workers will overlap
+
+Two workers whose batches touch overlapping aggregate groups will contend on the
+same group rows. That is fine; deadlocking on them is not. Every statement that
+writes group rows takes its locks in a **single consistent order — ascending
+group key** — via an ordered pre-lock ahead of the write:
+
+```sql
+WITH locked AS (
+  SELECT group_key FROM agg_target WHERE group_key = ANY(:groups)
+  ORDER BY group_key FOR UPDATE
+)
+-- ... the actual merge, guarded so `locked` is genuinely referenced
+```
+
+A consistent total lock order has no cycle, so overlapping workers merely
+serialize on a shared hot group instead of deadlocking. That plus a bounded,
+idempotent retry on the residual serialization failures (`40001`/`40P01`) is the
+whole deadlock story.
+
+> **The same Postgres gotcha as the claim statement:** an unreferenced `FOR
+> UPDATE` pre-lock CTE gets pruned and locks nothing. Force it with a `count(*)`
+> guard in the outer query — this is an easy bug to ship and a silent one.
+
+## Downstream propagation, and why it terminates
+
+Step 4 stages the keys whose derived values depend on what just changed —
+including, for a one-to-many aggregate, the parent groups of a changed child.
+This is where the old-image requirement from
+[01](01-intake-and-lsn-confirmation.md) is cashed in: a child **delete** or a
+**re-parent** must refresh both the group the child joined (from the live row) and
+the group it left (from the staged old image, which is the only place that
+information still exists).
+
+Two termination mechanisms:
+
+- **Filtered staging.** Dependents are staged only for tables that actually have a
+  derivation reading the changed table, so an acyclic dependency graph drains to
+  empty. Cycles are rejected at definition time.
+- **A schema-derived hop bound.** Each staged dependent carries a hop generation
+  one past its deepest trigger (reset to 0 by any fresh source change — hence the
+  `src_changed` OR rule in the fold). A wave climbing beyond the graph's
+  cross-table depth plus slack cannot happen on the declared schema, so it raises a
+  named error identifying the bound, the generation and the cycling tables.
+
+An absolute round ceiling survives as defence-in-depth, catching runaways the hop
+bound cannot (e.g. an unbounded stream of fresh intake). It is no longer the
+contract, so its message stays hedged: exceeding it is *not* necessarily a cycle.
+
+## Suppressing no-op writes
+
+A source may feed several named derived tables, and a change usually affects only
+one of them. The write carries a value-diff guard:
+
+```sql
+INSERT INTO target (...) VALUES (...)
+ON CONFLICT (pk) DO UPDATE SET ...
+ WHERE (target.a, target.b) IS DISTINCT FROM (EXCLUDED.a, EXCLUDED.b)
+```
+
+so a target a change did not actually affect sees no tuple churn at all. It is
+the relief valve for hot tables, and what makes per-source (not per-target)
+version fencing free: a sibling target's idempotent recompute writes nothing.
+
+The set of keys **physically written** is then the "this recompute changed
+something" signal that filters downstream propagation. Deleted keys count as
+changed.
+
+## Failure classification
+
+Treating every Phase-3 failure uniformly turns a transient blip into a quarantined
+key, or a genuine schema error into a silently parked one. The classification:
+
+| Class | Examples | Treatment |
+|---|---|---|
+| **Transient** | serialization/deadlock (`40001`/`40P01`), lock-not-available, statement timeout, dropped connection | retry; **charge nothing to any key** — a transient failure is not attributable |
+| **Version fence miss** | a definition changed mid-drain | reload the schema and retry; back off on *consecutive* misses only |
+| **Halting schema diagnosis** | a tripped hop bound (a real cross-table value cycle); a relationship endpoint that is not a source column | **propagate loudly**; never quarantine. Quarantining would convert a loud, actionable error into a key that blocks reads forever |
+| **Ordering artefact** | a delta guard tripped while a lower-numbered batch is still outstanding | self-heals; charge only once every predecessor has drained |
+| **Everything else** | a genuinely poisonous change | isolate and charge — see [06](06-cleanup-and-reclaim.md) |
+
+The halting class deserves emphasis: **failing that way stops the whole instance,
+deliberately.** The batch holding the offending change can never drain, cleanup
+requires every older batch to be drained, so the ring fills and seals start
+failing. That is the correct semantic for a genuine schema cycle — nothing may be
+silently skipped — but it is instance-wide rather than scoped to the tables
+named, and the error message should say so. It also needs a real metric (a
+counter plus the last reason), because "stopped" and "slow" look identical from
+the outside otherwise.
+
+## Invariants
+
+1. **The claim is an optimization; the fence plus the atomic apply ∪ mark are the
+   correctness mechanism.** A patch that makes correctness depend on claim
+   exclusivity is wrong.
+2. **The claimed batch is immutable.** Every producer writes to the *active*
+   batch, including a worker doing downstream propagation.
+3. **Apply and the drained mark are one commit**, per claimed bucket set.
+   Splitting them reintroduces double-counting on the non-idempotent delta path.
+4. **A row's bucket is a total function of the row and its batch** — no row in
+   two buckets, none in zero.
+5. **The fold's four rules are individually load-bearing.**
+6. **Recompute reads committed current state and is deterministic.** A written
+   value is never *wrong* — it is a deterministic function of the state that was
+   read — only possibly *superseded*, and a later batch guarantees the superseding
+   recompute runs. Parallelism costs some redundant recomputes, never a wrong
+   final value.

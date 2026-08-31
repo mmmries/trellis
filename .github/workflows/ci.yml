@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    # Mirrors spiff-emu/peg: the org's Actions setup runs on the self-hosted
+    # runner label, not GitHub-hosted ubuntu-latest (whose token is not trusted
+    # to fetch org repo contents — checkout returned HTTP 403 there).
+    runs-on: spiff-ubuntu-4-16
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Local composite action (mirrors peg) so we don't need an allowlisted
+        # third-party toolchain action. Pinned to the version in
+        # rust-toolchain.toml so CI and local dev never drift.
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.98.0"
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Install PostgreSQL server binaries
+        # the shared test harness (see testkit/src/cluster.rs) shells out to
+        # initdb/postgres/pg_isready/createdb/dropdb to spin up throwaway
+        # instances for engine's (and other crates') integration tests.
+        # Prefer PostgreSQL server binaries already present on the runner (not
+        # necessarily on PATH); fall back to installing the distro package.
+        run: |
+          set -euo pipefail
+          pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin 2>/dev/null | sort -V | tail -n1 || true)"
+          if [ -z "$pg_bin" ]; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql
+            pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin | sort -V | tail -n1)"
+          fi
+          echo "using PostgreSQL server binaries from: $pg_bin"
+          echo "$pg_bin" >> "$GITHUB_PATH"
+
+      - name: Test
+        run: cargo test --workspace
