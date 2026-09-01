@@ -183,9 +183,15 @@ async fn hand_staged_apply_of_a_source_change_converges_to_the_oracle() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &numeric_columns(&["price", "tax"]))
-        .await
-        .expect("create target table");
+    create_target_table(
+        &db.pool,
+        &def,
+        "public",
+        &pk,
+        &numeric_columns(&["price", "tax"]),
+    )
+    .await
+    .expect("create target table");
 
     // Pre-populate the target directly, standing in for backfill-on-create
     // (#6), which this issue defers.

@@ -171,7 +171,7 @@ async fn drain_matches_the_oracle_across_an_insert_update_and_delete() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -264,7 +264,7 @@ async fn a_fully_drained_single_bucket_batch_flips_the_segment_to_drained() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -317,7 +317,7 @@ async fn a_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -410,7 +410,7 @@ async fn a_definition_change_on_a_touched_source_trips_the_version_fence() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -507,7 +507,7 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_fence() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -582,7 +582,7 @@ async fn a_write_that_changes_nothing_is_suppressed_as_a_no_op() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -649,7 +649,7 @@ async fn a_truncate_clears_every_target_row_but_a_same_batch_post_truncate_inser
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create order_totals table");
 
@@ -664,9 +664,15 @@ async fn a_truncate_clears_every_target_row_but_a_same_batch_post_truncate_inser
     )
     .await
     .expect("create order_summary definition");
-    create_target_table(&db.pool, &summary_def.def, &pk, &order_totals_columns)
-        .await
-        .expect("create order_summary table");
+    create_target_table(
+        &db.pool,
+        &summary_def.def,
+        "public",
+        &pk,
+        &order_totals_columns,
+    )
+    .await
+    .expect("create order_summary table");
 
     // Rows an earlier drain left behind — the truncate must clear every one
     // of them, and its clear must propagate downstream to order_summary's
@@ -870,7 +876,7 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create order_totals table");
 
@@ -885,9 +891,15 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
     )
     .await
     .expect("create order_summary definition");
-    create_target_table(&db.pool, &summary_def.def, &pk, &order_totals_columns)
-        .await
-        .expect("create order_summary table");
+    create_target_table(
+        &db.pool,
+        &summary_def.def,
+        "public",
+        &pk,
+        &order_totals_columns,
+    )
+    .await
+    .expect("create order_summary table");
 
     insert_cdc_row(
         &client,
@@ -1007,7 +1019,7 @@ async fn a_text_column_passthrough_round_trips_through_compute() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -1087,7 +1099,7 @@ async fn a_string_literal_field_writes_its_value_through_compute() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -1142,7 +1154,7 @@ async fn a_boolean_column_passthrough_round_trips_through_compute() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -1230,7 +1242,7 @@ async fn a_function_call_composed_with_greater_than_round_trips_through_compute(
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -1310,7 +1322,7 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -1429,7 +1441,7 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 

@@ -143,7 +143,7 @@ async fn seed_order_totals(db: &TestDatabase, client: &Client) -> TransformDef {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
     def
@@ -528,9 +528,15 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &summary_def.def, &pk, &order_totals_columns)
-        .await
-        .expect("create order_summary table");
+    create_target_table(
+        &db.pool,
+        &summary_def.def,
+        "public",
+        &pk,
+        &order_totals_columns,
+    )
+    .await
+    .expect("create order_summary table");
 
     // Already at the hop bound: applying and propagating once more must trip
     // it.
@@ -891,7 +897,7 @@ async fn a_batch_failure_that_only_reproduces_combined_surfaces_unblamed() {
         .await
         .expect("create aggregate definition");
     let def = parse(source).expect("parse aggregate definition");
-    create_aggregate_target_table(&db.pool, &def, &source_columns)
+    create_aggregate_target_table(&db.pool, &def, "public", &source_columns)
         .await
         .expect("create aggregate target table");
     client

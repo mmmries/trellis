@@ -1,15 +1,26 @@
 //! Target-table DDL for a 1-1 [`TransformDef`] (issue #25).
 //!
 //! **Neighbor-table convention**: the target table is created under the
-//! literal name `def.target`, in the same (Trellis-managed) schema as the
-//! catalog and everything else `crate::pool` points `search_path` at — never
-//! back onto the source table (`docs/data-flow.md`'s "calculated columns
-//! live on a neighbor table" rule: writing them onto the replicated source
-//! row would feed our own WAL into ingestion). No extra prefix/suffix is
-//! added because `transform_definitions.target_table` is already `unique`
-//! (see `V2__transform_catalog.sql`), so collisions across definitions are
-//! already ruled out at the catalog layer; deriving a *different* name from
-//! it would just be a second name to keep in sync for no benefit.
+//! literal name `def.target`, in a separately-configurable *target schema*
+//! (`Config::target_schema`, issue #15) — deliberately decoupled from the
+//! Trellis-managed catalog schema (`Config::schema`) everything else
+//! `crate::pool` points `search_path` at, and defaulting to `public` (the
+//! same default any other bare `CREATE TABLE` would land in) rather than
+//! the Trellis instance schema: a POC that defaulted target tables into the
+//! Trellis schema found a high chance of future name conflicts as Trellis
+//! grows its own catalog/state tables there. The target table never lands
+//! back onto the source table either way (`docs/data-flow.md`'s
+//! "calculated columns live on a neighbor table" rule: writing them onto the
+//! replicated source row would feed our own WAL into ingestion). No extra
+//! prefix/suffix is added to `def.target` because `transform_definitions.target_table`
+//! is already `unique` (see `V2__transform_catalog.sql`), so collisions
+//! across definitions are already ruled out at the catalog layer; deriving
+//! a *different* name from it would just be a second name to keep in sync
+//! for no benefit. That catalog constraint is global across every target
+//! schema today (not scoped per-schema) — more conservative than strictly
+//! necessary now that target tables can live in different schemas, but
+//! left as-is pending a decision on whether per-schema uniqueness is worth
+//! the extra catalog complexity.
 //!
 //! The target's primary key is inherited from the source table's own primary
 //! key (name and type, introspected live from `pg_catalog` — the one piece
@@ -160,9 +171,22 @@ pub async fn source_primary_key(
 }
 
 /// The neighbor target table's name for `def` — see module docs for why this
-/// is simply `def.target` unchanged.
+/// is simply `def.target` unchanged. Unqualified: the catalog stores and
+/// looks up target tables by this bare name, independent of which schema
+/// [`qualified_target_table`] actually creates it under.
 pub fn neighbor_table_name(def: &TransformDef) -> &str {
     &def.target
+}
+
+/// The fully schema-qualified name of `def`'s neighbor target table under
+/// `target_schema` (see the module doc comment) — `"{target_schema}"."{def.target}"`,
+/// each component quoted independently via [`quote_ident`].
+pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String {
+    format!(
+        "{}.{}",
+        quote_ident(target_schema),
+        quote_ident(neighbor_table_name(def))
+    )
 }
 
 /// Creates `def`'s neighbor target table (idempotent: `create table if not
@@ -172,9 +196,15 @@ pub fn neighbor_table_name(def: &TransformDef) -> &str {
 /// map `def` was validated against — needed here to re-derive each field's
 /// type, since the grammar has no separate "declare a target column's type"
 /// syntax (a field's inferred type *is* its target column's type).
+///
+/// `target_schema` is the schema the table is created under (see
+/// [`qualified_target_table`]) — distinct from the connection's own
+/// Trellis-managed schema, so this is always schema-qualified explicitly
+/// rather than relying on `search_path`.
 pub async fn create_target_table(
     pool: &Pool,
     def: &TransformDef,
+    target_schema: &str,
     pk: &PrimaryKeyColumn,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<(), DdlError> {
@@ -182,7 +212,7 @@ pub async fn create_target_table(
 
     let mut sql = format!(
         "create table if not exists {} ({} {} primary key",
-        quote_ident(neighbor_table_name(def)),
+        qualified_target_table(target_schema, def),
         quote_ident(&pk.name),
         pk.data_type,
     );
@@ -267,12 +297,17 @@ pub(crate) fn avg_partial_columns(field_name: &str) -> (String, String) {
 /// contributes no separate column — it's assumed to be that same grouping
 /// value passed through, already covered by the primary key column above.
 ///
+/// `target_schema` is the schema the table is created under — see
+/// [`create_target_table`]'s doc comment on why this is always
+/// schema-qualified explicitly rather than relying on `search_path`.
+///
 /// # Panics
 ///
 /// If `def.key_space` is not [`KeySpace::Aggregate`].
 pub async fn create_aggregate_target_table(
     pool: &Pool,
     def: &TransformDef,
+    target_schema: &str,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<(), DdlError> {
     let KeySpace::Aggregate { group_by } = &def.key_space else {
@@ -283,7 +318,7 @@ pub async fn create_aggregate_target_table(
 
     let mut sql = format!(
         "create table if not exists {} (",
-        quote_ident(neighbor_table_name(def))
+        qualified_target_table(target_schema, def)
     );
     for (i, column) in group_by.iter().enumerate() {
         if i > 0 {
@@ -359,5 +394,17 @@ mod tests {
     #[test]
     fn neighbor_table_name_is_the_definitions_target() {
         assert_eq!(neighbor_table_name(&def()), "order_totals");
+    }
+
+    #[test]
+    fn qualified_target_table_combines_target_schema_and_name() {
+        assert_eq!(
+            qualified_target_table("public", &def()),
+            "\"public\".\"order_totals\""
+        );
+        assert_eq!(
+            qualified_target_table("analytics", &def()),
+            "\"analytics\".\"order_totals\""
+        );
     }
 }

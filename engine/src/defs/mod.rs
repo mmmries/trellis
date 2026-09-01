@@ -43,7 +43,7 @@ pub use catalog::{
 };
 pub use ddl::{
     DdlError, PrimaryKeyColumn, create_aggregate_target_table, create_target_table,
-    neighbor_table_name, source_primary_key,
+    neighbor_table_name, qualified_target_table, source_primary_key,
 };
 pub use error::ParseError;
 pub use eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};

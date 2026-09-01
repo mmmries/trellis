@@ -119,7 +119,7 @@ async fn setup_source_and_target(pool: &Pool, raw: &Client) -> engine::defs::Pri
     let pk = source_primary_key(pool, "orders")
         .await
         .expect("introspect source primary key");
-    create_target_table(pool, &totals_def(), &pk, &source_columns)
+    create_target_table(pool, &totals_def(), "public", &pk, &source_columns)
         .await
         .expect("create target table");
     pk
@@ -418,6 +418,7 @@ async fn a_transform_registered_against_a_new_source_table_backfills_without_a_c
     create_target_table(
         &db.pool,
         &comments_calc_def(),
+        "public",
         &comments_pk,
         &comments_columns,
     )

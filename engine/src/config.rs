@@ -11,7 +11,14 @@
 //!    `PGDATABASE` environment variables, assembled into a DSN.
 //!
 //! The Postgres schema Trellis manages its own objects under is likewise
-//! resolved from `TRELLIS_SCHEMA`, defaulting to [`DEFAULT_SCHEMA`].
+//! resolved from `TRELLIS_SCHEMA`, defaulting to [`DEFAULT_SCHEMA`]. The
+//! schema *transform target tables* are created under is a separate,
+//! independently configurable setting — resolved from `TRELLIS_TARGET_SCHEMA`,
+//! defaulting to [`DEFAULT_TARGET_SCHEMA`] (`public`) — deliberately decoupled
+//! from the Trellis-managed catalog schema above (issue #15): defaulting
+//! target tables into the same schema as the catalog made every new
+//! transform a potential name collision with Trellis's own future
+//! catalog/state objects.
 
 use crate::error::Error;
 use std::fmt;
@@ -25,11 +32,22 @@ use std::fmt;
 /// schemas). See `docs/instance-identity.md`.
 pub const DEFAULT_SCHEMA: &str = "trellis";
 
+/// The default Postgres schema transform *target* tables are created
+/// under — `public`, matching the default schema every other DDL statement
+/// (e.g. a bare `CREATE TABLE`) would land in absent an explicit schema.
+/// Deliberately distinct from [`DEFAULT_SCHEMA`]: target tables are
+/// application data a user queries directly, not part of Trellis's own
+/// managed footprint, so defaulting them into the Trellis instance schema
+/// (as an earlier POC did) meant a high chance of future name conflicts as
+/// Trellis grows its own catalog/state tables in that schema (issue #15).
+pub const DEFAULT_TARGET_SCHEMA: &str = "public";
+
 /// Resolved connection configuration.
 ///
-/// Both fields are private and every constructor validates the schema name
-/// via [`validate_schema_name`], so there is no way to hold a `Config` whose
-/// schema hasn't been checked — see [`Config::with_schema`].
+/// Every field but `dsn` is private and every constructor validates the
+/// schema names via [`validate_schema_name`], so there is no way to hold a
+/// `Config` whose schema hasn't been checked — see [`Config::with_schema`]
+/// and [`Config::with_target_schema`].
 #[derive(Debug, Clone)]
 pub struct Config {
     /// A Postgres connection string, in either URL (`postgresql://...`) or
@@ -37,6 +55,9 @@ pub struct Config {
     dsn: String,
     /// The schema Trellis operates in. See [`DEFAULT_SCHEMA`].
     schema: String,
+    /// The schema transform target tables are created under. See
+    /// [`DEFAULT_TARGET_SCHEMA`].
+    target_schema: String,
 }
 
 impl Config {
@@ -57,29 +78,46 @@ impl Config {
         }
 
         let schema = std::env::var("TRELLIS_SCHEMA").unwrap_or_else(|_| DEFAULT_SCHEMA.to_string());
-        Self::with_schema(dsn, schema)
+        let target_schema = target_schema_from_env();
+        Self::with_schema(dsn, schema)?.with_target_schema(target_schema)
     }
 
     /// Builds a [`Config`] from an explicit DSN, bypassing environment
-    /// resolution entirely (the schema is still resolved from
-    /// `TRELLIS_SCHEMA`/[`DEFAULT_SCHEMA`] and validated). Useful for tests.
+    /// resolution entirely (the schema and target schema are still resolved
+    /// from `TRELLIS_SCHEMA`/[`DEFAULT_SCHEMA`] and
+    /// `TRELLIS_TARGET_SCHEMA`/[`DEFAULT_TARGET_SCHEMA`], and validated).
+    /// Useful for tests.
     pub fn from_dsn(dsn: impl Into<String>) -> Result<Self, Error> {
         let schema = std::env::var("TRELLIS_SCHEMA").unwrap_or_else(|_| DEFAULT_SCHEMA.to_string());
-        Self::with_schema(dsn, schema)
+        let target_schema = target_schema_from_env();
+        Self::with_schema(dsn, schema)?.with_target_schema(target_schema)
     }
 
     /// Builds a [`Config`] from an explicit DSN and schema, validating the
-    /// schema via [`validate_schema_name`]. This is the one place a `Config`
-    /// is actually constructed — [`Config::resolve`] and
-    /// [`Config::from_dsn`] both resolve a schema and hand it to this — so
-    /// there is no path to a `Config` carrying an unvalidated schema name.
+    /// schema via [`validate_schema_name`] and defaulting the target schema
+    /// to [`DEFAULT_TARGET_SCHEMA`] (override via [`Config::with_target_schema`]).
+    /// This is the one place a `Config` is actually constructed —
+    /// [`Config::resolve`] and [`Config::from_dsn`] both resolve a schema
+    /// and hand it to this — so there is no path to a `Config` carrying an
+    /// unvalidated schema name.
     pub fn with_schema(dsn: impl Into<String>, schema: impl Into<String>) -> Result<Self, Error> {
         let schema = schema.into();
         validate_schema_name(&schema)?;
         Ok(Self {
             dsn: dsn.into(),
             schema,
+            target_schema: DEFAULT_TARGET_SCHEMA.to_string(),
         })
+    }
+
+    /// Returns `self` with its target schema overridden to `target_schema`,
+    /// validated via [`validate_schema_name`] just like [`Config::with_schema`]
+    /// validates the instance schema.
+    pub fn with_target_schema(mut self, target_schema: impl Into<String>) -> Result<Self, Error> {
+        let target_schema = target_schema.into();
+        validate_schema_name(&target_schema)?;
+        self.target_schema = target_schema;
+        Ok(self)
     }
 
     /// The Postgres connection string this instance was configured with.
@@ -91,6 +129,12 @@ impl Config {
     /// [`DEFAULT_SCHEMA`] and `docs/instance-identity.md`.
     pub fn schema(&self) -> &str {
         &self.schema
+    }
+
+    /// The Postgres schema transform target tables are created under. See
+    /// [`DEFAULT_TARGET_SCHEMA`].
+    pub fn target_schema(&self) -> &str {
+        &self.target_schema
     }
 
     fn dsn_from_env() -> String {
@@ -112,15 +156,22 @@ impl Config {
 
 impl fmt::Display for Config {
     /// A short, human-readable summary of the resolved instance identity —
-    /// the schema this instance operates in — for wherever configuration
-    /// gets reported (logs, diagnostics). Deliberately omits the DSN, which
-    /// may carry a password.
+    /// the schema this instance operates in, and the schema its transform
+    /// target tables are created under — for wherever configuration gets
+    /// reported (logs, diagnostics). Deliberately omits the DSN, which may
+    /// carry a password.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "trellis instance in schema {:?}", self.schema)
+        write!(
+            f,
+            "trellis instance in schema {:?} (target tables in schema {:?})",
+            self.schema, self.target_schema
+        )
     }
 }
 
-/// Validates a candidate Trellis schema name.
+/// Validates a candidate schema name — used for both the Trellis instance
+/// schema (`TRELLIS_SCHEMA`) and the transform target schema
+/// (`TRELLIS_TARGET_SCHEMA`).
 ///
 /// Every place this name reaches SQL goes through [`crate::pool::quote_ident`]
 /// as a quoted (delimited) identifier, so Postgres will accept almost any
@@ -129,8 +180,8 @@ impl fmt::Display for Config {
 /// doesn't protect against are:
 ///
 /// - **Empty or all-whitespace.** Not a name at all — almost certainly a
-///   misconfigured `TRELLIS_SCHEMA` (e.g. `TRELLIS_SCHEMA=" "`), not an
-///   intentional identity.
+///   misconfigured `TRELLIS_SCHEMA`/`TRELLIS_TARGET_SCHEMA` (e.g. set to
+///   `" "`), not an intentional identity.
 /// - **Longer than 63 bytes.** Postgres's `NAMEDATALEN` limit means longer
 ///   identifiers are *silently truncated*, not rejected — two distinct
 ///   configured names could collide under truncation without anyone
@@ -142,23 +193,30 @@ impl fmt::Display for Config {
 fn validate_schema_name(name: &str) -> Result<(), Error> {
     if name.trim().is_empty() {
         return Err(Error::Config(
-            "TRELLIS_SCHEMA must not be empty or all-whitespace".to_string(),
+            "schema name must not be empty or all-whitespace".to_string(),
         ));
     }
     if name.contains('\0') {
         return Err(Error::Config(
-            "TRELLIS_SCHEMA must not contain a NUL byte".to_string(),
+            "schema name must not contain a NUL byte".to_string(),
         ));
     }
     if name.len() > 63 {
         return Err(Error::Config(format!(
-            "TRELLIS_SCHEMA {name:?} is {} bytes long, exceeding Postgres's 63-byte \
+            "schema name {name:?} is {} bytes long, exceeding Postgres's 63-byte \
              identifier limit (NAMEDATALEN); Postgres would silently truncate it, \
-             which could collide with another instance's schema name",
+             which could collide with another schema name",
             name.len()
         )));
     }
     Ok(())
+}
+
+/// Resolves the target schema from `TRELLIS_TARGET_SCHEMA`, defaulting to
+/// [`DEFAULT_TARGET_SCHEMA`] — the one place both [`Config::resolve`] and
+/// [`Config::from_dsn`] read this env var, so they can't drift.
+fn target_schema_from_env() -> String {
+    std::env::var("TRELLIS_TARGET_SCHEMA").unwrap_or_else(|_| DEFAULT_TARGET_SCHEMA.to_string())
 }
 
 #[cfg(test)]
@@ -170,6 +228,34 @@ mod tests {
         let config = Config::resolve(Some("postgresql://example/db".to_string())).unwrap();
         assert_eq!(config.dsn(), "postgresql://example/db");
         assert_eq!(config.schema(), DEFAULT_SCHEMA);
+    }
+
+    #[test]
+    fn target_schema_defaults_to_public_not_the_instance_schema() {
+        let config = Config::from_dsn("postgresql://example/db").unwrap();
+        assert_eq!(config.target_schema(), DEFAULT_TARGET_SCHEMA);
+        assert_eq!(DEFAULT_TARGET_SCHEMA, "public");
+        assert_ne!(config.target_schema(), config.schema());
+    }
+
+    #[test]
+    fn with_target_schema_overrides_the_default() {
+        let config = Config::from_dsn("postgresql://example/db")
+            .unwrap()
+            .with_target_schema("analytics")
+            .unwrap();
+        assert_eq!(config.target_schema(), "analytics");
+        // Overriding the target schema leaves the instance schema alone.
+        assert_eq!(config.schema(), DEFAULT_SCHEMA);
+    }
+
+    #[test]
+    fn invalid_target_schema_name_is_rejected() {
+        let err = Config::from_dsn("postgresql://example/db")
+            .unwrap()
+            .with_target_schema("")
+            .unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
     }
 
     #[test]

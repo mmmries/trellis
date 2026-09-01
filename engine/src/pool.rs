@@ -2,10 +2,16 @@
 //!
 //! [`Pool::new`] wires up a `deadpool_postgres::Pool` from a resolved
 //! [`Config`] and attaches a per-connection session bootstrap hook (via
-//! deadpool's `post_create` hook). Today that hook only pins `search_path`
-//! to the configured Trellis schema, so migrations and future staging
-//! objects land in a predictable place without every query needing to
-//! qualify table names.
+//! deadpool's `post_create` hook). That hook pins `search_path` to the
+//! configured Trellis schema followed by the configured target schema (see
+//! `Config::target_schema`), so migrations and staging objects land in the
+//! Trellis schema and transform target tables resolve without every query
+//! needing to qualify table names, while [`crate::defs::ddl`] still
+//! schema-qualifies target-table DDL explicitly (`search_path` only decides
+//! where an *unqualified* `CREATE TABLE` lands, and that must be the
+//! Trellis schema, not the target schema, for the rest of this module's
+//! unqualified references to Trellis's own objects to keep resolving
+//! correctly).
 //!
 //! This hook is also the seam intake will extend: it's the one place that
 //! runs exactly once per physical connection, before it's ever handed to a
@@ -55,11 +61,13 @@ impl Pool {
         let manager = Manager::from_config(pg_config, NoTls, manager_config);
 
         let schema = config.schema().to_string();
+        let target_schema = config.target_schema().to_string();
         let inner = DeadpoolPool::builder(manager)
             .post_create(Hook::async_fn(move |client, _metrics| {
                 let schema = schema.clone();
+                let target_schema = target_schema.clone();
                 Box::pin(async move {
-                    session_bootstrap(client, &schema)
+                    session_bootstrap(client, &schema, &target_schema)
                         .await
                         .map_err(HookError::Backend)
                 })
@@ -79,16 +87,23 @@ impl Pool {
 /// Runs once per physical connection, right after it's established and
 /// before it's returned to any caller.
 ///
-/// Stubbed out beyond pinning `search_path`: this is the seam intake will
+/// Pins `search_path` to `schema` (first, so unqualified references to
+/// Trellis's own objects always resolve there) followed by `target_schema`
+/// (so unqualified reads/writes against a transform target table resolve
+/// even when it lives outside both `schema` and `public`) and `public`
+/// (Postgres's own default, kept last as a fallback for anything that
+/// depends on it today). Beyond `search_path`, this is the seam intake will
 /// use to enforce `synchronous_commit = on`.
 async fn session_bootstrap(
     client: &mut tokio_postgres::Client,
     schema: &str,
+    target_schema: &str,
 ) -> Result<(), tokio_postgres::Error> {
     client
         .batch_execute(&format!(
-            "set search_path to {}, public",
-            quote_ident(schema)
+            "set search_path to {}, {}, public",
+            quote_ident(schema),
+            quote_ident(target_schema)
         ))
         .await
 }
