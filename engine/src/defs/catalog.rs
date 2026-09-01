@@ -267,6 +267,23 @@ pub async fn transforms_for_source(
     Ok(result)
 }
 
+/// Every distinct source table with at least one registered transform
+/// definition, unqualified (as stored — see [`create_definition`]'s
+/// `def.source`). Issue #14: a running [`crate::Client`]'s maintenance loop
+/// polls this to notice a transform registered against a source table it
+/// hasn't seen before, so it can add that table to the publication and
+/// discharge its backfill without waiting for a restart.
+pub async fn all_source_tables(pool: &Pool) -> Result<Vec<String>, CatalogError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "select distinct source_table from transform_definitions",
+            &[],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|r| r.get(0)).collect())
+}
+
 /// The current version of `source_table`, or `None` if no definition has
 /// ever been created against it.
 pub async fn source_table_version(

@@ -38,7 +38,9 @@ pub mod registry;
 pub mod validate;
 
 pub use ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
-pub use catalog::{CatalogError, create_definition, source_table_version, transforms_for_source};
+pub use catalog::{
+    CatalogError, all_source_tables, create_definition, source_table_version, transforms_for_source,
+};
 pub use ddl::{
     DdlError, PrimaryKeyColumn, create_aggregate_target_table, create_target_table,
     neighbor_table_name, source_primary_key,

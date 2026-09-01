@@ -323,7 +323,7 @@ async fn table_add_backfills_existing_rows_once_the_fence_settles_and_retries_sa
         .await
         .expect("connect producer session");
     publication::reconcile_publication(
-        &mut session,
+        session.client_mut(),
         "test_pub",
         &[format!("{DEFAULT_SCHEMA}.widgets")],
     )
@@ -339,7 +339,7 @@ async fn table_add_backfills_existing_rows_once_the_fence_settles_and_retries_sa
 
     // The fence hasn't settled — the straggler is still open — so this pass
     // must leave the marker untouched and stage nothing.
-    publication::run_pending_backfills(&mut session, "wake")
+    publication::run_pending_backfills(session.client_mut(), "wake")
         .await
         .expect("run_pending_backfills (unsettled)");
     let seg_0_count_before: i64 = setup
@@ -366,7 +366,7 @@ async fn table_add_backfills_existing_rows_once_the_fence_settles_and_retries_sa
 
     // Now the fence has settled: this pass backfills the 3 pre-existing rows
     // and discharges the marker, atomically.
-    publication::run_pending_backfills(&mut session, "wake")
+    publication::run_pending_backfills(session.client_mut(), "wake")
         .await
         .expect("run_pending_backfills (settled)");
 
@@ -394,7 +394,7 @@ async fn table_add_backfills_existing_rows_once_the_fence_settles_and_retries_sa
     // Re-running the setup pass with the marker already gone (the crash
     // scenario where a *later* pass finds nothing left to do) must be a
     // harmless no-op, never a duplicate backfill.
-    publication::run_pending_backfills(&mut session, "wake")
+    publication::run_pending_backfills(session.client_mut(), "wake")
         .await
         .expect("run_pending_backfills (idempotent no-op)");
     let seg_0_count_after: i64 = setup

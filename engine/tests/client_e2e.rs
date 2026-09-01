@@ -341,6 +341,121 @@ async fn a_truncate_clears_the_target_then_post_truncate_inserts_converge_to_the
     client.shutdown().await.expect("clean shutdown");
 }
 
+/// The transform a new-source-table registration exercises: independent of
+/// `totals_def`/`orders`, so this file's other tests (which never touch
+/// `comments`) can't accidentally satisfy it.
+fn comments_calc_def() -> TransformDef {
+    TransformDef {
+        target: "comments_calc".to_string(),
+        source: "comments".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "total".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::Column("x".to_string())),
+                rhs: Box::new(Expr::Column("y".to_string())),
+            },
+        }],
+        predicate: Predicate::True,
+    }
+}
+
+/// Issue #14's regression case: a transform registered — via
+/// `defs::create_definition`, mirroring what `defctl add` does under the
+/// hood — against a source table that was **not** in
+/// `ClientOptions::source_tables` at `Client::start` time must still get
+/// published and backfilled while that same client keeps running, with no
+/// restart. Before the fix, `reconcile_publication`/`run_pending_backfills`
+/// only ever ran once, from `setup_staging`, so `comments` would never join
+/// the publication and `comments_calc` would stay empty for as long as this
+/// client kept running.
+#[tokio::test]
+async fn a_transform_registered_against_a_new_source_table_backfills_without_a_client_restart() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+
+    // Only `orders` is known at start time — `comments` doesn't exist yet,
+    // let alone have a registered transform.
+    setup_source_and_target(&db.pool, &raw).await;
+
+    let options = ClientOptions {
+        staging_worker: true,
+        application_threads: 2,
+        source_tables: vec![format!("{DEFAULT_SCHEMA}.orders")],
+        // A short reconcile cadence so the test doesn't have to wait out a
+        // production-sized interval to observe the periodic re-reconcile.
+        reconcile_interval: Duration::from_millis(200),
+        ..Default::default()
+    };
+    let client = TrellisClient::start(db.dsn(), options).expect("client start");
+
+    // Register the new table and its transform *after* the client is
+    // already running — the exact sequence the issue describes (`defctl
+    // run` already up, then `defctl add` against a previously-unwatched
+    // table) — including pre-existing rows, so this also proves the
+    // backfill (not just the go-forward stream) reaches a table added this
+    // way.
+    raw.batch_execute(
+        "create table comments (id integer primary key, x numeric, y numeric); \
+         insert into comments (id, x, y) values (1, 3.00, 4.00), (2, 1.00, 1.00)",
+    )
+    .await
+    .expect("create comments and seed pre-existing rows");
+
+    let comments_columns = numeric_columns(&["id", "x", "y"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM comments_calc FROM comments SELECT x + y AS total",
+        &comments_columns,
+    )
+    .await
+    .expect("register comments_calc against the new source table");
+    let comments_pk = engine::defs::source_primary_key(&db.pool, "comments")
+        .await
+        .expect("introspect comments primary key");
+    create_target_table(
+        &db.pool,
+        &comments_calc_def(),
+        &comments_pk,
+        &comments_columns,
+    )
+    .await
+    .expect("create comments_calc target table");
+
+    let def = comments_calc_def();
+    poll_until(
+        Duration::from_secs(20),
+        Duration::from_millis(200),
+        "comments_calc never converged with the oracle after registering a transform \
+         against a new source table on an already-running client",
+        async || {
+            let target: HashMap<String, Option<String>> = raw
+                .query("select id::text, total::text from comments_calc", &[])
+                .await
+                .expect("read comments_calc")
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect();
+            target == oracle_snapshot(&db.pool, &def, "id", &comments_columns).await
+        },
+    )
+    .await;
+
+    let target_count: i64 = raw
+        .query_one("select count(*) from comments_calc", &[])
+        .await
+        .expect("count comments_calc rows")
+        .get(0);
+    assert_eq!(
+        target_count, 2,
+        "both pre-existing comments rows must have backfilled"
+    );
+
+    client.shutdown().await.expect("clean shutdown");
+}
+
 #[tokio::test]
 async fn staging_and_application_threads_are_independent_knobs() {
     let cluster = TestCluster::start();
