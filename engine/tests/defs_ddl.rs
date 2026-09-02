@@ -51,9 +51,15 @@ async fn target_table_is_created_with_inherited_pk_and_numeric_calculated_column
     assert_eq!(pk.name, "id");
     assert_eq!(pk.data_type, "integer");
 
-    create_target_table(&db.pool, &def, &pk, &numeric_columns(&["price", "tax"]))
-        .await
-        .expect("create target table");
+    create_target_table(
+        &db.pool,
+        &def,
+        "public",
+        &pk,
+        &numeric_columns(&["price", "tax"]),
+    )
+    .await
+    .expect("create target table");
 
     let columns = client
         .query(
@@ -93,6 +99,89 @@ async fn target_table_is_created_with_inherited_pk_and_numeric_calculated_column
 }
 
 #[tokio::test]
+async fn target_table_defaults_to_the_public_schema_not_the_trellis_instance_schema() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+
+    client
+        .batch_execute("create table orders (id integer primary key, price numeric, tax numeric)")
+        .await
+        .expect("seed source table");
+
+    let def = order_totals_def();
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+
+    create_target_table(
+        &db.pool,
+        &def,
+        "public",
+        &pk,
+        &numeric_columns(&["price", "tax"]),
+    )
+    .await
+    .expect("create target table");
+
+    let schema: String = client
+        .query_one(
+            "select table_schema from information_schema.tables where table_name = $1",
+            &[&def.target],
+        )
+        .await
+        .expect("introspect target table's schema")
+        .get(0);
+    assert_eq!(schema, "public");
+    assert_ne!(
+        schema, "trellis",
+        "target table must not default into the trellis instance schema"
+    );
+}
+
+#[tokio::test]
+async fn target_table_is_created_in_a_configured_non_default_schema() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+
+    client
+        .batch_execute(
+            "create table orders (id integer primary key, price numeric, tax numeric); \
+             create schema analytics",
+        )
+        .await
+        .expect("seed source table and target schema");
+
+    let def = order_totals_def();
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+
+    create_target_table(
+        &db.pool,
+        &def,
+        "analytics",
+        &pk,
+        &numeric_columns(&["price", "tax"]),
+    )
+    .await
+    .expect("create target table in the configured target schema");
+
+    let schemas: Vec<String> = client
+        .query(
+            "select table_schema from information_schema.tables where table_name = $1",
+            &[&def.target],
+        )
+        .await
+        .expect("introspect target table's schema")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(schemas, vec!["analytics".to_string()]);
+}
+
+#[tokio::test]
 async fn creating_the_target_table_twice_is_a_no_op() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -108,12 +197,24 @@ async fn creating_the_target_table_twice_is_a_no_op() {
         .await
         .expect("introspect source primary key");
 
-    create_target_table(&db.pool, &def, &pk, &numeric_columns(&["price", "tax"]))
-        .await
-        .expect("first create");
-    create_target_table(&db.pool, &def, &pk, &numeric_columns(&["price", "tax"]))
-        .await
-        .expect("second create is idempotent");
+    create_target_table(
+        &db.pool,
+        &def,
+        "public",
+        &pk,
+        &numeric_columns(&["price", "tax"]),
+    )
+    .await
+    .expect("first create");
+    create_target_table(
+        &db.pool,
+        &def,
+        "public",
+        &pk,
+        &numeric_columns(&["price", "tax"]),
+    )
+    .await
+    .expect("second create is idempotent");
 }
 
 #[tokio::test]
@@ -151,7 +252,7 @@ async fn text_and_boolean_calculated_fields_get_matching_target_column_types() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table with text/boolean columns");
 
@@ -215,7 +316,7 @@ async fn uuid_column_passthrough_gets_a_matching_target_column_type() {
         .expect("introspect source primary key");
     assert_eq!(pk.data_type, "uuid");
 
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table with a uuid passthrough column");
 
@@ -287,7 +388,7 @@ async fn uuid_column_works_as_an_aggregate_group_by_key() {
         ("word_count".to_string(), ValueType::Numeric),
     ]);
 
-    create_aggregate_target_table(&db.pool, &def, &source_columns)
+    create_aggregate_target_table(&db.pool, &def, "public", &source_columns)
         .await
         .expect("create aggregate target table with a uuid group-by key");
 
@@ -369,7 +470,7 @@ async fn aggregate_target_table_gets_a_composite_primary_key_from_the_grouping_c
         ("amount".to_string(), ValueType::Numeric),
     ]);
 
-    create_aggregate_target_table(&db.pool, &def, &source_columns)
+    create_aggregate_target_table(&db.pool, &def, "public", &source_columns)
         .await
         .expect("create aggregate target table");
 

@@ -95,6 +95,15 @@ impl ProducerSession {
     pub fn client(&self) -> &Client {
         &self.client
     }
+
+    /// A mutable handle to the underlying connection, for callers (e.g.
+    /// [`crate::intake::publication::reconcile_publication`]) that take a
+    /// plain `&mut Client` rather than a whole `ProducerSession`, so the
+    /// same function also works against a non-producer connection (see
+    /// that function's doc comment).
+    pub fn client_mut(&mut self) -> &mut Client {
+        &mut self.client
+    }
 }
 
 /// `SHOW synchronous_commit` rather than `pg_settings`: this is the session's

@@ -267,35 +267,49 @@ async fn decode_image(pool: &Pool, image_text: &str) -> Result<Row, ApplyError> 
     Ok(row)
 }
 
-/// Re-reads `key`'s current row from `source_table` live, for a folded
-/// change that carried no image at all (see [`compute`]'s doc comment on
-/// the three shapes). `to_jsonb(t.*)` turns the whole row into one jsonb
-/// object in the query itself, so [`decode_image`] can decode it exactly
-/// like a staged image — one code path for "turn a row into a [`Row`]",
-/// whether the JSON came from the ring or from a live `SELECT`. `None`
-/// means the row is gone (already deleted, or never existed under this
-/// key), which [`compute`] treats as a delete.
-async fn read_live_row(
+/// Re-reads every one of `keys`' current rows from `source_table` live, in
+/// one round trip, for folded changes that carried no image at all (see
+/// [`compute`]'s doc comment on the three shapes) — the batched replacement
+/// for what used to be one `read_live_row` round trip per key (issue #13: a
+/// backfill's initial enumeration stages every pre-existing row as exactly
+/// this shape, so a naive per-key refetch made backfill throughput scale
+/// with source table size in network round trips, not rows).
+///
+/// The `jsonb_each_text` unnest happens in the same query as the `any($1)`
+/// row lookup — a `cross join lateral`, one column per matched row — so
+/// decoding costs no extra round trip either; [`decode_image`]'s per-image
+/// query is only paid for images that arrive already staged (`new_image`),
+/// never for a live refetch. A key absent from the returned map means its
+/// row is gone (already deleted, or never existed), which [`compute`]
+/// treats as a delete, matching `read_live_row`'s old `None` case exactly.
+async fn read_live_rows_batch(
     pool: &Pool,
     source_table: &str,
     pk: &PrimaryKeyColumn,
-    key: &str,
-) -> Result<Option<Row>, ApplyError> {
+    keys: &[&str],
+) -> Result<HashMap<String, Row>, ApplyError> {
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
     let client = pool.get().await?;
+    let pk_ident = quote_ident(&pk.name);
     let sql = format!(
-        "select to_jsonb(t.*)::text from {} t where {} = $1::text::{}",
+        "select m.k, e.key, e.value \
+         from (select {pk_ident}::text as k, to_jsonb(t.*) as doc from {} t \
+               where {pk_ident} = any($1::text[]::{}[])) m \
+         cross join lateral jsonb_each_text(m.doc) e",
         quote_ident(source_table),
-        quote_ident(&pk.name),
         pk.data_type,
     );
-    let row = client.query_opt(&sql, &[&key]).await?;
-    match row {
-        Some(row) => {
-            let image_text: String = row.get(0);
-            Ok(Some(decode_image(pool, &image_text).await?))
-        }
-        None => Ok(None),
+    let db_rows = client.query(&sql, &[&keys]).await?;
+    let mut rows: HashMap<String, Row> = HashMap::new();
+    for db_row in db_rows {
+        let key: String = db_row.get(0);
+        let field: String = db_row.get(1);
+        let value: Option<String> = db_row.get(2);
+        rows.entry(key).or_default().insert(field, value);
     }
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------
@@ -514,15 +528,34 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // change) — since every definition subscribed to this source
         // evaluates the exact same row (issue #69): the image a change
         // carries, or the live re-read for an image-less recompute trigger,
-        // doesn't depend on which definition is reading it.
+        // doesn't depend on which definition is reading it. The `(None,
+        // None)` shape — a bare recompute trigger with no image, the shape
+        // every backfill enumeration produces — is collected instead of
+        // re-read immediately, so every such key in this batch is fetched
+        // in one [`read_live_rows_batch`] round trip rather than one
+        // round trip per key (issue #13).
         let mut rows: Vec<Option<Row>> = Vec::with_capacity(changes.len());
-        for change in &changes {
+        let mut live_refetch_indices: Vec<usize> = Vec::new();
+        for (i, change) in changes.iter().enumerate() {
             let row = match (&change.new_image, &change.old_image) {
                 (Some(image_text), _) => Some(decode_image(pool, image_text).await?),
                 (None, Some(_)) => None,
-                (None, None) => read_live_row(pool, source_key, &pk, &change.key).await?,
+                (None, None) => {
+                    live_refetch_indices.push(i);
+                    None
+                }
             };
             rows.push(row);
+        }
+        if !live_refetch_indices.is_empty() {
+            let live_keys: Vec<&str> = live_refetch_indices
+                .iter()
+                .map(|&i| changes[i].key.as_str())
+                .collect();
+            let mut live_rows = read_live_rows_batch(pool, source_key, &pk, &live_keys).await?;
+            for &i in &live_refetch_indices {
+                rows[i] = live_rows.remove(changes[i].key.as_str());
+            }
         }
 
         let defs = catalog::transforms_for_source(pool, source_key).await?;

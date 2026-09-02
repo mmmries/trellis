@@ -149,7 +149,7 @@ async fn setup(db: &testkit::TestDatabase) -> engine::defs::ast::TransformDef {
     create_definition(&db.pool, ORDER_SUMMARY_SOURCE, &source_columns)
         .await
         .expect("create aggregate definition");
-    create_aggregate_target_table(&db.pool, &def, &source_columns)
+    create_aggregate_target_table(&db.pool, &def, "public", &source_columns)
         .await
         .expect("create aggregate target table");
     def
@@ -1054,7 +1054,7 @@ async fn setup_counts(db: &testkit::TestDatabase) -> engine::defs::ast::Transfor
     create_definition(&db.pool, ORDER_COUNTS_SOURCE, &source_columns)
         .await
         .expect("create COUNT(*) aggregate definition");
-    create_aggregate_target_table(&db.pool, &def, &source_columns)
+    create_aggregate_target_table(&db.pool, &def, "public", &source_columns)
         .await
         .expect("create COUNT(*) aggregate target table");
     def

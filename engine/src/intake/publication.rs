@@ -81,13 +81,25 @@ async fn current_publication_tables(
 /// table commits the `ALTER` and a `pending_backfill` marker in one
 /// transaction, so the follow-up enumeration ([`run_pending_backfills`]) is
 /// exactly as durable as the schema change that requires it. Idempotent:
-/// safe to call on every setup pass.
+/// safe to call on every setup pass, and (issue #14) on every periodic
+/// re-reconciliation pass a running client's maintenance loop makes.
+///
+/// Takes a plain `&mut tokio_postgres::Client` rather than a
+/// [`crate::staging::session::ProducerSession`]: nothing here needs that
+/// session's guards (`synchronous_commit`, the producer singleton advisory
+/// lock) — only its `transaction()`/`client()` shape, which a plain
+/// `Client` has too. That matters for a running client's maintenance loop,
+/// whose own connection is never a `ProducerSession`: the one already-live
+/// `ProducerSession` for the whole client lifetime is intake's own (held for
+/// as long as [`super::Intake`] runs), and the singleton lock it holds is
+/// session-scoped — a second `ProducerSession::connect` call while intake is
+/// running would simply fail to acquire it.
 pub async fn reconcile_publication(
-    session: &mut ProducerSession,
+    client: &mut tokio_postgres::Client,
     publication: &str,
     desired_tables: &[String],
 ) -> Result<(), IntakeError> {
-    let current = current_publication_tables(session.client(), publication).await?;
+    let current = current_publication_tables(client, publication).await?;
     let desired: BTreeSet<&String> = desired_tables.iter().collect();
 
     let to_add: Vec<&String> = desired_tables
@@ -100,7 +112,7 @@ pub async fn reconcile_publication(
         return Ok(());
     }
 
-    let txn = session.transaction().await?;
+    let txn = client.transaction().await?;
     for table in &to_drop {
         let (schema, name) = split_qualified(table)?;
         txn.execute(
@@ -313,20 +325,20 @@ async fn enumerate_and_append(txn: &Transaction<'_>, src_table: &str) -> Result<
 /// the marker durable; a fence that hasn't settled yet is left alone for the
 /// next setup pass — this function is meant to be retried on every one.
 pub async fn run_pending_backfills(
-    session: &mut ProducerSession,
+    client: &mut tokio_postgres::Client,
     wake_channel: &str,
 ) -> Result<(), IntakeError> {
-    let pending = fetch_pending_backfills(session.client()).await?;
+    let pending = fetch_pending_backfills(client).await?;
     if pending.is_empty() {
         return Ok(());
     }
-    let now = current_snapshot(session.client()).await?;
+    let now = current_snapshot(client).await?;
 
     for marker in pending {
         if !now.settled_since(&marker.fence) {
             continue;
         }
-        let txn = session.transaction().await?;
+        let txn = client.transaction().await?;
         enumerate_and_append(&txn, &marker.table).await?;
         txn.execute(
             "delete from pending_backfill where table_name = $1",

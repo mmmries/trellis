@@ -171,7 +171,7 @@ async fn drain_matches_the_oracle_across_an_insert_update_and_delete() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -264,7 +264,7 @@ async fn a_fully_drained_single_bucket_batch_flips_the_segment_to_drained() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -317,7 +317,7 @@ async fn a_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -410,7 +410,7 @@ async fn a_definition_change_on_a_touched_source_trips_the_version_fence() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -507,7 +507,7 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_fence() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -582,7 +582,7 @@ async fn a_write_that_changes_nothing_is_suppressed_as_a_no_op() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -649,7 +649,7 @@ async fn a_truncate_clears_every_target_row_but_a_same_batch_post_truncate_inser
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create order_totals table");
 
@@ -664,9 +664,15 @@ async fn a_truncate_clears_every_target_row_but_a_same_batch_post_truncate_inser
     )
     .await
     .expect("create order_summary definition");
-    create_target_table(&db.pool, &summary_def.def, &pk, &order_totals_columns)
-        .await
-        .expect("create order_summary table");
+    create_target_table(
+        &db.pool,
+        &summary_def.def,
+        "public",
+        &pk,
+        &order_totals_columns,
+    )
+    .await
+    .expect("create order_summary table");
 
     // Rows an earlier drain left behind — the truncate must clear every one
     // of them, and its clear must propagate downstream to order_summary's
@@ -870,7 +876,7 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create order_totals table");
 
@@ -885,9 +891,15 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
     )
     .await
     .expect("create order_summary definition");
-    create_target_table(&db.pool, &summary_def.def, &pk, &order_totals_columns)
-        .await
-        .expect("create order_summary table");
+    create_target_table(
+        &db.pool,
+        &summary_def.def,
+        "public",
+        &pk,
+        &order_totals_columns,
+    )
+    .await
+    .expect("create order_summary table");
 
     insert_cdc_row(
         &client,
@@ -1007,7 +1019,7 @@ async fn a_text_column_passthrough_round_trips_through_compute() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -1087,7 +1099,7 @@ async fn a_string_literal_field_writes_its_value_through_compute() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -1142,7 +1154,7 @@ async fn a_boolean_column_passthrough_round_trips_through_compute() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -1230,7 +1242,7 @@ async fn a_function_call_composed_with_greater_than_round_trips_through_compute(
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
 
@@ -1270,4 +1282,282 @@ async fn a_function_call_composed_with_greater_than_round_trips_through_compute(
         !absent,
         "row without 'foo' in name should have has_foo = false"
     );
+}
+
+/// Issue #13: a backfill's initial enumeration stages every pre-existing
+/// source row as a bare `Recompute` trigger with no image, which
+/// `compute()` must re-read live from the source table. Before the fix,
+/// that re-read was one `select ... where id = $1` round trip per key; this
+/// asserts it is now exactly one batched `where id = any($1)` round trip
+/// for the whole bucket, regardless of key count, by turning on Postgres
+/// statement logging and counting matches in the server log — and that the
+/// result is still correct, matching the oracle.
+#[tokio::test]
+async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batched_query() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    const N: usize = 25;
+
+    let mut seed_sql = "create table orders (id integer primary key, price numeric, tax numeric); \
+         insert into orders (id, price, tax) values "
+        .to_string();
+    let rows: Vec<String> = (1..=N).map(|i| format!("({i}, {i}.00, 1.00)")).collect();
+    seed_sql.push_str(&rows.join(", "));
+    client
+        .batch_execute(&seed_sql)
+        .await
+        .expect("seed source table");
+
+    let def = order_totals_def();
+    let source_columns = numeric_columns(&["id", "price", "tax"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM orders SELECT price + tax AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create definition");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+        .await
+        .expect("create target table");
+
+    // Every row staged as a bare recompute trigger — no old/new image —
+    // exactly the shape a backfill's enumeration produces.
+    for i in 1..=N {
+        client
+            .execute(
+                "insert into seg_0 (src_table, key, op, hop_gen) \
+                 values ('orders', $1, 'recompute', 0)",
+                &[&i.to_string()],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("insert recompute row {i} failed: {e}"));
+    }
+
+    // Turn on statement logging only for the drain below, so the log
+    // reflects just the queries this batch's live refetch issues.
+    client
+        .execute("alter system set log_statement = 'all'", &[])
+        .await
+        .expect("enable statement logging");
+    client
+        .execute("select pg_reload_conf()", &[])
+        .await
+        .expect("reload config");
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let outcome = drain(&db.pool, seg_seq, "worker").await;
+    assert_eq!(outcome.keys_written, N);
+
+    client
+        .execute("alter system reset log_statement", &[])
+        .await
+        .expect("disable statement logging");
+    client
+        .execute("select pg_reload_conf()", &[])
+        .await
+        .expect("reload config");
+
+    let log =
+        std::fs::read_to_string(cluster.root().join("postgres.log")).expect("read postgres log");
+    let refetch_queries: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("from \"orders\" t") && line.contains("\"id\" ="))
+        .collect();
+    assert_eq!(
+        refetch_queries.len(),
+        1,
+        "the live refetch for this bucket's {N} keys must be exactly one query, not one per key:\n{log}"
+    );
+    assert!(
+        refetch_queries[0].contains("= any("),
+        "the one refetch query must batch every key via `= any($1)`, not a single-key `= $1`:\n{}",
+        refetch_queries[0]
+    );
+
+    let oracle = recompute(&db.pool, &def, &pk.name, &source_columns)
+        .await
+        .expect("oracle recompute");
+    let target_rows = client
+        .query("select id::text, total::text from order_totals", &[])
+        .await
+        .expect("read target table");
+    assert_eq!(target_rows.len(), N);
+    for row in target_rows {
+        let id: String = row.get(0);
+        let total: Option<String> = row.get(1);
+        let expected = &oracle[&id];
+        assert_eq!(
+            total,
+            expected["total"].as_ref().map(|n| n.to_string()),
+            "total mismatch for id {id}"
+        );
+    }
+}
+
+/// A single bucket mixing all three shapes `compute()` dispatches on (see
+/// its own doc comment): a staged `new_image` (decoded inline, no refetch),
+/// a genuine CDC delete (`old_image` only, no refetch either), and bare
+/// recompute triggers (the only shape needing [`read_live_rows_batch`]).
+/// Guards against a fix that only handles a homogeneous, all-recompute
+/// bucket: the batched refetch must cover exactly the recompute keys, the
+/// other two shapes must still resolve correctly without ever touching it,
+/// and all three shapes' outcomes must be correct in the same drain.
+#[tokio::test]
+async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    // The live table's *final* state (the oracle recomputes straight from
+    // it, matching this file's existing convention): 1, 2, and 5 survive —
+    // 1 and 5 via their bare recompute triggers, 2 via its staged
+    // new_image, which must match the row here — while 3 and 4 are already
+    // gone, one via a bare recompute trigger resolving to a delete, the
+    // other via a genuine staged CDC delete.
+    client
+        .batch_execute(
+            "create table orders (id integer primary key, price numeric, tax numeric); \
+             insert into orders (id, price, tax) values \
+             (1, 10.00, 1.50), (2, 20.00, 2.00), (5, 50.00, 5.00)",
+        )
+        .await
+        .expect("seed source table");
+
+    let def = order_totals_def();
+    let source_columns = numeric_columns(&["id", "price", "tax"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM orders SELECT price + tax AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create definition");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+        .await
+        .expect("create target table");
+
+    // Pre-populate target rows for 3 and 4, standing in for data an earlier
+    // drain wrote before this batch's deletes arrive.
+    client
+        .execute(
+            "insert into order_totals (id, total) values (3, 999), (4, 999)",
+            &[],
+        )
+        .await
+        .expect("pre-populate target rows this batch deletes");
+
+    // Bare recompute triggers (need the batched refetch): 1 (row present,
+    // write) and 3 (row absent, delete).
+    for key in ["1", "3"] {
+        client
+            .execute(
+                "insert into seg_0 (src_table, key, op, hop_gen) \
+                 values ('orders', $1, 'recompute', 0)",
+                &[&key],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("insert recompute row {key} failed: {e}"));
+    }
+    // A staged new_image (decoded inline, no refetch): 2, written from its
+    // own image regardless of what (if anything) is live in `orders`.
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "2",
+        "insert",
+        None,
+        Some(r#"{"price":"20.00","tax":"2.00"}"#),
+    )
+    .await;
+    // A genuine CDC delete (old_image only, no refetch): 4.
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "4",
+        "delete",
+        Some(r#"{"price":"40.00","tax":"4.00"}"#),
+        None,
+    )
+    .await;
+    // A second bare recompute trigger (row present, write): 5 — so the
+    // batched refetch covers more than one key, not just the one that
+    // happens to resolve to a delete.
+    client
+        .execute(
+            "insert into seg_0 (src_table, key, op, hop_gen) \
+             values ('orders', '5', 'recompute', 0)",
+            &[],
+        )
+        .await
+        .expect("insert recompute row 5");
+
+    client
+        .execute("alter system set log_statement = 'all'", &[])
+        .await
+        .expect("enable statement logging");
+    client
+        .execute("select pg_reload_conf()", &[])
+        .await
+        .expect("reload config");
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let outcome = drain(&db.pool, seg_seq, "worker").await;
+    assert_eq!(outcome.keys_written, 3, "1, 2, and 5 must be written");
+    assert_eq!(outcome.keys_deleted, 2, "3 and 4 must be deleted");
+
+    client
+        .execute("alter system reset log_statement", &[])
+        .await
+        .expect("disable statement logging");
+    client
+        .execute("select pg_reload_conf()", &[])
+        .await
+        .expect("reload config");
+
+    let log =
+        std::fs::read_to_string(cluster.root().join("postgres.log")).expect("read postgres log");
+    let refetch_queries: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("from \"orders\" t") && line.contains("\"id\" ="))
+        .collect();
+    assert_eq!(
+        refetch_queries.len(),
+        1,
+        "the bare-recompute subset (1, 3, 5) must still cost exactly one batched refetch:\n{log}"
+    );
+    assert!(
+        refetch_queries[0].contains("= any("),
+        "the one refetch query must batch its keys via `= any($1)`:\n{}",
+        refetch_queries[0]
+    );
+
+    let oracle = recompute(&db.pool, &def, &pk.name, &source_columns)
+        .await
+        .expect("oracle recompute");
+    let target_rows = client
+        .query("select id::text, total::text from order_totals", &[])
+        .await
+        .expect("read target table");
+    assert_eq!(target_rows.len(), 3, "only 1, 2, and 5 must remain");
+    for row in target_rows {
+        let id: String = row.get(0);
+        let total: Option<String> = row.get(1);
+        let expected = &oracle[&id];
+        assert_eq!(
+            total,
+            expected["total"].as_ref().map(|n| n.to_string()),
+            "total mismatch for id {id}"
+        );
+    }
 }

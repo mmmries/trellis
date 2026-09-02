@@ -38,13 +38,14 @@
 
 use std::fmt;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tokio_postgres::NoTls;
 use tokio_postgres::config::Host;
 
 use crate::config::Config;
+use crate::defs::{self, CatalogError};
 use crate::intake::{self, IntakeConfig, IntakeError};
 use crate::pool::{Pool, quote_ident};
 use crate::staging::{
@@ -91,6 +92,17 @@ pub struct ClientOptions {
     pub reclaim_ttl: Duration,
     /// How often the maintenance loop (seal/recover/reclaim) ticks.
     pub maintenance_interval: Duration,
+    /// How often the maintenance loop re-derives the desired source-table
+    /// set from `transform_definitions` (issue #14) and re-runs
+    /// [`intake::publication::reconcile_publication`] /
+    /// [`intake::publication::run_pending_backfills`] against it — so a
+    /// transform registered against a table not in `source_tables` at
+    /// [`Client::start`] time still gets published and backfilled without a
+    /// restart. Coarser than `maintenance_interval` by default: unlike
+    /// seal/reclaim, this does a catalog query and (when a table is newly
+    /// added) an `ALTER PUBLICATION` plus a full backfill enumeration, none
+    /// of which need sub-second freshness.
+    pub reconcile_interval: Duration,
     /// The window [`staging::count_live_drainers`] uses to size a claim's
     /// share of a batch's buckets.
     pub drainer_window: Duration,
@@ -120,6 +132,7 @@ impl Default for ClientOptions {
             wake_channel: "trellis_wake".to_string(),
             reclaim_ttl: Duration::from_secs(30),
             maintenance_interval: Duration::from_millis(300),
+            reconcile_interval: Duration::from_secs(5),
             drainer_window: staging::DEFAULT_DRAINER_WINDOW,
             spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
             hard_cap: intake::spill::DEFAULT_HARD_CAP,
@@ -401,11 +414,19 @@ async fn run(
             let _ = intake.run().await;
         }));
 
+        let maintenance_config = MaintenanceConfig {
+            dsn: dsn.clone(),
+            schema: config.schema().to_string(),
+            pool: pool.clone(),
+            publication: options.publication.clone(),
+            base_source_tables: options.source_tables.clone(),
+            wake_channel: options.wake_channel.clone(),
+            interval: options.maintenance_interval,
+            reclaim_ttl: options.reclaim_ttl,
+            reconcile_interval: options.reconcile_interval,
+        };
         maintenance_task = Some(tokio::spawn(maintenance_loop(
-            dsn.clone(),
-            config.schema().to_string(),
-            options.maintenance_interval,
-            options.reclaim_ttl,
+            maintenance_config,
             shutdown_rx.clone(),
         )));
     }
@@ -491,7 +512,7 @@ async fn setup_staging(
 
     ensure_publication_exists(session.client(), &options.publication).await?;
     intake::publication::reconcile_publication(
-        &mut session,
+        session.client_mut(),
         &options.publication,
         &options.source_tables,
     )
@@ -507,7 +528,8 @@ async fn setup_staging(
         .get(0);
 
     if has_progress {
-        intake::publication::run_pending_backfills(&mut session, &options.wake_channel).await?;
+        intake::publication::run_pending_backfills(session.client_mut(), &options.wake_channel)
+            .await?;
     } else {
         intake::publication::initial_snapshot_handshake(
             &mut session,
@@ -597,24 +619,51 @@ fn build_intake_config(
 // Ring maintenance loop: seal / recover / reclaim
 // ---------------------------------------------------------------------
 
-/// Runs seal-on-demand, stuck-seal recovery, stale-claim reclaim, and
-/// drained-segment retirement (stage 06, issue #13/#58) on a fixed tick
-/// until shutdown. Rides only with the staging worker (see the module doc
-/// comment) — application-only clients never run this, since
-/// sealing/recovery/reclaim/retirement are ring-wide operations that must
-/// not be duplicated across every client in a fleet.
+/// Everything [`maintenance_loop`] needs — bundled into a struct purely to
+/// keep the function signature within clippy's argument-count lint, same as
+/// [`AppWorkerConfig`].
+struct MaintenanceConfig {
+    dsn: String,
+    schema: String,
+    pool: Pool,
+    publication: String,
+    base_source_tables: Vec<String>,
+    wake_channel: String,
+    interval: Duration,
+    reclaim_ttl: Duration,
+    reconcile_interval: Duration,
+}
+
+/// Runs seal-on-demand, stuck-seal recovery, stale-claim reclaim,
+/// drained-segment retirement (stage 06, issue #13/#58), and — on its own,
+/// coarser cadence — publication/backfill re-reconciliation (issue #14) on a
+/// fixed tick until shutdown. Rides only with the staging worker (see the
+/// module doc comment) — application-only clients never run this, since
+/// sealing/recovery/reclaim/retirement/reconciliation are ring-wide
+/// operations that must not be duplicated across every client in a fleet.
 ///
 /// Holds one dedicated connection across ticks (reconnecting lazily on
 /// error) rather than opening a fresh one every tick.
-async fn maintenance_loop(
-    dsn: String,
-    schema: String,
-    interval: Duration,
-    reclaim_ttl: Duration,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
+async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Receiver<bool>) {
+    let MaintenanceConfig {
+        dsn,
+        schema,
+        pool,
+        publication,
+        base_source_tables,
+        wake_channel,
+        interval,
+        reclaim_ttl,
+        reconcile_interval,
+    } = config;
+
     let seal_config = SealConfig::default();
     let mut client: Option<tokio_postgres::Client> = None;
+    // Due immediately on the very first tick rather than waiting a full
+    // `reconcile_interval` after startup — `setup_staging` already ran one
+    // reconciliation pass at that point, but this makes the loop's own
+    // cadence not depend on when it happens to first observe `Instant::now()`.
+    let mut next_reconcile = Instant::now();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -636,6 +685,19 @@ async fn maintenance_loop(
             if !failed {
                 failed = staging::retire_drained_segments(c).await.is_err();
             }
+            if !failed && Instant::now() >= next_reconcile {
+                failed = reconcile_source_tables(
+                    c,
+                    &pool,
+                    &schema,
+                    &publication,
+                    &base_source_tables,
+                    &wake_channel,
+                )
+                .await
+                .is_err();
+                next_reconcile = Instant::now() + reconcile_interval;
+            }
             if failed {
                 // Drop and reconnect next tick rather than spin on a wedged
                 // connection; every one of these operations is naturally
@@ -650,6 +712,74 @@ async fn maintenance_loop(
             _ = tokio::time::sleep(interval) => {}
         }
     }
+}
+
+/// Failure modes [`reconcile_source_tables`] composes, purely so its `?`
+/// call sites don't have to hand-unwrap two unrelated error enums
+/// ([`CatalogError`] from the desired-table-set query, [`IntakeError`] from
+/// the reconcile/backfill calls themselves) — [`maintenance_loop`] only ever
+/// asks `.is_err()` of the result, so this never needs to be more than that.
+#[derive(Debug)]
+enum ReconcileError {
+    Catalog(CatalogError),
+    Intake(IntakeError),
+}
+
+impl fmt::Display for ReconcileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReconcileError::Catalog(err) => write!(f, "{err}"),
+            ReconcileError::Intake(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl From<CatalogError> for ReconcileError {
+    fn from(err: CatalogError) -> Self {
+        ReconcileError::Catalog(err)
+    }
+}
+
+impl From<IntakeError> for ReconcileError {
+    fn from(err: IntakeError) -> Self {
+        ReconcileError::Intake(err)
+    }
+}
+
+/// Issue #14: re-derives the desired source-table set as the union of
+/// `base_source_tables` (whatever [`ClientOptions::source_tables`] was at
+/// [`Client::start`] time — kept so an embedder that only ever passes an
+/// explicit list, with no `transform_definitions` row for a table, still
+/// gets exactly the old, static behavior) and every source table
+/// [`defs::all_source_tables`] finds registered in the catalog right now,
+/// then reconciles the publication and discharges any resulting backfill
+/// against that set — the same two calls [`setup_staging`] makes once at
+/// startup, just re-run periodically so a transform registered against a
+/// new table while this client is already running is picked up without a
+/// restart.
+///
+/// Takes a plain `&mut tokio_postgres::Client`, not a [`ProducerSession`]:
+/// see [`intake::publication::reconcile_publication`]'s doc comment for why
+/// a fresh `ProducerSession` isn't available here (intake's own session
+/// holds the producer singleton for the client's whole lifetime).
+async fn reconcile_source_tables(
+    client: &mut tokio_postgres::Client,
+    pool: &Pool,
+    schema: &str,
+    publication: &str,
+    base_source_tables: &[String],
+    wake_channel: &str,
+) -> Result<(), ReconcileError> {
+    let mut desired: std::collections::BTreeSet<String> =
+        base_source_tables.iter().cloned().collect();
+    for table in defs::all_source_tables(pool).await? {
+        desired.insert(intake::publication::qualify(schema, &table)?);
+    }
+    let desired: Vec<String> = desired.into_iter().collect();
+
+    intake::publication::reconcile_publication(client, publication, &desired).await?;
+    intake::publication::run_pending_backfills(client, wake_channel).await?;
+    Ok(())
 }
 
 /// Opens a standalone `tokio_postgres` connection with `search_path`
