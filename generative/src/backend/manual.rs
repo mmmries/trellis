@@ -42,6 +42,11 @@ pub enum ManualBackendError {
     UnknownTable {
         table: String,
     },
+    /// [`ManualBackend::connect`] was given no explicitly-named connection
+    /// target. Design doc §6: refuse to run against a database the run did
+    /// not name, so this stays enforced if a "point at an existing cluster"
+    /// mode is ever added.
+    UnnamedTarget,
     Config(engine::Error),
     Client(ClientError),
     Catalog(CatalogError),
@@ -178,8 +183,19 @@ impl ManualBackend {
     /// Connects to `dsn` — an already-migrated Trellis database (see
     /// `testkit::TestCluster::create_isolated_database`) — but installs
     /// nothing yet.
+    ///
+    /// `dsn` must be given explicitly by the caller (never inferred from an
+    /// environment default): design doc §6 wants every run to refuse an
+    /// unnamed target, moot today since `testkit` always hands one over
+    /// explicitly, but enforced so it stays moot if an external-cluster mode
+    /// is ever added. The resolved target is printed so a run's connection
+    /// is never silently ambiguous.
     pub async fn connect(dsn: impl Into<String>) -> Result<Self, ManualBackendError> {
         let dsn = dsn.into();
+        if dsn.trim().is_empty() {
+            return Err(ManualBackendError::UnnamedTarget);
+        }
+        println!("generative: connecting ManualBackend to {dsn}");
         let config = Config::from_dsn(dsn.clone())?;
         let pool = Pool::new(&config)?;
 

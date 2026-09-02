@@ -74,7 +74,17 @@ fn run_one(program: &generative::model::Program) -> Result<(), TestCaseError> {
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
             match run_convergence(&mut backend, &pool, program).await {
-                Ok(()) => Ok(()),
+                Ok(outcome) => {
+                    if outcome.as_pass() {
+                        Ok(())
+                    } else {
+                        // Unreachable today: run_convergence's only `Ok` is
+                        // `Outcome::Ran` (design doc §6). Asserted anyway so
+                        // this stays the single decision point rather than
+                        // a second, parallel pass/fail path.
+                        Err(TestCaseError::fail(format!("run did not pass: {outcome}")))
+                    }
+                }
                 Err(RunError::Diverged(d)) => Err(TestCaseError::fail(format!(
                     "convergence diverged after op {} (target {}):\n{}",
                     d.op_index, d.def_target, d.report
@@ -121,9 +131,10 @@ async fn a_hand_built_program_converges_end_to_end() {
         .expect("connect manual backend");
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
-    run_convergence(&mut backend, &pool, &program)
+    let outcome = run_convergence(&mut backend, &pool, &program)
         .await
         .expect("hand-built program must converge end-to-end");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
 }
 
 /// Control (design doc §7): a program whose mutate stream includes ops that
@@ -161,9 +172,10 @@ async fn no_op_mutations_on_missing_rows_still_converge() {
         .expect("connect manual backend");
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
-    run_convergence(&mut backend, &pool, &program)
+    let outcome = run_convergence(&mut backend, &pool, &program)
         .await
         .expect("no-op mutations must not break convergence");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
 }
 
 /// The red half of the control (design doc §6/§7): prove the harness can tell
@@ -188,9 +200,10 @@ async fn the_harness_detects_a_corrupted_target() {
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
     // First converge cleanly through the real property.
-    run_convergence(&mut backend, &pool, &program)
+    let outcome = run_convergence(&mut backend, &pool, &program)
         .await
         .expect("program must converge before we corrupt it");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
 
     // Corrupt one target cell directly; the source is untouched, so both the
     // SQL oracle and the evaluator still compute the right value.
