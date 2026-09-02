@@ -115,12 +115,16 @@ async fn a_hand_built_program_converges_end_to_end() {
     // Seed three rows, then update one and delete one — every mutate hits a
     // real row.
     let program = build_program(
-        &[(10, 1), (20, 2), (30, 3)],
+        &[
+            (Some(10), Some(1)),
+            (Some(20), Some(2)),
+            (Some(30), Some(3)),
+        ],
         &[
             Mutate::Update {
                 pk: 1,
-                c1: 100,
-                c2: 5,
+                c1: Some(100),
+                c2: Some(5),
             },
             Mutate::Delete { pk: 2 },
         ],
@@ -148,21 +152,21 @@ async fn no_op_mutations_on_missing_rows_still_converge() {
     let db = cluster.create_isolated_database().await;
 
     let program = build_program(
-        &[(7, 8)],
+        &[(Some(7), Some(8))],
         &[
             // pk 42 was never seeded: an update and a delete that hit nothing.
             Mutate::Update {
                 pk: 42,
-                c1: 1,
-                c2: 1,
+                c1: Some(1),
+                c2: Some(1),
             },
             Mutate::Delete { pk: 42 },
             // A real update on the one seeded row, to prove the run still makes
             // progress after the no-ops.
             Mutate::Update {
                 pk: 1,
-                c1: 9,
-                c2: 9,
+                c1: Some(9),
+                c2: Some(9),
             },
         ],
     );
@@ -190,7 +194,7 @@ async fn the_harness_detects_a_corrupted_target() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
-    let program = build_program(&[(10, 1), (20, 2)], &[]);
+    let program = build_program(&[(Some(10), Some(1)), (Some(20), Some(2))], &[]);
     let def = program.defs[0].clone();
     let pk_col = program.tables[0].pk_col.clone();
 
@@ -233,4 +237,76 @@ async fn the_harness_detects_a_corrupted_target() {
         report.evaluator_vs_sql.is_empty(),
         "only the persisted target is wrong; the evaluator agrees with the SQL oracle: {report}"
     );
+}
+
+/// Closes the issue #6 gap: a program whose mutate stream includes a
+/// [`Mutate::DuplicateInsert`] — a second `INSERT` at an already-seeded pk,
+/// rejected by the source table's real primary-key constraint. Unlike the
+/// missing-pk update/delete case (`no_op_mutations_on_missing_rows_still_converge`),
+/// this is a genuine `apply()` `Err`, not a silent zero-row success. The
+/// insert is atomic, so the source is unaffected, and the property must still
+/// converge — "an op that errors changed nothing" (design doc §4) exercised
+/// against a real rejection, not just a no-op.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_duplicate_pk_insert_error_still_converges() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program(
+        &[(Some(1), Some(2)), (Some(3), Some(4))],
+        &[
+            // pk 1 is already seeded: this insert must be rejected by the
+            // primary-key constraint, a real `apply()` error.
+            Mutate::DuplicateInsert {
+                pk: 1,
+                c1: Some(999),
+                c2: Some(999),
+            },
+            // A real update afterward, to prove the run still makes progress.
+            Mutate::Update {
+                pk: 1,
+                c1: Some(10),
+                c2: Some(20),
+            },
+        ],
+    );
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("a rejected duplicate-pk insert must not break convergence");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+}
+
+/// A seeded row with `NULL` in a nullable column (design doc §3's awkward
+/// values) converges: `NULL + n = NULL` on both sides (Postgres's `numeric`
+/// arithmetic and `engine::defs::eval`'s `Operator::Add` arm agree), so the
+/// SQL oracle and the maintained target must agree too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_null_value_in_a_nullable_column_converges() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program(
+        &[(None, Some(4)), (Some(5), None)],
+        &[Mutate::Update {
+            pk: 1,
+            c1: None,
+            c2: None,
+        }],
+    );
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("NULL values in nullable columns must not break convergence");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
 }
