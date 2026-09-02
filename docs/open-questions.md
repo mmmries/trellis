@@ -44,6 +44,15 @@ via backfill, but **not** granularity changes (1-1 / aggregate / cross-join is
 fixed at creation). The versioning scheme for the Postgres-stored schema and the
 migration path for an in-place column edit are not yet designed.
 
+One target is settled independent of the API surface: a definition's calculated
+fields (and the relationships they reference) are chosen and applied **together,
+as one atomic unit that backfills in a single pass** — defining a table with an
+initial set of columns enumerates the source once, not once per column. Growing a
+table must never require a separate backfill job per added column; a batch of
+column edits should likewise backfill in one pass, with single-column incremental
+backfill available only as an optimization. The concrete redefinition API is
+still to be designed.
+
 ## Transform grammar — concrete syntax
 
 [ADR-0004](decisions/0004-transform-definition-grammar.md) settled the approach
@@ -55,3 +64,8 @@ and, for the 1-1/`+`-only slice (issue #22), the outer statement shape
   spelling are now settled — see ADR-0004).
 * Whether the grammar and its stored schema are versioned independently of the
   transform-redefinition scheme (above).
+
+Relationship grammar and reference syntax are no longer open — the standalone
+`RELATIONSHIP ... FROM ... TO ...` declaration, the relationship-name-headed path
+(`relationship.column`), and the to-one/to-many cardinality rules are settled in
+[0006-relationships](decisions/0006-relationships.md).
