@@ -4,3 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+engine = { path = "../engine" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-postgres = "0.7.13"
+
+[dev-dependencies]
+testkit = { path = "../testkit" }

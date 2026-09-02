@@ -263,6 +263,12 @@ dependencies = [
 [[package]]
 name = "generative"
 version = "0.1.0"
+dependencies = [
+ "engine",
+ "testkit",
+ "tokio",
+ "tokio-postgres",
+]
 
 [[package]]
 name = "getrandom"
