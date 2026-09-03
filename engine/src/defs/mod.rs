@@ -39,7 +39,8 @@ pub mod validate;
 
 pub use ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 pub use catalog::{
-    CatalogError, all_source_tables, create_definition, source_table_version, transforms_for_source,
+    CatalogError, all_source_tables, create_definition, node_for_table, resolve_node,
+    source_table_version, transforms_for_source,
 };
 pub use ddl::{
     DdlError, PrimaryKeyColumn, create_aggregate_target_table, create_target_table,
@@ -48,7 +49,7 @@ pub use ddl::{
 pub use error::ParseError;
 pub use eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
 pub use invertibility::{AggregateArg, CountArg, Invertibility, PartialField, Verdict, classify};
-pub use model::Definition;
+pub use model::{Definition, NodeKind, SchemaNode};
 pub use oracle::{
     OracleError, Recomputed, recompute, recompute_aggregate, render_aggregate_select_sql,
     render_expr_sql,

@@ -26,7 +26,7 @@ use crate::pool::Pool;
 
 use super::ast::{TransformDef, ValueType};
 use super::error::ParseError;
-use super::model::Definition;
+use super::model::{Definition, NodeKind, SchemaNode};
 use super::parser::parse;
 use super::validate::{ValidationError, validate};
 
@@ -121,6 +121,15 @@ pub async fn create_definition(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
+    // Issue #20: every definition's source and target resolve to a
+    // first-class `SchemaNode`, created on first reference (a source node
+    // the moment something first transforms it; a target node the moment
+    // its owning definition is created) — a side effect alongside the
+    // catalog writes below rather than a change to `TransformDef`'s shape,
+    // per the issue's "prefer the smaller change" guidance.
+    resolve_node_in_txn(&txn, &def.source, NodeKind::Source).await?;
+    resolve_node_in_txn(&txn, &def.target, NodeKind::Target).await?;
+
     let version: i64 = txn
         .query_one(
             "insert into source_table_versions (source_table, version)
@@ -161,6 +170,85 @@ pub async fn create_definition(
         def,
         source_columns: source_columns.clone(),
     })
+}
+
+/// Resolves `table_name` to its [`SchemaNode`], creating one if this is the
+/// first time Trellis has seen the table and setting its `kind` role flag
+/// (`is_source`/`is_target`) to `true`. Idempotent, and additive across
+/// roles: resolving the same table under both [`NodeKind::Source`] and
+/// [`NodeKind::Target`] over separate calls (chained/multi-hop transforms —
+/// see [`super::model::NodeKind`]'s doc comment) merges into one node with
+/// both flags set, rather than erroring.
+///
+/// Runs in its own transaction; [`create_definition`] instead calls
+/// [`resolve_node_in_txn`] directly so both of a definition's node
+/// resolutions land in the same transaction as the definition write.
+pub async fn resolve_node(
+    pool: &Pool,
+    table_name: &str,
+    kind: NodeKind,
+) -> Result<SchemaNode, CatalogError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    let node = resolve_node_in_txn(&txn, table_name, kind).await?;
+    txn.commit().await?;
+    Ok(node)
+}
+
+/// The transactional core of [`resolve_node`] — see its doc comment.
+/// Upserts `table_name`, OR-ing `kind`'s role flag into whatever the row
+/// already has (or defaulting the other flag `false` if the row is new).
+async fn resolve_node_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    table_name: &str,
+    kind: NodeKind,
+) -> Result<SchemaNode, CatalogError> {
+    let (is_source, is_target) = match kind {
+        NodeKind::Source => (true, false),
+        NodeKind::Target => (false, true),
+    };
+
+    let row = txn
+        .query_one(
+            "insert into schema_nodes (table_name, is_source, is_target)
+             values ($1, $2, $3)
+             on conflict (table_name) do update
+                set is_source = schema_nodes.is_source or excluded.is_source,
+                    is_target = schema_nodes.is_target or excluded.is_target
+             returning id, is_source, is_target",
+            &[&table_name, &is_source, &is_target],
+        )
+        .await?;
+
+    Ok(SchemaNode {
+        id: row.get(0),
+        table_name: table_name.to_string(),
+        is_source: row.get(1),
+        is_target: row.get(2),
+    })
+}
+
+/// The [`SchemaNode`] already resolved for `table_name`, or `None` if
+/// nothing has ever referenced it as a source or a target.
+pub async fn node_for_table(
+    pool: &Pool,
+    table_name: &str,
+) -> Result<Option<SchemaNode>, CatalogError> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "select id, is_source, is_target from schema_nodes where table_name = $1",
+            &[&table_name],
+        )
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+
+    Ok(Some(SchemaNode {
+        id: row.get(0),
+        table_name: table_name.to_string(),
+        is_source: row.get(1),
+        is_target: row.get(2),
+    }))
 }
 
 /// Splits `source_columns` into the parallel key/value text arrays
