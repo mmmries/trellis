@@ -317,3 +317,52 @@ async fn unrelated_definitions_are_not_flagged_as_a_cycle() {
     .await
     .expect("x -> y definition, disjoint from a -> b, should be stored");
 }
+
+/// A "shortcut" edge across nodes that already share a path — given existing
+/// edges a -> b -> c, declaring a -> c directly — is not a cycle and must be
+/// allowed. This exercises the case where source and target share a graph
+/// neighbor without an actual cycle, which the fully-disjoint case above
+/// doesn't cover: the reachability search must find that "b" (an
+/// intermediate, not the source) is not actually the destination and keep
+/// walking to "a", not falsely conclude proximity implies a cycle.
+///
+/// The a -> b and b -> c edges are seeded directly via `resolve_node`/
+/// `persist_edge` (as `persisting_the_same_edge_twice_does_not_duplicate_the_row`
+/// does above) rather than through two `create_definition` calls: a real
+/// `TRANSFORM c FROM b ...` definition would already occupy target "c" in
+/// `transform_definitions` (unique per table), which would make the
+/// shortcut's own `TRANSFORM c FROM a ...` fail on that unrelated unique
+/// constraint before the cycle check is even reached.
+#[tokio::test]
+async fn a_shortcut_edge_across_an_existing_path_is_not_a_cycle() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let a_node = resolve_node(&db.pool, "a", NodeKind::Source)
+        .await
+        .expect("resolve a as source");
+    let b_source_node = resolve_node(&db.pool, "b", NodeKind::Source)
+        .await
+        .expect("resolve b as source");
+    let b_target_node = resolve_node(&db.pool, "b", NodeKind::Target)
+        .await
+        .expect("resolve b as target");
+    let c_node = resolve_node(&db.pool, "c", NodeKind::Target)
+        .await
+        .expect("resolve c as target");
+
+    persist_edge(&db.pool, a_node.id, b_target_node.id, EdgeKind::Source)
+        .await
+        .expect("seed a -> b edge");
+    persist_edge(&db.pool, b_source_node.id, c_node.id, EdgeKind::Source)
+        .await
+        .expect("seed b -> c edge");
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM c FROM a SELECT price AS total_again",
+        &HashMap::from([("price".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect("a -> c is a shortcut across an existing path, not a cycle");
+}

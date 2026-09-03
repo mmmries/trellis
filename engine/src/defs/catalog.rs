@@ -136,6 +136,13 @@ pub async fn create_definition(
     // already persisted. Checked against the transaction's own view of
     // `schema_edges` so it sees the graph exactly as it will look right up
     // to (but not including) the edge this definition is about to add.
+    // Known v1 limitation: under Postgres's default read-committed
+    // isolation, two concurrent `create_definition` calls (e.g. one adding
+    // a->b, another adding b->a) can each pass this check before either
+    // commits — nothing here serializes them (no advisory lock/
+    // SERIALIZABLE) — so a cycle could theoretically still persist. Same
+    // class of race as any check-then-insert pattern; accepted for now,
+    // out of scope for this issue.
     reject_if_table_cycle(&txn, &def.source, &def.target).await?;
 
     // Issue #21: a transform's `FROM` is a `Source` dependency edge from its
