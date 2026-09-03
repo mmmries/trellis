@@ -72,16 +72,32 @@ table's own granularity and merely *enrich* it with columns looked up from a
 related table — order lines decorated with `product.category_name`.
 
 A relationship is a named, directed link from one table to another, defined by
-a join key (e.g. `order_line_items.product_id -> products.id`). A calculated
-field on the source table can then reference the related table's columns
-through qualified paths like `product.category_name` or
-`account.customer_segment`.
+a join key (e.g. `order_line_items.product_id -> products.id`) and declared as
+its own reusable statement. A calculated field on the referencing table can then
+reference the related table's columns through qualified paths whose head is the
+relationship name — `product.category_name` or `account.customer_segment`.
 
-The target keeps its own primary key and granularity — a 1-1 table stays 1-1 —
-and each enriched column is populated from the single related row the join key
-resolves to. A relationship must resolve to at most one related row; a link
-that can match many is a cross-join, which produces a new pairing-grained table
-rather than decorating an existing one.
+Either endpoint may be a source table or a transform target, in any combination.
+The referencing table keeps its own primary key and granularity — a 1-1 table
+stays 1-1 — and is merely decorated with enrichment columns. How those columns
+may be referenced depends on the relationship's **cardinality**:
+
+* **To-one** (the to-side join key is a primary key or is `UNIQUE`): resolves to
+  at most one related row. Enrichment columns are referenced as bare paths
+  (`product.category_name`), each populated from that single related row. If no
+  related row matches, the enriched columns read null.
+* **To-many** (the to-side join key is not unique): many related rows may match.
+  Their columns may be referenced only when wrapped in exactly one aggregate
+  function (`sum(comments.word_count)`), computed over the related rows with the
+  same semantics as a `GROUP BY` aggregate.
+
+A relationship — either cardinality — keeps the referencing table's granularity
+and folds related data into scalar columns. This is distinct from a **cross-join**,
+which *changes* granularity to produce a new pairing-grained table. See
+[0006-relationships](decisions/0006-relationships.md) for the full design, and
+[0005-source-schema-is-user-owned](decisions/0005-source-schema-is-user-owned.md)
+for how the cardinality/uniqueness prerequisites are validated (never imposed) on
+the user's source schema.
 
 ## Calculated Fields
 
@@ -90,8 +106,10 @@ populated by a formula rather than copied from a source column. A formula may
 reference:
 
 * Columns on the source row(s) that feed the calculated row.
-* Columns on related tables, through a declared relationship
-  (`relationship.column`).
+* Columns on related tables, through a declared relationship: as a bare path
+  (`relationship.column`) for a to-one relationship, or wrapped in an aggregate
+  (`sum(relationship.column)`) for a to-many one (see
+  [Relationships](#relationships)).
 * Other calculated columns on the same target table.
 
 The set of calculated fields is chosen independently of granularity, but
