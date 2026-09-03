@@ -271,6 +271,35 @@ async fn a_duplicate_pk_insert_error_still_converges() {
         ],
     );
 
+    // Pin the claim `run_convergence` below merely exercises: applying the
+    // duplicate-pk insert directly, against a backend that already has the
+    // seed rows, must be a genuine `Err` — not a silent no-op or an upsert.
+    // Otherwise this test would still pass even if `DuplicateInsert` stopped
+    // actually erroring, since `run_convergence` discards `apply()`'s result.
+    // Uses its own isolated database so it can't interfere with the real run
+    // below (which needs to install and apply the program from scratch).
+    {
+        let pin_db = cluster.create_isolated_database().await;
+        let mut pin_backend = ManualBackend::connect(pin_db.dsn())
+            .await
+            .expect("connect manual backend");
+        pin_backend
+            .install(&program)
+            .await
+            .expect("install a valid program");
+        // ops[0..2) are the two seed inserts; ops[2] is the DuplicateInsert mutate.
+        for seed_op in &program.ops[0..2] {
+            pin_backend
+                .apply(seed_op)
+                .await
+                .expect("seed insert must succeed");
+        }
+        pin_backend
+            .apply(&program.ops[2])
+            .await
+            .expect_err("a second insert at an already-seeded pk must be rejected by the primary-key constraint");
+    }
+
     let mut backend = ManualBackend::connect(db.dsn())
         .await
         .expect("connect manual backend");
