@@ -4,3 +4,19 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+engine = { path = "../engine" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-postgres = "0.7.13"
+# proptest powers the generator's strategies and integrated shrinking, but it
+# must never enter a normal `cargo build`: it's an optional dependency behind
+# the `proptest` feature, and the `generative` self dev-dependency below turns
+# that feature on for this crate's own tests (so `cargo test`/`clippy
+# --all-targets` see the strategies) without leaking it workspace-wide.
+proptest = { version = "1.11", optional = true }
+
+[features]
+proptest = ["dep:proptest"]
+
+[dev-dependencies]
+testkit = { path = "../testkit" }
+generative = { path = ".", features = ["proptest"] }
