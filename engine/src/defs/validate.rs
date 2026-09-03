@@ -29,6 +29,18 @@ pub enum ValidationError {
     UnresolvedColumn { field: String, column: String },
     /// The calculated-column dependency graph contains a cycle.
     Cycle { cycle: Vec<String> },
+    /// Adding a table-to-table dependency edge from a definition's source to
+    /// its target would create a cycle in the two-level dependency graph
+    /// (issue #22 follow-up: cycle detection generalized from column-only,
+    /// within one [`TransformDef`], to the whole graph of tables connected
+    /// by [`super::model::SchemaEdge`]s — currently just `Source` edges, but
+    /// checked generically over whatever edge kinds exist so `Join`/
+    /// `Relationship` edges need no rework here once persisted). Distinct
+    /// from [`ValidationError::Cycle`], which names calculated *columns*
+    /// within a single definition, since this names *tables* across
+    /// definitions and is only ever detected once the persisted graph is
+    /// consulted — see [`super::catalog`].
+    TableCycle { cycle: Vec<String> },
     /// The target table is the same as the source table. Calculated columns
     /// must live on a separate neighbor table — writing them back onto the
     /// source would feed our own WAL into ingestion (see `docs/data-flow.md`).
@@ -101,6 +113,9 @@ impl fmt::Display for ValidationError {
             ),
             ValidationError::Cycle { cycle } => {
                 write!(f, "cycle among calculated columns: {}", cycle.join(" -> "))
+            }
+            ValidationError::TableCycle { cycle } => {
+                write!(f, "cycle among tables: {}", cycle.join(" -> "))
             }
             ValidationError::TargetEqualsSource { table } => write!(
                 f,

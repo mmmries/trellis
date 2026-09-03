@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 
 use engine::defs::{
-    EdgeKind, NodeKind, ValueType, create_definition, dependents_of, persist_edge, resolve_node,
-    transforms_for_source,
+    CatalogError, EdgeKind, NodeKind, ValidationError, ValueType, create_definition, dependents_of,
+    persist_edge, resolve_node, transforms_for_source,
 };
 use testkit::TestCluster;
 
@@ -202,4 +202,118 @@ async fn persisting_the_same_edge_twice_does_not_duplicate_the_row() {
         .expect("count schema_edges rows");
     let count: i64 = rows[0].get(0);
     assert_eq!(count, 1);
+}
+
+/// A direct table-level cycle — A -> B already exists, then B -> A is
+/// declared — is rejected at definition time (issue #22, generalized from
+/// column-only to the two-level graph), not just persisted as a second edge.
+#[tokio::test]
+async fn a_direct_table_cycle_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM b FROM a SELECT price AS total",
+        &HashMap::from([("price".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect("a -> b definition should be stored");
+
+    let err = create_definition(
+        &db.pool,
+        "TRANSFORM a FROM b SELECT total AS price",
+        &HashMap::from([("total".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect_err("b -> a would close a direct cycle with a -> b");
+
+    match err {
+        CatalogError::Validate(ValidationError::TableCycle { cycle }) => {
+            assert_eq!(
+                cycle,
+                vec!["a".to_string(), "b".to_string(), "a".to_string()]
+            );
+        }
+        other => panic!("expected Validate(TableCycle), got {other:?}"),
+    }
+
+    // The rejected definition must not have persisted anything: "a" still
+    // has exactly one dependent.
+    let a_dependents = dependents_of(&db.pool, "a", EdgeKind::Source)
+        .await
+        .expect("query a's dependents");
+    assert_eq!(a_dependents.len(), 1);
+}
+
+/// A transitive table-level cycle — A -> B -> C already exists, then C -> A
+/// is declared — is rejected, not just a direct A <-> B cycle.
+#[tokio::test]
+async fn a_transitive_table_cycle_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM b FROM a SELECT price AS total",
+        &HashMap::from([("price".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect("a -> b definition should be stored");
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM c FROM b SELECT total AS total_again",
+        &HashMap::from([("total".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect("b -> c definition should be stored");
+
+    let err = create_definition(
+        &db.pool,
+        "TRANSFORM a FROM c SELECT total_again AS price",
+        &HashMap::from([("total_again".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect_err("c -> a would close a transitive cycle with a -> b -> c");
+
+    match err {
+        CatalogError::Validate(ValidationError::TableCycle { cycle }) => {
+            assert_eq!(
+                cycle,
+                vec![
+                    "a".to_string(),
+                    "b".to_string(),
+                    "c".to_string(),
+                    "a".to_string(),
+                ]
+            );
+        }
+        other => panic!("expected Validate(TableCycle), got {other:?}"),
+    }
+}
+
+/// Two definitions from an unrelated, disjoint part of the graph must not be
+/// mistaken for a cycle — this pins down that the check is a real
+/// reachability search, not a blanket "any second edge is suspicious" rule.
+#[tokio::test]
+async fn unrelated_definitions_are_not_flagged_as_a_cycle() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM b FROM a SELECT price AS total",
+        &HashMap::from([("price".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect("a -> b definition should be stored");
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM y FROM x SELECT price AS total",
+        &HashMap::from([("price".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect("x -> y definition, disjoint from a -> b, should be stored");
 }

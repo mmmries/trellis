@@ -19,7 +19,7 @@
 //! v1 definitions are immutable: this module only exposes creation and
 //! read, no update/delete.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::pool::Pool;
@@ -129,6 +129,14 @@ pub async fn create_definition(
     // per the issue's "prefer the smaller change" guidance.
     let source_node = resolve_node_in_txn(&txn, &def.source, NodeKind::Source).await?;
     let target_node = resolve_node_in_txn(&txn, &def.target, NodeKind::Target).await?;
+
+    // Issue #22 (generalized): reject this definition if the `Source` edge
+    // it's about to add — def.source -> def.target — would close a cycle in
+    // the table-level dependency graph, transitively through any edges
+    // already persisted. Checked against the transaction's own view of
+    // `schema_edges` so it sees the graph exactly as it will look right up
+    // to (but not including) the edge this definition is about to add.
+    reject_if_table_cycle(&txn, &def.source, &def.target).await?;
 
     // Issue #21: a transform's `FROM` is a `Source` dependency edge from its
     // source node to its target node — persisted alongside the node
@@ -275,6 +283,88 @@ async fn persist_edge_in_txn(
     )
     .await?;
     Ok(())
+}
+
+/// Rejects a definition whose `Source` edge — `source_table -> target_table`
+/// — would close a cycle in the table-level dependency graph: this holds
+/// iff `target_table` can already reach `source_table` through some path of
+/// existing [`super::model::SchemaEdge`]s (of any kind — see
+/// [`create_definition`]'s call site for why this stays kind-generic).
+/// Walks the transaction's current `schema_edges`/`schema_nodes` state as a
+/// small in-memory adjacency map, hand-rolled DFS, matching
+/// [`super::validate::detect_cycle`]'s column-level convention rather than
+/// pulling in a graph crate for a problem this small.
+async fn reject_if_table_cycle(
+    txn: &tokio_postgres::Transaction<'_>,
+    source_table: &str,
+    target_table: &str,
+) -> Result<(), CatalogError> {
+    let rows = txn
+        .query(
+            "select from_node.table_name, to_node.table_name
+             from schema_edges se
+             join schema_nodes from_node on from_node.id = se.from_node_id
+             join schema_nodes to_node on to_node.id = se.to_node_id",
+            &[],
+        )
+        .await?;
+
+    let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        let from: String = row.get(0);
+        let to: String = row.get(1);
+        adjacency.entry(from).or_default().push(to);
+    }
+
+    if let Some(mut path) = find_table_path(&adjacency, target_table, source_table) {
+        // `path` is target_table -> ... -> source_table; appending
+        // target_table closes the loop the new source_table -> target_table
+        // edge would create, for a message naming the whole cycle.
+        path.push(target_table.to_string());
+        return Err(ValidationError::TableCycle { cycle: path }.into());
+    }
+    Ok(())
+}
+
+/// DFS from `from` to `to` over `adjacency`, returning the path (inclusive
+/// of both ends) if one exists.
+fn find_table_path(
+    adjacency: &HashMap<String, Vec<String>>,
+    from: &str,
+    to: &str,
+) -> Option<Vec<String>> {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut path: Vec<String> = Vec::new();
+    if find_table_path_from(adjacency, from, to, &mut visited, &mut path) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn find_table_path_from(
+    adjacency: &HashMap<String, Vec<String>>,
+    node: &str,
+    to: &str,
+    visited: &mut HashSet<String>,
+    path: &mut Vec<String>,
+) -> bool {
+    path.push(node.to_string());
+    if node == to {
+        return true;
+    }
+    visited.insert(node.to_string());
+    if let Some(neighbors) = adjacency.get(node) {
+        for neighbor in neighbors {
+            if !visited.contains(neighbor)
+                && find_table_path_from(adjacency, neighbor, to, visited, path)
+            {
+                return true;
+            }
+        }
+    }
+    path.pop();
+    false
 }
 
 /// The [`SchemaNode`] already resolved for `table_name`, or `None` if
