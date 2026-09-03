@@ -4,7 +4,10 @@
 
 use std::collections::HashMap;
 
-use engine::defs::{EdgeKind, ValueType, create_definition, dependents_of, transforms_for_source};
+use engine::defs::{
+    EdgeKind, NodeKind, ValueType, create_definition, dependents_of, persist_edge, resolve_node,
+    transforms_for_source,
+};
 use testkit::TestCluster;
 
 #[tokio::test]
@@ -129,12 +132,13 @@ async fn transforms_for_source_agrees_with_dependents_of_source_edges() {
     assert_eq!(via_wrapper, via_resolver);
 }
 
-/// Re-declaring the same source/target pair through `create_definition`
-/// (a definition's target table matching an already-known source, i.e. a
-/// chained transform's second half being defined) does not double-insert
-/// the `Source` edge between the same two nodes.
+/// Two distinct definitions from the same source (different targets) each
+/// get their own `Source` edge — `dependents_of` fans out to all of them,
+/// not just the first. (This is a fan-out test, not a dedup test: see
+/// `persisting_the_same_edge_twice_does_not_duplicate_the_row` below for
+/// coverage of the `on conflict do nothing` path.)
 #[tokio::test]
-async fn re_resolving_the_same_source_and_target_pair_does_not_duplicate_the_edge() {
+async fn dependents_of_returns_all_distinct_source_edges_for_fan_out() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -160,4 +164,42 @@ async fn re_resolving_the_same_source_and_target_pair_does_not_duplicate_the_edg
         .await
         .expect("query dependents");
     assert_eq!(dependents.len(), 2);
+}
+
+/// `create_definition` can never exercise `schema_edges`'s
+/// `on conflict (from_node_id, to_node_id, kind) do nothing` dedup path
+/// itself: `transform_definitions.target_table` is unique, so no two
+/// definitions can ever resolve to the same `(from_node_id, to_node_id)`
+/// pair. This test drives the conflict path directly through
+/// `persist_edge`, calling it twice with the identical triple, and asserts
+/// exactly one row lands in `schema_edges`.
+#[tokio::test]
+async fn persisting_the_same_edge_twice_does_not_duplicate_the_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let from_node = resolve_node(&db.pool, "orders", NodeKind::Source)
+        .await
+        .expect("resolve source node");
+    let to_node = resolve_node(&db.pool, "order_totals", NodeKind::Target)
+        .await
+        .expect("resolve target node");
+
+    persist_edge(&db.pool, from_node.id, to_node.id, EdgeKind::Source)
+        .await
+        .expect("first persist_edge call establishes the edge");
+    persist_edge(&db.pool, from_node.id, to_node.id, EdgeKind::Source)
+        .await
+        .expect("second persist_edge call with the same triple hits on conflict do nothing");
+
+    let client = db.pool.get().await.expect("get connection");
+    let rows = client
+        .query(
+            "select count(*) from schema_edges where from_node_id = $1 and to_node_id = $2 and kind = $3",
+            &[&from_node.id, &to_node.id, &EdgeKind::Source.as_str()],
+        )
+        .await
+        .expect("count schema_edges rows");
+    let count: i64 = rows[0].get(0);
+    assert_eq!(count, 1);
 }

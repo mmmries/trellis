@@ -234,6 +234,26 @@ async fn resolve_node_in_txn(
     })
 }
 
+/// Pool-level wrapper over [`persist_edge_in_txn`], mirroring
+/// [`resolve_node`]'s relationship to [`resolve_node_in_txn`]. Exists so the
+/// `on conflict do nothing` dedup path on `schema_edges`'s
+/// `(from_node_id, to_node_id, kind)` uniqueness constraint has direct test
+/// coverage — [`create_definition`] can never hit it itself, since
+/// `transform_definitions.target_table` is unique and so no two definitions
+/// can ever resolve to the same `(from_node_id, to_node_id)` pair.
+pub async fn persist_edge(
+    pool: &Pool,
+    from_node_id: i64,
+    to_node_id: i64,
+    kind: EdgeKind,
+) -> Result<(), CatalogError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    persist_edge_in_txn(&txn, from_node_id, to_node_id, kind).await?;
+    txn.commit().await?;
+    Ok(())
+}
+
 /// Records that `to_node_id` depends on `from_node_id` via `kind` — the
 /// transactional core [`create_definition`] calls for a transform's `FROM`
 /// edge. `on conflict do nothing` on `schema_edges`'s
