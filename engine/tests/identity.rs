@@ -260,5 +260,8 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    assert_eq!(
+        applied,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    );
 }

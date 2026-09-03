@@ -54,3 +54,40 @@ pub struct SchemaNode {
     pub is_source: bool,
     pub is_target: bool,
 }
+
+/// Which kind of dependency a [`super::catalog`] edge represents (issue
+/// #21). Only [`EdgeKind::Source`] is ever persisted today — a transform's
+/// `FROM` is its only join input the AST can produce (see
+/// `engine/src/defs/ast.rs`'s `TransformDef::source`, a single `String`, no
+/// multi-source join yet). `Join` and `Relationship` exist so the column
+/// this enum backs doesn't need a migration when join-edge persistence and
+/// relationship edges (issues #24-#27) land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeKind {
+    Source,
+    Join,
+    Relationship,
+}
+
+impl EdgeKind {
+    /// The text this variant is persisted/queried as in `schema_edges.kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EdgeKind::Source => "source",
+            EdgeKind::Join => "join",
+            EdgeKind::Relationship => "relationship",
+        }
+    }
+}
+
+/// A directed dependency edge between two [`SchemaNode`]s: `to_node`
+/// depends on `from_node` via `kind` (e.g. a `Source` edge from `orders` to
+/// `order_totals` means `order_totals` is a transform target reading from
+/// `orders`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaEdge {
+    pub id: i64,
+    pub from_node_id: i64,
+    pub to_node_id: i64,
+    pub kind: EdgeKind,
+}

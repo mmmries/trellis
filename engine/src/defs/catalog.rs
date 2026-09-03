@@ -26,7 +26,7 @@ use crate::pool::Pool;
 
 use super::ast::{TransformDef, ValueType};
 use super::error::ParseError;
-use super::model::{Definition, NodeKind, SchemaNode};
+use super::model::{Definition, EdgeKind, NodeKind, SchemaNode};
 use super::parser::parse;
 use super::validate::{ValidationError, validate};
 
@@ -127,8 +127,14 @@ pub async fn create_definition(
     // its owning definition is created) — a side effect alongside the
     // catalog writes below rather than a change to `TransformDef`'s shape,
     // per the issue's "prefer the smaller change" guidance.
-    resolve_node_in_txn(&txn, &def.source, NodeKind::Source).await?;
-    resolve_node_in_txn(&txn, &def.target, NodeKind::Target).await?;
+    let source_node = resolve_node_in_txn(&txn, &def.source, NodeKind::Source).await?;
+    let target_node = resolve_node_in_txn(&txn, &def.target, NodeKind::Target).await?;
+
+    // Issue #21: a transform's `FROM` is a `Source` dependency edge from its
+    // source node to its target node — persisted alongside the node
+    // resolutions above so `dependents_of` can walk the graph instead of
+    // matching on `transform_definitions.source_table` string equality.
+    persist_edge_in_txn(&txn, source_node.id, target_node.id, EdgeKind::Source).await?;
 
     let version: i64 = txn
         .query_one(
@@ -228,6 +234,29 @@ async fn resolve_node_in_txn(
     })
 }
 
+/// Records that `to_node_id` depends on `from_node_id` via `kind` — the
+/// transactional core [`create_definition`] calls for a transform's `FROM`
+/// edge. `on conflict do nothing` on `schema_edges`'s
+/// `(from_node_id, to_node_id, kind)` uniqueness constraint makes
+/// re-declaring the same transform's edge idempotent (definitions are
+/// immutable, but nothing stops the same source/target pair from being
+/// resolved through this path more than once as the graph grows).
+async fn persist_edge_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    from_node_id: i64,
+    to_node_id: i64,
+    kind: EdgeKind,
+) -> Result<(), CatalogError> {
+    txn.execute(
+        "insert into schema_edges (from_node_id, to_node_id, kind)
+         values ($1, $2, $3)
+         on conflict (from_node_id, to_node_id, kind) do nothing",
+        &[&from_node_id, &to_node_id, &kind.as_str()],
+    )
+    .await?;
+    Ok(())
+}
+
 /// The [`SchemaNode`] already resolved for `table_name`, or `None` if
 /// nothing has ever referenced it as a source or a target.
 pub async fn node_for_table(
@@ -278,30 +307,39 @@ struct PendingDefinition {
     source_columns: HashMap<String, ValueType>,
 }
 
-/// The transform definitions currently subscribed to `source_table` — the
-/// mapping intake (#7/#8) will use to decide what to subscribe to.
+/// The transform definitions that depend on `node_table` via a `kind` edge
+/// in the persisted dependency graph (issue #21) — e.g. `EdgeKind::Source`
+/// answers "what reads from `node_table` as its `FROM`". Walking
+/// `schema_edges` (rather than matching on
+/// `transform_definitions.source_table` string equality) is what makes this
+/// a real graph lookup: multi-hop chains resolve by calling this again with
+/// a dependent's target table, not by any special-casing here.
 ///
 /// One query, not one-per-definition-row (issue #69): a `left join lateral
-/// jsonb_each_text(...)` unnests every subscribed definition's persisted
+/// jsonb_each_text(...)` unnests every dependent definition's persisted
 /// `source_columns` map inline, so this is still "decode JSON via SQL, no
 /// serde_json dependency" — matching `staging::apply::decode_image`'s
 /// convention — just decoded for every row in one round trip instead of one
 /// per definition. The `left join` (rather than an inner join/`cross join
 /// lateral`) matters: a definition whose `source_columns` is `{}` must still
 /// come back with zero entries, not disappear from the result entirely.
-pub async fn transforms_for_source(
+pub async fn dependents_of(
     pool: &Pool,
-    source_table: &str,
+    node_table: &str,
+    kind: EdgeKind,
 ) -> Result<Vec<Definition>, CatalogError> {
     let client = pool.get().await?;
     let rows = client
         .query(
             "select t.id, t.source_version, t.definition_text, e.key, e.value
-             from transform_definitions t
+             from schema_nodes from_node
+             join schema_edges se on se.from_node_id = from_node.id and se.kind = $2
+             join schema_nodes to_node on to_node.id = se.to_node_id
+             join transform_definitions t on t.target_table = to_node.table_name
              left join lateral jsonb_each_text(t.source_columns) e on true
-             where t.source_table = $1
+             where from_node.table_name = $1
              order by t.id",
-            &[&source_table],
+            &[&node_table, &kind.as_str()],
         )
         .await?;
 
@@ -353,6 +391,17 @@ pub async fn transforms_for_source(
         });
     }
     Ok(result)
+}
+
+/// The transform definitions currently subscribed to `source_table` — the
+/// mapping intake (#7/#8) will use to decide what to subscribe to. A thin
+/// wrapper over [`dependents_of`] filtered to [`EdgeKind::Source`], the only
+/// edge kind persisted today.
+pub async fn transforms_for_source(
+    pool: &Pool,
+    source_table: &str,
+) -> Result<Vec<Definition>, CatalogError> {
+    dependents_of(pool, source_table, EdgeKind::Source).await
 }
 
 /// Every distinct source table with at least one registered transform
