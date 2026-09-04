@@ -23,6 +23,21 @@ pub struct TransformDef {
     pub predicate: Predicate,
 }
 
+/// A parsed standalone relationship declaration (ADR-0006):
+/// `RELATIONSHIP <name> FROM <from_table>.<fk_col> TO <to_table>.<pk_col>`.
+///
+/// This slice (issue #24) is grammar + AST only — cardinality validation,
+/// catalog storage, and referencing a relationship from a calculated field
+/// are all deferred to later issues.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationshipDef {
+    pub name: String,
+    pub from_table: String,
+    pub from_col: String,
+    pub to_table: String,
+    pub to_col: String,
+}
+
 /// The target table's primary-key space (see `docs/transforms.md#granularity`).
 ///
 /// [`KeySpace::Aggregate`] (issue #11's groundwork) is a `GROUP BY <cols>`
