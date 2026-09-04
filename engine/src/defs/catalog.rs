@@ -24,10 +24,12 @@ use std::fmt;
 
 use crate::pool::Pool;
 
-use super::ast::{TransformDef, ValueType};
+use super::ast::{RelationshipDef, TransformDef, ValueType};
 use super::error::ParseError;
-use super::model::{Definition, EdgeKind, NodeKind, SchemaNode};
-use super::parser::parse;
+use super::model::{
+    Definition, EdgeKind, NodeKind, RelationshipDefinition, SchemaEdge, SchemaNode,
+};
+use super::parser::{parse, parse_relationship};
 use super::validate::{ValidationError, validate};
 
 /// Why creating or reading a definition failed.
@@ -228,6 +230,98 @@ pub async fn create_definition(
         def,
         source_columns: source_columns.clone(),
     })
+}
+
+/// Parses and stores a new relationship declaration (issue #26, ADR-0006):
+/// resolves/creates `schema_nodes` for both endpoints, persists a
+/// `schema_edges` row from `from_table` to `to_table` tagged
+/// [`EdgeKind::Relationship`], and inserts the immutable
+/// `relationship_definitions` row — all in one transaction, mirroring
+/// [`create_definition`]'s pattern.
+///
+/// Deliberately does **not**: validate that `from_col`/`to_col` exist as
+/// real columns, check FK/PK-ness, enforce a to-one relationship's
+/// uniqueness prerequisite, or run [`reject_if_table_cycle`] against the new
+/// edge. All of that is cardinality/schema validation ADR-0005 and
+/// ADR-0006 describe as definition-time checks, but it's explicitly later
+/// issue scope per issue #26 — this function is storage only: a relationship
+/// round-trips through the catalog and shows up as a typed edge, nothing
+/// more.
+///
+/// Node-kind resolution: a relationship's endpoints may each be "a source
+/// table or a transform target, in any combination" (ADR-0006), and nothing
+/// here can tell which without cross-referencing `transform_definitions`.
+/// Both endpoints resolve as [`NodeKind::Source`] — directionally accurate
+/// either way, since computing the join reads both tables' columns
+/// regardless of whether one side later turns out to also be a transform
+/// target — and [`resolve_node_in_txn`]'s flags are additive (OR'd in, never
+/// cleared), so a later `create_definition` call that resolves the same
+/// table as [`NodeKind::Target`] merges into the same node rather than
+/// conflicting with this choice.
+pub async fn create_relationship(
+    pool: &Pool,
+    source_text: &str,
+) -> Result<RelationshipDefinition, CatalogError> {
+    let def: RelationshipDef = parse_relationship(source_text)?;
+
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+
+    let from_node = resolve_node_in_txn(&txn, &def.from_table, NodeKind::Source).await?;
+    let to_node = resolve_node_in_txn(&txn, &def.to_table, NodeKind::Source).await?;
+
+    persist_edge_in_txn(&txn, from_node.id, to_node.id, EdgeKind::Relationship).await?;
+
+    let id: i64 = txn
+        .query_one(
+            "insert into relationship_definitions
+                (name, from_table, from_col, to_table, to_col, definition_text)
+             values ($1, $2, $3, $4, $5, $6)
+             returning id",
+            &[
+                &def.name,
+                &def.from_table,
+                &def.from_col,
+                &def.to_table,
+                &def.to_col,
+                &source_text,
+            ],
+        )
+        .await?
+        .get(0);
+
+    txn.commit().await?;
+
+    Ok(RelationshipDefinition { id, def })
+}
+
+/// Reads back the relationship named `name` declared on `from_table` — the
+/// pair a [`super::ast::Expr::RelationshipPath`]'s `rel` head resolves
+/// against (ADR-0006: a relationship name is unique per from-table, not
+/// global, so both are needed to identify one row). Re-parses the persisted
+/// `definition_text` rather than reconstructing [`RelationshipDef`] from the
+/// denormalized columns, matching [`dependents_of`]'s "reuse the grammar's
+/// own parser" convention.
+pub async fn relationship_by_name(
+    pool: &Pool,
+    from_table: &str,
+    name: &str,
+) -> Result<Option<RelationshipDefinition>, CatalogError> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "select id, definition_text
+             from relationship_definitions
+             where from_table = $1 and name = $2",
+            &[&from_table, &name],
+        )
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+
+    let id: i64 = row.get(0);
+    let text: String = row.get(1);
+    let def = parse_relationship(&text)?;
+    Ok(Some(RelationshipDefinition { id, def }))
 }
 
 /// Resolves `table_name` to its [`SchemaNode`], creating one if this is the
@@ -432,6 +526,42 @@ pub async fn node_for_table(
         is_source: row.get(1),
         is_target: row.get(2),
     }))
+}
+
+/// The [`SchemaEdge`]s of `kind` directed away from `node_table` — a
+/// generalized, `transform_definitions`-agnostic sibling of
+/// [`dependents_of`] for edge kinds whose dependents don't join back into
+/// `transform_definitions` (e.g. [`EdgeKind::Relationship`], whose
+/// dependents are `relationship_definitions` rows, read separately via
+/// [`relationship_by_name`]). Returns raw edges rather than joining onto any
+/// definition table, so it works for any [`EdgeKind`] without needing a
+/// kind-specific query.
+pub async fn edges_from(
+    pool: &Pool,
+    node_table: &str,
+    kind: EdgeKind,
+) -> Result<Vec<SchemaEdge>, CatalogError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "select se.id, se.from_node_id, se.to_node_id
+             from schema_edges se
+             join schema_nodes from_node on from_node.id = se.from_node_id
+             where from_node.table_name = $1 and se.kind = $2
+             order by se.id",
+            &[&node_table, &kind.as_str()],
+        )
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| SchemaEdge {
+            id: row.get(0),
+            from_node_id: row.get(1),
+            to_node_id: row.get(2),
+            kind,
+        })
+        .collect())
 }
 
 /// Splits `source_columns` into the parallel key/value text arrays

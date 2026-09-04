@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use super::ast::{TransformDef, ValueType};
+use super::ast::{RelationshipDef, TransformDef, ValueType};
 
 /// A transform definition as stored in the catalog: the parsed AST — source
 /// table, target table name, and calculated fields are all on
@@ -20,6 +20,19 @@ pub struct Definition {
     pub source_version: i64,
     pub def: TransformDef,
     pub source_columns: HashMap<String, ValueType>,
+}
+
+/// A relationship declaration as stored in the catalog (issue #26): the
+/// parsed [`RelationshipDef`] plus the catalog-assigned id. Unlike
+/// [`Definition`], there's no `source_version`/`source_columns` to carry —
+/// a relationship's endpoints aren't validated against a live column-type
+/// map at creation time (no source-schema DDL, ADR-0005; cardinality/FK
+/// validation is later issue scope), so nothing here depends on the
+/// from-side table's version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationshipDefinition {
+    pub id: i64,
+    pub def: RelationshipDef,
 }
 
 /// Which role [`super::catalog::resolve_node`] is being asked to establish
