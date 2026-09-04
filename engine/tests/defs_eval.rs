@@ -309,10 +309,7 @@ async fn comments_to_many(client: &tokio_postgres::Client) -> RelationshipContex
 
     let mut to_rows_by_key: HashMap<String, Vec<Row>> = HashMap::new();
     for c in client
-        .query(
-            "select post_id::text, word_count::text from comments",
-            &[],
-        )
+        .query("select post_id::text, word_count::text from comments", &[])
         .await
         .expect("read comments")
     {
