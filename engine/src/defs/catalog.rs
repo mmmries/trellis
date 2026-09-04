@@ -268,6 +268,13 @@ pub async fn create_relationship(
     let txn = client.transaction().await?;
 
     let from_node = resolve_node_in_txn(&txn, &def.from_table, NodeKind::Source).await?;
+    // `to_table` is marked `is_source` here too, even though a relationship's
+    // to-side is often really a transform target: the flag is additive/OR'd
+    // (a later `create_definition` call can still set `is_target` on the
+    // same node), and today's only `is_source` reader — `all_source_tables`,
+    // the publication feeder — reads `transform_definitions`, not this flag,
+    // so no consumer is misled. If a future `is_source` consumer reads
+    // `schema_nodes` directly, re-check this call.
     let to_node = resolve_node_in_txn(&txn, &def.to_table, NodeKind::Source).await?;
 
     persist_edge_in_txn(&txn, from_node.id, to_node.id, EdgeKind::Relationship).await?;

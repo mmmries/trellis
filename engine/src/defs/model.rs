@@ -69,12 +69,13 @@ pub struct SchemaNode {
 }
 
 /// Which kind of dependency a [`super::catalog`] edge represents (issue
-/// #21). Only [`EdgeKind::Source`] is ever persisted today — a transform's
-/// `FROM` is its only join input the AST can produce (see
-/// `engine/src/defs/ast.rs`'s `TransformDef::source`, a single `String`, no
-/// multi-source join yet). `Join` and `Relationship` exist so the column
-/// this enum backs doesn't need a migration when join-edge persistence and
-/// relationship edges (issues #24-#27) land.
+/// #21). [`EdgeKind::Relationship`] is persisted by `create_relationship`
+/// (issue #26); [`EdgeKind::Source`] remains the only kind a transform
+/// itself persists — a transform's `FROM` is its only join input the AST
+/// can produce (see `engine/src/defs/ast.rs`'s `TransformDef::source`, a
+/// single `String`, no multi-source join yet). `Join` exists so the column
+/// this enum backs doesn't need a migration when join-edge persistence
+/// lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeKind {
     Source,
