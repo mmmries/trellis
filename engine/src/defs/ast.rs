@@ -72,6 +72,12 @@ pub enum Expr {
     NumberLiteral(String),
     /// A single-quoted string literal (issue #63).
     StringLiteral(String),
+    /// A `<rel>.<column>` relationship-path reference (issue #25, ADR-0006).
+    /// `rel` is the head's **relationship name**, not a table/alias —
+    /// resolving whether it's an actually-declared relationship, and its
+    /// cardinality, is deferred to later validation/eval issues; this
+    /// variant is grammar + AST only.
+    RelationshipPath { rel: String, column: String },
     BinaryOp {
         op: Operator,
         lhs: Box<Expr>,

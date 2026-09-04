@@ -84,6 +84,11 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
             }
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        Expr::RelationshipPath { .. } => {
+            unreachable!(
+                "the generator never constructs a RelationshipPath (issue #25 is grammar + AST only; no generator support yet)"
+            )
+        }
     }
 }
 

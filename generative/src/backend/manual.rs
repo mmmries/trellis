@@ -148,6 +148,11 @@ fn render_expr(expr: &Expr) -> String {
             let args: Vec<String> = args.iter().map(render_expr).collect();
             format!("{name}({})", args.join(", "))
         }
+        Expr::RelationshipPath { .. } => {
+            unreachable!(
+                "the generator never constructs a RelationshipPath (issue #25 is grammar + AST only; no generator support yet)"
+            )
+        }
     }
 }
 

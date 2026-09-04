@@ -13,9 +13,12 @@
 //! cross-join (`JOIN <other> ON <cond>`) key-space clause will slot in;
 //! this slice only accepts the 1-1 case (clause absent) and rejects both
 //! keywords by name if present. `<expr>` supports column references,
-//! numeric and string literals, `+`, `>` (issue #65), and `name(args)`
-//! function calls against [`super::registry::FUNCTIONS`] (issue #64);
-//! `<predicate>` accepts only the literal `TRUE`.
+//! numeric and string literals, `+`, `>` (issue #65), `name(args)`
+//! function calls against [`super::registry::FUNCTIONS`] (issue #64), and
+//! `<rel>.<column>` relationship-path references (issue #25, ADR-0006) —
+//! whose head is a relationship name, resolved and cardinality-checked by
+//! later issues, not this parser. `<predicate>` accepts only the literal
+//! `TRUE`.
 //!
 //! A second, standalone statement form (ADR-0006, issue #24) declares a
 //! named relationship rather than a transform:
@@ -150,11 +153,11 @@ impl Parser {
     /// Parses a dot-qualified `<table>.<col>` reference, the new-relative-to
     /// existing-statement-forms syntax ADR-0006 introduces for a
     /// relationship's endpoints. There's no reuse target in the expression
-    /// grammar for this: `parse_primary`'s `a.b` handling parses an
-    /// identifier then rejects a following `.` as an
-    /// [`ParseError::UnsupportedRelationshipPath`], which is specific to
-    /// expression context and not what a relationship declaration's
-    /// endpoints should report on malformed input.
+    /// grammar for this: `parse_primary`'s `a.b` handling (issue #25) builds
+    /// an [`Expr::RelationshipPath`] whose head is a relationship name, not
+    /// a table — a different semantic than a relationship declaration's
+    /// `<table>.<col>` endpoints, so malformed input here still gets its own
+    /// report rather than being unified with the expression-grammar path.
     fn expect_table_dot_column(&mut self) -> Result<(String, String), ParseError> {
         let table = self.expect_ident()?;
         self.expect_symbol('.')?;
@@ -351,10 +354,8 @@ impl Parser {
 
                 if self.peek_is_symbol('.') {
                     self.advance();
-                    let field = self.expect_ident()?;
-                    return Err(ParseError::UnsupportedRelationshipPath {
-                        path: format!("{name}.{field}"),
-                    });
+                    let column = self.expect_ident()?;
+                    return Ok(Expr::RelationshipPath { rel: name, column });
                 }
 
                 if self.peek_is_symbol('(') {

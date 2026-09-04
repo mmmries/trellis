@@ -271,6 +271,10 @@ fn collect_columns(expr: &Expr, field_names: &HashSet<&str>, out: &mut HashSet<S
             }
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        // Not a source-column reference by name; the validator (#23)
+        // rejects relationship paths outright, so `render_expr_sql` never
+        // has to render one (issue #25 is grammar + AST only).
+        Expr::RelationshipPath { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_columns(lhs, field_names, out);
             collect_columns(rhs, field_names, out);
@@ -297,6 +301,11 @@ pub fn render_expr_sql(expr: &Expr) -> String {
         Expr::Column(name) => quote_ident(name),
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::RelationshipPath { rel, column } => panic!(
+            "render_expr_sql called on an unresolved relationship path '{rel}.{column}' \
+             — the validator (#23) should have rejected this before reaching the oracle \
+             (issue #25 is grammar + AST only)"
+        ),
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = match op {
                 Operator::Add => "+",

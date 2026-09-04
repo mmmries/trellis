@@ -264,14 +264,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_relationship_path() {
-        let err = parse("TRANSFORM t FROM s SELECT product.category_name AS x").unwrap_err();
-        match err {
-            ParseError::UnsupportedRelationshipPath { path } => {
-                assert_eq!(path, "product.category_name");
+    fn parses_relationship_path() {
+        let def = parse("TRANSFORM t FROM s SELECT product.category_name AS x").unwrap();
+        assert_eq!(
+            def.fields[0].expr,
+            Expr::RelationshipPath {
+                rel: "product".to_string(),
+                column: "category_name".to_string(),
             }
-            other => panic!("expected UnsupportedRelationshipPath, got {other:?}"),
-        }
+        );
     }
 
     #[test]

@@ -20,8 +20,6 @@ pub enum ParseError {
     /// A construct outside the 1-1 key-space this grammar slice supports
     /// (aggregate `GROUP BY`, cross-join `JOIN`).
     UnsupportedKeySpace { construct: String, detail: String },
-    /// A relationship-path reference (`a.b`) in an expression.
-    UnsupportedRelationshipPath { path: String },
     /// An operator other than `+`.
     UnsupportedOperator { operator: String },
     /// A function call other than one in [`super::registry::FUNCTIONS`].
@@ -63,10 +61,6 @@ impl fmt::Display for ParseError {
             ParseError::UnsupportedKeySpace { construct, detail } => {
                 write!(f, "unsupported key-space construct '{construct}': {detail}")
             }
-            ParseError::UnsupportedRelationshipPath { path } => write!(
-                f,
-                "relationship-path reference '{path}' is not supported by this grammar slice (1-1 key-space only, see issue #22)"
-            ),
             ParseError::UnsupportedOperator { operator } => write!(
                 f,
                 "unsupported operator '{operator}': only '+' and '>' are currently implemented (ADR-0004: grammar and evaluator function sets must match)"

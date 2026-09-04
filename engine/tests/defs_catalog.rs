@@ -307,7 +307,7 @@ async fn an_unresolved_column_reference_is_rejected() {
 }
 
 #[tokio::test]
-async fn cross_join_and_relationship_definitions_are_rejected_cleanly() {
+async fn cross_join_and_partial_data_definitions_are_rejected_cleanly() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -320,15 +320,6 @@ async fn cross_join_and_relationship_definitions_are_rejected_cleanly() {
     .unwrap_err();
     assert!(matches!(cross_join, CatalogError::Parse(_)));
 
-    let relationship = create_definition(
-        &db.pool,
-        "TRANSFORM t FROM s SELECT product.category_name AS x",
-        &HashMap::new(),
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(relationship, CatalogError::Parse(_)));
-
     let partial_data = create_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT a AS x WHERE a = b",
@@ -339,6 +330,45 @@ async fn cross_join_and_relationship_definitions_are_rejected_cleanly() {
     assert!(matches!(partial_data, CatalogError::Parse(_)));
 
     // None of the rejected attempts should have left a row behind.
+    let subscribers = transforms_for_source(&db.pool, "s")
+        .await
+        .expect("query mapping");
+    assert!(subscribers.is_empty());
+}
+
+/// Unlike `JOIN`, a `<rel>.<column>` relationship path is now real grammar
+/// (issue #25) rather than a parse-time rejection, so it parses successfully
+/// and instead fails at validation (the validator has no relationship
+/// resolution yet — that's a separate, later issue) — exercising that the
+/// catalog's parse-then-validate pipeline routes it through validation
+/// rather than short-circuiting at parse time the way `JOIN` still does.
+#[tokio::test]
+async fn a_relationship_path_definition_is_rejected_at_validation() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let err = create_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT product.category_name AS x",
+        &HashMap::new(),
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        CatalogError::Validate(ValidationError::UnsupportedRelationshipPath {
+            field,
+            rel,
+            column,
+        }) => {
+            assert_eq!(field, "x");
+            assert_eq!(rel, "product");
+            assert_eq!(column, "category_name");
+        }
+        other => panic!("expected an UnsupportedRelationshipPath validation error, got {other:?}"),
+    }
+
+    // The rejected attempt should not have left a row behind.
     let subscribers = transforms_for_source(&db.pool, "s")
         .await
         .expect("query mapping");

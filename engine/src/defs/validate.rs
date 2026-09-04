@@ -98,6 +98,17 @@ pub enum ValidationError {
     /// keeps that assumption enforced at validation, not a silent DDL-time
     /// skip.
     GroupingColumnFieldMustBePassthrough { field: String },
+    /// A field's expression contains a `<rel>.<column>` relationship-path
+    /// reference (issue #25's grammar). Resolving a relationship name,
+    /// checking its cardinality, and evaluating the path are all separate,
+    /// later issues (ADR-0006) — this validator rejects it outright rather
+    /// than letting an unresolvable reference reach [`super::eval`] or
+    /// [`super::oracle`].
+    UnsupportedRelationshipPath {
+        field: String,
+        rel: String,
+        column: String,
+    },
 }
 
 impl fmt::Display for ValidationError {
@@ -170,6 +181,12 @@ impl fmt::Display for ValidationError {
                 f,
                 "calculated field '{field}' shares its name with a GROUP BY column, so it must \
                  be a bare passthrough of that column (e.g. `{field}`), not another expression"
+            ),
+            ValidationError::UnsupportedRelationshipPath { field, rel, column } => write!(
+                f,
+                "calculated field '{field}' references relationship path '{rel}.{column}', \
+                 which is not yet supported (grammar-only per issue #25; resolution and \
+                 evaluation are separate, later issues)"
             ),
         }
     }
@@ -317,6 +334,13 @@ fn validate_aggregate_field_expr(
             Ok(())
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) => Ok(()),
+        Expr::RelationshipPath { rel, column } => {
+            Err(ValidationError::UnsupportedRelationshipPath {
+                field: field_name.to_string(),
+                rel: rel.clone(),
+                column: column.clone(),
+            })
+        }
         Expr::BinaryOp { lhs, rhs, .. } => {
             validate_aggregate_field_expr(
                 lhs,
@@ -353,6 +377,10 @@ fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::Column(name) => out.push(name.clone()),
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        // Not a source-column reference by name — `infer_expr` rejects this
+        // via `ValidationError::UnsupportedRelationshipPath` once type
+        // inference walks the same expression.
+        Expr::RelationshipPath { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_columns(lhs, out);
             collect_columns(rhs, out);
@@ -464,6 +492,13 @@ fn infer_expr(
         }
         Expr::NumberLiteral(_) => Ok(ValueType::Numeric),
         Expr::StringLiteral(_) => Ok(ValueType::Text),
+        Expr::RelationshipPath { rel, column } => {
+            Err(ValidationError::UnsupportedRelationshipPath {
+                field: field_name.to_string(),
+                rel: rel.clone(),
+                column: column.clone(),
+            })
+        }
         Expr::BinaryOp { op, lhs, rhs } => {
             let lhs_t = infer_expr(
                 lhs,
