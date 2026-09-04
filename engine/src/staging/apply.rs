@@ -894,8 +894,14 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 let field_types: Vec<ValueType> = if eval::relationship_references(&def.def)
                     .is_empty()
                 {
-                    let inferred_types =
-                        validate::infer_field_types(&def.def, &def.source_columns)?;
+                    // This branch runs only for relationship-free definitions
+                    // (guarded above), so type inference needs no relationship
+                    // metadata: an empty map (issue #40).
+                    let inferred_types = validate::infer_field_types(
+                        &def.def,
+                        &def.source_columns,
+                        &std::collections::HashMap::new(),
+                    )?;
                     field_names
                         .iter()
                         .map(|name| {

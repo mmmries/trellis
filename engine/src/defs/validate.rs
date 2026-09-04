@@ -18,6 +18,25 @@ use std::fmt;
 use regex::Regex;
 
 use super::ast::{Expr, KeySpace, Predicate, TransformDef, ValueType};
+use super::model::RelationshipCardinality;
+
+/// A relationship referenced by a definition, resolved by the caller
+/// ([`super::catalog`]) against the persisted relationship catalog and live
+/// `pg_catalog` so this (sync, DB-less) validator can enforce ADR-0006's
+/// reference-time rules. Mirrors how `source_columns` is resolved by the
+/// caller and passed in: the validator itself never touches the database.
+///
+/// `column_types` maps each to-side column this relationship's paths
+/// reference to its [`ValueType`], so a `<rel>.<column>` enrichment field's
+/// type can be inferred from the *to-side* column it reads (the from-side
+/// `source_columns` map has no entry for it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRelationship {
+    pub cardinality: RelationshipCardinality,
+    pub to_table: String,
+    pub to_col: String,
+    pub column_types: HashMap<String, ValueType>,
+}
 
 /// Why a [`TransformDef`] was rejected by the validator.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,13 +117,41 @@ pub enum ValidationError {
     /// keeps that assumption enforced at validation, not a silent DDL-time
     /// skip.
     GroupingColumnFieldMustBePassthrough { field: String },
-    /// A field's expression contains a `<rel>.<column>` relationship-path
-    /// reference (issue #25's grammar). Resolving a relationship name,
-    /// checking its cardinality, and evaluating the path are all separate,
-    /// later issues (ADR-0006) — this validator rejects it outright rather
-    /// than letting an unresolvable reference reach [`super::eval`] or
-    /// [`super::oracle`].
-    UnsupportedRelationshipPath {
+    /// A field's expression references a `<rel>.<column>` path whose `<rel>`
+    /// is not a relationship declared on this definition's source table
+    /// (ADR-0006: relationship names are scoped per from-table). Resolved by
+    /// the caller against the relationship catalog and reported here rather
+    /// than reaching [`super::eval`] as an `UnknownRelationship` at apply
+    /// time.
+    UnknownRelationship { field: String, rel: String },
+    /// A field wraps a *to-one* relationship path in an aggregate
+    /// (`SUM(<rel>.<column>)`), which ADR-0006 forbids: a to-one path already
+    /// resolves to a single related value, so aggregating it is meaningless.
+    /// Use the bare `<rel>.<column>` enrichment instead.
+    RelationshipToOneWrappedInAggregate {
+        field: String,
+        rel: String,
+        column: String,
+    },
+    /// A field references a *to-many* relationship path bare
+    /// (`<rel>.<column>` with no aggregate), which ADR-0006 forbids: a
+    /// to-many path denotes a *set* of related values, so a bare reference is
+    /// ambiguous. Wrap it in an aggregate (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG`)
+    /// that folds the set to a single value.
+    RelationshipToManyRequiresAggregate {
+        field: String,
+        rel: String,
+        column: String,
+    },
+    /// An [`super::ast::KeySpace::Aggregate`] (GROUP BY) definition's field
+    /// references a `<rel>.<column>` relationship path. ADR-0006 relationship
+    /// enrichment is a row-grain (OneToOne) construct: a path folds over
+    /// *related* rows, orthogonal to a GROUP BY that folds over *source*
+    /// rows, and combining the two grains is unsupported. Rejected here so
+    /// the aggregate DDL/apply paths — which type-infer with no relationship
+    /// metadata — never have to (they'd otherwise accept it at define time
+    /// and fail unmaterializably at staging).
+    RelationshipPathInAggregate {
         field: String,
         rel: String,
         column: String,
@@ -238,11 +285,30 @@ impl fmt::Display for ValidationError {
                 "calculated field '{field}' shares its name with a GROUP BY column, so it must \
                  be a bare passthrough of that column (e.g. `{field}`), not another expression"
             ),
-            ValidationError::UnsupportedRelationshipPath { field, rel, column } => write!(
+            ValidationError::UnknownRelationship { field, rel } => write!(
                 f,
-                "calculated field '{field}' references relationship path '{rel}.{column}', \
-                 which is not yet supported (grammar-only per issue #25; resolution and \
-                 evaluation are separate, later issues)"
+                "calculated field '{field}' references relationship '{rel}', which is not \
+                 declared on this definition's source table (relationship names are scoped \
+                 per from-table, ADR-0006)"
+            ),
+            ValidationError::RelationshipToOneWrappedInAggregate { field, rel, column } => write!(
+                f,
+                "calculated field '{field}' wraps to-one relationship path '{rel}.{column}' in \
+                 an aggregate; a to-one relationship already resolves to a single related value, \
+                 so drop the aggregate and reference '{rel}.{column}' directly (ADR-0006)"
+            ),
+            ValidationError::RelationshipToManyRequiresAggregate { field, rel, column } => write!(
+                f,
+                "calculated field '{field}' references to-many relationship path '{rel}.{column}' \
+                 bare; a to-many relationship denotes a set of related values, so wrap it in an \
+                 aggregate such as SUM({rel}.{column}) or COUNT({rel}.{column}) (ADR-0006)"
+            ),
+            ValidationError::RelationshipPathInAggregate { field, rel, column } => write!(
+                f,
+                "calculated field '{field}' references relationship path '{rel}.{column}' in a \
+                 GROUP BY (aggregate) definition; relationship enrichment is a row-grain \
+                 construct that can't be combined with a GROUP BY grain — use it in a \
+                 OneToOne definition instead (ADR-0006)"
             ),
             ValidationError::UnknownRelationshipColumn { table, column } => write!(
                 f,
@@ -342,6 +408,7 @@ impl std::error::Error for RelationshipWarning {}
 pub fn validate(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
+    relationships: &HashMap<String, ResolvedRelationship>,
 ) -> Result<(), ValidationError> {
     if def.target == def.source {
         return Err(ValidationError::TargetEqualsSource {
@@ -442,9 +509,81 @@ pub fn validate(
 
     detect_cycle(&deps)?;
 
-    infer_field_types(def, source_columns)?;
+    // ADR-0006 reference-time cardinality rules: a to-one relationship is
+    // enriched by a bare `<rel>.<column>`; a to-many by an aggregate over the
+    // path. Checked here (with catalog-resolved cardinalities) before type
+    // inference, which relies on the relationship being resolvable.
+    for field in &def.fields {
+        validate_relationship_refs(&field.expr, &field.name, relationships, false)?;
+    }
+
+    infer_field_types(def, source_columns, relationships)?;
 
     Ok(())
+}
+
+/// Walks a field's expression enforcing ADR-0006's cardinality rules on every
+/// `<rel>.<column>` relationship path it contains. `in_aggregate` tracks
+/// whether the current position is the sole argument of an aggregate function
+/// (the only shape the parser admits for a path under an aggregate — see the
+/// parser's OneToOne to-many handling and [`super::eval`]'s to-many arm).
+///
+/// - unknown relationship name → [`ValidationError::UnknownRelationship`];
+/// - to-one path under an aggregate →
+///   [`ValidationError::RelationshipToOneWrappedInAggregate`];
+/// - bare to-many path (not under an aggregate) →
+///   [`ValidationError::RelationshipToManyRequiresAggregate`].
+///
+/// The referenced column's existence and type are checked separately by
+/// [`infer_expr`], which resolves the path against `column_types`.
+fn validate_relationship_refs(
+    expr: &Expr,
+    field_name: &str,
+    relationships: &HashMap<String, ResolvedRelationship>,
+    in_aggregate: bool,
+) -> Result<(), ValidationError> {
+    match expr {
+        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => Ok(()),
+        Expr::RelationshipPath { rel, column } => {
+            let Some(resolved) = relationships.get(rel) else {
+                return Err(ValidationError::UnknownRelationship {
+                    field: field_name.to_string(),
+                    rel: rel.clone(),
+                });
+            };
+            match resolved.cardinality {
+                RelationshipCardinality::ToOne if in_aggregate => {
+                    Err(ValidationError::RelationshipToOneWrappedInAggregate {
+                        field: field_name.to_string(),
+                        rel: rel.clone(),
+                        column: column.clone(),
+                    })
+                }
+                RelationshipCardinality::ToMany if !in_aggregate => {
+                    Err(ValidationError::RelationshipToManyRequiresAggregate {
+                        field: field_name.to_string(),
+                        rel: rel.clone(),
+                        column: column.clone(),
+                    })
+                }
+                _ => Ok(()),
+            }
+        }
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            // A relationship path never appears directly under a binary
+            // operator as an aggregate argument, so the aggregate context does
+            // not propagate across an operator.
+            validate_relationship_refs(lhs, field_name, relationships, false)?;
+            validate_relationship_refs(rhs, field_name, relationships, false)
+        }
+        Expr::FunctionCall { name, args } => {
+            let is_aggregate = super::registry::lookup_aggregate_function(name).is_some();
+            for arg in args {
+                validate_relationship_refs(arg, field_name, relationships, is_aggregate)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Walks a [`KeySpace::Aggregate`] field's expression, rejecting a bare
@@ -475,8 +614,14 @@ fn validate_aggregate_field_expr(
             Ok(())
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) => Ok(()),
+        // ADR-0006 relationship enrichment is a row-grain (OneToOne)
+        // construct; it can't share a field with a GROUP BY grain. Reject a
+        // path in an aggregate definition outright, so the aggregate DDL/apply
+        // paths (which type-infer with an empty relationship map) never see
+        // one — otherwise it would validate at define time yet fail
+        // unmaterializably at staging.
         Expr::RelationshipPath { rel, column } => {
-            Err(ValidationError::UnsupportedRelationshipPath {
+            Err(ValidationError::RelationshipPathInAggregate {
                 field: field_name.to_string(),
                 rel: rel.clone(),
                 column: column.clone(),
@@ -518,9 +663,9 @@ fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::Column(name) => out.push(name.clone()),
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
-        // Not a source-column reference by name — `infer_expr` rejects this
-        // via `ValidationError::UnsupportedRelationshipPath` once type
-        // inference walks the same expression.
+        // Not a source-column reference by name — its type is resolved from
+        // relationship metadata by `infer_expr`, and its cardinality rules by
+        // `validate_relationship_refs`, when they walk the same expression.
         Expr::RelationshipPath { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_columns(lhs, out);
@@ -548,6 +693,7 @@ fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
 pub(crate) fn infer_field_types(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
+    relationships: &HashMap<String, ResolvedRelationship>,
 ) -> Result<HashMap<String, ValueType>, ValidationError> {
     let fields_by_name: HashMap<&str, &super::ast::FieldDef> =
         def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
@@ -559,6 +705,7 @@ pub(crate) fn infer_field_types(
             let t = infer_field(
                 field,
                 source_columns,
+                relationships,
                 &fields_by_name,
                 &mut types,
                 &mut in_progress,
@@ -572,6 +719,7 @@ pub(crate) fn infer_field_types(
 fn infer_field(
     field: &super::ast::FieldDef,
     source_columns: &HashMap<String, ValueType>,
+    relationships: &HashMap<String, ResolvedRelationship>,
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
@@ -588,6 +736,7 @@ fn infer_field(
         &field.expr,
         &field.name,
         source_columns,
+        relationships,
         fields_by_name,
         types,
         in_progress,
@@ -602,6 +751,7 @@ fn infer_expr(
     expr: &Expr,
     field_name: &str,
     source_columns: &HashMap<String, ValueType>,
+    relationships: &HashMap<String, ResolvedRelationship>,
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
@@ -617,6 +767,7 @@ fn infer_expr(
                 return infer_field(
                     calc_field,
                     source_columns,
+                    relationships,
                     fields_by_name,
                     types,
                     in_progress,
@@ -634,10 +785,23 @@ fn infer_expr(
         Expr::NumberLiteral(_) => Ok(ValueType::Numeric),
         Expr::StringLiteral(_) => Ok(ValueType::Text),
         Expr::RelationshipPath { rel, column } => {
-            Err(ValidationError::UnsupportedRelationshipPath {
-                field: field_name.to_string(),
-                rel: rel.clone(),
-                column: column.clone(),
+            // A `<rel>.<column>` enrichment's type is the *to-side* column's
+            // type, resolved by the caller into `relationships`. The
+            // relationship's existence and this path's cardinality were
+            // already checked by `validate_relationship_refs`; here only the
+            // referenced column's existence (hence its type) remains.
+            let resolved =
+                relationships
+                    .get(rel)
+                    .ok_or_else(|| ValidationError::UnknownRelationship {
+                        field: field_name.to_string(),
+                        rel: rel.clone(),
+                    })?;
+            resolved.column_types.get(column).copied().ok_or_else(|| {
+                ValidationError::UnknownRelationshipColumn {
+                    table: resolved.to_table.clone(),
+                    column: column.clone(),
+                }
             })
         }
         Expr::BinaryOp { op, lhs, rhs } => {
@@ -645,6 +809,7 @@ fn infer_expr(
                 lhs,
                 field_name,
                 source_columns,
+                relationships,
                 fields_by_name,
                 types,
                 in_progress,
@@ -653,6 +818,7 @@ fn infer_expr(
                 rhs,
                 field_name,
                 source_columns,
+                relationships,
                 fields_by_name,
                 types,
                 in_progress,
@@ -690,6 +856,7 @@ fn infer_expr(
                         arg,
                         field_name,
                         source_columns,
+                        relationships,
                         fields_by_name,
                         types,
                         in_progress,
@@ -702,6 +869,7 @@ fn infer_expr(
                     arg,
                     field_name,
                     source_columns,
+                    relationships,
                     fields_by_name,
                     types,
                     in_progress,
@@ -842,7 +1010,7 @@ mod tests {
             },
         ]);
         let source_columns = numeric_columns(&["price"]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
     #[test]
@@ -851,7 +1019,7 @@ mod tests {
             name: "x".to_string(),
             expr: col("mystery"),
         }]);
-        let err = validate(&d, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &HashMap::new(), &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UnresolvedColumn {
@@ -875,7 +1043,7 @@ mod tests {
                 expr: col("x"),
             },
         ]);
-        let err = validate(&d, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &HashMap::new(), &HashMap::new()).unwrap_err();
         match err {
             ValidationError::Cycle { .. } => {}
             other => panic!("expected Cycle, got {other:?}"),
@@ -894,7 +1062,7 @@ mod tests {
             name: "x".to_string(),
             expr: col("x"),
         }]);
-        let err = validate(&d, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &HashMap::new(), &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UnresolvedColumn {
@@ -929,7 +1097,7 @@ mod tests {
             },
         ]);
         let source_columns = numeric_columns(&["c"]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
     #[test]
@@ -940,7 +1108,7 @@ mod tests {
         }]);
         d.target = "s".to_string();
         d.source = "s".to_string();
-        let err = validate(&d, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &HashMap::new(), &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::TargetEqualsSource {
@@ -961,7 +1129,7 @@ mod tests {
                 expr: Expr::NumberLiteral("2".to_string()),
             },
         ]);
-        let err = validate(&d, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &HashMap::new(), &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::DuplicateFieldName {
@@ -977,7 +1145,7 @@ mod tests {
             expr: col("text_col"),
         }]);
         let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
     #[test]
@@ -987,7 +1155,7 @@ mod tests {
             expr: col("author"),
         }]);
         let source_columns = HashMap::from([("author".to_string(), ValueType::Uuid)]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
     #[test]
@@ -1012,7 +1180,7 @@ mod tests {
             ("author".to_string(), ValueType::Uuid),
             ("word_count".to_string(), ValueType::Numeric),
         ]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
     #[test]
@@ -1022,7 +1190,7 @@ mod tests {
             expr: col("flag"),
         }]);
         let source_columns = HashMap::from([("flag".to_string(), ValueType::Boolean)]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
     #[test]
@@ -1036,7 +1204,7 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
-        let err = validate(&d, &source_columns).unwrap_err();
+        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::TypeMismatch {
@@ -1053,7 +1221,7 @@ mod tests {
             name: "out".to_string(),
             expr: Expr::StringLiteral("hi".to_string()),
         }]);
-        assert_eq!(validate(&d, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &HashMap::new(), &HashMap::new()), Ok(()));
     }
 
     #[test]
@@ -1066,7 +1234,7 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
     #[test]
@@ -1079,7 +1247,7 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("number_col".to_string(), ValueType::Numeric)]);
-        let err = validate(&d, &source_columns).unwrap_err();
+        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::FunctionArgTypeMismatch {
@@ -1103,7 +1271,7 @@ mod tests {
             },
         }]);
         let source_columns = numeric_columns(&["number_col"]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
     #[test]
@@ -1117,7 +1285,7 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
-        let err = validate(&d, &source_columns).unwrap_err();
+        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::TypeMismatch {
@@ -1142,8 +1310,8 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("name".to_string(), ValueType::Text)]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
-        let types = infer_field_types(&d, &source_columns).unwrap();
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        let types = infer_field_types(&d, &source_columns, &HashMap::new()).unwrap();
         assert_eq!(types["has_foo"], ValueType::Boolean);
     }
 
@@ -1161,7 +1329,7 @@ mod tests {
             },
         }]);
         let source_columns = numeric_columns(&["number_col"]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
     #[test]
@@ -1174,7 +1342,7 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
     #[test]
@@ -1190,7 +1358,7 @@ mod tests {
             ("text_col".to_string(), ValueType::Text),
             ("pattern_col".to_string(), ValueType::Text),
         ]);
-        let err = validate(&d, &source_columns).unwrap_err();
+        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::NonLiteralRegexPattern {
@@ -1237,7 +1405,55 @@ mod tests {
             ],
         );
         let source_columns = numeric_columns(&["order_id", "amount"]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+    }
+
+    #[test]
+    fn a_relationship_path_in_an_aggregate_definition_is_rejected() {
+        // A GROUP BY (aggregate) definition can't carry row-grain relationship
+        // enrichment (ADR-0006). Even with the relationship resolved and the
+        // path aggregate-wrapped (so per-field cardinality would pass), the
+        // aggregate-keyspace grain rejects it — this keeps the aggregate
+        // DDL/apply paths' empty-relationship-map assumption sound (Finding 1
+        // of #40's review).
+        let d = aggregate_def(
+            &["order_id"],
+            vec![
+                FieldDef {
+                    name: "order_id".to_string(),
+                    expr: col("order_id"),
+                },
+                FieldDef {
+                    name: "total_words".to_string(),
+                    expr: Expr::FunctionCall {
+                        name: "SUM".to_string(),
+                        args: vec![Expr::RelationshipPath {
+                            rel: "comments".to_string(),
+                            column: "word_count".to_string(),
+                        }],
+                    },
+                },
+            ],
+        );
+        let source_columns = numeric_columns(&["order_id"]);
+        let relationships = HashMap::from([(
+            "comments".to_string(),
+            ResolvedRelationship {
+                cardinality: RelationshipCardinality::ToMany,
+                to_table: "comments".to_string(),
+                to_col: "order_id".to_string(),
+                column_types: HashMap::from([("word_count".to_string(), ValueType::Numeric)]),
+            },
+        )]);
+        let err = validate(&d, &source_columns, &relationships).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::RelationshipPathInAggregate {
+                field: "total_words".to_string(),
+                rel: "comments".to_string(),
+                column: "word_count".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -1249,7 +1465,7 @@ mod tests {
                 expr: col("missing"),
             }],
         );
-        let err = validate(&d, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &HashMap::new(), &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UnresolvedGroupByColumn {
@@ -1268,7 +1484,7 @@ mod tests {
             }],
         );
         let source_columns = numeric_columns(&["order_id", "amount"]);
-        let err = validate(&d, &source_columns).unwrap_err();
+        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UngroupedColumnReference {
@@ -1291,7 +1507,7 @@ mod tests {
             }],
         );
         let source_columns = numeric_columns(&["order_id"]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
     #[test]
@@ -1307,7 +1523,7 @@ mod tests {
             }],
         );
         let source_columns = numeric_columns(&["order_id"]);
-        let err = validate(&d, &source_columns).unwrap_err();
+        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::GroupingColumnFieldMustBePassthrough {
@@ -1326,7 +1542,7 @@ mod tests {
             }],
         );
         let source_columns = numeric_columns(&["order_id"]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
     #[test]
@@ -1345,7 +1561,7 @@ mod tests {
             ("id".to_string(), ValueType::Numeric),
             ("label".to_string(), ValueType::Text),
         ]);
-        let err = validate(&d, &source_columns).unwrap_err();
+        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::FunctionArgTypeMismatch {
@@ -1368,7 +1584,7 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
-        let err = validate(&d, &source_columns).unwrap_err();
+        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
         match err {
             ValidationError::InvalidRegexPattern { field, pattern, .. } => {
                 assert_eq!(field, "out");

@@ -368,19 +368,24 @@ impl Parser {
                             // path folds over *related* rows, not a GROUP BY
                             // group, so it is valid in a row-grain (OneToOne)
                             // target even though ordinary aggregates are not.
-                            // Any other aggregate shape here is a genuine
-                            // wrong-key-space error.
-                            let args = self.parse_call_args()?;
-                            if matches!(args.as_slice(), [Expr::RelationshipPath { .. }]) {
-                                return Ok(Expr::FunctionCall { name: upper, args });
-                            }
-                            return Err(ParseError::UnsupportedKeySpace {
+                            // Any other aggregate shape here — including
+                            // `COUNT(*)`, whose `*` is not a `parse_call_args`
+                            // expression — is a genuine wrong-key-space error.
+                            let unsupported = || ParseError::UnsupportedKeySpace {
                                 construct: format!("{name}(...)"),
                                 detail: "aggregate functions require an aggregate key-space \
                                     (GROUP BY) or a to-many relationship path argument, \
                                     neither of which applies here"
                                     .to_string(),
-                            });
+                            };
+                            if self.peek_is_symbol('*') {
+                                return Err(unsupported());
+                            }
+                            let args = self.parse_call_args()?;
+                            if matches!(args.as_slice(), [Expr::RelationshipPath { .. }]) {
+                                return Ok(Expr::FunctionCall { name: upper, args });
+                            }
+                            return Err(unsupported());
                         }
 
                         if upper == "COUNT" {

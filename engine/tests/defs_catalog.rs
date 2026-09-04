@@ -336,14 +336,17 @@ async fn cross_join_and_partial_data_definitions_are_rejected_cleanly() {
     assert!(subscribers.is_empty());
 }
 
-/// Unlike `JOIN`, a `<rel>.<column>` relationship path is now real grammar
-/// (issue #25) rather than a parse-time rejection, so it parses successfully
-/// and instead fails at validation (the validator has no relationship
-/// resolution yet — that's a separate, later issue) — exercising that the
-/// catalog's parse-then-validate pipeline routes it through validation
-/// rather than short-circuiting at parse time the way `JOIN` still does.
+/// A `<rel>.<column>` relationship path is real grammar (issue #25) that
+/// parses successfully and is now validated against catalog-resolved
+/// relationship metadata (issue #40). With no relationship named `product`
+/// declared, the head is unknown, so validation rejects it with
+/// `UnknownRelationship` — naming the offending field — rather than the
+/// old blanket "relationship paths are unsupported" rejection. This exercises
+/// that the catalog's parse-then-validate pipeline resolves relationships and
+/// routes an unknown one through validation, not a parse-time short-circuit
+/// the way `JOIN` still does.
 #[tokio::test]
-async fn a_relationship_path_definition_is_rejected_at_validation() {
+async fn a_relationship_path_to_an_unknown_relationship_is_rejected_at_validation() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -356,16 +359,11 @@ async fn a_relationship_path_definition_is_rejected_at_validation() {
     .unwrap_err();
 
     match err {
-        CatalogError::Validate(ValidationError::UnsupportedRelationshipPath {
-            field,
-            rel,
-            column,
-        }) => {
+        CatalogError::Validate(ValidationError::UnknownRelationship { field, rel }) => {
             assert_eq!(field, "x");
             assert_eq!(rel, "product");
-            assert_eq!(column, "category_name");
         }
-        other => panic!("expected an UnsupportedRelationshipPath validation error, got {other:?}"),
+        other => panic!("expected an UnknownRelationship validation error, got {other:?}"),
     }
 
     // The rejected attempt should not have left a row behind.

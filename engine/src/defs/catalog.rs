@@ -31,7 +31,7 @@ use super::model::{
     SchemaNode,
 };
 use super::parser::{parse, parse_relationship};
-use super::validate::{RelationshipWarning, ValidationError, validate};
+use super::validate::{RelationshipWarning, ResolvedRelationship, ValidationError, validate};
 
 /// Why creating or reading a definition failed.
 #[derive(Debug)]
@@ -132,7 +132,13 @@ pub async fn create_definition(
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse(source_text)?;
-    validate(&def, source_columns)?;
+    // Issue #40: enrichment fields (`<rel>.<col>`) are validated against
+    // catalog-resolved relationship metadata — cardinality (ADR-0006's
+    // to-one/to-many rules) and each referenced to-side column's type — which
+    // the sync, DB-less validator can't fetch itself, so resolve it here (same
+    // caller-supplies-context split as `source_columns`).
+    let relationships = resolve_relationships(pool, &def).await?;
+    validate(&def, source_columns, &relationships)?;
 
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
@@ -459,6 +465,102 @@ pub async fn relationships_to_table(
         });
     }
     Ok(result)
+}
+
+/// Resolves every relationship a definition's calculated fields reference
+/// (issue #40) into the [`ResolvedRelationship`] map [`super::validate`] needs
+/// to enforce ADR-0006's reference-time cardinality and type rules. The
+/// validator is sync and DB-less, so — exactly like `source_columns` — the
+/// caller does the catalog + `pg_catalog` lookups here and passes the result
+/// in.
+///
+/// For each distinct relationship name used in `def` (via
+/// [`super::eval::relationship_references`]), looks it up on `def.source` and
+/// resolves the type of every to-side column those paths read. A referenced
+/// column that doesn't exist on the to-side is a hard
+/// [`ValidationError::UnknownRelationshipColumn`] here (ADR-0005: check, don't
+/// assume). An unknown relationship *name* is left absent from the map so the
+/// validator reports it as [`ValidationError::UnknownRelationship`] against
+/// the specific field, rather than this resolver guessing which field to
+/// blame.
+pub(crate) async fn resolve_relationships(
+    pool: &Pool,
+    def: &TransformDef,
+) -> Result<HashMap<String, ResolvedRelationship>, CatalogError> {
+    let mut cols_by_rel: HashMap<String, Vec<String>> = HashMap::new();
+    for (rel, column) in super::eval::relationship_references(def) {
+        cols_by_rel.entry(rel).or_default().push(column);
+    }
+
+    let mut resolved = HashMap::with_capacity(cols_by_rel.len());
+    for (rel, columns) in cols_by_rel {
+        let Some(reldef) = relationship_by_name(pool, &def.source, &rel).await? else {
+            // Unknown name: leave it out; the validator names the offending
+            // field in `ValidationError::UnknownRelationship`.
+            continue;
+        };
+        let to_table = reldef.def.to_table.clone();
+        let mut column_types = HashMap::with_capacity(columns.len());
+        for column in columns {
+            let pg_type = column_type(pool, &to_table, &column).await?;
+            column_types.insert(column, value_type_from_pg(&pg_type));
+        }
+        resolved.insert(
+            rel,
+            ResolvedRelationship {
+                cardinality: reldef.cardinality,
+                to_table,
+                to_col: reldef.def.to_col.clone(),
+                column_types,
+            },
+        );
+    }
+    Ok(resolved)
+}
+
+/// Pooled (non-transaction) counterpart to [`column_type_in_txn`], for
+/// resolvers that run before `create_definition` opens its transaction (issue
+/// #40's [`resolve_relationships`]). Same query, same
+/// [`ValidationError::UnknownRelationshipColumn`] on a missing column.
+async fn column_type(pool: &Pool, table: &str, column: &str) -> Result<String, CatalogError> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "select pg_catalog.format_type(a.atttypid, a.atttypmod)
+             from pg_attribute a
+             where a.attrelid = pg_catalog.to_regclass($1)
+               and a.attname = $2
+               and a.attnum > 0
+               and not a.attisdropped",
+            &[&table, &column],
+        )
+        .await?;
+    match row {
+        Some(row) => Ok(row.get(0)),
+        None => Err(ValidationError::UnknownRelationshipColumn {
+            table: table.to_string(),
+            column: column.to_string(),
+        }
+        .into()),
+    }
+}
+
+/// Maps a Postgres `format_type` rendering to the evaluator's [`ValueType`].
+/// A copy of `staging::apply`'s same-named helper (the `defs` layer is
+/// upstream of `staging`, so it can't reuse it without a backward
+/// dependency); keep the two in sync. Anything not clearly numeric, boolean,
+/// or uuid is treated as text, the safe verbatim-passthrough default for a
+/// to-side enrichment column.
+fn value_type_from_pg(pg_type: &str) -> ValueType {
+    let base = pg_type.split('(').next().unwrap_or(pg_type).trim();
+    match base {
+        "uuid" => ValueType::Uuid,
+        "boolean" => ValueType::Boolean,
+        "smallint" | "integer" | "bigint" | "numeric" | "real" | "double precision" => {
+            ValueType::Numeric
+        }
+        _ => ValueType::Text,
+    }
 }
 
 /// The Postgres type of `table.column`, as rendered by `format_type`, via a
