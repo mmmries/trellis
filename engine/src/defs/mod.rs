@@ -58,7 +58,7 @@ pub use model::{
 };
 pub use oracle::{
     OracleError, Recomputed, recompute, recompute_aggregate, render_aggregate_select_sql,
-    render_expr_sql,
+    render_expr_sql, render_relationship_select_sql,
 };
 pub use parser::{parse, parse_relationship};
 pub use validate::{RelationshipWarning, ValidationError, validate};
