@@ -47,6 +47,9 @@ pub enum CatalogError {
     /// [`create_definition`], since that's the only writer and it only ever
     /// encodes [`ValueType`]'s variants.
     UnknownValueType { column: String, text: String },
+    /// The definition's initial backfill (issue #23) failed to enumerate its
+    /// source table.
+    Backfill(crate::intake::IntakeError),
 }
 
 impl fmt::Display for CatalogError {
@@ -65,6 +68,9 @@ impl fmt::Display for CatalogError {
                 f,
                 "column '{column}' has an unrecognized persisted value type '{text}'"
             ),
+            CatalogError::Backfill(err) => {
+                write!(f, "failed to backfill the definition's source table: {err}")
+            }
         }
     }
 }
@@ -77,6 +83,7 @@ impl std::error::Error for CatalogError {
             CatalogError::Db(err) => Some(err),
             CatalogError::Pool(err) => Some(err),
             CatalogError::UnknownValueType { .. } => None,
+            CatalogError::Backfill(err) => Some(err),
         }
     }
 }
@@ -102,6 +109,12 @@ impl From<tokio_postgres::Error> for CatalogError {
 impl From<crate::error::Error> for CatalogError {
     fn from(err: crate::error::Error) -> Self {
         CatalogError::Pool(err)
+    }
+}
+
+impl From<crate::intake::IntakeError> for CatalogError {
+    fn from(err: crate::intake::IntakeError) -> Self {
+        CatalogError::Backfill(err)
     }
 }
 
@@ -150,6 +163,30 @@ pub async fn create_definition(
     // resolutions above so `dependents_of` can walk the graph instead of
     // matching on `transform_definitions.source_table` string equality.
     persist_edge_in_txn(&txn, source_node.id, target_node.id, EdgeKind::Source).await?;
+
+    // Issue #23: a definition's initial backfill is one enumeration of its
+    // source table, staged as `Recompute` triggers into the active ring
+    // segment via the same append path CDC/reverse-propagation use — one
+    // call here regardless of how many calculated fields the definition
+    // declares, not one per field, preserving the "N columns, one backfill"
+    // property as the definition model becomes first-class. Today the
+    // grammar's `FROM`/`TARGET` have no schema-qualification syntax, so
+    // `def.source` must be resolved by kind rather than by a single fixed
+    // schema: a chained definition's source can itself be a *previous*
+    // definition's target table, which always lives in
+    // `DEFAULT_TARGET_SCHEMA` (`create_target_table`'s hardcoded schema
+    // argument) — not the ambient Trellis schema every raw/CDC-tracked
+    // source resolves to via `pool::session_bootstrap`'s `search_path`. The
+    // node we just resolved above (`source_node`) already carries exactly
+    // this signal: `is_target` is true iff some earlier `create_definition`
+    // call registered `def.source` as a target.
+    let source_schema = if source_node.is_target {
+        crate::config::DEFAULT_TARGET_SCHEMA
+    } else {
+        crate::config::DEFAULT_SCHEMA
+    };
+    let qualified_source = crate::intake::publication::qualify(source_schema, &def.source)?;
+    crate::intake::publication::enumerate_and_append(&txn, &qualified_source).await?;
 
     let version: i64 = txn
         .query_one(

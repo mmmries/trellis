@@ -5,15 +5,56 @@
 use std::collections::HashMap;
 
 use engine::defs::{
-    CatalogError, EdgeKind, NodeKind, ValidationError, ValueType, create_definition, dependents_of,
-    persist_edge, resolve_node, transforms_for_source,
+    CatalogError, EdgeKind, NodeKind, ValidationError, ValueType, create_definition,
+    create_target_table, dependents_of, parse, persist_edge, resolve_node, source_primary_key,
+    transforms_for_source,
 };
 use testkit::TestCluster;
+
+/// Creates a minimal backing relation for a definition's source table
+/// (issue #23's backfill enumerates it for real, via a live `regclass`/
+/// catalog lookup) — a bare PK column is enough, since `validate()` checks
+/// column references against the passed-in `source_columns` map, not the
+/// live schema. Left unqualified so it lands via the pool's ambient
+/// `search_path` (Trellis schema first), matching the schema
+/// `create_definition` assumes for `def.source` today.
+async fn create_bare_source_table(pool: &engine::pool::Pool, name: &str) {
+    let client = pool.get().await.expect("get connection");
+    client
+        .batch_execute(&format!("create table {name} (id serial primary key)"))
+        .await
+        .expect("create bare source table");
+}
+
+/// Physically materializes `dsl`'s target table under `public` (mirroring
+/// what a real chained definition always does before anything downstream can
+/// name it as a `FROM` source). A handful of tests below chain a second
+/// definition off of a target that was only ever registered in the catalog
+/// via `create_definition`, never backfilled with a real table — issue #23
+/// made that chained definition's own backfill actually enumerate its
+/// source, so the source now has to be a real, queryable relation in
+/// whichever schema `create_definition`'s `is_target` check resolves it to
+/// (`public`, same as [`create_target_table`]'s own hardcoded schema), not
+/// just a name in `schema_nodes`.
+async fn materialize_chained_target(
+    pool: &engine::pool::Pool,
+    dsl: &str,
+    source_columns: &HashMap<String, ValueType>,
+) {
+    let def = parse(dsl).expect("parse dsl for target materialization");
+    let pk = source_primary_key(pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(pool, &def, "public", &pk, source_columns)
+        .await
+        .expect("materialize chained target table");
+}
 
 #[tokio::test]
 async fn creating_a_definition_persists_a_source_edge() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
 
     create_definition(
         &db.pool,
@@ -34,6 +75,7 @@ async fn creating_a_definition_persists_a_source_edge() {
 async fn a_node_with_no_dependents_of_a_kind_returns_empty() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
 
     create_definition(
         &db.pool,
@@ -70,14 +112,23 @@ async fn a_node_with_no_dependents_of_a_kind_returns_empty() {
 async fn the_dependency_graph_is_walkable_across_multiple_hops() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "a").await;
+    create_bare_source_table(&db.pool, "b").await;
 
+    let b_source_columns = HashMap::from([("price".to_string(), ValueType::Numeric)]);
     create_definition(
         &db.pool,
         "TRANSFORM b FROM a SELECT price AS total",
-        &HashMap::from([("price".to_string(), ValueType::Numeric)]),
+        &b_source_columns,
     )
     .await
     .expect("a -> b definition should be stored");
+    materialize_chained_target(
+        &db.pool,
+        "TRANSFORM b FROM a SELECT price AS total",
+        &b_source_columns,
+    )
+    .await;
 
     create_definition(
         &db.pool,
@@ -113,6 +164,7 @@ async fn the_dependency_graph_is_walkable_across_multiple_hops() {
 async fn transforms_for_source_agrees_with_dependents_of_source_edges() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
 
     create_definition(
         &db.pool,
@@ -141,6 +193,7 @@ async fn transforms_for_source_agrees_with_dependents_of_source_edges() {
 async fn dependents_of_returns_all_distinct_source_edges_for_fan_out() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
 
     create_definition(
         &db.pool,
@@ -211,6 +264,7 @@ async fn persisting_the_same_edge_twice_does_not_duplicate_the_row() {
 async fn a_direct_table_cycle_is_rejected() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "a").await;
 
     create_definition(
         &db.pool,
@@ -252,14 +306,23 @@ async fn a_direct_table_cycle_is_rejected() {
 async fn a_transitive_table_cycle_is_rejected() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "a").await;
+    create_bare_source_table(&db.pool, "b").await;
 
+    let b_source_columns = HashMap::from([("price".to_string(), ValueType::Numeric)]);
     create_definition(
         &db.pool,
         "TRANSFORM b FROM a SELECT price AS total",
-        &HashMap::from([("price".to_string(), ValueType::Numeric)]),
+        &b_source_columns,
     )
     .await
     .expect("a -> b definition should be stored");
+    materialize_chained_target(
+        &db.pool,
+        "TRANSFORM b FROM a SELECT price AS total",
+        &b_source_columns,
+    )
+    .await;
 
     create_definition(
         &db.pool,
@@ -300,6 +363,8 @@ async fn a_transitive_table_cycle_is_rejected() {
 async fn unrelated_definitions_are_not_flagged_as_a_cycle() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "a").await;
+    create_bare_source_table(&db.pool, "x").await;
 
     create_definition(
         &db.pool,
@@ -337,6 +402,7 @@ async fn unrelated_definitions_are_not_flagged_as_a_cycle() {
 async fn a_shortcut_edge_across_an_existing_path_is_not_a_cycle() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "a").await;
 
     let a_node = resolve_node(&db.pool, "a", NodeKind::Source)
         .await

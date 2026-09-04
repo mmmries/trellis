@@ -6,10 +6,24 @@ use std::collections::HashMap;
 use engine::defs::{NodeKind, ValueType, create_definition, node_for_table, resolve_node};
 use testkit::TestCluster;
 
+/// Creates a minimal backing relation for a definition's source table
+/// (issue #23's backfill enumerates it for real, via a live `regclass`/
+/// catalog lookup) — a bare PK column is enough, since `validate()` checks
+/// column references against the passed-in `source_columns` map, not the
+/// live schema.
+async fn create_bare_source_table(pool: &engine::pool::Pool, name: &str) {
+    let client = pool.get().await.expect("get connection");
+    client
+        .batch_execute(&format!("create table {name} (id serial primary key)"))
+        .await
+        .expect("create bare source table");
+}
+
 #[tokio::test]
 async fn creating_a_definition_resolves_its_source_and_target_as_nodes() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
 
     create_definition(
         &db.pool,
@@ -96,6 +110,8 @@ async fn resolving_a_table_under_the_other_kind_merges_into_one_dual_role_node()
 async fn a_definitions_target_matching_an_existing_source_node_merges_roles() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
+    create_bare_source_table(&db.pool, "upstream").await;
 
     create_definition(
         &db.pool,

@@ -147,15 +147,14 @@ async fn drain_matches_the_oracle_across_an_insert_update_and_delete() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
-    // The live source table's *final* state: order 3 has already been
-    // deleted (a real CDC delete would have removed it from `orders` too;
-    // this test's "live" table always reflects that end state), 1 and 2
-    // are present at the values their staged changes carry.
+    // `orders` starts empty — its rows arrive below, after the definition
+    // exists, purely as this batch's staged CDC events. That keeps the
+    // definition's own initial backfill (which enumerates whatever `orders`
+    // holds at definition time) from separately re-discovering and writing
+    // the same rows this test's hand-staged changes are about to describe,
+    // which would collide with them in the same segment.
     client
-        .batch_execute(
-            "create table orders (id integer primary key, price numeric, tax numeric); \
-             insert into orders (id, price, tax) values (1, 10.00, 1.50), (2, 20.00, 2.00)",
-        )
+        .batch_execute("create table orders (id integer primary key, price numeric, tax numeric)")
         .await
         .expect("seed source table");
 
@@ -174,6 +173,18 @@ async fn drain_matches_the_oracle_across_an_insert_update_and_delete() {
     create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
+
+    // The live source table's *final* state: order 3 has already been
+    // deleted (a real CDC delete would have removed it from `orders` too;
+    // this test's "live" table always reflects that end state), 1 and 2
+    // are present at the values their staged changes carry.
+    client
+        .execute(
+            "insert into orders (id, price, tax) values (1, 10.00, 1.50), (2, 20.00, 2.00)",
+            &[],
+        )
+        .await
+        .expect("seed source rows after the definition exists");
 
     // Pre-populate a target row for order 3, standing in for data an
     // earlier drain wrote before this batch's delete arrives.
@@ -244,11 +255,12 @@ async fn a_fully_drained_single_bucket_batch_flips_the_segment_to_drained() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
+    // `orders` starts empty so the definition's own initial backfill (below)
+    // enumerates nothing; the row arrives afterward, purely as this batch's
+    // staged CDC event, so it doesn't collide with a backfill-staged
+    // recompute for the same key in the same segment.
     client
-        .batch_execute(
-            "create table orders (id integer primary key, price numeric, tax numeric); \
-             insert into orders (id, price, tax) values (1, 10.00, 1.50)",
-        )
+        .batch_execute("create table orders (id integer primary key, price numeric, tax numeric)")
         .await
         .expect("seed source table");
 
@@ -267,6 +279,14 @@ async fn a_fully_drained_single_bucket_batch_flips_the_segment_to_drained() {
     create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
+
+    client
+        .execute(
+            "insert into orders (id, price, tax) values (1, 10.00, 1.50)",
+            &[],
+        )
+        .await
+        .expect("seed source rows after the definition exists");
 
     insert_cdc_row(
         &client,
@@ -297,11 +317,10 @@ async fn a_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
+    // `orders` starts empty so the definition's own initial backfill enumerates
+    // nothing; the row arrives afterward as this batch's staged CDC event.
     client
-        .batch_execute(
-            "create table orders (id integer primary key, price numeric, tax numeric); \
-             insert into orders (id, price, tax) values (1, 10.00, 1.50)",
-        )
+        .batch_execute("create table orders (id integer primary key, price numeric, tax numeric)")
         .await
         .expect("seed source table");
 
@@ -320,6 +339,14 @@ async fn a_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
     create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
+
+    client
+        .execute(
+            "insert into orders (id, price, tax) values (1, 10.00, 1.50)",
+            &[],
+        )
+        .await
+        .expect("seed source rows after the definition exists");
 
     insert_cdc_row(
         &client,
@@ -476,11 +503,12 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_fence() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
+    // `orders` starts empty so order_totals' own initial backfill enumerates
+    // nothing; its row arrives afterward as this batch's staged CDC event.
     client
         .batch_execute(
             "create table orders (id integer primary key, price numeric, tax numeric); \
-             create table widgets (id integer primary key, cost numeric); \
-             insert into orders (id, price, tax) values (1, 10.00, 1.50)",
+             create table widgets (id integer primary key, cost numeric)",
         )
         .await
         .expect("seed source tables");
@@ -510,6 +538,14 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_fence() {
     create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
+
+    client
+        .execute(
+            "insert into orders (id, price, tax) values (1, 10.00, 1.50)",
+            &[],
+        )
+        .await
+        .expect("seed source rows after the definitions exist");
 
     insert_cdc_row(
         &client,
@@ -629,11 +665,12 @@ async fn a_truncate_clears_every_target_row_but_a_same_batch_post_truncate_inser
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
+    // `orders` starts empty so order_totals' own initial backfill enumerates
+    // nothing; row 4 arrives afterward, purely as this batch's staged CDC
+    // event, so it doesn't collide with a backfill-staged recompute for the
+    // same key in the same segment.
     client
-        .batch_execute(
-            "create table orders (id integer primary key, price numeric, tax numeric); \
-             insert into orders (id, price, tax) values (4, 40.00, 4.00)",
-        )
+        .batch_execute("create table orders (id integer primary key, price numeric, tax numeric)")
         .await
         .expect("seed source table");
 
@@ -673,6 +710,14 @@ async fn a_truncate_clears_every_target_row_but_a_same_batch_post_truncate_inser
     )
     .await
     .expect("create order_summary table");
+
+    client
+        .execute(
+            "insert into orders (id, price, tax) values (4, 40.00, 4.00)",
+            &[],
+        )
+        .await
+        .expect("seed source rows after both definitions exist");
 
     // Rows an earlier drain left behind — the truncate must clear every one
     // of them, and its clear must propagate downstream to order_summary's
@@ -856,11 +901,12 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
+    // `orders` starts empty so order_totals' own initial backfill enumerates
+    // nothing; row 1 arrives afterward, purely as this batch's staged CDC
+    // event, so it doesn't collide with a backfill-staged recompute for the
+    // same key in the same segment.
     client
-        .batch_execute(
-            "create table orders (id integer primary key, price numeric, tax numeric); \
-             insert into orders (id, price, tax) values (1, 10.00, 1.50)",
-        )
+        .batch_execute("create table orders (id integer primary key, price numeric, tax numeric)")
         .await
         .expect("seed source table");
 
@@ -900,6 +946,14 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
     )
     .await
     .expect("create order_summary table");
+
+    client
+        .execute(
+            "insert into orders (id, price, tax) values (1, 10.00, 1.50)",
+            &[],
+        )
+        .await
+        .expect("seed source rows after both definitions exist");
 
     insert_cdc_row(
         &client,
@@ -990,11 +1044,12 @@ async fn a_text_column_passthrough_round_trips_through_compute() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
+    // `items` starts empty so the definition's own initial backfill
+    // enumerates nothing; its rows arrive afterward as this batch's staged
+    // CDC events, so they don't collide with a backfill-staged recompute for
+    // the same keys in the same segment.
     client
-        .batch_execute(
-            "create table items (id integer primary key, label text); \
-             insert into items (id, label) values (1, 'hello world'), (2, '007')",
-        )
+        .batch_execute("create table items (id integer primary key, label text)")
         .await
         .expect("seed source table");
 
@@ -1022,6 +1077,14 @@ async fn a_text_column_passthrough_round_trips_through_compute() {
     create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
+
+    client
+        .execute(
+            "insert into items (id, label) values (1, 'hello world'), (2, '007')",
+            &[],
+        )
+        .await
+        .expect("seed source rows after the definition exists");
 
     insert_cdc_row(
         &client,
@@ -1070,11 +1133,11 @@ async fn a_string_literal_field_writes_its_value_through_compute() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
+    // `items` starts empty so the definition's own initial backfill
+    // enumerates nothing; its row arrives afterward as this batch's staged
+    // CDC event.
     client
-        .batch_execute(
-            "create table items (id integer primary key); \
-             insert into items (id) values (1)",
-        )
+        .batch_execute("create table items (id integer primary key)")
         .await
         .expect("seed source table");
 
@@ -1103,6 +1166,11 @@ async fn a_string_literal_field_writes_its_value_through_compute() {
         .await
         .expect("create target table");
 
+    client
+        .execute("insert into items (id) values (1)", &[])
+        .await
+        .expect("seed source rows after the definition exists");
+
     insert_cdc_row(&client, "seg_0", "items", "1", "insert", None, Some("{}")).await;
 
     let seg_seq = seal_active_segment(&mut client).await;
@@ -1125,11 +1193,11 @@ async fn a_boolean_column_passthrough_round_trips_through_compute() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
+    // `items` starts empty so the definition's own initial backfill
+    // enumerates nothing; its rows arrive afterward as this batch's staged
+    // CDC events.
     client
-        .batch_execute(
-            "create table items (id integer primary key, flag boolean); \
-             insert into items (id, flag) values (1, true), (2, false)",
-        )
+        .batch_execute("create table items (id integer primary key, flag boolean)")
         .await
         .expect("seed source table");
 
@@ -1157,6 +1225,14 @@ async fn a_boolean_column_passthrough_round_trips_through_compute() {
     create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
+
+    client
+        .execute(
+            "insert into items (id, flag) values (1, true), (2, false)",
+            &[],
+        )
+        .await
+        .expect("seed source rows after the definition exists");
 
     insert_cdc_row(
         &client,
@@ -1203,11 +1279,11 @@ async fn a_function_call_composed_with_greater_than_round_trips_through_compute(
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
+    // `items` starts empty so the definition's own initial backfill
+    // enumerates nothing; its rows arrive afterward as this batch's staged
+    // CDC events.
     client
-        .batch_execute(
-            "create table items (id integer primary key, name text); \
-             insert into items (id, name) values (1, 'has foo in it'), (2, 'no match here')",
-        )
+        .batch_execute("create table items (id integer primary key, name text)")
         .await
         .expect("seed source table");
 
@@ -1245,6 +1321,14 @@ async fn a_function_call_composed_with_greater_than_round_trips_through_compute(
     create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
+
+    client
+        .execute(
+            "insert into items (id, name) values (1, 'has foo in it'), (2, 'no match here')",
+            &[],
+        )
+        .await
+        .expect("seed source rows after the definition exists");
 
     insert_cdc_row(
         &client,
@@ -1420,12 +1504,13 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
     // new_image, which must match the row here — while 3 and 4 are already
     // gone, one via a bare recompute trigger resolving to a delete, the
     // other via a genuine staged CDC delete.
+    //
+    // `orders` starts empty so the definition's own initial backfill
+    // enumerates nothing; rows 1, 2, and 5 arrive afterward, purely as this
+    // batch's staged changes below, so they don't collide with a
+    // backfill-staged recompute for the same keys in the same segment.
     client
-        .batch_execute(
-            "create table orders (id integer primary key, price numeric, tax numeric); \
-             insert into orders (id, price, tax) values \
-             (1, 10.00, 1.50), (2, 20.00, 2.00), (5, 50.00, 5.00)",
-        )
+        .batch_execute("create table orders (id integer primary key, price numeric, tax numeric)")
         .await
         .expect("seed source table");
 
@@ -1444,6 +1529,15 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
     create_target_table(&db.pool, &def, "public", &pk, &source_columns)
         .await
         .expect("create target table");
+
+    client
+        .execute(
+            "insert into orders (id, price, tax) values \
+             (1, 10.00, 1.50), (2, 20.00, 2.00), (5, 50.00, 5.00)",
+            &[],
+        )
+        .await
+        .expect("seed source rows after the definition exists");
 
     // Pre-populate target rows for 3 and 4, standing in for data an earlier
     // drain wrote before this batch's deletes arrive.
