@@ -432,7 +432,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let err = validate(&def, &source_columns).unwrap_err();
+        let err = validate(&def, &source_columns, &std::collections::HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::TypeMismatch {

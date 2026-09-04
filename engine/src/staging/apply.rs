@@ -816,13 +816,21 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // *to-side*. A change to a related row must re-derive every from-side
         // row whose enrichment reads it. For each relationship pointing at
         // this table, collect the join-key text of every to-side row this
-        // batch touched — the related row's `to_col`, which is a PRIMARY
-        // KEY/UNIQUE column (the relationship invariant), so it rides in the
-        // default replica identity of every image, including a delete's
-        // pre-image: no `REPLICA IDENTITY FULL` on the to-side is needed. Then
-        // resolve, with one live lookup, the from-side keys whose `from_col`
-        // matches, and stage each as an image-less recompute at the triggering
-        // change's `hop_gen + 1`.
+        // batch touched — the related row's `to_col`. For a to-one this is a
+        // PRIMARY KEY/UNIQUE column, so it rides in the default replica
+        // identity of every image, including a delete's pre-image. For a
+        // to-many, `to_col` is the *foreign* side (non-key), so it only rides
+        // in the pre-image when the to-side carries an adequate replica
+        // identity — which is exactly why issue #41 gates that at
+        // `create_relationship` (define) time: `REPLICA IDENTITY FULL` or a
+        // covering replica-identity index. That gate is creation-time only and
+        // not re-validated per batch, so an operator who later relaxes the
+        // to-side's replica identity would silently degrade reverse recompute
+        // here (the `.unwrap_or(&None)` below cannot tell an absent column from
+        // a genuine NULL — hence the guard must live at define time, not here).
+        // Then resolve, with one live lookup, the from-side keys whose
+        // `from_col` matches, and stage each as an image-less recompute at the
+        // triggering change's `hop_gen + 1`.
         let inbound_rels = catalog::relationships_to_table(pool, source_key).await?;
         // Decode each change's pre-image once, reused across every inbound
         // relationship below (the join key lives in the pre-image for a
@@ -894,8 +902,14 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 let field_types: Vec<ValueType> = if eval::relationship_references(&def.def)
                     .is_empty()
                 {
-                    let inferred_types =
-                        validate::infer_field_types(&def.def, &def.source_columns)?;
+                    // This branch runs only for relationship-free definitions
+                    // (guarded above), so type inference needs no relationship
+                    // metadata: an empty map (issue #40).
+                    let inferred_types = validate::infer_field_types(
+                        &def.def,
+                        &def.source_columns,
+                        &std::collections::HashMap::new(),
+                    )?;
                     field_names
                         .iter()
                         .map(|name| {

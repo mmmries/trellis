@@ -160,7 +160,9 @@ pub(super) fn classify_fields(
     group_by: &[String],
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<Vec<AggFieldPlan>, ApplyError> {
-    let field_types = validate::infer_field_types(def, source_columns)?;
+    // GROUP BY aggregate fields never reference a relationship path (that's
+    // OneToOne enrichment, issue #40), so inference uses an empty map.
+    let field_types = validate::infer_field_types(def, source_columns, &HashMap::new())?;
     let mut plans = Vec::with_capacity(def.fields.len());
     for field in &def.fields {
         if group_by.contains(&field.name) {

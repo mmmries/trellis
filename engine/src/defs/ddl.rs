@@ -78,6 +78,11 @@ pub enum DdlError {
     /// against this same `source_columns`, since a validated definition's
     /// fields always type-check.
     InvalidDefinition(ValidationError),
+    /// A persisted relationship's stored `definition_text` failed to re-parse
+    /// while resolving relationships referenced by `def` (issue #40). Only
+    /// arises on stored-data corruption or cross-version parser drift, but the
+    /// catalog layer surfaces it rather than panicking.
+    RelationshipReparse(super::error::ParseError),
     /// A direct Postgres protocol/query error.
     Db(tokio_postgres::Error),
     /// Acquiring a connection from the pool failed.
@@ -98,6 +103,11 @@ impl fmt::Display for DdlError {
             DdlError::InvalidDefinition(err) => {
                 write!(f, "cannot generate target-table DDL: {err}")
             }
+            DdlError::RelationshipReparse(err) => write!(
+                f,
+                "cannot generate target-table DDL: a referenced relationship's stored \
+                 definition failed to re-parse: {err}"
+            ),
             DdlError::Db(err) => {
                 write!(f, "target-table DDL database error: ")?;
                 crate::error::write_pg_error(f, err)
@@ -112,6 +122,7 @@ impl std::error::Error for DdlError {
         match self {
             DdlError::NoPrimaryKey { .. } | DdlError::CompositePrimaryKeyUnsupported { .. } => None,
             DdlError::InvalidDefinition(err) => Some(err),
+            DdlError::RelationshipReparse(err) => Some(err),
             DdlError::Db(err) => Some(err),
             DdlError::Pool(err) => Some(err),
         }
@@ -133,6 +144,26 @@ impl From<crate::error::Error> for DdlError {
 impl From<ValidationError> for DdlError {
     fn from(err: ValidationError) -> Self {
         DdlError::InvalidDefinition(err)
+    }
+}
+
+/// Collapses a [`super::catalog::CatalogError`] from relationship resolution
+/// (issue #40) into a [`DdlError`]. Relationship resolution does catalog reads
+/// (DB/pool errors), a `pg_catalog` column-type lookup that raises
+/// `Validate(UnknownRelationshipColumn)` for a missing to-side column, and —
+/// via `relationship_by_name` — a re-parse of each referenced relationship's
+/// stored `definition_text`, which can raise `Parse` on stored-data
+/// corruption or parser drift. The backfill/unknown-value-type variants come
+/// from paths `resolve_relationships` never exercises, so those remain
+/// unreachable here.
+fn map_resolve_error(err: super::catalog::CatalogError) -> DdlError {
+    use super::catalog::CatalogError;
+    match err {
+        CatalogError::Db(e) => DdlError::Db(e),
+        CatalogError::Pool(e) => DdlError::Pool(e),
+        CatalogError::Validate(e) => DdlError::InvalidDefinition(e),
+        CatalogError::Parse(e) => DdlError::RelationshipReparse(e),
+        other => unreachable!("resolve_relationships cannot produce {other:?}"),
     }
 }
 
@@ -208,7 +239,15 @@ pub async fn create_target_table(
     pk: &PrimaryKeyColumn,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<(), DdlError> {
-    let field_types = super::validate::infer_field_types(def, source_columns)?;
+    // Issue #40: a relationship-enriched field's type is the referenced
+    // to-side column's type, which `infer_field_types` reads from resolved
+    // relationship metadata. Resolve it the same way `create_definition` does
+    // (catalog + `pg_catalog` lookups); a relationship-free definition
+    // resolves to an empty map and behaves exactly as before.
+    let relationships = super::catalog::resolve_relationships(pool, def)
+        .await
+        .map_err(map_resolve_error)?;
+    let field_types = super::validate::infer_field_types(def, source_columns, &relationships)?;
 
     let mut sql = format!(
         "create table if not exists {} ({} {} primary key",
@@ -314,7 +353,10 @@ pub async fn create_aggregate_target_table(
         panic!("create_aggregate_target_table called on a non-aggregate definition");
     };
 
-    let field_types = super::validate::infer_field_types(def, source_columns)?;
+    // A GROUP BY aggregate target never reads a relationship path (those are
+    // OneToOne enrichment, issue #40), so it type-infers against an empty
+    // relationship map.
+    let field_types = super::validate::infer_field_types(def, source_columns, &HashMap::new())?;
 
     let mut sql = format!(
         "create table if not exists {} (",
