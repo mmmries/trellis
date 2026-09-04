@@ -31,7 +31,7 @@ use super::model::{
     SchemaNode,
 };
 use super::parser::{parse, parse_relationship};
-use super::validate::{ValidationError, validate};
+use super::validate::{RelationshipWarning, ValidationError, validate};
 
 /// Why creating or reading a definition failed.
 #[derive(Debug)]
@@ -279,6 +279,7 @@ pub async fn create_relationship(
     let from_type = column_type_in_txn(&txn, &def.from_table, &def.from_col).await?;
     let to_type = column_type_in_txn(&txn, &def.to_table, &def.to_col).await?;
     assert_comparable_types(&def, &from_type, &to_type)?;
+    assert_join_key_type_supported(&def, &from_type, &to_type)?;
 
     let already_declared: bool = txn
         .query_one(
@@ -326,6 +327,14 @@ pub async fn create_relationship(
 
     let cardinality = to_col_cardinality_in_txn(&txn, &def.to_table, &def.to_col).await?;
 
+    let mut warnings = Vec::new();
+    if !has_usable_fk_index_in_txn(&txn, &def.from_table, &def.from_col).await? {
+        warnings.push(RelationshipWarning::MissingFkIndex {
+            from_table: def.from_table.clone(),
+            from_col: def.from_col.clone(),
+        });
+    }
+
     let id: i64 = txn
         .query_one(
             "insert into relationship_definitions
@@ -351,6 +360,7 @@ pub async fn create_relationship(
         id,
         def,
         cardinality,
+        warnings,
     })
 }
 
@@ -393,7 +403,55 @@ pub async fn relationship_by_name(
         id,
         def,
         cardinality,
+        // Creation-time guidance, not a fact about the persisted row — see
+        // the field's doc comment on [`RelationshipDefinition`].
+        warnings: Vec::new(),
     }))
+}
+
+/// Every relationship whose `to_table` is `to_table` — the reverse of
+/// [`relationship_by_name`]'s `from_table` lookup. The staging reverse
+/// recompute (issue #30) uses this to answer "a row in this table just
+/// changed; which relationships point *at* it, so which from-side targets must
+/// re-derive?". Re-parses each `definition_text` and reads `cardinality` from
+/// its own column, exactly like [`relationship_by_name`].
+pub async fn relationships_to_table(
+    pool: &Pool,
+    to_table: &str,
+) -> Result<Vec<RelationshipDefinition>, CatalogError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "select id, definition_text, cardinality
+             from relationship_definitions
+             where to_table = $1
+             order by id",
+            &[&to_table],
+        )
+        .await?;
+
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: i64 = row.get(0);
+        let text: String = row.get(1);
+        let cardinality_text: String = row.get(2);
+        let def = parse_relationship(&text)?;
+        let cardinality = RelationshipCardinality::from_persisted(&cardinality_text)
+            .unwrap_or_else(|| {
+                panic!(
+                    "relationship_definitions.cardinality held unrecognized value '{cardinality_text}'"
+                )
+            });
+        result.push(RelationshipDefinition {
+            id,
+            def,
+            cardinality,
+            // Creation-time guidance, not a fact about the persisted row — see
+            // the field's doc comment on [`RelationshipDefinition`].
+            warnings: Vec::new(),
+        });
+    }
+    Ok(result)
 }
 
 /// The Postgres type of `table.column`, as rendered by `format_type`, via a
@@ -451,6 +509,65 @@ fn type_family(pg_type: &str) -> &str {
         "text" | "character varying" | "character" => "text",
         other => other,
     }
+}
+
+/// Postgres type base names (modifier already stripped, as in
+/// [`type_family`]) whose equality is *text-stable* — `a::text = b::text`
+/// agrees with the type's native typed `=` for every value. This is a
+/// positive allowlist, not [`type_family`]'s equivalence-class bucketing:
+/// [`type_family`] groups `character`/`character varying`/`text` together
+/// (correctly, for comparability) even though `character`'s native `=` is
+/// blank-padding-insensitive while its `::text` rendering is blank-padded,
+/// so a family-based check would wrongly wave it through here.
+///
+/// Only the join key's *own* type matters for this list, not what it's
+/// compared against, so allowed/rejected status is a per-type fact.
+/// Anything not named here — `numeric`/`real`/`double precision`
+/// (fractional/arbitrary-precision: `1.0::text` != `1.00::text` though
+/// numerically equal), `character`/`citext` (blank-padding or
+/// case-insensitivity native to the type but not its `::text` form),
+/// `timestamp`/`timestamptz`/`date`/`time` (`::text` is session-TimeZone- or
+/// style-dependent), `boolean`, `bytea`, `json`/`jsonb`, or any unknown
+/// type — is rejected as a join key.
+const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
+    "smallint",
+    "integer",
+    "bigint",
+    "uuid",
+    "text",
+    "character varying",
+];
+
+/// Rejects `def` if either endpoint's join key type isn't in
+/// [`TEXT_STABLE_JOIN_KEY_TYPES`] — issue #28 review, hardened per review of
+/// #27/#28 (a numeric-only blocklist missed `character(n)`, `citext`, and
+/// `timestamptz`, which also diverge under the engine's `::text`-equality
+/// join vs. the Postgres oracle's native typed `=`). Checks both sides
+/// rather than relying on [`assert_comparable_types`]'s family match to
+/// stand in for the other: `character` and `character varying` share a
+/// family but only one is on this allowlist, so a from/to pair could
+/// straddle the line.
+fn assert_join_key_type_supported(
+    def: &RelationshipDef,
+    from_type: &str,
+    to_type: &str,
+) -> Result<(), CatalogError> {
+    for (table, column, pg_type) in [
+        (&def.from_table, &def.from_col, from_type),
+        (&def.to_table, &def.to_col, to_type),
+    ] {
+        let base = pg_type.split('(').next().unwrap_or(pg_type).trim();
+        if !TEXT_STABLE_JOIN_KEY_TYPES.contains(&base) {
+            return Err(ValidationError::RelationshipUnsupportedJoinKeyType {
+                name: def.name.clone(),
+                table: table.clone(),
+                column: column.clone(),
+                pg_type: pg_type.to_string(),
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Rejects `def` if `from_type`/`to_type` (both already resolved by
@@ -516,6 +633,61 @@ async fn to_col_cardinality_in_txn(
     } else {
         RelationshipCardinality::ToMany
     })
+}
+
+/// Whether `from_table` has a usable index for looking up rows by
+/// `from_col` (issue #31) — the query reverse propagation runs when a
+/// related `to_table` row changes (ADR-0006). "Usable" means a `btree`
+/// index whose *leading* column is `from_col`: a plain `where from_col =
+/// $1` lookup can use such an index regardless of what other columns
+/// follow it, so — unlike [`to_col_cardinality_in_txn`]'s uniqueness check —
+/// this doesn't require `from_col` to be the index's only column.
+///
+/// Excludes indexes that can't be trusted for this lookup:
+/// * `indisvalid` — a not-yet-validated index (e.g. left behind by a failed
+///   `CREATE INDEX CONCURRENTLY`) isn't usable yet.
+/// * `am.amname = 'btree'` — other access methods (`gin`, `brin`, `hash`)
+///   either don't support this leading-column equality lookup the way
+///   btree does, or aren't worth special-casing for what's only a
+///   performance hint.
+/// * `indexprs is null` — an expression index's leading "column" isn't a
+///   plain column reference, so `indkey[0]` is `0` and never matches a real
+///   `attnum`; this is already excluded by the `indkey[0] = a.attnum` join
+///   condition, called out here since it's not obvious from the SQL alone.
+/// * `indpred is null` — a partial index only covers the rows satisfying
+///   its predicate, so the planner won't use it for an unqualified
+///   `from_col = $1` lookup across all rows; same exclusion
+///   [`to_col_cardinality_in_txn`] applies for uniqueness, for the same
+///   reason.
+///
+/// Never issues DDL — this only informs the caller's decision to emit
+/// [`RelationshipWarning::MissingFkIndex`] (ADR-0005: Trellis never modifies
+/// the source schema).
+async fn has_usable_fk_index_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    from_table: &str,
+    from_col: &str,
+) -> Result<bool, CatalogError> {
+    let has_index: bool = txn
+        .query_one(
+            "select exists (
+                select 1
+                from pg_index i
+                join pg_attribute a
+                  on a.attrelid = i.indrelid and a.attname = $2
+                join pg_class ic on ic.oid = i.indexrelid
+                join pg_am am on am.oid = ic.relam
+                where i.indrelid = pg_catalog.to_regclass($1)
+                  and i.indisvalid
+                  and i.indpred is null
+                  and am.amname = 'btree'
+                  and i.indkey[0] = a.attnum
+             )",
+            &[&from_table, &from_col],
+        )
+        .await?
+        .get(0);
+    Ok(has_index)
 }
 
 /// Resolves `table_name` to its [`SchemaNode`], creating one if this is the

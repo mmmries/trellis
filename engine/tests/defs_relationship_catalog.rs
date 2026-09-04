@@ -5,9 +5,9 @@
 use std::collections::HashMap;
 
 use engine::defs::{
-    CatalogError, EdgeKind, RelationshipCardinality, ValidationError, ValueType, create_definition,
-    create_relationship, create_target_table, edges_from, parse, relationship_by_name,
-    source_primary_key,
+    CatalogError, EdgeKind, RelationshipCardinality, RelationshipDefinition, RelationshipWarning,
+    ValidationError, ValueType, create_definition, create_relationship, create_target_table,
+    edges_from, parse, relationship_by_name, source_primary_key,
 };
 use testkit::TestCluster;
 
@@ -56,6 +56,25 @@ async fn create_table_with_text_column(pool: &engine::pool::Pool, name: &str, co
         .expect("create table with text column");
 }
 
+/// A table with a `numeric`-typed column, for the numeric-join-key
+/// rejection test.
+async fn create_table_with_numeric_column(pool: &engine::pool::Pool, name: &str, col: &str) {
+    create_table_with_typed_column(pool, name, col, "numeric").await;
+}
+
+async fn create_table_with_typed_column(
+    pool: &engine::pool::Pool,
+    name: &str,
+    col: &str,
+    sql_type: &str,
+) {
+    let client = pool.get().await.expect("get connection");
+    client
+        .batch_execute(&format!("create table {name} ({col} {sql_type})"))
+        .await
+        .expect("create table with typed column");
+}
+
 #[tokio::test]
 async fn a_relationship_round_trips_through_the_catalog() {
     let cluster = TestCluster::start();
@@ -82,8 +101,17 @@ async fn a_relationship_round_trips_through_the_catalog() {
         .expect("read query")
         .expect("relationship should be found");
 
+    // `warnings` (issue #31) is creation-time guidance, not a persisted
+    // fact — see `RelationshipDefinition::warnings`'s doc comment — so it's
+    // compared separately rather than folded into the full-struct equality
+    // below.
+    assert_eq!(read_back.warnings, Vec::new());
     assert_eq!(
-        read_back, created,
+        read_back,
+        RelationshipDefinition {
+            warnings: Vec::new(),
+            ..created.clone()
+        },
         "re-parsed read-back must match the created value"
     );
 }
@@ -301,6 +329,119 @@ async fn a_type_mismatch_between_endpoints_is_rejected() {
     }
     let message = err.to_string();
     assert!(message.contains("not comparable"));
+
+    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+        .await
+        .expect("read query");
+    assert!(missing.is_none());
+}
+
+/// Issue #28 review, ADR-0006: a join key resolving to a fractional or
+/// arbitrary-precision numeric type (`numeric`, `real`, `double precision`)
+/// is rejected at `create_relationship` time. The engine compares join keys
+/// as raw `::text`, which is exact for integer/uuid/text keys
+/// (`a_relationship_round_trips_through_the_catalog` covers the integer
+/// case) but not for this family — Postgres considers `1.0::numeric =
+/// 1.00::numeric` but their `::text` renderings differ, which would produce
+/// a false-miss NULL in the engine where a real LEFT JOIN matches.
+#[tokio::test]
+async fn a_numeric_join_key_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_numeric_column(&db.pool, "order_line_items", "product_id").await;
+    create_table_with_numeric_column(&db.pool, "products", "id").await;
+
+    let err = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .unwrap_err();
+
+    match &err {
+        CatalogError::Validate(ValidationError::RelationshipUnsupportedJoinKeyType {
+            name,
+            table,
+            column,
+            ..
+        }) => {
+            assert_eq!(name, "product");
+            assert_eq!(table, "order_line_items");
+            assert_eq!(column, "product_id");
+        }
+        other => panic!("expected RelationshipUnsupportedJoinKeyType, got {other:?}"),
+    }
+    let message = err.to_string();
+    assert!(message.contains("numeric"));
+
+    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+        .await
+        .expect("read query");
+    assert!(missing.is_none());
+}
+
+/// Issue #28 review (epic #19 cross-cutting): the join-key guard is a
+/// positive allowlist of text-stable types, not just a numeric blocklist.
+/// `character(n)` shares a `type_family` with `text`/`varchar` but its native
+/// `=` is blank-padding-insensitive while its `::text` form is blank-padded,
+/// so the engine's text-equality join would diverge from the oracle's typed
+/// join. Rejected at `create_relationship` time.
+#[tokio::test]
+async fn a_character_n_join_key_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_typed_column(&db.pool, "order_line_items", "product_id", "character(8)")
+        .await;
+    create_table_with_typed_column(&db.pool, "products", "id", "character(8)").await;
+
+    let err = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .unwrap_err();
+
+    match &err {
+        CatalogError::Validate(ValidationError::RelationshipUnsupportedJoinKeyType {
+            column,
+            ..
+        }) => assert_eq!(column, "product_id"),
+        other => panic!("expected RelationshipUnsupportedJoinKeyType, got {other:?}"),
+    }
+
+    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+        .await
+        .expect("read query");
+    assert!(missing.is_none());
+}
+
+/// Companion to `a_character_n_join_key_is_rejected`: `timestamptz` renders to
+/// a session-`TimeZone`-dependent `::text`, so it is not a text-stable join
+/// key and is rejected.
+#[tokio::test]
+async fn a_timestamptz_join_key_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_typed_column(
+        &db.pool,
+        "order_line_items",
+        "product_id",
+        "timestamp with time zone",
+    )
+    .await;
+    create_table_with_typed_column(&db.pool, "products", "id", "timestamp with time zone").await;
+
+    let err = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        &err,
+        CatalogError::Validate(ValidationError::RelationshipUnsupportedJoinKeyType { .. })
+    ));
 
     let missing = relationship_by_name(&db.pool, "order_line_items", "product")
         .await
@@ -527,6 +668,262 @@ async fn a_to_column_in_a_composite_unique_index_is_still_to_many() {
     .expect("valid relationship should be stored");
 
     assert_eq!(created.cardinality, RelationshipCardinality::ToMany);
+}
+
+/// Issue #31 / ADR-0005: a from-side join column with no usable index still
+/// makes for a *correct* relationship — reverse propagation is a plain
+/// `from_col = $1` lookup — but it's a full scan on every update to the
+/// to-side, so `create_relationship` surfaces it as a performance warning
+/// naming the exact `CREATE INDEX` the user may run, rather than rejecting
+/// the definition or creating the index itself.
+#[tokio::test]
+async fn a_missing_from_side_index_surfaces_a_performance_warning() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    create_table_with_pk(&db.pool, "products", "id").await;
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .expect("valid relationship should still be stored");
+
+    assert_eq!(
+        created.warnings,
+        vec![RelationshipWarning::MissingFkIndex {
+            from_table: "order_line_items".to_string(),
+            from_col: "product_id".to_string(),
+        }]
+    );
+    let message = created.warnings[0].to_string();
+    assert!(message.contains("order_line_items"));
+    assert!(message.contains("product_id"));
+    assert!(message.contains("CREATE INDEX ON order_line_items (product_id);"));
+
+    let client = db.pool.get().await.expect("get connection");
+    let index_count: i64 = client
+        .query_one(
+            "select count(*) from pg_indexes where tablename = 'order_line_items'",
+            &[],
+        )
+        .await
+        .expect("query")
+        .get(0);
+    assert_eq!(
+        index_count, 0,
+        "the warning must not have caused Trellis to create the index itself"
+    );
+}
+
+/// A plain `btree` index whose leading column is the from-side join column
+/// is usable for the reverse lookup, so no warning is surfaced.
+#[tokio::test]
+async fn a_usable_from_side_index_suppresses_the_performance_warning() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    create_table_with_pk(&db.pool, "products", "id").await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("create index on order_line_items (product_id)")
+        .await
+        .expect("create index on from-side join column");
+    drop(client);
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .expect("valid relationship should be stored");
+
+    assert_eq!(created.warnings, Vec::new());
+}
+
+/// A from-side primary key also backs a usable `btree` index (Postgres
+/// creates one implicitly), so it likewise suppresses the warning.
+#[tokio::test]
+async fn a_from_side_primary_key_suppresses_the_performance_warning() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_pk(&db.pool, "order_line_items", "product_id").await;
+    create_table_with_pk(&db.pool, "products", "id").await;
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .expect("valid relationship should be stored");
+
+    assert_eq!(created.warnings, Vec::new());
+}
+
+/// An index that merely *contains* the from-side join column, but not as
+/// its leading column, can't be used for a `from_col = $1` lookup — the
+/// warning still fires.
+#[tokio::test]
+async fn an_index_where_the_join_column_is_not_leading_still_warns() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("create table order_line_items (other_col integer, product_id integer)")
+        .await
+        .expect("create from-table");
+    client
+        .batch_execute("create index on order_line_items (other_col, product_id)")
+        .await
+        .expect("create index with product_id trailing, not leading");
+    drop(client);
+    create_table_with_pk(&db.pool, "products", "id").await;
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .expect("valid relationship should be stored");
+
+    assert_eq!(
+        created.warnings,
+        vec![RelationshipWarning::MissingFkIndex {
+            from_table: "order_line_items".to_string(),
+            from_col: "product_id".to_string(),
+        }]
+    );
+}
+
+/// A composite index *led by* the join column is usable even though it
+/// isn't the index's only column — leading-column position is what matters
+/// for an equality lookup, not exclusivity (contrast the to-side's
+/// uniqueness check, which does require exclusivity).
+#[tokio::test]
+async fn a_composite_index_led_by_the_join_column_suppresses_the_warning() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("create table order_line_items (product_id integer, other_col integer)")
+        .await
+        .expect("create from-table");
+    client
+        .batch_execute("create index on order_line_items (product_id, other_col)")
+        .await
+        .expect("create index led by product_id");
+    drop(client);
+    create_table_with_pk(&db.pool, "products", "id").await;
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .expect("valid relationship should be stored");
+
+    assert_eq!(created.warnings, Vec::new());
+}
+
+/// A partial index led by the join column doesn't cover every row, so it
+/// can't be relied on for a generic reverse lookup — the warning still
+/// fires, mirroring the to-side cardinality check's exclusion of partial
+/// indexes for the same reason.
+#[tokio::test]
+async fn a_partial_index_on_the_join_column_still_warns() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("create table order_line_items (product_id integer, active boolean)")
+        .await
+        .expect("create from-table");
+    client
+        .batch_execute("create index on order_line_items (product_id) where active")
+        .await
+        .expect("create partial index");
+    drop(client);
+    create_table_with_pk(&db.pool, "products", "id").await;
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .expect("valid relationship should be stored");
+
+    assert_eq!(
+        created.warnings,
+        vec![RelationshipWarning::MissingFkIndex {
+            from_table: "order_line_items".to_string(),
+            from_col: "product_id".to_string(),
+        }]
+    );
+}
+
+/// An expression index's leading "column" isn't a plain column reference
+/// (`indkey[0]` is `0`, which never matches a real `attnum`), so it isn't
+/// usable for a `from_col = $1` lookup — the warning still fires.
+#[tokio::test]
+async fn an_expression_index_on_the_join_column_still_warns() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("create index on order_line_items ((product_id + 0))")
+        .await
+        .expect("create expression index on join column");
+    drop(client);
+    create_table_with_pk(&db.pool, "products", "id").await;
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .expect("valid relationship should be stored");
+
+    assert_eq!(
+        created.warnings,
+        vec![RelationshipWarning::MissingFkIndex {
+            from_table: "order_line_items".to_string(),
+            from_col: "product_id".to_string(),
+        }]
+    );
+}
+
+/// A `hash` index doesn't support the leading-column equality lookup the
+/// way `btree` does, and isn't worth special-casing for what's only a
+/// performance hint — the warning still fires.
+#[tokio::test]
+async fn a_hash_index_on_the_join_column_still_warns() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("create index on order_line_items using hash (product_id)")
+        .await
+        .expect("create hash index on join column");
+    drop(client);
+    create_table_with_pk(&db.pool, "products", "id").await;
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .expect("valid relationship should be stored");
+
+    assert_eq!(
+        created.warnings,
+        vec![RelationshipWarning::MissingFkIndex {
+            from_table: "order_line_items".to_string(),
+            from_col: "product_id".to_string(),
+        }]
+    );
 }
 
 /// ADR-0006: relationship edges join the same cross-table dependency graph

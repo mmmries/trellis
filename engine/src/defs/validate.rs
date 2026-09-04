@@ -132,6 +132,23 @@ pub enum ValidationError {
     /// `relationship_definitions` unique constraint that backstops this
     /// check against a same-name race between concurrent callers.
     DuplicateRelationshipName { from_table: String, name: String },
+    /// A relationship's join key resolved to a Postgres type that isn't
+    /// text-stable — one where `a::text = b::text` disagrees with the type's
+    /// native typed `=` (see
+    /// [`super::catalog::TEXT_STABLE_JOIN_KEY_TYPES`]). Trellis's evaluator,
+    /// staging reverse-lookup, and oracle all join by raw `::text` equality,
+    /// but the oracle SELECT joins by native `=`, so a non-text-stable key
+    /// (`numeric`/`real`/`double precision` — `1.0` vs `1.00`; `character(n)`
+    /// — blank-padding; `citext` — case; `timestamptz` — session TimeZone)
+    /// would render a real LEFT JOIN match as a false-miss NULL in the
+    /// engine. Rejected at definition time rather than silently diverging
+    /// from the Postgres oracle.
+    RelationshipUnsupportedJoinKeyType {
+        name: String,
+        table: String,
+        column: String,
+        pg_type: String,
+    },
 }
 
 impl fmt::Display for ValidationError {
@@ -233,11 +250,61 @@ impl fmt::Display for ValidationError {
                 "relationship '{name}' is already declared on '{from_table}'; relationship \
                  names must be unique per from-table (ADR-0006), so pick a different name"
             ),
+            ValidationError::RelationshipUnsupportedJoinKeyType {
+                name,
+                table,
+                column,
+                pg_type,
+            } => write!(
+                f,
+                "relationship '{name}' joins on {table}.{column} ({pg_type}), a type whose \
+                 equality isn't text-stable, so the engine (which compares join keys as text) \
+                 would silently diverge from the Postgres oracle's typed join; supported join \
+                 key types are integer, bigint, smallint, uuid, text, and character varying"
+            ),
         }
     }
 }
 
 impl std::error::Error for ValidationError {}
+
+/// A non-fatal caveat surfaced alongside an otherwise-successful definition —
+/// distinct from [`ValidationError`], which rejects the definition outright.
+/// Per ADR-0005's "correctness vs. performance" split: a missing correctness
+/// prerequisite is a hard rejection, but a missing *performance* prerequisite
+/// (this type's only variant so far) still leaves the definition correct, so
+/// it's surfaced as guidance instead of an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelationshipWarning {
+    /// The from-side join column (issue #31) has no usable btree index —
+    /// reverse propagation (ADR-0006: "finding rows to re-derive when a
+    /// related row changes") is still correct, since it's a plain
+    /// `from_col = $1` lookup, but a full scan of `from_table` on every
+    /// update to `to_table` is slow. Per ADR-0005, Trellis never creates the
+    /// index itself; it only names the exact DDL the user may run.
+    MissingFkIndex {
+        from_table: String,
+        from_col: String,
+    },
+}
+
+impl fmt::Display for RelationshipWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RelationshipWarning::MissingFkIndex {
+                from_table,
+                from_col,
+            } => write!(
+                f,
+                "no index on '{from_table}.{from_col}'; finding rows to re-derive when a \
+                 related row changes will require a full scan of '{from_table}' — consider \
+                 `CREATE INDEX ON {from_table} ({from_col});`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RelationshipWarning {}
 
 /// Validates `def` against the 1-1 subset. `source_columns` maps each
 /// column name known to exist on `def.source` to its [`ValueType`];

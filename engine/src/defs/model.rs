@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use super::ast::{RelationshipDef, TransformDef, ValueType};
+use super::validate::RelationshipWarning;
 
 /// A transform definition as stored in the catalog: the parsed AST — source
 /// table, target table name, and calculated fields are all on
@@ -40,6 +41,13 @@ pub struct RelationshipDefinition {
     pub id: i64,
     pub def: RelationshipDef,
     pub cardinality: RelationshipCardinality,
+    /// Non-fatal caveats surfaced alongside this (still-successful)
+    /// definition (issue #31) — e.g. a missing from-side index. Empty on the
+    /// read-back path ([`super::catalog::relationship_by_name`]): a warning
+    /// is creation-time guidance, not a fact about the persisted row, and
+    /// `pg_catalog` state (an index dropped later) can drift from what was
+    /// true at creation anyway.
+    pub warnings: Vec<RelationshipWarning>,
 }
 
 /// Whether a relationship's to-side is guaranteed at most one row per
