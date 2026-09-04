@@ -149,6 +149,22 @@ pub enum ValidationError {
         column: String,
         pg_type: String,
     },
+    /// A *to-many* relationship's to-side (issue #41) lacks a replica identity
+    /// that carries the join column in row pre-images. For to-many, the join
+    /// key (`to_col`) is a *non-PK* column on the to-side, and the staging
+    /// reverse-recompute resolver reads it from the DELETE/UPDATE pre-image to
+    /// find which from-side rows to re-derive. Under the default replica
+    /// identity (primary key), that non-PK column is absent from the
+    /// pre-image, so a delete or a re-parent (UPDATE of the join column) would
+    /// silently under-recompute and diverge from the Postgres oracle with no
+    /// error. Accepted only when the to-side has `REPLICA IDENTITY FULL` or a
+    /// replica-identity index covering `to_col`; rejected at definition time
+    /// (ADR-0006, a correctness prerequisite → hard reject per ADR-0005).
+    RelationshipToManyRequiresReplicaIdentity {
+        name: String,
+        to_table: String,
+        to_col: String,
+    },
 }
 
 impl fmt::Display for ValidationError {
@@ -261,6 +277,19 @@ impl fmt::Display for ValidationError {
                  equality isn't text-stable, so the engine (which compares join keys as text) \
                  would silently diverge from the Postgres oracle's typed join; supported join \
                  key types are integer, bigint, smallint, uuid, text, and character varying"
+            ),
+            ValidationError::RelationshipToManyRequiresReplicaIdentity {
+                name,
+                to_table,
+                to_col,
+            } => write!(
+                f,
+                "relationship '{name}' is to-many (its join key {to_table}.{to_col} is not \
+                 unique), so the to-side needs a replica identity that carries {to_col} in \
+                 delete/re-parent pre-images — otherwise reverse recompute can't find the \
+                 from-side rows to re-derive and silently diverges from the Postgres oracle; \
+                 run `ALTER TABLE {to_table} REPLICA IDENTITY FULL;` (or use a replica-identity \
+                 index that covers {to_col})"
             ),
         }
     }

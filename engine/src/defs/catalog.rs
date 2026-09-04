@@ -327,6 +327,13 @@ pub async fn create_relationship(
 
     let cardinality = to_col_cardinality_in_txn(&txn, &def.to_table, &def.to_col).await?;
 
+    // To-many's join key is a non-PK column on the to-side; reverse recompute
+    // reads it from delete/re-parent pre-images, which the default (PK)
+    // replica identity omits — reject unless the to-side carries it (#41).
+    if cardinality == RelationshipCardinality::ToMany {
+        assert_replica_identity_supports_to_many(&txn, &def).await?;
+    }
+
     let mut warnings = Vec::new();
     if !has_usable_fk_index_in_txn(&txn, &def.from_table, &def.from_col).await? {
         warnings.push(RelationshipWarning::MissingFkIndex {
@@ -633,6 +640,62 @@ async fn to_col_cardinality_in_txn(
     } else {
         RelationshipCardinality::ToMany
     })
+}
+
+/// Rejects a *to-many* relationship (issue #41) whose to-side lacks a replica
+/// identity that carries the join column (`to_col`) in row pre-images. For
+/// to-many the join key is a *non-PK* column, and the staging reverse-recompute
+/// resolver reads it from a DELETE/UPDATE pre-image to find which from-side
+/// rows to re-derive. Under the default replica identity (`d`, the primary
+/// key) — or none (`n`) — that non-PK column is absent from the pre-image, so
+/// a delete or re-parent would silently under-recompute and diverge from the
+/// Postgres oracle. Correct only when the to-side has:
+/// * `REPLICA IDENTITY FULL` (`relreplident = 'f'`) — every column is in the
+///   pre-image; or
+/// * `REPLICA IDENTITY USING INDEX` (`relreplident = 'i'`) whose index — the
+///   one flagged `pg_index.indisreplident` — includes `to_col` among its
+///   columns (`indkey` maps to the attnum of `to_col`).
+///
+/// Callers invoke this only for [`RelationshipCardinality::ToMany`]; to-one
+/// carries the FK in the from-side's own row image and needs no extra replica
+/// identity (see ADR-0006). Assumes `to_table`/`to_col` already resolved.
+async fn assert_replica_identity_supports_to_many(
+    txn: &tokio_postgres::Transaction<'_>,
+    def: &RelationshipDef,
+) -> Result<(), CatalogError> {
+    let adequate: bool = txn
+        .query_one(
+            "select
+                c.relreplident = 'f'
+                or (
+                    c.relreplident = 'i'
+                    and exists (
+                        select 1
+                        from pg_index i
+                        join pg_attribute a
+                          on a.attrelid = i.indrelid and a.attname = $2
+                        where i.indrelid = c.oid
+                          and i.indisreplident
+                          and a.attnum = any(i.indkey::int2[])
+                    )
+                )
+             from pg_class c
+             where c.oid = pg_catalog.to_regclass($1)",
+            &[&def.to_table, &def.to_col],
+        )
+        .await?
+        .get(0);
+
+    if adequate {
+        Ok(())
+    } else {
+        Err(ValidationError::RelationshipToManyRequiresReplicaIdentity {
+            name: def.name.clone(),
+            to_table: def.to_table.clone(),
+            to_col: def.to_col.clone(),
+        }
+        .into())
+    }
 }
 
 /// Whether `from_table` has a usable index for looking up rows by

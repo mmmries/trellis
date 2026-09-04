@@ -167,10 +167,15 @@ directions:
 * **Reverse (a *related* row changes).** Trellis resolves, from the dependency
   graph, which relationships target the changed table, then re-derives the
   referencing rows whose join key matches the changed row's key. That key comes
-  from the changed row's replica image — always present in the default replica
-  identity, so no extra replica identity is needed on the to-side. This reuses
-  the existing "recompute" staging path rather than a bespoke persisted reverse
-  index.
+  from the changed row's replica image. For a **to-one** relationship the join
+  key is the to-side's own primary key, always present in the default replica
+  identity, so no extra replica identity is needed. For a **to-many**
+  relationship the join key is a *non-PK* column on the to-side, which the
+  default (PK) replica identity omits from delete/re-parent pre-images; such a
+  relationship therefore requires `REPLICA IDENTITY FULL` (or a replica-identity
+  index covering the join column) on the to-side, enforced at define time. This
+  reuses the existing "recompute" staging path rather than a bespoke persisted
+  reverse index.
 
   Finding the affected referencing rows is a lookup on the from-side join column.
   That lookup is **correct without an index**; an index only makes it fast. Per
