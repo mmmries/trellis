@@ -1,14 +1,64 @@
-//! Integration tests for the relationship catalog (issue #26), run against a
-//! real, ephemeral Postgres instance via the shared harness
-//! (`testkit::TestCluster`).
+//! Integration tests for the relationship catalog (issue #26 storage, issue
+//! #27 validation), run against a real, ephemeral Postgres instance via the
+//! shared harness (`testkit::TestCluster`).
 
-use engine::defs::{CatalogError, EdgeKind, create_relationship, edges_from, relationship_by_name};
+use engine::defs::{
+    CatalogError, EdgeKind, RelationshipCardinality, ValidationError, create_relationship,
+    edges_from, relationship_by_name,
+};
 use testkit::TestCluster;
+
+/// A bare table with an integer primary key named `pk_col` — good enough to
+/// stand in as a relationship's to-side when the test wants a `UNIQUE`/`PK`
+/// column present (cardinality `ToOne`).
+async fn create_table_with_pk(pool: &engine::pool::Pool, name: &str, pk_col: &str) {
+    let client = pool.get().await.expect("get connection");
+    client
+        .batch_execute(&format!(
+            "create table {name} ({pk_col} serial primary key)"
+        ))
+        .await
+        .expect("create table with pk");
+}
+
+/// A table with an ordinary (non-unique) integer column — a relationship's
+/// from-side, or a to-side deliberately left without a uniqueness guarantee
+/// (cardinality `ToMany`).
+async fn create_table_with_plain_column(pool: &engine::pool::Pool, name: &str, col: &str) {
+    let client = pool.get().await.expect("get connection");
+    client
+        .batch_execute(&format!("create table {name} ({col} integer)"))
+        .await
+        .expect("create table with plain column");
+}
+
+/// A table with a plain-`UNIQUE` (not primary-key) integer column — the
+/// other route to cardinality `ToOne` per ADR-0006.
+async fn create_table_with_unique_column(pool: &engine::pool::Pool, name: &str, col: &str) {
+    let client = pool.get().await.expect("get connection");
+    client
+        .batch_execute(&format!(
+            "create table {name} ({col} integer unique, other_col integer)"
+        ))
+        .await
+        .expect("create table with unique column");
+}
+
+/// A table with a `text`-typed column, for type-mismatch tests.
+async fn create_table_with_text_column(pool: &engine::pool::Pool, name: &str, col: &str) {
+    let client = pool.get().await.expect("get connection");
+    client
+        .batch_execute(&format!("create table {name} ({col} text)"))
+        .await
+        .expect("create table with text column");
+}
 
 #[tokio::test]
 async fn a_relationship_round_trips_through_the_catalog() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    create_table_with_pk(&db.pool, "products", "id").await;
 
     let created = create_relationship(
         &db.pool,
@@ -22,6 +72,7 @@ async fn a_relationship_round_trips_through_the_catalog() {
     assert_eq!(created.def.from_col, "product_id");
     assert_eq!(created.def.to_table, "products");
     assert_eq!(created.def.to_col, "id");
+    assert_eq!(created.cardinality, RelationshipCardinality::ToOne);
 
     let read_back = relationship_by_name(&db.pool, "order_line_items", "product")
         .await
@@ -52,6 +103,8 @@ async fn relationship_by_name_returns_none_for_an_unknown_pair() {
 async fn a_relationship_appears_as_a_typed_edge_in_the_resolver() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "posts", "author_id").await;
+    create_table_with_pk(&db.pool, "users", "id").await;
 
     create_relationship(
         &db.pool,
@@ -87,12 +140,19 @@ async fn a_relationship_appears_as_a_typed_edge_in_the_resolver() {
 
 /// ADR-0006's "Naming and scope": a relationship name is unique **per
 /// from-table**, not global — declaring the same name twice on the same
-/// from-table is rejected, but the same name on two different from-tables is
-/// fine.
+/// from-table is rejected, with an actionable message (issue #27), but the
+/// same name on two different from-tables is fine.
 #[tokio::test]
 async fn a_duplicate_name_on_the_same_from_table_is_rejected() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("create table posts (author_id integer, editor_id integer)")
+        .await
+        .expect("create posts");
+    drop(client);
+    create_table_with_pk(&db.pool, "users", "id").await;
 
     create_relationship(
         &db.pool,
@@ -108,18 +168,25 @@ async fn a_duplicate_name_on_the_same_from_table_is_rejected() {
     .await
     .unwrap_err();
 
-    assert!(matches!(err, CatalogError::Db(_)));
+    match &err {
+        CatalogError::Validate(ValidationError::DuplicateRelationshipName { from_table, name }) => {
+            assert_eq!(from_table, "posts");
+            assert_eq!(name, "author");
+        }
+        other => panic!("expected DuplicateRelationshipName, got {other:?}"),
+    }
     let message = err.to_string();
-    assert!(
-        message.contains("duplicate key value violates unique constraint"),
-        "expected the underlying Postgres detail in the error message, got: {message}"
-    );
+    assert!(message.contains("author"));
+    assert!(message.contains("posts"));
 }
 
 #[tokio::test]
 async fn the_same_relationship_name_is_allowed_on_different_from_tables() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "posts", "owner_id").await;
+    create_table_with_plain_column(&db.pool, "comments", "owner_id").await;
+    create_table_with_pk(&db.pool, "users", "id").await;
 
     create_relationship(
         &db.pool,
@@ -147,13 +214,15 @@ async fn the_same_relationship_name_is_allowed_on_different_from_tables() {
 }
 
 /// No DDL is ever issued against `from_table`/`to_table` (ADR-0005): storing
-/// a relationship never requires those tables to physically exist — nothing
-/// in this test creates `order_line_items`/`products` as real relations,
-/// only `create_relationship`'s catalog-only writes.
+/// a relationship never creates, alters, or indexes those tables — only the
+/// test setup's own `create table` calls (not `create_relationship`) put
+/// these two relations there.
 #[tokio::test]
 async fn creating_a_relationship_issues_no_ddl_against_the_source_tables() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    create_table_with_pk(&db.pool, "products", "id").await;
 
     create_relationship(
         &db.pool,
@@ -163,20 +232,17 @@ async fn creating_a_relationship_issues_no_ddl_against_the_source_tables() {
     .expect("valid relationship should be stored");
 
     let client = db.pool.get().await.expect("get connection");
-    let exists: bool = client
+    let index_count: i64 = client
         .query_one(
-            "select exists (
-                select 1 from information_schema.tables
-                where table_name in ('order_line_items', 'products')
-            )",
+            "select count(*) from pg_indexes where tablename = 'order_line_items'",
             &[],
         )
         .await
         .expect("query")
         .get(0);
-    assert!(
-        !exists,
-        "no physical table should have been created for either endpoint"
+    assert_eq!(
+        index_count, 0,
+        "no index should have been added to the from-table"
     );
 }
 
@@ -192,6 +258,256 @@ async fn an_unparseable_relationship_is_rejected_and_leaves_no_row() {
     assert!(matches!(err, CatalogError::Parse(_)));
 
     let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+        .await
+        .expect("read query");
+    assert!(missing.is_none());
+}
+
+/// ADR-0006's "type-check the join": a from-side column and to-side column
+/// with incompatible types (here `integer` vs `text`) is rejected at
+/// `create_relationship` time with an actionable message, not silently
+/// stored.
+#[tokio::test]
+async fn a_type_mismatch_between_endpoints_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    create_table_with_text_column(&db.pool, "products", "id").await;
+
+    let err = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .unwrap_err();
+
+    match &err {
+        CatalogError::Validate(ValidationError::RelationshipTypeMismatch {
+            name,
+            from_table,
+            to_table,
+            ..
+        }) => {
+            assert_eq!(name, "product");
+            assert_eq!(from_table, "order_line_items");
+            assert_eq!(to_table, "products");
+        }
+        other => panic!("expected RelationshipTypeMismatch, got {other:?}"),
+    }
+    let message = err.to_string();
+    assert!(message.contains("not comparable"));
+
+    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+        .await
+        .expect("read query");
+    assert!(missing.is_none());
+}
+
+/// Slightly different integer widths (`integer` FK to `bigint`-identity-style
+/// PK) are still comparable — the common case a strict exact-type-match rule
+/// would wrongly reject.
+#[tokio::test]
+async fn compatible_integer_widths_are_accepted() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("create table products (id bigint primary key)")
+        .await
+        .expect("create products with bigint pk");
+    drop(client);
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .expect("integer-to-bigint join should be accepted as comparable");
+}
+
+/// ADR-0006's endpoint-resolution requirement: a relationship whose
+/// `from_col`/`to_col` doesn't exist on the named table (including the table
+/// itself not existing) is rejected with an actionable message.
+#[tokio::test]
+async fn an_unknown_from_column_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_pk(&db.pool, "products", "id").await;
+    // `order_line_items` never created at all.
+
+    let err = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .unwrap_err();
+
+    match &err {
+        CatalogError::Validate(ValidationError::UnknownRelationshipColumn { table, column }) => {
+            assert_eq!(table, "order_line_items");
+            assert_eq!(column, "product_id");
+        }
+        other => panic!("expected UnknownRelationshipColumn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_to_column_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    create_table_with_pk(&db.pool, "products", "id").await;
+
+    let err = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.missing_col",
+    )
+    .await
+    .unwrap_err();
+
+    match &err {
+        CatalogError::Validate(ValidationError::UnknownRelationshipColumn { table, column }) => {
+            assert_eq!(table, "products");
+            assert_eq!(column, "missing_col");
+        }
+        other => panic!("expected UnknownRelationshipColumn, got {other:?}"),
+    }
+}
+
+/// ADR-0006's cardinality rule: `to_col` being the table's `PRIMARY KEY`
+/// determines `ToOne`.
+#[tokio::test]
+async fn a_primary_key_to_column_determines_to_one_cardinality() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    create_table_with_pk(&db.pool, "products", "id").await;
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .expect("valid relationship should be stored");
+
+    assert_eq!(created.cardinality, RelationshipCardinality::ToOne);
+    let read_back = relationship_by_name(&db.pool, "order_line_items", "product")
+        .await
+        .expect("read query")
+        .expect("relationship should be found");
+    assert_eq!(read_back.cardinality, RelationshipCardinality::ToOne);
+}
+
+/// ADR-0006's cardinality rule: a plain `UNIQUE` (non-PK) `to_col` also
+/// determines `ToOne`.
+#[tokio::test]
+async fn a_plain_unique_to_column_determines_to_one_cardinality() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "accounts", "profile_code").await;
+    create_table_with_unique_column(&db.pool, "profiles", "code").await;
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP profile FROM accounts.profile_code TO profiles.code",
+    )
+    .await
+    .expect("valid relationship should be stored");
+
+    assert_eq!(created.cardinality, RelationshipCardinality::ToOne);
+}
+
+/// ADR-0006's cardinality rule: a `to_col` with no uniqueness guarantee at
+/// all determines `ToMany`. This issue (#27) stores that cardinality but
+/// does not itself reject anything based on it — rejecting a bare-path
+/// reference to a `ToMany` relationship is reference-time behavior
+/// (validating how the relationship is *used* in a calculated field),
+/// deferred past this issue since no such reference resolves yet (see
+/// `engine::defs::Expr::RelationshipPath`).
+#[tokio::test]
+async fn a_non_unique_to_column_determines_to_many_cardinality() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    create_table_with_plain_column(&db.pool, "products", "id").await;
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .expect("valid relationship should be stored, even though its to-side isn't unique");
+
+    assert_eq!(created.cardinality, RelationshipCardinality::ToMany);
+    let read_back = relationship_by_name(&db.pool, "order_line_items", "product")
+        .await
+        .expect("read query")
+        .expect("relationship should be found");
+    assert_eq!(read_back.cardinality, RelationshipCardinality::ToMany);
+}
+
+/// A `to_col` that merely participates in a multi-column `UNIQUE`/`PRIMARY
+/// KEY` index doesn't make it, alone, a unique key — cardinality must still
+/// be `ToMany`.
+#[tokio::test]
+async fn a_to_column_in_a_composite_unique_index_is_still_to_many() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("create table products (id integer, region text, primary key (id, region))")
+        .await
+        .expect("create products with composite pk");
+    drop(client);
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .expect("valid relationship should be stored");
+
+    assert_eq!(created.cardinality, RelationshipCardinality::ToMany);
+}
+
+/// ADR-0006: relationship edges join the same cross-table dependency graph
+/// transform edges do, and a new edge that would close a cycle is rejected —
+/// generalizing the existing `Source`-edge cycle detector (issue #21) rather
+/// than introducing a relationship-specific one.
+#[tokio::test]
+async fn a_relationship_edge_that_would_close_a_cycle_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table a (id serial primary key, b_id integer);
+             create table b (id serial primary key, a_id integer)",
+        )
+        .await
+        .expect("create a and b");
+    drop(client);
+
+    create_relationship(&db.pool, "RELATIONSHIP b FROM a.b_id TO b.id")
+        .await
+        .expect("first relationship should be stored");
+
+    // b -> a would close a 2-cycle: a -> b -> a.
+    let err = create_relationship(&db.pool, "RELATIONSHIP a FROM b.a_id TO a.id")
+        .await
+        .unwrap_err();
+
+    match err {
+        CatalogError::Validate(ValidationError::TableCycle { cycle }) => {
+            assert!(cycle.contains(&"a".to_string()));
+            assert!(cycle.contains(&"b".to_string()));
+        }
+        other => panic!("expected TableCycle, got {other:?}"),
+    }
+
+    let missing = relationship_by_name(&db.pool, "b", "a")
         .await
         .expect("read query");
     assert!(missing.is_none());

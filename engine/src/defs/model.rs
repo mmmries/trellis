@@ -26,13 +26,59 @@ pub struct Definition {
 /// parsed [`RelationshipDef`] plus the catalog-assigned id. Unlike
 /// [`Definition`], there's no `source_version`/`source_columns` to carry —
 /// a relationship's endpoints aren't validated against a live column-type
-/// map at creation time (no source-schema DDL, ADR-0005; cardinality/FK
-/// validation is later issue scope), so nothing here depends on the
-/// from-side table's version.
+/// map the way a transform's source is (no source-schema DDL, ADR-0005), so
+/// nothing here depends on the from-side table's version. `cardinality` is
+/// [`super::catalog::create_relationship`]'s one piece of derived state
+/// (issue #27): computed once, live against `pg_catalog`, at creation time
+/// and persisted rather than re-introspected on every read, so a later
+/// reference-time check (validating a bare-path vs. aggregate-wrapped use of
+/// the relationship — deferred past issue #27, since no such reference
+/// syntax resolves yet) has a stable answer even if the underlying
+/// PK/`UNIQUE` index is later dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationshipDefinition {
     pub id: i64,
     pub def: RelationshipDef,
+    pub cardinality: RelationshipCardinality,
+}
+
+/// Whether a relationship's to-side is guaranteed at most one row per
+/// from-row (issue #27, ADR-0006): [`RelationshipCardinality::ToOne`] iff
+/// `to_col` is the sole column of a `PRIMARY KEY` or `UNIQUE` index on
+/// `to_table` at the moment the relationship is declared, `ToMany`
+/// otherwise. ADR-0006 requires a `ToMany` relationship's bare-path
+/// references to be rejected in favor of an aggregate-wrapped form — that
+/// rejection is reference-time (checked where a relationship is *used* in a
+/// calculated field), and deferred past issue #27 since no such reference
+/// resolves yet (see [`super::ast::Expr::RelationshipPath`]'s current
+/// unconditional rejection in [`super::validate`]); this type exists now so
+/// that check has something to read once it lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationshipCardinality {
+    ToOne,
+    ToMany,
+}
+
+impl RelationshipCardinality {
+    /// The text this variant is persisted/queried as in
+    /// `relationship_definitions.cardinality`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelationshipCardinality::ToOne => "one",
+            RelationshipCardinality::ToMany => "many",
+        }
+    }
+
+    /// Parses [`Self::as_str`]'s persisted form back, or `None` for any
+    /// other text — meaning the row was written by something other than
+    /// [`super::catalog::create_relationship`].
+    pub fn from_str(text: &str) -> Option<Self> {
+        match text {
+            "one" => Some(RelationshipCardinality::ToOne),
+            "many" => Some(RelationshipCardinality::ToMany),
+            _ => None,
+        }
+    }
 }
 
 /// Which role [`super::catalog::resolve_node`] is being asked to establish

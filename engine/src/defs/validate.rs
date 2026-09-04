@@ -109,6 +109,29 @@ pub enum ValidationError {
         rel: String,
         column: String,
     },
+    /// A relationship endpoint (issue #27, ADR-0006) names a `table.column`
+    /// pair that doesn't exist, as introspected live against `pg_catalog` —
+    /// ADR-0005 forbids Trellis from assuming a column exists rather than
+    /// checking, even though it never issues DDL against the table itself.
+    UnknownRelationshipColumn { table: String, column: String },
+    /// A relationship's `from_col`/`to_col` (issue #27, ADR-0006's "type-check
+    /// the join") resolved to Postgres types that aren't comparable — e.g.
+    /// joining a `text` column to a `uuid` column.
+    RelationshipTypeMismatch {
+        name: String,
+        from_table: String,
+        from_col: String,
+        from_type: String,
+        to_table: String,
+        to_col: String,
+        to_type: String,
+    },
+    /// A relationship name was already declared on the same `from_table`
+    /// (issue #27, surfacing ADR-0006's "Naming and scope": unique
+    /// per-from-table, not global) with an actionable message, ahead of the
+    /// `relationship_definitions` unique constraint that backstops this
+    /// check against a same-name race between concurrent callers.
+    DuplicateRelationshipName { from_table: String, name: String },
 }
 
 impl fmt::Display for ValidationError {
@@ -187,6 +210,28 @@ impl fmt::Display for ValidationError {
                 "calculated field '{field}' references relationship path '{rel}.{column}', \
                  which is not yet supported (grammar-only per issue #25; resolution and \
                  evaluation are separate, later issues)"
+            ),
+            ValidationError::UnknownRelationshipColumn { table, column } => write!(
+                f,
+                "relationship references '{table}.{column}', which does not exist"
+            ),
+            ValidationError::RelationshipTypeMismatch {
+                name,
+                from_table,
+                from_col,
+                from_type,
+                to_table,
+                to_col,
+                to_type,
+            } => write!(
+                f,
+                "relationship '{name}' joins {from_table}.{from_col} ({from_type}) to \
+                 {to_table}.{to_col} ({to_type}), which are not comparable types"
+            ),
+            ValidationError::DuplicateRelationshipName { from_table, name } => write!(
+                f,
+                "relationship '{name}' is already declared on '{from_table}'; relationship \
+                 names must be unique per from-table (ADR-0006), so pick a different name"
             ),
         }
     }

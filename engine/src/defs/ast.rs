@@ -26,9 +26,11 @@ pub struct TransformDef {
 /// A parsed standalone relationship declaration (ADR-0006):
 /// `RELATIONSHIP <name> FROM <from_table>.<fk_col> TO <to_table>.<pk_col>`.
 ///
-/// This slice (issue #24) is grammar + AST only — cardinality validation,
-/// catalog storage, and referencing a relationship from a calculated field
-/// are all deferred to later issues.
+/// This slice (issue #24) is grammar + AST only. Catalog storage
+/// ([`super::catalog::create_relationship`]) and endpoint/cardinality
+/// validation (issue #27) build on top of it; referencing a relationship
+/// from a calculated field's expression is still deferred — see
+/// [`super::ast::Expr::RelationshipPath`]'s doc comment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationshipDef {
     pub name: String,

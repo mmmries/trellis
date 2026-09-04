@@ -27,7 +27,8 @@ use crate::pool::Pool;
 use super::ast::{RelationshipDef, TransformDef, ValueType};
 use super::error::ParseError;
 use super::model::{
-    Definition, EdgeKind, NodeKind, RelationshipDefinition, SchemaEdge, SchemaNode,
+    Definition, EdgeKind, NodeKind, RelationshipCardinality, RelationshipDefinition, SchemaEdge,
+    SchemaNode,
 };
 use super::parser::{parse, parse_relationship};
 use super::validate::{ValidationError, validate};
@@ -59,7 +60,7 @@ impl fmt::Display for CatalogError {
         match self {
             CatalogError::Parse(err) => write!(f, "failed to parse transform definition: {err}"),
             CatalogError::Validate(err) => {
-                write!(f, "transform definition failed validation: {err}")
+                write!(f, "definition failed validation: {err}")
             }
             CatalogError::Db(err) => {
                 write!(f, "transform catalog database error: ")?;
@@ -232,21 +233,29 @@ pub async fn create_definition(
     })
 }
 
-/// Parses and stores a new relationship declaration (issue #26, ADR-0006):
-/// resolves/creates `schema_nodes` for both endpoints, persists a
-/// `schema_edges` row from `from_table` to `to_table` tagged
-/// [`EdgeKind::Relationship`], and inserts the immutable
+/// Parses, validates, and stores a new relationship declaration (issue #26
+/// storage, issue #27 validation, ADR-0006): resolves/creates `schema_nodes`
+/// for both endpoints, persists a `schema_edges` row from `from_table` to
+/// `to_table` tagged [`EdgeKind::Relationship`], and inserts the immutable
 /// `relationship_definitions` row — all in one transaction, mirroring
 /// [`create_definition`]'s pattern.
 ///
-/// Deliberately does **not**: validate that `from_col`/`to_col` exist as
-/// real columns, check FK/PK-ness, enforce a to-one relationship's
-/// uniqueness prerequisite, or run [`reject_if_table_cycle`] against the new
-/// edge. All of that is cardinality/schema validation ADR-0005 and
-/// ADR-0006 describe as definition-time checks, but it's explicitly later
-/// issue scope per issue #26 — this function is storage only: a relationship
-/// round-trips through the catalog and shows up as a typed edge, nothing
-/// more.
+/// Validates, in order: both endpoints' `table.column` exist and resolve to
+/// comparable Postgres types ([`column_type_in_txn`] /
+/// [`assert_comparable_types`], ADR-0006's "type-check the join"); the
+/// relationship's name is not already declared on `from_table`
+/// ([`ValidationError::DuplicateRelationshipName`], a friendlier
+/// definition-time surfacing of the same rule
+/// `relationship_definitions_from_table_name_key` backstops at the DB
+/// level); and the new `Relationship` edge would not close a cycle
+/// ([`reject_if_table_cycle`], generalized unchanged from
+/// [`create_definition`]'s `Source`-edge use). Cardinality
+/// ([`RelationshipCardinality`]) is determined via
+/// [`to_col_cardinality_in_txn`] and persisted, not rejected on — ADR-0006's
+/// "a to-many reference must be aggregate-wrapped" rule is a *reference*-time
+/// check (validating how a relationship is *used* in a calculated field),
+/// deferred past this issue since no such reference resolves yet (see
+/// [`super::ast::Expr::RelationshipPath`]).
 ///
 /// Node-kind resolution: a relationship's endpoints may each be "a source
 /// table or a transform target, in any combination" (ADR-0006), and nothing
@@ -267,6 +276,27 @@ pub async fn create_relationship(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
+    let from_type = column_type_in_txn(&txn, &def.from_table, &def.from_col).await?;
+    let to_type = column_type_in_txn(&txn, &def.to_table, &def.to_col).await?;
+    assert_comparable_types(&def, &from_type, &to_type)?;
+
+    let already_declared: bool = txn
+        .query_one(
+            "select exists (
+                select 1 from relationship_definitions where from_table = $1 and name = $2
+             )",
+            &[&def.from_table, &def.name],
+        )
+        .await?
+        .get(0);
+    if already_declared {
+        return Err(ValidationError::DuplicateRelationshipName {
+            from_table: def.from_table.clone(),
+            name: def.name.clone(),
+        }
+        .into());
+    }
+
     let from_node = resolve_node_in_txn(&txn, &def.from_table, NodeKind::Source).await?;
     // `to_table` is marked `is_source` here too, even though a relationship's
     // to-side is often really a transform target: the flag is additive/OR'd
@@ -277,13 +307,17 @@ pub async fn create_relationship(
     // `schema_nodes` directly, re-check this call.
     let to_node = resolve_node_in_txn(&txn, &def.to_table, NodeKind::Source).await?;
 
+    reject_if_table_cycle(&txn, &def.from_table, &def.to_table).await?;
+
     persist_edge_in_txn(&txn, from_node.id, to_node.id, EdgeKind::Relationship).await?;
+
+    let cardinality = to_col_cardinality_in_txn(&txn, &def.to_table, &def.to_col).await?;
 
     let id: i64 = txn
         .query_one(
             "insert into relationship_definitions
-                (name, from_table, from_col, to_table, to_col, definition_text)
-             values ($1, $2, $3, $4, $5, $6)
+                (name, from_table, from_col, to_table, to_col, definition_text, cardinality)
+             values ($1, $2, $3, $4, $5, $6, $7)
              returning id",
             &[
                 &def.name,
@@ -292,6 +326,7 @@ pub async fn create_relationship(
                 &def.to_table,
                 &def.to_col,
                 &source_text,
+                &cardinality.as_str(),
             ],
         )
         .await?
@@ -299,7 +334,11 @@ pub async fn create_relationship(
 
     txn.commit().await?;
 
-    Ok(RelationshipDefinition { id, def })
+    Ok(RelationshipDefinition {
+        id,
+        def,
+        cardinality,
+    })
 }
 
 /// Reads back the relationship named `name` declared on `from_table` — the
@@ -308,7 +347,9 @@ pub async fn create_relationship(
 /// global, so both are needed to identify one row). Re-parses the persisted
 /// `definition_text` rather than reconstructing [`RelationshipDef`] from the
 /// denormalized columns, matching [`dependents_of`]'s "reuse the grammar's
-/// own parser" convention.
+/// own parser" convention; `cardinality` is read back from its own column
+/// instead, since it isn't part of the source text (issue #27: it's derived,
+/// not declared).
 pub async fn relationship_by_name(
     pool: &Pool,
     from_table: &str,
@@ -317,7 +358,7 @@ pub async fn relationship_by_name(
     let client = pool.get().await?;
     let row = client
         .query_opt(
-            "select id, definition_text
+            "select id, definition_text, cardinality
              from relationship_definitions
              where from_table = $1 and name = $2",
             &[&from_table, &name],
@@ -327,8 +368,123 @@ pub async fn relationship_by_name(
 
     let id: i64 = row.get(0);
     let text: String = row.get(1);
+    let cardinality_text: String = row.get(2);
     let def = parse_relationship(&text)?;
-    Ok(Some(RelationshipDefinition { id, def }))
+    let cardinality = RelationshipCardinality::from_str(&cardinality_text).unwrap_or_else(|| {
+        panic!("relationship_definitions.cardinality held unrecognized value '{cardinality_text}'")
+    });
+    Ok(Some(RelationshipDefinition {
+        id,
+        def,
+        cardinality,
+    }))
+}
+
+/// The Postgres type of `table.column`, as rendered by `format_type`, via a
+/// bound `::regclass` cast (matching [`super::ddl::source_primary_key`]'s
+/// convention) rather than string-interpolating either name into the query.
+/// Distinguishes "the table itself doesn't resolve" from "the table exists
+/// but has no such column" only in that both are reported the same way
+/// (issue #27 doesn't need the distinction: either one means the endpoint
+/// isn't real) — see [`ValidationError::UnknownRelationshipColumn`].
+async fn column_type_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    table: &str,
+    column: &str,
+) -> Result<String, CatalogError> {
+    let row = txn
+        .query_opt(
+            "select pg_catalog.format_type(a.atttypid, a.atttypmod)
+             from pg_attribute a
+             where a.attrelid = pg_catalog.to_regclass($1)
+               and a.attname = $2
+               and a.attnum > 0
+               and not a.attisdropped",
+            &[&table, &column],
+        )
+        .await?;
+    match row {
+        Some(row) => Ok(row.get(0)),
+        None => Err(ValidationError::UnknownRelationshipColumn {
+            table: table.to_string(),
+            column: column.to_string(),
+        }
+        .into()),
+    }
+}
+
+/// Postgres type names that are freely joinable despite not being textually
+/// identical — the common case of an identity primary key (`bigint`) and a
+/// foreign key column declared as a plain `integer`, or a `text`/`character
+/// varying` split between two independently-authored tables. Anything not
+/// named here must match `from_type`/`to_type` exactly to be considered
+/// comparable; see [`assert_comparable_types`].
+fn type_family(pg_type: &str) -> &str {
+    match pg_type {
+        "smallint" | "integer" | "bigint" => "integer",
+        "numeric" | "real" | "double precision" => "numeric",
+        "text" | "character varying" | "character" => "text",
+        other => other,
+    }
+}
+
+/// Rejects `def` if `from_type`/`to_type` (both already resolved by
+/// [`column_type_in_txn`]) aren't in the same [`type_family`] — ADR-0006's
+/// "type-check the join" requirement.
+fn assert_comparable_types(
+    def: &RelationshipDef,
+    from_type: &str,
+    to_type: &str,
+) -> Result<(), CatalogError> {
+    if type_family(from_type) == type_family(to_type) {
+        return Ok(());
+    }
+    Err(ValidationError::RelationshipTypeMismatch {
+        name: def.name.clone(),
+        from_table: def.from_table.clone(),
+        from_col: def.from_col.clone(),
+        from_type: from_type.to_string(),
+        to_table: def.to_table.clone(),
+        to_col: def.to_col.clone(),
+        to_type: to_type.to_string(),
+    }
+    .into())
+}
+
+/// [`RelationshipCardinality::ToOne`] iff `to_col` is the sole column of a
+/// `PRIMARY KEY` or `UNIQUE` index on `to_table`, introspected live against
+/// `pg_catalog` (`pg_index.indisunique` covers both index kinds; `indkey`'s
+/// length excludes any multi-column index `to_col` merely participates in,
+/// since that doesn't make `to_col` alone unique) — ADR-0006's cardinality
+/// rule. Assumes `to_table`/`to_col` already resolved (callers run this
+/// after [`column_type_in_txn`] has confirmed both exist).
+async fn to_col_cardinality_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    to_table: &str,
+    to_col: &str,
+) -> Result<RelationshipCardinality, CatalogError> {
+    let is_unique: bool = txn
+        .query_one(
+            "select exists (
+                select 1
+                from pg_index i
+                join pg_attribute a
+                  on a.attrelid = i.indrelid and a.attname = $2
+                where i.indrelid = pg_catalog.to_regclass($1)
+                  and i.indisunique
+                  and array_length(i.indkey::int2[], 1) = 1
+                  and i.indkey[0] = a.attnum
+             )",
+            &[&to_table, &to_col],
+        )
+        .await?
+        .get(0);
+
+    Ok(if is_unique {
+        RelationshipCardinality::ToOne
+    } else {
+        RelationshipCardinality::ToMany
+    })
 }
 
 /// Resolves `table_name` to its [`SchemaNode`], creating one if this is the

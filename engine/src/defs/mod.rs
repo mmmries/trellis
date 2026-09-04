@@ -52,7 +52,10 @@ pub use ddl::{
 pub use error::ParseError;
 pub use eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
 pub use invertibility::{AggregateArg, CountArg, Invertibility, PartialField, Verdict, classify};
-pub use model::{Definition, EdgeKind, NodeKind, RelationshipDefinition, SchemaEdge, SchemaNode};
+pub use model::{
+    Definition, EdgeKind, NodeKind, RelationshipCardinality, RelationshipDefinition, SchemaEdge,
+    SchemaNode,
+};
 pub use oracle::{
     OracleError, Recomputed, recompute, recompute_aggregate, render_aggregate_select_sql,
     render_expr_sql,
