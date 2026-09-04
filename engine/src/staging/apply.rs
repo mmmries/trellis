@@ -30,10 +30,13 @@ use std::fmt;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{GenericClient, Transaction};
 
-use crate::defs::ast::{KeySpace, ValueType};
+use crate::defs::ast::{KeySpace, TransformDef, ValueType};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
-use crate::defs::eval::{self, EvalError, Row};
+use crate::defs::eval::{
+    self, EvalError, RelationshipContext, Row, ToManyRelationship, ToOneRelationship,
+};
+use crate::defs::model::RelationshipCardinality;
 use crate::defs::validate::{self, ValidationError};
 use crate::pool::{Pool, quote_ident};
 
@@ -312,6 +315,221 @@ async fn read_live_rows_batch(
     Ok(rows)
 }
 
+/// The from-side keys whose `from_col` matches any of `join_keys` (compared as
+/// `::text`, the relationship join-key convention shared with the evaluator —
+/// exact for the integer/uuid/text keys relationships allow, numeric keys
+/// being rejected at definition time). Returns `(from_pk_text, from_col_text)`
+/// so the reverse-recompute caller can map each matched from-side row back to
+/// the join value — hence the triggering related-row change's `hop_gen` — that
+/// pulled it in. A `NULL` `from_col` never matches (SQL `NULL`), so such rows
+/// are absent, exactly like the evaluator's LEFT JOIN no-match.
+async fn from_side_keys_for_join(
+    pool: &Pool,
+    from_table: &str,
+    from_pk: &PrimaryKeyColumn,
+    from_col: &str,
+    join_keys: &[String],
+) -> Result<Vec<(String, String)>, ApplyError> {
+    if join_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let client = pool.get().await?;
+    let sql = format!(
+        "select {pk}::text, {col}::text \
+         from {tbl} \
+         where {col}::text = any($1::text[])",
+        pk = quote_ident(&from_pk.name),
+        col = quote_ident(from_col),
+        tbl = quote_ident(from_table),
+    );
+    let rows = client.query(&sql, &[&join_keys]).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+        .collect())
+}
+
+/// Builds the [`RelationshipContext`] a relationship-enriched from-side target
+/// needs to re-evaluate (issue #30 wiring of the #28/#29 evaluator): for each
+/// relationship the definition references, the related to-side rows keyed by
+/// their `to_col` text, plus the referenced to-side columns' types. Join keys
+/// are the distinct `from_col` values of the from-side rows this batch will
+/// evaluate — so only the related rows those rows actually need are fetched.
+/// `from_table` is the definition's own source table (a relationship's
+/// `from_table`).
+async fn build_relationship_context(
+    pool: &Pool,
+    from_table: &str,
+    def: &TransformDef,
+    rows: &[Option<Row>],
+) -> Result<RelationshipContext, ApplyError> {
+    // Group the referenced columns by relationship name (a relationship may be
+    // read for more than one column across the definition's fields).
+    let mut cols_by_rel: HashMap<String, Vec<String>> = HashMap::new();
+    for (rel, column) in eval::relationship_references(def) {
+        let cols = cols_by_rel.entry(rel).or_default();
+        if !cols.contains(&column) {
+            cols.push(column);
+        }
+    }
+
+    let mut by_name: HashMap<String, ToOneRelationship> = HashMap::new();
+    let mut to_many_by_name: HashMap<String, ToManyRelationship> = HashMap::new();
+
+    for (rel_name, columns) in cols_by_rel {
+        let Some(reldef) = catalog::relationship_by_name(pool, from_table, &rel_name).await? else {
+            // Unknown relationship: leave it out and let the evaluator surface
+            // `EvalError::UnknownRelationship`, the same as the pure path.
+            continue;
+        };
+        let from_col = reldef.def.from_col.clone();
+        let to_col = reldef.def.to_col.clone();
+        let to_table = reldef.def.to_table.clone();
+
+        // The join keys we need on the to-side: the distinct non-NULL
+        // `from_col` values of the from-side rows this batch evaluates.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut join_keys: Vec<String> = Vec::new();
+        for row in rows.iter().flatten() {
+            if let Some(Some(text)) = row.get(&from_col) {
+                if seen.insert(text.as_str()) {
+                    join_keys.push(text.clone());
+                }
+            }
+        }
+
+        let to_columns = to_column_types(pool, &to_table, &columns).await?;
+        let grouped = fetch_to_side_rows(pool, &to_table, &to_col, &join_keys).await?;
+
+        match reldef.cardinality {
+            RelationshipCardinality::ToOne => {
+                // `to_col` is UNIQUE, so each key has exactly one related row.
+                let to_rows_by_key = grouped
+                    .into_iter()
+                    .filter_map(|(k, mut v)| v.pop().map(|row| (k, row)))
+                    .collect();
+                by_name.insert(
+                    rel_name,
+                    ToOneRelationship {
+                        from_col,
+                        cardinality: RelationshipCardinality::ToOne,
+                        to_columns,
+                        to_rows_by_key,
+                    },
+                );
+            }
+            RelationshipCardinality::ToMany => {
+                to_many_by_name.insert(
+                    rel_name,
+                    ToManyRelationship {
+                        from_col,
+                        to_columns,
+                        to_rows_by_key: grouped,
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(RelationshipContext::new(by_name).with_to_many(to_many_by_name))
+}
+
+/// The to-side rows whose `to_col` matches any of `join_keys`, grouped by that
+/// key's `::text` (the evaluator's key convention, shared with
+/// [`from_side_keys_for_join`]). A `NULL` `to_col` is absent (SQL `NULL` never
+/// joins) — matching the evaluator's requirement that such a to-side row carry
+/// no key. To-one relationships get exactly one row per key (`to_col` is
+/// UNIQUE); to-many get the full related set. Decodes each row's columns via
+/// the same in-SQL `jsonb_each_text` unnest [`read_live_rows_batch`] uses.
+async fn fetch_to_side_rows(
+    pool: &Pool,
+    to_table: &str,
+    to_col: &str,
+    join_keys: &[String],
+) -> Result<HashMap<String, Vec<Row>>, ApplyError> {
+    if join_keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let client = pool.get().await?;
+    let sql = format!(
+        "select m.jk, m.rn, e.key, e.value \
+         from (select {col}::text as jk, \
+                      row_number() over () as rn, \
+                      to_jsonb(t.*) as doc \
+               from {tbl} t \
+               where {col}::text = any($1::text[])) m \
+         cross join lateral jsonb_each_text(m.doc) e",
+        col = quote_ident(to_col),
+        tbl = quote_ident(to_table),
+    );
+    let db_rows = client.query(&sql, &[&join_keys]).await?;
+    // Assemble each row by its stable `rn`, carrying its join key, then group.
+    let mut assembled: HashMap<i64, (String, Row)> = HashMap::new();
+    for db_row in db_rows {
+        let jk: String = db_row.get(0);
+        let rn: i64 = db_row.get(1);
+        let field: String = db_row.get(2);
+        let value: Option<String> = db_row.get(3);
+        let entry = assembled.entry(rn).or_insert_with(|| (jk, Row::new()));
+        entry.1.insert(field, value);
+    }
+    let mut grouped: HashMap<String, Vec<Row>> = HashMap::new();
+    for (_, (jk, row)) in assembled {
+        grouped.entry(jk).or_default().push(row);
+    }
+    Ok(grouped)
+}
+
+/// The [`ValueType`] of each named column on `table`, introspected live from
+/// `pg_catalog` via `format_type` (matching `catalog::column_type_in_txn`), so
+/// a to-side relationship column's text is typed the same way the from-side
+/// source columns are. A column not found is simply absent — the evaluator
+/// defaults an absent to-side column to `Numeric`.
+async fn to_column_types(
+    pool: &Pool,
+    table: &str,
+    columns: &[String],
+) -> Result<HashMap<String, ValueType>, ApplyError> {
+    if columns.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "select a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod) \
+             from pg_attribute a \
+             where a.attrelid = pg_catalog.to_regclass($1) \
+               and a.attname = any($2::text[]) \
+               and a.attnum > 0 \
+               and not a.attisdropped",
+            &[&table, &columns],
+        )
+        .await?;
+    let mut types = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let name: String = row.get(0);
+        let pg_type: String = row.get(1);
+        types.insert(name, value_type_from_pg(&pg_type));
+    }
+    Ok(types)
+}
+
+/// Maps a Postgres `format_type` rendering to the evaluator's [`ValueType`],
+/// mirroring `catalog::type_family`'s buckets. Anything not clearly numeric,
+/// boolean, or uuid is treated as text — a verbatim passthrough that can't
+/// misparse, the safe default for a to-side enrichment column.
+fn value_type_from_pg(pg_type: &str) -> ValueType {
+    let base = pg_type.split('(').next().unwrap_or(pg_type).trim();
+    match base {
+        "uuid" => ValueType::Uuid,
+        "boolean" => ValueType::Boolean,
+        "smallint" | "integer" | "bigint" | "numeric" | "real" | "double precision" => {
+            ValueType::Numeric
+        }
+        _ => ValueType::Text,
+    }
+}
+
 // ---------------------------------------------------------------------
 // Phase 2: compute
 // ---------------------------------------------------------------------
@@ -447,6 +665,16 @@ pub struct ApplyPlan {
     /// [`apply_and_mark_drained`] on a successful commit, per doc 06's "a
     /// clean drain clears the counters for the keys it just applied."
     applied_keys: Vec<(String, String)>,
+    /// Issue #30's reverse recompute: when a *to-side* (related) row changed,
+    /// each `(from_table, from_key_text, hop_gen)` here is a from-side row
+    /// whose relationship enrichment depends on that changed related row and
+    /// so must be re-derived. Resolved in Phase 2 (a live join-key lookup on
+    /// `from_table` — see [`from_side_keys_for_join`]) and emitted as ordinary
+    /// image-less [`StagedChange::Recompute`]s by [`apply_and_mark_drained`],
+    /// reusing the same async staging/apply/fence pipeline forward propagation
+    /// uses rather than any bespoke persisted reverse index. `hop_gen` is the
+    /// triggering related-row change's own `hop_gen + 1`, hop-bounded at emit.
+    reverse_recomputes: Vec<(String, String, i32)>,
 }
 
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
@@ -497,6 +725,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     let mut versions: HashMap<String, Option<i64>> = HashMap::new();
     let mut targets: HashMap<String, TargetPlan> = HashMap::new();
     let mut aggregate_targets: HashMap<String, AggregateTargetPlan> = HashMap::new();
+    let mut reverse_recomputes: Vec<(String, String, i32)> = Vec::new();
 
     for (source_key, changes) in by_source {
         let version = catalog::source_table_version(pool, source_key).await?;
@@ -583,20 +812,96 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             old_rows.resize_with(changes.len(), || None);
         }
 
+        // Reverse recompute (issue #30): this source is some relationship's
+        // *to-side*. A change to a related row must re-derive every from-side
+        // row whose enrichment reads it. For each relationship pointing at
+        // this table, collect the join-key text of every to-side row this
+        // batch touched — the related row's `to_col`, which is a PRIMARY
+        // KEY/UNIQUE column (the relationship invariant), so it rides in the
+        // default replica identity of every image, including a delete's
+        // pre-image: no `REPLICA IDENTITY FULL` on the to-side is needed. Then
+        // resolve, with one live lookup, the from-side keys whose `from_col`
+        // matches, and stage each as an image-less recompute at the triggering
+        // change's `hop_gen + 1`.
+        let inbound_rels = catalog::relationships_to_table(pool, source_key).await?;
+        for rel in &inbound_rels {
+            // Join-key text -> the max `hop_gen` of the to-side changes that
+            // touched it (a re-parent update touches both its old and new
+            // key; a delete carries only its pre-image).
+            let mut key_hops: HashMap<String, i32> = HashMap::new();
+            for (i, change) in changes.iter().enumerate() {
+                let mut note = |value: &Option<String>, hop: i32| {
+                    if let Some(text) = value {
+                        key_hops
+                            .entry(text.clone())
+                            .and_modify(|h| *h = (*h).max(hop))
+                            .or_insert(hop);
+                    }
+                };
+                if let Some(row) = &rows[i] {
+                    note(row.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
+                }
+                if let Some(old_text) = &change.old_image {
+                    let old = decode_image(pool, old_text).await?;
+                    note(old.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
+                }
+            }
+            if key_hops.is_empty() {
+                continue;
+            }
+            let join_keys: Vec<String> = key_hops.keys().cloned().collect();
+            let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
+            let matches = from_side_keys_for_join(
+                pool,
+                &rel.def.from_table,
+                &from_pk,
+                &rel.def.from_col,
+                &join_keys,
+            )
+            .await?;
+            for (from_key, join_text) in matches {
+                let hop = key_hops.get(&join_text).copied().unwrap_or(0) + 1;
+                reverse_recomputes.push((rel.def.from_table.clone(), from_key, hop));
+            }
+        }
+
         for def in &defs {
             let KeySpace::Aggregate { group_by } = &def.def.key_space else {
                 let field_names: Vec<String> =
                     def.def.fields.iter().map(|f| f.name.clone()).collect();
-                let inferred_types = validate::infer_field_types(&def.def, &def.source_columns)?;
-                let field_types: Vec<ValueType> = field_names
-                    .iter()
-                    .map(|name| {
-                        inferred_types
-                            .get(name)
-                            .copied()
-                            .unwrap_or(ValueType::Numeric)
-                    })
-                    .collect();
+                // A relationship-enriched field's type can't come from
+                // `infer_field_types` (it rejects a `<rel>.<column>` path,
+                // whose type is a *to-side* column's, unknown to the from-side
+                // type map). The field's inferred type *is* its target column's
+                // declared type, though (see `infer_field_types`' doc), and
+                // that column already exists — introspect it. Non-relationship
+                // definitions keep the pure inference, behavior-identical.
+                let field_types: Vec<ValueType> = if eval::relationship_references(&def.def)
+                    .is_empty()
+                {
+                    let inferred_types =
+                        validate::infer_field_types(&def.def, &def.source_columns)?;
+                    field_names
+                        .iter()
+                        .map(|name| {
+                            inferred_types
+                                .get(name)
+                                .copied()
+                                .unwrap_or(ValueType::Numeric)
+                        })
+                        .collect()
+                } else {
+                    let target_types = to_column_types(pool, &def.def.target, &field_names).await?;
+                    field_names
+                        .iter()
+                        .map(|name| {
+                            target_types
+                                .get(name)
+                                .copied()
+                                .unwrap_or(ValueType::Numeric)
+                        })
+                        .collect()
+                };
                 let plan = targets
                     .entry(def.def.target.clone())
                     .or_insert_with(|| TargetPlan {
@@ -613,6 +918,21 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 // recompiling it per row would be wasted work at realistic row
                 // volumes.
                 let mut regex_cache = eval::RegexCache::new();
+
+                // Relationship enrichment (issues #28/#29 eval, wired here by
+                // #30): a target reading a `<rel>.<column>` path (to-one) or an
+                // aggregate over one (to-many) needs the related to-side rows
+                // built into a `RelationshipContext`. Built once per definition
+                // over this source's from-side rows — the join keys are their
+                // `from_col` values — then threaded into every row eval below.
+                // A definition with no relationship references stays on the
+                // plain `eval::evaluate` path, behavior-identical to before.
+                let rel_ctx = if eval::relationship_references(&def.def).is_empty() {
+                    None
+                } else {
+                    Some(build_relationship_context(pool, source_key, &def.def, &rows).await?)
+                };
+
                 // Three shapes, per fold.rs's rules: `Some(new_image)` is an
                 // insert/update, evaluated straight from the staged post-image.
                 // `(None, Some(old_image))` is a genuine CDC delete — the fold's
@@ -636,12 +956,21 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             // (#63's write-path gap: persisted alongside the
                             // definition — see `catalog::create_definition` —
                             // rather than defaulting every column to Numeric).
-                            let mut evaluated = eval::evaluate(
-                                &def.def,
-                                row,
-                                &def.source_columns,
-                                &mut regex_cache,
-                            )?;
+                            let mut evaluated = match &rel_ctx {
+                                Some(ctx) => eval::evaluate_with_relationships(
+                                    &def.def,
+                                    row,
+                                    &def.source_columns,
+                                    ctx,
+                                    &mut regex_cache,
+                                )?,
+                                None => eval::evaluate(
+                                    &def.def,
+                                    row,
+                                    &def.source_columns,
+                                    &mut regex_cache,
+                                )?,
+                            };
                             let values: Vec<Option<String>> = field_names
                                 .iter()
                                 .map(|name| match evaluated.remove(name) {
@@ -786,6 +1115,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         aggregate_clears,
         poisoned_park,
         applied_keys,
+        reverse_recomputes,
     })
 }
 
@@ -1148,6 +1478,24 @@ pub async fn apply_and_mark_drained(
                 group_key: None,
             });
         }
+    }
+
+    // Reverse recompute (issue #30): from-side rows a changed related row must
+    // re-derive, resolved in Phase 2 and staged here as ordinary image-less
+    // recomputes — the same shape and same hop bound forward propagation uses,
+    // just keyed by the from-side table/PK rather than a touched target key.
+    for (from_table, key, hop_gen) in &plan.reverse_recomputes {
+        if *hop_gen > MAX_HOP_GEN {
+            hop_bound_tables.push(from_table.clone());
+            worst_hop_gen = worst_hop_gen.max(*hop_gen);
+            continue;
+        }
+        recompute_changes.push(StagedChange::Recompute {
+            src_table: from_table.clone(),
+            key: key.clone(),
+            hop_gen: *hop_gen,
+            group_key: None,
+        });
     }
 
     if !hop_bound_tables.is_empty() {

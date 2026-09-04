@@ -409,6 +409,51 @@ pub async fn relationship_by_name(
     }))
 }
 
+/// Every relationship whose `to_table` is `to_table` — the reverse of
+/// [`relationship_by_name`]'s `from_table` lookup. The staging reverse
+/// recompute (issue #30) uses this to answer "a row in this table just
+/// changed; which relationships point *at* it, so which from-side targets must
+/// re-derive?". Re-parses each `definition_text` and reads `cardinality` from
+/// its own column, exactly like [`relationship_by_name`].
+pub async fn relationships_to_table(
+    pool: &Pool,
+    to_table: &str,
+) -> Result<Vec<RelationshipDefinition>, CatalogError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "select id, definition_text, cardinality
+             from relationship_definitions
+             where to_table = $1
+             order by id",
+            &[&to_table],
+        )
+        .await?;
+
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: i64 = row.get(0);
+        let text: String = row.get(1);
+        let cardinality_text: String = row.get(2);
+        let def = parse_relationship(&text)?;
+        let cardinality = RelationshipCardinality::from_persisted(&cardinality_text)
+            .unwrap_or_else(|| {
+                panic!(
+                    "relationship_definitions.cardinality held unrecognized value '{cardinality_text}'"
+                )
+            });
+        result.push(RelationshipDefinition {
+            id,
+            def,
+            cardinality,
+            // Creation-time guidance, not a fact about the persisted row — see
+            // the field's doc comment on [`RelationshipDefinition`].
+            warnings: Vec::new(),
+        });
+    }
+    Ok(result)
+}
+
 /// The Postgres type of `table.column`, as rendered by `format_type`, via a
 /// bound `::regclass` cast (matching [`super::ddl::source_primary_key`]'s
 /// convention) rather than string-interpolating either name into the query.

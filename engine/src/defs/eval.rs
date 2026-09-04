@@ -348,6 +348,39 @@ pub fn evaluate_with_relationships(
     Ok(cache)
 }
 
+/// Every `<rel>.<column>` relationship reference in `def`'s field expressions,
+/// as `(relationship_name, column)` pairs — both bare to-one paths
+/// ([`Expr::RelationshipPath`]) and aggregate-wrapped to-many paths
+/// (`SUM(<rel>.<column>)`, which parse to a [`Expr::FunctionCall`] whose sole
+/// argument is a path). The staging reverse-recompute path (issue #30) uses
+/// this to learn which relationships a target reads — and which of their
+/// to-side columns — so it can build a [`RelationshipContext`] for the
+/// from-side recompute without re-walking the AST itself. Pairs may repeat if
+/// the same reference appears in more than one field; the caller dedups.
+pub fn relationship_references(def: &TransformDef) -> Vec<(String, String)> {
+    let mut refs = Vec::new();
+    for field in &def.fields {
+        collect_relationship_refs(&field.expr, &mut refs);
+    }
+    refs
+}
+
+fn collect_relationship_refs(expr: &Expr, out: &mut Vec<(String, String)>) {
+    match expr {
+        Expr::RelationshipPath { rel, column } => out.push((rel.clone(), column.clone())),
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            collect_relationship_refs(lhs, out);
+            collect_relationship_refs(rhs, out);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_relationship_refs(arg, out);
+            }
+        }
+        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+    }
+}
+
 /// Evaluates one field, memoizing into `cache` (also used to resolve
 /// forward/backward references to other calculated fields on the same
 /// target). [`super::validate`] is supposed to guarantee the reference
