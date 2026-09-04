@@ -31,7 +31,7 @@ use super::model::{
     SchemaNode,
 };
 use super::parser::{parse, parse_relationship};
-use super::validate::{ValidationError, validate};
+use super::validate::{RelationshipWarning, ValidationError, validate};
 
 /// Why creating or reading a definition failed.
 #[derive(Debug)]
@@ -326,6 +326,14 @@ pub async fn create_relationship(
 
     let cardinality = to_col_cardinality_in_txn(&txn, &def.to_table, &def.to_col).await?;
 
+    let mut warnings = Vec::new();
+    if !has_usable_fk_index_in_txn(&txn, &def.from_table, &def.from_col).await? {
+        warnings.push(RelationshipWarning::MissingFkIndex {
+            from_table: def.from_table.clone(),
+            from_col: def.from_col.clone(),
+        });
+    }
+
     let id: i64 = txn
         .query_one(
             "insert into relationship_definitions
@@ -351,6 +359,7 @@ pub async fn create_relationship(
         id,
         def,
         cardinality,
+        warnings,
     })
 }
 
@@ -393,6 +402,9 @@ pub async fn relationship_by_name(
         id,
         def,
         cardinality,
+        // Creation-time guidance, not a fact about the persisted row — see
+        // the field's doc comment on [`RelationshipDefinition`].
+        warnings: Vec::new(),
     }))
 }
 
@@ -516,6 +528,61 @@ async fn to_col_cardinality_in_txn(
     } else {
         RelationshipCardinality::ToMany
     })
+}
+
+/// Whether `from_table` has a usable index for looking up rows by
+/// `from_col` (issue #31) — the query reverse propagation runs when a
+/// related `to_table` row changes (ADR-0006). "Usable" means a `btree`
+/// index whose *leading* column is `from_col`: a plain `where from_col =
+/// $1` lookup can use such an index regardless of what other columns
+/// follow it, so — unlike [`to_col_cardinality_in_txn`]'s uniqueness check —
+/// this doesn't require `from_col` to be the index's only column.
+///
+/// Excludes indexes that can't be trusted for this lookup:
+/// * `indisvalid` — a not-yet-validated index (e.g. left behind by a failed
+///   `CREATE INDEX CONCURRENTLY`) isn't usable yet.
+/// * `am.amname = 'btree'` — other access methods (`gin`, `brin`, `hash`)
+///   either don't support this leading-column equality lookup the way
+///   btree does, or aren't worth special-casing for what's only a
+///   performance hint.
+/// * `indexprs is null` — an expression index's leading "column" isn't a
+///   plain column reference, so `indkey[0]` is `0` and never matches a real
+///   `attnum`; this is already excluded by the `indkey[0] = a.attnum` join
+///   condition, called out here since it's not obvious from the SQL alone.
+/// * `indpred is null` — a partial index only covers the rows satisfying
+///   its predicate, so the planner won't use it for an unqualified
+///   `from_col = $1` lookup across all rows; same exclusion
+///   [`to_col_cardinality_in_txn`] applies for uniqueness, for the same
+///   reason.
+///
+/// Never issues DDL — this only informs the caller's decision to emit
+/// [`RelationshipWarning::MissingFkIndex`] (ADR-0005: Trellis never modifies
+/// the source schema).
+async fn has_usable_fk_index_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    from_table: &str,
+    from_col: &str,
+) -> Result<bool, CatalogError> {
+    let has_index: bool = txn
+        .query_one(
+            "select exists (
+                select 1
+                from pg_index i
+                join pg_attribute a
+                  on a.attrelid = i.indrelid and a.attname = $2
+                join pg_class ic on ic.oid = i.indexrelid
+                join pg_am am on am.oid = ic.relam
+                where i.indrelid = pg_catalog.to_regclass($1)
+                  and i.indisvalid
+                  and i.indpred is null
+                  and am.amname = 'btree'
+                  and i.indkey[0] = a.attnum
+             )",
+            &[&from_table, &from_col],
+        )
+        .await?
+        .get(0);
+    Ok(has_index)
 }
 
 /// Resolves `table_name` to its [`SchemaNode`], creating one if this is the

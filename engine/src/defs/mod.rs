@@ -61,7 +61,7 @@ pub use oracle::{
     render_expr_sql,
 };
 pub use parser::{parse, parse_relationship};
-pub use validate::{ValidationError, validate};
+pub use validate::{RelationshipWarning, ValidationError, validate};
 
 #[cfg(test)]
 mod tests {
