@@ -79,20 +79,63 @@ pub struct ToOneRelationship {
     pub to_rows_by_key: HashMap<String, Row>,
 }
 
+/// One to-many relationship's read-side data (issue #29): the aggregate
+/// counterpart to [`ToOneRelationship`]. Where a to-one path resolves a single
+/// related row, a to-many path is only legal wrapped in an aggregate
+/// (`SUM(comments.word_count)`, ADR-0006), which folds over the *set* of
+/// related to-side rows sharing the from-row's join value. That set is what
+/// `to_rows_by_key` holds — a `Vec<Row>` per join-key text, instead of the
+/// single `Row` a to-one carries.
+///
+/// The join value is keyed by the same raw *text* as [`ToOneRelationship`]
+/// (see that type's note on scale-insensitivity for fractional-numeric keys),
+/// for consistency; a from-row whose join key is absent from the map (or
+/// `NULL`) has an empty related set — the aggregate's empty result
+/// (`COUNT` → `0`, `SUM`/`MIN`/`MAX`/`AVG` → `NULL`).
+pub struct ToManyRelationship {
+    /// The from-row column whose value is the join key (the relationship's
+    /// `from_col`), matched against the to-side rows' key text.
+    pub from_col: String,
+    /// The to-side column value-types, used to parse a referenced column's
+    /// text, exactly as [`ToOneRelationship::to_columns`].
+    pub to_columns: HashMap<String, ValueType>,
+    /// The related to-side rows grouped by their join-value text. A key with
+    /// no entry (or a `NULL` from-side join key) is the empty set.
+    pub to_rows_by_key: HashMap<String, Vec<Row>>,
+}
+
 /// The relationships available to the evaluator, keyed by the relationship
 /// name that heads a `<rel>.<column>` path. The pure [`evaluate`] entry
 /// supplies an empty one (matching pre-#28 behavior: a path then errors with
 /// [`EvalError::UnknownRelationship`]); [`evaluate_with_relationships`] threads
 /// a populated one built by the caller (the staging integration is issue #30).
+///
+/// To-one relationships (a bare `<rel>.<column>` path, issue #28) live in
+/// `by_name`; to-many relationships (an aggregate-wrapped path, issue #29) in
+/// `to_many_by_name`. A given relationship name resolves as exactly one of the
+/// two — the two maps are disjoint.
 #[derive(Default)]
 pub struct RelationshipContext {
     by_name: HashMap<String, ToOneRelationship>,
+    to_many_by_name: HashMap<String, ToManyRelationship>,
 }
 
 impl RelationshipContext {
-    /// Builds a context from relationship-name to its resolved to-one data.
+    /// Builds a context from relationship-name to its resolved to-one data,
+    /// with no to-many relationships.
     pub fn new(by_name: HashMap<String, ToOneRelationship>) -> Self {
-        Self { by_name }
+        Self {
+            by_name,
+            to_many_by_name: HashMap::new(),
+        }
+    }
+
+    /// Adds the to-many relationship data (issue #29), for a context that has
+    /// aggregate-wrapped relationship paths to resolve. Chains onto [`new`].
+    #[must_use]
+    pub fn with_to_many(mut self, to_many_by_name: HashMap<String, ToManyRelationship>) -> Self {
+        self.to_many_by_name = to_many_by_name;
+        self
     }
 }
 
@@ -482,6 +525,23 @@ fn eval_expr(
             )?;
             Ok(apply_operator(*op, lhs, rhs))
         }
+        // A to-many relationship enrichment (issue #29): an aggregate function
+        // whose sole argument is a `<rel>.<column>` path. Unlike a GROUP BY
+        // aggregate — which folds over a group of the target's own source rows
+        // (`eval_aggregate_expr`) — this folds over the *related* to-side rows
+        // sharing this from-row's join value, keyed by that value rather than a
+        // grouping tuple (ADR-0006). The field itself lives on the referencing
+        // (row-grain) target, so it is evaluated here in the row path, not the
+        // aggregate path.
+        Expr::FunctionCall { name, args }
+            if super::registry::lookup_aggregate_function(name).is_some()
+                && matches!(args.as_slice(), [Expr::RelationshipPath { .. }]) =>
+        {
+            let Expr::RelationshipPath { rel, column } = &args[0] else {
+                unreachable!("guarded by the matches! above");
+            };
+            eval_to_many_aggregate(name, rel, column, field_name, row, relationships)
+        }
         Expr::FunctionCall { name, args } => {
             let mut arg_values = Vec::with_capacity(args.len());
             for arg in args {
@@ -500,6 +560,101 @@ fn eval_expr(
             Ok(apply_function(name, arg_values, regex_cache))
         }
     }
+}
+
+/// Folds an aggregate (`SUM`/`MIN`/`MAX`/`AVG`/`COUNT`) over the to-side rows
+/// of a to-many relationship for one from-row (issue #29). The from-row's
+/// `from_col` value is the join key; the related rows are the set stored under
+/// that key, and `column` is read off each related row (typed by the
+/// relationship's `to_columns`, defaulting to `Numeric` like the [`Row`]-column
+/// handling in [`eval_expr`]).
+///
+/// Empty-set semantics match Postgres's correlated aggregate over zero rows:
+/// `COUNT` → `0`, `SUM`/`MIN`/`MAX`/`AVG` → `NULL`. An empty set arises from a
+/// `NULL` join key (SQL `NULL` never joins), a key with no related rows, or a
+/// relationship with no entry under this key. `COUNT(<rel>.<column>)` counts
+/// related rows whose `column` is non-`NULL` (Postgres `COUNT(<col>)`); the
+/// four numeric folds skip `NULL` rows and yield `NULL` if none remain, reusing
+/// [`reduce_numeric_aggregate`] — the same reducer as [`fold_aggregate`].
+fn eval_to_many_aggregate(
+    name: &str,
+    rel: &str,
+    column: &str,
+    field_name: &str,
+    from_row: &Row,
+    relationships: &RelationshipContext,
+) -> Result<Option<Value>, EvalError> {
+    // The relationship must be a known to-many. A name that isn't (unknown, or
+    // a to-one used with an aggregate wrapper — the validator's job to reject)
+    // errors as unknown, defense-in-depth like the to-one path arm.
+    let Some(reldata) = relationships.to_many_by_name.get(rel) else {
+        return Err(EvalError::UnknownRelationship {
+            field: field_name.to_string(),
+            rel: rel.to_string(),
+        });
+    };
+    // The join key comes from the from-row's `from_col`. A NULL key never joins
+    // (SQL `NULL != NULL`), and a key with no stored rows both mean the empty
+    // set — the aggregate's empty result below.
+    let related: &[Row] = match from_row.get(&reldata.from_col) {
+        Some(Some(key)) => reldata
+            .to_rows_by_key
+            .get(key)
+            .map_or(&[][..], Vec::as_slice),
+        Some(None) => &[],
+        None => {
+            return Err(EvalError::MissingColumn {
+                field: field_name.to_string(),
+                column: reldata.from_col.clone(),
+            });
+        }
+    };
+
+    if name == "COUNT" {
+        // `COUNT(<rel>.<column>)`: related rows whose `column` is non-NULL,
+        // matching Postgres `COUNT(<col>)`. The empty set counts to 0.
+        let mut count: usize = 0;
+        for row in related {
+            match row.get(column) {
+                Some(Some(_)) => count += 1,
+                Some(None) => {}
+                None => {
+                    return Err(EvalError::MissingColumn {
+                        field: field_name.to_string(),
+                        column: column.to_string(),
+                    });
+                }
+            }
+        }
+        return Ok(Some(Value::Numeric(int_numeric(count))));
+    }
+
+    // SUM/MIN/MAX/AVG: read `column` off each related row, skipping NULLs (and,
+    // defense-in-depth, any non-Numeric value a hand-built AST slipped past the
+    // validator's Numeric-only check), then fold. All-NULL / empty => NULL.
+    let value_type = reldata
+        .to_columns
+        .get(column)
+        .copied()
+        .unwrap_or(ValueType::Numeric);
+    let mut values: Vec<Numeric> = Vec::new();
+    for row in related {
+        match row.get(column) {
+            Some(Some(text)) => {
+                if let Value::Numeric(n) = parse_value(field_name, value_type, text)? {
+                    values.push(n);
+                }
+            }
+            Some(None) => {}
+            None => {
+                return Err(EvalError::MissingColumn {
+                    field: field_name.to_string(),
+                    column: column.to_string(),
+                });
+            }
+        }
+    }
+    Ok(reduce_numeric_aggregate(name, values))
 }
 
 /// Evaluates every calculated field of an [`KeySpace::Aggregate`] definition
@@ -782,8 +937,17 @@ fn fold_aggregate(
         // elsewhere in this module).
     }
 
+    Ok(reduce_numeric_aggregate(name, values))
+}
+
+/// Reduces the collected non-`NULL` numeric values of `SUM`/`MIN`/`MAX`/`AVG`
+/// to the aggregate's result, or `None` (SQL `NULL`) when `values` is empty —
+/// Postgres's "aggregate of zero non-NULL values is NULL" rule. Shared by
+/// [`fold_aggregate`] (a GROUP BY group's rows) and [`eval_to_many_aggregate`]
+/// (a to-many relationship's related rows) so both fold identically.
+fn reduce_numeric_aggregate(name: &str, values: Vec<Numeric>) -> Option<Value> {
     if values.is_empty() {
-        return Ok(None);
+        return None;
     }
 
     let result = match name {
@@ -821,9 +985,9 @@ fn fold_aggregate(
                 .expect("a usize always renders as a valid decimal literal");
             sum.div(&count_numeric)
         }
-        _ => unreachable!("fold_aggregate is only called for registered aggregate function names"),
+        _ => unreachable!("reduce_numeric_aggregate is only called for SUM/MIN/MAX/AVG"),
     };
-    Ok(Some(Value::Numeric(result)))
+    Some(Value::Numeric(result))
 }
 
 /// `+` and `>` are both Numeric-operand operators (per ADR-0004, neither
@@ -1725,6 +1889,162 @@ mod tests {
         }]);
         let r = row(&[("category_id", Some("10"))]);
         let err = eval(&d, &r, &numeric_types(&["category_id"])).unwrap_err();
+        assert!(
+            matches!(err, EvalError::UnknownRelationship { .. }),
+            "got {err:?}"
+        );
+    }
+
+    // --- to-many aggregate relationship enrichment (issue #29) ---
+
+    /// A to-many relationship `comments` whose from-side join column is `id`
+    /// (the post's PK), keyed by that value; each related comment row carries a
+    /// Numeric `word_count`. Post `1` has three comments (one with a NULL
+    /// word_count), post `2` has one, post `3` has none.
+    fn comments_context() -> RelationshipContext {
+        let mut to_columns = HashMap::new();
+        to_columns.insert("word_count".to_string(), ValueType::Numeric);
+
+        let mut to_rows_by_key: HashMap<String, Vec<Row>> = HashMap::new();
+        to_rows_by_key.insert(
+            "1".to_string(),
+            vec![
+                row(&[("word_count", Some("10"))]),
+                row(&[("word_count", Some("20"))]),
+                row(&[("word_count", None)]),
+            ],
+        );
+        to_rows_by_key.insert("2".to_string(), vec![row(&[("word_count", Some("5"))])]);
+
+        let mut to_many = HashMap::new();
+        to_many.insert(
+            "comments".to_string(),
+            ToManyRelationship {
+                from_col: "id".to_string(),
+                to_columns,
+                to_rows_by_key,
+            },
+        );
+        RelationshipContext::default().with_to_many(to_many)
+    }
+
+    fn agg_rel(func: &str) -> TransformDef {
+        def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: call(func, vec![rel_path("comments", "word_count")]),
+        }])
+    }
+
+    #[test]
+    fn to_many_sum_folds_related_rows_skipping_null() {
+        // 10 + 20, the NULL word_count skipped (Postgres SUM skips NULLs).
+        let r = row(&[("id", Some("1"))]);
+        let result = eval_rel(
+            &agg_rel("SUM"),
+            &r,
+            &numeric_types(&["id"]),
+            &comments_context(),
+        )
+        .unwrap();
+        match result["out"].as_ref().unwrap() {
+            Value::Numeric(n) => assert_eq!(n.to_string(), "30"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_many_min_max_avg_over_related_rows() {
+        let r = row(&[("id", Some("1"))]);
+        let types = numeric_types(&["id"]);
+        let ctx = comments_context();
+        let min = eval_rel(&agg_rel("MIN"), &r, &types, &ctx).unwrap();
+        let max = eval_rel(&agg_rel("MAX"), &r, &types, &ctx).unwrap();
+        let avg = eval_rel(&agg_rel("AVG"), &r, &types, &ctx).unwrap();
+        assert_eq!(
+            min["out"],
+            Some(Value::Numeric(Numeric::parse("10").unwrap()))
+        );
+        assert_eq!(
+            max["out"],
+            Some(Value::Numeric(Numeric::parse("20").unwrap()))
+        );
+        // (10 + 20) / 2 — the NULL row does not count toward AVG's divisor.
+        // AVG carries a fractional scale (like Postgres `numeric` avg), so
+        // compare by value rather than by exact scale/text.
+        match avg["out"].as_ref().unwrap() {
+            Value::Numeric(n) => {
+                assert_eq!(
+                    n.compare(&Numeric::parse("15").unwrap()),
+                    std::cmp::Ordering::Equal
+                )
+            }
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_many_count_counts_non_null_related_values() {
+        // COUNT(comments.word_count): 3 comments, but the NULL word_count is
+        // not counted (Postgres COUNT(<col>) counts non-NULLs) => 2.
+        let r = row(&[("id", Some("1"))]);
+        let result = eval_rel(
+            &agg_rel("COUNT"),
+            &r,
+            &numeric_types(&["id"]),
+            &comments_context(),
+        )
+        .unwrap();
+        assert_eq!(
+            result["out"],
+            Some(Value::Numeric(Numeric::parse("2").unwrap()))
+        );
+    }
+
+    #[test]
+    fn to_many_empty_set_count_is_zero_others_null() {
+        // Post 3 has no related comments — the empty set.
+        let r = row(&[("id", Some("3"))]);
+        let types = numeric_types(&["id"]);
+        let ctx = comments_context();
+        assert_eq!(
+            eval_rel(&agg_rel("COUNT"), &r, &types, &ctx).unwrap()["out"],
+            Some(Value::Numeric(Numeric::parse("0").unwrap())),
+            "COUNT over empty set is 0"
+        );
+        for func in ["SUM", "MIN", "MAX", "AVG"] {
+            assert_eq!(
+                eval_rel(&agg_rel(func), &r, &types, &ctx).unwrap()["out"],
+                None,
+                "{func} over empty set is NULL"
+            );
+        }
+    }
+
+    #[test]
+    fn to_many_null_join_key_is_the_empty_set() {
+        // A NULL from-side join key never joins => empty set (COUNT 0).
+        let r = row(&[("id", None)]);
+        let result = eval_rel(
+            &agg_rel("COUNT"),
+            &r,
+            &numeric_types(&["id"]),
+            &comments_context(),
+        )
+        .unwrap();
+        assert_eq!(
+            result["out"],
+            Some(Value::Numeric(Numeric::parse("0").unwrap()))
+        );
+    }
+
+    #[test]
+    fn to_many_unknown_relationship_errors() {
+        let r = row(&[("id", Some("1"))]);
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: call("SUM", vec![rel_path("nope", "word_count")]),
+        }]);
+        let err = eval_rel(&d, &r, &numeric_types(&["id"]), &comments_context()).unwrap_err();
         assert!(
             matches!(err, EvalError::UnknownRelationship { .. }),
             "got {err:?}"
