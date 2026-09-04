@@ -28,6 +28,7 @@ use regex::Regex;
 use crate::numeric::{Numeric, NumericParseError};
 
 use super::ast::{Expr, FieldDef, KeySpace, Operator, TransformDef, ValueType};
+use super::model::RelationshipCardinality;
 
 /// A source-row image: column name to its text value, or `None` for SQL
 /// `NULL`. This is the staged post-image, not a live database row — the
@@ -44,6 +45,56 @@ pub type Row = HashMap<String, Option<String>>;
 /// compile); reusing one across `evaluate` calls for the same definition is
 /// what avoids the per-row recompilation.
 pub type RegexCache = HashMap<String, Regex>;
+
+/// One to-one relationship's read-side data, everything the evaluator needs
+/// to resolve a `<rel>.<column>` path (issue #28): the from-row column that
+/// holds the join key, the to-side rows to look that key up in, and the
+/// to-side column types so a referenced column's text parses the same way a
+/// source column's does.
+///
+/// `to_rows_by_key` is indexed by the *text* of the to-side join column
+/// (`to_col`), and the from-row's join key is matched against it by the same
+/// text. That's exact for the join-key types Trellis relationships actually
+/// use as a to-side `PRIMARY KEY`/`UNIQUE` column — integers, UUIDs, text —
+/// whose canonical text encoding is stable; it is *not* scale-insensitive for
+/// a fractional-numeric key (Postgres treats `1` and `1.0` as equal in a
+/// join, this index would not). A to-side row whose `to_col` is `NULL` must
+/// be omitted from the index by the builder: SQL `NULL` never joins, so it
+/// has no key.
+pub struct ToOneRelationship {
+    /// The from-row column whose value is the join key (the relationship's
+    /// `from_col`).
+    pub from_col: String,
+    /// The relationship's cardinality, so a to-*many* relationship referenced
+    /// as a bare path can be rejected here rather than silently taking an
+    /// arbitrary matching row (aggregate-wrapped to-many is issue #29).
+    pub cardinality: RelationshipCardinality,
+    /// The to-side column value-types, used to parse a referenced column's
+    /// text. A column absent here defaults to `Numeric`, matching the
+    /// [`Row`]-column handling in [`eval_expr`].
+    pub to_columns: HashMap<String, ValueType>,
+    /// The to-side rows, keyed by their `to_col` text value. A from-row whose
+    /// join key is absent (or `NULL`) has no match — LEFT JOIN semantics, the
+    /// enrichment column evaluates to `NULL`.
+    pub to_rows_by_key: HashMap<String, Row>,
+}
+
+/// The relationships available to the evaluator, keyed by the relationship
+/// name that heads a `<rel>.<column>` path. The pure [`evaluate`] entry
+/// supplies an empty one (matching pre-#28 behavior: a path then errors with
+/// [`EvalError::UnknownRelationship`]); [`evaluate_with_relationships`] threads
+/// a populated one built by the caller (the staging integration is issue #30).
+#[derive(Default)]
+pub struct RelationshipContext {
+    by_name: HashMap<String, ToOneRelationship>,
+}
+
+impl RelationshipContext {
+    /// Builds a context from relationship-name to its resolved to-one data.
+    pub fn new(by_name: HashMap<String, ToOneRelationship>) -> Self {
+        Self { by_name }
+    }
+}
 
 /// A calculated value the evaluator produces, per [`ValueType`]. `Uuid`
 /// (issue #79) carries its Postgres text rendering verbatim, the same way
@@ -112,6 +163,22 @@ pub enum EvalError {
         rel: String,
         column: String,
     },
+    /// A field references a relationship name (the `<rel>` head of a path)
+    /// that the caller supplied no data for. The validator is supposed to
+    /// reject an unknown relationship before eval, so this is defense-in-depth
+    /// for the same reason as [`EvalError::Cycle`] — and it's also what the
+    /// pure [`evaluate`] entry (empty [`RelationshipContext`]) returns for any
+    /// relationship path.
+    UnknownRelationship { field: String, rel: String },
+    /// A field references a to-*many* relationship as a bare `<rel>.<column>`
+    /// path in a non-aggregate (row) context. A to-many relationship's
+    /// enrichment must be aggregate-wrapped (issue #29, ADR-0006); a bare path
+    /// has no single row to read.
+    AggregateRequiredForToMany {
+        field: String,
+        rel: String,
+        column: String,
+    },
 }
 
 impl fmt::Display for EvalError {
@@ -143,6 +210,17 @@ impl fmt::Display for EvalError {
                 "calculated field '{field}' references relationship path '{rel}.{column}', \
                  which is not yet supported (grammar-only per issue #25)"
             ),
+            EvalError::UnknownRelationship { field, rel } => write!(
+                f,
+                "calculated field '{field}' references relationship '{rel}', which is not \
+                 available to the evaluator"
+            ),
+            EvalError::AggregateRequiredForToMany { field, rel, column } => write!(
+                f,
+                "calculated field '{field}' references to-many relationship path \
+                 '{rel}.{column}' without an aggregate; a to-many relationship must be \
+                 aggregate-wrapped"
+            ),
         }
     }
 }
@@ -154,7 +232,9 @@ impl std::error::Error for EvalError {
             EvalError::MissingColumn { .. }
             | EvalError::InvalidBoolean { .. }
             | EvalError::Cycle(_)
-            | EvalError::UnsupportedRelationshipPath { .. } => None,
+            | EvalError::UnsupportedRelationshipPath { .. }
+            | EvalError::UnknownRelationship { .. }
+            | EvalError::AggregateRequiredForToMany { .. } => None,
         }
     }
 }
@@ -179,6 +259,28 @@ pub fn evaluate(
     source_columns: &HashMap<String, ValueType>,
     regex_cache: &mut RegexCache,
 ) -> Result<HashMap<String, Option<Value>>, EvalError> {
+    evaluate_with_relationships(
+        def,
+        row,
+        source_columns,
+        &RelationshipContext::default(),
+        regex_cache,
+    )
+}
+
+/// Like [`evaluate`], but with [`RelationshipContext`] read-side data so a
+/// field's `<rel>.<column>` to-one relationship path (issue #28) resolves the
+/// single related row and reads the referenced column. A path whose `rel` has
+/// no entry in `relationships` errors ([`EvalError::UnknownRelationship`]);
+/// with the empty context [`evaluate`] passes, any path errors, matching the
+/// pure evaluator's pre-#28 behavior.
+pub fn evaluate_with_relationships(
+    def: &TransformDef,
+    row: &Row,
+    source_columns: &HashMap<String, ValueType>,
+    relationships: &RelationshipContext,
+    regex_cache: &mut RegexCache,
+) -> Result<HashMap<String, Option<Value>>, EvalError> {
     let fields_by_name: HashMap<&str, &FieldDef> =
         def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
 
@@ -190,6 +292,7 @@ pub fn evaluate(
                 field,
                 row,
                 source_columns,
+                relationships,
                 &fields_by_name,
                 &mut cache,
                 &mut in_progress,
@@ -213,6 +316,7 @@ fn eval_field(
     field: &FieldDef,
     row: &Row,
     source_columns: &HashMap<String, ValueType>,
+    relationships: &RelationshipContext,
     fields_by_name: &HashMap<&str, &FieldDef>,
     cache: &mut HashMap<String, Option<Value>>,
     in_progress: &mut HashSet<String>,
@@ -229,6 +333,7 @@ fn eval_field(
         &field.name,
         row,
         source_columns,
+        relationships,
         fields_by_name,
         cache,
         in_progress,
@@ -251,6 +356,7 @@ fn eval_expr(
     field_name: &str,
     row: &Row,
     source_columns: &HashMap<String, ValueType>,
+    relationships: &RelationshipContext,
     fields_by_name: &HashMap<&str, &FieldDef>,
     cache: &mut HashMap<String, Option<Value>>,
     in_progress: &mut HashSet<String>,
@@ -270,6 +376,7 @@ fn eval_expr(
                     calc_field,
                     row,
                     source_columns,
+                    relationships,
                     fields_by_name,
                     cache,
                     in_progress,
@@ -295,17 +402,68 @@ fn eval_expr(
             parse_number(field_name, text).map(|n| Some(Value::Numeric(n)))
         }
         Expr::StringLiteral(text) => Ok(Some(Value::Text(text.clone()))),
-        Expr::RelationshipPath { rel, column } => Err(EvalError::UnsupportedRelationshipPath {
-            field: field_name.to_string(),
-            rel: rel.clone(),
-            column: column.clone(),
-        }),
+        Expr::RelationshipPath { rel, column } => {
+            // To-one resolution (issue #28): find the relationship, read the
+            // from-row's join key, look up the single to-side row by that key,
+            // and read the referenced column from it. A missing match (no
+            // to-side row, or a NULL join key) is NULL enrichment — LEFT JOIN
+            // semantics — leaving the from-row itself intact.
+            let Some(reldata) = relationships.by_name.get(rel) else {
+                return Err(EvalError::UnknownRelationship {
+                    field: field_name.to_string(),
+                    rel: rel.clone(),
+                });
+            };
+            if reldata.cardinality == RelationshipCardinality::ToMany {
+                // A bare to-many path has no single row to read; issue #29
+                // handles the aggregate-wrapped form.
+                return Err(EvalError::AggregateRequiredForToMany {
+                    field: field_name.to_string(),
+                    rel: rel.clone(),
+                    column: column.clone(),
+                });
+            }
+            // The join key comes from the from-row's `from_col`. A NULL key
+            // never joins (SQL `NULL != NULL`), so it's a no-match → NULL.
+            let key = match row.get(&reldata.from_col) {
+                Some(Some(text)) => text,
+                Some(None) => return Ok(None),
+                None => {
+                    return Err(EvalError::MissingColumn {
+                        field: field_name.to_string(),
+                        column: reldata.from_col.clone(),
+                    });
+                }
+            };
+            let Some(to_row) = reldata.to_rows_by_key.get(key) else {
+                return Ok(None);
+            };
+            // Read the enrichment column off the matched to-side row, parsing
+            // its text with the to-side column's type (defaulting to Numeric,
+            // matching the `Expr::Column` arm above).
+            match to_row.get(column) {
+                Some(Some(text)) => {
+                    let value_type = reldata
+                        .to_columns
+                        .get(column)
+                        .copied()
+                        .unwrap_or(ValueType::Numeric);
+                    parse_value(field_name, value_type, text).map(Some)
+                }
+                Some(None) => Ok(None),
+                None => Err(EvalError::MissingColumn {
+                    field: field_name.to_string(),
+                    column: column.clone(),
+                }),
+            }
+        }
         Expr::BinaryOp { op, lhs, rhs } => {
             let lhs = eval_expr(
                 lhs,
                 field_name,
                 row,
                 source_columns,
+                relationships,
                 fields_by_name,
                 cache,
                 in_progress,
@@ -316,6 +474,7 @@ fn eval_expr(
                 field_name,
                 row,
                 source_columns,
+                relationships,
                 fields_by_name,
                 cache,
                 in_progress,
@@ -331,6 +490,7 @@ fn eval_expr(
                     field_name,
                     row,
                     source_columns,
+                    relationships,
                     fields_by_name,
                     cache,
                     in_progress,
@@ -594,6 +754,10 @@ fn fold_aggregate(
     regex_cache: &mut RegexCache,
 ) -> Result<Option<Value>, EvalError> {
     let mut values: Vec<Numeric> = Vec::new();
+    // The aggregate path does not wire relationships (issue #29 handles a
+    // to-many relationship's aggregate-wrapped enrichment); a bare path in an
+    // aggregate argument therefore errors as unknown, defense-in-depth.
+    let relationships = RelationshipContext::default();
     for row in rows {
         let mut per_row_cache = HashMap::new();
         let mut per_row_in_progress = HashSet::new();
@@ -602,6 +766,7 @@ fn fold_aggregate(
             field_name,
             row,
             source_columns,
+            &relationships,
             fields_by_name,
             &mut per_row_cache,
             &mut per_row_in_progress,
@@ -1331,5 +1496,238 @@ mod tests {
             Value::Numeric(n) => assert_eq!(n.to_string(), "6"),
             other => panic!("expected Numeric, got {other:?}"),
         }
+    }
+
+    // --- to-one relationship path resolution (issue #28) ---
+
+    fn rel_path(rel: &str, column: &str) -> Expr {
+        Expr::RelationshipPath {
+            rel: rel.to_string(),
+            column: column.to_string(),
+        }
+    }
+
+    /// A to-one relationship named `category` whose from-side FK column is
+    /// `category_id`, joining to a `categories` table keyed by `id`, with a
+    /// `name` (Text) and `rate` (Numeric) column on the to-side.
+    fn category_context() -> RelationshipContext {
+        let mut to_columns = HashMap::new();
+        to_columns.insert("name".to_string(), ValueType::Text);
+        to_columns.insert("rate".to_string(), ValueType::Numeric);
+
+        let mut to_rows_by_key = HashMap::new();
+        to_rows_by_key.insert(
+            "10".to_string(),
+            row(&[
+                ("id", Some("10")),
+                ("name", Some("Widgets")),
+                ("rate", Some("1.5")),
+            ]),
+        );
+        to_rows_by_key.insert(
+            "20".to_string(),
+            row(&[("id", Some("20")), ("name", None), ("rate", Some("2"))]),
+        );
+
+        let mut by_name = HashMap::new();
+        by_name.insert(
+            "category".to_string(),
+            ToOneRelationship {
+                from_col: "category_id".to_string(),
+                cardinality: RelationshipCardinality::ToOne,
+                to_columns,
+                to_rows_by_key,
+            },
+        );
+        RelationshipContext::new(by_name)
+    }
+
+    fn eval_rel(
+        d: &TransformDef,
+        r: &Row,
+        types: &HashMap<String, ValueType>,
+        rels: &RelationshipContext,
+    ) -> Result<HashMap<String, Option<Value>>, EvalError> {
+        evaluate_with_relationships(d, r, types, rels, &mut RegexCache::new())
+    }
+
+    #[test]
+    fn to_one_path_reads_the_matched_to_side_column() {
+        let d = def(vec![FieldDef {
+            name: "category_name".to_string(),
+            expr: rel_path("category", "name"),
+        }]);
+        let r = row(&[("category_id", Some("10"))]);
+        let result = eval_rel(
+            &d,
+            &r,
+            &numeric_types(&["category_id"]),
+            &category_context(),
+        )
+        .unwrap();
+        match result["category_name"].as_ref().unwrap() {
+            Value::Text(s) => assert_eq!(s, "Widgets"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_one_path_numeric_column_parses_with_to_side_type() {
+        let d = def(vec![FieldDef {
+            name: "category_rate".to_string(),
+            expr: rel_path("category", "rate"),
+        }]);
+        let r = row(&[("category_id", Some("10"))]);
+        let result = eval_rel(
+            &d,
+            &r,
+            &numeric_types(&["category_id"]),
+            &category_context(),
+        )
+        .unwrap();
+        match result["category_rate"].as_ref().unwrap() {
+            Value::Numeric(n) => assert_eq!(n.to_string(), "1.5"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_one_path_no_match_is_null() {
+        // FK 99 has no matching to-side row — LEFT JOIN leaves the enrichment
+        // NULL while the from-row still exists.
+        let d = def(vec![FieldDef {
+            name: "category_name".to_string(),
+            expr: rel_path("category", "name"),
+        }]);
+        let r = row(&[("category_id", Some("99"))]);
+        let result = eval_rel(
+            &d,
+            &r,
+            &numeric_types(&["category_id"]),
+            &category_context(),
+        )
+        .unwrap();
+        assert_eq!(result["category_name"], None);
+    }
+
+    #[test]
+    fn to_one_path_null_fk_is_null() {
+        // A NULL join key never matches (SQL NULL != NULL).
+        let d = def(vec![FieldDef {
+            name: "category_name".to_string(),
+            expr: rel_path("category", "name"),
+        }]);
+        let r = row(&[("category_id", None)]);
+        let result = eval_rel(
+            &d,
+            &r,
+            &numeric_types(&["category_id"]),
+            &category_context(),
+        )
+        .unwrap();
+        assert_eq!(result["category_name"], None);
+    }
+
+    #[test]
+    fn to_one_path_null_to_side_column_is_null() {
+        // FK 20 matches, but that to-side row's `name` is NULL.
+        let d = def(vec![FieldDef {
+            name: "category_name".to_string(),
+            expr: rel_path("category", "name"),
+        }]);
+        let r = row(&[("category_id", Some("20"))]);
+        let result = eval_rel(
+            &d,
+            &r,
+            &numeric_types(&["category_id"]),
+            &category_context(),
+        )
+        .unwrap();
+        assert_eq!(result["category_name"], None);
+    }
+
+    #[test]
+    fn to_one_path_composes_in_a_larger_expression() {
+        // A relationship path is an ordinary sub-expression: rate + 10.
+        let d = def(vec![FieldDef {
+            name: "adjusted".to_string(),
+            expr: add(
+                rel_path("category", "rate"),
+                Expr::NumberLiteral("10".to_string()),
+            ),
+        }]);
+        let r = row(&[("category_id", Some("10"))]);
+        let result = eval_rel(
+            &d,
+            &r,
+            &numeric_types(&["category_id"]),
+            &category_context(),
+        )
+        .unwrap();
+        match result["adjusted"].as_ref().unwrap() {
+            Value::Numeric(n) => assert_eq!(n.to_string(), "11.5"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_relationship_errors() {
+        let d = def(vec![FieldDef {
+            name: "x".to_string(),
+            expr: rel_path("nonexistent", "name"),
+        }]);
+        let r = row(&[("category_id", Some("10"))]);
+        let err = eval_rel(
+            &d,
+            &r,
+            &numeric_types(&["category_id"]),
+            &category_context(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, EvalError::UnknownRelationship { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn to_many_bare_path_requires_aggregate() {
+        let mut by_name = HashMap::new();
+        by_name.insert(
+            "orders".to_string(),
+            ToOneRelationship {
+                from_col: "id".to_string(),
+                cardinality: RelationshipCardinality::ToMany,
+                to_columns: HashMap::new(),
+                to_rows_by_key: HashMap::new(),
+            },
+        );
+        let rels = RelationshipContext::new(by_name);
+        let d = def(vec![FieldDef {
+            name: "x".to_string(),
+            expr: rel_path("orders", "total"),
+        }]);
+        let r = row(&[("id", Some("1"))]);
+        let err = eval_rel(&d, &r, &numeric_types(&["id"]), &rels).unwrap_err();
+        assert!(
+            matches!(err, EvalError::AggregateRequiredForToMany { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn plain_evaluate_has_no_relationships_so_a_path_errors() {
+        // The pure entry supplies an empty context — matching pre-#28 behavior
+        // that any relationship path is unresolvable.
+        let d = def(vec![FieldDef {
+            name: "x".to_string(),
+            expr: rel_path("category", "name"),
+        }]);
+        let r = row(&[("category_id", Some("10"))]);
+        let err = eval(&d, &r, &numeric_types(&["category_id"])).unwrap_err();
+        assert!(
+            matches!(err, EvalError::UnknownRelationship { .. }),
+            "got {err:?}"
+        );
     }
 }

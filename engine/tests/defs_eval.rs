@@ -7,7 +7,10 @@
 use std::collections::HashMap;
 
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use engine::defs::eval::{RegexCache, Row, evaluate};
+use engine::defs::eval::{
+    RegexCache, RelationshipContext, Row, ToOneRelationship, evaluate, evaluate_with_relationships,
+};
+use engine::defs::model::RelationshipCardinality;
 use testkit::TestCluster;
 
 fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
@@ -185,4 +188,113 @@ async fn staged_image_matches_evaluation_of_the_equivalent_live_row() {
     )
     .unwrap();
     assert_eq!(from_live, from_manual);
+}
+
+/// A to-one relationship path (`category.name`, issue #28) evaluates to the
+/// same enrichment a Postgres `LEFT JOIN` produces — for from-rows that match
+/// a to-side row, ones that don't (NULL enrichment, from-row survives), a NULL
+/// FK, and a matched to-side row whose referenced column is itself NULL.
+#[tokio::test]
+async fn to_one_relationship_matches_postgres_left_join() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+
+    client
+        .batch_execute(
+            "create table categories (id integer primary key, name text);
+             insert into categories (id, name) values (10, 'Widgets'), (20, null);
+             create table products (id integer primary key, category_id integer);
+             insert into products (id, category_id)
+                 values (1, 10), (2, 20), (3, 99), (4, null)",
+        )
+        .await
+        .expect("seed tables");
+
+    // Postgres's own LEFT JOIN is the oracle: product id -> joined category name.
+    let expected: HashMap<i32, Option<String>> = {
+        let rows = client
+            .query(
+                "select p.id, c.name
+                   from products p
+                   left join categories c on p.category_id = c.id",
+                &[],
+            )
+            .await
+            .expect("left join");
+        rows.into_iter()
+            .map(|r| (r.get::<_, i32>(0), r.get::<_, Option<String>>(1)))
+            .collect()
+    };
+
+    // Build the to-one context from the categories table read back as text —
+    // the same text image the staging path would carry (issue #30 wires this).
+    let mut to_columns = HashMap::new();
+    to_columns.insert("name".to_string(), ValueType::Text);
+    let mut to_rows_by_key = HashMap::new();
+    for cat in client
+        .query("select id::text, name::text from categories", &[])
+        .await
+        .expect("read categories")
+    {
+        let id: String = cat.get(0);
+        let name: Option<String> = cat.get(1);
+        let mut r: Row = HashMap::new();
+        r.insert("id".to_string(), Some(id.clone()));
+        r.insert("name".to_string(), name);
+        to_rows_by_key.insert(id, r);
+    }
+    let mut by_name = HashMap::new();
+    by_name.insert(
+        "category".to_string(),
+        ToOneRelationship {
+            from_col: "category_id".to_string(),
+            cardinality: RelationshipCardinality::ToOne,
+            to_columns,
+            to_rows_by_key,
+        },
+    );
+    let rels = RelationshipContext::new(by_name);
+
+    let def = TransformDef {
+        target: "enriched_products".to_string(),
+        source: "products".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "category_name".to_string(),
+            expr: Expr::RelationshipPath {
+                rel: "category".to_string(),
+                column: "name".to_string(),
+            },
+        }],
+        predicate: Predicate::True,
+    };
+
+    // Each product's FK read back as text, matching a staged image.
+    for product in client
+        .query("select id, category_id::text from products", &[])
+        .await
+        .expect("read products")
+    {
+        let id: i32 = product.get(0);
+        let category_id: Option<String> = product.get(1);
+        let mut from_row: Row = HashMap::new();
+        from_row.insert("category_id".to_string(), category_id);
+
+        let result = evaluate_with_relationships(
+            &def,
+            &from_row,
+            &numeric_columns(&["category_id"]),
+            &rels,
+            &mut RegexCache::new(),
+        )
+        .expect("evaluation succeeds");
+        let actual = result["category_name"].as_ref().map(|v| v.to_string());
+
+        assert_eq!(
+            actual, expected[&id],
+            "product {id}: evaluator={actual:?} left-join={:?}",
+            expected[&id]
+        );
+    }
 }
