@@ -824,6 +824,22 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // matches, and stage each as an image-less recompute at the triggering
         // change's `hop_gen + 1`.
         let inbound_rels = catalog::relationships_to_table(pool, source_key).await?;
+        // Decode each change's pre-image once, reused across every inbound
+        // relationship below (the join key lives in the pre-image for a
+        // delete/re-parent). Skipped entirely when this table is nobody's
+        // to-side, so the common no-relationship source pays nothing.
+        let reverse_old_rows: Vec<Option<Row>> = if inbound_rels.is_empty() {
+            Vec::new()
+        } else {
+            let mut decoded = Vec::with_capacity(changes.len());
+            for change in &changes {
+                decoded.push(match &change.old_image {
+                    Some(image_text) => Some(decode_image(pool, image_text).await?),
+                    None => None,
+                });
+            }
+            decoded
+        };
         for rel in &inbound_rels {
             // Join-key text -> the max `hop_gen` of the to-side changes that
             // touched it (a re-parent update touches both its old and new
@@ -841,8 +857,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 if let Some(row) = &rows[i] {
                     note(row.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
                 }
-                if let Some(old_text) = &change.old_image {
-                    let old = decode_image(pool, old_text).await?;
+                if let Some(old) = &reverse_old_rows[i] {
                     note(old.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
                 }
             }

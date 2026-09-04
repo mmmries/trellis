@@ -59,11 +59,20 @@ async fn create_table_with_text_column(pool: &engine::pool::Pool, name: &str, co
 /// A table with a `numeric`-typed column, for the numeric-join-key
 /// rejection test.
 async fn create_table_with_numeric_column(pool: &engine::pool::Pool, name: &str, col: &str) {
+    create_table_with_typed_column(pool, name, col, "numeric").await;
+}
+
+async fn create_table_with_typed_column(
+    pool: &engine::pool::Pool,
+    name: &str,
+    col: &str,
+    sql_type: &str,
+) {
     let client = pool.get().await.expect("get connection");
     client
-        .batch_execute(&format!("create table {name} ({col} numeric)"))
+        .batch_execute(&format!("create table {name} ({col} {sql_type})"))
         .await
-        .expect("create table with numeric column");
+        .expect("create table with typed column");
 }
 
 #[tokio::test]
@@ -350,7 +359,7 @@ async fn a_numeric_join_key_is_rejected() {
     .unwrap_err();
 
     match &err {
-        CatalogError::Validate(ValidationError::RelationshipUnsupportedNumericJoinKey {
+        CatalogError::Validate(ValidationError::RelationshipUnsupportedJoinKeyType {
             name,
             table,
             column,
@@ -360,10 +369,79 @@ async fn a_numeric_join_key_is_rejected() {
             assert_eq!(table, "order_line_items");
             assert_eq!(column, "product_id");
         }
-        other => panic!("expected RelationshipUnsupportedNumericJoinKey, got {other:?}"),
+        other => panic!("expected RelationshipUnsupportedJoinKeyType, got {other:?}"),
     }
     let message = err.to_string();
     assert!(message.contains("numeric"));
+
+    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+        .await
+        .expect("read query");
+    assert!(missing.is_none());
+}
+
+/// Issue #28 review (epic #19 cross-cutting): the join-key guard is a
+/// positive allowlist of text-stable types, not just a numeric blocklist.
+/// `character(n)` shares a `type_family` with `text`/`varchar` but its native
+/// `=` is blank-padding-insensitive while its `::text` form is blank-padded,
+/// so the engine's text-equality join would diverge from the oracle's typed
+/// join. Rejected at `create_relationship` time.
+#[tokio::test]
+async fn a_character_n_join_key_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_typed_column(&db.pool, "order_line_items", "product_id", "character(8)")
+        .await;
+    create_table_with_typed_column(&db.pool, "products", "id", "character(8)").await;
+
+    let err = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .unwrap_err();
+
+    match &err {
+        CatalogError::Validate(ValidationError::RelationshipUnsupportedJoinKeyType {
+            column,
+            ..
+        }) => assert_eq!(column, "product_id"),
+        other => panic!("expected RelationshipUnsupportedJoinKeyType, got {other:?}"),
+    }
+
+    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+        .await
+        .expect("read query");
+    assert!(missing.is_none());
+}
+
+/// Companion to `a_character_n_join_key_is_rejected`: `timestamptz` renders to
+/// a session-`TimeZone`-dependent `::text`, so it is not a text-stable join
+/// key and is rejected.
+#[tokio::test]
+async fn a_timestamptz_join_key_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_typed_column(
+        &db.pool,
+        "order_line_items",
+        "product_id",
+        "timestamp with time zone",
+    )
+    .await;
+    create_table_with_typed_column(&db.pool, "products", "id", "timestamp with time zone").await;
+
+    let err = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        &err,
+        CatalogError::Validate(ValidationError::RelationshipUnsupportedJoinKeyType { .. })
+    ));
 
     let missing = relationship_by_name(&db.pool, "order_line_items", "product")
         .await

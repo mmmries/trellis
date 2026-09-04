@@ -279,7 +279,7 @@ pub async fn create_relationship(
     let from_type = column_type_in_txn(&txn, &def.from_table, &def.from_col).await?;
     let to_type = column_type_in_txn(&txn, &def.to_table, &def.to_col).await?;
     assert_comparable_types(&def, &from_type, &to_type)?;
-    assert_no_numeric_join_key(&def, &from_type)?;
+    assert_join_key_type_supported(&def, &from_type, &to_type)?;
 
     let already_declared: bool = txn
         .query_one(
@@ -511,31 +511,63 @@ fn type_family(pg_type: &str) -> &str {
     }
 }
 
-/// The [`type_family`] bucket rejected by [`assert_no_numeric_join_key`] —
-/// fractional/arbitrary-precision types whose `::text` rendering isn't
-/// stable under numeric equality (see
-/// [`ValidationError::RelationshipUnsupportedNumericJoinKey`]).
-const NUMERIC_FAMILY: &str = "numeric";
+/// Postgres type base names (modifier already stripped, as in
+/// [`type_family`]) whose equality is *text-stable* — `a::text = b::text`
+/// agrees with the type's native typed `=` for every value. This is a
+/// positive allowlist, not [`type_family`]'s equivalence-class bucketing:
+/// [`type_family`] groups `character`/`character varying`/`text` together
+/// (correctly, for comparability) even though `character`'s native `=` is
+/// blank-padding-insensitive while its `::text` rendering is blank-padded,
+/// so a family-based check would wrongly wave it through here.
+///
+/// Only the join key's *own* type matters for this list, not what it's
+/// compared against, so allowed/rejected status is a per-type fact.
+/// Anything not named here — `numeric`/`real`/`double precision`
+/// (fractional/arbitrary-precision: `1.0::text` != `1.00::text` though
+/// numerically equal), `character`/`citext` (blank-padding or
+/// case-insensitivity native to the type but not its `::text` form),
+/// `timestamp`/`timestamptz`/`date`/`time` (`::text` is session-TimeZone- or
+/// style-dependent), `boolean`, `bytea`, `json`/`jsonb`, or any unknown
+/// type — is rejected as a join key.
+const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
+    "smallint",
+    "integer",
+    "bigint",
+    "uuid",
+    "text",
+    "character varying",
+];
 
-/// Rejects `def` if its join key resolved to the `numeric` [`type_family`]
-/// (`numeric`/`real`/`double precision`) — issue #28 review. The engine
-/// compares join keys as raw `::text`, which is exact for integer/uuid/text
-/// keys but not for this family, so allowing it here would let the engine
-/// silently diverge from the Postgres oracle. Must run after
-/// [`assert_comparable_types`] has confirmed `from_type`/`to_type` share a
-/// family, so checking either side's type is equivalent; `from_type` is used
-/// arbitrarily.
-fn assert_no_numeric_join_key(def: &RelationshipDef, from_type: &str) -> Result<(), CatalogError> {
-    if type_family(from_type) != NUMERIC_FAMILY {
-        return Ok(());
+/// Rejects `def` if either endpoint's join key type isn't in
+/// [`TEXT_STABLE_JOIN_KEY_TYPES`] — issue #28 review, hardened per review of
+/// #27/#28 (a numeric-only blocklist missed `character(n)`, `citext`, and
+/// `timestamptz`, which also diverge under the engine's `::text`-equality
+/// join vs. the Postgres oracle's native typed `=`). Checks both sides
+/// rather than relying on [`assert_comparable_types`]'s family match to
+/// stand in for the other: `character` and `character varying` share a
+/// family but only one is on this allowlist, so a from/to pair could
+/// straddle the line.
+fn assert_join_key_type_supported(
+    def: &RelationshipDef,
+    from_type: &str,
+    to_type: &str,
+) -> Result<(), CatalogError> {
+    for (table, column, pg_type) in [
+        (&def.from_table, &def.from_col, from_type),
+        (&def.to_table, &def.to_col, to_type),
+    ] {
+        let base = pg_type.split('(').next().unwrap_or(pg_type).trim();
+        if !TEXT_STABLE_JOIN_KEY_TYPES.contains(&base) {
+            return Err(ValidationError::RelationshipUnsupportedJoinKeyType {
+                name: def.name.clone(),
+                table: table.clone(),
+                column: column.clone(),
+                pg_type: pg_type.to_string(),
+            }
+            .into());
+        }
     }
-    Err(ValidationError::RelationshipUnsupportedNumericJoinKey {
-        name: def.name.clone(),
-        table: def.from_table.clone(),
-        column: def.from_col.clone(),
-        pg_type: from_type.to_string(),
-    }
-    .into())
+    Ok(())
 }
 
 /// Rejects `def` if `from_type`/`to_type` (both already resolved by

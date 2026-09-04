@@ -132,17 +132,18 @@ pub enum ValidationError {
     /// `relationship_definitions` unique constraint that backstops this
     /// check against a same-name race between concurrent callers.
     DuplicateRelationshipName { from_table: String, name: String },
-    /// A relationship's join key resolved to a fractional/arbitrary-precision
-    /// numeric Postgres type (`numeric`, `real`, `double precision` — see
-    /// [`super::catalog::type_family`]'s `"numeric"` bucket). Trellis's
-    /// evaluator compares join keys as `::text` (issue #28 review), and
-    /// Postgres's `::text` rendering of these types isn't stable under
-    /// numeric equality (`1.0::numeric::text` is `"1.0"`, `1.00::numeric::text`
-    /// is `"1.00"`, though `1.0::numeric = 1.00::numeric` is `true`), so a
-    /// real LEFT JOIN match would render as a false-miss NULL in the engine.
-    /// Rejected at definition time rather than silently diverging from the
-    /// Postgres oracle.
-    RelationshipUnsupportedNumericJoinKey {
+    /// A relationship's join key resolved to a Postgres type that isn't
+    /// text-stable — one where `a::text = b::text` disagrees with the type's
+    /// native typed `=` (see
+    /// [`super::catalog::TEXT_STABLE_JOIN_KEY_TYPES`]). Trellis's evaluator,
+    /// staging reverse-lookup, and oracle all join by raw `::text` equality,
+    /// but the oracle SELECT joins by native `=`, so a non-text-stable key
+    /// (`numeric`/`real`/`double precision` — `1.0` vs `1.00`; `character(n)`
+    /// — blank-padding; `citext` — case; `timestamptz` — session TimeZone)
+    /// would render a real LEFT JOIN match as a false-miss NULL in the
+    /// engine. Rejected at definition time rather than silently diverging
+    /// from the Postgres oracle.
+    RelationshipUnsupportedJoinKeyType {
         name: String,
         table: String,
         column: String,
@@ -249,18 +250,17 @@ impl fmt::Display for ValidationError {
                 "relationship '{name}' is already declared on '{from_table}'; relationship \
                  names must be unique per from-table (ADR-0006), so pick a different name"
             ),
-            ValidationError::RelationshipUnsupportedNumericJoinKey {
+            ValidationError::RelationshipUnsupportedJoinKeyType {
                 name,
                 table,
                 column,
                 pg_type,
             } => write!(
                 f,
-                "relationship '{name}' joins on {table}.{column} ({pg_type}), a floating-point \
-                 or arbitrary-precision numeric column; equal numeric values can render as \
-                 different text (e.g. '1.0' vs '1.00'), so numeric-family columns aren't \
-                 supported as relationship join keys — use an integer, uuid, or text column \
-                 instead"
+                "relationship '{name}' joins on {table}.{column} ({pg_type}), a type whose \
+                 equality isn't text-stable, so the engine (which compares join keys as text) \
+                 would silently diverge from the Postgres oracle's typed join; supported join \
+                 key types are integer, bigint, smallint, uuid, text, and character varying"
             ),
         }
     }
