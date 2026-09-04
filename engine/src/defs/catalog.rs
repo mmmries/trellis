@@ -370,9 +370,12 @@ pub async fn relationship_by_name(
     let text: String = row.get(1);
     let cardinality_text: String = row.get(2);
     let def = parse_relationship(&text)?;
-    let cardinality = RelationshipCardinality::from_str(&cardinality_text).unwrap_or_else(|| {
-        panic!("relationship_definitions.cardinality held unrecognized value '{cardinality_text}'")
-    });
+    let cardinality =
+        RelationshipCardinality::from_persisted(&cardinality_text).unwrap_or_else(|| {
+            panic!(
+                "relationship_definitions.cardinality held unrecognized value '{cardinality_text}'"
+            )
+        });
     Ok(Some(RelationshipDefinition {
         id,
         def,
@@ -419,8 +422,17 @@ async fn column_type_in_txn(
 /// varying` split between two independently-authored tables. Anything not
 /// named here must match `from_type`/`to_type` exactly to be considered
 /// comparable; see [`assert_comparable_types`].
+///
+/// `pg_type` is [`column_type_in_txn`]'s `format_type(atttypid, atttypmod)`
+/// rendering, which includes any length/precision modifier (`character
+/// varying(255)`, `numeric(10,2)`). The modifier is stripped before bucket
+/// matching — otherwise `varchar(255)` and `varchar(100)`, or `text` and
+/// `varchar(n)`, would fall into the `other` catch-all as two distinct
+/// strings and be wrongly rejected as a type mismatch, even though they're
+/// exactly the kind of join this function exists to allow.
 fn type_family(pg_type: &str) -> &str {
-    match pg_type {
+    let base = pg_type.split('(').next().unwrap_or(pg_type).trim();
+    match base {
         "smallint" | "integer" | "bigint" => "integer",
         "numeric" | "real" | "double precision" => "numeric",
         "text" | "character varying" | "character" => "text",
@@ -456,7 +468,11 @@ fn assert_comparable_types(
 /// `pg_catalog` (`pg_index.indisunique` covers both index kinds; `indkey`'s
 /// length excludes any multi-column index `to_col` merely participates in,
 /// since that doesn't make `to_col` alone unique) — ADR-0006's cardinality
-/// rule. Assumes `to_table`/`to_col` already resolved (callers run this
+/// rule. `indisvalid`/`indpred is null` exclude indexes that don't actually
+/// guarantee global uniqueness of `to_col`: a not-yet-validated index (e.g.
+/// left behind by a failed `CREATE UNIQUE INDEX CONCURRENTLY`) or a partial
+/// unique index (`... where active`), which only constrains the rows it
+/// covers. Assumes `to_table`/`to_col` already resolved (callers run this
 /// after [`column_type_in_txn`] has confirmed both exist).
 async fn to_col_cardinality_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
@@ -472,6 +488,8 @@ async fn to_col_cardinality_in_txn(
                   on a.attrelid = i.indrelid and a.attname = $2
                 where i.indrelid = pg_catalog.to_regclass($1)
                   and i.indisunique
+                  and i.indisvalid
+                  and i.indpred is null
                   and array_length(i.indkey::int2[], 1) = 1
                   and i.indkey[0] = a.attnum
              )",

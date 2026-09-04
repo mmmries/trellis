@@ -326,6 +326,58 @@ async fn compatible_integer_widths_are_accepted() {
     .expect("integer-to-bigint join should be accepted as comparable");
 }
 
+/// `text` and `character varying(n)` are the same [`type_family`] bucket,
+/// but `format_type` renders the latter with its length modifier
+/// (`character varying(255)`) — a regression check that bucket matching
+/// strips the modifier rather than comparing the two renderings verbatim
+/// (which would wrongly reject this as a mismatch).
+#[tokio::test]
+async fn text_and_varchar_are_accepted_as_comparable() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_text_column(&db.pool, "order_line_items", "sku").await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("create table products (sku character varying(255) primary key)")
+        .await
+        .expect("create products with varchar pk");
+    drop(client);
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.sku TO products.sku",
+    )
+    .await
+    .expect("text-to-varchar join should be accepted as comparable");
+}
+
+/// Two `character varying` columns with different length modifiers
+/// (`varchar(50)` vs `varchar(255)`) are comparable — same regression as
+/// [`text_and_varchar_are_accepted_as_comparable`], but for two modifier
+/// renderings that differ from each other rather than one lacking a
+/// modifier at all.
+#[tokio::test]
+async fn varchar_columns_with_different_lengths_are_accepted() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table order_line_items (sku character varying(50));
+             create table products (sku character varying(255) primary key)",
+        )
+        .await
+        .expect("create tables with differing varchar lengths");
+    drop(client);
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.sku TO products.sku",
+    )
+    .await
+    .expect("varchar(50)-to-varchar(255) join should be accepted as comparable");
+}
+
 /// ADR-0006's endpoint-resolution requirement: a relationship whose
 /// `from_col`/`to_col` doesn't exist on the named table (including the table
 /// itself not existing) is rejected with an actionable message.

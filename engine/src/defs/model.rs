@@ -71,8 +71,13 @@ impl RelationshipCardinality {
 
     /// Parses [`Self::as_str`]'s persisted form back, or `None` for any
     /// other text — meaning the row was written by something other than
-    /// [`super::catalog::create_relationship`].
-    pub fn from_str(text: &str) -> Option<Self> {
+    /// [`super::catalog::create_relationship`]. Named `from_persisted`
+    /// rather than `from_str` so it isn't confused with (and doesn't trip
+    /// clippy's `should_implement_trait` lint against) `std::str::FromStr`,
+    /// which this isn't — there's no matching `Err` type worth inventing
+    /// for a value that should only ever come from this table's own
+    /// `check` constraint.
+    pub fn from_persisted(text: &str) -> Option<Self> {
         match text {
             "one" => Some(RelationshipCardinality::ToOne),
             "many" => Some(RelationshipCardinality::ToMany),
