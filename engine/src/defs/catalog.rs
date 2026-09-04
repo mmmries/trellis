@@ -307,9 +307,22 @@ pub async fn create_relationship(
     // `schema_nodes` directly, re-check this call.
     let to_node = resolve_node_in_txn(&txn, &def.to_table, NodeKind::Source).await?;
 
-    reject_if_table_cycle(&txn, &def.from_table, &def.to_table).await?;
+    // The `Relationship` edge is persisted `to_table -> from_table` (parent
+    // -> child), matching `Source`'s "to_node depends on from_node"
+    // convention (see `SchemaEdge`'s doc comment): the FK-holding
+    // `from_table` is the dependent side — a bare-path reference like
+    // `product.x` in a calculated field over `from_table` pulls from
+    // `to_table`, so `from_table` depends on `to_table`, not the reverse.
+    // Persisting it `from_table -> to_table` instead (the naive reading of
+    // "FROM ... TO ...") would invert that: it'd wrongly reject a
+    // target-table-references-its-own-source relationship as a false
+    // 2-cycle (both edges actually mean "target depends on source"), and it
+    // would make future dependents-of-a-changed-table traversals (#28+)
+    // miss relationship dependents, since `edges_from(to_table)` wouldn't
+    // reach `from_table` at all.
+    reject_if_table_cycle(&txn, &def.to_table, &def.from_table).await?;
 
-    persist_edge_in_txn(&txn, from_node.id, to_node.id, EdgeKind::Relationship).await?;
+    persist_edge_in_txn(&txn, to_node.id, from_node.id, EdgeKind::Relationship).await?;
 
     let cardinality = to_col_cardinality_in_txn(&txn, &def.to_table, &def.to_col).await?;
 

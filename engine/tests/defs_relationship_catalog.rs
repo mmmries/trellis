@@ -2,9 +2,12 @@
 //! #27 validation), run against a real, ephemeral Postgres instance via the
 //! shared harness (`testkit::TestCluster`).
 
+use std::collections::HashMap;
+
 use engine::defs::{
-    CatalogError, EdgeKind, RelationshipCardinality, ValidationError, create_relationship,
-    edges_from, relationship_by_name,
+    CatalogError, EdgeKind, RelationshipCardinality, ValidationError, ValueType, create_definition,
+    create_relationship, create_target_table, edges_from, parse, relationship_by_name,
+    source_primary_key,
 };
 use testkit::TestCluster;
 
@@ -98,7 +101,9 @@ async fn relationship_by_name_returns_none_for_an_unknown_pair() {
 
 /// Acceptance criterion: the declared relationship appears as a typed edge
 /// in the resolver — a `Relationship`-kind `schema_edges` row from the
-/// from-table's node to the to-table's node, distinct from a `Source` edge.
+/// to-table's node to the from-table's node (matching `Source`'s "to_node
+/// depends on from_node" convention: the FK-holding from-table is the
+/// dependent side), distinct from a `Source` edge.
 #[tokio::test]
 async fn a_relationship_appears_as_a_typed_edge_in_the_resolver() {
     let cluster = TestCluster::start();
@@ -113,7 +118,7 @@ async fn a_relationship_appears_as_a_typed_edge_in_the_resolver() {
     .await
     .expect("valid relationship should be stored");
 
-    let relationship_edges = edges_from(&db.pool, "posts", EdgeKind::Relationship)
+    let relationship_edges = edges_from(&db.pool, "users", EdgeKind::Relationship)
         .await
         .expect("query edges");
     assert_eq!(relationship_edges.len(), 1);
@@ -127,12 +132,12 @@ async fn a_relationship_appears_as_a_typed_edge_in_the_resolver() {
         .await
         .expect("query node")
         .expect("users node should exist");
-    assert_eq!(relationship_edges[0].from_node_id, from_node.id);
-    assert_eq!(relationship_edges[0].to_node_id, to_node.id);
+    assert_eq!(relationship_edges[0].from_node_id, to_node.id);
+    assert_eq!(relationship_edges[0].to_node_id, from_node.id);
 
     // No `Source` edge was created by declaring a relationship — the two
     // edge kinds stay distinct in the graph.
-    let source_edges = edges_from(&db.pool, "posts", EdgeKind::Source)
+    let source_edges = edges_from(&db.pool, "users", EdgeKind::Source)
         .await
         .expect("query edges");
     assert!(source_edges.is_empty());
@@ -563,4 +568,50 @@ async fn a_relationship_edge_that_would_close_a_cycle_is_rejected() {
         .await
         .expect("read query");
     assert!(missing.is_none());
+}
+
+/// Regression for the edge-direction fix: a transform target declaring a
+/// relationship back to its own source table must be accepted, not rejected
+/// as a false 2-cycle. Both the `Source` edge (`orders -> order_totals`, from
+/// `create_definition`) and the `Relationship` edge this test adds mean the
+/// same thing — "`order_totals` depends on `orders`" — so persisting the
+/// relationship edge in the direction consistent with `Source`'s "to_node
+/// depends on from_node" convention (`orders -> order_totals`, i.e.
+/// `to_table -> from_table`) must not trip the cycle detector. Persisting it
+/// naively as `from_table -> to_table` (`order_totals -> orders`) would have
+/// made `order_totals` and `orders` mutually reachable, and rejected this as
+/// closing a cycle even though there is no real cycle.
+#[tokio::test]
+async fn a_relationship_from_a_transform_target_back_to_its_own_source_is_accepted() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_pk(&db.pool, "orders", "id").await;
+
+    let dsl = "TRANSFORM order_totals FROM orders SELECT id AS total";
+    let source_columns = HashMap::from([("id".to_string(), ValueType::Numeric)]);
+    create_definition(&db.pool, dsl, &source_columns)
+        .await
+        .expect("valid definition should be stored");
+
+    let def = parse(dsl).expect("parse dsl for target materialization");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+        .await
+        .expect("materialize chained target table");
+
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("alter table order_totals add column order_ref integer")
+        .await
+        .expect("add fk-shaped column to target table");
+    drop(client);
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP origin FROM order_totals.order_ref TO orders.id",
+    )
+    .await
+    .expect("relationship back to a target's own source should not be a false cycle");
 }
