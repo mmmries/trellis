@@ -279,6 +279,7 @@ pub async fn create_relationship(
     let from_type = column_type_in_txn(&txn, &def.from_table, &def.from_col).await?;
     let to_type = column_type_in_txn(&txn, &def.to_table, &def.to_col).await?;
     assert_comparable_types(&def, &from_type, &to_type)?;
+    assert_no_numeric_join_key(&def, &from_type)?;
 
     let already_declared: bool = txn
         .query_one(
@@ -463,6 +464,33 @@ fn type_family(pg_type: &str) -> &str {
         "text" | "character varying" | "character" => "text",
         other => other,
     }
+}
+
+/// The [`type_family`] bucket rejected by [`assert_no_numeric_join_key`] —
+/// fractional/arbitrary-precision types whose `::text` rendering isn't
+/// stable under numeric equality (see
+/// [`ValidationError::RelationshipUnsupportedNumericJoinKey`]).
+const NUMERIC_FAMILY: &str = "numeric";
+
+/// Rejects `def` if its join key resolved to the `numeric` [`type_family`]
+/// (`numeric`/`real`/`double precision`) — issue #28 review. The engine
+/// compares join keys as raw `::text`, which is exact for integer/uuid/text
+/// keys but not for this family, so allowing it here would let the engine
+/// silently diverge from the Postgres oracle. Must run after
+/// [`assert_comparable_types`] has confirmed `from_type`/`to_type` share a
+/// family, so checking either side's type is equivalent; `from_type` is used
+/// arbitrarily.
+fn assert_no_numeric_join_key(def: &RelationshipDef, from_type: &str) -> Result<(), CatalogError> {
+    if type_family(from_type) != NUMERIC_FAMILY {
+        return Ok(());
+    }
+    Err(ValidationError::RelationshipUnsupportedNumericJoinKey {
+        name: def.name.clone(),
+        table: def.from_table.clone(),
+        column: def.from_col.clone(),
+        pg_type: from_type.to_string(),
+    }
+    .into())
 }
 
 /// Rejects `def` if `from_type`/`to_type` (both already resolved by

@@ -56,6 +56,16 @@ async fn create_table_with_text_column(pool: &engine::pool::Pool, name: &str, co
         .expect("create table with text column");
 }
 
+/// A table with a `numeric`-typed column, for the numeric-join-key
+/// rejection test.
+async fn create_table_with_numeric_column(pool: &engine::pool::Pool, name: &str, col: &str) {
+    let client = pool.get().await.expect("get connection");
+    client
+        .batch_execute(&format!("create table {name} ({col} numeric)"))
+        .await
+        .expect("create table with numeric column");
+}
+
 #[tokio::test]
 async fn a_relationship_round_trips_through_the_catalog() {
     let cluster = TestCluster::start();
@@ -310,6 +320,50 @@ async fn a_type_mismatch_between_endpoints_is_rejected() {
     }
     let message = err.to_string();
     assert!(message.contains("not comparable"));
+
+    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+        .await
+        .expect("read query");
+    assert!(missing.is_none());
+}
+
+/// Issue #28 review, ADR-0006: a join key resolving to a fractional or
+/// arbitrary-precision numeric type (`numeric`, `real`, `double precision`)
+/// is rejected at `create_relationship` time. The engine compares join keys
+/// as raw `::text`, which is exact for integer/uuid/text keys
+/// (`a_relationship_round_trips_through_the_catalog` covers the integer
+/// case) but not for this family — Postgres considers `1.0::numeric =
+/// 1.00::numeric` but their `::text` renderings differ, which would produce
+/// a false-miss NULL in the engine where a real LEFT JOIN matches.
+#[tokio::test]
+async fn a_numeric_join_key_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_numeric_column(&db.pool, "order_line_items", "product_id").await;
+    create_table_with_numeric_column(&db.pool, "products", "id").await;
+
+    let err = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .unwrap_err();
+
+    match &err {
+        CatalogError::Validate(ValidationError::RelationshipUnsupportedNumericJoinKey {
+            name,
+            table,
+            column,
+            ..
+        }) => {
+            assert_eq!(name, "product");
+            assert_eq!(table, "order_line_items");
+            assert_eq!(column, "product_id");
+        }
+        other => panic!("expected RelationshipUnsupportedNumericJoinKey, got {other:?}"),
+    }
+    let message = err.to_string();
+    assert!(message.contains("numeric"));
 
     let missing = relationship_by_name(&db.pool, "order_line_items", "product")
         .await
@@ -711,6 +765,70 @@ async fn a_partial_index_on_the_join_column_still_warns() {
         .batch_execute("create index on order_line_items (product_id) where active")
         .await
         .expect("create partial index");
+    drop(client);
+    create_table_with_pk(&db.pool, "products", "id").await;
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .expect("valid relationship should be stored");
+
+    assert_eq!(
+        created.warnings,
+        vec![RelationshipWarning::MissingFkIndex {
+            from_table: "order_line_items".to_string(),
+            from_col: "product_id".to_string(),
+        }]
+    );
+}
+
+/// An expression index's leading "column" isn't a plain column reference
+/// (`indkey[0]` is `0`, which never matches a real `attnum`), so it isn't
+/// usable for a `from_col = $1` lookup — the warning still fires.
+#[tokio::test]
+async fn an_expression_index_on_the_join_column_still_warns() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("create index on order_line_items ((product_id + 0))")
+        .await
+        .expect("create expression index on join column");
+    drop(client);
+    create_table_with_pk(&db.pool, "products", "id").await;
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+    )
+    .await
+    .expect("valid relationship should be stored");
+
+    assert_eq!(
+        created.warnings,
+        vec![RelationshipWarning::MissingFkIndex {
+            from_table: "order_line_items".to_string(),
+            from_col: "product_id".to_string(),
+        }]
+    );
+}
+
+/// A `hash` index doesn't support the leading-column equality lookup the
+/// way `btree` does, and isn't worth special-casing for what's only a
+/// performance hint — the warning still fires.
+#[tokio::test]
+async fn a_hash_index_on_the_join_column_still_warns() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("create index on order_line_items using hash (product_id)")
+        .await
+        .expect("create hash index on join column");
     drop(client);
     create_table_with_pk(&db.pool, "products", "id").await;
 

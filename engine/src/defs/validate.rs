@@ -132,6 +132,22 @@ pub enum ValidationError {
     /// `relationship_definitions` unique constraint that backstops this
     /// check against a same-name race between concurrent callers.
     DuplicateRelationshipName { from_table: String, name: String },
+    /// A relationship's join key resolved to a fractional/arbitrary-precision
+    /// numeric Postgres type (`numeric`, `real`, `double precision` — see
+    /// [`super::catalog::type_family`]'s `"numeric"` bucket). Trellis's
+    /// evaluator compares join keys as `::text` (issue #28 review), and
+    /// Postgres's `::text` rendering of these types isn't stable under
+    /// numeric equality (`1.0::numeric::text` is `"1.0"`, `1.00::numeric::text`
+    /// is `"1.00"`, though `1.0::numeric = 1.00::numeric` is `true`), so a
+    /// real LEFT JOIN match would render as a false-miss NULL in the engine.
+    /// Rejected at definition time rather than silently diverging from the
+    /// Postgres oracle.
+    RelationshipUnsupportedNumericJoinKey {
+        name: String,
+        table: String,
+        column: String,
+        pg_type: String,
+    },
 }
 
 impl fmt::Display for ValidationError {
@@ -232,6 +248,19 @@ impl fmt::Display for ValidationError {
                 f,
                 "relationship '{name}' is already declared on '{from_table}'; relationship \
                  names must be unique per from-table (ADR-0006), so pick a different name"
+            ),
+            ValidationError::RelationshipUnsupportedNumericJoinKey {
+                name,
+                table,
+                column,
+                pg_type,
+            } => write!(
+                f,
+                "relationship '{name}' joins on {table}.{column} ({pg_type}), a floating-point \
+                 or arbitrary-precision numeric column; equal numeric values can render as \
+                 different text (e.g. '1.0' vs '1.00'), so numeric-family columns aren't \
+                 supported as relationship join keys — use an integer, uuid, or text column \
+                 instead"
             ),
         }
     }
