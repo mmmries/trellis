@@ -270,6 +270,11 @@ fn render_expr(expr: &Expr) -> String {
             "oracle: function-call rendering ({name}) is out of scope for the numeric-+ slice \
              (issue #64 adds functions); extend `render_expr` when the generator emits it"
         ),
+        Expr::RelationshipPath { rel, column } => panic!(
+            "oracle: relationship-path rendering ('{rel}.{column}') is out of scope for the \
+             numeric-+ slice (issue #25 is grammar + AST only; no generator support yet); \
+             extend `render_expr` when the generator emits it"
+        ),
     }
 }
 

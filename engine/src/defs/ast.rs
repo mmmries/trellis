@@ -23,6 +23,23 @@ pub struct TransformDef {
     pub predicate: Predicate,
 }
 
+/// A parsed standalone relationship declaration (ADR-0006):
+/// `RELATIONSHIP <name> FROM <from_table>.<fk_col> TO <to_table>.<pk_col>`.
+///
+/// This slice (issue #24) is grammar + AST only. Catalog storage
+/// ([`super::catalog::create_relationship`]) and endpoint/cardinality
+/// validation (issue #27) build on top of it; referencing a relationship
+/// from a calculated field's expression is still deferred — see
+/// [`super::ast::Expr::RelationshipPath`]'s doc comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationshipDef {
+    pub name: String,
+    pub from_table: String,
+    pub from_col: String,
+    pub to_table: String,
+    pub to_col: String,
+}
+
 /// The target table's primary-key space (see `docs/transforms.md#granularity`).
 ///
 /// [`KeySpace::Aggregate`] (issue #11's groundwork) is a `GROUP BY <cols>`
@@ -57,6 +74,12 @@ pub enum Expr {
     NumberLiteral(String),
     /// A single-quoted string literal (issue #63).
     StringLiteral(String),
+    /// A `<rel>.<column>` relationship-path reference (issue #25, ADR-0006).
+    /// `rel` is the head's **relationship name**, not a table/alias —
+    /// resolving whether it's an actually-declared relationship, and its
+    /// cardinality, is deferred to later validation/eval issues; this
+    /// variant is grammar + AST only.
+    RelationshipPath { rel: String, column: String },
     BinaryOp {
         op: Operator,
         lhs: Box<Expr>,

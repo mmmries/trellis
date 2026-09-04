@@ -100,6 +100,18 @@ pub enum EvalError {
     /// and gets exercised standalone in tests and by future callers (#25),
     /// so this is defense-in-depth against a stack overflow.
     Cycle(String),
+    /// A field's expression contains a `<rel>.<column>` relationship-path
+    /// reference (issue #25's grammar). The validator (#23) rejects this
+    /// outright via `ValidationError::UnsupportedRelationshipPath`, so this
+    /// arm is defense-in-depth for the same reason as [`EvalError::Cycle`]:
+    /// `evaluate`/`evaluate_aggregate` are `pub` and can be called directly,
+    /// bypassing `validate`. Resolving and evaluating a relationship path is
+    /// a separate, later issue.
+    UnsupportedRelationshipPath {
+        field: String,
+        rel: String,
+        column: String,
+    },
 }
 
 impl fmt::Display for EvalError {
@@ -126,6 +138,11 @@ impl fmt::Display for EvalError {
                 f,
                 "calculated field '{field}' is part of a cyclic reference"
             ),
+            EvalError::UnsupportedRelationshipPath { field, rel, column } => write!(
+                f,
+                "calculated field '{field}' references relationship path '{rel}.{column}', \
+                 which is not yet supported (grammar-only per issue #25)"
+            ),
         }
     }
 }
@@ -136,7 +153,8 @@ impl std::error::Error for EvalError {
             EvalError::InvalidNumber { source, .. } => Some(source),
             EvalError::MissingColumn { .. }
             | EvalError::InvalidBoolean { .. }
-            | EvalError::Cycle(_) => None,
+            | EvalError::Cycle(_)
+            | EvalError::UnsupportedRelationshipPath { .. } => None,
         }
     }
 }
@@ -277,6 +295,11 @@ fn eval_expr(
             parse_number(field_name, text).map(|n| Some(Value::Numeric(n)))
         }
         Expr::StringLiteral(text) => Ok(Some(Value::Text(text.clone()))),
+        Expr::RelationshipPath { rel, column } => Err(EvalError::UnsupportedRelationshipPath {
+            field: field_name.to_string(),
+            rel: rel.clone(),
+            column: column.clone(),
+        }),
         Expr::BinaryOp { op, lhs, rhs } => {
             let lhs = eval_expr(
                 lhs,
@@ -449,6 +472,11 @@ fn eval_aggregate_expr(
             parse_number(field_name, text).map(|n| Some(Value::Numeric(n)))
         }
         Expr::StringLiteral(text) => Ok(Some(Value::Text(text.clone()))),
+        Expr::RelationshipPath { rel, column } => Err(EvalError::UnsupportedRelationshipPath {
+            field: field_name.to_string(),
+            rel: rel.clone(),
+            column: column.clone(),
+        }),
         Expr::BinaryOp { op, lhs, rhs } => {
             let lhs = eval_aggregate_expr(
                 lhs,

@@ -16,10 +16,26 @@ fn columns(names: &[&str]) -> HashMap<String, ValueType> {
         .collect()
 }
 
+/// Creates a minimal backing relation for a definition's source table
+/// (issue #23's backfill enumerates it for real, via a live `regclass`/
+/// catalog lookup) — a bare PK column is enough, since `validate()` checks
+/// column references against the passed-in `source_columns` map, not the
+/// live schema. Left unqualified so it lands via the pool's ambient
+/// `search_path` (Trellis schema first), matching the schema
+/// `create_definition` assumes for `def.source` today.
+async fn create_bare_source_table(pool: &engine::pool::Pool, name: &str) {
+    let client = pool.get().await.expect("get connection");
+    client
+        .batch_execute(&format!("create table {name} (id serial primary key)"))
+        .await
+        .expect("create bare source table");
+}
+
 #[tokio::test]
 async fn valid_definition_is_stored_and_retrievable() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
 
     let def = create_definition(
         &db.pool,
@@ -50,6 +66,7 @@ async fn valid_definition_is_stored_and_retrievable() {
 async fn transforms_for_source_returns_the_persisted_source_column_types() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
 
     let source_columns: HashMap<String, ValueType> = HashMap::from([
         ("price".to_string(), ValueType::Numeric),
@@ -88,6 +105,7 @@ async fn transforms_for_source_returns_the_persisted_source_column_types() {
 async fn a_definition_with_no_source_columns_survives_the_left_join_read() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "widgets").await;
 
     let def = create_definition(
         &db.pool,
@@ -119,6 +137,7 @@ async fn a_definition_with_no_source_columns_survives_the_left_join_read() {
 async fn transforms_for_source_groups_multiple_subscribers_by_id() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
 
     let totals_columns = HashMap::from([
         ("price".to_string(), ValueType::Numeric),
@@ -162,6 +181,8 @@ async fn transforms_for_source_groups_multiple_subscribers_by_id() {
 async fn creating_a_new_definition_bumps_the_source_tables_version() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
+    create_bare_source_table(&db.pool, "customers").await;
 
     let first = create_definition(
         &db.pool,
@@ -219,6 +240,7 @@ async fn a_column_cycle_within_a_target_is_rejected() {
 async fn a_text_column_passthrough_is_stored_and_retrievable() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "widgets").await;
 
     let source_columns = HashMap::from([("label".to_string(), ValueType::Text)]);
     let def = create_definition(
@@ -285,7 +307,7 @@ async fn an_unresolved_column_reference_is_rejected() {
 }
 
 #[tokio::test]
-async fn cross_join_and_relationship_definitions_are_rejected_cleanly() {
+async fn cross_join_and_partial_data_definitions_are_rejected_cleanly() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -298,15 +320,6 @@ async fn cross_join_and_relationship_definitions_are_rejected_cleanly() {
     .unwrap_err();
     assert!(matches!(cross_join, CatalogError::Parse(_)));
 
-    let relationship = create_definition(
-        &db.pool,
-        "TRANSFORM t FROM s SELECT product.category_name AS x",
-        &HashMap::new(),
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(relationship, CatalogError::Parse(_)));
-
     let partial_data = create_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT a AS x WHERE a = b",
@@ -317,6 +330,45 @@ async fn cross_join_and_relationship_definitions_are_rejected_cleanly() {
     assert!(matches!(partial_data, CatalogError::Parse(_)));
 
     // None of the rejected attempts should have left a row behind.
+    let subscribers = transforms_for_source(&db.pool, "s")
+        .await
+        .expect("query mapping");
+    assert!(subscribers.is_empty());
+}
+
+/// Unlike `JOIN`, a `<rel>.<column>` relationship path is now real grammar
+/// (issue #25) rather than a parse-time rejection, so it parses successfully
+/// and instead fails at validation (the validator has no relationship
+/// resolution yet — that's a separate, later issue) — exercising that the
+/// catalog's parse-then-validate pipeline routes it through validation
+/// rather than short-circuiting at parse time the way `JOIN` still does.
+#[tokio::test]
+async fn a_relationship_path_definition_is_rejected_at_validation() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let err = create_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT product.category_name AS x",
+        &HashMap::new(),
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        CatalogError::Validate(ValidationError::UnsupportedRelationshipPath {
+            field,
+            rel,
+            column,
+        }) => {
+            assert_eq!(field, "x");
+            assert_eq!(rel, "product");
+            assert_eq!(column, "category_name");
+        }
+        other => panic!("expected an UnsupportedRelationshipPath validation error, got {other:?}"),
+    }
+
+    // The rejected attempt should not have left a row behind.
     let subscribers = transforms_for_source(&db.pool, "s")
         .await
         .expect("query mapping");
@@ -359,6 +411,7 @@ async fn an_aggregate_definition_with_an_unresolvable_group_by_column_is_rejecte
 async fn source_to_transform_mapping_reflects_a_newly_created_definition() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
 
     let before = transforms_for_source(&db.pool, "orders")
         .await
@@ -393,6 +446,8 @@ async fn source_to_transform_mapping_reflects_a_newly_created_definition() {
 async fn a_duplicate_target_table_surfaces_the_underlying_postgres_detail() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
+    create_bare_source_table(&db.pool, "customers").await;
 
     create_definition(
         &db.pool,

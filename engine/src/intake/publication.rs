@@ -270,7 +270,15 @@ const BACKFILL_CURSOR: &str = "trellis_backfill_cursor";
 /// spill). A cursor only lives for the transaction that declares it, which
 /// is exactly the scope `txn` already has here — so paging changes nothing
 /// about the one-transaction durability guarantee both callers rely on.
-async fn enumerate_and_append(txn: &Transaction<'_>, src_table: &str) -> Result<(), IntakeError> {
+///
+/// Also reused by definition creation's backfill (issue #23): a definition
+/// enumerates its source exactly once here regardless of how many
+/// calculated fields it declares, preserving the "N columns, one backfill"
+/// property as the definition model becomes first-class.
+pub(crate) async fn enumerate_and_append(
+    txn: &Transaction<'_>,
+    src_table: &str,
+) -> Result<(), IntakeError> {
     let (schema, table) = split_qualified(src_table)?;
     let pk_cols = primary_key_columns(txn, schema, table).await?;
     if pk_cols.is_empty() {

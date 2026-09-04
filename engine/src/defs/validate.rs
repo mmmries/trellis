@@ -29,6 +29,18 @@ pub enum ValidationError {
     UnresolvedColumn { field: String, column: String },
     /// The calculated-column dependency graph contains a cycle.
     Cycle { cycle: Vec<String> },
+    /// Adding a table-to-table dependency edge from a definition's source to
+    /// its target would create a cycle in the two-level dependency graph
+    /// (issue #22 follow-up: cycle detection generalized from column-only,
+    /// within one [`TransformDef`], to the whole graph of tables connected
+    /// by [`super::model::SchemaEdge`]s — currently just `Source` edges, but
+    /// checked generically over whatever edge kinds exist so `Join`/
+    /// `Relationship` edges need no rework here once persisted). Distinct
+    /// from [`ValidationError::Cycle`], which names calculated *columns*
+    /// within a single definition, since this names *tables* across
+    /// definitions and is only ever detected once the persisted graph is
+    /// consulted — see [`super::catalog`].
+    TableCycle { cycle: Vec<String> },
     /// The target table is the same as the source table. Calculated columns
     /// must live on a separate neighbor table — writing them back onto the
     /// source would feed our own WAL into ingestion (see `docs/data-flow.md`).
@@ -86,6 +98,40 @@ pub enum ValidationError {
     /// keeps that assumption enforced at validation, not a silent DDL-time
     /// skip.
     GroupingColumnFieldMustBePassthrough { field: String },
+    /// A field's expression contains a `<rel>.<column>` relationship-path
+    /// reference (issue #25's grammar). Resolving a relationship name,
+    /// checking its cardinality, and evaluating the path are all separate,
+    /// later issues (ADR-0006) — this validator rejects it outright rather
+    /// than letting an unresolvable reference reach [`super::eval`] or
+    /// [`super::oracle`].
+    UnsupportedRelationshipPath {
+        field: String,
+        rel: String,
+        column: String,
+    },
+    /// A relationship endpoint (issue #27, ADR-0006) names a `table.column`
+    /// pair that doesn't exist, as introspected live against `pg_catalog` —
+    /// ADR-0005 forbids Trellis from assuming a column exists rather than
+    /// checking, even though it never issues DDL against the table itself.
+    UnknownRelationshipColumn { table: String, column: String },
+    /// A relationship's `from_col`/`to_col` (issue #27, ADR-0006's "type-check
+    /// the join") resolved to Postgres types that aren't comparable — e.g.
+    /// joining a `text` column to a `uuid` column.
+    RelationshipTypeMismatch {
+        name: String,
+        from_table: String,
+        from_col: String,
+        from_type: String,
+        to_table: String,
+        to_col: String,
+        to_type: String,
+    },
+    /// A relationship name was already declared on the same `from_table`
+    /// (issue #27, surfacing ADR-0006's "Naming and scope": unique
+    /// per-from-table, not global) with an actionable message, ahead of the
+    /// `relationship_definitions` unique constraint that backstops this
+    /// check against a same-name race between concurrent callers.
+    DuplicateRelationshipName { from_table: String, name: String },
 }
 
 impl fmt::Display for ValidationError {
@@ -101,6 +147,9 @@ impl fmt::Display for ValidationError {
             ),
             ValidationError::Cycle { cycle } => {
                 write!(f, "cycle among calculated columns: {}", cycle.join(" -> "))
+            }
+            ValidationError::TableCycle { cycle } => {
+                write!(f, "cycle among tables: {}", cycle.join(" -> "))
             }
             ValidationError::TargetEqualsSource { table } => write!(
                 f,
@@ -155,6 +204,34 @@ impl fmt::Display for ValidationError {
                 f,
                 "calculated field '{field}' shares its name with a GROUP BY column, so it must \
                  be a bare passthrough of that column (e.g. `{field}`), not another expression"
+            ),
+            ValidationError::UnsupportedRelationshipPath { field, rel, column } => write!(
+                f,
+                "calculated field '{field}' references relationship path '{rel}.{column}', \
+                 which is not yet supported (grammar-only per issue #25; resolution and \
+                 evaluation are separate, later issues)"
+            ),
+            ValidationError::UnknownRelationshipColumn { table, column } => write!(
+                f,
+                "relationship references '{table}.{column}', which does not exist"
+            ),
+            ValidationError::RelationshipTypeMismatch {
+                name,
+                from_table,
+                from_col,
+                from_type,
+                to_table,
+                to_col,
+                to_type,
+            } => write!(
+                f,
+                "relationship '{name}' joins {from_table}.{from_col} ({from_type}) to \
+                 {to_table}.{to_col} ({to_type}), which are not comparable types"
+            ),
+            ValidationError::DuplicateRelationshipName { from_table, name } => write!(
+                f,
+                "relationship '{name}' is already declared on '{from_table}'; relationship \
+                 names must be unique per from-table (ADR-0006), so pick a different name"
             ),
         }
     }
@@ -302,6 +379,13 @@ fn validate_aggregate_field_expr(
             Ok(())
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) => Ok(()),
+        Expr::RelationshipPath { rel, column } => {
+            Err(ValidationError::UnsupportedRelationshipPath {
+                field: field_name.to_string(),
+                rel: rel.clone(),
+                column: column.clone(),
+            })
+        }
         Expr::BinaryOp { lhs, rhs, .. } => {
             validate_aggregate_field_expr(
                 lhs,
@@ -338,6 +422,10 @@ fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::Column(name) => out.push(name.clone()),
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        // Not a source-column reference by name — `infer_expr` rejects this
+        // via `ValidationError::UnsupportedRelationshipPath` once type
+        // inference walks the same expression.
+        Expr::RelationshipPath { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_columns(lhs, out);
             collect_columns(rhs, out);
@@ -449,6 +537,13 @@ fn infer_expr(
         }
         Expr::NumberLiteral(_) => Ok(ValueType::Numeric),
         Expr::StringLiteral(_) => Ok(ValueType::Text),
+        Expr::RelationshipPath { rel, column } => {
+            Err(ValidationError::UnsupportedRelationshipPath {
+                field: field_name.to_string(),
+                rel: rel.clone(),
+                column: column.clone(),
+            })
+        }
         Expr::BinaryOp { op, lhs, rhs } => {
             let lhs_t = infer_expr(
                 lhs,

@@ -13,11 +13,27 @@
 //! cross-join (`JOIN <other> ON <cond>`) key-space clause will slot in;
 //! this slice only accepts the 1-1 case (clause absent) and rejects both
 //! keywords by name if present. `<expr>` supports column references,
-//! numeric and string literals, `+`, `>` (issue #65), and `name(args)`
-//! function calls against [`super::registry::FUNCTIONS`] (issue #64);
-//! `<predicate>` accepts only the literal `TRUE`.
+//! numeric and string literals, `+`, `>` (issue #65), `name(args)`
+//! function calls against [`super::registry::FUNCTIONS`] (issue #64), and
+//! `<rel>.<column>` relationship-path references (issue #25, ADR-0006) —
+//! whose head is a relationship name, resolved and cardinality-checked by
+//! later issues, not this parser. `<predicate>` accepts only the literal
+//! `TRUE`.
+//!
+//! A second, standalone statement form (ADR-0006, issue #24) declares a
+//! named relationship rather than a transform:
+//!
+//! ```text
+//! RELATIONSHIP <name> FROM <from_table>.<fk_col> TO <to_table>.<pk_col>
+//! ```
+//!
+//! It's parsed by [`parse_relationship`], a sibling entry point to [`parse`]
+//! rather than a case [`parse`] itself dispatches on — see [`parse`]'s doc
+//! comment for why. This slice is grammar + AST only: referencing a
+//! relationship from a calculated field, cardinality validation, and catalog
+//! storage are all separate, later issues.
 
-use super::ast::{Expr, FieldDef, KeySpace, Predicate, TransformDef};
+use super::ast::{Expr, FieldDef, KeySpace, Predicate, RelationshipDef, TransformDef};
 use super::error::ParseError;
 use super::lexer::{Token, lex};
 use super::registry::{
@@ -28,6 +44,15 @@ use super::registry::{
 const OPERATOR_CHARS: &[char] = &['+', '-', '*', '/', '%', '>', '<', '='];
 
 /// Parses a transform definition's source text into a [`TransformDef`].
+///
+/// This entry point is unchanged by issue #24's `RELATIONSHIP` statement: it
+/// stays `TransformDef`-typed so existing callers (the catalog, the tests
+/// above) don't need to unwrap a statement-kind enum. See
+/// [`parse_relationship`] for the sibling entry point that parses the new
+/// standalone-relationship grammar; both share the same lexer and error type,
+/// and a caller that doesn't yet know which kind of statement it has can
+/// peek the first token itself (`RELATIONSHIP` vs. `TRANSFORM`) to choose
+/// between them, the same check [`parse_relationship`] makes internally.
 pub fn parse(input: &str) -> Result<TransformDef, ParseError> {
     let tokens = lex(input)?;
     Parser {
@@ -36,6 +61,22 @@ pub fn parse(input: &str) -> Result<TransformDef, ParseError> {
         is_aggregate: false,
     }
     .parse_transform_def()
+}
+
+/// Parses a standalone relationship declaration's source text into a
+/// [`RelationshipDef`] (ADR-0006, issue #24):
+///
+/// ```text
+/// RELATIONSHIP <name> FROM <from_table>.<fk_col> TO <to_table>.<pk_col>
+/// ```
+pub fn parse_relationship(input: &str) -> Result<RelationshipDef, ParseError> {
+    let tokens = lex(input)?;
+    Parser {
+        tokens,
+        pos: 0,
+        is_aggregate: false,
+    }
+    .parse_relationship_def()
 }
 
 struct Parser {
@@ -96,6 +137,34 @@ impl Parser {
         matches!(self.peek(), Token::Symbol(s) if *s == c)
     }
 
+    fn expect_symbol(&mut self, c: char) -> Result<(), ParseError> {
+        match self.advance() {
+            Token::Symbol(s) if s == c => Ok(()),
+            Token::Eof => Err(ParseError::UnexpectedEof {
+                expected: format!("'{c}'"),
+            }),
+            other => Err(ParseError::UnexpectedToken {
+                expected: format!("'{c}'"),
+                found: other.describe(),
+            }),
+        }
+    }
+
+    /// Parses a dot-qualified `<table>.<col>` reference, the new-relative-to
+    /// existing-statement-forms syntax ADR-0006 introduces for a
+    /// relationship's endpoints. There's no reuse target in the expression
+    /// grammar for this: `parse_primary`'s `a.b` handling (issue #25) builds
+    /// an [`Expr::RelationshipPath`] whose head is a relationship name, not
+    /// a table — a different semantic than a relationship declaration's
+    /// `<table>.<col>` endpoints, so malformed input here still gets its own
+    /// report rather than being unified with the expression-grammar path.
+    fn expect_table_dot_column(&mut self) -> Result<(String, String), ParseError> {
+        let table = self.expect_ident()?;
+        self.expect_symbol('.')?;
+        let column = self.expect_ident()?;
+        Ok((table, column))
+    }
+
     fn parse_transform_def(&mut self) -> Result<TransformDef, ParseError> {
         self.expect_keyword("TRANSFORM")?;
         let target = self.expect_ident()?;
@@ -133,6 +202,43 @@ impl Parser {
             key_space,
             fields,
             predicate,
+        })
+    }
+
+    /// Parses `RELATIONSHIP <name> FROM <from_table>.<fk_col> TO
+    /// <to_table>.<pk_col>` (ADR-0006, issue #24). `RELATIONSHIP`/`FROM`/`TO`
+    /// are matched case-insensitively, matching every other keyword in this
+    /// grammar (`expect_keyword`); `name` and the four table/column
+    /// components are captured as raw identifiers, exactly like
+    /// `parse_transform_def`'s `target`/`source` — validating them as real
+    /// tables/columns (cardinality, existence, cycles) is deferred to a
+    /// later issue per ADR-0006's own scoping.
+    fn parse_relationship_def(&mut self) -> Result<RelationshipDef, ParseError> {
+        self.expect_keyword("RELATIONSHIP")?;
+        let name = self.expect_ident()?;
+
+        self.expect_keyword("FROM")?;
+        let (from_table, from_col) = self.expect_table_dot_column()?;
+
+        self.expect_keyword("TO")?;
+        let (to_table, to_col) = self.expect_table_dot_column()?;
+
+        match self.advance() {
+            Token::Eof => {}
+            other => {
+                return Err(ParseError::UnexpectedToken {
+                    expected: "end of input".to_string(),
+                    found: other.describe(),
+                });
+            }
+        }
+
+        Ok(RelationshipDef {
+            name,
+            from_table,
+            from_col,
+            to_table,
+            to_col,
         })
     }
 
@@ -248,10 +354,8 @@ impl Parser {
 
                 if self.peek_is_symbol('.') {
                     self.advance();
-                    let field = self.expect_ident()?;
-                    return Err(ParseError::UnsupportedRelationshipPath {
-                        path: format!("{name}.{field}"),
-                    });
+                    let column = self.expect_ident()?;
+                    return Ok(Expr::RelationshipPath { rel: name, column });
                 }
 
                 if self.peek_is_symbol('(') {

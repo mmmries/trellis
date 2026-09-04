@@ -37,9 +37,13 @@ mod parser;
 pub mod registry;
 pub mod validate;
 
-pub use ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
+pub use ast::{
+    Expr, FieldDef, KeySpace, Operator, Predicate, RelationshipDef, TransformDef, ValueType,
+};
 pub use catalog::{
-    CatalogError, all_source_tables, create_definition, source_table_version, transforms_for_source,
+    CatalogError, all_source_tables, create_definition, create_relationship, dependents_of,
+    edges_from, node_for_table, persist_edge, relationship_by_name, resolve_node,
+    source_table_version, transforms_for_source,
 };
 pub use ddl::{
     DdlError, PrimaryKeyColumn, create_aggregate_target_table, create_target_table,
@@ -48,12 +52,15 @@ pub use ddl::{
 pub use error::ParseError;
 pub use eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
 pub use invertibility::{AggregateArg, CountArg, Invertibility, PartialField, Verdict, classify};
-pub use model::Definition;
+pub use model::{
+    Definition, EdgeKind, NodeKind, RelationshipCardinality, RelationshipDefinition, SchemaEdge,
+    SchemaNode,
+};
 pub use oracle::{
     OracleError, Recomputed, recompute, recompute_aggregate, render_aggregate_select_sql,
     render_expr_sql,
 };
-pub use parser::parse;
+pub use parser::{parse, parse_relationship};
 pub use validate::{ValidationError, validate};
 
 #[cfg(test)]
@@ -261,14 +268,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_relationship_path() {
-        let err = parse("TRANSFORM t FROM s SELECT product.category_name AS x").unwrap_err();
-        match err {
-            ParseError::UnsupportedRelationshipPath { path } => {
-                assert_eq!(path, "product.category_name");
+    fn parses_relationship_path() {
+        let def = parse("TRANSFORM t FROM s SELECT product.category_name AS x").unwrap();
+        assert_eq!(
+            def.fields[0].expr,
+            Expr::RelationshipPath {
+                rel: "product".to_string(),
+                column: "category_name".to_string(),
             }
-            other => panic!("expected UnsupportedRelationshipPath, got {other:?}"),
-        }
+        );
     }
 
     #[test]
@@ -455,6 +463,115 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn parses_a_relationship_declaration() {
+        let rel = parse_relationship(
+            "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+        )
+        .unwrap();
+        assert_eq!(
+            rel,
+            RelationshipDef {
+                name: "product".to_string(),
+                from_table: "order_line_items".to_string(),
+                from_col: "product_id".to_string(),
+                to_table: "products".to_string(),
+                to_col: "id".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_second_relationship_declaration_with_different_names() {
+        let rel =
+            parse_relationship("RELATIONSHIP author FROM posts.author_id TO users.id").unwrap();
+        assert_eq!(
+            rel,
+            RelationshipDef {
+                name: "author".to_string(),
+                from_table: "posts".to_string(),
+                from_col: "author_id".to_string(),
+                to_table: "users".to_string(),
+                to_col: "id".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn relationship_keywords_are_case_insensitive() {
+        let rel = parse_relationship(
+            "relationship product from order_line_items.product_id to products.id",
+        )
+        .unwrap();
+        assert_eq!(rel.name, "product");
+    }
+
+    #[test]
+    fn rejects_relationship_missing_from() {
+        let err =
+            parse_relationship("RELATIONSHIP product order_line_items.product_id TO products.id")
+                .unwrap_err();
+        match err {
+            ParseError::UnexpectedToken { expected, .. } => assert_eq!(expected, "'FROM'"),
+            other => panic!("expected UnexpectedToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_relationship_missing_dot_on_from_column() {
+        let err = parse_relationship("RELATIONSHIP product FROM order_line_items TO products.id")
+            .unwrap_err();
+        match err {
+            ParseError::UnexpectedToken { expected, .. } => assert_eq!(expected, "'.'"),
+            other => panic!("expected UnexpectedToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_relationship_missing_to() {
+        let err =
+            parse_relationship("RELATIONSHIP product FROM order_line_items.product_id products.id")
+                .unwrap_err();
+        match err {
+            ParseError::UnexpectedToken { expected, .. } => assert_eq!(expected, "'TO'"),
+            other => panic!("expected UnexpectedToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_relationship_missing_name() {
+        let err =
+            parse_relationship("RELATIONSHIP FROM order_line_items.product_id TO products.id")
+                .unwrap_err();
+        match err {
+            ParseError::UnexpectedToken { expected, .. } => assert_eq!(expected, "'FROM'"),
+            other => panic!("expected UnexpectedToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_relationship_trailing_garbage() {
+        let err = parse_relationship(
+            "RELATIONSHIP product FROM order_line_items.product_id TO products.id EXTRA",
+        )
+        .unwrap_err();
+        match err {
+            ParseError::UnexpectedToken { expected, .. } => assert_eq!(expected, "end of input"),
+            other => panic!("expected UnexpectedToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_relationship_missing_dot_on_to_column() {
+        let err =
+            parse_relationship("RELATIONSHIP product FROM order_line_items.product_id TO products")
+                .unwrap_err();
+        match err {
+            ParseError::UnexpectedEof { expected } => assert_eq!(expected, "'.'"),
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
     }
 
     #[test]
