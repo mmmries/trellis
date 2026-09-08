@@ -320,6 +320,17 @@ pub async fn create_target_table(
     // still serve as a relationship join key). Only introspect the source
     // table's column types when at least one such field exists — a definition
     // with none behaves exactly as before, no extra query.
+    //
+    // Staging (`staging::apply`) still casts every value through its
+    // `ValueType`-based cast (e.g. `::text::numeric`) before the INSERT,
+    // regardless of the narrower concrete column type declared here — it
+    // relies on Postgres's implicit assignment cast (`numeric` -> `integer`,
+    // `text` -> `varchar(n)`, ...) to land the value. That's only safe because
+    // a bare passthrough's value provably originates from this same,
+    // identically-typed source column, so it always satisfies the narrower
+    // column's constraints. If a passthrough field's value could ever diverge
+    // from its source column's type/width, this coupling would need
+    // revisiting (staging would need to cast to the concrete type too).
     let passthroughs: HashMap<&str, &str> = def
         .fields
         .iter()
