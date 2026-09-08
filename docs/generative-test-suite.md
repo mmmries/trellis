@@ -16,7 +16,7 @@ recompute oracle**, and shrinks any failure to a minimal reproducing program.
 
 This document records the architecture we are building toward and the tradeoffs
 behind each choice. The step-by-step build plan lives in the tracking epic
-(spiff-emu/trellis, label `Epic`: *Generative correctness test suite*); this doc
+(salesforce-misc/trellis, label `Epic`: *Generative correctness test suite*); this doc
 is the design it references.
 
 ---
