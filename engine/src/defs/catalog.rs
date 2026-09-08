@@ -53,6 +53,10 @@ pub enum CatalogError {
     /// The definition's initial backfill (issue #23) failed to enumerate its
     /// source table.
     Backfill(crate::intake::IntakeError),
+    /// `def.source` doesn't resolve to any schema on this connection's
+    /// search path (see [`resolve_source_schema_in_txn`]) — the table was
+    /// dropped, renamed, or never existed under that bare name.
+    SourceTableNotFound(String),
 }
 
 impl fmt::Display for CatalogError {
@@ -74,6 +78,9 @@ impl fmt::Display for CatalogError {
             CatalogError::Backfill(err) => {
                 write!(f, "failed to backfill the definition's source table: {err}")
             }
+            CatalogError::SourceTableNotFound(table) => {
+                write!(f, "source table \"{table}\" not found on the search path")
+            }
         }
     }
 }
@@ -87,6 +94,7 @@ impl std::error::Error for CatalogError {
             CatalogError::Pool(err) => Some(err),
             CatalogError::UnknownValueType { .. } => None,
             CatalogError::Backfill(err) => Some(err),
+            CatalogError::SourceTableNotFound(_) => None,
         }
     }
 }
@@ -180,21 +188,17 @@ pub async fn create_definition(
     // declares, not one per field, preserving the "N columns, one backfill"
     // property as the definition model becomes first-class. Today the
     // grammar's `FROM`/`TARGET` have no schema-qualification syntax, so
-    // `def.source` must be resolved by kind rather than by a single fixed
-    // schema: a chained definition's source can itself be a *previous*
-    // definition's target table, which always lives in
-    // `DEFAULT_TARGET_SCHEMA` (`create_target_table`'s hardcoded schema
-    // argument) — not the ambient Trellis schema every raw/CDC-tracked
-    // source resolves to via `pool::session_bootstrap`'s `search_path`. The
-    // node we just resolved above (`source_node`) already carries exactly
-    // this signal: `is_target` is true iff some earlier `create_definition`
-    // call registered `def.source` as a target.
-    let source_schema = if source_node.is_target {
-        crate::config::DEFAULT_TARGET_SCHEMA
-    } else {
-        crate::config::DEFAULT_SCHEMA
-    };
-    let qualified_source = crate::intake::publication::qualify(source_schema, &def.source)?;
+    // `def.source` must be resolved live, exactly as Postgres itself would
+    // resolve the bare name: via `resolve_source_schema_in_txn`, which walks
+    // `search_path` (`pool::session_bootstrap` pins it to the Trellis
+    // schema, then the target schema, then `public`, in that order). This
+    // covers both a raw/CDC source (typically `public`) and a chained
+    // definition's source being a *previous* definition's target table
+    // (whatever schema `config.target_schema()` actually resolved to,
+    // which may not be the `DEFAULT_TARGET_SCHEMA` constant if overridden)
+    // without needing to special-case on `source_node.is_target`.
+    let source_schema = resolve_source_schema_in_txn(&txn, &def.source).await?;
+    let qualified_source = crate::intake::publication::qualify(&source_schema, &def.source)?;
     crate::intake::publication::enumerate_and_append(&txn, &qualified_source).await?;
 
     let version: i64 = txn
@@ -516,6 +520,30 @@ pub(crate) async fn resolve_relationships(
         );
     }
     Ok(resolved)
+}
+
+/// Resolves `source_table`'s actual schema the same way Postgres itself
+/// would resolve the bare, unqualified name: the first schema on this
+/// connection's `search_path` (`current_schemas(false)`, in `search_path`
+/// order) that actually has a table by that name. Mirrors `defctl`'s own
+/// `source_columns`/`qualified_source_tables` introspection — see
+/// [`create_definition`]'s call site for why this replaced an
+/// `is_target`-based guess.
+async fn resolve_source_schema_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    source_table: &str,
+) -> Result<String, CatalogError> {
+    let row = txn
+        .query_opt(
+            "select table_schema from information_schema.tables \
+             where table_name = $1 and table_schema = any(current_schemas(false)) \
+             order by array_position(current_schemas(false), table_schema) \
+             limit 1",
+            &[&source_table],
+        )
+        .await?;
+    row.map(|row| row.get(0))
+        .ok_or_else(|| CatalogError::SourceTableNotFound(source_table.to_string()))
 }
 
 /// Pooled (non-transaction) counterpart to [`column_type_in_txn`], for
