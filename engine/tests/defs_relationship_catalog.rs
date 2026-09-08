@@ -1246,3 +1246,76 @@ async fn an_integer_passthrough_on_a_calculated_table_is_a_valid_join_key() {
     .await
     .expect("integer passthrough on a calculated table must be a valid join key");
 }
+
+/// Negative counterpart to
+/// `an_integer_passthrough_on_a_calculated_table_is_a_valid_join_key`: the
+/// #45 fix only narrows a bare passthrough to the source column's *concrete*
+/// type when that type is itself text-stable (e.g. `integer`). A passthrough
+/// of a genuinely `numeric`/`real`/`double precision` source column must
+/// still be DDL'd with that (non-text-stable) concrete type and therefore
+/// still fail the join-key allowlist exactly as before the fix — confirming
+/// #45 didn't accidentally make true-numeric-family columns eligible as join
+/// keys.
+#[tokio::test]
+async fn a_numeric_passthrough_on_a_calculated_table_is_still_rejected_as_a_join_key() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table authors (id real primary key, name text); \
+             create table posts (id integer primary key, author real, body text)",
+        )
+        .await
+        .expect("seed authors and posts");
+    drop(client);
+
+    // A calculated 1-1 transform over `posts` that passes the `author`
+    // `real` column through alongside a derived field.
+    let dsl =
+        "TRANSFORM posts_calc FROM posts SELECT author AS author, octet_length(body) AS byte_size";
+    let source_columns = HashMap::from([
+        ("author".to_string(), ValueType::Numeric),
+        ("body".to_string(), ValueType::Text),
+    ]);
+    create_definition(&db.pool, dsl, &source_columns)
+        .await
+        .expect("valid calculated definition should be stored");
+
+    let def = parse(dsl).expect("parse dsl for target materialization");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+        .await
+        .expect("materialize calculated target table");
+
+    // Relate the calculated table's `real` passthrough (checked first, as
+    // the from-side) to `authors.id` (also `real`, so the two endpoints are
+    // comparable and the join-key-type check — not the type-mismatch check
+    // — is what rejects this).
+    let err = create_relationship(
+        &db.pool,
+        "RELATIONSHIP author FROM posts_calc.author TO authors.id",
+    )
+    .await
+    .unwrap_err();
+
+    match &err {
+        CatalogError::Validate(ValidationError::RelationshipUnsupportedJoinKeyType {
+            table,
+            column,
+            ..
+        }) => {
+            assert_eq!(table, "posts_calc");
+            assert_eq!(column, "author");
+        }
+        other => panic!("expected RelationshipUnsupportedJoinKeyType, got {other:?}"),
+    }
+
+    let missing = relationship_by_name(&db.pool, "posts_calc", "author")
+        .await
+        .expect("read query");
+    assert!(missing.is_none());
+}
