@@ -1484,6 +1484,92 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
     }
 }
 
+/// Regression test for the bind-parameter cap (`apply_target`'s
+/// `MAX_WRITE_PARAMS_PER_STATEMENT`): a single target's write batch large
+/// enough that one unchunked `INSERT ... VALUES` would need more than
+/// Postgres's 65535-bind-parameter-per-statement limit. `order_totals` has
+/// 2 columns per row (`id`, `total`), so 33,000 rows needs 66,000 params —
+/// over the cap, and enough to force the chunking loop to split across two
+/// chunks (30,000 + 3,000) rather than just brush the boundary. Before the
+/// fix, this batch would fail every attempt with a `Kind::Parse` "invalid
+/// message length: parameters is not drained" error and retry forever
+/// (issue: apply_target never completing on a >~16k-row backfill).
+#[tokio::test]
+async fn a_write_batch_past_the_bind_parameter_cap_chunks_and_still_drains() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    const N: i64 = 33_000;
+
+    client
+        .batch_execute(
+            "create table orders (id integer primary key, price numeric, tax numeric); \
+             insert into orders (id, price, tax) \
+             select i, i::numeric, 1.00 from generate_series(1, 33000) as i",
+        )
+        .await
+        .expect("seed source table");
+
+    let def = order_totals_def();
+    let source_columns = numeric_columns(&["id", "price", "tax"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM orders SELECT price + tax AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create definition");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+        .await
+        .expect("create target table");
+
+    // Every row staged as a bare recompute trigger, same shape a backfill's
+    // enumeration produces — one `INSERT ... SELECT` rather than N round
+    // trips, since staging this many rows isn't itself what's under test.
+    client
+        .execute(
+            "insert into seg_0 (src_table, key, op, hop_gen) \
+             select 'orders', i::text, 'recompute', 0 from generate_series(1, $1::bigint) as i",
+            &[&N],
+        )
+        .await
+        .expect("stage recompute rows");
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let outcome = drain(&db.pool, seg_seq, "worker").await;
+    assert_eq!(outcome.keys_written, N as usize);
+
+    let target_count: i64 = client
+        .query_one("select count(*) from order_totals", &[])
+        .await
+        .expect("count target table")
+        .get(0);
+    assert_eq!(target_count, N);
+
+    let oracle = recompute(&db.pool, &def, &pk.name, &source_columns)
+        .await
+        .expect("oracle recompute");
+    let target_rows = client
+        .query("select id::text, total::text from order_totals", &[])
+        .await
+        .expect("read target table");
+    assert_eq!(target_rows.len() as i64, N);
+    for row in target_rows {
+        let id: String = row.get(0);
+        let total: Option<String> = row.get(1);
+        let expected = &oracle[&id];
+        assert_eq!(
+            total,
+            expected["total"].as_ref().map(|n| n.to_string()),
+            "total mismatch for id {id}"
+        );
+    }
+}
+
 /// A single bucket mixing all three shapes `compute()` dispatches on (see
 /// its own doc comment): a staged `new_image` (decoded inline, no refetch),
 /// a genuine CDC delete (`old_image` only, no refetch either), and bare

@@ -1152,20 +1152,32 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
 // Phase 3: apply ∪ mark-drained
 // ---------------------------------------------------------------------
 
-/// Runs one target table's ordered pre-lock, no-op-suppressed upsert, and
-/// delete as a single statement, returning the keys Postgres actually wrote
-/// to vs. deleted (as opposed to every key this batch merely *proposed* —
-/// the no-op-suppression `WHERE ... IS DISTINCT FROM ...` guard can mean a
+/// Postgres's wire protocol caps one statement's total bound parameters at
+/// `i16::MAX` (65535) — the same limit `append::append`'s `MAX_ROWS_PER_STATEMENT`
+/// exists to respect. A write row's parameter count scales with its target's
+/// field count, so unlike `append::append` (whose row shape is fixed) this
+/// is a parameter budget, not a row count: [`apply_target`] divides it by
+/// `cols_per_row` to get the actual chunk size. 60000 leaves headroom below
+/// 65535 regardless of column count.
+const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
+
+/// Runs one target table's ordered pre-lock, then its no-op-suppressed
+/// upsert and delete, returning the keys Postgres actually wrote to vs.
+/// deleted (as opposed to every key this batch merely *proposed* — the
+/// no-op-suppression `WHERE ... IS DISTINCT FROM ...` guard can mean a
 /// proposed write physically changes nothing).
 ///
-/// The `locked` CTE takes every key this call touches (write or delete)
-/// `FOR UPDATE`, ordered ascending — the deadlock-avoidance convention doc
-/// 05 calls for between concurrent workers writing overlapping target rows
-/// — and is referenced from both `upserted`/`deleted` via a non-correlated
-/// `(select count(*) from locked) >= 0` guard, mirroring `claim.rs`'s
-/// `flip_guard` exactly: an unreferenced data-modifying CTE is silently
-/// planned away by Postgres, so both branches must force `locked` to run
-/// even when their own row set is empty.
+/// The pre-lock takes every key this call touches (write or delete) `FOR
+/// UPDATE`, ordered ascending, in one round trip — the deadlock-avoidance
+/// convention doc 05 calls for between concurrent workers writing
+/// overlapping target rows. It binds the whole key set as a single `text[]`
+/// parameter, so — unlike the upsert below — its size never approaches the
+/// bind-parameter cap regardless of batch size. Because this transaction
+/// already holds every lock it needs before the upsert/delete run, chunking
+/// those into multiple statements below doesn't reopen the ordering gap the
+/// pre-lock exists to close: two transactions racing on overlapping keys
+/// still each take every lock, in the same ascending order, before either
+/// writes anything.
 async fn apply_target(
     txn: &Transaction<'_>,
     target: &str,
@@ -1189,22 +1201,15 @@ async fn apply_target(
     lock_keys.sort_unstable();
     lock_keys.dedup();
 
-    let mut sql = format!(
-        "with locked as ( \
-             select {pk_ident} from {target_ident} \
+    txn.query(
+        &format!(
+            "select {pk_ident} from {target_ident} \
              where {pk_ident} = any($1::text[]::{pk_cast}[]) \
-             order by {pk_ident} for update \
-         )"
-    );
-
-    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&lock_keys];
-    let mut next_param = 2usize;
-
-    // Owned text renderings of every write row's values, kept alive for the
-    // whole function so `params` can borrow into them.
-    let write_pk_texts: Vec<&str> = plan.writes.iter().map(|w| w.pk_text.as_str()).collect();
-    let write_field_texts: Vec<Vec<Option<String>>> =
-        plan.writes.iter().map(|w| w.values.clone()).collect();
+             order by {pk_ident} for update"
+        ),
+        &[&lock_keys],
+    )
+    .await?;
 
     let field_pg_types: Vec<&str> = plan
         .field_types
@@ -1222,18 +1227,11 @@ async fn apply_target(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let has_writes = !plan.writes.is_empty();
-    if has_writes {
+    let mut written = Vec::new();
+    if !plan.writes.is_empty() {
         let cols_per_row = 1 + plan.field_names.len();
-        let mut rows_sql = Vec::with_capacity(plan.writes.len());
-        for i in 0..plan.writes.len() {
-            let base = next_param + i * cols_per_row;
-            let mut row_parts = vec![format!("${base}::text::{pk_cast}")];
-            for (j, pg_type) in field_pg_types.iter().enumerate() {
-                row_parts.push(format!("${}::text::{pg_type}", base + 1 + j));
-            }
-            rows_sql.push(format!("({})", row_parts.join(", ")));
-        }
+        let rows_per_chunk = (MAX_WRITE_PARAMS_PER_STATEMENT / cols_per_row).max(1);
+
         let set_list = field_idents
             .iter()
             .map(|f| format!("{f} = excluded.{f}"))
@@ -1250,63 +1248,73 @@ async fn apply_target(
             .collect::<Vec<_>>()
             .join(", ");
 
-        sql.push_str(&format!(
-            ", upserted as ( \
-                 insert into {target_ident} ({col_list}) \
+        for chunk in plan.writes.chunks(rows_per_chunk) {
+            let mut rows_sql = Vec::with_capacity(chunk.len());
+            let mut params: Vec<&(dyn ToSql + Sync)> =
+                Vec::with_capacity(chunk.len() * cols_per_row);
+            for (i, write) in chunk.iter().enumerate() {
+                let base = i * cols_per_row;
+                let mut row_parts = vec![format!("${}::text::{pk_cast}", base + 1)];
+                params.push(&write.pk_text);
+                for (j, pg_type) in field_pg_types.iter().enumerate() {
+                    row_parts.push(format!("${}::text::{pg_type}", base + 2 + j));
+                    params.push(&write.values[j]);
+                }
+                rows_sql.push(format!("({})", row_parts.join(", ")));
+            }
+
+            let sql = format!(
+                "insert into {target_ident} ({col_list}) \
                  select * from (values {}) as v({col_list}) \
-                 where (select count(*) from locked) >= 0 \
                  on conflict ({pk_ident}) do update set {set_list} \
                  where ({target_cols}) is distinct from ({excluded_cols}) \
-                 returning {pk_ident}::text as pk \
-             )",
-            rows_sql.join(", "),
-        ));
-
-        for (pk_text, field_texts) in write_pk_texts.iter().zip(write_field_texts.iter()) {
-            params.push(pk_text);
-            for v in field_texts {
-                params.push(v);
-            }
+                 returning {pk_ident}::text as pk",
+                rows_sql.join(", "),
+            );
+            let rows = txn.query(&sql, &params).await?;
+            written.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
         }
-        next_param += plan.writes.len() * cols_per_row;
     }
 
-    let delete_keys: Vec<&str> = plan.deletes.iter().map(|d| d.pk_text.as_str()).collect();
-    let has_deletes = !plan.deletes.is_empty();
-    if has_deletes {
-        sql.push_str(&format!(
-            ", deleted as ( \
-                 delete from {target_ident} \
-                 where {pk_ident} = any(${next_param}::text[]::{pk_cast}[]) \
-                   and (select count(*) from locked) >= 0 \
-                 returning {pk_ident}::text as pk \
-             )"
-        ));
-        params.push(&delete_keys);
-    }
+    // A key can appear in both `plan.writes` and `plan.deletes` (e.g. two
+    // differently-qualified `src_table` spellings folding to the same
+    // catalog source and disagreeing on whether the row is still live —
+    // see `compute`'s per-change write/delete dispatch). The old
+    // single-CTE-statement form of this function got "the write wins"
+    // for free from Postgres's rule that every data-modifying CTE in one
+    // WITH sees the same pre-statement snapshot, so a delete could never
+    // remove a row its sibling CTE had just inserted. Splitting the write
+    // and delete into separate sequential statements (above/below) loses
+    // that guarantee — the delete would now run against a snapshot that
+    // already includes the write — so it's restored explicitly here
+    // instead: never delete a key this same call just wrote.
+    let write_keys: std::collections::HashSet<&str> = plan
+        .writes
+        .iter()
+        .map(|w| w.pk_text.as_str())
+        .collect();
 
-    let mut selects = Vec::new();
-    if has_writes {
-        selects.push("select 'w' as kind, pk from upserted".to_string());
-    }
-    if has_deletes {
-        selects.push("select 'd' as kind, pk from deleted".to_string());
-    }
-    sql.push(' ');
-    sql.push_str(&selects.join(" union all "));
-
-    let rows = txn.query(&sql, &params).await?;
-    let mut written = Vec::new();
     let mut deleted = Vec::new();
-    for row in rows {
-        let kind: &str = row.get(0);
-        let pk: String = row.get(1);
-        if kind == "w" {
-            written.push(pk);
-        } else {
-            deleted.push(pk);
-        }
+    let delete_keys: Vec<&str> = plan
+        .deletes
+        .iter()
+        .map(|d| d.pk_text.as_str())
+        .filter(|k| !write_keys.contains(k))
+        .collect();
+    if !delete_keys.is_empty() {
+        let rows = txn
+            .query(
+                &format!(
+                    "delete from {target_ident} \
+                     where {pk_ident} = any($1::text[]::{pk_cast}[]) \
+                     returning {pk_ident}::text as pk"
+                ),
+                &[&delete_keys],
+            )
+            .await?;
+        deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
     }
+
     Ok((written, deleted))
 }
 
