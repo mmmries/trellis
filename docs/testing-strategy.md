@@ -116,7 +116,7 @@ pinned.
 independent oracle, over random valid programs, with failures shrunk to a minimal
 reproducing program.** This is the `generative` crate; its full architecture and
 tradeoffs live in `docs/generative-test-suite.md`, and the build plan is the
-tracking epic (spiff-emu/trellis#33). In brief:
+tracking epic (salesforce-misc/trellis#2). In brief:
 
 - **Trigger:** a randomly generated *valid* program — a schema, transform
   definitions, and a sequence of source mutations — driven through the real engine

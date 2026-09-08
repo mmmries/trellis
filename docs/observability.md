@@ -26,8 +26,8 @@ ones are collected under [Open questions](#open-questions).
 * **Transform status** — every transform carries an observable lifecycle status
   (`waiting_to_backfill` → `backfilling` → `live`, plus `quarantined`), so an
   operator can see a newly-defined transform is still populating rather than
-  live — the right-sized answer to the silent-stall problem in
-  [#52](#backfill-status-and-the-xmin-caveat).
+  live — the right-sized answer to the silent-stall problem (#14; see the
+  [`xmin` caveat below](#backfill-status-and-the-xmin-caveat)).
 
 **Non-goals (for this pass)**
 
@@ -211,4 +211,4 @@ We'll pin exact crates and versions when we start implementation.
 * [data-flow](data-flow.md) — the flow these metrics measure.
 * [open-questions](open-questions.md#backfill-status-and-observability) — the
   pre-existing backfill-status/lag-telemetry question this doc subsumes.
-* [#52](https://github.com/spiff-emu/trellis/issues/52) — the motivating stall.
+* [#14](https://github.com/salesforce-misc/trellis/issues/14) — the motivating stall.
