@@ -55,6 +55,38 @@ pub(crate) fn pg_type_name(value_type: ValueType) -> &'static str {
     }
 }
 
+/// The source column a bare passthrough/rename field reads, if `field`'s
+/// expression is exactly a reference to one source column (`SELECT author AS
+/// author` or `SELECT author AS foo`) — the only shape whose target column
+/// type can be narrowed to the source column's *concrete* Postgres type
+/// (issue #45). Returns `None` for any other expression (arithmetic,
+/// aggregates, function calls, literals), whose result genuinely can't be
+/// narrower than its inferred [`ValueType`], so those keep collapsing through
+/// [`pg_type_name`] exactly as before.
+///
+/// Mirrors [`super::validate`]/[`super::eval`]'s resolution order: a reference
+/// to a *different* calculated field that happens to share a source column's
+/// name resolves to that field, not the source column, so it isn't treated as
+/// a source-column passthrough here.
+fn passthrough_source_column<'a>(
+    field: &'a FieldDef,
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+) -> Option<&'a str> {
+    let Expr::Column(name) = &field.expr else {
+        return None;
+    };
+    if !source_columns.contains_key(name) {
+        return None;
+    }
+    let resolves_to_other_calc_field =
+        name != &field.name && def.fields.iter().any(|f| &f.name == name);
+    if resolves_to_other_calc_field {
+        return None;
+    }
+    Some(name.as_str())
+}
+
 /// The source table's primary key, as introspected from `pg_catalog`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrimaryKeyColumn {
@@ -201,6 +233,39 @@ pub async fn source_primary_key(
     }
 }
 
+/// Every column of `source_table`, mapped to its *concrete* Postgres type as
+/// rendered by `format_type` (e.g. `integer`, `bigint`, `character
+/// varying(255)`) — the same `pg_catalog` introspection [`source_primary_key`]
+/// does for the primary key, widened to every column. Used by
+/// [`create_target_table`] to give a bare source-column passthrough field its
+/// source column's exact type rather than collapsing it through [`ValueType`]
+/// (issue #45): a passthrough of an `integer` FK must stay `integer` on the
+/// target so it remains eligible as a relationship join key, instead of
+/// widening to `numeric` (which the join-key allowlist excludes). The rendered
+/// type is safe to interpolate into DDL for the same reason
+/// [`PrimaryKeyColumn::data_type`] is — it comes from the catalog, not user
+/// input.
+async fn source_column_pg_types(
+    pool: &Pool,
+    source_table: &str,
+) -> Result<HashMap<String, String>, DdlError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "select a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod)
+             from pg_attribute a
+             where a.attrelid = pg_catalog.to_regclass($1)
+               and a.attnum > 0
+               and not a.attisdropped",
+            &[&source_table],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect())
+}
+
 /// The neighbor target table's name for `def` — see module docs for why this
 /// is simply `def.target` unchanged. Unqualified: the catalog stores and
 /// looks up target tables by this bare name, independent of which schema
@@ -249,6 +314,36 @@ pub async fn create_target_table(
         .map_err(map_resolve_error)?;
     let field_types = super::validate::infer_field_types(def, source_columns, &relationships)?;
 
+    // Issue #45: a bare source-column passthrough keeps the source column's
+    // *concrete* Postgres type instead of collapsing through `ValueType` (so a
+    // passthrough of an `integer` FK stays `integer`, not `numeric`, and can
+    // still serve as a relationship join key). Only introspect the source
+    // table's column types when at least one such field exists — a definition
+    // with none behaves exactly as before, no extra query.
+    //
+    // Staging (`staging::apply`) still casts every value through its
+    // `ValueType`-based cast (e.g. `::text::numeric`) before the INSERT,
+    // regardless of the narrower concrete column type declared here — it
+    // relies on Postgres's implicit assignment cast (`numeric` -> `integer`,
+    // `text` -> `varchar(n)`, ...) to land the value. That's only safe because
+    // a bare passthrough's value provably originates from this same,
+    // identically-typed source column, so it always satisfies the narrower
+    // column's constraints. If a passthrough field's value could ever diverge
+    // from its source column's type/width, this coupling would need
+    // revisiting (staging would need to cast to the concrete type too).
+    let passthroughs: HashMap<&str, &str> = def
+        .fields
+        .iter()
+        .filter_map(|f| {
+            passthrough_source_column(f, def, source_columns).map(|col| (f.name.as_str(), col))
+        })
+        .collect();
+    let source_pg_types = if passthroughs.is_empty() {
+        HashMap::new()
+    } else {
+        source_column_pg_types(pool, &def.source).await?
+    };
+
     let mut sql = format!(
         "create table if not exists {} ({} {} primary key",
         qualified_target_table(target_schema, def),
@@ -256,12 +351,19 @@ pub async fn create_target_table(
         pk.data_type,
     );
     for field in &def.fields {
-        let pg_type = pg_type_name(
-            field_types
-                .get(&field.name)
-                .copied()
-                .unwrap_or(ValueType::Numeric),
-        );
+        let pg_type = match passthroughs
+            .get(field.name.as_str())
+            .and_then(|col| source_pg_types.get(*col))
+        {
+            Some(concrete) => concrete.clone(),
+            None => pg_type_name(
+                field_types
+                    .get(&field.name)
+                    .copied()
+                    .unwrap_or(ValueType::Numeric),
+            )
+            .to_string(),
+        };
         sql.push_str(&format!(", {} {}", quote_ident(&field.name), pg_type));
     }
     sql.push(')');
