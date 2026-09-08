@@ -1186,3 +1186,63 @@ async fn a_relationship_from_a_transform_target_back_to_its_own_source_is_accept
     .await
     .expect("relationship back to a target's own source should not be a false cycle");
 }
+
+/// Issue #45 end-to-end: a calculated target table that passes an `integer` FK
+/// column through (`SELECT author AS author`) must be usable as a relationship
+/// endpoint. Before the fix the passthrough column was DDL'd as `numeric`
+/// (`ValueType::Numeric` collapses every integer family to `numeric`), and
+/// `numeric` is excluded from the join-key allowlist — so this relationship
+/// was rejected with `RelationshipUnsupportedJoinKeyType`, even though the raw
+/// `posts.author` column joins fine. With the passthrough now DDL'd as
+/// `integer`, the relationship is accepted. Mirrors the issue's POC repro
+/// (`authors`/`posts` from `poc/schema_dump.sql`), against the calculated
+/// table rather than the raw one.
+#[tokio::test]
+async fn an_integer_passthrough_on_a_calculated_table_is_a_valid_join_key() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table authors (id integer primary key, name text); \
+             create table posts (id integer primary key, author integer, body text)",
+        )
+        .await
+        .expect("seed authors and posts");
+    drop(client);
+
+    // A calculated 1-1 transform over `posts` that passes the `author`
+    // integer FK through alongside a derived field.
+    let dsl =
+        "TRANSFORM posts_calc FROM posts SELECT author AS author, octet_length(body) AS byte_size";
+    let source_columns = HashMap::from([
+        ("author".to_string(), ValueType::Numeric),
+        ("body".to_string(), ValueType::Text),
+    ]);
+    create_definition(&db.pool, dsl, &source_columns)
+        .await
+        .expect("valid calculated definition should be stored");
+
+    let def = parse(dsl).expect("parse dsl for target materialization");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+        .await
+        .expect("materialize calculated target table");
+
+    // `posts_calc.author` is the to-many join key (a non-unique column), so
+    // the to-side needs a replica identity carrying it (#41) — orthogonal to
+    // the #45 join-key-type fix under test.
+    set_replica_identity_full(&db.pool, "posts_calc").await;
+
+    // The exact repro from the issue: relate `authors.id` to the calculated
+    // table's passthrough column. This is what previously failed.
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP posts_calc FROM authors.id TO posts_calc.author",
+    )
+    .await
+    .expect("integer passthrough on a calculated table must be a valid join key");
+}

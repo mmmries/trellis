@@ -343,6 +343,98 @@ async fn uuid_column_passthrough_gets_a_matching_target_column_type() {
     );
 }
 
+/// Issue #45: a bare passthrough of an integer-family source column keeps the
+/// source column's *concrete* Postgres type on the target (`integer` stays
+/// `integer`, `bigint` stays `bigint`, `smallint` stays `smallint`), instead
+/// of collapsing through `ValueType::Numeric` to `numeric` — so the target
+/// column stays eligible as a relationship join key. A non-passthrough field
+/// (arithmetic over the same columns) still widens to `numeric`, since its
+/// result genuinely can't be narrower.
+#[tokio::test]
+async fn integer_family_passthrough_keeps_its_concrete_type_but_arithmetic_widens() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+
+    client
+        .batch_execute(
+            "create table posts (
+                 id integer primary key,
+                 author integer,
+                 views bigint,
+                 rank smallint
+             )",
+        )
+        .await
+        .expect("seed source table");
+
+    let def = TransformDef {
+        target: "posts_calc".to_string(),
+        source: "posts".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![
+            // Rename passthrough: `author AS author_id` — still a bare
+            // reference to one integer source column.
+            FieldDef {
+                name: "author_id".to_string(),
+                expr: Expr::Column("author".to_string()),
+            },
+            FieldDef {
+                name: "views".to_string(),
+                expr: Expr::Column("views".to_string()),
+            },
+            FieldDef {
+                name: "rank".to_string(),
+                expr: Expr::Column("rank".to_string()),
+            },
+            // Arithmetic over an integer column is not a passthrough, so it
+            // keeps widening to `numeric`.
+            FieldDef {
+                name: "author_plus_one".to_string(),
+                expr: Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(Expr::Column("author".to_string())),
+                    rhs: Box::new(Expr::NumberLiteral("1".to_string())),
+                },
+            },
+        ],
+        predicate: Predicate::True,
+    };
+    let source_columns = numeric_columns(&["author", "views", "rank"]);
+
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+        .await
+        .expect("create target table");
+
+    let columns = client
+        .query(
+            "select column_name, data_type
+             from information_schema.columns
+             where table_name = $1
+             order by ordinal_position",
+            &[&def.target],
+        )
+        .await
+        .expect("introspect target columns");
+    let columns: Vec<(String, String)> = columns
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        columns,
+        vec![
+            ("id".to_string(), "integer".to_string()),
+            ("author_id".to_string(), "integer".to_string()),
+            ("views".to_string(), "bigint".to_string()),
+            ("rank".to_string(), "smallint".to_string()),
+            ("author_plus_one".to_string(), "numeric".to_string()),
+        ]
+    );
+}
+
 /// Issue #79's downstream case: a `uuid` column carried through a 1-1
 /// passthrough must also work as an aggregate `GROUP BY` key.
 #[tokio::test]
