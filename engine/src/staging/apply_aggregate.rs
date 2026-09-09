@@ -1118,19 +1118,29 @@ fn keyset_unnest(group_by_types: &[ValueType], start: usize, with_ordinality: bo
     )
 }
 
-/// A `<alias>.<group col> is not distinct from k.c<i>` conjunction, matching
-/// a row of `alias` against the keyset relation — `IS NOT DISTINCT FROM` for
-/// the same NULL-grouping-column reason [`group_where_clause`] uses it.
-fn keyset_match(group_by: &[String], alias: &str) -> String {
+/// A `<alias>.<group col> <op> k.c<i>` conjunction, matching a row of `alias`
+/// against the keyset relation. `null_safe[i]` selects the operator per column:
+///
+/// - `false` → plain `=`. Safe *and preferred* when no group in this batch
+///   binds a NULL for column `i`: with a non-NULL right-hand side, `col = k`
+///   and `col IS NOT DISTINCT FROM k` are identical (both reject NULL `col`),
+///   but `=` is hashable/indexable so Postgres can pick a Hash Join instead of
+///   the `IS NOT DISTINCT FROM` Nested Loop that rescans the whole keyset per
+///   source row (the O(table_size²/…) blowup behind issues #59/#62).
+/// - `true` → `is not distinct from`, required only for a column that actually
+///   carries a NULL group key in this batch (a NULL key never matches under
+///   `=`), for the same NULL-grouping reason [`group_where_clause`] uses it.
+fn keyset_match(group_by: &[String], alias: &str, null_safe: &[bool]) -> String {
     group_by
         .iter()
         .enumerate()
         .map(|(i, col)| {
-            format!(
-                "{alias}.{} is not distinct from k.{}",
-                quote_ident(col),
-                keyset_col(i)
-            )
+            let op = if null_safe[i] {
+                "is not distinct from"
+            } else {
+                "="
+            };
+            format!("{alias}.{} {op} k.{}", quote_ident(col), keyset_col(i))
         })
         .collect::<Vec<_>>()
         .join(" and ")
@@ -1184,6 +1194,11 @@ async fn apply_forced_groups_bulk(
     let arity = plan.group_by.len();
     let forced_groups: Vec<&GroupPlan> = forced.iter().map(|(_, g)| *g).collect();
     let arrays = transpose_group_values(arity, &forced_groups);
+    // Per-column: does any touched group bind a NULL key here? Only then does
+    // this column need the null-safe (non-hashable) match operator; otherwise
+    // plain `=` is equivalent and lets Postgres hash-join the keyset to the
+    // source instead of nested-looping it (see [`keyset_match`], #59/#62).
+    let null_safe: Vec<bool> = arrays.iter().map(|a| a.iter().any(|v| v.is_none())).collect();
     let source_ident = quote_ident(&plan.source);
     let target_ident = quote_ident(target);
     let group_idents: Vec<String> = plan.group_by.iter().map(|c| quote_ident(c)).collect();
@@ -1192,7 +1207,7 @@ async fn apply_forced_groups_bulk(
     let survivor_sql = format!(
         "select distinct k.ord::bigint from {} join {source_ident} s on {}",
         keyset_unnest(&plan.group_by_types, 1, true),
-        keyset_match(&plan.group_by, "s"),
+        keyset_match(&plan.group_by, "s", &null_safe),
     );
     let survivor_params: Vec<&(dyn ToSql + Sync)> =
         arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
@@ -1277,7 +1292,7 @@ async fn apply_forced_groups_bulk(
             insert_cols.join(", "),
             select_exprs.join(", "),
             keyset_unnest(&plan.group_by_types, 1, false),
-            keyset_match(&plan.group_by, "s"),
+            keyset_match(&plan.group_by, "s", &null_safe),
             select_exprs[..arity].join(", "),
             group_idents.join(", "),
             update_sets.join(", "),
@@ -1295,7 +1310,7 @@ async fn apply_forced_groups_bulk(
              where {} and k.ord = any(${ord_param}::bigint[]) \
              returning k.ord::bigint",
             keyset_unnest(&plan.group_by_types, 1, true),
-            keyset_match(&plan.group_by, "t"),
+            keyset_match(&plan.group_by, "t", &null_safe),
         );
         let mut delete_params: Vec<&(dyn ToSql + Sync)> =
             arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
@@ -1371,6 +1386,10 @@ pub(super) async fn apply_aggregate_target(
     // pre-lock, which is why a from-scratch backfill (all groups new) takes no
     // locks here and cannot contend.
     let prelock_arrays = transpose_group_values(arity, &all_groups);
+    let prelock_null_safe: Vec<bool> = prelock_arrays
+        .iter()
+        .map(|a| a.iter().any(|v| v.is_none()))
+        .collect();
     let prelock_params: Vec<&(dyn ToSql + Sync)> = prelock_arrays
         .iter()
         .map(|a| a as &(dyn ToSql + Sync))
@@ -1383,7 +1402,7 @@ pub(super) async fn apply_aggregate_target(
     let prelock_sql = format!(
         "select 1 from {target_ident} t join {} on {} order by {} for update of t",
         keyset_unnest(&plan.group_by_types, 1, false),
-        keyset_match(&plan.group_by, "t"),
+        keyset_match(&plan.group_by, "t", &prelock_null_safe),
         order_by.join(", "),
     );
     txn.query(&prelock_sql, &prelock_params).await?;
@@ -1522,5 +1541,92 @@ mod tests {
             .expect("count order_summary")
             .get(0);
         assert_eq!(remaining, 0, "the stale target row must be gone");
+    }
+
+    /// A forced group whose key column is *NULL* must still be matched by the
+    /// bulk recompute. This is the case that keeps [`keyset_match`]'s null-safe
+    /// operator: with a NULL key, `col = k` never matches (even a NULL `col`),
+    /// so `null_safe` must flip that column back to `is not distinct from`.
+    /// Guards against the `=` fast path (chosen when no key is NULL) ever
+    /// swallowing a genuinely NULL-keyed group.
+    #[tokio::test]
+    async fn apply_forced_groups_bulk_recomputes_a_null_keyed_group() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // Two source rows with a NULL group key contribute to the NULL group.
+        // The target keys `order_id` as nullable-`unique` rather than a real
+        // target's `NOT NULL` PK, so the recomputed NULL group can actually be
+        // stored — this test isolates keyset_match's NULL-match semantics, not
+        // the target's key-storability (a NULL group can't persist to a PK'd
+        // target, independent of this fix).
+        client
+            .batch_execute(
+                "create table order_items \
+                 (id integer primary key, order_id integer, amount numeric); \
+                 create table order_summary \
+                 (order_id numeric unique, total numeric, __total_count bigint); \
+                 insert into order_items (id, order_id, amount) \
+                 values (1, null, 5.00), (2, null, 7.00)",
+            )
+            .await
+            .expect("create source/target and seed NULL-keyed source rows");
+
+        let plan = AggregateTargetPlan::new(
+            vec!["order_id".to_string()],
+            vec![ValueType::Numeric],
+            vec![AggFieldPlan {
+                name: "total".to_string(),
+                value_type: ValueType::Numeric,
+                kind: AggFieldKind::Sum,
+            }],
+            "order_items".to_string(),
+            HashMap::from([(
+                "total".to_string(),
+                Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![Expr::Column("amount".to_string())],
+                },
+            )]),
+        );
+
+        // A forced group keyed by NULL (`group_values = [None]`).
+        let mut group = GroupPlan::new(vec![None]);
+        group.force_full_recompute = true;
+        group.hop_gen = 1;
+        let key = "1:".to_string();
+        let forced = vec![(&key, &group)];
+
+        let txn = client.transaction().await.expect("begin");
+        let (written, deleted) = apply_forced_groups_bulk(&txn, "order_summary", &plan, &forced)
+            .await
+            .expect("bulk apply");
+        txn.commit().await.expect("commit");
+
+        assert_eq!(
+            written,
+            vec![(key.clone(), 1)],
+            "the NULL-keyed group survives and is written"
+        );
+        assert!(deleted.is_empty(), "nothing is extinct");
+
+        let total: String = client
+            .query_one(
+                "select total::text from order_summary where order_id is null",
+                &[],
+            )
+            .await
+            .expect("fetch NULL-keyed summary row")
+            .get(0);
+        assert_eq!(
+            total, "12.00",
+            "the NULL group's SUM must include both NULL-keyed source rows"
+        );
     }
 }
