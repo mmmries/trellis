@@ -152,6 +152,32 @@ pub async fn create_definition(
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<Definition, CatalogError> {
+    create_definition_inner(pool, source_text, source_columns, true).await
+}
+
+/// Like [`create_definition`], but stages *no* ring-enumeration backfill: the
+/// definition and its version bump are persisted, but the source table is not
+/// enumerated into the ring. Callers that build the target directly
+/// (`defs::backfill::backfill_definition` — issue #63 M3's set-based,
+/// key-range-chunked source→target build) use this so the from-scratch build
+/// doesn't *also* flood the ring with one `Recompute` marker per source row;
+/// the ring is then left to handle only live CDC deltas after the direct
+/// build's fence. Every other caller wants the ring-enumeration backfill and
+/// keeps using [`create_definition`].
+pub async fn create_definition_without_backfill(
+    pool: &Pool,
+    source_text: &str,
+    source_columns: &HashMap<String, ValueType>,
+) -> Result<Definition, CatalogError> {
+    create_definition_inner(pool, source_text, source_columns, false).await
+}
+
+async fn create_definition_inner(
+    pool: &Pool,
+    source_text: &str,
+    source_columns: &HashMap<String, ValueType>,
+    backfill: bool,
+) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse(source_text)?;
     // Issue #40: enrichment fields (`<rel>.<col>`) are validated against
     // catalog-resolved relationship metadata — cardinality (ADR-0006's
@@ -222,9 +248,11 @@ pub async fn create_definition(
     // (whatever schema `config.target_schema()` actually resolved to,
     // which may not be the `DEFAULT_TARGET_SCHEMA` constant if overridden)
     // without needing to special-case on `source_node.is_target`.
-    let source_schema = resolve_source_schema_in_txn(&txn, &def.source).await?;
-    let qualified_source = crate::intake::publication::qualify(&source_schema, &def.source)?;
-    crate::intake::publication::enumerate_and_append(&txn, &qualified_source).await?;
+    if backfill {
+        let source_schema = resolve_source_schema_in_txn(&txn, &def.source).await?;
+        let qualified_source = crate::intake::publication::qualify(&source_schema, &def.source)?;
+        crate::intake::publication::enumerate_and_append(&txn, &qualified_source).await?;
+    }
 
     let version: i64 = txn
         .query_one(
