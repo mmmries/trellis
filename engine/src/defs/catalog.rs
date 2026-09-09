@@ -312,10 +312,12 @@ pub async fn create_relationship(
     // `to_table` is marked `is_source` here too, even though a relationship's
     // to-side is often really a transform target: the flag is additive/OR'd
     // (a later `create_definition` call can still set `is_target` on the
-    // same node), and today's only `is_source` reader — `all_source_tables`,
-    // the publication feeder — reads `transform_definitions`, not this flag,
-    // so no consumer is misled. If a future `is_source` consumer reads
-    // `schema_nodes` directly, re-check this call.
+    // same node), and no consumer reads `schema_nodes.is_source` directly
+    // today — [`all_source_tables`] (the publication feeder) reads
+    // `transform_definitions`/`relationship_definitions` directly, not this
+    // flag (issue #65: it now also follows relationship edges transitively,
+    // but still via those tables, not `schema_nodes`). If a future
+    // `is_source` consumer reads `schema_nodes` directly, re-check this call.
     let to_node = resolve_node_in_txn(&txn, &def.to_table, NodeKind::Source).await?;
 
     // The `Relationship` edge is persisted `to_table -> from_table` (parent
@@ -1247,17 +1249,47 @@ pub async fn transforms_for_source(
     dependents_of(pool, source_table, EdgeKind::Source).await
 }
 
-/// Every distinct source table with at least one registered transform
-/// definition, unqualified (as stored — see [`create_definition`]'s
-/// `def.source`). Issue #14: a running [`crate::Client`]'s maintenance loop
-/// polls this to notice a transform registered against a source table it
-/// hasn't seen before, so it can add that table to the publication and
-/// discharge its backfill without waiting for a restart.
+/// Every table that needs CDC capture for at least one registered transform
+/// (issue #65): every distinct anchor `source_table` (as stored — see
+/// [`create_definition`]'s `def.source`), plus every table transitively
+/// reachable from one of those anchors by following
+/// `relationship_definitions.from_table -> to_table` edges. A calculated
+/// field on a transform anchored at `from_table` can read a relationship
+/// path into `to_table` (and, through a chained relationship declared with
+/// `to_table` as its own `from_table`, into a table beyond that), so
+/// `to_table` must be in the CDC publication too, even though no transform
+/// is anchored there directly — see the issue for the silently-dropped-write
+/// bug this closes.
+///
+/// The recursive CTE below seeds the set with the same anchor tables the
+/// pre-#65 query returned, then unions in each edge's `to_table` reached
+/// from a table already in the set, transitively. `union` (not `union all`)
+/// is required, not just tidy: Postgres's recursive-query dedup compares
+/// each new candidate row against every row already in the accumulated
+/// result and drops it if already present, so a relationship cycle (`to_table`
+/// eventually looping back to an ancestor `from_table`) can only ever
+/// propose table names already in the set — the recursion adds nothing new
+/// on that iteration and terminates, rather than looping forever. A
+/// relationship declared on a table that never anchors a registered
+/// transform never seeds the recursion, so its `to_table` correctly never
+/// appears (issue #65's test case 4).
+///
+/// Issue #14: a running [`crate::Client`]'s maintenance loop polls this to
+/// notice a transform (or now, a relationship reachable from one) registered
+/// against a table it hasn't seen before, so it can add that table to the
+/// publication and discharge its backfill without waiting for a restart.
 pub async fn all_source_tables(pool: &Pool) -> Result<Vec<String>, CatalogError> {
     let client = pool.get().await?;
     let rows = client
         .query(
-            "select distinct source_table from transform_definitions",
+            "with recursive reachable(table_name) as (
+                select distinct source_table from transform_definitions
+                union
+                select rd.to_table
+                from relationship_definitions rd
+                join reachable r on r.table_name = rd.from_table
+             )
+             select table_name from reachable",
             &[],
         )
         .await?;

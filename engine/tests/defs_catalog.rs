@@ -5,7 +5,8 @@
 use std::collections::HashMap;
 
 use engine::defs::{
-    CatalogError, ValidationError, ValueType, create_definition, transforms_for_source,
+    CatalogError, ValidationError, ValueType, all_source_tables, create_definition,
+    create_relationship, transforms_for_source,
 };
 use testkit::TestCluster;
 
@@ -29,6 +30,22 @@ async fn create_bare_source_table(pool: &engine::pool::Pool, name: &str) {
         .batch_execute(&format!("create table {name} (id serial primary key)"))
         .await
         .expect("create bare source table");
+}
+
+/// A table usable as either endpoint of a relationship declared by
+/// [`create_relationship`] (issue #65's `all_source_tables` tests): `id` is
+/// a serial primary key, suitable as a relationship's unique `to_col`
+/// (cardinality `ToOne`, avoiding the to-many replica-identity requirement
+/// these tests don't care about); `fk_col` is a plain, non-unique integer
+/// column of the same type family, suitable as a relationship's `from_col`.
+async fn create_bare_relationship_table(pool: &engine::pool::Pool, name: &str) {
+    let client = pool.get().await.expect("get connection");
+    client
+        .batch_execute(&format!(
+            "create table {name} (id serial primary key, fk_col integer)"
+        ))
+        .await
+        .expect("create bare relationship table");
 }
 
 #[tokio::test]
@@ -473,4 +490,120 @@ async fn a_duplicate_target_table_surfaces_the_underlying_postgres_detail() {
         message.contains("transform_definitions_target_table_key"),
         "expected the violated constraint's name in the error message, got: {message}"
     );
+}
+
+/// Issue #65, case 1: with no relationships declared at all, `all_source_tables`
+/// must still behave exactly as it did pre-#65 — just the anchor
+/// `source_table` of each registered transform.
+#[tokio::test]
+async fn all_source_tables_with_no_relationships_returns_only_anchor_tables() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM orders SELECT price AS total",
+        &columns(&["price"]),
+    )
+    .await
+    .expect("valid definition should be stored");
+
+    let mut tables = all_source_tables(&db.pool).await.expect("query mapping");
+    tables.sort();
+    assert_eq!(tables, vec!["orders".to_string()]);
+}
+
+/// Issue #65, case 2: a transform anchored on `a`, plus a relationship
+/// `a -> b` (`a` is `from_table`, `b` is `to_table`), must pull `b` into the
+/// result too — the CDC gap the issue reports, where a calculated field on
+/// `a` reading a relationship path into `b` needs `b`'s writes captured.
+#[tokio::test]
+async fn all_source_tables_follows_a_single_relationship_hop() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_bare_relationship_table(&db.pool, "a").await;
+    create_bare_relationship_table(&db.pool, "b").await;
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM a_calc FROM a SELECT 1 AS x",
+        &HashMap::new(),
+    )
+    .await
+    .expect("valid definition should be stored");
+
+    create_relationship(&db.pool, "RELATIONSHIP r1 FROM a.fk_col TO b.id")
+        .await
+        .expect("valid relationship should be stored");
+
+    let mut tables = all_source_tables(&db.pool).await.expect("query mapping");
+    tables.sort();
+    assert_eq!(tables, vec!["a".to_string(), "b".to_string()]);
+}
+
+/// Issue #65, case 3: a multi-hop chain — relationship `a -> b` and
+/// `b -> c` — with the transform anchored only on `a`, must resolve the
+/// transitive closure, pulling in both `b` and `c`, not just the direct
+/// hop.
+#[tokio::test]
+async fn all_source_tables_follows_a_multi_hop_relationship_chain() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_bare_relationship_table(&db.pool, "a").await;
+    create_bare_relationship_table(&db.pool, "b").await;
+    create_bare_relationship_table(&db.pool, "c").await;
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM a_calc FROM a SELECT 1 AS x",
+        &HashMap::new(),
+    )
+    .await
+    .expect("valid definition should be stored");
+
+    create_relationship(&db.pool, "RELATIONSHIP r1 FROM a.fk_col TO b.id")
+        .await
+        .expect("a -> b relationship should be stored");
+    create_relationship(&db.pool, "RELATIONSHIP r2 FROM b.fk_col TO c.id")
+        .await
+        .expect("b -> c relationship should be stored");
+
+    let mut tables = all_source_tables(&db.pool).await.expect("query mapping");
+    tables.sort();
+    assert_eq!(
+        tables,
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
+}
+
+/// Issue #65, case 4: a relationship declared on a table that is not any
+/// transform's `source_table` must not leak its `to_table` into the
+/// result — only tables reachable from an actual registered transform's
+/// anchor should appear. `x -> y` here is never seeded (neither `x` nor `y`
+/// anchors a transform), so both must be absent even though the
+/// relationship itself is validly stored; only `z`, the real transform's
+/// anchor, should come back.
+#[tokio::test]
+async fn all_source_tables_does_not_leak_relationships_unreachable_from_any_transform() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_bare_relationship_table(&db.pool, "x").await;
+    create_bare_relationship_table(&db.pool, "y").await;
+    create_bare_source_table(&db.pool, "z").await;
+
+    create_relationship(&db.pool, "RELATIONSHIP r1 FROM x.fk_col TO y.id")
+        .await
+        .expect("valid relationship should be stored");
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM z_calc FROM z SELECT 1 AS x",
+        &HashMap::new(),
+    )
+    .await
+    .expect("valid definition should be stored");
+
+    let tables = all_source_tables(&db.pool).await.expect("query mapping");
+    assert_eq!(tables, vec!["z".to_string()]);
 }
