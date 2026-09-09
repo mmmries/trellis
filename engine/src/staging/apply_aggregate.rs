@@ -1150,8 +1150,8 @@ fn transpose_group_values(arity: usize, groups: &[&GroupPlan]) -> Vec<Vec<Option
 /// sequence [`upsert_group`]'s forced branches would otherwise run once each
 /// — the aggregate analog of [`super::apply::apply_target`]'s bulk chunked
 /// write. Instead of `O(forced groups)` round trips (an existence probe plus
-/// one probe per field, per group, each an unindexed scan pre-#59's DDL
-/// index), this is a fixed handful of statements regardless of group count:
+/// one probe per field, per group — each a separate source scan), this is a
+/// fixed handful of statements regardless of group count:
 ///
 /// 1. One `SELECT` over the source, joined to the bound keyset, returning the
 ///    ordinals of forced groups that still have at least one source row (the
@@ -1266,7 +1266,9 @@ async fn apply_forced_groups_bulk(
         // group-by-only "aggregate" the grammar can't express.
         debug_assert!(!update_sets.is_empty());
 
-        let group_select: Vec<String> = group_idents.iter().map(|c| format!("s.{c}")).collect();
+        // The `GROUP BY` mirrors the leading `arity` SELECT expressions
+        // (`select_exprs`'s `s.<group col>` prefix), so reuse them rather
+        // than rebuilding the identical list.
         let insert_sql = format!(
             "insert into {target_ident} ({}) \
              select {} from {} join {source_ident} s on {} \
@@ -1276,7 +1278,7 @@ async fn apply_forced_groups_bulk(
             select_exprs.join(", "),
             keyset_unnest(&plan.group_by_types, 1, false),
             keyset_match(&plan.group_by, "s"),
-            group_select.join(", "),
+            select_exprs[..arity].join(", "),
             group_idents.join(", "),
             update_sets.join(", "),
         );
