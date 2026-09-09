@@ -1398,3 +1398,207 @@ async fn backfilling_many_groups_matches_the_oracle_without_per_group_source_sca
          the bulk recompute must not scan once per group (issue #59)"
     );
 }
+
+const REGION_SALES_SOURCE: &str = "TRANSFORM region_sales FROM sales \
+     GROUP BY region, order_id \
+     SELECT region AS region, order_id AS order_id, SUM(amount) AS total, COUNT(*) AS cnt";
+
+fn region_sales_columns() -> HashMap<String, ValueType> {
+    HashMap::from([
+        ("id".to_string(), ValueType::Numeric),
+        ("region".to_string(), ValueType::Text),
+        ("order_id".to_string(), ValueType::Numeric),
+        ("amount".to_string(), ValueType::Numeric),
+    ])
+}
+
+/// `region_sales` keyed by `(region, order_id)` text, as `(total, cnt)`.
+async fn read_region_target(
+    client: &Client,
+) -> HashMap<(String, String), (Option<String>, Option<String>)> {
+    client
+        .query(
+            "select region::text, order_id::text, total::text, cnt::text from region_sales",
+            &[],
+        )
+        .await
+        .expect("read region_sales")
+        .into_iter()
+        .map(|row| {
+            let region: String = row.get(0);
+            let order_id: String = row.get(1);
+            ((region, order_id), (row.get(2), row.get(3)))
+        })
+        .collect()
+}
+
+async fn read_region_oracle(
+    client: &Client,
+    def: &engine::defs::ast::TransformDef,
+) -> HashMap<(String, String), (Option<String>, Option<String>)> {
+    let sql = engine::defs::render_aggregate_select_sql(def);
+    let sql = format!("select region::text, order_id::text, total::text, cnt::text from ({sql}) o");
+    client
+        .query(&sql, &[])
+        .await
+        .expect("run region oracle sql")
+        .into_iter()
+        .map(|row| {
+            let region: String = row.get(0);
+            let order_id: String = row.get(1);
+            ((region, order_id), (row.get(2), row.get(3)))
+        })
+        .collect()
+}
+
+/// A from-scratch backfill over a **multi-column** `GROUP BY` (issue #59):
+/// every source row is staged image-less, so every `(region, order_id)`
+/// group is forced onto the bulk-recompute path — exercising
+/// `keyset_unnest`/`keyset_match`/`transpose_group_values` at arity 2 (and,
+/// via `region`, a non-numeric key column's `::text[]::text[]` cast). Must
+/// match the oracle exactly.
+#[tokio::test]
+async fn backfilling_a_multi_column_group_by_matches_the_oracle() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table sales \
+             (id integer primary key, region text, order_id integer, amount numeric)",
+        )
+        .await
+        .expect("create source table");
+
+    let def = parse(REGION_SALES_SOURCE).expect("parse multi-column aggregate definition");
+    let source_columns = region_sales_columns();
+    create_definition(&db.pool, REGION_SALES_SOURCE, &source_columns)
+        .await
+        .expect("create multi-column aggregate definition");
+    create_aggregate_target_table(&db.pool, &def, "public", &source_columns)
+        .await
+        .expect("create multi-column aggregate target table");
+
+    // Several distinct (region, order_id) groups, some sharing a region, some
+    // sharing an order_id, most with more than one row.
+    client
+        .batch_execute(
+            "insert into sales (id, region, order_id, amount) values \
+             (1, 'west', 10, 2.00), (2, 'west', 10, 3.00), \
+             (3, 'west', 20, 5.00), \
+             (4, 'east', 10, 7.00), (5, 'east', 10, 1.00), \
+             (6, 'east', 30, 9.00)",
+        )
+        .await
+        .expect("seed live sales rows");
+
+    for id in 1..=6 {
+        insert_cdc_row(
+            &client,
+            "seg_0",
+            "sales",
+            &id.to_string(),
+            "recompute",
+            None,
+            None,
+        )
+        .await;
+    }
+
+    let seg0 = seal_active_segment(&mut client).await;
+    let outcome = drain(&db.pool, seg0, "worker").await;
+    assert_eq!(
+        outcome.keys_written, 4,
+        "four distinct (region, order_id) groups are newly created"
+    );
+
+    let target = read_region_target(&client).await;
+    let oracle = read_region_oracle(&client, &def).await;
+    assert_eq!(
+        target, oracle,
+        "multi-column backfill must match the oracle exactly"
+    );
+}
+
+/// One `apply_aggregate_target` batch that mixes a forced (image-less)
+/// group and an ordinary delta group must route each down its own path (the
+/// forced group through the bulk recompute, the delta group through the
+/// unchanged per-group `upsert_group`) and land both correctly against the
+/// oracle.
+#[tokio::test]
+async fn a_mixed_forced_and_delta_batch_matches_the_oracle() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table order_items (id integer primary key, order_id integer, amount numeric)",
+        )
+        .await
+        .expect("create source table");
+
+    let def = setup(&db).await;
+
+    // Seed group 10 with a normal delta batch so it has a live target row.
+    client
+        .execute(
+            "insert into order_items (id, order_id, amount) values (1, 10, 4.00)",
+            &[],
+        )
+        .await
+        .expect("seed group 10");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "order_items",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"order_id":"10","amount":"4.00"}"#),
+    )
+    .await;
+    let seg0 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg0, "worker").await;
+
+    // One batch: an image-less recompute for group 10 (forced -> bulk path)
+    // alongside an ordinary insert for a brand-new group 20 (delta path).
+    client
+        .batch_execute(
+            "update order_items set amount = 6.00 where id = 1; \
+             insert into order_items (id, order_id, amount) values (2, 20, 8.00)",
+        )
+        .await
+        .expect("apply live end-state for mixed batch");
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "order_items",
+        "1",
+        "recompute",
+        None,
+        None,
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "order_items",
+        "2",
+        "insert",
+        None,
+        Some(r#"{"order_id":"20","amount":"8.00"}"#),
+    )
+    .await;
+
+    let seg1 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg1, "worker").await;
+
+    let target = read_target(&client).await;
+    let oracle = read_oracle(&client, &def).await;
+    assert_eq!(
+        target, oracle,
+        "a batch mixing a forced group and a delta group must match the oracle"
+    );
+}

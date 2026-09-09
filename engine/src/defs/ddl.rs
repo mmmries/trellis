@@ -528,24 +528,41 @@ pub async fn create_aggregate_target_table(
 }
 
 /// A stable, collision-resistant index name for `source`'s `group_by`
-/// columns, kept within Postgres's 63-byte identifier limit. The readable
-/// `trellis_agg_<source>_<cols>` form is used whenever it fits; otherwise the
-/// name is derived from a deterministic FNV-1a hash of that same string
-/// (deterministic — unlike `std::hash::DefaultHasher`, whose output is not
-/// stable across builds — so `create index if not exists` stays idempotent
-/// across process restarts and versions rather than creating a second index
-/// under a drifted name).
+/// columns, kept within Postgres's 63-byte identifier limit.
+///
+/// The name always ends in a deterministic FNV-1a hash of a length-prefixed
+/// canonical encoding of the `(source, group_by)` tuple (the same
+/// `<len>:<value>` framing `derive_group_key` uses), so no two distinct
+/// tuples can ever produce the same name — a plain `<source>_<cols>` join is
+/// *not* injective (source `a_b` + `["c"]` and source `a` + `["b_c"]` both
+/// render `a_b_c`), and a colliding name would make `create index if not
+/// exists` silently no-op against the wrong table's index, leaving a source
+/// unindexed and quietly reintroducing issue #59's O(groups × rows) scan.
+/// FNV-1a (not `std::hash::DefaultHasher`, whose output is unstable across
+/// builds) keeps the name identical across restarts and versions so the
+/// `if not exists` stays idempotent. A readable slug is prepended for
+/// human legibility and truncated to keep the whole name within 63 bytes;
+/// the hash suffix, not the slug, is what guarantees uniqueness.
 fn aggregate_group_index_name(source: &str, group_by: &[String]) -> String {
-    let raw = format!("trellis_agg_{}_{}", source, group_by.join("_"));
-    if raw.len() <= 63 {
-        return raw;
+    let mut canonical = format!("{}:{source}", source.len());
+    for col in group_by {
+        canonical.push_str(&format!("{}:{col}", col.len()));
     }
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in raw.as_bytes() {
+    for byte in canonical.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    format!("trellis_agg_{hash:016x}")
+
+    let slug = format!("{}_{}", source, group_by.join("_"));
+    // "trellis_agg_" (12) + slug + "_" (1) + 16 hex digits = 29 + slug bytes;
+    // cap the slug so the whole name fits Postgres's 63-byte identifier limit.
+    const MAX_SLUG: usize = 63 - 29;
+    let mut end = slug.len().min(MAX_SLUG);
+    while !slug.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("trellis_agg_{}_{hash:016x}", &slug[..end])
 }
 
 #[cfg(test)]
@@ -584,6 +601,31 @@ mod tests {
         assert_eq!(
             qualified_target_table("analytics", &def()),
             "\"analytics\".\"order_totals\""
+        );
+    }
+
+    #[test]
+    fn aggregate_group_index_name_disambiguates_underscore_collisions() {
+        // The ambiguous readable pair: `a_b` + ["c"] vs `a` + ["b_c"] both
+        // join to `a_b_c`, but the length-prefixed hash must keep them apart.
+        let a = aggregate_group_index_name("a_b", &["c".to_string()]);
+        let b = aggregate_group_index_name("a", &["b_c".to_string()]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn aggregate_group_index_name_stays_within_postgres_identifier_limit() {
+        let long_cols: Vec<String> = (0..20).map(|i| format!("column_number_{i}")).collect();
+        let name = aggregate_group_index_name("a_very_long_source_table_name", &long_cols);
+        assert!(name.len() <= 63, "index name {name:?} exceeds 63 bytes");
+    }
+
+    #[test]
+    fn aggregate_group_index_name_is_deterministic() {
+        let cols = vec!["order_id".to_string(), "region".to_string()];
+        assert_eq!(
+            aggregate_group_index_name("orders", &cols),
+            aggregate_group_index_name("orders", &cols),
         );
     }
 }

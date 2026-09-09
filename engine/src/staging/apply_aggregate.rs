@@ -1436,3 +1436,89 @@ pub(super) async fn apply_aggregate_target(
 
     Ok(AggregateApplyResult { written, deleted })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_postgres::NoTls;
+
+    /// The bulk-recompute path's extinct-group `DELETE` (step 3 of
+    /// [`apply_forced_groups_bulk`]) removes a forced group's target row when
+    /// no source row survives. Today's producers can't actually stage this —
+    /// `accumulate_changes` only marks a group `force_full_recompute` when its
+    /// refetched row exists, so a forced group always has a live
+    /// representative and survives (the module doc's note that this scenario
+    /// "is not exercised by today's producers") — so this drives the branch
+    /// directly with a hand-built plan rather than through a drain, to keep
+    /// the defensive path covered against future producers that could stage a
+    /// genuinely extinct forced group.
+    #[tokio::test]
+    async fn apply_forced_groups_bulk_deletes_an_extinct_forced_group() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // Empty source (no surviving rows for any group) + a target holding a
+        // stale row for group 10.
+        client
+            .batch_execute(
+                "create table order_items \
+                 (id integer primary key, order_id integer, amount numeric); \
+                 create table order_summary \
+                 (order_id numeric primary key, total numeric, __total_count bigint); \
+                 insert into order_summary (order_id, total, __total_count) \
+                 values (10, 99.00, 1)",
+            )
+            .await
+            .expect("create source/target and seed a stale target row");
+
+        let plan = AggregateTargetPlan::new(
+            vec!["order_id".to_string()],
+            vec![ValueType::Numeric],
+            vec![AggFieldPlan {
+                name: "total".to_string(),
+                value_type: ValueType::Numeric,
+                kind: AggFieldKind::Sum,
+            }],
+            "order_items".to_string(),
+            HashMap::from([(
+                "total".to_string(),
+                Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![Expr::Column("amount".to_string())],
+                },
+            )]),
+        );
+
+        let mut group = GroupPlan::new(vec![Some("10".to_string())]);
+        group.force_full_recompute = true;
+        group.hop_gen = 3;
+        let key = "2:10".to_string();
+        let forced = vec![(&key, &group)];
+
+        let txn = client.transaction().await.expect("begin");
+        let (written, deleted) = apply_forced_groups_bulk(&txn, "order_summary", &plan, &forced)
+            .await
+            .expect("bulk apply");
+        txn.commit().await.expect("commit");
+
+        assert!(written.is_empty(), "an extinct group writes nothing");
+        assert_eq!(
+            deleted,
+            vec![(key.clone(), 3)],
+            "the extinct forced group's target row must be reported deleted"
+        );
+
+        let remaining: i64 = client
+            .query_one("select count(*) from order_summary", &[])
+            .await
+            .expect("count order_summary")
+            .get(0);
+        assert_eq!(remaining, 0, "the stale target row must be gone");
+    }
+}
