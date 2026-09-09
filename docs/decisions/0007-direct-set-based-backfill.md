@@ -30,13 +30,47 @@ Implemented in [`engine::defs::backfill`]:
   WHERE <pk> > lo AND <pk> <= hi ON CONFLICT (<pk>) DO UPDATE`. Range bounds are
   discovered by `max()`-over-`LIMIT`, so every source row falls in exactly one
   range regardless of gaps in the key values.
-- **Aggregates** chunk by *group-key* range (ordered distinct group tuples,
-  every N-th tuple a boundary) and build each chunk with `INSERT … SELECT …
-  GROUP BY … ON CONFLICT DO UPDATE`. Because a group is a single point in
-  group-key space, it lands wholly in exactly one chunk.
+- **Aggregates** aggregate the whole source in a **single** full-table scan
+  into a connection-scoped temp *staging* table (`CREATE TEMP TABLE … AS SELECT
+  <group_cols>, <aggs> FROM source WHERE <keys not null> GROUP BY <group_cols>`),
+  then chunk the **writes** from that staging table into the target by group-key
+  range — each range an `INSERT INTO target SELECT … FROM staging WHERE
+  (<group_cols>) > lo AND (<group_cols>) <= hi ON CONFLICT DO UPDATE`. Because a
+  group is a single point in group-key space, it lands wholly in exactly one
+  chunk.
 
-Each chunk is one bounded transaction. The build is synchronous and complete on
-return.
+Each chunk write is one bounded transaction. The build is synchronous and
+complete on return.
+
+## Single-pass aggregation, then chunked writes — not chunked aggregation
+
+The aggregate build must **not** chunk by group-key range directly over the
+*source*. An earlier revision did — each chunk ran `INSERT … SELECT … FROM
+source WHERE (<group_cols>) > lo AND (<group_cols>) <= hi GROUP BY …`. The source
+has no index on the GROUP BY columns (only its PK; an index on the GROUP BY
+columns was tried in an earlier milestone and abandoned as ineffective, see ADR
+0005), so every chunk did a full **sequential scan of the entire source**
+filtered to one key range. With `C` chunks that is `O(C × source_size)` total
+scan work — the exact "re-scan the whole table per chunk" pathology milestones 1
+and 2 fixed elsewhere in #63, reintroduced by the new bulk-build mechanism. It
+was confirmed empirically: 100k groups → 10 chunks → ~1.25s (~125ms/chunk, each
+roughly one full-table scan) against a ~65ms single-pass `GROUP BY` floor, and
+projected to ~12.5s at 1M groups (100 chunks) — past the 10s ceiling and ~200x
+the compute floor.
+
+The accepted design scans the source **exactly once** (the `CREATE TEMP TABLE …
+AS SELECT … GROUP BY`), and every later read — boundary discovery and every
+chunk write — hits the staging table, which is *group-count*-sized, not
+*source*-sized. A primary key on staging's group columns (valid: the group tuple
+is unique in an aggregated result) makes each chunk's range-write an index range
+scan rather than a staging seq scan, so even at pathological cardinality (nearly
+one group per source row) the writes never degrade into repeated full scans.
+Total scan work is `O(source_size)` for the one aggregation pass plus
+`O(group_count)` for the writes — never `O(C × source_size)`. Empirically this
+took the 100k-group phase from ~1.25s to ~0.75s. The staging table is dropped
+before creation (in case a crashed prior backfill on a reused pooled connection
+left one behind) and after the writes complete, so it never leaks back into the
+pool.
 
 ## Overwrite-by-group-key, not additive-by-PK
 
@@ -63,9 +97,9 @@ excluded.col`) walking the source PK for aggregates. We instead **overwrite**
 
 An aggregate target's `GROUP BY` columns are its primary key, so Postgres forbids
 a NULL there: a group with a NULL key has no representable target row, and the
-ring can't store one either. The direct build excludes such groups (they fall out
-of every row-value range comparison naturally, since a comparison against a NULL
-bound is itself NULL) rather than attempting to insert them.
+ring can't store one either. The direct build excludes such groups when it builds
+the staging table (`WHERE <keys> IS NOT NULL`), so they never reach the target,
+rather than attempting to insert them.
 
 ## Wiring
 
@@ -78,8 +112,8 @@ and continue to use the ring.
 
 ## Consequences
 
-- The M0 benchmark's aggregate phase drops from ~55s to ~1.3s (100k groups) and
-  ~0.1s (100 groups) on the dev box; the two cardinalities now diverge sharply,
+- The M0 benchmark's aggregate phase drops from ~55s to ~0.75s (100k groups) and
+  ~0.04s (100 groups) on the dev box; the two cardinalities now diverge sharply,
   since the direct build's cost tracks group count. Regression ceilings tightened
   to 10s / 5s accordingly.
 - The ring is no longer on the critical path for a from-scratch build, only for

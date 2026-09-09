@@ -345,6 +345,89 @@ async fn aggregate_build_is_idempotent_on_rerun() {
     assert_aggregate_matches_oracle(&db, &def).await;
 }
 
+#[tokio::test]
+async fn aggregate_build_scans_source_once_not_per_chunk() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    // 30k distinct singleton groups over a 30k-row source: three 10k-group
+    // write chunks. The M3-review bug filtered the *source* by group-key range
+    // per chunk with no group-key index, so each of the (chunks) writes did a
+    // full sequential scan of `s` — O(chunks x source_size). The fix aggregates
+    // the source once into a staging table and chunk-writes from that, so `s` is
+    // sequentially scanned exactly once for the whole build. pg_stat_user_tables
+    // records cumulative seq scans per table; we assert the build adds at most a
+    // couple (the single aggregation pass, allowing slop for planner/autovacuum),
+    // never one-per-chunk.
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, author numeric, sz numeric); \
+             insert into s (id, author, sz) \
+             select g, g, g from generate_series(1, 30000) g",
+        )
+        .await
+        .expect("seed source");
+    drop(client);
+
+    let src = "TRANSFORM t FROM s GROUP BY author \
+               SELECT author AS author, SUM(sz) AS total, COUNT(*) AS n";
+    let def = parse(src).expect("parse");
+    let cols = numeric(&["author", "sz"]);
+    create_definition_without_backfill(&db.pool, src, &cols)
+        .await
+        .expect("create def");
+    create_aggregate_target_table(&db.pool, &def, "public", &cols)
+        .await
+        .expect("create target");
+
+    // Reads `s`'s cumulative sequential-scan count. Per-backend stats are flushed
+    // to shared memory lazily (rate-limited to ~once/sec unless forced), and the
+    // backfill runs on a *different* pooled connection than this reader, so poll
+    // a few times letting the collector settle and take the largest observation.
+    async fn seq_scans(db: &testkit::TestDatabase) -> i64 {
+        let mut max = 0i64;
+        for _ in 0..10 {
+            let client = db.pool.get().await.expect("get connection");
+            client
+                .execute("select pg_stat_force_next_flush()", &[])
+                .await
+                .ok();
+            let scans: i64 = client
+                .query_one(
+                    "select coalesce(seq_scan, 0) from pg_stat_user_tables where relname = 's'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            max = max.max(scans);
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        max
+    }
+
+    let before = seq_scans(&db).await;
+    backfill_definition(&db.pool, &def, "public", &cols)
+        .await
+        .expect("backfill");
+    let after = seq_scans(&db).await;
+
+    assert_aggregate_matches_oracle(&db, &def).await;
+
+    let delta = after - before;
+    // The build scans `s` once (the single-pass aggregation into staging); every
+    // chunk write and the boundary scan hit the group-count-sized staging table
+    // instead. The M3-review bug re-scanned `s` per write chunk plus once for
+    // boundary discovery — with three chunks here that was >= 4, and it grew with
+    // cardinality. 2 leaves slop for an incidental autovacuum/analyze scan.
+    assert!(
+        delta <= 2,
+        "aggregate build should scan the source about once, not once per chunk \
+         (seq_scan delta on s was {delta})"
+    );
+}
+
 /// Asserts `public.t` (the aggregate target `def` built) is value-equal to a
 /// fresh `GROUP BY` over the source rendered straight from `def`, comparing
 /// every group's visible columns. NULL-key groups are excluded from the oracle:

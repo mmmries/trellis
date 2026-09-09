@@ -27,14 +27,16 @@ mod scenario;
 
 use std::time::Duration;
 
-/// Post-M3 this shape's aggregate phase measures ~1.3-1.4s on this
-/// harness/box across repeated runs — the direct, group-key-range-chunked
+/// Post-M3 this shape's aggregate phase measures ~0.7-0.8s on this
+/// harness/box across repeated runs — the direct, single-pass-then-chunked
 /// build ([`engine::defs::backfill_definition`], issue #63) replaced the ring
-/// drain that took ~55-58s here (and ~1m50s on the issue's poc cluster). 10s
-/// keeps ~7x headroom over this box's measurement for CI/dev-machine jitter
-/// and cold caches while still firing long before any regression back toward
-/// the old tens-of-seconds mechanism. Revisit once a CI-hardware baseline
-/// exists.
+/// drain that took ~55-58s here (and ~1m50s on the issue's poc cluster). The
+/// M3-review fix (aggregate the source once into a staging table, then chunk
+/// the writes from that small table instead of re-scanning the source per
+/// chunk) took this from ~1.25s to ~0.75s. 10s keeps >10x headroom over this
+/// box's measurement for CI/dev-machine jitter and cold caches while still
+/// firing long before any regression back toward the old tens-of-seconds
+/// mechanism. Revisit once a CI-hardware baseline exists.
 const HIGH_CARDINALITY_CEILING: Duration = Duration::from_secs(10);
 
 /// Post-M3 this shape's aggregate phase measures ~0.1s on this harness/box:

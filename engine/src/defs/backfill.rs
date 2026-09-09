@@ -89,6 +89,14 @@ const BACKFILL_CHUNK_ROWS: i64 = 50_000;
 /// of how many groups the source has in total.
 const BACKFILL_CHUNK_GROUPS: i64 = 10_000;
 
+/// Connection-scoped staging table the aggregate build materializes its
+/// single-pass `GROUP BY` into before chunk-writing to the target. A fixed name
+/// is safe: the build holds one pooled connection for its whole duration (so no
+/// two aggregate builds share this name concurrently — concurrent builds get
+/// distinct connections/sessions), and it is dropped both before creation
+/// (crash-leftover on a reused pooled connection) and after the writes.
+const STAGE_TABLE: &str = "_trellis_backfill_agg_staging";
+
 /// Why a direct backfill could not run.
 #[derive(Debug)]
 pub enum BackfillError {
@@ -336,17 +344,39 @@ fn agg_arg_sql(expr: &Expr) -> String {
     render_expr_sql(&args[0])
 }
 
-/// The aggregate build: chunk by *group key* range so each group is computed
-/// in exactly one chunk, then `INSERT … SELECT … GROUP BY … ON CONFLICT DO
-/// UPDATE SET col = excluded.col` (overwrite) each chunk. See the module docs
-/// for why overwrite-by-group-key rather than additive-by-PK.
+/// The aggregate build: aggregate the whole source in a **single** full-table
+/// scan into a temporary staging table, then chunk the *writes* from that small
+/// (group-count-sized) staging table into the target by group-key range. See
+/// the module docs for why overwrite-by-group-key rather than additive-by-PK.
+///
+/// # Why single-pass-then-chunked-write (issue #63 M3 review)
+///
+/// An earlier shape chunked by group-key range directly over the *source*: each
+/// chunk ran `INSERT … SELECT … FROM source WHERE (<group_cols>) > lo AND
+/// (<group_cols>) <= hi GROUP BY …`. The source has no index on the group-key
+/// columns (only its PK — an index on the GROUP BY columns was tried and
+/// abandoned as ineffective, ADR 0005 / commit e001d8a), so every chunk did a
+/// full sequential scan of the entire source filtered to one key range. With
+/// `C` chunks that is `O(C × source_size)` total scan work — the exact
+/// "rescan-the-whole-table-per-chunk" pathology M1/M2 fixed elsewhere in #63,
+/// reappearing here. At 1M distinct groups (100 chunks) it projected to ~12.5s,
+/// ~200x the ~60ms single-pass `GROUP BY` floor.
+///
+/// This design instead scans the source exactly **once** to materialize the
+/// aggregate into a staging table (the `CREATE TEMP TABLE … AS SELECT … GROUP
+/// BY` below — one seq scan, the ~60ms floor), and every subsequent read is of
+/// that staging table, which is *group-count*-sized, not *source*-sized. A
+/// primary key on the staging table's group columns turns each chunk's
+/// range-write into a cheap index range scan rather than a staging seq scan, so
+/// total scan work is `O(source_size)` for the one aggregation pass plus
+/// `O(group_count)` for the writes — never `O(C × source_size)`.
 ///
 /// Non-`NULL` group keys are partitioned into `(prev, hi]` ranges over the
-/// ordered distinct group tuples, which cover every non-`NULL` group exactly
-/// once. A group whose key has a `NULL` component is deliberately never built:
-/// the target's GROUP BY columns are its primary key, so no such row can exist
-/// (the ring can't store one either). Those groups drop out of every range
-/// naturally, since a row-value comparison against a `NULL` bound is `NULL`.
+/// ordered distinct group tuples in staging, which cover every non-`NULL` group
+/// exactly once. A group whose key has a `NULL` component is deliberately never
+/// built: the target's GROUP BY columns are its primary key, so no such row can
+/// exist (the ring can't store one either). Such groups are filtered out when
+/// staging is built, so they never reach the target.
 async fn backfill_aggregate(
     pool: &Pool,
     def: &TransformDef,
@@ -362,11 +392,14 @@ async fn backfill_aggregate(
         .map(|c| ddl::pg_type_name(source_columns.get(c).copied().unwrap_or(ValueType::Numeric)))
         .collect();
 
-    // Build the INSERT column list and its matching SELECT expressions, mirroring
+    // Build the INSERT column list and, for each, the aggregate SELECT
+    // expression that computes it from the source — mirroring
     // `apply_forced_groups_bulk`'s per-field-kind construction (issue #63 M3
-    // concern #3) so a directly-built target is byte-identical to a ring-built one.
+    // concern #3) so a directly-built target is byte-identical to a ring-built
+    // one. Group-key columns come first; every column is a stable target column
+    // name, so it doubles as the staging table's column name.
     let mut insert_cols: Vec<String> = group_idents.clone();
-    let mut select_exprs: Vec<String> = group_idents.clone();
+    let mut stage_exprs: Vec<String> = group_idents.clone();
     for field in &def.fields {
         if group_by.contains(&field.name) {
             continue;
@@ -376,30 +409,30 @@ async fn backfill_aggregate(
             FieldKind::Sum => {
                 let arg = agg_arg_sql(&field.expr);
                 insert_cols.push(col);
-                select_exprs.push(format!("sum({arg})"));
+                stage_exprs.push(format!("sum({arg})"));
                 insert_cols.push(quote_ident(&count_partial_column(&field.name)));
-                select_exprs.push(format!("count({arg})"));
+                stage_exprs.push(format!("count({arg})"));
             }
             FieldKind::Avg => {
                 let arg = agg_arg_sql(&field.expr);
                 let (sum_col, count_col) = avg_partial_columns(&field.name);
                 insert_cols.push(quote_ident(&sum_col));
-                select_exprs.push(format!("sum({arg})"));
+                stage_exprs.push(format!("sum({arg})"));
                 insert_cols.push(quote_ident(&count_col));
-                select_exprs.push(format!("count({arg})"));
+                stage_exprs.push(format!("count({arg})"));
                 insert_cols.push(col);
-                select_exprs.push(format!(
+                stage_exprs.push(format!(
                     "case when count({arg}) = 0 then null \
                      else sum({arg}) / count({arg})::numeric end"
                 ));
             }
             FieldKind::Count => {
                 insert_cols.push(col);
-                select_exprs.push("count(*)::numeric".to_string());
+                stage_exprs.push("count(*)::numeric".to_string());
             }
             FieldKind::RecomputeOnly => {
                 insert_cols.push(col);
-                select_exprs.push(format!("({})", render_expr_sql(&field.expr)));
+                stage_exprs.push(format!("({})", render_expr_sql(&field.expr)));
             }
         }
     }
@@ -413,32 +446,63 @@ async fn backfill_aggregate(
     debug_assert!(!update_sets.is_empty());
 
     let insert_cols_sql = insert_cols.join(", ");
-    let select_exprs_sql = select_exprs.join(", ");
     let group_by_sql = group_idents.join(", ");
+    let group_tuple = group_idents.join(", ");
     let conflict_sql = group_idents.join(", ");
     let update_sets_sql = update_sets.join(", ");
-
-    let insert_for = |where_clause: &str| {
-        format!(
-            "insert into {target} ({insert_cols_sql}) \
-             select {select_exprs_sql} from {source}{where_clause} \
-             group by {group_by_sql} \
-             on conflict ({conflict_sql}) do update set {update_sets_sql}"
-        )
-    };
-
-    let client = pool.get().await?;
-
-    // Discover non-NULL group-key range boundaries: every BACKFILL_CHUNK_GROUPS-th
-    // distinct group tuple in ascending order. NULL-key groups are excluded here
-    // (they can't participate in row-value range comparisons) and are never built
-    // at all — the target PK forbids a NULL group key.
     let not_null_pred = group_idents
         .iter()
         .map(|c| format!("{c} is not null"))
         .collect::<Vec<_>>()
         .join(" and ");
-    let group_tuple = group_idents.join(", ");
+    // Each staging column aliased to its target column name, so the staging
+    // table's columns line up with `insert_cols` for a plain SELECT on write.
+    let stage_select_sql = insert_cols
+        .iter()
+        .zip(&stage_exprs)
+        .map(|(col, expr)| format!("{expr} as {col}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let client = pool.get().await?;
+
+    // Single full-table scan: aggregate the whole (non-NULL-key) source into a
+    // connection-scoped staging table. This is the ~60ms `GROUP BY` floor and
+    // the *only* pass over the source. The staging table has one row per group.
+    // Drop first in case a crashed prior backfill on this pooled connection left
+    // one behind; drop again at the end so it doesn't leak back into the pool.
+    client
+        .batch_execute(&format!("drop table if exists {STAGE_TABLE}"))
+        .await?;
+    client
+        .execute(
+            &format!(
+                "create temp table {STAGE_TABLE} as \
+                 select {stage_select_sql} from {source} \
+                 where {not_null_pred} group by {group_by_sql}"
+            ),
+            &[],
+        )
+        .await?;
+    // A primary key on the group columns makes each chunk's range-write below an
+    // index range scan of the staging table rather than a full staging scan —
+    // the group tuple is unique in the aggregated result, so it is a valid PK.
+    client
+        .batch_execute(&format!(
+            "alter table {STAGE_TABLE} add primary key ({group_tuple})"
+        ))
+        .await?;
+
+    let insert_for = |where_clause: &str| {
+        format!(
+            "insert into {target} ({insert_cols_sql}) \
+             select {insert_cols_sql} from {STAGE_TABLE}{where_clause} \
+             on conflict ({conflict_sql}) do update set {update_sets_sql}"
+        )
+    };
+
+    // Discover group-key range boundaries from the small staging table: every
+    // BACKFILL_CHUNK_GROUPS-th group tuple in ascending order.
     let boundary_select_text = group_idents
         .iter()
         .map(|c| format!("{c}::text"))
@@ -447,7 +511,7 @@ async fn backfill_aggregate(
     let boundary_sql = format!(
         "select {boundary_select_text} from ( \
              select {group_tuple}, row_number() over (order by {group_tuple}) as rn \
-             from (select distinct {group_tuple} from {source} where {not_null_pred}) d \
+             from {STAGE_TABLE} \
          ) x where x.rn % {BACKFILL_CHUNK_GROUPS} = 0 order by {group_tuple}"
     );
     let boundary_rows = client.query(&boundary_sql, &[]).await?;
@@ -462,9 +526,9 @@ async fn backfill_aggregate(
 
     // A row-value comparison `(g1, g2, …) <op> (b1::t1, b2::t2, …)` against a
     // bound tuple, binding the bound components as $start.. text and casting each
-    // to its group column's type. Boundaries come from a `where … is not null`
-    // scan, so every component is `Some` — but `Option<String>` is what the row
-    // getter yields, so unwrap defensively.
+    // to its group column's type. Boundaries come from staging (whose keys are
+    // all non-NULL), so every component is `Some`, but `Option<String>` is what
+    // the row getter yields, so unwrap defensively.
     let tuple_cmp = |op: &str, start: usize| -> String {
         let lhs = group_tuple.clone();
         let rhs = (0..arity)
@@ -497,16 +561,14 @@ async fn backfill_aggregate(
     }
 
     // Final open-ended range above the last boundary — or, when there were no
-    // boundaries at all (distinct group count <= BACKFILL_CHUNK_GROUPS), the
-    // single range covering every non-NULL group.
+    // boundaries at all (group count <= BACKFILL_CHUNK_GROUPS), the single range
+    // covering every group in staging.
     match &prev {
         None => {
-            client
-                .execute(&insert_for(&format!(" where {not_null_pred}")), &[])
-                .await?;
+            client.execute(&insert_for(""), &[]).await?;
         }
         Some(prev) => {
-            let clause = format!(" where {} and {not_null_pred}", tuple_cmp(">", 1));
+            let clause = format!(" where {}", tuple_cmp(">", 1));
             let params: Vec<String> = prev.iter().map(|v| v.clone().unwrap_or_default()).collect();
             let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
                 params.iter().map(|p| p as _).collect();
@@ -514,10 +576,13 @@ async fn backfill_aggregate(
         }
     }
 
-    // A group with a NULL in its key is intentionally never built: the target's
-    // GROUP BY columns are its primary key, so Postgres forbids a NULL there and
-    // such a group has no representable target row (the ring can't store one
-    // either). Those groups are excluded from every range above (a row-value
-    // comparison against a NULL bound is itself NULL) and get no dedicated pass.
+    // Return the staging table to a clean slate before the connection goes back
+    // to the pool. NULL-key groups were filtered out when staging was built, so
+    // they never reach the target: the target's GROUP BY columns are its primary
+    // key and Postgres forbids a NULL there (the ring can't store one either).
+    client
+        .batch_execute(&format!("drop table if exists {STAGE_TABLE}"))
+        .await?;
+
     Ok(())
 }
