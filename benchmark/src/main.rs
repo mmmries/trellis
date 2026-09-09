@@ -39,7 +39,7 @@ use std::time::Duration;
 /// mechanism. Revisit once a CI-hardware baseline exists.
 const HIGH_CARDINALITY_CEILING: Duration = Duration::from_secs(10);
 
-/// Post-M3 this shape's aggregate phase measures ~0.1s on this harness/box:
+/// Post-M3 this shape's aggregate phase measures ~35ms on this harness/box:
 /// with only 100 groups the direct build issues a single group-key chunk, so
 /// it's far faster than the 100k-group high-cardinality shape (which they no
 /// longer track — the direct build's cost scales with group count, so the two
