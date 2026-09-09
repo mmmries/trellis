@@ -10,38 +10,36 @@
 //!   as the headline number.
 //! - **aggregate**: `posts_calc` (now fully populated, `n` rows) ->
 //!   `posts_totals`, `GROUP BY author`. This is the phase the issue's
-//!   milestones (M1 done, M2/M3/M4 pending) target, and the one the
-//!   regression ceiling gates — it only starts once `posts_calc` is fully
-//!   converged, so it exercises the same "backfill over an already-populated
-//!   table" bulk-recompute path the poc measured (~1m50s post-M1,
-//!   high-cardinality), not an incremental delta path.
+//!   milestones target, and the one the regression ceiling gates — it starts
+//!   once `posts_calc` is fully built, so it exercises the "backfill over an
+//!   already-populated table" path (~1m50s pre-M3, high-cardinality), not an
+//!   incremental delta path.
 //!
-//! Both phases use a fresh [`engine::Client`] apiece (`staging_worker` +
-//! application workers), started right before the definition that kicks off
-//! that phase's backfill, and polled via
-//! [`engine::staging::has_pending`] — the ring's own "is anything still
-//! unconverged" gate — until it reports `false`. No fixed sleep, no bespoke
-//! convergence heuristic.
+//! As of M3 (issue #63) both phases build their target with
+//! [`engine::defs::backfill_definition`] — a direct, key-range-chunked
+//! source→target build that bypasses the staging ring — paired with
+//! [`engine::defs::create_definition_without_backfill`] so the ring
+//! enumeration doesn't also run. The build is synchronous and complete on
+//! return, so each phase is timed by simply wrapping the `backfill_definition`
+//! call; the pre-M3 `Client` + `has_pending` convergence poll is gone.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use engine::config::DEFAULT_SCHEMA;
 use engine::defs::{
-    ValueType, create_aggregate_target_table, create_definition, create_target_table, parse,
-    source_primary_key,
+    ValueType, backfill_definition, create_aggregate_target_table,
+    create_definition_without_backfill, create_target_table, parse, source_primary_key,
 };
-use engine::staging::has_pending;
-use engine::{Client as TrellisClient, ClientOptions};
 use testkit::TestCluster;
 use tokio_postgres::{Client as RawClient, NoTls};
 
 use crate::generate;
 
 /// Connects directly to `dsn` (bypassing `engine::Pool`), matching the
-/// convention `engine`'s own integration tests use — `has_pending` wants a
-/// `tokio_postgres::GenericClient`, which the pool's wrapped client doesn't
-/// implement, so polling goes through a raw connection instead.
+/// convention `engine`'s own integration tests use — the reference-floor and
+/// correctness queries below want a plain `tokio_postgres::Client`, which the
+/// pool's wrapped client doesn't expose, so they go through a raw connection.
 async fn connect_raw(dsn: &str) -> RawClient {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
     tokio::spawn(async move {
@@ -52,37 +50,6 @@ async fn connect_raw(dsn: &str) -> RawClient {
         .await
         .expect("set search_path");
     client
-}
-
-/// How often the convergence poll checks `has_pending` again. Cheap (a
-/// handful of indexed existence probes — see `converge::has_pending`'s own
-/// doc comment), so a short interval doesn't meaningfully perturb the
-/// measurement.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Upper bound on how long a single phase's convergence poll will wait
-/// before giving up and panicking, independent of the scenario's regression
-/// ceiling (which is checked, and can fail the run, only after a phase
-/// actually converges). Generous: a hang here means the pipeline is stuck,
-/// not just slow, and should fail loudly rather than after the ceiling's
-/// own ordinary "too slow" message.
-const WATCHDOG: Duration = Duration::from_secs(20 * 60);
-
-async fn await_drained(raw: &RawClient) -> Duration {
-    let start = Instant::now();
-    loop {
-        let pending = has_pending(raw).await.expect("has_pending");
-        if !pending {
-            return start.elapsed();
-        }
-        if start.elapsed() > WATCHDOG {
-            panic!(
-                "backfill did not converge within the {WATCHDOG:?} watchdog — the pipeline is \
-                 stuck, not just slow"
-            );
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
 }
 
 fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
@@ -161,7 +128,7 @@ pub async fn run(name: &str, n: i64, g: i64, ceiling: Duration) -> BenchResult {
 
     let calc_start = Instant::now();
     let calc_def = parse(calc_source).expect("parse posts_calc definition");
-    create_definition(&db.pool, calc_source, &posts_columns)
+    create_definition_without_backfill(&db.pool, calc_source, &posts_columns)
         .await
         .expect("create posts_calc definition");
     let posts_pk = source_primary_key(&db.pool, "posts")
@@ -171,22 +138,14 @@ pub async fn run(name: &str, n: i64, g: i64, ceiling: Duration) -> BenchResult {
         .await
         .expect("create posts_calc target table");
 
-    let calc_client = TrellisClient::start(
-        db.dsn(),
-        ClientOptions {
-            staging_worker: true,
-            application_threads: 4,
-            source_tables: vec![format!("{DEFAULT_SCHEMA}.posts")],
-            ..Default::default()
-        },
-    )
-    .expect("start posts_calc client");
-    await_drained(&raw).await;
-    let calc_backfill_ms = calc_start.elapsed().as_millis();
-    calc_client
-        .shutdown()
+    // M3: build the target directly from source in bounded key-range chunks,
+    // bypassing the ring entirely (issue #63). Synchronous and complete on
+    // return, so there's no ring to drain — the previous `Client` +
+    // `has_pending` convergence poll this phase used is gone.
+    backfill_definition(&db.pool, &calc_def, "public", &posts_columns)
         .await
-        .expect("shut down posts_calc client");
+        .expect("direct backfill posts_calc");
+    let calc_backfill_ms = calc_start.elapsed().as_millis();
 
     let calc_rows: i64 = raw
         .query_one("select count(*) from posts_calc", &[])
@@ -210,32 +169,22 @@ pub async fn run(name: &str, n: i64, g: i64, ceiling: Duration) -> BenchResult {
 
     let aggregate_start = Instant::now();
     let totals_def = parse(totals_source).expect("parse posts_totals definition");
-    create_definition(&db.pool, totals_source, &calc_columns)
+    create_definition_without_backfill(&db.pool, totals_source, &calc_columns)
         .await
         .expect("create posts_totals definition");
     create_aggregate_target_table(&db.pool, &totals_def, "public", &calc_columns)
         .await
         .expect("create posts_totals target table");
 
-    let totals_client = TrellisClient::start(
-        db.dsn(),
-        ClientOptions {
-            staging_worker: true,
-            application_threads: 4,
-            // `posts_calc`'s target table lives in `public` (the
-            // `target_schema` passed to `create_target_table` above), not
-            // in `DEFAULT_SCHEMA` like the raw `posts` source table does.
-            source_tables: vec!["public.posts_calc".to_string()],
-            ..Default::default()
-        },
-    )
-    .expect("start posts_totals client");
-    await_drained(&raw).await;
-    let aggregate_backfill_ms = aggregate_start.elapsed().as_millis();
-    totals_client
-        .shutdown()
+    // M3: the aggregate build is chunked by group-key range and overwrites each
+    // group in one pass (issue #63). This is the phase the regression ceiling
+    // gates — and the one low-cardinality (few, large groups) vs high-cardinality
+    // (many, small groups) now diverge on, since the number of group-key chunks
+    // tracks group count directly.
+    backfill_definition(&db.pool, &totals_def, "public", &calc_columns)
         .await
-        .expect("shut down posts_totals client");
+        .expect("direct backfill posts_totals");
+    let aggregate_backfill_ms = aggregate_start.elapsed().as_millis();
 
     let (correctness_ok, group_count) = check_correctness(&raw, &totals_def).await;
 

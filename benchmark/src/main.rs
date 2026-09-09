@@ -27,29 +27,23 @@ mod scenario;
 
 use std::time::Duration;
 
-/// The issue's own poc baseline (measured on a different box, "poc cluster
-/// :5430") reports ~1m50s for this shape post-M1; on this harness/box the
-/// same post-M1 code measures ~55-58s across repeated runs (see the M0 PR
-/// description for the full numbers) — box speed, not a mechanism
-/// difference, since this run's `correctness_ok` matches the oracle exactly
-/// and takes the identical bulk-recompute path the issue describes. 120s
-/// leaves only ~2x headroom over this box's measurement for CI/dev-machine
-/// jitter without hiding a real regression — tighten (or loosen, if CI
-/// hardware is slower) once a CI-hardware baseline exists and once M2/M3/M4
-/// land.
-const HIGH_CARDINALITY_CEILING: Duration = Duration::from_secs(120);
+/// Post-M3 this shape's aggregate phase measures ~1.3-1.4s on this
+/// harness/box across repeated runs — the direct, group-key-range-chunked
+/// build ([`engine::defs::backfill_definition`], issue #63) replaced the ring
+/// drain that took ~55-58s here (and ~1m50s on the issue's poc cluster). 10s
+/// keeps ~7x headroom over this box's measurement for CI/dev-machine jitter
+/// and cold caches while still firing long before any regression back toward
+/// the old tens-of-seconds mechanism. Revisit once a CI-hardware baseline
+/// exists.
+const HIGH_CARDINALITY_CEILING: Duration = Duration::from_secs(10);
 
-/// Measured on this harness/box at ~55-58s (see above) — within noise of the
-/// high-cardinality shape today, because a from-scratch `create_definition`
-/// backfill enumerates and stages its whole source table in one commit
-/// (`intake::publication::enumerate_and_append`), which always lands in
-/// exactly one ring segment regardless of `(n, g)`. #62's segment-repetition
-/// multiplier this scenario is meant to stress needs *multiple* segments to
-/// bite — that starts mattering once M3's key-range-chunked direct-build
-/// (or any other multi-transaction backfill path) lands, at which point
-/// this shape should start diverging sharply from high-cardinality's. Same
-/// 120s ceiling for now; revisit once M2/M3 change the mechanism.
-const LOW_CARDINALITY_CEILING: Duration = Duration::from_secs(120);
+/// Post-M3 this shape's aggregate phase measures ~0.1s on this harness/box:
+/// with only 100 groups the direct build issues a single group-key chunk, so
+/// it's far faster than the 100k-group high-cardinality shape (which they no
+/// longer track — the direct build's cost scales with group count, so the two
+/// diverge sharply, as M3 intended). 5s keeps generous headroom while still
+/// catching a regression that would make small-group builds pathological.
+const LOW_CARDINALITY_CEILING: Duration = Duration::from_secs(5);
 
 struct Scenario {
     name: &'static str,
