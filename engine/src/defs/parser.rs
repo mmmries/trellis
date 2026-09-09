@@ -433,6 +433,14 @@ impl Parser {
                         return Ok(Expr::FunctionCall { name: upper, args });
                     }
 
+                    if upper == "COALESCE" {
+                        let args = self.parse_call_args()?;
+                        if args.is_empty() {
+                            return Err(ParseError::AtLeastOneArgumentRequired { name: upper });
+                        }
+                        return Ok(Expr::FunctionCall { name: upper, args });
+                    }
+
                     let spec = match lookup_function(&upper) {
                         Some(spec) => spec,
                         None => {

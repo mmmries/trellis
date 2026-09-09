@@ -840,6 +840,28 @@ fn infer_expr(
             }
             Ok(spec.return_type)
         }
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            let mut common_type = None;
+            for (i, arg) in args.iter().enumerate() {
+                let arg_t = infer_expr(
+                    arg, field_name, source_columns, relationships, fields_by_name, types, in_progress,
+                )?;
+                if let Some(ct) = common_type {
+                    if ct != arg_t {
+                        return Err(ValidationError::FunctionArgTypeMismatch {
+                            field: field_name.to_string(),
+                            function: name.clone(),
+                            arg_index: i,
+                            expected: ct,
+                            found: arg_t,
+                        });
+                    }
+                } else {
+                    common_type = Some(arg_t);
+                }
+            }
+            return Ok(common_type.unwrap());
+        }
         Expr::FunctionCall { name, args } => {
             // The parser only ever builds a `FunctionCall` node for a name
             // it already looked up in `registry::FUNCTIONS` and checked

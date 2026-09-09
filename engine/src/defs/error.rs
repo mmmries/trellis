@@ -41,6 +41,8 @@ pub enum ParseError {
     NonImmutableConstruct { name: String },
     /// A partial-data predicate other than a literal `TRUE`.
     UnsupportedPredicate { detail: String },
+    /// `COALESCE` called with zero arguments.
+    AtLeastOneArgumentRequired { name: String },
 }
 
 impl fmt::Display for ParseError {
@@ -87,6 +89,9 @@ impl fmt::Display for ParseError {
             ),
             ParseError::UnsupportedPredicate { detail } => {
                 write!(f, "unsupported partial-data predicate: {detail}")
+            }
+            ParseError::AtLeastOneArgumentRequired { name } => {
+                write!(f, "function '{name}' requires at least 1 argument")
             }
         }
     }

@@ -575,6 +575,25 @@ fn eval_expr(
             };
             eval_to_many_aggregate(name, rel, column, field_name, row, relationships)
         }
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            for arg in args {
+                let val = eval_expr(
+                    arg,
+                    field_name,
+                    row,
+                    source_columns,
+                    relationships,
+                    fields_by_name,
+                    cache,
+                    in_progress,
+                    regex_cache,
+                )?;
+                if val.is_some() {
+                    return Ok(val); // Short-circuit: first non-null wins
+                }
+            }
+            Ok(None)
+        }
         Expr::FunctionCall { name, args } => {
             let mut arg_values = Vec::with_capacity(args.len());
             for arg in args {
@@ -872,6 +891,25 @@ fn eval_aggregate_expr(
                 fields_by_name,
                 regex_cache,
             )
+        }
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            for arg in args {
+                let val = eval_aggregate_expr(
+                    arg,
+                    field_name,
+                    rows,
+                    group_by,
+                    source_columns,
+                    fields_by_name,
+                    cache,
+                    in_progress,
+                    regex_cache,
+                )?;
+                if val.is_some() {
+                    return Ok(val);
+                }
+            }
+            Ok(None)
         }
         Expr::FunctionCall { name, args } => {
             let mut arg_values = Vec::with_capacity(args.len());
