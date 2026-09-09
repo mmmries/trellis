@@ -1359,6 +1359,12 @@ async fn apply_target(
 ///    observably happen one without the other. Empty `DELETE ... RETURNING`
 ///    means the claim was already gone — [`ApplyError::ClaimLost`].
 /// 6. A `pg_notify` on `wake_channel`, for anything awaiting convergence.
+///
+/// A thin single-segment wrapper over [`apply_and_mark_drained_many`] (issue
+/// #63 Milestone 2) — every step below is shared verbatim with the
+/// multi-segment path; this function exists only to keep the pre-#63 public
+/// signature (and the every-`drain_once`-drains-exactly-one-segment
+/// contract every existing caller and test relies on) unchanged.
 pub async fn apply_and_mark_drained(
     txn: &Transaction<'_>,
     seg_seq: i64,
@@ -1366,6 +1372,42 @@ pub async fn apply_and_mark_drained(
     plan: &ApplyPlan,
     wake_channel: &str,
 ) -> Result<ApplyOutcome, ApplyError> {
+    let outcome =
+        apply_and_mark_drained_many(txn, &[seg_seq], claimed_by, plan, wake_channel).await?;
+    Ok(ApplyOutcome {
+        keys_written: outcome.keys_written,
+        keys_deleted: outcome.keys_deleted,
+        batch_drained: outcome.segments_drained[0].1,
+    })
+}
+
+/// The [`apply_and_mark_drained`] steps generalized over `seg_seqs` — issue
+/// #63 Milestone 2's segment-coalescing seam. `plan` (Phase 2's output) was
+/// computed once over every coalesced segment's *merged* folded changes
+/// ([`super::fold::merge_folded_changes`]), so steps 1-4 below (version
+/// fence, truncate clears, ordered writes, downstream propagation) already
+/// run exactly once for the whole batch — that sharing *is* the milestone's
+/// win, collapsing what used to be one such pass per sealed segment into
+/// one pass for however many sealed segments this call coalesces. Only step
+/// 5 (completion) is inherently per-segment: each `seg_seq` in `seg_seqs`
+/// has its own `seg_claims` rows and its own `drained_mask`, so "this
+/// claim's buckets are drained" must still be recorded once per segment,
+/// all in this same transaction — the one place this function's cost still
+/// scales with segment count, and it is O(1) per segment (no source-table
+/// work), unlike the passes above it.
+///
+/// `seg_seqs` must be the segments this call actually holds at least one
+/// claimed bucket on (never a segment this worker claimed nothing from —
+/// see [`drain_many`]'s `owned` filtering), and, since [`ApplyPlan::versions`]
+/// etc. are shared across all of them, must never mix a truncate-bearing
+/// segment with any other (see [`next_claimable_segments`]'s barrier).
+pub async fn apply_and_mark_drained_many(
+    txn: &Transaction<'_>,
+    seg_seqs: &[i64],
+    claimed_by: &str,
+    plan: &ApplyPlan,
+    wake_channel: &str,
+) -> Result<ManyApplyOutcome, ApplyError> {
     // 1. Version fence.
     for (source_key, loaded_version) in &plan.versions {
         let row = txn
@@ -1388,8 +1430,12 @@ pub async fn apply_and_mark_drained(
     // do this itself, in the same transaction, not just the batch that
     // caused the eviction. See `quarantine::park_batch_contribution`'s doc
     // comment for why this runs unconditionally rather than only on the
-    // batch that tripped the threshold.
-    quarantine::park_batch_contribution(txn, seg_seq, &plan.poisoned_park).await?;
+    // batch that tripped the threshold. Attributed to the lowest (earliest)
+    // of the coalesced segments — `poison_held`'s `seg_seq` is audit
+    // bookkeeping ("which batch's contribution is this"), not something
+    // later correctness depends on picking exactly right among several
+    // equally-valid coalesced segments.
+    quarantine::park_batch_contribution(txn, seg_seqs[0], &plan.poisoned_park).await?;
 
     let mut keys_written = 0usize;
     let mut keys_deleted = 0usize;
@@ -1551,60 +1597,66 @@ pub async fn apply_and_mark_drained(
     // "clean drain clears counters for keys it applied."
     quarantine::clear_key_deaths(txn, &plan.applied_keys).await?;
 
-    // 5. Completion: release this claim and mark its buckets drained, in
-    // one statement.
-    let bucket_count: i16 = txn
-        .query_one(
-            "select bucket_count from segments where seg_seq = $1",
-            &[&seg_seq],
-        )
-        .await?
-        .get(0);
+    // 5. Completion: release each coalesced segment's claim and mark its
+    // buckets drained, in one statement per segment — inherently per-segment
+    // (each has its own `seg_claims` rows and `drained_mask`), unlike steps
+    // 1-4 above, which already ran once for the whole coalesced batch.
+    let mut segments_drained = Vec::with_capacity(seg_seqs.len());
+    for &seg_seq in seg_seqs {
+        let bucket_count: i16 = txn
+            .query_one(
+                "select bucket_count from segments where seg_seq = $1",
+                &[&seg_seq],
+            )
+            .await?
+            .get(0);
 
-    let claimed_buckets: Vec<i16> = txn
-        .query(
-            "delete from seg_claims where seg_seq = $1 and claimed_by = $2 returning bucket",
-            &[&seg_seq, &claimed_by],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
+        let claimed_buckets: Vec<i16> = txn
+            .query(
+                "delete from seg_claims where seg_seq = $1 and claimed_by = $2 returning bucket",
+                &[&seg_seq, &claimed_by],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
 
-    if claimed_buckets.is_empty() {
-        return Err(ApplyError::ClaimLost);
+        if claimed_buckets.is_empty() {
+            return Err(ApplyError::ClaimLost);
+        }
+
+        let mut mask: i64 = 0;
+        for bucket in &claimed_buckets {
+            mask |= 1i64 << bucket;
+        }
+        let full_mask: i64 = (1i64 << bucket_count) - 1;
+
+        let completed = txn
+            .query_opt(
+                "update segments \
+                 set drained_mask = drained_mask | $2::bigint, \
+                     state = case when (drained_mask | $2::bigint) = $3::bigint \
+                                  then 'drained' else state end \
+                 where seg_seq = $1 and state = 'draining' \
+                 returning state",
+                &[&seg_seq, &mask, &full_mask],
+            )
+            .await?;
+        let batch_drained = matches!(
+            completed.map(|row| row.get::<_, String>(0)),
+            Some(state) if state == "drained"
+        );
+        segments_drained.push((seg_seq, batch_drained));
     }
-
-    let mut mask: i64 = 0;
-    for bucket in &claimed_buckets {
-        mask |= 1i64 << bucket;
-    }
-    let full_mask: i64 = (1i64 << bucket_count) - 1;
-
-    let completed = txn
-        .query_opt(
-            "update segments \
-             set drained_mask = drained_mask | $2::bigint, \
-                 state = case when (drained_mask | $2::bigint) = $3::bigint \
-                              then 'drained' else state end \
-             where seg_seq = $1 and state = 'draining' \
-             returning state",
-            &[&seg_seq, &mask, &full_mask],
-        )
-        .await?;
-    let batch_drained = matches!(
-        completed.map(|row| row.get::<_, String>(0)),
-        Some(state) if state == "drained"
-    );
 
     // 6. Wake anything awaiting convergence.
     txn.execute("select pg_notify($1, '')", &[&wake_channel])
         .await?;
 
-    Ok(ApplyOutcome {
+    Ok(ManyApplyOutcome {
         keys_written,
         keys_deleted,
-        batch_drained,
+        segments_drained,
     })
 }
 
@@ -1617,6 +1669,20 @@ pub struct ApplyOutcome {
     pub keys_written: usize,
     pub keys_deleted: usize,
     pub batch_drained: bool,
+}
+
+/// What one successful [`apply_and_mark_drained_many`] call did — the
+/// coalesced-segment counterpart to [`ApplyOutcome`] (issue #63 Milestone
+/// 2): the same physically-written/deleted key counts, now totalled across
+/// every segment this call drained from, plus each individual segment's own
+/// `(seg_seq, batch_drained)` completion result — a coalesced call can flip
+/// some of its segments to `'drained'` while leaving others still short a
+/// peer's bucket, exactly as any one of them would on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManyApplyOutcome {
+    pub keys_written: usize,
+    pub keys_deleted: usize,
+    pub segments_drained: Vec<(i64, bool)>,
 }
 
 // ---------------------------------------------------------------------
@@ -1734,9 +1800,152 @@ pub async fn drain_once(
     }
 }
 
+/// The most sealed segments [`drain_many`] will coalesce into a single
+/// compute-and-apply pass. A burst of incremental writes seals a new
+/// segment roughly every 300ms (`ClientOptions::maintenance_interval`'s
+/// default); this bounds how much of that backlog one drain call takes on
+/// at once, so a very long burst still drains in several coalesced calls
+/// rather than one unbounded one holding a single transaction (and its
+/// locks) open over an ever-growing plan.
+pub const MAX_COALESCE_SEGMENTS: usize = 32;
+
+/// [`drain_once`] generalized over more than one sealed segment (issue #63
+/// Milestone 2): claims and folds every segment in `seg_seqs` in one short
+/// transaction (Phase 1), merges their folded changes into one
+/// [`fold::merge_folded_changes`] list, then runs Phase 2 (compute) and
+/// Phase 3 (apply ∪ mark-drained, via [`apply_and_mark_drained_many`])
+/// exactly *once* over the merged list — collapsing what would have been
+/// one full compute-and-apply pass per segment (each with its own version
+/// fence read, its own ordered pre-lock/upsert, its own forced-group
+/// bulk-recompute for any [`crate::defs::ast::KeySpace::Aggregate`] target,
+/// and its own downstream-propagation staging) into one such pass for the
+/// whole batch.
+///
+/// `seg_seqs` should come from [`next_claimable_segments`], which already
+/// enforces the invariant this function relies on but does not itself
+/// re-check: never mix a truncate-bearing segment with any other (a
+/// truncate is drained alone — see that function's own doc comment on the
+/// barrier). `seg_seqs` need not be claimable in full — a segment every one
+/// of whose buckets a peer already holds simply contributes nothing and is
+/// dropped before Phase 2 runs (mirroring [`drain_once`]'s `filter.is_empty()`
+/// short-circuit, just per-segment instead of for the one segment it has).
+///
+/// Returns `Ok(None)` if this call's claims won nothing at all across every
+/// segment in `seg_seqs` (every bucket of every one of them was already
+/// claimed by a peer). Otherwise returns the winning attempt's
+/// [`ManyApplyOutcome`], covering only the segments this call actually
+/// claimed at least one bucket from — never a segment it claimed nothing
+/// on, which [`apply_and_mark_drained_many`]'s completion step would
+/// otherwise misreport as [`ApplyError::ClaimLost`].
+pub async fn drain_many(
+    pool: &Pool,
+    seg_seqs: &[i64],
+    claimed_by: &str,
+    live_workers: i64,
+    wake_channel: &str,
+) -> Result<Option<ManyApplyOutcome>, ApplyError> {
+    if seg_seqs.is_empty() {
+        return Ok(None);
+    }
+
+    let (mut folded, owned_segments) = {
+        let mut client = pool.get().await?;
+        let txn = client.transaction().await?;
+        let mut per_segment: Vec<Vec<FoldedChange>> = Vec::with_capacity(seg_seqs.len());
+        let mut owned: Vec<i64> = Vec::with_capacity(seg_seqs.len());
+        for &seg_seq in seg_seqs {
+            claim::claim(&*txn, seg_seq, claimed_by, live_workers).await?;
+            let filter = claim::owned_bucket_filter(&*txn, seg_seq, claimed_by).await?;
+            if filter.is_empty() {
+                continue;
+            }
+            owned.push(seg_seq);
+            per_segment.push(fold::fold(&txn, seg_seq, filter).await?);
+        }
+        txn.commit().await?;
+        if owned.is_empty() {
+            return Ok(None);
+        }
+        (fold::merge_folded_changes(per_segment), owned)
+    };
+
+    // Every retry-classification helper below (`classify_and_retry`,
+    // `isolate_and_evict`) takes one representative `seg_seq` purely as
+    // audit/probe bookkeeping (which batch's contribution a parked poison
+    // row names; which real claim a rollback-only probe transaction's
+    // completion step exercises) — never as something correctness depends
+    // on picking exactly right among several equally-valid coalesced
+    // segments. The lowest of this call's owned segments is as good a
+    // representative as any; see `apply_and_mark_drained_many`'s doc
+    // comment on the same choice for `poisoned_park`.
+    let representative_seg_seq = owned_segments[0];
+
+    let mut backoff = FenceMissBackoff::new();
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let plan = match compute(pool, &folded).await {
+            Ok(plan) => plan,
+            Err(ApplyError::SourceTableDropped { source_table }) => {
+                quarantine::purge_dropped_table(pool, &source_table).await?;
+                folded.retain(|c| c.src_table != source_table);
+                attempt -= 1;
+                continue;
+            }
+            Err(err) => {
+                if let Some(retry_folded) = classify_and_retry(
+                    pool,
+                    representative_seg_seq,
+                    claimed_by,
+                    wake_channel,
+                    &folded,
+                    attempt,
+                    &mut backoff,
+                    err,
+                )
+                .await?
+                {
+                    folded = retry_folded;
+                }
+                continue;
+            }
+        };
+
+        let mut client = pool.get().await?;
+        let txn = client.transaction().await?;
+        match apply_and_mark_drained_many(&txn, &owned_segments, claimed_by, &plan, wake_channel)
+            .await
+        {
+            Ok(outcome) => {
+                txn.commit().await?;
+                backoff.reset();
+                return Ok(Some(outcome));
+            }
+            Err(err) => {
+                let _ = txn.rollback().await;
+                if let Some(retry_folded) = classify_and_retry(
+                    pool,
+                    representative_seg_seq,
+                    claimed_by,
+                    wake_channel,
+                    &folded,
+                    attempt,
+                    &mut backoff,
+                    err,
+                )
+                .await?
+                {
+                    folded = retry_folded;
+                }
+            }
+        }
+    }
+}
+
 /// Classifies `err` (per [`quarantine::classify`]) and either retries or
-/// propagates, shared by both [`drain_once`]'s Phase 2 and Phase 3 failure
-/// arms so a bad key is attributed identically regardless of which phase
+/// propagates, shared by both [`drain_once`] and [`drain_many`]'s Phase 2
+/// and Phase 3 failure arms so a bad key is attributed identically
+/// regardless of which phase — or which of the two orchestrators —
 /// first surfaced it.
 ///
 /// Returns `Ok(Some(retry_folded))` if isolation evicted at least one key —
@@ -1834,9 +2043,42 @@ async fn classify_and_retry(
 pub async fn next_claimable_segment(
     client: &impl GenericClient,
 ) -> Result<Option<i64>, ApplyError> {
-    let row = client
-        .query_opt(
-            "select seg_seq from segments \
+    Ok(next_claimable_segments(client, 1).await?.into_iter().next())
+}
+
+/// [`next_claimable_segment`] generalized to return up to `max_batch`
+/// claimable segments at once (issue #63 Milestone 2), for [`drain_many`] to
+/// coalesce — the batch a burst of quickly-sealing segments needs so each
+/// one doesn't pay its own full compute-and-apply pass.
+///
+/// Runs the exact same barrier-respecting query [`next_claimable_segment`]
+/// does (see its doc comment for the truncate barrier `B`), just without
+/// `next_claimable_segment`'s `limit 1`. The only additional rule this adds
+/// is the one [`drain_many`]'s doc comment calls out as its caller-side
+/// invariant: **a truncate-bearing segment is never coalesced with another
+/// segment.** Because `B` is by definition the *lowest* seg_seq among
+/// undrained truncate-bearing segments and this query never returns
+/// anything past `B`, the only truncate-bearing segment that can ever
+/// appear in the result set is `B` itself, and — being the barrier's own
+/// upper bound — it is always the *last* (highest-`seg_seq`) row, never the
+/// first. So: walk the ascending rows, taking ordinary (non-truncate)
+/// segments into the batch; the moment a truncate-bearing row is reached,
+/// stop — returning it alone if the batch collected so far is otherwise
+/// empty (it's the lowest claimable segment, so it must be handed out on
+/// its own), or returning what's already been collected without it
+/// otherwise (it'll be handed out alone on some future call, once nothing
+/// ordinary remains ahead of it).
+pub async fn next_claimable_segments(
+    client: &impl GenericClient,
+    max_batch: usize,
+) -> Result<Vec<i64>, ApplyError> {
+    if max_batch == 0 {
+        return Ok(Vec::new());
+    }
+    let limit = max_batch as i64;
+    let rows = client
+        .query(
+            "select seg_seq, has_truncate from segments \
              where state in ('sealed', 'draining') \
                and drained_mask <> ((1::bigint << bucket_count) - 1) \
                and seg_seq <= coalesce( \
@@ -1846,9 +2088,22 @@ pub async fn next_claimable_segment(
                    seg_seq \
                ) \
              order by seg_seq asc \
-             limit 1",
-            &[],
+             limit $1",
+            &[&limit],
         )
         .await?;
-    Ok(row.map(|r| r.get(0)))
+
+    let mut batch = Vec::with_capacity(rows.len());
+    for row in rows {
+        let seg_seq: i64 = row.get(0);
+        let has_truncate: bool = row.get(1);
+        if has_truncate {
+            if batch.is_empty() {
+                batch.push(seg_seq);
+            }
+            break;
+        }
+        batch.push(seg_seq);
+    }
+    Ok(batch)
 }
