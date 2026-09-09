@@ -88,6 +88,7 @@
 //! this batch drains, which is not exercised by today's producers.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use tokio_postgres::Transaction;
 use tokio_postgres::types::ToSql;
@@ -1401,6 +1402,573 @@ fn agg_arg_sql(plan: &AggregateTargetPlan, field_name: &str) -> String {
     oracle::render_expr_sql(&args[0])
 }
 
+// ---------------------------------------------------------------------
+// Batched ordinary-delta upsert (issue #63 M4)
+// ---------------------------------------------------------------------
+
+/// Whether [`upsert_group`]'s write for `group` would touch any column at
+/// all — mirrors that function's own `update_sets.is_empty()` no-op check
+/// (see its doc comment), computed up front so [`apply_aggregate_target`]
+/// can exclude a genuinely inactive group before it ever reaches a write
+/// path, batched or not.
+fn group_has_activity(plan: &AggregateTargetPlan, group: &GroupPlan) -> bool {
+    plan.fields
+        .iter()
+        .any(|f| f.kind == AggFieldKind::RecomputeOnly || group.field_accum.contains_key(&f.name))
+}
+
+/// Encodes `values` (already-rendered `Numeric` text — see [`FieldAccum`])
+/// as a Postgres array-literal string (`{"1.00","-2.50"}`), so one group's
+/// whole variable-length adds/subs list can travel as a single `text[]`
+/// *element* alongside every other touched group's own list in one bind
+/// parameter — the ragged-2-D-array problem [`apply_delta_groups_bulk`]'s
+/// doc comment describes. Every element is double-quoted and
+/// backslash-escaped defensively; `Numeric`'s text form never actually
+/// contains `{`, `}`, `,`, or whitespace (see `numeric.rs`), but quoting
+/// costs nothing and removes any need to keep this code in sync with that
+/// assumption.
+fn array_literal(values: &[String]) -> String {
+    let mut out = String::from("{");
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        for ch in v.chars() {
+            if ch == '"' || ch == '\\' {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+    }
+    out.push('}');
+    out
+}
+
+/// [`sum_array_expr`]'s sibling for a per-row array-literal *column*
+/// (produced by [`array_literal`], one per touched group) rather than a
+/// single top-level bind parameter: `(select coalesce(sum(v), 0) from
+/// unnest(<col_ref>::text[]::numeric[]) v)`.
+fn array_literal_sum_expr(col_ref: &str) -> String {
+    format!("(select coalesce(sum(v), 0) from unnest({col_ref}::text[]::numeric[]) v)")
+}
+
+/// One extra `unnest(...)` array parameter for [`delta_carrier_unnest`],
+/// type-erased so a single `Vec` can carry the different concrete
+/// carrier shapes [`build_delta_carriers`] produces (one `bool[]`/
+/// `bigint[]`/`text[]` per field, per touched group) as one homogeneous
+/// collection of bind parameters.
+enum CarrierArray {
+    Text(Vec<String>),
+    NullableText(Vec<Option<String>>),
+    Bool(Vec<bool>),
+    BigInt(Vec<i64>),
+}
+
+impl CarrierArray {
+    fn as_param(&self) -> &(dyn ToSql + Sync) {
+        match self {
+            CarrierArray::Text(v) => v,
+            CarrierArray::NullableText(v) => v,
+            CarrierArray::Bool(v) => v,
+            CarrierArray::BigInt(v) => v,
+        }
+    }
+}
+
+/// Like [`keyset_unnest`], but the derived relation also carries this
+/// bucket's per-group field data (`extra`: `(column name, pg element type)`
+/// pairs, one `unnest(...)` array per pair) alongside the `GROUP BY`
+/// columns — the shape [`apply_delta_groups_bulk`]'s statements read every
+/// per-group value they need from, keyed by the same 1-based `ord`
+/// [`keyset_unnest`] already produces. Always `with ordinality`, and always
+/// aliased `k` (like [`keyset_unnest`]) so [`keyset_match`] needs no variant
+/// of its own.
+fn delta_carrier_unnest(group_by_types: &[ValueType], extra: &[(&str, &str)]) -> String {
+    let mut arrays: Vec<String> = group_by_types
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| format!("${}::text[]::{}[]", i + 1, ddl::pg_type_name(*ty)))
+        .collect();
+    let base = group_by_types.len();
+    for (i, (_, pg_type)) in extra.iter().enumerate() {
+        arrays.push(format!("${}::{}[]", base + i + 1, pg_type));
+    }
+    let mut cols: Vec<String> = (0..group_by_types.len()).map(keyset_col).collect();
+    cols.extend(extra.iter().map(|(name, _)| name.to_string()));
+    cols.push("ord".to_string());
+    format!(
+        "unnest({}) with ordinality as k({})",
+        arrays.join(", "),
+        cols.join(", ")
+    )
+}
+
+/// Bulk counterpart to [`probe_field_value`] for every
+/// [`AggFieldKind::RecomputeOnly`] field on `plan`, across every group in
+/// this bucket at once — one join-and-group-by over the source instead of
+/// one probe per group, reusing [`keyset_unnest`]/[`keyset_match`] exactly
+/// as [`apply_forced_groups_bulk`] does for its own bulk recompute. Callers
+/// already know (via [`probe_group_exists`], run per group before this
+/// bucket is ever assembled) that every group here has at least one
+/// surviving source row, so the inner join can never silently drop one.
+///
+/// Returns one `Vec<Option<String>>` per `RecomputeOnly` field, in
+/// [`AggregateTargetPlan::fields`] order, each aligned with `groups`
+/// (index `i` is that field's value for `groups[i]`) — an empty outer `Vec`
+/// if `plan` has no `RecomputeOnly` field at all, skipping the query
+/// entirely.
+async fn probe_recompute_fields_bulk(
+    txn: &Transaction<'_>,
+    plan: &AggregateTargetPlan,
+    key_arrays: &[Vec<Option<String>>],
+    null_safe: &[bool],
+    group_count: usize,
+) -> Result<Vec<Vec<Option<String>>>, ApplyError> {
+    let recompute_fields: Vec<&AggFieldPlan> = plan
+        .fields
+        .iter()
+        .filter(|f| f.kind == AggFieldKind::RecomputeOnly)
+        .collect();
+    if recompute_fields.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let source_ident = quote_ident(&plan.source);
+    let select_exprs: Vec<String> = recompute_fields
+        .iter()
+        .map(|f| {
+            format!(
+                "({})::text",
+                oracle::render_expr_sql(&plan.field_exprs[f.name.as_str()])
+            )
+        })
+        .collect();
+    let sql = format!(
+        "select k.ord::bigint, {} from {} join {source_ident} s on {} group by k.ord",
+        select_exprs.join(", "),
+        keyset_unnest(&plan.group_by_types, 1, true),
+        keyset_match(&plan.group_by, "s", null_safe),
+    );
+    let params: Vec<&(dyn ToSql + Sync)> = key_arrays
+        .iter()
+        .map(|a| a as &(dyn ToSql + Sync))
+        .collect();
+    let rows = txn.query(&sql, &params).await?;
+
+    let mut result: Vec<Vec<Option<String>>> =
+        vec![vec![None; group_count]; recompute_fields.len()];
+    for row in &rows {
+        let ord: i64 = row.get(0);
+        let i = (ord - 1) as usize;
+        for f_idx in 0..recompute_fields.len() {
+            result[f_idx][i] = row.get(f_idx + 1);
+        }
+    }
+    Ok(result)
+}
+
+/// Builds every field's carrier arrays and SQL fragments for
+/// [`apply_delta_groups_bulk`] — the batched counterpart to
+/// [`upsert_group`]'s Pass 1 + Pass 2, computed once and shared by that
+/// function's `UPDATE`/`INSERT` statements alike. Each field's fragments
+/// are [`upsert_group`]'s own expressions, verbatim, just reading a
+/// carrier column (`k.f{idx}_...`) instead of a per-group bind parameter,
+/// and — for [`AggFieldKind::Sum`]/[`AggFieldKind::Avg`]/[`AggFieldKind::Count`]
+/// — gated by `k.f{idx}_active` (`case when ... then ... else <untouched>
+/// end`) wherever [`upsert_group`] would have omitted that field's columns
+/// entirely for a group with no [`FieldAccum`] entry. `RecomputeOnly`
+/// fields need no `active` gate — [`upsert_group`] always probes and writes
+/// them unconditionally — and read straight from `recompute_values` (see
+/// [`probe_recompute_fields_bulk`]) rather than carrying their own
+/// probe-triggering data.
+///
+/// Returns `(carriers, insert_cols, insert_exprs, update_sets)`: `carriers`
+/// is every extra `unnest(...)` array [`delta_carrier_unnest`] needs beyond
+/// the `GROUP BY` columns; `insert_cols`/`insert_exprs` are this bucket's
+/// non-`GROUP BY` `INSERT` columns and their `SELECT` expressions (a fresh
+/// row's own carrier data only — no target row exists yet to reference);
+/// `update_sets` are the `UPDATE ... FROM` `SET` assignments (free to
+/// reference both the target row and the carrier columns at once — see
+/// [`apply_delta_groups_bulk`]'s doc comment on why only this half of the
+/// write can do that).
+fn build_delta_carriers(
+    plan: &AggregateTargetPlan,
+    groups: &[(&String, &GroupPlan)],
+    recompute_values: &[Vec<Option<String>>],
+    target_ident: &str,
+) -> (
+    Vec<(String, String, CarrierArray)>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+) {
+    let mut carriers: Vec<(String, String, CarrierArray)> = Vec::new();
+    let mut insert_cols: Vec<String> = Vec::new();
+    let mut insert_exprs: Vec<String> = Vec::new();
+    let mut update_sets: Vec<String> = Vec::new();
+    let mut recompute_idx = 0;
+
+    for (idx, field) in plan.fields.iter().enumerate() {
+        let col = quote_ident(&field.name);
+        match field.kind {
+            AggFieldKind::Sum | AggFieldKind::Avg => {
+                let active_name = format!("f{idx}_active");
+                let adds_name = format!("f{idx}_adds");
+                let subs_name = format!("f{idx}_subs");
+                let count_delta_name = format!("f{idx}_count_delta");
+
+                let active: Vec<bool> = groups
+                    .iter()
+                    .map(|(_, g)| g.field_accum.contains_key(&field.name))
+                    .collect();
+                let adds: Vec<String> = groups
+                    .iter()
+                    .map(|(_, g)| {
+                        array_literal(
+                            g.field_accum
+                                .get(&field.name)
+                                .map(|a| a.adds.as_slice())
+                                .unwrap_or(&[]),
+                        )
+                    })
+                    .collect();
+                let subs: Vec<String> = groups
+                    .iter()
+                    .map(|(_, g)| {
+                        array_literal(
+                            g.field_accum
+                                .get(&field.name)
+                                .map(|a| a.subs.as_slice())
+                                .unwrap_or(&[]),
+                        )
+                    })
+                    .collect();
+                let count_delta: Vec<i64> = groups
+                    .iter()
+                    .map(|(_, g)| {
+                        g.field_accum
+                            .get(&field.name)
+                            .map(|a| a.adds.len() as i64 - a.subs.len() as i64)
+                            .unwrap_or(0)
+                    })
+                    .collect();
+
+                carriers.push((
+                    active_name.clone(),
+                    "bool".to_string(),
+                    CarrierArray::Bool(active),
+                ));
+                carriers.push((
+                    adds_name.clone(),
+                    "text".to_string(),
+                    CarrierArray::Text(adds),
+                ));
+                carriers.push((
+                    subs_name.clone(),
+                    "text".to_string(),
+                    CarrierArray::Text(subs),
+                ));
+                carriers.push((
+                    count_delta_name.clone(),
+                    "bigint".to_string(),
+                    CarrierArray::BigInt(count_delta),
+                ));
+
+                let active = format!("k.{active_name}");
+                let sum_delta = format!(
+                    "({} - {})",
+                    array_literal_sum_expr(&format!("k.{adds_name}")),
+                    array_literal_sum_expr(&format!("k.{subs_name}")),
+                );
+                let count_delta_ref = format!("k.{count_delta_name}");
+
+                if field.kind == AggFieldKind::Sum {
+                    let count_col = quote_ident(&count_partial_column(&field.name));
+                    let insert_count = count_delta_ref.clone();
+                    let insert_sum =
+                        format!("case when {insert_count} = 0 then null else {sum_delta} end");
+                    insert_cols.push(col.clone());
+                    insert_exprs.push(format!(
+                        "case when {active} then {insert_sum} else null end"
+                    ));
+                    insert_cols.push(count_col.clone());
+                    insert_exprs.push(format!(
+                        "case when {active} then {insert_count} else null end"
+                    ));
+
+                    let update_count =
+                        format!("coalesce({target_ident}.{count_col}, 0) + {count_delta_ref}");
+                    let update_sum_raw = format!("coalesce({target_ident}.{col}, 0) + {sum_delta}");
+                    let update_sum = format!(
+                        "case when ({update_count}) = 0 then null else ({update_sum_raw}) end"
+                    );
+                    update_sets.push(format!(
+                        "{col} = case when {active} then {update_sum} else {target_ident}.{col} end"
+                    ));
+                    update_sets.push(format!(
+                        "{count_col} = case when {active} then {update_count} else {target_ident}.{count_col} end"
+                    ));
+                } else {
+                    let (sum_col_name, count_col_name) = avg_partial_columns(&field.name);
+                    let sum_col = quote_ident(&sum_col_name);
+                    let count_col = quote_ident(&count_col_name);
+                    let avg_col = col.clone();
+
+                    let insert_sum = sum_delta.clone();
+                    let insert_count = count_delta_ref.clone();
+                    let insert_avg = format!(
+                        "case when {insert_count} = 0 then null \
+                         else {insert_sum} / ({insert_count})::numeric end"
+                    );
+                    insert_cols.push(sum_col.clone());
+                    insert_exprs.push(format!(
+                        "case when {active} then {insert_sum} else null end"
+                    ));
+                    insert_cols.push(count_col.clone());
+                    insert_exprs.push(format!(
+                        "case when {active} then {insert_count} else null end"
+                    ));
+                    insert_cols.push(avg_col.clone());
+                    insert_exprs.push(format!(
+                        "case when {active} then {insert_avg} else null end"
+                    ));
+
+                    let update_sum = format!("coalesce({target_ident}.{sum_col}, 0) + {sum_delta}");
+                    let update_count =
+                        format!("coalesce({target_ident}.{count_col}, 0) + {count_delta_ref}");
+                    let update_avg = format!(
+                        "case when ({update_count}) = 0 then null \
+                         else ({update_sum}) / ({update_count})::numeric end"
+                    );
+                    update_sets.push(format!(
+                        "{sum_col} = case when {active} then {update_sum} else {target_ident}.{sum_col} end"
+                    ));
+                    update_sets.push(format!(
+                        "{count_col} = case when {active} then {update_count} else {target_ident}.{count_col} end"
+                    ));
+                    update_sets.push(format!(
+                        "{avg_col} = case when {active} then {update_avg} else {target_ident}.{avg_col} end"
+                    ));
+                }
+            }
+            AggFieldKind::Count => {
+                let active_name = format!("f{idx}_active");
+                let count_delta_name = format!("f{idx}_count_delta");
+                let active: Vec<bool> = groups
+                    .iter()
+                    .map(|(_, g)| g.field_accum.contains_key(&field.name))
+                    .collect();
+                let count_delta: Vec<i64> = groups
+                    .iter()
+                    .map(|(_, g)| {
+                        g.field_accum
+                            .get(&field.name)
+                            .map(|a| a.adds.len() as i64 - a.subs.len() as i64)
+                            .unwrap_or(0)
+                    })
+                    .collect();
+                carriers.push((
+                    active_name.clone(),
+                    "bool".to_string(),
+                    CarrierArray::Bool(active),
+                ));
+                carriers.push((
+                    count_delta_name.clone(),
+                    "bigint".to_string(),
+                    CarrierArray::BigInt(count_delta),
+                ));
+
+                let active = format!("k.{active_name}");
+                let count_delta_ref = format!("k.{count_delta_name}");
+                insert_cols.push(col.clone());
+                insert_exprs.push(format!(
+                    "case when {active} then ({count_delta_ref})::numeric else null end"
+                ));
+                update_sets.push(format!(
+                    "{col} = case when {active} then coalesce({target_ident}.{col}, 0) + {count_delta_ref} else {target_ident}.{col} end"
+                ));
+            }
+            AggFieldKind::RecomputeOnly => {
+                let r_name = format!("f{idx}_r");
+                let values: Vec<Option<String>> = (0..groups.len())
+                    .map(|i| recompute_values[recompute_idx][i].clone())
+                    .collect();
+                recompute_idx += 1;
+                carriers.push((
+                    r_name.clone(),
+                    "text".to_string(),
+                    CarrierArray::NullableText(values),
+                ));
+                let pg_type = ddl::pg_type_name(field.value_type);
+                let expr = format!("k.{r_name}::text::{pg_type}");
+                insert_cols.push(col.clone());
+                insert_exprs.push(expr.clone());
+                update_sets.push(format!("{col} = {expr}"));
+            }
+        }
+    }
+
+    (carriers, insert_cols, insert_exprs, update_sets)
+}
+
+/// Non-forced, source-existing groups' batched counterpart to per-group
+/// [`upsert_group`] (issue #63 M4, absorbing #60): the same
+/// increment-or-recompute logic [`upsert_group`]'s Pass 2 builds per group
+/// (see [`build_delta_carriers`]), expressed once as one `UPDATE ... FROM
+/// unnest(...)` plus (only if some group in this bucket has no target row
+/// yet) one `INSERT ... SELECT ... FROM unnest(...) ON CONFLICT DO NOTHING`,
+/// instead of one `INSERT ... ON CONFLICT DO UPDATE` per group — a
+/// round-trip reduction only, never a different computed value. Callers
+/// must exclude a group with no activity at all first (see
+/// [`group_has_activity`]) and must only reach here for more than one such
+/// group at once — [`apply_aggregate_target`] still calls [`upsert_group`]
+/// directly for a lone group, since this function's worst case (three round
+/// trips) only pays for itself once a batch touches several groups together.
+///
+/// Two statements (occasionally three) instead of one exist because
+/// Postgres's `ON CONFLICT DO UPDATE SET` — and a plain `INSERT ...
+/// RETURNING` — can only ever see the target table and the special
+/// `excluded` row, never the `unnest(...)` relation an `INSERT ... SELECT`
+/// reads from (confirmed empirically: referencing it raises "missing
+/// FROM-clause entry"), so a single upsert statement has no way to combine
+/// "this row's own delta" with "the target's current value" the way
+/// [`upsert_group`]'s literal per-row bind parameters let it do. `UPDATE ...
+/// FROM`, by contrast, *can* reference both the target row and the
+/// `FROM`-list relation in the same `SET`/`RETURNING` (confirmed
+/// empirically too), so the first statement below handles every group that
+/// already has a target row.
+///
+/// Whatever that `UPDATE` doesn't match must be a brand-new group: this
+/// function only ever runs after [`apply_aggregate_target`]'s ascending
+/// pre-lock has already taken every *existing* touched row for the whole
+/// batch, so nothing can race the `UPDATE` — the only race left is a
+/// concurrent writer inserting one of the same brand-new rows. The second
+/// statement is therefore a plain per-row `INSERT` (no arithmetic against
+/// existing state needed — there is none yet), guarded by `ON CONFLICT DO
+/// NOTHING`. A straggler that loses that race — unmatched by the `UPDATE`,
+/// not actually inserted by this `INSERT` — necessarily has a target row by
+/// now (the only way its insert could have found a conflict), so one final
+/// `UPDATE ... FROM`, identical to the first but restricted to just the
+/// stragglers, always finishes them off in one more round.
+///
+/// Knowing *which* pending groups the `INSERT` actually inserted (as
+/// opposed to skipped via `ON CONFLICT DO NOTHING`) needs its own
+/// correlation, for the same reason the `UPDATE`/`INSERT` split exists at
+/// all: a plain `INSERT ... RETURNING` cannot see the `unnest(...)` it read
+/// from, only real target columns. Wrapping it in a CTE that `RETURNING`s
+/// the target's own primary-key columns, then joining that back to a fresh
+/// read of the same keyset by native-typed primary-key equality, recovers
+/// the touched ordinals without that restriction ever coming into play.
+async fn apply_delta_groups_bulk(
+    txn: &Transaction<'_>,
+    target: &str,
+    plan: &AggregateTargetPlan,
+    groups: &[(&String, &GroupPlan)],
+) -> Result<(), ApplyError> {
+    let arity = plan.group_by.len();
+    let target_ident = quote_ident(target);
+    let pk_idents: Vec<String> = plan.group_by.iter().map(|c| quote_ident(c)).collect();
+
+    let group_plans: Vec<&GroupPlan> = groups.iter().map(|(_, g)| *g).collect();
+    let key_arrays = transpose_group_values(arity, &group_plans);
+    let null_safe: Vec<bool> = key_arrays
+        .iter()
+        .map(|a| a.iter().any(|v| v.is_none()))
+        .collect();
+
+    let recompute_values =
+        probe_recompute_fields_bulk(txn, plan, &key_arrays, &null_safe, groups.len()).await?;
+
+    let (carriers, insert_cols_fields, insert_exprs_fields, update_sets) =
+        build_delta_carriers(plan, groups, &recompute_values, &target_ident);
+
+    let extra: Vec<(&str, &str)> = carriers
+        .iter()
+        .map(|(name, ty, _)| (name.as_str(), ty.as_str()))
+        .collect();
+    let unnest_sql = delta_carrier_unnest(&plan.group_by_types, &extra);
+
+    let mut base_params: Vec<&(dyn ToSql + Sync)> = key_arrays
+        .iter()
+        .map(|a| a as &(dyn ToSql + Sync))
+        .collect();
+    base_params.extend(carriers.iter().map(|(_, _, data)| data.as_param()));
+
+    // Round 1: every group that already has a target row.
+    let update_sql = format!(
+        "update {target_ident} set {} from {unnest_sql} where {}",
+        update_sets.join(", "),
+        keyset_match(&plan.group_by, &target_ident, &null_safe),
+    );
+    let update_returning_sql = format!("{update_sql} returning k.ord::bigint");
+    let updated_rows = txn.query(&update_returning_sql, &base_params).await?;
+    let updated_ords: HashSet<i64> = updated_rows.iter().map(|r| r.get::<_, i64>(0)).collect();
+
+    let n = groups.len() as i64;
+    let pending_ords: Vec<i64> = (1..=n).filter(|o| !updated_ords.contains(o)).collect();
+    if pending_ords.is_empty() {
+        return Ok(());
+    }
+
+    // Round 2: brand-new groups, correlated back to `ord` via the
+    // CTE-plus-join workaround this function's doc comment describes.
+    let mut insert_cols = pk_idents.clone();
+    insert_cols.extend(insert_cols_fields);
+    let select_exprs: Vec<String> = (0..arity)
+        .map(|i| format!("k.{}", keyset_col(i)))
+        .chain(insert_exprs_fields)
+        .collect();
+    let pending_param_idx = base_params.len() + 1;
+    let insert_sql = format!(
+        "with ins as (\
+            insert into {target_ident} ({}) \
+            select {} from {unnest_sql} where k.ord = any(${pending_param_idx}::bigint[]) \
+            on conflict ({}) do nothing \
+            returning {} \
+         ) \
+         select k.ord::bigint from {unnest_sql} join ins on {} \
+         where k.ord = any(${pending_param_idx}::bigint[])",
+        insert_cols.join(", "),
+        select_exprs.join(", "),
+        pk_idents.join(", "),
+        pk_idents.join(", "),
+        keyset_match(&plan.group_by, "ins", &null_safe),
+    );
+    let mut insert_params = base_params.clone();
+    insert_params.push(&pending_ords);
+    let inserted_rows = txn.query(&insert_sql, &insert_params).await?;
+    let inserted_ords: HashSet<i64> = inserted_rows.iter().map(|r| r.get::<_, i64>(0)).collect();
+
+    let stragglers: Vec<i64> = pending_ords
+        .iter()
+        .copied()
+        .filter(|o| !inserted_ords.contains(o))
+        .collect();
+    if stragglers.is_empty() {
+        return Ok(());
+    }
+
+    // Round 3: a concurrent writer's brand-new row this batch also touched
+    // — see the doc comment on why this is provably the last round needed.
+    let straggler_param_idx = base_params.len() + 1;
+    let fallback_sql = format!(
+        "{update_sql} and k.ord = any(${straggler_param_idx}::bigint[]) returning k.ord::bigint"
+    );
+    let mut fallback_params = base_params.clone();
+    fallback_params.push(&stragglers);
+    let rows = txn.query(&fallback_sql, &fallback_params).await?;
+    debug_assert_eq!(
+        rows.len(),
+        stragglers.len(),
+        "a straggler group must have a target row by round 3 — the only way \
+         its round-2 insert could have found a conflict"
+    );
+
+    Ok(())
+}
+
 /// Phase 3 for one aggregate target table. Every group this batch touched is
 /// written or deleted under a single ascending-ordered pre-lock taken up
 /// front (see below), then split by strategy:
@@ -1410,8 +1978,12 @@ fn agg_arg_sql(plan: &AggregateTargetPlan, field_name: &str) -> String {
 ///   through [`apply_forced_groups_bulk`], a fixed handful of bulk statements
 ///   regardless of how many groups are forced, rather than a per-group probe
 ///   sequence each.
-/// - Ordinary delta groups keep the per-group [`upsert_group`] path
-///   (existence probe + increment-or-delete), unchanged.
+/// - Ordinary delta groups still probe existence and delete per group,
+///   unchanged, but a batch's surviving, active groups (see
+///   [`group_has_activity`]) are upserted together: a lone group still goes
+///   through [`upsert_group`] directly, while more than one goes through
+///   the batched [`apply_delta_groups_bulk`] instead of one
+///   `upsert_group` call each (issue #63 M4).
 ///
 /// **Deadlock avoidance.** [`super::apply::apply_target`]'s 1-1 path takes
 /// every target row it will touch `FOR UPDATE` in ascending key order, in one
@@ -1482,6 +2054,7 @@ pub(super) async fn apply_aggregate_target(
         deleted.extend(d);
     }
 
+    let mut delta_groups: Vec<(&String, &GroupPlan)> = Vec::new();
     for key in group_keys {
         let group = &plan.groups[key];
         if group.force_full_recompute {
@@ -1511,8 +2084,26 @@ pub(super) async fn apply_aggregate_target(
             continue;
         }
 
-        if upsert_group(txn, target, plan, group).await? {
-            written.push((key.clone(), group.hop_gen));
+        if group_has_activity(plan, group) {
+            delta_groups.push((key, group));
+        }
+    }
+
+    match delta_groups.len() {
+        0 => {}
+        1 => {
+            let (key, group) = delta_groups[0];
+            if upsert_group(txn, target, plan, group).await? {
+                written.push((key.clone(), group.hop_gen));
+            }
+        }
+        _ => {
+            apply_delta_groups_bulk(txn, target, plan, &delta_groups).await?;
+            written.extend(
+                delta_groups
+                    .iter()
+                    .map(|(key, group)| ((*key).clone(), group.hop_gen)),
+            );
         }
     }
 
@@ -1689,5 +2280,466 @@ mod tests {
             total, "12.00",
             "the NULL group's SUM must include both NULL-keyed source rows"
         );
+    }
+
+    /// A plan with `Sum`, `Avg`, `Count`, and `RecomputeOnly` fields over
+    /// `order_items`/`order_summary` — shared by the batched-upsert tests
+    /// below so the schema and field wiring stay in one place.
+    fn delta_plan_fields() -> (Vec<AggFieldPlan>, HashMap<String, Expr>) {
+        let fields = vec![
+            AggFieldPlan {
+                name: "total".to_string(),
+                value_type: ValueType::Numeric,
+                kind: AggFieldKind::Sum,
+            },
+            AggFieldPlan {
+                name: "avg_amount".to_string(),
+                value_type: ValueType::Numeric,
+                kind: AggFieldKind::Avg,
+            },
+            AggFieldPlan {
+                name: "row_count".to_string(),
+                value_type: ValueType::Numeric,
+                kind: AggFieldKind::Count,
+            },
+            AggFieldPlan {
+                name: "max_amount".to_string(),
+                value_type: ValueType::Numeric,
+                kind: AggFieldKind::RecomputeOnly,
+            },
+        ];
+        let exprs = HashMap::from([
+            (
+                "total".to_string(),
+                Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![Expr::Column("amount".to_string())],
+                },
+            ),
+            (
+                "avg_amount".to_string(),
+                Expr::FunctionCall {
+                    name: "AVG".to_string(),
+                    args: vec![Expr::Column("amount".to_string())],
+                },
+            ),
+            (
+                "max_amount".to_string(),
+                Expr::FunctionCall {
+                    name: "MAX".to_string(),
+                    args: vec![Expr::Column("amount".to_string())],
+                },
+            ),
+        ]);
+        (fields, exprs)
+    }
+
+    fn delta_plan() -> AggregateTargetPlan {
+        let (fields, exprs) = delta_plan_fields();
+        AggregateTargetPlan::new(
+            vec!["order_id".to_string()],
+            vec![ValueType::Numeric],
+            fields,
+            "order_items".to_string(),
+            exprs,
+        )
+    }
+
+    const ORDER_SCHEMA_SQL: &str = "\
+        create table order_items \
+        (id integer primary key, order_id numeric, amount numeric); \
+        create table order_summary \
+        (order_id numeric primary key, \
+         total numeric, __total_count bigint, \
+         avg_amount numeric, __avg_amount_sum numeric, __avg_amount_count bigint, \
+         row_count numeric, \
+         max_amount numeric)";
+
+    /// Reads back every `order_summary` row, sorted by `order_id`, as text —
+    /// used to compare the batched path's output against the unbatched
+    /// per-group path's output byte-for-byte.
+    async fn read_order_summary(client: &tokio_postgres::Client) -> Vec<Vec<Option<String>>> {
+        let rows = client
+            .query(
+                "select order_id::text, total::text, __total_count::text, \
+                 avg_amount::text, __avg_amount_sum::text, __avg_amount_count::text, \
+                 row_count::text, max_amount::text \
+                 from order_summary order by order_id",
+                &[],
+            )
+            .await
+            .expect("read order_summary");
+        rows.iter()
+            .map(|r| (0..8).map(|i| r.get(i)).collect())
+            .collect()
+    }
+
+    /// [`apply_delta_groups_bulk`]'s three touched-group shapes — a plain
+    /// value edit on an existing row (net count delta zero, sum delta
+    /// nonzero: the case that rules out a single `ON CONFLICT DO UPDATE`
+    /// statement, see that function's doc comment), a brand-new group (the
+    /// `INSERT` round), and an existing group gaining a row (the `UPDATE`
+    /// round with an active count delta) — must land on exactly the values
+    /// [`upsert_group`] would have produced one group at a time. Proves it
+    /// two ways: against hand-computed expected values, and against a
+    /// second database fed the same seed data one group per
+    /// [`apply_aggregate_target`] call (forcing the singleton/`upsert_group`
+    /// path for every group).
+    #[tokio::test]
+    async fn apply_delta_groups_bulk_matches_per_group_upsert_across_field_kinds() {
+        let cluster = testkit::TestCluster::start();
+
+        let seed_sql = format!(
+            "{ORDER_SCHEMA_SQL}; \
+             insert into order_items (id, order_id, amount) values \
+             (1, 1, 8.00), (2, 2, 7.00), (10, 4, 10.00), (11, 4, 20.00); \
+             insert into order_summary \
+             (order_id, total, __total_count, avg_amount, __avg_amount_sum, \
+              __avg_amount_count, row_count, max_amount) \
+             values \
+             (1, 5.00, 1, 5.00, 5.00, 1, 1, 5.00), \
+             (4, 10.00, 1, 10.00, 10.00, 1, 1, 10.00)"
+        );
+
+        // Group 1: an in-place value edit (5.00 -> 8.00) on an existing row —
+        // net count delta 0, sum delta +3.00.
+        let mut group_1 = GroupPlan::new(vec![Some("1".to_string())]);
+        group_1.field_accum.insert(
+            "total".to_string(),
+            FieldAccum {
+                adds: vec!["8.00".to_string()],
+                subs: vec!["5.00".to_string()],
+            },
+        );
+        group_1.field_accum.insert(
+            "avg_amount".to_string(),
+            FieldAccum {
+                adds: vec!["8.00".to_string()],
+                subs: vec!["5.00".to_string()],
+            },
+        );
+        group_1.hop_gen = 1;
+
+        // Group 2: a brand-new group (no target row yet) — the `INSERT` round.
+        let mut group_2 = GroupPlan::new(vec![Some("2".to_string())]);
+        group_2.field_accum.insert(
+            "total".to_string(),
+            FieldAccum {
+                adds: vec!["7.00".to_string()],
+                subs: vec![],
+            },
+        );
+        group_2.field_accum.insert(
+            "avg_amount".to_string(),
+            FieldAccum {
+                adds: vec!["7.00".to_string()],
+                subs: vec![],
+            },
+        );
+        group_2.field_accum.insert(
+            "row_count".to_string(),
+            FieldAccum {
+                adds: vec!["1".to_string()],
+                subs: vec![],
+            },
+        );
+        group_2.hop_gen = 2;
+
+        // Group 4: an existing group gaining a second row.
+        let mut group_4 = GroupPlan::new(vec![Some("4".to_string())]);
+        group_4.field_accum.insert(
+            "total".to_string(),
+            FieldAccum {
+                adds: vec!["20.00".to_string()],
+                subs: vec![],
+            },
+        );
+        group_4.field_accum.insert(
+            "avg_amount".to_string(),
+            FieldAccum {
+                adds: vec!["20.00".to_string()],
+                subs: vec![],
+            },
+        );
+        group_4.field_accum.insert(
+            "row_count".to_string(),
+            FieldAccum {
+                adds: vec!["1".to_string()],
+                subs: vec![],
+            },
+        );
+        group_4.hop_gen = 3;
+
+        let groups = vec![
+            ("g1".to_string(), group_1),
+            ("g2".to_string(), group_2),
+            ("g4".to_string(), group_4),
+        ];
+
+        // Bulk run: all three groups through one `apply_aggregate_target`
+        // call (`delta_groups.len() == 3`, so [`apply_delta_groups_bulk`]).
+        let db_bulk = cluster.create_isolated_database().await;
+        let (mut bulk_client, bulk_conn) = tokio_postgres::connect(db_bulk.dsn(), NoTls)
+            .await
+            .expect("connect bulk");
+        tokio::spawn(async move {
+            let _ = bulk_conn.await;
+        });
+        bulk_client
+            .batch_execute(&seed_sql)
+            .await
+            .expect("seed bulk db");
+        let mut bulk_plan = delta_plan();
+        bulk_plan.groups = groups.clone().into_iter().collect();
+        let txn = bulk_client.transaction().await.expect("begin bulk");
+        let result = apply_aggregate_target(&txn, "order_summary", &bulk_plan)
+            .await
+            .expect("bulk apply");
+        txn.commit().await.expect("commit bulk");
+        assert!(result.deleted.is_empty(), "no group went extinct");
+        let mut written_keys: Vec<&str> = result.written.iter().map(|(k, _)| k.as_str()).collect();
+        written_keys.sort();
+        assert_eq!(
+            written_keys,
+            vec!["g1", "g2", "g4"],
+            "every active group must be reported written"
+        );
+
+        // Unbatched run: the same seed, but one `apply_aggregate_target`
+        // call per group, each with only that one group in its plan — always
+        // takes the `delta_groups.len() == 1` branch, i.e. [`upsert_group`]
+        // directly, exactly as issue #63 M4 found it.
+        let db_single = cluster.create_isolated_database().await;
+        let (mut single_client, single_conn) = tokio_postgres::connect(db_single.dsn(), NoTls)
+            .await
+            .expect("connect single");
+        tokio::spawn(async move {
+            let _ = single_conn.await;
+        });
+        single_client
+            .batch_execute(&seed_sql)
+            .await
+            .expect("seed single db");
+        for (key, group) in &groups {
+            let mut plan = delta_plan();
+            plan.groups = HashMap::from([(key.clone(), group.clone())]);
+            let txn = single_client.transaction().await.expect("begin single");
+            apply_aggregate_target(&txn, "order_summary", &plan)
+                .await
+                .expect("per-group apply");
+            txn.commit().await.expect("commit single");
+        }
+
+        let bulk_rows = read_order_summary(&bulk_client).await;
+        let single_rows = read_order_summary(&single_client).await;
+        assert_eq!(
+            bulk_rows, single_rows,
+            "the batched path must produce byte-for-byte the same rows as \
+             one upsert_group call per group"
+        );
+
+        assert_eq!(
+            bulk_rows,
+            vec![
+                vec![
+                    Some("1".to_string()),
+                    Some("8.00".to_string()),
+                    Some("1".to_string()),
+                    Some("8.0000000000000000".to_string()),
+                    Some("8.00".to_string()),
+                    Some("1".to_string()),
+                    Some("1".to_string()),
+                    Some("8.00".to_string()),
+                ],
+                vec![
+                    Some("2".to_string()),
+                    Some("7.00".to_string()),
+                    Some("1".to_string()),
+                    Some("7.0000000000000000".to_string()),
+                    Some("7.00".to_string()),
+                    Some("1".to_string()),
+                    Some("1".to_string()),
+                    Some("7.00".to_string()),
+                ],
+                vec![
+                    Some("4".to_string()),
+                    Some("30.00".to_string()),
+                    Some("2".to_string()),
+                    Some("15.0000000000000000".to_string()),
+                    Some("30.00".to_string()),
+                    Some("2".to_string()),
+                    Some("2".to_string()),
+                    Some("20.00".to_string()),
+                ],
+            ],
+            "hand-computed expected values for each field kind"
+        );
+    }
+
+    /// A single active group must still take the unbatched [`upsert_group`]
+    /// path (`delta_groups.len() == 1` in [`apply_aggregate_target`]) rather
+    /// than ever reaching [`apply_delta_groups_bulk`] — the degenerate case
+    /// issue #63 M4 explicitly keeps on the pre-existing path.
+    #[tokio::test]
+    async fn apply_aggregate_target_routes_a_lone_group_through_upsert_group() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        client
+            .batch_execute(&format!(
+                "{ORDER_SCHEMA_SQL}; \
+                 insert into order_items (id, order_id, amount) values (1, 9, 7.00)"
+            ))
+            .await
+            .expect("seed");
+
+        let mut group = GroupPlan::new(vec![Some("9".to_string())]);
+        group.field_accum.insert(
+            "total".to_string(),
+            FieldAccum {
+                adds: vec!["7.00".to_string()],
+                subs: vec![],
+            },
+        );
+        group.field_accum.insert(
+            "avg_amount".to_string(),
+            FieldAccum {
+                adds: vec!["7.00".to_string()],
+                subs: vec![],
+            },
+        );
+        group.field_accum.insert(
+            "row_count".to_string(),
+            FieldAccum {
+                adds: vec!["1".to_string()],
+                subs: vec![],
+            },
+        );
+        group.hop_gen = 5;
+
+        let mut plan = delta_plan();
+        plan.groups = HashMap::from([("g9".to_string(), group)]);
+
+        let txn = client.transaction().await.expect("begin");
+        let result = apply_aggregate_target(&txn, "order_summary", &plan)
+            .await
+            .expect("apply");
+        txn.commit().await.expect("commit");
+
+        assert_eq!(
+            result.written,
+            vec![("g9".to_string(), 5)],
+            "the lone group must be reported written"
+        );
+
+        let row = client
+            .query_one(
+                "select total::text, row_count::text, max_amount::text \
+                 from order_summary where order_id = 9",
+                &[],
+            )
+            .await
+            .expect("fetch");
+        assert_eq!(row.get::<_, String>(0), "7.00");
+        assert_eq!(row.get::<_, String>(1), "1");
+        assert_eq!(row.get::<_, String>(2), "7.00");
+    }
+
+    /// A batch touching hundreds of brand-new groups at once — each
+    /// [`build_delta_carriers`]/[`delta_carrier_unnest`] parameter is one
+    /// bind slot per field regardless of group count (the arrays carrying
+    /// per-group data grow in *length*, not in bind-parameter *count* — see
+    /// [`apply_delta_groups_bulk`]'s doc comment), so this exercises scale
+    /// without ever approaching the bind-parameter cap issue #58 fixed for
+    /// the per-row literal case. Also demonstrates the round-trip reduction:
+    /// one [`apply_aggregate_target`] call issues a handful of statements
+    /// for the whole batch, not one `upsert_group` per group.
+    #[tokio::test]
+    async fn apply_delta_groups_bulk_handles_hundreds_of_new_groups() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        client
+            .batch_execute(ORDER_SCHEMA_SQL)
+            .await
+            .expect("create schema");
+
+        const N: i64 = 500;
+        let mut insert_sql = String::from("insert into order_items (id, order_id, amount) values ");
+        let mut groups: HashMap<String, GroupPlan> = HashMap::new();
+        for i in 1..=N {
+            if i > 1 {
+                insert_sql.push_str(", ");
+            }
+            let amount = format!("{i}.00");
+            insert_sql.push_str(&format!("({i}, {i}, {amount})"));
+
+            let mut group = GroupPlan::new(vec![Some(i.to_string())]);
+            group.field_accum.insert(
+                "total".to_string(),
+                FieldAccum {
+                    adds: vec![amount.clone()],
+                    subs: vec![],
+                },
+            );
+            group.field_accum.insert(
+                "avg_amount".to_string(),
+                FieldAccum {
+                    adds: vec![amount],
+                    subs: vec![],
+                },
+            );
+            group.field_accum.insert(
+                "row_count".to_string(),
+                FieldAccum {
+                    adds: vec!["1".to_string()],
+                    subs: vec![],
+                },
+            );
+            group.hop_gen = i as i32;
+            groups.insert(format!("g{i}"), group);
+        }
+        client.batch_execute(&insert_sql).await.expect("seed");
+
+        let mut plan = delta_plan();
+        plan.groups = groups;
+
+        let txn = client.transaction().await.expect("begin");
+        let result = apply_aggregate_target(&txn, "order_summary", &plan)
+            .await
+            .expect("bulk apply");
+        txn.commit().await.expect("commit");
+
+        assert_eq!(result.written.len(), N as usize);
+        assert!(result.deleted.is_empty());
+
+        let count: i64 = client
+            .query_one("select count(*) from order_summary", &[])
+            .await
+            .expect("count")
+            .get(0);
+        assert_eq!(count, N, "every new group must have been inserted");
+
+        let sample = client
+            .query_one(
+                "select total::text, max_amount::text from order_summary where order_id = 250",
+                &[],
+            )
+            .await
+            .expect("fetch sample");
+        assert_eq!(sample.get::<_, String>(0), "250.00");
+        assert_eq!(sample.get::<_, String>(1), "250.00");
     }
 }
