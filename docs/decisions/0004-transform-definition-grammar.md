@@ -94,6 +94,29 @@ definition time (see [transforms](../transforms.md)). `<predicate>` accepts
 only the literal `TRUE` for now (the partial-data predicate is otherwise
 deferred).
 
+`COALESCE(<expr>, ...)` is also accepted (issue #64) — the first
+non-`NULL` argument, or `NULL` if all are. It's immutable, so it clears the
+growth-policy bar, but it's *variadic* rather than fixed-arity, so it isn't a
+registry function: the parser special-cases it (requiring at least one
+argument, as Postgres does), and the evaluator short-circuits on the first
+non-`NULL`. It is a **safe subset** of Postgres's `COALESCE`, not yet full
+parity — the accepted-language-is-the-spec goal makes the gaps worth naming:
+
+* All arguments must resolve to the *same* type (exact match), where Postgres
+  runs type resolution to a common type. Because this grammar's type lattice
+  is coarser than Postgres's (a single `Numeric`, no distinct `int`/`bigint`),
+  no *expressible* mismatch behaves differently — cross-category mixes like
+  `numeric`/`text` are rejected by both.
+* There is no `unknown`-typed literal: a quoted literal is always `Text`, so
+  `COALESCE(<numeric>, '0')` — which Postgres coerces to `numeric` — is a type
+  mismatch here. Write a numeric literal (`COALESCE(<numeric>, 0)`) instead.
+* There is no `NULL` literal in the grammar at all, so Postgres's idiomatic
+  `COALESCE(x, NULL)` isn't expressible; a bare `NULL` parses as a column
+  reference and is rejected as unresolved.
+
+These are tracked toward full compatibility; each is pinned by a divergence
+test in `engine/src/defs`.
+
 `FROM <source>` is deliberately where a future key-space clause slots in —
 `GROUP BY <cols>` for the aggregate case, `JOIN <other> ON <cond>
 [INNER|LEFT|RIGHT]` for cross-join — without changing the statement's outer

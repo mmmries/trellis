@@ -583,6 +583,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn render_expr_sql_renders_coalesce_as_a_postgres_function_call() {
+        // COALESCE renders through the generic `name(args)` arm to lowercase
+        // `coalesce(...)` — valid Postgres — so the correctness oracle can
+        // cross-check the evaluator's COALESCE output against Postgres's own.
+        let expr = Expr::FunctionCall {
+            name: "COALESCE".to_string(),
+            args: vec![
+                Expr::Column("amount".to_string()),
+                Expr::NumberLiteral("0".to_string()),
+            ],
+        };
+        assert_eq!(render_expr_sql(&expr), "coalesce(\"amount\", 0::numeric)");
+    }
+
     fn category_rel() -> HashMap<String, RelationshipDef> {
         HashMap::from([(
             "category".to_string(),

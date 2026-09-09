@@ -389,6 +389,84 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_variadic_coalesce_call() {
+        // COALESCE is variadic (unlike the fixed-arity registry functions),
+        // so it isn't looked up in `registry::FUNCTIONS`; the parser accepts
+        // any argument count >= 1, matching Postgres.
+        let def = parse("TRANSFORM t FROM s SELECT COALESCE(a, b, 0) AS x").unwrap();
+        assert_eq!(
+            def.fields[0].expr,
+            Expr::FunctionCall {
+                name: "COALESCE".to_string(),
+                args: vec![
+                    Expr::Column("a".to_string()),
+                    Expr::Column("b".to_string()),
+                    Expr::NumberLiteral("0".to_string()),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_single_argument_coalesce_call() {
+        // Postgres allows a one-argument COALESCE (it simply returns that
+        // argument); the parser's arity floor is 1, so this is accepted.
+        let def = parse("TRANSFORM t FROM s SELECT COALESCE(a) AS x").unwrap();
+        assert_eq!(
+            def.fields[0].expr,
+            Expr::FunctionCall {
+                name: "COALESCE".to_string(),
+                args: vec![Expr::Column("a".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_coalesce_with_no_arguments() {
+        // Postgres rejects `COALESCE()` as a syntax error; we reject it with a
+        // dedicated at-least-one-argument message.
+        let err = parse("TRANSFORM t FROM s SELECT COALESCE() AS x").unwrap_err();
+        match err {
+            ParseError::AtLeastOneArgumentRequired { name } => assert_eq!(name, "COALESCE"),
+            other => panic!("expected AtLeastOneArgumentRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalesce_with_a_null_literal_argument_is_unsupported() {
+        // DIVERGENCE from Postgres (tracked toward full compatibility):
+        // Postgres's most idiomatic COALESCE form takes a bare `NULL` literal
+        // (e.g. `COALESCE(NULL, default)`), but this grammar has no NULL
+        // literal (`ast.rs` has no such `Expr`/`Value` variant). `NULL` is
+        // therefore parsed as an ordinary column reference and rejected at
+        // validation as an unresolved column, rather than behaving as SQL
+        // NULL.
+        let def = parse("TRANSFORM t FROM s SELECT COALESCE(a, NULL) AS x").unwrap();
+        assert_eq!(
+            def.fields[0].expr,
+            Expr::FunctionCall {
+                name: "COALESCE".to_string(),
+                args: vec![
+                    Expr::Column("a".to_string()),
+                    Expr::Column("NULL".to_string()),
+                ],
+            }
+        );
+        let source_columns = std::collections::HashMap::from([(
+            "a".to_string(),
+            ValueType::Numeric,
+        )]);
+        let err = validate(&def, &source_columns, &std::collections::HashMap::new()).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::UnresolvedColumn {
+                field: "x".to_string(),
+                column: "NULL".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn parses_a_greater_than_expression() {
         let def = parse("TRANSFORM t FROM s SELECT a > 0 AS positive").unwrap();
         assert_eq!(
