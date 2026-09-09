@@ -508,9 +508,44 @@ pub async fn create_aggregate_target_table(
     sql.push_str(&format!(", primary key ({})", pk_columns.join(", ")));
     sql.push(')');
 
+    // Index the source table's `GROUP BY` columns (issue #59): every
+    // aggregate probe and the backfill's bulk recompute filter/group the
+    // source on exactly these columns, so without this index each is a full
+    // sequential scan — turning a from-scratch backfill into `O(groups ×
+    // source_rows)`. `if not exists` keeps this idempotent alongside the
+    // `create table if not exists` above.
+    let index_sql = format!(
+        "create index if not exists {} on {} ({})",
+        quote_ident(&aggregate_group_index_name(&def.source, group_by)),
+        quote_ident(&def.source),
+        pk_columns.join(", "),
+    );
+
     let client = pool.get().await?;
     client.batch_execute(&sql).await?;
+    client.batch_execute(&index_sql).await?;
     Ok(())
+}
+
+/// A stable, collision-resistant index name for `source`'s `group_by`
+/// columns, kept within Postgres's 63-byte identifier limit. The readable
+/// `trellis_agg_<source>_<cols>` form is used whenever it fits; otherwise the
+/// name is derived from a deterministic FNV-1a hash of that same string
+/// (deterministic — unlike `std::hash::DefaultHasher`, whose output is not
+/// stable across builds — so `create index if not exists` stays idempotent
+/// across process restarts and versions rather than creating a second index
+/// under a drifted name).
+fn aggregate_group_index_name(source: &str, group_by: &[String]) -> String {
+    let raw = format!("trellis_agg_{}_{}", source, group_by.join("_"));
+    if raw.len() <= 63 {
+        return raw;
+    }
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in raw.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("trellis_agg_{hash:016x}")
 }
 
 #[cfg(test)]

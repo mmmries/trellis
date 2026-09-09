@@ -1080,12 +1080,271 @@ async fn upsert_group(
     Ok(!rows.is_empty())
 }
 
-/// Phase 3 for one aggregate target table: for every group this batch
-/// touched, in ascending group-key order (see [`upsert_group`]'s doc
-/// comment on why that ordering alone, with no batched pre-lock CTE, is
-/// enough to avoid the deadlocks doc 05 calls for avoiding), checks whether
-/// the group still has any source rows at all and either deletes its target
-/// row (extinct) or upserts its delta/probed values (still alive).
+/// The `k`-alias column name for the `i`th `GROUP BY` column in a keyset
+/// `unnest(...)` — see [`keyset_unnest`]. Named `c0`, `c1`, … so they never
+/// collide with the source/target's own (arbitrarily-named) grouping columns
+/// when both appear in one query's join condition.
+fn keyset_col(i: usize) -> String {
+    format!("c{i}")
+}
+
+/// `unnest($start::text[]::t0[], $start+1::text[]::t1[], …) [with ordinality]
+/// as k(c0, c1, …[, ord])` — the bound touched-group keys as a derived
+/// relation, one array parameter per `GROUP BY` column (so the whole keyset
+/// is `group_by.len()` bind parameters regardless of how many groups it
+/// carries, well under Postgres's bind cap — unlike #58's per-row literals).
+/// `with_ordinality` adds a 1-based `ord` column, letting a caller map a
+/// matched row back to which touched group produced it without re-encoding
+/// its (typed) key columns back to the [`derive_group_key`] text form.
+fn keyset_unnest(group_by_types: &[ValueType], start: usize, with_ordinality: bool) -> String {
+    let arrays: Vec<String> = group_by_types
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| format!("${}::text[]::{}[]", start + i, ddl::pg_type_name(*ty)))
+        .collect();
+    let mut cols: Vec<String> = (0..group_by_types.len()).map(keyset_col).collect();
+    if with_ordinality {
+        cols.push("ord".to_string());
+    }
+    format!(
+        "unnest({}){} as k({})",
+        arrays.join(", "),
+        if with_ordinality {
+            " with ordinality"
+        } else {
+            ""
+        },
+        cols.join(", ")
+    )
+}
+
+/// A `<alias>.<group col> is not distinct from k.c<i>` conjunction, matching
+/// a row of `alias` against the keyset relation — `IS NOT DISTINCT FROM` for
+/// the same NULL-grouping-column reason [`group_where_clause`] uses it.
+fn keyset_match(group_by: &[String], alias: &str) -> String {
+    group_by
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            format!(
+                "{alias}.{} is not distinct from k.{}",
+                quote_ident(col),
+                keyset_col(i)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// The per-`GROUP BY`-column value arrays for `groups`, transposed so column
+/// `j`'s array is every group's `group_values[j]` — the shape each keyset
+/// `unnest(...)` array parameter binds (see [`keyset_unnest`]).
+fn transpose_group_values(arity: usize, groups: &[&GroupPlan]) -> Vec<Vec<Option<String>>> {
+    (0..arity)
+        .map(|j| groups.iter().map(|g| g.group_values[j].clone()).collect())
+        .collect()
+}
+
+/// The full-recompute path for every [`GroupPlan::force_full_recompute`]
+/// group in one batch (issue #59), replacing the per-group probe + upsert
+/// sequence [`upsert_group`]'s forced branches would otherwise run once each
+/// — the aggregate analog of [`super::apply::apply_target`]'s bulk chunked
+/// write. Instead of `O(forced groups)` round trips (an existence probe plus
+/// one probe per field, per group, each an unindexed scan pre-#59's DDL
+/// index), this is a fixed handful of statements regardless of group count:
+///
+/// 1. One `SELECT` over the source, joined to the bound keyset, returning the
+///    ordinals of forced groups that still have at least one source row (the
+///    survivors) — the bulk replacement for the per-group [`probe_group_exists`].
+/// 2. One `INSERT … SELECT <group cols>, <per-field aggregate exprs> FROM
+///    source JOIN keyset GROUP BY <group cols> ON CONFLICT DO UPDATE` that
+///    recomputes every survivor group's visible columns and hidden
+///    `SUM`/`AVG` partials in a single grouped pass (the join restricts the
+///    scan to touched groups, so extinct groups simply produce no row and are
+///    never inserted). Each field's SELECT expression is built exactly as its
+///    per-group probe would compute it (`sum(arg)`/`count(arg)` for
+///    `SUM`/`AVG`, `count(*)` for `COUNT`, [`oracle::render_expr_sql`] for a
+///    `RecomputeOnly` field) — Postgres's `sum()` being NULL over zero
+///    non-null values preserves the same "NULL, not 0" rule the per-group
+///    path guards, with no extra `case` needed for the visible sum column.
+/// 3. One `DELETE … USING keyset` for the extinct groups (touched but with no
+///    surviving source row), the bulk replacement for the per-group
+///    [`delete_group_row`].
+///
+/// Callers must have already taken this batch's ascending-ordered pre-lock
+/// (see [`apply_aggregate_target`]) — this function's own statements lock
+/// rows in planner-chosen order, so the pre-lock is what preserves the
+/// ascending-lock-order deadlock-avoidance invariant.
+async fn apply_forced_groups_bulk(
+    txn: &Transaction<'_>,
+    target: &str,
+    plan: &AggregateTargetPlan,
+    forced: &[(&String, &GroupPlan)],
+) -> Result<(Vec<(String, i32)>, Vec<(String, i32)>), ApplyError> {
+    let arity = plan.group_by.len();
+    let forced_groups: Vec<&GroupPlan> = forced.iter().map(|(_, g)| *g).collect();
+    let arrays = transpose_group_values(arity, &forced_groups);
+    let source_ident = quote_ident(&plan.source);
+    let target_ident = quote_ident(target);
+    let group_idents: Vec<String> = plan.group_by.iter().map(|c| quote_ident(c)).collect();
+
+    // 1. Survivor ordinals: which forced groups still have a source row.
+    let survivor_sql = format!(
+        "select distinct k.ord::bigint from {} join {source_ident} s on {}",
+        keyset_unnest(&plan.group_by_types, 1, true),
+        keyset_match(&plan.group_by, "s"),
+    );
+    let survivor_params: Vec<&(dyn ToSql + Sync)> =
+        arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+    let survivor_rows = txn.query(&survivor_sql, &survivor_params).await?;
+    let survivor_ords: std::collections::HashSet<i64> =
+        survivor_rows.iter().map(|r| r.get::<_, i64>(0)).collect();
+
+    let mut written = Vec::new();
+    let mut extinct_ords: Vec<i64> = Vec::new();
+    for (i, (key, group)) in forced.iter().enumerate() {
+        let ord = (i + 1) as i64;
+        if survivor_ords.contains(&ord) {
+            written.push(((*key).clone(), group.hop_gen));
+        } else {
+            extinct_ords.push(ord);
+        }
+    }
+
+    // 2. Bulk recompute of every survivor group (the join to the keyset means
+    // extinct groups produce no SELECT row, so this touches only survivors).
+    if !survivor_ords.is_empty() {
+        let mut insert_cols: Vec<String> = group_idents.clone();
+        let mut select_exprs: Vec<String> = group_idents.iter().map(|c| format!("s.{c}")).collect();
+
+        for field in &plan.fields {
+            let col = quote_ident(&field.name);
+            match field.kind {
+                AggFieldKind::Sum => {
+                    let arg = agg_arg_sql(plan, &field.name);
+                    let count_col = quote_ident(&count_partial_column(&field.name));
+                    insert_cols.push(col.clone());
+                    select_exprs.push(format!("sum({arg})"));
+                    insert_cols.push(count_col);
+                    select_exprs.push(format!("count({arg})"));
+                }
+                AggFieldKind::Avg => {
+                    let arg = agg_arg_sql(plan, &field.name);
+                    let (sum_col_name, count_col_name) = avg_partial_columns(&field.name);
+                    let sum_col = quote_ident(&sum_col_name);
+                    let count_col = quote_ident(&count_col_name);
+                    insert_cols.push(sum_col);
+                    select_exprs.push(format!("sum({arg})"));
+                    insert_cols.push(count_col);
+                    select_exprs.push(format!("count({arg})"));
+                    insert_cols.push(col.clone());
+                    select_exprs.push(format!(
+                        "case when count({arg}) = 0 then null \
+                         else sum({arg}) / count({arg})::numeric end"
+                    ));
+                }
+                AggFieldKind::Count => {
+                    insert_cols.push(col.clone());
+                    select_exprs.push("count(*)::numeric".to_string());
+                }
+                AggFieldKind::RecomputeOnly => {
+                    let expr = oracle::render_expr_sql(&plan.field_exprs[field.name.as_str()]);
+                    insert_cols.push(col.clone());
+                    select_exprs.push(format!("({expr})"));
+                }
+            }
+        }
+
+        let update_sets: Vec<String> = insert_cols
+            .iter()
+            .skip(arity)
+            .map(|c| format!("{c} = excluded.{c}"))
+            .collect();
+        // Every field this grammar can put on an aggregate target contributes
+        // at least one column, so a definition always has at least one
+        // non-`GROUP BY` field to update; an empty `update_sets` would mean a
+        // group-by-only "aggregate" the grammar can't express.
+        debug_assert!(!update_sets.is_empty());
+
+        let group_select: Vec<String> = group_idents.iter().map(|c| format!("s.{c}")).collect();
+        let insert_sql = format!(
+            "insert into {target_ident} ({}) \
+             select {} from {} join {source_ident} s on {} \
+             group by {} \
+             on conflict ({}) do update set {}",
+            insert_cols.join(", "),
+            select_exprs.join(", "),
+            keyset_unnest(&plan.group_by_types, 1, false),
+            keyset_match(&plan.group_by, "s"),
+            group_select.join(", "),
+            group_idents.join(", "),
+            update_sets.join(", "),
+        );
+        txn.query(&insert_sql, &survivor_params).await?;
+    }
+
+    // 3. Extinct groups: touched, but no surviving source row — delete their
+    // target rows in one statement, `ord` telling us which we removed.
+    let mut deleted = Vec::new();
+    if !extinct_ords.is_empty() {
+        let ord_param = arity + 1;
+        let delete_sql = format!(
+            "delete from {target_ident} t using {} \
+             where {} and k.ord = any(${ord_param}::bigint[]) \
+             returning k.ord::bigint",
+            keyset_unnest(&plan.group_by_types, 1, true),
+            keyset_match(&plan.group_by, "t"),
+        );
+        let mut delete_params: Vec<&(dyn ToSql + Sync)> =
+            arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+        delete_params.push(&extinct_ords);
+        let rows = txn.query(&delete_sql, &delete_params).await?;
+        let deleted_ords: std::collections::HashSet<i64> =
+            rows.iter().map(|r| r.get::<_, i64>(0)).collect();
+        for (i, (key, group)) in forced.iter().enumerate() {
+            let ord = (i + 1) as i64;
+            if deleted_ords.contains(&ord) {
+                deleted.push(((*key).clone(), group.hop_gen));
+            }
+        }
+    }
+
+    Ok((written, deleted))
+}
+
+/// The rendered SQL for a `SUM`/`AVG` field's single argument expression —
+/// [`oracle::render_expr_sql`] over the call's one argument, exactly as
+/// [`probe_sum_and_count`] renders it, so the bulk path computes the same
+/// `sum(arg)`/`count(arg)` the per-group probe would.
+fn agg_arg_sql(plan: &AggregateTargetPlan, field_name: &str) -> String {
+    let Expr::FunctionCall { args, .. } = &plan.field_exprs[field_name] else {
+        panic!("agg_arg_sql called on a non-SUM/AVG field");
+    };
+    oracle::render_expr_sql(&args[0])
+}
+
+/// Phase 3 for one aggregate target table. Every group this batch touched is
+/// written or deleted under a single ascending-ordered pre-lock taken up
+/// front (see below), then split by strategy:
+///
+/// - [`GroupPlan::force_full_recompute`] groups (image-less changes — every
+///   group of a from-scratch backfill, the case issue #59 is about) go
+///   through [`apply_forced_groups_bulk`], a fixed handful of bulk statements
+///   regardless of how many groups are forced, rather than a per-group probe
+///   sequence each.
+/// - Ordinary delta groups keep the per-group [`upsert_group`] path
+///   (existence probe + increment-or-delete), unchanged.
+///
+/// **Deadlock avoidance.** [`super::apply::apply_target`]'s 1-1 path takes
+/// every target row it will touch `FOR UPDATE` in ascending key order, in one
+/// pre-lock statement, before any write — so two workers contending on
+/// overlapping rows always acquire locks in the same order. This function
+/// mirrors that: it pre-locks every touched group's existing target row in
+/// ascending `GROUP BY`-column order before running either the bulk or the
+/// per-group writes below, since the bulk `INSERT`/`DELETE` lock rows in
+/// planner-chosen order (and the per-group loop's own encoded-key order need
+/// not match the SQL column order) — the pre-lock, not the write order, is
+/// what fixes the acquisition order once every lock is held up front.
 pub(super) async fn apply_aggregate_target(
     txn: &Transaction<'_>,
     target: &str,
@@ -1093,12 +1352,59 @@ pub(super) async fn apply_aggregate_target(
 ) -> Result<AggregateApplyResult, ApplyError> {
     let mut group_keys: Vec<&String> = plan.groups.keys().collect();
     group_keys.sort();
+    if group_keys.is_empty() {
+        return Ok(AggregateApplyResult {
+            written: Vec::new(),
+            deleted: Vec::new(),
+        });
+    }
+
+    let target_ident = quote_ident(target);
+    let all_groups: Vec<&GroupPlan> = group_keys.iter().map(|k| &plan.groups[*k]).collect();
+    let arity = plan.group_by.len();
+
+    // Ascending-ordered pre-lock over every touched group's existing target
+    // row, in one statement — see this function's doc comment. Locks nothing
+    // for brand-new groups (no target row yet), exactly like `apply_target`'s
+    // pre-lock, which is why a from-scratch backfill (all groups new) takes no
+    // locks here and cannot contend.
+    let prelock_arrays = transpose_group_values(arity, &all_groups);
+    let prelock_params: Vec<&(dyn ToSql + Sync)> = prelock_arrays
+        .iter()
+        .map(|a| a as &(dyn ToSql + Sync))
+        .collect();
+    let order_by: Vec<String> = plan
+        .group_by
+        .iter()
+        .map(|c| format!("t.{}", quote_ident(c)))
+        .collect();
+    let prelock_sql = format!(
+        "select 1 from {target_ident} t join {} on {} order by {} for update of t",
+        keyset_unnest(&plan.group_by_types, 1, false),
+        keyset_match(&plan.group_by, "t"),
+        order_by.join(", "),
+    );
+    txn.query(&prelock_sql, &prelock_params).await?;
 
     let mut written = Vec::new();
     let mut deleted = Vec::new();
 
+    let forced: Vec<(&String, &GroupPlan)> = group_keys
+        .iter()
+        .map(|k| (*k, &plan.groups[*k]))
+        .filter(|(_, g)| g.force_full_recompute)
+        .collect();
+    if !forced.is_empty() {
+        let (w, d) = apply_forced_groups_bulk(txn, target, plan, &forced).await?;
+        written.extend(w);
+        deleted.extend(d);
+    }
+
     for key in group_keys {
         let group = &plan.groups[key];
+        if group.force_full_recompute {
+            continue;
+        }
         let exists = probe_group_exists(
             txn,
             &plan.source,

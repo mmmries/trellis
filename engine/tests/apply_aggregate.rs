@@ -1300,3 +1300,101 @@ async fn count_star_image_less_recompute_trigger_probes_a_stale_count() {
         "COUNT must be probed (1 + the out-of-band row), not left stale at 1"
     );
 }
+
+/// A from-scratch backfill (every source row staged image-less, so every
+/// group takes the full-recompute path — issue #59) over many groups must
+/// (a) land exactly the oracle's values for all of them, and (b) not scan
+/// the source table once per group. The pre-#59 per-group probe loop did an
+/// existence probe plus one probe per field for each group — `O(groups)`
+/// source scans — so with `GROUP_COUNT` groups it would scan `order_items`
+/// thousands of times; the bulk path is a fixed handful regardless. We read
+/// that scan count straight off `pg_stat_user_tables` as the regression
+/// guard.
+#[tokio::test]
+async fn backfilling_many_groups_matches_the_oracle_without_per_group_source_scans() {
+    const GROUP_COUNT: i64 = 750;
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table order_items (id integer primary key, order_id integer, amount numeric)",
+        )
+        .await
+        .expect("create source table");
+
+    let def = setup(&db).await;
+
+    // Two rows per group (distinct amounts) so SUM/AVG/MAX/MIN are all
+    // non-trivial and the oracle comparison is a real correctness check, not
+    // a one-row identity.
+    let mut values = Vec::new();
+    for g in 1..=GROUP_COUNT {
+        let id_a = g * 2 - 1;
+        let id_b = g * 2;
+        values.push(format!("({id_a}, {g}, {g}.00)"));
+        values.push(format!("({id_b}, {g}, {}.00)", g * 3));
+    }
+    client
+        .batch_execute(&format!(
+            "insert into order_items (id, order_id, amount) values {}",
+            values.join(", ")
+        ))
+        .await
+        .expect("seed live order_items rows");
+
+    // Stage every source row as an image-less change — exactly what a
+    // from-scratch backfill enqueues — so each group is forced to full
+    // recompute.
+    for g in 1..=GROUP_COUNT {
+        for id in [g * 2 - 1, g * 2] {
+            insert_cdc_row(
+                &client,
+                "seg_0",
+                "order_items",
+                &id.to_string(),
+                "recompute",
+                None,
+                None,
+            )
+            .await;
+        }
+    }
+
+    let seg0 = seal_active_segment(&mut client).await;
+    let outcome = drain(&db.pool, seg0, "worker").await;
+    assert_eq!(
+        outcome.keys_written, GROUP_COUNT as usize,
+        "every one of the {GROUP_COUNT} groups is newly created"
+    );
+
+    let target = read_target(&client).await;
+    let oracle = read_oracle(&client, &def).await;
+    assert_eq!(
+        target, oracle,
+        "the bulk backfill of {GROUP_COUNT} groups must match the oracle exactly"
+    );
+
+    // The regression guard: source scans must stay a small constant, not
+    // scale with GROUP_COUNT. The bulk path scans `order_items` a handful of
+    // times per batch (the batched live-row refetch, the survivor probe, and
+    // the INSERT ... SELECT recompute); the pre-#59 loop scanned it
+    // `O(GROUP_COUNT)` times. A generous ceiling well below GROUP_COUNT
+    // fails loudly on regression while tolerating planner/refetch variation.
+    let scans: i64 = client
+        .query_one(
+            "select coalesce(seq_scan, 0) + coalesce(idx_scan, 0) \
+             from pg_stat_user_tables where relname = 'order_items'",
+            &[],
+        )
+        .await
+        .expect("read order_items scan count")
+        .get(0);
+    assert!(
+        scans < 50,
+        "backfilling {GROUP_COUNT} groups scanned order_items {scans} times; \
+         the bulk recompute must not scan once per group (issue #59)"
+    );
+}
