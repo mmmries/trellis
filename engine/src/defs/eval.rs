@@ -575,6 +575,25 @@ fn eval_expr(
             };
             eval_to_many_aggregate(name, rel, column, field_name, row, relationships)
         }
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            for arg in args {
+                let val = eval_expr(
+                    arg,
+                    field_name,
+                    row,
+                    source_columns,
+                    relationships,
+                    fields_by_name,
+                    cache,
+                    in_progress,
+                    regex_cache,
+                )?;
+                if val.is_some() {
+                    return Ok(val); // Short-circuit: first non-null wins
+                }
+            }
+            Ok(None)
+        }
         Expr::FunctionCall { name, args } => {
             let mut arg_values = Vec::with_capacity(args.len());
             for arg in args {
@@ -872,6 +891,25 @@ fn eval_aggregate_expr(
                 fields_by_name,
                 regex_cache,
             )
+        }
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            for arg in args {
+                let val = eval_aggregate_expr(
+                    arg,
+                    field_name,
+                    rows,
+                    group_by,
+                    source_columns,
+                    fields_by_name,
+                    cache,
+                    in_progress,
+                    regex_cache,
+                )?;
+                if val.is_some() {
+                    return Ok(val);
+                }
+            }
+            Ok(None)
         }
         Expr::FunctionCall { name, args } => {
             let mut arg_values = Vec::with_capacity(args.len());
@@ -1650,6 +1688,64 @@ mod tests {
         assert_eq!(result["out"], None);
     }
 
+    #[test]
+    fn coalesce_returns_the_first_non_null_argument() {
+        // `COALESCE(a, b)` — matches Postgres: the leftmost argument that
+        // isn't NULL wins, and later arguments are never consulted once one
+        // is found (the loop returns on the first `is_some()`).
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: call("COALESCE", vec![col("a"), col("b")]),
+        }]);
+
+        // a is NULL, so b is used.
+        let r = row(&[("a", None), ("b", Some("7"))]);
+        let result = eval(&d, &r, &numeric_types(&["a", "b"])).unwrap();
+        match result["out"].as_ref().unwrap() {
+            Value::Numeric(n) => assert_eq!(n.to_string(), "7"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+
+        // a is present, so a wins and b is irrelevant.
+        let r = row(&[("a", Some("3")), ("b", Some("7"))]);
+        let result = eval(&d, &r, &numeric_types(&["a", "b"])).unwrap();
+        match result["out"].as_ref().unwrap() {
+            Value::Numeric(n) => assert_eq!(n.to_string(), "3"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalesce_falls_through_to_a_literal_default() {
+        // The idiomatic "replace NULL with a constant" shape: every column
+        // argument is NULL, so the trailing literal is returned.
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: call(
+                "COALESCE",
+                vec![col("a"), col("b"), Expr::NumberLiteral("0".to_string())],
+            ),
+        }]);
+        let r = row(&[("a", None), ("b", None)]);
+        let result = eval(&d, &r, &numeric_types(&["a", "b"])).unwrap();
+        match result["out"].as_ref().unwrap() {
+            Value::Numeric(n) => assert_eq!(n.to_string(), "0"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalesce_is_null_when_every_argument_is_null() {
+        // Postgres `COALESCE` over all-NULL arguments is itself NULL.
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: call("COALESCE", vec![col("a"), col("b")]),
+        }]);
+        let r = row(&[("a", None), ("b", None)]);
+        let result = eval(&d, &r, &numeric_types(&["a", "b"])).unwrap();
+        assert_eq!(result["out"], None);
+    }
+
     fn aggregate_def(group_by: &[&str], fields: Vec<FieldDef>) -> TransformDef {
         TransformDef {
             target: "t".to_string(),
@@ -1691,6 +1787,44 @@ mod tests {
             evaluate_aggregate(&d, &rows, &numeric_types(&["id"]), &mut RegexCache::new()).unwrap();
         match result["t"].as_ref().unwrap() {
             Value::Numeric(n) => assert_eq!(n.to_string(), "6"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalesce_over_an_aggregate_replaces_the_empty_group_null() {
+        // The motivating case (PR #64): `SUM` over a group whose summed
+        // column is entirely NULL yields NULL (Postgres empty-set SUM), and
+        // `COALESCE(SUM(amount), 0)` turns that into 0 rather than letting the
+        // NULL propagate. Exercises the aggregate-path COALESCE arm.
+        let d = aggregate_def(
+            &["id"],
+            vec![
+                FieldDef {
+                    name: "id".to_string(),
+                    expr: col("id"),
+                },
+                FieldDef {
+                    name: "total".to_string(),
+                    expr: call(
+                        "COALESCE",
+                        vec![
+                            call("SUM", vec![col("amount")]),
+                            Expr::NumberLiteral("0".to_string()),
+                        ],
+                    ),
+                },
+            ],
+        );
+        let rows = vec![
+            row(&[("id", Some("1")), ("amount", None)]),
+            row(&[("id", Some("1")), ("amount", None)]),
+        ];
+        let result =
+            evaluate_aggregate(&d, &rows, &numeric_types(&["id", "amount"]), &mut RegexCache::new())
+                .unwrap();
+        match result["total"].as_ref().unwrap() {
+            Value::Numeric(n) => assert_eq!(n.to_string(), "0"),
             other => panic!("expected Numeric, got {other:?}"),
         }
     }

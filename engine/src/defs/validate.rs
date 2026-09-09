@@ -840,6 +840,28 @@ fn infer_expr(
             }
             Ok(spec.return_type)
         }
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            let mut common_type = None;
+            for (i, arg) in args.iter().enumerate() {
+                let arg_t = infer_expr(
+                    arg, field_name, source_columns, relationships, fields_by_name, types, in_progress,
+                )?;
+                if let Some(ct) = common_type {
+                    if ct != arg_t {
+                        return Err(ValidationError::FunctionArgTypeMismatch {
+                            field: field_name.to_string(),
+                            function: name.clone(),
+                            arg_index: i,
+                            expected: ct,
+                            found: arg_t,
+                        });
+                    }
+                } else {
+                    common_type = Some(arg_t);
+                }
+            }
+            return Ok(common_type.unwrap());
+        }
         Expr::FunctionCall { name, args } => {
             // The parser only ever builds a `FunctionCall` node for a name
             // it already looked up in `registry::FUNCTIONS` and checked
@@ -1258,6 +1280,93 @@ mod tests {
                 found: ValueType::Numeric,
             }
         );
+    }
+
+    #[test]
+    fn coalesce_infers_the_common_argument_type() {
+        // All arguments share a type, so COALESCE's result type is that type
+        // (here Text), matching Postgres's `COALESCE(text, text) -> text`.
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: Expr::FunctionCall {
+                name: "COALESCE".to_string(),
+                args: vec![col("text_col"), Expr::StringLiteral("fallback".to_string())],
+            },
+        }]);
+        let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        let types = infer_field_types(&d, &source_columns, &HashMap::new()).unwrap();
+        assert_eq!(types["out"], ValueType::Text);
+    }
+
+    #[test]
+    fn coalesce_with_incompatible_argument_types_is_rejected() {
+        // `COALESCE(numeric, text)` is rejected — and Postgres rejects the
+        // same expression ("COALESCE types numeric and text cannot be
+        // matched"), so this is faithful, not a divergence. It pins the
+        // exact-type-match rule the arm enforces.
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: Expr::FunctionCall {
+                name: "COALESCE".to_string(),
+                args: vec![col("number_col"), col("text_col")],
+            },
+        }]);
+        let source_columns = HashMap::from([
+            ("number_col".to_string(), ValueType::Numeric),
+            ("text_col".to_string(), ValueType::Text),
+        ]);
+        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::FunctionArgTypeMismatch {
+                field: "out".to_string(),
+                function: "COALESCE".to_string(),
+                arg_index: 1,
+                expected: ValueType::Numeric,
+                found: ValueType::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn coalesce_rejects_a_string_literal_postgres_would_coerce() {
+        // DIVERGENCE from Postgres (tracked toward full compatibility):
+        // Postgres types an *unadorned* literal like `'0'` as `unknown` and
+        // coerces it to the other arguments' type, so `COALESCE(number, '0')`
+        // resolves to `numeric` and succeeds. This grammar has no `unknown`
+        // literal — a quoted literal is always `Text` (see `ast.rs`) — so the
+        // same expression is rejected as a type mismatch. Users must instead
+        // write a numeric literal (`COALESCE(number, 0)`), which is accepted.
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: Expr::FunctionCall {
+                name: "COALESCE".to_string(),
+                args: vec![col("number_col"), Expr::StringLiteral("0".to_string())],
+            },
+        }]);
+        let source_columns = numeric_columns(&["number_col"]);
+        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::FunctionArgTypeMismatch {
+                field: "out".to_string(),
+                function: "COALESCE".to_string(),
+                arg_index: 1,
+                expected: ValueType::Numeric,
+                found: ValueType::Text,
+            }
+        );
+
+        // The numeric-literal spelling Postgres also accepts is accepted here.
+        let d = def(vec![FieldDef {
+            name: "out".to_string(),
+            expr: Expr::FunctionCall {
+                name: "COALESCE".to_string(),
+                args: vec![col("number_col"), Expr::NumberLiteral("0".to_string())],
+            },
+        }]);
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
     #[test]
