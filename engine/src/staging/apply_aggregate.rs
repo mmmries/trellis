@@ -2742,4 +2742,273 @@ mod tests {
         assert_eq!(sample.get::<_, String>(0), "250.00");
         assert_eq!(sample.get::<_, String>(1), "250.00");
     }
+
+    /// Round 3's mop-up `UPDATE` (issue #63 M4) exists for exactly one case:
+    /// a batch's round-2 `INSERT ... ON CONFLICT DO NOTHING` for a brand-new
+    /// group loses the unique-constraint race to a truly concurrent writer
+    /// inserting that same group. Every other test in this module runs
+    /// single-connection, so round 3 has never actually executed before this
+    /// test. This forces the real race with two live connections: writer A
+    /// holds an uncommitted `INSERT` for group 42 open while writer B's bulk
+    /// call (group 42 plus an uncontested group 43, to force the bulk path)
+    /// blocks on that row's unique index, then only releases writer A once a
+    /// third, monitoring connection has actually observed writer B's backend
+    /// waiting on a lock in `pg_stat_activity` — a real, confirmed wait, not
+    /// a sleep-and-hope. Proves the mopped-up value both against
+    /// hand-computed expectations and against a second database fed the same
+    /// two deltas with no race at all.
+    #[tokio::test]
+    async fn apply_delta_groups_bulk_mops_up_a_straggler_that_lost_the_insert_race() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+
+        let (mut client_a, conn_a) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect a");
+        tokio::spawn(async move {
+            let _ = conn_a.await;
+        });
+        let (mut client_b, conn_b) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect b");
+        tokio::spawn(async move {
+            let _ = conn_b.await;
+        });
+        let (monitor, conn_m) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect monitor");
+        tokio::spawn(async move {
+            let _ = conn_m.await;
+        });
+
+        client_a
+            .batch_execute(&format!(
+                "{ORDER_SCHEMA_SQL}; \
+                 insert into order_items (id, order_id, amount) values \
+                 (1, 42, 3.00), (2, 42, 5.00), (3, 43, 10.00)"
+            ))
+            .await
+            .expect("seed");
+
+        let b_pid: i32 = client_b
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("b pid")
+            .get(0);
+
+        // Writer A: wins the race for group 42 — inserts its own delta
+        // (amount 3.00, one row) as a brand-new group and holds the
+        // transaction open, uncommitted, so the row is a live, lock-held
+        // conflict for writer B's round-2 `INSERT` below.
+        let txn_a = client_a.transaction().await.expect("begin a");
+        txn_a
+            .execute(
+                "insert into order_summary \
+                 (order_id, total, __total_count, avg_amount, __avg_amount_sum, \
+                  __avg_amount_count, row_count, max_amount) \
+                 values (42, 3.00, 1, 3.00, 3.00, 1, 1, 3.00)",
+                &[],
+            )
+            .await
+            .expect("writer a's winning insert");
+
+        // Writer B: group 42 (amount 5.00 — the same group A just won) plus
+        // group 43 (a genuinely uncontested new group), batched together so
+        // `apply_aggregate_target` takes the bulk path
+        // (`delta_groups.len() == 2`), not the lone-group `upsert_group`
+        // path.
+        let mut group_42 = GroupPlan::new(vec![Some("42".to_string())]);
+        group_42.field_accum.insert(
+            "total".to_string(),
+            FieldAccum {
+                adds: vec!["5.00".to_string()],
+                subs: vec![],
+            },
+        );
+        group_42.field_accum.insert(
+            "avg_amount".to_string(),
+            FieldAccum {
+                adds: vec!["5.00".to_string()],
+                subs: vec![],
+            },
+        );
+        group_42.field_accum.insert(
+            "row_count".to_string(),
+            FieldAccum {
+                adds: vec!["1".to_string()],
+                subs: vec![],
+            },
+        );
+        group_42.hop_gen = 1;
+
+        let mut group_43 = GroupPlan::new(vec![Some("43".to_string())]);
+        group_43.field_accum.insert(
+            "total".to_string(),
+            FieldAccum {
+                adds: vec!["10.00".to_string()],
+                subs: vec![],
+            },
+        );
+        group_43.field_accum.insert(
+            "avg_amount".to_string(),
+            FieldAccum {
+                adds: vec!["10.00".to_string()],
+                subs: vec![],
+            },
+        );
+        group_43.field_accum.insert(
+            "row_count".to_string(),
+            FieldAccum {
+                adds: vec!["1".to_string()],
+                subs: vec![],
+            },
+        );
+        group_43.hop_gen = 2;
+
+        let mut plan_b = delta_plan();
+        plan_b.groups =
+            HashMap::from([("g42".to_string(), group_42), ("g43".to_string(), group_43)]);
+
+        // Writer B's call blocks inside round 2's `INSERT ... ON CONFLICT DO
+        // NOTHING` on group 42's still-uncommitted row — a real unique-index
+        // wait. This future only commits writer A once the monitor
+        // connection has actually observed writer B's backend blocked on a
+        // lock, so the interleaving is forced, not hoped for.
+        let release_a = async {
+            loop {
+                let blocked: bool = monitor
+                    .query_one(
+                        "select exists(select 1 from pg_stat_activity \
+                         where pid = $1 and wait_event_type = 'Lock')",
+                        &[&b_pid],
+                    )
+                    .await
+                    .expect("poll pg_stat_activity")
+                    .get(0);
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            txn_a.commit().await.expect("commit a");
+        };
+
+        let run_b = async {
+            let txn_b = client_b.transaction().await.expect("begin b");
+            let result = apply_aggregate_target(&txn_b, "order_summary", &plan_b)
+                .await
+                .expect("bulk apply must mop up the straggler");
+            txn_b.commit().await.expect("commit b");
+            result
+        };
+
+        let (_, result) = tokio::join!(release_a, run_b);
+
+        let mut written_keys: Vec<&str> = result.written.iter().map(|(k, _)| k.as_str()).collect();
+        written_keys.sort();
+        assert_eq!(
+            written_keys,
+            vec!["g42", "g43"],
+            "both groups — the straggler and the uncontested one — must be reported written"
+        );
+
+        let row42 = client_a
+            .query_one(
+                "select total::text, __total_count::text, avg_amount::text, \
+                 __avg_amount_sum::text, __avg_amount_count::text, row_count::text, \
+                 max_amount::text from order_summary where order_id = 42",
+                &[],
+            )
+            .await
+            .expect("fetch 42");
+        assert_eq!(
+            row42.get::<_, String>(0),
+            "8.00",
+            "group 42's total must be A's 3.00 plus B's 5.00 — not double-applied, not dropped"
+        );
+        assert_eq!(row42.get::<_, String>(1), "2");
+        assert_eq!(row42.get::<_, String>(2), "4.0000000000000000");
+        assert_eq!(row42.get::<_, String>(3), "8.00");
+        assert_eq!(row42.get::<_, String>(4), "2");
+        assert_eq!(row42.get::<_, String>(5), "2");
+        assert_eq!(row42.get::<_, String>(6), "5.00");
+
+        let row43 = client_a
+            .query_one(
+                "select total::text, row_count::text, max_amount::text \
+                 from order_summary where order_id = 43",
+                &[],
+            )
+            .await
+            .expect("fetch 43");
+        assert_eq!(row43.get::<_, String>(0), "10.00");
+        assert_eq!(row43.get::<_, String>(1), "1");
+        assert_eq!(row43.get::<_, String>(2), "10.00");
+
+        // Independent oracle: the same two deltas applied with no race at
+        // all (A's delta first, committed, then B's) on a second database
+        // must land on the identical final row for group 42 — proving
+        // round 3's mop-up is equivalent to the race never happening.
+        let db_seq = cluster.create_isolated_database().await;
+        let (mut seq_client, seq_conn) = tokio_postgres::connect(db_seq.dsn(), NoTls)
+            .await
+            .expect("connect sequential");
+        tokio::spawn(async move {
+            let _ = seq_conn.await;
+        });
+        seq_client
+            .batch_execute(&format!(
+                "{ORDER_SCHEMA_SQL}; \
+                 insert into order_items (id, order_id, amount) values \
+                 (1, 42, 3.00), (2, 42, 5.00), (3, 43, 10.00)"
+            ))
+            .await
+            .expect("seed sequential");
+
+        let mut seed_plan = delta_plan();
+        let mut seed_group = GroupPlan::new(vec![Some("42".to_string())]);
+        seed_group.field_accum.insert(
+            "total".to_string(),
+            FieldAccum {
+                adds: vec!["3.00".to_string()],
+                subs: vec![],
+            },
+        );
+        seed_group.field_accum.insert(
+            "avg_amount".to_string(),
+            FieldAccum {
+                adds: vec!["3.00".to_string()],
+                subs: vec![],
+            },
+        );
+        seed_group.field_accum.insert(
+            "row_count".to_string(),
+            FieldAccum {
+                adds: vec!["1".to_string()],
+                subs: vec![],
+            },
+        );
+        seed_group.hop_gen = 1;
+        seed_plan.groups = HashMap::from([("g42".to_string(), seed_group)]);
+        let txn = seq_client.transaction().await.expect("begin seed");
+        apply_aggregate_target(&txn, "order_summary", &seed_plan)
+            .await
+            .expect("seed a's delta sequentially");
+        txn.commit().await.expect("commit seed");
+
+        let mut plan_b_seq = delta_plan();
+        plan_b_seq.groups = plan_b.groups.clone();
+        let txn = seq_client.transaction().await.expect("begin seq b");
+        apply_aggregate_target(&txn, "order_summary", &plan_b_seq)
+            .await
+            .expect("apply b sequentially");
+        txn.commit().await.expect("commit seq b");
+
+        let seq_rows = read_order_summary(&seq_client).await;
+        let raced_rows = read_order_summary(&client_a).await;
+        assert_eq!(
+            raced_rows, seq_rows,
+            "the raced result must match the sequential (no-race) result exactly"
+        );
+    }
 }
