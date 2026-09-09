@@ -110,6 +110,16 @@ the target directly instead pair `create_definition_without_backfill` with
 1-1 relationship-enriched definitions are not yet supported by the direct path
 and continue to use the ring.
 
+The one real (non-benchmark, non-test) consumer of the definition-creation API,
+the generative harness's `ManualBackend` (`generative/src/backend/manual.rs`),
+is wired onto the direct path: it creates the target table, runs
+`backfill_definition`, and then persists the definition with
+`create_definition_without_backfill`; a `BackfillError::Unsupported` result
+falls back to the original `create_definition` (ring enumeration), the same path
+that definition took before. Today's generator only emits `KeySpace::OneToOne`
+definitions with no relationship paths, so that fallback is dead-but-safe
+insurance — the fast path handles every definition the harness produces.
+
 ## Consequences
 
 - The M0 benchmark's aggregate phase drops from ~55s to ~0.75s (100k groups) and

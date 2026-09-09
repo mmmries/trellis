@@ -13,7 +13,8 @@ use std::time::Duration;
 use engine::config::DEFAULT_SCHEMA;
 use engine::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use engine::defs::{
-    CatalogError, DdlError, create_definition, create_target_table, qualified_target_table,
+    BackfillError, CatalogError, DdlError, backfill_definition, create_definition,
+    create_definition_without_backfill, create_target_table, qualified_target_table,
     source_primary_key,
 };
 use engine::staging::{StagingError, await_converged, watermark_token};
@@ -51,6 +52,7 @@ pub enum ManualBackendError {
     Client(ClientError),
     Catalog(CatalogError),
     Ddl(DdlError),
+    Backfill(BackfillError),
     Staging(StagingError),
     Db(tokio_postgres::Error),
 }
@@ -76,6 +78,12 @@ impl From<CatalogError> for ManualBackendError {
 impl From<DdlError> for ManualBackendError {
     fn from(err: DdlError) -> Self {
         ManualBackendError::Ddl(err)
+    }
+}
+
+impl From<BackfillError> for ManualBackendError {
+    fn from(err: BackfillError) -> Self {
+        ManualBackendError::Backfill(err)
     }
 }
 
@@ -260,10 +268,35 @@ impl ManualBackend {
         let source_columns = Self::source_columns(&source_table);
 
         let text = render_definition(def)?;
-        create_definition(&self.pool, &text, &source_columns).await?;
-
         let pk = source_primary_key(&self.pool, &def.source).await?;
         create_target_table(&self.pool, def, "public", &pk, &source_columns).await?;
+
+        // Issue #63 M3: build the target directly from its source with the
+        // fast, set-based, key-range-chunked path instead of flooding the ring
+        // with one `Recompute` marker per source row. `backfill_definition`
+        // needs the target table to already exist and reads only from `def`
+        // (not the catalog), so it runs before the definition is persisted; no
+        // CDC is flowing yet (the engine client only starts after `install`
+        // has processed every definition), so this is exactly the pre-live
+        // build/CDC fence the direct path documents.
+        //
+        // A definition the direct build can't render — a relationship-enriched
+        // 1-1 def (`BackfillError::Unsupported`) — falls back to the original
+        // `create_definition`, whose bundled ring enumeration is the same path
+        // it took before this change. Today's generator never emits such a
+        // definition (`render_definition` only accepts `KeySpace::OneToOne`
+        // with no relationship paths), so the fallback is currently
+        // dead-but-safe insurance; the fast path handles every definition this
+        // backend actually produces.
+        match backfill_definition(&self.pool, def, "public", &source_columns).await {
+            Ok(()) => {
+                create_definition_without_backfill(&self.pool, &text, &source_columns).await?;
+            }
+            Err(BackfillError::Unsupported(_)) => {
+                create_definition(&self.pool, &text, &source_columns).await?;
+            }
+            Err(err) => return Err(err.into()),
+        }
         Ok(())
     }
 
