@@ -29,16 +29,17 @@ use std::time::Duration;
 
 /// The issue's own poc baseline (measured on a different box, "poc cluster
 /// :5430") reports ~1m50s for this shape post-M1; on this harness/box the
-/// same post-M1 code measures ~25s (see the M0 PR description for the
-/// full number) — box speed, not a mechanism difference, since this run's
-/// `correctness_ok` matches the oracle exactly and takes the identical
-/// bulk-recompute path the issue describes. 120s leaves ~4-5x headroom
-/// over this box's measurement for CI/dev-machine jitter without hiding a
-/// real regression; tighten once a CI-hardware baseline exists and once
-/// M2/M3/M4 land.
+/// same post-M1 code measures ~55-58s across repeated runs (see the M0 PR
+/// description for the full numbers) — box speed, not a mechanism
+/// difference, since this run's `correctness_ok` matches the oracle exactly
+/// and takes the identical bulk-recompute path the issue describes. 120s
+/// leaves only ~2x headroom over this box's measurement for CI/dev-machine
+/// jitter without hiding a real regression — tighten (or loosen, if CI
+/// hardware is slower) once a CI-hardware baseline exists and once M2/M3/M4
+/// land.
 const HIGH_CARDINALITY_CEILING: Duration = Duration::from_secs(120);
 
-/// Measured on this harness/box at ~25s (see above) — within noise of the
+/// Measured on this harness/box at ~55-58s (see above) — within noise of the
 /// high-cardinality shape today, because a from-scratch `create_definition`
 /// backfill enumerates and stages its whole source table in one commit
 /// (`intake::publication::enumerate_and_append`), which always lands in
