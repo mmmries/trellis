@@ -103,22 +103,39 @@ rather than attempting to insert them.
 
 ## Wiring
 
-`create_definition` still enumerates into the ring and is unchanged (it has many
-callers and the publication-ADD backfill path depends on it). Callers that build
-the target directly instead pair `create_definition_without_backfill` with
-`backfill_definition`, so the from-scratch build does not also flood the ring.
-1-1 relationship-enriched definitions are not yet supported by the direct path
-and continue to use the ring.
+`create_definition` (bare ring enumeration) is unchanged and still exists, but it
+is no longer the primary entry point a real caller should reach for. That role
+belongs to `engine::defs::install_definition`: it creates the target table, tries
+`backfill_definition` (the direct path), persists via
+`create_definition_without_backfill` on success, and falls back to
+`create_definition` (ring enumeration) on `BackfillError::Unsupported`. This
+supersedes an earlier version of this ADR's wiring account, which described the
+direct path as reachable only through the generative harness's `ManualBackend`
+(`generative/src/backend/manual.rs`) — at that point true, but not what a real,
+non-test/non-benchmark caller of the definition-creation API would hit, since
+`ManualBackend` is a correctness/oracle fuzz harness, not a production consumer.
+`install_definition` closes that gap: it is the shared implementation both
+`ManualBackend` and any real caller of `create_definition` should use, and
+`ManualBackend` has been rewired onto it rather than hand-rolling the same
+create-table → backfill → fallback sequence itself.
 
-The one real (non-benchmark, non-test) consumer of the definition-creation API,
-the generative harness's `ManualBackend` (`generative/src/backend/manual.rs`),
-is wired onto the direct path: it creates the target table, runs
-`backfill_definition`, and then persists the definition with
-`create_definition_without_backfill`; a `BackfillError::Unsupported` result
-falls back to the original `create_definition` (ring enumeration), the same path
-that definition took before. Today's generator only emits `KeySpace::OneToOne`
-definitions with no relationship paths, so that fallback is dead-but-safe
-insurance — the fast path handles every definition the harness produces.
+1-1 relationship-enriched definitions were entirely unsupported by the direct
+path at first (any `uses_relationships(def)` definition returned
+`BackfillError::Unsupported` and fell back to the ring unconditionally). That
+was too broad: it caught the shape that actually motivated this issue — a
+`KeySpace::OneToOne` transform whose fields `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over a
+to-many relationship (e.g. an `authors` table aggregating over related `posts`/
+`comments`) — leaving it on the slow ring path regardless of how fast the plain
+aggregate/1-1 cases became. `backfill_relationship_one_to_one` now handles that
+specific shape directly: one `GROUP BY`-aggregated temp staging table per
+referenced to-many relationship, `LEFT JOIN`ed back to the source on its primary
+key and chunked by source PK range (reusing the same range-walk as the plain 1-1
+path), matching the ring/oracle's no-match semantics (`COUNT` → 0, `SUM`/`MIN`/
+`MAX`/`AVG` → NULL on an empty child set). The `Unsupported` boundary is now
+narrower and shape-specific: a bare to-one lookup (`category.name`, no aggregate
+wrapper), an aggregate over a to-one relationship, or a relationship reference
+nested inside a larger expression still falls back to the ring — only the
+to-many-aggregate shape is direct-built.
 
 ## Consequences
 
@@ -128,5 +145,9 @@ insurance — the fast path handles every definition the harness produces.
   to 10s / 5s accordingly.
 - The ring is no longer on the critical path for a from-scratch build, only for
   live deltas after it.
-- Relationship-enriched 1-1 backfills remain on the ring until the direct path
-  learns to render their join.
+- Relationship-enriched `OneToOne` **to-many aggregates** are also off the ring
+  now: a 100k-author / 1M-post / 4.5M-comment `SUM`/`COUNT`-over-two-relationships
+  benchmark scenario went from ~1 minute (ring path, the real-world case that
+  originally exposed this gap) to ~0.6-0.7s through `install_definition` — roughly
+  90x. Bare to-one lookups and any other relationship shape not listed above
+  remain on the ring until the direct path learns to render them.
