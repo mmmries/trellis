@@ -13,8 +13,7 @@ use std::time::Duration;
 use engine::config::DEFAULT_SCHEMA;
 use engine::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use engine::defs::{
-    CatalogError, DdlError, create_definition, create_target_table, qualified_target_table,
-    source_primary_key,
+    CatalogError, DdlError, install_definition, qualified_target_table, source_primary_key,
 };
 use engine::staging::{StagingError, await_converged, watermark_token};
 use engine::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
@@ -239,8 +238,8 @@ impl ManualBackend {
         Ok(())
     }
 
-    /// `source_columns` for `table`, as [`create_definition`]/
-    /// [`create_target_table`] want it.
+    /// `source_columns` for `table`, as `engine::defs::install_definition`
+    /// wants it.
     fn source_columns(table: &Table) -> HashMap<String, ValueType> {
         table
             .columns
@@ -260,10 +259,17 @@ impl ManualBackend {
         let source_columns = Self::source_columns(&source_table);
 
         let text = render_definition(def)?;
-        create_definition(&self.pool, &text, &source_columns).await?;
 
-        let pk = source_primary_key(&self.pool, &def.source).await?;
-        create_target_table(&self.pool, def, "public", &pk, &source_columns).await?;
+        // Issue #63 C1: `install_definition` is the same front door real
+        // callers use — it creates the target table, then tries the fast,
+        // set-based direct build first and falls back to the ring-based
+        // `create_definition` only for a shape the direct build can't render
+        // yet (`BackfillError::Unsupported`, folded into `CatalogError` —
+        // see its doc comment). Routing the fuzz harness through it, instead
+        // of hand-rolling the same create-table/backfill/persist sequence,
+        // keeps this backend exercising the exact path production traffic
+        // takes.
+        install_definition(&self.pool, &text, &source_columns, "public").await?;
         Ok(())
     }
 

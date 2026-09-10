@@ -1820,9 +1820,13 @@ mod tests {
             row(&[("id", Some("1")), ("amount", None)]),
             row(&[("id", Some("1")), ("amount", None)]),
         ];
-        let result =
-            evaluate_aggregate(&d, &rows, &numeric_types(&["id", "amount"]), &mut RegexCache::new())
-                .unwrap();
+        let result = evaluate_aggregate(
+            &d,
+            &rows,
+            &numeric_types(&["id", "amount"]),
+            &mut RegexCache::new(),
+        )
+        .unwrap();
         match result["total"].as_ref().unwrap() {
             Value::Numeric(n) => assert_eq!(n.to_string(), "0"),
             other => panic!("expected Numeric, got {other:?}"),

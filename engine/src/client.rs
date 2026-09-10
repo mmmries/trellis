@@ -867,22 +867,29 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         // `poll_interval` floor (200ms by default) is comfortably inside
         // that window even when idle. What's wasteful isn't the cadence,
         // it's checking out a separate pooled connection just for it: one
-        // connection serves both this and `next_claimable_segment` below.
+        // connection serves both this and `next_claimable_segments` below.
         // A failed refresh isn't fatal — it costs this worker one tick of
         // undercounting toward the share denominator, not correctness — so
-        // it doesn't block trying `next_claimable_segment` on the same
+        // it doesn't block trying `next_claimable_segments` on the same
         // connection.
-        let seg_seq = match pool.get().await {
+        //
+        // Issue #63 Milestone 2: asks for up to `MAX_COALESCE_SEGMENTS` at
+        // once rather than just the lowest one, so a burst of quickly
+        // sealing segments (many ready before this worker gets back around
+        // to claiming) drains in one coalesced `drain_many` call instead of
+        // one `drain_once` call — and one full compute-and-apply pass —
+        // per segment.
+        let seg_seqs = match pool.get().await {
             Ok(client) => {
                 let _ = staging::register_drainer(&**client, &claimed_by).await;
-                staging::next_claimable_segment(&**client).await
+                staging::next_claimable_segments(&**client, staging::MAX_COALESCE_SEGMENTS).await
             }
             Err(err) => Err(err.into()),
         };
 
-        let seg_seq = match seg_seq {
-            Ok(Some(seq)) => seq,
-            Ok(None) => {
+        let seg_seqs = match seg_seqs {
+            Ok(seqs) if !seqs.is_empty() => seqs,
+            Ok(_) => {
                 if wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await {
                     break;
                 }
@@ -896,7 +903,9 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
             }
         };
 
-        heartbeat.register(seg_seq, claimed_by.clone()).await;
+        for &seg_seq in &seg_seqs {
+            heartbeat.register(seg_seq, claimed_by.clone()).await;
+        }
 
         let live_workers = match pool.get().await {
             Ok(client) => staging::count_live_drainers(&**client, drainer_window)
@@ -906,33 +915,38 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         };
 
         let outcome =
-            staging::drain_once(&pool, seg_seq, &claimed_by, live_workers, &wake_channel).await;
+            staging::drain_many(&pool, &seg_seqs, &claimed_by, live_workers, &wake_channel).await;
         let drain_failed = outcome.is_err();
         if drain_failed {
             // Release immediately rather than waiting on the reclaim TTL:
-            // `drain_once` has already exhausted its own internal retries
+            // `drain_many` has already exhausted its own internal retries
             // by the time it returns an error, so nothing about waiting
-            // longer helps, and every tick this worker holds the claim
+            // longer helps, and every tick this worker holds a claim
             // un-refreshed is a tick some other worker can't pick it up.
             if let Ok(client) = pool.get().await {
-                let _ = staging::release(&**client, seg_seq, &claimed_by).await;
+                for &seg_seq in &seg_seqs {
+                    let _ = staging::release(&**client, seg_seq, &claimed_by).await;
+                }
             }
         }
 
-        heartbeat.deregister(seg_seq, &claimed_by).await;
+        for &seg_seq in &seg_seqs {
+            heartbeat.deregister(seg_seq, &claimed_by).await;
+        }
 
         // Back off before re-looping unless we actually drained something.
-        // `next_claimable_segment` picks the lowest sealed/undrained segment
-        // by state alone, so any iteration that made no progress on it would
-        // otherwise be re-selected and spun on hot across every worker with
-        // no sleep. Two no-progress cases:
+        // `next_claimable_segments` picks the lowest sealed/undrained
+        // segments by state alone, so any iteration that made no progress on
+        // them would otherwise be re-selected and spun on hot across every
+        // worker with no sleep. Two no-progress cases:
         //   - `Err(_)`: a batch that fails deterministically (a poison
         //     change); principled quarantine is issue #16.
-        //   - `Ok(None)`: this call won no buckets — every bucket is already
-        //     claimed by a peer (or already drained) — but the segment is
-        //     still `draining`, so `next_claimable_segment` hands back the
-        //     same seq until the peer finishes.
-        // Only `Ok(Some(_))` re-loops immediately, to grab the next segment
+        //   - `Ok(None)`: this call won no buckets — every bucket of every
+        //     requested segment is already claimed by a peer (or already
+        //     drained) — but they're still `draining`, so
+        //     `next_claimable_segments` hands back the same seqs until the
+        //     peer finishes.
+        // Only `Ok(Some(_))` re-loops immediately, to grab the next batch
         // promptly. The poll floor (or a wake/shutdown) bounds the idle wait.
         let made_progress = matches!(outcome, Ok(Some(_)));
         if !made_progress && wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await {

@@ -1771,3 +1771,222 @@ async fn a_mixed_forced_and_delta_batch_matches_the_oracle() {
         "a batch mixing a forced group and a delta group must match the oracle"
     );
 }
+
+/// Issue #63 Milestone 2 follow-up: `drain_many`'s segment-coalescing path
+/// (see `apply.rs`'s `drain_many_coalesces_two_sealed_segments_into_one_apply_pass`)
+/// only had 1-1 TRANSFORM coverage. M2's actual motivation is the cost of an
+/// aggregate's forced-group recompute — this test exercises the coalesced
+/// path against a real `KeySpace::Aggregate` target, with a group touched by
+/// *both* segments, in three ways a naive per-segment (rather than
+/// merged-then-applied) implementation could get wrong:
+///
+/// - Group 10 is touched by the *same key* (id 2) in both segments, via a
+///   chained update (3.00 -> 6.00 -> 9.00). `merge_pair` must stitch the
+///   earliest old-image and the latest new-image into one net delta (+6),
+///   not apply +3 twice or use the wrong old-image and land on +3.
+/// - Group 20 is touched by *different keys* in each segment (id 4 in
+///   segment 1, id 5 in segment 2) — no key-level merge at all, so this
+///   checks that `accumulate_changes` sums both segments' contributions into
+///   one group write rather than only seeing whichever segment's fold
+///   happened to run.
+/// - Group 30 is reachable *only* via an image-less recompute trigger staged
+///   in segment 1 (id 6), with segment 2 contributing nothing to that group.
+///   If the forced full-recompute path silently dropped out under
+///   coalescing, group 30 would never appear at all.
+#[tokio::test]
+async fn drain_many_coalesces_two_sealed_segments_into_one_aggregate_apply_pass() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full",
+        )
+        .await
+        .expect("create source table");
+
+    let def = setup(&db).await;
+
+    // Pre-seed: group 10's baseline (members 1 and 2), established by an
+    // ordinary, non-coalesced drain before the coalesced batch under test.
+    client
+        .execute(
+            "insert into order_items (id, order_id, amount) values (1, 10, 5.00), (2, 10, 3.00)",
+            &[],
+        )
+        .await
+        .expect("seed group 10's baseline live rows");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "order_items",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"order_id":"10","amount":"5.00"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "order_items",
+        "2",
+        "insert",
+        None,
+        Some(r#"{"order_id":"10","amount":"3.00"}"#),
+    )
+    .await;
+    let seg0 = seal_active_segment(&mut client).await;
+    let outcome0 = drain(&db.pool, seg0, "worker").await;
+    assert_eq!(outcome0.keys_written, 1, "group 10 is newly created");
+
+    let target = read_target(&client).await;
+    assert_eq!(target["10"].0.as_deref(), Some("8.00"), "group 10 baseline");
+
+    // A row that has already landed live, entirely out-of-band (never
+    // reflected by any CDC image) — group 30 doesn't exist in the target
+    // yet, and only a forced full recompute can bring it in.
+    client
+        .execute(
+            "insert into order_items (id, order_id, amount) values (6, 30, 13.00)",
+            &[],
+        )
+        .await
+        .expect("out-of-band insert into group 30");
+
+    // Segment 1: id 2's interim update (group 10, chained across segments),
+    // a brand-new row in group 20 (id 4), and an image-less recompute
+    // trigger for group 30 (id 6).
+    client
+        .execute("update order_items set amount = 6.00 where id = 2", &[])
+        .await
+        .expect("apply id 2's interim live update");
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "order_items",
+        "2",
+        "update",
+        Some(r#"{"order_id":"10","amount":"3.00"}"#),
+        Some(r#"{"order_id":"10","amount":"6.00"}"#),
+    )
+    .await;
+    client
+        .execute(
+            "insert into order_items (id, order_id, amount) values (4, 20, 7.00)",
+            &[],
+        )
+        .await
+        .expect("insert id 4 into group 20");
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "order_items",
+        "4",
+        "insert",
+        None,
+        Some(r#"{"order_id":"20","amount":"7.00"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "order_items",
+        "6",
+        "recompute",
+        None,
+        None,
+    )
+    .await;
+    let seg1 = seal_active_segment(&mut client).await;
+
+    // Segment 2: id 2's final update (same key as segment 1, closing the
+    // chain at 9.00) and a second, distinct row in group 20 (id 5) — group
+    // 20 is now touched by both segments, but never by the same key.
+    client
+        .execute("update order_items set amount = 9.00 where id = 2", &[])
+        .await
+        .expect("apply id 2's final live update");
+    insert_cdc_row(
+        &client,
+        "seg_2",
+        "order_items",
+        "2",
+        "update",
+        Some(r#"{"order_id":"10","amount":"6.00"}"#),
+        Some(r#"{"order_id":"10","amount":"9.00"}"#),
+    )
+    .await;
+    client
+        .execute(
+            "insert into order_items (id, order_id, amount) values (5, 20, 11.00)",
+            &[],
+        )
+        .await
+        .expect("insert id 5 into group 20");
+    insert_cdc_row(
+        &client,
+        "seg_2",
+        "order_items",
+        "5",
+        "insert",
+        None,
+        Some(r#"{"order_id":"20","amount":"11.00"}"#),
+    )
+    .await;
+    let seg2 = seal_active_segment(&mut client).await;
+
+    let outcome = apply::drain_many(
+        &db.pool,
+        &[seg1, seg2],
+        "worker",
+        1,
+        "trellis_apply_aggregate_test",
+    )
+    .await
+    .expect("drain_many")
+    .expect("drain_many must claim and drain something");
+
+    assert_eq!(
+        outcome.keys_written, 3,
+        "groups 10, 20, and 30 must each be written exactly once"
+    );
+    assert_eq!(outcome.keys_deleted, 0);
+    assert_eq!(outcome.segments_drained.len(), 2);
+    for &(seg_seq, fully_drained) in &outcome.segments_drained {
+        assert!(
+            fully_drained,
+            "segment {seg_seq} must be fully drained by the single coalesced apply pass"
+        );
+    }
+
+    let target = read_target(&client).await;
+    let oracle = read_oracle(&client, &def).await;
+    assert_eq!(
+        target, oracle,
+        "the coalesced aggregate apply pass must match the oracle exactly"
+    );
+
+    assert_eq!(
+        target["10"].0.as_deref(),
+        Some("14.00"),
+        "group 10: id 2's chained update (3.00 -> 6.00 -> 9.00) must net a single \
+         +6.00 delta on top of the 8.00 baseline (5.00 + 3.00), not double-apply \
+         +3.00 twice or mis-merge onto the wrong old image"
+    );
+    assert_eq!(
+        target["20"].0.as_deref(),
+        Some("18.00"),
+        "group 20: id 4 (segment 1) and id 5 (segment 2) must both contribute to \
+         one merged group write (7.00 + 11.00), even though no single key was \
+         touched by both segments"
+    );
+    assert_eq!(
+        target["30"].0.as_deref(),
+        Some("13.00"),
+        "group 30 is only reachable via id 6's image-less recompute trigger in \
+         segment 1 — if the forced full-recompute path were dropped under \
+         coalescing, this group would never appear at all"
+    );
+}

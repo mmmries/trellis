@@ -844,7 +844,13 @@ fn infer_expr(
             let mut common_type = None;
             for (i, arg) in args.iter().enumerate() {
                 let arg_t = infer_expr(
-                    arg, field_name, source_columns, relationships, fields_by_name, types, in_progress,
+                    arg,
+                    field_name,
+                    source_columns,
+                    relationships,
+                    fields_by_name,
+                    types,
+                    in_progress,
                 )?;
                 if let Some(ct) = common_type {
                     if ct != arg_t {

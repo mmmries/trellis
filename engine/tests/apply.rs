@@ -1741,3 +1741,215 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
         );
     }
 }
+
+#[tokio::test]
+async fn drain_many_coalesces_two_sealed_segments_into_one_apply_pass() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute("create table orders (id integer primary key, price numeric, tax numeric)")
+        .await
+        .expect("seed source table");
+
+    let def = order_totals_def();
+    let source_columns = numeric_columns(&["id", "price", "tax"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM orders SELECT price + tax AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create definition");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+        .await
+        .expect("create target table");
+
+    client
+        .execute(
+            "insert into orders (id, price, tax) values \
+             (1, 10.00, 1.50), (2, 30.00, 3.00), (3, 1.00, 0.10)",
+            &[],
+        )
+        .await
+        .expect("seed source rows after the definition exists");
+
+    // Segment 1: order 1 arrives, and order 2's first (interim) update.
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"price":"10.00","tax":"1.50"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "2",
+        "update",
+        Some(r#"{"price":"5.00","tax":"0.50"}"#),
+        Some(r#"{"price":"20.00","tax":"2.00"}"#),
+    )
+    .await;
+    let seg1 = seal_active_segment(&mut client).await;
+
+    // Segment 2: order 2's second update (same key as segment 1, so the
+    // merge must collapse both into one write reflecting only the final
+    // image) plus a brand-new order 3.
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "orders",
+        "2",
+        "update",
+        Some(r#"{"price":"20.00","tax":"2.00"}"#),
+        Some(r#"{"price":"30.00","tax":"3.00"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "orders",
+        "3",
+        "insert",
+        None,
+        Some(r#"{"price":"1.00","tax":"0.10"}"#),
+    )
+    .await;
+    let seg2 = seal_active_segment(&mut client).await;
+
+    let outcome = apply::drain_many(&db.pool, &[seg1, seg2], "worker", 1, "trellis_apply_test")
+        .await
+        .expect("drain_many")
+        .expect("drain_many must claim and drain something");
+
+    assert_eq!(
+        outcome.keys_written, 3,
+        "orders 1, 2, and 3 must each be written exactly once, \
+         even though order 2 was touched by both segments"
+    );
+    assert_eq!(outcome.keys_deleted, 0);
+    assert_eq!(
+        outcome.segments_drained.len(),
+        2,
+        "both coalesced segments must report a drain outcome"
+    );
+    for &(seg_seq, fully_drained) in &outcome.segments_drained {
+        assert!(
+            fully_drained,
+            "segment {seg_seq} must be fully drained by the single coalesced apply pass"
+        );
+        assert_eq!(segment_state(&client, seg_seq).await, SegmentState::Drained);
+    }
+
+    let oracle = recompute(&db.pool, &def, &pk.name, &source_columns)
+        .await
+        .expect("oracle recompute");
+    let target_rows = client
+        .query("select id::text, total::text from order_totals", &[])
+        .await
+        .expect("read target table");
+    assert_eq!(target_rows.len(), oracle.len());
+    for row in target_rows {
+        let id: String = row.get(0);
+        let total: Option<String> = row.get(1);
+        let expected = &oracle[&id];
+        assert_eq!(
+            total,
+            expected["total"].as_ref().map(|n| n.to_string()),
+            "total mismatch for id {id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn next_claimable_segments_stops_at_the_first_undrained_truncate() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    // Segment 1: ordinary, no truncate.
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "a",
+        "insert",
+        None,
+        Some(r#"{"v":"a"}"#),
+    )
+    .await;
+    let seg1 = seal_active_segment(&mut client).await;
+
+    // Segment 2: bears a truncate — a two-directional barrier that must
+    // never be coalesced with anything else.
+    insert_truncate_row(&client, "seg_1", "orders").await;
+    let seg2 = seal_active_segment(&mut client).await;
+
+    // Segment 3: ordinary again, sealed after the truncate.
+    insert_cdc_row(
+        &client,
+        "seg_2",
+        "orders",
+        "b",
+        "insert",
+        None,
+        Some(r#"{"v":"b"}"#),
+    )
+    .await;
+    let seg3 = seal_active_segment(&mut client).await;
+
+    // All three sealed and undrained: a wide batch request must stop at
+    // seg1, excluding the truncate-bearing seg2 and everything past it —
+    // never coalescing an ordinary segment with a truncate.
+    let batch = apply::next_claimable_segments(&client, 10)
+        .await
+        .expect("query barrier");
+    assert_eq!(batch, vec![seg1]);
+
+    client
+        .execute(
+            "update segments \
+             set state = 'drained', drained_mask = (1::bigint << bucket_count) - 1 \
+             where seg_seq = $1",
+            &[&seg1],
+        )
+        .await
+        .expect("mark seg1 drained");
+
+    // seg2 (the truncate) is now the lowest undrained segment: it must be
+    // handed out alone, never bundled with seg3.
+    let batch = apply::next_claimable_segments(&client, 10)
+        .await
+        .expect("query barrier");
+    assert_eq!(
+        batch,
+        vec![seg2],
+        "the truncate segment must be handed out alone, not coalesced with seg3"
+    );
+
+    client
+        .execute(
+            "update segments \
+             set state = 'drained', drained_mask = (1::bigint << bucket_count) - 1 \
+             where seg_seq = $1",
+            &[&seg2],
+        )
+        .await
+        .expect("mark seg2 drained");
+
+    // Only now, with the truncate itself drained, does seg3 become
+    // claimable.
+    let batch = apply::next_claimable_segments(&client, 10)
+        .await
+        .expect("query barrier");
+    assert_eq!(batch, vec![seg3]);
+}

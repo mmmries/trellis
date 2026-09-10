@@ -25,6 +25,8 @@ use std::fmt;
 use crate::pool::Pool;
 
 use super::ast::{KeySpace, RelationshipDef, TransformDef, ValueType};
+use super::backfill::{self, BackfillError};
+use super::ddl::{self, DdlError};
 use super::error::ParseError;
 use super::model::{
     Definition, EdgeKind, NodeKind, RelationshipCardinality, RelationshipDefinition, SchemaEdge,
@@ -68,6 +70,14 @@ pub enum CatalogError {
     /// backfill...") would misdescribe a definition-time rejection as a
     /// backfill failure.
     ReplicaIdentityRequired(crate::intake::IntakeError),
+    /// [`install_definition`]'s target-table DDL (run before either backfill
+    /// path) failed.
+    Ddl(DdlError),
+    /// [`install_definition`]'s direct backfill attempt
+    /// ([`backfill::backfill_definition`]) failed with something other than
+    /// [`BackfillError::Unsupported`] — an `Unsupported` shape instead falls
+    /// back to the ring ([`create_definition`]) rather than surfacing here.
+    DirectBackfill(BackfillError),
 }
 
 impl fmt::Display for CatalogError {
@@ -93,6 +103,8 @@ impl fmt::Display for CatalogError {
                 write!(f, "source table \"{table}\" not found on the search path")
             }
             CatalogError::ReplicaIdentityRequired(err) => write!(f, "{err}"),
+            CatalogError::Ddl(err) => write!(f, "failed to create target table: {err}"),
+            CatalogError::DirectBackfill(err) => write!(f, "direct backfill failed: {err}"),
         }
     }
 }
@@ -108,6 +120,8 @@ impl std::error::Error for CatalogError {
             CatalogError::Backfill(err) => Some(err),
             CatalogError::SourceTableNotFound(_) => None,
             CatalogError::ReplicaIdentityRequired(err) => Some(err),
+            CatalogError::Ddl(err) => Some(err),
+            CatalogError::DirectBackfill(err) => Some(err),
         }
     }
 }
@@ -151,6 +165,81 @@ pub async fn create_definition(
     pool: &Pool,
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
+) -> Result<Definition, CatalogError> {
+    create_definition_inner(pool, source_text, source_columns, true).await
+}
+
+/// Like [`create_definition`], but stages *no* ring-enumeration backfill: the
+/// definition and its version bump are persisted, but the source table is not
+/// enumerated into the ring. Callers that build the target directly
+/// (`defs::backfill::backfill_definition` — issue #63 M3's set-based,
+/// key-range-chunked source→target build) use this so the from-scratch build
+/// doesn't *also* flood the ring with one `Recompute` marker per source row;
+/// the ring is then left to handle only live CDC deltas after the direct
+/// build's fence. Every other caller wants the ring-enumeration backfill and
+/// keeps using [`create_definition`].
+pub async fn create_definition_without_backfill(
+    pool: &Pool,
+    source_text: &str,
+    source_columns: &HashMap<String, ValueType>,
+) -> Result<Definition, CatalogError> {
+    create_definition_inner(pool, source_text, source_columns, false).await
+}
+
+/// The front door real callers use to stand up a new definition (issue #63
+/// C1): creates the target table, then backfills it with the fast,
+/// set-based [`backfill::backfill_definition`] when `def`'s shape supports
+/// it, falling back to the ring-based [`create_definition`] only on
+/// [`BackfillError::Unsupported`].
+///
+/// Target-table creation always runs first, unconditionally — before either
+/// backfill path is attempted — because neither `backfill_definition` nor
+/// `create_definition` creates it themselves; both assume it already exists
+/// (see their own doc comments). Doing it once here, ahead of both branches,
+/// preserves the fast path's build/CDC fence: the table exists and is fully
+/// built by the direct backfill *before* the definition is ever persisted to
+/// the catalog via [`create_definition_without_backfill`], so nothing can
+/// fold a CDC delta onto this target before the build has run. The ring
+/// fallback branch also benefits from the table already existing, though it
+/// has no comparable fence requirement of its own.
+pub async fn install_definition(
+    pool: &Pool,
+    source_text: &str,
+    source_columns: &HashMap<String, ValueType>,
+    target_schema: &str,
+) -> Result<Definition, CatalogError> {
+    let def: TransformDef = parse(source_text)?;
+
+    match &def.key_space {
+        KeySpace::OneToOne => {
+            let pk = ddl::source_primary_key(pool, &def.source)
+                .await
+                .map_err(CatalogError::Ddl)?;
+            ddl::create_target_table(pool, &def, target_schema, &pk, source_columns)
+                .await
+                .map_err(CatalogError::Ddl)?;
+        }
+        KeySpace::Aggregate { .. } => {
+            ddl::create_aggregate_target_table(pool, &def, target_schema, source_columns)
+                .await
+                .map_err(CatalogError::Ddl)?;
+        }
+    }
+
+    match backfill::backfill_definition(pool, &def, target_schema, source_columns).await {
+        Ok(()) => create_definition_without_backfill(pool, source_text, source_columns).await,
+        Err(BackfillError::Unsupported(_)) => {
+            create_definition(pool, source_text, source_columns).await
+        }
+        Err(err) => Err(CatalogError::DirectBackfill(err)),
+    }
+}
+
+async fn create_definition_inner(
+    pool: &Pool,
+    source_text: &str,
+    source_columns: &HashMap<String, ValueType>,
+    backfill: bool,
 ) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse(source_text)?;
     // Issue #40: enrichment fields (`<rel>.<col>`) are validated against
@@ -222,9 +311,11 @@ pub async fn create_definition(
     // (whatever schema `config.target_schema()` actually resolved to,
     // which may not be the `DEFAULT_TARGET_SCHEMA` constant if overridden)
     // without needing to special-case on `source_node.is_target`.
-    let source_schema = resolve_source_schema_in_txn(&txn, &def.source).await?;
-    let qualified_source = crate::intake::publication::qualify(&source_schema, &def.source)?;
-    crate::intake::publication::enumerate_and_append(&txn, &qualified_source).await?;
+    if backfill {
+        let source_schema = resolve_source_schema_in_txn(&txn, &def.source).await?;
+        let qualified_source = crate::intake::publication::qualify(&source_schema, &def.source)?;
+        crate::intake::publication::enumerate_and_append(&txn, &qualified_source).await?;
+    }
 
     let version: i64 = txn
         .query_one(

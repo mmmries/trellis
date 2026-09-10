@@ -56,7 +56,8 @@ pub use append::{
     CdcOp, RING_SIZE, StagedChange, TRUNCATE_SENTINEL_KEY, append, ring_slot_is_free,
 };
 pub use apply::{
-    ApplyError, ApplyOutcome, ApplyPlan, MAX_HOP_GEN, drain_once, next_claimable_segment,
+    ApplyError, ApplyOutcome, ApplyPlan, MAX_COALESCE_SEGMENTS, MAX_HOP_GEN, ManyApplyOutcome,
+    drain_many, drain_once, next_claimable_segment, next_claimable_segments,
 };
 pub use claim::{
     DEFAULT_DRAINER_WINDOW, MIN_ROWS_TO_SPLIT, SEG_BUCKETS, claim, count_live_drainers,
@@ -66,7 +67,7 @@ pub use converge::{
     await_converged, converged_through, has_pending, pending_count, watermark_token,
 };
 pub use error::StagingError;
-pub use fold::{BucketFilter, FoldedChange, fold};
+pub use fold::{BucketFilter, FoldedChange, fold, merge_folded_changes};
 pub use liveness::{
     FENCE_MISS_INITIAL_DELAY, FENCE_MISS_MAX_DELAY, FenceMissBackoff, HeartbeatDaemon,
     HeartbeatDaemonConfig, acquire_pause_lease, claim_unless_paused, claiming_is_paused,

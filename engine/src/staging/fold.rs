@@ -13,6 +13,7 @@
 //! populates buckets itself — [`BucketFilter::all`] is the whole unsplit
 //! batch.
 
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 use tokio_postgres::Transaction;
@@ -258,4 +259,277 @@ pub async fn fold(
             is_truncate: row.get(10),
         })
         .collect())
+}
+
+/// Merges several segments' already-folded change lists — issue #63
+/// Milestone 2's segment-coalescing seam. Each element of `per_segment` is
+/// one segment's own [`fold`] output, already unique per `(src_table,
+/// key)`; `per_segment` itself must be ordered **ascending by seg_seq**
+/// (oldest segment first), since [`merge_pair`] assumes its `earlier`
+/// argument really did seal before its `later` one.
+///
+/// A key touched in only one segment passes through unchanged. A key
+/// touched in more than one segment is combined via [`merge_pair`], applied
+/// left-to-right in seal order — exactly the same reduction [`fold`]'s own
+/// `array_agg(... order by lsn, change_id)` arg-extremes compute for one
+/// segment's raw rows, just run here over already-reduced per-segment
+/// records instead of raw ones. Deduplicating by key here, before the
+/// combined list ever reaches [`super::apply::compute`], matters beyond
+/// bookkeeping: [`super::apply::apply_target`]'s upsert binds every write in
+/// one `INSERT ... ON CONFLICT` statement, and Postgres rejects a statement
+/// that would update the same conflict target row twice
+/// (`ON CONFLICT DO UPDATE command cannot affect row a second time`) — so
+/// coalescing segments without this merge would make any key touched by
+/// more than one of them fail outright instead of silently misapplying.
+pub fn merge_folded_changes(per_segment: Vec<Vec<FoldedChange>>) -> Vec<FoldedChange> {
+    let mut merged: Vec<FoldedChange> = Vec::new();
+    let mut index: HashMap<(String, String), usize> = HashMap::new();
+    for segment in per_segment {
+        for change in segment {
+            let dedup_key = (change.src_table.clone(), change.key.clone());
+            match index.get(&dedup_key) {
+                Some(&i) => {
+                    let earlier = std::mem::replace(&mut merged[i], change.clone());
+                    merged[i] = merge_pair(earlier, change);
+                }
+                None => {
+                    index.insert(dedup_key, merged.len());
+                    merged.push(change);
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// Combines two [`FoldedChange`] records for the same `(src_table, key)`,
+/// one from an earlier-sealed segment and one from a later one, into the
+/// record [`fold`] would have produced had both segments' underlying rows
+/// been folded together in one pass. Field-by-field, mirroring [`fold`]'s
+/// own SQL rules (see [`FoldedChange`]'s doc comments):
+///
+/// - `new_image`/`old_image`: whichever side actually carries image
+///   evidence (either image field set) wins its half — `later` for the
+///   post-image (its window is strictly the more recent), `earlier` for the
+///   pre-image. A side with neither image set contributed no image
+///   information at all (a bare recompute trigger folded alone), so it
+///   defers entirely to the other side rather than overwriting real
+///   evidence with `None`.
+/// - `src_changed`/`lsn`: `Option::max` — `None` sorts below every `Some`,
+///   and among two `Some`s the greater watermark/timestamp wins, matching
+///   "OR across the group" and "GREATEST over every row" respectively.
+/// - `origin_lsn`: the lesser of the two, ignoring a missing side —
+///   `Option::min` would wrongly let a `None` beat a real `Some`.
+/// - `hop_gen`: 0 if the merged `src_changed` is `Some` (a source change
+///   resets propagation depth), else the greater of the two hop generations.
+/// - `first_seen`: the earlier of the two — first append into either
+///   segment.
+/// - `group_key`: `earlier`'s, if it has one — "first non-null value by
+///   append order".
+/// - `is_truncate`: OR. In practice always `false` here: the batching layer
+///   that builds `per_segment` never coalesces a truncate-bearing segment
+///   with any other (a truncate is its own drain barrier — see
+///   `apply::next_claimable_segments`), so no truncate row can reach this
+///   function paired with anything. Kept as a real OR anyway rather than
+///   assumed away, so a future caller that breaks that invariant fails
+///   toward "still marked as a truncate" rather than toward silently
+///   dropping one.
+fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
+    let earlier_has_image = earlier.old_image.is_some() || earlier.new_image.is_some();
+    let later_has_image = later.old_image.is_some() || later.new_image.is_some();
+    let src_changed = earlier.src_changed.max(later.src_changed);
+    let hop_gen = if src_changed.is_some() {
+        0
+    } else {
+        earlier.hop_gen.max(later.hop_gen)
+    };
+    let origin_lsn = match (earlier.origin_lsn, later.origin_lsn) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+
+    FoldedChange {
+        src_table: earlier.src_table,
+        key: earlier.key,
+        new_image: if later_has_image {
+            later.new_image
+        } else {
+            earlier.new_image
+        },
+        old_image: if earlier_has_image {
+            earlier.old_image
+        } else {
+            later.old_image
+        },
+        src_changed,
+        origin_lsn,
+        lsn: earlier.lsn.max(later.lsn),
+        hop_gen,
+        first_seen: earlier.first_seen.min(later.first_seen),
+        group_key: earlier.group_key.or(later.group_key),
+        is_truncate: earlier.is_truncate || later.is_truncate,
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn base(key: &str) -> FoldedChange {
+        FoldedChange {
+            src_table: "orders".to_string(),
+            key: key.to_string(),
+            new_image: None,
+            old_image: None,
+            src_changed: None,
+            origin_lsn: None,
+            lsn: None,
+            hop_gen: 0,
+            first_seen: SystemTime::UNIX_EPOCH,
+            group_key: None,
+            is_truncate: false,
+        }
+    }
+
+    /// A key touched in only one of the coalesced segments passes straight
+    /// through, untouched by the merge — the common case for a burst where
+    /// most keys are touched once.
+    #[test]
+    fn untouched_keys_pass_through_unmerged() {
+        let seg_a = vec![base("1")];
+        let seg_b = vec![base("2")];
+        let mut merged = merge_folded_changes(vec![seg_a, seg_b]);
+        merged.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].key, "1");
+        assert_eq!(merged[1].key, "2");
+    }
+
+    /// A key updated in two coalesced segments folds to exactly one
+    /// [`FoldedChange`] — the "never affect the same ON CONFLICT row twice"
+    /// invariant [`merge_folded_changes`]'s doc comment calls out — carrying
+    /// the earliest pre-image and the latest post-image across both
+    /// windows, as if the whole span had been folded in one pass.
+    #[test]
+    fn same_key_across_segments_merges_to_one_record_with_earliest_old_and_latest_new_image() {
+        let mut first = base("1");
+        first.old_image = Some(r#"{"v":1}"#.to_string());
+        first.new_image = Some(r#"{"v":2}"#.to_string());
+        first.lsn = Some(PgLsn::from(10));
+        first.first_seen = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+
+        let mut second = base("1");
+        second.old_image = Some(r#"{"v":2}"#.to_string());
+        second.new_image = Some(r#"{"v":3}"#.to_string());
+        second.lsn = Some(PgLsn::from(20));
+        second.first_seen = SystemTime::UNIX_EPOCH + Duration::from_secs(2);
+
+        let merged = merge_folded_changes(vec![vec![first], vec![second]]);
+        assert_eq!(merged.len(), 1, "one row per key, never two");
+        let merged = &merged[0];
+        assert_eq!(merged.old_image, Some(r#"{"v":1}"#.to_string()));
+        assert_eq!(merged.new_image, Some(r#"{"v":3}"#.to_string()));
+        assert_eq!(merged.lsn, Some(PgLsn::from(20)));
+        assert_eq!(
+            merged.first_seen,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1)
+        );
+    }
+
+    /// A later segment's bare recompute trigger (no image at all — the
+    /// image-less shape a reverse-recompute or backfill enumeration stages)
+    /// must not blot out an earlier segment's real image evidence for the
+    /// same key.
+    #[test]
+    fn image_less_later_segment_defers_to_earlier_segments_image() {
+        let mut first = base("1");
+        first.old_image = Some(r#"{"v":1}"#.to_string());
+        first.new_image = Some(r#"{"v":2}"#.to_string());
+
+        let second = base("1"); // no image at all: a bare recompute trigger
+
+        let merged = merge_folded_changes(vec![vec![first], vec![second]]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].new_image, Some(r#"{"v":2}"#.to_string()));
+        assert_eq!(merged[0].old_image, Some(r#"{"v":1}"#.to_string()));
+    }
+
+    /// A genuine delete (`new_image: None`, `old_image: Some(..)`) in a
+    /// later segment must survive the merge as a delete, not be treated as
+    /// "no new information" just because `new_image` is `None`.
+    #[test]
+    fn later_segment_delete_overrides_earlier_segments_write() {
+        let mut first = base("1");
+        first.old_image = Some(r#"{"v":1}"#.to_string());
+        first.new_image = Some(r#"{"v":2}"#.to_string());
+
+        let mut second = base("1");
+        second.old_image = Some(r#"{"v":2}"#.to_string());
+        second.new_image = None; // deleted in the later segment
+
+        let merged = merge_folded_changes(vec![vec![first], vec![second]]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].new_image, None,
+            "the later segment's delete must win, not be papered over by the earlier write"
+        );
+        assert_eq!(merged[0].old_image, Some(r#"{"v":1}"#.to_string()));
+    }
+
+    /// `hop_gen` resets to 0 once any contributing segment carries a real
+    /// source change, and otherwise takes the max across segments —
+    /// mirroring `fold`'s own per-segment rule applied across segments too.
+    #[test]
+    fn hop_gen_resets_on_a_source_change_else_takes_the_max() {
+        let mut first = base("1");
+        first.hop_gen = 3;
+        let mut second = base("1");
+        second.hop_gen = 5;
+        let merged = merge_folded_changes(vec![vec![first.clone()], vec![second.clone()]]);
+        assert_eq!(merged[0].hop_gen, 5, "no source change: max of the two");
+
+        second.src_changed = Some(SystemTime::UNIX_EPOCH);
+        let merged = merge_folded_changes(vec![vec![first], vec![second]]);
+        assert_eq!(
+            merged[0].hop_gen, 0,
+            "a source change in either segment resets hop_gen"
+        );
+    }
+
+    /// `origin_lsn` takes the lesser of the two non-null sides — a plain
+    /// `Option::min` would wrongly let a missing side beat a real one.
+    #[test]
+    fn origin_lsn_takes_the_lesser_non_null_side() {
+        let mut first = base("1");
+        first.origin_lsn = None;
+        let mut second = base("1");
+        second.origin_lsn = Some(PgLsn::from(7));
+        let merged = merge_folded_changes(vec![vec![first], vec![second]]);
+        assert_eq!(merged[0].origin_lsn, Some(PgLsn::from(7)));
+    }
+
+    /// More than two contributing segments still fold to exactly one
+    /// record, taking the latest post-image across all of them — the
+    /// realistic burst shape this milestone targets.
+    #[test]
+    fn three_segments_touching_the_same_key_merge_to_one_record() {
+        let mut a = base("1");
+        a.new_image = Some("\"a\"".to_string());
+        a.lsn = Some(PgLsn::from(1));
+        let mut b = base("1");
+        b.new_image = Some("\"b\"".to_string());
+        b.lsn = Some(PgLsn::from(2));
+        let mut c = base("1");
+        c.new_image = Some("\"c\"".to_string());
+        c.lsn = Some(PgLsn::from(3));
+
+        let merged = merge_folded_changes(vec![vec![a], vec![b], vec![c]]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].new_image, Some("\"c\"".to_string()));
+        assert_eq!(merged[0].lsn, Some(PgLsn::from(3)));
+    }
 }

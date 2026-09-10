@@ -25,6 +25,7 @@
 //! specific unsupported construct (see [`error::ParseError`]).
 
 pub mod ast;
+pub mod backfill;
 pub mod catalog;
 pub mod ddl;
 pub mod error;
@@ -40,10 +41,11 @@ pub mod validate;
 pub use ast::{
     Expr, FieldDef, KeySpace, Operator, Predicate, RelationshipDef, TransformDef, ValueType,
 };
+pub use backfill::{BackfillError, backfill_definition};
 pub use catalog::{
-    CatalogError, all_source_tables, create_definition, create_relationship, dependents_of,
-    edges_from, node_for_table, persist_edge, relationship_by_name, resolve_node,
-    source_table_version, transforms_for_source,
+    CatalogError, all_source_tables, create_definition, create_definition_without_backfill,
+    create_relationship, dependents_of, edges_from, install_definition, node_for_table,
+    persist_edge, relationship_by_name, resolve_node, source_table_version, transforms_for_source,
 };
 pub use ddl::{
     DdlError, PrimaryKeyColumn, create_aggregate_target_table, create_target_table,
@@ -452,10 +454,8 @@ mod tests {
                 ],
             }
         );
-        let source_columns = std::collections::HashMap::from([(
-            "a".to_string(),
-            ValueType::Numeric,
-        )]);
+        let source_columns =
+            std::collections::HashMap::from([("a".to_string(), ValueType::Numeric)]);
         let err = validate(&def, &source_columns, &std::collections::HashMap::new()).unwrap_err();
         assert_eq!(
             err,

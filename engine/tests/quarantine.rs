@@ -885,7 +885,8 @@ async fn a_batch_failure_that_only_reproduces_combined_surfaces_unblamed() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric)",
+            "create table order_items (id integer primary key, order_id integer, amount numeric); \
+             alter table order_items replica identity full",
         )
         .await
         .expect("create source table");
