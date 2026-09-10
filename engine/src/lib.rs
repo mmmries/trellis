@@ -1,9 +1,14 @@
 //! Trellis engine: a declarative API for creating incrementally maintained
 //! data transformations in PostgreSQL.
 //!
-//! [`client::Client`] is the embedder's entry point — one call starts CDC
-//! intake, ring maintenance, and N application workers against a live
-//! database. Everything else in the crate is machinery `Client` composes:
+//! [`app::Trellis`] is the embedder's entry point — one facade covering the
+//! whole lifecycle: apply migrations, register relationships and transform
+//! definitions, list them, request backfills, and run the live pipeline
+//! (CDC intake, ring maintenance, and N application workers). It composes
+//! everything below into one interface so callers never stitch the
+//! primitives together themselves; [`client::Client`] is the runtime it
+//! starts, still public for embedders that want to drive it directly.
+//! Everything else in the crate is machinery these compose:
 //!
 //! - [`config`] resolves a [`Config`] from CLI args + environment.
 //! - [`pool`] manages a `deadpool-postgres` connection pool and exposes the
@@ -31,6 +36,7 @@
 //! every maintenance tick ([`client::ClientOptions::maintenance_interval`]).
 //! Quarantine, stage 06's other half, is not yet implemented.
 
+pub mod app;
 pub mod client;
 pub mod config;
 pub mod defs;
@@ -42,8 +48,12 @@ pub mod numeric;
 pub mod pool;
 pub mod staging;
 
+pub use app::{
+    DefinitionSummary, PoisonEntry, RelationshipSummary, Trellis, TrellisError, TrellisOptions,
+};
 pub use client::{Client, ClientError, ClientOptions};
 pub use config::Config;
+pub use defs::{Definition, RelationshipCardinality, RelationshipDefinition};
 pub use error::Error;
 pub use identity::Identity;
 pub use migrate::migrate;

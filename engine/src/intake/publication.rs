@@ -327,11 +327,206 @@ pub(crate) async fn enumerate_and_append(
     Ok(())
 }
 
+/// A fence snapshot plus the row count captured at that same instant, for a
+/// table a direct backfill is about to fold into a target (issue #79, bug B).
+/// Produced by [`capture_backfill_coverage_fence`] *before* the build reads the
+/// table and later persisted by [`write_backfill_coverage`].
+#[derive(Clone, Debug)]
+pub struct CoverageFence {
+    pub fence: String,
+    pub count: i64,
+}
+
+/// Captures the fence snapshot and row count for `qualified_table` in one
+/// statement (issue #79, bug B) — so both describe the same MVCC instant.
+///
+/// **This must be called before the direct build reads the table**, not after.
+/// The build reads each relationship's to-side table once (into a staging
+/// table) and the source in progressive per-chunk statements, each under its
+/// own autocommit snapshot — there is no single build snapshot. A row that is
+/// inserted or updated *after* the build reads it but *before* a fence captured
+/// post-build would be visible in that post-build fence yet absent from the
+/// target, so [`coverage_covers`] would wrongly skip its catch-up and drop the
+/// change (the table joins the publication later still, so CDC never carries
+/// it either). A fence captured before any build read cannot vouch for such a
+/// row: its `xmin` is invisible in the earlier fence, so `coverage_covers`
+/// falls back to enumeration — the safe default the fix demands.
+pub async fn capture_backfill_coverage_fence(
+    client: &impl GenericClient,
+    qualified_table: &str,
+) -> Result<CoverageFence, IntakeError> {
+    let (schema, table) = split_qualified(qualified_table)?;
+    let row = client
+        .query_one(
+            &format!(
+                "select count(*)::bigint, pg_current_snapshot()::text from {}.{}",
+                quote_ident(schema),
+                quote_ident(table)
+            ),
+            &[],
+        )
+        .await?;
+    Ok(CoverageFence {
+        count: row.get(0),
+        fence: row.get(1),
+    })
+}
+
+/// Persists a coverage record: as of `fence.fence`, `qualified_table` held
+/// `fence.count` rows, all of which a direct backfill folded into an
+/// already-built target (issue #79, bug B). [`coverage_covers`] later consults
+/// this to skip a redundant catch-up enumeration.
+///
+/// A plain upsert (last write wins) is correct because the caller
+/// ([`crate::defs::catalog::install_definition`]) only ever records coverage
+/// for a table with exactly one reader, and *clears* it (see
+/// [`clear_backfill_coverage`]) the moment a second reader appears — so two
+/// live recordings for one table never coexist to be reconciled.
+pub async fn write_backfill_coverage(
+    client: &impl GenericClient,
+    qualified_table: &str,
+    fence: &CoverageFence,
+) -> Result<(), IntakeError> {
+    client
+        .execute(
+            "insert into backfill_coverage (table_name, fence_snapshot, covered_row_count) \
+             values ($1, $2::text::pg_snapshot, $3) \
+             on conflict (table_name) do update set \
+               fence_snapshot = excluded.fence_snapshot, \
+               covered_row_count = excluded.covered_row_count",
+            &[&qualified_table, &fence.fence, &fence.count],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Captures a fence for `qualified_table` and immediately persists it — the
+/// capture-and-write-at-once convenience used by tests that record coverage for
+/// a table nothing is concurrently building. Real installs
+/// ([`crate::defs::catalog::install_definition`]) must instead
+/// [`capture_backfill_coverage_fence`] *before* the build and
+/// [`write_backfill_coverage`] after it (see the former's doc comment).
+pub async fn record_backfill_coverage(
+    client: &impl GenericClient,
+    qualified_table: &str,
+) -> Result<(), IntakeError> {
+    let fence = capture_backfill_coverage_fence(client, qualified_table).await?;
+    write_backfill_coverage(client, qualified_table, &fence).await
+}
+
+/// Drops any coverage record for `qualified_table` — called when a table gains
+/// a second reader (so the single-reader assumption [`write_backfill_coverage`]
+/// relies on no longer holds). Removing the record forces [`coverage_covers`]
+/// back to full enumeration — the safe default.
+pub async fn clear_backfill_coverage(
+    client: &impl GenericClient,
+    qualified_table: &str,
+) -> Result<(), IntakeError> {
+    client
+        .execute(
+            "delete from backfill_coverage where table_name = $1",
+            &[&qualified_table],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Whether `table`'s pre-existing rows are already fully reflected in a
+/// directly-built target and its catch-up enumeration can therefore be
+/// skipped (issue #79, bug B). Returns `false` — meaning "enumerate, the safe
+/// default" — whenever anything is uncertain.
+///
+/// # Why not a plain fence comparison
+///
+/// The obvious design — "skip if the build's fence is at least as recent as
+/// the table's publication-join fence" — cannot work, because the direct
+/// build *always* precedes the join in time: a definition is built (reading
+/// the current source + relationship tables) and only *afterward* does the
+/// periodic reconcile loop notice those tables and add them to the
+/// publication. So the build snapshot's xids are always *older* than the join
+/// fence's, and any whole-snapshot `settled_since`-style test would either
+/// never skip (useless) or always skip (unsafe) — the global xid clock
+/// advances between build and join regardless of whether *this* table saw any
+/// write, so it cannot answer the only question that matters: did **this
+/// table** change in the gap between the build and the join?
+///
+/// # What we actually check
+///
+/// The build's coverage record (`backfill_coverage`) names the exact snapshot
+/// `fence` at which the table was fully folded into a target, plus the row
+/// count at that instant. The table's contribution is unchanged since the
+/// fence — and the build therefore still fully covers it — iff **all three**
+/// hold:
+///
+/// 1. No surviving row was inserted or updated after the fence: every live
+///    row's `xmin` is visible in `fence` (`pg_visible_in_snapshot`). An insert
+///    or in-place update stamps a fresh, fence-invisible `xmin`, so this
+///    catches both.
+/// 2. The current row count equals the recorded count. This is what catches a
+///    *delete*, whose tuple simply vanishes and so leaves no invisible `xmin`
+///    behind. (Insert-then-delete churn that nets to the same count is still
+///    caught by rule 1 via the inserted row's `xmin` — unless that row was
+///    also deleted, in which case the table's contribution genuinely did not
+///    change and skipping is correct.)
+/// 3. Both the fence and the current snapshot are in xid epoch 0 (their
+///    `pg_snapshot` xmax is below 2^32). The `xmin::text::xid8` cast in rule 1
+///    reads a 32-bit tuple xid as an epoch-0 `xid8`; once the xid counter has
+///    wrapped (epoch > 0) that reconstruction is wrong, so past the first
+///    wraparound we conservatively refuse to skip rather than risk comparing
+///    across epochs. Every case short of ~2^32 lifetime transactions — all
+///    tests, and any realistic build→join window — is epoch 0.
+///
+/// A concurrent writer is a non-issue: the caller only reaches here once the
+/// marker's own fence has settled, and an as-yet-uncommitted row is simply not
+/// visible in `fence`, so it lands on the safe side (rule 1 fails → enumerate).
+async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, IntakeError> {
+    let (schema, name) = split_qualified(table)?;
+    let Some(row) = txn
+        .query_opt(
+            "select fence_snapshot::text, covered_row_count \
+             from backfill_coverage where table_name = $1",
+            &[&table],
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let fence: String = row.get(0);
+    let count: i64 = row.get(1);
+    let covered: bool = txn
+        .query_one(
+            &format!(
+                "select \
+                   pg_snapshot_xmax($1::text::pg_snapshot) < '4294967296'::xid8 \
+                   and pg_snapshot_xmax(pg_current_snapshot()) < '4294967296'::xid8 \
+                   and (select count(*)::bigint from {sch}.{tbl}) = $2 \
+                   and not exists ( \
+                     select 1 from {sch}.{tbl} \
+                     where not pg_visible_in_snapshot(xmin::text::xid8, $1::text::pg_snapshot) \
+                   )",
+                sch = quote_ident(schema),
+                tbl = quote_ident(name),
+            ),
+            &[&fence, &count],
+        )
+        .await?
+        .get(0);
+    Ok(covered)
+}
+
 /// Runs every pending backfill whose fence has settled, staging its
 /// pre-existing rows and deleting the marker in the *same* transaction as
 /// that staging commit. A crash between the `ALTER` and this point leaves
 /// the marker durable; a fence that hasn't settled yet is left alone for the
 /// next setup pass — this function is meant to be retried on every one.
+///
+/// Issue #79 (bug B): before enumerating a marker's table, consult
+/// [`coverage_covers`]. When a direct backfill has already folded the table's
+/// current contents into a target and the table provably hasn't changed since,
+/// the enumeration would stage millions of `Recompute` markers that only
+/// re-derive already-correct values — so the marker is discharged with nothing
+/// staged. Any uncertainty falls back to the full enumeration this has always
+/// done, so the skip can never drop work.
 pub async fn run_pending_backfills(
     client: &mut tokio_postgres::Client,
     wake_channel: &str,
@@ -347,14 +542,21 @@ pub async fn run_pending_backfills(
             continue;
         }
         let txn = client.transaction().await?;
-        enumerate_and_append(&txn, &marker.table).await?;
+        let staged = if coverage_covers(&txn, &marker.table).await? {
+            false
+        } else {
+            enumerate_and_append(&txn, &marker.table).await?;
+            true
+        };
         txn.execute(
             "delete from pending_backfill where table_name = $1",
             &[&marker.table],
         )
         .await?;
-        txn.execute("select pg_notify($1, '')", &[&wake_channel])
-            .await?;
+        if staged {
+            txn.execute("select pg_notify($1, '')", &[&wake_channel])
+                .await?;
+        }
         txn.commit().await?;
     }
     Ok(())
@@ -419,7 +621,22 @@ pub async fn initial_snapshot_handshake(
     // — `append::append` has no state that requires being called exactly
     // once (see its own doc comment: it just reads the ring pointer and
     // inserts).
+    //
+    // Issue #79 (bug B): a table a direct backfill already folded into a
+    // target — and that provably hasn't changed since ([`coverage_covers`]) —
+    // is skipped here exactly as `run_pending_backfills` skips it, so the
+    // fresh-install path floods the ring no worse than a restart does. This
+    // preserves gap-free-by-construction: `coverage_covers` is evaluated in
+    // this same repeatable-read snapshot (≈ the slot's consistent point), so
+    // any write between the build's coverage fence and that point leaves a
+    // fence-invisible `xmin` or changes the row count → `coverage_covers`
+    // returns false → the table is enumerated, the safe default. Only a table
+    // byte-for-byte identical to its covered state is skipped, and everything
+    // after the consistent point streams via CDC as usual.
     for table in tables {
+        if coverage_covers(&txn, table).await? {
+            continue;
+        }
         enumerate_and_append(&txn, table).await?;
     }
     txn.execute(

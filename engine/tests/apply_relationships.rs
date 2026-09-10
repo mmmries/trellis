@@ -544,3 +544,108 @@ async fn reverse_recompute_to_many_stages_from_side_recomputes() {
         "comment delete re-derives its article"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #79: two to-many relationships sharing one from_table must dedupe
+// ---------------------------------------------------------------------
+
+/// The number of `Recompute` rows staged for `from_table`/`key` in the active
+/// segment — deliberately *not* `distinct`, unlike [`staged_from_side_recomputes`]
+/// above: issue #79 is exactly a case where the same key is staged more than
+/// once, which a `distinct` read would silently hide.
+async fn staged_recompute_count(client: &Client, from_table: &str, key: &str) -> i64 {
+    let seg = active_seg_table(client).await;
+    let sql = format!("select count(*) from {seg} where src_table = $1 and key = $2");
+    client
+        .query_one(sql.as_str(), &[&from_table, &key])
+        .await
+        .expect("count staged recomputes")
+        .get(0)
+}
+
+#[tokio::test]
+async fn reverse_recompute_dedupes_across_relationships_sharing_from_table() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    // Two independent to-many relationships into the same from-table
+    // (`articles`), mirroring issue #79's `posts`/`comments` -> `authors`
+    // shape: a single batch that touches article 1 through *both* relationships
+    // must stage exactly one recompute for article 1, not one per relationship.
+    client
+        .batch_execute(
+            "create table articles (id integer primary key, title text); \
+             create table comments (id integer primary key, article_id integer, word_count integer); \
+             create table likes (id integer primary key, article_id integer); \
+             alter table comments replica identity full; \
+             alter table likes replica identity full; \
+             insert into articles (id, title) values (1, 'a1')",
+        )
+        .await
+        .expect("create tables and seed from-side rows");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP comments FROM articles.id TO comments.article_id",
+    )
+    .await
+    .expect("create comments relationship");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP likes FROM articles.id TO likes.article_id",
+    )
+    .await
+    .expect("create likes relationship");
+
+    client
+        .execute(
+            "insert into comments (id, article_id, word_count) values (100, 1, 5)",
+            &[],
+        )
+        .await
+        .expect("insert comment");
+    client
+        .execute("insert into likes (id, article_id) values (200, 1)", &[])
+        .await
+        .expect("insert like");
+
+    // Both to-side changes land in the *same* batch (one seal drains both),
+    // so `compute`'s single call sees inbound relationships from two
+    // different source tables (`comments`, `likes`) that share `articles`
+    // as their common from_table.
+    stage_cdc(
+        &client,
+        "comments",
+        "100",
+        "insert",
+        None,
+        Some("{\"id\":100,\"article_id\":1,\"word_count\":5}"),
+    )
+    .await;
+    stage_cdc(
+        &client,
+        "likes",
+        "200",
+        "insert",
+        None,
+        Some("{\"id\":200,\"article_id\":1}"),
+    )
+    .await;
+
+    let seg = seal_active_segment(&mut client).await;
+    while apply::drain_once(&db.pool, seg, "reverse_test", 1, "trellis_apply_test")
+        .await
+        .expect("drain_once")
+        .is_some()
+    {}
+
+    assert_eq!(
+        staged_recompute_count(&client, "articles", "1").await,
+        1,
+        "article 1 must be staged exactly once even though two relationships \
+         (comments, likes) both touched it in this batch"
+    );
+
+    drain_to_quiescence(&db.pool, &mut client).await;
+}

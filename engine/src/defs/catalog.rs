@@ -226,13 +226,135 @@ pub async fn install_definition(
         }
     }
 
+    // Issue #79 (bug B): capture each table's coverage fence *before* the
+    // build reads it. The fence must precede every build read — a fence taken
+    // after the build could vouch for a row the build never folded (see
+    // `plan_direct_backfill_coverage` / `capture_backfill_coverage_fence`).
+    let coverage_plan = plan_direct_backfill_coverage(pool, &def).await?;
+
     match backfill::backfill_definition(pool, &def, target_schema, source_columns).await {
-        Ok(()) => create_definition_without_backfill(pool, source_text, source_columns).await,
+        Ok(()) => {
+            // The build folded each planned table's pre-build contents into the
+            // target. Persist that coverage *before* the definition is
+            // persisted, so the redundant publication-join catch-up enumeration
+            // of those tables can be skipped.
+            commit_direct_backfill_coverage(pool, &coverage_plan).await?;
+            create_definition_without_backfill(pool, source_text, source_columns).await
+        }
         Err(BackfillError::Unsupported(_)) => {
             create_definition(pool, source_text, source_columns).await
         }
         Err(err) => Err(CatalogError::DirectBackfill(err)),
     }
+}
+
+/// What to do with one table's coverage once a direct build succeeds: either
+/// persist a fence captured before the build, or clear any stale record.
+enum CoveragePlan {
+    /// This build is the table's sole reader — record the pre-build fence.
+    Record {
+        qualified: String,
+        fence: crate::intake::publication::CoverageFence,
+    },
+    /// Another definition already reads this table (built at a different
+    /// fence), so only a full enumeration can be trusted to catch every reader
+    /// up — clear any coverage to force that.
+    Clear { qualified: String },
+}
+
+/// Plans direct-backfill coverage (issue #79, bug B) for a definition about to
+/// be built through the fast path: its own source table plus every to-side
+/// relationship table its fields read. For each, either captures a coverage
+/// fence (row count + snapshot) or, when another definition already reads the
+/// table, marks it for clearing.
+///
+/// **Runs before the build.** The captured fence must predate every read the
+/// build makes of the table: the build reads to-side tables early (into staging
+/// tables) and the source in per-chunk statements, none under a single
+/// snapshot, so a fence taken *after* the build could be newer than a write the
+/// build never saw and wrongly certify it as covered. A pre-build fence instead
+/// leaves any build-window write invisible in the fence, so
+/// [`crate::intake::publication::coverage_covers`] falls back to enumeration.
+///
+/// Also runs before the new definition is persisted, so [`table_has_other_reader`]
+/// sees only the *pre-existing* readers of each table.
+async fn plan_direct_backfill_coverage(
+    pool: &Pool,
+    def: &TransformDef,
+) -> Result<Vec<CoveragePlan>, CatalogError> {
+    // Distinct to-side tables this definition reads through a relationship.
+    let resolved = resolve_relationships(pool, def).await?;
+    let mut tables: HashSet<String> = resolved.values().map(|r| r.to_table.clone()).collect();
+    tables.insert(def.source.clone());
+
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    let mut plans = Vec::with_capacity(tables.len());
+    for bare_table in tables {
+        let schema = resolve_source_schema_in_txn(&txn, &bare_table).await?;
+        let qualified = crate::intake::publication::qualify(&schema, &bare_table)?;
+        if table_has_other_reader(&txn, &bare_table).await? {
+            plans.push(CoveragePlan::Clear { qualified });
+        } else {
+            let fence =
+                crate::intake::publication::capture_backfill_coverage_fence(&*txn, &qualified)
+                    .await?;
+            plans.push(CoveragePlan::Record { qualified, fence });
+        }
+    }
+    txn.commit().await?;
+    Ok(plans)
+}
+
+/// Persists a [`plan_direct_backfill_coverage`] result once the direct build
+/// has succeeded (issue #79, bug B), in one transaction so the whole plan lands
+/// atomically.
+async fn commit_direct_backfill_coverage(
+    pool: &Pool,
+    plans: &[CoveragePlan],
+) -> Result<(), CatalogError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    for plan in plans {
+        match plan {
+            CoveragePlan::Record { qualified, fence } => {
+                crate::intake::publication::write_backfill_coverage(&*txn, qualified, fence)
+                    .await?;
+            }
+            CoveragePlan::Clear { qualified } => {
+                crate::intake::publication::clear_backfill_coverage(&*txn, qualified).await?;
+            }
+        }
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Whether any *already-persisted* transform definition reads `table` — either
+/// as its own `FROM` source, or as the to-side of a relationship anchored on a
+/// table some definition transforms. Conservative on the relationship side: it
+/// does not confirm the anchoring definition's text actually references that
+/// relationship, so it may report a reader where none truly exists. That only
+/// ever suppresses a coverage record (falling back to full enumeration), which
+/// is always safe — the direction the issue's safety valve demands.
+async fn table_has_other_reader(
+    txn: &tokio_postgres::Transaction<'_>,
+    table: &str,
+) -> Result<bool, CatalogError> {
+    let exists: bool = txn
+        .query_one(
+            "select \
+               exists(select 1 from transform_definitions where source_table = $1) \
+               or exists( \
+                 select 1 from relationship_definitions r \
+                 join transform_definitions d on d.source_table = r.from_table \
+                 where r.to_table = $1 \
+               )",
+            &[&table],
+        )
+        .await?
+        .get(0);
+    Ok(exists)
 }
 
 async fn create_definition_inner(
