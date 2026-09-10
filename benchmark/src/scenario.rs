@@ -40,7 +40,7 @@ use crate::generate;
 /// convention `engine`'s own integration tests use — the reference-floor and
 /// correctness queries below want a plain `tokio_postgres::Client`, which the
 /// pool's wrapped client doesn't expose, so they go through a raw connection.
-async fn connect_raw(dsn: &str) -> RawClient {
+pub(crate) async fn connect_raw(dsn: &str) -> RawClient {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
     tokio::spawn(async move {
         let _ = connection.await;

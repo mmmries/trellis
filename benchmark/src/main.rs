@@ -12,6 +12,7 @@
 //! cargo run -p benchmark --release -- low-cardinality
 //! cargo run -p benchmark --release -- both
 //! cargo run -p benchmark --release -- custom --n 200000 --g 500 --ceiling-secs 60
+//! cargo run -p benchmark --release -- relationship-aggregate
 //! ```
 //!
 //! `--release` matters: this pushes 1M rows through a real Postgres
@@ -24,6 +25,7 @@
 
 mod generate;
 mod scenario;
+mod scenario_relationship;
 
 use std::time::Duration;
 
@@ -68,9 +70,60 @@ const LOW_CARDINALITY: Scenario = Scenario {
     ceiling: LOW_CARDINALITY_CEILING,
 };
 
+/// Row counts for the relationship-aggregate scenario (issue #63, C3),
+/// matching the real-world ratios reported in the poc that motivated
+/// `backfill_relationship_one_to_one`: 100k authors, 1M posts, 4.5M comments.
+const RELATIONSHIP_AUTHORS: i64 = 100_000;
+const RELATIONSHIP_POSTS: i64 = 1_000_000;
+const RELATIONSHIP_COMMENTS: i64 = 4_500_000;
+
+/// Measured ~660-670ms for `install_definition` end to end (target-table
+/// creation + the direct relationship-aware build,
+/// `backfill_relationship_one_to_one`) on this harness/box across repeated
+/// runs against the full 100k/1M/4.5M row counts above — down from the ~1
+/// minute the ring path took on the real-world shape that motivated this
+/// benchmark (issue #63 C2's handoff doc). 10s keeps >10x headroom for
+/// CI/dev-machine jitter and cold caches while still firing long before any
+/// regression back toward the ring's tens-of-seconds mechanism. Revisit once
+/// a CI-hardware baseline exists.
+const RELATIONSHIP_AGGREGATE_CEILING: Duration = Duration::from_secs(10);
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let scenarios = match parse_args(&args) {
+    let name = args.first().map(String::as_str).unwrap_or("both");
+
+    if name == "relationship-aggregate" {
+        let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
+        let result = runtime.block_on(scenario_relationship::run(
+            "relationship-aggregate",
+            RELATIONSHIP_AUTHORS,
+            RELATIONSHIP_POSTS,
+            RELATIONSHIP_COMMENTS,
+            RELATIONSHIP_AGGREGATE_CEILING,
+        ));
+        println!("{}", result.to_json());
+        let mut failed = false;
+        if !result.within_ceiling {
+            failed = true;
+            eprintln!(
+                "REGRESSION: {} install_definition took {}ms, over its {}ms ceiling",
+                result.scenario, result.backfill_ms, result.ceiling_ms
+            );
+        }
+        if !result.correctness_ok {
+            failed = true;
+            eprintln!(
+                "CORRECTNESS FAILURE: {}'s backfilled author_totals did not match the oracle",
+                result.scenario
+            );
+        }
+        if failed {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let scenarios = match parse_args(&args, name) {
         Ok(scenarios) => scenarios,
         Err(message) => {
             eprintln!("{message}");
@@ -114,8 +167,9 @@ fn main() {
 /// Parses argv into the list of scenarios to run. `custom` reads
 /// `--n`/`--g`/`--ceiling-secs` (all required); every other name is one of
 /// the two fixed scenarios above, or `both` for both of them in sequence.
-fn parse_args(args: &[String]) -> Result<Vec<Scenario>, String> {
-    let name = args.first().map(String::as_str).unwrap_or("both");
+/// (`relationship-aggregate` is handled separately in `main` — it doesn't fit
+/// this `n`/`g` shape.)
+fn parse_args(args: &[String], name: &str) -> Result<Vec<Scenario>, String> {
     match name {
         "high-cardinality" => Ok(vec![HIGH_CARDINALITY]),
         "low-cardinality" => Ok(vec![LOW_CARDINALITY]),
@@ -133,7 +187,7 @@ fn parse_args(args: &[String]) -> Result<Vec<Scenario>, String> {
         }
         other => Err(format!(
             "unknown scenario {other:?} — expected one of: high-cardinality, low-cardinality, \
-             both, custom"
+             both, relationship-aggregate, custom"
         )),
     }
 }
