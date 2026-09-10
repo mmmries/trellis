@@ -28,7 +28,9 @@ async fn migrate_up_is_idempotent() {
 
     assert_eq!(
         first_run,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+        ],
         "expected exactly V1 through V18 to be applied"
     );
 

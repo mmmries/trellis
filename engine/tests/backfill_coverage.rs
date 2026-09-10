@@ -176,6 +176,113 @@ async fn a_table_with_no_coverage_is_enumerated_as_before() {
     );
 }
 
+/// An in-place UPDATE after the coverage fence keeps the row *count* unchanged,
+/// so the count check alone would wrongly certify the table as covered. The
+/// per-row `xmin`-visibility check must independently catch it: the updated
+/// tuple carries a fresh, fence-invisible `xmin`, forcing full enumeration.
+/// This pins the `xmin` half of `coverage_covers`'s AND as load-bearing —
+/// distinct from the insert case (which the count check would also catch).
+#[tokio::test]
+async fn an_update_after_the_coverage_fence_forces_full_enumeration() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table widgets (id bigint primary key, label text); \
+             insert into widgets (id, label) values (1, 'a'), (2, 'b'), (3, 'c'); \
+             create publication test_pub;",
+        )
+        .await
+        .expect("seed source");
+
+    let table = format!("{DEFAULT_SCHEMA}.widgets");
+    publication::record_backfill_coverage(&client, &table)
+        .await
+        .expect("record coverage as of the current 3 rows");
+
+    // An in-place update: still 3 rows, but row 2's current value differs from
+    // what a direct build folded at the fence. Count is unchanged, so only the
+    // xmin-visibility check can catch this.
+    client
+        .execute("update widgets set label = 'B' where id = 2", &[])
+        .await
+        .expect("update a row after the fence without changing the count");
+
+    publication::reconcile_publication(&mut client, "test_pub", std::slice::from_ref(&table))
+        .await
+        .expect("reconcile adds widgets");
+    publication::run_pending_backfills(&mut client, "wake")
+        .await
+        .expect("run_pending_backfills");
+
+    assert_eq!(
+        recompute_count(&client, &table).await,
+        3,
+        "an update the count check can't see must still force enumeration via xmin"
+    );
+    assert_eq!(pending_marker_count(&client).await, 0);
+}
+
+/// A write in the window *between* the pre-build fence capture and the
+/// coverage write — i.e. concurrent with the direct build itself — must force
+/// enumeration. The build reads each table once, early; a fence captured after
+/// the build would be newer than such a write and wrongly certify it as
+/// covered, silently dropping it (the table joins the publication only later,
+/// so CDC never carries it either). Capturing the fence *before* the build (via
+/// [`publication::capture_backfill_coverage_fence`]) leaves the write invisible
+/// in the fence, so enumeration runs. This pins issue #79 bug B's fence timing.
+#[tokio::test]
+async fn a_write_during_the_build_window_forces_full_enumeration() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table widgets (id bigint primary key, label text); \
+             insert into widgets (id, label) values (1, 'a'), (2, 'b'), (3, 'c'); \
+             create publication test_pub;",
+        )
+        .await
+        .expect("seed source");
+
+    let table = format!("{DEFAULT_SCHEMA}.widgets");
+
+    // Phase 1: capture the fence *before* the build reads the table.
+    let fence = publication::capture_backfill_coverage_fence(&client, &table)
+        .await
+        .expect("capture pre-build fence");
+
+    // A write lands while the build is running — after the fence, before the
+    // coverage record is written. An in-place update keeps the count at 3, so
+    // only the pre-build fence's xmin visibility can catch it.
+    client
+        .execute("update widgets set label = 'B' where id = 2", &[])
+        .await
+        .expect("write during the build window");
+
+    // Phase 2: the build finished; persist coverage with the pre-build fence.
+    publication::write_backfill_coverage(&client, &table, &fence)
+        .await
+        .expect("write coverage with the pre-build fence");
+
+    publication::reconcile_publication(&mut client, "test_pub", std::slice::from_ref(&table))
+        .await
+        .expect("reconcile adds widgets");
+    publication::run_pending_backfills(&mut client, "wake")
+        .await
+        .expect("run_pending_backfills");
+
+    assert_eq!(
+        recompute_count(&client, &table).await,
+        3,
+        "a build-window write the build never folded must force enumeration"
+    );
+    assert_eq!(pending_marker_count(&client).await, 0);
+}
+
 /// End-to-end: a relationship-enriched 1-1 definition fast-built through
 /// `install_definition` records coverage for its own source *and* both to-side
 /// relationship tables it reads — and so a to-side table's later publication

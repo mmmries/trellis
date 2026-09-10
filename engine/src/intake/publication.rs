@@ -327,22 +327,34 @@ pub(crate) async fn enumerate_and_append(
     Ok(())
 }
 
-/// Records that `qualified_table` (a `"schema.table"` name, as [`qualify`]
-/// builds) has, as of *now*, been fully folded into an already-built target by
-/// a direct backfill (issue #79, bug B) — capturing both a fence snapshot and
-/// the table's current row count in one statement (so they share one MVCC
-/// snapshot and describe the same instant). [`coverage_covers`] later consults
-/// this to skip a redundant catch-up enumeration.
+/// A fence snapshot plus the row count captured at that same instant, for a
+/// table a direct backfill is about to fold into a target (issue #79, bug B).
+/// Produced by [`capture_backfill_coverage_fence`] *before* the build reads the
+/// table and later persisted by [`write_backfill_coverage`].
+#[derive(Clone, Debug)]
+pub struct CoverageFence {
+    pub fence: String,
+    pub count: i64,
+}
+
+/// Captures the fence snapshot and row count for `qualified_table` in one
+/// statement (issue #79, bug B) — so both describe the same MVCC instant.
 ///
-/// A plain upsert (last write wins) is correct because the caller
-/// ([`crate::defs::catalog::install_definition`]) only ever records coverage
-/// for a table with exactly one reader, and *clears* it (see
-/// [`clear_backfill_coverage`]) the moment a second reader appears — so two
-/// live recordings for one table never coexist to be reconciled.
-pub async fn record_backfill_coverage(
+/// **This must be called before the direct build reads the table**, not after.
+/// The build reads each relationship's to-side table once (into a staging
+/// table) and the source in progressive per-chunk statements, each under its
+/// own autocommit snapshot — there is no single build snapshot. A row that is
+/// inserted or updated *after* the build reads it but *before* a fence captured
+/// post-build would be visible in that post-build fence yet absent from the
+/// target, so [`coverage_covers`] would wrongly skip its catch-up and drop the
+/// change (the table joins the publication later still, so CDC never carries
+/// it either). A fence captured before any build read cannot vouch for such a
+/// row: its `xmin` is invisible in the earlier fence, so `coverage_covers`
+/// falls back to enumeration — the safe default the fix demands.
+pub async fn capture_backfill_coverage_fence(
     client: &impl GenericClient,
     qualified_table: &str,
-) -> Result<(), IntakeError> {
+) -> Result<CoverageFence, IntakeError> {
     let (schema, table) = split_qualified(qualified_table)?;
     let row = client
         .query_one(
@@ -354,8 +366,27 @@ pub async fn record_backfill_coverage(
             &[],
         )
         .await?;
-    let count: i64 = row.get(0);
-    let fence: String = row.get(1);
+    Ok(CoverageFence {
+        count: row.get(0),
+        fence: row.get(1),
+    })
+}
+
+/// Persists a coverage record: as of `fence.fence`, `qualified_table` held
+/// `fence.count` rows, all of which a direct backfill folded into an
+/// already-built target (issue #79, bug B). [`coverage_covers`] later consults
+/// this to skip a redundant catch-up enumeration.
+///
+/// A plain upsert (last write wins) is correct because the caller
+/// ([`crate::defs::catalog::install_definition`]) only ever records coverage
+/// for a table with exactly one reader, and *clears* it (see
+/// [`clear_backfill_coverage`]) the moment a second reader appears — so two
+/// live recordings for one table never coexist to be reconciled.
+pub async fn write_backfill_coverage(
+    client: &impl GenericClient,
+    qualified_table: &str,
+    fence: &CoverageFence,
+) -> Result<(), IntakeError> {
     client
         .execute(
             "insert into backfill_coverage (table_name, fence_snapshot, covered_row_count) \
@@ -363,17 +394,30 @@ pub async fn record_backfill_coverage(
              on conflict (table_name) do update set \
                fence_snapshot = excluded.fence_snapshot, \
                covered_row_count = excluded.covered_row_count",
-            &[&qualified_table, &fence, &count],
+            &[&qualified_table, &fence.fence, &fence.count],
         )
         .await?;
     Ok(())
 }
 
+/// Captures a fence for `qualified_table` and immediately persists it — the
+/// capture-and-write-at-once convenience used by tests that record coverage for
+/// a table nothing is concurrently building. Real installs
+/// ([`crate::defs::catalog::install_definition`]) must instead
+/// [`capture_backfill_coverage_fence`] *before* the build and
+/// [`write_backfill_coverage`] after it (see the former's doc comment).
+pub async fn record_backfill_coverage(
+    client: &impl GenericClient,
+    qualified_table: &str,
+) -> Result<(), IntakeError> {
+    let fence = capture_backfill_coverage_fence(client, qualified_table).await?;
+    write_backfill_coverage(client, qualified_table, &fence).await
+}
+
 /// Drops any coverage record for `qualified_table` — called when a table gains
-/// a second reader (so the single-reader assumption [`record_backfill_coverage`]
-/// relies on no longer holds) or when any definition is built through the ring
-/// path (which never records coverage of its own). Removing the record forces
-/// [`coverage_covers`] back to full enumeration — the safe default.
+/// a second reader (so the single-reader assumption [`write_backfill_coverage`]
+/// relies on no longer holds). Removing the record forces [`coverage_covers`]
+/// back to full enumeration — the safe default.
 pub async fn clear_backfill_coverage(
     client: &impl GenericClient,
     qualified_table: &str,
