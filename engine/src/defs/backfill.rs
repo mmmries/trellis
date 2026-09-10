@@ -67,15 +67,17 @@
 
 use std::collections::HashMap;
 
-use crate::pool::{Pool, quote_ident};
+use crate::pool::{Client, Pool, quote_ident};
 
-use super::ast::{Expr, KeySpace, TransformDef, ValueType};
+use super::ast::{Expr, KeySpace, RelationshipDef, TransformDef, ValueType};
 use super::ddl::{
     self, PrimaryKeyColumn, avg_partial_columns, count_partial_column, qualified_target_table,
     source_primary_key,
 };
 use super::invertibility::{AggregateArg, CountArg, classify};
-use super::oracle::render_expr_sql;
+use super::model::RelationshipCardinality;
+use super::oracle::{render_expr_sql, render_rel_expr_sql};
+use super::registry::lookup_aggregate_function;
 
 /// Rows per chunk for the 1-1 primary-key-range build. Each chunk is one
 /// bounded transaction; 50k keeps a chunk's write set well within a
@@ -166,7 +168,11 @@ pub async fn backfill_definition(
     match &def.key_space {
         KeySpace::OneToOne => {
             let pk = source_primary_key(pool, &def.source).await?;
-            backfill_one_to_one(pool, def, target_schema, &pk).await
+            if uses_relationships(def) {
+                backfill_relationship_one_to_one(pool, def, target_schema, &pk).await
+            } else {
+                backfill_one_to_one(pool, def, target_schema, &pk).await
+            }
         }
         KeySpace::Aggregate { group_by } => {
             backfill_aggregate(pool, def, target_schema, group_by, source_columns).await
@@ -242,6 +248,43 @@ async fn backfill_one_to_one(
     debug_assert!(!update_sets.is_empty());
 
     let client = pool.get().await?;
+    for (lo, hi) in discover_pk_ranges(&client, &source, pk).await? {
+        let where_clause = pk_range_where(&pk_ident, pk_cast, &lo);
+        let insert_sql = format!(
+            "insert into {target} ({insert_cols}) \
+             select {select_exprs} from {source} where {where_clause} \
+             on conflict ({pk_ident}) do update set {update_sets}"
+        );
+        match &lo {
+            None => {
+                client.execute(&insert_sql, &[&hi]).await?;
+            }
+            Some(lo) => {
+                client.execute(&insert_sql, &[lo, &hi]).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Walks the source primary key in half-open `(lo, hi]` ranges, returning them
+/// in order (the first range's `lo` is `None`, meaning "`pk <= hi`"). Each `hi`
+/// is the max PK of the next `BACKFILL_CHUNK_ROWS` rows above the previous `hi`
+/// (`max()`-over-`LIMIT`); the walk stops when no rows remain above the last
+/// boundary. The ranges partition the source exactly once with no gap or
+/// overlap regardless of gaps in the key values. Shared by both 1-1 builds so
+/// the plain and relationship-enriched paths chunk identically — see
+/// [`backfill_one_to_one`]'s doc comment for the off-by-one this guards against.
+/// `source` is the already-quoted source table identifier.
+async fn discover_pk_ranges(
+    client: &Client,
+    source: &str,
+    pk: &PrimaryKeyColumn,
+) -> Result<Vec<(Option<String>, String)>, BackfillError> {
+    let pk_ident = quote_ident(&pk.name);
+    let pk_cast = pk.data_type.as_str();
+    let mut ranges = Vec::new();
     let mut lo: Option<String> = None;
     loop {
         let hi: Option<String> = match &lo {
@@ -273,35 +316,25 @@ async fn backfill_one_to_one(
                 row.get(0)
             }
         };
-
         let Some(hi) = hi else {
             break;
         };
-
-        let where_clause = match &lo {
-            None => format!("{pk_ident} <= $1::text::{pk_cast}"),
-            Some(_) => {
-                format!("{pk_ident} > $1::text::{pk_cast} and {pk_ident} <= $2::text::{pk_cast}")
-            }
-        };
-        let insert_sql = format!(
-            "insert into {target} ({insert_cols}) \
-             select {select_exprs} from {source} where {where_clause} \
-             on conflict ({pk_ident}) do update set {update_sets}"
-        );
-        match &lo {
-            None => {
-                client.execute(&insert_sql, &[&hi]).await?;
-            }
-            Some(lo) => {
-                client.execute(&insert_sql, &[lo, &hi]).await?;
-            }
-        }
-
+        ranges.push((lo.clone(), hi.clone()));
         lo = Some(hi);
     }
+    Ok(ranges)
+}
 
-    Ok(())
+/// The `where` predicate restricting a PK-range chunk to `(lo, hi]`, binding the
+/// bounds as `$1` (and `$2` when `lo` is present). Paired with
+/// [`discover_pk_ranges`]; the caller binds `hi` (first chunk) or `lo, hi`.
+fn pk_range_where(pk_ident: &str, pk_cast: &str, lo: &Option<String>) -> String {
+    match lo {
+        None => format!("{pk_ident} <= $1::text::{pk_cast}"),
+        Some(_) => {
+            format!("{pk_ident} > $1::text::{pk_cast} and {pk_ident} <= $2::text::{pk_cast}")
+        }
+    }
 }
 
 /// One aggregate field's build strategy — the direct-build counterpart to
@@ -583,6 +616,318 @@ async fn backfill_aggregate(
     client
         .batch_execute(&format!("drop table if exists {STAGE_TABLE}"))
         .await?;
+
+    Ok(())
+}
+
+/// Prefix for the connection-scoped staging tables the relationship build
+/// materializes one per referenced to-many relationship. Safe as a fixed name
+/// for the same reason [`STAGE_TABLE`] is: the build holds one pooled
+/// connection for its whole duration and drops each table before creating it
+/// (crash leftover) and after the writes.
+const REL_STAGE_TABLE_PREFIX: &str = "_trellis_backfill_rel_staging_";
+
+/// How one field of a relationship-enriched 1-1 definition is built.
+enum RelFieldPlan {
+    /// A field with no relationship reference — rendered as source SQL exactly
+    /// as the plain 1-1 build (and the oracle) render it.
+    Source(String),
+    /// A field that is exactly a top-level aggregate over a to-many
+    /// relationship path (`SUM(rel.col)` / `COUNT(rel.col)` / …). Its value is
+    /// read from `rel`'s staging table; `agg` is the uppercased aggregate name
+    /// (only `COUNT` needs the empty-set `coalesce(_, 0)`, matching Postgres's
+    /// correlated `count` over zero rows — every other aggregate's empty-set
+    /// result is `NULL`, which the `LEFT JOIN` already yields).
+    ToManyAgg {
+        rel: String,
+        agg: String,
+        column: String,
+    },
+}
+
+/// Whether `expr` reads any relationship path anywhere in its tree.
+fn expr_uses_relationship(expr: &Expr) -> bool {
+    match expr {
+        Expr::RelationshipPath { .. } => true,
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            expr_uses_relationship(lhs) || expr_uses_relationship(rhs)
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(expr_uses_relationship),
+        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => false,
+    }
+}
+
+/// Classifies one field of a relationship-enriched 1-1 definition into a
+/// [`RelFieldPlan`], or `None` if the direct build can't render it correctly
+/// (so the caller falls back to the ring). The only relationship shape the
+/// direct build supports is a *top-level* aggregate whose sole argument is a
+/// relationship path — the to-many aggregate the evaluator and oracle both
+/// match structurally. A bare to-one path (`category.name`), or a relationship
+/// reference nested inside a larger expression (`SUM(rel.x) + 1`,
+/// `count(rel.a) > 0`), is left `None` and handled by the ring.
+fn plan_rel_field(
+    expr: &Expr,
+    source: &str,
+    rel_defs: &HashMap<String, RelationshipDef>,
+) -> Option<RelFieldPlan> {
+    if let Expr::FunctionCall { name, args } = expr
+        && lookup_aggregate_function(name).is_some()
+        && let [Expr::RelationshipPath { rel, column }] = args.as_slice()
+    {
+        return Some(RelFieldPlan::ToManyAgg {
+            rel: rel.clone(),
+            agg: name.clone(),
+            column: column.clone(),
+        });
+    }
+    if expr_uses_relationship(expr) {
+        return None;
+    }
+    Some(RelFieldPlan::Source(render_rel_expr_sql(
+        expr, source, rel_defs,
+    )))
+}
+
+/// Maps a relationship-lookup [`super::catalog::CatalogError`] into a
+/// [`BackfillError`]. Only the DB/pool variants arise in the real install flow
+/// (a referenced relationship's metadata was already resolved and validated by
+/// `create_target_table` just before this build runs); a stored-definition
+/// re-parse failure (corruption/parser drift) falls back to the ring, which
+/// re-parses and surfaces the real error itself.
+fn map_rel_lookup_err(err: super::catalog::CatalogError) -> BackfillError {
+    use super::catalog::CatalogError;
+    match err {
+        CatalogError::Db(e) => BackfillError::Db(e),
+        CatalogError::Pool(e) => BackfillError::Pool(e),
+        _ => BackfillError::Unsupported(
+            "a relationship whose stored definition failed to resolve".to_string(),
+        ),
+    }
+}
+
+/// The relationship-enriched 1-1 build: computes a target whose fields
+/// aggregate over to-many relationship paths (`SUM(posts.x)`, `COUNT(comments)`)
+/// directly with set-based SQL, instead of staging every source row as a
+/// `Recompute` marker for per-row Rust evaluation.
+///
+/// Each referenced to-many relationship is aggregated over its whole to-side
+/// table **once** into a connection-scoped staging table grouped by the join
+/// key (one row per distinct key, primary-keyed for cheap index probes) — the
+/// same single-pass-then-chunked-write shape [`backfill_aggregate`] uses, so
+/// the to-side is never re-scanned per chunk. The target is then written in
+/// source-primary-key range chunks (reusing [`discover_pk_ranges`], identical
+/// to [`backfill_one_to_one`]): each chunk `INSERT … SELECT`s a bounded PK
+/// range of the source `LEFT JOIN`ed to every relationship's staging table on
+/// its join key.
+///
+/// The result is byte-identical to the correlated-subquery oracle
+/// (`oracle::render_relationship_select_sql`) and the per-row evaluator
+/// (`eval::eval_to_many_aggregate`): a grouped aggregate over the matching
+/// to-side rows equals the correlated aggregate over the same rows, and the
+/// `LEFT JOIN`'s no-match `NULL` reproduces Postgres's empty-correlated-set
+/// semantics (`SUM`/`MIN`/`MAX`/`AVG` → `NULL`), with `COUNT` `coalesce`d to `0`
+/// to match `count` over the empty set. Unlike the aggregate build, this target
+/// carries no hidden partial columns: a relationship-enriched 1-1 target has
+/// none (see `ddl::create_target_table`) — its live CDC deltas are applied by a
+/// full per-parent recompute in the ring, not an incremental partial fold, so
+/// there is nothing here to keep in lockstep.
+///
+/// Falls back with [`BackfillError::Unsupported`] (routing the whole definition
+/// to the ring) if any field is a shape this build can't render exactly — a
+/// bare to-one lookup, a relationship reference nested inside a larger
+/// expression, or an aggregate over a relationship that resolves to a to-one.
+async fn backfill_relationship_one_to_one(
+    pool: &Pool,
+    def: &TransformDef,
+    target_schema: &str,
+    pk: &PrimaryKeyColumn,
+) -> Result<(), BackfillError> {
+    // Resolve every referenced relationship to its endpoints + cardinality the
+    // same way the rest of the catalog does (`relationship_by_name`), so this
+    // build reads the identical join metadata the ring/oracle do.
+    let mut rel_defs: HashMap<String, RelationshipDef> = HashMap::new();
+    let mut rel_cardinality: HashMap<String, RelationshipCardinality> = HashMap::new();
+    for (rel, _column) in super::eval::relationship_references(def) {
+        if rel_defs.contains_key(&rel) {
+            continue;
+        }
+        let Some(reldef) = super::catalog::relationship_by_name(pool, &def.source, &rel)
+            .await
+            .map_err(map_rel_lookup_err)?
+        else {
+            // Unknown relationship name: the direct build can't render it — let
+            // the ring path surface the same `UnknownRelationship` the
+            // evaluator/validator would.
+            return Err(BackfillError::Unsupported(
+                "a definition referencing an unknown relationship".to_string(),
+            ));
+        };
+        rel_cardinality.insert(rel.clone(), reldef.cardinality);
+        rel_defs.insert(rel, reldef.def);
+    }
+
+    // Classify every field; bail to the ring on the first unsupported shape.
+    let plans: Vec<RelFieldPlan> = def
+        .fields
+        .iter()
+        .map(|f| {
+            plan_rel_field(&f.expr, &def.source, &rel_defs).ok_or_else(|| {
+                BackfillError::Unsupported(
+                    "a relationship-enriched 1-1 field that isn't a top-level to-many aggregate"
+                        .to_string(),
+                )
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Every to-many aggregate must resolve to a to-many relationship; an
+    // aggregate over a to-one is a shape the validator rejects — fall back
+    // rather than emit wrong SQL for it.
+    for plan in &plans {
+        if let RelFieldPlan::ToManyAgg { rel, .. } = plan
+            && rel_cardinality.get(rel) != Some(&RelationshipCardinality::ToMany)
+        {
+            return Err(BackfillError::Unsupported(
+                "an aggregate over a to-one relationship".to_string(),
+            ));
+        }
+    }
+
+    let source = quote_ident(&def.source);
+    let target = qualified_target_table(target_schema, def);
+    let pk_ident = quote_ident(&pk.name);
+    let pk_cast = pk.data_type.as_str();
+    let pk_qualified = format!("{source}.{pk_ident}");
+
+    let client = pool.get().await?;
+
+    // Materialize one staging table per referenced to-many relationship: its
+    // to-side table aggregated by the join key, one aliased column per field
+    // reading that relationship. `rel_stage` maps a relationship name to its
+    // staging table's identifier so the chunked write below can `LEFT JOIN` it.
+    // Ordered by relationship name for deterministic table indices.
+    let mut rel_names: Vec<&String> = rel_defs.keys().collect();
+    rel_names.sort();
+    let mut rel_stage: HashMap<String, String> = HashMap::new();
+    for (i, rel) in rel_names.iter().enumerate() {
+        let stage = format!("{REL_STAGE_TABLE_PREFIX}{i}");
+        let reldef = &rel_defs[*rel];
+        // The aggregate columns this relationship needs — one per field that
+        // reads it, aliased to that field's name so the write can reference it.
+        let mut agg_exprs: Vec<String> = Vec::new();
+        for field in &def.fields {
+            if let RelFieldPlan::ToManyAgg {
+                rel: field_rel,
+                agg,
+                column,
+            } = plan_rel_field(&field.expr, &def.source, &rel_defs)
+                .expect("fields already classified as supported")
+                && &field_rel == *rel
+            {
+                agg_exprs.push(format!(
+                    "{}({}) as {}",
+                    agg.to_lowercase(),
+                    quote_ident(&column),
+                    quote_ident(&field.name),
+                ));
+            }
+        }
+        let to_table = quote_ident(&reldef.to_table);
+        let to_col = quote_ident(&reldef.to_col);
+        client
+            .batch_execute(&format!("drop table if exists {stage}"))
+            .await?;
+        // Group by the join key; a NULL key never joins (SQL `NULL != NULL`), so
+        // filtering it out is harmless and lets the key be a primary key.
+        client
+            .execute(
+                &format!(
+                    "create temp table {stage} as \
+                     select {to_col} as _k, {aggs} from {to_table} \
+                     where {to_col} is not null group by {to_col}",
+                    aggs = agg_exprs.join(", "),
+                ),
+                &[],
+            )
+            .await?;
+        client
+            .batch_execute(&format!("alter table {stage} add primary key (_k)"))
+            .await?;
+        rel_stage.insert((*rel).clone(), stage);
+    }
+
+    // Build the INSERT's column list, its per-field SELECT expression, and the
+    // ON CONFLICT update set. The primary key comes first, then one column per
+    // field in definition order (mirroring `backfill_one_to_one`).
+    let field_idents: Vec<String> = def.fields.iter().map(|f| quote_ident(&f.name)).collect();
+    let select_field_exprs: Vec<String> = def
+        .fields
+        .iter()
+        .zip(&plans)
+        .map(|(field, plan)| match plan {
+            RelFieldPlan::Source(sql) => sql.clone(),
+            RelFieldPlan::ToManyAgg { rel, agg, .. } => {
+                let stage_ref = format!("{}.{}", rel_stage[rel], quote_ident(&field.name));
+                if agg == "COUNT" {
+                    format!("coalesce({stage_ref}, 0)")
+                } else {
+                    stage_ref
+                }
+            }
+        })
+        .collect();
+
+    let insert_cols = std::iter::once(pk_ident.clone())
+        .chain(field_idents.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let select_exprs = std::iter::once(pk_qualified.clone())
+        .chain(select_field_exprs.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let update_sets = field_idents
+        .iter()
+        .map(|f| format!("{f} = excluded.{f}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    debug_assert!(!update_sets.is_empty());
+
+    // Each relationship's staging table LEFT JOINed to the source on its join
+    // key, so a source row with no matching to-side rows survives with NULL
+    // aggregates (Postgres's empty-correlated-set semantics).
+    let joins = rel_names
+        .iter()
+        .map(|rel| {
+            let stage = &rel_stage[*rel];
+            let from_col = quote_ident(&rel_defs[*rel].from_col);
+            format!("left join {stage} on {stage}._k = {source}.{from_col}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    for (lo, hi) in discover_pk_ranges(&client, &source, pk).await? {
+        let where_clause = pk_range_where(&pk_qualified, pk_cast, &lo);
+        let insert_sql = format!(
+            "insert into {target} ({insert_cols}) \
+             select {select_exprs} from {source} {joins} where {where_clause} \
+             on conflict ({pk_ident}) do update set {update_sets}"
+        );
+        match &lo {
+            None => {
+                client.execute(&insert_sql, &[&hi]).await?;
+            }
+            Some(lo) => {
+                client.execute(&insert_sql, &[lo, &hi]).await?;
+            }
+        }
+    }
+
+    // Drop the staging tables before the connection returns to the pool.
+    for stage in rel_stage.values() {
+        client
+            .batch_execute(&format!("drop table if exists {stage}"))
+            .await?;
+    }
 
     Ok(())
 }

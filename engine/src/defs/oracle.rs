@@ -457,7 +457,7 @@ fn collect_to_one_rels<'a>(expr: &'a Expr, out: &mut BTreeSet<&'a str>) {
 /// are qualified with the source table (so they don't collide with a JOINed
 /// to-side column of the same name), a bare to-one path reads off its JOIN
 /// alias, and an aggregate-wrapped to-many path becomes a correlated subquery.
-fn render_rel_expr_sql(
+pub(crate) fn render_rel_expr_sql(
     expr: &Expr,
     source: &str,
     relationships: &HashMap<String, RelationshipDef>,
