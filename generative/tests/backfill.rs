@@ -11,6 +11,23 @@
 //! already-present rows directly. A final live update proves the ring still
 //! folds a post-build CDC delta onto the directly-built row (the build/CDC
 //! fence).
+//!
+//! **Why the mid-test `quiesce` is load-bearing.** Phase 1's `install` starts
+//! the engine client (its source-table set is non-empty), which creates the
+//! replication slot; the seed inserts that follow are therefore captured by
+//! CDC and staged into the ring as `Recompute` markers. Without draining them
+//! first, those markers stay *pending* — and the moment phase 2 persists the
+//! definition, the applier folds them onto the freshly-created target,
+//! computing the very same values the direct build would. That masks M3
+//! completely: the test would still pass even if `install_definition`'s
+//! `backfill_definition` call were a no-op (the CDC fold, not the direct
+//! build, would be doing the work). Quiescing *before* the definition exists
+//! drains those seed markers while no definition references the source, so
+//! they fold into nothing and leave the ring empty. After that, the direct
+//! build is the *only* thing that can populate the target — which is exactly
+//! the real M3 production scenario (a new definition installed over a source
+//! already live under CDC with pre-existing rows), and what makes this test
+//! actually discriminate: no-op the direct build and it fails.
 
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use generative::backend::{Backend, ManualBackend};
@@ -75,8 +92,19 @@ async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {
             .expect("seed source row");
     }
 
-    // Phase 2: install the definition against the now-populated source. Its
-    // target must be built by the direct backfill.
+    // Drain the CDC markers the seed inserts staged, *before* any definition
+    // exists to fold them onto. This is what forces the target to be built by
+    // the direct backfill alone in phase 2 rather than by a still-pending CDC
+    // fold — see this module's doc comment. Remove it and the test silently
+    // stops testing M3 (it would pass even against a no-op direct build).
+    backend
+        .quiesce()
+        .await
+        .expect("quiesce to drain seed CDC before the definition exists");
+
+    // Phase 2: install the definition against the now-populated source. With
+    // the seed markers already drained, its target can only be built by the
+    // direct backfill.
     let def_only = Program {
         tables: vec![],
         defs: vec![def],

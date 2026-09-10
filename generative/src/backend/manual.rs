@@ -275,10 +275,21 @@ impl ManualBackend {
         // fast, set-based, key-range-chunked path instead of flooding the ring
         // with one `Recompute` marker per source row. `backfill_definition`
         // needs the target table to already exist and reads only from `def`
-        // (not the catalog), so it runs before the definition is persisted; no
-        // CDC is flowing yet (the engine client only starts after `install`
-        // has processed every definition), so this is exactly the pre-live
-        // build/CDC fence the direct path documents.
+        // (not the catalog), so it runs before the definition is persisted.
+        //
+        // The build/CDC fence is *not* "no CDC is flowing yet" — an engine
+        // client may already be live and streaming this source's changes
+        // (e.g. another definition on the same source was installed earlier,
+        // or, as `generative/tests/backfill.rs` exercises, the source table
+        // was installed and populated in a prior `install` call). The real
+        // invariant is narrower: *this* definition is invisible to the
+        // application worker until `create_definition_without_backfill` (or
+        // the ring-based `create_definition` on the fallback path) commits it
+        // to the catalog, and that commit happens only after the direct build
+        // below has already run. So no live CDC fold can race the direct build
+        // for this definition's target — the applier has no definition to fold
+        // onto until the build is done — regardless of whether the source
+        // already has an active client draining changes for other reasons.
         //
         // A definition the direct build can't render — a relationship-enriched
         // 1-1 def (`BackfillError::Unsupported`) — falls back to the original
