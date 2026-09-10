@@ -13,9 +13,7 @@ use std::time::Duration;
 use engine::config::DEFAULT_SCHEMA;
 use engine::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use engine::defs::{
-    BackfillError, CatalogError, DdlError, backfill_definition, create_definition,
-    create_definition_without_backfill, create_target_table, qualified_target_table,
-    source_primary_key,
+    CatalogError, DdlError, install_definition, qualified_target_table, source_primary_key,
 };
 use engine::staging::{StagingError, await_converged, watermark_token};
 use engine::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
@@ -52,7 +50,6 @@ pub enum ManualBackendError {
     Client(ClientError),
     Catalog(CatalogError),
     Ddl(DdlError),
-    Backfill(BackfillError),
     Staging(StagingError),
     Db(tokio_postgres::Error),
 }
@@ -78,12 +75,6 @@ impl From<CatalogError> for ManualBackendError {
 impl From<DdlError> for ManualBackendError {
     fn from(err: DdlError) -> Self {
         ManualBackendError::Ddl(err)
-    }
-}
-
-impl From<BackfillError> for ManualBackendError {
-    fn from(err: BackfillError) -> Self {
-        ManualBackendError::Backfill(err)
     }
 }
 
@@ -268,46 +259,17 @@ impl ManualBackend {
         let source_columns = Self::source_columns(&source_table);
 
         let text = render_definition(def)?;
-        let pk = source_primary_key(&self.pool, &def.source).await?;
-        create_target_table(&self.pool, def, "public", &pk, &source_columns).await?;
 
-        // Issue #63 M3: build the target directly from its source with the
-        // fast, set-based, key-range-chunked path instead of flooding the ring
-        // with one `Recompute` marker per source row. `backfill_definition`
-        // needs the target table to already exist and reads only from `def`
-        // (not the catalog), so it runs before the definition is persisted.
-        //
-        // The build/CDC fence is *not* "no CDC is flowing yet" — an engine
-        // client may already be live and streaming this source's changes
-        // (e.g. another definition on the same source was installed earlier,
-        // or, as `generative/tests/backfill.rs` exercises, the source table
-        // was installed and populated in a prior `install` call). The real
-        // invariant is narrower: *this* definition is invisible to the
-        // application worker until `create_definition_without_backfill` (or
-        // the ring-based `create_definition` on the fallback path) commits it
-        // to the catalog, and that commit happens only after the direct build
-        // below has already run. So no live CDC fold can race the direct build
-        // for this definition's target — the applier has no definition to fold
-        // onto until the build is done — regardless of whether the source
-        // already has an active client draining changes for other reasons.
-        //
-        // A definition the direct build can't render — a relationship-enriched
-        // 1-1 def (`BackfillError::Unsupported`) — falls back to the original
-        // `create_definition`, whose bundled ring enumeration is the same path
-        // it took before this change. Today's generator never emits such a
-        // definition (`render_definition` only accepts `KeySpace::OneToOne`
-        // with no relationship paths), so the fallback is currently
-        // dead-but-safe insurance; the fast path handles every definition this
-        // backend actually produces.
-        match backfill_definition(&self.pool, def, "public", &source_columns).await {
-            Ok(()) => {
-                create_definition_without_backfill(&self.pool, &text, &source_columns).await?;
-            }
-            Err(BackfillError::Unsupported(_)) => {
-                create_definition(&self.pool, &text, &source_columns).await?;
-            }
-            Err(err) => return Err(err.into()),
-        }
+        // Issue #63 C1: `install_definition` is the same front door real
+        // callers use — it creates the target table, then tries the fast,
+        // set-based direct build first and falls back to the ring-based
+        // `create_definition` only for a shape the direct build can't render
+        // yet (`BackfillError::Unsupported`, folded into `CatalogError` —
+        // see its doc comment). Routing the fuzz harness through it, instead
+        // of hand-rolling the same create-table/backfill/persist sequence,
+        // keeps this backend exercising the exact path production traffic
+        // takes.
+        install_definition(&self.pool, &text, &source_columns, "public").await?;
         Ok(())
     }
 
