@@ -227,12 +227,87 @@ pub async fn install_definition(
     }
 
     match backfill::backfill_definition(pool, &def, target_schema, source_columns).await {
-        Ok(()) => create_definition_without_backfill(pool, source_text, source_columns).await,
+        Ok(()) => {
+            // Issue #79 (bug B): the direct build just folded the current
+            // contents of `def.source` and every to-side relationship table it
+            // reads into the target. Record that coverage *before* persisting
+            // this definition, so the redundant publication-join catch-up
+            // enumeration of those tables can be skipped (see
+            // `record_direct_backfill_coverage`).
+            record_direct_backfill_coverage(pool, &def).await?;
+            create_definition_without_backfill(pool, source_text, source_columns).await
+        }
         Err(BackfillError::Unsupported(_)) => {
             create_definition(pool, source_text, source_columns).await
         }
         Err(err) => Err(CatalogError::DirectBackfill(err)),
     }
+}
+
+/// Records direct-backfill coverage (issue #79, bug B) for a definition that
+/// was just built through the fast path: the definition's own source table
+/// plus every to-side relationship table its fields read. Coverage lets
+/// [`crate::intake::publication::run_pending_backfills`] skip the redundant
+/// full-table enumeration those tables would otherwise trigger when they join
+/// the CDC publication.
+///
+/// Runs *before* the new definition is persisted, so [`table_has_other_reader`]
+/// sees only the *pre-existing* readers of each table. Coverage is recorded
+/// only for a table this build is the sole reader of; if any other definition
+/// already reads it, we instead *clear* coverage, because a second reader was
+/// (or will be) built at a different fence and only a full enumeration can be
+/// trusted to catch every reader up — the conservative default the issue's
+/// safety valve calls for. Recording all tables in one transaction keeps the
+/// read-then-write of `table_has_other_reader`/record/clear consistent.
+async fn record_direct_backfill_coverage(
+    pool: &Pool,
+    def: &TransformDef,
+) -> Result<(), CatalogError> {
+    // Distinct to-side tables this definition reads through a relationship.
+    let resolved = resolve_relationships(pool, def).await?;
+    let mut tables: HashSet<String> = resolved.values().map(|r| r.to_table.clone()).collect();
+    tables.insert(def.source.clone());
+
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    for bare_table in tables {
+        let schema = resolve_source_schema_in_txn(&txn, &bare_table).await?;
+        let qualified = crate::intake::publication::qualify(&schema, &bare_table)?;
+        if table_has_other_reader(&txn, &bare_table).await? {
+            crate::intake::publication::clear_backfill_coverage(&*txn, &qualified).await?;
+        } else {
+            crate::intake::publication::record_backfill_coverage(&*txn, &qualified).await?;
+        }
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Whether any *already-persisted* transform definition reads `table` — either
+/// as its own `FROM` source, or as the to-side of a relationship anchored on a
+/// table some definition transforms. Conservative on the relationship side: it
+/// does not confirm the anchoring definition's text actually references that
+/// relationship, so it may report a reader where none truly exists. That only
+/// ever suppresses a coverage record (falling back to full enumeration), which
+/// is always safe — the direction the issue's safety valve demands.
+async fn table_has_other_reader(
+    txn: &tokio_postgres::Transaction<'_>,
+    table: &str,
+) -> Result<bool, CatalogError> {
+    let exists: bool = txn
+        .query_one(
+            "select \
+               exists(select 1 from transform_definitions where source_table = $1) \
+               or exists( \
+                 select 1 from relationship_definitions r \
+                 join transform_definitions d on d.source_table = r.from_table \
+                 where r.to_table = $1 \
+               )",
+            &[&table],
+        )
+        .await?
+        .get(0);
+    Ok(exists)
 }
 
 async fn create_definition_inner(

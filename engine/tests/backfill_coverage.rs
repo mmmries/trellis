@@ -1,0 +1,266 @@
+//! Issue #79 (bug B): a table whose current contents a *direct* backfill has
+//! already folded into a built target must not be re-enumerated row-by-row
+//! when it joins the CDC publication. These tests pin the two layers of that
+//! fix:
+//!
+//! - the publication-layer decision itself (`record_backfill_coverage` +
+//!   `run_pending_backfills`): a covered, unchanged table skips enumeration; a
+//!   table written to *after* the coverage fence is still fully enumerated; a
+//!   table with no coverage at all is enumerated as it always was; and
+//!
+//! - the front-door wiring (`install_definition`): a relationship-enriched 1-1
+//!   definition built via the fast path records coverage for its own source
+//!   *and* every to-side relationship table it reads, so that to-side table's
+//!   later publication join skips its catch-up.
+
+use std::collections::HashMap;
+
+use engine::config::DEFAULT_SCHEMA;
+use engine::defs::{ValueType, create_relationship, install_definition};
+use engine::intake::publication;
+use tokio_postgres::{Client, NoTls};
+
+async fn connect_raw(dsn: &str) -> Client {
+    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
+        .await
+        .expect("set search_path");
+    client
+}
+
+/// Recompute rows staged into the fresh install's active segment (`seg_0`) for
+/// `src_table` — the enumeration's signature.
+async fn recompute_count(client: &Client, src_table: &str) -> i64 {
+    client
+        .query_one(
+            "select count(*) from seg_0 where op = 'recompute' and src_table = $1",
+            &[&src_table],
+        )
+        .await
+        .expect("count seg_0 recompute rows")
+        .get(0)
+}
+
+async fn pending_marker_count(client: &Client) -> i64 {
+    client
+        .query_one("select count(*) from pending_backfill", &[])
+        .await
+        .expect("count pending_backfill")
+        .get(0)
+}
+
+/// A covered table that has not changed since its coverage fence skips the
+/// catch-up enumeration entirely: the marker is discharged with zero staged
+/// rows.
+#[tokio::test]
+async fn covered_and_unchanged_table_skips_enumeration() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table widgets (id bigint primary key); \
+             insert into widgets (id) values (1), (2), (3); \
+             create publication test_pub;",
+        )
+        .await
+        .expect("seed source with pre-existing rows");
+
+    let table = format!("{DEFAULT_SCHEMA}.widgets");
+    publication::record_backfill_coverage(&client, &table)
+        .await
+        .expect("record coverage as of the current 3 rows");
+
+    publication::reconcile_publication(&mut client, "test_pub", std::slice::from_ref(&table))
+        .await
+        .expect("reconcile adds widgets and leaves a marker");
+    assert_eq!(pending_marker_count(&client).await, 1);
+
+    publication::run_pending_backfills(&mut client, "wake")
+        .await
+        .expect("run_pending_backfills");
+
+    assert_eq!(
+        recompute_count(&client, &table).await,
+        0,
+        "a covered, unchanged table must stage nothing"
+    );
+    assert_eq!(
+        pending_marker_count(&client).await,
+        0,
+        "the marker is still discharged even when enumeration is skipped"
+    );
+}
+
+/// A write between the coverage fence and the publication join makes the
+/// coverage stale, so the table is still fully enumerated — the safety
+/// property that distinguishes this fix from a blanket "skip whenever any
+/// coverage exists".
+#[tokio::test]
+async fn a_write_after_the_coverage_fence_forces_full_enumeration() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table widgets (id bigint primary key); \
+             insert into widgets (id) values (1), (2), (3); \
+             create publication test_pub;",
+        )
+        .await
+        .expect("seed source");
+
+    let table = format!("{DEFAULT_SCHEMA}.widgets");
+    publication::record_backfill_coverage(&client, &table)
+        .await
+        .expect("record coverage as of the current 3 rows");
+
+    // A genuine write lands *after* the coverage fence but *before* the table
+    // joins the publication — exactly the gap a direct build can't have seen.
+    client
+        .execute("insert into widgets (id) values (4)", &[])
+        .await
+        .expect("write a fourth row after the fence");
+
+    publication::reconcile_publication(&mut client, "test_pub", std::slice::from_ref(&table))
+        .await
+        .expect("reconcile adds widgets");
+    publication::run_pending_backfills(&mut client, "wake")
+        .await
+        .expect("run_pending_backfills");
+
+    assert_eq!(
+        recompute_count(&client, &table).await,
+        4,
+        "stale coverage must fall back to enumerating every current row"
+    );
+    assert_eq!(pending_marker_count(&client).await, 0);
+}
+
+/// No coverage record at all (the ring-fallback path never writes one) means
+/// the enumeration runs exactly as it always has — the regression guard for
+/// the safety-valve default.
+#[tokio::test]
+async fn a_table_with_no_coverage_is_enumerated_as_before() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table widgets (id bigint primary key); \
+             insert into widgets (id) values (1), (2), (3); \
+             create publication test_pub;",
+        )
+        .await
+        .expect("seed source");
+
+    let table = format!("{DEFAULT_SCHEMA}.widgets");
+    publication::reconcile_publication(&mut client, "test_pub", std::slice::from_ref(&table))
+        .await
+        .expect("reconcile adds widgets");
+    publication::run_pending_backfills(&mut client, "wake")
+        .await
+        .expect("run_pending_backfills");
+
+    assert_eq!(
+        recompute_count(&client, &table).await,
+        3,
+        "with no coverage record, every pre-existing row is enumerated"
+    );
+}
+
+/// End-to-end: a relationship-enriched 1-1 definition fast-built through
+/// `install_definition` records coverage for its own source *and* both to-side
+/// relationship tables it reads — and so a to-side table's later publication
+/// join skips its catch-up enumeration.
+#[tokio::test]
+async fn install_definition_records_coverage_and_a_to_side_join_skips() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    // Source + related tables live explicitly in `public`, so the schema the
+    // catalog resolves for them matches the qualified names used below.
+    client
+        .batch_execute(
+            "create table public.authors (id integer primary key, name text); \
+             create table public.posts (id integer primary key, author_id integer, words integer); \
+             create table public.comments (id integer primary key, author_id integer); \
+             alter table public.posts replica identity full; \
+             alter table public.comments replica identity full; \
+             insert into public.authors (id, name) values (1, 'a'), (2, 'b'), (3, 'c'); \
+             insert into public.posts (id, author_id, words) values (100, 1, 10), (101, 1, 20), (102, 2, 5); \
+             insert into public.comments (id, author_id) values (200, 1), (201, 2); \
+             create publication test_pub;",
+        )
+        .await
+        .expect("seed authors + related tables");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP posts FROM authors.id TO posts.author_id",
+    )
+    .await
+    .expect("create posts relationship");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP comments FROM authors.id TO comments.author_id",
+    )
+    .await
+    .expect("create comments relationship");
+
+    let source_columns: HashMap<String, ValueType> =
+        HashMap::from([("id".to_string(), ValueType::Numeric)]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM author_totals FROM authors SELECT \
+             SUM(posts.words) AS word_sum, COUNT(comments.id) AS comment_count",
+        &source_columns,
+        "public",
+    )
+    .await
+    .expect("install_definition via the direct relationship path");
+
+    // Coverage recorded for the source and both to-side tables it reads.
+    let covered: Vec<String> = client
+        .query(
+            "select table_name from backfill_coverage order by table_name",
+            &[],
+        )
+        .await
+        .expect("read backfill_coverage")
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        covered,
+        vec![
+            "public.authors".to_string(),
+            "public.comments".to_string(),
+            "public.posts".to_string(),
+        ],
+        "direct build records coverage for its source and every to-side table"
+    );
+
+    // `posts` joins the publication with no intervening writes → skip.
+    publication::reconcile_publication(&mut client, "test_pub", &["public.posts".to_string()])
+        .await
+        .expect("reconcile adds public.posts");
+    publication::run_pending_backfills(&mut client, "wake")
+        .await
+        .expect("run_pending_backfills");
+
+    assert_eq!(
+        recompute_count(&client, "public.posts").await,
+        0,
+        "a fast-built to-side table's catch-up is skipped"
+    );
+    assert_eq!(pending_marker_count(&client).await, 0);
+}
