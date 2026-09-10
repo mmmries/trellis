@@ -212,12 +212,6 @@ async fn backfill_one_to_one(
     target_schema: &str,
     pk: &PrimaryKeyColumn,
 ) -> Result<(), BackfillError> {
-    if uses_relationships(def) {
-        return Err(BackfillError::Unsupported(
-            "relationship-enriched 1-1 definitions".to_string(),
-        ));
-    }
-
     let source = quote_ident(&def.source);
     let target = qualified_target_table(target_schema, def);
     let pk_ident = quote_ident(&pk.name);

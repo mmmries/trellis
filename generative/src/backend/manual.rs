@@ -238,8 +238,8 @@ impl ManualBackend {
         Ok(())
     }
 
-    /// `source_columns` for `table`, as [`create_definition`]/
-    /// [`create_target_table`] want it.
+    /// `source_columns` for `table`, as `engine::defs::install_definition`
+    /// wants it.
     fn source_columns(table: &Table) -> HashMap<String, ValueType> {
         table
             .columns

@@ -183,8 +183,9 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
 }
 
 // ---------------------------------------------------------------------
-// Unsupported/ring-fallback branch: a relationship-enriched OneToOne
-// definition, the shape `backfill_one_to_one` explicitly rejects.
+// Unsupported/ring-fallback branch: a bare to-one relationship lookup
+// (no aggregate wrapper) — a shape `backfill_relationship_one_to_one`
+// explicitly rejects, since it only renders to-many aggregates.
 // ---------------------------------------------------------------------
 
 fn to_one_def() -> TransformDef {

@@ -146,8 +146,13 @@ to-many-aggregate shape is direct-built.
 - The ring is no longer on the critical path for a from-scratch build, only for
   live deltas after it.
 - Relationship-enriched `OneToOne` **to-many aggregates** are also off the ring
-  now: a 100k-author / 1M-post / 4.5M-comment `SUM`/`COUNT`-over-two-relationships
-  benchmark scenario went from ~1 minute (ring path, the real-world case that
-  originally exposed this gap) to ~0.6-0.7s through `install_definition` — roughly
-  90x. Bare to-one lookups and any other relationship shape not listed above
-  remain on the ring until the direct path learns to render them.
+  now: the committed `relationship-aggregate` benchmark scenario (100k authors,
+  1M posts, 4.5M comments, `SUM`/`COUNT` over both) measures ~0.6-0.7s through
+  `install_definition` on the direct path. The ~1 minute figure it improves on is
+  the ring-path baseline from the original poc report that motivated this work,
+  not a number the committed benchmark suite reproduces on this side of the
+  comparison (the benchmark doesn't carry an unpatched ring-path variant to
+  re-measure against) — so "~90x" is provenance from that report, not a
+  same-benchmark before/after. Bare to-one lookups and any other relationship
+  shape not listed above remain on the ring until the direct path learns to
+  render them.
