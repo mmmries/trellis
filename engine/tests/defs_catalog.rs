@@ -607,3 +607,55 @@ async fn all_source_tables_does_not_leak_relationships_unreachable_from_any_tran
     let tables = all_source_tables(&db.pool).await.expect("query mapping");
     assert_eq!(tables, vec!["z".to_string()]);
 }
+
+/// Issue #36's exact repro: a 1-1 transform with a pass-through field named
+/// the same as the source column it reads (`author AS author`) must not be
+/// rejected as a self-referencing cycle, even alongside other calculated
+/// fields on the same target. `is_self_passthrough` in `validate.rs`
+/// already exempts `column == field.name` when `column` is a source
+/// column — this pins that exemption against the issue's literal schema
+/// and DSL so a regression here fails loudly.
+#[tokio::test]
+async fn a_passthrough_field_sharing_its_source_columns_name_is_not_a_cycle() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table authors (
+                 id integer not null,
+                 created_at timestamp with time zone default now() not null,
+                 name character varying not null,
+                 constraint authors_pkey primary key (id)
+             );
+             create table posts (
+                 id integer not null,
+                 created_at timestamp with time zone default now() not null,
+                 title text,
+                 body text,
+                 author integer not null,
+                 constraint posts_pkey primary key (id),
+                 constraint posts_author_fkey foreign key (author)
+                     references authors(id) on update cascade on delete cascade
+             );",
+        )
+        .await
+        .expect("seed authors and posts");
+    drop(client);
+
+    let source_columns: HashMap<String, ValueType> = HashMap::from([
+        ("author".to_string(), ValueType::Numeric),
+        ("body".to_string(), ValueType::Text),
+    ]);
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM posts_calc FROM posts SELECT author AS author, \
+         regexp_count(body, '(^|[^A-Za-z0-9_])') as word_count, \
+         octet_length(body) as byte_size",
+        &source_columns,
+    )
+    .await
+    .expect("author AS author passthrough must not be rejected as a self-reference cycle");
+}
