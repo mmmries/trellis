@@ -454,10 +454,8 @@ mod tests {
                 ],
             }
         );
-        let source_columns = std::collections::HashMap::from([(
-            "a".to_string(),
-            ValueType::Numeric,
-        )]);
+        let source_columns =
+            std::collections::HashMap::from([("a".to_string(), ValueType::Numeric)]);
         let err = validate(&def, &source_columns, &std::collections::HashMap::new()).unwrap_err();
         assert_eq!(
             err,

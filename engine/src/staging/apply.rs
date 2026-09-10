@@ -1288,11 +1288,8 @@ async fn apply_target(
     // that guarantee — the delete would now run against a snapshot that
     // already includes the write — so it's restored explicitly here
     // instead: never delete a key this same call just wrote.
-    let write_keys: std::collections::HashSet<&str> = plan
-        .writes
-        .iter()
-        .map(|w| w.pk_text.as_str())
-        .collect();
+    let write_keys: std::collections::HashSet<&str> =
+        plan.writes.iter().map(|w| w.pk_text.as_str()).collect();
 
     let mut deleted = Vec::new();
     let delete_keys: Vec<&str> = plan

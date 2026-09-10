@@ -71,8 +71,7 @@ use crate::pool::{Client, Pool, quote_ident};
 
 use super::ast::{Expr, KeySpace, RelationshipDef, TransformDef, ValueType};
 use super::ddl::{
-    self, PrimaryKeyColumn, avg_partial_columns, count_partial_column, qualified_target_table,
-    source_primary_key,
+    self, PrimaryKeyColumn, avg_sum_column, qualified_target_table, source_primary_key,
 };
 use super::invertibility::{AggregateArg, CountArg, classify};
 use super::model::RelationshipCardinality;
@@ -425,8 +424,17 @@ async fn backfill_aggregate(
     // concern #3) so a directly-built target is byte-identical to a ring-built
     // one. Group-key columns come first; every column is a stable target column
     // name, so it doubles as the staging table's column name.
+    let count_cols = ddl::count_column_names(&def.fields);
     let mut insert_cols: Vec<String> = group_idents.clone();
     let mut stage_exprs: Vec<String> = group_idents.clone();
+    // Issue #48: two fields (e.g. `SUM(amount)`/`AVG(amount)`) can share one
+    // hidden count column (`count_cols`) — track which shared names have
+    // already been emitted into this staging table's column list, so a
+    // second field sharing a column never emits a duplicate, which both
+    // `CREATE TEMP TABLE ... AS SELECT` and the later `ON CONFLICT DO
+    // UPDATE` reject.
+    let mut emitted_count_cols: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for field in &def.fields {
         if group_by.contains(&field.name) {
             continue;
@@ -437,16 +445,22 @@ async fn backfill_aggregate(
                 let arg = agg_arg_sql(&field.expr);
                 insert_cols.push(col);
                 stage_exprs.push(format!("sum({arg})"));
-                insert_cols.push(quote_ident(&count_partial_column(&field.name)));
-                stage_exprs.push(format!("count({arg})"));
+                let count_col_name = count_cols[&field.name].clone();
+                if emitted_count_cols.insert(count_col_name.clone()) {
+                    insert_cols.push(quote_ident(&count_col_name));
+                    stage_exprs.push(format!("count({arg})"));
+                }
             }
             FieldKind::Avg => {
                 let arg = agg_arg_sql(&field.expr);
-                let (sum_col, count_col) = avg_partial_columns(&field.name);
+                let sum_col = avg_sum_column(&field.name);
+                let count_col_name = count_cols[&field.name].clone();
                 insert_cols.push(quote_ident(&sum_col));
                 stage_exprs.push(format!("sum({arg})"));
-                insert_cols.push(quote_ident(&count_col));
-                stage_exprs.push(format!("count({arg})"));
+                if emitted_count_cols.insert(count_col_name.clone()) {
+                    insert_cols.push(quote_ident(&count_col_name));
+                    stage_exprs.push(format!("count({arg})"));
+                }
                 insert_cols.push(col);
                 stage_exprs.push(format!(
                     "case when count({arg}) = 0 then null \

@@ -1609,6 +1609,14 @@ fn build_delta_carriers(
     let mut insert_exprs: Vec<String> = Vec::new();
     let mut update_sets: Vec<String> = Vec::new();
     let mut recompute_idx = 0;
+    // Issue #48: two fields can share one hidden count column
+    // (`plan.count_column_names`) — track which shared names this statement
+    // has already emitted a column/SET clause for, mirroring
+    // `apply_forced_groups_bulk`'s `emitted_count_cols` guard, so a second
+    // field sharing a column never emits a duplicate insert column or `SET
+    // count_col = ..., count_col = ...` (which Postgres rejects outright).
+    let mut emitted_count_cols: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for (idx, field) in plan.fields.iter().enumerate() {
         let col = quote_ident(&field.name);
@@ -1685,17 +1693,14 @@ fn build_delta_carriers(
                 let count_delta_ref = format!("k.{count_delta_name}");
 
                 if field.kind == AggFieldKind::Sum {
-                    let count_col = quote_ident(&count_partial_column(&field.name));
+                    let count_col_name = plan.count_column_names[&field.name].clone();
+                    let count_col = quote_ident(&count_col_name);
                     let insert_count = count_delta_ref.clone();
                     let insert_sum =
                         format!("case when {insert_count} = 0 then null else {sum_delta} end");
                     insert_cols.push(col.clone());
                     insert_exprs.push(format!(
                         "case when {active} then {insert_sum} else null end"
-                    ));
-                    insert_cols.push(count_col.clone());
-                    insert_exprs.push(format!(
-                        "case when {active} then {insert_count} else null end"
                     ));
 
                     let update_count =
@@ -1707,11 +1712,18 @@ fn build_delta_carriers(
                     update_sets.push(format!(
                         "{col} = case when {active} then {update_sum} else {target_ident}.{col} end"
                     ));
-                    update_sets.push(format!(
-                        "{count_col} = case when {active} then {update_count} else {target_ident}.{count_col} end"
-                    ));
+                    if emitted_count_cols.insert(count_col_name) {
+                        insert_cols.push(count_col.clone());
+                        insert_exprs.push(format!(
+                            "case when {active} then {insert_count} else null end"
+                        ));
+                        update_sets.push(format!(
+                            "{count_col} = case when {active} then {update_count} else {target_ident}.{count_col} end"
+                        ));
+                    }
                 } else {
-                    let (sum_col_name, count_col_name) = avg_partial_columns(&field.name);
+                    let sum_col_name = avg_sum_column(&field.name);
+                    let count_col_name = plan.count_column_names[&field.name].clone();
                     let sum_col = quote_ident(&sum_col_name);
                     let count_col = quote_ident(&count_col_name);
                     let avg_col = col.clone();
@@ -1725,10 +1737,6 @@ fn build_delta_carriers(
                     insert_cols.push(sum_col.clone());
                     insert_exprs.push(format!(
                         "case when {active} then {insert_sum} else null end"
-                    ));
-                    insert_cols.push(count_col.clone());
-                    insert_exprs.push(format!(
-                        "case when {active} then {insert_count} else null end"
                     ));
                     insert_cols.push(avg_col.clone());
                     insert_exprs.push(format!(
@@ -1746,11 +1754,17 @@ fn build_delta_carriers(
                         "{sum_col} = case when {active} then {update_sum} else {target_ident}.{sum_col} end"
                     ));
                     update_sets.push(format!(
-                        "{count_col} = case when {active} then {update_count} else {target_ident}.{count_col} end"
-                    ));
-                    update_sets.push(format!(
                         "{avg_col} = case when {active} then {update_avg} else {target_ident}.{avg_col} end"
                     ));
+                    if emitted_count_cols.insert(count_col_name) {
+                        insert_cols.push(count_col.clone());
+                        insert_exprs.push(format!(
+                            "case when {active} then {insert_count} else null end"
+                        ));
+                        update_sets.push(format!(
+                            "{count_col} = case when {active} then {update_count} else {target_ident}.{count_col} end"
+                        ));
+                    }
                 }
             }
             AggFieldKind::Count => {
@@ -2345,13 +2359,18 @@ mod tests {
         )
     }
 
+    // `total` (SUM) and `avg_amount` (AVG) both aggregate the identical
+    // `amount` argument, so issue #48 merges them onto one hidden running-count
+    // column — `__total_count` (the first of the two fields declared) — rather
+    // than each minting its own; there is deliberately no `__avg_amount_count`
+    // column here.
     const ORDER_SCHEMA_SQL: &str = "\
         create table order_items \
         (id integer primary key, order_id numeric, amount numeric); \
         create table order_summary \
         (order_id numeric primary key, \
          total numeric, __total_count bigint, \
-         avg_amount numeric, __avg_amount_sum numeric, __avg_amount_count bigint, \
+         avg_amount numeric, __avg_amount_sum numeric, \
          row_count numeric, \
          max_amount numeric)";
 
@@ -2362,7 +2381,7 @@ mod tests {
         let rows = client
             .query(
                 "select order_id::text, total::text, __total_count::text, \
-                 avg_amount::text, __avg_amount_sum::text, __avg_amount_count::text, \
+                 avg_amount::text, __avg_amount_sum::text, \
                  row_count::text, max_amount::text \
                  from order_summary order by order_id",
                 &[],
@@ -2370,7 +2389,7 @@ mod tests {
             .await
             .expect("read order_summary");
         rows.iter()
-            .map(|r| (0..8).map(|i| r.get(i)).collect())
+            .map(|r| (0..7).map(|i| r.get(i)).collect())
             .collect()
     }
 
@@ -2395,10 +2414,10 @@ mod tests {
              (1, 1, 8.00), (2, 2, 7.00), (10, 4, 10.00), (11, 4, 20.00); \
              insert into order_summary \
              (order_id, total, __total_count, avg_amount, __avg_amount_sum, \
-              __avg_amount_count, row_count, max_amount) \
+              row_count, max_amount) \
              values \
-             (1, 5.00, 1, 5.00, 5.00, 1, 1, 5.00), \
-             (4, 10.00, 1, 10.00, 10.00, 1, 1, 10.00)"
+             (1, 5.00, 1, 5.00, 5.00, 1, 5.00), \
+             (4, 10.00, 1, 10.00, 10.00, 1, 10.00)"
         );
 
         // Group 1: an in-place value edit (5.00 -> 8.00) on an existing row —
@@ -2548,7 +2567,6 @@ mod tests {
                     Some("8.0000000000000000".to_string()),
                     Some("8.00".to_string()),
                     Some("1".to_string()),
-                    Some("1".to_string()),
                     Some("8.00".to_string()),
                 ],
                 vec![
@@ -2558,7 +2576,6 @@ mod tests {
                     Some("7.0000000000000000".to_string()),
                     Some("7.00".to_string()),
                     Some("1".to_string()),
-                    Some("1".to_string()),
                     Some("7.00".to_string()),
                 ],
                 vec![
@@ -2567,7 +2584,6 @@ mod tests {
                     Some("2".to_string()),
                     Some("15.0000000000000000".to_string()),
                     Some("30.00".to_string()),
-                    Some("2".to_string()),
                     Some("2".to_string()),
                     Some("20.00".to_string()),
                 ],
@@ -2805,8 +2821,8 @@ mod tests {
             .execute(
                 "insert into order_summary \
                  (order_id, total, __total_count, avg_amount, __avg_amount_sum, \
-                  __avg_amount_count, row_count, max_amount) \
-                 values (42, 3.00, 1, 3.00, 3.00, 1, 1, 3.00)",
+                  row_count, max_amount) \
+                 values (42, 3.00, 1, 3.00, 3.00, 1, 3.00)",
                 &[],
             )
             .await
@@ -2915,7 +2931,7 @@ mod tests {
         let row42 = client_a
             .query_one(
                 "select total::text, __total_count::text, avg_amount::text, \
-                 __avg_amount_sum::text, __avg_amount_count::text, row_count::text, \
+                 __avg_amount_sum::text, row_count::text, \
                  max_amount::text from order_summary where order_id = 42",
                 &[],
             )
@@ -2930,8 +2946,7 @@ mod tests {
         assert_eq!(row42.get::<_, String>(2), "4.0000000000000000");
         assert_eq!(row42.get::<_, String>(3), "8.00");
         assert_eq!(row42.get::<_, String>(4), "2");
-        assert_eq!(row42.get::<_, String>(5), "2");
-        assert_eq!(row42.get::<_, String>(6), "5.00");
+        assert_eq!(row42.get::<_, String>(5), "5.00");
 
         let row43 = client_a
             .query_one(
