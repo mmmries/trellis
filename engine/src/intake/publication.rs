@@ -621,7 +621,22 @@ pub async fn initial_snapshot_handshake(
     // — `append::append` has no state that requires being called exactly
     // once (see its own doc comment: it just reads the ring pointer and
     // inserts).
+    //
+    // Issue #79 (bug B): a table a direct backfill already folded into a
+    // target — and that provably hasn't changed since ([`coverage_covers`]) —
+    // is skipped here exactly as `run_pending_backfills` skips it, so the
+    // fresh-install path floods the ring no worse than a restart does. This
+    // preserves gap-free-by-construction: `coverage_covers` is evaluated in
+    // this same repeatable-read snapshot (≈ the slot's consistent point), so
+    // any write between the build's coverage fence and that point leaves a
+    // fence-invisible `xmin` or changes the row count → `coverage_covers`
+    // returns false → the table is enumerated, the safe default. Only a table
+    // byte-for-byte identical to its covered state is skipped, and everything
+    // after the consistent point streams via CDC as usual.
     for table in tables {
+        if coverage_covers(&txn, table).await? {
+            continue;
+        }
         enumerate_and_append(&txn, table).await?;
     }
     txn.execute(
