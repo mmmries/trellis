@@ -7,8 +7,9 @@
 //! per-row evaluator in `apply_relationships.rs`. These exercise the no-match
 //! (zero related rows) and all-NULL-argument cases that decide the empty-set
 //! semantics (`COUNT` -> 0, `SUM`/`MIN`/`MAX`/`AVG` -> NULL), a parent with
-//! several related rows, two distinct to-many relationships joined at once, and
-//! an idempotent re-run.
+//! several related rows, two distinct to-many relationships joined at once,
+//! and a re-run after the children are mutated (insert/update/delete)
+//! between the two builds.
 
 use std::collections::HashMap;
 
@@ -218,7 +219,7 @@ async fn relationship_build_matches_oracle_including_no_match_and_multi_child() 
 }
 
 #[tokio::test]
-async fn relationship_build_is_idempotent_on_rerun() {
+async fn relationship_build_rerun_reflects_source_mutations() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -226,11 +227,61 @@ async fn relationship_build_is_idempotent_on_rerun() {
     backfill_definition(&db.pool, &def, "public", &source_columns())
         .await
         .expect("first backfill");
+
+    // Mutate the to-many children directly in Postgres between runs: insert a
+    // new post for author 2 (previously one post with all-NULL words, so its
+    // aggregates were the empty-set NULL/0 values), update an existing post's
+    // value for author 1, and delete one of author 1's comments. A re-run
+    // must recompute from this new state, not just replay the first run's
+    // values via `ON CONFLICT` — the gap the old same-data-rerun version of
+    // this test didn't cover.
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "insert into posts (id, author_id, words) values (103, 2, 50); \
+             update posts set words = 99 where id = 101; \
+             delete from comments where id = 201",
+        )
+        .await
+        .expect("mutate child tables between runs");
+    drop(client);
+
     backfill_definition(&db.pool, &def, "public", &source_columns())
         .await
-        .expect("second backfill");
+        .expect("second backfill after mutation");
 
-    // Overwrite ON CONFLICT means the re-run recomputes to the same values (the
-    // crash-recovery story) rather than doubling any SUM/COUNT.
+    let client = db.pool.get().await.expect("get connection");
+
+    // Author 1: post 101's words changed 20 -> 99, moving the sum/avg/max;
+    // one of its two comments was deleted.
+    let row = client
+        .query_one(
+            "select word_sum = 109, post_count = 2, word_avg = 54.5, \
+                    lo = 10, hi = 99, comment_count = 1 \
+             from public.author_totals where id = 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    for i in 0..6 {
+        assert!(row.get::<_, bool>(i), "author 1 post-mutation column {i}");
+    }
+
+    // Author 2: the new post moves it out of the all-NULL empty-set case for
+    // SUM/AVG/MIN/MAX into a real aggregate.
+    let row = client
+        .query_one(
+            "select word_sum = 50, post_count = 1, word_avg = 50, \
+                    lo = 50, hi = 50 \
+             from public.author_totals where id = 2",
+            &[],
+        )
+        .await
+        .unwrap();
+    for i in 0..5 {
+        assert!(row.get::<_, bool>(i), "author 2 post-mutation column {i}");
+    }
+
+    drop(client);
     assert_matches_oracle(&db).await;
 }
