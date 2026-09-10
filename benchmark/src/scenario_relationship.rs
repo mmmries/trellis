@@ -90,8 +90,12 @@ pub async fn run(
     .expect("set replica identity on relationship to-side tables");
 
     let authors_load = generate::load_authors(&db.pool, authors).await;
-    let posts_load = generate::load_posts(&db.pool, posts, authors).await;
-    let comments_load = generate::load_comments(&db.pool, comments, authors).await;
+    // `_with_holdout`, not the plain loaders: deliberately leaves every
+    // `ZERO_CHILDREN_MODULUS`-th author with zero posts/comments, so the
+    // no-match (`COUNT -> 0`/`SUM -> NULL`) path is exercised at benchmark
+    // scale, not just by the small-fixture engine tests.
+    let posts_load = generate::load_posts_with_holdout(&db.pool, posts, authors).await;
+    let comments_load = generate::load_comments_with_holdout(&db.pool, comments, authors).await;
     let load_ms = (authors_load + posts_load + comments_load).as_millis();
 
     create_relationship(
