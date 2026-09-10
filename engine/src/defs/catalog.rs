@@ -24,7 +24,7 @@ use std::fmt;
 
 use crate::pool::Pool;
 
-use super::ast::{RelationshipDef, TransformDef, ValueType};
+use super::ast::{KeySpace, RelationshipDef, TransformDef, ValueType};
 use super::error::ParseError;
 use super::model::{
     Definition, EdgeKind, NodeKind, RelationshipCardinality, RelationshipDefinition, SchemaEdge,
@@ -57,6 +57,17 @@ pub enum CatalogError {
     /// search path (see [`resolve_source_schema_in_txn`]) — the table was
     /// dropped, renamed, or never existed under that bare name.
     SourceTableNotFound(String),
+    /// An aggregate (`GROUP BY`) definition (issue #47) was rejected because
+    /// its source table's replica identity doesn't guarantee the old row
+    /// image the delta-maintenance path (`apply_aggregate.rs`) needs on
+    /// delete/update/re-parent. Wraps [`crate::intake::IntakeError`] — the
+    /// same [`crate::intake::require_replica_identity_full`] check
+    /// [`assert_replica_identity_supports_to_many`] mirrors for relationships
+    /// (#41) — rather than [`CatalogError::Backfill`]'s blanket
+    /// `From<IntakeError>`, since that variant's message ("failed to
+    /// backfill...") would misdescribe a definition-time rejection as a
+    /// backfill failure.
+    ReplicaIdentityRequired(crate::intake::IntakeError),
 }
 
 impl fmt::Display for CatalogError {
@@ -81,6 +92,7 @@ impl fmt::Display for CatalogError {
             CatalogError::SourceTableNotFound(table) => {
                 write!(f, "source table \"{table}\" not found on the search path")
             }
+            CatalogError::ReplicaIdentityRequired(err) => write!(f, "{err}"),
         }
     }
 }
@@ -95,6 +107,7 @@ impl std::error::Error for CatalogError {
             CatalogError::UnknownValueType { .. } => None,
             CatalogError::Backfill(err) => Some(err),
             CatalogError::SourceTableNotFound(_) => None,
+            CatalogError::ReplicaIdentityRequired(err) => Some(err),
         }
     }
 }
@@ -150,6 +163,18 @@ pub async fn create_definition(
 
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
+
+    // Issue #47: an aggregate (`GROUP BY`) definition's delta-maintenance
+    // path needs the source row's *old* image on delete/update/re-parent
+    // (`apply_aggregate.rs`'s `accumulate_changes`) to find which group to
+    // decrement — reject up front, before any of this transaction's other
+    // side effects, if the source table's replica identity can't guarantee
+    // one. Checked first (ahead of node/edge/backfill work below) so a
+    // doomed-to-fail aggregate definition never enumerates its source table
+    // or touches the schema graph.
+    if let KeySpace::Aggregate { .. } = &def.key_space {
+        assert_replica_identity_supports_aggregate(&txn, &def).await?;
+    }
 
     // Issue #20: every definition's source and target resolve to a
     // first-class `SchemaNode`, created on first reference (a source node
@@ -828,6 +853,49 @@ async fn assert_replica_identity_supports_to_many(
         }
         .into())
     }
+}
+
+/// Rejects an aggregate (`GROUP BY`) definition (issue #47) whose source
+/// table's replica identity doesn't guarantee an old row image on
+/// delete/update. Unlike [`assert_replica_identity_supports_to_many`]'s
+/// to-many relationship check — which only needs one non-PK join column
+/// (`to_col`) present in the pre-image, and so accepts a covering
+/// `REPLICA IDENTITY USING INDEX` — an aggregate's delta maintenance
+/// (`apply_aggregate.rs`'s `accumulate_changes`) needs the *entire* old row:
+/// every `GROUP BY` column (to find which group a deleted/re-parented row
+/// was decrementing) and every column any `SUM`/`AVG`/`MIN`/`MAX` field
+/// reads (to subtract its old contribution). Only `REPLICA IDENTITY FULL`
+/// (`relreplident = 'f'`) guarantees that for an arbitrary set of columns, so
+/// this doesn't attempt the narrower per-column index check the to-many path
+/// does.
+///
+/// Delegates the actual rejection to
+/// [`crate::intake::require_replica_identity_full`] (issue #7's scaffolding,
+/// previously unwired — see its module doc) so the error text — including
+/// the exact `ALTER TABLE ... REPLICA IDENTITY FULL;` statement — comes from
+/// one place rather than being duplicated here. That function's own
+/// `needs_old_image` parameter is unconditional (it rejects whenever passed
+/// `true`, regardless of the table's actual replica identity), so it is not
+/// enough on its own — [`crate::intake::needs_old_image`] would always
+/// return `true` for [`KeySpace::Aggregate`], rejecting every aggregate
+/// definition forever, even after an operator runs the suggested `ALTER
+/// TABLE`. This function closes that gap by querying `pg_class.relreplident`
+/// itself first and only passing `true` through when the source table is
+/// actually inadequate today.
+async fn assert_replica_identity_supports_aggregate(
+    txn: &tokio_postgres::Transaction<'_>,
+    def: &TransformDef,
+) -> Result<(), CatalogError> {
+    let is_full: bool = txn
+        .query_one(
+            "select relreplident = 'f' from pg_class where oid = pg_catalog.to_regclass($1)",
+            &[&def.source],
+        )
+        .await?
+        .get(0);
+
+    crate::intake::require_replica_identity_full(&def.source, !is_full)
+        .map_err(CatalogError::ReplicaIdentityRequired)
 }
 
 /// Whether `from_table` has a usable index for looking up rows by

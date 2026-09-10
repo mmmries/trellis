@@ -607,3 +607,193 @@ async fn all_source_tables_does_not_leak_relationships_unreachable_from_any_tran
     let tables = all_source_tables(&db.pool).await.expect("query mapping");
     assert_eq!(tables, vec!["z".to_string()]);
 }
+
+/// Issue #36's exact repro: a 1-1 transform with a pass-through field named
+/// the same as the source column it reads (`author AS author`) must not be
+/// rejected as a self-referencing cycle, even alongside other calculated
+/// fields on the same target. `is_self_passthrough` in `validate.rs`
+/// already exempts `column == field.name` when `column` is a source
+/// column — this pins that exemption against the issue's literal schema
+/// and DSL so a regression here fails loudly.
+#[tokio::test]
+async fn a_passthrough_field_sharing_its_source_columns_name_is_not_a_cycle() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table authors (
+                 id integer not null,
+                 created_at timestamp with time zone default now() not null,
+                 name character varying not null,
+                 constraint authors_pkey primary key (id)
+             );
+             create table posts (
+                 id integer not null,
+                 created_at timestamp with time zone default now() not null,
+                 title text,
+                 body text,
+                 author integer not null,
+                 constraint posts_pkey primary key (id),
+                 constraint posts_author_fkey foreign key (author)
+                     references authors(id) on update cascade on delete cascade
+             );",
+        )
+        .await
+        .expect("seed authors and posts");
+    drop(client);
+
+    let source_columns: HashMap<String, ValueType> = HashMap::from([
+        ("author".to_string(), ValueType::Numeric),
+        ("body".to_string(), ValueType::Text),
+    ]);
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM posts_calc FROM posts SELECT author AS author, \
+         regexp_count(body, '(^|[^A-Za-z0-9_])') as word_count, \
+         octet_length(body) as byte_size",
+        &source_columns,
+    )
+    .await
+    .expect("author AS author passthrough must not be rejected as a self-reference cycle");
+}
+
+/// Seeds the `authors`/`posts` schema from `poc/schema_dump.sql` (the same
+/// DDL issue #36's test above uses) — the exact repro schema issue #47's
+/// report is filed against.
+async fn create_authors_and_posts(pool: &engine::pool::Pool) {
+    let client = pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table authors (
+                 id integer not null,
+                 created_at timestamp with time zone default now() not null,
+                 name character varying not null,
+                 constraint authors_pkey primary key (id)
+             );
+             create table posts (
+                 id integer not null,
+                 created_at timestamp with time zone default now() not null,
+                 title text,
+                 body text,
+                 author integer not null,
+                 constraint posts_pkey primary key (id),
+                 constraint posts_author_fkey foreign key (author)
+                     references authors(id) on update cascade on delete cascade
+             );",
+        )
+        .await
+        .expect("seed authors and posts");
+}
+
+/// Issue #47: a 1-1 transform (`posts_calc`) against `posts` must succeed
+/// regardless of `posts`'s replica identity — [`KeySpace::OneToOne`]
+/// derivations are a pure function of the *current* row and never need an
+/// old image.
+#[tokio::test]
+async fn a_one_to_one_transform_succeeds_regardless_of_replica_identity() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_authors_and_posts(&db.pool).await;
+
+    let source_columns: HashMap<String, ValueType> =
+        HashMap::from([("author".to_string(), ValueType::Numeric)]);
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM posts_calc FROM posts SELECT author AS author",
+        &source_columns,
+    )
+    .await
+    .expect("a 1-1 transform needs no old image, so it must succeed at default replica identity");
+}
+
+/// Issue #47's exact repro: an aggregate (`GROUP BY`) transform's
+/// delta-maintenance path (`apply_aggregate.rs`) needs the source row's old
+/// image on delete/update/re-parent to find which group to decrement — a
+/// requirement `defs::catalog::create_definition` never checked, so defining
+/// `posts_totals` (`GROUP BY author`) against `posts` at its default (PK-only)
+/// replica identity must be rejected at define time, naming the exact `ALTER
+/// TABLE posts REPLICA IDENTITY FULL;` fix — not silently accepted only to
+/// corrupt totals later on a delete or non-key update.
+#[tokio::test]
+async fn an_aggregate_transform_against_default_replica_identity_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_authors_and_posts(&db.pool).await;
+
+    let source_columns: HashMap<String, ValueType> =
+        HashMap::from([("author".to_string(), ValueType::Numeric)]);
+
+    // The 1-1 transform above is unaffected by `posts`'s replica identity
+    // and should still succeed even though the aggregate attempt below will
+    // be rejected.
+    create_definition(
+        &db.pool,
+        "TRANSFORM posts_calc FROM posts SELECT author AS author",
+        &source_columns,
+    )
+    .await
+    .expect("1-1 transform should succeed regardless of replica identity");
+
+    let err = create_definition(
+        &db.pool,
+        "TRANSFORM posts_totals FROM posts GROUP BY author SELECT author AS author, \
+         COUNT(*) AS post_count",
+        &source_columns,
+    )
+    .await
+    .unwrap_err();
+
+    match &err {
+        CatalogError::ReplicaIdentityRequired(_) => {}
+        other => panic!("expected ReplicaIdentityRequired, got {other:?}"),
+    }
+    let message = err.to_string();
+    assert!(
+        message.contains("ALTER TABLE posts REPLICA IDENTITY FULL;"),
+        "expected the exact ALTER TABLE fix in the error message, got: {message}"
+    );
+
+    // The rejected attempt must not have left a row behind.
+    let subscribers = transforms_for_source(&db.pool, "posts")
+        .await
+        .expect("query mapping");
+    assert_eq!(
+        subscribers.len(),
+        1,
+        "only posts_calc should be registered; posts_totals must not have been persisted"
+    );
+    assert_eq!(subscribers[0].def.target, "posts_calc");
+}
+
+/// Issue #47: the same aggregate definition succeeds once `posts` has
+/// `REPLICA IDENTITY FULL`, which puts every column (including `author`) into
+/// delete/update pre-images.
+#[tokio::test]
+async fn an_aggregate_transform_against_replica_identity_full_is_accepted() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_authors_and_posts(&db.pool).await;
+    {
+        let client = db.pool.get().await.expect("get connection");
+        client
+            .batch_execute("alter table posts replica identity full")
+            .await
+            .expect("set replica identity full");
+    }
+
+    let source_columns: HashMap<String, ValueType> =
+        HashMap::from([("author".to_string(), ValueType::Numeric)]);
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM posts_totals FROM posts GROUP BY author SELECT author AS author, \
+         COUNT(*) AS post_count",
+        &source_columns,
+    )
+    .await
+    .expect("aggregate transform with REPLICA IDENTITY FULL should be accepted");
+}
