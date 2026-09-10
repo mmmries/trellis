@@ -22,21 +22,25 @@
 //!   contribution into a per-group delta, and [`apply_aggregate_target`]
 //!   applies that delta as a Postgres-side increment (`col = col + ...`),
 //!   never re-reading the source table for the field's own sake. `AVG`
-//!   needs two hidden partial columns (`__{field}_sum`, `__{field}_count}` —
-//!   see `defs::ddl::avg_partial_columns`) since `avg = sum / count` and
-//!   neither half alone is invertible; the visible `avg` column is derived
-//!   from them in the same statement. `SUM` needs one hidden partial
-//!   column too (`__{field}_count` — see `defs::ddl::count_partial_column`),
-//!   even though its own arithmetic never needs a count: Postgres's `sum()`
-//!   is `NULL`, not `0`, over zero non-null values, and without a running
-//!   count the delta model can't tell "this group's last non-null
-//!   contributor just left" (must go `NULL`) from "this group's
-//!   contributions happen to net to zero" (a real `0`) — a plain running
-//!   total alone can't distinguish those two cases once other rows in the
-//!   group remain. Both fields' full-recompute path (image-less changes, or
-//!   a group forced onto it — see below) re-derives *both* partials from a
-//!   live probe, keeping them consistent with what a fresh delta from that
-//!   point forward would produce.
+//!   needs two hidden partial columns (`__{field}_sum` — see
+//!   `defs::ddl::avg_sum_column` — and a running-count partial) since `avg =
+//!   sum / count` and neither half alone is invertible; the visible `avg`
+//!   column is derived from them in the same statement. `SUM` needs a
+//!   running-count partial too, even though its own arithmetic never needs a
+//!   count: Postgres's `sum()` is `NULL`, not `0`, over zero non-null values,
+//!   and without a running count the delta model can't tell "this group's
+//!   last non-null contributor just left" (must go `NULL`) from "this
+//!   group's contributions happen to net to zero" (a real `0`) — a plain
+//!   running total alone can't distinguish those two cases once other rows
+//!   in the group remain. The running-count partial's *column name* is
+//!   shared across every `SUM`/`AVG` field that aggregates the exact same
+//!   argument (issue #48 — see `defs::ddl::count_column_names`'s doc comment
+//!   for why that sharing is scoped to "same argument", not "any
+//!   count-needing field on this target"); `AggregateTargetPlan::count_column_names`
+//!   holds the resolved name for each field. Both fields' full-recompute path
+//!   (image-less changes, or a group forced onto it — see below) re-derives
+//!   *both* partials from a live probe, keeping them consistent with what a
+//!   fresh delta from that point forward would produce.
 //! - A field that is a direct `COUNT(*)` call (issue #75) is
 //!   [`AggFieldKind::Count`] — also invertible, and simpler than `SUM`: its
 //!   new value is `old value + (rows added) - (rows removed)`, with no
@@ -89,7 +93,7 @@ use tokio_postgres::Transaction;
 use tokio_postgres::types::ToSql;
 
 use crate::defs::ast::{Expr, KeySpace, TransformDef, ValueType};
-use crate::defs::ddl::{self, avg_partial_columns, count_partial_column};
+use crate::defs::ddl::{self, avg_sum_column};
 use crate::defs::eval::{self, RegexCache, Row};
 use crate::defs::invertibility::{self, AggregateArg, CountArg};
 use crate::defs::oracle;
@@ -266,6 +270,15 @@ pub(super) struct AggregateTargetPlan {
     pub groups: HashMap<String, GroupPlan>,
     pub source: String,
     pub field_exprs: HashMap<String, Expr>,
+    /// Every [`AggFieldKind::Sum`]/[`AggFieldKind::Avg`] field's hidden
+    /// running-count partial column name (issue #48) — derived once here via
+    /// [`ddl::count_column_names_from`] over this plan's own `fields`/
+    /// `field_exprs`, the exact same merge rule (and, for fields sharing an
+    /// argument, the exact same resulting name) `ddl::count_column_names`
+    /// uses to decide which columns `create_aggregate_target_table` actually
+    /// creates. See that function's doc comment for why two fields only ever
+    /// share a column when they aggregate the identical argument expression.
+    pub count_column_names: HashMap<String, String>,
 }
 
 impl AggregateTargetPlan {
@@ -276,6 +289,17 @@ impl AggregateTargetPlan {
         source: String,
         field_exprs: HashMap<String, Expr>,
     ) -> Self {
+        let count_column_names = ddl::count_column_names_from(fields.iter().filter_map(|f| {
+            if !matches!(f.kind, AggFieldKind::Sum | AggFieldKind::Avg) {
+                return None;
+            }
+            match field_exprs.get(f.name.as_str()) {
+                Some(Expr::FunctionCall { args, .. }) => {
+                    args.first().map(|arg| (f.name.as_str(), arg))
+                }
+                _ => None,
+            }
+        }));
         AggregateTargetPlan {
             group_by,
             group_by_types,
@@ -283,6 +307,7 @@ impl AggregateTargetPlan {
             groups: HashMap::new(),
             source,
             field_exprs,
+            count_column_names,
         }
     }
 }
@@ -872,12 +897,25 @@ async fn upsert_group(
     let mut update_sets: Vec<String> = Vec::new();
     let mut params: Vec<&(dyn ToSql + Sync)> = group_where_params(&group.group_values);
     let mut next = params.len() + 1;
+    // Issue #48: two fields (e.g. `SUM(amount)`/`AVG(amount)`) can share one
+    // hidden count column (`plan.count_column_names`) — this tracks which
+    // shared names this statement has already written a column/SET clause
+    // for, so a second field sharing that name never emits a duplicate
+    // `insert into ... (..., count_col, ..., count_col, ...)` / `set count_col
+    // = ..., count_col = ...`, which Postgres rejects outright. The first
+    // field to reach a given shared column always wins; since every field
+    // sharing a column aggregates the identical argument, their independently
+    // computed count deltas for it are numerically identical anyway (see
+    // `ddl::count_column_names`'s doc comment), so it does not matter which
+    // one's expression is the one actually written.
+    let mut emitted_count_cols: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for column in &columns {
         match column {
             ColumnPlan::SumDelta(name, count_idx) => {
                 let accum = &group.field_accum[name];
-                let count_col_name = count_partial_column(name);
+                let count_col_name = plan.count_column_names[name].clone();
                 let count_col = quote_ident(&count_col_name);
                 let col = quote_ident(name);
 
@@ -914,14 +952,16 @@ async fn upsert_group(
 
                 insert_cols.push(col.clone());
                 insert_exprs.push(insert_sum);
-                insert_cols.push(count_col.clone());
-                insert_exprs.push(insert_count);
+                if emitted_count_cols.insert(count_col_name.clone()) {
+                    insert_cols.push(count_col.clone());
+                    insert_exprs.push(insert_count);
+                    update_sets.push(format!("{count_col} = {update_count}"));
+                }
 
                 update_sets.push(format!("{col} = {update_sum}"));
-                update_sets.push(format!("{count_col} = {update_count}"));
             }
             ColumnPlan::SumForced(name, idx) => {
-                let count_col_name = count_partial_column(name);
+                let count_col_name = plan.count_column_names[name].clone();
                 let count_col = quote_ident(&count_col_name);
                 let col = quote_ident(name);
                 let sum_expr = format!("${next}::text::numeric");
@@ -931,14 +971,17 @@ async fn upsert_group(
                 next += 2;
                 insert_cols.push(col.clone());
                 insert_exprs.push(sum_expr.clone());
-                insert_cols.push(count_col.clone());
-                insert_exprs.push(count_expr.clone());
+                if emitted_count_cols.insert(count_col_name.clone()) {
+                    insert_cols.push(count_col.clone());
+                    insert_exprs.push(count_expr.clone());
+                    update_sets.push(format!("{count_col} = {count_expr}"));
+                }
                 update_sets.push(format!("{col} = {sum_expr}"));
-                update_sets.push(format!("{count_col} = {count_expr}"));
             }
             ColumnPlan::AvgDelta(name, count_idx) => {
                 let accum = &group.field_accum[name];
-                let (sum_col_name, count_col_name) = avg_partial_columns(name);
+                let sum_col_name = avg_sum_column(name);
+                let count_col_name = plan.count_column_names[name].clone();
                 let sum_col = quote_ident(&sum_col_name);
                 let count_col = quote_ident(&count_col_name);
                 let avg_col = quote_ident(name);
@@ -976,17 +1019,20 @@ async fn upsert_group(
 
                 insert_cols.push(sum_col.clone());
                 insert_exprs.push(insert_sum);
-                insert_cols.push(count_col.clone());
-                insert_exprs.push(insert_count);
+                if emitted_count_cols.insert(count_col_name.clone()) {
+                    insert_cols.push(count_col.clone());
+                    insert_exprs.push(insert_count);
+                    update_sets.push(format!("{count_col} = {update_count}"));
+                }
                 insert_cols.push(avg_col.clone());
                 insert_exprs.push(insert_avg);
 
                 update_sets.push(format!("{sum_col} = {update_sum}"));
-                update_sets.push(format!("{count_col} = {update_count}"));
                 update_sets.push(format!("{avg_col} = {update_avg}"));
             }
             ColumnPlan::AvgForced(name, idx) => {
-                let (sum_col_name, count_col_name) = avg_partial_columns(name);
+                let sum_col_name = avg_sum_column(name);
+                let count_col_name = plan.count_column_names[name].clone();
                 let sum_col = quote_ident(&sum_col_name);
                 let count_col = quote_ident(&count_col_name);
                 let avg_col = quote_ident(name);
@@ -1002,12 +1048,14 @@ async fn upsert_group(
                 );
                 insert_cols.push(sum_col.clone());
                 insert_exprs.push(sum_expr.clone());
-                insert_cols.push(count_col.clone());
-                insert_exprs.push(count_expr.clone());
+                if emitted_count_cols.insert(count_col_name.clone()) {
+                    insert_cols.push(count_col.clone());
+                    insert_exprs.push(count_expr.clone());
+                    update_sets.push(format!("{count_col} = {count_expr}"));
+                }
                 insert_cols.push(avg_col.clone());
                 insert_exprs.push(avg_expr.clone());
                 update_sets.push(format!("{sum_col} = {sum_expr}"));
-                update_sets.push(format!("{count_col} = {count_expr}"));
                 update_sets.push(format!("{avg_col} = {avg_expr}"));
             }
             ColumnPlan::CountDelta(name, count_idx) => {
@@ -1198,7 +1246,10 @@ async fn apply_forced_groups_bulk(
     // this column need the null-safe (non-hashable) match operator; otherwise
     // plain `=` is equivalent and lets Postgres hash-join the keyset to the
     // source instead of nested-looping it (see [`keyset_match`], #59/#62).
-    let null_safe: Vec<bool> = arrays.iter().map(|a| a.iter().any(|v| v.is_none())).collect();
+    let null_safe: Vec<bool> = arrays
+        .iter()
+        .map(|a| a.iter().any(|v| v.is_none()))
+        .collect();
     let source_ident = quote_ident(&plan.source);
     let target_ident = quote_ident(target);
     let group_idents: Vec<String> = plan.group_by.iter().map(|c| quote_ident(c)).collect();
@@ -1231,27 +1282,37 @@ async fn apply_forced_groups_bulk(
     if !survivor_ords.is_empty() {
         let mut insert_cols: Vec<String> = group_idents.clone();
         let mut select_exprs: Vec<String> = group_idents.iter().map(|c| format!("s.{c}")).collect();
+        // Issue #48: same dedup as `upsert_group` — two fields sharing a
+        // hidden count column (`plan.count_column_names`) must only
+        // contribute that column/select-expression pair once, or this bulk
+        // `INSERT ... SELECT` ends up with the same column named twice.
+        let mut emitted_count_cols: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for field in &plan.fields {
             let col = quote_ident(&field.name);
             match field.kind {
                 AggFieldKind::Sum => {
                     let arg = agg_arg_sql(plan, &field.name);
-                    let count_col = quote_ident(&count_partial_column(&field.name));
                     insert_cols.push(col.clone());
                     select_exprs.push(format!("sum({arg})"));
-                    insert_cols.push(count_col);
-                    select_exprs.push(format!("count({arg})"));
+                    let count_col_name = plan.count_column_names[&field.name].clone();
+                    if emitted_count_cols.insert(count_col_name.clone()) {
+                        insert_cols.push(quote_ident(&count_col_name));
+                        select_exprs.push(format!("count({arg})"));
+                    }
                 }
                 AggFieldKind::Avg => {
                     let arg = agg_arg_sql(plan, &field.name);
-                    let (sum_col_name, count_col_name) = avg_partial_columns(&field.name);
+                    let sum_col_name = avg_sum_column(&field.name);
                     let sum_col = quote_ident(&sum_col_name);
-                    let count_col = quote_ident(&count_col_name);
                     insert_cols.push(sum_col);
                     select_exprs.push(format!("sum({arg})"));
-                    insert_cols.push(count_col);
-                    select_exprs.push(format!("count({arg})"));
+                    let count_col_name = plan.count_column_names[&field.name].clone();
+                    if emitted_count_cols.insert(count_col_name.clone()) {
+                        insert_cols.push(quote_ident(&count_col_name));
+                        select_exprs.push(format!("count({arg})"));
+                    }
                     insert_cols.push(col.clone());
                     select_exprs.push(format!(
                         "case when count({arg}) = 0 then null \

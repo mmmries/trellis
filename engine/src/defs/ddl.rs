@@ -391,7 +391,7 @@ fn is_avg_field(field: &FieldDef) -> bool {
 /// Whether `field` is a direct `SUM(...)` call — see [`is_avg_field`]'s doc
 /// comment for why this is checked structurally rather than via
 /// `invertibility::classify`. `SUM` needs its own hidden running-count
-/// partial (see [`count_partial_column`]) for the same reason `AVG` needs
+/// partial (see [`count_column_names`]) for the same reason `AVG` needs
 /// one: Postgres's `sum()` is `NULL`, not `0`, over zero non-null values, and
 /// without a count the delta model can't distinguish "no contributions left"
 /// from "contributions that net to zero" once a group's row count is no
@@ -400,26 +400,107 @@ fn is_sum_field(field: &FieldDef) -> bool {
     matches!(&field.expr, Expr::FunctionCall { name, .. } if name == "SUM")
 }
 
-/// The hidden running-count partial column name a `SUM`/`AVG` field
-/// maintains (issue #11's delta model): the count of non-null argument
-/// values contributing to the group, matching Postgres's own
-/// `count(<same argument>)` "skip NULLs" semantics. `pub(crate)` so
-/// `staging::apply_aggregate` binds against the exact same name this module
-/// creates, rather than re-deriving it.
-pub(crate) fn count_partial_column(field_name: &str) -> String {
-    format!("__{field_name}_count")
+/// The hidden running-sum partial column name an `AVG` field maintains
+/// (issue #11's delta model): the numerator `AVG`'s visible column is derived
+/// from (`avg = sum / count`). Always one per `AVG` field — unlike the
+/// running-count partial (see [`count_column_names`]'s doc comment on issue
+/// #48), two `AVG` fields' running sums can never be shared: even when two
+/// fields aggregate the exact same argument, their *sums* are only equal by
+/// construction for `SUM`-vs-`AVG` pairs that also share a count (an `AVG`
+/// field always needs its own sum regardless, since `SUM`'s visible column
+/// already *is* that shared sum for the `SUM` half — there is no second
+/// consumer to fold onto). `pub(crate)` so `staging::apply_aggregate` binds
+/// against the exact same name this module creates, rather than re-deriving
+/// it.
+pub(crate) fn avg_sum_column(field_name: &str) -> String {
+    format!("__{field_name}_sum")
 }
 
-/// The hidden partial column names an `AVG` field maintains: its running-sum
-/// partial (`__{field}_sum`, holding the numerator `AVG`'s visible column is
-/// derived from) and its running-count partial (shared naming scheme with
-/// [`count_partial_column`], the same denominator `SUM` also needs).
-/// `pub(crate)` for the same reason as [`count_partial_column`].
-pub(crate) fn avg_partial_columns(field_name: &str) -> (String, String) {
-    (
-        format!("__{field_name}_sum"),
-        count_partial_column(field_name),
+/// The `Expr` a `SUM`/`AVG` field aggregates over — `None` for any other
+/// field shape. [`count_column_names`] uses this to decide which fields'
+/// hidden count partials can share a column; `staging::apply_aggregate`'s
+/// `AggregateTargetPlan` runs the equivalent lookup against its own
+/// already-classified fields, over the same [`Expr`] equality, to derive
+/// matching names without a second implementation of this rule.
+fn count_needing_arg(field: &FieldDef) -> Option<&Expr> {
+    if !is_sum_field(field) && !is_avg_field(field) {
+        return None;
+    }
+    match &field.expr {
+        Expr::FunctionCall { args, .. } => args.first(),
+        _ => None,
+    }
+}
+
+/// Assigns every `SUM`/`AVG` field in `fields` (in declaration order) the
+/// name of the hidden running-count partial column it maintains (issue #11's
+/// delta model: the count of non-null argument values contributing to the
+/// group, matching Postgres's own `count(<same argument>)` "skip NULLs"
+/// semantics) — `pub(crate)` so `staging::apply_aggregate`'s
+/// `AggregateTargetPlan` derives the exact same names this module's DDL
+/// creates, rather than re-deriving them independently (a divergence there
+/// would mean the apply path writes to a column the DDL never created, or
+/// vice versa).
+///
+/// **Issue #48**: naively, every count-needing field got its own
+/// `__{field}_count` column, even when two fields aggregate the exact
+/// identical argument expression (e.g. `SUM(amount) AS total, AVG(amount) AS
+/// average` both aggregating the same `amount` column) and are therefore
+/// provably counting the exact same set of non-null-contributing rows. This
+/// function detects that case — via [`Expr`]'s derived structural
+/// `PartialEq` on [`count_needing_arg`]'s result — and has the later field's
+/// entry point at the earlier field's column name instead of minting a
+/// second, redundant one.
+///
+/// It deliberately does **not** merge count columns across fields whose
+/// arguments differ (e.g. the issue's own motivating example, `SUM(word_count)
+/// AS total_words, SUM(byte_size) AS total_bytes`) into one target-wide
+/// `__group_count`, even though the issue asked for exactly that: two
+/// different source columns can have different `NULL`s on the very same row,
+/// so their "count of non-null contributing rows" can genuinely diverge (a
+/// row with a `NULL` `word_count` but a real `byte_size` contributes to one
+/// count and not the other). Forcing them onto one shared column would
+/// silently corrupt whichever field's count that column doesn't actually
+/// track the moment their arguments' `NULL` patterns diverge — the delta
+/// model would compute the wrong "does this group still have any non-null
+/// contributor" answer for one of the two fields, producing a stale `0`/wrong
+/// number where Postgres would show `NULL`, or vice versa (see
+/// `staging::apply_aggregate`'s `sum_goes_null_not_zero_when_a_groups_remaining_rows_are_all_null`
+/// test for the exact failure shape this would reintroduce). Only fields
+/// that provably always agree — same argument expression — are ever merged.
+pub(crate) fn count_column_names(fields: &[FieldDef]) -> HashMap<String, String> {
+    count_column_names_from(
+        fields
+            .iter()
+            .filter_map(|f| count_needing_arg(f).map(|arg| (f.name.as_str(), arg))),
     )
+}
+
+/// The core of [`count_column_names`], generalized over any source of
+/// `(field_name, aggregated_arg)` pairs rather than a literal `&[FieldDef]` —
+/// `staging::apply_aggregate`'s `AggregateTargetPlan` has already classified
+/// its fields into [`super::ast::FieldDef`]-free `AggFieldPlan`s by the time
+/// it needs these names, so it builds its own `(name, arg)` pairs from that
+/// classification plus its `field_exprs` map and calls straight into this,
+/// rather than re-implementing the merge rule (see [`count_column_names`]'s
+/// doc comment on why that rule's correctness matters) a second time.
+pub(crate) fn count_column_names_from<'a>(
+    entries: impl Iterator<Item = (&'a str, &'a Expr)>,
+) -> HashMap<String, String> {
+    let mut by_arg: Vec<(&Expr, String)> = Vec::new();
+    let mut names = HashMap::new();
+    for (field_name, arg) in entries {
+        let name = match by_arg.iter().find(|(seen, _)| **seen == *arg) {
+            Some((_, existing)) => existing.clone(),
+            None => {
+                let fresh = format!("__{field_name}_count");
+                by_arg.push((arg, fresh.clone()));
+                fresh
+            }
+        };
+        names.insert(field_name.to_string(), name);
+    }
+    names
 }
 
 /// Creates an [`super::ast::KeySpace::Aggregate`] definition's neighbor
@@ -476,6 +557,15 @@ pub async fn create_aggregate_target_table(
         );
         sql.push_str(&format!("{} {}", quote_ident(column), pg_type));
     }
+    // Issue #48: fields aggregating the exact same argument (e.g. `SUM(amount)
+    // AS total, AVG(amount) AS average`) share one hidden running-count
+    // partial column rather than each minting its own — see
+    // `count_column_names`'s doc comment for why this dedup is scoped to
+    // "same argument expression" rather than "any count-needing field on this
+    // target", which would silently corrupt the delta model once two fields'
+    // arguments have different `NULL` patterns.
+    let count_cols = count_column_names(&def.fields);
+    let mut emitted_count_cols: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for field in &def.fields {
         if group_by.contains(&field.name) {
             continue;
@@ -489,19 +579,25 @@ pub async fn create_aggregate_target_table(
         sql.push_str(&format!(", {} {}", quote_ident(&field.name), pg_type));
 
         // AVG's hidden partials (see `is_avg_field`'s doc comment): the
-        // visible column above holds the derived `sum / count`, these two
-        // hold the state the delta model actually increments.
+        // visible column above holds the derived `sum / count`. The running
+        // sum is always this field's own; the running count may already have
+        // been declared by an earlier field sharing this exact argument.
         if is_avg_field(field) {
-            let (sum_col, count_col) = avg_partial_columns(&field.name);
+            let sum_col = avg_sum_column(&field.name);
             sql.push_str(&format!(", {} numeric", quote_ident(&sum_col)));
-            sql.push_str(&format!(", {} bigint", quote_ident(&count_col)));
+            let count_col = &count_cols[&field.name];
+            if emitted_count_cols.insert(count_col.as_str()) {
+                sql.push_str(&format!(", {} bigint", quote_ident(count_col)));
+            }
         } else if is_sum_field(field) {
             // SUM's hidden count partial (see `is_sum_field`'s doc comment):
             // the visible column above holds the running sum directly, but
             // this is needed to tell "sum of nothing" (NULL) from "sum that
             // happens to net to zero" (0).
-            let count_col = count_partial_column(&field.name);
-            sql.push_str(&format!(", {} bigint", quote_ident(&count_col)));
+            let count_col = &count_cols[&field.name];
+            if emitted_count_cols.insert(count_col.as_str()) {
+                sql.push_str(&format!(", {} bigint", quote_ident(count_col)));
+            }
         }
     }
     let pk_columns: Vec<String> = group_by.iter().map(|c| quote_ident(c)).collect();

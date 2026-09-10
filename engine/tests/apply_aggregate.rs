@@ -163,7 +163,7 @@ async fn drain_matches_the_oracle_for_aggregate_insert_update_delete_and_grain_m
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric)",
+            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full",
         )
         .await
         .expect("create source table");
@@ -367,7 +367,7 @@ async fn independent_aggregate_batches_deltas_commute_under_out_of_order_drain()
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric)",
+            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full",
         )
         .await
         .expect("create source table");
@@ -430,7 +430,7 @@ async fn an_aggregate_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); \
+            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full; \
              insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
         )
         .await
@@ -530,7 +530,7 @@ async fn a_definition_change_on_an_aggregate_only_source_trips_the_version_fence
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); \
+            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full; \
              insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
         )
         .await
@@ -605,7 +605,7 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_aggregate_
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); \
+            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full; \
              create table widgets (id integer primary key, cost numeric); \
              insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
         )
@@ -690,7 +690,7 @@ async fn two_overlapping_group_writers_serialize_via_ascending_lock_order_not_de
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); \
+            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full; \
              insert into order_items (id, order_id, amount) values (1, 10, 1.00), (2, 20, 1.00)",
         )
         .await
@@ -835,7 +835,7 @@ async fn image_less_recompute_trigger_still_probes_a_stale_sum_field() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); \
+            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full; \
              insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
         )
         .await
@@ -916,7 +916,7 @@ async fn sum_goes_null_not_zero_when_a_groups_remaining_rows_are_all_null() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); \
+            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full; \
              insert into order_items (id, order_id, amount) values (1, 10, 5.00), (2, 10, NULL)",
         )
         .await
@@ -982,6 +982,175 @@ async fn sum_goes_null_not_zero_when_a_groups_remaining_rows_are_all_null() {
         target["10"].0, None,
         "SUM must go NULL once the group's last non-null contributor is gone, \
          not the arithmetic-but-wrong coalesce(5.00, 0) + (0 - 5.00) = 0"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Shared count columns across SUM/AVG fields (issue #48)
+// ---------------------------------------------------------------------
+
+/// Two SUM fields over two DIFFERENT source columns. Unlike
+/// `ORDER_SUMMARY_SOURCE` (whose SUM and AVG already share `amount` and so
+/// exercise the shared-count-column path on the *happy* side), this fixture
+/// exercises the *safety boundary*: `total_words` and `total_bytes` must each
+/// keep their own hidden running-count partial, because `word_count` and
+/// `byte_size` can go NULL independently of each other on the same row.
+const POSTS_TOTALS_SOURCE: &str = "TRANSFORM posts_totals FROM posts_calc GROUP BY author \
+     SELECT author AS author, SUM(word_count) AS total_words, SUM(byte_size) AS total_bytes";
+
+async fn setup_posts_totals(db: &testkit::TestDatabase) -> engine::defs::ast::TransformDef {
+    let def = parse(POSTS_TOTALS_SOURCE).expect("parse posts_totals aggregate definition");
+    let source_columns = numeric_columns(&["id", "author", "word_count", "byte_size"]);
+    create_definition(&db.pool, POSTS_TOTALS_SOURCE, &source_columns)
+        .await
+        .expect("create posts_totals definition");
+    create_aggregate_target_table(&db.pool, &def, "public", &source_columns)
+        .await
+        .expect("create posts_totals target table");
+    def
+}
+
+/// Fetches `posts_totals`'s current rows, keyed by `author` text, as
+/// `(total_words, total_bytes)` text tuples.
+async fn read_posts_totals_target(
+    client: &Client,
+) -> HashMap<String, (Option<String>, Option<String>)> {
+    client
+        .query(
+            "select author::text, total_words::text, total_bytes::text from posts_totals",
+            &[],
+        )
+        .await
+        .expect("read posts_totals")
+        .into_iter()
+        .map(|row| {
+            let author: String = row.get(0);
+            (author, (row.get(1), row.get(2)))
+        })
+        .collect()
+}
+
+/// Runs the oracle's own `SELECT ... GROUP BY` against the live `posts_calc`
+/// table, in the same shape [`read_posts_totals_target`] returns.
+async fn read_posts_totals_oracle(
+    client: &Client,
+    def: &engine::defs::ast::TransformDef,
+) -> HashMap<String, (Option<String>, Option<String>)> {
+    let sql = engine::defs::render_aggregate_select_sql(def);
+    let sql = format!("select author::text, total_words::text, total_bytes::text from ({sql}) o");
+    client
+        .query(&sql, &[])
+        .await
+        .expect("run oracle sql")
+        .into_iter()
+        .map(|row| {
+            let author: String = row.get(0);
+            (author, (row.get(1), row.get(2)))
+        })
+        .collect()
+}
+
+/// Issue #48: `total_words` (`SUM(word_count)`) and `total_bytes`
+/// (`SUM(byte_size)`) must maintain *independent* hidden running counts, even
+/// though a naive fix for #48 would merge every SUM/AVG field in a target
+/// down to one shared `__group_count`. This seeds two rows per group whose
+/// NULL-ness is deliberately staggered across the two columns, then deletes
+/// the row that is each field's *only* non-null contributor — driving one
+/// field to `NULL` while the other must stay a real number. A shared/merged
+/// count column would corrupt at least one of the two outcomes.
+#[tokio::test]
+async fn aggregate_columns_over_different_arguments_maintain_independent_counts_through_insert_and_delete()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table posts_calc (
+                 id integer primary key, author integer, word_count numeric, byte_size numeric
+             ); \
+             alter table posts_calc replica identity full",
+        )
+        .await
+        .expect("create source table");
+
+    let def = setup_posts_totals(&db).await;
+
+    // Group 1 gets two rows: r1 contributes a non-null word_count but a NULL
+    // byte_size; r2 is the mirror image (NULL word_count, non-null
+    // byte_size). Each field's total is driven entirely by the other row.
+    client
+        .execute(
+            "insert into posts_calc (id, author, word_count, byte_size) values \
+             (1, 1, 100, NULL), (2, 1, NULL, 20)",
+            &[],
+        )
+        .await
+        .expect("seed live posts_calc rows");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "posts_calc",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"author":"1","word_count":"100","byte_size":null}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "posts_calc",
+        "2",
+        "insert",
+        None,
+        Some(r#"{"author":"1","word_count":null,"byte_size":"20"}"#),
+    )
+    .await;
+    let seg0 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg0, "worker").await;
+
+    let target = read_posts_totals_target(&client).await;
+    assert_eq!(
+        target["1"],
+        (Some("100".to_string()), Some("20".to_string())),
+        "seed: total_words from r1 only, total_bytes from r2 only"
+    );
+
+    // Delete r1 (word_count = 100, byte_size = NULL): it was total_words's
+    // *only* non-null contributor, so total_words must go NULL, but it made
+    // no contribution to total_bytes's count at all, so total_bytes (still
+    // backed by r2) must be completely unaffected.
+    client
+        .execute("delete from posts_calc where id = 1", &[])
+        .await
+        .expect("apply live end-state");
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "posts_calc",
+        "1",
+        "delete",
+        Some(r#"{"author":"1","word_count":"100","byte_size":null}"#),
+        None,
+    )
+    .await;
+    let seg1 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg1, "worker").await;
+
+    let target = read_posts_totals_target(&client).await;
+    let oracle = read_posts_totals_oracle(&client, &def).await;
+    assert_eq!(
+        target, oracle,
+        "must match the oracle even once the two fields' non-null contributors diverge"
+    );
+    assert_eq!(
+        target["1"],
+        (None, Some("20".to_string())),
+        "total_words must go NULL (its only non-null contributor, r1, is gone) while \
+         total_bytes must stay 20 (r2, its own non-null contributor, is untouched) — a \
+         shared/merged count column would corrupt one of these two independent outcomes"
     );
 }
 
@@ -1073,7 +1242,7 @@ async fn count_star_composes_with_avg_across_insert_update_delete_and_grain_migr
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric)",
+            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full",
         )
         .await
         .expect("create source table");
@@ -1242,7 +1411,7 @@ async fn count_star_image_less_recompute_trigger_probes_a_stale_count() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); \
+            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full; \
              insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
         )
         .await
@@ -1320,7 +1489,7 @@ async fn backfilling_many_groups_matches_the_oracle_without_per_group_source_sca
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric)",
+            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full",
         )
         .await
         .expect("create source table");
@@ -1466,7 +1635,7 @@ async fn backfilling_a_multi_column_group_by_matches_the_oracle() {
     client
         .batch_execute(
             "create table sales \
-             (id integer primary key, region text, order_id integer, amount numeric)",
+             (id integer primary key, region text, order_id integer, amount numeric); alter table sales replica identity full",
         )
         .await
         .expect("create source table");
@@ -1534,7 +1703,7 @@ async fn a_mixed_forced_and_delta_batch_matches_the_oracle() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric)",
+            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full",
         )
         .await
         .expect("create source table");
