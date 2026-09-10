@@ -417,6 +417,7 @@ async fn run(
         let maintenance_config = MaintenanceConfig {
             dsn: dsn.clone(),
             schema: config.schema().to_string(),
+            target_schema: config.target_schema().to_string(),
             pool: pool.clone(),
             publication: options.publication.clone(),
             base_source_tables: options.source_tables.clone(),
@@ -625,6 +626,11 @@ fn build_intake_config(
 struct MaintenanceConfig {
     dsn: String,
     schema: String,
+    /// Schema newly-discovered [`defs::all_source_tables`] entries qualify
+    /// against (issue #14's own connection/`LISTEN` setup still uses
+    /// `schema`, the Trellis catalog schema — source tables live under
+    /// `target_schema` instead, see [`Config::target_schema`]).
+    target_schema: String,
     pool: Pool,
     publication: String,
     base_source_tables: Vec<String>,
@@ -648,6 +654,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     let MaintenanceConfig {
         dsn,
         schema,
+        target_schema,
         pool,
         publication,
         base_source_tables,
@@ -689,7 +696,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 failed = reconcile_source_tables(
                     c,
                     &pool,
-                    &schema,
+                    &target_schema,
                     &publication,
                     &base_source_tables,
                     &wake_channel,
@@ -765,7 +772,7 @@ impl From<IntakeError> for ReconcileError {
 async fn reconcile_source_tables(
     client: &mut tokio_postgres::Client,
     pool: &Pool,
-    schema: &str,
+    source_schema: &str,
     publication: &str,
     base_source_tables: &[String],
     wake_channel: &str,
@@ -773,7 +780,7 @@ async fn reconcile_source_tables(
     let mut desired: std::collections::BTreeSet<String> =
         base_source_tables.iter().cloned().collect();
     for table in defs::all_source_tables(pool).await? {
-        desired.insert(intake::publication::qualify(schema, &table)?);
+        desired.insert(intake::publication::qualify(source_schema, &table)?);
     }
     let desired: Vec<String> = desired.into_iter().collect();
 
