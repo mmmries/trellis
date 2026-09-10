@@ -725,7 +725,17 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     let mut versions: HashMap<String, Option<i64>> = HashMap::new();
     let mut targets: HashMap<String, TargetPlan> = HashMap::new();
     let mut aggregate_targets: HashMap<String, AggregateTargetPlan> = HashMap::new();
-    let mut reverse_recomputes: Vec<(String, String, i32)> = Vec::new();
+    // Issue #79: deduped across *every* relationship (and every source_key)
+    // this whole `compute` call processes, not just within one relationship's
+    // `key_hops` — two distinct inbound relationships sharing the same
+    // `from_table` (e.g. `posts` and `comments` both pointing at `authors`)
+    // otherwise each independently queue a full reverse-recompute pass over
+    // every touched from-side key, doubling (or worse, with N relationships)
+    // the backlog for no benefit: only one recompute per from-side row is
+    // ever needed, at the highest hop_gen any contributing relationship
+    // required. Keyed by `(from_table, from_key)`; drained into the
+    // `Vec` shape `ApplyPlan` expects right before it's constructed below.
+    let mut reverse_recomputes: HashMap<(String, String), i32> = HashMap::new();
 
     for (source_key, changes) in by_source {
         let version = catalog::source_table_version(pool, source_key).await?;
@@ -884,7 +894,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             .await?;
             for (from_key, join_text) in matches {
                 let hop = key_hops.get(&join_text).copied().unwrap_or(0) + 1;
-                reverse_recomputes.push((rel.def.from_table.clone(), from_key, hop));
+                reverse_recomputes
+                    .entry((rel.def.from_table.clone(), from_key))
+                    .and_modify(|h| *h = (*h).max(hop))
+                    .or_insert(hop);
             }
         }
 
@@ -1134,6 +1147,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             .is_empty();
         downstream_readers.insert(target.clone(), has_downstream);
     }
+
+    let reverse_recomputes: Vec<(String, String, i32)> = reverse_recomputes
+        .into_iter()
+        .map(|((from_table, from_key), hop)| (from_table, from_key, hop))
+        .collect();
 
     Ok(ApplyPlan {
         versions,
