@@ -12,7 +12,7 @@ use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, Transform
 use engine::defs::qualified_target_table;
 use engine::{Config, Pool};
 use generative::backend::{Backend, ManualBackend};
-use generative::model::{NamePool, Op, Program, Table};
+use generative::model::{NamePool, Op, OpOutcome, Program, Table};
 use generative::oracle::{self, evaluator_oracle, sql_oracle, three_way};
 use testkit::TestCluster;
 
@@ -51,6 +51,7 @@ fn numeric_add_program() -> (Program, TransformDef, Table, String) {
                     (a.clone(), Some("10.00".to_string())),
                     (b.clone(), Some("1.50".to_string())),
                 ],
+                expect: OpOutcome::Succeeds,
             },
             Op::Insert {
                 table: source.name.clone(),
@@ -59,6 +60,7 @@ fn numeric_add_program() -> (Program, TransformDef, Table, String) {
                     (a.clone(), Some("20.00".to_string())),
                     (b.clone(), Some("2.00".to_string())),
                 ],
+                expect: OpOutcome::Succeeds,
             },
         ],
     };

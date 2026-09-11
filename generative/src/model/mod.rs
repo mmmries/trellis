@@ -55,6 +55,37 @@ impl Table {
     }
 }
 
+/// What a generator expects an op's `apply()` to actually do at the backend
+/// (design doc §4 "operation errors are checked, not swallowed"). Carried on
+/// the [`Op`] itself (not a parallel `Vec`) so it shrinks with the op and
+/// prints in a failing proptest counterexample.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OpOutcome {
+    /// The op is accepted and affects at least one row.
+    Succeeds,
+    /// The op is rejected outright — `apply()` returns `Err`.
+    Fails,
+    /// The op is accepted but affects zero rows (e.g. an update/delete
+    /// targeting a primary key that was never seeded).
+    AffectsNoRows,
+    /// Any of the listed outcomes is acceptable. Unused today — kept so the
+    /// classifier stays exhaustive-ready for future nondeterministic
+    /// (fault-injection) cases, where more than one real outcome is valid.
+    AnyOf(Vec<OpOutcome>),
+}
+
+impl OpOutcome {
+    /// Whether `actual` — a real, observed outcome, never itself `AnyOf` —
+    /// satisfies `self`. For every variant but `AnyOf` this is plain
+    /// equality; `AnyOf` is satisfied if any of its members is.
+    pub fn matches(&self, actual: &OpOutcome) -> bool {
+        match self {
+            OpOutcome::AnyOf(options) => options.iter().any(|option| option.matches(actual)),
+            _ => self == actual,
+        }
+    }
+}
+
 /// One source-table mutation. Values are the column's rendered *text* form
 /// (`None` is SQL `NULL`), not a typed value: the backend seam applies each
 /// op as raw source DML (design doc §1), where every bound parameter is
@@ -65,16 +96,31 @@ pub enum Op {
     Insert {
         table: String,
         row: Vec<(String, Option<String>)>,
+        expect: OpOutcome,
     },
     Update {
         table: String,
         pk: String,
         changes: Vec<(String, Option<String>)>,
+        expect: OpOutcome,
     },
     Delete {
         table: String,
         pk: String,
+        expect: OpOutcome,
     },
+}
+
+impl Op {
+    /// The outcome the generator expects this op's `apply()` to produce
+    /// (design doc §4). See [`OpOutcome`].
+    pub fn expect(&self) -> &OpOutcome {
+        match self {
+            Op::Insert { expect, .. } | Op::Update { expect, .. } | Op::Delete { expect, .. } => {
+                expect
+            }
+        }
+    }
 }
 
 /// A generated program: a schema, the transform definitions over it, and a
@@ -177,6 +223,7 @@ mod tests {
                     (table.pk_col.clone(), Some("1".to_string())),
                     ("c1".to_string(), Some("2".to_string())),
                 ],
+                expect: OpOutcome::Succeeds,
             }],
         };
         let printed = format!("{program:?}");

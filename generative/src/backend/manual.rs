@@ -333,9 +333,9 @@ impl super::Backend for ManualBackend {
         Ok(())
     }
 
-    async fn apply(&mut self, op: &Op) -> Result<(), ManualBackendError> {
-        match op {
-            Op::Insert { table, row } => {
+    async fn apply(&mut self, op: &Op) -> Result<u64, ManualBackendError> {
+        let affected = match op {
+            Op::Insert { table, row, .. } => {
                 let columns: Vec<&str> = row.iter().map(|(c, _)| c.as_str()).collect();
                 let assignments: Vec<Assignment> = row
                     .iter()
@@ -373,9 +373,11 @@ impl super::Backend for ManualBackend {
                     .iter()
                     .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
                     .collect();
-                self.raw.execute(&sql, &params).await?;
+                self.raw.execute(&sql, &params).await?
             }
-            Op::Update { table, pk, changes } => {
+            Op::Update {
+                table, pk, changes, ..
+            } => {
                 let pk_col = self
                     .tables
                     .get(table)
@@ -410,9 +412,9 @@ impl super::Backend for ManualBackend {
                     .iter()
                     .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
                     .collect();
-                self.raw.execute(&sql, &params).await?;
+                self.raw.execute(&sql, &params).await?
             }
-            Op::Delete { table, pk } => {
+            Op::Delete { table, pk, .. } => {
                 let pk_col = self
                     .tables
                     .get(table)
@@ -430,10 +432,10 @@ impl super::Backend for ManualBackend {
                     quote_ident(&pk_col),
                     pg_type_name(pk_type),
                 );
-                self.raw.execute(&sql, &[pk]).await?;
+                self.raw.execute(&sql, &[pk]).await?
             }
-        }
-        Ok(())
+        };
+        Ok(affected)
     }
 
     async fn quiesce(&mut self) -> Result<(), ManualBackendError> {

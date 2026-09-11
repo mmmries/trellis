@@ -256,6 +256,7 @@ fn pk_column_is_never_null_or_missing_across_many_generated_programs() {
             if let Op::Insert {
                 table: table_name,
                 row,
+                ..
             } = op
             {
                 let table = program

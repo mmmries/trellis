@@ -23,7 +23,7 @@ use engine::Pool;
 use engine::defs::ast::ValueType;
 
 use crate::backend::{Backend, Snapshot};
-use crate::model::Program;
+use crate::model::{OpOutcome, Program};
 use crate::oracle::{self, ThreeWayReport};
 
 /// Classifies whether a property run counted as evidence at all (design doc
@@ -118,6 +118,17 @@ pub enum RunError {
     Oracle(String),
     /// The materialized state disagreed with the oracle after some op.
     Diverged(Divergence),
+    /// An op's actual `apply()` outcome did not match what the generator
+    /// expected of it (design doc §4 "operation errors are checked, not
+    /// swallowed") — e.g. a `DuplicateInsert` the generator built to always
+    /// collide with a seeded pk instead succeeded, meaning the backend's
+    /// primary-key constraint (or the generator's own assumptions about it)
+    /// silently stopped holding.
+    UnexpectedOpOutcome {
+        op_index: usize,
+        expected: OpOutcome,
+        actual: OpOutcome,
+    },
 }
 
 /// Installs `program`, then applies each op and checks convergence after it.
@@ -144,8 +155,24 @@ pub async fn run_convergence<B: Backend>(
 
     for (op_index, op) in program.ops.iter().enumerate() {
         // A rejected op is a source no-op, not a skip: fall through to quiesce
-        // and compare anyway (design doc §4). We deliberately drop the error.
-        let _ = backend.apply(op).await;
+        // and compare anyway (design doc §4). The actual outcome (not just
+        // whether it errored) is classified and checked against what the
+        // generator expected of this exact op — closing the gap where an op
+        // that stopped erroring (or started affecting rows it shouldn't)
+        // would go unnoticed.
+        let actual = match backend.apply(op).await {
+            Err(_) => OpOutcome::Fails,
+            Ok(0) => OpOutcome::AffectsNoRows,
+            Ok(_) => OpOutcome::Succeeds,
+        };
+        let expected = op.expect();
+        if !expected.matches(&actual) {
+            return Err(RunError::UnexpectedOpOutcome {
+                op_index,
+                expected: expected.clone(),
+                actual,
+            });
+        }
 
         backend
             .quiesce()
