@@ -392,6 +392,78 @@ async fn install_definition_builds_a_bare_alias_of_a_sum_field_declared_before_i
     );
 }
 
+/// Several bare aliases of the same `SUM` field, declared out of order and
+/// on both sides of it (`grand_total`/`super_total` alias `total`, which
+/// itself is declared between them). Their *substituted* forms are all
+/// structurally identical (`SUM(amount)`), so `count_column_names_from`'s
+/// same-argument dedup (issue #48) must fold all three onto the one hidden
+/// running-count column `total` itself would get — exercising that the
+/// dedup, `ddl::create_aggregate_target_table`'s column creation, and
+/// `backfill_aggregate`'s writes all agree on *which* name that is,
+/// regardless of which of the three fields is first in declaration order.
+/// A group with an all-`NULL` argument additionally pins that the shared
+/// count still distinguishes "sum of nothing" (`NULL`) from "sum that nets
+/// to zero" for every alias, not just the field that directly wraps `SUM`.
+#[tokio::test]
+async fn install_definition_shares_one_count_column_across_several_aliases_of_a_sum_field() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table order_items \
+             (id bigint primary key, order_id bigint, amount numeric); \
+             alter table order_items replica identity full; \
+             insert into order_items (id, order_id, amount) values \
+             (1, 10, 5), (2, 10, 7), (3, 20, null)",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = columns(&[
+        ("order_id", ValueType::Numeric),
+        ("amount", ValueType::Numeric),
+    ]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM order_summary FROM order_items GROUP BY order_id \
+         SELECT order_id AS order_id, grand_total AS super_total, \
+         total AS grand_total, SUM(amount) AS total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition shares one count column across several SUM aliases");
+
+    let mut rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = client
+        .query(
+            "select order_id::text, total::text, grand_total::text, super_total::text \
+             from order_summary order by order_id",
+            &[],
+        )
+        .await
+        .expect("read order_summary")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "10".to_string(),
+                Some("12".to_string()),
+                Some("12".to_string()),
+                Some("12".to_string())
+            ),
+            ("20".to_string(), None, None, None),
+        ],
+        "every alias of `total` must equal `total` in every group, including NULL \
+         (sum of an all-NULL group), regardless of declaration order"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Unsupported/ring-fallback branch: a bare to-one relationship lookup
 // (no aggregate wrapper) — a shape `backfill_relationship_one_to_one`
