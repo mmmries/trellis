@@ -10,10 +10,11 @@ env:
 
 jobs:
   ci:
-    # Mirrors spiff-emu/peg: the org's Actions setup runs on the self-hosted
-    # runner label, not GitHub-hosted ubuntu-latest (whose token is not trusted
-    # to fetch org repo contents — checkout returned HTTP 403 there).
-    runs-on: spiff-ubuntu-4-16
+    # This repo moved from a private org with self-hosted runners (whose
+    # token trust required the spiff-ubuntu-4-16 label) to the public
+    # salesforce-misc org, which has no such self-hosted runner. Use the
+    # standard GitHub-hosted runner instead.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
