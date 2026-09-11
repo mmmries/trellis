@@ -370,7 +370,7 @@ fn node_count(expr: &Expr) -> usize {
 /// [`BackfillError::Unsupported`] (safe fallback to the ring). A field that
 /// only ever references real source columns, literals, and relationship paths
 /// is returned as a verbatim deep copy.
-fn substitute_all_fields(def: &TransformDef) -> Result<Vec<Expr>, BackfillError> {
+pub(crate) fn substitute_all_fields(def: &TransformDef) -> Result<Vec<Expr>, BackfillError> {
     let fields_by_name: HashMap<&str, &Expr> = def
         .fields
         .iter()
@@ -397,6 +397,31 @@ fn substitute_all_fields(def: &TransformDef) -> Result<Vec<Expr>, BackfillError>
             )
         })
         .collect()
+}
+
+/// [`substitute_all_fields`], reshaped into a by-field-name map. The Aggregate
+/// key-space's SQL-rendering call sites (`backfill_aggregate`,
+/// `staging::apply_aggregate::classify_fields`, `staging::apply`'s aggregate
+/// dispatch, and the test oracle's `oracle::render_aggregate_select_sql`) all
+/// need to look a field's self-contained expression up by name rather than
+/// walk `def.fields` positionally — this is the one substitution pass each of
+/// them shares (issue: a `GROUP BY` field like `total + total AS
+/// double_total` referencing another calculated field `total = SUM(amount)`
+/// previously rendered the raw, un-substituted `Expr::Column("total")` as a
+/// bare SQL identifier, which Postgres rejects since `total` is neither a
+/// source column nor a same-SELECT-list-visible name; the 1-1 key-space fixed
+/// the equivalent bug via this same [`substitute_all_fields`] call for issue
+/// #83, but the Aggregate key-space's call sites never adopted it).
+pub(crate) fn substituted_field_exprs(
+    def: &TransformDef,
+) -> Result<HashMap<String, Expr>, BackfillError> {
+    let substituted = substitute_all_fields(def)?;
+    Ok(def
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .zip(substituted)
+        .collect())
 }
 
 /// The 1-1 build: walk the source primary key in half-open `(lo, hi]` ranges,
@@ -621,6 +646,13 @@ async fn backfill_aggregate(
     group_by: &[String],
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<(), BackfillError> {
+    // Substitute any cross-field-alias reference (e.g. `double_total = total +
+    // total` where `total` is itself a field) with a deep copy of the
+    // referenced field's expression tree, so every field's expression is
+    // self-contained before `classify_field`/`render_expr_sql` see it — see
+    // [`substituted_field_exprs`]. A cyclic alias chain falls back to the ring.
+    let substituted = substituted_field_exprs(def)?;
+
     let source = quote_ident(&def.source);
     let target = qualified_target_table(target_schema, def);
     let group_idents: Vec<String> = group_by.iter().map(|c| quote_ident(c)).collect();
@@ -635,7 +667,27 @@ async fn backfill_aggregate(
     // concern #3) so a directly-built target is byte-identical to a ring-built
     // one. Group-key columns come first; every column is a stable target column
     // name, so it doubles as the staging table's column name.
-    let count_cols = ddl::count_column_names(&def.fields);
+    // Derived from the substituted view (not raw `def.fields`) so a field that
+    // only resolves to a bare `SUM`/`AVG` call *after* alias substitution
+    // (e.g. `total2 = total` where `total = SUM(amount)`) gets a count-column
+    // name consistent with `classify_field`'s own (also substituted)
+    // classification in the loop below — mirrors the same
+    // classify-then-derive-count-names pattern
+    // `staging::apply_aggregate::AggregateTargetPlan::new` already uses over
+    // its own substituted `field_exprs`, rather than re-deriving names from a
+    // raw-shape-only pass that a purely-aliased field would never match.
+    let count_cols = ddl::count_column_names_from(def.fields.iter().filter_map(|f| {
+        if group_by.contains(&f.name) {
+            return None;
+        }
+        let expr = &substituted[&f.name];
+        match (classify_field(expr), expr) {
+            (FieldKind::Sum | FieldKind::Avg, Expr::FunctionCall { args, .. }) => {
+                args.first().map(|arg| (f.name.as_str(), arg))
+            }
+            _ => None,
+        }
+    }));
     let mut insert_cols: Vec<String> = group_idents.clone();
     let mut stage_exprs: Vec<String> = group_idents.clone();
     // Issue #48: two fields (e.g. `SUM(amount)`/`AVG(amount)`) can share one
@@ -651,9 +703,10 @@ async fn backfill_aggregate(
             continue;
         }
         let col = quote_ident(&field.name);
-        match classify_field(&field.expr) {
+        let expr = &substituted[&field.name];
+        match classify_field(expr) {
             FieldKind::Sum => {
-                let arg = agg_arg_sql(&field.expr);
+                let arg = agg_arg_sql(expr);
                 insert_cols.push(col);
                 stage_exprs.push(format!("sum({arg})"));
                 let count_col_name = count_cols[&field.name].clone();
@@ -663,7 +716,7 @@ async fn backfill_aggregate(
                 }
             }
             FieldKind::Avg => {
-                let arg = agg_arg_sql(&field.expr);
+                let arg = agg_arg_sql(expr);
                 let sum_col = avg_sum_column(&field.name);
                 let count_col_name = count_cols[&field.name].clone();
                 insert_cols.push(quote_ident(&sum_col));
@@ -684,7 +737,7 @@ async fn backfill_aggregate(
             }
             FieldKind::RecomputeOnly => {
                 insert_cols.push(col);
-                stage_exprs.push(format!("({})", render_expr_sql(&field.expr)));
+                stage_exprs.push(format!("({})", render_expr_sql(expr)));
             }
         }
     }

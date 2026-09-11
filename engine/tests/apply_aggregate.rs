@@ -1990,3 +1990,164 @@ async fn drain_many_coalesces_two_sealed_segments_into_one_aggregate_apply_pass(
          coalescing, this group would never appear at all"
     );
 }
+
+// ---------------------------------------------------------------------
+// Cross-field-alias reference on a `GROUP BY` field (a calculated field
+// referencing another calculated field by name)
+// ---------------------------------------------------------------------
+
+const ORDER_ALIAS_SOURCE: &str = "TRANSFORM order_alias_totals FROM order_items GROUP BY order_id \
+     SELECT order_id AS order_id, SUM(amount) AS total, total + total AS double_total";
+
+async fn setup_order_alias_totals(db: &testkit::TestDatabase) -> engine::defs::ast::TransformDef {
+    let def = parse(ORDER_ALIAS_SOURCE).expect("parse order_alias_totals aggregate definition");
+    let source_columns = numeric_columns(&["id", "order_id", "amount"]);
+    create_definition(&db.pool, ORDER_ALIAS_SOURCE, &source_columns)
+        .await
+        .expect("create order_alias_totals definition");
+    create_aggregate_target_table(&db.pool, &def, "public", &source_columns)
+        .await
+        .expect("create order_alias_totals target table");
+    def
+}
+
+/// Fetches `order_alias_totals`'s current rows, keyed by `order_id` text, as
+/// `(total, double_total)` text tuples.
+async fn read_order_alias_totals_target(
+    client: &Client,
+) -> HashMap<String, (Option<String>, Option<String>)> {
+    client
+        .query(
+            "select order_id::text, total::text, double_total::text from order_alias_totals",
+            &[],
+        )
+        .await
+        .expect("read order_alias_totals")
+        .into_iter()
+        .map(|row| {
+            let order_id: String = row.get(0);
+            (order_id, (row.get(1), row.get(2)))
+        })
+        .collect()
+}
+
+/// Runs the oracle's own `SELECT ... GROUP BY` (via
+/// `render_aggregate_select_sql`) against the live `order_items` table, in
+/// the same shape [`read_order_alias_totals_target`] returns — exercising
+/// the fix's fourth call site (the oracle used to hit the identical
+/// "column does not exist" error this test's real target would, which is
+/// why it was never caught as a working point of comparison for this
+/// shape).
+async fn read_order_alias_totals_oracle(
+    client: &Client,
+    def: &engine::defs::ast::TransformDef,
+) -> HashMap<String, (Option<String>, Option<String>)> {
+    let sql = engine::defs::render_aggregate_select_sql(def);
+    let sql = format!("select order_id::text, total::text, double_total::text from ({sql}) o");
+    client
+        .query(&sql, &[])
+        .await
+        .expect("run oracle sql")
+        .into_iter()
+        .map(|row| {
+            let order_id: String = row.get(0);
+            (order_id, (row.get(1), row.get(2)))
+        })
+        .collect()
+}
+
+/// Regression test: a `GROUP BY` field that references another calculated
+/// field by name (`double_total = total + total`, where `total =
+/// SUM(amount)`) is valid per the validator (`validate_aggregate_field_expr`
+/// only rejects a *bare source column* outside an aggregate call) and the
+/// per-row evaluator (`eval::evaluate_aggregate` resolves it recursively via
+/// `fields_by_name`), but three SQL-rendering call sites
+/// (`apply_aggregate::classify_fields`, the `staging::apply` aggregate
+/// dispatch's `field_exprs`, and `oracle::render_aggregate_select_sql`) used
+/// to render `double_total`'s raw, un-substituted `Expr::Column("total")` as
+/// a bare SQL identifier — which Postgres rejects, since `total` names
+/// neither a source column nor a same-SELECT-list-visible name. This
+/// exercises the live incremental-apply path specifically (an INSERT
+/// followed by an UPDATE, both landing through the ordinary CDC/drain path,
+/// not the direct backfill), confirming `classify_fields`/
+/// `accumulate_changes`/the `RecomputeOnly` probe path (`probe_field_value`)
+/// all correctly resolve `double_total` against `total`'s current value.
+#[tokio::test]
+async fn drain_computes_an_aggregate_cross_field_alias_through_insert_and_update() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table order_items (id integer primary key, order_id integer, amount numeric); \
+             alter table order_items replica identity full",
+        )
+        .await
+        .expect("create source table");
+
+    let def = setup_order_alias_totals(&db).await;
+
+    // Seed group 10 via an ordinary insert batch: total = 5.00, double_total
+    // = 10.00.
+    client
+        .execute(
+            "insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
+            &[],
+        )
+        .await
+        .expect("seed live order_items row");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "order_items",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"order_id":"10","amount":"5.00"}"#),
+    )
+    .await;
+    let seg0 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg0, "worker").await;
+
+    let target = read_order_alias_totals_target(&client).await;
+    let oracle = read_order_alias_totals_oracle(&client, &def).await;
+    assert_eq!(target, oracle, "seed batch must already match the oracle");
+    assert_eq!(
+        target["10"],
+        (Some("5.00".to_string()), Some("10.00".to_string())),
+        "double_total must be 2 * total after the seed insert"
+    );
+
+    // Update the row's amount: total = 9.00, double_total must follow to
+    // 18.00, re-derived by the RecomputeOnly probe path (double_total is a
+    // composed expression, never incremented directly).
+    client
+        .execute("update order_items set amount = 9.00 where id = 1", &[])
+        .await
+        .expect("apply live update");
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "order_items",
+        "1",
+        "update",
+        Some(r#"{"order_id":"10","amount":"5.00"}"#),
+        Some(r#"{"order_id":"10","amount":"9.00"}"#),
+    )
+    .await;
+    let seg1 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg1, "worker").await;
+
+    let target = read_order_alias_totals_target(&client).await;
+    let oracle = read_order_alias_totals_oracle(&client, &def).await;
+    assert_eq!(
+        target, oracle,
+        "must match the oracle after the update that changes total"
+    );
+    assert_eq!(
+        target["10"],
+        (Some("9.00".to_string()), Some("18.00".to_string())),
+        "double_total must track 2 * total after the update"
+    );
+}

@@ -85,6 +85,16 @@ pub enum ApplyError {
     /// module's own convention of not trusting invariants it cannot enforce
     /// itself.
     Validate(ValidationError),
+    /// Substituting a `GROUP BY` definition's cross-field-alias references
+    /// (`defs::backfill::substituted_field_exprs`) failed — a cyclic alias
+    /// chain or a pathologically large expansion. Both are rejected by
+    /// [`crate::defs::validate::validate`] (a real cycle) or bounded at
+    /// definition-creation time (the direct backfill's node budget) before a
+    /// definition can ever reach live apply, so this should not be reachable
+    /// for a definition that already passed backfill at creation time — kept
+    /// as a typed error rather than a panic per this module's convention of
+    /// not trusting invariants it cannot enforce itself.
+    Backfill(crate::defs::backfill::BackfillError),
     /// A direct Postgres protocol/query error, for statements this module
     /// runs itself (the version fence, the per-target apply statement, the
     /// completion statement) rather than through another module's helper.
@@ -129,6 +139,9 @@ impl fmt::Display for ApplyError {
             ApplyError::Validate(err) => {
                 write!(f, "calculated-field type inference error: {err}")
             }
+            ApplyError::Backfill(err) => {
+                write!(f, "calculated-field alias substitution error: {err}")
+            }
             ApplyError::Db(err) => {
                 write!(f, "apply database error: ")?;
                 crate::error::write_pg_error(f, err)
@@ -165,6 +178,7 @@ impl std::error::Error for ApplyError {
             ApplyError::Ddl(err) => Some(err),
             ApplyError::Eval(err) => Some(err),
             ApplyError::Validate(err) => Some(err),
+            ApplyError::Backfill(err) => Some(err),
             ApplyError::Db(err) => Some(err),
             ApplyError::Pool(err) => Some(err),
             ApplyError::ClaimLost
@@ -202,6 +216,12 @@ impl From<EvalError> for ApplyError {
 impl From<ValidationError> for ApplyError {
     fn from(err: ValidationError) -> Self {
         ApplyError::Validate(err)
+    }
+}
+
+impl From<crate::defs::backfill::BackfillError> for ApplyError {
+    fn from(err: crate::defs::backfill::BackfillError) -> Self {
+        ApplyError::Backfill(err)
     }
 }
 
@@ -1049,14 +1069,22 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         .unwrap_or(ValueType::Numeric)
                 })
                 .collect();
-            let field_plans =
-                apply_aggregate::classify_fields(&def.def, group_by, &def.source_columns)?;
-            let field_exprs: HashMap<String, crate::defs::ast::Expr> = def
-                .def
-                .fields
-                .iter()
-                .filter(|f| !group_by.contains(&f.name))
-                .map(|f| (f.name.clone(), f.expr.clone()))
+            // Substitute cross-field-alias references (e.g. `double_total =
+            // total + total` where `total` is itself a field) once up front,
+            // so classification and the plan's rendered `field_exprs` share
+            // one substitution pass — see
+            // `defs::backfill::substituted_field_exprs`'s doc comment for why
+            // the raw, un-substituted `Expr` can't be rendered as SQL.
+            let substituted_exprs = crate::defs::backfill::substituted_field_exprs(&def.def)?;
+            let field_plans = apply_aggregate::classify_fields(
+                &def.def,
+                group_by,
+                &def.source_columns,
+                &substituted_exprs,
+            )?;
+            let field_exprs: HashMap<String, crate::defs::ast::Expr> = substituted_exprs
+                .into_iter()
+                .filter(|(name, _)| !group_by.contains(name))
                 .collect();
             let target_plan = aggregate_targets
                 .entry(def.def.target.clone())

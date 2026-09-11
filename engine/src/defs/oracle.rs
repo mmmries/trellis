@@ -222,13 +222,27 @@ fn group_key(image: &Row, group_by: &[String]) -> String {
 /// so no separate aggregate-rendering logic is needed; only the `GROUP BY`
 /// clause itself is new.
 ///
+/// Every field is first substituted (see
+/// [`super::backfill::substituted_field_exprs`]) so a `GROUP BY` field that
+/// references another calculated field by name (e.g. `double_total = total +
+/// total`) renders as a self-contained expression instead of a bare
+/// `Column("total")` — a same-SELECT-list alias Postgres does not resolve.
+///
 /// # Panics
 ///
-/// If `def.key_space` is not [`KeySpace::Aggregate`].
+/// If `def.key_space` is not [`KeySpace::Aggregate`], or if substitution
+/// fails (a cyclic alias chain, or a pathologically large expansion — see
+/// [`super::backfill::substituted_field_exprs`]'s doc comment). This helper
+/// is a test-only reference-SQL oracle (only ever called from `engine`'s and
+/// `benchmark`'s test/comparison code, never a production path), so it stays
+/// infallible and simply panics on either misuse rather than growing a
+/// `Result` that would ripple into every call site for no real benefit here.
 pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
     let KeySpace::Aggregate { group_by } = &def.key_space else {
         panic!("render_aggregate_select_sql called on a non-aggregate definition");
     };
+    let substituted = super::backfill::substituted_field_exprs(def)
+        .expect("aggregate oracle rendering requires a substitutable definition");
 
     let select_list: Vec<String> = def
         .fields
@@ -236,7 +250,7 @@ pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
         .map(|field| {
             format!(
                 "{} as {}",
-                render_expr_sql(&field.expr),
+                render_expr_sql(&substituted[&field.name]),
                 quote_ident(&field.name)
             )
         })

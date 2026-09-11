@@ -160,10 +160,21 @@ pub(super) struct AggFieldPlan {
 /// already skip) has nothing to classify and defaults to
 /// [`AggFieldKind::RecomputeOnly`] — the safe fallback the issue calls for
 /// ("everything else goes on the recompute path").
+///
+/// `field_exprs` is every field's *substituted* expression (see
+/// `defs::backfill::substituted_field_exprs`), keyed by field name, computed
+/// once by the caller and shared with the `field_exprs` map
+/// [`AggregateTargetPlan`] later renders from — classification must run
+/// against the same self-contained expression that rendering uses, not
+/// `field.expr` directly: a `GROUP BY` field may reference another
+/// calculated field by name (e.g. `double_total = total + total` where
+/// `total = SUM(amount)`), and only the substituted form exposes the
+/// underlying aggregate call shape this match inspects.
 pub(super) fn classify_fields(
     def: &TransformDef,
     group_by: &[String],
     source_columns: &HashMap<String, ValueType>,
+    field_exprs: &HashMap<String, Expr>,
 ) -> Result<Vec<AggFieldPlan>, ApplyError> {
     // GROUP BY aggregate fields never reference a relationship path (that's
     // OneToOne enrichment, issue #40), so inference uses an empty map.
@@ -177,7 +188,7 @@ pub(super) fn classify_fields(
             .get(&field.name)
             .copied()
             .unwrap_or(ValueType::Numeric);
-        let kind = match &field.expr {
+        let kind = match &field_exprs[&field.name] {
             Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
                 match invertibility::classify("COUNT", AggregateArg::Count(CountArg::Star)) {
                     Some(v) if v.is_invertible() => AggFieldKind::Count,

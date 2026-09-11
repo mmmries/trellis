@@ -522,6 +522,105 @@ async fn aggregate_recompute_matches_postgres_group_by_exactly() {
     }
 }
 
+/// A `GROUP BY` field referencing another calculated field by name
+/// (`double_total = total + total`, where `total = SUM(amount)`) — the
+/// Aggregate-key-space counterpart of issue #83's 1-1 cross-field-alias
+/// substitution fix, which was never extended to this oracle's rendering
+/// (`render_aggregate_select_sql` used to render `double_total`'s raw
+/// `Expr::Column("total")` as a bare SQL identifier, which Postgres rejects
+/// since `total` names neither a source column nor a same-SELECT-list-visible
+/// name — so this oracle never actually ran as working ground truth for this
+/// shape; both the real target and the oracle would have hit the identical
+/// "column does not exist" error). Confirms the oracle now renders valid SQL
+/// that agrees with the evaluator-driven [`recompute_aggregate`].
+#[tokio::test]
+async fn aggregate_recompute_matches_postgres_group_by_for_a_cross_field_alias() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+
+    client
+        .batch_execute(
+            "create table order_line_items (
+                 id integer primary key, order_id integer, amount numeric
+             );
+             insert into order_line_items (id, order_id, amount) values
+                 (1, 1, 10.00),
+                 (2, 2, -5.25),
+                 (3, 2, 10.00)",
+        )
+        .await
+        .expect("seed source table");
+
+    let def = TransformDef {
+        target: "order_alias_totals".to_string(),
+        source: "order_line_items".to_string(),
+        key_space: KeySpace::Aggregate {
+            group_by: vec!["order_id".to_string()],
+        },
+        fields: vec![
+            FieldDef {
+                name: "order_id".to_string(),
+                expr: Expr::Column("order_id".to_string()),
+            },
+            FieldDef {
+                name: "total".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![Expr::Column("amount".to_string())],
+                },
+            },
+            FieldDef {
+                name: "double_total".to_string(),
+                expr: Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(Expr::Column("total".to_string())),
+                    rhs: Box::new(Expr::Column("total".to_string())),
+                },
+            },
+        ],
+        predicate: Predicate::True,
+    };
+    let source_columns = HashMap::from([
+        ("order_id".to_string(), ValueType::Numeric),
+        ("amount".to_string(), ValueType::Numeric),
+    ]);
+
+    let oracle_result = recompute_aggregate(&db.pool, &def, &source_columns)
+        .await
+        .expect("oracle recompute_aggregate");
+
+    let base_sql = render_aggregate_select_sql(&def);
+    let sql = format!("select order_id::text, total::text, double_total::text from ({base_sql}) t");
+    let postgres_rows = client
+        .query(sql.as_str(), &[])
+        .await
+        .expect("query postgres");
+
+    assert_eq!(postgres_rows.len(), 2);
+    for row in postgres_rows {
+        let order_id: String = row.get(0);
+        let total: Option<String> = row.get(1);
+        let double_total: Option<String> = row.get(2);
+
+        // See the matching comment in
+        // `oracle_recompute_aggregate_equals_per_group_evaluation` — the
+        // oracle's `Recomputed` map is keyed by its internal length-prefixed
+        // grouping-key encoding, not the bare grouping-column text.
+        let expected = &oracle_result[&format!("{}:{order_id}", order_id.len())];
+        assert_eq!(
+            total,
+            expected["total"].as_ref().map(|v| v.to_string()),
+            "total mismatch for order_id {order_id}"
+        );
+        assert_eq!(
+            double_total,
+            expected["double_total"].as_ref().map(|v| v.to_string()),
+            "double_total mismatch for order_id {order_id}"
+        );
+    }
+}
+
 /// A to-one enrichment (`category.name`, issue #28) rendered as a `LEFT JOIN`
 /// (issue #32) must agree with the evaluator's resolution row-for-row over the
 /// same seeded data — a genuine oracle: the rendered SQL runs in Postgres and

@@ -250,6 +250,83 @@ async fn install_definition_fast_path_builds_a_plain_cross_field_alias_chain() {
 }
 
 // ---------------------------------------------------------------------
+// Fast-path success branch: an Aggregate (`GROUP BY`) definition whose
+// `GROUP BY` field references another calculated field's alias (the
+// Aggregate-key-space counterpart of the plain cross-field-alias test above
+// — `total + total AS double_total` where `total = SUM(amount)`). Before this
+// fix, `backfill_aggregate`'s `classify_field`/`render_expr_sql` rendered
+// `double_total`'s raw, un-substituted `Expr::Column("total")` as a bare SQL
+// identifier, which Postgres rejects (`total` names neither a source column
+// nor a same-SELECT-list-visible name) — the direct build now inlines the
+// alias first (`substituted_field_exprs`), same as the 1-1 path.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn install_definition_fast_path_builds_an_aggregate_cross_field_alias_chain() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table order_items \
+             (id bigint primary key, order_id bigint, amount numeric); \
+             alter table order_items replica identity full; \
+             insert into order_items (id, order_id, amount) values \
+             (1, 10, 5), (2, 10, 7), (3, 20, 3)",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = columns(&[
+        ("order_id", ValueType::Numeric),
+        ("amount", ValueType::Numeric),
+    ]);
+    // `double_total` references `total`, itself a calculated field
+    // (`SUM(amount)`). Substitution inlines it to `sum(amount) + sum(amount)`
+    // before any SQL is rendered.
+    install_definition(
+        &db.pool,
+        "TRANSFORM order_summary FROM order_items GROUP BY order_id \
+         SELECT order_id AS order_id, SUM(amount) AS total, \
+         total + total AS double_total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition builds the aggregate alias chain directly");
+
+    // The direct build populates the target synchronously and stages nothing
+    // in the ring — the fast-path signature (see the sibling fast-path tests).
+    let mut rows: Vec<(String, String, String)> = client
+        .query(
+            "select order_id::text, total::text, double_total::text \
+             from order_summary order by order_id",
+            &[],
+        )
+        .await
+        .expect("read order_summary")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("10".to_string(), "12".to_string(), "24".to_string()),
+            ("20".to_string(), "3".to_string(), "6".to_string()),
+        ],
+        "direct build computes the aggregate alias chain correctly for every group \
+         (double_total = 2 * sum(amount))"
+    );
+    assert_eq!(
+        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.order_items")).await,
+        0,
+        "fast path must not enumerate the source into the ring"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Unsupported/ring-fallback branch: a bare to-one relationship lookup
 // (no aggregate wrapper) — a shape `backfill_relationship_one_to_one`
 // explicitly rejects, since it only renders to-many aggregates.
