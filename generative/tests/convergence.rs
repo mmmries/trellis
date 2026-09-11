@@ -33,15 +33,40 @@ use testkit::TestCluster;
 
 /// One tokio runtime and one shared, initdb-once cluster for a test thread's
 /// proptest cases. See the module doc comment for why this is thread-local.
+///
+/// `coverage` (A2, `local_docs/generative-suite-improvement-plan.md`)
+/// accumulates every program `run_one` drives, pass or fail, so the property
+/// can report what it actually exercised instead of a single green/red bit —
+/// see [`Harness`]'s `Drop` impl below.
 struct Harness {
     runtime: tokio::runtime::Runtime,
     cluster: TestCluster,
+    coverage: std::cell::RefCell<generative::run::Coverage>,
+}
+
+impl Drop for Harness {
+    /// Prints the accumulated [`generative::run::Coverage`] when the test
+    /// thread exits. Print-only, deliberately: this runs during the shared
+    /// thread-local's teardown, which can itself be *during* an unwind if the
+    /// macro-generated proptest test is re-panicking with a shrunk failure —
+    /// asserting or panicking here risks a double panic, which aborts the
+    /// whole test process instead of cleanly failing one test. This is
+    /// human/CI-visible reporting only, never a pass/fail gate (the floor
+    /// assertions for that live in `tests/coverage.rs`, which never touches a
+    /// database).
+    fn drop(&mut self) {
+        eprintln!(
+            "generative: convergence run coverage:\n{}",
+            self.coverage.borrow()
+        );
+    }
 }
 
 thread_local! {
     static HARNESS: Harness = Harness {
         runtime: tokio::runtime::Runtime::new().expect("build tokio runtime"),
         cluster: TestCluster::start(),
+        coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
     };
 }
 
@@ -65,6 +90,10 @@ fn proptest_config() -> ProptestConfig {
 /// shrinks toward the smallest program and prints it.
 fn run_one(program: &generative::model::Program) -> Result<(), TestCaseError> {
     HARNESS.with(|h| {
+        // Recorded unconditionally, before the run: even a case that goes on
+        // to fail (and shrinks) is real evidence of what the generator drew.
+        h.coverage.borrow_mut().record_program(program);
+
         h.runtime.block_on(async {
             let db = h.cluster.create_isolated_database().await;
             let mut backend = ManualBackend::connect(db.dsn())

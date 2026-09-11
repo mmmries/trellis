@@ -16,6 +16,10 @@
 //! [`Backend`] trait and an [`engine::Pool`], so any backend and any source of
 //! programs can reuse it.
 
+mod coverage;
+
+pub use coverage::Coverage;
+
 use std::collections::HashMap;
 use std::fmt;
 
