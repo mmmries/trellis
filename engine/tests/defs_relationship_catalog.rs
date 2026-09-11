@@ -5,9 +5,10 @@
 use std::collections::HashMap;
 
 use engine::defs::{
-    CatalogError, EdgeKind, RelationshipCardinality, RelationshipDefinition, RelationshipWarning,
-    ValidationError, ValueType, create_definition, create_relationship, create_target_table,
-    edges_from, parse, relationship_by_name, source_primary_key,
+    CatalogError, EdgeKind, RelationshipCardinality, RelationshipDefinition,
+    RelationshipTypeMismatch, RelationshipWarning, ValidationError, ValueType, create_definition,
+    create_relationship, create_target_table, edges_from, parse, relationship_by_name,
+    source_primary_key,
 };
 use testkit::TestCluster;
 
@@ -326,12 +327,13 @@ async fn a_type_mismatch_between_endpoints_is_rejected() {
     .unwrap_err();
 
     match &err {
-        CatalogError::Validate(ValidationError::RelationshipTypeMismatch {
-            name,
-            from_table,
-            to_table,
-            ..
-        }) => {
+        CatalogError::Validate(ValidationError::RelationshipTypeMismatch(mismatch)) => {
+            let RelationshipTypeMismatch {
+                name,
+                from_table,
+                to_table,
+                ..
+            } = &**mismatch;
             assert_eq!(name, "product");
             assert_eq!(from_table, "order_line_items");
             assert_eq!(to_table, "products");

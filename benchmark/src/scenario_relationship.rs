@@ -149,6 +149,9 @@ pub async fn run(
 /// whose per-row correlated-subquery shape is meant for the small fixtures in
 /// `engine/tests` and doesn't scale to this benchmark's row counts) — an
 /// exact-value check over every author, not just a row count or a sample.
+/// Per-author `(word_sum, post_count, comment_count)`, keyed by author id.
+type AuthorTotals = HashMap<String, (Option<String>, Option<String>, Option<String>)>;
+
 async fn check_correctness(raw: &RawClient) -> bool {
     let oracle_sql = "select a.id::text, p.word_sum::text, coalesce(p.post_count, 0)::text, \
              coalesce(c.comment_count, 0)::text \
@@ -160,7 +163,7 @@ async fn check_correctness(raw: &RawClient) -> bool {
          left join ( \
              select author, count(id) as comment_count from comments group by author \
          ) c on c.author = a.id";
-    let oracle: HashMap<String, (Option<String>, Option<String>, Option<String>)> = raw
+    let oracle: AuthorTotals = raw
         .query(oracle_sql, &[])
         .await
         .expect("run relationship oracle query")
@@ -171,7 +174,7 @@ async fn check_correctness(raw: &RawClient) -> bool {
         })
         .collect();
 
-    let target: HashMap<String, (Option<String>, Option<String>, Option<String>)> = raw
+    let target: AuthorTotals = raw
         .query(
             "select id::text, word_sum::text, post_count::text, comment_count::text \
              from author_totals",

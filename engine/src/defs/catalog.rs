@@ -33,7 +33,9 @@ use super::model::{
     SchemaNode,
 };
 use super::parser::{parse, parse_relationship};
-use super::validate::{RelationshipWarning, ResolvedRelationship, ValidationError, validate};
+use super::validate::{
+    RelationshipTypeMismatch, RelationshipWarning, ResolvedRelationship, ValidationError, validate,
+};
 
 /// Why creating or reading a definition failed.
 #[derive(Debug)]
@@ -958,16 +960,18 @@ fn assert_comparable_types(
     if type_family(from_type) == type_family(to_type) {
         return Ok(());
     }
-    Err(ValidationError::RelationshipTypeMismatch {
-        name: def.name.clone(),
-        from_table: def.from_table.clone(),
-        from_col: def.from_col.clone(),
-        from_type: from_type.to_string(),
-        to_table: def.to_table.clone(),
-        to_col: def.to_col.clone(),
-        to_type: to_type.to_string(),
-    }
-    .into())
+    Err(
+        ValidationError::RelationshipTypeMismatch(Box::new(RelationshipTypeMismatch {
+            name: def.name.clone(),
+            from_table: def.from_table.clone(),
+            from_col: def.from_col.clone(),
+            from_type: from_type.to_string(),
+            to_table: def.to_table.clone(),
+            to_col: def.to_col.clone(),
+            to_type: to_type.to_string(),
+        }))
+        .into(),
+    )
 }
 
 /// [`RelationshipCardinality::ToOne`] iff `to_col` is the sole column of a

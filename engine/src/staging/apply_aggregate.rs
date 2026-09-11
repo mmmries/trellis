@@ -1562,8 +1562,8 @@ async fn probe_recompute_fields_bulk(
     for row in &rows {
         let ord: i64 = row.get(0);
         let i = (ord - 1) as usize;
-        for f_idx in 0..recompute_fields.len() {
-            result[f_idx][i] = row.get(f_idx + 1);
+        for (f_idx, field_row) in result.iter_mut().enumerate() {
+            field_row[i] = row.get(f_idx + 1);
         }
     }
     Ok(result)
@@ -1593,17 +1593,21 @@ async fn probe_recompute_fields_bulk(
 /// reference both the target row and the carrier columns at once — see
 /// [`apply_delta_groups_bulk`]'s doc comment on why only this half of the
 /// write can do that).
+/// `(carriers, insert_cols, insert_exprs, update_sets)` — see
+/// [`build_delta_carriers`]'s doc comment for what each element holds.
+type DeltaCarrierPlan = (
+    Vec<(String, String, CarrierArray)>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+);
+
 fn build_delta_carriers(
     plan: &AggregateTargetPlan,
     groups: &[(&String, &GroupPlan)],
     recompute_values: &[Vec<Option<String>>],
     target_ident: &str,
-) -> (
-    Vec<(String, String, CarrierArray)>,
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-) {
+) -> DeltaCarrierPlan {
     let mut carriers: Vec<(String, String, CarrierArray)> = Vec::new();
     let mut insert_cols: Vec<String> = Vec::new();
     let mut insert_exprs: Vec<String> = Vec::new();
