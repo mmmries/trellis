@@ -250,6 +250,223 @@ async fn install_definition_fast_path_builds_a_plain_cross_field_alias_chain() {
 }
 
 // ---------------------------------------------------------------------
+// Fast-path success branch: an Aggregate (`GROUP BY`) definition whose
+// `GROUP BY` field references another calculated field's alias (the
+// Aggregate-key-space counterpart of the plain cross-field-alias test above
+// — `total + total AS double_total` where `total = SUM(amount)`). Before this
+// fix, `backfill_aggregate`'s `classify_field`/`render_expr_sql` rendered
+// `double_total`'s raw, un-substituted `Expr::Column("total")` as a bare SQL
+// identifier, which Postgres rejects (`total` names neither a source column
+// nor a same-SELECT-list-visible name) — the direct build now inlines the
+// alias first (`substituted_field_exprs`), same as the 1-1 path.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn install_definition_fast_path_builds_an_aggregate_cross_field_alias_chain() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table order_items \
+             (id bigint primary key, order_id bigint, amount numeric); \
+             alter table order_items replica identity full; \
+             insert into order_items (id, order_id, amount) values \
+             (1, 10, 5), (2, 10, 7), (3, 20, 3)",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = columns(&[
+        ("order_id", ValueType::Numeric),
+        ("amount", ValueType::Numeric),
+    ]);
+    // `double_total` references `total`, itself a calculated field
+    // (`SUM(amount)`). Substitution inlines it to `sum(amount) + sum(amount)`
+    // before any SQL is rendered.
+    install_definition(
+        &db.pool,
+        "TRANSFORM order_summary FROM order_items GROUP BY order_id \
+         SELECT order_id AS order_id, SUM(amount) AS total, \
+         total + total AS double_total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition builds the aggregate alias chain directly");
+
+    // The direct build populates the target synchronously and stages nothing
+    // in the ring — the fast-path signature (see the sibling fast-path tests).
+    let mut rows: Vec<(String, String, String)> = client
+        .query(
+            "select order_id::text, total::text, double_total::text \
+             from order_summary order by order_id",
+            &[],
+        )
+        .await
+        .expect("read order_summary")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("10".to_string(), "12".to_string(), "24".to_string()),
+            ("20".to_string(), "3".to_string(), "6".to_string()),
+        ],
+        "direct build computes the aggregate alias chain correctly for every group \
+         (double_total = 2 * sum(amount))"
+    );
+    assert_eq!(
+        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.order_items")).await,
+        0,
+        "fast path must not enumerate the source into the ring"
+    );
+}
+
+/// A bare (not `BinaryOp`-wrapped) alias of a `SUM` field, declared *before*
+/// the field it aliases — `SELECT ..., total AS grand_total, SUM(amount) AS
+/// total`. Forward references are legal (the validator's cycle check and the
+/// evaluator's `fields_by_name` lookup are both declaration-order-agnostic),
+/// so `grand_total`'s classification (does it need a hidden running-count
+/// column, and under what name?) can only be answered from its *substituted*
+/// form (`SUM(amount)`), not its raw `Column("total")` shape. This pins the
+/// declaration-order-dependent regression the `double_total = total + total`
+/// case above doesn't cover: that shape is a `BinaryOp`, which never
+/// classifies as a bare `SUM`/`AVG` field either way, so it never exercised
+/// `ddl::create_aggregate_target_table`'s own (substitution-aware)
+/// `is_sum_field`/`count_column_names` classification — only a bare-alias
+/// field does.
+#[tokio::test]
+async fn install_definition_builds_a_bare_alias_of_a_sum_field_declared_before_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table order_items \
+             (id bigint primary key, order_id bigint, amount numeric); \
+             alter table order_items replica identity full; \
+             insert into order_items (id, order_id, amount) values \
+             (1, 10, 5), (2, 10, 7), (3, 20, 3)",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = columns(&[
+        ("order_id", ValueType::Numeric),
+        ("amount", ValueType::Numeric),
+    ]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM order_summary FROM order_items GROUP BY order_id \
+         SELECT order_id AS order_id, total AS grand_total, SUM(amount) AS total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition builds a bare alias of a SUM field declared before it");
+
+    let mut rows: Vec<(String, String, String)> = client
+        .query(
+            "select order_id::text, total::text, grand_total::text \
+             from order_summary order by order_id",
+            &[],
+        )
+        .await
+        .expect("read order_summary")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("10".to_string(), "12".to_string(), "12".to_string()),
+            ("20".to_string(), "3".to_string(), "3".to_string()),
+        ],
+        "grand_total must equal total in every group, regardless of declaration order"
+    );
+}
+
+/// Several bare aliases of the same `SUM` field, declared out of order and
+/// on both sides of it (`grand_total`/`super_total` alias `total`, which
+/// itself is declared between them). Their *substituted* forms are all
+/// structurally identical (`SUM(amount)`), so `count_column_names_from`'s
+/// same-argument dedup (issue #48) must fold all three onto the one hidden
+/// running-count column `total` itself would get — exercising that the
+/// dedup, `ddl::create_aggregate_target_table`'s column creation, and
+/// `backfill_aggregate`'s writes all agree on *which* name that is,
+/// regardless of which of the three fields is first in declaration order.
+/// A group with an all-`NULL` argument additionally pins that the shared
+/// count still distinguishes "sum of nothing" (`NULL`) from "sum that nets
+/// to zero" for every alias, not just the field that directly wraps `SUM`.
+#[tokio::test]
+async fn install_definition_shares_one_count_column_across_several_aliases_of_a_sum_field() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table order_items \
+             (id bigint primary key, order_id bigint, amount numeric); \
+             alter table order_items replica identity full; \
+             insert into order_items (id, order_id, amount) values \
+             (1, 10, 5), (2, 10, 7), (3, 20, null)",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = columns(&[
+        ("order_id", ValueType::Numeric),
+        ("amount", ValueType::Numeric),
+    ]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM order_summary FROM order_items GROUP BY order_id \
+         SELECT order_id AS order_id, grand_total AS super_total, \
+         total AS grand_total, SUM(amount) AS total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition shares one count column across several SUM aliases");
+
+    // (order_id, total, grand_total, super_total)
+    type Row = (String, Option<String>, Option<String>, Option<String>);
+    let mut rows: Vec<Row> = client
+        .query(
+            "select order_id::text, total::text, grand_total::text, super_total::text \
+             from order_summary order by order_id",
+            &[],
+        )
+        .await
+        .expect("read order_summary")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "10".to_string(),
+                Some("12".to_string()),
+                Some("12".to_string()),
+                Some("12".to_string())
+            ),
+            ("20".to_string(), None, None, None),
+        ],
+        "every alias of `total` must equal `total` in every group, including NULL \
+         (sum of an all-NULL group), regardless of declaration order"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Unsupported/ring-fallback branch: a bare to-one relationship lookup
 // (no aggregate wrapper) — a shape `backfill_relationship_one_to_one`
 // explicitly rejects, since it only renders to-many aggregates.

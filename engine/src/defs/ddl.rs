@@ -115,6 +115,18 @@ pub enum DdlError {
     /// arises on stored-data corruption or cross-version parser drift, but the
     /// catalog layer surfaces it rather than panicking.
     RelationshipReparse(super::error::ParseError),
+    /// Substituting an [`super::ast::KeySpace::Aggregate`] definition's
+    /// cross-field-alias references (see
+    /// [`super::backfill::substituted_field_exprs`]) failed — a cyclic alias
+    /// chain or a pathologically large expansion. A real cycle is already
+    /// rejected by [`super::validate::validate`] before DDL generation runs,
+    /// so this should not be reachable for a definition that reaches this
+    /// point; kept as a typed error rather than a panic, matching this
+    /// module's treatment of every other "should not happen" case above.
+    /// Boxed because [`super::backfill::BackfillError`] itself has a
+    /// [`super::backfill::BackfillError::Ddl`] variant holding a [`DdlError`]
+    /// — an unboxed cycle here would make both types infinite-sized.
+    AliasSubstitution(Box<super::backfill::BackfillError>),
     /// A direct Postgres protocol/query error.
     Db(tokio_postgres::Error),
     /// Acquiring a connection from the pool failed.
@@ -140,6 +152,11 @@ impl fmt::Display for DdlError {
                 "cannot generate target-table DDL: a referenced relationship's stored \
                  definition failed to re-parse: {err}"
             ),
+            DdlError::AliasSubstitution(err) => write!(
+                f,
+                "cannot generate target-table DDL: calculated-field alias substitution \
+                 error: {err}"
+            ),
             DdlError::Db(err) => {
                 write!(f, "target-table DDL database error: ")?;
                 crate::error::write_pg_error(f, err)
@@ -155,6 +172,7 @@ impl std::error::Error for DdlError {
             DdlError::NoPrimaryKey { .. } | DdlError::CompositePrimaryKeyUnsupported { .. } => None,
             DdlError::InvalidDefinition(err) => Some(err),
             DdlError::RelationshipReparse(err) => Some(err),
+            DdlError::AliasSubstitution(err) => Some(err),
             DdlError::Db(err) => Some(err),
             DdlError::Pool(err) => Some(err),
         }
@@ -176,6 +194,12 @@ impl From<crate::error::Error> for DdlError {
 impl From<ValidationError> for DdlError {
     fn from(err: ValidationError) -> Self {
         DdlError::InvalidDefinition(err)
+    }
+}
+
+impl From<super::backfill::BackfillError> for DdlError {
+    fn from(err: super::backfill::BackfillError) -> Self {
+        DdlError::AliasSubstitution(Box::new(err))
     }
 }
 
@@ -384,8 +408,15 @@ pub async fn create_target_table(
 /// `Text`/`Boolean`-argument `AVG` this gate would need to route to the
 /// recompute path instead — the name alone determines the answer for every
 /// definition this grammar can actually produce.
-fn is_avg_field(field: &FieldDef) -> bool {
-    matches!(&field.expr, Expr::FunctionCall { name, .. } if name == "AVG")
+///
+/// Takes the field's expression directly (rather than a [`FieldDef`]) so a
+/// caller can classify a *substituted* expression — see
+/// [`create_aggregate_target_table`]'s doc comment on why a bare
+/// cross-field-alias reference (`total2 = total` where `total = SUM(amount)`)
+/// must be classified against its self-contained, alias-resolved form rather
+/// than the raw `Expr::Column("total")` a naive per-field read would see.
+fn is_avg_field(expr: &Expr) -> bool {
+    matches!(expr, Expr::FunctionCall { name, .. } if name == "AVG")
 }
 
 /// Whether `field` is a direct `SUM(...)` call — see [`is_avg_field`]'s doc
@@ -396,8 +427,8 @@ fn is_avg_field(field: &FieldDef) -> bool {
 /// without a count the delta model can't distinguish "no contributions left"
 /// from "contributions that net to zero" once a group's row count is no
 /// longer directly observable from the running sum alone.
-fn is_sum_field(field: &FieldDef) -> bool {
-    matches!(&field.expr, Expr::FunctionCall { name, .. } if name == "SUM")
+fn is_sum_field(expr: &Expr) -> bool {
+    matches!(expr, Expr::FunctionCall { name, .. } if name == "SUM")
 }
 
 /// The hidden running-sum partial column name an `AVG` field maintains
@@ -422,11 +453,11 @@ pub(crate) fn avg_sum_column(field_name: &str) -> String {
 /// `AggregateTargetPlan` runs the equivalent lookup against its own
 /// already-classified fields, over the same [`Expr`] equality, to derive
 /// matching names without a second implementation of this rule.
-fn count_needing_arg(field: &FieldDef) -> Option<&Expr> {
-    if !is_sum_field(field) && !is_avg_field(field) {
+fn count_needing_arg(expr: &Expr) -> Option<&Expr> {
+    if !is_sum_field(expr) && !is_avg_field(expr) {
         return None;
     }
-    match &field.expr {
+    match expr {
         Expr::FunctionCall { args, .. } => args.first(),
         _ => None,
     }
@@ -468,11 +499,22 @@ fn count_needing_arg(field: &FieldDef) -> Option<&Expr> {
 /// `staging::apply_aggregate`'s `sum_goes_null_not_zero_when_a_groups_remaining_rows_are_all_null`
 /// test for the exact failure shape this would reintroduce). Only fields
 /// that provably always agree — same argument expression — are ever merged.
-pub(crate) fn count_column_names(fields: &[FieldDef]) -> HashMap<String, String> {
+/// `substituted` maps each field name to its cross-field-alias-resolved
+/// expression (see [`super::backfill::substituted_field_exprs`]) — classifying
+/// off the substituted view rather than each field's raw, possibly-aliasing
+/// `Expr` is what lets a field that only resolves to a bare `SUM`/`AVG` call
+/// *after* substitution (`total2 = total` where `total = SUM(amount)`) still
+/// get a hidden count-column name here, consistent with
+/// [`create_aggregate_target_table`]'s own (also substituted) classification
+/// of the very same field.
+pub(crate) fn count_column_names(
+    fields: &[FieldDef],
+    substituted: &HashMap<String, Expr>,
+) -> HashMap<String, String> {
     count_column_names_from(
-        fields
-            .iter()
-            .filter_map(|f| count_needing_arg(f).map(|arg| (f.name.as_str(), arg))),
+        fields.iter().filter_map(|f| {
+            count_needing_arg(&substituted[&f.name]).map(|arg| (f.name.as_str(), arg))
+        }),
     )
 }
 
@@ -536,6 +578,14 @@ pub async fn create_aggregate_target_table(
         panic!("create_aggregate_target_table called on a non-aggregate definition");
     };
 
+    // Substitute cross-field-alias references (e.g. `total2 = total` where
+    // `total = SUM(amount)`) before classifying any field as `SUM`/`AVG`
+    // below — `is_avg_field`/`is_sum_field`/`count_column_names` must agree
+    // with `backfill_aggregate`'s and `apply_aggregate::classify_fields`'s own
+    // (already substituted) classification of the same field, or the columns
+    // this DDL creates diverge from the columns those paths later write to.
+    let substituted = super::backfill::substituted_field_exprs(def)?;
+
     // A GROUP BY aggregate target never reads a relationship path (those are
     // OneToOne enrichment, issue #40), so it type-infers against an empty
     // relationship map.
@@ -564,7 +614,7 @@ pub async fn create_aggregate_target_table(
     // "same argument expression" rather than "any count-needing field on this
     // target", which would silently corrupt the delta model once two fields'
     // arguments have different `NULL` patterns.
-    let count_cols = count_column_names(&def.fields);
+    let count_cols = count_column_names(&def.fields, &substituted);
     let mut emitted_count_cols: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for field in &def.fields {
         if group_by.contains(&field.name) {
@@ -578,18 +628,19 @@ pub async fn create_aggregate_target_table(
         );
         sql.push_str(&format!(", {} {}", quote_ident(&field.name), pg_type));
 
+        let expr = &substituted[&field.name];
         // AVG's hidden partials (see `is_avg_field`'s doc comment): the
         // visible column above holds the derived `sum / count`. The running
         // sum is always this field's own; the running count may already have
         // been declared by an earlier field sharing this exact argument.
-        if is_avg_field(field) {
+        if is_avg_field(expr) {
             let sum_col = avg_sum_column(&field.name);
             sql.push_str(&format!(", {} numeric", quote_ident(&sum_col)));
             let count_col = &count_cols[&field.name];
             if emitted_count_cols.insert(count_col.as_str()) {
                 sql.push_str(&format!(", {} bigint", quote_ident(count_col)));
             }
-        } else if is_sum_field(field) {
+        } else if is_sum_field(expr) {
             // SUM's hidden count partial (see `is_sum_field`'s doc comment):
             // the visible column above holds the running sum directly, but
             // this is needed to tell "sum of nothing" (NULL) from "sum that
