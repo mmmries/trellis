@@ -65,7 +65,22 @@ impl Drop for Harness {
 thread_local! {
     static HARNESS: Harness = Harness {
         runtime: tokio::runtime::Runtime::new().expect("build tokio runtime"),
-        cluster: TestCluster::start(),
+        cluster: {
+            // Improvement-plan workstream C, task C2: opt-in per-call timing
+            // around cluster startup (`initdb` + `pg_ctl start`), the most
+            // expensive one-time cost the shared thread-local harness pays.
+            // Silent and free unless `GENERATIVE_COST_TIMING` is set, same
+            // convention as C1's `GENERATIVE_QUIESCE_TIMING` in
+            // `generative/src/backend/manual.rs` (see
+            // `local_docs/generative-suite-improvement-plan.md` "C2").
+            let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
+            let start = timing_enabled.then(std::time::Instant::now);
+            let cluster = TestCluster::start();
+            if let Some(start) = start {
+                eprintln!("COST_TIMING cluster_startup {}", start.elapsed().as_millis());
+            }
+            cluster
+        },
         coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
     };
 }
@@ -95,7 +110,15 @@ fn run_one(program: &generative::model::Program) -> Result<(), TestCaseError> {
         h.coverage.borrow_mut().record_program(program);
 
         h.runtime.block_on(async {
+            // C2: per-case isolated-database provisioning (schema, slot,
+            // publication) inside the shared cluster. See the cluster-startup
+            // timing above for the env-var convention.
+            let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
+            let start = timing_enabled.then(std::time::Instant::now);
             let db = h.cluster.create_isolated_database().await;
+            if let Some(start) = start {
+                eprintln!("COST_TIMING db_provision {}", start.elapsed().as_millis());
+            }
             let mut backend = ManualBackend::connect(db.dsn())
                 .await
                 .expect("connect manual backend");

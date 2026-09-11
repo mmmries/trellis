@@ -152,10 +152,23 @@ pub async fn run_convergence<B: Backend>(
     pool: &Pool,
     program: &Program,
 ) -> Result<Outcome, RunError> {
-    backend
-        .install(program)
-        .await
-        .map_err(|e| RunError::Install(format!("{e:?}")))?;
+    // Improvement-plan workstream C, task C2: opt-in per-call timing around
+    // each phase of the loop below, to find out where the suite's wall-clock
+    // time actually goes (install, apply, snapshot, oracle recompute) rather
+    // than guessing — see `local_docs/generative-suite-improvement-plan.md`
+    // "C2" and its companion §1.3's cautionary tale about tuning before
+    // instrumenting. Same convention as C1's `GENERATIVE_QUIESCE_TIMING` in
+    // `crate::backend::manual::ManualBackend::quiesce`: an independent env
+    // var (`GENERATIVE_COST_TIMING`), checked once per call site, silent and
+    // free unless set.
+    let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
+
+    let start = timing_enabled.then(std::time::Instant::now);
+    let install_result = backend.install(program).await;
+    if let Some(start) = start {
+        eprintln!("COST_TIMING install {}", start.elapsed().as_millis());
+    }
+    install_result.map_err(|e| RunError::Install(format!("{e:?}")))?;
 
     for (op_index, op) in program.ops.iter().enumerate() {
         // A rejected op is a source no-op, not a skip: fall through to quiesce
@@ -164,7 +177,12 @@ pub async fn run_convergence<B: Backend>(
         // generator expected of this exact op — closing the gap where an op
         // that stopped erroring (or started affecting rows it shouldn't)
         // would go unnoticed.
-        let actual = match backend.apply(op).await {
+        let start = timing_enabled.then(std::time::Instant::now);
+        let apply_result = backend.apply(op).await;
+        if let Some(start) = start {
+            eprintln!("COST_TIMING apply {}", start.elapsed().as_millis());
+        }
+        let actual = match apply_result {
             Err(_) => OpOutcome::Fails,
             Ok(0) => OpOutcome::AffectsNoRows,
             Ok(_) => OpOutcome::Succeeds,
@@ -182,15 +200,20 @@ pub async fn run_convergence<B: Backend>(
             .quiesce()
             .await
             .map_err(|e| RunError::Quiesce(format!("{e:?}")))?;
-        let snapshot = backend
-            .snapshot()
-            .await
-            .map_err(|e| RunError::Snapshot(format!("{e:?}")))?;
 
-        if let Some((def_target, report)) = check_program(pool, program, &snapshot)
-            .await
-            .map_err(RunError::Oracle)?
-        {
+        let start = timing_enabled.then(std::time::Instant::now);
+        let snapshot = backend.snapshot().await;
+        if let Some(start) = start {
+            eprintln!("COST_TIMING snapshot {}", start.elapsed().as_millis());
+        }
+        let snapshot = snapshot.map_err(|e| RunError::Snapshot(format!("{e:?}")))?;
+
+        let start = timing_enabled.then(std::time::Instant::now);
+        let checked = check_program(pool, program, &snapshot).await;
+        if let Some(start) = start {
+            eprintln!("COST_TIMING oracle {}", start.elapsed().as_millis());
+        }
+        if let Some((def_target, report)) = checked.map_err(RunError::Oracle)? {
             return Err(RunError::Diverged(Divergence {
                 op_index,
                 def_target,
