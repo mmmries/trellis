@@ -164,15 +164,7 @@ pub enum ValidationError {
     /// A relationship's `from_col`/`to_col` (issue #27, ADR-0006's "type-check
     /// the join") resolved to Postgres types that aren't comparable — e.g.
     /// joining a `text` column to a `uuid` column.
-    RelationshipTypeMismatch {
-        name: String,
-        from_table: String,
-        from_col: String,
-        from_type: String,
-        to_table: String,
-        to_col: String,
-        to_type: String,
-    },
+    RelationshipTypeMismatch(Box<RelationshipTypeMismatch>),
     /// A relationship name was already declared on the same `from_table`
     /// (issue #27, surfacing ADR-0006's "Naming and scope": unique
     /// per-from-table, not global) with an actionable message, ahead of the
@@ -212,6 +204,20 @@ pub enum ValidationError {
         to_table: String,
         to_col: String,
     },
+}
+
+/// Payload of [`ValidationError::RelationshipTypeMismatch`], boxed out of the
+/// enum so this variant's seven `String` fields don't inflate every error
+/// type that wraps [`ValidationError`] (clippy::result_large_err).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationshipTypeMismatch {
+    pub name: String,
+    pub from_table: String,
+    pub from_col: String,
+    pub from_type: String,
+    pub to_table: String,
+    pub to_col: String,
+    pub to_type: String,
 }
 
 impl fmt::Display for ValidationError {
@@ -314,19 +320,22 @@ impl fmt::Display for ValidationError {
                 f,
                 "relationship references '{table}.{column}', which does not exist"
             ),
-            ValidationError::RelationshipTypeMismatch {
-                name,
-                from_table,
-                from_col,
-                from_type,
-                to_table,
-                to_col,
-                to_type,
-            } => write!(
-                f,
-                "relationship '{name}' joins {from_table}.{from_col} ({from_type}) to \
-                 {to_table}.{to_col} ({to_type}), which are not comparable types"
-            ),
+            ValidationError::RelationshipTypeMismatch(mismatch) => {
+                let RelationshipTypeMismatch {
+                    name,
+                    from_table,
+                    from_col,
+                    from_type,
+                    to_table,
+                    to_col,
+                    to_type,
+                } = &**mismatch;
+                write!(
+                    f,
+                    "relationship '{name}' joins {from_table}.{from_col} ({from_type}) to \
+                     {to_table}.{to_col} ({to_type}), which are not comparable types"
+                )
+            }
             ValidationError::DuplicateRelationshipName { from_table, name } => write!(
                 f,
                 "relationship '{name}' is already declared on '{from_table}'; relationship \
@@ -866,7 +875,7 @@ fn infer_expr(
                     common_type = Some(arg_t);
                 }
             }
-            return Ok(common_type.unwrap());
+            Ok(common_type.unwrap())
         }
         Expr::FunctionCall { name, args } => {
             // The parser only ever builds a `FunctionCall` node for a name

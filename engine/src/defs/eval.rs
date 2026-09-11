@@ -388,6 +388,7 @@ fn collect_relationship_refs(expr: &Expr, out: &mut Vec<(String, String)>) {
 /// names currently being resolved on this recursion path — is a
 /// defense-in-depth guard against a cyclic definition that reaches here
 /// anyway (`evaluate` is `pub` and used standalone in tests/#25).
+#[allow(clippy::too_many_arguments)]
 fn eval_field(
     field: &FieldDef,
     row: &Row,

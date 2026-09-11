@@ -391,10 +391,10 @@ async fn build_relationship_context(
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut join_keys: Vec<String> = Vec::new();
         for row in rows.iter().flatten() {
-            if let Some(Some(text)) = row.get(&from_col) {
-                if seen.insert(text.as_str()) {
-                    join_keys.push(text.clone());
-                }
+            if let Some(Some(text)) = row.get(&from_col)
+                && seen.insert(text.as_str())
+            {
+                join_keys.push(text.clone());
             }
         }
 
