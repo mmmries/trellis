@@ -222,60 +222,145 @@ fn uses_relationships(def: &TransformDef) -> bool {
 /// (`backfill_definition` before `create_definition` → `validate`), so a
 /// cyclic definition does reach this code — falling back to the ring lets the
 /// validator then reject it, instead of overflowing the stack here.
+///
+/// `memo` caches each field's fully-substituted expression by field name. A
+/// field's substituted form depends only on the field (its own name scopes the
+/// self-passthrough carve-out) and `fields_by_name`, never on the reference
+/// site, so a field expanded once is reused (not re-expanded from its own
+/// definition) everywhere it is referenced. Without this, a field referenced
+/// from several places re-runs the full transitive expansion each time — a
+/// diamond DAG (`out_a = shared`, `out_b = shared`, `shared = <deep chain>`)
+/// pays for the deep chain once per referrer instead of once.
+///
+/// `budget` caps the number of expression nodes the substituted output may
+/// contain, across the whole definition, and is charged as nodes are produced
+/// (including the nodes a `memo` clone materializes). Memoization removes
+/// *redundant* work but cannot shrink an output that is inherently large: a
+/// pure doubling chain (`f0 = f1 + f1`, `f1 = f2 + f2`, … `fn = price + price`)
+/// expands to 2^n copies of `price`, and each memo hit still clones its whole
+/// cached subtree, so the substituted tree — and thus the work to build it — is
+/// genuinely exponential in `n`. Because `install_definition` runs this direct
+/// build *before* the validator, such a definition (which is valid DSL: no
+/// cycle, no unknown reference) would otherwise OOM/hang the install. Exceeding
+/// the budget yields [`BackfillError::Unsupported`], falling back to the ring —
+/// the same safe outcome the pre-inlining code gave by never attempting these
+/// shapes directly.
 fn substitute_field_aliases(
     expr: &Expr,
     self_name: &str,
     fields_by_name: &HashMap<&str, &Expr>,
     visiting: &mut HashSet<String>,
+    memo: &mut HashMap<String, Expr>,
+    budget: &mut usize,
 ) -> Result<Expr, BackfillError> {
     match expr {
         Expr::Column(name) => {
             if name != self_name
-                && let Some(other) = fields_by_name.get(name.as_str())
+                && let Some(other) = fields_by_name.get(name.as_str()).copied()
             {
+                if let Some(cached) = memo.get(name) {
+                    // A cached subtree can never exceed the budget it was itself
+                    // built under, so charging its full node count is bounded.
+                    charge_budget(budget, node_count(cached))?;
+                    return Ok(cached.clone());
+                }
                 if !visiting.insert(name.clone()) {
                     return Err(BackfillError::Unsupported(
                         "a cyclic calculated-field alias reference".to_string(),
                     ));
                 }
-                let substituted = substitute_field_aliases(other, name, fields_by_name, visiting)?;
+                let substituted =
+                    substitute_field_aliases(other, name, fields_by_name, visiting, memo, budget)?;
                 visiting.remove(name);
+                memo.insert(name.clone(), substituted.clone());
                 Ok(substituted)
             } else {
+                charge_budget(budget, 1)?;
                 Ok(Expr::Column(name.clone()))
             }
         }
-        Expr::NumberLiteral(text) => Ok(Expr::NumberLiteral(text.clone())),
-        Expr::StringLiteral(text) => Ok(Expr::StringLiteral(text.clone())),
-        Expr::RelationshipPath { rel, column } => Ok(Expr::RelationshipPath {
-            rel: rel.clone(),
-            column: column.clone(),
-        }),
-        Expr::BinaryOp { op, lhs, rhs } => Ok(Expr::BinaryOp {
-            op: *op,
-            lhs: Box::new(substitute_field_aliases(
-                lhs,
-                self_name,
-                fields_by_name,
-                visiting,
-            )?),
-            rhs: Box::new(substitute_field_aliases(
-                rhs,
-                self_name,
-                fields_by_name,
-                visiting,
-            )?),
-        }),
+        Expr::NumberLiteral(text) => {
+            charge_budget(budget, 1)?;
+            Ok(Expr::NumberLiteral(text.clone()))
+        }
+        Expr::StringLiteral(text) => {
+            charge_budget(budget, 1)?;
+            Ok(Expr::StringLiteral(text.clone()))
+        }
+        Expr::RelationshipPath { rel, column } => {
+            charge_budget(budget, 1)?;
+            Ok(Expr::RelationshipPath {
+                rel: rel.clone(),
+                column: column.clone(),
+            })
+        }
+        Expr::BinaryOp { op, lhs, rhs } => {
+            charge_budget(budget, 1)?;
+            Ok(Expr::BinaryOp {
+                op: *op,
+                lhs: Box::new(substitute_field_aliases(
+                    lhs,
+                    self_name,
+                    fields_by_name,
+                    visiting,
+                    memo,
+                    budget,
+                )?),
+                rhs: Box::new(substitute_field_aliases(
+                    rhs,
+                    self_name,
+                    fields_by_name,
+                    visiting,
+                    memo,
+                    budget,
+                )?),
+            })
+        }
         Expr::FunctionCall { name, args } => {
+            charge_budget(budget, 1)?;
             let args = args
                 .iter()
-                .map(|arg| substitute_field_aliases(arg, self_name, fields_by_name, visiting))
+                .map(|arg| {
+                    substitute_field_aliases(arg, self_name, fields_by_name, visiting, memo, budget)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Expr::FunctionCall {
                 name: name.clone(),
                 args,
             })
         }
+    }
+}
+
+/// Node budget for one definition's alias substitution — see
+/// [`substitute_field_aliases`]. Any realistic transform inlines a handful of
+/// nodes; this cap is orders of magnitude above that, so it only ever trips on
+/// a pathologically self-referential definition whose inlined form would
+/// explode (which then falls back to the ring rather than OOMing the install).
+const MAX_SUBSTITUTED_NODES: usize = 100_000;
+
+/// Charges `cost` nodes against the remaining `budget`, or returns
+/// [`BackfillError::Unsupported`] if the budget cannot cover it.
+fn charge_budget(budget: &mut usize, cost: usize) -> Result<(), BackfillError> {
+    match budget.checked_sub(cost) {
+        Some(remaining) => {
+            *budget = remaining;
+            Ok(())
+        }
+        None => Err(BackfillError::Unsupported(
+            "a calculated-field alias expansion larger than the direct build's size budget"
+                .to_string(),
+        )),
+    }
+}
+
+/// Total number of nodes in `expr`'s tree.
+fn node_count(expr: &Expr) -> usize {
+    match expr {
+        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => 1,
+        Expr::RelationshipPath { .. } => 1,
+        Expr::BinaryOp { lhs, rhs, .. } => 1 + node_count(lhs) + node_count(rhs),
+        Expr::FunctionCall { args, .. } => 1 + args.iter().map(node_count).sum::<usize>(),
     }
 }
 
@@ -291,11 +376,25 @@ fn substitute_all_fields(def: &TransformDef) -> Result<Vec<Expr>, BackfillError>
         .iter()
         .map(|f| (f.name.as_str(), &f.expr))
         .collect();
+    // One memo shared across every field: a field expanded while substituting
+    // an earlier field is reused (not re-expanded) when a later field references
+    // it too, keeping the whole pass linear in total substituted size.
+    let mut memo: HashMap<String, Expr> = HashMap::new();
+    // One node budget shared across every field, so a definition can't slip a
+    // huge expansion past the cap by splitting it over many fields.
+    let mut budget = MAX_SUBSTITUTED_NODES;
     def.fields
         .iter()
         .map(|f| {
             let mut visiting = HashSet::new();
-            substitute_field_aliases(&f.expr, &f.name, &fields_by_name, &mut visiting)
+            substitute_field_aliases(
+                &f.expr,
+                &f.name,
+                &fields_by_name,
+                &mut visiting,
+                &mut memo,
+                &mut budget,
+            )
         })
         .collect()
 }
@@ -1214,6 +1313,76 @@ mod tests {
             substitute_all_fields(&def),
             Err(BackfillError::Unsupported(_))
         ));
+    }
+
+    /// Evaluates a substituted arithmetic tree with every `price` leaf = 1, so
+    /// the result counts how many `price` copies the inlining produced — the
+    /// value a doubling chain `f_k = f_{k+1} + f_{k+1}` must compute.
+    fn eval_price_ones(expr: &Expr) -> f64 {
+        match expr {
+            Expr::Column(_) => 1.0,
+            Expr::NumberLiteral(text) => text.parse().unwrap(),
+            Expr::BinaryOp {
+                op: Operator::Add,
+                lhs,
+                rhs,
+            } => eval_price_ones(lhs) + eval_price_ones(rhs),
+            other => panic!("unexpected node in doubling-chain output: {other:?}"),
+        }
+    }
+
+    /// Builds a doubling chain `f0 = f1 + f1`, …, `f{levels-1} = f{levels} +
+    /// f{levels}`, `f{levels} = price + price`. Its fully-inlined form has
+    /// 2^(levels+1) `price` leaves, and each field is referenced twice — the
+    /// diamond/chain shape that re-expands catastrophically without care.
+    fn doubling_chain(levels: usize) -> TransformDef {
+        let mut fields = Vec::new();
+        for k in 0..levels {
+            let child = format!("f{}", k + 1);
+            fields.push(field(&format!("f{k}"), add(col(&child), col(&child))));
+        }
+        fields.push(field(
+            &format!("f{levels}"),
+            add(col("price"), col("price")),
+        ));
+        def_with(fields)
+    }
+
+    /// A moderately deep doubling chain (each field referenced twice) inlines
+    /// correctly and quickly: memoization keeps the pass bounded, and the
+    /// result is `2^(levels+1)` `price` copies (verified via `eval_price_ones`).
+    /// This is the shape that, un-memoized, re-expands each level twice.
+    #[test]
+    fn substitute_inlines_a_deep_diamond_chain_quickly() {
+        let levels = 12; // 2^13 = 8192 price leaves — comfortably under the cap.
+        let def = doubling_chain(levels);
+        let start = std::time::Instant::now();
+        let out = substitute_all_fields(&def).expect("under the node budget");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "deep diamond substitution should be bounded, took {elapsed:?}"
+        );
+        // f0 is the first field; its inlined value is 2^(levels+1) price copies.
+        assert_eq!(eval_price_ones(&out[0]), 2f64.powi(levels as i32 + 1));
+    }
+
+    /// A doubling chain deep enough that its inlined form would explode past the
+    /// node budget must fall back to the ring (`Unsupported`) instead of
+    /// OOMing/hanging — the budget is the real guard, since the substituted
+    /// output of a pure doubling chain is inherently exponential and no amount
+    /// of memoization can shrink it. Must return promptly, never blow up.
+    #[test]
+    fn substitute_bails_when_the_inlined_form_would_explode() {
+        let def = doubling_chain(40); // 2^41 leaves — far past MAX_SUBSTITUTED_NODES.
+        let start = std::time::Instant::now();
+        let result = substitute_all_fields(&def);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "budget must trip promptly, took {elapsed:?}"
+        );
+        assert!(matches!(result, Err(BackfillError::Unsupported(_))));
     }
 
     #[test]
