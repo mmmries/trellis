@@ -351,9 +351,10 @@ async fn install_definition_falls_back_to_ring_for_relationship_enriched_definit
         ("title", ValueType::Text),
     ]);
 
-    // The direct backfill path explicitly rejects any relationship-enriched
-    // 1-1 shape (`backfill::uses_relationships`); `install_definition` must
-    // catch `BackfillError::Unsupported` and fall back to the ring-based
+    // `uses_relationships` routes this to `backfill_relationship_one_to_one`,
+    // but a bare to-one lookup (`category.name`, no aggregate) is a shape
+    // `collect_agg_leaves` still rejects. `install_definition` must catch the
+    // resulting `BackfillError::Unsupported` and fall back to the ring-based
     // `create_definition`, having already created the target table itself
     // (a second `create_target_table` call in the fallback would have errored
     // on the already-existing relation, which never happens here).
