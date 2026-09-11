@@ -117,6 +117,16 @@ pub enum ValidationError {
     /// keeps that assumption enforced at validation, not a silent DDL-time
     /// skip.
     GroupingColumnFieldMustBePassthrough { field: String },
+    /// A [`KeySpace::OneToOne`] definition has a calculated field whose alias
+    /// matches the name of a real source column, but whose expression isn't a
+    /// bare passthrough of that same column. Without this guard, a *different*
+    /// field referencing that name would resolve it via `fields_by_name`
+    /// (issue #80's inter-field composition) and get the calculated value
+    /// instead of the real column, with the alias unconditionally — and
+    /// silently — shadowing the column. Mirrors
+    /// [`ValidationError::GroupingColumnFieldMustBePassthrough`]'s guard for
+    /// the `Aggregate` arm.
+    CalculatedFieldShadowsSourceColumn { field: String },
     /// A field's expression references a `<rel>.<column>` path whose `<rel>`
     /// is not a relationship declared on this definition's source table
     /// (ADR-0006: relationship names are scoped per from-table). Resolved by
@@ -291,6 +301,13 @@ impl fmt::Display for ValidationError {
                 "calculated field '{field}' shares its name with a GROUP BY column, so it must \
                  be a bare passthrough of that column (e.g. `{field}`), not another expression"
             ),
+            ValidationError::CalculatedFieldShadowsSourceColumn { field } => write!(
+                f,
+                "calculated field '{field}' shares its name with a source column, so it must \
+                 be a bare passthrough of that column (e.g. `{field}`), not another expression; \
+                 a different name avoids shadowing the real column for other fields that \
+                 reference it"
+            ),
             ValidationError::UnknownRelationship { field, rel } => write!(
                 f,
                 "calculated field '{field}' references relationship '{rel}', which is not \
@@ -430,7 +447,26 @@ pub fn validate(
     // `Aggregate` has real runtime checks (below), since — unlike the other
     // arm here — the AST can encode an invalid one.
     match &def.key_space {
-        KeySpace::OneToOne => {}
+        KeySpace::OneToOne => {
+            for field in &def.fields {
+                // A calculated field aliased to a real source column's name
+                // must be a bare passthrough of it (issue #80) — the same
+                // shape the `Aggregate` arm below enforces for grouping
+                // columns. `is_self_passthrough`'s exemption in `infer_expr`/
+                // `eval_expr` only covers a field referencing its *own* name;
+                // without this check here, a different, non-passthrough
+                // field could still claim the column's name, and any *third*
+                // field referencing that name would then silently resolve to
+                // the calculated value instead of the real column.
+                if source_columns.contains_key(&field.name)
+                    && !matches!(&field.expr, Expr::Column(name) if name == &field.name)
+                {
+                    return Err(ValidationError::CalculatedFieldShadowsSourceColumn {
+                        field: field.name.clone(),
+                    });
+                }
+            }
+        }
         KeySpace::Aggregate { group_by } => {
             for column in group_by {
                 if !source_columns.contains_key(column) {
@@ -1134,6 +1170,44 @@ mod tests {
             },
         ]);
         let source_columns = numeric_columns(&["c"]);
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+    }
+
+    #[test]
+    fn a_calc_field_named_after_a_real_column_must_be_a_bare_passthrough() {
+        // Issue #80's exact shape: `total_posted_words` is a calculated-field
+        // alias, but a real source column of the same name also exists. A
+        // third field (not exercised here, since this alone is already
+        // rejected) referencing that name would otherwise silently resolve
+        // to the alias instead of the real column via `fields_by_name`.
+        let d = def(vec![FieldDef {
+            name: "total_posted_words".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(col("word_count")),
+                rhs: Box::new(Expr::NumberLiteral("1".to_string())),
+            },
+        }]);
+        let source_columns = numeric_columns(&["word_count", "total_posted_words"]);
+        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::CalculatedFieldShadowsSourceColumn {
+                field: "total_posted_words".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_calc_field_bare_passthrough_of_a_same_named_column_is_still_allowed() {
+        // The self-passthrough idiom (issue #36) must remain legal: a field
+        // named after a real column, whose expression is exactly that
+        // column, is unambiguous and carries no shadowing risk.
+        let d = def(vec![FieldDef {
+            name: "price".to_string(),
+            expr: col("price"),
+        }]);
+        let source_columns = numeric_columns(&["price"]);
         assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
