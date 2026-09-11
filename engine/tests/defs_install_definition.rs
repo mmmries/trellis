@@ -436,7 +436,9 @@ async fn install_definition_shares_one_count_column_across_several_aliases_of_a_
     .await
     .expect("install_definition shares one count column across several SUM aliases");
 
-    let mut rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = client
+    // (order_id, total, grand_total, super_total)
+    type Row = (String, Option<String>, Option<String>, Option<String>);
+    let mut rows: Vec<Row> = client
         .query(
             "select order_id::text, total::text, grand_total::text, super_total::text \
              from order_summary order by order_id",
