@@ -183,6 +183,90 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
 }
 
 // ---------------------------------------------------------------------
+// Unsupported/ring-fallback branch: a plain 1-1 field that references
+// another calculated field's alias (issue #83 follow-up). Neither direct
+// renderer resolves an alias to the field that computes it — each renders
+// `Column(name)` as a bare source-column reference, which Postgres rejects
+// for a same-SELECT-list alias (`column "double_price" does not exist`).
+// Before the fix, `backfill_one_to_one` had no fallback at all for this
+// shape and `install_definition` surfaced the raw Postgres error as a hard
+// `CatalogError::DirectBackfill`; it must now fall back to the ring instead.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn install_definition_falls_back_to_ring_for_a_plain_cross_field_alias_reference() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, price numeric, tax numeric); \
+             insert into s (id, price, tax) values (1, 10, 1), (2, 20, 2), (3, 30, 3)",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = numeric(&["price", "tax"]);
+    // `total` references `double_price`, itself a calculated field
+    // (`price + price`) — not a real source column. Direct-build rendering
+    // would emit `select ..., (double_price + tax) as total ...`, which
+    // Postgres rejects since `double_price` isn't a real column of `s` and
+    // isn't visible as a prior SELECT-list alias either.
+    install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT price + price AS double_price, \
+         double_price + tax AS total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect(
+        "install_definition must fall back to the ring for a cross-field-alias \
+         reference, not surface a raw Postgres error",
+    );
+
+    // The ring fallback enumerates every existing source row into the active
+    // segment (the same signature `install_definition_falls_back_to_ring_for_\
+    // relationship_enriched_definition` below checks) and leaves the target
+    // empty until drained.
+    assert_eq!(
+        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.s")).await,
+        3,
+        "ring fallback enumerated every existing source row"
+    );
+    let empty: i64 = client
+        .query_one("select count(*) from t", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(empty, 0, "ring fallback does not build rows synchronously");
+
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let mut rows: Vec<(i64, String, String)> = client
+        .query(
+            "select id, double_price::text, total::text from t order by id",
+            &[],
+        )
+        .await
+        .expect("read t")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    rows.sort_by_key(|(id, ..)| *id);
+    assert_eq!(
+        rows,
+        vec![
+            (1, "20".to_string(), "21".to_string()),
+            (2, "40".to_string(), "42".to_string()),
+            (3, "60".to_string(), "63".to_string()),
+        ],
+        "ring-fallback build computes the alias chain correctly for every row"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Unsupported/ring-fallback branch: a bare to-one relationship lookup
 // (no aggregate wrapper) — a shape `backfill_relationship_one_to_one`
 // explicitly rejects, since it only renders to-many aggregates.
@@ -349,5 +433,114 @@ async fn install_definition_falls_back_to_ring_for_relationship_enriched_definit
         target_to_one(&client).await,
         oracle_to_one(&client).await,
         "after a live CDC insert following the fallback"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Unsupported/ring-fallback branch: a relationship-enriched 1-1 field that
+// references another (to-many-aggregate) field's alias (issue #83 — the
+// original report: `post_count + comment_count AS total`). `plan_rel_field`
+// must classify `total`'s expression as unsupported rather than handing it
+// to `render_rel_expr_sql`, which would render `Column("post_count")` as a
+// bare `"authors"."post_count"` reference — not a real column of `authors`.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn install_definition_falls_back_to_ring_for_a_relationship_cross_field_alias_reference() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table authors (id integer primary key, name text); \
+             create table posts (id integer primary key, author_id integer); \
+             create table comments (id integer primary key, author_id integer); \
+             alter table posts replica identity full; \
+             alter table comments replica identity full; \
+             insert into authors (id, name) values (1, 'a'), (2, 'b'); \
+             insert into posts (id, author_id) values (100, 1), (101, 1); \
+             insert into comments (id, author_id) values (200, 1), (201, 1), (202, 1)",
+        )
+        .await
+        .expect("create + seed tables");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP posts FROM authors.id TO posts.author_id",
+    )
+    .await
+    .expect("create posts relationship");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP comments FROM authors.id TO comments.author_id",
+    )
+    .await
+    .expect("create comments relationship");
+
+    let source_columns: HashMap<String, ValueType> =
+        columns(&[("id", ValueType::Numeric), ("name", ValueType::Text)]);
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM author_totals FROM authors SELECT \
+         COUNT(posts.id) AS post_count, \
+         COUNT(comments.id) AS comment_count, \
+         post_count + comment_count AS total",
+        &source_columns,
+        "public",
+    )
+    .await
+    .expect(
+        "install_definition must fall back to the ring for a relationship-enriched \
+         cross-field-alias reference, not crash",
+    );
+
+    // The ring fallback enumerated every existing author row — the same
+    // fallback signature the plain-path and to-one-relationship siblings
+    // check — and the target starts empty.
+    assert_eq!(
+        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.authors")).await,
+        2,
+        "ring fallback enumerated every existing source row"
+    );
+    let empty: i64 = client
+        .query_one("select count(*) from author_totals", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(empty, 0, "ring fallback does not build rows synchronously");
+
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let mut rows: Vec<(String, String, String, String)> = client
+        .query(
+            "select id::text, post_count::text, comment_count::text, total::text \
+             from author_totals order by id",
+            &[],
+        )
+        .await
+        .expect("read author_totals")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "1".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+                "5".to_string()
+            ),
+            (
+                "2".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "0".to_string()
+            ),
+        ],
+        "ring-fallback build computes the relationship alias chain correctly"
     );
 }

@@ -65,7 +65,7 @@
 //!    ring's row-at-a-time apply path (`staging::apply::apply_target`) must
 //!    chunk around.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::pool::{Client, Pool, quote_ident};
 
@@ -193,6 +193,53 @@ fn uses_relationships(def: &TransformDef) -> bool {
     def.fields.iter().any(|f| walk(&f.expr))
 }
 
+/// Whether `expr` — belonging to the field named `field_name` — contains a
+/// `Column(name)` that refers to *another* calculated field's alias (i.e.
+/// `name` names a different entry in `field_names`, the full set of `def`'s
+/// field names). A field reading a source column of its own name
+/// (`price AS price`) is the legitimate "self-passthrough" pattern the
+/// validator's `infer_expr` (see `validate.rs`) explicitly carves out as a
+/// real source-column reference, not a self-dependency — so `name ==
+/// field_name` is never flagged here, only a *different* field's name.
+///
+/// Neither direct-build renderer (`render_expr_sql` / `render_rel_expr_sql`)
+/// resolves an alias reference to the field that computes it — each renders
+/// `Column(name)` as a bare reference to a same-named *source* column
+/// (`quote_ident(name)` / `{source}.{name}`), which is exactly what Postgres
+/// rejects when `name` is actually another calculated field's SELECT-list
+/// alias (`select a+b as x, x+c as y` errors `column "x" does not exist`).
+/// Both direct-build paths call this before rendering, so such a field falls
+/// back to the ring instead of crashing (issue #83 follow-up).
+fn expr_references_other_field_alias(
+    expr: &Expr,
+    field_name: &str,
+    field_names: &HashSet<&str>,
+) -> bool {
+    match expr {
+        Expr::Column(name) => name != field_name && field_names.contains(name.as_str()),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => false,
+        Expr::RelationshipPath { .. } => false,
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            expr_references_other_field_alias(lhs, field_name, field_names)
+                || expr_references_other_field_alias(rhs, field_name, field_names)
+        }
+        Expr::FunctionCall { args, .. } => args
+            .iter()
+            .any(|arg| expr_references_other_field_alias(arg, field_name, field_names)),
+    }
+}
+
+/// Whether any field of `def` references another field's alias anywhere in
+/// its expression tree — see [`expr_references_other_field_alias`]. Builds
+/// the field-name set once, mirroring `oracle::referenced_source_columns`'s
+/// pattern.
+fn uses_cross_field_alias(def: &TransformDef) -> bool {
+    let field_names: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
+    def.fields
+        .iter()
+        .any(|f| expr_references_other_field_alias(&f.expr, &f.name, &field_names))
+}
+
 /// The 1-1 build: walk the source primary key in half-open `(lo, hi]` ranges,
 /// each `INSERT … SELECT … ON CONFLICT DO UPDATE`-ing one bounded chunk.
 ///
@@ -211,6 +258,19 @@ async fn backfill_one_to_one(
     target_schema: &str,
     pk: &PrimaryKeyColumn,
 ) -> Result<(), BackfillError> {
+    // A field referencing another calculated field's alias (e.g. `total =
+    // double_price + tax` where `double_price` is itself a field) can't be
+    // rendered by `render_expr_sql`, which renders every `Column(name)` as a
+    // bare source-column reference — Postgres rejects one SELECT-list alias
+    // referencing another in the same SELECT list. Bail before building any
+    // SQL so this shape falls back to the ring instead of surfacing a raw
+    // Postgres error as a hard `CatalogError::DirectBackfill`.
+    if uses_cross_field_alias(def) {
+        return Err(BackfillError::Unsupported(
+            "a field that references another calculated field's alias".to_string(),
+        ));
+    }
+
     let source = quote_ident(&def.source);
     let target = qualified_target_table(target_schema, def);
     let pk_ident = quote_ident(&pk.name);
@@ -665,18 +725,26 @@ fn expr_uses_relationship(expr: &Expr) -> bool {
     }
 }
 
-/// Classifies one field of a relationship-enriched 1-1 definition into a
-/// [`RelFieldPlan`], or `None` if the direct build can't render it correctly
-/// (so the caller falls back to the ring). The only relationship shape the
-/// direct build supports is a *top-level* aggregate whose sole argument is a
-/// relationship path — the to-many aggregate the evaluator and oracle both
-/// match structurally. A bare to-one path (`category.name`), or a relationship
-/// reference nested inside a larger expression (`SUM(rel.x) + 1`,
-/// `count(rel.a) > 0`), is left `None` and handled by the ring.
+/// Classifies one field (named `field_name`) of a relationship-enriched 1-1
+/// definition into a [`RelFieldPlan`], or `None` if the direct build can't
+/// render it correctly (so the caller falls back to the ring). The only
+/// relationship shape the direct build supports is a *top-level* aggregate
+/// whose sole argument is a relationship path — the to-many aggregate the
+/// evaluator and oracle both match structurally. A bare to-one path
+/// (`category.name`), a relationship reference nested inside a larger
+/// expression (`SUM(rel.x) + 1`, `count(rel.a) > 0`), or a non-relationship
+/// expression that references another field's alias (issue #83 follow-up —
+/// see [`expr_references_other_field_alias`]; `render_rel_expr_sql` renders
+/// `Column(name)` as a bare `{source}.{name}` reference, which Postgres
+/// rejects for a same-SELECT-list alias) is left `None` and handled by the
+/// ring. `field_names` is the full set of `def`'s field names, built once by
+/// the caller.
 fn plan_rel_field(
     expr: &Expr,
+    field_name: &str,
     source: &str,
     rel_defs: &HashMap<String, RelationshipDef>,
+    field_names: &HashSet<&str>,
 ) -> Option<RelFieldPlan> {
     if let Expr::FunctionCall { name, args } = expr
         && lookup_aggregate_function(name).is_some()
@@ -689,6 +757,9 @@ fn plan_rel_field(
         });
     }
     if expr_uses_relationship(expr) {
+        return None;
+    }
+    if expr_references_other_field_alias(expr, field_name, field_names) {
         return None;
     }
     Some(RelFieldPlan::Source(render_rel_expr_sql(
@@ -775,16 +846,20 @@ async fn backfill_relationship_one_to_one(
     }
 
     // Classify every field; bail to the ring on the first unsupported shape.
+    let field_names: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
     let plans: Vec<RelFieldPlan> = def
         .fields
         .iter()
         .map(|f| {
-            plan_rel_field(&f.expr, &def.source, &rel_defs).ok_or_else(|| {
-                BackfillError::Unsupported(
-                    "a relationship-enriched 1-1 field that isn't a top-level to-many aggregate"
-                        .to_string(),
-                )
-            })
+            plan_rel_field(&f.expr, &f.name, &def.source, &rel_defs, &field_names).ok_or_else(
+                || {
+                    BackfillError::Unsupported(
+                        "a relationship-enriched 1-1 field that isn't a top-level to-many \
+                         aggregate, or that references another calculated field's alias"
+                            .to_string(),
+                    )
+                },
+            )
         })
         .collect::<Result<_, _>>()?;
 
@@ -828,8 +903,14 @@ async fn backfill_relationship_one_to_one(
                 rel: field_rel,
                 agg,
                 column,
-            } = plan_rel_field(&field.expr, &def.source, &rel_defs)
-                .expect("fields already classified as supported")
+            } = plan_rel_field(
+                &field.expr,
+                &field.name,
+                &def.source,
+                &rel_defs,
+                &field_names,
+            )
+            .expect("fields already classified as supported")
                 && &field_rel == *rel
             {
                 agg_exprs.push(format!(
@@ -938,4 +1019,126 @@ async fn backfill_relationship_one_to_one(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::ast::{FieldDef, Operator, Predicate};
+    use super::*;
+
+    /// `total = double_price + tax`, where `double_price` is itself a
+    /// calculated field (`price + price`) — the shape that used to crash both
+    /// direct-build renderers with a raw Postgres "column does not exist"
+    /// error (issue #83 follow-up).
+    fn cross_alias_def() -> TransformDef {
+        TransformDef {
+            target: "order_totals".to_string(),
+            source: "orders".to_string(),
+            key_space: KeySpace::OneToOne,
+            fields: vec![
+                FieldDef {
+                    name: "double_price".to_string(),
+                    expr: Expr::BinaryOp {
+                        op: Operator::Add,
+                        lhs: Box::new(Expr::Column("price".to_string())),
+                        rhs: Box::new(Expr::Column("price".to_string())),
+                    },
+                },
+                FieldDef {
+                    name: "total".to_string(),
+                    expr: Expr::BinaryOp {
+                        op: Operator::Add,
+                        lhs: Box::new(Expr::Column("double_price".to_string())),
+                        rhs: Box::new(Expr::Column("tax".to_string())),
+                    },
+                },
+            ],
+            predicate: Predicate::True,
+        }
+    }
+
+    /// A field referencing a source column that happens to share its own
+    /// name (`price AS price`) — the legitimate self-passthrough pattern
+    /// `validate::infer_expr` explicitly carves out, which is *not* an alias
+    /// reference and must still take the direct-build path.
+    fn self_passthrough_def() -> TransformDef {
+        TransformDef {
+            target: "order_view".to_string(),
+            source: "orders".to_string(),
+            key_space: KeySpace::OneToOne,
+            fields: vec![FieldDef {
+                name: "price".to_string(),
+                expr: Expr::Column("price".to_string()),
+            }],
+            predicate: Predicate::True,
+        }
+    }
+
+    #[test]
+    fn uses_cross_field_alias_detects_a_field_referencing_another_fields_alias() {
+        assert!(uses_cross_field_alias(&cross_alias_def()));
+    }
+
+    #[test]
+    fn uses_cross_field_alias_allows_self_passthrough() {
+        assert!(!uses_cross_field_alias(&self_passthrough_def()));
+    }
+
+    #[test]
+    fn uses_cross_field_alias_allows_plain_definitions_with_no_field_name_collisions() {
+        let def = TransformDef {
+            target: "t".to_string(),
+            source: "s".to_string(),
+            key_space: KeySpace::OneToOne,
+            fields: vec![FieldDef {
+                name: "x".to_string(),
+                expr: Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(Expr::Column("a".to_string())),
+                    rhs: Box::new(Expr::Column("a".to_string())),
+                },
+            }],
+            predicate: Predicate::True,
+        };
+        assert!(!uses_cross_field_alias(&def));
+    }
+
+    /// `total = post_count + comment_count`, where both are to-many-aggregate
+    /// fields on a relationship-enriched 1-1 definition — the relationship
+    /// path's counterpart of `cross_alias_def`'s bug (issue #83 follow-up).
+    fn rel_field_names() -> HashSet<&'static str> {
+        HashSet::from(["post_count", "comment_count", "total"])
+    }
+
+    #[test]
+    fn plan_rel_field_falls_back_for_a_field_referencing_a_to_many_aggregate_fields_alias() {
+        let expr = Expr::BinaryOp {
+            op: Operator::Add,
+            lhs: Box::new(Expr::Column("post_count".to_string())),
+            rhs: Box::new(Expr::Column("comment_count".to_string())),
+        };
+        let plan = plan_rel_field(
+            &expr,
+            "total",
+            "authors",
+            &HashMap::new(),
+            &rel_field_names(),
+        );
+        assert!(
+            plan.is_none(),
+            "a field referencing another to-many-aggregate field's alias must not be classified \
+             as a plain Source expression"
+        );
+    }
+
+    #[test]
+    fn plan_rel_field_still_classifies_a_plain_source_field() {
+        let expr = Expr::Column("name".to_string());
+        let field_names: HashSet<&str> = HashSet::from(["name"]);
+        let plan = plan_rel_field(&expr, "name", "authors", &HashMap::new(), &field_names);
+        assert!(
+            matches!(plan, Some(RelFieldPlan::Source(_))),
+            "a plain source column reference (no alias collision) must still direct-build"
+        );
+    }
 }
