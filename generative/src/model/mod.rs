@@ -63,7 +63,15 @@ impl Table {
 pub enum OpOutcome {
     /// The op is accepted and affects at least one row.
     Succeeds,
-    /// The op is rejected outright — `apply()` returns `Err`.
+    /// The op is rejected outright — `apply()` returns `Err`. The
+    /// classifier that produces this (see `run::run_convergence`) does not
+    /// inspect *why* — any `Err` counts, not specifically the constraint
+    /// violation a generator like `DuplicateInsert` is built to trigger. An
+    /// op expecting `Fails` that instead errors for an unrelated reason
+    /// (e.g. a transient connection failure) would still "match"; an op
+    /// expecting `Succeeds`/`AffectsNoRows` that errors for any reason is
+    /// still caught. A `FailsWith(kind)` variant would close that gap; not
+    /// worth it until a generator actually needs to distinguish error kinds.
     Fails,
     /// The op is accepted but affects zero rows (e.g. an update/delete
     /// targeting a primary key that was never seeded).
