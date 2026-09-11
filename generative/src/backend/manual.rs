@@ -439,8 +439,25 @@ impl super::Backend for ManualBackend {
     }
 
     async fn quiesce(&mut self) -> Result<(), ManualBackendError> {
+        // Improvement-plan workstream C, task C1: opt-in per-call timing
+        // around the watermark -> converge round trip, to test the
+        // hypothesis (see `local_docs/generative-suite-improvement-plan.md`)
+        // that the convergence property's wall-clock variance is caused by
+        // the same ~10s seal age-gate stall suspected in
+        // `local_docs/transit-comparison.md` §3.3. Silent and free unless
+        // `GENERATIVE_QUIESCE_TIMING` is set: the env lookup happens once per
+        // call so the default (unset) path pays exactly one `var_os` check
+        // and no clock reads.
+        let timing_enabled = std::env::var_os("GENERATIVE_QUIESCE_TIMING").is_some();
+        let start = timing_enabled.then(std::time::Instant::now);
+
         let token = watermark_token(&self.raw).await?;
-        await_converged(&self.raw, token, QUIESCE_TIMEOUT).await?;
+        let result = await_converged(&self.raw, token, QUIESCE_TIMEOUT).await;
+
+        if let Some(start) = start {
+            eprintln!("QUIESCE_TIMING {}", start.elapsed().as_millis());
+        }
+        result?;
         Ok(())
     }
 
