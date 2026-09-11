@@ -51,9 +51,7 @@ use std::time::SystemTime;
 
 use crate::client::{Client, ClientError, ClientOptions};
 use crate::config::Config;
-use crate::defs::{
-    self, CatalogError, Definition, ParseError, RelationshipDefinition, ValueType,
-};
+use crate::defs::{self, CatalogError, Definition, ParseError, RelationshipDefinition, ValueType};
 use crate::pool::Pool;
 
 /// Options a client sets when it [`connect`](Trellis::connect)s.
@@ -356,22 +354,22 @@ impl Trellis {
     }
 }
 
-/// The distinct source tables across every registered definition, each
-/// qualified as `"schema.table"` for [`ClientOptions::source_tables`].
-/// `transform_definitions.source_table` is stored bare, so this resolves each
-/// one's schema off `information_schema`.
-async fn qualified_source_tables(pool: &Pool) -> Result<Vec<String>, TrellisError> {
+/// The full transitive closure of source tables reachable from every
+/// registered definition — each definition's direct anchor table plus every
+/// relationship `to_table` reachable from one (see
+/// [`defs::all_source_tables`]) — each qualified as `"schema.table"` for
+/// [`ClientOptions::source_tables`]. `all_source_tables` returns bare table
+/// names, so this resolves each one's schema off `information_schema`.
+///
+/// `pub` (rather than `pub(crate)`) only so `engine/tests/app.rs` can exercise
+/// it directly as `engine::app::qualified_source_tables`; not re-exported
+/// from the crate root, so it isn't part of [`Trellis`]'s public surface.
+pub async fn qualified_source_tables(pool: &Pool) -> Result<Vec<String>, TrellisError> {
     let client = pool.get().await?;
-    let rows = client
-        .query(
-            "select distinct source_table from transform_definitions",
-            &[],
-        )
-        .await?;
+    let tables = defs::all_source_tables(pool).await?;
 
-    let mut qualified = Vec::with_capacity(rows.len());
-    for row in rows {
-        let source_table: String = row.get(0);
+    let mut qualified = Vec::with_capacity(tables.len());
+    for source_table in tables {
         let schema_rows = client
             .query(
                 "select table_schema from information_schema.tables \

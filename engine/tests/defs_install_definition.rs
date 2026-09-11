@@ -183,6 +183,73 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
 }
 
 // ---------------------------------------------------------------------
+// Fast-path success branch: a plain 1-1 field that references another
+// calculated field's alias (issue #83 — `double_price + tax AS total` where
+// `double_price = price + price`). WI1 made this shape fall back to the ring
+// (safe, but slow); the direct build now inlines the alias chain
+// (`substitute_all_fields`) and builds it set-based, so the source is never
+// enumerated into the ring. (Supersedes WI1's ring-fallback assertion for
+// this shape — expected and correct.)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn install_definition_fast_path_builds_a_plain_cross_field_alias_chain() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, price numeric, tax numeric); \
+             insert into s (id, price, tax) values (1, 10, 1), (2, 20, 2), (3, 30, 3)",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = numeric(&["price", "tax"]);
+    // `total` references `double_price`, itself a calculated field
+    // (`price + price`). Substitution inlines it to `(price + price) + tax`,
+    // so the direct build renders self-contained source SQL.
+    install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT price + price AS double_price, \
+         double_price + tax AS total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition builds the alias chain directly");
+
+    // The direct build populates the target synchronously and stages nothing
+    // in the ring — the fast-path signature (see the sibling fast-path test).
+    let mut rows: Vec<(i64, String, String)> = client
+        .query(
+            "select id, double_price::text, total::text from t order by id",
+            &[],
+        )
+        .await
+        .expect("read t")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    rows.sort_by_key(|(id, ..)| *id);
+    assert_eq!(
+        rows,
+        vec![
+            (1, "20".to_string(), "21".to_string()),
+            (2, "40".to_string(), "42".to_string()),
+            (3, "60".to_string(), "63".to_string()),
+        ],
+        "direct build computes the alias chain correctly for every row"
+    );
+    assert_eq!(
+        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.s")).await,
+        0,
+        "fast path must not enumerate the source into the ring"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Unsupported/ring-fallback branch: a bare to-one relationship lookup
 // (no aggregate wrapper) — a shape `backfill_relationship_one_to_one`
 // explicitly rejects, since it only renders to-many aggregates.
@@ -284,9 +351,10 @@ async fn install_definition_falls_back_to_ring_for_relationship_enriched_definit
         ("title", ValueType::Text),
     ]);
 
-    // The direct backfill path explicitly rejects any relationship-enriched
-    // 1-1 shape (`backfill::uses_relationships`); `install_definition` must
-    // catch `BackfillError::Unsupported` and fall back to the ring-based
+    // `uses_relationships` routes this to `backfill_relationship_one_to_one`,
+    // but a bare to-one lookup (`category.name`, no aggregate) is a shape
+    // `collect_agg_leaves` still rejects. `install_definition` must catch the
+    // resulting `BackfillError::Unsupported` and fall back to the ring-based
     // `create_definition`, having already created the target table itself
     // (a second `create_target_table` call in the fallback would have errored
     // on the already-existing relation, which never happens here).
@@ -349,5 +417,272 @@ async fn install_definition_falls_back_to_ring_for_relationship_enriched_definit
         target_to_one(&client).await,
         oracle_to_one(&client).await,
         "after a live CDC insert following the fallback"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Fast-path success branch: a relationship-enriched 1-1 field that references
+// other (to-many-aggregate) fields' aliases (issue #83 — the original
+// report: `count(posts.id), count(comments.id), post_count + comment_count
+// AS total`, which used to HARD-CRASH). Substitution inlines `total` to
+// `count(posts.id) + count(comments.id)`; the two shared `count` leaves are
+// deduped into one staged column each, and the whole tree renders against
+// them — so the definition builds directly, no ring enumeration.
+// (Supersedes WI1's ring-fallback assertion for this shape.)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn install_definition_fast_path_builds_a_relationship_cross_field_alias_chain() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table authors (id integer primary key, name text); \
+             create table posts (id integer primary key, author_id integer); \
+             create table comments (id integer primary key, author_id integer); \
+             alter table posts replica identity full; \
+             alter table comments replica identity full; \
+             insert into authors (id, name) values (1, 'a'), (2, 'b'); \
+             insert into posts (id, author_id) values (100, 1), (101, 1); \
+             insert into comments (id, author_id) values (200, 1), (201, 1), (202, 1)",
+        )
+        .await
+        .expect("create + seed tables");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP posts FROM authors.id TO posts.author_id",
+    )
+    .await
+    .expect("create posts relationship");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP comments FROM authors.id TO comments.author_id",
+    )
+    .await
+    .expect("create comments relationship");
+
+    let source_columns: HashMap<String, ValueType> =
+        columns(&[("id", ValueType::Numeric), ("name", ValueType::Text)]);
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM author_totals FROM authors SELECT \
+         COUNT(posts.id) AS post_count, \
+         COUNT(comments.id) AS comment_count, \
+         post_count + comment_count AS total",
+        &source_columns,
+        "public",
+    )
+    .await
+    .expect("install_definition builds the relationship alias chain directly");
+
+    // Direct build: target populated synchronously, nothing staged in the ring.
+    let mut rows: Vec<(String, String, String, String)> = client
+        .query(
+            "select id::text, post_count::text, comment_count::text, total::text \
+             from author_totals order by id",
+            &[],
+        )
+        .await
+        .expect("read author_totals")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "1".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+                "5".to_string()
+            ),
+            (
+                "2".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "0".to_string()
+            ),
+        ],
+        "direct build computes the relationship alias chain correctly"
+    );
+    assert_eq!(
+        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.authors")).await,
+        0,
+        "fast path must not enumerate the source into the ring"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Fast-path success branch: a coalesce-wrapped to-many aggregate
+// (`coalesce(sum(posts.word_count), 0)`, issue #83) — the normal way to write
+// a nullable aggregate. The aggregate leaf nested inside `coalesce` is now
+// recognized, staged, and rendered as `coalesce(<staged-ref>, 0)`, so the
+// definition builds directly instead of falling back to the ring.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn install_definition_fast_path_builds_a_coalesce_wrapped_aggregate() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table authors (id integer primary key, name text); \
+             create table posts (id integer primary key, author_id integer, word_count integer); \
+             alter table posts replica identity full; \
+             insert into authors (id, name) values (1, 'a'), (2, 'b'); \
+             insert into posts (id, author_id, word_count) values \
+             (100, 1, 10), (101, 1, 20)",
+        )
+        .await
+        .expect("create + seed tables");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP posts FROM authors.id TO posts.author_id",
+    )
+    .await
+    .expect("create posts relationship");
+
+    let source_columns: HashMap<String, ValueType> =
+        columns(&[("id", ValueType::Numeric), ("name", ValueType::Text)]);
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM author_totals FROM authors SELECT \
+         coalesce(sum(posts.word_count), 0) AS total_words",
+        &source_columns,
+        "public",
+    )
+    .await
+    .expect("install_definition builds a coalesce-wrapped aggregate directly");
+
+    let mut rows: Vec<(String, String)> = client
+        .query(
+            "select id::text, total_words::text from author_totals order by id",
+            &[],
+        )
+        .await
+        .expect("read author_totals")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("1".to_string(), "30".to_string()),
+            // No posts -> coalesce(NULL, 0) = 0, not NULL.
+            ("2".to_string(), "0".to_string()),
+        ],
+        "coalesce(sum(...), 0) builds directly with the empty set coalesced to 0"
+    );
+    assert_eq!(
+        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.authors")).await,
+        0,
+        "fast path must not enumerate the source into the ring"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Fast-path success branch: the deepest nesting issue #83's repro implies —
+// an alias-derived field summing two coalesce-wrapped aggregates over
+// *different* relationships (`total_words = total_posted_words +
+// total_commented_words`, each itself `coalesce(sum(...), 0)`). Substitution
+// inlines both, giving `coalesce(sum(posts.word_count), 0) +
+// coalesce(sum(comments.word_count), 0)`; the two distinct SUM leaves are
+// staged (one per relationship) and the tree renders against them.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table authors (id integer primary key, name text); \
+             create table posts (id integer primary key, author_id integer, word_count integer); \
+             create table comments (id integer primary key, author_id integer, word_count integer); \
+             alter table posts replica identity full; \
+             alter table comments replica identity full; \
+             insert into authors (id, name) values (1, 'a'), (2, 'b'); \
+             insert into posts (id, author_id, word_count) values (100, 1, 10), (101, 1, 20); \
+             insert into comments (id, author_id, word_count) values (200, 1, 3), (201, 1, 4)",
+        )
+        .await
+        .expect("create + seed tables");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP posts FROM authors.id TO posts.author_id",
+    )
+    .await
+    .expect("create posts relationship");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP comments FROM authors.id TO comments.author_id",
+    )
+    .await
+    .expect("create comments relationship");
+
+    let source_columns: HashMap<String, ValueType> =
+        columns(&[("id", ValueType::Numeric), ("name", ValueType::Text)]);
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM author_totals FROM authors SELECT \
+         coalesce(sum(posts.word_count), 0) AS total_posted_words, \
+         coalesce(sum(comments.word_count), 0) AS total_commented_words, \
+         total_posted_words + total_commented_words AS total_words",
+        &source_columns,
+        "public",
+    )
+    .await
+    .expect("install_definition builds the nested coalesce alias chain directly");
+
+    let mut rows: Vec<(String, String, String, String)> = client
+        .query(
+            "select id::text, total_posted_words::text, total_commented_words::text, \
+             total_words::text from author_totals order by id",
+            &[],
+        )
+        .await
+        .expect("read author_totals")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            // posts 10+20=30, comments 3+4=7, total 37.
+            (
+                "1".to_string(),
+                "30".to_string(),
+                "7".to_string(),
+                "37".to_string()
+            ),
+            // No related rows -> every coalesce(NULL, 0) = 0.
+            (
+                "2".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "0".to_string()
+            ),
+        ],
+        "nested coalesce+alias chain builds directly with correct sums"
+    );
+    assert_eq!(
+        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.authors")).await,
+        0,
+        "fast path must not enumerate the source into the ring"
     );
 }

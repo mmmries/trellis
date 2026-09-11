@@ -65,17 +65,17 @@
 //!    ring's row-at-a-time apply path (`staging::apply::apply_target`) must
 //!    chunk around.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::pool::{Client, Pool, quote_ident};
 
-use super::ast::{Expr, KeySpace, RelationshipDef, TransformDef, ValueType};
+use super::ast::{Expr, KeySpace, Operator, RelationshipDef, TransformDef, ValueType};
 use super::ddl::{
     self, PrimaryKeyColumn, avg_sum_column, qualified_target_table, source_primary_key,
 };
 use super::invertibility::{AggregateArg, CountArg, classify};
 use super::model::RelationshipCardinality;
-use super::oracle::{render_expr_sql, render_rel_expr_sql};
+use super::oracle::render_expr_sql;
 use super::registry::lookup_aggregate_function;
 
 /// Rows per chunk for the 1-1 primary-key-range build. Each chunk is one
@@ -193,6 +193,212 @@ fn uses_relationships(def: &TransformDef) -> bool {
     def.fields.iter().any(|f| walk(&f.expr))
 }
 
+/// Recursively substitutes every cross-field-alias reference in `expr` — a
+/// `Column(name)` that names a *different* calculated field of the same
+/// definition — with a deep copy of that field's own (also-substituted)
+/// expression tree, so the returned expression is self-contained: it
+/// references only real source columns, literals, relationship paths, and
+/// composition. Substitution repeats transitively (a substituted-in field may
+/// itself reference yet another field) until no field-alias references remain.
+///
+/// `self_name` is the name of the field `expr` belongs to. A
+/// `Column(self_name)` is the validator's "self-passthrough" (`price AS price`
+/// — a real source column that happens to share the field's name, which
+/// `validate::infer_expr` explicitly carves out as a source reference, not a
+/// self-dependency), so it is left untouched and never treated as an alias.
+///
+/// After this pass the existing renderers (`render_expr_sql` and the
+/// relationship renderer below) need no awareness of field aliases: every
+/// `Column` leaf is a real source column, which is exactly what they render.
+///
+/// `fields_by_name` maps every field name to its expression. `visiting` is the
+/// set of field names currently being expanded on this recursion path; a field
+/// re-encountered while already being expanded is a cyclic alias chain
+/// (`a = b + 1, b = a + 1`) and yields [`BackfillError::Unsupported`] rather
+/// than recursing forever. This guard is load-bearing, not merely defensive:
+/// transform-definition text is user-supplied DSL, and the validator's cycle
+/// check (`validate::infer_field_types` / `ValidationError::Cycle`) runs
+/// *after* the direct backfill in `install_definition`
+/// (`backfill_definition` before `create_definition` → `validate`), so a
+/// cyclic definition does reach this code — falling back to the ring lets the
+/// validator then reject it, instead of overflowing the stack here.
+///
+/// `memo` caches each field's fully-substituted expression by field name. A
+/// field's substituted form depends only on the field (its own name scopes the
+/// self-passthrough carve-out) and `fields_by_name`, never on the reference
+/// site, so a field expanded once is reused (not re-expanded from its own
+/// definition) everywhere it is referenced. Without this, a field referenced
+/// from several places re-runs the full transitive expansion each time — a
+/// diamond DAG (`out_a = shared`, `out_b = shared`, `shared = <deep chain>`)
+/// pays for the deep chain once per referrer instead of once.
+///
+/// `budget` caps the number of expression nodes the substituted output may
+/// contain, across the whole definition, and is charged as nodes are produced
+/// (including the nodes a `memo` clone materializes). Memoization removes
+/// *redundant* work but cannot shrink an output that is inherently large: a
+/// pure doubling chain (`f0 = f1 + f1`, `f1 = f2 + f2`, … `fn = price + price`)
+/// expands to 2^n copies of `price`, and each memo hit still clones its whole
+/// cached subtree, so the substituted tree — and thus the work to build it — is
+/// genuinely exponential in `n`. Because `install_definition` runs this direct
+/// build *before* the validator, such a definition (which is valid DSL: no
+/// cycle, no unknown reference) would otherwise OOM/hang the install. Exceeding
+/// the budget yields [`BackfillError::Unsupported`], falling back to the ring —
+/// the same safe outcome the pre-inlining code gave by never attempting these
+/// shapes directly.
+fn substitute_field_aliases(
+    expr: &Expr,
+    self_name: &str,
+    fields_by_name: &HashMap<&str, &Expr>,
+    visiting: &mut HashSet<String>,
+    memo: &mut HashMap<String, Expr>,
+    budget: &mut usize,
+) -> Result<Expr, BackfillError> {
+    match expr {
+        Expr::Column(name) => {
+            if name != self_name
+                && let Some(other) = fields_by_name.get(name.as_str()).copied()
+            {
+                if let Some(cached) = memo.get(name) {
+                    // A cached subtree can never exceed the budget it was itself
+                    // built under, so charging its full node count is bounded.
+                    charge_budget(budget, node_count(cached))?;
+                    return Ok(cached.clone());
+                }
+                if !visiting.insert(name.clone()) {
+                    return Err(BackfillError::Unsupported(
+                        "a cyclic calculated-field alias reference".to_string(),
+                    ));
+                }
+                let substituted =
+                    substitute_field_aliases(other, name, fields_by_name, visiting, memo, budget)?;
+                visiting.remove(name);
+                memo.insert(name.clone(), substituted.clone());
+                Ok(substituted)
+            } else {
+                charge_budget(budget, 1)?;
+                Ok(Expr::Column(name.clone()))
+            }
+        }
+        Expr::NumberLiteral(text) => {
+            charge_budget(budget, 1)?;
+            Ok(Expr::NumberLiteral(text.clone()))
+        }
+        Expr::StringLiteral(text) => {
+            charge_budget(budget, 1)?;
+            Ok(Expr::StringLiteral(text.clone()))
+        }
+        Expr::RelationshipPath { rel, column } => {
+            charge_budget(budget, 1)?;
+            Ok(Expr::RelationshipPath {
+                rel: rel.clone(),
+                column: column.clone(),
+            })
+        }
+        Expr::BinaryOp { op, lhs, rhs } => {
+            charge_budget(budget, 1)?;
+            Ok(Expr::BinaryOp {
+                op: *op,
+                lhs: Box::new(substitute_field_aliases(
+                    lhs,
+                    self_name,
+                    fields_by_name,
+                    visiting,
+                    memo,
+                    budget,
+                )?),
+                rhs: Box::new(substitute_field_aliases(
+                    rhs,
+                    self_name,
+                    fields_by_name,
+                    visiting,
+                    memo,
+                    budget,
+                )?),
+            })
+        }
+        Expr::FunctionCall { name, args } => {
+            charge_budget(budget, 1)?;
+            let args = args
+                .iter()
+                .map(|arg| {
+                    substitute_field_aliases(arg, self_name, fields_by_name, visiting, memo, budget)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Expr::FunctionCall {
+                name: name.clone(),
+                args,
+            })
+        }
+    }
+}
+
+/// Node budget for one definition's alias substitution — see
+/// [`substitute_field_aliases`]. Any realistic transform inlines a handful of
+/// nodes; this cap is orders of magnitude above that, so it only ever trips on
+/// a pathologically self-referential definition whose inlined form would
+/// explode (which then falls back to the ring rather than OOMing the install).
+const MAX_SUBSTITUTED_NODES: usize = 100_000;
+
+/// Charges `cost` nodes against the remaining `budget`, or returns
+/// [`BackfillError::Unsupported`] if the budget cannot cover it.
+fn charge_budget(budget: &mut usize, cost: usize) -> Result<(), BackfillError> {
+    match budget.checked_sub(cost) {
+        Some(remaining) => {
+            *budget = remaining;
+            Ok(())
+        }
+        None => Err(BackfillError::Unsupported(
+            "a calculated-field alias expansion larger than the direct build's size budget"
+                .to_string(),
+        )),
+    }
+}
+
+/// Total number of nodes in `expr`'s tree.
+fn node_count(expr: &Expr) -> usize {
+    match expr {
+        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => 1,
+        Expr::RelationshipPath { .. } => 1,
+        Expr::BinaryOp { lhs, rhs, .. } => 1 + node_count(lhs) + node_count(rhs),
+        Expr::FunctionCall { args, .. } => 1 + args.iter().map(node_count).sum::<usize>(),
+    }
+}
+
+/// Substitutes cross-field-alias references in every field of `def`, returning
+/// each field's self-contained expression in definition order. See
+/// [`substitute_field_aliases`]; a cyclic alias chain yields
+/// [`BackfillError::Unsupported`] (safe fallback to the ring). A field that
+/// only ever references real source columns, literals, and relationship paths
+/// is returned as a verbatim deep copy.
+fn substitute_all_fields(def: &TransformDef) -> Result<Vec<Expr>, BackfillError> {
+    let fields_by_name: HashMap<&str, &Expr> = def
+        .fields
+        .iter()
+        .map(|f| (f.name.as_str(), &f.expr))
+        .collect();
+    // One memo shared across every field: a field expanded while substituting
+    // an earlier field is reused (not re-expanded) when a later field references
+    // it too, keeping the whole pass linear in total substituted size.
+    let mut memo: HashMap<String, Expr> = HashMap::new();
+    // One node budget shared across every field, so a definition can't slip a
+    // huge expansion past the cap by splitting it over many fields.
+    let mut budget = MAX_SUBSTITUTED_NODES;
+    def.fields
+        .iter()
+        .map(|f| {
+            let mut visiting = HashSet::new();
+            substitute_field_aliases(
+                &f.expr,
+                &f.name,
+                &fields_by_name,
+                &mut visiting,
+                &mut memo,
+                &mut budget,
+            )
+        })
+        .collect()
+}
+
 /// The 1-1 build: walk the source primary key in half-open `(lo, hi]` ranges,
 /// each `INSERT … SELECT … ON CONFLICT DO UPDATE`-ing one bounded chunk.
 ///
@@ -211,17 +417,22 @@ async fn backfill_one_to_one(
     target_schema: &str,
     pk: &PrimaryKeyColumn,
 ) -> Result<(), BackfillError> {
+    // Substitute any cross-field-alias reference (e.g. `total = double_price +
+    // tax` where `double_price` is itself a field) with a deep copy of the
+    // referenced field's expression tree, so every field's expression is
+    // self-contained before `render_expr_sql` sees it — it renders each
+    // `Column(name)` as a bare source-column reference, which Postgres rejects
+    // for a same-SELECT-list alias. A cyclic alias chain falls back to the ring
+    // (issue #83 follow-up).
+    let substituted = substitute_all_fields(def)?;
+
     let source = quote_ident(&def.source);
     let target = qualified_target_table(target_schema, def);
     let pk_ident = quote_ident(&pk.name);
     let pk_cast = pk.data_type.as_str();
 
     let field_idents: Vec<String> = def.fields.iter().map(|f| quote_ident(&f.name)).collect();
-    let field_exprs: Vec<String> = def
-        .fields
-        .iter()
-        .map(|f| render_expr_sql(&f.expr))
-        .collect();
+    let field_exprs: Vec<String> = substituted.iter().map(render_expr_sql).collect();
 
     let insert_cols = std::iter::once(pk_ident.clone())
         .chain(field_idents.iter().cloned())
@@ -635,65 +846,118 @@ async fn backfill_aggregate(
 /// (crash leftover) and after the writes.
 const REL_STAGE_TABLE_PREFIX: &str = "_trellis_backfill_rel_staging_";
 
-/// How one field of a relationship-enriched 1-1 definition is built.
-enum RelFieldPlan {
-    /// A field with no relationship reference — rendered as source SQL exactly
-    /// as the plain 1-1 build (and the oracle) render it.
-    Source(String),
-    /// A field that is exactly a top-level aggregate over a to-many
-    /// relationship path (`SUM(rel.col)` / `COUNT(rel.col)` / …). Its value is
-    /// read from `rel`'s staging table; `agg` is the uppercased aggregate name
-    /// (only `COUNT` needs the empty-set `coalesce(_, 0)`, matching Postgres's
-    /// correlated `count` over zero rows — every other aggregate's empty-set
-    /// result is `NULL`, which the `LEFT JOIN` already yields).
-    ToManyAgg {
-        rel: String,
-        agg: String,
-        column: String,
-    },
-}
+/// A distinct to-many-aggregate leaf: `agg(rel.column)` — an aggregate
+/// function whose sole argument is a relationship path. Ordered `(rel, agg,
+/// column)` so a set of leaves gets a deterministic, field-name-independent
+/// staging-column assignment (see [`backfill_relationship_one_to_one`]).
+type AggLeaf = (String, String, String);
 
-/// Whether `expr` reads any relationship path anywhere in its tree.
-fn expr_uses_relationship(expr: &Expr) -> bool {
-    match expr {
-        Expr::RelationshipPath { .. } => true,
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            expr_uses_relationship(lhs) || expr_uses_relationship(rhs)
-        }
-        Expr::FunctionCall { args, .. } => args.iter().any(expr_uses_relationship),
-        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => false,
+/// If `name(args)` is a to-many-aggregate leaf `agg(rel.column)`, returns
+/// `(rel, column)`. This is the exact structural shape the evaluator
+/// (`eval::eval_to_many_aggregate`) and oracle (`oracle::render_rel_expr_sql`)
+/// match; here it can appear anywhere in a (substituted) expression tree, not
+/// just at its top level.
+fn agg_leaf_parts(name: &str, args: &[Expr]) -> Option<(String, String)> {
+    if lookup_aggregate_function(name).is_some()
+        && let [Expr::RelationshipPath { rel, column }] = args
+    {
+        Some((rel.clone(), column.clone()))
+    } else {
+        None
     }
 }
 
-/// Classifies one field of a relationship-enriched 1-1 definition into a
-/// [`RelFieldPlan`], or `None` if the direct build can't render it correctly
-/// (so the caller falls back to the ring). The only relationship shape the
-/// direct build supports is a *top-level* aggregate whose sole argument is a
-/// relationship path — the to-many aggregate the evaluator and oracle both
-/// match structurally. A bare to-one path (`category.name`), or a relationship
-/// reference nested inside a larger expression (`SUM(rel.x) + 1`,
-/// `count(rel.a) > 0`), is left `None` and handled by the ring.
-fn plan_rel_field(
+/// Walks a (substituted) relationship-enriched field expression, collecting
+/// every distinct to-many-aggregate leaf `agg(rel.column)` into `leaves`, and
+/// validating that the tree contains only shapes the direct build can render:
+/// real source columns, literals, aggregate leaves, and composition
+/// (`BinaryOp`/`FunctionCall`, including `coalesce(agg(rel.col), literal)` —
+/// the aggregate nested inside the wrapping function is collected as a leaf,
+/// and the wrapper renders generically). A bare relationship path — a to-one
+/// lookup (`category.name`), or any relationship reference that isn't the sole
+/// argument of an aggregate — is a shape this build can't render and yields
+/// [`BackfillError::Unsupported`], routing the whole definition to the ring.
+fn collect_agg_leaves(expr: &Expr, leaves: &mut BTreeSet<AggLeaf>) -> Result<(), BackfillError> {
+    match expr {
+        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => Ok(()),
+        Expr::RelationshipPath { .. } => Err(BackfillError::Unsupported(
+            "a bare to-one relationship lookup, or a relationship reference nested inside a \
+             larger expression"
+                .to_string(),
+        )),
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            collect_agg_leaves(lhs, leaves)?;
+            collect_agg_leaves(rhs, leaves)
+        }
+        Expr::FunctionCall { name, args } => {
+            if let Some((rel, column)) = agg_leaf_parts(name, args) {
+                leaves.insert((rel, name.clone(), column));
+                Ok(())
+            } else {
+                for arg in args {
+                    collect_agg_leaves(arg, leaves)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Renders a (substituted) relationship-enriched field expression to SQL over
+/// the source `LEFT JOIN`ed to each relationship's staging table — the
+/// staged-column counterpart of `oracle::render_rel_expr_sql`, which renders
+/// the same aggregates as correlated subqueries instead. Source columns are
+/// qualified with the source table; a to-many-aggregate leaf reads its
+/// pre-aggregated staging column via `leaf_cols`/`rel_stage` (with `COUNT`
+/// coalesced to `0` for the empty set — the `LEFT JOIN`'s no-match `NULL`
+/// otherwise carries the empty-set result, which is `NULL` for every other
+/// aggregate); a `coalesce(agg(rel.col), literal)` therefore renders as
+/// `coalesce(<staged-ref>, <literal>)` through the generic function arm, so it
+/// is just one instance of the general pattern rather than a special case.
+/// Returns `None` if a relationship path or an aggregate leaf without a
+/// staging column survives (which validation via [`collect_agg_leaves`] should
+/// already have ruled out — but this fails safe rather than panicking).
+fn render_rel_field_direct(
     expr: &Expr,
     source: &str,
-    rel_defs: &HashMap<String, RelationshipDef>,
-) -> Option<RelFieldPlan> {
-    if let Expr::FunctionCall { name, args } = expr
-        && lookup_aggregate_function(name).is_some()
-        && let [Expr::RelationshipPath { rel, column }] = args.as_slice()
-    {
-        return Some(RelFieldPlan::ToManyAgg {
-            rel: rel.clone(),
-            agg: name.clone(),
-            column: column.clone(),
-        });
+    rel_stage: &HashMap<String, String>,
+    leaf_cols: &HashMap<AggLeaf, String>,
+) -> Option<String> {
+    match expr {
+        Expr::Column(name) => Some(format!("{}.{}", quote_ident(source), quote_ident(name))),
+        Expr::NumberLiteral(text) => Some(format!("{text}::numeric")),
+        Expr::StringLiteral(text) => Some(format!("'{}'::text", text.replace('\'', "''"))),
+        Expr::RelationshipPath { .. } => None,
+        Expr::BinaryOp { op, lhs, rhs } => {
+            let symbol = match op {
+                Operator::Add => "+",
+                Operator::GreaterThan => ">",
+            };
+            let lhs = render_rel_field_direct(lhs, source, rel_stage, leaf_cols)?;
+            let rhs = render_rel_field_direct(rhs, source, rel_stage, leaf_cols)?;
+            Some(format!("({lhs} {symbol} {rhs})"))
+        }
+        Expr::FunctionCall { name, args } => {
+            if let Some((rel, column)) = agg_leaf_parts(name, args) {
+                let col = leaf_cols.get(&(rel.clone(), name.clone(), column))?;
+                let stage = rel_stage.get(&rel)?;
+                let stage_ref = format!("{stage}.{}", quote_ident(col));
+                if name == "COUNT" {
+                    Some(format!("coalesce({stage_ref}, 0)"))
+                } else {
+                    Some(stage_ref)
+                }
+            } else if name == "COUNT" && args.is_empty() {
+                Some("count(*)".to_string())
+            } else {
+                let rendered: Option<Vec<String>> = args
+                    .iter()
+                    .map(|arg| render_rel_field_direct(arg, source, rel_stage, leaf_cols))
+                    .collect();
+                Some(format!("{}({})", name.to_lowercase(), rendered?.join(", ")))
+            }
+        }
     }
-    if expr_uses_relationship(expr) {
-        return None;
-    }
-    Some(RelFieldPlan::Source(render_rel_expr_sql(
-        expr, source, rel_defs,
-    )))
 }
 
 /// Maps a relationship-lookup [`super::catalog::CatalogError`] into a
@@ -714,36 +978,53 @@ fn map_rel_lookup_err(err: super::catalog::CatalogError) -> BackfillError {
 }
 
 /// The relationship-enriched 1-1 build: computes a target whose fields
-/// aggregate over to-many relationship paths (`SUM(posts.x)`, `COUNT(comments)`)
-/// directly with set-based SQL, instead of staging every source row as a
-/// `Recompute` marker for per-row Rust evaluation.
+/// aggregate over to-many relationship paths (`SUM(posts.x)`, `COUNT(comments)`,
+/// `coalesce(sum(posts.x), 0)`, `post_count + comment_count`) directly with
+/// set-based SQL, instead of staging every source row as a `Recompute` marker
+/// for per-row Rust evaluation.
+///
+/// Each field's expression is first made self-contained by
+/// [`substitute_all_fields`] — a cross-field-alias reference like `total =
+/// post_count + comment_count` becomes `count(posts.id) + count(comments.id)`
+/// in place, so a to-many-aggregate leaf `agg(rel.col)` (bare, or nested
+/// anywhere in an arbitrary `BinaryOp`/`FunctionCall` tree, e.g. inside a
+/// `coalesce(_, literal)`) is the only relationship shape the tree can hold.
+/// [`collect_agg_leaves`] gathers the *distinct* such leaves across all fields
+/// and rejects any unsupported shape (a bare to-one path, or an aggregate over
+/// a to-one relationship) to the ring.
 ///
 /// Each referenced to-many relationship is aggregated over its whole to-side
 /// table **once** into a connection-scoped staging table grouped by the join
 /// key (one row per distinct key, primary-keyed for cheap index probes) — the
 /// same single-pass-then-chunked-write shape [`backfill_aggregate`] uses, so
-/// the to-side is never re-scanned per chunk. The target is then written in
-/// source-primary-key range chunks (reusing [`discover_pk_ranges`], identical
-/// to [`backfill_one_to_one`]): each chunk `INSERT … SELECT`s a bounded PK
-/// range of the source `LEFT JOIN`ed to every relationship's staging table on
-/// its join key.
+/// the to-side is never re-scanned per chunk. That staging table carries one
+/// column per *distinct aggregate leaf* reading the relationship — keyed by the
+/// leaf itself, not by field name, and named by a synthetic collision-free
+/// index (`_agg_0`, …) — so a leaf shared by several fields (`count(posts.id)`
+/// appearing in both `post_count` and `post_count + comment_count`) is computed
+/// and staged exactly once. The target is then written in source-primary-key
+/// range chunks (reusing [`discover_pk_ranges`], identical to
+/// [`backfill_one_to_one`]): each chunk `INSERT … SELECT`s a bounded PK range
+/// of the source `LEFT JOIN`ed to every relationship's staging table on its
+/// join key, with each field rendered by [`render_rel_field_direct`] against
+/// those staged columns.
 ///
 /// The result is byte-identical to the correlated-subquery oracle
 /// (`oracle::render_relationship_select_sql`) and the per-row evaluator
 /// (`eval::eval_to_many_aggregate`): a grouped aggregate over the matching
 /// to-side rows equals the correlated aggregate over the same rows, and the
 /// `LEFT JOIN`'s no-match `NULL` reproduces Postgres's empty-correlated-set
-/// semantics (`SUM`/`MIN`/`MAX`/`AVG` → `NULL`), with `COUNT` `coalesce`d to `0`
-/// to match `count` over the empty set. Unlike the aggregate build, this target
-/// carries no hidden partial columns: a relationship-enriched 1-1 target has
-/// none (see `ddl::create_target_table`) — its live CDC deltas are applied by a
-/// full per-parent recompute in the ring, not an incremental partial fold, so
-/// there is nothing here to keep in lockstep.
+/// semantics (`SUM`/`MIN`/`MAX`/`AVG` → `NULL`), with a bare `COUNT` `coalesce`d
+/// to `0` to match `count` over the empty set. Unlike the aggregate build, this
+/// target carries no hidden partial columns: a relationship-enriched 1-1 target
+/// has none (see `ddl::create_target_table`) — its live CDC deltas are applied
+/// by a full per-parent recompute in the ring, not an incremental partial fold,
+/// so there is nothing here to keep in lockstep.
 ///
 /// Falls back with [`BackfillError::Unsupported`] (routing the whole definition
 /// to the ring) if any field is a shape this build can't render exactly — a
-/// bare to-one lookup, a relationship reference nested inside a larger
-/// expression, or an aggregate over a relationship that resolves to a to-one.
+/// bare to-one lookup (bare or nested), an aggregate over a relationship that
+/// resolves to a to-one, an unknown relationship, or a cyclic alias chain.
 async fn backfill_relationship_one_to_one(
     pool: &Pool,
     def: &TransformDef,
@@ -774,32 +1055,44 @@ async fn backfill_relationship_one_to_one(
         rel_defs.insert(rel, reldef.def);
     }
 
-    // Classify every field; bail to the ring on the first unsupported shape.
-    let plans: Vec<RelFieldPlan> = def
-        .fields
-        .iter()
-        .map(|f| {
-            plan_rel_field(&f.expr, &def.source, &rel_defs).ok_or_else(|| {
-                BackfillError::Unsupported(
-                    "a relationship-enriched 1-1 field that isn't a top-level to-many aggregate"
-                        .to_string(),
-                )
-            })
-        })
-        .collect::<Result<_, _>>()?;
+    // Make every field self-contained (substituting cross-field-alias
+    // references), then collect the distinct to-many-aggregate leaves across
+    // all fields — bailing to the ring on any unsupported shape (a bare to-one
+    // path, a nested relationship reference, or a cyclic alias chain).
+    let substituted = substitute_all_fields(def)?;
+    let mut leaves: BTreeSet<AggLeaf> = BTreeSet::new();
+    for expr in &substituted {
+        collect_agg_leaves(expr, &mut leaves)?;
+    }
 
-    // Every to-many aggregate must resolve to a to-many relationship; an
-    // aggregate over a to-one is a shape the validator rejects — fall back
-    // rather than emit wrong SQL for it.
-    for plan in &plans {
-        if let RelFieldPlan::ToManyAgg { rel, .. } = plan
-            && rel_cardinality.get(rel) != Some(&RelationshipCardinality::ToMany)
-        {
-            return Err(BackfillError::Unsupported(
-                "an aggregate over a to-one relationship".to_string(),
-            ));
+    // Every aggregate leaf must resolve to a known to-many relationship; an
+    // aggregate over a to-one (or an unknown relationship) is a shape the
+    // validator rejects — fall back rather than emit wrong SQL for it.
+    for (rel, _agg, _column) in &leaves {
+        match rel_cardinality.get(rel) {
+            Some(RelationshipCardinality::ToMany) => {}
+            Some(_) => {
+                return Err(BackfillError::Unsupported(
+                    "an aggregate over a to-one relationship".to_string(),
+                ));
+            }
+            None => {
+                return Err(BackfillError::Unsupported(
+                    "a definition referencing an unknown relationship".to_string(),
+                ));
+            }
         }
     }
+
+    // Assign each distinct leaf a synthetic, collision-free staging-column
+    // name keyed by its index in the sorted leaf set — never by a field name,
+    // since one leaf may be shared by several fields (and thus belong to no
+    // single field) once cross-field aliases are substituted.
+    let leaf_cols: HashMap<AggLeaf, String> = leaves
+        .iter()
+        .enumerate()
+        .map(|(i, leaf)| (leaf.clone(), format!("_agg_{i}")))
+        .collect();
 
     let source = quote_ident(&def.source);
     let target = qualified_target_table(target_schema, def);
@@ -809,37 +1102,36 @@ async fn backfill_relationship_one_to_one(
 
     let client = pool.get().await?;
 
-    // Materialize one staging table per referenced to-many relationship: its
-    // to-side table aggregated by the join key, one aliased column per field
-    // reading that relationship. `rel_stage` maps a relationship name to its
-    // staging table's identifier so the chunked write below can `LEFT JOIN` it.
-    // Ordered by relationship name for deterministic table indices.
-    let mut rel_names: Vec<&String> = rel_defs.keys().collect();
+    // The relationships that actually carry an aggregate leaf, in a
+    // deterministic order for stable staging-table indices. (Every relationship
+    // in `rel_defs` was referenced by the def; any referenced only by an
+    // unsupported shape already bailed to the ring in `collect_agg_leaves`.)
+    let mut rel_names: Vec<String> = leaves.iter().map(|(rel, ..)| rel.clone()).collect();
     rel_names.sort();
+    rel_names.dedup();
+
+    // Materialize one staging table per such relationship: its to-side table
+    // aggregated by the join key, one column per distinct aggregate leaf
+    // reading it (aliased to the leaf's synthetic name). `rel_stage` maps a
+    // relationship name to its staging table's identifier so the chunked write
+    // below can `LEFT JOIN` it.
     let mut rel_stage: HashMap<String, String> = HashMap::new();
     for (i, rel) in rel_names.iter().enumerate() {
         let stage = format!("{REL_STAGE_TABLE_PREFIX}{i}");
-        let reldef = &rel_defs[*rel];
-        // The aggregate columns this relationship needs — one per field that
-        // reads it, aliased to that field's name so the write can reference it.
-        let mut agg_exprs: Vec<String> = Vec::new();
-        for field in &def.fields {
-            if let RelFieldPlan::ToManyAgg {
-                rel: field_rel,
-                agg,
-                column,
-            } = plan_rel_field(&field.expr, &def.source, &rel_defs)
-                .expect("fields already classified as supported")
-                && &field_rel == *rel
-            {
-                agg_exprs.push(format!(
+        let reldef = &rel_defs[rel];
+        let agg_exprs: Vec<String> = leaves
+            .iter()
+            .filter(|(leaf_rel, ..)| leaf_rel == rel)
+            .map(|leaf| {
+                let (_rel, agg, column) = leaf;
+                format!(
                     "{}({}) as {}",
                     agg.to_lowercase(),
-                    quote_ident(&column),
-                    quote_ident(&field.name),
-                ));
-            }
-        }
+                    quote_ident(column),
+                    quote_ident(&leaf_cols[leaf]),
+                )
+            })
+            .collect();
         let to_table = quote_ident(&reldef.to_table);
         let to_col = quote_ident(&reldef.to_col);
         client
@@ -861,29 +1153,24 @@ async fn backfill_relationship_one_to_one(
         client
             .batch_execute(&format!("alter table {stage} add primary key (_k)"))
             .await?;
-        rel_stage.insert((*rel).clone(), stage);
+        rel_stage.insert(rel.clone(), stage);
     }
 
     // Build the INSERT's column list, its per-field SELECT expression, and the
     // ON CONFLICT update set. The primary key comes first, then one column per
-    // field in definition order (mirroring `backfill_one_to_one`).
+    // field in definition order (mirroring `backfill_one_to_one`). Each field's
+    // (substituted) expression renders against the staged aggregate columns.
     let field_idents: Vec<String> = def.fields.iter().map(|f| quote_ident(&f.name)).collect();
-    let select_field_exprs: Vec<String> = def
-        .fields
+    let select_field_exprs: Vec<String> = substituted
         .iter()
-        .zip(&plans)
-        .map(|(field, plan)| match plan {
-            RelFieldPlan::Source(sql) => sql.clone(),
-            RelFieldPlan::ToManyAgg { rel, agg, .. } => {
-                let stage_ref = format!("{}.{}", rel_stage[rel], quote_ident(&field.name));
-                if agg == "COUNT" {
-                    format!("coalesce({stage_ref}, 0)")
-                } else {
-                    stage_ref
-                }
-            }
+        .map(|expr| {
+            render_rel_field_direct(expr, &def.source, &rel_stage, &leaf_cols).ok_or_else(|| {
+                BackfillError::Unsupported(
+                    "a relationship-enriched 1-1 field the direct build can't render".to_string(),
+                )
+            })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     let insert_cols = std::iter::once(pk_ident.clone())
         .chain(field_idents.iter().cloned())
@@ -906,8 +1193,8 @@ async fn backfill_relationship_one_to_one(
     let joins = rel_names
         .iter()
         .map(|rel| {
-            let stage = &rel_stage[*rel];
-            let from_col = quote_ident(&rel_defs[*rel].from_col);
+            let stage = &rel_stage[rel];
+            let from_col = quote_ident(&rel_defs[rel].from_col);
             format!("left join {stage} on {stage}._k = {source}.{from_col}")
         })
         .collect::<Vec<_>>()
@@ -938,4 +1225,273 @@ async fn backfill_relationship_one_to_one(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::ast::{FieldDef, Operator, Predicate};
+    use super::*;
+
+    fn col(name: &str) -> Expr {
+        Expr::Column(name.to_string())
+    }
+
+    fn add(lhs: Expr, rhs: Expr) -> Expr {
+        Expr::BinaryOp {
+            op: Operator::Add,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    fn field(name: &str, expr: Expr) -> FieldDef {
+        FieldDef {
+            name: name.to_string(),
+            expr,
+        }
+    }
+
+    fn agg(name: &str, rel: &str, column: &str) -> Expr {
+        Expr::FunctionCall {
+            name: name.to_string(),
+            args: vec![Expr::RelationshipPath {
+                rel: rel.to_string(),
+                column: column.to_string(),
+            }],
+        }
+    }
+
+    fn def_with(fields: Vec<FieldDef>) -> TransformDef {
+        TransformDef {
+            target: "t".to_string(),
+            source: "s".to_string(),
+            key_space: KeySpace::OneToOne,
+            fields,
+            predicate: Predicate::True,
+        }
+    }
+
+    /// `total = double_price + tax`, where `double_price` is itself a
+    /// calculated field (`price + price`) — the alias-derived shape issue #83
+    /// asks the plain direct build to render. Substitution must inline
+    /// `double_price` into `total`, leaving only real source columns.
+    #[test]
+    fn substitute_inlines_a_cross_field_alias_chain() {
+        let def = def_with(vec![
+            field("double_price", add(col("price"), col("price"))),
+            field("total", add(col("double_price"), col("tax"))),
+        ]);
+        let out = substitute_all_fields(&def).expect("no cycle");
+        assert_eq!(render_expr_sql(&out[0]), r#"("price" + "price")"#);
+        assert_eq!(
+            render_expr_sql(&out[1]),
+            r#"(("price" + "price") + "tax")"#,
+            "total inlines double_price's own expression tree"
+        );
+    }
+
+    /// A field referencing a source column that happens to share its own name
+    /// (`price AS price`) — the self-passthrough `validate::infer_expr` carves
+    /// out — must be left untouched, not treated as a (self-)alias reference.
+    #[test]
+    fn substitute_leaves_self_passthrough_untouched() {
+        let def = def_with(vec![field("price", col("price"))]);
+        let out = substitute_all_fields(&def).expect("no cycle");
+        assert_eq!(render_expr_sql(&out[0]), r#""price""#);
+    }
+
+    /// A cyclic alias chain (`a = b + 1, b = a + 1`) must fall back to the ring
+    /// (`Unsupported`) rather than recurse forever — the validator's own cycle
+    /// check runs only *after* the direct backfill.
+    #[test]
+    fn substitute_detects_a_cycle() {
+        let def = def_with(vec![
+            field("a", add(col("b"), Expr::NumberLiteral("1".to_string()))),
+            field("b", add(col("a"), Expr::NumberLiteral("1".to_string()))),
+        ]);
+        assert!(matches!(
+            substitute_all_fields(&def),
+            Err(BackfillError::Unsupported(_))
+        ));
+    }
+
+    /// Evaluates a substituted arithmetic tree with every `price` leaf = 1, so
+    /// the result counts how many `price` copies the inlining produced — the
+    /// value a doubling chain `f_k = f_{k+1} + f_{k+1}` must compute.
+    fn eval_price_ones(expr: &Expr) -> f64 {
+        match expr {
+            Expr::Column(_) => 1.0,
+            Expr::NumberLiteral(text) => text.parse().unwrap(),
+            Expr::BinaryOp {
+                op: Operator::Add,
+                lhs,
+                rhs,
+            } => eval_price_ones(lhs) + eval_price_ones(rhs),
+            other => panic!("unexpected node in doubling-chain output: {other:?}"),
+        }
+    }
+
+    /// Builds a doubling chain `f0 = f1 + f1`, …, `f{levels-1} = f{levels} +
+    /// f{levels}`, `f{levels} = price + price`. Its fully-inlined form has
+    /// 2^(levels+1) `price` leaves, and each field is referenced twice — the
+    /// diamond/chain shape that re-expands catastrophically without care.
+    fn doubling_chain(levels: usize) -> TransformDef {
+        let mut fields = Vec::new();
+        for k in 0..levels {
+            let child = format!("f{}", k + 1);
+            fields.push(field(&format!("f{k}"), add(col(&child), col(&child))));
+        }
+        fields.push(field(
+            &format!("f{levels}"),
+            add(col("price"), col("price")),
+        ));
+        def_with(fields)
+    }
+
+    /// A moderately deep doubling chain (each field referenced twice) inlines
+    /// correctly and quickly: memoization keeps the pass bounded, and the
+    /// result is `2^(levels+1)` `price` copies (verified via `eval_price_ones`).
+    /// This is the shape that, un-memoized, re-expands each level twice.
+    #[test]
+    fn substitute_inlines_a_deep_diamond_chain_quickly() {
+        let levels = 12; // 2^13 = 8192 price leaves — comfortably under the cap.
+        let def = doubling_chain(levels);
+        let start = std::time::Instant::now();
+        let out = substitute_all_fields(&def).expect("under the node budget");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "deep diamond substitution should be bounded, took {elapsed:?}"
+        );
+        // f0 is the first field; its inlined value is 2^(levels+1) price copies.
+        assert_eq!(eval_price_ones(&out[0]), 2f64.powi(levels as i32 + 1));
+    }
+
+    /// A doubling chain deep enough that its inlined form would explode past the
+    /// node budget must fall back to the ring (`Unsupported`) instead of
+    /// OOMing/hanging — the budget is the real guard, since the substituted
+    /// output of a pure doubling chain is inherently exponential and no amount
+    /// of memoization can shrink it. Must return promptly, never blow up.
+    #[test]
+    fn substitute_bails_when_the_inlined_form_would_explode() {
+        let def = doubling_chain(40); // 2^41 leaves — far past MAX_SUBSTITUTED_NODES.
+        let start = std::time::Instant::now();
+        let result = substitute_all_fields(&def);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "budget must trip promptly, took {elapsed:?}"
+        );
+        assert!(matches!(result, Err(BackfillError::Unsupported(_))));
+    }
+
+    #[test]
+    fn collect_agg_leaves_gathers_distinct_leaves() {
+        // `count(posts.id) + count(comments.id)` — two distinct leaves.
+        let expr = add(agg("COUNT", "posts", "id"), agg("COUNT", "comments", "id"));
+        let mut leaves = BTreeSet::new();
+        collect_agg_leaves(&expr, &mut leaves).expect("supported");
+        assert_eq!(
+            leaves,
+            BTreeSet::from([
+                (
+                    "comments".to_string(),
+                    "COUNT".to_string(),
+                    "id".to_string()
+                ),
+                ("posts".to_string(), "COUNT".to_string(), "id".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn collect_agg_leaves_sees_through_coalesce() {
+        // `coalesce(sum(posts.word_count), 0)` — the aggregate nested inside a
+        // wrapping function is collected as a leaf.
+        let expr = Expr::FunctionCall {
+            name: "COALESCE".to_string(),
+            args: vec![
+                agg("SUM", "posts", "word_count"),
+                Expr::NumberLiteral("0".to_string()),
+            ],
+        };
+        let mut leaves = BTreeSet::new();
+        collect_agg_leaves(&expr, &mut leaves).expect("supported");
+        assert_eq!(
+            leaves,
+            BTreeSet::from([(
+                "posts".to_string(),
+                "SUM".to_string(),
+                "word_count".to_string()
+            )])
+        );
+    }
+
+    #[test]
+    fn collect_agg_leaves_rejects_a_bare_to_one_path() {
+        let expr = Expr::RelationshipPath {
+            rel: "category".to_string(),
+            column: "name".to_string(),
+        };
+        let mut leaves = BTreeSet::new();
+        assert!(matches!(
+            collect_agg_leaves(&expr, &mut leaves),
+            Err(BackfillError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn render_rel_field_direct_renders_leaves_and_coalesce() {
+        let rel_stage: HashMap<String, String> =
+            HashMap::from([("posts".to_string(), "stage0".to_string())]);
+        let leaf_cols: HashMap<AggLeaf, String> = HashMap::from([
+            (
+                ("posts".to_string(), "COUNT".to_string(), "id".to_string()),
+                "_agg_0".to_string(),
+            ),
+            (
+                (
+                    "posts".to_string(),
+                    "SUM".to_string(),
+                    "word_count".to_string(),
+                ),
+                "_agg_1".to_string(),
+            ),
+        ]);
+
+        // Bare COUNT keeps empty-set-is-0.
+        assert_eq!(
+            render_rel_field_direct(&agg("COUNT", "posts", "id"), "s", &rel_stage, &leaf_cols)
+                .unwrap(),
+            r#"coalesce(stage0."_agg_0", 0)"#
+        );
+        // Bare SUM is left as the LEFT JOIN's NULL.
+        assert_eq!(
+            render_rel_field_direct(
+                &agg("SUM", "posts", "word_count"),
+                "s",
+                &rel_stage,
+                &leaf_cols
+            )
+            .unwrap(),
+            r#"stage0."_agg_1""#
+        );
+        // `coalesce(sum(...), 0)` renders through the generic function arm.
+        let coalesced = Expr::FunctionCall {
+            name: "COALESCE".to_string(),
+            args: vec![
+                agg("SUM", "posts", "word_count"),
+                Expr::NumberLiteral("0".to_string()),
+            ],
+        };
+        assert_eq!(
+            render_rel_field_direct(&coalesced, "s", &rel_stage, &leaf_cols).unwrap(),
+            r#"coalesce(stage0."_agg_1", 0::numeric)"#
+        );
+        // A plain source column is qualified with the source table.
+        assert_eq!(
+            render_rel_field_direct(&col("name"), "s", &rel_stage, &leaf_cols).unwrap(),
+            r#""s"."name""#
+        );
+    }
 }
