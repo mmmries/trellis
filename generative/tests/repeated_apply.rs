@@ -45,14 +45,24 @@
 //!   `apply()` calls is a real, valid delta (the row is live both times), so
 //!   the target must reflect the net result of *both* having actually run —
 //!   not double-count anything the way a naive incremental-`SUM`-style
-//!   target might if the engine's `Aggregate` fold were implemented wrong.
+//!   target might if the engine's `Aggregate` fold were implemented wrong,
+//!   and not drop either one, leaving the target stuck reflecting a stale
+//!   intermediate value. The two applies below deliberately carry
+//!   *different* `c1`/`c2` values (not the same `Op` re-applied verbatim):
+//!   with identical values, "both deltas landed" and "the engine silently
+//!   dropped one of the two" are indistinguishable — the source row and its
+//!   full recompute end up identical either way. Distinct values make the
+//!   assertion below a real trap: the target must equal `f(row after both
+//!   updates)`, not `f(row after only the first)`, so a dropped second delta
+//!   (or a stale-image read that folds two deltas using the first's
+//!   captured row rather than the current one) shows up as a divergence.
 //!   Every definition this branch's generator draws is `KeySpace::OneToOne`
 //!   (a full recompute from the current source row, not an incremental
-//!   delta fold), so this doesn't yet reach that specific `Aggregate` risk —
-//!   but it's still real, valuable coverage of "the pipeline handles two
-//!   back-to-back real transactions against the same row without dropping
-//!   or double-applying either one," which is the actual, honest scope of
-//!   this task.
+//!   delta fold), so this doesn't yet reach the `Aggregate`-specific
+//!   double-counting risk — but it's still real, valuable coverage of "the
+//!   pipeline handles two back-to-back real transactions against the same
+//!   row without dropping or double-applying either one," which is the
+//!   actual, honest scope of this task.
 
 use engine::{Config, Pool};
 use generative::backend::{Backend, ManualBackend};
@@ -61,30 +71,40 @@ use generative::model::OpOutcome;
 use generative::run::check_program;
 use testkit::TestCluster;
 
-/// The genuinely non-trivial D1 case: the same `Update` applied twice in a
-/// row (no quiesce in between, so both deltas can land close together in the
-/// staging ring before either is folded). Both calls are real, live-row
-/// updates — the second is not a no-op and not a constraint violation, it's
-/// the same statement legitimately re-run — so both succeed, and the
-/// converged target must reflect the update's values exactly once each
-/// column, not doubled, tripled, or reverted.
+/// The genuinely non-trivial D1 case: two `Update`s against the same row,
+/// back to back (no quiesce in between, so both deltas can land close
+/// together in the staging ring before either is folded). Both calls are
+/// real, live-row updates with *distinct* `c1`/`c2` values — see the module
+/// doc comment for why the values must differ for this to be a real trap
+/// rather than a vacuous pin — so both succeed, and the converged target
+/// must reflect the *second* update's values, not the first's (a dropped
+/// second delta) and not some other combination (a stale-image fold).
 #[tokio::test(flavor = "multi_thread")]
-async fn the_same_update_applied_twice_in_a_row_still_converges() {
+async fn two_distinct_updates_to_the_same_row_back_to_back_still_converge() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
     let program = build_program(
         &[(Some(1), Some(2))],
-        &[Mutate::Update {
-            pk: 1,
-            c1: Some(10),
-            c2: Some(20),
-        }],
+        &[
+            Mutate::Update {
+                pk: 1,
+                c1: Some(10),
+                c2: Some(20),
+            },
+            Mutate::Update {
+                pk: 1,
+                c1: Some(99),
+                c2: Some(1),
+            },
+        ],
     );
-    // ops: [seed insert, update]
+    // ops: [seed insert, first update, second update]
     let seed = &program.ops[0];
-    let update = &program.ops[1];
-    assert_eq!(update.expect(), &OpOutcome::Succeeds);
+    let first_update = &program.ops[1];
+    let second_update = &program.ops[2];
+    assert_eq!(first_update.expect(), &OpOutcome::Succeeds);
+    assert_eq!(second_update.expect(), &OpOutcome::Succeeds);
 
     let mut backend = ManualBackend::connect(db.dsn())
         .await
@@ -96,10 +116,10 @@ async fn the_same_update_applied_twice_in_a_row_still_converges() {
     let affected = backend.apply(seed).await.expect("seed insert must succeed");
     assert!(affected > 0);
 
-    // Two back-to-back applies of the exact same Update, no quiesce between
+    // Two back-to-back applies of two different Updates, no quiesce between
     // them: both are real, distinct transactions against a still-live row.
     let first = backend
-        .apply(update)
+        .apply(first_update)
         .await
         .expect("first update application must succeed");
     assert_eq!(
@@ -107,13 +127,13 @@ async fn the_same_update_applied_twice_in_a_row_still_converges() {
         "the first update must affect exactly the one seeded row"
     );
     let second = backend
-        .apply(update)
+        .apply(second_update)
         .await
-        .expect("re-applying the identical update must still succeed (the row is still live)");
+        .expect("second update application must still succeed (the row is still live)");
     assert_eq!(
         second, 1,
-        "the second, identical update must still affect exactly the one live row — it is a \
-         real re-run, not a no-op"
+        "the second update must still affect exactly the one live row — it is a real, distinct \
+         transaction, not a no-op"
     );
 
     backend.quiesce().await.expect("quiesce");
@@ -123,8 +143,8 @@ async fn the_same_update_applied_twice_in_a_row_still_converges() {
         .expect("oracle check must run");
     assert!(
         divergence.is_none(),
-        "repeating an identical, still-valid Update must not leave the target diverged from the \
-         real (cumulative, not double-counted) source state: {divergence:?}"
+        "two back-to-back Updates to the same row must not leave the target diverged from the \
+         real (net-of-both, not dropped-or-double-counted) source state: {divergence:?}"
     );
 }
 
