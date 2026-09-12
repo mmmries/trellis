@@ -26,7 +26,7 @@ pub struct OperatorSpec {
     ///
     /// Levels are spaced out (not packed as 0, 1, 2, ...) so a new operator
     /// can be slotted between two existing levels later without
-    /// renumbering everything else. Use the [`Precedence`] constants below
+    /// renumbering everything else. Use the [`precedence`] constants below
     /// rather than a raw number.
     pub precedence: u8,
 }
