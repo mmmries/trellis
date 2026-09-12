@@ -60,25 +60,43 @@ async Rust via dirty schedulers; Ruby has no comparable idiom. Building two
 different async-bridging strategies for one API, when neither host language
 actually needs concurrent in-flight calls at this boundary, isn't worth it.
 
-**Decision:** the FFI-facing surface is synchronous. A call like `define()`
-blocks (on a dedicated thread owning its own runtime — the same pattern
-`Client::start` already uses internally) and returns once the definition is
-registered.
+**Decision:** the FFI-facing surface is synchronous, and it blocks only on
+*registration*, never on backfill — regardless of which build path a
+definition uses. `define()` blocks (on a dedicated thread owning its own
+runtime — the same pattern `Client::start` already uses internally) just long
+enough to create the target table, capture the coverage fence, and persist the
+definition/enumerate its backfill work; it returns before a single row of the
+target is actually built.
 
-This isn't new architecture bolted onto the async engine — `install_definition`
+**Correction from this doc's first draft:** that draft justified the sync
+decision by pointing out `install_definition`
 (`engine/src/defs/catalog.rs:207`) already blocks synchronously through a full
-backfill on the fast direct-build path, which covers most transform shapes
-today. Only the ring-fallback path (`create_definition`, for shapes the fast
-path can't handle) returns before backfill finishes, leaving the row-by-row
-build to the running `Client`'s CDC/apply loop. So "call blocks on register,
-poll separately for backfill completion" is formalizing a split that already
-exists, not inventing one.
+backfill on the fast direct-build path today, and treated "sync call, separate
+poll for completion" as merely formalizing the existing ring-fallback path's
+behavior. That reasoning doesn't survive contact with scale: even the fast,
+chunked direct-build path (ADR-0007) takes real wall-clock time on a
+billion-row table, and blocking a call — or an in-call loop — for however long
+that takes means an interrupted process (the FFI caller's, or the one doing
+the building) loses all progress. [ADR-0007's amendment](decisions/0007-direct-set-based-backfill.md#backgrounding-and-resumability-amendment)
+now makes backfill *always* background and resumable for both build paths: the
+chunked writes ADR-0007 already breaks the direct build into become a durable,
+claimable work queue that running drain (application) threads execute — the
+same claim/heartbeat/reclaim-stale machinery they already use for sealed ring
+segments — rather than an in-call loop on whatever connection happened to call
+`define()`. `staging_worker` is unrelated to this (it only owns keeping up
+with the logical replication slot); it's `application_threads` that finishes
+transform work, backfill included.
 
 **Follow-on:** this is exactly what issue #55's transform status lifecycle
 (`waiting_to_backfill` → `backfilling` → `live`, plus `quarantined`) is for. A
-host-language caller defines a transform (sync call returns once registered),
-then polls `status(transform)` (see #4 below) until it's `live` — the same
-poll-for-completion pattern requested for embedding.
+host-language caller defines a transform (sync call returns once registered
+and its backfill work is queued), then polls `status(transform)` (see #4
+below) until it's `live` — the same poll-for-completion pattern requested for
+embedding. Note this now means progress requires at least one drain-thread
+worker running *somewhere* in the fleet; a connection that only ever calls
+`define()` and never runs any client with `application_threads > 0` will see
+its definition sit in `waiting_to_backfill` indefinitely — worth calling out
+in whatever documentation eventually covers this for embedders.
 
 Still open: whether the synchronous wrapper lives directly on `Trellis` in the
 `engine` crate, or in a separate shim crate built specifically for #87's FFI
