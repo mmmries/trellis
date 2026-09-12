@@ -482,20 +482,60 @@ mod tests {
         );
     }
 
-    /// Pins the safety net documented on [`registry::OPERATORS`] (issue
-    /// #67): `a > b + c` flat-parses left-associatively as `(a > b) + c`,
-    /// not Postgres's `a > (b + c)`. `+`'s spec requires a Numeric lhs, but
-    /// `a > b` evaluates to Boolean, so the divergent regrouping is caught
-    /// as a type mismatch rather than silently computing a wrong answer.
+    /// Permanent regression pin for real operator precedence (issue #67,
+    /// see [`registry::OPERATORS`]'s doc comment): `a > b + c` must parse as
+    /// `a > (b + c)`, since `+` ([`registry::precedence::ADDITIVE`]) binds
+    /// tighter than `>` ([`registry::precedence::COMPARISON`]), matching
+    /// Postgres's own grouping — not the old flat left-to-right parse that
+    /// used to build `(a > b) + c` here (renamed from
+    /// `flat_parse_of_mixed_operators_is_caught_by_type_checking`, which
+    /// pinned that wrong behavior and relied on the type checker to catch
+    /// the resulting type mismatch). With real precedence, the types line
+    /// up correctly by construction and `validate` accepts the expression.
     #[test]
-    fn flat_parse_of_mixed_operators_is_caught_by_type_checking() {
+    fn mixed_operators_respect_precedence() {
         let def = parse("TRANSFORM t FROM s SELECT a > b + c AS result").unwrap();
         assert_eq!(
             def.fields[0].expr,
             Expr::BinaryOp {
-                op: Operator::Add,
+                op: Operator::GreaterThan,
+                lhs: Box::new(Expr::Column("a".to_string())),
+                rhs: Box::new(Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(Expr::Column("b".to_string())),
+                    rhs: Box::new(Expr::Column("c".to_string())),
+                }),
+            }
+        );
+
+        let source_columns: std::collections::HashMap<String, ValueType> = [
+            ("a".to_string(), ValueType::Numeric),
+            ("b".to_string(), ValueType::Numeric),
+            ("c".to_string(), ValueType::Numeric),
+        ]
+        .into_iter()
+        .collect();
+        validate(&def, &source_columns, &std::collections::HashMap::new())
+            .expect("a > (b + c) type-checks cleanly under real precedence");
+    }
+
+    /// Same operators as [`mixed_operators_respect_precedence`], reordered
+    /// so the additive operator comes first: `a + b > c` groups as
+    /// `(a + b) > c` under real precedence too (`+` still binds tighter
+    /// than `>`, and there's only one way to slot a comparison around an
+    /// already-complete additive expression). This happens to be the same
+    /// tree the old flat left-to-right parser also produced for this
+    /// particular ordering — but now for the right reason, not by
+    /// coincidence of parse order.
+    #[test]
+    fn additive_before_comparison_still_binds_additive_first() {
+        let def = parse("TRANSFORM t FROM s SELECT a + b > c AS result").unwrap();
+        assert_eq!(
+            def.fields[0].expr,
+            Expr::BinaryOp {
+                op: Operator::GreaterThan,
                 lhs: Box::new(Expr::BinaryOp {
-                    op: Operator::GreaterThan,
+                    op: Operator::Add,
                     lhs: Box::new(Expr::Column("a".to_string())),
                     rhs: Box::new(Expr::Column("b".to_string())),
                 }),
@@ -510,13 +550,26 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let err = validate(&def, &source_columns, &std::collections::HashMap::new()).unwrap_err();
+        validate(&def, &source_columns, &std::collections::HashMap::new())
+            .expect("(a + b) > c type-checks cleanly");
+    }
+
+    /// A same-precedence chain (`+`, `+`) stays left-associative under real
+    /// precedence, exactly as it did under the old flat parser: `a + b + c`
+    /// parses as `(a + b) + c`, not `a + (b + c)`.
+    #[test]
+    fn same_precedence_chain_is_left_associative() {
+        let def = parse("TRANSFORM t FROM s SELECT a + b + c AS result").unwrap();
         assert_eq!(
-            err,
-            ValidationError::TypeMismatch {
-                field: "result".to_string(),
-                expected: ValueType::Numeric,
-                found: ValueType::Boolean,
+            def.fields[0].expr,
+            Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(Expr::Column("a".to_string())),
+                    rhs: Box::new(Expr::Column("b".to_string())),
+                }),
+                rhs: Box::new(Expr::Column("c".to_string())),
             }
         );
     }
