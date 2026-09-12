@@ -101,15 +101,14 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
     }
 }
 
-/// Every operator the generator currently supports (today: just `+`) appears
-/// over every argument type it supports (`Numeric, Numeric`).
-///
-/// `engine::defs::ast::Operator` also has `GreaterThan` (`Numeric, Numeric ->
-/// Boolean`), but the generator does not draw it yet — that widening is
-/// tracked separately (issue #65 added the operator to the engine grammar;
-/// generating it is a future generator issue, not this one). This test scopes
-/// itself to what the generator actually draws today, and will need a
-/// `GreaterThan` case added the day that widening lands.
+/// `build_program`'s fixed `total = c1 + c2` field (unaffected by
+/// improvement-plan task B2's new "derived" field — see
+/// `generate::build_program_multi_with_derived`'s doc comment, which layers
+/// on top of `build_program_multi` rather than changing its output) still
+/// draws exactly `Operator::Add` over `Numeric, Numeric`, unchanged from
+/// before task B2. `Operator::GreaterThan` is drawn too now, but only by the
+/// proptest strategy's independent `derived` field — see
+/// `trivial_program_sometimes_draws_greater_than` below for that floor.
 #[test]
 fn every_supported_operator_appears_over_every_supported_argument_type() {
     let program = build_program(&[(Some(1), Some(2))], &[]);
@@ -494,5 +493,87 @@ fn trivial_program_sometimes_draws_defs_sharing_a_source_and_sometimes_draws_def
     assert!(
         saw_different_sources,
         "expected at least one sample where all defs draw distinct source tables across 500 samples"
+    );
+}
+
+/// Improvement-plan task B2: the default strategy's new "derived" field
+/// (`generate::DerivedShape`) must sometimes draw `Operator::GreaterThan` —
+/// sampled the same way as every other genuinely-probabilistic floor above
+/// (many samples, not every sample: which `DerivedShape` variant a def draws
+/// is random).
+#[test]
+fn trivial_program_sometimes_draws_greater_than() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    assert!(
+        coverage.operators.contains("GreaterThan"),
+        "coverage floor failed: expected \"GreaterThan\" among operators across 500 samples:\n{coverage}"
+    );
+}
+
+/// Improvement-plan task B2: each of the five scalar functions
+/// (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/`REGEXP_COUNT`/`COALESCE`) must
+/// appear at least once across many samples — the same "each shape reachable
+/// across a bounded number of samples" floor as `GreaterThan` above, applied
+/// to every function `generate::DerivedShape` can draw.
+#[test]
+fn trivial_program_draws_every_scalar_function_at_least_once() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    for function in [
+        "STRPOS",
+        "OCTET_LENGTH",
+        "CHAR_LENGTH",
+        "REGEXP_COUNT",
+        "COALESCE",
+    ] {
+        assert!(
+            coverage.functions.contains(function),
+            "coverage floor failed: expected {function:?} among functions across 500 samples:\n{coverage}"
+        );
+    }
+}
+
+/// Improvement-plan task B2: the default strategy must sometimes draw a
+/// nested (depth >= 3) expression tree — e.g. `(c1 + c2) > c1`
+/// (`DerivedShape::ArithmeticGreaterThan`) or `STRPOS(text_col, 'x') > 0`
+/// (`DerivedShape::StrposGreaterThan`) — not just the single-operator/
+/// single-function leaves every other `DerivedShape` variant (and `total`)
+/// draws. `Coverage::max_expr_depth` is the accumulator this asserts
+/// against; see its doc comment for why it's tracked separately from
+/// `expr_shapes`.
+#[test]
+fn trivial_program_sometimes_draws_a_nested_expression() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    assert!(
+        coverage.max_expr_depth >= 3,
+        "coverage floor failed: expected a nested expression of depth >= 3 across 500 samples \
+         (max depth seen: {}):\n{coverage}",
+        coverage.max_expr_depth
     );
 }

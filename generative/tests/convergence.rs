@@ -22,11 +22,13 @@
 //! -p generative --test convergence`). Failing seeds are persisted to the
 //! checked-in `tests/proptest-regressions/convergence.txt` and replayed first.
 
+use engine::defs::ast::Expr;
 use engine::defs::qualified_target_table;
 use engine::{Config, Pool};
 use generative::backend::{Backend, ManualBackend};
 use generative::generate::{
-    Mutate, TableSpec, build_program, build_program_multi, trivial_program,
+    DerivedShape, Mutate, TableSpec, build_program, build_program_multi,
+    build_program_multi_with_derived, trivial_program,
 };
 use generative::run::{RunError, check_program, run_convergence};
 use proptest::prelude::*;
@@ -491,5 +493,73 @@ async fn a_text_boolean_uuid_program_converges_end_to_end() {
     let outcome = run_convergence(&mut backend, &pool, &program)
         .await
         .expect("a Text/Boolean/Uuid program must converge end-to-end");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+}
+
+/// Improvement-plan task B2: a hand-built program whose "derived" field is
+/// `STRPOS(text_col, 'wor') > 0` — a nested, *mixed* operator-and-function
+/// expression (`Operator::GreaterThan` wrapping a `FunctionCall`) — driven
+/// through the real convergence property end-to-end. Not just the property
+/// happening to draw this `DerivedShape` sometimes (per this suite's own
+/// "coverage that silently drops out" principle, same rationale as the B1/B3
+/// pins above): this is the specific shape the render_expr parenthesization
+/// fix (`generative::backend::manual::render_expr`) and the oracle's new
+/// `>`/function rendering (`generative::oracle::render_expr`) both exist for.
+///
+/// Row 1's `text_col` is `"hello world"`, so `STRPOS(text_col, 'wor')` finds
+/// a match (`> 0` is `true`); row 2's is `"goodbye"`, so it doesn't (`> 0` is
+/// `false`) — both branches of the nested comparison get real, live coverage,
+/// not just the "always true" or "always false" case a less deliberate
+/// choice of values could have left untested.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nested_mixed_operator_and_function_expression_converges_end_to_end() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program_multi_with_derived(
+        &[TableSpec {
+            seed_values: vec![(Some(1), Some(2)), (Some(3), Some(4))],
+            text_values: vec![Some("hello world".to_string()), Some("goodbye".to_string())],
+            bool_values: vec![Some("true".to_string()), Some("false".to_string())],
+            uuid_values: vec![
+                Some("123e4567-e89b-42d3-a456-426614174000".to_string()),
+                Some("00000000-0000-4000-8000-000000000000".to_string()),
+            ],
+            mutates: vec![],
+        }],
+        &[0],
+        &[DerivedShape::StrposGreaterThan {
+            needle: "wor".to_string(),
+            threshold: 0,
+        }],
+    );
+    assert_eq!(program.tables.len(), 1);
+    assert_eq!(program.defs.len(), 1);
+    assert_eq!(
+        program.defs[0].fields.len(),
+        5,
+        "expected total + 3 passthroughs + 1 derived"
+    );
+    let derived = &program.defs[0].fields.last().expect("derived field").expr;
+    assert!(
+        matches!(
+            derived,
+            Expr::BinaryOp {
+                op: engine::defs::ast::Operator::GreaterThan,
+                lhs,
+                ..
+            } if matches!(lhs.as_ref(), Expr::FunctionCall { name, .. } if name == "STRPOS")
+        ),
+        "expected the derived field to be STRPOS(...) > <literal>, got {derived:?}"
+    );
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("a nested mixed operator-and-function expression must converge end-to-end");
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
 }
