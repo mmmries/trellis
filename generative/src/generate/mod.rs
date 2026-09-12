@@ -88,7 +88,7 @@
 //!
 //! [`Strategy`]: proptest::strategy::Strategy
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 
@@ -538,6 +538,235 @@ pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Progr
     Program {
         tables: built_tables,
         defs,
+        ops,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Improvement-plan workstream D, task D2: order-insensitivity over
+// commuting ops.
+// ---------------------------------------------------------------------
+//
+// The property this section supports (`generative/tests/order_insensitivity.rs`)
+// is: reorder ops that target *distinct derived-target keys*, and
+// convergence must be identical. The load-bearing design point is what
+// "distinct derived-target keys" means: it must be keyed off **the target
+// key each op maps to under each installed definition sourced from that
+// op's table**, not off the op's raw source `(table, pk)` — even though
+// today (this branch's generator only ever emits [`KeySpace::OneToOne`]
+// definitions) those two things always coincide, so the distinction is
+// currently invisible in practice.
+//
+// Why bother, if it's invisible today? [`KeySpace::Aggregate { group_by }`]
+// already exists in `engine::defs::ast`, and a parallel effort is adding
+// generative coverage for it. Once an `Aggregate` definition is generated
+// here, two ops on *different* source pks can land in the *same* aggregate
+// group (the `GROUP BY` columns match), and reordering them relative to an
+// op that reads a *different* group would no longer be obviously safe the
+// way "different pk, different row" is today. Keying the whole analysis off
+// [`target_key_for`] — which happens to reduce to the source pk for
+// `OneToOne`, but doesn't have to for `Aggregate` — means widening the
+// generator to draw `Aggregate` definitions later only requires filling in
+// that one match arm, not reworking every call site that decides whether
+// two ops may be reordered.
+
+/// The table an [`Op`] targets, regardless of its kind.
+fn op_table(op: &Op) -> &str {
+    match op {
+        Op::Insert { table, .. } | Op::Update { table, .. } | Op::Delete { table, .. } => table,
+    }
+}
+
+/// The value of `table`'s own primary-key column that `op` (which must
+/// target `table`) reads or writes — `None` only if `op` doesn't actually
+/// carry that column (a generator bug: every [`Op::Insert`] this crate
+/// builds always carries the pk column, non-`NULL`, and `Update`/`Delete`
+/// carry it directly as `pk`).
+fn op_pk_value(op: &Op, table: &Table) -> Option<String> {
+    match op {
+        Op::Insert { row, .. } => row
+            .iter()
+            .find(|(name, _)| name == &table.pk_col)
+            .and_then(|(_, value)| value.clone()),
+        Op::Update { pk, .. } | Op::Delete { pk, .. } => Some(pk.clone()),
+    }
+}
+
+/// The key of the target-table row `op` contributes to under `def`, if
+/// `def.source` names `op`'s own table (`None` otherwise — the definition is
+/// irrelevant to this op) — see the module-section doc comment above for why
+/// this, rather than the raw source pk, is what [`ops_commute`] must be keyed
+/// on.
+///
+/// `None` also covers "the key can't be determined from `op` alone": for
+/// `KeySpace::Aggregate`, an `Update`/`Delete` op carries no guarantee it
+/// touches (or reveals) every `group_by` column — an `Update` may leave every
+/// grouping column untouched, and a `Delete` carries no columns at all — so
+/// resolving the *actual* group a pre-existing row belongs to would need a
+/// source-row lookup this model-only function deliberately never does.
+/// Callers must treat `None` conservatively, as "may conflict with anything
+/// on this table", never as "definitely independent" — see [`ops_commute`].
+pub fn target_key_for(def: &TransformDef, table: &Table, op: &Op) -> Option<String> {
+    if op_table(op) != def.source {
+        return None;
+    }
+    match &def.key_space {
+        KeySpace::OneToOne => op_pk_value(op, table),
+        // No generator on this branch draws a `KeySpace::Aggregate`
+        // definition yet (see the module-section doc comment), so this arm
+        // is unreachable in practice today. It is still filled in — rather
+        // than `unreachable!()` — for the one case it *can* honestly answer
+        // (an `Insert` that carries every `group_by` column in its own row,
+        // exactly the way `OneToOne` reads the pk column off the same row),
+        // so the seam is real rather than a stub that would need rewriting
+        // the day an `Aggregate` generator lands.
+        KeySpace::Aggregate { group_by } => match op {
+            Op::Insert { row, .. } => {
+                let mut parts = Vec::with_capacity(group_by.len());
+                for column in group_by {
+                    let value = row.iter().find(|(name, _)| name == column)?.1.clone();
+                    // A `NULL` grouping value is itself a value Postgres's
+                    // `GROUP BY` treats as one group (nulls compare equal for
+                    // grouping purposes) — encode it as a value distinct from
+                    // any real rendered column text, rather than collapsing
+                    // it into the empty string a real value could also
+                    // render as.
+                    parts.push(value.unwrap_or_else(|| "\u{0}NULL\u{0}".to_string()));
+                }
+                Some(parts.join("\u{1f}"))
+            }
+            Op::Update { .. } | Op::Delete { .. } => None,
+        },
+    }
+}
+
+/// Whether `a` and `b` — two ops belonging to `program` — may be freely
+/// reordered relative to each other without changing the program's eventual
+/// converged state (D2).
+///
+/// Ops on different tables always commute: every definition this generator
+/// installs gets its own freshly-minted target ([`NamePool::next_table_name`]),
+/// so two different source tables can never feed the same target row, and a
+/// source table's own rows are obviously independent of another table's.
+///
+/// Ops on the *same* table commute only if **both**:
+/// - they touch different rows of that table's own primary key (a table's
+///   raw rows are part of [`crate::backend::Snapshot`] too, independent of
+///   any definition reading them — design doc §1), and
+/// - under *every* definition sourced from that table, they resolve to
+///   different target keys via [`target_key_for`] — an unresolved (`None`)
+///   key is a conflict, never a pass.
+pub fn ops_commute(program: &Program, a: &Op, b: &Op) -> bool {
+    let (table_a, table_b) = (op_table(a), op_table(b));
+    if table_a != table_b {
+        return true;
+    }
+    let Some(table) = program.tables.iter().find(|t| t.name == table_a) else {
+        // An op names a table the program never declared — a generator bug
+        // this function has no business papering over by claiming
+        // independence.
+        return false;
+    };
+
+    let same_row = match (op_pk_value(a, table), op_pk_value(b, table)) {
+        (Some(pk_a), Some(pk_b)) => pk_a == pk_b,
+        // An unresolved pk is a generator bug, not evidence of
+        // independence — be conservative.
+        _ => true,
+    };
+    if same_row {
+        return false;
+    }
+
+    program
+        .defs
+        .iter()
+        .filter(|def| def.source == table_a)
+        .all(
+            |def| match (target_key_for(def, table, a), target_key_for(def, table, b)) {
+                (Some(key_a), Some(key_b)) => key_a != key_b,
+                _ => false,
+            },
+        )
+}
+
+/// Partitions `program.ops`' indices into commute groups: ops sharing a
+/// group must keep their original relative order; ops in different groups
+/// may be freely interleaved in any order ([`ops_commute`]). Each group's own
+/// indices are kept in original relative (increasing) order.
+///
+/// Built with a small union-find over the pairwise [`ops_commute`] predicate,
+/// rather than hardcoding "group by (table, pk)" directly: that pairwise
+/// predicate is the one place `Aggregate` support would need to grow
+/// (via [`target_key_for`]), so grouping through it — instead of re-deriving
+/// an equivalent-but-separate key here — keeps this function correct for
+/// free the day that widening lands, and safe (via the union step) even if a
+/// future predicate is no longer transitive across three or more ops.
+fn commute_groups(program: &Program) -> Vec<Vec<usize>> {
+    let n = program.ops.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        if parent[x] != x {
+            parent[x] = find(parent, parent[x]);
+        }
+        parent[x]
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let (root_a, root_b) = (find(parent, a), find(parent, b));
+        if root_a != root_b {
+            parent[root_a] = root_b;
+        }
+    }
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if !ops_commute(program, &program.ops[i], &program.ops[j]) {
+                union(&mut parent, i, j);
+            }
+        }
+    }
+
+    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        groups.entry(root).or_default().push(i);
+    }
+
+    let mut result: Vec<Vec<usize>> = groups.into_values().collect();
+    // Deterministic output order (by each group's first/smallest index), so
+    // `reordered_by_commute_groups` below is itself deterministic.
+    result.sort_by_key(|group| group[0]);
+    result
+}
+
+/// Builds a second, independently-valid op ordering for `program`: the same
+/// tables/defs and the same *set* of ops, but with the commute groups
+/// ([`commute_groups`]) concatenated in reverse order — each group's own
+/// internal relative order is left untouched.
+///
+/// That internal-order guarantee is what keeps every op's `expect()` — set by
+/// [`build_program_multi`]'s per-table pk-liveness simulation, which only
+/// ever depends on *earlier same-pk ops* — still valid against the new
+/// ordering: an op's real `apply()` outcome is unaffected by ops outside its
+/// own commute group being shuffled around it.
+///
+/// Reversing group order (rather than drawing an arbitrary permutation) is a
+/// deliberately simple construction that differs from the input whenever
+/// there is more than one group: `generative/tests/order_insensitivity.rs`
+/// only needs *some* second valid ordering to diff the original against, not
+/// a random sample of every valid ordering.
+pub fn reordered_by_commute_groups(program: &Program) -> Program {
+    let groups = commute_groups(program);
+    let mut ops = Vec::with_capacity(program.ops.len());
+    for group in groups.iter().rev() {
+        for &index in group {
+            ops.push(program.ops[index].clone());
+        }
+    }
+    Program {
+        tables: program.tables.clone(),
+        defs: program.defs.clone(),
         ops,
     }
 }
@@ -1137,6 +1366,147 @@ mod tests {
             assert_ne!(
                 program.defs[0].target, program.defs[1].target,
                 "two defs over the same source must still get distinct targets"
+            );
+        }
+    }
+
+    /// Improvement-plan task D2: fast, DB-free pins on the commutation
+    /// analysis itself ([`ops_commute`]/[`commute_groups`]/
+    /// [`reordered_by_commute_groups`]) — the slow, DB-backed half (do two
+    /// commuting orderings actually converge identically against a real
+    /// cluster) lives in `generative/tests/order_insensitivity.rs`.
+    mod order_insensitivity {
+        use super::*;
+
+        #[test]
+        fn ops_on_different_tables_always_commute() {
+            let program = build_program_multi(
+                &[
+                    TableSpec::numeric_only(vec![(Some(1), Some(2))], vec![]),
+                    TableSpec::numeric_only(vec![(Some(3), Some(4))], vec![]),
+                ],
+                &[0, 1],
+            );
+            // ops[0] seeds table A's pk 1, ops[1] seeds table B's pk 1 —
+            // different tables, so they commute even though the pk (1)
+            // happens to coincide.
+            assert!(ops_commute(&program, &program.ops[0], &program.ops[1]));
+        }
+
+        #[test]
+        fn ops_on_the_same_table_and_pk_never_commute() {
+            let program = build_program(
+                &[(Some(1), Some(2))],
+                &[Mutate::Update {
+                    pk: 1,
+                    c1: Some(9),
+                    c2: Some(9),
+                }],
+            );
+            // ops[0] seeds pk 1, ops[1] updates that same pk 1.
+            assert!(!ops_commute(&program, &program.ops[0], &program.ops[1]));
+        }
+
+        #[test]
+        fn ops_on_the_same_table_but_different_pks_commute() {
+            let program = build_program(&[(Some(1), Some(2)), (Some(3), Some(4))], &[]);
+            // ops[0] seeds pk 1, ops[1] seeds pk 2 — same table, distinct
+            // rows, no def-level collision (OneToOne: target key == pk).
+            assert!(ops_commute(&program, &program.ops[0], &program.ops[1]));
+        }
+
+        #[test]
+        fn target_key_for_one_to_one_is_the_source_pk() {
+            let program = build_program(&[(Some(1), Some(2))], &[]);
+            let table = &program.tables[0];
+            let def = &program.defs[0];
+            assert_eq!(
+                target_key_for(def, table, &program.ops[0]),
+                Some("1".to_string())
+            );
+        }
+
+        #[test]
+        fn target_key_for_returns_none_for_a_definition_over_a_different_table() {
+            let program = build_program_multi(
+                &[
+                    TableSpec::numeric_only(vec![(Some(1), Some(2))], vec![]),
+                    TableSpec::numeric_only(vec![(Some(3), Some(4))], vec![]),
+                ],
+                // def 0 sources table 0 only.
+                &[0],
+            );
+            let table_b = &program.tables[1];
+            let def = &program.defs[0];
+            // ops[1] is table B's seed insert; def 0 is sourced from table A.
+            assert_eq!(target_key_for(def, table_b, &program.ops[1]), None);
+        }
+
+        #[test]
+        fn reordered_by_commute_groups_preserves_the_same_multiset_of_ops() {
+            let program = build_program(
+                &[(Some(1), Some(2)), (Some(3), Some(4))],
+                &[
+                    Mutate::Update {
+                        pk: 1,
+                        c1: Some(10),
+                        c2: Some(20),
+                    },
+                    Mutate::Update {
+                        pk: 2,
+                        c1: Some(30),
+                        c2: Some(40),
+                    },
+                ],
+            );
+            let reordered = reordered_by_commute_groups(&program);
+
+            let mut original_ops = program.ops.clone();
+            let mut reordered_ops = reordered.ops.clone();
+            original_ops.sort_by_key(|op| format!("{op:?}"));
+            reordered_ops.sort_by_key(|op| format!("{op:?}"));
+            assert_eq!(
+                original_ops, reordered_ops,
+                "reordering must never add, drop, or mutate an op — only its position: \
+                 original {:#?} vs reordered {:#?}",
+                program.ops, reordered.ops
+            );
+        }
+
+        #[test]
+        fn reordered_by_commute_groups_preserves_relative_order_within_a_pk() {
+            let program = build_program(
+                &[(Some(1), Some(2))],
+                &[
+                    Mutate::Update {
+                        pk: 1,
+                        c1: Some(10),
+                        c2: Some(20),
+                    },
+                    Mutate::Delete { pk: 1 },
+                ],
+            );
+            let reordered = reordered_by_commute_groups(&program);
+
+            // pk 1's own ops (seed, update, delete) all belong to one commute
+            // group (there's only one row in play at all), so the whole
+            // program has exactly one group and the reordering must be the
+            // identity — this is the pin that a same-pk sequence never gets
+            // scrambled internally.
+            assert_eq!(reordered.ops, program.ops);
+        }
+
+        #[test]
+        fn reordered_by_commute_groups_can_actually_change_order_across_independent_pks() {
+            let program = build_program(
+                &[(Some(1), Some(2)), (Some(3), Some(4)), (Some(5), Some(6))],
+                &[],
+            );
+            let reordered = reordered_by_commute_groups(&program);
+            assert_ne!(
+                reordered.ops, program.ops,
+                "three independent single-row groups must reorder under a group-order reversal: \
+                 {reordered:#?}"
             );
         }
     }
