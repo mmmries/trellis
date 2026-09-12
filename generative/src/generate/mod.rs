@@ -66,16 +66,34 @@
 //! declares the `GROUP BY` columns as the target's Postgres `PRIMARY KEY`,
 //! which is unconditionally `NOT NULL` — so a source row with a `NULL`
 //! grouping value makes every attempted write to that group fail with a
-//! genuine `null value in column ... violates not-null constraint` error,
-//! confirmed with a from-scratch, `ManualBackend`-free repro directly against
-//! `engine::staging::apply`. Worse, `engine::client`'s `app_worker_loop`
-//! treats that as "one bad batch" and retries the *same* segment forever
-//! rather than surfacing it as fatal, so the source table's watermark never
-//! advances and `staging::await_converged` never returns — observed as this
-//! suite's own `run_convergence` hanging past its 30-second
-//! `QUIESCE_TIMEOUT` on a freshly-provisioned, uncontended cluster with a
-//! single seeded row. See [`grain_value`]'s doc comment for the full
-//! writeup. That's a real, reproducible liveness bug worth fixing
+//! genuine `null value in column ... violates not-null constraint` error.
+//! **Corrected during review, against an independent from-scratch repro
+//! directly against `engine::staging::apply::drain_once`:** this is *not*
+//! an infinite retry of the same segment, and it does *not* stall the source
+//! table's watermark. `engine::client`'s `app_worker_loop` releases a failed
+//! claim and re-fetches the same segment, but `staging::quarantine`'s
+//! existing isolate-before-blaming machinery (`quarantine::classify` routes
+//! a plain Postgres constraint-violation error to `FailureClass::Isolate`)
+//! probes the offending row alone, charges it a death, and — once its death
+//! count crosses `quarantine::DEFAULT_DEATH_THRESHOLD` (5, reached within a
+//! single `drain_once` call in the repro) — evicts and parks it, letting the
+//! rest of the batch drain normally; `engine/tests/quarantine.rs`'s
+//! `repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still_drains`
+//! already covers exactly this recovery path for a different deterministic
+//! per-row failure. The real, still-unfixed defect is narrower and
+//! *silent*: the `NULL`-keyed row's contribution is permanently excluded
+//! from its aggregate group, with no automatic recovery — and not even a
+//! manual `quarantine::release_key` recovers it, since replaying the same
+//! row just reproduces the identical constraint violation and re-quarantines
+//! it. What *does* genuinely hang is this suite's own `run_convergence`/
+//! `quiesce`: `staging::converge::converged_through`'s condition 4
+//! deliberately treats any live `poison_held` row as "not converged" until
+//! an operator releases it, and nothing here ever does — so a token at or
+//! past the poisoned row's LSN never converges, observed as `quiesce`
+//! hanging past its 30-second `QUIESCE_TIMEOUT`. See [`grain_value`]'s doc
+//! comment for the full writeup. That's a real, reproducible correctness bug
+//! (a legal SQL `NULL` grouping value is silently and permanently dropped
+//! from its aggregate, unrecoverably) worth fixing
 //! (`create_aggregate_target_table` needs a NULL-tolerant unique constraint
 //! instead of a bare composite `PRIMARY KEY`), but it's an engine schema
 //! change outside this generative-suite-widening task's scope — so this
@@ -1023,28 +1041,48 @@ mod strategy {
     /// error — confirmed directly against a from-scratch, ManualBackend-free
     /// `engine::staging::apply` repro during this task's own testing, one
     /// `COUNT(*)`-only field, one seeded row with `NULL` grain, nothing else.
-    /// Worse than a rejected write: the constraint violation surfaces deep
-    /// inside `staging::apply`'s CDC drain path
-    /// (`engine::client`'s `app_worker_loop`, whose own doc comment says "one
-    /// bad batch never crashes the worker" — it releases the claim and
-    /// *keeps retrying the same segment*), so the batch is retried forever,
-    /// the watermark for that source table never advances past it, and
-    /// `staging::await_converged` never returns — observed directly as this
-    /// suite's `run_convergence` timing out at its 30s `QUIESCE_TIMEOUT`
-    /// on a *fresh, uncontended* cluster, not just under load. This is a
-    /// real, reproducible liveness bug (a NULL grouping value can wedge an
-    /// aggregate source table's ingestion permanently), not merely an
-    /// unsupported edge case — flagged here rather than fixed, since a real
-    /// fix needs a schema change to `create_aggregate_target_table` (a
+    ///
+    /// **Corrected during review** (an independent repro against
+    /// `engine::staging::apply::drain_once` directly): the failure is *not*
+    /// an infinite retry of the same segment and does *not* stall the
+    /// source table's watermark. `staging::quarantine::classify` routes a
+    /// plain constraint-violation error to `FailureClass::Isolate`, whose
+    /// isolate-before-blaming machinery (`quarantine::isolate_and_evict`)
+    /// probes the offending row alone, charges it a death each real attempt,
+    /// and — once it crosses `quarantine::DEFAULT_DEATH_THRESHOLD` (5,
+    /// reached within a *single* `drain_once` call in the repro) — evicts
+    /// and parks it, letting the rest of the batch (and every other key)
+    /// drain and apply normally; `engine/tests/quarantine.rs`'s
+    /// `repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still_drains`
+    /// already covers this exact recovery path for an unrelated
+    /// deterministically-malformed value. The real defect is narrower and
+    /// silent, not a liveness wedge: the `NULL`-keyed row's contribution is
+    /// permanently excluded from its aggregate group with no automatic
+    /// recovery, and the repro further shows even a manual
+    /// `quarantine::release_key` cannot recover it — replaying the same row
+    /// just reproduces the identical constraint violation and re-quarantines
+    /// it. What genuinely never resolves on its own is this suite's own
+    /// `run_convergence`/`quiesce`: `staging::converge::converged_through`'s
+    /// condition 4 deliberately treats any live `poison_held` row as "not
+    /// converged" until an operator releases it, which nothing here ever
+    /// does — so a token at or past the poisoned row's LSN never converges,
+    /// observed directly as this suite's `run_convergence` timing out at its
+    /// 30s `QUIESCE_TIMEOUT` on a *fresh, uncontended* cluster, not just
+    /// under load. This is still a real, reproducible bug worth fixing — a
+    /// legal SQL `NULL` grouping value is silently and permanently dropped
+    /// from its aggregate, with no way to recover it even by hand — just a
+    /// narrower and different one than "retries forever" would suggest; a
+    /// real fix needs a schema change to `create_aggregate_target_table` (a
     /// NULL-tolerant unique constraint instead of a bare `PRIMARY KEY`, plus
     /// whatever upsert-conflict-target changes that implies throughout
     /// `staging::apply_aggregate`), which is engine work well outside this
     /// generative-suite-widening task's scope. Until that lands, this
-    /// generator must not draw a value that's *known* to wedge the very
-    /// pipeline it's exercising — see also `tests/coverage.rs`'s
-    /// `awkward_values_off_never_draws_null`, which this keeps satisfying
-    /// unconditionally (there's no `awkward_values`-gated branch to keep in
-    /// sync here at all now) rather than incidentally.
+    /// generator must not draw a value that's *known* to silently and
+    /// permanently drop data from the very pipeline it's exercising — see
+    /// also `tests/coverage.rs`'s `awkward_values_off_never_draws_null`,
+    /// which this keeps satisfying unconditionally (there's no
+    /// `awkward_values`-gated branch to keep in sync here at all now) rather
+    /// than incidentally.
     fn grain_value() -> impl Strategy<Value = Option<String>> {
         prop_oneof![
             Just(Some("0".to_string())),

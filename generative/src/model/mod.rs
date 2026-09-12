@@ -146,9 +146,15 @@ pub struct Program {
 /// target's primary key (never `NULL`, enforced by the source table's own
 /// `primary key` constraint), a grouping column genuinely can be `NULL` —
 /// Postgres's `GROUP BY` groups every `NULL` grouping value together as one
-/// group, and the generative suite's grain column deliberately draws `NULL`
-/// as one of its four values specifically to reach that case (see
-/// `crate::generate`'s grain-column doc comment). [`crate::oracle`]'s SQL
+/// group — but the generative suite's grain column never actually draws
+/// `NULL` (see `crate::generate::strategy::grain_value`'s doc comment for the
+/// real engine bug a `NULL` grouping value hits, which is why this stays
+/// scoped out of the generator for now); this function still handles a
+/// `NULL` component correctly regardless, since a hand-built pin can
+/// construct one directly (see [`crate::generate::TableSpec::grain_values`]'s
+/// doc comment), and [`engine::defs::oracle::recompute_aggregate`]'s own
+/// private `group_key` this mirrors has no such restriction either.
+/// [`crate::oracle`]'s SQL
 /// oracle, its evaluator oracle (via [`engine::defs::oracle::recompute_aggregate`],
 /// whose own private `group_key` uses this exact same length-prefixing
 /// scheme independently), and [`crate::backend::ManualBackend`]'s persisted-
