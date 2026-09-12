@@ -140,6 +140,40 @@ pub struct Program {
     pub ops: Vec<Op>,
 }
 
+/// The composite row-key convention for an [`engine::defs::ast::KeySpace::Aggregate`]
+/// target (improvement-plan task B4): every row in a `GROUP BY` target is
+/// keyed by its grouping column(s)' rendered text values, but unlike a 1-1
+/// target's primary key (never `NULL`, enforced by the source table's own
+/// `primary key` constraint), a grouping column genuinely can be `NULL` —
+/// Postgres's `GROUP BY` groups every `NULL` grouping value together as one
+/// group — but the generative suite's grain column never actually draws
+/// `NULL` (see `crate::generate::strategy::grain_value`'s doc comment for the
+/// real engine bug a `NULL` grouping value hits, which is why this stays
+/// scoped out of the generator for now); this function still handles a
+/// `NULL` component correctly regardless, since a hand-built pin can
+/// construct one directly (see [`crate::generate::TableSpec::grain_values`]'s
+/// doc comment), and [`engine::defs::oracle::recompute_aggregate`]'s own
+/// private `group_key` this mirrors has no such restriction either.
+/// [`crate::oracle`]'s SQL
+/// oracle, its evaluator oracle (via [`engine::defs::oracle::recompute_aggregate`],
+/// whose own private `group_key` uses this exact same length-prefixing
+/// scheme independently), and [`crate::backend::ManualBackend`]'s persisted-
+/// target reader all key their rows through this one function, so a group's
+/// identity lines up across all three sources of the three-way comparison
+/// regardless of whether any grouping column is `NULL`.
+///
+/// Each component is length-prefixed (`"{len}:{value}"`, `NULL` rendered as
+/// the empty string before prefixing) rather than joined on a bare
+/// separator, so a grouping column whose value itself contains the
+/// separator character can never make two distinct groupings collide.
+pub fn group_key(values: &[Option<String>]) -> String {
+    values
+        .iter()
+        .map(|v| v.clone().unwrap_or_default())
+        .map(|v| format!("{}:{v}", v.len()))
+        .collect()
+}
+
 /// Small, fixed name pools (`t0`, `d0`, `c0`, ...) rather than random
 /// identifiers — a shrunk counterexample you can read at a glance beats one
 /// that is technically smaller (design doc §1). Each kind of name has its
@@ -216,6 +250,29 @@ mod tests {
         );
         assert_eq!(table.columns[1].value_type, ValueType::Numeric);
         assert_eq!(table.columns[2].value_type, ValueType::Text);
+    }
+
+    #[test]
+    fn group_key_distinguishes_null_from_a_real_value() {
+        assert_ne!(group_key(&[None]), group_key(&[Some("0".to_string())]));
+    }
+
+    #[test]
+    fn group_key_is_stable_for_equal_inputs() {
+        assert_eq!(
+            group_key(&[Some("1".to_string()), None]),
+            group_key(&[Some("1".to_string()), None])
+        );
+    }
+
+    #[test]
+    fn group_key_length_prefixing_avoids_a_naive_join_collision() {
+        // A bare `,`-joined key would make these two distinct groupings
+        // collide (`("x,y", "z")` vs. `("x", "y,z")`); length-prefixing each
+        // component keeps them apart.
+        let a = group_key(&[Some("x,y".to_string()), Some("z".to_string())]);
+        let b = group_key(&[Some("x".to_string()), Some("y,z".to_string())]);
+        assert_ne!(a, b);
     }
 
     #[test]
