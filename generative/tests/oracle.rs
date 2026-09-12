@@ -209,7 +209,7 @@ async fn an_evaluator_disagreement_reads_as_evaluator_not_sql() {
         .await
         .expect("evaluator oracle");
 
-    let report = three_way(&program, &def, &target, &evaluator, &sql);
+    let report = three_way(&program, &def, &columns, &target, &evaluator, &sql);
 
     assert!(report.diverged(), "drift must be caught");
     assert!(

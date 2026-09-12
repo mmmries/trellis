@@ -34,12 +34,15 @@ fn sorted_value_types(types: impl IntoIterator<Item = ValueType>) -> Vec<&'stati
 
 /// Every scalar type appears both as a plain column and via a derivation.
 ///
-/// Today's whole type surface is Numeric-only end to end (design doc §3):
-/// the source table's columns are Numeric, and the sole definition's
-/// derivation (`c1 + c2`) only ever references Numeric columns. This fails
-/// loudly the day a `Text`/`Boolean`/`Uuid` column is added to the generated
-/// schema without a matching derivation landing alongside it — exactly the
-/// "coverage that silently drops out" the design doc warns about.
+/// Improvement-plan task B1 widened the generator's whole type surface past
+/// Numeric-only (design doc §3): every table now also gets one `Text`, one
+/// `Boolean`, and one `Uuid` column, each with its own identity-passthrough
+/// field (`SELECT <col> AS <col>`) on every def sourced from that table — see
+/// `generate::build_program_multi`'s doc comment. This test's whole point is
+/// to fail loudly the day a scalar type is added to the generated schema
+/// without a matching derivation landing alongside it — exactly the
+/// "coverage that silently drops out" the design doc warns about — so its
+/// expected-surface assertion is widened here, not weakened or dropped.
 #[test]
 fn every_column_scalar_type_appears_via_a_derivation() {
     let program = build_program(&[(Some(1), Some(2))], &[]);
@@ -48,15 +51,21 @@ fn every_column_scalar_type_appears_via_a_derivation() {
     let column_types = sorted_value_types(source.columns.iter().map(|c| c.value_type));
     assert_eq!(
         column_types,
-        vec!["numeric"],
+        vec!["boolean", "numeric", "text", "uuid"],
         "the generator's column type surface changed — widen this assertion (and the \
          derivation check below) alongside it, don't just let it pass silently"
     );
 
     let def = &program.defs[0];
-    assert_eq!(def.fields.len(), 1, "expected exactly one calculated field");
+    assert_eq!(
+        def.fields.len(),
+        4,
+        "expected `total` plus one passthrough field per new column (task B1)"
+    );
     let mut derivation_types_raw = Vec::new();
-    collect_column_types(&def.fields[0].expr, source, &mut derivation_types_raw);
+    for field in &def.fields {
+        collect_column_types(&field.expr, source, &mut derivation_types_raw);
+    }
     let derivation_types = sorted_value_types(derivation_types_raw);
     assert_eq!(
         derivation_types, column_types,
@@ -210,17 +219,37 @@ fn trivial_program_sometimes_draws_a_duplicate_pk_insert() {
     );
 }
 
+/// Whether any table in `program` has two inserts at the same pk. Keyed by
+/// `(table name, pk)`, not pk alone: since B3 (improvement-plan), a program
+/// can draw multiple tables, and every table's seeded pks independently
+/// start at 1 (see `generate::tests::pk_liveness_multi_table`) — table A's
+/// pk 1 and table B's pk 1 are two different rows, not a duplicate, so
+/// pk-alone dedup would false-positive on the common case of two tables each
+/// seeding a pk-1 row. Each insert's pk column is looked up on *its own*
+/// target table (via `Op::Insert`'s `table` field), not assumed to be
+/// `program.tables[0]`'s — a different table's pk column has a different
+/// name (see `NamePool`), so that assumption would otherwise panic the
+/// first time an insert targeted any table but the first one drawn.
 fn has_duplicate_pk_insert(program: &generative::model::Program) -> bool {
-    let table = &program.tables[0];
     let mut seen = HashSet::new();
     for op in &program.ops {
-        if let Op::Insert { row, .. } = op {
+        if let Op::Insert {
+            table: table_name,
+            row,
+            ..
+        } = op
+        {
+            let table = program
+                .tables
+                .iter()
+                .find(|t| &t.name == table_name)
+                .expect("insert must target a declared table");
             let pk = row
                 .iter()
                 .find(|(name, _)| *name == table.pk_col)
                 .and_then(|(_, v)| v.clone())
                 .expect("insert must carry a pk value");
-            if !seen.insert(pk) {
+            if !seen.insert((table_name.clone(), pk)) {
                 return true;
             }
         }
@@ -315,6 +344,21 @@ fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
             .new_tree(&mut runner)
             .expect("strategy must produce a value")
             .current();
+
+        // Improvement-plan task B1: unlike NULL/duplicate-insert (genuinely
+        // probabilistic, checked only in aggregate below), every table
+        // always gets one Text/Boolean/Uuid column — so this is checked on
+        // *every* sampled program, not just "at least one of 500", the
+        // stronger form the task calls for where it actually holds.
+        for table in &program.tables {
+            let types = sorted_value_types(table.columns.iter().map(|c| c.value_type));
+            assert_eq!(
+                types,
+                vec!["boolean", "numeric", "text", "uuid"],
+                "every table must always have exactly this type surface: {program:#?}"
+            );
+        }
+
         coverage.record_program(&program);
     }
 
@@ -333,10 +377,17 @@ fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
         );
     }
 
-    assert!(
-        coverage.types_exercised.contains("numeric"),
-        "coverage floor failed: expected \"numeric\" among types_exercised:\n{coverage}"
-    );
+    // Improvement-plan task B1: every table always gets one Text, one
+    // Boolean, and one Uuid column (not a probabilistically-drawn shape like
+    // NULL/duplicate-insert above), so these are an unconditional floor —
+    // "every single sample", not "at least one of 500" — over 500 samples of
+    // a strategy that always draws at least one table.
+    for value_type in ["numeric", "text", "boolean", "uuid"] {
+        assert!(
+            coverage.types_exercised.contains(value_type),
+            "coverage floor failed: expected {value_type:?} among types_exercised:\n{coverage}"
+        );
+    }
 
     assert!(
         coverage.key_spaces.contains_key("OneToOne"),
@@ -353,5 +404,95 @@ fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
     assert!(
         coverage.operators.contains("Add"),
         "coverage floor failed: expected \"Add\" among operators:\n{coverage}"
+    );
+}
+
+/// Improvement-plan task B3: the default strategy must sometimes draw more
+/// than one source table — sampled the same way as
+/// `awkward_values_on_sometimes_draws_null`/
+/// `trivial_program_sometimes_draws_a_duplicate_pk_insert` above. Before B3
+/// this was structurally impossible (`build_program` always built exactly
+/// one table); this is the coverage meta-test that would catch B3's widening
+/// silently regressing back to always-one (design doc §3 "coverage that
+/// silently drops out").
+#[test]
+fn trivial_program_sometimes_draws_more_than_one_table() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let saw_multiple_tables = (0..500).any(|_| {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        program.tables.len() > 1
+    });
+    assert!(
+        saw_multiple_tables,
+        "the generator must sometimes draw more than one table across 500 samples"
+    );
+}
+
+/// The definition-count half of B3's coverage floor: the default strategy
+/// must sometimes draw more than one definition in the same program
+/// (whether or not those definitions share a source table — this test only
+/// asserts the count, not the fan-out shape).
+#[test]
+fn trivial_program_sometimes_draws_more_than_one_definition() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let saw_multiple_defs = (0..500).any(|_| {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        program.defs.len() > 1
+    });
+    assert!(
+        saw_multiple_defs,
+        "the generator must sometimes draw more than one definition across 500 samples"
+    );
+}
+
+/// Both "two defs sharing one source table" and "defs spread across
+/// different source tables" must be reachable — B3's stated goal is that
+/// neither shape is forced out by the other. Sampled together (rather than
+/// as two separate single-shape tests) so a single 500-sample run has to
+/// produce both, matching how the strategy actually draws (independently,
+/// not correlated).
+#[test]
+fn trivial_program_sometimes_draws_defs_sharing_a_source_and_sometimes_draws_defs_on_different_sources()
+ {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut saw_shared_source = false;
+    let mut saw_different_sources = false;
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        if program.defs.len() < 2 {
+            continue;
+        }
+        let sources: Vec<&str> = program.defs.iter().map(|d| d.source.as_str()).collect();
+        let mut deduped = sources.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        if deduped.len() < sources.len() {
+            // At least two defs collapsed onto the same source.
+            saw_shared_source = true;
+        }
+        if deduped.len() == sources.len() {
+            // Every def in this sample has its own distinct source.
+            saw_different_sources = true;
+        }
+    }
+    assert!(
+        saw_shared_source,
+        "expected at least one sample where two or more defs share a source table across 500 samples"
+    );
+    assert!(
+        saw_different_sources,
+        "expected at least one sample where all defs draw distinct source tables across 500 samples"
     );
 }

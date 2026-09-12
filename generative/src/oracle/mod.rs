@@ -451,13 +451,15 @@ fn diff(
 /// Compares the three field-only renderings of `def`'s target against the SQL
 /// oracle `sql`, producing a localized [`ThreeWayReport`].
 ///
-/// Field types drive the per-cell comparison: every field the numeric-`+`
-/// slice produces is [`ValueType::Numeric`] (so decimals compare by value),
-/// but this resolves each field's type from `def` rather than assuming it, so
-/// it stays correct as the grammar widens.
+/// Field types drive the per-cell comparison: numeric fields (`total =
+/// c1 + c2`) compare by decimal value, `Text`/`Boolean`/`Uuid` passthrough
+/// fields (task B1) compare byte-exact — this resolves each field's type
+/// from `def` and `source_columns` rather than assuming it, so it stays
+/// correct as the grammar widens.
 pub fn three_way(
     program: &Program,
     def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
     target: &Rows,
     evaluator: &Rows,
     sql: &Rows,
@@ -465,7 +467,7 @@ pub fn three_way(
     let field_types: HashMap<&str, ValueType> = def
         .fields
         .iter()
-        .map(|f| (f.name.as_str(), field_value_type(&f.expr)))
+        .map(|f| (f.name.as_str(), field_value_type(&f.expr, source_columns)))
         .collect();
     let comparison_for = |column: &str| {
         field_types
@@ -481,16 +483,28 @@ pub fn three_way(
     }
 }
 
-/// The [`ValueType`] a numeric-`+`-slice field expression produces. Panics on
-/// any shape [`render_expr`] also refuses, keeping the two in lockstep so the
-/// oracle never infers a type for a shape it can't render.
-fn field_value_type(expr: &Expr) -> ValueType {
+/// The [`ValueType`] a field expression produces, given `source_columns` (the
+/// source table's own column types — the same map [`evaluator_oracle`] and
+/// `check` already thread through). Panics on any shape [`render_expr`] also
+/// refuses, keeping the two in lockstep so the oracle never infers a type for
+/// a shape it can't render.
+///
+/// Improvement-plan task B1 widened the generator to draw bare
+/// `Expr::Column` passthrough fields over `Text`/`Boolean`/`Uuid` source
+/// columns (`SELECT <col> AS <col>`), not just the numeric operands of
+/// `total = c1 + c2` — so a `Column` reference is no longer always Numeric;
+/// this now looks its actual type up on the source schema, exactly as the
+/// comment this replaces said would eventually be needed.
+fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) -> ValueType {
     match expr {
-        // A column reference in the numeric-+ slice is always Numeric — the
-        // only column type a rendered field can reference here (the pk and
-        // every addable column). When the grammar widens to Text/Boolean/Uuid
-        // passthrough fields, this must consult the source schema.
-        Expr::Column(_) | Expr::NumberLiteral(_) => ValueType::Numeric,
+        Expr::Column(name) => *source_columns.get(name).unwrap_or_else(|| {
+            panic!(
+                "oracle: field expression references source column {name:?} that isn't in \
+                 source_columns — a generator/caller bug (source_columns must list every column \
+                 on the def's actual source table)"
+            )
+        }),
+        Expr::NumberLiteral(_) => ValueType::Numeric,
         Expr::BinaryOp {
             op: Operator::Add, ..
         } => ValueType::Numeric,
@@ -520,7 +534,14 @@ pub async fn check(
     let sql = sql_oracle(pool, def, pk_column).await?;
     let evaluator = evaluator_oracle(pool, def, pk_column, source_columns).await?;
     let target = target_fields(target, pk_column);
-    Ok(three_way(program, def, &target, &evaluator, &sql))
+    Ok(three_way(
+        program,
+        def,
+        source_columns,
+        &target,
+        &evaluator,
+        &sql,
+    ))
 }
 
 #[cfg(test)]
