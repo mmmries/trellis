@@ -41,6 +41,7 @@ use std::fmt;
 use engine::Pool;
 use engine::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use engine::defs::oracle::{OracleError, recompute};
+use engine::defs::registry;
 use engine::numeric::Numeric;
 
 use crate::model::Program;
@@ -237,43 +238,56 @@ fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
-/// Renders a numeric calculated-field expression back to Postgres SQL text.
+/// Renders a calculated-field expression back to Postgres SQL text.
 ///
 /// Deliberately independent of the engine's evaluator *and* of
 /// `engine::defs::oracle::render_expr_sql` — the oracle's whole value is that
-/// its `SELECT` shares no code with the thing it checks. Scoped to the
-/// numeric-`+` slice (issue #5): anything beyond it panics naming the missing
-/// work rather than guessing (design doc §2 "refuse to guess"), so the day
-/// the generator widens, this fails loudly instead of emitting false
-/// differentials.
+/// its `SELECT` shares no code with the thing it checks (both happen to
+/// choose the same idiomatic rendering — quoted identifiers, an explicit cast
+/// on every literal, `name(args)` for a function call — independently, not by
+/// sharing an implementation). Improvement-plan task B2 widened this past the
+/// original numeric-`+` slice (issue #5) to `Operator::GreaterThan`,
+/// `Expr::StringLiteral`, and the five scalar functions
+/// (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/`REGEXP_COUNT`/`COALESCE`) the
+/// generator now draws (see `crate::generate::DerivedShape`). Anything still
+/// beyond that (a relationship path) panics naming the missing work rather
+/// than guessing (design doc §2 "refuse to guess"), so a future widening
+/// fails loudly instead of emitting a false differential.
+///
+/// **Collation.** `>` here is `Numeric, Numeric -> Boolean`
+/// (`engine::defs::registry::OPERATORS` never gives it a `Text` operand), and
+/// none of the five functions performs a collation-sensitive comparison:
+/// `STRPOS` is a plain substring search (byte/character match, not locale
+/// ordering), `OCTET_LENGTH`/`CHAR_LENGTH` just count, `REGEXP_COUNT`'s
+/// patterns are drawn only from `generate::strategy::REGEXP_COUNT_PATTERN_POOL`
+/// (literal text and `.`/`*`/`+`/`?`/`[...]`/`|`/`^`/`$` — no locale-dependent
+/// POSIX bracket classes like `[[:alpha:]]`), and `COALESCE` does no
+/// comparison at all (it just returns its first non-`NULL` argument). So
+/// unlike task B1's text *ordering* concern (which this task's own plan flags
+/// as the load-bearing collation risk), nothing B2 adds needs the oracle and
+/// the engine's underlying Postgres session pinned to the same collation —
+/// there is no ordering comparison in this grammar for the two to disagree
+/// about.
 fn render_expr(expr: &Expr) -> String {
     match expr {
         Expr::Column(name) => quote_ident(name),
         Expr::NumberLiteral(text) => text.clone(),
-        Expr::BinaryOp {
-            op: Operator::Add,
-            lhs,
-            rhs,
-        } => format!("({} + {})", render_expr(lhs), render_expr(rhs)),
-        Expr::BinaryOp {
-            op: Operator::GreaterThan,
-            ..
-        } => panic!(
-            "oracle: `>` comparison rendering is out of scope for the numeric-+ slice \
-             (issue #65 widens the grammar); extend `render_expr` when the generator emits it"
-        ),
-        Expr::StringLiteral(_) => panic!(
-            "oracle: text-literal rendering is out of scope for the numeric-+ slice \
-             (issue #63 widens the value model); extend `render_expr` when the generator emits it"
-        ),
-        Expr::FunctionCall { name, .. } => panic!(
-            "oracle: function-call rendering ({name}) is out of scope for the numeric-+ slice \
-             (issue #64 adds functions); extend `render_expr` when the generator emits it"
-        ),
+        Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::BinaryOp { op, lhs, rhs } => {
+            let symbol = match op {
+                Operator::Add => "+",
+                Operator::GreaterThan => ">",
+            };
+            format!("({} {symbol} {})", render_expr(lhs), render_expr(rhs))
+        }
+        Expr::FunctionCall { name, args } => {
+            let rendered_args: Vec<String> = args.iter().map(render_expr).collect();
+            format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
+        }
         Expr::RelationshipPath { rel, column } => panic!(
-            "oracle: relationship-path rendering ('{rel}.{column}') is out of scope for the \
-             numeric-+ slice (issue #25 is grammar + AST only; no generator support yet); \
-             extend `render_expr` when the generator emits it"
+            "oracle: relationship-path rendering ('{rel}.{column}') is out of scope for this \
+             generator (issue #25 is grammar + AST only; no generator support yet); extend \
+             `render_expr` when the generator emits it"
         ),
     }
 }
@@ -493,8 +507,18 @@ pub fn three_way(
 /// `Expr::Column` passthrough fields over `Text`/`Boolean`/`Uuid` source
 /// columns (`SELECT <col> AS <col>`), not just the numeric operands of
 /// `total = c1 + c2` — so a `Column` reference is no longer always Numeric;
-/// this now looks its actual type up on the source schema, exactly as the
-/// comment this replaces said would eventually be needed.
+/// this now looks its actual type up on the source schema.
+///
+/// Task B2 widens it again: `BinaryOp`/`FunctionCall`'s return type is no
+/// longer hardcoded `Numeric` either — it's read off
+/// `engine::defs::registry::operator_spec`/`lookup_function`, the same
+/// source of truth the parser/validator/evaluator all already share
+/// (ADR-0004), rather than this oracle keeping its own separate copy of
+/// "which operator/function returns which type" that could silently drift
+/// from the registry's. `COALESCE` is the one function whose return type
+/// isn't a fixed registry entry (it types as its *arguments'* common type,
+/// exactly as `validate.rs`'s `infer_expr` computes it) — self-recursing into
+/// the first argument mirrors that.
 fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) -> ValueType {
     match expr {
         Expr::Column(name) => *source_columns.get(name).unwrap_or_else(|| {
@@ -505,11 +529,22 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
             )
         }),
         Expr::NumberLiteral(_) => ValueType::Numeric,
-        Expr::BinaryOp {
-            op: Operator::Add, ..
-        } => ValueType::Numeric,
-        _ => {
-            // render_expr already panics on these with the follow-up issue
+        Expr::StringLiteral(_) => ValueType::Text,
+        Expr::BinaryOp { op, .. } => registry::operator_spec(*op).return_type,
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            field_value_type(&args[0], source_columns)
+        }
+        Expr::FunctionCall { name, .. } => registry::lookup_function(name)
+            .map(|spec| spec.return_type)
+            .unwrap_or_else(|| {
+                panic!(
+                    "oracle: unknown function {name:?} — the generator only ever builds calls \
+                     registered in engine::defs::registry::FUNCTIONS; extend field_value_type \
+                     (and render_expr) if that set ever widens"
+                )
+            }),
+        Expr::RelationshipPath { .. } => {
+            // render_expr already panics on this with the follow-up issue
             // named; reaching here would mean the two drifted out of sync.
             render_expr(expr);
             unreachable!("render_expr panics on every shape field_value_type does not model")
@@ -694,5 +729,122 @@ mod tests {
             predicate: Predicate::True,
         };
         let _ = render_select(&def, "c0");
+    }
+
+    /// Improvement-plan task B2: `>` renders like `+` (parenthesized,
+    /// operator between the two rendered operands) — the oracle no longer
+    /// panics on `Operator::GreaterThan` the way it did before this task.
+    #[test]
+    fn render_expr_renders_greater_than() {
+        let expr = Expr::BinaryOp {
+            op: Operator::GreaterThan,
+            lhs: Box::new(Expr::Column("c1".into())),
+            rhs: Box::new(Expr::Column("c2".into())),
+        };
+        assert_eq!(render_expr(&expr), "(\"c1\" > \"c2\")");
+    }
+
+    /// A string literal renders as a single-quote-escaped, explicitly
+    /// `::text`-cast Postgres literal — the same explicit-cast convention
+    /// `engine::defs::oracle::render_expr_sql` independently uses for the
+    /// same reason (an unadorned string constant leaves Postgres to infer a
+    /// type, and an explicit cast removes that ambiguity).
+    #[test]
+    fn render_expr_renders_a_string_literal_with_an_escaped_quote() {
+        let expr = Expr::StringLiteral("o'clock".into());
+        assert_eq!(render_expr(&expr), "'o''clock'::text");
+    }
+
+    /// A function call renders as `<lowercased name>(<rendered args>)` —
+    /// Postgres's own function-call syntax, matching every function name the
+    /// grammar accepts case-insensitively either way.
+    #[test]
+    fn render_expr_renders_a_function_call() {
+        let expr = Expr::FunctionCall {
+            name: "STRPOS".into(),
+            args: vec![
+                Expr::Column("text_col".into()),
+                Expr::StringLiteral("x".into()),
+            ],
+        };
+        assert_eq!(render_expr(&expr), "strpos(\"text_col\", 'x'::text)");
+    }
+
+    /// A nested, mixed operator-and-function expression renders with every
+    /// `BinaryOp` operand parenthesized and the function call nested inside —
+    /// `STRPOS(text_col, 'x') > 0`, the exact shape
+    /// `generate::DerivedShape::StrposGreaterThan` draws and
+    /// `tests/convergence.rs`'s hand-built pin exercises end-to-end.
+    #[test]
+    fn render_expr_renders_a_nested_function_and_operator_expression() {
+        let expr = Expr::BinaryOp {
+            op: Operator::GreaterThan,
+            lhs: Box::new(Expr::FunctionCall {
+                name: "STRPOS".into(),
+                args: vec![
+                    Expr::Column("text_col".into()),
+                    Expr::StringLiteral("x".into()),
+                ],
+            }),
+            rhs: Box::new(Expr::NumberLiteral("0".into())),
+        };
+        assert_eq!(render_expr(&expr), "(strpos(\"text_col\", 'x'::text) > 0)");
+    }
+
+    /// [`field_value_type`] reads `>`'s return type off the shared registry
+    /// (`engine::defs::registry::operator_spec`) rather than hardcoding it —
+    /// this pins that it actually gets `Boolean`, not the `Numeric` every
+    /// prior operator (`+`) happened to return.
+    #[test]
+    fn field_value_type_of_greater_than_is_boolean() {
+        let expr = Expr::BinaryOp {
+            op: Operator::GreaterThan,
+            lhs: Box::new(Expr::Column("c1".into())),
+            rhs: Box::new(Expr::Column("c2".into())),
+        };
+        let source_columns = HashMap::from([
+            ("c1".to_string(), ValueType::Numeric),
+            ("c2".to_string(), ValueType::Numeric),
+        ]);
+        assert_eq!(field_value_type(&expr, &source_columns), ValueType::Boolean);
+    }
+
+    /// Every one of the five scalar functions type-checks to its registered
+    /// return type (all `Numeric` today) via [`field_value_type`], and
+    /// `COALESCE` specifically types as its first argument's type rather
+    /// than a fixed registry entry.
+    #[test]
+    fn field_value_type_of_each_scalar_function_matches_its_registry_return_type() {
+        let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
+        for name in ["STRPOS", "OCTET_LENGTH", "CHAR_LENGTH", "REGEXP_COUNT"] {
+            let args = match name {
+                "STRPOS" | "REGEXP_COUNT" => vec![
+                    Expr::Column("text_col".into()),
+                    Expr::StringLiteral("x".into()),
+                ],
+                _ => vec![Expr::Column("text_col".into())],
+            };
+            let expr = Expr::FunctionCall {
+                name: name.to_string(),
+                args,
+            };
+            assert_eq!(
+                field_value_type(&expr, &source_columns),
+                ValueType::Numeric,
+                "{name} must type-check as Numeric"
+            );
+        }
+
+        let coalesce = Expr::FunctionCall {
+            name: "COALESCE".into(),
+            args: vec![
+                Expr::Column("text_col".into()),
+                Expr::StringLiteral("x".into()),
+            ],
+        };
+        assert_eq!(
+            field_value_type(&coalesce, &source_columns),
+            ValueType::Text
+        );
     }
 }

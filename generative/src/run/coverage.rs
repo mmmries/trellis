@@ -37,10 +37,27 @@ pub struct Coverage {
     /// Which [`Operator`] names appear on any `Expr::BinaryOp` encountered
     /// while walking `expr_shapes`.
     pub operators: HashSet<&'static str>,
+    /// Which function names (the [`Expr::FunctionCall`] `name` field, one of
+    /// `engine::defs::registry::FUNCTIONS`/`AGGREGATE_FUNCTION_SPECS`'s
+    /// canonical uppercased names) appear across every `FieldDef.expr` on
+    /// every def, walked recursively alongside `expr_shapes` (improvement-plan
+    /// task B2). An unrecognized function name is tallied as `"Other"` rather
+    /// than panicking — this accumulator has no failure mode of its own, it
+    /// just can't name what it's never been told about.
+    pub functions: HashSet<&'static str>,
     /// Which [`ValueType`] names appear on any column of any table.
     pub types_exercised: HashSet<&'static str>,
     /// `"OneToOne"` / `"Aggregate"`, tallied from each def's [`KeySpace`].
     pub key_spaces: HashMap<&'static str, usize>,
+    /// The deepest `Expr` tree seen across every `FieldDef.expr` on every
+    /// def, a leaf (`Column`/`NumberLiteral`/`StringLiteral`/
+    /// `RelationshipPath`) counting as depth 1 (improvement-plan task B2):
+    /// the floor a nested, multi-level expression (e.g. `STRPOS(t, 'x') > 0`,
+    /// depth 3) needs to prove itself against, distinct from `expr_shapes`
+    /// (which shapes appear at all) since a program could draw both
+    /// `BinaryOp` and `FunctionCall` shapes without ever nesting one inside
+    /// the other.
+    pub max_expr_depth: usize,
 }
 
 impl Coverage {
@@ -82,34 +99,48 @@ impl Coverage {
     }
 
     /// Recursively tallies `expr`'s own shape and, for `BinaryOp`, its
-    /// operator, then descends into its subexpressions.
-    fn record_expr(&mut self, expr: &Expr) {
-        match expr {
+    /// operator (and for `FunctionCall`, its function name), then descends
+    /// into its subexpressions, returning `expr`'s own tree depth (a leaf is
+    /// depth 1) so [`Self::max_expr_depth`] can track the deepest tree seen
+    /// across every call.
+    fn record_expr(&mut self, expr: &Expr) -> usize {
+        let depth = match expr {
             Expr::Column(_) => {
                 self.expr_shapes.insert("Column");
+                1
             }
             Expr::NumberLiteral(_) => {
                 self.expr_shapes.insert("NumberLiteral");
+                1
             }
             Expr::StringLiteral(_) => {
                 self.expr_shapes.insert("StringLiteral");
+                1
             }
             Expr::RelationshipPath { .. } => {
                 self.expr_shapes.insert("RelationshipPath");
+                1
             }
             Expr::BinaryOp { op, lhs, rhs } => {
                 self.expr_shapes.insert("BinaryOp");
                 self.operators.insert(operator_name(*op));
-                self.record_expr(lhs);
-                self.record_expr(rhs);
+                let lhs_depth = self.record_expr(lhs);
+                let rhs_depth = self.record_expr(rhs);
+                1 + lhs_depth.max(rhs_depth)
             }
-            Expr::FunctionCall { args, .. } => {
+            Expr::FunctionCall { name, args } => {
                 self.expr_shapes.insert("FunctionCall");
-                for arg in args {
-                    self.record_expr(arg);
-                }
+                self.functions.insert(function_name(name));
+                let max_arg_depth = args
+                    .iter()
+                    .map(|arg| self.record_expr(arg))
+                    .max()
+                    .unwrap_or(0);
+                1 + max_arg_depth
             }
-        }
+        };
+        self.max_expr_depth = self.max_expr_depth.max(depth);
+        depth
     }
 }
 
@@ -153,6 +184,28 @@ fn operator_name(op: Operator) -> &'static str {
     }
 }
 
+/// Maps a [`Expr::FunctionCall`] name to a stable `&'static str` for
+/// [`Coverage::functions`], matching the canonical uppercased names
+/// `engine::defs::registry::FUNCTIONS`/`AGGREGATE_FUNCTION_SPECS` already use
+/// (and the generator only ever builds). A name outside that fixed set
+/// collapses to `"Other"` rather than leaking an arbitrary caller-owned
+/// `String` into a `HashSet<&'static str>`.
+fn function_name(name: &str) -> &'static str {
+    match name {
+        "STRPOS" => "STRPOS",
+        "OCTET_LENGTH" => "OCTET_LENGTH",
+        "CHAR_LENGTH" => "CHAR_LENGTH",
+        "REGEXP_COUNT" => "REGEXP_COUNT",
+        "COALESCE" => "COALESCE",
+        "SUM" => "SUM",
+        "MIN" => "MIN",
+        "MAX" => "MAX",
+        "AVG" => "AVG",
+        "COUNT" => "COUNT",
+        _ => "Other",
+    }
+}
+
 /// Sorted `(name, count)` pairs, since `HashMap` iteration order isn't
 /// stable across runs and this is meant to be read/diffed by a human.
 fn sorted_counts(map: &HashMap<&'static str, usize>) -> Vec<(&'static str, usize)> {
@@ -190,6 +243,7 @@ impl fmt::Display for Coverage {
             sorted_names(&self.expr_shapes).join(", ")
         )?;
         writeln!(f, "operators: {}", sorted_names(&self.operators).join(", "))?;
+        writeln!(f, "functions: {}", sorted_names(&self.functions).join(", "))?;
         writeln!(
             f,
             "types_exercised: {}",
@@ -200,7 +254,9 @@ impl fmt::Display for Coverage {
         for (name, count) in sorted_counts(&self.key_spaces) {
             write!(f, " {name}={count}")?;
         }
-        writeln!(f)
+        writeln!(f)?;
+
+        writeln!(f, "max_expr_depth: {}", self.max_expr_depth)
     }
 }
 

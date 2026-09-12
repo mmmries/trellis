@@ -48,9 +48,14 @@
 //!   `every_column_scalar_type_appears_via_a_derivation`) without also
 //!   having to model heterogeneous per-type `Update`/`DuplicateInsert`
 //!   payloads — a separate future widening, not this task.
-//! - No new operators, functions, or comparisons over the new types are
-//!   drawn (that's B2, gated on a precedence-table prerequisite this session
-//!   already decided to defer).
+//! - At the time B1 landed, no operators/functions/comparisons over the new
+//!   types were drawn yet (that widening was gated on a precedence-table
+//!   prerequisite, deferred to a later session). Improvement-plan task
+//!   **B2** ("Operators, functions, and literals") is that later session: it
+//!   adds `Operator::GreaterThan`, `Expr::NumberLiteral`/`Expr::StringLiteral`,
+//!   and the five scalar functions (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/
+//!   `REGEXP_COUNT`/`COALESCE`) as one additional, nested "derived" field per
+//!   definition — see [`DerivedShape`] and [`build_program_multi_with_derived`].
 //! - Only syntactically-valid UUID text is ever drawn, or `NULL` — never a
 //!   malformed UUID string. A malformed one would fail the `INSERT`/
 //!   `UPDATE` statement's own `$n::text::uuid` cast, which is real, separate
@@ -542,6 +547,229 @@ pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Progr
     }
 }
 
+/// Improvement-plan task B2's D0 investigation ("with `>` and the five new
+/// functions in play, is there now a genuine, row-data-dependent way for a
+/// *valid* (post-`validate()`) definition to still error at eval time?").
+///
+/// **Finding: no.** Every shape [`DerivedShape`] draws stays eval-time-
+/// infallible for the *values* this generator actually produces, the same
+/// way AVG's hidden count-partial already keeps `+`/`AVG` divide-by-zero-free
+/// (see this module's numeric-path pairing note above). Walked one shape at a
+/// time (`engine/src/defs/eval.rs`'s `apply_operator`/`apply_function`):
+///
+/// - **`Operator::GreaterThan`**: both operands are `engine::numeric::Numeric`
+///   (arbitrary-precision decimal, like `+`), and `Numeric::compare` never
+///   errors — there is no overflow, division, or precision loss to trigger
+///   one. `Postgres::numeric >` cannot error either.
+/// - **`STRPOS`**: `haystack.find(needle)` is a total function over any two
+///   `&str`s (`""`, no match, unicode — all handled, see
+///   `engine/tests/defs_text_functions.rs`'s `STRPOS_CASES`); it always
+///   returns a `usize`, never fails. Postgres's `strpos` is equally total.
+/// - **`OCTET_LENGTH`/`CHAR_LENGTH`**: `str::len`/`str::chars().count()` never
+///   fail for any valid Rust `String` (which every `Text` value already is,
+///   having come from a Postgres `text` column — always valid UTF-8).
+/// - **`REGEXP_COUNT`**: the *only* eval-time failure mode `eval::regexp_count`
+///   has is `Regex::new(pattern)` failing to compile — and `validate.rs`'s
+///   `validate_regexp_pattern` already compiles the pattern with the exact
+///   same `regex` crate at *validate* time and rejects the definition before
+///   it ever reaches eval, for every pattern this generator draws (a string
+///   literal, never a column reference, so it's always the specific literal
+///   `validate` checked). A validated definition can therefore never hit a
+///   pattern-compile failure at eval time. The one caveat worth naming for a
+///   future widening: Rust's `regex` crate and Postgres's own ARE dialect are
+///   different engines, so a pattern the Rust crate compiles is not
+///   guaranteed to be one Postgres's `regexp_count` also accepts (or accepts
+///   with the same semantics) — a *dialect* mismatch, not a data-dependent
+///   one. This generator sidesteps that risk entirely by only ever drawing
+///   `REGEXP_COUNT` patterns from `strategy::REGEXP_COUNT_PATTERN_POOL`, the
+///   same dialect-common subset (literal text, `.`, `*`, `+`, `?`, `[...]`,
+///   `|`, `^`, `$`) `engine/tests/defs_text_functions.rs` already vets against
+///   real Postgres — never an arbitrary pattern that might expose that gap.
+///   A future widening that draws *arbitrary* regex syntax would need to
+///   cross exactly this boundary (and would be the first place a genuine
+///   SQL-oracle-vs-engine divergence, not a row-data-dependent eval error,
+///   could show up).
+/// - **`COALESCE`**: pure control flow (`eval_expr`'s `COALESCE` arm
+///   short-circuits on the first non-`None` argument) — there is no
+///   computation of its own to fail.
+///
+/// Since no shape here has a real, generator-reachable, row-data-dependent
+/// error path, D0's "error-to-NULL oracle rendering" design (the plan's
+/// option 2) has nothing to quarantine yet and is **not built** in this
+/// session — building it now would be unused machinery with nothing to
+/// exercise it, the same call this module's original numeric-`+`-only D0
+/// pass made, just re-verified against the wider operator/function set this
+/// task adds. The day a future widening draws something genuinely
+/// data-dependent-fallible (an arbitrary regex pattern against arbitrary
+/// text, a numeric cast that can overflow a *narrower* column type, division
+/// by a column that can be zero, ...), this is the comment to update and the
+/// decision to revisit.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DerivedShape {
+    /// `STRPOS(<text_col>, '<needle>')` — Numeric.
+    Strpos { needle: String },
+    /// `OCTET_LENGTH(<text_col>)` — Numeric.
+    OctetLength,
+    /// `CHAR_LENGTH(<text_col>)` — Numeric.
+    CharLength,
+    /// `REGEXP_COUNT(<text_col>, '<pattern>')` — Numeric. `pattern` is always
+    /// one of `strategy::REGEXP_COUNT_PATTERN_POOL` — see this enum's own
+    /// doc comment (the D0 finding) for why that pool, specifically, is what
+    /// keeps this shape eval-time-infallible.
+    RegexpCount { pattern: String },
+    /// `COALESCE(<c1>, <fallback>)` — Numeric.
+    CoalesceNumeric { fallback: i64 },
+    /// `<c1> > <c2>` — Boolean; the plain, unnested `Operator::GreaterThan`
+    /// case.
+    PlainGreaterThan,
+    /// `(<c1> + <c2>) > <c1>` — Boolean, depth 3: a `BinaryOp` nested inside
+    /// another `BinaryOp` (the `c1 + c2 > c1` shape improvement-plan task B2
+    /// names explicitly).
+    ArithmeticGreaterThan,
+    /// `STRPOS(<text_col>, '<needle>') > <threshold>` — Boolean, depth 3: a
+    /// `FunctionCall` nested inside a `BinaryOp` (the `STRPOS(...) > 0` shape
+    /// improvement-plan task B2 names explicitly) — the mixed
+    /// operator-and-function nesting `tests/convergence.rs`'s hand-built pin
+    /// exercises end-to-end.
+    StrposGreaterThan { needle: String, threshold: i64 },
+}
+
+impl DerivedShape {
+    /// A `STRPOS(<text_col>, '<needle>')` call, shared by [`Self::Strpos`]
+    /// and [`Self::StrposGreaterThan`] so the two variants can't drift.
+    fn strpos_call(text_col: &str, needle: &str) -> Expr {
+        Expr::FunctionCall {
+            name: "STRPOS".to_string(),
+            args: vec![
+                Expr::Column(text_col.to_string()),
+                Expr::StringLiteral(needle.to_string()),
+            ],
+        }
+    }
+
+    /// Builds this shape's [`Expr`] tree against a table's own `c1`/`c2`
+    /// (numeric) and `text_col` (text) column names — the same three columns
+    /// [`build_program_multi_with_derived`] already threads through for the
+    /// `total`/passthrough fields.
+    pub fn build_expr(&self, c1: &str, c2: &str, text_col: &str) -> Expr {
+        match self {
+            DerivedShape::Strpos { needle } => Self::strpos_call(text_col, needle),
+            DerivedShape::OctetLength => Expr::FunctionCall {
+                name: "OCTET_LENGTH".to_string(),
+                args: vec![Expr::Column(text_col.to_string())],
+            },
+            DerivedShape::CharLength => Expr::FunctionCall {
+                name: "CHAR_LENGTH".to_string(),
+                args: vec![Expr::Column(text_col.to_string())],
+            },
+            DerivedShape::RegexpCount { pattern } => Expr::FunctionCall {
+                name: "REGEXP_COUNT".to_string(),
+                args: vec![
+                    Expr::Column(text_col.to_string()),
+                    Expr::StringLiteral(pattern.clone()),
+                ],
+            },
+            DerivedShape::CoalesceNumeric { fallback } => Expr::FunctionCall {
+                name: "COALESCE".to_string(),
+                args: vec![
+                    Expr::Column(c1.to_string()),
+                    Expr::NumberLiteral(fallback.to_string()),
+                ],
+            },
+            DerivedShape::PlainGreaterThan => Expr::BinaryOp {
+                op: Operator::GreaterThan,
+                lhs: Box::new(Expr::Column(c1.to_string())),
+                rhs: Box::new(Expr::Column(c2.to_string())),
+            },
+            DerivedShape::ArithmeticGreaterThan => Expr::BinaryOp {
+                op: Operator::GreaterThan,
+                lhs: Box::new(Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(Expr::Column(c1.to_string())),
+                    rhs: Box::new(Expr::Column(c2.to_string())),
+                }),
+                rhs: Box::new(Expr::Column(c1.to_string())),
+            },
+            DerivedShape::StrposGreaterThan { needle, threshold } => Expr::BinaryOp {
+                op: Operator::GreaterThan,
+                lhs: Box::new(Self::strpos_call(text_col, needle)),
+                rhs: Box::new(Expr::NumberLiteral(threshold.to_string())),
+            },
+        }
+    }
+}
+
+/// Improvement-plan task B2: builds on [`build_program_multi`] by appending
+/// one more calculated field (named `"derived"`) to every definition, drawn
+/// from [`DerivedShape`] — the widening that exercises `Operator::GreaterThan`,
+/// `Expr::NumberLiteral`/`Expr::StringLiteral`, the five scalar functions
+/// (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/`REGEXP_COUNT`/`COALESCE`), and a
+/// nested (depth >= 2) expression tree — none of which [`build_program_multi`]
+/// itself draws.
+///
+/// Deliberately layered *on top of* [`build_program_multi`] (calling it, then
+/// pushing one field per def) rather than folded into it: every existing
+/// caller of `build_program_multi` — every hand-built pin across
+/// `generative/tests/*.rs`, this module's own unit tests, `tests/coverage.rs`'s
+/// exact-field-count assertions — keeps its exact prior behavior (task B3's
+/// fixed `total`/passthrough shape, untouched), and only the (new) default
+/// proptest strategy (see `strategy::trivial_program_with`) actually draws a
+/// `derived` field.
+///
+/// Panics if `derived.len() != def_sources.len()` — a generator bug, matching
+/// this module's other length-contract checks ([`TableSpec`]'s
+/// `text_values`/`bool_values`/`uuid_values`).
+pub fn build_program_multi_with_derived(
+    tables: &[TableSpec],
+    def_sources: &[usize],
+    derived: &[DerivedShape],
+) -> Program {
+    assert_eq!(
+        derived.len(),
+        def_sources.len(),
+        "build_program_multi_with_derived: derived must have one entry per definition \
+         ({} definitions, {} derived shapes) — a generator bug",
+        def_sources.len(),
+        derived.len()
+    );
+
+    let mut program = build_program_multi(tables, def_sources);
+
+    // Looked up by table name up front, before the mutable loop over
+    // `program.defs` below, so the two loops don't need to borrow
+    // `program.tables` and `program.defs` simultaneously.
+    let columns_by_table: std::collections::HashMap<String, (String, String, String)> = program
+        .tables
+        .iter()
+        .map(|table| {
+            (
+                table.name.clone(),
+                (
+                    table.columns[1].name.clone(),
+                    table.columns[2].name.clone(),
+                    table.columns[3].name.clone(),
+                ),
+            )
+        })
+        .collect();
+
+    for (def, shape) in program.defs.iter_mut().zip(derived) {
+        let (c1, c2, text_col) = columns_by_table.get(&def.source).unwrap_or_else(|| {
+            panic!(
+                "build_program_multi_with_derived: def.source {:?} names no table in the \
+                 program — a generator bug",
+                def.source
+            )
+        });
+        def.fields.push(FieldDef {
+            name: "derived".to_string(),
+            expr: shape.build_expr(c1, c2, text_col),
+        });
+    }
+
+    program
+}
+
 #[cfg(feature = "proptest")]
 mod strategy {
     use super::*;
@@ -703,6 +931,61 @@ mod strategy {
         }
     }
 
+    /// A short ASCII string, drawn from the same alphabet as [`plain_text`]
+    /// (improvement-plan task B2), used as `STRPOS`'s needle argument. Kept
+    /// in that alphabet (rather than fully arbitrary text) so a meaningful
+    /// fraction of draws actually land a hit against a table's `Text` column
+    /// (also drawn from [`plain_text`]'s alphabet) — a `STRPOS` that only
+    /// ever returns `0` would still be correct, but a needle that sometimes
+    /// hits is better coverage of the function's non-zero branch. Can be
+    /// empty (Postgres's own `strpos(x, '') = 1` convention).
+    fn strpos_needle() -> BoxedStrategy<String> {
+        "[a-zA-Z0-9 ]{0,3}".boxed()
+    }
+
+    /// Regex patterns [`DerivedShape::RegexpCount`] draws from — restricted
+    /// to syntax common to Rust's `regex` crate and Postgres's default ARE
+    /// dialect (literal text, `.`, `*`, `+`, `?`, `[...]`, `|`, `^`, `$`),
+    /// the exact same restriction `engine/tests/defs_text_functions.rs`'s
+    /// `REGEXP_COUNT_METACHARACTER_CASES` already vets against real
+    /// Postgres. See [`DerivedShape`]'s doc comment (the D0 finding) for why
+    /// this specific restriction is what keeps `REGEXP_COUNT` eval-time-
+    /// infallible for what this generator draws — a pattern outside this
+    /// pool could in principle compile under the `regex` crate (so pass
+    /// `validate()`) yet mean something different, or nothing, under
+    /// Postgres's own ARE dialect, which is a dialect-mismatch risk this
+    /// pool exists specifically to avoid.
+    const REGEXP_COUNT_PATTERN_POOL: &[&str] = &[
+        "a", "o", "e", "a.c", "colou?r", "cat|dog", "[a-z]+", "^a", "a$",
+    ];
+
+    fn regexp_pattern() -> BoxedStrategy<String> {
+        proptest::sample::select(REGEXP_COUNT_PATTERN_POOL)
+            .prop_map(str::to_string)
+            .boxed()
+    }
+
+    /// Draws one [`DerivedShape`] (improvement-plan task B2), equally
+    /// weighted across every variant — each of the five scalar functions,
+    /// the plain and nested `Operator::GreaterThan` shapes, all reachable
+    /// with the same probability, since the coverage floor
+    /// (`tests/coverage.rs`) needs every one of them to show up across a
+    /// bounded number of samples, not just the common case.
+    fn derived_shape() -> impl Strategy<Value = DerivedShape> {
+        prop_oneof![
+            strpos_needle().prop_map(|needle| DerivedShape::Strpos { needle }),
+            Just(DerivedShape::OctetLength),
+            Just(DerivedShape::CharLength),
+            regexp_pattern().prop_map(|pattern| DerivedShape::RegexpCount { pattern }),
+            (0..=VALUE_MAX).prop_map(|fallback| DerivedShape::CoalesceNumeric { fallback }),
+            Just(DerivedShape::PlainGreaterThan),
+            Just(DerivedShape::ArithmeticGreaterThan),
+            (strpos_needle(), 0..=VALUE_MAX).prop_map(|(needle, threshold)| {
+                DerivedShape::StrposGreaterThan { needle, threshold }
+            }),
+        ]
+    }
+
     /// One mutate targeting `seed_count` seeded rows. The primary key for
     /// `Update`/`Delete` is drawn from `1..=seed_count + 1`: values
     /// `1..=seed_count` hit a seeded (or otherwise still-live) row, and
@@ -777,14 +1060,25 @@ mod strategy {
     ///
     /// `awkward_values` gates only the *value* draws (see [`value`]); it does
     /// not affect [`Mutate::DuplicateInsert`], which is a distinct widening
-    /// (a real `apply()` failure, not an awkward value) always available.
+    /// (a real `apply()` failure, not an awkward value) always available. It
+    /// likewise does not gate [`DerivedShape`] (improvement-plan task B2):
+    /// every definition always gets one `derived` field, the same
+    /// "unconditional, not a probabilistically-drawn dimension" choice task
+    /// B1 made for the `Text`/`Boolean`/`Uuid` columns above — see
+    /// [`build_program_multi_with_derived`].
     pub fn trivial_program_with(awkward_values: bool) -> impl Strategy<Value = Program> {
         prop::collection::vec(table_spec(awkward_values), 1..=MAX_TABLES)
             .prop_flat_map(|tables| {
                 let def_sources = prop::collection::vec(0..tables.len(), 1..=MAX_DEFS);
                 (Just(tables), def_sources)
             })
-            .prop_map(|(tables, def_sources)| build_program_multi(&tables, &def_sources))
+            .prop_flat_map(|(tables, def_sources)| {
+                let derived = prop::collection::vec(derived_shape(), def_sources.len());
+                (Just(tables), Just(def_sources), derived)
+            })
+            .prop_map(|(tables, def_sources, derived)| {
+                build_program_multi_with_derived(&tables, &def_sources, &derived)
+            })
     }
 
     /// The generator's default strategy: awkward values (NULLs) on, so real
