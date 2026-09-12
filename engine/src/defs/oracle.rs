@@ -252,22 +252,58 @@ pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
 }
 
 /// The set of `def.source` column names any calculated field references —
-/// i.e. every [`Expr::Column`] name that isn't itself another calculated
+/// i.e. every [`Expr::Column`] name that isn't itself *another* calculated
 /// field's name. Used to select only the columns a recompute actually needs.
+///
+/// A field referencing a source column of its own name (`SELECT c AS c`,
+/// the generative suite's improvement-plan task B1 identity-passthrough
+/// shape) is a passthrough, not a reference to another calculated field —
+/// this must mirror the same `is_self_passthrough` carve-out
+/// `eval.rs`'s `eval_expr` and `validate.rs`'s cycle detection already make,
+/// or a self-referencing passthrough field's own source column never makes
+/// it into the recompute's `SELECT` list and `eval_expr` fails with
+/// `EvalError::MissingColumn` even though the same definition installs and
+/// backfills correctly (`engine/tests/defs_backfill_direct.rs`'s `SELECT a
+/// AS a` goes through a different path — direct-build/backfill — that
+/// already has this carve-out via `ddl::passthrough_source_column`; this
+/// oracle-recompute path did not, until task B1's generative coverage of a
+/// real end-to-end passthrough-field run found the gap).
+///
+/// Unlike `eval.rs`'s and `validate.rs`'s versions of this same carve-out,
+/// this one doesn't also check that `name` actually names a real source
+/// column (`is_self_passthrough = name == field_name &&
+/// source_columns.contains_key(name)`) — it can't, cheaply, since this
+/// function takes no `source_columns` map. That's safe only because both
+/// callers ([`recompute`], [`recompute_aggregate`]) are documented as
+/// running exclusively against an already-validated, already-installed
+/// `TransformDef` (see `recompute`'s own doc comment), and `validate()`
+/// already rejects a field naming itself when that name isn't a real source
+/// column (`UnresolvedColumn`, not treated as a passthrough) before a
+/// definition can ever be persisted. This is an implicit invariant enforced
+/// by caller discipline, not the type system — if a future caller ever
+/// invokes `recompute`/`recompute_aggregate` against a `TransformDef` that
+/// hasn't been through `validate()`, thread `source_columns` through here
+/// too and add the same guard.
 fn referenced_source_columns(def: &TransformDef) -> HashSet<String> {
     let field_names: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
 
     let mut columns = HashSet::new();
     for field in &def.fields {
-        collect_columns(&field.expr, &field_names, &mut columns);
+        collect_columns(&field.expr, field.name.as_str(), &field_names, &mut columns);
     }
     columns
 }
 
-fn collect_columns(expr: &Expr, field_names: &HashSet<&str>, out: &mut HashSet<String>) {
+fn collect_columns(
+    expr: &Expr,
+    field_name: &str,
+    field_names: &HashSet<&str>,
+    out: &mut HashSet<String>,
+) {
     match expr {
         Expr::Column(name) => {
-            if !field_names.contains(name.as_str()) {
+            let is_self_passthrough = name == field_name;
+            if is_self_passthrough || !field_names.contains(name.as_str()) {
                 out.insert(name.clone());
             }
         }
@@ -277,12 +313,12 @@ fn collect_columns(expr: &Expr, field_names: &HashSet<&str>, out: &mut HashSet<S
         // has to render one (issue #25 is grammar + AST only).
         Expr::RelationshipPath { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
-            collect_columns(lhs, field_names, out);
-            collect_columns(rhs, field_names, out);
+            collect_columns(lhs, field_name, field_names, out);
+            collect_columns(rhs, field_name, field_names, out);
         }
         Expr::FunctionCall { args, .. } => {
             for arg in args {
-                collect_columns(arg, field_names, out);
+                collect_columns(arg, field_name, field_names, out);
             }
         }
     }
@@ -561,6 +597,38 @@ mod tests {
         assert_eq!(
             columns,
             HashSet::from(["price".to_string(), "tax".to_string()])
+        );
+    }
+
+    /// A field naming itself (`SELECT c AS c`, the generative suite's
+    /// improvement-plan task B1 identity-passthrough shape) must still
+    /// include its own source column — `is_self_passthrough`'s carve-out in
+    /// `collect_columns`. Before this test's fix, a field's own name was
+    /// treated identically to *any other* calculated field's name (both were
+    /// in `field_names`), so a self-named field's source column was silently
+    /// dropped from the recompute `SELECT` list and `evaluate` failed with
+    /// `EvalError::MissingColumn` even though the definition installs and
+    /// backfills correctly via the direct-build path
+    /// (`engine/tests/defs_backfill_direct.rs`'s `SELECT a AS a`), which
+    /// already special-cases this via `ddl::passthrough_source_column`.
+    #[test]
+    fn referenced_source_columns_includes_a_self_named_passthrough_columns_own_source() {
+        let def = TransformDef {
+            target: "t1".to_string(),
+            source: "t0".to_string(),
+            key_space: KeySpace::OneToOne,
+            fields: vec![FieldDef {
+                name: "c".to_string(),
+                expr: Expr::Column("c".to_string()),
+            }],
+            predicate: Predicate::True,
+        };
+        let columns = referenced_source_columns(&def);
+        assert_eq!(
+            columns,
+            HashSet::from(["c".to_string()]),
+            "a field's own source column must not be excluded just because it shares the \
+             field's name"
         );
     }
 
