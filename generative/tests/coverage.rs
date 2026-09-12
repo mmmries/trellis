@@ -8,9 +8,10 @@
 
 use std::collections::HashSet;
 
-use engine::defs::ast::{Expr, Operator, ValueType};
+use engine::defs::ast::{Expr, KeySpace, Operator, ValueType};
+use engine::defs::invertibility::{AggregateArg, CountArg, Invertibility, classify};
 use generative::generate::{Mutate, build_program, trivial_program, trivial_program_with};
-use generative::model::{Op, Table};
+use generative::model::{Op, Program, Table};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
 
@@ -494,5 +495,128 @@ fn trivial_program_sometimes_draws_defs_sharing_a_source_and_sometimes_draws_def
     assert!(
         saw_different_sources,
         "expected at least one sample where all defs draw distinct source tables across 500 samples"
+    );
+}
+
+/// Every [`Expr::FunctionCall`] name appearing anywhere in `program`'s defs
+/// (recursing into arguments, though today's `KeySpace::Aggregate` generator
+/// only ever nests one level deep — a `SUM`/`AVG`/`MIN`/`MAX` call wrapping a
+/// bare `Column`, or a bare `COUNT`).
+fn all_function_call_names(program: &Program) -> HashSet<String> {
+    let mut names = HashSet::new();
+    fn walk(expr: &Expr, out: &mut HashSet<String>) {
+        if let Expr::FunctionCall { name, args } = expr {
+            out.insert(name.clone());
+            for arg in args {
+                walk(arg, out);
+            }
+        }
+    }
+    for def in &program.defs {
+        for field in &def.fields {
+            walk(&field.expr, &mut names);
+        }
+    }
+    names
+}
+
+/// Improvement-plan task B4 (the widening unit's coverage meta-test): all
+/// five aggregate functions (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`,
+/// `engine::defs::registry::AGGREGATE_FUNCTIONS`) must actually get drawn
+/// across enough sampled programs — this is the floor that would catch B4's
+/// aggregate-function widening silently regressing (design doc §3 "coverage
+/// that silently drops out"), the same principle every other floor test in
+/// this file already checks for an earlier widening.
+#[test]
+fn trivial_program_draws_all_five_aggregate_functions_across_enough_samples() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut seen: HashSet<String> = HashSet::new();
+    for _ in 0..1000 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        seen.extend(all_function_call_names(&program));
+        if seen.len() >= 5 {
+            break;
+        }
+    }
+    for name in ["SUM", "COUNT", "AVG", "MIN", "MAX"] {
+        assert!(
+            seen.contains(name),
+            "expected {name} to be drawn among aggregate function calls across 1000 samples; \
+             saw: {seen:?}"
+        );
+    }
+}
+
+/// The other half of B4's coverage floor: both invertibility classes
+/// (`engine::defs::invertibility::Invertibility`) must appear across a run —
+/// at least one `Invertible` function (`SUM`/`COUNT`/`AVG`) and at least one
+/// `RecomputeOnly` function (`MIN`/`MAX`) — not just "all five names appear"
+/// in the abstract. This is what makes the generative suite a real exerciser
+/// of the engine's invertibility split (`docs/generative-test-suite.md` §4
+/// calls the aggregate delta path "the hardest guarantee" precisely because
+/// of this split), not just a name-coverage checklist.
+#[test]
+fn trivial_program_draws_both_invertibility_classes_across_enough_samples() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut saw_invertible = false;
+    let mut saw_recompute_only = false;
+    for _ in 0..1000 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        for name in all_function_call_names(&program) {
+            let arg = if name == "COUNT" {
+                AggregateArg::Count(CountArg::Star)
+            } else {
+                AggregateArg::Column(ValueType::Numeric)
+            };
+            let verdict = classify(&name, arg)
+                .unwrap_or_else(|| panic!("{name} must be a known aggregate function"));
+            match verdict.invertibility {
+                Invertibility::Invertible => saw_invertible = true,
+                Invertibility::RecomputeOnly => saw_recompute_only = true,
+            }
+        }
+        if saw_invertible && saw_recompute_only {
+            break;
+        }
+    }
+    assert!(
+        saw_invertible,
+        "expected at least one Invertible aggregate function (SUM/COUNT/AVG) across 1000 samples"
+    );
+    assert!(
+        saw_recompute_only,
+        "expected at least one RecomputeOnly aggregate function (MIN/MAX) across 1000 samples"
+    );
+}
+
+/// The key-space half of B4's coverage floor: the default strategy must
+/// sometimes draw a `KeySpace::Aggregate` definition at all (not just
+/// `OneToOne`, the only shape before this task) — sampled the same way as
+/// `trivial_program_sometimes_draws_more_than_one_table` above.
+#[test]
+fn trivial_program_sometimes_draws_an_aggregate_key_space() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let saw_aggregate = (0..500).any(|_| {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        program
+            .defs
+            .iter()
+            .any(|def| matches!(def.key_space, KeySpace::Aggregate { .. }))
+    });
+    assert!(
+        saw_aggregate,
+        "the generator must sometimes draw a KeySpace::Aggregate definition across 500 samples"
     );
 }

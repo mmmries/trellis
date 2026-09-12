@@ -38,6 +38,82 @@
 //! `uuid_values` fields and the `text_value`/`bool_value`/`uuid_value`
 //! strategies below.
 //!
+//! Improvement-plan task **B4** ("Aggregates") widens the generator past
+//! `KeySpace::OneToOne` for the first time: every table now *also*
+//! gets a "grain" column — one more [`ValueType::Numeric`] column,
+//! unconditionally, the same "every table gets it" philosophy B1 used for
+//! `Text`/`Boolean`/`Uuid` (see [`TableSpec`]'s `grain_values` field and the
+//! `grain_value` strategy below) — and each definition independently draws
+//! either the existing `total = c1 + c2` [`KeySpace::OneToOne`] shape, or a
+//! new [`KeySpace::Aggregate`] shape grouped by that table's grain column,
+//! with 2–5 fields drawn from `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over `c1`/`c2`
+//! (see [`DefShape`], [`AggregateFn`], and the `aggregate_functions`/
+//! `def_shape` strategies below). The grain column is deliberately **not**
+//! `c1`/`c2` (which keep their existing wider `0..=VALUE_MAX` range and
+//! remain the *values being aggregated*) — it's a tiny three-value domain
+//! (`0`, `1`, or `2`, see [`GRAIN_MAX`]) specifically so a handful of seed
+//! rows collide onto the same group, and a handful of `Delete` mutates has
+//! real odds of emptying one out entirely — the single hardest edge in
+//! aggregate maintenance (`docs/generative-test-suite.md` §4 calls the
+//! aggregate delta path "the hardest guarantee": the only non-idempotent
+//! maintenance in the engine), per `local_docs/generative-suite-improvement-plan.md`'s
+//! task B4.
+//!
+//! **The domain is *not* "0, 1, 2, plus `NULL`"**, despite the improvement
+//! plan's own text asking for exactly that. A `NULL` grouping value was
+//! implemented and drawn during this task's development, and immediately
+//! found a real engine bug: `engine::defs::ddl::create_aggregate_target_table`
+//! declares the `GROUP BY` columns as the target's Postgres `PRIMARY KEY`,
+//! which is unconditionally `NOT NULL` — so a source row with a `NULL`
+//! grouping value makes every attempted write to that group fail with a
+//! genuine `null value in column ... violates not-null constraint` error,
+//! confirmed with a from-scratch, `ManualBackend`-free repro directly against
+//! `engine::staging::apply`. Worse, `engine::client`'s `app_worker_loop`
+//! treats that as "one bad batch" and retries the *same* segment forever
+//! rather than surfacing it as fatal, so the source table's watermark never
+//! advances and `staging::await_converged` never returns — observed as this
+//! suite's own `run_convergence` hanging past its 30-second
+//! `QUIESCE_TIMEOUT` on a freshly-provisioned, uncontended cluster with a
+//! single seeded row. See [`grain_value`]'s doc comment for the full
+//! writeup. That's a real, reproducible liveness bug worth fixing
+//! (`create_aggregate_target_table` needs a NULL-tolerant unique constraint
+//! instead of a bare composite `PRIMARY KEY`), but it's an engine schema
+//! change outside this generative-suite-widening task's scope — so this
+//! generator draws only the three non-`NULL` grain values, not the `NULL`
+//! group the plan asked for, until that engine fix lands.
+//!
+//! **Design choice: every table gets a grain column, not just tables an
+//! `Aggregate` def happens to source from.** The alternative (only tables
+//! selected as an aggregate def's source get one) would need the table shape
+//! itself to depend on how the *definitions* built on top of it turn out to
+//! be drawn — but `table_spec` draws a `TableSpec` independently of, and
+//! before, any def that might reference it (`trivial_program_with` draws all
+//! tables first, then draws each def's source table index and shape). Making
+//! every table's shape identical regardless of how it ends up used keeps
+//! `TableSpec`/`Table::new` exactly as uniform as B1 already left them, and
+//! costs nothing: an `Aggregate` def can then source from *any* drawn table
+//! without a second table-shape variant to thread through, and a `OneToOne`
+//! def sourced from a table just leaves that table's grain column
+//! undrawn-from (present in the schema, never referenced by a field) —
+//! exactly how a `OneToOne` def already leaves the pk column's *identity* as
+//! a pk unused as a value.
+//!
+//! **B4 scope cuts:** the grain column is seeded once at `INSERT` time and
+//! never touched by `Update`/`Delete`/`DuplicateInsert` (same B1 precedent —
+//! a group changing membership via delete/insert of whole rows is already
+//! the sharpest edge; *migrating* a live row from one group to another via
+//! `Update` is real, separate coverage `engine/tests/apply_aggregate.rs`
+//! already exercises by hand, not drawn here). `KeySpace::Aggregate.group_by`
+//! is always exactly one column (never a composite/multi-column group-by,
+//! which the engine grammar supports but this generator does not draw).
+//! `OneToOne` defs never get a grain passthrough field (unlike the B1
+//! `Text`/`Boolean`/`Uuid` columns) — the grain column's role here is
+//! structural (an aggregate grouping key), not a type-coverage dimension, so
+//! giving it a bare passthrough field would add surface without adding
+//! coverage of anything the derivation-type coverage meta-test
+//! (`tests/coverage.rs`'s `every_column_scalar_type_appears_via_a_derivation`)
+//! doesn't already assert via `c1`/`c2`.
+//!
 //! **B1 scope cuts, stated plainly (design doc §3's own standard for honest
 //! narrowing):**
 //! - The new columns are seeded once at `INSERT` time and never touched by
@@ -135,6 +211,18 @@ pub const MAX_TABLES: usize = 3;
 /// to `MAX_TABLES`: two definitions can and do land on the same table.
 pub const MAX_DEFS: usize = 3;
 
+/// The inclusive upper bound of the grain column's value domain
+/// (improvement-plan task B4): `0..=GRAIN_MAX` is the grain column's *entire*
+/// value space — kept at `2` (three possible values total; see
+/// [`grain_value`]'s doc comment for why this is three, not the plan's
+/// originally-requested four including `NULL`) so it stays "tiny,
+/// heavily-repeating" (the plan's own words): with `MAX_SEED_ROWS` (4) rows
+/// drawn from a 3-value domain, a real collision (two seed rows landing in
+/// the same group) is the common case, not a rare one, and a handful of
+/// `Delete` mutates has real odds of emptying a group entirely — see the
+/// module doc comment's B4 section.
+pub const GRAIN_MAX: i64 = 2;
+
 /// Renders an `Option<i64>` value to the rendered-text form
 /// [`crate::model::Op`] wants: `None` (SQL `NULL`) stays `None`.
 fn render(value: Option<i64>) -> Option<String> {
@@ -188,6 +276,78 @@ pub enum Mutate {
     },
 }
 
+/// Which of a source table's two aggregated columns (`c1`/`c2`) a generated
+/// `SUM`/`AVG`/`MIN`/`MAX` field aggregates over (improvement-plan task B4).
+/// `COUNT(*)` has no column argument at all (see [`AggregateFn::Count`]), so
+/// this only shows up nested inside the other four variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateColumn {
+    C1,
+    C2,
+}
+
+/// One calculated field of a generated [`KeySpace::Aggregate`] definition
+/// (task B4): one of the five functions
+/// `engine::defs::registry::AGGREGATE_FUNCTIONS` accepts, carrying which
+/// column it aggregates (all but `Count`, which is `COUNT(*)` row-counting
+/// and takes no argument at all). Kept as a small enum — rather than a bare
+/// `(name, column)` pair — so [`build_program_multi_with_shapes`]'s match
+/// stays exhaustive against the registry's actual function set: adding a
+/// sixth aggregate function to the engine would need a new variant here
+/// before it could compile, not just a new string someone forgot to draw.
+///
+/// Two of `SUM`/`COUNT`/`AVG` are [`engine::defs::invertibility::Invertibility::Invertible`]
+/// (delta-maintained); `MIN`/`MAX` are always
+/// [`engine::defs::invertibility::Invertibility::RecomputeOnly`] — see that
+/// module's doc comment. Drawing a real mix of both classes in the same
+/// aggregate def (not just across different defs) is exactly what
+/// `tests/coverage.rs`'s B4 floor tests assert actually happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFn {
+    Sum(AggregateColumn),
+    Count,
+    Avg(AggregateColumn),
+    Min(AggregateColumn),
+    Max(AggregateColumn),
+}
+
+impl AggregateFn {
+    /// This function's canonical uppercased name, exactly as
+    /// `engine::defs::registry::AGGREGATE_FUNCTIONS` spells it.
+    fn name(self) -> &'static str {
+        match self {
+            AggregateFn::Sum(_) => "SUM",
+            AggregateFn::Count => "COUNT",
+            AggregateFn::Avg(_) => "AVG",
+            AggregateFn::Min(_) => "MIN",
+            AggregateFn::Max(_) => "MAX",
+        }
+    }
+
+    /// The aggregated column, for every variant but `Count` (which has none).
+    fn column(self) -> Option<AggregateColumn> {
+        match self {
+            AggregateFn::Sum(c)
+            | AggregateFn::Avg(c)
+            | AggregateFn::Min(c)
+            | AggregateFn::Max(c) => Some(c),
+            AggregateFn::Count => None,
+        }
+    }
+}
+
+/// Which shape a generated [`TransformDef`] takes (improvement-plan task B4
+/// widens this past the previous always-`OneToOne` assumption): the existing
+/// `total = c1 + c2` [`KeySpace::OneToOne`] shape, or a `GROUP BY`
+/// [`KeySpace::Aggregate`] shape over one of its source table's grain column,
+/// with `functions` giving its calculated fields beyond the grain-column
+/// passthrough (see [`build_program_multi_with_shapes`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DefShape {
+    OneToOne,
+    Aggregate { functions: Vec<AggregateFn> },
+}
+
 /// One drawn table's seed rows and post-seed mutate stream, for
 /// [`build_program_multi`].
 ///
@@ -224,20 +384,31 @@ pub struct TableSpec {
     /// `i + 1`'s `Uuid` column (task B1). Same length contract as
     /// `text_values`.
     pub uuid_values: Vec<Option<String>>,
+    /// `grain_values[i]` is the rendered value (`"0"`/`"1"`/`"2"`, see
+    /// [`GRAIN_MAX`]) for seeded primary key `i + 1`'s grain column
+    /// (improvement-plan task B4). Stays `Option<String>` — the same shape
+    /// every other seeded column here uses — so a hand-built pin can still
+    /// construct a `None` (SQL `NULL`) grain value directly if one is ever
+    /// needed (e.g. a regression pin for the `NULL`-grouping-key engine bug
+    /// [`grain_value`]'s doc comment describes), even though the `grain_value`
+    /// proptest strategy itself never draws one. Same length contract as
+    /// `text_values`. Never touched by [`Mutate`] — see the module doc
+    /// comment's B4 scope cuts.
+    pub grain_values: Vec<Option<String>>,
     /// Mutates appended after this table's seed inserts (seed-before-mutate,
     /// design doc §3), targeting only this table's own pks. Never touches
-    /// the `Text`/`Boolean`/`Uuid` columns above — see the module doc
-    /// comment's B1 scope cut.
+    /// the `Text`/`Boolean`/`Uuid`/grain columns above — see the module doc
+    /// comment's B1/B4 scope cuts.
     pub mutates: Vec<Mutate>,
 }
 
 impl TableSpec {
     /// Builds a `TableSpec` whose `Text`/`Boolean`/`Uuid` columns (task B1)
-    /// are all `NULL` for every seed row — a convenience for callers that
-    /// only care about the numeric seed/mutate shape (e.g. the pk-liveness
-    /// unit tests below, and [`build_program`]'s two-argument convenience
-    /// wrapper), sparing them from hand-counting a matching-length `NULL`
-    /// vector for each of the three new columns.
+    /// and grain column (task B4) are all `NULL` for every seed row — a
+    /// convenience for callers that only care about the numeric seed/mutate
+    /// shape (e.g. the pk-liveness unit tests below, and [`build_program`]'s
+    /// two-argument convenience wrapper), sparing them from hand-counting a
+    /// matching-length `NULL` vector for each of the four new columns.
     pub fn numeric_only(
         seed_values: Vec<(Option<i64>, Option<i64>)>,
         mutates: Vec<Mutate>,
@@ -248,6 +419,7 @@ impl TableSpec {
             text_values: vec![None; row_count],
             bool_values: vec![None; row_count],
             uuid_values: vec![None; row_count],
+            grain_values: vec![None; row_count],
             mutates,
         }
     }
@@ -378,14 +550,60 @@ pub fn build_program(seed_values: &[(Option<i64>, Option<i64>)], mutates: &[Muta
 /// is out of range for `tables` — both are generator bugs (every strategy
 /// below draws `1..=MAX_TABLES`/`1..=MAX_DEFS` and indexes accordingly), not
 /// conditions a caller should need to handle.
+///
+/// A thin wrapper around [`build_program_multi_with_shapes`] (every def
+/// `OneToOne`) kept at its original `&[usize]` signature rather than folded
+/// away — the same "don't touch two dozen call sites for an orthogonal
+/// widening" reasoning [`build_program`]'s own doc comment gives for staying
+/// at its two-argument shape (improvement-plan task B4 widens *which shapes*
+/// a def can take, not how many tables/defs a program has, which is what
+/// this signature already expresses).
 pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Program {
+    let defs: Vec<(usize, DefShape)> = def_sources
+        .iter()
+        .map(|&idx| (idx, DefShape::OneToOne))
+        .collect();
+    build_program_multi_with_shapes(tables, &defs)
+}
+
+/// [`build_program_multi`]'s general form (improvement-plan task B4): `defs[j]`
+/// is `(source table index, shape)` for definition `j`, so each definition
+/// independently draws not just *which* table it sources from but *which
+/// shape* it takes — the existing `total = c1 + c2` [`KeySpace::OneToOne`], or
+/// a `GROUP BY` [`KeySpace::Aggregate`] over that table's grain column with
+/// [`DefShape::Aggregate`]'s `functions` as its non-grouping fields.
+///
+/// Every table gets its own numeric pk/`c1`/`c2` schema, plus (task B1) one
+/// `Text`/`Boolean`/`Uuid` column each, plus (task B4) one further Numeric
+/// "grain" column (see the module doc comment), and its own independent
+/// pk-liveness simulation (a fresh `HashSet` per `TableSpec`, via
+/// [`render_mutate`]): table A's deletes and inserts can never be mistaken
+/// for table B's, and each table's seeded pks start at `1` regardless of how
+/// many rows an earlier table seeded — table identity, not draw order, is
+/// what a pk is scoped to.
+///
+/// Ops are emitted one table at a time, in `tables` order: all of table 0's
+/// seeds and mutates, then all of table 1's, and so on. This keeps a
+/// counterexample's op stream legible (every op naming table N groups
+/// together) and is not a claim that real traffic interleaves tables that
+/// way — nothing about the model or the backend assumes any particular
+/// interleaving.
+///
+/// Panics if `tables` or `defs` is empty, or if a `defs` entry's table index
+/// is out of range for `tables` — both are generator bugs (every strategy
+/// below draws `1..=MAX_TABLES`/`1..=MAX_DEFS` and indexes accordingly), not
+/// conditions a caller should need to handle.
+pub fn build_program_multi_with_shapes(
+    tables: &[TableSpec],
+    defs: &[(usize, DefShape)],
+) -> Program {
     assert!(
         !tables.is_empty(),
-        "build_program_multi: a program must draw at least one table"
+        "build_program_multi_with_shapes: a program must draw at least one table"
     );
     assert!(
-        !def_sources.is_empty(),
-        "build_program_multi: a program must draw at least one definition"
+        !defs.is_empty(),
+        "build_program_multi_with_shapes: a program must draw at least one definition"
     );
 
     let mut pool = NamePool::new();
@@ -397,29 +615,40 @@ pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Progr
         assert_eq!(
             spec.text_values.len(),
             row_count,
-            "build_program_multi: text_values must have one entry per seed row \
+            "build_program_multi_with_shapes: text_values must have one entry per seed row \
              ({row_count} seed rows, {} text values) — a generator bug",
             spec.text_values.len()
         );
         assert_eq!(
             spec.bool_values.len(),
             row_count,
-            "build_program_multi: bool_values must have one entry per seed row \
+            "build_program_multi_with_shapes: bool_values must have one entry per seed row \
              ({row_count} seed rows, {} bool values) — a generator bug",
             spec.bool_values.len()
         );
         assert_eq!(
             spec.uuid_values.len(),
             row_count,
-            "build_program_multi: uuid_values must have one entry per seed row \
+            "build_program_multi_with_shapes: uuid_values must have one entry per seed row \
              ({row_count} seed rows, {} uuid values) — a generator bug",
             spec.uuid_values.len()
         );
+        assert_eq!(
+            spec.grain_values.len(),
+            row_count,
+            "build_program_multi_with_shapes: grain_values must have one entry per seed row \
+             ({row_count} seed rows, {} grain values) — a generator bug",
+            spec.grain_values.len()
+        );
 
-        // Task B1: every table gets a Text/Boolean/Uuid column, always —
-        // see the module doc comment. `Table::new` builds columns in the
-        // order given, so `columns[3..=5]` are these three, after the pk
-        // (`columns[0]`) and `c1`/`c2` (`columns[1..=2]`).
+        // Tasks B1/B4: every table gets a Text/Boolean/Uuid column and a
+        // grain column, always — see the module doc comment. `Table::new`
+        // builds columns in the order given, so `columns[3..=5]` are
+        // Text/Boolean/Uuid and `columns[6]` is the grain column, after the
+        // pk (`columns[0]`) and `c1`/`c2` (`columns[1..=2]`). The grain
+        // column is appended last (rather than interleaved) so every
+        // existing `columns[1..=5]` index above is untouched by this
+        // widening.
         let source = Table::new(
             &mut pool,
             &[
@@ -428,6 +657,7 @@ pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Progr
                 ValueType::Text,
                 ValueType::Boolean,
                 ValueType::Uuid,
+                ValueType::Numeric,
             ],
         );
         let c1 = source.columns[1].name.clone();
@@ -435,6 +665,7 @@ pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Progr
         let text_col = source.columns[3].name.clone();
         let bool_col = source.columns[4].name.clone();
         let uuid_col = source.columns[5].name.clone();
+        let grain_col = source.columns[6].name.clone();
 
         // This table's own pk-liveness simulation, independent of every
         // other table's — see [`render_mutate`] and the function doc
@@ -456,6 +687,9 @@ pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Progr
                     (text_col.clone(), spec.text_values[i].clone()),
                     (bool_col.clone(), spec.bool_values[i].clone()),
                     (uuid_col.clone(), spec.uuid_values[i].clone()),
+                    // Task B4: likewise seeded once and never mutated — see
+                    // the module doc comment's B4 scope cuts.
+                    (grain_col.clone(), spec.grain_values[i].clone()),
                 ],
                 expect: OpOutcome::Succeeds,
             });
@@ -481,13 +715,13 @@ pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Progr
         built_tables.push(source);
     }
 
-    let defs = def_sources
+    let defs = defs
         .iter()
-        .map(|&idx| {
-            let source = built_tables.get(idx).unwrap_or_else(|| {
+        .map(|(idx, shape)| {
+            let source = built_tables.get(*idx).unwrap_or_else(|| {
                 panic!(
-                    "build_program_multi: def_sources index {idx} out of range for {} tables — \
-                     a generator bug",
+                    "build_program_multi_with_shapes: defs index {idx} out of range for {} \
+                     tables — a generator bug",
                     built_tables.len()
                 )
             });
@@ -496,40 +730,76 @@ pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Progr
             let text_col = source.columns[3].name.clone();
             let bool_col = source.columns[4].name.clone();
             let uuid_col = source.columns[5].name.clone();
+            let grain_col = source.columns[6].name.clone();
+
+            let (key_space, fields) = match shape {
+                DefShape::OneToOne => (
+                    KeySpace::OneToOne,
+                    vec![
+                        FieldDef {
+                            name: "total".to_string(),
+                            expr: Expr::BinaryOp {
+                                op: Operator::Add,
+                                lhs: Box::new(Expr::Column(c1)),
+                                rhs: Box::new(Expr::Column(c2)),
+                            },
+                        },
+                        // Task B1: one identity-passthrough field per new
+                        // column, reusing the column's own name as the field
+                        // name (`SELECT <col> AS <col>`) — the exact shape
+                        // `engine/tests/defs_backfill_direct.rs` already
+                        // exercises by hand, and every def sourced from this
+                        // table gets the same three, determined by the
+                        // table's shape rather than drawn independently per
+                        // def (matching how `total` already works). The
+                        // grain column (task B4) deliberately gets no
+                        // matching passthrough field here — see the module
+                        // doc comment's B4 scope cuts.
+                        FieldDef {
+                            name: text_col.clone(),
+                            expr: Expr::Column(text_col),
+                        },
+                        FieldDef {
+                            name: bool_col.clone(),
+                            expr: Expr::Column(bool_col),
+                        },
+                        FieldDef {
+                            name: uuid_col.clone(),
+                            expr: Expr::Column(uuid_col),
+                        },
+                    ],
+                ),
+                DefShape::Aggregate { functions } => {
+                    // The grouping-column passthrough field
+                    // (`SELECT <grain> AS <grain>`) is required —
+                    // `engine::defs::validate::validate` rejects any other
+                    // expression under a grouping column's own name — and
+                    // every other field is one of `functions`, drawn from
+                    // `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over `c1`/`c2` (see
+                    // [`AggregateFn`]/`aggregate_field_def`).
+                    let mut fields = vec![FieldDef {
+                        name: grain_col.clone(),
+                        expr: Expr::Column(grain_col.clone()),
+                    }];
+                    fields.extend(
+                        functions
+                            .iter()
+                            .map(|func| aggregate_field_def(*func, &c1, &c2)),
+                    );
+                    (
+                        KeySpace::Aggregate {
+                            group_by: vec![grain_col],
+                        },
+                        fields,
+                    )
+                }
+            };
+
             TransformDef {
                 target: pool.next_table_name(),
                 source: source.name.clone(),
-                key_space: KeySpace::OneToOne,
-                fields: vec![
-                    FieldDef {
-                        name: "total".to_string(),
-                        expr: Expr::BinaryOp {
-                            op: Operator::Add,
-                            lhs: Box::new(Expr::Column(c1)),
-                            rhs: Box::new(Expr::Column(c2)),
-                        },
-                    },
-                    // Task B1: one identity-passthrough field per new
-                    // column, reusing the column's own name as the field
-                    // name (`SELECT <col> AS <col>`) — the exact shape
-                    // `engine/tests/defs_backfill_direct.rs` already
-                    // exercises by hand, and every def sourced from this
-                    // table gets the same three, determined by the table's
-                    // shape rather than drawn independently per def
-                    // (matching how `total` already works).
-                    FieldDef {
-                        name: text_col.clone(),
-                        expr: Expr::Column(text_col),
-                    },
-                    FieldDef {
-                        name: bool_col.clone(),
-                        expr: Expr::Column(bool_col),
-                    },
-                    FieldDef {
-                        name: uuid_col.clone(),
-                        expr: Expr::Column(uuid_col),
-                    },
-                ],
+                key_space,
+                fields,
                 predicate: Predicate::True,
             }
         })
@@ -539,6 +809,40 @@ pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Progr
         tables: built_tables,
         defs,
         ops,
+    }
+}
+
+/// Builds one [`FieldDef`] for a drawn [`AggregateFn`] (improvement-plan task
+/// B4): the field name encodes both the function and its aggregated column
+/// (`sum_c1`, `avg_c2`, ...) so distinct `(function, column)` draws — even two
+/// functions sharing the same column, e.g. `SUM(c1)` and `AVG(c1)`, which
+/// deliberately exercises `engine::defs::ddl::count_column_names`'s shared
+/// hidden-count-column path — never collide; `COUNT` has no column and always
+/// takes the fixed name `cnt`. `c1`/`c2` are the source table's own rendered
+/// column names (as everywhere else in this module).
+fn aggregate_field_def(func: AggregateFn, c1: &str, c2: &str) -> FieldDef {
+    let column_name = |column: AggregateColumn| match column {
+        AggregateColumn::C1 => c1.to_string(),
+        AggregateColumn::C2 => c2.to_string(),
+    };
+    match func.column() {
+        Some(column) => {
+            let column_name = column_name(column);
+            FieldDef {
+                name: format!("{}_{column_name}", func.name().to_lowercase()),
+                expr: Expr::FunctionCall {
+                    name: func.name().to_string(),
+                    args: vec![Expr::Column(column_name)],
+                },
+            }
+        }
+        None => FieldDef {
+            name: "cnt".to_string(),
+            expr: Expr::FunctionCall {
+                name: func.name().to_string(),
+                args: Vec::new(),
+            },
+        },
     }
 }
 
@@ -703,6 +1007,135 @@ mod strategy {
         }
     }
 
+    /// A single grain column value (improvement-plan task B4): `0..=GRAIN_MAX`,
+    /// always `Some` — **never `NULL`**, despite the improvement-plan task's
+    /// original text asking for a "0, 1, 2, plus NULL" domain. This is a
+    /// deliberate scope cut discovered *while building this task*, not an
+    /// oversight: a `NULL` grouping value is real, standard SQL (Postgres's
+    /// `GROUP BY` puts every `NULL` into one group, like any other value),
+    /// but this engine's `KeySpace::Aggregate` target-table DDL
+    /// (`engine::defs::ddl::create_aggregate_target_table`) declares the
+    /// `group_by` columns as the target's `PRIMARY KEY` — and Postgres
+    /// primary-key columns are `NOT NULL` unconditionally, by definition, with
+    /// no opt-out. A source row whose grouping column is `NULL` therefore
+    /// makes every write to that group's target row fail with a real
+    /// Postgres `null value in column ... violates not-null constraint`
+    /// error — confirmed directly against a from-scratch, ManualBackend-free
+    /// `engine::staging::apply` repro during this task's own testing, one
+    /// `COUNT(*)`-only field, one seeded row with `NULL` grain, nothing else.
+    /// Worse than a rejected write: the constraint violation surfaces deep
+    /// inside `staging::apply`'s CDC drain path
+    /// (`engine::client`'s `app_worker_loop`, whose own doc comment says "one
+    /// bad batch never crashes the worker" — it releases the claim and
+    /// *keeps retrying the same segment*), so the batch is retried forever,
+    /// the watermark for that source table never advances past it, and
+    /// `staging::await_converged` never returns — observed directly as this
+    /// suite's `run_convergence` timing out at its 30s `QUIESCE_TIMEOUT`
+    /// on a *fresh, uncontended* cluster, not just under load. This is a
+    /// real, reproducible liveness bug (a NULL grouping value can wedge an
+    /// aggregate source table's ingestion permanently), not merely an
+    /// unsupported edge case — flagged here rather than fixed, since a real
+    /// fix needs a schema change to `create_aggregate_target_table` (a
+    /// NULL-tolerant unique constraint instead of a bare `PRIMARY KEY`, plus
+    /// whatever upsert-conflict-target changes that implies throughout
+    /// `staging::apply_aggregate`), which is engine work well outside this
+    /// generative-suite-widening task's scope. Until that lands, this
+    /// generator must not draw a value that's *known* to wedge the very
+    /// pipeline it's exercising — see also `tests/coverage.rs`'s
+    /// `awkward_values_off_never_draws_null`, which this keeps satisfying
+    /// unconditionally (there's no `awkward_values`-gated branch to keep in
+    /// sync here at all now) rather than incidentally.
+    fn grain_value() -> impl Strategy<Value = Option<String>> {
+        prop_oneof![
+            Just(Some("0".to_string())),
+            Just(Some("1".to_string())),
+            Just(Some("2".to_string())),
+        ]
+    }
+
+    /// Which of a source table's two aggregated columns (`c1`/`c2`) a drawn
+    /// `SUM`/`AVG`/`MIN`/`MAX` field aggregates over (task B4).
+    fn aggregate_column() -> impl Strategy<Value = AggregateColumn> {
+        prop_oneof![Just(AggregateColumn::C1), Just(AggregateColumn::C2),]
+    }
+
+    /// The five function *kinds* [`aggregate_functions`] can draw, without
+    /// their column argument — kept as its own tiny enum so
+    /// `proptest::sample::subsequence` (which needs a concrete, `Clone`
+    /// element type to draw an order-preserving, duplicate-free subset from)
+    /// has something to draw over; [`aggregate_functions`] then pairs each
+    /// drawn kind with an independently-drawn column.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FnKind {
+        Sum,
+        Count,
+        Avg,
+        Min,
+        Max,
+    }
+
+    const ALL_FN_KINDS: [FnKind; 5] = [
+        FnKind::Sum,
+        FnKind::Count,
+        FnKind::Avg,
+        FnKind::Min,
+        FnKind::Max,
+    ];
+
+    /// A drawn `Aggregate` def's non-grouping fields (task B4): 2 to 5 of the
+    /// five aggregate functions (`engine::defs::registry::AGGREGATE_FUNCTIONS`),
+    /// each drawn at most once (`subsequence` over [`ALL_FN_KINDS`] never
+    /// repeats an element), so multiple functions genuinely co-occur on the
+    /// same def without ever needing two fields of the same name. Every
+    /// column-taking function's column is drawn independently per *function*
+    /// (not per occurrence, since each function occurs at most once anyway),
+    /// so two different functions landing on the *same* column — e.g.
+    /// `SUM(c1)` and `AVG(c1)` — is a real, reachable draw: that's precisely
+    /// the shape that exercises `engine::defs::ddl::count_column_names`'s
+    /// shared hidden-count-column path (two fields aggregating the exact same
+    /// argument share one partial column) from the generative side, not just
+    /// `engine/tests/apply_aggregate.rs`'s hand-built fixture.
+    ///
+    /// The lower bound of 2 (not 1) guarantees at least two functions always
+    /// co-occur, per the improvement-plan task's explicit ask ("draw at least
+    /// 2-3 of the five per aggregate def so multiple functions actually
+    /// co-occur"); the upper bound of 5 lets every function appear in the
+    /// same def when proptest happens to draw it.
+    fn aggregate_functions() -> impl Strategy<Value = Vec<AggregateFn>> {
+        (
+            proptest::sample::subsequence(ALL_FN_KINDS.to_vec(), 2..=5),
+            aggregate_column(),
+            aggregate_column(),
+            aggregate_column(),
+            aggregate_column(),
+        )
+            .prop_map(|(kinds, sum_col, avg_col, min_col, max_col)| {
+                kinds
+                    .into_iter()
+                    .map(|kind| match kind {
+                        FnKind::Sum => AggregateFn::Sum(sum_col),
+                        FnKind::Count => AggregateFn::Count,
+                        FnKind::Avg => AggregateFn::Avg(avg_col),
+                        FnKind::Min => AggregateFn::Min(min_col),
+                        FnKind::Max => AggregateFn::Max(max_col),
+                    })
+                    .collect()
+            })
+    }
+
+    /// Which shape a drawn definition takes (task B4): the existing
+    /// `OneToOne` `total = c1 + c2` shape, or a new `Aggregate` shape.
+    /// Weighted evenly so both shapes get substantial, comparable coverage
+    /// across a run — this is the dimension `tests/coverage.rs`'s B4 floor
+    /// tests sample against, so it must not be so lopsided that 500 samples
+    /// has a real chance of missing one of the five aggregate functions.
+    fn def_shape() -> impl Strategy<Value = DefShape> {
+        prop_oneof![
+            1 => Just(DefShape::OneToOne),
+            1 => aggregate_functions().prop_map(|functions| DefShape::Aggregate { functions }),
+        ]
+    }
+
     /// One mutate targeting `seed_count` seeded rows. The primary key for
     /// `Update`/`Delete` is drawn from `1..=seed_count + 1`: values
     /// `1..=seed_count` hit a seeded (or otherwise still-live) row, and
@@ -729,12 +1162,12 @@ mod strategy {
 
     /// One drawn table's seed rows and mutate stream (see [`TableSpec`]):
     /// seed `1..=MAX_SEED_ROWS` rows with random values (now including one
-    /// `Text`/`Boolean`/`Uuid` value per row, task B1), then append
-    /// `0..=MAX_MUTATES` mutates over the numeric columns only (the new
-    /// columns are never mutated — see the module doc comment's scope cut) —
-    /// the per-table shape [`trivial_program_with`] always drew, now
-    /// reusable once per table in a multi-table program (improvement-plan
-    /// task B3).
+    /// `Text`/`Boolean`/`Uuid` value and one grain value per row, tasks
+    /// B1/B4), then append `0..=MAX_MUTATES` mutates over the numeric columns
+    /// only (the new columns are never mutated — see the module doc
+    /// comment's scope cuts) — the per-table shape [`trivial_program_with`]
+    /// always drew, now reusable once per table in a multi-table program
+    /// (improvement-plan task B3).
     fn table_spec(awkward_values: bool) -> impl Strategy<Value = TableSpec> {
         (1..=MAX_SEED_ROWS)
             .prop_flat_map(move |seed_count| {
@@ -745,17 +1178,21 @@ mod strategy {
                 let texts = prop::collection::vec(text_value(awkward_values), seed_count);
                 let bools = prop::collection::vec(bool_value(awkward_values), seed_count);
                 let uuids = prop::collection::vec(uuid_value(awkward_values), seed_count);
+                let grains = prop::collection::vec(grain_value(), seed_count);
                 let mutates =
                     prop::collection::vec(mutate(seed_count, awkward_values), 0..=MAX_MUTATES);
-                (seeds, texts, bools, uuids, mutates)
+                (seeds, texts, bools, uuids, grains, mutates)
             })
             .prop_map(
-                |(seed_values, text_values, bool_values, uuid_values, mutates)| TableSpec {
-                    seed_values,
-                    text_values,
-                    bool_values,
-                    uuid_values,
-                    mutates,
+                |(seed_values, text_values, bool_values, uuid_values, grain_values, mutates)| {
+                    TableSpec {
+                        seed_values,
+                        text_values,
+                        bool_values,
+                        uuid_values,
+                        grain_values,
+                        mutates,
+                    }
                 },
             )
     }
@@ -763,28 +1200,35 @@ mod strategy {
     /// Draws a [`Program`] over `1..=MAX_TABLES` tables and `1..=MAX_DEFS`
     /// definitions (improvement-plan task B3): each table independently
     /// draws its own seed/mutate stream ([`table_spec`]), and each
-    /// definition independently draws *which* table it reads from —
+    /// definition independently draws both *which* table it reads from —
     /// uniformly over `0..table_count`, with no bias toward distinct
-    /// sources — so "two definitions sharing one source table" and
-    /// "definitions spread across different tables" are both reachable in
-    /// the same run, including a mix of both in one program. Everything maps
-    /// through [`build_program_multi`], so proptest's integrated shrinking
-    /// reduces the def count, then the table count (both ahead of any
-    /// table's row count, values, or mutate stream — the same
+    /// sources — and (task B4) *which shape* it takes ([`def_shape`]), so
+    /// "two definitions sharing one source table" and "definitions spread
+    /// across different tables" are both reachable in the same program,
+    /// including a mix of `OneToOne` and `Aggregate` defs. Everything maps
+    /// through [`build_program_multi_with_shapes`], so proptest's integrated
+    /// shrinking reduces the def count, then the table count (both ahead of
+    /// any table's row count, values, or mutate stream — the same
     /// `1..=N`-via-`prop_flat_map` idiom [`MAX_SEED_ROWS`]/[`MAX_MUTATES`]
     /// already use), toward the smallest reproducing program — a 1-table/
     /// 1-def counterexample is the readable one.
     ///
-    /// `awkward_values` gates only the *value* draws (see [`value`]); it does
-    /// not affect [`Mutate::DuplicateInsert`], which is a distinct widening
-    /// (a real `apply()` failure, not an awkward value) always available.
+    /// `awkward_values` gates every other column's `NULL` draw (see
+    /// [`value`], [`text_value`], [`bool_value`], [`uuid_value`]); it does not
+    /// gate [`grain_value`] (which never draws `NULL` at all — see its own
+    /// doc comment for the engine bug that finding forced this scope cut
+    /// over), nor does it affect [`Mutate::DuplicateInsert`] or [`def_shape`]
+    /// (which of a def's fields are `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over — a
+    /// distinct, structural widening, always available regardless of the
+    /// flag).
     pub fn trivial_program_with(awkward_values: bool) -> impl Strategy<Value = Program> {
         prop::collection::vec(table_spec(awkward_values), 1..=MAX_TABLES)
             .prop_flat_map(|tables| {
-                let def_sources = prop::collection::vec(0..tables.len(), 1..=MAX_DEFS);
-                (Just(tables), def_sources)
+                let table_count = tables.len();
+                let defs = prop::collection::vec((0..table_count, def_shape()), 1..=MAX_DEFS);
+                (Just(tables), defs)
             })
-            .prop_map(|(tables, def_sources)| build_program_multi(&tables, &def_sources))
+            .prop_map(|(tables, defs)| build_program_multi_with_shapes(&tables, &defs))
     }
 
     /// The generator's default strategy: awkward values (NULLs) on, so real
