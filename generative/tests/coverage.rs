@@ -210,17 +210,37 @@ fn trivial_program_sometimes_draws_a_duplicate_pk_insert() {
     );
 }
 
+/// Whether any table in `program` has two inserts at the same pk. Keyed by
+/// `(table name, pk)`, not pk alone: since B3 (improvement-plan), a program
+/// can draw multiple tables, and every table's seeded pks independently
+/// start at 1 (see `generate::tests::pk_liveness_multi_table`) — table A's
+/// pk 1 and table B's pk 1 are two different rows, not a duplicate, so
+/// pk-alone dedup would false-positive on the common case of two tables each
+/// seeding a pk-1 row. Each insert's pk column is looked up on *its own*
+/// target table (via `Op::Insert`'s `table` field), not assumed to be
+/// `program.tables[0]`'s — a different table's pk column has a different
+/// name (see `NamePool`), so that assumption would otherwise panic the
+/// first time an insert targeted any table but the first one drawn.
 fn has_duplicate_pk_insert(program: &generative::model::Program) -> bool {
-    let table = &program.tables[0];
     let mut seen = HashSet::new();
     for op in &program.ops {
-        if let Op::Insert { row, .. } = op {
+        if let Op::Insert {
+            table: table_name,
+            row,
+            ..
+        } = op
+        {
+            let table = program
+                .tables
+                .iter()
+                .find(|t| &t.name == table_name)
+                .expect("insert must target a declared table");
             let pk = row
                 .iter()
                 .find(|(name, _)| *name == table.pk_col)
                 .and_then(|(_, v)| v.clone())
                 .expect("insert must carry a pk value");
-            if !seen.insert(pk) {
+            if !seen.insert((table_name.clone(), pk)) {
                 return true;
             }
         }
@@ -353,5 +373,95 @@ fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
     assert!(
         coverage.operators.contains("Add"),
         "coverage floor failed: expected \"Add\" among operators:\n{coverage}"
+    );
+}
+
+/// Improvement-plan task B3: the default strategy must sometimes draw more
+/// than one source table — sampled the same way as
+/// `awkward_values_on_sometimes_draws_null`/
+/// `trivial_program_sometimes_draws_a_duplicate_pk_insert` above. Before B3
+/// this was structurally impossible (`build_program` always built exactly
+/// one table); this is the coverage meta-test that would catch B3's widening
+/// silently regressing back to always-one (design doc §3 "coverage that
+/// silently drops out").
+#[test]
+fn trivial_program_sometimes_draws_more_than_one_table() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let saw_multiple_tables = (0..500).any(|_| {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        program.tables.len() > 1
+    });
+    assert!(
+        saw_multiple_tables,
+        "the generator must sometimes draw more than one table across 500 samples"
+    );
+}
+
+/// The definition-count half of B3's coverage floor: the default strategy
+/// must sometimes draw more than one definition in the same program
+/// (whether or not those definitions share a source table — this test only
+/// asserts the count, not the fan-out shape).
+#[test]
+fn trivial_program_sometimes_draws_more_than_one_definition() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let saw_multiple_defs = (0..500).any(|_| {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        program.defs.len() > 1
+    });
+    assert!(
+        saw_multiple_defs,
+        "the generator must sometimes draw more than one definition across 500 samples"
+    );
+}
+
+/// Both "two defs sharing one source table" and "defs spread across
+/// different source tables" must be reachable — B3's stated goal is that
+/// neither shape is forced out by the other. Sampled together (rather than
+/// as two separate single-shape tests) so a single 500-sample run has to
+/// produce both, matching how the strategy actually draws (independently,
+/// not correlated).
+#[test]
+fn trivial_program_sometimes_draws_defs_sharing_a_source_and_sometimes_draws_defs_on_different_sources()
+ {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut saw_shared_source = false;
+    let mut saw_different_sources = false;
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        if program.defs.len() < 2 {
+            continue;
+        }
+        let sources: Vec<&str> = program.defs.iter().map(|d| d.source.as_str()).collect();
+        let mut deduped = sources.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        if deduped.len() < sources.len() {
+            // At least two defs collapsed onto the same source.
+            saw_shared_source = true;
+        }
+        if deduped.len() == sources.len() {
+            // Every def in this sample has its own distinct source.
+            saw_different_sources = true;
+        }
+    }
+    assert!(
+        saw_shared_source,
+        "expected at least one sample where two or more defs share a source table across 500 samples"
+    );
+    assert!(
+        saw_different_sources,
+        "expected at least one sample where all defs draw distinct source tables across 500 samples"
     );
 }
