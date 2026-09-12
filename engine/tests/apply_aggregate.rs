@@ -985,6 +985,97 @@ async fn sum_goes_null_not_zero_when_a_groups_remaining_rows_are_all_null() {
     );
 }
 
+/// Regression pin for a genuine incremental-`AVG`-maintenance correctness
+/// bug (found reviewing the generative test suite's `KeySpace::Aggregate`
+/// coverage): three plain `INSERT`s into the *same* group, each landing in
+/// its own drain (so each contributes to the group's `AVG` one row at a
+/// time, exactly like a live CDC stream rather than one bulk seed batch),
+/// used to leave `avg_amount` a *different, wrong* `numeric` value than
+/// Postgres's own `avg()` — not a display/formatting difference, a
+/// genuinely different rational number (`46.33333333333333333333`, 22
+/// digits after the point, vs. the correct `46.3333333333333333`, 16).
+///
+/// Root cause: `apply_aggregate::row_contribution` computed each row's
+/// contribution to an `AVG` field by evaluating that field's own `AVG(...)`
+/// expression over a one-row slice — which, per `eval::reduce_numeric_aggregate`,
+/// really does perform a `numeric` division (`row's value / 1`). Postgres's
+/// `numeric` division scale depends on the *operands'*
+/// scale/weight (`Numeric::div`'s `select_div_scale`), not merely "same
+/// value, unchanged" — so this inflated a single integer contribution like
+/// `67` into `67.0000000000000000`, and `0` into
+/// `0.00000000000000000000`. That inflated-scale text then flowed straight
+/// into the hidden `__avg_amount_sum` running-sum partial via SQL `sum()`
+/// (whose result scale floats up to at least its inputs'), so the scale
+/// inflation compounded with every row this group ever accumulated — and
+/// the *final* `sum / count` division `upsert_group` performs for the
+/// visible `avg_amount` column inherited that already-inflated dividend
+/// scale, landing on a different (over-precise, wrongly-rounded) result
+/// than Postgres's own `avg()`, which only ever divides once, at the very
+/// end, over the group's true final sum/count.
+///
+/// Fixed by evaluating `AVG` fields as the equivalent `SUM` for the sole
+/// purpose of computing a one-row contribution (see
+/// `apply_aggregate::contribution_def`'s doc comment): `SUM`'s reduction is
+/// pure `Numeric::add`, whose result scale for a single addend is exactly
+/// that addend's own scale — no division, no inflation.
+#[tokio::test]
+async fn avg_maintenance_matches_the_oracle_across_three_single_row_drains_into_one_group() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full",
+        )
+        .await
+        .expect("create source table");
+
+    let def = setup(&db).await;
+
+    // Three plain inserts into the same group (order_id 0), values 67, 0,
+    // 72 (sum 139, count 3) — each sealed and drained on its own, one row
+    // per batch, so `avg_amount` is incrementally maintained three times in
+    // a row rather than seeded in one bulk batch.
+    for (seg, id, amount) in [("seg_0", 1, "67"), ("seg_1", 2, "0"), ("seg_2", 3, "72")] {
+        client
+            .execute(
+                &format!(
+                    "insert into order_items (id, order_id, amount) values ({id}, 0, {amount})"
+                ),
+                &[],
+            )
+            .await
+            .expect("seed live order_items row");
+        insert_cdc_row(
+            &client,
+            seg,
+            "order_items",
+            &id.to_string(),
+            "insert",
+            None,
+            Some(&format!(r#"{{"order_id":"0","amount":"{amount}"}}"#)),
+        )
+        .await;
+        let seg_seq = seal_active_segment(&mut client).await;
+        drain(&db.pool, seg_seq, "worker").await;
+    }
+
+    let target = read_target(&client).await;
+    let oracle = read_oracle(&client, &def).await;
+    assert_eq!(
+        target, oracle,
+        "avg_amount (and every other aggregate column) must match the oracle bit-for-bit \
+         after three single-row drains into one group"
+    );
+    assert_eq!(
+        target["0"].1.as_deref(),
+        Some("46.3333333333333333"),
+        "avg_amount must equal Postgres's own avg(67, 0, 72), not a scale-inflated value \
+         accumulated from dividing each row's contribution by 1 along the way"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Shared count columns across SUM/AVG fields (issue #48)
 // ---------------------------------------------------------------------

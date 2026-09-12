@@ -352,15 +352,51 @@ fn derive_group_key(row: &Row, group_by: &[String]) -> (Vec<Option<String>>, Str
 /// text (`None` for a null/absent contribution — Postgres's "aggregate
 /// skips NULL" rule). Reuses [`eval::evaluate_aggregate`] over a
 /// single-row slice rather than a second per-row evaluator: aggregating
-/// `SUM`/`AVG`/`MIN`/`MAX` over exactly one row *is* that row's
-/// contribution (a sum of one value is that value; an average of one value
-/// is that value; skipped-if-null falls out of the same "aggregate of zero
-/// non-NULL values is NULL" rule `fold_aggregate` already implements) — see
-/// the module doc comment's "The delta model" section. Only
-/// [`AggFieldKind::Sum`]/[`AggFieldKind::Avg`] fields' entries are read by
-/// callers; [`AggFieldKind::RecomputeOnly`] fields' one-row values here are
-/// unused (and, for `MIN`/`MAX`, not even meaningful as a "contribution" —
-/// those are re-derived by probe instead, never from this map).
+/// `SUM`/`MIN`/`MAX` over exactly one row *is* that row's contribution (a
+/// sum of one value is that value; skipped-if-null falls out of the same
+/// "aggregate of zero non-NULL values is NULL" rule `fold_aggregate` already
+/// implements) — see the module doc comment's "The delta model" section.
+/// Only [`AggFieldKind::Sum`]/[`AggFieldKind::Avg`] fields' entries are read
+/// by callers; [`AggFieldKind::RecomputeOnly`] fields' one-row values here
+/// are unused (and, for `MIN`/`MAX`, not even meaningful as a "contribution"
+/// — those are re-derived by probe instead, never from this map).
+///
+/// **`AVG` fields are evaluated as `SUM` instead of `AVG`** (see
+/// [`contribution_def`]): a naive reading of "an average of one value is
+/// that value" is true of the *mathematical* value but not of the exact
+/// Postgres `numeric` this crate must bit-for-bit reproduce.
+/// `reduce_numeric_aggregate`'s `AVG` arm ends every reduction — even over a
+/// single row — with a real `numeric` division (`sum / count`), and
+/// Postgres's own division picks its result scale from the *operands'*
+/// scale/weight (`Numeric::div`'s `select_div_scale`), not from "the
+/// dividend, unchanged": dividing by the `1`-row count this delta model
+/// always reduces over inflates the contribution's scale (e.g. `67` becomes
+/// `67.0000000000000000`, and `0` becomes `0.00000000000000000000`) well
+/// past the value's own natural scale. That inflated-scale text then feeds
+/// straight into [`sum_array_expr`]'s SQL-side `sum()` over this field's
+/// hidden running-sum partial, and Postgres's `numeric` addition/division
+/// both float their own result scale up to at least their operands' —
+/// so the inflation compounds with every subsequent row this group ever
+/// accumulates, and the *final* `sum / count` division `upsert_group`'s
+/// `AvgDelta`/`AvgForced` arms perform for the visible column inherits an
+/// already-inflated dividend scale, producing a materially different
+/// (over-precise, and per `select_div_scale`'s scale-dependent rounding,
+/// not merely differently-*formatted*) result than Postgres's own `avg()`
+/// aggregate — which only ever divides once, over the group's true final
+/// sum/count, never through this row-by-row intermediate division at all.
+/// `SUM`'s reduction has no such step (`reduce_numeric_aggregate`'s `SUM`
+/// arm is pure `Numeric::add`, whose result scale is exactly
+/// `max(operand scales)` — a no-op scale-wise for a single addend), so
+/// evaluating the field as `SUM` instead yields the row's raw, unscaled
+/// contribution — exactly what this delta model needs to accumulate and
+/// divide, once, at the end.
+///
+/// `def` must already be [`contribution_def`]'s rewritten form (every
+/// caller in this module builds that once per batch and passes it here
+/// unchanged) rather than the original, unrewritten definition — this
+/// function trusts that rather than re-deriving it per row/change, since
+/// every call within one [`accumulate_changes`] batch would otherwise
+/// repeat the exact same rewrite of the exact same `def`.
 fn row_contribution(
     def: &TransformDef,
     row: &Row,
@@ -373,6 +409,33 @@ fn row_contribution(
         .into_iter()
         .map(|(name, value)| (name, value.map(|v| v.to_string())))
         .collect())
+}
+
+/// `def`, with every field whose own expression is a direct `AVG(...)` call
+/// rewritten to the equivalent `SUM(...)` call (same argument) — see
+/// [`row_contribution`]'s doc comment for why. Rewriting only fields whose
+/// *own* raw expression is structurally `AVG(...)` (rather than every field
+/// [`AggFieldKind::Avg`]-classifies, which uses the cross-field-alias-
+/// substituted view) still reaches every `AVG`-derived field: a field that
+/// only *aliases* an `AVG` field (e.g. `total2 = total` where
+/// `total = AVG(amount)`) has no `AVG` syntax of its own to rewrite, but its
+/// value is computed by recursing (via [`Expr::Column`]) into the aliased
+/// field's own cache entry — which this rewrite already corrected, since
+/// that field's own raw expression *is* the literal `AVG(...)` call. Every
+/// other field (grouping-key passthroughs, `SUM`/`MIN`/`MAX`/`COUNT`
+/// fields, and any calculated field composing one of those) is left
+/// byte-for-byte identical to `def`'s own field, so this changes nothing
+/// about their evaluation.
+fn contribution_def(def: &TransformDef) -> TransformDef {
+    let mut def = def.clone();
+    for field in &mut def.fields {
+        if let Expr::FunctionCall { name, .. } = &mut field.expr
+            && name == "AVG"
+        {
+            "SUM".clone_into(name);
+        }
+    }
+    def
 }
 
 /// Folds `changes` (one aggregate definition's slice of one drain's folded
@@ -401,6 +464,11 @@ pub(super) fn accumulate_changes(
     let KeySpace::Aggregate { group_by } = &def.key_space else {
         panic!("accumulate_changes called on a non-aggregate definition");
     };
+    // Built once per batch, not once per [`row_contribution`] call (every
+    // change needs it, and it's the same rewrite of the same `def` every
+    // time) — see [`contribution_def`]'s doc comment for why every `AVG`
+    // field is evaluated as the equivalent `SUM` here.
+    let contribution_def = contribution_def(def);
 
     for (i, change) in changes.iter().enumerate() {
         let is_image_less = change.old_image.is_none() && change.new_image.is_none();
@@ -423,7 +491,8 @@ pub(super) fn accumulate_changes(
         match (old_row, new_row) {
             (None, Some(new_row)) => {
                 let (values, key) = derive_group_key(new_row, group_by);
-                let contrib = row_contribution(def, new_row, source_columns, regex_cache)?;
+                let contrib =
+                    row_contribution(&contribution_def, new_row, source_columns, regex_cache)?;
                 let group = plan
                     .groups
                     .entry(key)
@@ -433,7 +502,8 @@ pub(super) fn accumulate_changes(
             }
             (Some(old_row), None) => {
                 let (values, key) = derive_group_key(old_row, group_by);
-                let contrib = row_contribution(def, old_row, source_columns, regex_cache)?;
+                let contrib =
+                    row_contribution(&contribution_def, old_row, source_columns, regex_cache)?;
                 let group = plan
                     .groups
                     .entry(key)
@@ -444,8 +514,10 @@ pub(super) fn accumulate_changes(
             (Some(old_row), Some(new_row)) => {
                 let (old_values, old_key) = derive_group_key(old_row, group_by);
                 let (new_values, new_key) = derive_group_key(new_row, group_by);
-                let old_contrib = row_contribution(def, old_row, source_columns, regex_cache)?;
-                let new_contrib = row_contribution(def, new_row, source_columns, regex_cache)?;
+                let old_contrib =
+                    row_contribution(&contribution_def, old_row, source_columns, regex_cache)?;
+                let new_contrib =
+                    row_contribution(&contribution_def, new_row, source_columns, regex_cache)?;
 
                 if old_key == new_key {
                     let group = plan
