@@ -34,12 +34,15 @@ fn sorted_value_types(types: impl IntoIterator<Item = ValueType>) -> Vec<&'stati
 
 /// Every scalar type appears both as a plain column and via a derivation.
 ///
-/// Today's whole type surface is Numeric-only end to end (design doc §3):
-/// the source table's columns are Numeric, and the sole definition's
-/// derivation (`c1 + c2`) only ever references Numeric columns. This fails
-/// loudly the day a `Text`/`Boolean`/`Uuid` column is added to the generated
-/// schema without a matching derivation landing alongside it — exactly the
-/// "coverage that silently drops out" the design doc warns about.
+/// Improvement-plan task B1 widened the generator's whole type surface past
+/// Numeric-only (design doc §3): every table now also gets one `Text`, one
+/// `Boolean`, and one `Uuid` column, each with its own identity-passthrough
+/// field (`SELECT <col> AS <col>`) on every def sourced from that table — see
+/// `generate::build_program_multi`'s doc comment. This test's whole point is
+/// to fail loudly the day a scalar type is added to the generated schema
+/// without a matching derivation landing alongside it — exactly the
+/// "coverage that silently drops out" the design doc warns about — so its
+/// expected-surface assertion is widened here, not weakened or dropped.
 #[test]
 fn every_column_scalar_type_appears_via_a_derivation() {
     let program = build_program(&[(Some(1), Some(2))], &[]);
@@ -48,15 +51,21 @@ fn every_column_scalar_type_appears_via_a_derivation() {
     let column_types = sorted_value_types(source.columns.iter().map(|c| c.value_type));
     assert_eq!(
         column_types,
-        vec!["numeric"],
+        vec!["boolean", "numeric", "text", "uuid"],
         "the generator's column type surface changed — widen this assertion (and the \
          derivation check below) alongside it, don't just let it pass silently"
     );
 
     let def = &program.defs[0];
-    assert_eq!(def.fields.len(), 1, "expected exactly one calculated field");
+    assert_eq!(
+        def.fields.len(),
+        4,
+        "expected `total` plus one passthrough field per new column (task B1)"
+    );
     let mut derivation_types_raw = Vec::new();
-    collect_column_types(&def.fields[0].expr, source, &mut derivation_types_raw);
+    for field in &def.fields {
+        collect_column_types(&field.expr, source, &mut derivation_types_raw);
+    }
     let derivation_types = sorted_value_types(derivation_types_raw);
     assert_eq!(
         derivation_types, column_types,
@@ -335,6 +344,21 @@ fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
             .new_tree(&mut runner)
             .expect("strategy must produce a value")
             .current();
+
+        // Improvement-plan task B1: unlike NULL/duplicate-insert (genuinely
+        // probabilistic, checked only in aggregate below), every table
+        // always gets one Text/Boolean/Uuid column — so this is checked on
+        // *every* sampled program, not just "at least one of 500", the
+        // stronger form the task calls for where it actually holds.
+        for table in &program.tables {
+            let types = sorted_value_types(table.columns.iter().map(|c| c.value_type));
+            assert_eq!(
+                types,
+                vec!["boolean", "numeric", "text", "uuid"],
+                "every table must always have exactly this type surface: {program:#?}"
+            );
+        }
+
         coverage.record_program(&program);
     }
 
@@ -353,10 +377,17 @@ fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
         );
     }
 
-    assert!(
-        coverage.types_exercised.contains("numeric"),
-        "coverage floor failed: expected \"numeric\" among types_exercised:\n{coverage}"
-    );
+    // Improvement-plan task B1: every table always gets one Text, one
+    // Boolean, and one Uuid column (not a probabilistically-drawn shape like
+    // NULL/duplicate-insert above), so these are an unconditional floor —
+    // "every single sample", not "at least one of 500" — over 500 samples of
+    // a strategy that always draws at least one table.
+    for value_type in ["numeric", "text", "boolean", "uuid"] {
+        assert!(
+            coverage.types_exercised.contains(value_type),
+            "coverage floor failed: expected {value_type:?} among types_exercised:\n{coverage}"
+        );
+    }
 
     assert!(
         coverage.key_spaces.contains_key("OneToOne"),

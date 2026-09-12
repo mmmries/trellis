@@ -395,9 +395,9 @@ async fn a_two_table_two_def_program_converges_end_to_end() {
 
     let program = build_program_multi(
         &[
-            TableSpec {
-                seed_values: vec![(Some(1), Some(2)), (Some(3), Some(4))],
-                mutates: vec![
+            TableSpec::numeric_only(
+                vec![(Some(1), Some(2)), (Some(3), Some(4))],
+                vec![
                     Mutate::Update {
                         pk: 1,
                         c1: Some(10),
@@ -405,15 +405,15 @@ async fn a_two_table_two_def_program_converges_end_to_end() {
                     },
                     Mutate::Delete { pk: 2 },
                 ],
-            },
-            TableSpec {
-                seed_values: vec![(Some(5), Some(6))],
-                mutates: vec![Mutate::Update {
+            ),
+            TableSpec::numeric_only(
+                vec![(Some(5), Some(6))],
+                vec![Mutate::Update {
                     pk: 1,
                     c1: Some(50),
                     c2: Some(60),
                 }],
-            },
+            ),
         ],
         // One definition per table (not fan-out) — the other B3 shape,
         // two defs sharing one source, is covered by
@@ -433,5 +433,63 @@ async fn a_two_table_two_def_program_converges_end_to_end() {
     let outcome = run_convergence(&mut backend, &pool, &program)
         .await
         .expect("a 2-table/2-def program must converge end-to-end");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+}
+
+/// Improvement-plan task B1: a hand-built program exercising the new
+/// `Text`/`Boolean`/`Uuid` columns (and their identity-passthrough fields)
+/// end-to-end against a real cluster — not just `trivial_program`'s property
+/// happening to draw them, per this suite's own "coverage that silently
+/// drops out" principle (same rationale as the B3 pin above).
+///
+/// Row 1 carries plain, unremarkable values for all three new columns. Row 2
+/// carries the U+001F ("unit separator") awkward text literal specifically
+/// (design doc §3 / the module doc comment's B1 scope-cut note): it's the
+/// same byte `engine::intake::extract_key`'s composite-key encoding treats
+/// specially, so proving *this* value round-trips correctly through a plain
+/// `Text` column — SQL binding, the `::text` cast on both insert and every
+/// read-back, this harness's own snapshot diffing — is the most direct way
+/// to confirm the "it doesn't yet attack key encoding, but it's still real
+/// text-round-tripping coverage" claim actually holds against a live engine,
+/// not just in the DB-free generator. Row 2 also draws `NULL` for the
+/// `Boolean` column, so a `NULL` in one of the new columns (not just
+/// `c1`/`c2`) gets real end-to-end coverage too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_text_boolean_uuid_program_converges_end_to_end() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program_multi(
+        &[TableSpec {
+            seed_values: vec![(Some(1), Some(2)), (Some(3), Some(4))],
+            text_values: vec![
+                Some("hello".to_string()),
+                Some("has\u{1f}unit-separator".to_string()),
+            ],
+            bool_values: vec![Some("true".to_string()), None],
+            uuid_values: vec![
+                Some("123e4567-e89b-42d3-a456-426614174000".to_string()),
+                Some("00000000-0000-4000-8000-000000000000".to_string()),
+            ],
+            mutates: vec![],
+        }],
+        &[0],
+    );
+    assert_eq!(program.tables.len(), 1);
+    assert_eq!(program.defs.len(), 1);
+    assert_eq!(
+        program.defs[0].fields.len(),
+        4,
+        "expected `total` plus one passthrough field per new column"
+    );
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("a Text/Boolean/Uuid program must converge end-to-end");
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
 }
