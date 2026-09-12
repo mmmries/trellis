@@ -302,6 +302,20 @@ pub enum Mutate {
     /// successful insert that revives it — [`build_program`] simulates pk
     /// liveness across the whole mutate stream to expect the right outcome
     /// either way (see its `expect: OpOutcome` derivation).
+    ///
+    /// A revival's rendered [`Op::Insert`] ([`render_mutate`]) carries the
+    /// *original* seed row's `Text`/`Boolean`/`Uuid`/grain column values
+    /// (tasks B1/B4), not fresh `NULL`s: those columns are "seeded once,
+    /// never touched again" (this enum only ever carries `c1`/`c2`), so a
+    /// revival is still logically the same row coming back, and must keep
+    /// its original non-numeric content. This matters well beyond
+    /// legibility for the grain column specifically — see the
+    /// `grain_value` proptest strategy's doc comment for the real engine bug
+    /// a `NULL` grain value hits; a revival that carelessly defaulted the
+    /// grain column to `NULL` would reopen exactly that bug through a second
+    /// door the generator never meant to leave open (`grain_value` itself
+    /// never draws `NULL`, but that guarantee is worthless if a revival
+    /// could still manufacture one).
     DuplicateInsert {
         pk: i64,
         c1: Option<i64>,
@@ -458,29 +472,35 @@ impl TableSpec {
     }
 }
 
-/// Renders one [`Mutate`] into the [`Op`] it becomes against `table` (columns
-/// `pk_col`/`c1`/`c2`), threading `live` — that table's own pk-liveness set —
-/// through so the emitted op's `expect` tracks the pk's *current* state, not
-/// just whether it was originally seeded (see [`Mutate::DuplicateInsert`]).
+/// Renders one [`Mutate`] into the [`Op`] it becomes against `table`
+/// (`table.columns[1..=2]` are `c1`/`c2`, `[3..=5]` are `Text`/`Boolean`/
+/// `Uuid`, `[6]` is the grain column — the same layout
+/// [`build_program_multi_with_shapes`] builds, see its doc comment),
+/// threading `live` — that table's own pk-liveness set — through so the
+/// emitted op's `expect` tracks the pk's *current* state, not just whether it
+/// was originally seeded (see [`Mutate::DuplicateInsert`]).
 ///
 /// Shared by [`build_program`] and [`build_program_multi`] so single- and
 /// multi-table programs run the exact same liveness logic — this is the one
 /// place that logic lives, specifically so a per-table bug (liveness leaking
 /// across tables, or one table's pks silently continuing another's
 /// numbering) has nowhere to hide a second, diverging copy.
-fn render_mutate(
-    mutate: &Mutate,
-    table: &str,
-    pk_col: &str,
-    c1: &str,
-    c2: &str,
-    live: &mut HashSet<i64>,
-) -> Op {
+///
+/// `spec` is the same [`TableSpec`] the caller already has the seed values
+/// in, so a [`Mutate::DuplicateInsert`] revival can look its original row's
+/// values back up by `pk` (always in `1..=spec.seed_values.len()`, since that
+/// variant's pk is only ever drawn from an originally-seeded pk — see
+/// [`Mutate::DuplicateInsert`]'s doc comment for why a revival must carry
+/// them, not default them to `NULL`).
+fn render_mutate(mutate: &Mutate, table: &Table, spec: &TableSpec, live: &mut HashSet<i64>) -> Op {
+    let table_name = &table.name;
+    let c1 = &table.columns[1].name;
+    let c2 = &table.columns[2].name;
     match mutate {
         Mutate::Update { pk, c1: a, c2: b } => Op::Update {
-            table: table.to_string(),
+            table: table_name.clone(),
             pk: pk.to_string(),
-            changes: vec![(c1.to_string(), render(*a)), (c2.to_string(), render(*b))],
+            changes: vec![(c1.clone(), render(*a)), (c2.clone(), render(*b))],
             expect: if live.contains(pk) {
                 OpOutcome::Succeeds
             } else {
@@ -488,7 +508,7 @@ fn render_mutate(
             },
         },
         Mutate::Delete { pk } => Op::Delete {
-            table: table.to_string(),
+            table: table_name.clone(),
             pk: pk.to_string(),
             // `remove` reports whether `pk` was live, and (whether or
             // not it was) leaves it dead afterward — exactly the delete
@@ -510,12 +530,37 @@ fn render_mutate(
                 live.insert(*pk);
                 OpOutcome::Succeeds
             };
+            // This variant's pk is always one of `1..=spec.seed_values.len()`
+            // (the `dup_pk` strategy never draws outside that range), so the
+            // original seed row's text/bool/uuid/grain values are always
+            // available here by index — see this function's own doc comment
+            // for why a revival must carry them forward rather than leaving
+            // them to default to `NULL` (a real, already-live row when this
+            // op `Fails` doesn't matter either way, since a failed `INSERT`
+            // changes nothing — Postgres never applies any of `row`).
+            let seed_index = (*pk as usize) - 1;
             Op::Insert {
-                table: table.to_string(),
+                table: table_name.clone(),
                 row: vec![
-                    (pk_col.to_string(), Some(pk.to_string())),
-                    (c1.to_string(), render(*a)),
-                    (c2.to_string(), render(*b)),
+                    (table.pk_col.clone(), Some(pk.to_string())),
+                    (c1.clone(), render(*a)),
+                    (c2.clone(), render(*b)),
+                    (
+                        table.columns[3].name.clone(),
+                        spec.text_values[seed_index].clone(),
+                    ),
+                    (
+                        table.columns[4].name.clone(),
+                        spec.bool_values[seed_index].clone(),
+                    ),
+                    (
+                        table.columns[5].name.clone(),
+                        spec.uuid_values[seed_index].clone(),
+                    ),
+                    (
+                        table.columns[6].name.clone(),
+                        spec.grain_values[seed_index].clone(),
+                    ),
                 ],
                 expect,
             }
@@ -735,14 +780,7 @@ pub fn build_program_multi_with_shapes(
         // Postgres outcome tracks the row's live/dead state at the moment it
         // runs, not the original seed.
         for mutate in &spec.mutates {
-            ops.push(render_mutate(
-                mutate,
-                &source.name,
-                &source.pk_col,
-                &c1,
-                &c2,
-                &mut live,
-            ));
+            ops.push(render_mutate(mutate, &source, spec, &mut live));
         }
 
         built_tables.push(source);
