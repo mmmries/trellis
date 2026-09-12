@@ -36,9 +36,11 @@
 //!
 //! [`Strategy`]: proptest::strategy::Strategy
 
+use std::collections::HashSet;
+
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 
-use crate::model::{NamePool, Op, Program, Table};
+use crate::model::{NamePool, Op, OpOutcome, Program, Table};
 
 /// The inclusive upper bound of the calculated-field value domain.
 ///
@@ -96,15 +98,22 @@ pub enum Mutate {
     },
     /// Delete row `pk`. A `pk` naming no seeded row is likewise a no-op.
     Delete { pk: i64 },
-    /// Insert a *second* row at an already-seeded `pk`. This is a genuine
-    /// `apply()` failure, not a source no-op: the source table's primary key
-    /// is a real Postgres `primary key` constraint, so this statement is
-    /// rejected with a unique-violation error and the source is left
-    /// unchanged (a single `INSERT` is atomic — it cannot partially apply).
-    /// Closes the issue #6 gap where every generated op used to succeed, so
-    /// "an op that errors changed nothing" (design doc §4) was never
-    /// exercised against a *real* rejection (a missing-pk update/delete comes
-    /// back as `Ok(0 rows)`, not an `Err`).
+    /// Insert a *second* row at an already-seeded `pk`. When that pk is
+    /// still live (the common case) this is a genuine `apply()` failure, not
+    /// a source no-op: the source table's primary key is a real Postgres
+    /// `primary key` constraint, so this statement is rejected with a
+    /// unique-violation error and the source is left unchanged (a single
+    /// `INSERT` is atomic — it cannot partially apply). Closes the issue #6
+    /// gap where every generated op used to succeed, so "an op that errors
+    /// changed nothing" (design doc §4) was never exercised against a *real*
+    /// rejection (a missing-pk update/delete comes back as `Ok(0 rows)`, not
+    /// an `Err`).
+    ///
+    /// If an earlier mutate in the same stream already deleted this pk, it
+    /// is no longer live: this "duplicate" insert is then an ordinary
+    /// successful insert that revives it — [`build_program`] simulates pk
+    /// liveness across the whole mutate stream to expect the right outcome
+    /// either way (see its `expect: OpOutcome` derivation).
     DuplicateInsert {
         pk: i64,
         c1: Option<i64>,
@@ -143,6 +152,13 @@ pub fn build_program(seed_values: &[(Option<i64>, Option<i64>)], mutates: &[Muta
         predicate: Predicate::True,
     };
 
+    // Which pks currently have a live row, simulated alongside op
+    // construction so a later mutate's expected outcome accounts for an
+    // earlier one on the *same* pk — not just whether it was originally
+    // seeded. Every seeded pk starts live; every seed insert always
+    // succeeds (pks are freshly minted, `1..=seed_count`, never colliding).
+    let mut live: HashSet<i64> = (1..=seed_values.len() as i64).collect();
+
     let mut ops = Vec::with_capacity(seed_values.len() + mutates.len());
     for (i, (a, b)) in seed_values.iter().enumerate() {
         let pk = (i + 1) as i64;
@@ -153,27 +169,60 @@ pub fn build_program(seed_values: &[(Option<i64>, Option<i64>)], mutates: &[Muta
                 (c1.clone(), render(*a)),
                 (c2.clone(), render(*b)),
             ],
+            expect: OpOutcome::Succeeds,
         });
     }
+    // A mutate's outcome depends on whether its pk is *currently* live, not
+    // just whether it started out seeded: the `mutate` strategy below can
+    // draw several mutates against the same pk (e.g. a `Delete` followed by
+    // an `Update`/`Delete`/`DuplicateInsert` on that same now-gone pk), and
+    // each one's real Postgres outcome tracks the row's live/dead state at
+    // the moment it runs, not the original seed.
     for mutate in mutates {
         ops.push(match mutate {
             Mutate::Update { pk, c1: a, c2: b } => Op::Update {
                 table: source.name.clone(),
                 pk: pk.to_string(),
                 changes: vec![(c1.clone(), render(*a)), (c2.clone(), render(*b))],
+                expect: if live.contains(pk) {
+                    OpOutcome::Succeeds
+                } else {
+                    OpOutcome::AffectsNoRows
+                },
             },
             Mutate::Delete { pk } => Op::Delete {
                 table: source.name.clone(),
                 pk: pk.to_string(),
+                // `remove` reports whether `pk` was live, and (whether or
+                // not it was) leaves it dead afterward — exactly the delete
+                // semantics we're simulating.
+                expect: if live.remove(pk) {
+                    OpOutcome::Succeeds
+                } else {
+                    OpOutcome::AffectsNoRows
+                },
             },
-            Mutate::DuplicateInsert { pk, c1: a, c2: b } => Op::Insert {
-                table: source.name.clone(),
-                row: vec![
-                    (source.pk_col.clone(), Some(pk.to_string())),
-                    (c1.clone(), render(*a)),
-                    (c2.clone(), render(*b)),
-                ],
-            },
+            Mutate::DuplicateInsert { pk, c1: a, c2: b } => {
+                // Only a genuine primary-key violation while `pk` is still
+                // live. If an earlier mutate already deleted it, this isn't
+                // a duplicate anymore — it's an ordinary successful insert
+                // that revives the pk.
+                let expect = if live.contains(pk) {
+                    OpOutcome::Fails
+                } else {
+                    live.insert(*pk);
+                    OpOutcome::Succeeds
+                };
+                Op::Insert {
+                    table: source.name.clone(),
+                    row: vec![
+                        (source.pk_col.clone(), Some(pk.to_string())),
+                        (c1.clone(), render(*a)),
+                        (c2.clone(), render(*b)),
+                    ],
+                    expect,
+                }
+            }
         });
     }
 
@@ -220,12 +269,16 @@ mod strategy {
 
     /// One mutate targeting `seed_count` seeded rows. The primary key for
     /// `Update`/`Delete` is drawn from `1..=seed_count + 1`: values
-    /// `1..=seed_count` hit a seeded row, and `seed_count + 1` deliberately
-    /// misses (a source no-op) so the property exercises the "op that errors
-    /// changed nothing" path (design doc §4). `DuplicateInsert`'s pk is drawn
-    /// from `1..=seed_count` only — it always collides with a seeded row, so
-    /// it always triggers a genuine primary-key-violation `apply()` error
-    /// (issue #6's gap, see [`Mutate::DuplicateInsert`]).
+    /// `1..=seed_count` hit a seeded (or otherwise still-live) row, and
+    /// `seed_count + 1` deliberately misses (a source no-op) so the property
+    /// exercises the "op that errors changed nothing" path (design doc §4).
+    /// `DuplicateInsert`'s pk is drawn from `1..=seed_count` only — a pk
+    /// that started out seeded. Whether it actually collides at apply time
+    /// depends on whether an earlier mutate in the same draw already deleted
+    /// it ([`build_program`] simulates this to expect the right outcome
+    /// either way, see [`Mutate::DuplicateInsert`]); most of the time it is
+    /// still live, so this is the generator's main source of genuine
+    /// primary-key-violation `apply()` errors (issue #6's gap).
     fn mutate(seed_count: usize, awkward_values: bool) -> impl Strategy<Value = Mutate> {
         let pk = 1..=(seed_count as i64 + 1);
         let dup_pk = 1..=(seed_count as i64);
@@ -364,5 +417,112 @@ mod tests {
         };
         let pk = row.first().unwrap();
         assert_eq!(pk.1.as_deref(), Some("1"));
+    }
+
+    /// `build_program`'s pk-liveness simulation must track a pk across
+    /// *multiple* mutates in the same stream, not just whether it was
+    /// originally seeded — these are fast, DB-free pins for sequences the
+    /// slow DB-backed proptest property only exercises when it happens to
+    /// draw them (issue #4/A1: an op's expected outcome must always match
+    /// what real Postgres would do).
+    mod pk_liveness {
+        use super::*;
+
+        #[test]
+        fn update_after_delete_on_the_same_pk_affects_no_rows() {
+            let program = build_program(
+                &[(Some(1), Some(2))],
+                &[
+                    Mutate::Delete { pk: 1 },
+                    Mutate::Update {
+                        pk: 1,
+                        c1: Some(9),
+                        c2: Some(9),
+                    },
+                ],
+            );
+            // ops: [seed insert, delete, update]
+            assert_eq!(program.ops[1].expect(), &OpOutcome::Succeeds);
+            assert_eq!(program.ops[2].expect(), &OpOutcome::AffectsNoRows);
+        }
+
+        #[test]
+        fn delete_after_delete_on_the_same_pk_affects_no_rows() {
+            let program = build_program(
+                &[(Some(1), Some(2))],
+                &[Mutate::Delete { pk: 1 }, Mutate::Delete { pk: 1 }],
+            );
+            assert_eq!(program.ops[1].expect(), &OpOutcome::Succeeds);
+            assert_eq!(program.ops[2].expect(), &OpOutcome::AffectsNoRows);
+        }
+
+        #[test]
+        fn duplicate_insert_after_delete_revives_the_pk_and_succeeds() {
+            let program = build_program(
+                &[(Some(1), Some(2))],
+                &[
+                    Mutate::Delete { pk: 1 },
+                    Mutate::DuplicateInsert {
+                        pk: 1,
+                        c1: Some(9),
+                        c2: Some(9),
+                    },
+                ],
+            );
+            assert_eq!(program.ops[1].expect(), &OpOutcome::Succeeds);
+            assert_eq!(program.ops[2].expect(), &OpOutcome::Succeeds);
+        }
+
+        #[test]
+        fn a_second_duplicate_insert_against_a_revived_pk_fails_again() {
+            let program = build_program(
+                &[(Some(1), Some(2))],
+                &[
+                    Mutate::Delete { pk: 1 },
+                    Mutate::DuplicateInsert {
+                        pk: 1,
+                        c1: Some(9),
+                        c2: Some(9),
+                    },
+                    Mutate::DuplicateInsert {
+                        pk: 1,
+                        c1: Some(7),
+                        c2: Some(7),
+                    },
+                ],
+            );
+            assert_eq!(program.ops[2].expect(), &OpOutcome::Succeeds);
+            assert_eq!(program.ops[3].expect(), &OpOutcome::Fails);
+        }
+
+        #[test]
+        fn duplicate_insert_against_a_still_live_seeded_pk_fails() {
+            let program = build_program(
+                &[(Some(1), Some(2))],
+                &[Mutate::DuplicateInsert {
+                    pk: 1,
+                    c1: Some(9),
+                    c2: Some(9),
+                }],
+            );
+            assert_eq!(program.ops[1].expect(), &OpOutcome::Fails);
+        }
+
+        #[test]
+        fn update_or_delete_on_an_unseeded_pk_affects_no_rows() {
+            let program = build_program(
+                &[(Some(1), Some(2))],
+                &[
+                    Mutate::Update {
+                        pk: 2,
+                        c1: Some(9),
+                        c2: Some(9),
+                    },
+                    Mutate::Delete { pk: 2 },
+                ],
+            );
+            assert_eq!(program.ops[1].expect(), &OpOutcome::AffectsNoRows);
+            assert_eq!(program.ops[2].expect(), &OpOutcome::AffectsNoRows);
+        }
     }
 }

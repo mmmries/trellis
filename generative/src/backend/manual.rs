@@ -333,9 +333,9 @@ impl super::Backend for ManualBackend {
         Ok(())
     }
 
-    async fn apply(&mut self, op: &Op) -> Result<(), ManualBackendError> {
-        match op {
-            Op::Insert { table, row } => {
+    async fn apply(&mut self, op: &Op) -> Result<u64, ManualBackendError> {
+        let affected = match op {
+            Op::Insert { table, row, .. } => {
                 let columns: Vec<&str> = row.iter().map(|(c, _)| c.as_str()).collect();
                 let assignments: Vec<Assignment> = row
                     .iter()
@@ -373,9 +373,11 @@ impl super::Backend for ManualBackend {
                     .iter()
                     .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
                     .collect();
-                self.raw.execute(&sql, &params).await?;
+                self.raw.execute(&sql, &params).await?
             }
-            Op::Update { table, pk, changes } => {
+            Op::Update {
+                table, pk, changes, ..
+            } => {
                 let pk_col = self
                     .tables
                     .get(table)
@@ -410,9 +412,9 @@ impl super::Backend for ManualBackend {
                     .iter()
                     .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
                     .collect();
-                self.raw.execute(&sql, &params).await?;
+                self.raw.execute(&sql, &params).await?
             }
-            Op::Delete { table, pk } => {
+            Op::Delete { table, pk, .. } => {
                 let pk_col = self
                     .tables
                     .get(table)
@@ -430,15 +432,32 @@ impl super::Backend for ManualBackend {
                     quote_ident(&pk_col),
                     pg_type_name(pk_type),
                 );
-                self.raw.execute(&sql, &[pk]).await?;
+                self.raw.execute(&sql, &[pk]).await?
             }
-        }
-        Ok(())
+        };
+        Ok(affected)
     }
 
     async fn quiesce(&mut self) -> Result<(), ManualBackendError> {
+        // Improvement-plan workstream C, task C1: opt-in per-call timing
+        // around the watermark -> converge round trip, to test the
+        // hypothesis (see `local_docs/generative-suite-improvement-plan.md`)
+        // that the convergence property's wall-clock variance is caused by
+        // the same ~10s seal age-gate stall suspected in
+        // `local_docs/transit-comparison.md` §3.3. Silent and free unless
+        // `GENERATIVE_QUIESCE_TIMING` is set: the env lookup happens once per
+        // call so the default (unset) path pays exactly one `var_os` check
+        // and no clock reads.
+        let timing_enabled = std::env::var_os("GENERATIVE_QUIESCE_TIMING").is_some();
+        let start = timing_enabled.then(std::time::Instant::now);
+
         let token = watermark_token(&self.raw).await?;
-        await_converged(&self.raw, token, QUIESCE_TIMEOUT).await?;
+        let result = await_converged(&self.raw, token, QUIESCE_TIMEOUT).await;
+
+        if let Some(start) = start {
+            eprintln!("QUIESCE_TIMING {}", start.elapsed().as_millis());
+        }
+        result?;
         Ok(())
     }
 

@@ -33,15 +33,55 @@ use testkit::TestCluster;
 
 /// One tokio runtime and one shared, initdb-once cluster for a test thread's
 /// proptest cases. See the module doc comment for why this is thread-local.
+///
+/// `coverage` (A2, `local_docs/generative-suite-improvement-plan.md`)
+/// accumulates every program `run_one` drives, pass or fail, so the property
+/// can report what it actually exercised instead of a single green/red bit —
+/// see [`Harness`]'s `Drop` impl below.
 struct Harness {
     runtime: tokio::runtime::Runtime,
     cluster: TestCluster,
+    coverage: std::cell::RefCell<generative::run::Coverage>,
+}
+
+impl Drop for Harness {
+    /// Prints the accumulated [`generative::run::Coverage`] when the test
+    /// thread exits. Print-only, deliberately: this runs during the shared
+    /// thread-local's teardown, which can itself be *during* an unwind if the
+    /// macro-generated proptest test is re-panicking with a shrunk failure —
+    /// asserting or panicking here risks a double panic, which aborts the
+    /// whole test process instead of cleanly failing one test. This is
+    /// human/CI-visible reporting only, never a pass/fail gate (the floor
+    /// assertions for that live in `tests/coverage.rs`, which never touches a
+    /// database).
+    fn drop(&mut self) {
+        eprintln!(
+            "generative: convergence run coverage:\n{}",
+            self.coverage.borrow()
+        );
+    }
 }
 
 thread_local! {
     static HARNESS: Harness = Harness {
         runtime: tokio::runtime::Runtime::new().expect("build tokio runtime"),
-        cluster: TestCluster::start(),
+        cluster: {
+            // Improvement-plan workstream C, task C2: opt-in per-call timing
+            // around cluster startup (`initdb` + `pg_ctl start`), the most
+            // expensive one-time cost the shared thread-local harness pays.
+            // Silent and free unless `GENERATIVE_COST_TIMING` is set, same
+            // convention as C1's `GENERATIVE_QUIESCE_TIMING` in
+            // `generative/src/backend/manual.rs` (see
+            // `local_docs/generative-suite-improvement-plan.md` "C2").
+            let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
+            let start = timing_enabled.then(std::time::Instant::now);
+            let cluster = TestCluster::start();
+            if let Some(start) = start {
+                eprintln!("COST_TIMING cluster_startup {}", start.elapsed().as_millis());
+            }
+            cluster
+        },
+        coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
     };
 }
 
@@ -65,8 +105,20 @@ fn proptest_config() -> ProptestConfig {
 /// shrinks toward the smallest program and prints it.
 fn run_one(program: &generative::model::Program) -> Result<(), TestCaseError> {
     HARNESS.with(|h| {
+        // Recorded unconditionally, before the run: even a case that goes on
+        // to fail (and shrinks) is real evidence of what the generator drew.
+        h.coverage.borrow_mut().record_program(program);
+
         h.runtime.block_on(async {
+            // C2: per-case isolated-database provisioning (schema, slot,
+            // publication) inside the shared cluster. See the cluster-startup
+            // timing above for the env-var convention.
+            let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
+            let start = timing_enabled.then(std::time::Instant::now);
             let db = h.cluster.create_isolated_database().await;
+            if let Some(start) = start {
+                eprintln!("COST_TIMING db_provision {}", start.elapsed().as_millis());
+            }
             let mut backend = ManualBackend::connect(db.dsn())
                 .await
                 .expect("connect manual backend");
@@ -271,35 +323,15 @@ async fn a_duplicate_pk_insert_error_still_converges() {
         ],
     );
 
-    // Pin the claim `run_convergence` below merely exercises: applying the
-    // duplicate-pk insert directly, against a backend that already has the
-    // seed rows, must be a genuine `Err` — not a silent no-op or an upsert.
-    // Otherwise this test would still pass even if `DuplicateInsert` stopped
-    // actually erroring, since `run_convergence` discards `apply()`'s result.
-    // Uses its own isolated database so it can't interfere with the real run
-    // below (which needs to install and apply the program from scratch).
-    {
-        let pin_db = cluster.create_isolated_database().await;
-        let mut pin_backend = ManualBackend::connect(pin_db.dsn())
-            .await
-            .expect("connect manual backend");
-        pin_backend
-            .install(&program)
-            .await
-            .expect("install a valid program");
-        // ops[0..2) are the two seed inserts; ops[2] is the DuplicateInsert mutate.
-        for seed_op in &program.ops[0..2] {
-            pin_backend
-                .apply(seed_op)
-                .await
-                .expect("seed insert must succeed");
-        }
-        pin_backend
-            .apply(&program.ops[2])
-            .await
-            .expect_err("a second insert at an already-seeded pk must be rejected by the primary-key constraint");
-    }
-
+    // No separate pin re-applying the duplicate-pk insert against a
+    // throwaway connection is needed here: `build_program` tags this op
+    // `OpOutcome::Fails`, and `run_convergence` itself now classifies every
+    // op's actual outcome and asserts it against that expectation (design
+    // doc §4 "operation errors are checked, not swallowed"). If
+    // `DuplicateInsert` ever stopped actually erroring (or started
+    // affecting rows), `run_convergence` below would return
+    // `Err(RunError::UnexpectedOpOutcome { .. })` and the `.expect` below
+    // would fail with that mismatch spelled out — no separate pin required.
     let mut backend = ManualBackend::connect(db.dsn())
         .await
         .expect("connect manual backend");

@@ -7,7 +7,7 @@
 
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use generative::backend::{Backend, ManualBackend};
-use generative::model::{NamePool, Op, Program, Table};
+use generative::model::{NamePool, Op, OpOutcome, Program, Table};
 use testkit::TestCluster;
 
 #[tokio::test]
@@ -47,6 +47,7 @@ async fn installs_a_trivial_def_and_converges_dml_to_the_expected_snapshot() {
                     (a.clone(), Some("10.00".to_string())),
                     (b.clone(), Some("1.50".to_string())),
                 ],
+                expect: OpOutcome::Succeeds,
             },
             Op::Insert {
                 table: source.name.clone(),
@@ -55,6 +56,7 @@ async fn installs_a_trivial_def_and_converges_dml_to_the_expected_snapshot() {
                     (a.clone(), Some("20.00".to_string())),
                     (b.clone(), Some("2.00".to_string())),
                 ],
+                expect: OpOutcome::Succeeds,
             },
         ],
     };
@@ -96,6 +98,7 @@ async fn installs_a_trivial_def_and_converges_dml_to_the_expected_snapshot() {
             table: source.name.clone(),
             pk: "1".to_string(),
             changes: vec![(a.clone(), Some("100.00".to_string()))],
+            expect: OpOutcome::Succeeds,
         })
         .await
         .expect("apply update");
@@ -103,6 +106,7 @@ async fn installs_a_trivial_def_and_converges_dml_to_the_expected_snapshot() {
         .apply(&Op::Delete {
             table: source.name.clone(),
             pk: "2".to_string(),
+            expect: OpOutcome::Succeeds,
         })
         .await
         .expect("apply delete");

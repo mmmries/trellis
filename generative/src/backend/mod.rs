@@ -41,8 +41,14 @@ pub trait Backend {
         program: &Program,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Applies one op as raw source DML.
-    fn apply(&mut self, op: &Op) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    /// Applies one op as raw source DML. On success, returns the number of
+    /// rows the statement affected — `0` for an update/delete that named a
+    /// primary key no row has (a source no-op, not an error); an `Err`
+    /// return means the statement itself was rejected (e.g. a primary-key
+    /// violation). Callers compare this against the op's
+    /// [`crate::model::OpOutcome`] expectation (design doc §4 "operation
+    /// errors are checked, not swallowed").
+    fn apply(&mut self, op: &Op) -> impl Future<Output = Result<u64, Self::Error>> + Send;
 
     /// Blocks until the engine has caught up with every op applied so far.
     fn quiesce(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;

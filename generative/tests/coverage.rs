@@ -256,6 +256,7 @@ fn pk_column_is_never_null_or_missing_across_many_generated_programs() {
             if let Op::Insert {
                 table: table_name,
                 row,
+                ..
             } = op
             {
                 let table = program
@@ -292,4 +293,65 @@ fn duplicate_insert_is_a_distinct_mutate_from_update_and_delete() {
     );
     assert_eq!(program.ops.len(), 2);
     assert!(matches!(program.ops[1], Op::Insert { .. }));
+}
+
+/// A2 (`local_docs/generative-suite-improvement-plan.md`): the [`Coverage`]
+/// accumulator's floors — no database, no `Harness`, just the default
+/// strategy sampled many times, same as every other test in this file. This
+/// is the fast half of A2's payoff: if the generator's own machinery ever
+/// stopped drawing one of these shapes (a `Delete`, a genuinely-failing op, a
+/// zero-row no-op, `+`, a numeric column, a `OneToOne` def), this test would
+/// catch it in milliseconds, without ever standing up a cluster. It
+/// deliberately does not check NULL or duplicate-pk-insert specifically — the
+/// two tests above already cover those, and `Coverage` itself only looks at
+/// op kind/outcome/structure, never op values.
+#[test]
+fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+
+    for kind in ["Insert", "Update", "Delete"] {
+        assert!(
+            coverage.ops_by_kind.get(kind).copied().unwrap_or(0) > 0,
+            "coverage floor failed: expected at least one {kind} op across 500 samples:\n{coverage}"
+        );
+    }
+
+    for outcome in ["Succeeds", "Fails", "AffectsNoRows"] {
+        assert!(
+            coverage.ops_by_outcome.get(outcome).copied().unwrap_or(0) > 0,
+            "coverage floor failed: expected at least one op with outcome {outcome} across 500 \
+             samples:\n{coverage}"
+        );
+    }
+
+    assert!(
+        coverage.types_exercised.contains("numeric"),
+        "coverage floor failed: expected \"numeric\" among types_exercised:\n{coverage}"
+    );
+
+    assert!(
+        coverage.key_spaces.contains_key("OneToOne"),
+        "coverage floor failed: expected \"OneToOne\" among key_spaces:\n{coverage}"
+    );
+
+    for shape in ["Column", "BinaryOp"] {
+        assert!(
+            coverage.expr_shapes.contains(shape),
+            "coverage floor failed: expected {shape:?} among expr_shapes:\n{coverage}"
+        );
+    }
+
+    assert!(
+        coverage.operators.contains("Add"),
+        "coverage floor failed: expected \"Add\" among operators:\n{coverage}"
+    );
 }

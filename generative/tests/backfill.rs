@@ -31,7 +31,7 @@
 
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use generative::backend::{Backend, ManualBackend};
-use generative::model::{NamePool, Op, Program, Table};
+use generative::model::{NamePool, Op, OpOutcome, Program, Table};
 use testkit::TestCluster;
 
 #[tokio::test]
@@ -87,6 +87,7 @@ async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {
                     (a.clone(), Some(av.to_string())),
                     (b.clone(), Some(bv.to_string())),
                 ],
+                expect: OpOutcome::Succeeds,
             })
             .await
             .expect("seed source row");
@@ -143,6 +144,7 @@ async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {
             table: source.name.clone(),
             pk: "1".to_string(),
             changes: vec![(a.clone(), Some("100.00".to_string()))],
+            expect: OpOutcome::Succeeds,
         })
         .await
         .expect("apply post-backfill update");
