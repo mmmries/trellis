@@ -130,6 +130,25 @@ fn render_definition(def: &TransformDef) -> Result<String, ManualBackendError> {
     ))
 }
 
+/// Renders a generator-built [`Expr`] back to the source text
+/// [`super::install_definition`]/`engine::defs::parser::parse` re-parses.
+///
+/// A `BinaryOp`'s operands are *unconditionally* parenthesized (issue #67's
+/// reviewer follow-up), not only when the operand is itself a lower-
+/// precedence `BinaryOp`: with real operator precedence now in the parser
+/// (`engine::defs::registry::OPERATORS`), a flat render like `a + b > c`
+/// silently reconstructs a *different* tree than a nested one the generator
+/// might build — e.g. `Add(a, GreaterThan(b, c))` would round-trip as
+/// `a + b > c`, which `+`'s tighter binding re-parses as `Add(a,b) >
+/// c` — the wrong tree. Always parenthesizing every operand (`(a) + (b > c)`)
+/// is simpler than computing whether a given operand's own precedence
+/// requires it, and correct regardless of what tree the generator composes,
+/// so it's the shape this renderer commits to before the generator ever
+/// nests `+` and `>` together (improvement-plan task B2). See
+/// `tests::render_expr_parenthesizes_nested_binary_ops_so_they_round_trip`
+/// for the regression pin, and `engine::defs::parser`'s grouping-paren
+/// support (issue #67 follow-up) that makes the rendered text re-parseable
+/// at all.
 fn render_expr(expr: &Expr) -> String {
     match expr {
         Expr::Column(name) => name.clone(),
@@ -137,7 +156,7 @@ fn render_expr(expr: &Expr) -> String {
         Expr::StringLiteral(text) => format!("'{}'", text.replace('\'', "''")),
         Expr::BinaryOp { op, lhs, rhs } => {
             format!(
-                "{} {} {}",
+                "({}) {} ({})",
                 render_expr(lhs),
                 render_operator(*op),
                 render_expr(rhs)
@@ -527,4 +546,79 @@ async fn read_table(
         result.insert(pk_value, by_column);
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine::defs::parse;
+
+    /// The reviewer-flagged follow-up to issue #67 (real operator
+    /// precedence): a nested, mixed-operator `Expr` — `Add(Column("a"),
+    /// GreaterThan(Column("b"), Column("c")))`, i.e. the tree a source
+    /// author would have to spell `a + (b > c)` to get — must round-trip
+    /// through `render_expr` and back through the real parser to the exact
+    /// same tree, not a reflowed one.
+    ///
+    /// Before this fix, `render_expr` rendered this tree flat as
+    /// `a + b > c`, which the precedence-climbing parser (issue #67) then
+    /// re-parses as `GreaterThan(Add(a, b), c)` — `+` binds tighter than
+    /// `>`, so it silently reconstructs the *wrong* tree, one that even
+    /// type-checks (`Numeric, Numeric -> Boolean`) even though it isn't what
+    /// was rendered. Unconditional parenthesization
+    /// (`render_expr`'s doc comment) fixes this by always rendering
+    /// `(a) + (b > c)`, which only parses one way regardless of any
+    /// operator's precedence.
+    #[test]
+    fn render_expr_parenthesizes_nested_binary_ops_so_they_round_trip() {
+        let expr = Expr::BinaryOp {
+            op: Operator::Add,
+            lhs: Box::new(Expr::Column("a".to_string())),
+            rhs: Box::new(Expr::BinaryOp {
+                op: Operator::GreaterThan,
+                lhs: Box::new(Expr::Column("b".to_string())),
+                rhs: Box::new(Expr::Column("c".to_string())),
+            }),
+        };
+
+        let rendered = render_expr(&expr);
+        let text = format!("TRANSFORM t FROM s SELECT {rendered} AS out");
+        let def = parse(&text).unwrap_or_else(|e| {
+            panic!("rendered expression {rendered:?} must re-parse cleanly: {e:?}")
+        });
+
+        assert_eq!(
+            def.fields[0].expr, expr,
+            "round-tripping through render_expr -> parse must reproduce the exact original \
+             tree; without unconditional parenthesization this would silently come back as \
+             `GreaterThan(Add(a, b), c)` instead (`+` binds tighter than `>`, so a flat, \
+             unparenthesized render loses the original grouping)"
+        );
+    }
+
+    /// The mirror shape — `GreaterThan(Add(a, b), c)`, i.e. `(a + b) > c` —
+    /// which happens to round-trip correctly even *without* parens (since
+    /// `+`'s tighter precedence reconstructs the same grouping by accident).
+    /// Pinned anyway so a future change to `render_expr` can't quietly regress
+    /// this direction while only testing the other one.
+    #[test]
+    fn render_expr_round_trips_a_greater_than_wrapping_an_add() {
+        let expr = Expr::BinaryOp {
+            op: Operator::GreaterThan,
+            lhs: Box::new(Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::Column("a".to_string())),
+                rhs: Box::new(Expr::Column("b".to_string())),
+            }),
+            rhs: Box::new(Expr::Column("c".to_string())),
+        };
+
+        let rendered = render_expr(&expr);
+        let text = format!("TRANSFORM t FROM s SELECT {rendered} AS out");
+        let def = parse(&text).unwrap_or_else(|e| {
+            panic!("rendered expression {rendered:?} must re-parse cleanly: {e:?}")
+        });
+
+        assert_eq!(def.fields[0].expr, expr);
+    }
 }

@@ -554,6 +554,32 @@ mod tests {
             .expect("(a + b) > c type-checks cleanly");
     }
 
+    /// Parenthesized grouping (issue #67's follow-up, needed once a caller
+    /// composes `+` and `>` and wants a grouping the precedence table alone
+    /// would never produce): `(a > b) + c` must override `+`'s tighter
+    /// binding and group the comparison first, unlike the unparenthesized
+    /// `a > b + c` (pinned by `mixed_operators_respect_precedence` above),
+    /// which groups `+` first. This is also the exact shape
+    /// `generative::backend::manual::render_expr`'s round-trip test
+    /// (`backend::manual::tests::render_expr_parenthesizes_nested_binary_ops_so_they_round_trip`)
+    /// depends on the parser being able to re-parse.
+    #[test]
+    fn parenthesized_grouping_overrides_precedence() {
+        let def = parse("TRANSFORM t FROM s SELECT (a > b) + c AS result").unwrap();
+        assert_eq!(
+            def.fields[0].expr,
+            Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::BinaryOp {
+                    op: Operator::GreaterThan,
+                    lhs: Box::new(Expr::Column("a".to_string())),
+                    rhs: Box::new(Expr::Column("b".to_string())),
+                }),
+                rhs: Box::new(Expr::Column("c".to_string())),
+            }
+        );
+    }
+
     /// A same-precedence chain (`+`, `+`) stays left-associative under real
     /// precedence, exactly as it did under the old flat parser: `a + b + c`
     /// parses as `(a + b) + c`, not `a + (b + c)`.

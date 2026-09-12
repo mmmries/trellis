@@ -13,7 +13,9 @@
 //! cross-join (`JOIN <other> ON <cond>`) key-space clause will slot in;
 //! this slice only accepts the 1-1 case (clause absent) and rejects both
 //! keywords by name if present. `<expr>` supports column references,
-//! numeric and string literals, `+`, `>` (issue #65), `name(args)`
+//! numeric and string literals, `+`, `>` (issue #65), parenthesized
+//! grouping (`(<expr>)`, issue #67 — needed once a caller composes `+` and
+//! `>` and must override the precedence table's own grouping), `name(args)`
 //! function calls against [`super::registry::FUNCTIONS`] (issue #64), and
 //! `<rel>.<column>` relationship-path references (issue #25, ADR-0006) —
 //! whose head is a relationship name, resolved and cardinality-checked by
@@ -370,6 +372,20 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         match self.advance() {
+            Token::Symbol('(') => {
+                // Parenthesized grouping (issue #67's precedence-climbing
+                // parser needs this for the rare case a caller must override
+                // the precedence table's own grouping — e.g. wrapping a
+                // `>` comparison as an operand of `+`, which the precedence
+                // table alone would never produce since `+` binds tighter).
+                // No new `Expr` variant: a grouping paren only steers which
+                // subtree `parse_binary_expr` builds around it, it carries no
+                // information of its own once parsing is done, so the
+                // parenthesized expression's own tree is returned unwrapped.
+                let expr = self.parse_expr()?;
+                self.expect_symbol(')')?;
+                Ok(expr)
+            }
             Token::Number(n) => Ok(Expr::NumberLiteral(n)),
             Token::String(s) => Ok(Expr::StringLiteral(s)),
             Token::Ident(name) => {
