@@ -17,6 +17,20 @@ correct but pathologically slow for a from-scratch build — issue #63 measured 
 cluster), dominated by ring bookkeeping over data that is entirely present up
 front and has no concurrent deltas to reconcile.
 
+**Amendment (2026-09-12):** "The build is synchronous and complete on return"
+(below) doesn't scale to the sizes the public API design
+([docs/public-api-design.md](../public-api-design.md)) needs to support — a
+1B-row table's direct build still takes real wall-clock time, and a
+synchronous in-call loop means an interrupted process (the caller's, or the
+one running the loop) loses everything and starts over. This amendment keeps
+every algorithmic decision below (range/group-key chunking, overwrite
+semantics, single-pass aggregation into a staging table) — those are exactly
+what makes the rest of this workable — but changes *who runs the chunks and
+when*: chunk execution moves from an in-call loop to a durable, claimable work
+queue that running drain (application) threads pick up, the same way they
+already claim sealed ring segments. See "Backgrounding and resumability"
+below.
+
 ## Decision
 
 The initial build of a target is computed **directly, set-based, source→target**,
@@ -156,3 +170,83 @@ to-many-aggregate shape is direct-built.
   same-benchmark before/after. Bare to-one lookups and any other relationship
   shape not listed above remain on the ring until the direct path learns to
   render them.
+
+## Backgrounding and resumability (amendment)
+
+`install_definition` today creates the target table, then runs
+`backfill_definition` (every chunk, back to back, in one call) before ever
+persisting the definition to the catalog — the caller's connection blocks for
+however long the whole build takes. That's the piece this amendment changes.
+
+**Chunks become a durable, claimable work queue**, not an in-call loop. Once
+the target table exists and the coverage fence is captured (both already fast,
+metadata-only operations — this ordering is unchanged from today, see issue
+#79 bug B's fence-before-build requirement), `install_definition` enumerates
+the same chunk boundaries `backfill_definition` computes today (PK ranges for
+1-1, group-key ranges for aggregates) but persists them as pending work items
+instead of executing them, then returns immediately — the definition is
+recorded and visible (`definitions()` lists it, status `waiting_to_backfill`)
+well before a single row of the target is built.
+
+**Drain (application) threads execute the queue.** Per-fleet clarification:
+`staging_worker` is only about keeping up with the logical replication slot
+(intake + ring maintenance); it is `application_threads` — the drain
+workers — that own finishing transform work, backfill included. Concretely,
+this reuses the exact claim/heartbeat/reclaim-stale machinery
+`engine/src/client.rs`'s app-worker loop already runs for sealed ring segments
+(`register_drainer`, `next_claimable_segments`, `HeartbeatDaemon`,
+`staging::reclaim_stale`): a backfill chunk becomes a second kind of claimable
+unit alongside a sealed segment, claimed by whichever drain thread gets to it
+next — including drain threads in entirely different processes across the
+fleet. This is also a throughput win, not just a resumability one: a huge
+table's chunks can be worked in parallel by every drain thread currently
+running, not just whichever single connection happened to call `define()`.
+
+**Crash safety** falls out of reusing that machinery rather than needing new
+machinery: a claimed-but-not-yet-committed chunk is protected by the same
+heartbeat + `reclaim_stale` TTL every ring-segment claim already relies on, so
+a drain thread dying mid-chunk doesn't strand that range — another drain
+thread reclaims and redoes it once the claim goes stale. Because each chunk's
+write is `overwrite`, not additive (already decided above, for the same
+reason), redoing a half-finished or fully-finished chunk is safe either way.
+
+**CDC deltas arriving during the build are parked, not released per-chunk.**
+While a definition sits in `waiting_to_backfill`/`backfilling`, any CDC delta
+for its source table(s) parks in the ring exactly the way `pending_backfill`
+already parks deltas for the ring-fallback path today — deliberately *not*
+per-chunk released as each range finishes (that would require re-deriving the
+fence/ordering guarantee per chunk instead of once per definition, real added
+complexity with no immediate need). Once every chunk work item for a
+definition is committed, the definition flips to `live` in one step and parked
+deltas discharge in one shot, the same `run_pending_backfills`-shaped event
+that already exists — just now the trigger for it is "every chunk claimed and
+done" instead of "the ring path's one-shot enumeration finished." The
+tradeoff this accepts: a very long build means a correspondingly long queue of
+parked deltas to fold through on discharge; acceptable for now, revisit if it
+becomes the actual bottleneck.
+
+**Open problem — the aggregate path's staging table.** The single-pass
+`GROUP BY` scan aggregates into a **connection-scoped `TEMP TABLE`** today,
+cleaned up on connection teardown. That doesn't survive being read by many
+different drain threads' own separate connections over however long the
+backfill takes. This needs to become a durable, definition-scoped staging
+table with its own explicit lifecycle (created once, dropped once every write
+chunk referencing it has committed or the definition is dropped) rather than
+riding on session teardown for cleanup. Leaning toward making the aggregation
+pass itself the definition's first work item — singly claimed, must complete
+before any write-chunk items are enumerated/claimable — rather than solving
+general multi-writer access to an in-progress aggregation. Not settled.
+
+Undecided:
+
+* Exact shape of the chunk work-item table (columns/claim semantics) — almost
+  certainly parallel to the existing `drainers`/segment-claim tables rather
+  than novel, but not drafted.
+* How the aggregate path's durable staging table gets cleaned up if a
+  definition is dropped/redefined mid-backfill (orphaned staging table).
+* Whether a stalled backfill (every chunk claimed, none completing — e.g. a
+  chunk that deterministically errors) needs its own fuse, distinct from the
+  per-column quarantine fuse in
+  [ADR-0003](0003-quarantine-storage-and-api.md)'s amendment, since a failure
+  here happens before a target row ever exists to attribute a quarantine
+  entry to.
