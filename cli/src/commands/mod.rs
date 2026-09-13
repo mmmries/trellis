@@ -1,0 +1,8 @@
+//! Subcommand implementations, one module per subcommand.
+//!
+//! `main.rs`'s dispatch is a small match on the subcommand name to the
+//! matching module's `parse`/`run`; adding `run`, `status`, or `prometheus`
+//! later means adding a module here plus one arm there, not touching
+//! anything else.
+
+pub mod define;
