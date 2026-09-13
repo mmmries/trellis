@@ -22,17 +22,16 @@
 //! enough information to guess at it, so this command says so plainly rather
 //! than fake a status column.
 //!
-//! [`Trellis::poisoned_since`] is deliberately *not* surfaced here either.
-//! Its own doc comment frames it as a point read since a `watermark` —
-//! suited to a running client polling "what's newly poisoned since I last
-//! checked" — not a "what's poisoned right now" snapshot. A one-shot command
-//! has no principled watermark to pick: `UNIX_EPOCH` would return the entire
-//! history of poison entries ever recorded (unbounded, and mostly
-//! uninteresting for a status check), while "now" would trivially return
-//! nothing. Rather than approximate a snapshot this primitive isn't built
-//! for, this command leaves poison entries out and says why; issue #55's
-//! real per-`(transform, column)` status (which *is* a current-state read)
-//! is the right fix, not a guessed watermark here.
+//! [`Trellis::poisoned_since`] *is* surfaced here, called with `UNIX_EPOCH`
+//! as the watermark. Despite its name suggesting a point-in-time delta, the
+//! underlying `poison` table (see `engine/migrations/V13__quarantine.sql`
+//! and `engine::staging::quarantine`) is a live marker of which
+//! `(src_table, key)` pairs are *currently* evicted, not an append-only
+//! log — rows are deleted on release, not just inserted on poison. So
+//! `poisoned_since(UNIX_EPOCH)` returns exactly today's outstanding
+//! quarantine set, which is precisely the "what's poisoned right now"
+//! snapshot a status command wants; it isn't the unbounded historical log
+//! its watermark-shaped signature might suggest.
 
 use engine::{Config, DefinitionSummary, RelationshipSummary, Trellis, TrellisOptions};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -106,14 +105,8 @@ pub async fn run(_args: Args, database_url: Option<String>) -> Result<String, St
 const STATUS_NOTE: &str = "\
 Note: per-transform/per-column lifecycle status (live/backfilling/quarantined/\
 paused) is not implemented yet — tracked as issue #55. This listing only \
-shows what is registered, not whether it has finished backfilling or is \
-currently quarantined.
-
-Poison-quarantine entries are omitted from this listing: `poisoned_since` \
-reads entries recorded after a given watermark, which fits a running client \
-polling for what's new, not a one-shot \"what's poisoned right now\" snapshot \
-— there's no principled watermark to pick here. Issue #55's per-column \
-status will be the right primitive for that.";
+shows what is registered and what is currently quarantined, not whether a \
+definition has finished backfilling.";
 
 /// Builds the full human-readable status report: definitions, relationships,
 /// then [`STATUS_NOTE`].
@@ -121,6 +114,10 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
     let definitions = trellis.definitions().await.map_err(|err| err.to_string())?;
     let relationships = trellis
         .relationships()
+        .await
+        .map_err(|err| err.to_string())?;
+    let poisoned = trellis
+        .poisoned_since(UNIX_EPOCH)
         .await
         .map_err(|err| err.to_string())?;
 
@@ -131,9 +128,25 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
     out.push_str("Relationships:\n");
     out.push_str(&format_relationships(&relationships));
     out.push('\n');
+    out.push_str(&format_poisoned(&poisoned));
+    out.push('\n');
     out.push_str(STATUS_NOTE);
 
     Ok(out)
+}
+
+fn format_poisoned(poisoned: &[engine::PoisonEntry]) -> String {
+    if poisoned.is_empty() {
+        return "Quarantined source rows: none\n".to_string();
+    }
+    let mut out = format!("Quarantined source rows: {}\n", poisoned.len());
+    for entry in poisoned {
+        out.push_str(&format!(
+            "  table={} key={:?} error={:?}\n",
+            entry.src_table, entry.key, entry.last_error
+        ));
+    }
+    out
 }
 
 fn format_definitions(definitions: &[DefinitionSummary]) -> String {
@@ -314,8 +327,29 @@ mod tests {
     }
 
     #[test]
-    fn note_mentions_issue_55_and_poisoned_since() {
+    fn note_mentions_issue_55() {
         assert!(STATUS_NOTE.contains("#55"));
-        assert!(STATUS_NOTE.contains("poisoned_since"));
+    }
+
+    #[test]
+    fn no_poisoned_entries_say_so_clearly() {
+        assert_eq!(format_poisoned(&[]), "Quarantined source rows: none\n");
+    }
+
+    #[test]
+    fn a_poisoned_entry_is_formatted_with_its_fields() {
+        use engine::PoisonEntry;
+
+        let entry = PoisonEntry {
+            src_table: "orders".to_string(),
+            key: "42".to_string(),
+            last_error: "division by zero".to_string(),
+            poisoned_at: UNIX_EPOCH,
+        };
+        let formatted = format_poisoned(std::slice::from_ref(&entry));
+        assert!(formatted.contains("Quarantined source rows: 1"));
+        assert!(formatted.contains("table=orders"));
+        assert!(formatted.contains("key=\"42\""));
+        assert!(formatted.contains("error=\"division by zero\""));
     }
 }
