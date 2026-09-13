@@ -1,11 +1,29 @@
-//! The manual/single-worker backend (design doc §4 "Two runtimes, one
-//! oracle"): harness-driven, one worker, lockstep apply -> quiesce ->
-//! compare. Drives the real engine as far as its current 1-1/numeric-`+`
-//! subset allows — a real [`engine::Client`] (one staging worker, one
-//! application worker) against a real, already-migrated Postgres database,
-//! reached only over raw source DML (never an application-level notify
-//! API), matching the production ingestion path
+//! The manual backend (design doc §4 "Two runtimes, one oracle"):
+//! harness-driven, lockstep apply -> quiesce -> compare, driven by the
+//! harness rather than a real subprocess-supervised deployment (that's what
+//! "manual" names — the harness itself polls `quiesce()` rather than the
+//! engine notifying it — *not* how many application workers the underlying
+//! [`EngineClient`] runs). Drives the real engine as far as its current
+//! 1-1/numeric-`+` subset allows — a real [`EngineClient`] (one staging
+//! worker, one *or more* application workers — see
+//! [`ManualBackend::connect_with_workers`]/[`ManualBackend::connect_with_options`],
+//! improvement-plan task D4) against a real, already-migrated Postgres
+//! database, reached only over raw source DML (never an application-level
+//! notify API), matching the production ingestion path
 //! (`docs/data-flow.md#ingestion-via-logical-replication`).
+//!
+//! **D4's "second runtime" is this same type, just started with more than one
+//! application worker** — not a separate `ConcurrentBackend` type. Nothing in
+//! `ManualBackend` (DDL rendering, DML rendering, `quiesce`, `snapshot`)
+//! assumes a single worker; the worker count only ever mattered to one line
+//! inside [`Backend::install`] that hardcoded `application_threads: 1`. A
+//! second type would have had to duplicate this module's substantial
+//! rendering logic (`render_definition`/`render_expr`/`read_table`/
+//! `read_aggregate_table`, none of which is worker-count-dependent) for zero
+//! behavioral difference; a parameterized constructor shares all of it and
+//! keeps exactly one implementation of the seam's DDL/DML/read-back logic to
+//! maintain. See `generative/tests/concurrent_convergence.rs` for the new,
+//! separate property/test file this constructor is meant to be driven from.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -196,10 +214,10 @@ struct Assignment {
     value: Option<String>,
 }
 
-/// The manual/single-worker backend. Owns a raw connection (DDL, DML,
-/// watermark reads, snapshot reads) and, once [`ManualBackend::install`]
-/// has run, a live [`EngineClient`] draining sealed batches into every
-/// installed definition's target table.
+/// The manual backend. Owns a raw connection (DDL, DML, watermark reads,
+/// snapshot reads) and, once [`ManualBackend::install`] has run, a live
+/// [`EngineClient`] draining sealed batches into every installed
+/// definition's target table.
 pub struct ManualBackend {
     dsn: String,
     pool: Pool,
@@ -207,12 +225,31 @@ pub struct ManualBackend {
     engine_client: Option<EngineClient>,
     tables: HashMap<String, Table>,
     defs: Vec<TransformDef>,
+    /// How many application-worker tasks [`Backend::install`] starts the
+    /// underlying [`EngineClient`] with (improvement-plan task D4). `1` for
+    /// every existing single-worker caller (unchanged default via
+    /// [`ManualBackend::connect`]); `>1` is the "second runtime"
+    /// `generative/tests/concurrent_convergence.rs` drives.
+    application_threads: usize,
+    /// How often the underlying `EngineClient`'s maintenance loop
+    /// (seal/recover/reclaim) ticks — see [`ClientOptions::maintenance_interval`].
+    /// Left at the engine's own default for every existing caller;
+    /// overridable via [`ManualBackend::connect_with_options`] so a
+    /// hand-built pin can widen it comfortably past how long a large burst of
+    /// raw DML takes to apply, guaranteeing every row of that burst lands in
+    /// the *same* sealed batch instead of splitting across an arbitrary
+    /// number of 300ms-apart maintenance ticks (see the D4 hand-built
+    /// "genuinely exceeds `MIN_ROWS_TO_SPLIT`" pin in
+    /// `generative/tests/concurrent_convergence.rs`).
+    maintenance_interval: Duration,
 }
 
 impl ManualBackend {
     /// Connects to `dsn` — an already-migrated Trellis database (see
     /// `testkit::TestCluster::create_isolated_database`) — but installs
-    /// nothing yet.
+    /// nothing yet. One application worker, the engine's default maintenance
+    /// cadence — see [`ManualBackend::connect_with_options`] for a backend
+    /// that can widen either.
     ///
     /// `dsn` must be given explicitly by the caller (never inferred from an
     /// environment default): design doc §6 wants every run to refuse an
@@ -221,11 +258,50 @@ impl ManualBackend {
     /// is ever added. The resolved target is printed so a run's connection
     /// is never silently ambiguous.
     pub async fn connect(dsn: impl Into<String>) -> Result<Self, ManualBackendError> {
+        Self::connect_with_options(dsn, 1, None).await
+    }
+
+    /// Like [`ManualBackend::connect`], but starts the underlying
+    /// [`EngineClient`] with `application_threads` app-worker tasks instead
+    /// of a hardcoded `1` (improvement-plan task D4's "second runtime" —
+    /// same `Backend` seam, same DDL/DML/quiesce/snapshot code, a real
+    /// multi-worker pool underneath). The engine's default maintenance
+    /// cadence is unchanged; see [`ManualBackend::connect_with_options`] if a
+    /// caller also needs to widen that (e.g. to force a large hand-built
+    /// burst into one sealed batch).
+    pub async fn connect_with_workers(
+        dsn: impl Into<String>,
+        application_threads: usize,
+    ) -> Result<Self, ManualBackendError> {
+        Self::connect_with_options(dsn, application_threads, None).await
+    }
+
+    /// [`ManualBackend::connect`]'s general form: `application_threads`
+    /// app-worker tasks, and — when `maintenance_interval` is `Some` — the
+    /// underlying [`EngineClient`]'s maintenance-loop cadence overridden from
+    /// [`ClientOptions`]'s own default (300ms). `None` keeps the engine's
+    /// default, exactly like [`ManualBackend::connect`]/
+    /// [`ManualBackend::connect_with_workers`].
+    ///
+    /// `dsn` must be given explicitly by the caller (never inferred from an
+    /// environment default): design doc §6 wants every run to refuse an
+    /// unnamed target, moot today since `testkit` always hands one over
+    /// explicitly, but enforced so it stays moot if an external-cluster mode
+    /// is ever added. The resolved target is printed so a run's connection
+    /// is never silently ambiguous.
+    pub async fn connect_with_options(
+        dsn: impl Into<String>,
+        application_threads: usize,
+        maintenance_interval: Option<Duration>,
+    ) -> Result<Self, ManualBackendError> {
         let dsn = dsn.into();
         if dsn.trim().is_empty() {
             return Err(ManualBackendError::UnnamedTarget);
         }
-        println!("generative: connecting ManualBackend to {dsn}");
+        println!(
+            "generative: connecting ManualBackend to {dsn} ({application_threads} application \
+             worker(s))"
+        );
         let config = Config::from_dsn(dsn.clone())?;
         let pool = Pool::new(&config)?;
 
@@ -243,7 +319,33 @@ impl ManualBackend {
             engine_client: None,
             tables: HashMap::new(),
             defs: Vec::new(),
+            application_threads,
+            maintenance_interval: maintenance_interval
+                .unwrap_or_else(|| ClientOptions::default().maintenance_interval),
         })
+    }
+
+    /// Diagnostic-only (improvement-plan task D4): the largest `bucket_count`
+    /// across every segment sealed so far, straight from
+    /// `engine::staging::claim`'s partition decision (`segments.bucket_count`,
+    /// fixed at seal time from row count alone — see
+    /// `engine::staging::claim::MIN_ROWS_TO_SPLIT`/`SEG_BUCKETS`). `0` if no
+    /// segment has sealed yet.
+    ///
+    /// This module is the one place the backend seam (its own doc comment)
+    /// allows to know the `segments` table exists at all — everything outside
+    /// it, including `generative/tests/concurrent_convergence.rs`'s hand-built
+    /// "a big batch really gets split across workers" pin, reaches this fact
+    /// only through this method, never by querying `segments` itself.
+    pub async fn max_bucket_count(&self) -> Result<i64, ManualBackendError> {
+        let row = self
+            .raw
+            .query_one(
+                "select coalesce(max(bucket_count)::int8, 0) from segments",
+                &[],
+            )
+            .await?;
+        Ok(row.get(0))
     }
 
     async fn create_source_table(&self, table: &Table) -> Result<(), ManualBackendError> {
@@ -371,8 +473,9 @@ impl super::Backend for ManualBackend {
         if !source_tables.is_empty() && self.engine_client.is_none() {
             let options = ClientOptions {
                 staging_worker: true,
-                application_threads: 1,
+                application_threads: self.application_threads,
                 source_tables,
+                maintenance_interval: self.maintenance_interval,
                 ..Default::default()
             };
             let client = EngineClient::start(self.dsn.clone(), options)?;
