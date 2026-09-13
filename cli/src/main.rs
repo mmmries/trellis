@@ -10,8 +10,7 @@
 //!
 //! Each subcommand lives in its own `commands::<name>` module; this file is
 //! just the top-level usage/help and the match that dispatches to one.
-//! Today that's `define`, `run`, and `status`; `prometheus` is meant to land
-//! the same way later, one module and one match arm.
+//! Today that's `define`, `run`, `status`, and `prometheus`.
 
 mod commands;
 mod connection;
@@ -25,6 +24,7 @@ Commands:
   define <GRAMMAR>   Register a TRANSFORM or RELATIONSHIP definition.
   run                 Run the live CDC/apply pipeline until interrupted.
   status              Print registered definitions/relationships and exit.
+  prometheus          Serve a placeholder metrics endpoint until interrupted.
 
 Options:
   -d, --database-url <URL>  Postgres connection string. May be given before
@@ -80,6 +80,7 @@ fn run(mut args: Vec<String>) -> ExitCode {
         "define" => run_define(args, database_url),
         "run" => run_run(args, database_url),
         "status" => run_status(args, database_url),
+        "prometheus" => run_prometheus(args, database_url),
         _ if wants_help(std::slice::from_ref(&command)) => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -208,6 +209,45 @@ fn run_status(args: Vec<String>, database_url: Option<String>) -> ExitCode {
     }
 }
 
+/// Dispatches `trellis prometheus`: handles `-h`/`--help` itself (so it
+/// works without a database connection — this command never needs one, see
+/// the module doc comment), otherwise parses the flags and serves the
+/// placeholder metrics endpoint until interrupted, on a single-use tokio
+/// runtime.
+fn run_prometheus(args: Vec<String>, database_url: Option<String>) -> ExitCode {
+    if wants_help(&args) {
+        print!("{}", commands::prometheus::USAGE);
+        return ExitCode::SUCCESS;
+    }
+
+    let parsed = match commands::prometheus::parse(&args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("error: failed to start async runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match runtime.block_on(commands::prometheus::run(parsed, database_url)) {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +339,29 @@ mod tests {
         // fail for the wrong reason in an environment with no database.
         assert_eq!(
             run(vec!["status".to_string(), "bogus".to_string()]),
+            ExitCode::FAILURE
+        );
+    }
+
+    #[test]
+    fn prometheus_help_is_success_without_a_database() {
+        assert_eq!(
+            run(vec!["prometheus".to_string(), "--help".to_string()]),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn prometheus_bad_bind_is_a_failure_without_a_database() {
+        // A malformed --bind value must be rejected during argv parsing,
+        // before any attempt to bind a socket or connect to a database —
+        // otherwise this test would hang or fail for the wrong reason.
+        assert_eq!(
+            run(vec![
+                "prometheus".to_string(),
+                "--bind".to_string(),
+                "not-a-socket-addr".to_string()
+            ]),
             ExitCode::FAILURE
         );
     }

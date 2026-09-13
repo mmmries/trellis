@@ -5,4 +5,4 @@ edition.workspace = true
 
 [dependencies]
 engine = { path = "../engine" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "time"] }
