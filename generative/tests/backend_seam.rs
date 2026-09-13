@@ -39,6 +39,7 @@ async fn installs_a_trivial_def_and_converges_dml_to_the_expected_snapshot() {
     let program = Program {
         tables: vec![source.clone()],
         defs: vec![def],
+        def_install_after_op: vec![0],
         ops: vec![
             Op::Insert {
                 table: source.name.clone(),
@@ -59,6 +60,8 @@ async fn installs_a_trivial_def_and_converges_dml_to_the_expected_snapshot() {
                 expect: OpOutcome::Succeeds,
             },
         ],
+        restart_after_ops: Vec::new(),
+        scale_out_after_ops: Vec::new(),
     };
 
     let mut backend = ManualBackend::connect(db.dsn())

@@ -10,8 +10,12 @@ use std::collections::HashSet;
 
 use engine::defs::ast::{Expr, KeySpace, Operator, ValueType};
 use engine::defs::invertibility::{AggregateArg, CountArg, Invertibility, classify};
-use generative::generate::{Mutate, build_program, trivial_program, trivial_program_with};
-use generative::model::{Op, Program, Table};
+use generative::generate::{
+    Mutate, build_program, bulk_insert_program, checkpoint_plan_for, noise_plan_for,
+    program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
+    trivial_program, trivial_program_with,
+};
+use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
 
@@ -142,8 +146,10 @@ fn every_supported_operator_appears_over_every_supported_argument_type() {
     }
 }
 
-/// Every value drawn from an `Op::Insert`/`Op::Update` in `program`, in draw
-/// order. Ignores `Op::Delete` (it carries no field values).
+/// Every value drawn from an `Op::Insert`/`Op::Update`/`Op::BulkInsert` in
+/// `program`, in draw order. Ignores `Op::Delete`/`Op::Truncate` (neither
+/// carries a field value — improvement-plan task E6's `Truncate` is exactly
+/// as value-free as `Delete` here).
 fn all_op_values(program: &generative::model::Program) -> Vec<Option<String>> {
     program
         .ops
@@ -151,7 +157,11 @@ fn all_op_values(program: &generative::model::Program) -> Vec<Option<String>> {
         .flat_map(|op| match op {
             Op::Insert { row, .. } => row.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
             Op::Update { changes, .. } => changes.iter().map(|(_, v)| v.clone()).collect(),
-            Op::Delete { .. } => Vec::new(),
+            Op::Delete { .. } | Op::Truncate { .. } => Vec::new(),
+            Op::BulkInsert { rows, .. } => rows
+                .iter()
+                .flat_map(|row| row.iter().map(|(_, v)| v.clone()))
+                .collect(),
         })
         .collect()
 }
@@ -743,5 +753,352 @@ fn trivial_program_sometimes_draws_an_aggregate_key_space() {
     assert!(
         saw_aggregate,
         "the generator must sometimes draw a KeySpace::Aggregate definition across 500 samples"
+    );
+}
+
+/// Regression coverage floor for a real engine bug (`apply_aggregate.rs`'s
+/// `add_contributions`/`sub_contributions`): a brand-new `Aggregate` group
+/// whose only source row has a `NULL` value for its sole `SUM`/`AVG`
+/// argument used to never get a target row written at all. The generator's
+/// existing `awkward_values` `NULL`-drawing logic (`generate::strategy::value`,
+/// exercised on every column including a table's very first seed row) already
+/// draws exactly this shape by construction — nothing new needed there, see
+/// `awkward_values_on_sometimes_draws_null` above for the general NULL floor
+/// this specializes — so this is purely a coverage floor confirming the
+/// specific "NULL on the table's very first live row, for a column that is
+/// some Aggregate def's SUM/AVG argument" shape stays reliably reachable, the
+/// same "coverage that silently drops out" principle every other floor test
+/// in this file already checks for its own shape.
+#[test]
+fn trivial_program_sometimes_draws_a_null_first_row_for_an_aggregate_sum_avg_argument() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let saw_it = (0..2000).any(|_| {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        program_has_null_first_row_sum_avg_arg(&program)
+    });
+    assert!(
+        saw_it,
+        "expected at least one sample with a NULL value on a table's very first \
+         live row for a column used as some Aggregate def's SUM/AVG argument, \
+         across 2000 samples"
+    );
+}
+
+/// Whether any [`KeySpace::Aggregate`] def in `program` has a `SUM`/`AVG`
+/// field whose argument column is `NULL` on its source table's very first
+/// `Insert` op (in program order — seed-before-mutate means this is always
+/// the table's first-ever seeded row, never a later mutate). Mirrors the
+/// exact shape that used to make `add_contributions`'s missing-entry bug
+/// bite: a group whose only contributing row is that same first row, with a
+/// `NULL` argument and no other row yet to anchor a write.
+fn program_has_null_first_row_sum_avg_arg(program: &Program) -> bool {
+    for def in &program.defs {
+        if !matches!(def.key_space, KeySpace::Aggregate { .. }) {
+            continue;
+        }
+        let sum_avg_columns = def.fields.iter().filter_map(|field| match &field.expr {
+            Expr::FunctionCall { name, args } if name == "SUM" || name == "AVG" => {
+                match args.first() {
+                    Some(Expr::Column(col)) => Some(col.as_str()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        });
+        let Some(Op::Insert { row, .. }) = program
+            .ops
+            .iter()
+            .find(|op| matches!(op, Op::Insert { table, .. } if table == &def.source))
+        else {
+            continue;
+        };
+        for col in sum_avg_columns {
+            if row
+                .iter()
+                .any(|(name, value)| name == col && value.is_none())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Workstream E, task E1: `noise_plan_for` must sometimes draw a non-empty
+/// plan at all (as opposed to always drawing zero events, which would make
+/// `tests/noise.rs`'s property vacuous) — sampled at a representative op
+/// count (4, `generate::MAX_MUTATES`'s own ceiling) the same way every other
+/// floor test here samples `trivial_program()`.
+#[test]
+fn noise_plan_for_sometimes_draws_at_least_one_event() {
+    let mut runner = TestRunner::default();
+    let strategy = noise_plan_for(4);
+    let saw_nonempty = (0..500).any(|_| {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        !plan.events.is_empty()
+    });
+    assert!(
+        saw_nonempty,
+        "noise_plan_for must sometimes draw at least one event across 500 samples"
+    );
+}
+
+/// E1: every [`NoiseAction`] variant — both DML (`Insert`/`Update`/`Delete`)
+/// and DDL (`AddColumn`/`DropColumn`) — must be reachable across enough
+/// samples, matching this suite's own "every shape reachable across a
+/// bounded number of samples" convention (e.g.
+/// `trivial_program_draws_every_scalar_function_at_least_once` above). If
+/// `AddColumn`/`DropColumn` silently stopped being drawn, the DDL half of
+/// E1's "ideally also some DDL" ask would quietly regress to DML-only noise
+/// without any test noticing.
+#[test]
+fn noise_plan_for_draws_every_action_variant_across_enough_samples() {
+    let mut runner = TestRunner::default();
+    let strategy = noise_plan_for(4);
+    let mut saw_insert = false;
+    let mut saw_update = false;
+    let mut saw_delete = false;
+    let mut saw_add_column = false;
+    let mut saw_drop_column = false;
+    for _ in 0..500 {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        for event in &plan.events {
+            let NoiseEventKind::Table(action) = &event.kind else {
+                panic!("noise_plan_for must only ever draw Table(..) events, got {event:?}");
+            };
+            match action {
+                NoiseAction::Insert { .. } => saw_insert = true,
+                NoiseAction::Update { .. } => saw_update = true,
+                NoiseAction::Delete { .. } => saw_delete = true,
+                NoiseAction::AddColumn { .. } => saw_add_column = true,
+                NoiseAction::DropColumn { .. } => saw_drop_column = true,
+            }
+        }
+        if saw_insert && saw_update && saw_delete && saw_add_column && saw_drop_column {
+            break;
+        }
+    }
+    assert!(
+        saw_insert,
+        "expected an Insert noise action across 500 samples"
+    );
+    assert!(
+        saw_update,
+        "expected an Update noise action across 500 samples"
+    );
+    assert!(
+        saw_delete,
+        "expected a Delete noise action across 500 samples"
+    );
+    assert!(
+        saw_add_column,
+        "expected an AddColumn noise action across 500 samples"
+    );
+    assert!(
+        saw_drop_column,
+        "expected a DropColumn noise action across 500 samples"
+    );
+}
+
+/// E1: `noise_plan_for` must sometimes draw an event at position `0` (fires
+/// before any real op) and sometimes at the last legal position (`op_count`,
+/// fires after the very last real op) — both ends of the interleaving range
+/// need real coverage, not just the middle.
+#[test]
+fn noise_plan_for_sometimes_fires_at_both_ends_of_the_op_stream() {
+    let mut runner = TestRunner::default();
+    let op_count = 4;
+    let strategy = noise_plan_for(op_count);
+    let mut saw_start = false;
+    let mut saw_end = false;
+    for _ in 0..500 {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        if plan.events.iter().any(|e| e.before_op == 0) {
+            saw_start = true;
+        }
+        if plan.events.iter().any(|e| e.before_op == op_count) {
+            saw_end = true;
+        }
+        if saw_start && saw_end {
+            break;
+        }
+    }
+    assert!(
+        saw_start,
+        "expected a noise event at position 0 (before any real op) across 500 samples"
+    );
+    assert!(
+        saw_end,
+        "expected a noise event at the last position (after the last real op) across 500 samples"
+    );
+}
+
+/// Workstream E, task E5: `checkpoint_plan_for` must sometimes draw at least
+/// one `CHECKPOINT` event (not always zero, which would make
+/// `tests/noise.rs`'s checkpoint property vacuous), and every drawn event
+/// must actually be the `CHECKPOINT` admin statement (task E5's whole
+/// point), never a `Table(..)` event (this plan never installs a table at
+/// all).
+#[test]
+fn checkpoint_plan_for_sometimes_draws_at_least_one_checkpoint() {
+    let mut runner = TestRunner::default();
+    let strategy = checkpoint_plan_for(4);
+    let mut saw_checkpoint = false;
+    for _ in 0..500 {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        assert!(
+            plan.table.is_none(),
+            "checkpoint_plan_for must never install a noise table: {plan:?}"
+        );
+        for event in &plan.events {
+            match &event.kind {
+                NoiseEventKind::Admin(sql) => {
+                    assert_eq!(
+                        sql, "CHECKPOINT",
+                        "checkpoint_plan_for must only draw CHECKPOINT"
+                    );
+                    saw_checkpoint = true;
+                }
+                NoiseEventKind::Table(action) => {
+                    panic!("checkpoint_plan_for must never draw a Table(..) event, got {action:?}")
+                }
+            }
+        }
+    }
+    assert!(
+        saw_checkpoint,
+        "checkpoint_plan_for must sometimes draw at least one CHECKPOINT across 500 samples"
+    );
+}
+
+/// Improvement-plan task E2's coverage floor: `program_with_mid_stream_def_install`
+/// must actually draw a deferred install (a nonzero `def_install_after_op`
+/// entry) across enough samples — sampled the same way as
+/// `trivial_program_sometimes_draws_more_than_one_table` above, via the
+/// `Coverage` accumulator's own tally rather than hand-walking the field here
+/// a second time.
+#[test]
+fn mid_stream_def_installs_actually_get_drawn() {
+    let mut runner = TestRunner::default();
+    let strategy = program_with_mid_stream_def_install(true);
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    assert!(
+        coverage.mid_stream_def_installs > 0,
+        "coverage floor failed: expected at least one deferred (mid-stream) definition install \
+         across 500 samples:\n{coverage}"
+    );
+}
+
+/// Improvement-plan task E3's coverage floor, restart half:
+/// `program_with_client_restart` must actually schedule a restart across
+/// enough samples.
+#[test]
+fn client_restarts_actually_get_drawn() {
+    let mut runner = TestRunner::default();
+    let strategy = program_with_client_restart(true);
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    assert!(
+        coverage.client_restarts > 0,
+        "coverage floor failed: expected at least one scheduled client restart across 500 \
+         samples:\n{coverage}"
+    );
+}
+
+/// Improvement-plan task E3's coverage floor, scale-out half: same shape as
+/// `client_restarts_actually_get_drawn` above, over `program_with_scale_out`.
+#[test]
+fn client_scale_outs_actually_get_drawn() {
+    let mut runner = TestRunner::default();
+    let strategy = program_with_scale_out(true);
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    assert!(
+        coverage.client_scale_outs > 0,
+        "coverage floor failed: expected at least one scheduled client scale-out across 500 \
+         samples:\n{coverage}"
+    );
+}
+
+/// Improvement-plan task E6's coverage floor, TRUNCATE half: the *default*
+/// strategy (`trivial_program`, not a dedicated one — `Mutate::Truncate` is
+/// drawn by the same shared `mutate()` strategy every other `Mutate` variant
+/// is) must sometimes draw a `Truncate` op across enough samples.
+#[test]
+fn trivial_program_sometimes_draws_a_truncate() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    assert!(
+        coverage.ops_by_kind.get("Truncate").copied().unwrap_or(0) > 0,
+        "coverage floor failed: expected at least one Truncate op across 500 samples:\n{coverage}"
+    );
+}
+
+/// Improvement-plan task E6's coverage floor, bulk-insert half:
+/// `bulk_insert_program`'s row-count dimension must actually get
+/// meaningfully large (not just "sometimes more than 1") across its shrink
+/// range — sampled the same way as the other floor tests above, checking
+/// `Coverage::max_bulk_insert_rows` against a threshold well above
+/// `MAX_SEED_ROWS`/`MAX_MUTATES`-scale counts so this floor could only pass
+/// if the dimension is real.
+#[test]
+fn bulk_insert_row_count_gets_meaningfully_large() {
+    let mut runner = TestRunner::default();
+    let strategy = bulk_insert_program();
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    assert!(
+        coverage.max_bulk_insert_rows > 100,
+        "coverage floor failed: expected a bulk insert of more than 100 rows across 500 \
+         samples:\n{coverage}"
     );
 }

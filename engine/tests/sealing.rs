@@ -195,6 +195,122 @@ async fn the_phase_gap_writer_is_claimed_exactly_once() {
     assert_claimed_exactly_once(&sealer, &[1, 2], "phase-gap").await;
 }
 
+/// Regression test for a real bug the generative suite's client-restart/
+/// scale-out lifecycle properties found: `seal::seal_if_active_nonempty` —
+/// the entry point `client::maintenance_loop` actually calls, not the bare
+/// `seal_phase1`/`seal_phase2` pair the tests above drive directly — used to
+/// refuse to seal an *empty* active segment unconditionally. That is right
+/// for the ordinary idle case, but wrong the moment the segment it's about
+/// to become the successor of is stranding a still-unfenced phase-gap
+/// straggler (same race as [`the_phase_gap_writer_is_claimed_exactly_once`]
+/// above): nothing else will ever force that successor's own fence to be
+/// captured if the ring goes quiet right after, so the straggler — sitting
+/// in a slot whose owning segment already reports `state = 'drained'` — is
+/// silently stranded forever, never folded into any target
+/// (`converge::converged_through`'s condition 3 doesn't treat a `'drained'`
+/// segment's slot as pending either, so this was also a false "converged").
+/// See `generative/tests/client_lifecycle.rs` and
+/// `generative/src/generate/mod.rs`'s `program_with_client_restart`/
+/// `program_with_scale_out` doc comments for the full investigation history:
+/// both a client restart and a scale-out were found to reproduce this, not
+/// because either is special, but because both perturb timing enough to
+/// make this always-latent race common.
+#[tokio::test]
+async fn an_empty_active_segment_still_seals_to_catch_a_stranded_straggler() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+
+    // Segment 1's own fence, S_1, is captured while nothing has yet
+    // committed into its slot beyond genesis — an ordinary, uneventful seal.
+    let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
+    assert_eq!(outcome.sealed_seg_seq, 1);
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq)
+        .await
+        .expect("seal phase 2");
+
+    // A straddler resolves the pointer as segment 1 (reading it before the
+    // flip above) and only commits into slot 0 now, after S_1 was already
+    // captured — invisible in S_1 forever, by construction.
+    let straddler = connect_raw(db.dsn()).await;
+    insert_recompute(&straddler, "seg_0", "stranded").await;
+
+    // Stand in for #14/#15's real apply-and-mark: everything segment 1
+    // *could* see has already drained, so it reports `'drained'` — exactly
+    // like the real bug, where a tiny batch drains almost instantly. The
+    // straddler landed in its slot regardless, and segment 1's own fence
+    // (already published) can never be made to include it.
+    sealer
+        .execute(
+            "update segments set state = 'drained' where seg_seq = $1",
+            &[&outcome.sealed_seg_seq],
+        )
+        .await
+        .expect("mark segment 1 drained");
+
+    // The active segment (2) is genuinely empty — nothing else has happened
+    // since the flip. The old, unconditional "only seal if non-empty" guard
+    // would return `Ok(None)` here and never look back, stranding the
+    // straddler for good.
+    let sealed = seal::seal_if_active_nonempty(&mut sealer)
+        .await
+        .expect("seal_if_active_nonempty");
+    assert!(
+        sealed.is_some(),
+        "an empty active segment must still seal when its predecessor is stranding an unfenced \
+         straggler — otherwise nothing ever captures the fence that would catch it"
+    );
+    let outcome2 = sealed.expect("checked above");
+    assert_eq!(outcome2.sealed_seg_seq, 2);
+
+    // `seal_if_active_nonempty` runs phase 2 itself (unlike bare
+    // `seal_phase1`), so segment 2's fence already exists — the straggler is
+    // claimable right away via the both-slots read.
+    assert_claimed_exactly_once(&sealer, &[1, 2], "stranded").await;
+}
+
+/// The companion negative control: an empty active segment whose
+/// predecessor has nothing unfenced left in its slot (the ordinary idle-tail
+/// case — every real system reaches this state at the end of any burst of
+/// traffic) must *not* seal. Without this, [`an_empty_active_segment_still_seals_to_catch_a_stranded_straggler`]'s
+/// fix could regress into resealing empty segments forever on a genuinely
+/// idle ring — the exact busy-loop
+/// docs/staging-and-claiming/03-sealing-and-the-fence.md's "Who seals, and
+/// when" section calls out as the reason seal-on-demand only fires for a
+/// non-empty active segment in the first place.
+#[tokio::test]
+async fn an_empty_active_segment_with_a_fully_fenced_predecessor_does_not_seal() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+
+    // An entirely ordinary row, present before the seal — genuinely visible
+    // in segment 1's own fence, not a straggler at all.
+    insert_recompute(&sealer, "seg_0", "ordinary").await;
+    let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq)
+        .await
+        .expect("seal phase 2");
+    sealer
+        .execute(
+            "update segments set state = 'drained' where seg_seq = $1",
+            &[&outcome.sealed_seg_seq],
+        )
+        .await
+        .expect("mark segment 1 drained");
+
+    // The active segment (2) is empty, and segment 1 has nothing unfenced
+    // left to catch — sealing now would be pure, unbounded busy-work.
+    let sealed = seal::seal_if_active_nonempty(&mut sealer)
+        .await
+        .expect("seal_if_active_nonempty");
+    assert!(
+        sealed.is_none(),
+        "an empty active segment with a fully-fenced predecessor must not seal — nothing to \
+         catch, and sealing anyway would busy-loop an idle ring forever"
+    );
+}
+
 #[tokio::test]
 async fn the_high_xid_writer_is_claimed_exactly_once_via_the_xmax_fix() {
     let cluster = TestCluster::start();

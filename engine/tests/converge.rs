@@ -201,6 +201,82 @@ async fn the_band_would_lie_the_slot_does_not() {
     );
 }
 
+/// Regression test for a real bug the generative suite's client-restart/
+/// scale-out lifecycle properties found: a `'drained'` segment used to clear
+/// *every* row in its slot unconditionally, including a phase-gap straggler
+/// (docs/staging-and-claiming/03-sealing-and-the-fence.md, "The scoping bug
+/// worth knowing about") that landed there *after* the segment's own fence
+/// was captured — such a row can never become visible in that immutable
+/// fence, so it is never folded into anything by *this* segment, and only
+/// the immediate successor's own fenced read (once that successor itself
+/// seals) can ever pick it up. If the segment's apply-and-mark nonetheless
+/// reaches `'drained'` (real for a tiny batch: everything it *could* see
+/// drains almost instantly) before that successor seal happens,
+/// `converged_through` used to report `true` — a straggler with no target
+/// write yet, silently misreported as fully converged. See
+/// `generative/tests/client_lifecycle.rs` and
+/// `generative/src/generate/mod.rs`'s `program_with_client_restart`/
+/// `program_with_scale_out` doc comments for the full investigation
+/// history, and `engine/tests/sealing.rs`'s
+/// `an_empty_active_segment_still_seals_to_catch_a_stranded_straggler` for
+/// the other half of the fix (making sure that successor seal actually
+/// happens).
+#[tokio::test]
+async fn a_drained_slots_unfenced_straggler_still_gates_convergence() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    seed_progress(&client, "slot1", 1000).await;
+
+    // Nothing in the active segment yet; seal it as-is, capturing S_1 over
+    // an empty slot.
+    let sealed_seg_seq = seal_active_segment(&mut client).await;
+
+    // A straggler lands directly in the now-sealed slot, after S_1 was
+    // captured — genuinely invisible in S_1 forever, the same shape
+    // `sealing.rs`'s phase-gap/straddler tests produce via real timing.
+    insert_with_origin(&client, "seg_0", "stranded", Some(10)).await;
+
+    let token = PgLsn::from(50);
+    assert!(
+        !converge::converged_through(&client, token)
+            .await
+            .expect("converged_through"),
+        "a freshly-sealed (not yet drained) slot must still gate on its own straggler"
+    );
+
+    // Stand in for #14/#15's real apply-and-mark: segment 1 has finished
+    // applying everything *it* could see and reports `'drained'` — but the
+    // straggler was never visible in S_1, so nothing has actually applied
+    // it yet.
+    set_segment_state(&client, sealed_seg_seq, "drained").await;
+    assert!(
+        !converge::converged_through(&client, token)
+            .await
+            .expect("converged_through"),
+        "a 'drained' owner must not clear a row it never actually saw — only a row genuinely \
+         visible in its own fence stops gating"
+    );
+
+    // Once the straggler is actually resolved — the successor's own fold
+    // claims it and it is retired out of the ring, exactly like any other
+    // fully-processed row — nothing is left to gate on. Simulated directly
+    // here (retirement's own truncate-then-delete is `retire.rs`'s concern,
+    // already covered there) rather than running the full claim/apply
+    // pipeline this module doesn't otherwise exercise.
+    client
+        .execute("truncate seg_0", &[])
+        .await
+        .expect("truncate seg_0");
+    assert!(
+        converge::converged_through(&client, token)
+            .await
+            .expect("converged_through"),
+        "once the straggler is gone (resolved and retired), the slot must stop gating"
+    );
+}
+
 #[tokio::test]
 async fn a_part_drained_batch_reports_its_whole_slot_pending() {
     let cluster = TestCluster::start();

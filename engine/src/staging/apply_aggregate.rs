@@ -226,14 +226,27 @@ pub(super) fn classify_fields(
 /// `apply_aggregate_target`'s doc comment on why letting Postgres do the
 /// arithmetic sidesteps that rather than growing `Numeric` for it).
 ///
-/// An entry only exists in [`GroupPlan::field_accum`] for a field that
-/// actually had *some* activity this batch (see [`accumulate_changes`]'s
-/// per-change cancellation) — a field with no entry is left untouched by
-/// [`apply_aggregate_target`], which both suppresses a true no-op write and
-/// preserves Postgres's "sum of zero non-null values is NULL" rule (a
-/// brand-new group whose only rows have a NULL argument gets no entry at
-/// all, so its column is left at its default `NULL` rather than a
-/// synthesized `0`).
+/// An entry only exists in [`GroupPlan::field_accum`] for a field whose
+/// group was actually touched by a row entering, leaving, or (for an
+/// in-place update to the same group) genuinely changing its contribution
+/// this batch (see [`accumulate_changes`]'s per-change cancellation) — a
+/// field with no entry at all is left untouched by [`apply_aggregate_target`],
+/// which suppresses a true no-op write for a group nothing here ever
+/// touched. Critically, this is *presence*, not *non-emptiness*: a row
+/// entering or leaving the group always gets an entry for every
+/// `Sum`/`Avg`/`Count` field (via [`add_contributions`]/[`sub_contributions`]),
+/// even when that row's own contribution is NULL and so pushes nothing into
+/// either `adds` or `subs` — an empty pair is a legitimate zero-effect delta
+/// (`sum_array_expr`'s `coalesce(sum(v), 0)` reduces it to `0`, and the
+/// accompanying zero net count then yields Postgres's own "sum of zero
+/// non-null values is NULL" rule downstream in [`upsert_group`]), not an
+/// absent one. This distinction is exactly what fixed issue #11 review
+/// finding #3: a brand-new group whose only row has a NULL `SUM`/`AVG`
+/// argument, and no `MIN`/`MAX`/`COUNT` field to otherwise anchor a write,
+/// used to get *no* `field_accum` entry at all (the old code only inserted
+/// one for a non-NULL contribution), so [`group_has_activity`] saw no
+/// activity and the group's target row was never written — not merely left
+/// at a wrong value, but silently never created.
 #[derive(Debug, Clone, Default)]
 struct FieldAccum {
     adds: Vec<String>,
@@ -584,6 +597,14 @@ pub(super) fn accumulate_changes(
     Ok(())
 }
 
+/// Registers `contrib`'s row as having entered `group`: every `Sum`/`Avg`/
+/// `Count` field always gets a [`FieldAccum`] entry (even one that stays
+/// empty, when this row's own contribution is NULL) — the entry's mere
+/// *presence* is what tells [`group_has_activity`]/[`upsert_group`] "a live
+/// row touched this field's group this batch," independent of whether that
+/// row happened to add anything to `adds`. See [`FieldAccum`]'s doc comment
+/// for why an empty pair is a legitimate zero-effect delta, not a reason to
+/// skip the entry entirely.
 fn add_contributions(
     fields: &[AggFieldPlan],
     group: &mut GroupPlan,
@@ -596,17 +617,16 @@ fn add_contributions(
         ) {
             continue;
         }
+        let accum = group.field_accum.entry(field.name.clone()).or_default();
         if let Some(v) = contrib.get(&field.name).cloned().flatten() {
-            group
-                .field_accum
-                .entry(field.name.clone())
-                .or_default()
-                .adds
-                .push(v);
+            accum.adds.push(v);
         }
     }
 }
 
+/// [`add_contributions`]'s counterpart for a row leaving `group` — see that
+/// function's doc comment; the same "always register the entry, only
+/// conditionally push into it" rule applies here for `subs`.
 fn sub_contributions(
     fields: &[AggFieldPlan],
     group: &mut GroupPlan,
@@ -619,13 +639,9 @@ fn sub_contributions(
         ) {
             continue;
         }
+        let accum = group.field_accum.entry(field.name.clone()).or_default();
         if let Some(v) = contrib.get(&field.name).cloned().flatten() {
-            group
-                .field_accum
-                .entry(field.name.clone())
-                .or_default()
-                .subs
-                .push(v);
+            accum.subs.push(v);
         }
     }
 }

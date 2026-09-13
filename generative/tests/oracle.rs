@@ -43,6 +43,7 @@ fn numeric_add_program() -> (Program, TransformDef, Table, String) {
     let program = Program {
         tables: vec![source.clone()],
         defs: vec![def.clone()],
+        def_install_after_op: vec![0],
         ops: vec![
             Op::Insert {
                 table: source.name.clone(),
@@ -63,6 +64,8 @@ fn numeric_add_program() -> (Program, TransformDef, Table, String) {
                 expect: OpOutcome::Succeeds,
             },
         ],
+        restart_after_ops: Vec::new(),
+        scale_out_after_ops: Vec::new(),
     };
 
     (program, def, source.clone(), target_name)

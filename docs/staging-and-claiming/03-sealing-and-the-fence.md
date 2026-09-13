@@ -181,8 +181,38 @@ inserting an already-taken `seg_seq`.
 
 **There is no timer.** A worker that finds nothing claimable and sees rows in the
 active segment seals it on demand, then retries the claim exactly once. The
-busy-loop guard is structural: it seals only a *non-empty* active segment, at
-most one seal per drain call.
+busy-loop guard is structural: it seals only a *non-empty* active segment — **or**
+an empty one whose immediate predecessor is still stranding a phase-gap straggler
+(below) — at most one seal per drain call either way.
+
+### The phase-gap straggler this guard used to strand
+
+The scoping bug above (predecessor-half `NOT visible in S_{k-1}`) is what lets a
+phase-gap writer land in `slot_k` *before* `S_k` is captured get folded in by
+batch *k*. A writer can also land in `slot_k` **after** `S_k` is captured — it
+read the pointer as *k* under the plain, unlocked read `append` uses (the pointer
+cannot be locked without serializing every writer against every seal — see "Why a
+naïve cut does not work"), and a concurrent seal flipped the pointer away from it
+before its own row committed. By construction such a row can never become visible
+in the now-immutable `S_k`, so the *only* read that can ever fold it in is the
+immediate successor's own both-slots read, via that same predecessor-half union
+clause — and that read only ever runs once the successor, `slot_{k+1}`, itself
+gets sealed.
+
+If nothing else forces that seal — the ring goes quiet right after the straggler
+lands, with no further real traffic — the plain "non-empty" busy-loop guard never
+fires it, `slot_k` reaches `drained` with the straggler still physically sitting
+in it, and nothing ever revisits the slot again. The fix is the second seal
+condition above: an empty active segment still seals when its immediate
+predecessor has a row that isn't visible in that predecessor's own published
+fence. This is self-limiting, not a reintroduction of the busy loop it guards
+against — it only ever fires while the *current* active segment's immediate
+predecessor genuinely has such a row, so once that row is folded in by the seal
+this triggers, the next active segment's own (different, fully-fenced)
+predecessor no longer qualifies. [07](07-convergence-and-await.md)'s condition 3
+has the matching other half: a `'drained'` slot owner does not, on its own, stop
+gating a row that was never actually visible in that owner's own fence — only a
+row that *was* visible in it may stop being pending on that basis.
 
 Seal-on-demand is deliberate. A fixed roll cadence (seal every 200 ms, say) makes
 every small change wait for the tick. Instead, **a batch is not a transaction** —

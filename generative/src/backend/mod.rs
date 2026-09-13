@@ -55,4 +55,24 @@ pub trait Backend {
 
     /// Reads back merged source+derived state as a [`Snapshot`].
     fn snapshot(&mut self) -> impl Future<Output = Result<Snapshot, Self::Error>> + Send;
+
+    /// Simulates an ungraceful crash-and-restart of the backend's primary
+    /// engine client (improvement-plan task E3): drops whatever is currently
+    /// running it and starts a fresh one against the same target. A real
+    /// `engine::Client`'s own `Drop` impl already performs a best-effort,
+    /// non-graceful shutdown signal with no draining — this is deliberately
+    /// *not* the graceful `shutdown().await` path — so simply dropping and
+    /// replacing the client is a faithful, free stand-in for "the process
+    /// died", with no subprocess/`SIGKILL` machinery needed. The ring is
+    /// durable Postgres state, not in-memory, so a fresh client is expected to
+    /// pick back up exactly where the crashed one left off: no stuck or lost
+    /// work, no duplicate processing.
+    fn restart(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Starts an additional engine client alongside whatever is already
+    /// running, application-worker-only (never a second staging worker —
+    /// see `engine::client`'s module doc comment: exactly one staging worker
+    /// per fleet), demonstrating multiple clients can coexist draining the
+    /// same ring (improvement-plan task E3).
+    fn scale_out(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

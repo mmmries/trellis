@@ -1,11 +1,29 @@
-//! The manual/single-worker backend (design doc §4 "Two runtimes, one
-//! oracle"): harness-driven, one worker, lockstep apply -> quiesce ->
-//! compare. Drives the real engine as far as its current 1-1/numeric-`+`
-//! subset allows — a real [`engine::Client`] (one staging worker, one
-//! application worker) against a real, already-migrated Postgres database,
-//! reached only over raw source DML (never an application-level notify
-//! API), matching the production ingestion path
+//! The manual backend (design doc §4 "Two runtimes, one oracle"):
+//! harness-driven, lockstep apply -> quiesce -> compare, driven by the
+//! harness rather than a real subprocess-supervised deployment (that's what
+//! "manual" names — the harness itself polls `quiesce()` rather than the
+//! engine notifying it — *not* how many application workers the underlying
+//! [`EngineClient`] runs). Drives the real engine as far as its current
+//! 1-1/numeric-`+` subset allows — a real [`EngineClient`] (one staging
+//! worker, one *or more* application workers — see
+//! [`ManualBackend::connect_with_workers`]/[`ManualBackend::connect_with_options`],
+//! improvement-plan task D4) against a real, already-migrated Postgres
+//! database, reached only over raw source DML (never an application-level
+//! notify API), matching the production ingestion path
 //! (`docs/data-flow.md#ingestion-via-logical-replication`).
+//!
+//! **D4's "second runtime" is this same type, just started with more than one
+//! application worker** — not a separate `ConcurrentBackend` type. Nothing in
+//! `ManualBackend` (DDL rendering, DML rendering, `quiesce`, `snapshot`)
+//! assumes a single worker; the worker count only ever mattered to one line
+//! inside [`Backend::install`] that hardcoded `application_threads: 1`. A
+//! second type would have had to duplicate this module's substantial
+//! rendering logic (`render_definition`/`render_expr`/`read_table`/
+//! `read_aggregate_table`, none of which is worker-count-dependent) for zero
+//! behavioral difference; a parameterized constructor shares all of it and
+//! keeps exactly one implementation of the seam's DDL/DML/read-back logic to
+//! maintain. See `generative/tests/concurrent_convergence.rs` for the new,
+//! separate property/test file this constructor is meant to be driven from.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -20,7 +38,9 @@ use engine::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
 use tokio_postgres::NoTls;
 
 use super::Snapshot;
-use crate::model::{Column, Op, Program, Table, group_key};
+use crate::model::{
+    Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Table, group_key,
+};
 
 /// How long [`ManualBackend::quiesce`] waits for convergence before giving
 /// up. Generous: this backend targets correctness, not latency, and a
@@ -42,6 +62,13 @@ pub enum ManualBackendError {
     /// not name, so this stays enforced if a "point at an existing cluster"
     /// mode is ever added.
     UnnamedTarget,
+    /// [`ManualBackend::restart`] was called before [`ManualBackend::install`]
+    /// ever started a primary engine client — nothing to restart. A generator
+    /// bug (improvement-plan task E3's `restart_after_ops` is only ever
+    /// nonzero on a program that also has at least one table, so `install`
+    /// always starts a client before any restart point is reached), not a
+    /// condition a caller should need to handle gracefully.
+    NoClientStarted,
     Config(engine::Error),
     Client(ClientError),
     Catalog(CatalogError),
@@ -188,6 +215,68 @@ fn render_operator(op: Operator) -> &'static str {
     }
 }
 
+/// Renders one [`NoiseAction`] to the SQL text [`ManualBackend::fire_noise_event`]
+/// runs directly (task E1) — the noise-table analog of [`render_definition`]/
+/// [`render_expr`], but for plain DDL/DML rather than a `TRANSFORM`
+/// definition. `Insert`/`Update` target `table.columns[1]` by name (falling
+/// back to the pk column if `table` is somehow columnless) — the one non-pk
+/// column every noise table `crate::generate::noise_table` builds gives it —
+/// so this works for any single-extra-column noise table shape without
+/// needing to know that column's name in advance.
+fn render_noise_action(table: &Table, action: &NoiseAction) -> String {
+    let value_col = table
+        .columns
+        .get(1)
+        .map(|c| c.name.as_str())
+        .unwrap_or(&table.pk_col);
+    match action {
+        NoiseAction::Insert { pk, value } => format!(
+            "insert into {} ({}, {}) values ({pk}, {})",
+            quote_ident(&table.name),
+            quote_ident(&table.pk_col),
+            quote_ident(value_col),
+            noise_sql_literal(value),
+        ),
+        NoiseAction::Update { pk, value } => format!(
+            "update {} set {} = {} where {} = {pk}",
+            quote_ident(&table.name),
+            quote_ident(value_col),
+            noise_sql_literal(value),
+            quote_ident(&table.pk_col),
+        ),
+        NoiseAction::Delete { pk } => format!(
+            "delete from {} where {} = {pk}",
+            quote_ident(&table.name),
+            quote_ident(&table.pk_col),
+        ),
+        NoiseAction::AddColumn { name, value_type } => format!(
+            "alter table {} add column {} {}",
+            quote_ident(&table.name),
+            quote_ident(name),
+            pg_type_name(*value_type),
+        ),
+        NoiseAction::DropColumn { name } => format!(
+            "alter table {} drop column {}",
+            quote_ident(&table.name),
+            quote_ident(name),
+        ),
+    }
+}
+
+/// A SQL literal for a noise [`NoiseAction`] value: `NULL`, or a
+/// single-quoted, escaped text literal. Used unconditionally regardless of
+/// the target column's declared type: an untyped string literal in an
+/// `INSERT`/`UPDATE`'s value position is coerced to whatever the target
+/// column's real type is (standard Postgres literal-type inference), so this
+/// needs no type dispatch of its own the way [`Assignment`]'s real-op
+/// rendering does with its explicit `::text::<type>` casts.
+fn noise_sql_literal(value: &Option<String>) -> String {
+    match value {
+        None => "NULL".to_string(),
+        Some(text) => format!("'{}'", text.replace('\'', "''")),
+    }
+}
+
 /// One row's placeholder assignment for an `INSERT`/`UPDATE` statement:
 /// `column = $n::type` (or `column` for the column list), plus the bound
 /// text value at that position.
@@ -196,23 +285,54 @@ struct Assignment {
     value: Option<String>,
 }
 
-/// The manual/single-worker backend. Owns a raw connection (DDL, DML,
-/// watermark reads, snapshot reads) and, once [`ManualBackend::install`]
-/// has run, a live [`EngineClient`] draining sealed batches into every
-/// installed definition's target table.
+/// The manual backend. Owns a raw connection (DDL, DML, watermark reads,
+/// snapshot reads) and, once [`ManualBackend::install`] has run, a live
+/// [`EngineClient`] draining sealed batches into every installed
+/// definition's target table.
 pub struct ManualBackend {
     dsn: String,
     pool: Pool,
     raw: tokio_postgres::Client,
     engine_client: Option<EngineClient>,
+    /// The options the primary `engine_client` was started with — remembered
+    /// so [`ManualBackend::restart`] (improvement-plan task E3) can start a
+    /// fresh client against the exact same target rather than needing the
+    /// caller to hand the options back in.
+    client_options: Option<ClientOptions>,
+    /// Additional application-worker-only clients started by
+    /// [`ManualBackend::scale_out`] (improvement-plan task E3). Kept alive for
+    /// the backend's own lifetime (dropped, and so best-effort-signalled to
+    /// stop, only when `self` is) — nothing here ever reads back out of this
+    /// list, it exists purely so these clients keep running and aren't
+    /// dropped the instant `scale_out` returns.
+    scale_out_clients: Vec<EngineClient>,
     tables: HashMap<String, Table>,
     defs: Vec<TransformDef>,
+    /// How many application-worker tasks [`Backend::install`] starts the
+    /// underlying [`EngineClient`] with (improvement-plan task D4). `1` for
+    /// every existing single-worker caller (unchanged default via
+    /// [`ManualBackend::connect`]); `>1` is the "second runtime"
+    /// `generative/tests/concurrent_convergence.rs` drives.
+    application_threads: usize,
+    /// How often the underlying `EngineClient`'s maintenance loop
+    /// (seal/recover/reclaim) ticks — see [`ClientOptions::maintenance_interval`].
+    /// Left at the engine's own default for every existing caller;
+    /// overridable via [`ManualBackend::connect_with_options`] so a
+    /// hand-built pin can widen it comfortably past how long a large burst of
+    /// raw DML takes to apply, guaranteeing every row of that burst lands in
+    /// the *same* sealed batch instead of splitting across an arbitrary
+    /// number of 300ms-apart maintenance ticks (see the D4 hand-built
+    /// "genuinely exceeds `MIN_ROWS_TO_SPLIT`" pin in
+    /// `generative/tests/concurrent_convergence.rs`).
+    maintenance_interval: Duration,
 }
 
 impl ManualBackend {
     /// Connects to `dsn` — an already-migrated Trellis database (see
     /// `testkit::TestCluster::create_isolated_database`) — but installs
-    /// nothing yet.
+    /// nothing yet. One application worker, the engine's default maintenance
+    /// cadence — see [`ManualBackend::connect_with_options`] for a backend
+    /// that can widen either.
     ///
     /// `dsn` must be given explicitly by the caller (never inferred from an
     /// environment default): design doc §6 wants every run to refuse an
@@ -221,11 +341,50 @@ impl ManualBackend {
     /// is ever added. The resolved target is printed so a run's connection
     /// is never silently ambiguous.
     pub async fn connect(dsn: impl Into<String>) -> Result<Self, ManualBackendError> {
+        Self::connect_with_options(dsn, 1, None).await
+    }
+
+    /// Like [`ManualBackend::connect`], but starts the underlying
+    /// [`EngineClient`] with `application_threads` app-worker tasks instead
+    /// of a hardcoded `1` (improvement-plan task D4's "second runtime" —
+    /// same `Backend` seam, same DDL/DML/quiesce/snapshot code, a real
+    /// multi-worker pool underneath). The engine's default maintenance
+    /// cadence is unchanged; see [`ManualBackend::connect_with_options`] if a
+    /// caller also needs to widen that (e.g. to force a large hand-built
+    /// burst into one sealed batch).
+    pub async fn connect_with_workers(
+        dsn: impl Into<String>,
+        application_threads: usize,
+    ) -> Result<Self, ManualBackendError> {
+        Self::connect_with_options(dsn, application_threads, None).await
+    }
+
+    /// [`ManualBackend::connect`]'s general form: `application_threads`
+    /// app-worker tasks, and — when `maintenance_interval` is `Some` — the
+    /// underlying [`EngineClient`]'s maintenance-loop cadence overridden from
+    /// [`ClientOptions`]'s own default (300ms). `None` keeps the engine's
+    /// default, exactly like [`ManualBackend::connect`]/
+    /// [`ManualBackend::connect_with_workers`].
+    ///
+    /// `dsn` must be given explicitly by the caller (never inferred from an
+    /// environment default): design doc §6 wants every run to refuse an
+    /// unnamed target, moot today since `testkit` always hands one over
+    /// explicitly, but enforced so it stays moot if an external-cluster mode
+    /// is ever added. The resolved target is printed so a run's connection
+    /// is never silently ambiguous.
+    pub async fn connect_with_options(
+        dsn: impl Into<String>,
+        application_threads: usize,
+        maintenance_interval: Option<Duration>,
+    ) -> Result<Self, ManualBackendError> {
         let dsn = dsn.into();
         if dsn.trim().is_empty() {
             return Err(ManualBackendError::UnnamedTarget);
         }
-        println!("generative: connecting ManualBackend to {dsn}");
+        println!(
+            "generative: connecting ManualBackend to {dsn} ({application_threads} application \
+             worker(s))"
+        );
         let config = Config::from_dsn(dsn.clone())?;
         let pool = Pool::new(&config)?;
 
@@ -241,9 +400,37 @@ impl ManualBackend {
             pool,
             raw,
             engine_client: None,
+            client_options: None,
+            scale_out_clients: Vec::new(),
             tables: HashMap::new(),
             defs: Vec::new(),
+            application_threads,
+            maintenance_interval: maintenance_interval
+                .unwrap_or_else(|| ClientOptions::default().maintenance_interval),
         })
+    }
+
+    /// Diagnostic-only (improvement-plan task D4): the largest `bucket_count`
+    /// across every segment sealed so far, straight from
+    /// `engine::staging::claim`'s partition decision (`segments.bucket_count`,
+    /// fixed at seal time from row count alone — see
+    /// `engine::staging::claim::MIN_ROWS_TO_SPLIT`/`SEG_BUCKETS`). `0` if no
+    /// segment has sealed yet.
+    ///
+    /// This module is the one place the backend seam (its own doc comment)
+    /// allows to know the `segments` table exists at all — everything outside
+    /// it, including `generative/tests/concurrent_convergence.rs`'s hand-built
+    /// "a big batch really gets split across workers" pin, reaches this fact
+    /// only through this method, never by querying `segments` itself.
+    pub async fn max_bucket_count(&self) -> Result<i64, ManualBackendError> {
+        let row = self
+            .raw
+            .query_one(
+                "select coalesce(max(bucket_count)::int8, 0) from segments",
+                &[],
+            )
+            .await?;
+        Ok(row.get(0))
     }
 
     async fn create_source_table(&self, table: &Table) -> Result<(), ManualBackendError> {
@@ -348,6 +535,63 @@ impl ManualBackend {
             value: value.clone(),
         }
     }
+
+    /// Creates a table with the exact same DDL shape [`ManualBackend::install`]
+    /// gives a real source table (task E1: untracked-object noise) —
+    /// including the same unconditional `replica identity full` (harmless,
+    /// and keeps this table indistinguishable from a real one at the DDL
+    /// level) — but never registers it in `self.tables` and never hands its
+    /// name to the engine's `ClientOptions.source_tables`. Those are the
+    /// only two places a table needs to appear to be "tracked" by this
+    /// backend or watched by the engine (see [`ManualBackend::install`]/
+    /// [`ManualBackend::snapshot`]), and `run::check_program`'s oracle never
+    /// looks at "every table in the schema" either — it only ever resolves a
+    /// definition's source/target through `Program.tables`/`Program.defs`
+    /// (see that function's own doc comment) — so a table installed this way
+    /// is structurally invisible to every check this suite runs, regardless
+    /// of what DML/DDL later targets it, or what its name/columns happen to
+    /// look like.
+    pub async fn install_noise_table(&mut self, table: &Table) -> Result<(), ManualBackendError> {
+        self.create_source_table(table).await
+    }
+
+    /// Runs one arbitrary SQL statement directly against this backend's own
+    /// connection, bypassing [`ManualBackend::apply`]'s op-shaped DML
+    /// entirely (task E1 noise DDL/DML; task E5's `CHECKPOINT`). Returns the
+    /// statement's affected-row count (`0` for a DDL statement or
+    /// `CHECKPOINT`, same as any other statement that doesn't affect table
+    /// rows).
+    pub async fn execute_raw(&self, sql: &str) -> Result<u64, ManualBackendError> {
+        Ok(self.raw.execute(sql, &[]).await?)
+    }
+
+    /// Fires one [`NoiseEvent`]'s [`NoiseEventKind`]: renders it to SQL text
+    /// ([`render_noise_action`] for a `Table` event, used as-is for an
+    /// `Admin` one) and runs it via [`ManualBackend::execute_raw`]. Errors
+    /// are swallowed (logged to stderr, never returned) — noise/
+    /// administration is deliberately allowed to fail (e.g. a `DROP COLUMN`
+    /// on a column an earlier event already dropped) without that ever
+    /// counting as a run failure; the whole point of tasks E1/E5 is that
+    /// nothing here can affect the tracked convergence check regardless of
+    /// whether it succeeds.
+    pub async fn fire_noise_event(&self, table: Option<&Table>, event: &NoiseEvent) {
+        let sql = match &event.kind {
+            NoiseEventKind::Admin(sql) => sql.clone(),
+            NoiseEventKind::Table(action) => {
+                let Some(table) = table else {
+                    eprintln!(
+                        "generative: noise event {event:?} names a Table(..) action but no \
+                         noise table was installed — skipping"
+                    );
+                    return;
+                };
+                render_noise_action(table, action)
+            }
+        };
+        if let Err(err) = self.execute_raw(&sql).await {
+            eprintln!("generative: noise statement {sql:?} failed (expected/ignored): {err:?}");
+        }
+    }
 }
 
 impl super::Backend for ManualBackend {
@@ -371,12 +615,17 @@ impl super::Backend for ManualBackend {
         if !source_tables.is_empty() && self.engine_client.is_none() {
             let options = ClientOptions {
                 staging_worker: true,
-                application_threads: 1,
+                application_threads: self.application_threads,
                 source_tables,
+                maintenance_interval: self.maintenance_interval,
                 ..Default::default()
             };
-            let client = EngineClient::start(self.dsn.clone(), options)?;
+            let client = EngineClient::start(self.dsn.clone(), options.clone())?;
             self.engine_client = Some(client);
+            // Remembered so `restart` (improvement-plan task E3) can start an
+            // equivalent replacement client without the caller needing to
+            // hand these options back in.
+            self.client_options = Some(options);
         }
         Ok(())
     }
@@ -482,6 +731,90 @@ impl super::Backend for ManualBackend {
                 );
                 self.raw.execute(&sql, &[pk]).await?
             }
+            Op::Truncate { table, .. } => {
+                // Improvement-plan task E6's load-bearing gotcha: Postgres's
+                // `TRUNCATE` command tag always reports `0` rows affected,
+                // regardless of how many rows actually existed — trusting
+                // that raw count into `run_convergence`'s
+                // `Ok(0) => AffectsNoRows` classifier would misclassify every
+                // non-empty truncate as a no-op, defeating "operation errors
+                // are checked, not swallowed" for this op entirely. So the
+                // real row count is synthesized here instead: a `SELECT
+                // count(*)` in the *same transaction* as the `TRUNCATE`,
+                // taken before it runs, so nothing can slip a concurrent
+                // write in between the count and the clear (moot for this
+                // single-threaded harness, but it's the honest way to make
+                // "the count reflects what actually got cleared" true by
+                // construction rather than by accident of timing).
+                let quoted = quote_ident(table);
+                let txn = self.raw.transaction().await?;
+                let count_row = txn
+                    .query_one(&format!("select count(*) from {quoted}"), &[])
+                    .await?;
+                let count: i64 = count_row.get(0);
+                txn.batch_execute(&format!("truncate table {quoted}"))
+                    .await?;
+                txn.commit().await?;
+                count as u64
+            }
+            Op::BulkInsert { table, rows, .. } => {
+                let Some(first_row) = rows.first() else {
+                    // An empty `rows` is a generator bug (there is no valid
+                    // SQL "insert zero rows" via a VALUES list) — not a
+                    // condition this backend should paper over by silently
+                    // doing nothing.
+                    panic!(
+                        "ManualBackend::apply: Op::BulkInsert against table {table:?} carries no \
+                         rows — a generator bug"
+                    );
+                };
+                let columns: Vec<&str> = first_row.iter().map(|(c, _)| c.as_str()).collect();
+                let column_list = columns
+                    .iter()
+                    .map(|c| quote_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let mut placeholder_groups = Vec::with_capacity(rows.len());
+                let mut params: Vec<Option<String>> =
+                    Vec::with_capacity(rows.len() * columns.len());
+                for row in rows {
+                    let row_columns: Vec<&str> = row.iter().map(|(c, _)| c.as_str()).collect();
+                    assert_eq!(
+                        row_columns, columns,
+                        "ManualBackend::apply: every Op::BulkInsert row must carry the same \
+                         columns in the same order as the first row — a generator bug (table \
+                         {table:?})"
+                    );
+                    let placeholders: Vec<String> = row
+                        .iter()
+                        .map(|(col, val)| {
+                            params.push(val.clone());
+                            format!(
+                                "${}::text::{}",
+                                params.len(),
+                                pg_type_name(
+                                    self.column(table, col)
+                                        .map(|c| c.value_type)
+                                        .unwrap_or(ValueType::Numeric)
+                                )
+                            )
+                        })
+                        .collect();
+                    placeholder_groups.push(format!("({})", placeholders.join(", ")));
+                }
+
+                let sql = format!(
+                    "insert into {} ({column_list}) values {}",
+                    quote_ident(table),
+                    placeholder_groups.join(", ")
+                );
+                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+                    .iter()
+                    .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+                    .collect();
+                self.raw.execute(&sql, &params).await?
+            }
         };
         Ok(affected)
     }
@@ -549,6 +882,48 @@ impl super::Backend for ManualBackend {
         }
 
         Ok(snapshot)
+    }
+
+    /// Improvement-plan task E3: drops the current primary `engine::Client`
+    /// (its own `Drop` impl fires here — best-effort shutdown signal, no
+    /// draining, no join: see the `Backend::restart` doc comment) and starts
+    /// a fresh one against the same dsn/options [`ManualBackend::install`]
+    /// remembered. The ring is durable Postgres state untouched by any of
+    /// this, so the new client resumes exactly where the old one left off.
+    async fn restart(&mut self) -> Result<(), ManualBackendError> {
+        let options = self
+            .client_options
+            .clone()
+            .ok_or(ManualBackendError::NoClientStarted)?;
+        // Dropping the old value here — before starting the replacement —
+        // is what fires `engine::Client`'s `Drop` impl (the crash stand-in);
+        // reassigning below wouldn't run it any differently, but doing it as
+        // its own statement keeps the "crash, then restart" sequencing
+        // explicit rather than implicit in the assignment.
+        self.engine_client = None;
+        let client = EngineClient::start(self.dsn.clone(), options)?;
+        self.engine_client = Some(client);
+        Ok(())
+    }
+
+    /// Improvement-plan task E3: starts an additional, application-worker-only
+    /// (`staging_worker: false`) `engine::Client` against the same dsn,
+    /// alongside whatever primary client `install` already started —
+    /// confirming multiple clients can coexist draining the same ring (the
+    /// module doc comment on `engine::Client` claims this is supported; this
+    /// is where the generative suite exercises that claim). Never touches
+    /// `source_tables`: an application-only client doesn't consult it (see
+    /// `ClientOptions::source_tables`'s own doc comment), so this needs no
+    /// state beyond the dsn.
+    async fn scale_out(&mut self) -> Result<(), ManualBackendError> {
+        let options = ClientOptions {
+            staging_worker: false,
+            application_threads: 1,
+            ..Default::default()
+        };
+        let client = EngineClient::start(self.dsn.clone(), options)?;
+        self.scale_out_clients.push(client);
+        Ok(())
     }
 }
 

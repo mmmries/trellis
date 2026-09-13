@@ -58,6 +58,27 @@ pub struct Coverage {
     /// `BinaryOp` and `FunctionCall` shapes without ever nesting one inside
     /// the other.
     pub max_expr_depth: usize,
+    /// Number of definitions, across every recorded program, whose
+    /// [`Program::def_install_after_op`] entry is nonzero — i.e. actually
+    /// deferred mid-stream rather than installed up front (improvement-plan
+    /// task E2). A floor test over [`crate::generate::program_with_mid_stream_def_install`]
+    /// asserts this is nonzero across enough samples: a coverage bit for "a
+    /// mid-stream install was actually drawn", not just "the strategy exists".
+    pub mid_stream_def_installs: usize,
+    /// Total [`Program::restart_after_ops`] entries across every recorded
+    /// program (improvement-plan task E3) — how many scheduled client
+    /// restarts were actually drawn.
+    pub client_restarts: usize,
+    /// Total [`Program::scale_out_after_ops`] entries across every recorded
+    /// program (improvement-plan task E3) — how many scheduled scale-outs
+    /// were actually drawn.
+    pub client_scale_outs: usize,
+    /// The largest [`Op::BulkInsert`] row count seen across every recorded
+    /// program (improvement-plan task E6) — a floor test asserts this
+    /// actually gets large across enough samples of
+    /// [`crate::generate::bulk_insert_program`], not just that a small one
+    /// occasionally shows up.
+    pub max_bulk_insert_rows: usize,
 }
 
 impl Coverage {
@@ -94,6 +115,22 @@ impl Coverage {
             for column in &table.columns {
                 self.types_exercised
                     .insert(value_type_name(column.value_type));
+            }
+        }
+
+        // Improvement-plan task E2.
+        self.mid_stream_def_installs += program
+            .def_install_after_op
+            .iter()
+            .filter(|&&at| at != 0)
+            .count();
+        // Improvement-plan task E3.
+        self.client_restarts += program.restart_after_ops.len();
+        self.client_scale_outs += program.scale_out_after_ops.len();
+        // Improvement-plan task E6.
+        for op in &program.ops {
+            if let Op::BulkInsert { rows, .. } = op {
+                self.max_bulk_insert_rows = self.max_bulk_insert_rows.max(rows.len());
             }
         }
     }
@@ -149,6 +186,8 @@ fn op_kind(op: &Op) -> &'static str {
         Op::Insert { .. } => "Insert",
         Op::Update { .. } => "Update",
         Op::Delete { .. } => "Delete",
+        Op::Truncate { .. } => "Truncate",
+        Op::BulkInsert { .. } => "BulkInsert",
     }
 }
 
@@ -256,7 +295,15 @@ impl fmt::Display for Coverage {
         }
         writeln!(f)?;
 
-        writeln!(f, "max_expr_depth: {}", self.max_expr_depth)
+        writeln!(f, "max_expr_depth: {}", self.max_expr_depth)?;
+        writeln!(
+            f,
+            "mid_stream_def_installs: {}",
+            self.mid_stream_def_installs
+        )?;
+        writeln!(f, "client_restarts: {}", self.client_restarts)?;
+        writeln!(f, "client_scale_outs: {}", self.client_scale_outs)?;
+        writeln!(f, "max_bulk_insert_rows: {}", self.max_bulk_insert_rows)
     }
 }
 

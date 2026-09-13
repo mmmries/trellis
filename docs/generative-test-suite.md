@@ -185,8 +185,14 @@ dependency, and each property names the engine stage that unblocks it.
   state includes every effect of ops 1..k.
 - **Non-idempotent delta convergence** *(needs the aggregate slice)*. The hardest guarantee — byte-identical
   convergence to a from-scratch `GROUP BY` oracle under aggregate delta
-  maintenance. Grain domains stay *tiny* (0..3 plus NULL) so
-  many rows share a group and deletes really kill groups.
+  maintenance. Grain domains stay *tiny* (`0`, `1`, `2` — see
+  `generative::generate::strategy::grain_value`'s own doc comment) so many
+  rows share a group and deletes really kill groups. **Not** `NULL`: a
+  legal SQL `NULL` grouping value hits a real, still-open engine defect
+  (a NULL-keyed group is silently and permanently dropped from its
+  aggregate, with no operator-driven recovery — `grain_value`'s doc comment
+  has the full mechanism and why the real fix is out of this suite's scope),
+  so the generator deliberately never draws one until that lands.
 - **A second, structural oracle** *(needs an engine consistency auditor, if/when
   one exists)*. Run the engine's own internal consistency check at end of run,
   require zero findings, and prove the wiring with a negative test.

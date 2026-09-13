@@ -71,7 +71,10 @@ async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {
     let source_only = Program {
         tables: vec![source.clone()],
         defs: vec![],
+        def_install_after_op: vec![],
         ops: vec![],
+        restart_after_ops: vec![],
+        scale_out_after_ops: vec![],
     };
     backend
         .install(&source_only)
@@ -109,7 +112,10 @@ async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {
     let def_only = Program {
         tables: vec![],
         defs: vec![def],
+        def_install_after_op: vec![0],
         ops: vec![],
+        restart_after_ops: vec![],
+        scale_out_after_ops: vec![],
     };
     backend
         .install(&def_only)

@@ -146,6 +146,24 @@ pub async fn converged_through(
     // transaction — so a populated slot with no registry row is unreachable.
     // If that ever changed, such orphaned rows would silently *not* gate (the
     // `exists` is false) — a false `converged`.
+    //
+    // **A `'drained'` owner does not, on its own, clear a row.** A phase-gap
+    // straggler (docs/staging-and-claiming/03-sealing-and-the-fence.md, "The
+    // scoping bug worth knowing about") can physically land in `r`'s slot
+    // *after* its owning segment's own fence (`s.fence_snapshot`) was
+    // captured — by construction it can never become visible in that
+    // immutable fence, so `s` can reach `'drained'` (every row *it* actually
+    // scanned got folded and applied) while this one straggler row sits
+    // there, folded by nobody. Only the immediate successor's own fenced
+    // read (`fenced_window`'s predecessor-half union clause) can ever claim
+    // it, and that only runs once the successor itself seals
+    // (`seal::seal_if_active_nonempty`'s straggler-catching case). Until
+    // then this row is still genuinely pending, so a `'drained'` owner only
+    // clears `r` when `r` itself was actually visible in that owner's own
+    // fence — never unconditionally. Without this, a straggler landing right
+    // as the ring goes quiet reports `converged` while its target never gets
+    // written — the exact silent-loss shape this predicate exists to
+    // prevent.
     let condition3 = per_ring_table(" union all ", |slot, table| {
         format!(
             "select 1 from {table} r \
@@ -153,7 +171,11 @@ pub async fn converged_through(
                and (r.origin_lsn is null or r.origin_lsn <= $1) \
                and exists ( \
                    select 1 from segments s \
-                   where s.ring_slot = {slot} and s.state <> 'drained' \
+                   where s.ring_slot = {slot} \
+                     and (s.state <> 'drained' \
+                          or (s.fence_snapshot is not null \
+                              and not pg_visible_in_snapshot( \
+                                  r.row_txid, s.fence_snapshot))) \
                )"
         )
     });

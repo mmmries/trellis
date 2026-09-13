@@ -201,7 +201,10 @@ use std::collections::{HashMap, HashSet};
 
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 
-use crate::model::{NamePool, Op, OpOutcome, Program, Table};
+use crate::model::{
+    Column, NamePool, NoiseAction, NoiseEvent, NoiseEventKind, NoisePlan, Op, OpOutcome, Program,
+    Table,
+};
 
 /// The inclusive upper bound of the calculated-field value domain.
 ///
@@ -321,6 +324,16 @@ pub enum Mutate {
         c1: Option<i64>,
         c2: Option<i64>,
     },
+    /// Clears every row of this table in one statement (improvement-plan task
+    /// E6). Renders to [`Op::Truncate`]. Whether this "affects rows" tracks
+    /// the table's *current* liveness set exactly like every other variant
+    /// here (`OpOutcome::Succeeds` if any pk is still live, `AffectsNoRows`
+    /// if the table happens to already be empty) — but unlike
+    /// `Update`/`Delete`, which touch one pk, this clears every remaining
+    /// live pk at once: [`render_mutate`] empties the whole `live` set, so
+    /// every mutate after a `Truncate` sees an empty table exactly as real
+    /// Postgres would.
+    Truncate,
 }
 
 /// Which of a source table's two aggregated columns (`c1`/`c2`) a generated
@@ -565,6 +578,18 @@ fn render_mutate(mutate: &Mutate, table: &Table, spec: &TableSpec, live: &mut Ha
                 expect,
             }
         }
+        Mutate::Truncate => {
+            let expect = if live.is_empty() {
+                OpOutcome::AffectsNoRows
+            } else {
+                OpOutcome::Succeeds
+            };
+            live.clear();
+            Op::Truncate {
+                table: table_name.clone(),
+                expect,
+            }
+        }
     }
 }
 
@@ -786,7 +811,7 @@ pub fn build_program_multi_with_shapes(
         built_tables.push(source);
     }
 
-    let defs = defs
+    let defs: Vec<TransformDef> = defs
         .iter()
         .map(|(idx, shape)| {
             let source = built_tables.get(*idx).unwrap_or_else(|| {
@@ -876,10 +901,20 @@ pub fn build_program_multi_with_shapes(
         })
         .collect();
 
+    // Improvement-plan task E2: every definition built here installs up
+    // front (`0`) by default — deferring one is [`defer_def_install`]'s job,
+    // layered on top of this builder's output exactly like
+    // [`build_program_multi_with_shapes_and_derived`] layers derived fields
+    // on top of it.
+    let def_install_after_op = vec![0; defs.len()];
+
     Program {
         tables: built_tables,
         defs,
+        def_install_after_op,
         ops,
+        restart_after_ops: Vec::new(),
+        scale_out_after_ops: Vec::new(),
     }
 }
 
@@ -1201,6 +1236,221 @@ pub fn build_program_multi_with_derived(
 }
 
 // ---------------------------------------------------------------------
+// Improvement-plan task E2: definition lifecycle — install mid-stream.
+// ---------------------------------------------------------------------
+
+/// Defers `program.defs[def_index]`'s install to just before `program.ops[after_op]`
+/// runs, instead of up front alongside every other definition (every builder
+/// above always sets `def_install_after_op[i] == 0` for every `i` — see
+/// [`Program::def_install_after_op`]'s own doc comment). Layered on top of an
+/// already-built `Program`, the same "layer a widening on top rather than
+/// thread it through the base builder" idiom
+/// [`build_program_multi_with_shapes_and_derived`] already uses for derived
+/// fields.
+///
+/// By the time `defs[def_index]` installs, `program.ops[0..after_op]` have
+/// already run — including, if `after_op` is chosen past that definition's
+/// own source table's first seed insert, real pre-existing source rows for
+/// [`engine::defs::catalog::install_definition`]'s direct-backfill path to
+/// build from (exactly the scenario `generative/tests/backfill.rs` exercises
+/// by hand against a bare [`crate::backend::ManualBackend`], now reachable
+/// from inside [`crate::run::run_convergence`]'s own op-stream loop). This
+/// function itself does not require that ordering — it only enforces the
+/// index bounds below — so a caller can also use it to defer a definition
+/// whose source table hasn't been touched yet at all, which is a legal (if
+/// less interesting) case too.
+///
+/// # Panics
+///
+/// - if `def_index` is out of range for `program.defs`.
+/// - if `after_op` is not strictly between `0` (exclusive — that's just the
+///   default, not a "defer") and `program.ops.len()` (exclusive): deferring
+///   to on/after the very last op would never reach a subsequent per-op
+///   convergence check inside `run_convergence`'s loop (see that function's
+///   doc comment), so a generator asking for it is a bug worth panicking on
+///   loudly rather than silently dropping the install.
+pub fn defer_def_install(mut program: Program, def_index: usize, after_op: usize) -> Program {
+    assert!(
+        def_index < program.defs.len(),
+        "defer_def_install: def_index {def_index} out of range for {} definitions — a generator \
+         bug",
+        program.defs.len()
+    );
+    assert!(
+        after_op >= 1 && after_op < program.ops.len(),
+        "defer_def_install: after_op ({after_op}) must be a real, still-to-come op index \
+         (1..{}) — 0 is just the default install-up-front timing, and on/after the last op would \
+         never reach a subsequent convergence check",
+        program.ops.len()
+    );
+    program.def_install_after_op[def_index] = after_op;
+    program
+}
+
+// ---------------------------------------------------------------------
+// Improvement-plan task E3: engine lifecycle — in-process client
+// restart/scale-out.
+// ---------------------------------------------------------------------
+
+/// Schedules a [`crate::backend::Backend::restart`] (simulating an in-process
+/// engine client crash-and-restart) right before `program.ops[after_op]` runs
+/// (improvement-plan task E3). Layered on top of an already-built `Program`,
+/// same idiom as [`defer_def_install`].
+///
+/// # Panics
+///
+/// If `after_op` is not strictly between `0` and `program.ops.len()`
+/// (exclusive on both ends) — see [`defer_def_install`]'s doc comment for why
+/// the same bound applies here (a restart scheduled on/after the last op
+/// would never be observed by a subsequent convergence check).
+pub fn schedule_restart(mut program: Program, after_op: usize) -> Program {
+    assert!(
+        after_op >= 1 && after_op < program.ops.len(),
+        "schedule_restart: after_op ({after_op}) must be a real, still-to-come op index \
+         (1..{}) — see defer_def_install's doc comment for why",
+        program.ops.len()
+    );
+    program.restart_after_ops.push(after_op);
+    program
+}
+
+/// Schedules a [`crate::backend::Backend::scale_out`] (starting an additional
+/// application-worker-only engine client) right before `program.ops[after_op]`
+/// runs (improvement-plan task E3). Same shape and bounds as
+/// [`schedule_restart`] — see its doc comment.
+pub fn schedule_scale_out(mut program: Program, after_op: usize) -> Program {
+    assert!(
+        after_op >= 1 && after_op < program.ops.len(),
+        "schedule_scale_out: after_op ({after_op}) must be a real, still-to-come op index \
+         (1..{}) — see defer_def_install's doc comment for why",
+        program.ops.len()
+    );
+    program.scale_out_after_ops.push(after_op);
+    program
+}
+
+// ---------------------------------------------------------------------
+// Improvement-plan task E6: bulk operations (TRUNCATE, bulk insert).
+// ---------------------------------------------------------------------
+
+/// The most rows [`build_bulk_insert_program`] draws into its single
+/// [`Op::BulkInsert`] (improvement-plan task E6) — far larger than
+/// [`MAX_SEED_ROWS`] (4, tuned for a *legible shrunk counterexample* across
+/// many per-row round trips) since a bulk insert is deliberately the opposite
+/// shape: one row count, one `apply` → `quiesce` → `snapshot` → compare round
+/// trip regardless of how large it is, so drawing it large costs one
+/// statement's worth of extra data, not extra round trips.
+pub const MAX_BULK_INSERT_ROWS: usize = 500;
+
+/// Builds a small, self-contained program exercising [`Op::BulkInsert`]
+/// (improvement-plan task E6): one table (the same numeric
+/// pk/`c1`/`c2`/grain shape [`build_program_multi_with_shapes`] uses, minus
+/// the `Text`/`Boolean`/`Uuid` columns — bulk-insert coverage is about row
+/// *count*, not type coverage, which task B1 already covers elsewhere), a
+/// single `Op::BulkInsert` seeding `row_count` rows in one statement
+/// (`pk = 1..=row_count`, `c1 = pk`, `c2 = pk * 2`, `grain = pk % 3`), one
+/// `OneToOne` def (`total = c1 + c2`) and one `Aggregate` def (`SUM(c1)`/
+/// `COUNT(*)` grouped by grain) over it — so a single large multi-row insert
+/// is proven to backfill/maintain correctly under both key-spaces at once —
+/// and (mirroring [`Mutate::Update`]/[`Mutate::Delete`]'s post-seed coverage)
+/// one `Update` and one `Delete` afterward, against pks guaranteed live by
+/// construction, so a bulk-inserted row is also provably visible to ordinary
+/// single-row mutation right after.
+///
+/// `row_count` must be at least 1 (a zero-row `INSERT ... VALUES` has no
+/// valid SQL rendering — see [`crate::backend::ManualBackend::apply`]'s
+/// `Op::BulkInsert` arm, which panics on an empty `rows`).
+pub fn build_bulk_insert_program(row_count: usize) -> Program {
+    assert!(
+        row_count >= 1,
+        "build_bulk_insert_program: row_count must be at least 1 (a zero-row bulk insert has no \
+         valid SQL rendering)"
+    );
+
+    let mut pool = NamePool::new();
+    let table = Table::new(
+        &mut pool,
+        &[ValueType::Numeric, ValueType::Numeric, ValueType::Numeric],
+    );
+    let c1 = table.columns[1].name.clone();
+    let c2 = table.columns[2].name.clone();
+    let grain = table.columns[3].name.clone();
+
+    let rows: Vec<Vec<(String, Option<String>)>> = (1..=row_count as i64)
+        .map(|pk| {
+            vec![
+                (table.pk_col.clone(), Some(pk.to_string())),
+                (c1.clone(), Some(pk.to_string())),
+                (c2.clone(), Some((pk * 2).to_string())),
+                (grain.clone(), Some((pk % 3).to_string())),
+            ]
+        })
+        .collect();
+
+    let mut ops = vec![Op::BulkInsert {
+        table: table.name.clone(),
+        rows,
+        expect: OpOutcome::Succeeds,
+    }];
+    // A post-bulk-insert `Update`/`Delete` against pk 1 (always live: every
+    // `row_count >= 1` bulk insert seeds it) — proves ordinary single-row
+    // mutation composes with a preceding bulk insert.
+    ops.push(Op::Update {
+        table: table.name.clone(),
+        pk: "1".to_string(),
+        changes: vec![(c1.clone(), Some("1000".to_string()))],
+        expect: OpOutcome::Succeeds,
+    });
+    ops.push(Op::Delete {
+        table: table.name.clone(),
+        pk: "1".to_string(),
+        expect: OpOutcome::Succeeds,
+    });
+
+    let one_to_one = TransformDef {
+        target: pool.next_table_name(),
+        source: table.name.clone(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "total".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::Column(c1.clone())),
+                rhs: Box::new(Expr::Column(c2.clone())),
+            },
+        }],
+        predicate: Predicate::True,
+    };
+    let aggregate = TransformDef {
+        target: pool.next_table_name(),
+        source: table.name.clone(),
+        key_space: KeySpace::Aggregate {
+            group_by: vec![grain.clone()],
+        },
+        fields: vec![
+            FieldDef {
+                name: grain.clone(),
+                expr: Expr::Column(grain),
+            },
+            aggregate_field_def(AggregateFn::Sum(AggregateColumn::C1), &c1, &c2),
+            aggregate_field_def(AggregateFn::Count, &c1, &c2),
+        ],
+        predicate: Predicate::True,
+    };
+    let defs = vec![one_to_one, aggregate];
+    let def_install_after_op = vec![0; defs.len()];
+
+    Program {
+        tables: vec![table],
+        defs,
+        def_install_after_op,
+        ops,
+        restart_after_ops: Vec::new(),
+        scale_out_after_ops: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------
 // Improvement-plan workstream D, task D2: order-insensitivity over
 // commuting ops.
 // ---------------------------------------------------------------------
@@ -1224,7 +1474,11 @@ pub fn build_program_multi_with_derived(
 /// The table an [`Op`] targets, regardless of its kind.
 fn op_table(op: &Op) -> &str {
     match op {
-        Op::Insert { table, .. } | Op::Update { table, .. } | Op::Delete { table, .. } => table,
+        Op::Insert { table, .. }
+        | Op::Update { table, .. }
+        | Op::Delete { table, .. }
+        | Op::Truncate { table, .. }
+        | Op::BulkInsert { table, .. } => table,
     }
 }
 
@@ -1232,7 +1486,11 @@ fn op_table(op: &Op) -> &str {
 /// target `table`) reads or writes — `None` only if `op` doesn't actually
 /// carry that column (a generator bug: every [`Op::Insert`] this crate
 /// builds always carries the pk column, non-`NULL`, and `Update`/`Delete`
-/// carry it directly as `pk`).
+/// carry it directly as `pk`), or if `op` inherently touches more than one
+/// pk at once (improvement-plan task E6's `Op::Truncate`/`Op::BulkInsert` —
+/// `None` here is the same "conservative, may conflict with anything on this
+/// table" signal [`ops_commute`] already treats an unresolved pk as, which is
+/// exactly right for a whole-table clear or a multi-row insert).
 fn op_pk_value(op: &Op, table: &Table) -> Option<String> {
     match op {
         Op::Insert { row, .. } => row
@@ -1240,6 +1498,7 @@ fn op_pk_value(op: &Op, table: &Table) -> Option<String> {
             .find(|(name, _)| name == &table.pk_col)
             .and_then(|(_, value)| value.clone()),
         Op::Update { pk, .. } | Op::Delete { pk, .. } => Some(pk.clone()),
+        Op::Truncate { .. } | Op::BulkInsert { .. } => None,
     }
 }
 
@@ -1288,6 +1547,10 @@ pub fn target_key_for(def: &TransformDef, table: &Table, op: &Op) -> Option<Stri
                 Some(parts.join("\u{1f}"))
             }
             Op::Update { .. } | Op::Delete { .. } => None,
+            // Improvement-plan task E6: a whole-table `Truncate` or a
+            // multi-row `BulkInsert` can touch more than one group at once —
+            // conservatively unresolved, same as `Update`/`Delete` above.
+            Op::Truncate { .. } | Op::BulkInsert { .. } => None,
         },
     }
 }
@@ -1419,8 +1682,62 @@ pub fn reordered_by_commute_groups(program: &Program) -> Program {
     Program {
         tables: program.tables.clone(),
         defs: program.defs.clone(),
+        // Carried over unchanged, not reinterpreted against the new op
+        // order: this function is only ever exercised (`tests/order_insensitivity.rs`)
+        // against programs from `trivial_program_with`/`build_program`, which
+        // always draw every def install up front (`0`) and never schedule a
+        // restart/scale-out — the only values reordering an op stream out
+        // from under an op-index-anchored field could silently invalidate.
+        def_install_after_op: program.def_install_after_op.clone(),
         ops,
+        restart_after_ops: program.restart_after_ops.clone(),
+        scale_out_after_ops: program.scale_out_after_ops.clone(),
     }
+}
+
+/// A noise table's fixed shape (improvement-plan Workstream E, task E1:
+/// untracked-object noise): a `Numeric` primary key column plus one extra
+/// column of `extra_type`. Kept to exactly two columns (pk + one extra) —
+/// noise doesn't need [`Table`]'s full multi-type-column richness, just
+/// enough shape for DML (`Insert`/`Update`/`Delete`) and DDL
+/// (`AddColumn`/`DropColumn`) noise to have somewhere to land. Never routed
+/// through [`NamePool`]: a noise table's name/columns must stay stable and
+/// caller-chosen (see [`adversarial_noise_table`]), not drawn from the same
+/// counter a real [`Program`]'s tables use.
+pub fn noise_table(name: &str, pk_col: &str, extra_col: &str, extra_type: ValueType) -> Table {
+    Table {
+        name: name.to_string(),
+        pk_col: pk_col.to_string(),
+        columns: vec![
+            Column {
+                name: pk_col.to_string(),
+                value_type: ValueType::Numeric,
+            },
+            Column {
+                name: extra_col.to_string(),
+                value_type: extra_type,
+            },
+        ],
+    }
+}
+
+/// A fixed, deliberately adversarial default noise table (task E1): named
+/// `"noise_untracked"` so it can never collide with a drawn [`Program`]'s own
+/// table/def names — [`NamePool`] only ever produces `t0`, `t1`, ... and
+/// `d0`, `d1`, ..., and `"noise_untracked"` matches neither pattern — but
+/// whose pk column is deliberately named `"c0"` (the exact name `NamePool`
+/// gives the very first table's pk column) and whose extra column is
+/// deliberately named `"total"` (a common def target field name — see
+/// [`build_program`]'s `total = c1 + c2` field), so a hand-built pin can
+/// demonstrate that even a noise table shaped to collide with a real table's
+/// *column* names causes no oracle confusion:
+/// `crate::backend::ManualBackend::snapshot`/`crate::run::check_program`
+/// only ever key off table *name*, and
+/// `crate::backend::ManualBackend::install_noise_table` never touches
+/// `self.tables`/`ClientOptions.source_tables` at all — a same-named column
+/// on an entirely different, untracked table cannot collide with anything.
+pub fn adversarial_noise_table() -> Table {
+    noise_table("noise_untracked", "c0", "total", ValueType::Text)
 }
 
 #[cfg(feature = "proptest")]
@@ -1821,15 +2138,25 @@ mod strategy {
     /// either way, see [`Mutate::DuplicateInsert`]); most of the time it is
     /// still live, so this is the generator's main source of genuine
     /// primary-key-violation `apply()` errors (issue #6's gap).
+    /// `Truncate` (improvement-plan task E6) is weighted at `1` against the
+    /// other three variants' `3` apiece — rare enough that most mutates still
+    /// exercise the ordinary per-pk paths (a `Truncate` wipes every remaining
+    /// live pk at once, so drawing it often would starve `Update`/`Delete`/
+    /// `DuplicateInsert` of live rows to act on across the rest of the same
+    /// mutate stream), common enough that a handful of seed rows/mutates
+    /// reliably hits one across many samples — the same
+    /// rare-but-reliable balance [`NULL_WEIGHT`]/[`AWKWARD_TEXT_WEIGHT`]
+    /// strike for their own awkward values.
     fn mutate(seed_count: usize, awkward_values: bool) -> impl Strategy<Value = Mutate> {
         let pk = 1..=(seed_count as i64 + 1);
         let dup_pk = 1..=(seed_count as i64);
         prop_oneof![
-            (pk.clone(), value(awkward_values), value(awkward_values))
+            3 => (pk.clone(), value(awkward_values), value(awkward_values))
                 .prop_map(|(pk, c1, c2)| Mutate::Update { pk, c1, c2 }),
-            pk.prop_map(|pk| Mutate::Delete { pk }),
-            (dup_pk, value(awkward_values), value(awkward_values))
+            3 => pk.prop_map(|pk| Mutate::Delete { pk }),
+            3 => (dup_pk, value(awkward_values), value(awkward_values))
                 .prop_map(|(pk, c1, c2)| Mutate::DuplicateInsert { pk, c1, c2 }),
+            1 => Just(Mutate::Truncate),
         ]
     }
 
@@ -1921,10 +2248,265 @@ mod strategy {
     pub fn trivial_program() -> impl Strategy<Value = Program> {
         trivial_program_with(true)
     }
+
+    /// A single [`NoiseAction`] against [`adversarial_noise_table`]'s shape
+    /// (task E1): a small pk domain (so `Update`/`Delete` sometimes land on a
+    /// row an earlier `Insert` in the same draw actually seeded, and
+    /// sometimes miss — mirroring [`mutate`]'s own pk-liveness-agnostic
+    /// design, since nothing here checks a noise op's outcome either way),
+    /// an occasional `NULL` value, and a small fixed pool of column names for
+    /// `AddColumn`/`DropColumn` that includes both a plausible fresh name
+    /// (`"extra1"`/`"extra2"`) and the noise table's own real column names
+    /// (`"c0"`/`"total"`) — so a drawn program sometimes tries to add a
+    /// column that already exists, or drop the pk itself, both of which
+    /// Postgres rejects and [`ManualBackend::fire_noise_event`]'s error
+    /// swallowing must tolerate.
+    ///
+    /// [`ManualBackend::fire_noise_event`]: crate::backend::ManualBackend::fire_noise_event
+    fn noise_pk() -> impl Strategy<Value = i64> {
+        1i64..=6
+    }
+
+    fn noise_value() -> impl Strategy<Value = Option<String>> {
+        prop_oneof![
+            3 => "[a-zA-Z0-9]{0,6}".prop_map(Some),
+            1 => Just(None),
+        ]
+    }
+
+    fn noise_column_name() -> impl Strategy<Value = String> {
+        proptest::sample::select(&["extra1", "extra2", "total", "c0"][..]).prop_map(str::to_string)
+    }
+
+    fn noise_extra_type() -> impl Strategy<Value = ValueType> {
+        prop_oneof![Just(ValueType::Numeric), Just(ValueType::Text)]
+    }
+
+    fn noise_action() -> impl Strategy<Value = NoiseAction> {
+        prop_oneof![
+            (noise_pk(), noise_value()).prop_map(|(pk, value)| NoiseAction::Insert { pk, value }),
+            (noise_pk(), noise_value()).prop_map(|(pk, value)| NoiseAction::Update { pk, value }),
+            noise_pk().prop_map(|pk| NoiseAction::Delete { pk }),
+            (noise_column_name(), noise_extra_type())
+                .prop_map(|(name, value_type)| NoiseAction::AddColumn { name, value_type }),
+            noise_column_name().prop_map(|name| NoiseAction::DropColumn { name }),
+        ]
+    }
+
+    /// Draws a task-E1 noise plan sized to a program with `op_count` real
+    /// ops: [`adversarial_noise_table`] (shared across every draw — task E1
+    /// only asks for "one extra noise table", not a whole drawn-table-shape
+    /// dimension) plus 0-5 [`NoiseEvent`]s at random positions in
+    /// `0..=op_count`, so a drawn plan sometimes fires before the very first
+    /// op, sometimes after the very last, and sometimes not at all.
+    pub fn noise_plan_for(op_count: usize) -> impl Strategy<Value = NoisePlan> {
+        prop::collection::vec((0..=op_count, noise_action()), 0..=5).prop_map(|events| NoisePlan {
+            table: Some(adversarial_noise_table()),
+            events: events
+                .into_iter()
+                .map(|(before_op, action)| NoiseEvent {
+                    before_op,
+                    kind: NoiseEventKind::Table(action),
+                })
+                .collect(),
+        })
+    }
+
+    /// Draws a task-E5 administration-only noise plan: no noise table at
+    /// all, just 0-3 bare `CHECKPOINT` statements at random positions in
+    /// `0..=op_count`.
+    pub fn checkpoint_plan_for(op_count: usize) -> impl Strategy<Value = NoisePlan> {
+        prop::collection::vec(0..=op_count, 0..=3).prop_map(|positions| NoisePlan {
+            table: None,
+            events: positions
+                .into_iter()
+                .map(|before_op| NoiseEvent {
+                    before_op,
+                    kind: NoiseEventKind::Admin("CHECKPOINT".to_string()),
+                })
+                .collect(),
+        })
+    }
+
+    /// Improvement-plan task E2: draws a [`trivial_program_with`] program,
+    /// then defers exactly one of its definitions' installs
+    /// ([`defer_def_install`]) to some point strictly after the first seed
+    /// insert into that definition's own source table — so the deferred
+    /// install always has at least one real, pre-existing source row to
+    /// backfill from, exercising the same direct-backfill-over-preexisting-
+    /// rows path `generative/tests/backfill.rs` exercises by hand, now from
+    /// inside the harness's own op-stream loop.
+    ///
+    /// A def whose source table's ops leave no room after that first insert
+    /// (its source table's own last op *is* that first insert, i.e. no
+    /// mutates follow it) isn't a candidate — deferring it would violate
+    /// [`defer_def_install`]'s `after_op < ops.len()` bound. If *no* def in
+    /// the drawn program has room, the program is returned unmodified (every
+    /// definition installs up front, same as [`trivial_program_with`] alone)
+    /// rather than this strategy failing to produce a value at all.
+    pub fn program_with_mid_stream_def_install(
+        awkward_values: bool,
+    ) -> impl Strategy<Value = Program> {
+        trivial_program_with(awkward_values).prop_flat_map(|program| {
+            let candidates: Vec<(usize, usize)> = program
+                .defs
+                .iter()
+                .enumerate()
+                .filter_map(|(def_index, def)| {
+                    let first_insert = program.ops.iter().position(
+                        |op| matches!(op, Op::Insert { table, .. } if table == &def.source),
+                    )?;
+                    let earliest = first_insert + 1;
+                    (earliest < program.ops.len()).then_some((def_index, earliest))
+                })
+                .collect();
+
+            if candidates.is_empty() {
+                return Just(program).boxed();
+            }
+
+            (proptest::sample::select(candidates), Just(program))
+                .prop_flat_map(|((def_index, earliest), program)| {
+                    let ops_len = program.ops.len();
+                    (Just(def_index), earliest..ops_len, Just(program))
+                })
+                .prop_map(|(def_index, after_op, program)| {
+                    defer_def_install(program, def_index, after_op)
+                })
+                .boxed()
+        })
+    }
+
+    /// [`trivial_program_with`], restricted to `KeySpace::OneToOne`
+    /// definitions only (every def drawn via [`build_program_multi_with_derived`],
+    /// which — like [`build_program_multi`] — never draws `DefShape::Aggregate`).
+    /// Exists solely for [`program_with_client_restart`] below — see that
+    /// function's doc comment for why a restart-carrying program is scoped
+    /// away from `Aggregate` definitions specifically.
+    fn trivial_one_to_one_program_with(awkward_values: bool) -> impl Strategy<Value = Program> {
+        prop::collection::vec(table_spec(awkward_values), 1..=MAX_TABLES)
+            .prop_flat_map(|tables| {
+                let table_count = tables.len();
+                let defs = prop::collection::vec((0..table_count, derived_shape()), 1..=MAX_DEFS);
+                (Just(tables), defs)
+            })
+            .prop_map(|(tables, defs_and_derived)| {
+                let (def_sources, derived): (Vec<usize>, Vec<DerivedShape>) =
+                    defs_and_derived.into_iter().unzip();
+                build_program_multi_with_derived(&tables, &def_sources, &derived)
+            })
+    }
+
+    /// Improvement-plan task E3: draws a [`trivial_one_to_one_program_with`]
+    /// program (see that function's own doc comment for the scope cut this
+    /// applies), then schedules a [`schedule_restart`] at a uniformly-drawn
+    /// mid-stream op index — a program with fewer than 2 ops (no room for a
+    /// "before some still-to-come op" index) is returned unmodified.
+    ///
+    /// **Scoped to `KeySpace::OneToOne` definitions, not
+    /// [`trivial_program_with`]'s full mix — a deliberate, documented scope
+    /// cut, discovered *while building this task*, mirroring
+    /// [`grain_value`]'s own precedent for a found-but-out-of-scope engine
+    /// bug.** Restarting the primary client mid-stream originally reproduced
+    /// a real engine bug: `engine::intake::Intake::connect` built its
+    /// `pgwire_replication::ReplicationConfig` with no explicit `start_lsn`,
+    /// so a fresh connection resumed from the replication *slot's own*
+    /// server-tracked `confirmed_flush_lsn` — which only advances once a
+    /// Standby Status Update actually reaches the server, an async, lagging
+    /// acknowledgment distinct from (and potentially behind) this
+    /// application's own durably-persisted `replication_progress.confirmed_lsn`.
+    /// A crash between "durably stage a transaction" and "the next status
+    /// update reaching Postgres" left the slot itself stale; reconnecting
+    /// against it (the previous behavior) made Postgres *redeliver* one or
+    /// more already-staged-and-fully-applied transactions, which the ring's
+    /// fold only collapses when a duplicate lands *before* the original
+    /// segment seals — once draining has already applied it, a redelivered
+    /// duplicate is a second, independent delta, silently double-counting an
+    /// `Aggregate` target's `SUM`/`COUNT`. **Fixed** (see
+    /// `engine::intake::Intake::connect`'s own updated doc comment/code):
+    /// `Intake::connect` now passes its own durably-read `last_confirmed` as
+    /// `start_lsn` explicitly, which can never be behind the slot's own
+    /// position, closing the large majority of this race.
+    ///
+    /// **A second, deeper bug survived that fix — since root-caused and
+    /// fixed too, unrelated to replication or to `OneToOne` at all.** A
+    /// wider, independently-run 40-case sweep over exactly this
+    /// `OneToOne`-restricted strategy still failed after only 13 successes
+    /// (a genuinely missing row, `present in SQL oracle, absent in
+    /// candidate` — a lost write, not a duplicate), and a fixed, non-
+    /// adversarial hand-built pin using this same restart primitive
+    /// reproduced the identical shape in roughly 1 of every 3-4 isolated
+    /// runs — see `generative/tests/client_lifecycle.rs`'s
+    /// `convergence_holds_across_a_mid_stream_client_restart`/
+    /// `a_restart_and_a_scale_out_interleaved_mid_stream_still_converge` doc
+    /// comments for the confirmed root cause: a seal/append race in
+    /// `engine::staging::seal::seal_if_active_nonempty`, latent regardless
+    /// of restart or `OneToOne` vs. `Aggregate`, that a restart's extra
+    /// timing perturbation (and a tiny test program's near-instant drain)
+    /// simply made likely to hit. The `OneToOne` restriction here predates
+    /// that finding and is no longer load-bearing for *this* bug — it is
+    /// left in place anyway (harmless, and this strategy has its own reasons
+    /// to stay narrow per [`trivial_one_to_one_program_with`]'s doc comment)
+    /// rather than churned as part of an unrelated bug fix.
+    ///
+    /// **[`program_with_scale_out`] hit the same bug independently,
+    /// confirming it has nothing to do with restart specifically.** An
+    /// independent re-review found scale-out — which never touches
+    /// intake/replication at all — could also lose a brand-new row/group
+    /// entirely (reproduced on the very first case generated in a fresh run,
+    /// no restart involved). That ruled out both `Intake::connect`'s
+    /// `start_lsn` path *and* the next hypothesis considered
+    /// (`claim`'s live-worker-count bucket-share math miscounting a
+    /// joining/leaving worker — ruled out directly: every program this
+    /// generator draws stays far below `claim::MIN_ROWS_TO_SPLIT`, so every
+    /// batch seals to one bucket, and `ceil(1 / live_workers)` is `1`
+    /// regardless of the count). See
+    /// `convergence_holds_across_a_mid_stream_scale_out`'s doc comment for
+    /// the confirmed mechanism. Both properties are re-enabled in
+    /// `client_lifecycle.rs`.
+    pub fn program_with_client_restart(awkward_values: bool) -> impl Strategy<Value = Program> {
+        trivial_one_to_one_program_with(awkward_values).prop_flat_map(|program| {
+            let ops_len = program.ops.len();
+            if ops_len < 2 {
+                return Just(program).boxed();
+            }
+            (1..ops_len, Just(program))
+                .prop_map(|(after_op, program)| schedule_restart(program, after_op))
+                .boxed()
+        })
+    }
+
+    /// Improvement-plan task E3's other lifecycle event: [`schedule_scale_out`]
+    /// at a uniformly-drawn mid-stream op index, same shape as
+    /// [`program_with_client_restart`].
+    pub fn program_with_scale_out(awkward_values: bool) -> impl Strategy<Value = Program> {
+        trivial_program_with(awkward_values).prop_flat_map(|program| {
+            let ops_len = program.ops.len();
+            if ops_len < 2 {
+                return Just(program).boxed();
+            }
+            (1..ops_len, Just(program))
+                .prop_map(|(after_op, program)| schedule_scale_out(program, after_op))
+                .boxed()
+        })
+    }
+
+    /// Improvement-plan task E6: [`build_bulk_insert_program`] with a
+    /// shrinkable row count, following the same `1..=MAX` via
+    /// `prop_flat_map` idiom [`MAX_SEED_ROWS`]/[`MAX_MUTATES`] already use —
+    /// proptest's integrated shrinking reduces the row count toward the
+    /// smallest one that still reproduces a failure.
+    pub fn bulk_insert_program() -> impl Strategy<Value = Program> {
+        (1..=MAX_BULK_INSERT_ROWS).prop_map(build_bulk_insert_program)
+    }
 }
 
 #[cfg(feature = "proptest")]
-pub use strategy::{trivial_program, trivial_program_with};
+pub use strategy::{
+    bulk_insert_program, checkpoint_plan_for, noise_plan_for, program_with_client_restart,
+    program_with_mid_stream_def_install, program_with_scale_out, trivial_program,
+    trivial_program_with,
+};
 
 #[cfg(test)]
 mod tests {
