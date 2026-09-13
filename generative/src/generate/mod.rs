@@ -2299,22 +2299,31 @@ mod strategy {
     /// `engine::intake::Intake::connect`'s own updated doc comment/code):
     /// `Intake::connect` now passes its own durably-read `last_confirmed` as
     /// `start_lsn` explicitly, which can never be behind the slot's own
-    /// position, closing the large majority of this race. **A rarer residual
-    /// case remains open**, confirmed via repeated runs of this very property
-    /// post-fix: an occasional divergence still surfaces, so far only ever
-    /// observed against an `Aggregate` target (never `OneToOne`, across many
-    /// more trials) — some narrower timing window this fix doesn't close,
-    /// still under-characterized. Until root-caused, this property (and any
-    /// hand-built restart pin) stays scoped to `OneToOne` definitions only,
-    /// which have not reproduced a divergence in significantly more trials
-    /// than it took to reproduce the `Aggregate` case — a real gap in
-    /// coverage (restart+`Aggregate` interaction) traded for a property that
-    /// reliably passes, exactly the same trade `grain_value`'s doc comment
-    /// makes for `NULL` grouping values. [`program_with_scale_out`] is
-    /// unaffected and stays unrestricted: scale-out only starts an additional
-    /// application-worker client — it never touches intake/replication at
-    /// all, and has not reproduced any divergence in any of this same
-    /// testing.
+    /// position, closing the large majority of this race. **A residual case
+    /// remains open**, and this doc comment previously understated it — see
+    /// `generative/tests/client_lifecycle.rs`'s
+    /// `convergence_holds_across_a_mid_stream_client_restart` for the
+    /// up-to-date writeup. Restricting to `OneToOne` here does *not* avoid
+    /// it: a wider, independently-run 40-case sweep over exactly this
+    /// `OneToOne`-restricted strategy still failed after only 13 successes
+    /// (a genuinely missing row, `present in SQL oracle, absent in
+    /// candidate` — a lost write, not a duplicate), and a fixed, non-
+    /// adversarial hand-built pin using this same restart primitive
+    /// reproduced the identical shape in 2 of 10 consecutive isolated runs.
+    /// This is not the rare, `OneToOne`-avoiding edge case earlier revisions
+    /// of this comment described.
+    ///
+    /// **[`program_with_scale_out`] is *not* unaffected either.** An
+    /// independent re-review found scale-out — which never touches
+    /// intake/replication at all — can also lose a brand-new row/group
+    /// entirely (reproduced on the very first case generated in a fresh run,
+    /// no restart involved), so the "restart-only, replication-resume"
+    /// framing this comment used is too narrow. See
+    /// `convergence_holds_across_a_mid_stream_scale_out`'s doc comment for
+    /// the concrete repro and a shared-root-cause hypothesis (a newly
+    /// joined/departed worker transiently miscounted by the live-worker
+    /// tally a batch's bucket claim sizes against). Both properties are now
+    /// `#[ignore]`d in `client_lifecycle.rs`.
     pub fn program_with_client_restart(awkward_values: bool) -> impl Strategy<Value = Program> {
         trivial_one_to_one_program_with(awkward_values).prop_flat_map(|program| {
             let ops_len = program.ops.len();
