@@ -28,6 +28,7 @@ bargain a database index makes — pay a little on write to make reads fast.
 This repo is home to a few key components:
 
 * `engine` is the rust crate that users will download and install into their application code
+* `cli` is `trellis`, an operator-facing binary that wraps `engine` for defining transforms/relationships, running the live pipeline, and checking status from a shell — run `cargo run -p trellis -- --help` (or `trellis --help` once installed) to see what it can do
 * `docs` outlines the key ideas and decisions this project has taken
 * `benchmark` is a harness for measuring throughput, latency and other key-metrics
 * `generative` is a generative test suite that is used to validate correctness under various scenarios and loads

@@ -213,7 +213,7 @@ fn format_timestamp(time: SystemTime) -> String {
 /// Converts a day count since the Unix epoch (1970-01-01) into a
 /// proleptic-Gregorian `(year, month, day)`. This is Howard Hinnant's public
 /// domain `civil_from_days` algorithm (see
-/// http://howardhinnant.github.io/date_algorithms.html) — a well-known,
+/// <http://howardhinnant.github.io/date_algorithms.html>) — a well-known,
 /// dependency-free way to do this conversion without a date/time crate.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
