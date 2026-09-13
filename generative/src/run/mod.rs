@@ -27,7 +27,7 @@ use engine::Pool;
 use engine::defs::ast::ValueType;
 
 use crate::backend::{Backend, Snapshot};
-use crate::model::{OpOutcome, Program};
+use crate::model::{Op, OpOutcome, Program};
 use crate::oracle::{self, ThreeWayReport};
 
 /// Classifies whether a property run counted as evidence at all (design doc
@@ -171,55 +171,158 @@ pub async fn run_convergence<B: Backend>(
     install_result.map_err(|e| RunError::Install(format!("{e:?}")))?;
 
     for (op_index, op) in program.ops.iter().enumerate() {
-        // A rejected op is a source no-op, not a skip: fall through to quiesce
-        // and compare anyway (design doc §4). The actual outcome (not just
-        // whether it errored) is classified and checked against what the
-        // generator expected of this exact op — closing the gap where an op
-        // that stopped erroring (or started affecting rows it shouldn't)
-        // would go unnoticed.
-        let start = timing_enabled.then(std::time::Instant::now);
-        let apply_result = backend.apply(op).await;
-        if let Some(start) = start {
-            eprintln!("COST_TIMING apply {}", start.elapsed().as_millis());
-        }
-        let actual = match apply_result {
-            Err(_) => OpOutcome::Fails,
-            Ok(0) => OpOutcome::AffectsNoRows,
-            Ok(_) => OpOutcome::Succeeds,
-        };
-        let expected = op.expect();
-        if !expected.matches(&actual) {
-            return Err(RunError::UnexpectedOpOutcome {
-                op_index,
-                expected: expected.clone(),
-                actual,
-            });
-        }
+        apply_and_check_outcome(backend, op_index, op, timing_enabled).await?;
+        quiesce_snapshot_and_check(backend, pool, program, op_index, timing_enabled).await?;
+    }
 
-        backend
-            .quiesce()
-            .await
-            .map_err(|e| RunError::Quiesce(format!("{e:?}")))?;
+    Ok(Outcome::Ran)
+}
 
-        let start = timing_enabled.then(std::time::Instant::now);
-        let snapshot = backend.snapshot().await;
-        if let Some(start) = start {
-            eprintln!("COST_TIMING snapshot {}", start.elapsed().as_millis());
-        }
-        let snapshot = snapshot.map_err(|e| RunError::Snapshot(format!("{e:?}")))?;
+/// Applies one op and checks its actual [`crate::backend::Backend::apply`]
+/// outcome against what the generator expected of it (design doc §4 "operation
+/// errors are checked, not swallowed"). Shared by [`run_convergence`] (which
+/// quiesces and compares after every single call to this) and
+/// [`run_convergence_bursty`] (which calls this several times in a row before
+/// quiescing/comparing once) — the outcome check itself is identical either
+/// way; only *when* the surrounding loop quiesces differs.
+///
+/// A rejected op is a source no-op, not a skip: the caller still quiesces and
+/// compares afterward regardless of what this returns on the `Ok` path.
+async fn apply_and_check_outcome<B: Backend>(
+    backend: &mut B,
+    op_index: usize,
+    op: &Op,
+    timing_enabled: bool,
+) -> Result<(), RunError> {
+    let start = timing_enabled.then(std::time::Instant::now);
+    let apply_result = backend.apply(op).await;
+    if let Some(start) = start {
+        eprintln!("COST_TIMING apply {}", start.elapsed().as_millis());
+    }
+    let actual = match apply_result {
+        Err(_) => OpOutcome::Fails,
+        Ok(0) => OpOutcome::AffectsNoRows,
+        Ok(_) => OpOutcome::Succeeds,
+    };
+    let expected = op.expect();
+    if !expected.matches(&actual) {
+        return Err(RunError::UnexpectedOpOutcome {
+            op_index,
+            expected: expected.clone(),
+            actual,
+        });
+    }
+    Ok(())
+}
 
-        let start = timing_enabled.then(std::time::Instant::now);
-        let checked = check_program(pool, program, &snapshot).await;
-        if let Some(start) = start {
-            eprintln!("COST_TIMING oracle {}", start.elapsed().as_millis());
+/// Quiesces, snapshots, and runs the three-way oracle check, reporting a
+/// divergence (if any) localized to `op_index` — the shared tail end of both
+/// [`run_convergence`]'s per-op loop and [`run_convergence_bursty`]'s
+/// per-burst loop. See [`apply_and_check_outcome`]'s doc comment for the
+/// division of labor between the two.
+async fn quiesce_snapshot_and_check<B: Backend>(
+    backend: &mut B,
+    pool: &Pool,
+    program: &Program,
+    op_index: usize,
+    timing_enabled: bool,
+) -> Result<(), RunError> {
+    backend
+        .quiesce()
+        .await
+        .map_err(|e| RunError::Quiesce(format!("{e:?}")))?;
+
+    let start = timing_enabled.then(std::time::Instant::now);
+    let snapshot = backend.snapshot().await;
+    if let Some(start) = start {
+        eprintln!("COST_TIMING snapshot {}", start.elapsed().as_millis());
+    }
+    let snapshot = snapshot.map_err(|e| RunError::Snapshot(format!("{e:?}")))?;
+
+    let start = timing_enabled.then(std::time::Instant::now);
+    let checked = check_program(pool, program, &snapshot).await;
+    if let Some(start) = start {
+        eprintln!("COST_TIMING oracle {}", start.elapsed().as_millis());
+    }
+    if let Some((def_target, report)) = checked.map_err(RunError::Oracle)? {
+        return Err(RunError::Diverged(Divergence {
+            op_index,
+            def_target,
+            report,
+        }));
+    }
+    Ok(())
+}
+
+/// Improvement-plan task D4 ("a second runtime"): like [`run_convergence`],
+/// but applies `program`'s ops in fixed-size **bursts** of up to `burst_size`
+/// ops back-to-back, with no [`Backend::quiesce`] call between them within a
+/// burst — quiescing, snapshotting, and running the three-way oracle check
+/// only once per burst, after its last op, instead of after every single op.
+///
+/// This exists to make a multi-worker [`Backend`] (e.g.
+/// `crate::backend::ManualBackend::connect_with_workers`) actually exercise
+/// concurrent, multi-row draining: `run_convergence`'s strict apply -> quiesce
+/// loop never lets more than one row's change be in flight at once, so a
+/// naive N-worker backend driven that way mostly tests "N idle-ish workers
+/// don't duplicate/corrupt a single claim" rather than a real batch getting
+/// split and drained by several workers at once
+/// (`engine::staging::claim`'s bucket-splitting only kicks in above
+/// `MIN_ROWS_TO_SPLIT` rows sealed in one batch). Letting several ops land
+/// before the harness ever asks the engine to catch up gives a real batch a
+/// chance to accumulate.
+///
+/// The ops within a burst are still applied strictly in `program.ops`'s own
+/// generated order, one at a time, each one's actual outcome still checked
+/// against [`Op::expect`] via [`apply_and_check_outcome`] — this is **not**
+/// the harness racing/interleaving ops against each other (that's a
+/// deliberately out-of-scope follow-up; see
+/// `generative/tests/concurrent_convergence.rs`'s module doc comment). It is
+/// only a change to *when* `quiesce()` is called, nothing about *what* is
+/// applied or in what order.
+///
+/// **Divergence localization is coarser than `run_convergence`'s.** A
+/// divergence found here is only known to have appeared somewhere within the
+/// offending burst — the [`Divergence::op_index`] recorded is the burst's
+/// *last* op, not necessarily the one that actually caused it, since nothing
+/// was checked in between. See the module doc comment on
+/// `generative/tests/concurrent_convergence.rs` for the shrink-trust
+/// convention this implies: hand-transcribe a burst failure into a
+/// `ManualBackend`-driven (single-worker, `burst_size` 1) hand-built pin to
+/// find out whether it's a true concurrency bug or reproduces under the
+/// manual runtime too.
+///
+/// Panics if `burst_size` is `0` — there is no such thing as a burst of zero
+/// ops, and silently treating it as "never quiesce" would just hang at
+/// `quiesce()`'s timeout instead of failing fast.
+pub async fn run_convergence_bursty<B: Backend>(
+    backend: &mut B,
+    pool: &Pool,
+    program: &Program,
+    burst_size: usize,
+) -> Result<Outcome, RunError> {
+    assert!(
+        burst_size > 0,
+        "run_convergence_bursty: burst_size must be at least 1"
+    );
+    let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
+
+    let start = timing_enabled.then(std::time::Instant::now);
+    let install_result = backend.install(program).await;
+    if let Some(start) = start {
+        eprintln!("COST_TIMING install {}", start.elapsed().as_millis());
+    }
+    install_result.map_err(|e| RunError::Install(format!("{e:?}")))?;
+
+    let mut op_index = 0usize;
+    for burst in program.ops.chunks(burst_size) {
+        for op in burst {
+            apply_and_check_outcome(backend, op_index, op, timing_enabled).await?;
+            op_index += 1;
         }
-        if let Some((def_target, report)) = checked.map_err(RunError::Oracle)? {
-            return Err(RunError::Diverged(Divergence {
-                op_index,
-                def_target,
-                report,
-            }));
-        }
+        let last_index_in_burst = op_index - 1;
+        quiesce_snapshot_and_check(backend, pool, program, last_index_in_burst, timing_enabled)
+            .await?;
     }
 
     Ok(Outcome::Ran)
