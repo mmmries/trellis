@@ -67,6 +67,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::error_code::{self, ErrorCode};
 use crate::pool::{Client, Pool, quote_ident};
 
 use super::ast::{Expr, KeySpace, Operator, RelationshipDef, TransformDef, ValueType};
@@ -113,6 +114,26 @@ pub enum BackfillError {
     /// ring path uses. Such definitions must keep going through
     /// [`super::catalog::create_definition`]'s ring enumeration.
     Unsupported(String),
+}
+
+impl BackfillError {
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// decision 3). Delegates to [`DdlError::code`] for
+    /// [`BackfillError::Ddl`] and [`error_code::classify_pg_error`] for a raw
+    /// Postgres error, so the mapping composes through nesting rather than
+    /// re-deriving a category. [`BackfillError::Unsupported`] doesn't fit
+    /// any of the more specific categories — it's this build path declining
+    /// a definition shape it doesn't render, not a rejection of the
+    /// definition itself (the direct-build caller falls back to the ring
+    /// path instead of surfacing it) — so it reports [`ErrorCode::Internal`].
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            BackfillError::Db(err) => error_code::classify_pg_error(err),
+            BackfillError::Pool(err) => err.code(),
+            BackfillError::Ddl(err) => err.code(),
+            BackfillError::Unsupported(_) => ErrorCode::Internal,
+        }
+    }
 }
 
 impl std::fmt::Display for BackfillError {

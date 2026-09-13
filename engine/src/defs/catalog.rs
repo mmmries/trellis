@@ -22,6 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use crate::error_code::{self, ErrorCode};
 use crate::pool::Pool;
 
 use super::ast::{KeySpace, RelationshipDef, TransformDef, ValueType};
@@ -37,7 +38,9 @@ use super::validate::{
     RelationshipTypeMismatch, RelationshipWarning, ResolvedRelationship, ValidationError, validate,
 };
 
-/// Why creating or reading a definition failed.
+/// Why creating or reading a definition failed. [`CatalogError::code`]
+/// reports a stable, coarse [`ErrorCode`] category for this error alongside
+/// its `Display` message — see `docs/public-api-design.md`, decision 3.
 #[derive(Debug)]
 pub enum CatalogError {
     /// The source text failed to parse (issue #22's grammar).
@@ -80,6 +83,34 @@ pub enum CatalogError {
     /// [`BackfillError::Unsupported`] — an `Unsupported` shape instead falls
     /// back to the ring ([`create_definition`]) rather than surfacing here.
     DirectBackfill(BackfillError),
+}
+
+impl CatalogError {
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// decision 3). Delegates to the wrapped error's own `code()` wherever
+    /// one nests here ([`CatalogError::Parse`], [`CatalogError::Validate`],
+    /// [`CatalogError::Pool`], [`CatalogError::Backfill`],
+    /// [`CatalogError::ReplicaIdentityRequired`], [`CatalogError::Ddl`],
+    /// [`CatalogError::DirectBackfill`]) rather than hardcoding one category
+    /// for a whole variant — so, for instance, a
+    /// [`CatalogError::Validate`]`(`[`ValidationError::DuplicateRelationshipName`]`)`
+    /// still reports [`ErrorCode::Conflict`], not [`ErrorCode::Validation`].
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            CatalogError::Parse(err) => err.code(),
+            CatalogError::Validate(err) => err.code(),
+            CatalogError::Db(err) => error_code::classify_pg_error(err),
+            CatalogError::Pool(err) => err.code(),
+            // Persisted data corruption — written by something other than
+            // this module's own writer.
+            CatalogError::UnknownValueType { .. } => ErrorCode::Internal,
+            CatalogError::Backfill(err) => err.code(),
+            CatalogError::SourceTableNotFound(_) => ErrorCode::NotFound,
+            CatalogError::ReplicaIdentityRequired(err) => err.code(),
+            CatalogError::Ddl(err) => err.code(),
+            CatalogError::DirectBackfill(err) => err.code(),
+        }
+    }
 }
 
 impl fmt::Display for CatalogError {
@@ -1715,4 +1746,59 @@ pub async fn source_table_version(
         )
         .await?;
     Ok(row.map(|row| row.get(0)))
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    #[test]
+    fn source_table_not_found_is_not_found() {
+        assert_eq!(
+            CatalogError::SourceTableNotFound("widgets".to_string()).code(),
+            ErrorCode::NotFound
+        );
+    }
+
+    #[test]
+    fn unknown_value_type_is_internal() {
+        assert_eq!(
+            CatalogError::UnknownValueType {
+                column: "price".to_string(),
+                text: "money".to_string(),
+            }
+            .code(),
+            ErrorCode::Internal
+        );
+    }
+
+    /// [`CatalogError::Parse`] must delegate to [`ParseError::code`] rather
+    /// than hardcoding a category.
+    #[test]
+    fn parse_delegates_to_the_wrapped_parse_error() {
+        let inner = ParseError::UnterminatedString;
+        let expected = inner.code();
+        let wrapped = CatalogError::Parse(inner);
+
+        assert_eq!(wrapped.code(), expected);
+        assert_eq!(wrapped.code(), ErrorCode::Parse);
+    }
+
+    /// [`CatalogError::Validate`] must delegate to [`ValidationError::code`]
+    /// rather than hardcoding a category — [`ValidationError::DuplicateRelationshipName`]
+    /// is the one variant that isn't plain [`ErrorCode::Validation`], so this
+    /// also exercises that [`ValidationError`]'s own special case survives
+    /// the extra layer of nesting.
+    #[test]
+    fn validate_delegates_to_the_wrapped_validation_error() {
+        let inner = ValidationError::DuplicateRelationshipName {
+            from_table: "orders".to_string(),
+            name: "customer".to_string(),
+        };
+        let expected = inner.code();
+        let wrapped = CatalogError::Validate(inner);
+
+        assert_eq!(wrapped.code(), expected);
+        assert_eq!(wrapped.code(), ErrorCode::Conflict);
+    }
 }

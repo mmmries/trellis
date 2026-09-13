@@ -29,6 +29,7 @@ use crate::numeric::{Numeric, NumericParseError};
 
 use super::ast::{Expr, FieldDef, KeySpace, Operator, TransformDef, ValueType};
 use super::model::RelationshipCardinality;
+use crate::error_code::ErrorCode;
 
 /// A source-row image: column name to its text value, or `None` for SQL
 /// `NULL`. This is the staged post-image, not a live database row — the
@@ -222,6 +223,18 @@ pub enum EvalError {
         rel: String,
         column: String,
     },
+}
+
+impl EvalError {
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// decision 3). Every variant here is defense-in-depth for an invariant
+    /// [`super::validate::validate`] is supposed to have already enforced
+    /// before evaluation runs (see this type's own doc comment) — reaching
+    /// any of them means something upstream didn't hold, not that the
+    /// caller supplied bad input, so all of them report [`ErrorCode::Internal`].
+    pub fn code(&self) -> ErrorCode {
+        ErrorCode::Internal
+    }
 }
 
 impl fmt::Display for EvalError {

@@ -38,6 +38,7 @@ use crate::defs::eval::{
 };
 use crate::defs::model::RelationshipCardinality;
 use crate::defs::validate::{self, ValidationError};
+use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
 
 use super::append::{self, StagedChange};
@@ -127,6 +128,34 @@ pub enum ApplyError {
     /// [`drain_once`] routes this to [`quarantine::purge_dropped_table`]
     /// rather than the ordinary isolate/evict path.
     SourceTableDropped { source_table: String },
+}
+
+impl ApplyError {
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// decision 3). Delegates to the wrapped error's own `code()` wherever
+    /// one nests here, so the mapping composes rather than re-deriving a
+    /// category this crate already has one for.
+    /// [`ApplyError::SourceTableDropped`] names a source table that no
+    /// longer exists -> [`ErrorCode::NotFound`]; [`ApplyError::ClaimLost`],
+    /// [`ApplyError::VersionFenceMiss`], and [`ApplyError::HopBoundExceeded`]
+    /// are all internal drain-mechanics conditions the caller can't act on
+    /// beyond "retry" -> [`ErrorCode::Internal`].
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            ApplyError::Staging(err) => err.code(),
+            ApplyError::Catalog(err) => err.code(),
+            ApplyError::Ddl(err) => err.code(),
+            ApplyError::Eval(err) => err.code(),
+            ApplyError::Validate(err) => err.code(),
+            ApplyError::Backfill(err) => err.code(),
+            ApplyError::Db(err) => error_code::classify_pg_error(err),
+            ApplyError::Pool(err) => err.code(),
+            ApplyError::ClaimLost
+            | ApplyError::VersionFenceMiss { .. }
+            | ApplyError::HopBoundExceeded { .. } => ErrorCode::Internal,
+            ApplyError::SourceTableDropped { .. } => ErrorCode::NotFound,
+        }
+    }
 }
 
 impl fmt::Display for ApplyError {

@@ -36,6 +36,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
 
 use super::ast::{Expr, FieldDef, KeySpace, TransformDef, ValueType};
@@ -131,6 +132,32 @@ pub enum DdlError {
     Db(tokio_postgres::Error),
     /// Acquiring a connection from the pool failed.
     Pool(crate::error::Error),
+}
+
+impl DdlError {
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// decision 3). Delegates to the wrapped error's own `code()` where one
+    /// nests here ([`DdlError::InvalidDefinition`], [`DdlError::AliasSubstitution`],
+    /// [`DdlError::Pool`]) or to [`error_code::classify_pg_error`] for a raw
+    /// Postgres error, so the mapping composes rather than re-deriving a
+    /// category for an error type that already has one.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            // The source table's shape doesn't support the 1-1 DDL slice —
+            // a rejected definition, same category as any other validation
+            // failure.
+            DdlError::NoPrimaryKey { .. } | DdlError::CompositePrimaryKeyUnsupported { .. } => {
+                ErrorCode::Validation
+            }
+            DdlError::InvalidDefinition(err) => err.code(),
+            // Stored-data corruption or cross-version parser drift, not a
+            // rejection of the current call's input.
+            DdlError::RelationshipReparse(_) => ErrorCode::Internal,
+            DdlError::AliasSubstitution(err) => err.code(),
+            DdlError::Db(err) => error_code::classify_pg_error(err),
+            DdlError::Pool(err) => err.code(),
+        }
+    }
 }
 
 impl fmt::Display for DdlError {

@@ -18,6 +18,13 @@
 //! interface and reach past it only when they genuinely need a primitive it
 //! doesn't expose.
 //!
+//! [`TrellisError::code`] reports a stable, coarse [`ErrorCode`] category
+//! for any failure this facade can return, on top of the existing `Display`
+//! message — settled ahead of issue #87's FFI embedding work so a host
+//! language on the other side of that boundary has something stable to
+//! match on instead of every internal Rust error variant (`docs/public-api-design.md`,
+//! decision 3).
+//!
 //! # Lifecycle
 //!
 //! ```no_run
@@ -54,6 +61,7 @@ use crate::config::Config;
 use crate::defs::{
     self, CatalogError, Definition, ParseError, RelationshipDefinition, TransformStatus, ValueType,
 };
+use crate::error_code::{self, ErrorCode};
 use crate::pool::Pool;
 
 /// Options a client sets when it [`connect`](Trellis::connect)s.
@@ -474,7 +482,9 @@ pub struct PoisonEntry {
 
 /// Why a [`Trellis`] operation failed. Composes the crate's lower-level error
 /// types via `From`, matching the hand-rolled-enum convention the rest of the
-/// crate uses.
+/// crate uses. [`TrellisError::code`] reports a stable, coarse [`ErrorCode`]
+/// category for this error alongside its `Display` message — see
+/// `docs/public-api-design.md`, decision 3.
 #[derive(Debug)]
 pub enum TrellisError {
     /// A definition failed to parse before it could be registered.
@@ -496,6 +506,34 @@ pub enum TrellisError {
     /// [`Trellis::request_backfill`] was asked to backfill a table that isn't
     /// a member of the publication yet.
     TableNotPublished { table: String, publication: String },
+}
+
+impl TrellisError {
+    /// This error's stable, coarse [`ErrorCode`] category
+    /// (`docs/public-api-design.md`, decision 3). Delegates to the wrapped
+    /// error's own `code()` wherever one nests here
+    /// ([`TrellisError::Parse`], [`TrellisError::Catalog`],
+    /// [`TrellisError::Client`], [`TrellisError::Engine`]) rather than
+    /// hardcoding one category for a whole variant, so the mapping composes
+    /// through nesting instead of re-deriving a category this crate already
+    /// has one for.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            TrellisError::Parse(err) => err.code(),
+            TrellisError::Catalog(err) => err.code(),
+            TrellisError::Client(err) => err.code(),
+            TrellisError::Engine(err) => err.code(),
+            TrellisError::Db(err) => error_code::classify_pg_error(err),
+            // `staging` requested with nothing registered, or a backfill
+            // request against an unpublished table, are both rejected calls
+            // given the connection's current state — same category as any
+            // other invalid-configuration error.
+            TrellisError::NoDefinitions | TrellisError::TableNotPublished { .. } => {
+                ErrorCode::Validation
+            }
+            TrellisError::SourceTableNotFound(_) => ErrorCode::NotFound,
+        }
+    }
 }
 
 impl std::fmt::Display for TrellisError {
@@ -568,5 +606,49 @@ impl From<crate::error::Error> for TrellisError {
 impl From<tokio_postgres::Error> for TrellisError {
     fn from(err: tokio_postgres::Error) -> Self {
         TrellisError::Db(err)
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    #[test]
+    fn no_definitions_is_validation() {
+        assert_eq!(TrellisError::NoDefinitions.code(), ErrorCode::Validation);
+    }
+
+    #[test]
+    fn source_table_not_found_is_not_found() {
+        assert_eq!(
+            TrellisError::SourceTableNotFound("widgets".to_string()).code(),
+            ErrorCode::NotFound
+        );
+    }
+
+    /// [`TrellisError::Catalog`] must delegate to [`CatalogError::code`]
+    /// rather than hardcoding a category — the exact composition-through-
+    /// nesting case `docs/public-api-design.md`'s decision 3 calls out.
+    #[test]
+    fn catalog_delegates_to_the_wrapped_catalog_error() {
+        let inner = CatalogError::SourceTableNotFound("orders".to_string());
+        let expected = inner.code();
+        let wrapped = TrellisError::Catalog(inner);
+
+        assert_eq!(wrapped.code(), expected);
+        assert_eq!(wrapped.code(), ErrorCode::NotFound);
+    }
+
+    /// Two layers of nesting: [`TrellisError::Client`] wraps
+    /// [`ClientError::Config`], which itself wraps [`crate::error::Error`] —
+    /// the code must survive both hops unchanged.
+    #[test]
+    fn client_delegates_through_two_layers_of_nesting() {
+        let inner = crate::error::Error::IncompatibleInstance("mismatched marker".to_string());
+        let expected = inner.code();
+        let wrapped = TrellisError::Client(ClientError::Config(inner));
+
+        assert_eq!(wrapped.code(), expected);
+        assert_eq!(wrapped.code(), ErrorCode::Conflict);
     }
 }

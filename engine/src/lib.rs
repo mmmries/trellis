@@ -22,6 +22,10 @@
 //!   apply path — see `docs/staging-and-claiming/README.md`.
 //! - [`defs`] parses, validates, and catalogs transform definitions (today:
 //!   the 1-1, `+`-only grammar — see `docs/decisions/0004-transform-definition-grammar.md`).
+//! - [`error_code`] is a small, stable [`error_code::ErrorCode`] taxonomy
+//!   every error type in this crate can report via a `code()` method,
+//!   independent of its own (freely growing) internal variants — see
+//!   `docs/public-api-design.md`, decision 3.
 //!
 //! **Current subset**: 1-1 scalar transforms only end to end (issue #11's
 //! 1-1 slice). Aggregate/invertible-delta maintenance is not yet wired up —
@@ -41,6 +45,7 @@ pub mod client;
 pub mod config;
 pub mod defs;
 pub mod error;
+pub mod error_code;
 pub mod identity;
 pub mod intake;
 pub mod migrate;
@@ -55,6 +60,7 @@ pub use client::{Client, ClientError, ClientOptions};
 pub use config::Config;
 pub use defs::{Definition, RelationshipCardinality, RelationshipDefinition, TransformStatus};
 pub use error::Error;
+pub use error_code::ErrorCode;
 pub use identity::Identity;
 pub use migrate::migrate;
 pub use numeric::Numeric;

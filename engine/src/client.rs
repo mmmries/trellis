@@ -46,6 +46,7 @@ use tokio_postgres::config::Host;
 
 use crate::config::Config;
 use crate::defs::{self, CatalogError};
+use crate::error_code::{self, ErrorCode};
 use crate::intake::{self, IntakeConfig, IntakeError};
 use crate::pool::{Pool, quote_ident};
 use crate::staging::{
@@ -149,7 +150,9 @@ impl Default for ClientOptions {
 /// Failure modes for [`Client::start`] and [`Client::shutdown`]. Composes
 /// the crate's other error types via `From`, matching
 /// [`StagingError`]/[`IntakeError`]/[`ApplyError`]/[`crate::error::Error`]'s
-/// own hand-rolled-enum convention.
+/// own hand-rolled-enum convention. [`ClientError::code`] reports a stable,
+/// coarse [`ErrorCode`] category for this error alongside its `Display`
+/// message — see `docs/public-api-design.md`, decision 3.
 #[derive(Debug)]
 pub enum ClientError {
     /// `staging_worker` was set but `source_tables` was empty — nothing to
@@ -175,6 +178,28 @@ pub enum ClientError {
     Intake(IntakeError),
     /// A failure from apply (drain_once).
     Apply(ApplyError),
+}
+
+impl ClientError {
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// decision 3). Delegates to the wrapped error's own `code()` wherever
+    /// one nests here, so the mapping composes rather than re-deriving a
+    /// category this crate already has one for.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            // `staging_worker` set with no source tables is a rejected
+            // call, same category as any other invalid-configuration error.
+            ClientError::NoSourceTables => ErrorCode::Validation,
+            ClientError::Spawn(_)
+            | ClientError::ThreadExitedBeforeReady
+            | ClientError::ThreadPanicked => ErrorCode::Internal,
+            ClientError::Config(err) => err.code(),
+            ClientError::Db(err) => error_code::classify_pg_error(err),
+            ClientError::Staging(err) => err.code(),
+            ClientError::Intake(err) => err.code(),
+            ClientError::Apply(err) => err.code(),
+        }
+    }
 }
 
 impl fmt::Display for ClientError {
@@ -1027,4 +1052,34 @@ async fn wake_listener(
         _client: client,
         _task: task,
     })
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    #[test]
+    fn no_source_tables_is_validation() {
+        assert_eq!(ClientError::NoSourceTables.code(), ErrorCode::Validation);
+    }
+
+    #[test]
+    fn thread_panicked_is_internal() {
+        assert_eq!(ClientError::ThreadPanicked.code(), ErrorCode::Internal);
+    }
+
+    /// [`ClientError::Config`] must delegate to [`crate::error::Error::code`]
+    /// rather than hardcoding a category — this is the same nested-error a
+    /// wrapped [`crate::error::Error::IncompatibleInstance`] should still
+    /// report as [`ErrorCode::Conflict`] through the wrapper, not whatever a
+    /// blanket "Config variant" category would be.
+    #[test]
+    fn config_delegates_to_the_wrapped_engine_error() {
+        let inner = crate::error::Error::IncompatibleInstance("mismatched marker".to_string());
+        let expected = inner.code();
+        let wrapped = ClientError::Config(inner);
+
+        assert_eq!(wrapped.code(), expected);
+        assert_eq!(wrapped.code(), ErrorCode::Conflict);
+    }
 }
