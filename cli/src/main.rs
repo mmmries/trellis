@@ -10,7 +10,7 @@
 //!
 //! Each subcommand lives in its own `commands::<name>` module; this file is
 //! just the top-level usage/help and the match that dispatches to one.
-//! Today that's only `define`; `run`, `status`, and `prometheus` are meant to
+//! Today that's `define` and `run`; `status` and `prometheus` are meant to
 //! land the same way later, one module and one match arm each.
 
 mod commands;
@@ -23,6 +23,7 @@ Usage: trellis <COMMAND> [OPTIONS]
 
 Commands:
   define <GRAMMAR>   Register a TRANSFORM or RELATIONSHIP definition.
+  run                 Run the live CDC/apply pipeline until interrupted.
 
 Options:
   -d, --database-url <URL>  Postgres connection string. May be given before
@@ -76,6 +77,7 @@ fn run(mut args: Vec<String>) -> ExitCode {
     let command = args.remove(0);
     match command.as_str() {
         "define" => run_define(args, database_url),
+        "run" => run_run(args, database_url),
         _ if wants_help(std::slice::from_ref(&command)) => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -130,6 +132,43 @@ fn run_define(args: Vec<String>, database_url: Option<String>) -> ExitCode {
     }
 }
 
+/// Dispatches `trellis run`: handles `-h`/`--help` itself (so it works
+/// without a database connection), otherwise parses the flags and runs the
+/// live pipeline until interrupted, on a single-use tokio runtime.
+fn run_run(args: Vec<String>, database_url: Option<String>) -> ExitCode {
+    if wants_help(&args) {
+        print!("{}", commands::run::USAGE);
+        return ExitCode::SUCCESS;
+    }
+
+    let parsed = match commands::run::parse(&args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("error: failed to start async runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match runtime.block_on(commands::run::run(parsed, database_url)) {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +208,40 @@ mod tests {
     #[test]
     fn define_missing_grammar_is_a_failure() {
         assert_eq!(run(vec!["define".to_string()]), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn run_help_is_success_without_a_database() {
+        assert_eq!(
+            run(vec!["run".to_string(), "--help".to_string()]),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn run_bad_flags_is_a_failure_without_a_database() {
+        // A bad --drain-threads value must be rejected during argv parsing,
+        // before any attempt to connect — otherwise this test would hang or
+        // fail for the wrong reason in an environment with no database.
+        assert_eq!(
+            run(vec![
+                "run".to_string(),
+                "--drain-threads".to_string(),
+                "banana".to_string()
+            ]),
+            ExitCode::FAILURE
+        );
+    }
+
+    #[test]
+    fn run_conflicting_staging_flags_is_a_failure_without_a_database() {
+        assert_eq!(
+            run(vec![
+                "run".to_string(),
+                "--staging".to_string(),
+                "--no-staging".to_string()
+            ]),
+            ExitCode::FAILURE
+        );
     }
 }
