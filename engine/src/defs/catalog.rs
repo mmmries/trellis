@@ -30,7 +30,7 @@ use super::ddl::{self, DdlError};
 use super::error::ParseError;
 use super::model::{
     Definition, EdgeKind, NodeKind, RelationshipCardinality, RelationshipDefinition, SchemaEdge,
-    SchemaNode,
+    SchemaNode, TransformStatus,
 };
 use super::parser::{parse, parse_relationship};
 use super::validate::{
@@ -168,7 +168,20 @@ pub async fn create_definition(
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<Definition, CatalogError> {
-    create_definition_inner(pool, source_text, source_columns, true).await
+    // `Live`, not `Backfilling`: by the time this call returns, the source
+    // table's pre-existing rows are already enumerated into the ring in the
+    // very same transaction the row is inserted in (see `create_definition_inner`),
+    // so there's no separate, awaited step for a caller to observe this row
+    // sitting through first. Only `install_definition`'s direct-build path
+    // has such a step — see its own `TransformStatus::Backfilling` use.
+    create_definition_inner(
+        pool,
+        source_text,
+        source_columns,
+        true,
+        TransformStatus::Live,
+    )
+    .await
 }
 
 /// Like [`create_definition`], but stages *no* ring-enumeration backfill: the
@@ -185,7 +198,14 @@ pub async fn create_definition_without_backfill(
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<Definition, CatalogError> {
-    create_definition_inner(pool, source_text, source_columns, false).await
+    create_definition_inner(
+        pool,
+        source_text,
+        source_columns,
+        false,
+        TransformStatus::Live,
+    )
+    .await
 }
 
 /// The front door real callers use to stand up a new definition (issue #63
@@ -197,13 +217,47 @@ pub async fn create_definition_without_backfill(
 /// Target-table creation always runs first, unconditionally — before either
 /// backfill path is attempted — because neither `backfill_definition` nor
 /// `create_definition` creates it themselves; both assume it already exists
-/// (see their own doc comments). Doing it once here, ahead of both branches,
-/// preserves the fast path's build/CDC fence: the table exists and is fully
-/// built by the direct backfill *before* the definition is ever persisted to
-/// the catalog via [`create_definition_without_backfill`], so nothing can
-/// fold a CDC delta onto this target before the build has run. The ring
-/// fallback branch also benefits from the table already existing, though it
-/// has no comparable fence requirement of its own.
+/// (see their own doc comments).
+///
+/// **Status lifecycle (issue #55).** Once the target exists and the coverage
+/// plan is captured, the definition row is persisted *speculatively* with
+/// [`TransformStatus::Backfilling`] — before [`backfill::backfill_definition`]
+/// runs, not after — so a status-polling caller (the pattern issue #82's
+/// public API design settles on) can observe the row the moment it exists
+/// rather than only once its backfill has already finished. Three things can
+/// happen next:
+///
+/// * The direct build succeeds: the coverage plan is committed and the row
+///   is flipped to [`TransformStatus::Live`] in place (same id, same
+///   `target_table`).
+/// * The direct build reports [`BackfillError::Unsupported`] (this shape
+///   can't be rendered directly): the speculative row is deleted and
+///   [`create_definition`] runs exactly as it did before this row existed,
+///   inserting its own — now `Live` — row via the ring path.  Deleting first
+///   frees `target_table`'s uniqueness constraint back up; re-running
+///   [`resolve_node_in_txn`]/[`persist_edge_in_txn`]/the `source_table_versions`
+///   bump for the same source/target pair is harmless — nodes upsert, edges
+///   dedupe on conflict, and an extra version bump only costs a downstream
+///   drain worker a routine, self-healing version-fence retry (see
+///   `staging::apply::ApplyError::VersionFenceMiss`).
+/// * The direct build fails for a real reason: the speculative row is
+///   deleted and the error propagates, matching this function's existing
+///   discipline of not rolling back the target-table DDL on failure either —
+///   a failed install leaves no catalog row and an unbuilt (or partially
+///   built), uncatalogued target table behind either way.
+///
+/// Known limitation, left to the backgrounded/resumable backfill work this
+/// status field is foundational for (see `docs/public-api-design.md`'s
+/// decision 1): persisting the row (and its `schema_nodes`/`schema_edges`)
+/// before the direct build completes means a running drain worker's
+/// [`transforms_for_source`] can, in principle, observe this transform and
+/// attempt to apply a live CDC delta against the target while the direct
+/// build is still writing it. `install_definition` remains fully synchronous
+/// today (single connection, no yield point a concurrent writer could widen
+/// the window through in the common case), so this is not expected to bite
+/// in practice yet, but making it airtight is exactly what backgrounding the
+/// backfill (rather than special-casing status filtering here) is meant to
+/// close.
 pub async fn install_definition(
     pool: &Pool,
     source_text: &str,
@@ -234,20 +288,74 @@ pub async fn install_definition(
     // `plan_direct_backfill_coverage` / `capture_backfill_coverage_fence`).
     let coverage_plan = plan_direct_backfill_coverage(pool, &def).await?;
 
+    // Issue #55: persist *before* running the backfill, not after — see this
+    // function's doc comment for the full status-lifecycle rationale and the
+    // cleanup story for each of the three outcomes below. No ring
+    // enumeration (`backfill: false`): the direct build below is what's about
+    // to fold the source's pre-existing rows in.
+    let mut definition = create_definition_inner(
+        pool,
+        source_text,
+        source_columns,
+        false,
+        TransformStatus::Backfilling,
+    )
+    .await?;
+
     match backfill::backfill_definition(pool, &def, target_schema, source_columns).await {
         Ok(()) => {
             // The build folded each planned table's pre-build contents into the
-            // target. Persist that coverage *before* the definition is
-            // persisted, so the redundant publication-join catch-up enumeration
-            // of those tables can be skipped.
+            // target. Persist that coverage *before* the definition is marked
+            // live, so the redundant publication-join catch-up enumeration of
+            // those tables can be skipped.
             commit_direct_backfill_coverage(pool, &coverage_plan).await?;
-            create_definition_without_backfill(pool, source_text, source_columns).await
+            mark_definition_status(pool, definition.id, TransformStatus::Live).await?;
+            definition.status = TransformStatus::Live;
+            Ok(definition)
         }
         Err(BackfillError::Unsupported(_)) => {
+            // This shape can't be built directly after all — discard the
+            // speculative row (see doc comment: safe, since the ring path
+            // below recreates every one of its side effects idempotently)
+            // and fall back exactly as if the speculative row never existed.
+            delete_definition_row(pool, definition.id).await?;
             create_definition(pool, source_text, source_columns).await
         }
-        Err(err) => Err(CatalogError::DirectBackfill(err)),
+        Err(err) => {
+            delete_definition_row(pool, definition.id).await?;
+            Err(CatalogError::DirectBackfill(err))
+        }
     }
+}
+
+/// Flips an already-persisted definition row to `status` in place (issue
+/// #55) — used by [`install_definition`] once its direct build finishes.
+async fn mark_definition_status(
+    pool: &Pool,
+    id: i64,
+    status: TransformStatus,
+) -> Result<(), CatalogError> {
+    let client = pool.get().await?;
+    client
+        .execute(
+            "update transform_definitions set status = $1 where id = $2",
+            &[&status.as_str(), &id],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Deletes a definition row by id (issue #55) — used by [`install_definition`]
+/// to discard the speculative `Backfilling` row it persists ahead of its
+/// direct build when that build doesn't pan out (falls back to the ring, or
+/// fails outright). Only ever targets a row this same call just inserted, so
+/// there's nothing else in the catalog yet that could reference it.
+async fn delete_definition_row(pool: &Pool, id: i64) -> Result<(), CatalogError> {
+    let client = pool.get().await?;
+    client
+        .execute("delete from transform_definitions where id = $1", &[&id])
+        .await?;
+    Ok(())
 }
 
 /// What to do with one table's coverage once a direct build succeeds: either
@@ -364,6 +472,7 @@ async fn create_definition_inner(
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
     backfill: bool,
+    status: TransformStatus,
 ) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse(source_text)?;
     // Issue #40: enrichment fields (`<rel>.<col>`) are validated against
@@ -455,11 +564,13 @@ async fn create_definition_inner(
 
     let (type_keys, type_vals) = encode_type_map(source_columns);
 
+    let status_text = status.as_str();
+
     let id: i64 = txn
         .query_one(
             "insert into transform_definitions
-                (target_table, source_table, source_version, definition_text, source_columns)
-             values ($1, $2, $3, $4, jsonb_object($5::text[], $6::text[]))
+                (target_table, source_table, source_version, definition_text, source_columns, status)
+             values ($1, $2, $3, $4, jsonb_object($5::text[], $6::text[]), $7)
              returning id",
             &[
                 &def.target,
@@ -468,6 +579,7 @@ async fn create_definition_inner(
                 &source_text,
                 &type_keys,
                 &type_vals,
+                &status_text,
             ],
         )
         .await?
@@ -480,6 +592,7 @@ async fn create_definition_inner(
         source_version: version,
         def,
         source_columns: source_columns.clone(),
+        status,
     })
 }
 
@@ -1434,6 +1547,7 @@ fn encode_type_map(source_columns: &HashMap<String, ValueType>) -> (Vec<&str>, V
 struct PendingDefinition {
     source_version: i64,
     text: String,
+    status: TransformStatus,
     source_columns: HashMap<String, ValueType>,
 }
 
@@ -1461,7 +1575,7 @@ pub async fn dependents_of(
     let client = pool.get().await?;
     let rows = client
         .query(
-            "select t.id, t.source_version, t.definition_text, e.key, e.value
+            "select t.id, t.source_version, t.definition_text, t.status, e.key, e.value
              from schema_nodes from_node
              join schema_edges se on se.from_node_id = from_node.id and se.kind = $2
              join schema_nodes to_node on to_node.id = se.to_node_id
@@ -1480,14 +1594,19 @@ pub async fn dependents_of(
 
     for row in rows {
         let id: i64 = row.get(0);
-        let key: Option<String> = row.get(3);
-        let value: Option<String> = row.get(4);
+        let key: Option<String> = row.get(4);
+        let value: Option<String> = row.get(5);
 
         let pending = by_id.entry(id).or_insert_with(|| {
             order.push(id);
+            let status_text: String = row.get(3);
+            let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+                panic!("transform_definitions.status held unrecognized value '{status_text}'")
+            });
             PendingDefinition {
                 source_version: row.get(1),
                 text: row.get(2),
+                status,
                 source_columns: HashMap::new(),
             }
         });
@@ -1518,6 +1637,7 @@ pub async fn dependents_of(
             source_version: pending.source_version,
             def,
             source_columns: pending.source_columns,
+            status: pending.status,
         });
     }
     Ok(result)

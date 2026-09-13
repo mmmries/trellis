@@ -22,7 +22,8 @@ use std::collections::HashMap;
 use engine::config::DEFAULT_SCHEMA;
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Predicate, RelationshipDef, TransformDef};
 use engine::defs::{
-    ValueType, create_relationship, install_definition, render_relationship_select_sql,
+    TransformStatus, ValueType, create_relationship, install_definition,
+    render_relationship_select_sql,
 };
 use engine::staging::apply;
 use engine::staging::{has_pending, retire_drained_segments};
@@ -180,6 +181,129 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
         0,
         "fast path must not enumerate the source into the ring"
     );
+}
+
+// ---------------------------------------------------------------------
+// Status lifecycle (issue #55): a definition that completes its backfill via
+// `install_definition` must come back — and be persisted — as `Live`, not
+// left sitting in the speculative `Backfilling` row the direct-build path
+// inserts ahead of the build (see `catalog::install_definition`'s doc
+// comment). Covers both the fast direct-build path and the ring-fallback
+// path, since each takes a different route to `Live` (an in-place status
+// flip vs. a fresh row from `create_definition` after the speculative row is
+// discarded).
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn install_definition_fast_path_ends_up_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) select g, g from generate_series(1, 50) g",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = numeric(&["a"]);
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT a + a AS x",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition via the fast path");
+
+    assert_eq!(
+        def.status,
+        TransformStatus::Live,
+        "install_definition must return the definition already flipped to Live"
+    );
+
+    let rows = client
+        .query(
+            "select status from transform_definitions where target_table = 't'",
+            &[],
+        )
+        .await
+        .expect("read back persisted status");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one row for `t` — no leftover speculative row"
+    );
+    let persisted_status: String = rows[0].get(0);
+    assert_eq!(
+        persisted_status, "live",
+        "the persisted row must have been flipped to live, not left at backfilling"
+    );
+}
+
+#[tokio::test]
+async fn install_definition_ring_fallback_ends_up_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table categories (id integer primary key, name text); \
+             create table articles (id integer primary key, category_id integer, title text); \
+             insert into categories (id, name) values (10, 'Tech'); \
+             insert into articles (id, category_id, title) values (1, 10, 'a1')",
+        )
+        .await
+        .expect("create + seed tables");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP category FROM articles.category_id TO categories.id",
+    )
+    .await
+    .expect("create to-one relationship");
+
+    let source_columns = columns(&[
+        ("id", ValueType::Numeric),
+        ("category_id", ValueType::Numeric),
+        ("title", ValueType::Text),
+    ]);
+
+    // Same `Unsupported` shape as the fallback test below: routes through
+    // the speculative-insert-then-delete-then-ring-recreate path in
+    // `install_definition`.
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM article_cat FROM articles SELECT category.name AS category_name",
+        &source_columns,
+        "public",
+    )
+    .await
+    .expect("install_definition falls back to the ring path");
+
+    assert_eq!(
+        def.status,
+        TransformStatus::Live,
+        "the ring-fallback path also persists Live, not Backfilling"
+    );
+
+    let rows = client
+        .query(
+            "select status from transform_definitions where target_table = 'article_cat'",
+            &[],
+        )
+        .await
+        .expect("read back persisted status");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the speculative row must have been deleted, leaving exactly the ring path's own row"
+    );
+    let persisted_status: String = rows[0].get(0);
+    assert_eq!(persisted_status, "live");
 }
 
 // ---------------------------------------------------------------------

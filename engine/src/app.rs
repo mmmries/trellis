@@ -51,7 +51,9 @@ use std::time::SystemTime;
 
 use crate::client::{Client, ClientError, ClientOptions};
 use crate::config::Config;
-use crate::defs::{self, CatalogError, Definition, ParseError, RelationshipDefinition, ValueType};
+use crate::defs::{
+    self, CatalogError, Definition, ParseError, RelationshipDefinition, TransformStatus, ValueType,
+};
 use crate::pool::Pool;
 
 /// Options a client sets when it [`connect`](Trellis::connect)s.
@@ -168,21 +170,53 @@ impl Trellis {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "select id, target_table, source_table, source_version, created_at \
+                "select id, target_table, source_table, source_version, status, created_at \
                  from transform_definitions order by id",
                 &[],
             )
             .await?;
         Ok(rows
             .into_iter()
-            .map(|row| DefinitionSummary {
-                id: row.get(0),
-                target_table: row.get(1),
-                source_table: row.get(2),
-                source_version: row.get(3),
-                created_at: row.get(4),
+            .map(|row| {
+                let status_text: String = row.get(4);
+                let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+                    panic!("transform_definitions.status held unrecognized value '{status_text}'")
+                });
+                DefinitionSummary {
+                    id: row.get(0),
+                    target_table: row.get(1),
+                    source_table: row.get(2),
+                    source_version: row.get(3),
+                    status,
+                    created_at: row.get(5),
+                }
             })
             .collect())
+    }
+
+    /// One registered transform definition's current [`TransformStatus`]
+    /// (issue #55), by target table name — the read a host-language embedder
+    /// polls after [`define`](Trellis::define) returns, per
+    /// `docs/public-api-design.md`'s decision 1 ("define, then poll status
+    /// until live"). A thin convenience over [`definitions`](Trellis::definitions)
+    /// for callers that only want one row rather than the full list.
+    pub async fn status(
+        &self,
+        target_table: &str,
+    ) -> Result<Option<TransformStatus>, TrellisError> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "select status from transform_definitions where target_table = $1",
+                &[&target_table],
+            )
+            .await?;
+        Ok(row.map(|row| {
+            let status_text: String = row.get(0);
+            TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+                panic!("transform_definitions.status held unrecognized value '{status_text}'")
+            })
+        }))
     }
 
     /// Every registered relationship declaration, oldest first.
@@ -409,6 +443,9 @@ pub struct DefinitionSummary {
     pub target_table: String,
     pub source_table: String,
     pub source_version: i64,
+    /// Where this transform is in its lifecycle (issue #55) — see
+    /// [`TransformStatus`].
+    pub status: TransformStatus,
     pub created_at: SystemTime,
 }
 

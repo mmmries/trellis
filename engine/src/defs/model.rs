@@ -21,6 +21,60 @@ pub struct Definition {
     pub source_version: i64,
     pub def: TransformDef,
     pub source_columns: HashMap<String, ValueType>,
+    /// Where this transform is in its lifecycle (issue #55) — see
+    /// [`TransformStatus`].
+    pub status: TransformStatus,
+}
+
+/// A transform's lifecycle status (issue #55), persisted as
+/// `transform_definitions.status`: `docs/transforms.md`'s "Status" section
+/// documents the full state machine this mirrors. [`super::catalog::install_definition`]
+/// is the only writer that transitions a row through more than one variant
+/// today — from [`TransformStatus::Backfilling`] to [`TransformStatus::Live`]
+/// once its (still fully synchronous) backfill completes; every other
+/// creation path persists [`TransformStatus::Live`] directly, since by the
+/// time those rows exist their backfill (ring-enumeration or direct build)
+/// has already been staged/completed. [`TransformStatus::WaitingToBackfill`]
+/// and [`TransformStatus::Quarantined`] aren't produced by any writer yet —
+/// they're reserved for the backgrounded-backfill and quarantine-fuse work
+/// this status field is foundational for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformStatus {
+    WaitingToBackfill,
+    Backfilling,
+    Live,
+    Quarantined,
+}
+
+impl TransformStatus {
+    /// The text this variant is persisted/queried as in
+    /// `transform_definitions.status`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransformStatus::WaitingToBackfill => "waiting_to_backfill",
+            TransformStatus::Backfilling => "backfilling",
+            TransformStatus::Live => "live",
+            TransformStatus::Quarantined => "quarantined",
+        }
+    }
+
+    /// Parses [`Self::as_str`]'s persisted form back, or `None` for any
+    /// other text — meaning the row was written by something other than
+    /// this module's own writers, since `transform_definitions.status`'s
+    /// `check` constraint only allows these four values. Named
+    /// `from_persisted` for the same reason [`RelationshipCardinality::from_persisted`]
+    /// is: this isn't `std::str::FromStr` (no matching `Err` type worth
+    /// inventing for a value that should only ever come from this table's
+    /// own `check` constraint).
+    pub fn from_persisted(text: &str) -> Option<Self> {
+        match text {
+            "waiting_to_backfill" => Some(TransformStatus::WaitingToBackfill),
+            "backfilling" => Some(TransformStatus::Backfilling),
+            "live" => Some(TransformStatus::Live),
+            "quarantined" => Some(TransformStatus::Quarantined),
+            _ => None,
+        }
+    }
 }
 
 /// A relationship declaration as stored in the catalog (issue #26): the

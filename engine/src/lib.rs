@@ -53,7 +53,7 @@ pub use app::{
 };
 pub use client::{Client, ClientError, ClientOptions};
 pub use config::Config;
-pub use defs::{Definition, RelationshipCardinality, RelationshipDefinition};
+pub use defs::{Definition, RelationshipCardinality, RelationshipDefinition, TransformStatus};
 pub use error::Error;
 pub use identity::Identity;
 pub use migrate::migrate;
