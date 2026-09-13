@@ -109,8 +109,10 @@
 
 use engine::{Config, Pool};
 use generative::backend::ManualBackend;
-use generative::generate::{Mutate, build_program, trivial_program};
-use generative::run::{RunError, run_convergence_bursty};
+use generative::generate::{
+    Mutate, build_program, schedule_restart, schedule_scale_out, trivial_program,
+};
+use generative::run::{RunError, run_convergence, run_convergence_bursty};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
@@ -335,4 +337,68 @@ async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
          intended (see this test's doc comment on `maintenance_interval`) or the engine's own \
          splitting decision regressed"
     );
+}
+
+/// Cross-cutting holistic-review pin: the phase-gap-straggler fix
+/// (`engine::staging::seal::seal_if_active_nonempty`'s straggler-catching
+/// case, `engine::staging::converge::converged_through`'s condition 3 — see
+/// `generative/tests/client_lifecycle.rs`'s module doc comment for the full
+/// writeup) was found and fixed entirely under the *single*-worker,
+/// burst-batching runtime (`ManualBackend::connect`/`connect_with_options`
+/// with `application_threads: 1`). That fix's own regression coverage
+/// (`client_lifecycle.rs`, `engine/tests/sealing.rs`, `engine/tests/converge.rs`)
+/// never drives it through this file's genuinely-concurrent, more-than-one-
+/// application-worker runtime at the same time as a restart/scale-out —
+/// i.e. nothing on this branch previously confirmed the fix holds when the
+/// *other* source of timing perturbation (D4's real multi-worker draining)
+/// is layered on top of E3's lifecycle events rather than exercised alone.
+/// This pin closes that gap directly: the same restart-then-scale-out
+/// sequence as `client_lifecycle.rs`'s
+/// `a_restart_and_a_scale_out_interleaved_mid_stream_still_converge`
+/// (restart right before a brand-new key's insert — the one shape that pin's
+/// own doc comment identifies as what can land as an unfenced phase-gap
+/// straggler), but against a `PROPERTY_WORKERS`-worker `ManualBackend`
+/// instead of the single-worker default.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_and_a_scale_out_interleaved_still_converge_under_the_concurrent_backend() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    // ops: [insert x4, update, delete] (indices 0..=5) — identical fixture
+    // shape to client_lifecycle.rs's single-worker pin of the same sequence.
+    let program = build_program(
+        &[
+            (Some(1), Some(1)),
+            (Some(2), Some(2)),
+            (Some(3), Some(3)),
+            (Some(4), Some(4)),
+        ],
+        &[
+            Mutate::Update {
+                pk: 2,
+                c1: Some(99),
+                c2: Some(1),
+            },
+            Mutate::Delete { pk: 3 },
+        ],
+    );
+    assert_eq!(program.ops.len(), 6, "sanity check on the fixture shape");
+
+    let program = schedule_restart(program, 2);
+    let program = schedule_scale_out(program, 5);
+
+    let mut backend = ManualBackend::connect_with_workers(db.dsn(), PROPERTY_WORKERS)
+        .await
+        .expect("connect concurrent backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "restart + scale-out interleaved mid-stream must converge under the concurrent \
+                 backend too: {e:?}"
+            )
+        });
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
 }
