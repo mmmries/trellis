@@ -745,3 +745,75 @@ fn trivial_program_sometimes_draws_an_aggregate_key_space() {
         "the generator must sometimes draw a KeySpace::Aggregate definition across 500 samples"
     );
 }
+
+/// Regression coverage floor for a real engine bug (`apply_aggregate.rs`'s
+/// `add_contributions`/`sub_contributions`): a brand-new `Aggregate` group
+/// whose only source row has a `NULL` value for its sole `SUM`/`AVG`
+/// argument used to never get a target row written at all. The generator's
+/// existing `awkward_values` `NULL`-drawing logic (`generate::strategy::value`,
+/// exercised on every column including a table's very first seed row) already
+/// draws exactly this shape by construction — nothing new needed there, see
+/// `awkward_values_on_sometimes_draws_null` above for the general NULL floor
+/// this specializes — so this is purely a coverage floor confirming the
+/// specific "NULL on the table's very first live row, for a column that is
+/// some Aggregate def's SUM/AVG argument" shape stays reliably reachable, the
+/// same "coverage that silently drops out" principle every other floor test
+/// in this file already checks for its own shape.
+#[test]
+fn trivial_program_sometimes_draws_a_null_first_row_for_an_aggregate_sum_avg_argument() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let saw_it = (0..2000).any(|_| {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        program_has_null_first_row_sum_avg_arg(&program)
+    });
+    assert!(
+        saw_it,
+        "expected at least one sample with a NULL value on a table's very first \
+         live row for a column used as some Aggregate def's SUM/AVG argument, \
+         across 2000 samples"
+    );
+}
+
+/// Whether any [`KeySpace::Aggregate`] def in `program` has a `SUM`/`AVG`
+/// field whose argument column is `NULL` on its source table's very first
+/// `Insert` op (in program order — seed-before-mutate means this is always
+/// the table's first-ever seeded row, never a later mutate). Mirrors the
+/// exact shape that used to make `add_contributions`'s missing-entry bug
+/// bite: a group whose only contributing row is that same first row, with a
+/// `NULL` argument and no other row yet to anchor a write.
+fn program_has_null_first_row_sum_avg_arg(program: &Program) -> bool {
+    for def in &program.defs {
+        if !matches!(def.key_space, KeySpace::Aggregate { .. }) {
+            continue;
+        }
+        let sum_avg_columns = def.fields.iter().filter_map(|field| match &field.expr {
+            Expr::FunctionCall { name, args } if name == "SUM" || name == "AVG" => {
+                match args.first() {
+                    Some(Expr::Column(col)) => Some(col.as_str()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        });
+        let Some(Op::Insert { row, .. }) = program
+            .ops
+            .iter()
+            .find(|op| matches!(op, Op::Insert { table, .. } if table == &def.source))
+        else {
+            continue;
+        };
+        for col in sum_avg_columns {
+            if row
+                .iter()
+                .any(|(name, value)| name == col && value.is_none())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}

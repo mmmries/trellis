@@ -985,6 +985,140 @@ async fn sum_goes_null_not_zero_when_a_groups_remaining_rows_are_all_null() {
     );
 }
 
+/// A brand-new `Aggregate` group whose *only* source row carries a NULL
+/// value for its sole `SUM`/`AVG` argument must still get a target row
+/// written — never a silent, permanent missing row.
+///
+/// Root cause: `classify_fields` correctly excludes the `GROUP BY`-echo
+/// field from `plan.fields` (it contributes no column of its own), so a
+/// definition with only `SUM`/`AVG` fields (no `MIN`/`MAX`/`COUNT`) has no
+/// `AggFieldKind::RecomputeOnly` field to anchor a write for a group whose
+/// only activity is a NULL contribution. `add_contributions`/
+/// `sub_contributions` used to insert a `field_accum` entry *only* when a
+/// row's contribution was non-NULL, so a NULL-only group's insert produced
+/// zero `field_accum` entries; `group_has_activity` then saw neither a
+/// `RecomputeOnly` field nor any `field_accum` entry, reported "no
+/// activity," and `apply_aggregate_target` never called `upsert_group` for
+/// the group at all — even though `probe_group_exists` correctly found the
+/// group's live row moments earlier.
+///
+/// This also exercises the symmetric direction: once that lone, NULL-only
+/// row is later deleted, the group must become fully extinct again (its
+/// target row removed), not left behind as a stale row.
+#[tokio::test]
+async fn a_brand_new_null_only_group_still_gets_a_target_row_and_is_removed_when_emptied() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table null_seed_items (id integer primary key, grp integer, amount numeric); \
+             alter table null_seed_items replica identity full",
+        )
+        .await
+        .expect("create source table");
+
+    // Deliberately only SUM/AVG fields (no MIN/MAX/COUNT) — this definition
+    // has no `AggFieldKind::RecomputeOnly` field, which is exactly the shape
+    // that let a NULL-only group's write get suppressed entirely.
+    let source_sql = "TRANSFORM null_seed_totals FROM null_seed_items GROUP BY grp \
+         SELECT grp AS grp, SUM(amount) AS total, AVG(amount) AS avg_amount";
+    let def = parse(source_sql).expect("parse null-seed aggregate definition");
+    let source_columns = numeric_columns(&["id", "grp", "amount"]);
+    create_definition(&db.pool, source_sql, &source_columns)
+        .await
+        .expect("create null-seed definition");
+    create_aggregate_target_table(&db.pool, &def, "public", &source_columns)
+        .await
+        .expect("create null-seed target table");
+
+    // The group's *only* row ever has a NULL argument.
+    client
+        .execute(
+            "insert into null_seed_items (id, grp, amount) values (1, 20, NULL)",
+            &[],
+        )
+        .await
+        .expect("apply live end-state");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "null_seed_items",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"grp":"20","amount":null}"#),
+    )
+    .await;
+    let seg0 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg0, "worker").await;
+
+    let target: HashMap<String, (Option<String>, Option<String>)> = client
+        .query(
+            "select grp::text, total::text, avg_amount::text from null_seed_totals",
+            &[],
+        )
+        .await
+        .expect("read null_seed_totals")
+        .into_iter()
+        .map(|row| {
+            let grp: String = row.get(0);
+            (grp, (row.get(1), row.get(2)))
+        })
+        .collect();
+    assert_eq!(
+        target.get("20"),
+        Some(&(None, None)),
+        "a brand-new group whose only row is NULL-argument must still get a \
+         target row (NULL SUM/AVG, not a missing row)"
+    );
+
+    let oracle_sql = engine::defs::render_aggregate_select_sql(&def);
+    let oracle_sql =
+        format!("select grp::text, total::text, avg_amount::text from ({oracle_sql}) o");
+    let oracle: HashMap<String, (Option<String>, Option<String>)> = client
+        .query(&oracle_sql, &[])
+        .await
+        .expect("run oracle sql")
+        .into_iter()
+        .map(|row| {
+            let grp: String = row.get(0);
+            (grp, (row.get(1), row.get(2)))
+        })
+        .collect();
+    assert_eq!(target, oracle, "must match the oracle");
+
+    // Now delete the group's only row: it must become fully extinct again,
+    // not left behind as a stale NULL-valued row.
+    client
+        .execute("delete from null_seed_items where id = 1", &[])
+        .await
+        .expect("apply live end-state");
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "null_seed_items",
+        "1",
+        "delete",
+        Some(r#"{"grp":"20","amount":null}"#),
+        None,
+    )
+    .await;
+    let seg1 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg1, "worker").await;
+
+    let remaining: i64 = client
+        .query_one("select count(*) from null_seed_totals", &[])
+        .await
+        .expect("count null_seed_totals")
+        .get(0);
+    assert_eq!(
+        remaining, 0,
+        "the group must disappear entirely once its last (NULL-only) row is gone"
+    );
+}
+
 /// Regression pin for a genuine incremental-`AVG`-maintenance correctness
 /// bug (found reviewing the generative test suite's `KeySpace::Aggregate`
 /// coverage): three plain `INSERT`s into the *same* group, each landing in
