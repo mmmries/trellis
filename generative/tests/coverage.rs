@@ -10,7 +10,11 @@ use std::collections::HashSet;
 
 use engine::defs::ast::{Expr, KeySpace, Operator, ValueType};
 use engine::defs::invertibility::{AggregateArg, CountArg, Invertibility, classify};
-use generative::generate::{Mutate, build_program, trivial_program, trivial_program_with};
+use generative::generate::{
+    Mutate, build_program, bulk_insert_program, program_with_client_restart,
+    program_with_mid_stream_def_install, program_with_scale_out, trivial_program,
+    trivial_program_with,
+};
 use generative::model::{Op, Program, Table};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
@@ -142,8 +146,10 @@ fn every_supported_operator_appears_over_every_supported_argument_type() {
     }
 }
 
-/// Every value drawn from an `Op::Insert`/`Op::Update` in `program`, in draw
-/// order. Ignores `Op::Delete` (it carries no field values).
+/// Every value drawn from an `Op::Insert`/`Op::Update`/`Op::BulkInsert` in
+/// `program`, in draw order. Ignores `Op::Delete`/`Op::Truncate` (neither
+/// carries a field value — improvement-plan task E6's `Truncate` is exactly
+/// as value-free as `Delete` here).
 fn all_op_values(program: &generative::model::Program) -> Vec<Option<String>> {
     program
         .ops
@@ -151,7 +157,11 @@ fn all_op_values(program: &generative::model::Program) -> Vec<Option<String>> {
         .flat_map(|op| match op {
             Op::Insert { row, .. } => row.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
             Op::Update { changes, .. } => changes.iter().map(|(_, v)| v.clone()).collect(),
-            Op::Delete { .. } => Vec::new(),
+            Op::Delete { .. } | Op::Truncate { .. } => Vec::new(),
+            Op::BulkInsert { rows, .. } => rows
+                .iter()
+                .flat_map(|row| row.iter().map(|(_, v)| v.clone()))
+                .collect(),
         })
         .collect()
 }
@@ -743,5 +753,121 @@ fn trivial_program_sometimes_draws_an_aggregate_key_space() {
     assert!(
         saw_aggregate,
         "the generator must sometimes draw a KeySpace::Aggregate definition across 500 samples"
+    );
+}
+
+/// Improvement-plan task E2's coverage floor: `program_with_mid_stream_def_install`
+/// must actually draw a deferred install (a nonzero `def_install_after_op`
+/// entry) across enough samples — sampled the same way as
+/// `trivial_program_sometimes_draws_more_than_one_table` above, via the
+/// `Coverage` accumulator's own tally rather than hand-walking the field here
+/// a second time.
+#[test]
+fn mid_stream_def_installs_actually_get_drawn() {
+    let mut runner = TestRunner::default();
+    let strategy = program_with_mid_stream_def_install(true);
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    assert!(
+        coverage.mid_stream_def_installs > 0,
+        "coverage floor failed: expected at least one deferred (mid-stream) definition install \
+         across 500 samples:\n{coverage}"
+    );
+}
+
+/// Improvement-plan task E3's coverage floor, restart half:
+/// `program_with_client_restart` must actually schedule a restart across
+/// enough samples.
+#[test]
+fn client_restarts_actually_get_drawn() {
+    let mut runner = TestRunner::default();
+    let strategy = program_with_client_restart(true);
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    assert!(
+        coverage.client_restarts > 0,
+        "coverage floor failed: expected at least one scheduled client restart across 500 \
+         samples:\n{coverage}"
+    );
+}
+
+/// Improvement-plan task E3's coverage floor, scale-out half: same shape as
+/// `client_restarts_actually_get_drawn` above, over `program_with_scale_out`.
+#[test]
+fn client_scale_outs_actually_get_drawn() {
+    let mut runner = TestRunner::default();
+    let strategy = program_with_scale_out(true);
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    assert!(
+        coverage.client_scale_outs > 0,
+        "coverage floor failed: expected at least one scheduled client scale-out across 500 \
+         samples:\n{coverage}"
+    );
+}
+
+/// Improvement-plan task E6's coverage floor, TRUNCATE half: the *default*
+/// strategy (`trivial_program`, not a dedicated one — `Mutate::Truncate` is
+/// drawn by the same shared `mutate()` strategy every other `Mutate` variant
+/// is) must sometimes draw a `Truncate` op across enough samples.
+#[test]
+fn trivial_program_sometimes_draws_a_truncate() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    assert!(
+        coverage.ops_by_kind.get("Truncate").copied().unwrap_or(0) > 0,
+        "coverage floor failed: expected at least one Truncate op across 500 samples:\n{coverage}"
+    );
+}
+
+/// Improvement-plan task E6's coverage floor, bulk-insert half:
+/// `bulk_insert_program`'s row-count dimension must actually get
+/// meaningfully large (not just "sometimes more than 1") across its shrink
+/// range — sampled the same way as the other floor tests above, checking
+/// `Coverage::max_bulk_insert_rows` against a threshold well above
+/// `MAX_SEED_ROWS`/`MAX_MUTATES`-scale counts so this floor could only pass
+/// if the dimension is real.
+#[test]
+fn bulk_insert_row_count_gets_meaningfully_large() {
+    let mut runner = TestRunner::default();
+    let strategy = bulk_insert_program();
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    assert!(
+        coverage.max_bulk_insert_rows > 100,
+        "coverage floor failed: expected a bulk insert of more than 100 rows across 500 \
+         samples:\n{coverage}"
     );
 }

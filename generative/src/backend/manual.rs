@@ -42,6 +42,13 @@ pub enum ManualBackendError {
     /// not name, so this stays enforced if a "point at an existing cluster"
     /// mode is ever added.
     UnnamedTarget,
+    /// [`ManualBackend::restart`] was called before [`ManualBackend::install`]
+    /// ever started a primary engine client — nothing to restart. A generator
+    /// bug (improvement-plan task E3's `restart_after_ops` is only ever
+    /// nonzero on a program that also has at least one table, so `install`
+    /// always starts a client before any restart point is reached), not a
+    /// condition a caller should need to handle gracefully.
+    NoClientStarted,
     Config(engine::Error),
     Client(ClientError),
     Catalog(CatalogError),
@@ -205,6 +212,18 @@ pub struct ManualBackend {
     pool: Pool,
     raw: tokio_postgres::Client,
     engine_client: Option<EngineClient>,
+    /// The options the primary `engine_client` was started with — remembered
+    /// so [`ManualBackend::restart`] (improvement-plan task E3) can start a
+    /// fresh client against the exact same target rather than needing the
+    /// caller to hand the options back in.
+    client_options: Option<ClientOptions>,
+    /// Additional application-worker-only clients started by
+    /// [`ManualBackend::scale_out`] (improvement-plan task E3). Kept alive for
+    /// the backend's own lifetime (dropped, and so best-effort-signalled to
+    /// stop, only when `self` is) — nothing here ever reads back out of this
+    /// list, it exists purely so these clients keep running and aren't
+    /// dropped the instant `scale_out` returns.
+    scale_out_clients: Vec<EngineClient>,
     tables: HashMap<String, Table>,
     defs: Vec<TransformDef>,
 }
@@ -241,6 +260,8 @@ impl ManualBackend {
             pool,
             raw,
             engine_client: None,
+            client_options: None,
+            scale_out_clients: Vec::new(),
             tables: HashMap::new(),
             defs: Vec::new(),
         })
@@ -375,8 +396,12 @@ impl super::Backend for ManualBackend {
                 source_tables,
                 ..Default::default()
             };
-            let client = EngineClient::start(self.dsn.clone(), options)?;
+            let client = EngineClient::start(self.dsn.clone(), options.clone())?;
             self.engine_client = Some(client);
+            // Remembered so `restart` (improvement-plan task E3) can start an
+            // equivalent replacement client without the caller needing to
+            // hand these options back in.
+            self.client_options = Some(options);
         }
         Ok(())
     }
@@ -482,6 +507,90 @@ impl super::Backend for ManualBackend {
                 );
                 self.raw.execute(&sql, &[pk]).await?
             }
+            Op::Truncate { table, .. } => {
+                // Improvement-plan task E6's load-bearing gotcha: Postgres's
+                // `TRUNCATE` command tag always reports `0` rows affected,
+                // regardless of how many rows actually existed — trusting
+                // that raw count into `run_convergence`'s
+                // `Ok(0) => AffectsNoRows` classifier would misclassify every
+                // non-empty truncate as a no-op, defeating "operation errors
+                // are checked, not swallowed" for this op entirely. So the
+                // real row count is synthesized here instead: a `SELECT
+                // count(*)` in the *same transaction* as the `TRUNCATE`,
+                // taken before it runs, so nothing can slip a concurrent
+                // write in between the count and the clear (moot for this
+                // single-threaded harness, but it's the honest way to make
+                // "the count reflects what actually got cleared" true by
+                // construction rather than by accident of timing).
+                let quoted = quote_ident(table);
+                let txn = self.raw.transaction().await?;
+                let count_row = txn
+                    .query_one(&format!("select count(*) from {quoted}"), &[])
+                    .await?;
+                let count: i64 = count_row.get(0);
+                txn.batch_execute(&format!("truncate table {quoted}"))
+                    .await?;
+                txn.commit().await?;
+                count as u64
+            }
+            Op::BulkInsert { table, rows, .. } => {
+                let Some(first_row) = rows.first() else {
+                    // An empty `rows` is a generator bug (there is no valid
+                    // SQL "insert zero rows" via a VALUES list) — not a
+                    // condition this backend should paper over by silently
+                    // doing nothing.
+                    panic!(
+                        "ManualBackend::apply: Op::BulkInsert against table {table:?} carries no \
+                         rows — a generator bug"
+                    );
+                };
+                let columns: Vec<&str> = first_row.iter().map(|(c, _)| c.as_str()).collect();
+                let column_list = columns
+                    .iter()
+                    .map(|c| quote_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let mut placeholder_groups = Vec::with_capacity(rows.len());
+                let mut params: Vec<Option<String>> =
+                    Vec::with_capacity(rows.len() * columns.len());
+                for row in rows {
+                    let row_columns: Vec<&str> = row.iter().map(|(c, _)| c.as_str()).collect();
+                    assert_eq!(
+                        row_columns, columns,
+                        "ManualBackend::apply: every Op::BulkInsert row must carry the same \
+                         columns in the same order as the first row — a generator bug (table \
+                         {table:?})"
+                    );
+                    let placeholders: Vec<String> = row
+                        .iter()
+                        .map(|(col, val)| {
+                            params.push(val.clone());
+                            format!(
+                                "${}::text::{}",
+                                params.len(),
+                                pg_type_name(
+                                    self.column(table, col)
+                                        .map(|c| c.value_type)
+                                        .unwrap_or(ValueType::Numeric)
+                                )
+                            )
+                        })
+                        .collect();
+                    placeholder_groups.push(format!("({})", placeholders.join(", ")));
+                }
+
+                let sql = format!(
+                    "insert into {} ({column_list}) values {}",
+                    quote_ident(table),
+                    placeholder_groups.join(", ")
+                );
+                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+                    .iter()
+                    .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+                    .collect();
+                self.raw.execute(&sql, &params).await?
+            }
         };
         Ok(affected)
     }
@@ -549,6 +658,48 @@ impl super::Backend for ManualBackend {
         }
 
         Ok(snapshot)
+    }
+
+    /// Improvement-plan task E3: drops the current primary `engine::Client`
+    /// (its own `Drop` impl fires here — best-effort shutdown signal, no
+    /// draining, no join: see the `Backend::restart` doc comment) and starts
+    /// a fresh one against the same dsn/options [`ManualBackend::install`]
+    /// remembered. The ring is durable Postgres state untouched by any of
+    /// this, so the new client resumes exactly where the old one left off.
+    async fn restart(&mut self) -> Result<(), ManualBackendError> {
+        let options = self
+            .client_options
+            .clone()
+            .ok_or(ManualBackendError::NoClientStarted)?;
+        // Dropping the old value here — before starting the replacement —
+        // is what fires `engine::Client`'s `Drop` impl (the crash stand-in);
+        // reassigning below wouldn't run it any differently, but doing it as
+        // its own statement keeps the "crash, then restart" sequencing
+        // explicit rather than implicit in the assignment.
+        self.engine_client = None;
+        let client = EngineClient::start(self.dsn.clone(), options)?;
+        self.engine_client = Some(client);
+        Ok(())
+    }
+
+    /// Improvement-plan task E3: starts an additional, application-worker-only
+    /// (`staging_worker: false`) `engine::Client` against the same dsn,
+    /// alongside whatever primary client `install` already started —
+    /// confirming multiple clients can coexist draining the same ring (the
+    /// module doc comment on `engine::Client` claims this is supported; this
+    /// is where the generative suite exercises that claim). Never touches
+    /// `source_tables`: an application-only client doesn't consult it (see
+    /// `ClientOptions::source_tables`'s own doc comment), so this needs no
+    /// state beyond the dsn.
+    async fn scale_out(&mut self) -> Result<(), ManualBackendError> {
+        let options = ClientOptions {
+            staging_worker: false,
+            application_threads: 1,
+            ..Default::default()
+        };
+        let client = EngineClient::start(self.dsn.clone(), options)?;
+        self.scale_out_clients.push(client);
+        Ok(())
     }
 }
 

@@ -117,6 +117,35 @@ pub enum Op {
         pk: String,
         expect: OpOutcome,
     },
+    /// Clears every row of `table` in one statement (improvement-plan task
+    /// E6). Rendered by [`crate::backend::ManualBackend::apply`] as a plain
+    /// `TRUNCATE TABLE`, **not** trusted for its own affected-row count:
+    /// Postgres's `TRUNCATE` command tag always reports `0` regardless of how
+    /// many rows existed, so the backend synthesizes a real count itself (a
+    /// `SELECT count(*)` in the same transaction, before issuing the
+    /// `TRUNCATE`) rather than letting `tokio_postgres::Client::execute`'s
+    /// raw return value flow into `run_convergence`'s
+    /// `Ok(0) => AffectsNoRows` classifier — see that function's module doc
+    /// comment and `ManualBackend::apply`'s own `Op::Truncate` arm for why
+    /// this is load-bearing: a naive pass-through would misclassify every
+    /// non-empty truncate as `AffectsNoRows`, silently defeating the "an op
+    /// that errors changed nothing" / "operation errors are checked, not
+    /// swallowed" invariant the whole run loop is built on.
+    Truncate { table: String, expect: OpOutcome },
+    /// Inserts every row of `rows` in a single `INSERT ... VALUES (...),
+    /// (...), ...` statement (improvement-plan task E6's bulk-insert
+    /// dimension) rather than [`Op::Insert`]'s one-row-per-statement shape.
+    /// Every entry of `rows` must carry the same columns, in the same order,
+    /// as every other entry — [`crate::backend::ManualBackend::apply`] takes
+    /// the column list from `rows[0]` and panics (a generator bug) if a later
+    /// row disagrees. A single multi-row `INSERT` is atomic exactly like a
+    /// single-row one (Postgres either inserts every row or none), so
+    /// `expect` covers the whole statement, not each row individually.
+    BulkInsert {
+        table: String,
+        rows: Vec<Vec<(String, Option<String>)>>,
+        expect: OpOutcome,
+    },
 }
 
 impl Op {
@@ -124,9 +153,11 @@ impl Op {
     /// (design doc §4). See [`OpOutcome`].
     pub fn expect(&self) -> &OpOutcome {
         match self {
-            Op::Insert { expect, .. } | Op::Update { expect, .. } | Op::Delete { expect, .. } => {
-                expect
-            }
+            Op::Insert { expect, .. }
+            | Op::Update { expect, .. }
+            | Op::Delete { expect, .. }
+            | Op::Truncate { expect, .. }
+            | Op::BulkInsert { expect, .. } => expect,
         }
     }
 }
@@ -137,7 +168,41 @@ impl Op {
 pub struct Program {
     pub tables: Vec<Table>,
     pub defs: Vec<TransformDef>,
+    /// `def_install_after_op[i]` is how many of `ops` must already have been
+    /// applied before `defs[i]` is installed (improvement-plan task E2):
+    /// `0` — every existing program's default, drawn by every strategy that
+    /// predates E2 — means "install up front, alongside every table, before
+    /// any op runs" (today's only behavior, and [`crate::run::run_convergence`]'s
+    /// default). A nonzero value `N` means "install this definition only once
+    /// `ops[0..N]` have already been applied" — real rows can already exist
+    /// in `defs[i].source` by then, exercising `engine::defs::catalog::install_definition`'s
+    /// direct-backfill-over-preexisting-rows path (the same path
+    /// `generative/tests/backfill.rs` exercises by hand, now reachable from
+    /// inside the harness's own op-stream loop). Must be index-aligned with
+    /// `defs` (same length) — see [`crate::generate::defer_def_install`] for
+    /// the one supported way to set an entry away from `0`, which enforces
+    /// `1 <= N < ops.len()` (deferring to before op 0 is just the default;
+    /// deferring to on/after the very last op would never reach a subsequent
+    /// per-op convergence check, so [`crate::run::run_convergence`] never
+    /// looks for it and a generator asking for it is a bug worth panicking on
+    /// rather than silently dropping the install).
+    pub def_install_after_op: Vec<usize>,
     pub ops: Vec<Op>,
+    /// Op indices (improvement-plan task E3) after which
+    /// [`crate::run::run_convergence`] calls [`crate::backend::Backend::restart`]
+    /// on the backend — simulating an in-process engine client crash-and-restart
+    /// mid-stream (see that trait method's doc comment). Entries must satisfy
+    /// `1 <= n < ops.len()` (see [`crate::generate::schedule_restart`], the one
+    /// supported way to add one) for the same "never after the last op" reason
+    /// `def_install_after_op` documents. Empty for every program that predates
+    /// E3.
+    pub restart_after_ops: Vec<usize>,
+    /// Op indices (improvement-plan task E3) after which
+    /// [`crate::run::run_convergence`] calls [`crate::backend::Backend::scale_out`]
+    /// on the backend — starting an additional application-worker-only engine
+    /// client alongside the existing one(s). Same index contract as
+    /// `restart_after_ops` — see [`crate::generate::schedule_scale_out`].
+    pub scale_out_after_ops: Vec<usize>,
 }
 
 /// The composite row-key convention for an [`engine::defs::ast::KeySpace::Aggregate`]
@@ -282,6 +347,7 @@ mod tests {
         let program = Program {
             tables: vec![table.clone()],
             defs: Vec::new(),
+            def_install_after_op: Vec::new(),
             ops: vec![Op::Insert {
                 table: table.name.clone(),
                 row: vec![
@@ -290,6 +356,8 @@ mod tests {
                 ],
                 expect: OpOutcome::Succeeds,
             }],
+            restart_after_ops: Vec::new(),
+            scale_out_after_ops: Vec::new(),
         };
         let printed = format!("{program:?}");
         assert!(printed.contains("Program"));

@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use engine::Pool;
-use engine::defs::ast::ValueType;
+use engine::defs::ast::{TransformDef, ValueType};
 
 use crate::backend::{Backend, Snapshot};
 use crate::model::{OpOutcome, Program};
@@ -133,6 +133,10 @@ pub enum RunError {
         expected: OpOutcome,
         actual: OpOutcome,
     },
+    /// A scheduled [`Backend::restart`] (improvement-plan task E3) failed.
+    Restart(String),
+    /// A scheduled [`Backend::scale_out`] (improvement-plan task E3) failed.
+    ScaleOut(String),
 }
 
 /// Installs `program`, then applies each op and checks convergence after it.
@@ -163,14 +167,78 @@ pub async fn run_convergence<B: Backend>(
     // free unless set.
     let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
 
+    // Improvement-plan task E2: only the definitions due at op index `n`
+    // (`def_install_after_op[i] == n`) — `n == 0` is every pre-E2 program's
+    // only value, so this reduces to "every definition" for those.
+    let due_defs = |n: usize| -> Vec<TransformDef> {
+        program
+            .defs
+            .iter()
+            .zip(program.def_install_after_op.iter())
+            .filter(|(_, at)| **at == n)
+            .map(|(def, _)| def.clone())
+            .collect()
+    };
+
     let start = timing_enabled.then(std::time::Instant::now);
-    let install_result = backend.install(program).await;
+    let initial_defs = due_defs(0);
+    let install_result = backend
+        .install(&Program {
+            tables: program.tables.clone(),
+            defs: initial_defs.clone(),
+            def_install_after_op: vec![0; initial_defs.len()],
+            ops: Vec::new(),
+            restart_after_ops: Vec::new(),
+            scale_out_after_ops: Vec::new(),
+        })
+        .await;
     if let Some(start) = start {
         eprintln!("COST_TIMING install {}", start.elapsed().as_millis());
     }
     install_result.map_err(|e| RunError::Install(format!("{e:?}")))?;
+    // Definitions actually installed so far, in the order they were
+    // installed — checked against the oracle below instead of blindly
+    // `program.defs` (task E2's whole point: a deferred definition must not
+    // be checked, or even looked up in the snapshot, before its own install
+    // point is reached).
+    let mut installed_defs = initial_defs;
 
     for (op_index, op) in program.ops.iter().enumerate() {
+        if op_index > 0 {
+            // Improvement-plan task E2: install whatever became due right
+            // before this op runs.
+            let due = due_defs(op_index);
+            if !due.is_empty() {
+                backend
+                    .install(&Program {
+                        tables: Vec::new(),
+                        defs: due.clone(),
+                        def_install_after_op: vec![0; due.len()],
+                        ops: Vec::new(),
+                        restart_after_ops: Vec::new(),
+                        scale_out_after_ops: Vec::new(),
+                    })
+                    .await
+                    .map_err(|e| RunError::Install(format!("{e:?}")))?;
+                installed_defs.extend(due);
+            }
+            // Improvement-plan task E3: a scheduled restart/scale-out fires
+            // right before the op it's anchored to, same as a deferred
+            // definition install above.
+            if program.restart_after_ops.contains(&op_index) {
+                backend
+                    .restart()
+                    .await
+                    .map_err(|e| RunError::Restart(format!("{e:?}")))?;
+            }
+            if program.scale_out_after_ops.contains(&op_index) {
+                backend
+                    .scale_out()
+                    .await
+                    .map_err(|e| RunError::ScaleOut(format!("{e:?}")))?;
+            }
+        }
+
         // A rejected op is a source no-op, not a skip: fall through to quiesce
         // and compare anyway (design doc §4). The actual outcome (not just
         // whether it errored) is classified and checked against what the
@@ -209,7 +277,7 @@ pub async fn run_convergence<B: Backend>(
         let snapshot = snapshot.map_err(|e| RunError::Snapshot(format!("{e:?}")))?;
 
         let start = timing_enabled.then(std::time::Instant::now);
-        let checked = check_program(pool, program, &snapshot).await;
+        let checked = check_defs(pool, program, &installed_defs, &snapshot).await;
         if let Some(start) = start {
             eprintln!("COST_TIMING oracle {}", start.elapsed().as_millis());
         }
@@ -232,12 +300,34 @@ pub async fn run_convergence<B: Backend>(
 /// Exposed (not just used by [`run_convergence`]) so a red/control test can
 /// feed it a deliberately corrupted snapshot and confirm the harness reports
 /// the divergence — proving it tells green from red (design doc §6/§7).
+///
+/// A thin wrapper around [`check_defs`] for `program.defs` in full — every
+/// caller that predates improvement-plan task E2 (every definition installs
+/// up front) wants exactly that. [`run_convergence`] itself calls
+/// [`check_defs`] directly with only the definitions installed *so far*,
+/// since a deferred definition (task E2) must not be checked — or even
+/// looked up in the snapshot — before its own install point is reached.
 pub async fn check_program(
     pool: &Pool,
     program: &Program,
     snapshot: &Snapshot,
 ) -> Result<Option<(String, ThreeWayReport)>, String> {
-    for def in &program.defs {
+    check_defs(pool, program, &program.defs, snapshot).await
+}
+
+/// [`check_program`]'s general form (improvement-plan task E2): runs the
+/// three-way oracle check for every definition in `defs` (not necessarily all
+/// of `program.defs` — see [`run_convergence`]'s use of this for a partially-
+/// installed program) against `snapshot`, returning the first `(target,
+/// report)` that diverged, or `None` if all converged. `program` is still
+/// needed for its `tables` (to resolve each definition's source schema).
+pub async fn check_defs(
+    pool: &Pool,
+    program: &Program,
+    defs: &[TransformDef],
+    snapshot: &Snapshot,
+) -> Result<Option<(String, ThreeWayReport)>, String> {
+    for def in defs {
         let source = program
             .tables
             .iter()
