@@ -44,7 +44,7 @@ pub fn extract_database_url(args: &mut Vec<String>) -> Result<Option<String>, St
     if let Some(second_idx) = args.iter().position(|a| a == LONG_FLAG || a == SHORT_FLAG) {
         let second_flag = &args[second_idx];
         return Err(format!(
-            "{flag}/{second_flag} may only be specified once, got both {LONG_FLAG} and {SHORT_FLAG}"
+            "{LONG_FLAG}/{SHORT_FLAG} may only be specified once, got both {flag} and {second_flag}"
         ));
     }
 
@@ -105,6 +105,42 @@ mod tests {
             "postgresql://a/b".to_string(),
             "TRANSFORM x FROM y".to_string(),
         ];
-        assert!(extract_database_url(&mut args).is_err());
+        let err = extract_database_url(&mut args).unwrap_err();
+        assert!(err.contains("--database-url"));
+        assert!(err.contains("-d"));
+    }
+
+    #[test]
+    fn long_flag_specified_twice_reports_the_flags_actually_used() {
+        // Both occurrences are `--database-url`; the error must name what
+        // was actually typed, not just assume one long and one short flag.
+        let mut args = vec![
+            "--database-url".to_string(),
+            "postgresql://x/y".to_string(),
+            "--database-url".to_string(),
+            "postgresql://a/b".to_string(),
+        ];
+        let err = extract_database_url(&mut args).unwrap_err();
+        assert!(
+            !err.contains("got both --database-url and -d"),
+            "error should not fabricate a short flag that was never given: {err}"
+        );
+    }
+
+    #[test]
+    fn short_flag_specified_twice_reports_the_flags_actually_used() {
+        // Both occurrences are `-d`; the error must not claim `--database-url`
+        // was one of the two flags seen.
+        let mut args = vec![
+            "-d".to_string(),
+            "postgresql://x/y".to_string(),
+            "-d".to_string(),
+            "postgresql://a/b".to_string(),
+        ];
+        let err = extract_database_url(&mut args).unwrap_err();
+        assert!(
+            !err.contains("got both --database-url and -d"),
+            "error should not fabricate a long flag that was never given: {err}"
+        );
     }
 }
