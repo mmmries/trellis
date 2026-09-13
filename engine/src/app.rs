@@ -25,11 +25,29 @@
 //! match on instead of every internal Rust error variant (`docs/public-api-design.md`,
 //! decision 3).
 //!
+//! **[`define`](Trellis::define) doesn't block on backfill.** Per
+//! `docs/public-api-design.md`'s decision 1 and
+//! [ADR-0007's amendment](../../docs/decisions/0007-direct-set-based-backfill.md#backgrounding-and-resumability-amendment),
+//! a plain (non-relationship) 1-1 transform's initial backfill runs as a
+//! durable, claimable queue of chunks that running drain
+//! (`application_threads`) workers execute — anywhere in the fleet, not
+//! necessarily on the connection that called `define()`. `define()` itself
+//! returns once the definition is registered and that chunk work is
+//! enumerated/persisted, with [`TransformStatus::Backfilling`]; callers that
+//! need the target actually populated poll [`Trellis::status`] until it
+//! reports [`TransformStatus::Live`] — which requires *some* client in the
+//! fleet to be running with `drain_threads > 0` (a `define`-only connection,
+//! with no such client anywhere, leaves the transform queued indefinitely).
+//! A relationship-enriched 1-1 transform (like the `count(posts.id)` example
+//! below) or an aggregate (`GROUP BY`) transform still builds fully
+//! synchronously in-call today — see `engine::defs::backfill`'s module docs
+//! for why those two shapes aren't chunked into the durable queue yet.
+//!
 //! # Lifecycle
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), engine::TrellisError> {
-//! use engine::{Config, Trellis, TrellisOptions};
+//! use engine::{Config, Trellis, TrellisOptions, TransformStatus};
 //!
 //! // Define transforms with no runtime attached.
 //! let trellis = Trellis::connect(Config::resolve(None)?, TrellisOptions::default()).await?;
@@ -42,11 +60,17 @@
 //!     .await?;
 //!
 //! // Separately, run the live pipeline: staging worker + two drain threads.
+//! // Drain threads are also what finish any queued backfill chunk work, for
+//! // a plain 1-1 transform `define()` returned before fully building.
 //! let running = Trellis::connect(
 //!     Config::resolve(None)?,
 //!     TrellisOptions { staging: true, drain_threads: 2 },
 //! )
 //! .await?;
+//! // Poll until every registered transform is done backfilling.
+//! while running.status("authors_calc").await? != Some(TransformStatus::Live) {
+//!     // ... sleep, then re-check ...
+//! }
 //! // ... run until shutdown ...
 //! running.shutdown().await?;
 //! # Ok(())
@@ -142,12 +166,21 @@ impl Trellis {
             .map_err(TrellisError::Engine)
     }
 
-    /// Registers a transform definition and builds its target table.
+    /// Registers a transform definition and creates its target table.
     ///
     /// Introspects the source table's columns for the validator, then routes
-    /// through [`defs::install_definition`] — the fast direct-build path that
-    /// computes the target server-side and records backfill coverage so the
-    /// live pipeline doesn't re-enumerate rows the build already folded in.
+    /// through [`defs::install_definition`] — the fast direct-build path.
+    ///
+    /// **Returns before backfill finishes** for a plain (non-relationship)
+    /// 1-1 transform (see this module's doc comment): the returned
+    /// [`Definition`] reports [`TransformStatus::Backfilling`], and the
+    /// target is populated in the background by whichever drain
+    /// (`application_threads`) workers are running in the fleet, not by this
+    /// call. Poll [`Trellis::status`] for [`TransformStatus::Live`] once you
+    /// need the target's contents. A relationship-enriched 1-1 or an
+    /// aggregate (`GROUP BY`) transform still builds synchronously — the
+    /// returned [`Definition`] already reports [`TransformStatus::Live`] for
+    /// those two shapes.
     pub async fn define(&self, definition_text: &str) -> Result<Definition, TrellisError> {
         let parsed = defs::parse(definition_text)?;
         let source_columns = self.source_columns(&parsed.source).await?;

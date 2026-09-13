@@ -29,9 +29,9 @@ async fn migrate_up_is_idempotent() {
     assert_eq!(
         first_run,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
         ],
-        "expected exactly V1 through V19 to be applied"
+        "expected exactly V1 through V20 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.

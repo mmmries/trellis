@@ -27,6 +27,7 @@
 pub mod ast;
 pub mod backfill;
 pub mod catalog;
+pub mod chunk_queue;
 pub mod ddl;
 pub mod error;
 pub mod eval;

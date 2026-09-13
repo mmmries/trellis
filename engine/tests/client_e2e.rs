@@ -21,7 +21,10 @@ use std::time::Duration;
 use engine::Pool;
 use engine::config::DEFAULT_SCHEMA;
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use engine::defs::{create_definition, create_target_table, recompute, source_primary_key};
+use engine::defs::{
+    TransformStatus, create_definition, create_target_table, install_definition, recompute,
+    source_primary_key,
+};
 use engine::{Client as TrellisClient, ClientOptions};
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
@@ -502,6 +505,87 @@ async fn staging_and_application_threads_are_independent_knobs() {
     assert_eq!(
         target_count, 0,
         "with zero application threads nothing should have drained into the target"
+    );
+
+    client.shutdown().await.expect("clean shutdown");
+}
+
+/// docs/decisions/0007's "Backgrounding and resumability" amendment, proven
+/// end-to-end through the real `Client` runtime rather than by manually
+/// calling `defs::chunk_queue`'s primitives (see `defs_backfill_chunk_queue.rs`
+/// for that lower-level coverage): `install_definition` on a plain
+/// (non-relationship) 1-1 transform returns immediately with the definition
+/// still `Backfilling`, and it's the running client's own `application_threads`
+/// drain workers — with no ring/CDC involved at all here (`staging_worker:
+/// false`) — that claim and finish its backfill chunk, flipping it to `Live`
+/// and building the target correctly.
+#[tokio::test]
+async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+
+    raw.batch_execute(
+        "create table widgets (id bigint primary key, price numeric); \
+         insert into widgets (id, price) select g, g from generate_series(1, 200) g",
+    )
+    .await
+    .expect("seed widgets");
+
+    let options = ClientOptions {
+        staging_worker: false,
+        application_threads: 2,
+        ..Default::default()
+    };
+    let client = TrellisClient::start(db.dsn(), options).expect("client start");
+
+    let widgets_columns = numeric_columns(&["id", "price"]);
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM widgets_calc FROM widgets SELECT price + price AS double_price",
+        &widgets_columns,
+        "public",
+    )
+    .await
+    .expect("install_definition enumerates chunk work and returns");
+    assert_eq!(
+        def.status,
+        TransformStatus::Backfilling,
+        "install_definition must return before any running drain worker finishes the chunk queue"
+    );
+
+    poll_until(
+        Duration::from_secs(20),
+        Duration::from_millis(100),
+        "widgets_calc's backfill chunk was never claimed and finished by a running drain worker",
+        async || {
+            let status: Option<String> = raw
+                .query_opt(
+                    "select status from transform_definitions where target_table = 'widgets_calc'",
+                    &[],
+                )
+                .await
+                .expect("read status")
+                .map(|row| row.get(0));
+            status.as_deref() == Some("live")
+        },
+    )
+    .await;
+
+    let mismatches: i64 = raw
+        .query_one(
+            "select count(*) from widgets \
+             left join widgets_calc on widgets_calc.id = widgets.id \
+             where widgets_calc.id is null \
+                or widgets_calc.double_price is distinct from widgets.price + widgets.price",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        mismatches, 0,
+        "a running drain worker must have built the target correctly"
     );
 
     client.shutdown().await.expect("clean shutdown");

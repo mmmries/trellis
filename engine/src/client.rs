@@ -45,6 +45,7 @@ use tokio_postgres::NoTls;
 use tokio_postgres::config::Host;
 
 use crate::config::Config;
+use crate::defs::chunk_queue;
 use crate::defs::{self, CatalogError};
 use crate::error_code::{self, ErrorCode};
 use crate::intake::{self, IntakeConfig, IntakeError};
@@ -465,6 +466,7 @@ async fn run(
             pool: pool.clone(),
             dsn: dsn.clone(),
             schema: config.schema().to_string(),
+            target_schema: config.target_schema().to_string(),
             claimed_by,
             wake_channel: options.wake_channel.clone(),
             drainer_window: options.drainer_window,
@@ -715,6 +717,15 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 failed = staging::reclaim_stale(c, reclaim_ttl).await.is_err();
             }
             if !failed {
+                // Backfill chunks' own reclaim-stale sweep (docs/decisions/0007's
+                // amendment): a drain worker that died mid-chunk leaves a
+                // stale claim here, freed the same way a stale `seg_claims`
+                // row is above.
+                failed = chunk_queue::reclaim_stale_chunks(c, reclaim_ttl)
+                    .await
+                    .is_err();
+            }
+            if !failed {
                 failed = staging::retire_drained_segments(c).await.is_err();
             }
             if !failed && Instant::now() >= next_reconcile {
@@ -848,6 +859,13 @@ struct AppWorkerConfig {
     pool: Pool,
     dsn: String,
     schema: String,
+    /// Schema `defs::chunk_queue::run_claimed_chunk` renders a claimed
+    /// backfill chunk's target-table SQL against — the same value
+    /// `install_definition` was called with (`Config::target_schema`), not
+    /// `schema` above (the Trellis catalog schema). Every drain worker in a
+    /// fleet is expected to share this, exactly like `MaintenanceConfig`'s
+    /// own `target_schema` field.
+    target_schema: String,
     claimed_by: String,
     wake_channel: String,
     drainer_window: Duration,
@@ -855,21 +873,35 @@ struct AppWorkerConfig {
     poll_interval: Duration,
 }
 
+/// How many pending backfill chunks one [`app_worker_loop`] iteration claims
+/// at a time — small enough that one worker doesn't hoard a huge definition's
+/// whole queue while peers sit idle, matching the spirit of
+/// `staging::MAX_COALESCE_SEGMENTS`'s own per-tick batch cap.
+const MAX_BACKFILL_CHUNK_CLAIM: i64 = 4;
+
 /// One application-worker task: registers itself as a drainer, runs an
-/// out-of-band heartbeat daemon for its claims, then loops claiming and
-/// draining sealed batches until shutdown.
+/// out-of-band heartbeat daemon for its ring-segment claims, then loops
+/// claiming and draining sealed batches *and* claiming and executing pending
+/// direct-build backfill chunks (docs/decisions/0007's amendment) until
+/// shutdown — both kinds of claimable work share this one loop/worker pool,
+/// per `docs/public-api-design.md`'s decision 1 ("it's `application_threads`
+/// that finishes transform work, backfill included").
 ///
 /// On a non-retryable error from [`staging::drain_once`] (anything
 /// `drain_once` itself gave up retrying — a fence miss and a serialization
 /// failure are already retried internally up to its own attempt cap), this
 /// releases the claim immediately (see [`staging::release`]) rather than
 /// leaving it to the reclaim TTL, then deregisters the heartbeat and
-/// continues: one bad batch never crashes the worker.
+/// continues: one bad batch never crashes the worker. A backfill chunk that
+/// fails to execute is released the same way (see [`drain_backfill_chunks`]),
+/// left for the reclaim-stale sweep or a retry by whichever worker claims it
+/// next.
 async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiver<bool>) {
     let AppWorkerConfig {
         pool,
         dsn,
         schema,
+        target_schema,
         claimed_by,
         wake_channel,
         drainer_window,
@@ -884,6 +916,13 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         if *shutdown_rx.borrow() {
             break;
         }
+
+        // Claim and execute pending direct-build backfill chunks before this
+        // iteration's ring-segment work, so a fleet running only backfill (no
+        // sealed segments yet) still makes progress every tick rather than
+        // getting stuck behind the segment path's own early `continue`s
+        // below.
+        let backfill_progress = drain_backfill_chunks(&pool, &claimed_by, &target_schema).await;
 
         // `register_drainer` doubles as the liveness refresh
         // `count_live_drainers` reads below (see its own doc comment), so it
@@ -914,14 +953,14 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
 
         let seg_seqs = match seg_seqs {
             Ok(seqs) if !seqs.is_empty() => seqs,
-            Ok(_) => {
-                if wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await {
-                    break;
-                }
-                continue;
-            }
-            Err(_) => {
-                if wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await {
+            Ok(_) | Err(_) => {
+                // No claimable segment this tick (or the lookup itself
+                // failed): only actually wait if the backfill-chunk claim
+                // above also made no progress — otherwise loop straight back
+                // around to claim more chunks without an idle wait.
+                if !backfill_progress
+                    && wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await
+                {
                     break;
                 }
                 continue;
@@ -973,11 +1012,47 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         //     peer finishes.
         // Only `Ok(Some(_))` re-loops immediately, to grab the next batch
         // promptly. The poll floor (or a wake/shutdown) bounds the idle wait.
-        let made_progress = matches!(outcome, Ok(Some(_)));
+        let made_progress = matches!(outcome, Ok(Some(_))) || backfill_progress;
         if !made_progress && wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await {
             break;
         }
     }
+}
+
+/// Claims up to [`MAX_BACKFILL_CHUNK_CLAIM`] pending direct-build backfill
+/// chunks (`defs::chunk_queue`, docs/decisions/0007's amendment) and executes
+/// each one, marking it done (flipping its definition `backfilling` ->
+/// `live` once every chunk is done — see `chunk_queue::finish_chunk`) or,
+/// on a write error, releasing the claim immediately for the reclaim-stale
+/// sweep or another worker to retry — the same "release on error rather than
+/// wait out the TTL" discipline [`app_worker_loop`]'s segment path uses.
+/// Returns whether it claimed anything, so the caller's own idle-wait
+/// decision treats a tick that only did backfill work as progress too.
+async fn drain_backfill_chunks(pool: &Pool, claimed_by: &str, target_schema: &str) -> bool {
+    let claimed = match pool.get().await {
+        Ok(client) => {
+            chunk_queue::claim_chunks(&**client, claimed_by, MAX_BACKFILL_CHUNK_CLAIM).await
+        }
+        Err(err) => Err(err.into()),
+    };
+    let claimed = match claimed {
+        Ok(chunks) if !chunks.is_empty() => chunks,
+        _ => return false,
+    };
+
+    for chunk in &claimed {
+        match chunk_queue::run_claimed_chunk(pool, chunk, target_schema).await {
+            Ok(()) => {
+                let _ = chunk_queue::finish_chunk(pool, chunk, claimed_by).await;
+            }
+            Err(_) => {
+                if let Ok(client) = pool.get().await {
+                    let _ = chunk_queue::release_chunk(&**client, chunk.id, claimed_by).await;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Waits for a wake notification, the poll-interval floor, or shutdown —

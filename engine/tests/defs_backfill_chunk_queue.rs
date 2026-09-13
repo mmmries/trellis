@@ -1,0 +1,455 @@
+//! Integration tests for the durable backfill-chunk work queue
+//! (`engine::defs::chunk_queue`, docs/decisions/0007's "Backgrounding and
+//! resumability" amendment): the claim/reclaim-stale idiom a drain worker
+//! uses to finish a plain (non-relationship) 1-1 direct-build definition's
+//! backfill in the background, and the CDC-race closure that makes excluding
+//! a non-`live` definition from the apply path ([`transforms_for_source`])
+//! safe rather than lossy.
+//!
+//! The staging harness (connect, stage a CDC row, seal/drain to quiescence)
+//! mirrors `defs_install_definition.rs`/`apply_relationships.rs`; see those
+//! files for the ring/seal mechanics.
+
+use std::time::Duration;
+
+use engine::config::DEFAULT_SCHEMA;
+use engine::defs::{TransformStatus, ValueType, chunk_queue, install_definition};
+use engine::intake::publication;
+use engine::staging::apply;
+use engine::staging::{has_pending, retire_drained_segments};
+use testkit::TestCluster;
+use tokio_postgres::types::PgLsn;
+use tokio_postgres::{Client, NoTls};
+
+async fn connect_raw(dsn: &str) -> Client {
+    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
+        .await
+        .expect("set search_path");
+    client
+}
+
+async fn seal_active_segment(client: &mut Client) -> i64 {
+    use engine::staging::seal;
+    let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+    seal::seal_phase2(client, outcome.sealed_seg_seq)
+        .await
+        .expect("seal phase 2");
+    outcome.sealed_seg_seq
+}
+
+async fn active_seg_table(client: &Client) -> String {
+    let ring_slot: i16 = client
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment pointer")
+        .get(0);
+    format!("seg_{ring_slot}")
+}
+
+async fn stage_cdc(
+    client: &Client,
+    src_table: &str,
+    key: &str,
+    op: &str,
+    old_image: Option<&str>,
+    new_image: Option<&str>,
+) {
+    let table = active_seg_table(client).await;
+    let lsn = PgLsn::from(1u64);
+    client
+        .execute(
+            &format!(
+                "insert into {table} (src_table, key, op, lsn, old_image, new_image, hop_gen) \
+                 values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0)"
+            ),
+            &[&src_table, &key, &op, &lsn, &old_image, &new_image],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
+}
+
+async fn drain_to_quiescence(pool: &engine::Pool, client: &mut Client) {
+    for _ in 0..16 {
+        let seg = seal_active_segment(client).await;
+        while apply::drain_once(pool, seg, "chunk_queue_test", 1, "trellis_chunk_queue_test")
+            .await
+            .expect("drain_once")
+            .is_some()
+        {}
+        retire_drained_segments(client)
+            .await
+            .expect("retire drained segments");
+        if !has_pending(client).await.expect("has_pending") {
+            return;
+        }
+    }
+    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
+}
+
+fn numeric(names: &[&str]) -> std::collections::HashMap<String, ValueType> {
+    names
+        .iter()
+        .map(|n| (n.to_string(), ValueType::Numeric))
+        .collect()
+}
+
+/// A chunk that gets claimed and then abandoned (the claiming worker "dies":
+/// no [`chunk_queue::finish_chunk`], no heartbeat refresh at all) must be
+/// freed by [`chunk_queue::reclaim_stale_chunks`] once its claim goes stale,
+/// exactly like a stale `seg_claims` row is today — and a second worker that
+/// then claims and finishes it must both build the target correctly and
+/// flip the definition to `Live`.
+#[tokio::test]
+async fn a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another_worker() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) values (1, 10), (2, 20), (3, 30)",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = numeric(&["a"]);
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT a + a AS x",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition enumerates chunk work and returns");
+    assert_eq!(
+        def.status,
+        TransformStatus::Backfilling,
+        "a plain 1-1 definition sits at backfilling until its chunks are claimed and finished"
+    );
+
+    // The dead worker: claims the (only, for this small table) chunk and
+    // does nothing else with it — no execution, no finish, no heartbeat.
+    let claimed = chunk_queue::claim_chunks(&client, "dead-worker", 10)
+        .await
+        .expect("claim_chunks");
+    assert_eq!(claimed.len(), 1, "one chunk covers this small source table");
+    let chunk = &claimed[0];
+
+    // Confirm it's really unavailable to a second claimant while the first
+    // claim is still fresh.
+    let none_yet = chunk_queue::claim_chunks(&client, "fresh-worker", 10)
+        .await
+        .expect("claim_chunks while still fresh");
+    assert!(
+        none_yet.is_empty(),
+        "a freshly-claimed chunk must not be claimable again before it goes stale"
+    );
+
+    let ttl = Duration::from_millis(300);
+    tokio::time::sleep(ttl + Duration::from_millis(150)).await;
+
+    let reclaimed = chunk_queue::reclaim_stale_chunks(&client, ttl)
+        .await
+        .expect("reclaim_stale_chunks");
+    assert_eq!(reclaimed, 1, "the dead worker's stale claim must be freed");
+
+    // A fresh worker now claims exactly that chunk, executes it, and
+    // finishes it.
+    let re_claimed = chunk_queue::claim_chunks(&client, "fresh-worker", 10)
+        .await
+        .expect("re-claim after reclaim_stale_chunks");
+    assert_eq!(re_claimed.len(), 1);
+    assert_eq!(
+        re_claimed[0].id, chunk.id,
+        "the fresh worker must win exactly the reclaimed chunk"
+    );
+
+    chunk_queue::run_claimed_chunk(&db.pool, &re_claimed[0], "public")
+        .await
+        .expect("run_claimed_chunk");
+    chunk_queue::finish_chunk(&db.pool, &re_claimed[0], "fresh-worker")
+        .await
+        .expect("finish_chunk");
+
+    let mismatches: i64 = client
+        .query_one(
+            "select count(*) from s left join t on t.id = s.id \
+             where t.id is null or t.x is distinct from s.a + s.a",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        mismatches, 0,
+        "the reclaiming worker's re-execution must have built the target correctly"
+    );
+
+    let status: String = client
+        .query_one(
+            "select status from transform_definitions where target_table = 't'",
+            &[],
+        )
+        .await
+        .expect("read back status")
+        .get(0);
+    assert_eq!(
+        status, "live",
+        "finishing the one remaining chunk must flip the definition to live"
+    );
+}
+
+/// A chunk already marked done cannot be double-completed by its original
+/// claimant after the claim was reclaimed and finished by someone else —
+/// `finish_chunk`'s `claimed_by = $2 and not done` scoping must leave a
+/// stale claimant's late finish as a no-op rather than erroring or
+/// re-triggering the definition-completion path a second time.
+#[tokio::test]
+async fn a_stale_claimants_late_finish_after_reclaim_is_a_no_op() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) values (1, 10)",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = numeric(&["a"]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT a AS x",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition");
+
+    let claimed = chunk_queue::claim_chunks(&client, "dead-worker", 10)
+        .await
+        .expect("claim_chunks");
+    assert_eq!(claimed.len(), 1);
+
+    let ttl = Duration::from_millis(300);
+    tokio::time::sleep(ttl + Duration::from_millis(150)).await;
+    chunk_queue::reclaim_stale_chunks(&client, ttl)
+        .await
+        .expect("reclaim_stale_chunks");
+
+    let re_claimed = chunk_queue::claim_chunks(&client, "fresh-worker", 10)
+        .await
+        .expect("re-claim");
+    assert_eq!(re_claimed.len(), 1);
+    chunk_queue::run_claimed_chunk(&db.pool, &re_claimed[0], "public")
+        .await
+        .expect("run_claimed_chunk");
+    chunk_queue::finish_chunk(&db.pool, &re_claimed[0], "fresh-worker")
+        .await
+        .expect("finish_chunk by the fresh worker");
+
+    // The original (dead) worker's late finish must not error and must not
+    // disturb the already-`live` definition.
+    chunk_queue::finish_chunk(&db.pool, &claimed[0], "dead-worker")
+        .await
+        .expect("a stale claimant's late finish must be a harmless no-op");
+
+    let status: String = client
+        .query_one(
+            "select status from transform_definitions where target_table = 't'",
+            &[],
+        )
+        .await
+        .expect("read back status")
+        .get(0);
+    assert_eq!(status, "live");
+}
+
+/// The CDC race docs/decisions/0007's amendment closes: a delta arriving on
+/// a source table shared by a `live` definition and a still-`backfilling`
+/// one must apply normally to the `live` definition while being excluded
+/// from the `backfilling` one — not corrupting/pre-populating it with a
+/// premature partial fold — and once the `backfilling` definition's chunk
+/// work finishes (flipping it `live`), the parked catch-up
+/// (`pending_backfill`, reused from the ring-fallback path — see
+/// `defs::catalog::complete_direct_backfill`) must fold in whatever changed
+/// on the source table while it sat excluded.
+#[tokio::test]
+async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_it_goes_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, a numeric); \
+             alter table s replica identity full; \
+             insert into s (id, a) values (1, 10)",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = numeric(&["a"]);
+
+    // Definition A: install and fully drain its chunk work now, so it's
+    // `live` before the CDC delta below arrives.
+    install_definition(
+        &db.pool,
+        "TRANSFORM a_calc FROM s SELECT a AS x",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition A");
+    let claimed_a = chunk_queue::claim_chunks(&client, "worker-a", 10)
+        .await
+        .expect("claim A's chunk");
+    assert_eq!(claimed_a.len(), 1);
+    chunk_queue::run_claimed_chunk(&db.pool, &claimed_a[0], "public")
+        .await
+        .expect("run A's chunk");
+    chunk_queue::finish_chunk(&db.pool, &claimed_a[0], "worker-a")
+        .await
+        .expect("finish A's chunk");
+    let status_a: String = client
+        .query_one(
+            "select status from transform_definitions where target_table = 'a_calc'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(status_a, "live", "A must be live before the delta arrives");
+
+    // Definition B: install (its target table now exists, one chunk
+    // enumerated) but do NOT drain its chunk — claim and *execute* it (so
+    // its one row is already built from `a`'s pre-delta value) without
+    // finishing it, so B sits at `backfilling` for the rest of this test
+    // until explicitly finished below. This is deliberately the harder case:
+    // even though this row's own chunk has already committed, the
+    // *definition* is still non-`live`, and the exclusion is definition-
+    // scoped (docs/decisions/0007's amendment: parked per-definition, not
+    // per-chunk/per-row).
+    install_definition(
+        &db.pool,
+        "TRANSFORM b_calc FROM s SELECT a AS y",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition B");
+    let claimed_b = chunk_queue::claim_chunks(&client, "worker-b", 10)
+        .await
+        .expect("claim B's chunk");
+    assert_eq!(claimed_b.len(), 1);
+    chunk_queue::run_claimed_chunk(&db.pool, &claimed_b[0], "public")
+        .await
+        .expect("run B's chunk");
+    // Deliberately not finished yet.
+
+    let pre_delta_y: i64 = client
+        .query_one("select y::bigint from b_calc where id = 1", &[])
+        .await
+        .expect("read b_calc before the delta")
+        .get(0);
+    assert_eq!(pre_delta_y, 10, "B's chunk built from a's pre-delta value");
+
+    // A live CDC update on `s`: a=10 -> a=99.
+    client
+        .execute("update s set a = 99 where id = 1", &[])
+        .await
+        .expect("update s.a");
+    stage_cdc(
+        &client,
+        &format!("{DEFAULT_SCHEMA}.s"),
+        "1",
+        "update",
+        Some(r#"{"id":1,"a":10}"#),
+        Some(r#"{"id":1,"a":99}"#),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    // A (live): the delta applied normally.
+    let a_x: i64 = client
+        .query_one("select x::bigint from a_calc where id = 1", &[])
+        .await
+        .expect("read a_calc after the delta")
+        .get(0);
+    assert_eq!(a_x, 99, "the live definition A must see the delta normally");
+
+    // B (still backfilling): must NOT have been touched by the delta —
+    // `dependents_of`/`transforms_for_source`'s status filter excludes it.
+    let b_y_before_discharge: i64 = client
+        .query_one("select y::bigint from b_calc where id = 1", &[])
+        .await
+        .expect("read b_calc after the delta, before B goes live")
+        .get(0);
+    assert_eq!(
+        b_y_before_discharge, 10,
+        "B must not observe the delta while still non-live — it was excluded, not folded in"
+    );
+
+    // Finish B's chunk: flips it to live and parks the pending_backfill
+    // catch-up marker for `s` (see `complete_direct_backfill`).
+    chunk_queue::finish_chunk(&db.pool, &claimed_b[0], "worker-b")
+        .await
+        .expect("finish B's chunk");
+    let status_b: String = client
+        .query_one(
+            "select status from transform_definitions where target_table = 'b_calc'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(status_b, "live");
+
+    // Immediately after going live, B still hasn't been caught up — the
+    // discharge is a separate, deliberate step (`run_pending_backfills`),
+    // not folded into `finish_chunk` itself.
+    let b_y_still_stale: i64 = client
+        .query_one("select y::bigint from b_calc where id = 1", &[])
+        .await
+        .expect("read b_calc immediately after going live")
+        .get(0);
+    assert_eq!(
+        b_y_still_stale, 10,
+        "the catch-up is parked, not applied synchronously by finish_chunk"
+    );
+
+    // Discharge the parked marker (the same `run_pending_backfills` event
+    // the ring-fallback path already relies on) and drain the resulting
+    // enumeration through the ring.
+    publication::run_pending_backfills(&mut client, "trellis_chunk_queue_test")
+        .await
+        .expect("run_pending_backfills");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let b_y_after_discharge: i64 = client
+        .query_one("select y::bigint from b_calc where id = 1", &[])
+        .await
+        .expect("read b_calc after discharge")
+        .get(0);
+    assert_eq!(
+        b_y_after_discharge, 99,
+        "discharging the parked marker must fold in the delta B missed while backfilling"
+    );
+
+    // A must be unaffected by the redundant re-enumeration (idempotent
+    // overwrite recomputes the same, already-correct value).
+    let a_x_after_discharge: i64 = client
+        .query_one("select x::bigint from a_calc where id = 1", &[])
+        .await
+        .expect("read a_calc after discharge")
+        .get(0);
+    assert_eq!(a_x_after_discharge, 99);
+}

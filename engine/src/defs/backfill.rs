@@ -202,7 +202,7 @@ pub async fn backfill_definition(
 
 /// Whether any of `def`'s field expressions reads a relationship path — the
 /// shape the 1-1 direct build can't render (see [`BackfillError::Unsupported`]).
-fn uses_relationships(def: &TransformDef) -> bool {
+pub(crate) fn uses_relationships(def: &TransformDef) -> bool {
     fn walk(expr: &Expr) -> bool {
         match expr {
             Expr::RelationshipPath { .. } => true,
@@ -473,6 +473,32 @@ async fn backfill_one_to_one(
     let substituted = substitute_all_fields(def)?;
 
     let source = quote_ident(&def.source);
+    let client = pool.get().await?;
+    for (lo, hi) in discover_pk_ranges(&client, &source, pk).await? {
+        write_one_to_one_range(&client, def, target_schema, pk, &substituted, &lo, &hi).await?;
+    }
+
+    Ok(())
+}
+
+/// One `(lo, hi]` PK-range chunk's write — the body [`backfill_one_to_one`]'s
+/// loop runs for every range in one call, and the durable chunk queue's
+/// [`execute_one_to_one_chunk`] runs for exactly one range claimed off
+/// `backfill_chunks` (docs/decisions/0007's "Backgrounding and resumability"
+/// amendment). `substituted` is the caller's already-computed
+/// [`substitute_all_fields`] output, so a queue-driven caller charged the
+/// `Unsupported`-detecting cost once at plan time doesn't pay it again per
+/// chunk beyond re-deriving the (cheap, pure) substitution itself.
+async fn write_one_to_one_range(
+    client: &Client,
+    def: &TransformDef,
+    target_schema: &str,
+    pk: &PrimaryKeyColumn,
+    substituted: &[Expr],
+    lo: &Option<String>,
+    hi: &str,
+) -> Result<(), BackfillError> {
+    let source = quote_ident(&def.source);
     let target = qualified_target_table(target_schema, def);
     let pk_ident = quote_ident(&pk.name);
     let pk_cast = pk.data_type.as_str();
@@ -497,25 +523,69 @@ async fn backfill_one_to_one(
     // one SELECT field), so `update_sets` is always non-empty.
     debug_assert!(!update_sets.is_empty());
 
-    let client = pool.get().await?;
-    for (lo, hi) in discover_pk_ranges(&client, &source, pk).await? {
-        let where_clause = pk_range_where(&pk_ident, pk_cast, &lo);
-        let insert_sql = format!(
-            "insert into {target} ({insert_cols}) \
-             select {select_exprs} from {source} where {where_clause} \
-             on conflict ({pk_ident}) do update set {update_sets}"
-        );
-        match &lo {
-            None => {
-                client.execute(&insert_sql, &[&hi]).await?;
-            }
-            Some(lo) => {
-                client.execute(&insert_sql, &[lo, &hi]).await?;
-            }
+    let where_clause = pk_range_where(&pk_ident, pk_cast, lo);
+    let insert_sql = format!(
+        "insert into {target} ({insert_cols}) \
+         select {select_exprs} from {source} where {where_clause} \
+         on conflict ({pk_ident}) do update set {update_sets}"
+    );
+    match lo {
+        None => {
+            client.execute(&insert_sql, &[&hi]).await?;
+        }
+        Some(lo) => {
+            client.execute(&insert_sql, &[lo, &hi]).await?;
         }
     }
-
     Ok(())
+}
+
+/// The read-only "planning" half of [`backfill_one_to_one`] (docs/decisions/0007's
+/// amendment): fails fast with [`BackfillError::Unsupported`] exactly as
+/// `backfill_one_to_one` would (same [`substitute_all_fields`] call), then
+/// returns the same `(lo, hi]` PK-range boundaries its loop would have
+/// walked — without writing a single row of the target. `defs::catalog::install_definition`
+/// calls this instead of `backfill_definition` for a plain (non-relationship)
+/// 1-1 definition, persisting the boundaries as durable `backfill_chunks`
+/// work items rather than executing them in-call.
+pub(crate) async fn plan_one_to_one_chunks(
+    pool: &Pool,
+    def: &TransformDef,
+) -> Result<Vec<(Option<String>, String)>, BackfillError> {
+    let _ = substitute_all_fields(def)?;
+    let pk = source_primary_key(pool, &def.source).await?;
+    let source = quote_ident(&def.source);
+    let client = pool.get().await?;
+    discover_pk_ranges(&client, &source, &pk).await
+}
+
+/// Executes exactly one previously-[`plan_one_to_one_chunks`]-enumerated
+/// chunk — the durable-queue counterpart of [`backfill_one_to_one`]'s loop
+/// body, claimed and run by a drain worker
+/// (`engine::client`'s `app_worker_loop`) rather than an in-call loop.
+/// Idempotent overwrite, like every chunk write in this module (ADR-0007): a
+/// worker that reclaims this chunk after a peer died mid-write redoes it
+/// safely.
+pub(crate) async fn execute_one_to_one_chunk(
+    pool: &Pool,
+    def: &TransformDef,
+    target_schema: &str,
+    lo: Option<&str>,
+    hi: &str,
+) -> Result<(), BackfillError> {
+    let pk = source_primary_key(pool, &def.source).await?;
+    let substituted = substitute_all_fields(def)?;
+    let client = pool.get().await?;
+    write_one_to_one_range(
+        &client,
+        def,
+        target_schema,
+        &pk,
+        &substituted,
+        &lo.map(|s| s.to_string()),
+        hi,
+    )
+    .await
 }
 
 /// Walks the source primary key in half-open `(lo, hi]` ranges, returning them
