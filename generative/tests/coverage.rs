@@ -8,9 +8,10 @@
 
 use std::collections::HashSet;
 
-use engine::defs::ast::{Expr, Operator, ValueType};
+use engine::defs::ast::{Expr, KeySpace, Operator, ValueType};
+use engine::defs::invertibility::{AggregateArg, CountArg, Invertibility, classify};
 use generative::generate::{Mutate, build_program, trivial_program, trivial_program_with};
-use generative::model::{Op, Table};
+use generative::model::{Op, Program, Table};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
 
@@ -101,15 +102,14 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
     }
 }
 
-/// Every operator the generator currently supports (today: just `+`) appears
-/// over every argument type it supports (`Numeric, Numeric`).
-///
-/// `engine::defs::ast::Operator` also has `GreaterThan` (`Numeric, Numeric ->
-/// Boolean`), but the generator does not draw it yet — that widening is
-/// tracked separately (issue #65 added the operator to the engine grammar;
-/// generating it is a future generator issue, not this one). This test scopes
-/// itself to what the generator actually draws today, and will need a
-/// `GreaterThan` case added the day that widening lands.
+/// `build_program`'s fixed `total = c1 + c2` field (unaffected by
+/// improvement-plan task B2's new "derived" field — see
+/// `generate::build_program_multi_with_derived`'s doc comment, which layers
+/// on top of `build_program_multi` rather than changing its output) still
+/// draws exactly `Operator::Add` over `Numeric, Numeric`, unchanged from
+/// before task B2. `Operator::GreaterThan` is drawn too now, but only by the
+/// proptest strategy's independent `derived` field — see
+/// `trivial_program_sometimes_draws_greater_than` below for that floor.
 #[test]
 fn every_supported_operator_appears_over_every_supported_argument_type() {
     let program = build_program(&[(Some(1), Some(2))], &[]);
@@ -494,5 +494,254 @@ fn trivial_program_sometimes_draws_defs_sharing_a_source_and_sometimes_draws_def
     assert!(
         saw_different_sources,
         "expected at least one sample where all defs draw distinct source tables across 500 samples"
+    );
+}
+
+/// Improvement-plan task B2: the default strategy's new "derived" field
+/// (`generate::DerivedShape`) must sometimes draw `Operator::GreaterThan` —
+/// sampled the same way as every other genuinely-probabilistic floor above
+/// (many samples, not every sample: which `DerivedShape` variant a def draws
+/// is random).
+#[test]
+fn trivial_program_sometimes_draws_greater_than() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    assert!(
+        coverage.operators.contains("GreaterThan"),
+        "coverage floor failed: expected \"GreaterThan\" among operators across 500 samples:\n{coverage}"
+    );
+}
+
+/// Improvement-plan task B2: each of the five scalar functions
+/// (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/`REGEXP_COUNT`/`COALESCE`) must
+/// appear at least once across many samples — the same "each shape reachable
+/// across a bounded number of samples" floor as `GreaterThan` above, applied
+/// to every function `generate::DerivedShape` can draw.
+#[test]
+fn trivial_program_draws_every_scalar_function_at_least_once() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    for function in [
+        "STRPOS",
+        "OCTET_LENGTH",
+        "CHAR_LENGTH",
+        "REGEXP_COUNT",
+        "COALESCE",
+    ] {
+        assert!(
+            coverage.functions.contains(function),
+            "coverage floor failed: expected {function:?} among functions across 500 samples:\n{coverage}"
+        );
+    }
+}
+
+/// Improvement-plan task B2: the default strategy must sometimes draw a
+/// nested (depth >= 3) expression tree — e.g. `(c1 + c2) > c1`
+/// (`DerivedShape::ArithmeticGreaterThan`) or `STRPOS(text_col, 'x') > 0`
+/// (`DerivedShape::StrposGreaterThan`) — not just the single-operator/
+/// single-function leaves every other `DerivedShape` variant (and `total`)
+/// draws. `Coverage::max_expr_depth` is the accumulator this asserts
+/// against; see its doc comment for why it's tracked separately from
+/// `expr_shapes`.
+#[test]
+fn trivial_program_sometimes_draws_a_nested_expression() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    assert!(
+        coverage.max_expr_depth >= 3,
+        "coverage floor failed: expected a nested expression of depth >= 3 across 500 samples \
+         (max depth seen: {}):\n{coverage}",
+        coverage.max_expr_depth
+    );
+}
+
+/// Every [`Expr::FunctionCall`] name appearing anywhere in `program`'s defs
+/// (recursing into arguments, though today's `KeySpace::Aggregate` generator
+/// only ever nests one level deep — a `SUM`/`AVG`/`MIN`/`MAX` call wrapping a
+/// bare `Column`, or a bare `COUNT`).
+fn all_function_call_names(program: &Program) -> HashSet<String> {
+    let mut names = HashSet::new();
+    fn walk(expr: &Expr, out: &mut HashSet<String>) {
+        if let Expr::FunctionCall { name, args } = expr {
+            out.insert(name.clone());
+            for arg in args {
+                walk(arg, out);
+            }
+        }
+    }
+    for def in &program.defs {
+        for field in &def.fields {
+            walk(&field.expr, &mut names);
+        }
+    }
+    names
+}
+
+/// Improvement-plan task B4 (the widening unit's coverage meta-test): all
+/// five aggregate functions (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`,
+/// `engine::defs::registry::AGGREGATE_FUNCTIONS`) must actually get drawn
+/// across enough sampled programs — this is the floor that would catch B4's
+/// aggregate-function widening silently regressing (design doc §3 "coverage
+/// that silently drops out"), the same principle every other floor test in
+/// this file already checks for an earlier widening.
+///
+/// **Post-merge fix.** The early-exit condition below used to read
+/// `seen.len() >= 5` unfiltered — a correct "all five aggregate names have
+/// been seen" check back when a generated program's `FunctionCall`s could
+/// only ever be aggregate ones. Now that improvement-plan task B2's scalar
+/// `DerivedShape` functions (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/
+/// `REGEXP_COUNT`/`COALESCE`) are drawn too (see
+/// [`AGGREGATE_FUNCTION_NAMES`]'s own doc comment), `seen` can reach 5
+/// distinct names from scalar functions alone, breaking out before any
+/// aggregate def — let alone `AVG` specifically — has actually been drawn.
+/// The loop now only counts aggregate names toward the early exit.
+#[test]
+fn trivial_program_draws_all_five_aggregate_functions_across_enough_samples() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut seen: HashSet<String> = HashSet::new();
+    for _ in 0..1000 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        seen.extend(all_function_call_names(&program));
+        let aggregate_names_seen = seen
+            .iter()
+            .filter(|name| AGGREGATE_FUNCTION_NAMES.contains(&name.as_str()))
+            .count();
+        if aggregate_names_seen >= AGGREGATE_FUNCTION_NAMES.len() {
+            break;
+        }
+    }
+    for name in AGGREGATE_FUNCTION_NAMES {
+        assert!(
+            seen.contains(*name),
+            "expected {name} to be drawn among aggregate function calls across 1000 samples; \
+             saw: {seen:?}"
+        );
+    }
+}
+
+/// The five `KeySpace::Aggregate` function names
+/// (`engine::defs::registry::AGGREGATE_FUNCTIONS`), duplicated here as a
+/// `const` rather than imported: `generative` doesn't re-export the engine's
+/// `registry` module, and this list is short/stable enough (the same
+/// `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` five [`AggregateFn`] already hardcodes) that
+/// a local copy is clearer than plumbing a new import through for one test.
+///
+/// **Why this filter is needed post-merge.** [`all_function_call_names`]
+/// collects *every* `FunctionCall` name in a program's defs, including the
+/// five scalar functions (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/
+/// `REGEXP_COUNT`/`COALESCE`) improvement-plan task B2's `DerivedShape` draws
+/// on `OneToOne` defs — B4 was developed before B2 merged in, when the only
+/// `FunctionCall`s a generated program could ever contain were aggregate
+/// ones, so `trivial_program_draws_both_invertibility_classes_across_enough_samples`
+/// below used to call [`classify`] on every collected name unfiltered. Now
+/// that both widenings are merged, an unfiltered name can be a scalar
+/// function `classify` has never heard of (it only knows the aggregate
+/// registry) — filtering to this list keeps that test checking what it always
+/// meant to check.
+///
+/// [`AggregateFn`]: generative::generate::AggregateFn
+const AGGREGATE_FUNCTION_NAMES: &[&str] = &["SUM", "COUNT", "AVG", "MIN", "MAX"];
+
+/// The other half of B4's coverage floor: both invertibility classes
+/// (`engine::defs::invertibility::Invertibility`) must appear across a run —
+/// at least one `Invertible` function (`SUM`/`COUNT`/`AVG`) and at least one
+/// `RecomputeOnly` function (`MIN`/`MAX`) — not just "all five names appear"
+/// in the abstract. This is what makes the generative suite a real exerciser
+/// of the engine's invertibility split (`docs/generative-test-suite.md` §4
+/// calls the aggregate delta path "the hardest guarantee" precisely because
+/// of this split), not just a name-coverage checklist.
+#[test]
+fn trivial_program_draws_both_invertibility_classes_across_enough_samples() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut saw_invertible = false;
+    let mut saw_recompute_only = false;
+    for _ in 0..1000 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        // Only classify the aggregate functions — see
+        // `AGGREGATE_FUNCTION_NAMES`'s doc comment for why a post-merge
+        // program's `FunctionCall`s aren't all aggregate ones anymore.
+        for name in all_function_call_names(&program)
+            .into_iter()
+            .filter(|name| AGGREGATE_FUNCTION_NAMES.contains(&name.as_str()))
+        {
+            let arg = if name == "COUNT" {
+                AggregateArg::Count(CountArg::Star)
+            } else {
+                AggregateArg::Column(ValueType::Numeric)
+            };
+            let verdict = classify(&name, arg)
+                .unwrap_or_else(|| panic!("{name} must be a known aggregate function"));
+            match verdict.invertibility {
+                Invertibility::Invertible => saw_invertible = true,
+                Invertibility::RecomputeOnly => saw_recompute_only = true,
+            }
+        }
+        if saw_invertible && saw_recompute_only {
+            break;
+        }
+    }
+    assert!(
+        saw_invertible,
+        "expected at least one Invertible aggregate function (SUM/COUNT/AVG) across 1000 samples"
+    );
+    assert!(
+        saw_recompute_only,
+        "expected at least one RecomputeOnly aggregate function (MIN/MAX) across 1000 samples"
+    );
+}
+
+/// The key-space half of B4's coverage floor: the default strategy must
+/// sometimes draw a `KeySpace::Aggregate` definition at all (not just
+/// `OneToOne`, the only shape before this task) — sampled the same way as
+/// `trivial_program_sometimes_draws_more_than_one_table` above.
+#[test]
+fn trivial_program_sometimes_draws_an_aggregate_key_space() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let saw_aggregate = (0..500).any(|_| {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        program
+            .defs
+            .iter()
+            .any(|def| matches!(def.key_space, KeySpace::Aggregate { .. }))
+    });
+    assert!(
+        saw_aggregate,
+        "the generator must sometimes draw a KeySpace::Aggregate definition across 500 samples"
     );
 }

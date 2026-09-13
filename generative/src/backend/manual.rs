@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use engine::config::DEFAULT_SCHEMA;
-use engine::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use engine::defs::{
     CatalogError, DdlError, install_definition, qualified_target_table, source_primary_key,
 };
@@ -20,7 +20,7 @@ use engine::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
 use tokio_postgres::NoTls;
 
 use super::Snapshot;
-use crate::model::{Column, Op, Program, Table};
+use crate::model::{Column, Op, Program, Table, group_key};
 
 /// How long [`ManualBackend::quiesce`] waits for convergence before giving
 /// up. Generous: this backend targets correctness, not latency, and a
@@ -33,10 +33,6 @@ const QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 /// messages, matching `engine::ClientError`'s own convention.
 #[derive(Debug)]
 pub enum ManualBackendError {
-    /// A definition's key-space isn't representable by this backend's
-    /// renderer yet (see [`render_definition`]) — today, only
-    /// [`KeySpace::OneToOne`].
-    UnsupportedKeySpace,
     /// An op named a table [`ManualBackend::install`] was never given.
     UnknownTable {
         table: String,
@@ -109,27 +105,49 @@ fn pg_type_name(value_type: ValueType) -> &'static str {
 /// Renders `def` back to the concrete `TRANSFORM ... FROM ... SELECT ...`
 /// syntax [`create_definition`] parses — the manual backend's only reason
 /// to exist, since [`crate::model::Program`] stores the parsed AST
-/// directly rather than source text. Only [`KeySpace::OneToOne`] is
-/// supported (today's generator scope, design doc §1); anything else is a
-/// generator bug this backend refuses to guess at.
+/// directly rather than source text. [`KeySpace::OneToOne`] and (as of
+/// improvement-plan task B4) [`KeySpace::Aggregate`] are both supported,
+/// matching `engine::defs::parser`'s own `GROUP BY <cols>` clause, which sits
+/// directly after `FROM <source>` and before `SELECT` (ADR-0004's reserved
+/// slot).
 fn render_definition(def: &TransformDef) -> Result<String, ManualBackendError> {
-    if def.key_space != KeySpace::OneToOne {
-        return Err(ManualBackendError::UnsupportedKeySpace);
-    }
     let fields: Vec<String> = def
         .fields
         .iter()
         .map(|field| format!("{} AS {}", render_expr(&field.expr), field.name))
         .collect();
     debug_assert_eq!(def.predicate, Predicate::True);
+    let key_space_clause = match &def.key_space {
+        KeySpace::OneToOne => String::new(),
+        KeySpace::Aggregate { group_by } => format!(" GROUP BY {}", group_by.join(", ")),
+    };
     Ok(format!(
-        "TRANSFORM {} FROM {} SELECT {}",
+        "TRANSFORM {} FROM {}{key_space_clause} SELECT {}",
         def.target,
         def.source,
         fields.join(", ")
     ))
 }
 
+/// Renders a generator-built [`Expr`] back to the source text
+/// [`super::install_definition`]/`engine::defs::parser::parse` re-parses.
+///
+/// A `BinaryOp`'s operands are *unconditionally* parenthesized (issue #67's
+/// reviewer follow-up), not only when the operand is itself a lower-
+/// precedence `BinaryOp`: with real operator precedence now in the parser
+/// (`engine::defs::registry::OPERATORS`), a flat render like `a + b > c`
+/// silently reconstructs a *different* tree than a nested one the generator
+/// might build — e.g. `Add(a, GreaterThan(b, c))` would round-trip as
+/// `a + b > c`, which `+`'s tighter binding re-parses as `Add(a,b) >
+/// c` — the wrong tree. Always parenthesizing every operand (`(a) + (b > c)`)
+/// is simpler than computing whether a given operand's own precedence
+/// requires it, and correct regardless of what tree the generator composes,
+/// so it's the shape this renderer commits to before the generator ever
+/// nests `+` and `>` together (improvement-plan task B2). See
+/// `tests::render_expr_parenthesizes_nested_binary_ops_so_they_round_trip`
+/// for the regression pin, and `engine::defs::parser`'s grouping-paren
+/// support (issue #67 follow-up) that makes the rendered text re-parseable
+/// at all.
 fn render_expr(expr: &Expr) -> String {
     match expr {
         Expr::Column(name) => name.clone(),
@@ -137,11 +155,19 @@ fn render_expr(expr: &Expr) -> String {
         Expr::StringLiteral(text) => format!("'{}'", text.replace('\'', "''")),
         Expr::BinaryOp { op, lhs, rhs } => {
             format!(
-                "{} {} {}",
+                "({}) {} ({})",
                 render_expr(lhs),
                 render_operator(*op),
                 render_expr(rhs)
             )
+        }
+        // `COUNT(*)` (task B4): the AST carries no argument for this shape
+        // (`args` is empty) — `engine::defs::parser` only ever accepts the
+        // literal `*` here, not an empty argument list, so this must render
+        // it back explicitly rather than falling through to the generic
+        // `name(args)` arm below (which would emit the invalid `COUNT()`).
+        Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
+            "COUNT(*)".to_string()
         }
         Expr::FunctionCall { name, args } => {
             let args: Vec<String> = args.iter().map(render_expr).collect();
@@ -235,6 +261,28 @@ impl ManualBackend {
         }
         sql.push(')');
         self.raw.batch_execute(&sql).await?;
+
+        // Improvement-plan task B4: a `KeySpace::Aggregate` definition needs
+        // a changed row's *old* image to know which group a deleted/
+        // re-parented row is leaving (`engine::intake::replica_identity`'s
+        // `needs_old_image`), and the engine checks this eagerly — creating
+        // an aggregate definition over a table with only the default replica
+        // identity (old image limited to the pk) is rejected outright with
+        // `CatalogError::ReplicaIdentityRequired`, exactly like
+        // `engine/tests/apply_aggregate.rs`'s own hand-built fixtures always
+        // `alter table ... replica identity full` up front. Every table this
+        // backend creates gets it unconditionally, rather than only tables
+        // an `Aggregate` def happens to source from: it's harmless for a
+        // `OneToOne` definition (strictly more WAL detail, never less), and
+        // doing it unconditionally means `install` never has to know in
+        // advance which of a program's tables end up feeding an aggregate
+        // def before any of them are created.
+        self.raw
+            .batch_execute(&format!(
+                "alter table {} replica identity full",
+                quote_ident(&table.name)
+            ))
+            .await?;
         Ok(())
     }
 
@@ -476,20 +524,27 @@ impl super::Backend for ManualBackend {
         }
 
         for def in &self.defs {
-            let pk = source_primary_key(&self.pool, &def.source).await?;
-            let target_columns: Vec<Column> = std::iter::once(Column {
-                name: pk.name.clone(),
-                value_type: ValueType::Numeric,
-            })
-            .chain(def.fields.iter().map(|f| Column {
-                name: f.name.clone(),
-                // The physical column type doesn't matter for a `::text`
-                // read; only the name is used below.
-                value_type: ValueType::Text,
-            }))
-            .collect();
             let qualified = qualified_target_table("public", def);
-            let rows = read_table(&self.raw, &qualified, &pk.name, &target_columns).await?;
+            let rows = match &def.key_space {
+                KeySpace::OneToOne => {
+                    let pk = source_primary_key(&self.pool, &def.source).await?;
+                    let target_columns: Vec<Column> = std::iter::once(Column {
+                        name: pk.name.clone(),
+                        value_type: ValueType::Numeric,
+                    })
+                    .chain(def.fields.iter().map(|f| Column {
+                        name: f.name.clone(),
+                        // The physical column type doesn't matter for a
+                        // `::text` read; only the name is used below.
+                        value_type: ValueType::Text,
+                    }))
+                    .collect();
+                    read_table(&self.raw, &qualified, &pk.name, &target_columns).await?
+                }
+                KeySpace::Aggregate { group_by } => {
+                    read_aggregate_table(&self.raw, &qualified, group_by, &def.fields).await?
+                }
+            };
             snapshot.insert(def.target.clone(), rows);
         }
 
@@ -527,4 +582,143 @@ async fn read_table(
         result.insert(pk_value, by_column);
     }
     Ok(result)
+}
+
+/// Reads an `Aggregate` key-space target table back as text, keyed by the
+/// same composite [`group_key`] convention the SQL oracle and the evaluator
+/// oracle key their own rows by (see `crate::oracle`'s module doc comment and
+/// [`group_key`]'s own) — so the three-way comparison lines the same group up
+/// across all three sources (improvement-plan task B4).
+///
+/// Unlike [`read_table`]'s single-column primary key (a real Postgres
+/// `primary key` constraint on the *source* table, so it's never `NULL`), a
+/// `GROUP BY` grouping column genuinely can be `NULL` (the generative suite's
+/// grain column deliberately draws one) — so every grouping column here is
+/// read as a nullable `Option<String>` rather than `expect`-ed `Some`, and
+/// `group_key` is what turns a possibly-`NULL` tuple of them into one
+/// [`Rows`]-shaped map key.
+///
+/// `fields` is `def.fields` — every field whose name matches one of
+/// `group_by`'s columns is excluded from the row's own value columns (it
+/// contributes no separate target column at all, mirroring
+/// `engine::defs::ddl::create_aggregate_target_table`'s own "a field named
+/// after a grouping column is that column's passthrough" rule), leaving only
+/// the real aggregate-measure columns.
+///
+/// [`Rows`]: crate::oracle::Rows
+async fn read_aggregate_table(
+    client: &tokio_postgres::Client,
+    qualified_table: &str,
+    group_by: &[String],
+    fields: &[FieldDef],
+) -> Result<BTreeMap<String, BTreeMap<String, Option<String>>>, ManualBackendError> {
+    let value_fields: Vec<&str> = fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .filter(|name| !group_by.iter().any(|g| g == name))
+        .collect();
+
+    let mut select_list: Vec<String> = group_by
+        .iter()
+        .map(|c| format!("{}::text", quote_ident(c)))
+        .collect();
+    select_list.extend(
+        value_fields
+            .iter()
+            .map(|c| format!("{}::text", quote_ident(c))),
+    );
+    let sql = format!("select {} from {qualified_table}", select_list.join(", "));
+    let rows = client.query(&sql, &[]).await?;
+
+    let mut result = BTreeMap::new();
+    for row in rows {
+        let group_values: Vec<Option<String>> = (0..group_by.len())
+            .map(|i| row.get::<_, Option<String>>(i))
+            .collect();
+        let key = group_key(&group_values);
+        let mut by_column = BTreeMap::new();
+        for (i, name) in value_fields.iter().enumerate() {
+            by_column.insert(
+                (*name).to_string(),
+                row.get::<_, Option<String>>(group_by.len() + i),
+            );
+        }
+        result.insert(key, by_column);
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine::defs::parse;
+
+    /// The reviewer-flagged follow-up to issue #67 (real operator
+    /// precedence): a nested, mixed-operator `Expr` — `Add(Column("a"),
+    /// GreaterThan(Column("b"), Column("c")))`, i.e. the tree a source
+    /// author would have to spell `a + (b > c)` to get — must round-trip
+    /// through `render_expr` and back through the real parser to the exact
+    /// same tree, not a reflowed one.
+    ///
+    /// Before this fix, `render_expr` rendered this tree flat as
+    /// `a + b > c`, which the precedence-climbing parser (issue #67) then
+    /// re-parses as `GreaterThan(Add(a, b), c)` — `+` binds tighter than
+    /// `>`, so it silently reconstructs the *wrong* tree, one that even
+    /// type-checks (`Numeric, Numeric -> Boolean`) even though it isn't what
+    /// was rendered. Unconditional parenthesization
+    /// (`render_expr`'s doc comment) fixes this by always rendering
+    /// `(a) + (b > c)`, which only parses one way regardless of any
+    /// operator's precedence.
+    #[test]
+    fn render_expr_parenthesizes_nested_binary_ops_so_they_round_trip() {
+        let expr = Expr::BinaryOp {
+            op: Operator::Add,
+            lhs: Box::new(Expr::Column("a".to_string())),
+            rhs: Box::new(Expr::BinaryOp {
+                op: Operator::GreaterThan,
+                lhs: Box::new(Expr::Column("b".to_string())),
+                rhs: Box::new(Expr::Column("c".to_string())),
+            }),
+        };
+
+        let rendered = render_expr(&expr);
+        let text = format!("TRANSFORM t FROM s SELECT {rendered} AS out");
+        let def = parse(&text).unwrap_or_else(|e| {
+            panic!("rendered expression {rendered:?} must re-parse cleanly: {e:?}")
+        });
+
+        assert_eq!(
+            def.fields[0].expr, expr,
+            "round-tripping through render_expr -> parse must reproduce the exact original \
+             tree; without unconditional parenthesization this would silently come back as \
+             `GreaterThan(Add(a, b), c)` instead (`+` binds tighter than `>`, so a flat, \
+             unparenthesized render loses the original grouping)"
+        );
+    }
+
+    /// The mirror shape — `GreaterThan(Add(a, b), c)`, i.e. `(a + b) > c` —
+    /// which happens to round-trip correctly even *without* parens (since
+    /// `+`'s tighter precedence reconstructs the same grouping by accident).
+    /// Pinned anyway so a future change to `render_expr` can't quietly regress
+    /// this direction while only testing the other one.
+    #[test]
+    fn render_expr_round_trips_a_greater_than_wrapping_an_add() {
+        let expr = Expr::BinaryOp {
+            op: Operator::GreaterThan,
+            lhs: Box::new(Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::Column("a".to_string())),
+                rhs: Box::new(Expr::Column("b".to_string())),
+            }),
+            rhs: Box::new(Expr::Column("c".to_string())),
+        };
+
+        let rendered = render_expr(&expr);
+        let text = format!("TRANSFORM t FROM s SELECT {rendered} AS out");
+        let def = parse(&text).unwrap_or_else(|e| {
+            panic!("rendered expression {rendered:?} must re-parse cleanly: {e:?}")
+        });
+
+        assert_eq!(def.fields[0].expr, expr);
+    }
 }

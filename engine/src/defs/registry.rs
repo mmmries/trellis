@@ -17,49 +17,75 @@ pub struct OperatorSpec {
     pub operator: Operator,
     pub arg_types: (ValueType, ValueType),
     pub return_type: ValueType,
+    /// Binding strength [`super::parser`]'s precedence-climbing loop uses
+    /// to group `a OP1 b OP2 c`: higher binds tighter, so an operator with
+    /// a higher `precedence` grabs its operands before a lower-precedence
+    /// one does. All operators here are left-associative, so operators at
+    /// the *same* level still group left-to-right (`a + b + c` parses as
+    /// `(a + b) + c`).
+    ///
+    /// Levels are spaced out (not packed as 0, 1, 2, ...) so a new operator
+    /// can be slotted between two existing levels later without
+    /// renumbering everything else. Use the [`precedence`] constants below
+    /// rather than a raw number.
+    pub precedence: u8,
+}
+
+/// Named precedence levels, standard SQL/Postgres order — highest binds
+/// tightest. Gaps are left between levels for future operators (e.g. `NOT`
+/// or `AND`/`OR`, both lower than comparison) without renumbering.
+pub mod precedence {
+    /// `=`, `<>`, `<`, `>`, `<=`, `>=` and similar comparisons.
+    pub const COMPARISON: u8 = 10;
+    /// Binary `+`, `-`.
+    pub const ADDITIVE: u8 = 20;
+    /// `*`, `/`, `%`.
+    pub const MULTIPLICATIVE: u8 = 30;
 }
 
 /// The full set of operators this grammar/evaluator pairing supports.
 ///
-/// # Precedence invariant (issue #67)
+/// # Precedence table (issue #67)
 ///
-/// [`super::parser`] parses binary operators flat and left-associative —
-/// there is no precedence table, so `a OP1 b OP2 c` always parses as
-/// `(a OP1 b) OP2 c`, regardless of what a precedence-aware grammar (e.g.
-/// Postgres's) would do with the same operators. That is currently safe
-/// only by accident of the two operators here sitting at different points
-/// in the type lattice: `+` is `(Numeric, Numeric) -> Numeric` and `>` is
-/// `(Numeric, Numeric) -> Boolean`. Any expression that would regroup
-/// differently under real precedence (e.g. `a > b + c`, which Postgres
-/// parses as `a > (b + c)`) instead flat-parses as `(a > b) + c`, and the
-/// type-checker in [`super::validate`] rejects that with a type mismatch
-/// ([`super::validate::ValidationError::TypeMismatch`], `+`'s lhs expects
-/// Numeric but gets the Boolean result of `a > b`) rather than silently
-/// computing a wrong-but-plausible answer. See `mod::tests::
-/// flat_parse_of_mixed_operators_is_caught_by_type_checking` for a
-/// regression test pinning this behavior.
+/// [`super::parser`] parses binary operators with a real precedence-climbing
+/// loop keyed off each [`OperatorSpec::precedence`] here, so `a OP1 b OP2 c`
+/// groups the way a precedence-aware grammar (e.g. Postgres's) would, not
+/// flat-left-to-right. `+` sits at [`precedence::ADDITIVE`] and `>` at
+/// [`precedence::COMPARISON`], so e.g. `a > b + c` parses as `a > (b + c)`
+/// (`+` binds tighter and grabs `b` and `c` first), matching Postgres.
 ///
-/// This is an emergent property of the current operator set, not a
-/// designed guarantee — it will silently break the day a second
+/// This matters beyond just matching Postgres's grouping: before this table
+/// existed, correctness relied on an accident of the type lattice — `+` is
+/// `(Numeric, Numeric) -> Numeric` and `>` is `(Numeric, Numeric) ->
+/// Boolean`, so the *wrong* flat-parse regrouping of `a > b + c` (as
+/// `(a > b) + c`) happened to get caught by [`super::validate`]'s type
+/// checker rather than silently computing a wrong-but-plausible answer. See
+/// `mod::tests::mixed_operators_respect_precedence` for the regression test
+/// pinning real precedence (renamed from `flat_parse_of_mixed_operators_is_
+/// caught_by_type_checking`, which pinned the old, wrong behavior).
+///
+/// Without a real precedence table, that safety net would have been only
+/// an emergent property of the current operator set: the day a second
 /// Numeric-returning operator (e.g. `-`, `*`) or a second Boolean-returning
 /// operator (e.g. `<`, `=`) is added at a "compatible" spot in the type
-/// lattice, such that both possible regroupings of some `a OP1 b OP2 c`
-/// still type-check (just to different results). Before adding such an
-/// operator: either verify no such regrouping exists, or add a real
-/// precedence table to the parser so parsing matches Postgres's grouping
-/// instead of relying on types to catch the mismatch after the fact.
+/// lattice, both possible flat-parse regroupings of some `a OP1 b OP2 c`
+/// could type-check (just to different results) with no type error to catch
+/// the mistake. Assigning every new operator a real [`precedence`] level
+/// (rather than leaving it flat) is what keeps that from happening.
 pub const OPERATORS: &[OperatorSpec] = &[
     OperatorSpec {
         symbol: "+",
         operator: Operator::Add,
         arg_types: (ValueType::Numeric, ValueType::Numeric),
         return_type: ValueType::Numeric,
+        precedence: precedence::ADDITIVE,
     },
     OperatorSpec {
         symbol: ">",
         operator: Operator::GreaterThan,
         arg_types: (ValueType::Numeric, ValueType::Numeric),
         return_type: ValueType::Boolean,
+        precedence: precedence::COMPARISON,
     },
 ];
 

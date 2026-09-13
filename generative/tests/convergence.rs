@@ -22,12 +22,16 @@
 //! -p generative --test convergence`). Failing seeds are persisted to the
 //! checked-in `tests/proptest-regressions/convergence.txt` and replayed first.
 
+use engine::defs::ast::Expr;
 use engine::defs::qualified_target_table;
 use engine::{Config, Pool};
 use generative::backend::{Backend, ManualBackend};
 use generative::generate::{
-    Mutate, TableSpec, build_program, build_program_multi, trivial_program,
+    AggregateColumn, AggregateFn, DefShape, DerivedShape, Mutate, TableSpec, build_program,
+    build_program_multi, build_program_multi_with_derived, build_program_multi_with_shapes,
+    trivial_program,
 };
+use generative::model::group_key;
 use generative::run::{RunError, check_program, run_convergence};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
@@ -471,6 +475,7 @@ async fn a_text_boolean_uuid_program_converges_end_to_end() {
                 Some("123e4567-e89b-42d3-a456-426614174000".to_string()),
                 Some("00000000-0000-4000-8000-000000000000".to_string()),
             ],
+            grain_values: vec![None, None],
             mutates: vec![],
         }],
         &[0],
@@ -492,4 +497,292 @@ async fn a_text_boolean_uuid_program_converges_end_to_end() {
         .await
         .expect("a Text/Boolean/Uuid program must converge end-to-end");
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
+}
+
+/// Improvement-plan task B2: a hand-built program whose "derived" field is
+/// `STRPOS(text_col, 'wor') > 0` — a nested, *mixed* operator-and-function
+/// expression (`Operator::GreaterThan` wrapping a `FunctionCall`) — driven
+/// through the real convergence property end-to-end. Not just the property
+/// happening to draw this `DerivedShape` sometimes (per this suite's own
+/// "coverage that silently drops out" principle, same rationale as the B1/B3
+/// pins above): this is the specific shape the render_expr parenthesization
+/// fix (`generative::backend::manual::render_expr`) and the oracle's new
+/// `>`/function rendering (`generative::oracle::render_expr`) both exist for.
+///
+/// Row 1's `text_col` is `"hello world"`, so `STRPOS(text_col, 'wor')` finds
+/// a match (`> 0` is `true`); row 2's is `"goodbye"`, so it doesn't (`> 0` is
+/// `false`) — both branches of the nested comparison get real, live coverage,
+/// not just the "always true" or "always false" case a less deliberate
+/// choice of values could have left untested.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nested_mixed_operator_and_function_expression_converges_end_to_end() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program_multi_with_derived(
+        &[TableSpec {
+            seed_values: vec![(Some(1), Some(2)), (Some(3), Some(4))],
+            text_values: vec![Some("hello world".to_string()), Some("goodbye".to_string())],
+            bool_values: vec![Some("true".to_string()), Some("false".to_string())],
+            uuid_values: vec![
+                Some("123e4567-e89b-42d3-a456-426614174000".to_string()),
+                Some("00000000-0000-4000-8000-000000000000".to_string()),
+            ],
+            grain_values: vec![None, None],
+            mutates: vec![],
+        }],
+        &[0],
+        &[DerivedShape::StrposGreaterThan {
+            needle: "wor".to_string(),
+            threshold: 0,
+        }],
+    );
+    assert_eq!(program.tables.len(), 1);
+    assert_eq!(program.defs.len(), 1);
+    assert_eq!(
+        program.defs[0].fields.len(),
+        5,
+        "expected total + 3 passthroughs + 1 derived"
+    );
+    let derived = &program.defs[0].fields.last().expect("derived field").expr;
+    assert!(
+        matches!(
+            derived,
+            Expr::BinaryOp {
+                op: engine::defs::ast::Operator::GreaterThan,
+                lhs,
+                ..
+            } if matches!(lhs.as_ref(), Expr::FunctionCall { name, .. } if name == "STRPOS")
+        ),
+        "expected the derived field to be STRPOS(...) > <literal>, got {derived:?}"
+    );
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("a nested mixed operator-and-function expression must converge end-to-end");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+}
+
+/// Improvement-plan task B4, the non-negotiable pin: a hand-built
+/// `KeySpace::Aggregate` program driven through the real convergence property
+/// end-to-end, specifically driving one group to empty via deletes — the
+/// single hardest edge the task names (the only non-idempotent maintenance
+/// path in the engine, per `docs/generative-test-suite.md` §4). Table `t0`'s
+/// grain column puts pks 1 and 2 in group `"0"` and pk 3 in group `"1"`; the
+/// mutate stream deletes *both* of group `"0"`'s members.
+///
+/// `run_convergence` already checks the persisted target against the SQL
+/// oracle after every op — Postgres's own `GROUP BY` naturally produces zero
+/// rows for an empty group, so if the engine ever left group `"0"`'s row
+/// behind (stale or zeroed) instead of deleting it outright, that per-op
+/// check would already fail — but the explicit snapshot assertions below
+/// additionally make the "genuinely gone, not left behind as zeroes" claim
+/// directly visible, per the task's own wording, rather than only inferred
+/// from a green run.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aggregate_group_emptied_by_deletes_converges_and_the_row_disappears() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program_multi_with_shapes(
+        &[TableSpec {
+            seed_values: vec![
+                (Some(10), Some(1)),
+                (Some(20), Some(2)),
+                (Some(99), Some(3)),
+            ],
+            text_values: vec![None, None, None],
+            bool_values: vec![None, None, None],
+            uuid_values: vec![None, None, None],
+            grain_values: vec![
+                Some("0".to_string()),
+                Some("0".to_string()),
+                Some("1".to_string()),
+            ],
+            mutates: vec![Mutate::Delete { pk: 1 }, Mutate::Delete { pk: 2 }],
+        }],
+        &[(
+            0,
+            DefShape::Aggregate {
+                functions: vec![
+                    AggregateFn::Sum(AggregateColumn::C1),
+                    AggregateFn::Count,
+                    AggregateFn::Avg(AggregateColumn::C1),
+                    AggregateFn::Min(AggregateColumn::C1),
+                    AggregateFn::Max(AggregateColumn::C1),
+                ],
+            },
+        )],
+    );
+    assert_eq!(program.tables.len(), 1);
+    assert_eq!(program.defs.len(), 1);
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("an aggregate group emptied by deletes must still converge end-to-end");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+
+    let snapshot = backend.snapshot().await.expect("snapshot after the run");
+    let target = &snapshot[&program.defs[0].target];
+    let emptied_group = group_key(&[Some("0".to_string())]);
+    let surviving_group = group_key(&[Some("1".to_string())]);
+    assert!(
+        !target.contains_key(&emptied_group),
+        "group \"0\" was emptied by deleting both its members and must have no target row at \
+         all — not a stale/zeroed row: {target:?}"
+    );
+    assert!(
+        target.contains_key(&surviving_group),
+        "group \"1\" (pk 3, untouched) must still have its target row: {target:?}"
+    );
+    let g1 = &target[&surviving_group];
+    assert_eq!(g1["sum_c1"], Some("99".to_string()), "group 1's sum");
+    assert_eq!(g1["cnt"], Some("1".to_string()), "group 1's count");
+    assert_eq!(g1["min_c1"], Some("99".to_string()), "group 1's min");
+    assert_eq!(g1["max_c1"], Some("99".to_string()), "group 1's max");
+}
+
+/// Improvement-plan task B4: `MIN`/`MAX` are always
+/// `engine::defs::invertibility::Invertibility::RecomputeOnly` (never
+/// delta-maintained) — deleting a group's *current* extreme member must
+/// recompute the new extreme from the group's remaining rows, not fall back
+/// to a stale cached value. `engine/tests/apply_aggregate.rs` already covers
+/// this shape by hand at the engine layer; this pin drives the identical
+/// edge through the generative harness's own convergence property, so a
+/// regression here is caught by the same three-way (target/evaluator/SQL)
+/// machinery every other case in this suite is.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_groups_current_min_and_max_forces_a_real_recompute() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program_multi_with_shapes(
+        &[TableSpec {
+            seed_values: vec![(Some(5), Some(0)), (Some(20), Some(0)), (Some(1), Some(0))],
+            text_values: vec![None, None, None],
+            bool_values: vec![None, None, None],
+            uuid_values: vec![None, None, None],
+            grain_values: vec![Some("0".to_string()); 3],
+            // Delete the current max (pk 2, c1=20) and the current min
+            // (pk 3, c1=1); only pk 1 (c1=5) survives.
+            mutates: vec![Mutate::Delete { pk: 2 }, Mutate::Delete { pk: 3 }],
+        }],
+        &[(
+            0,
+            DefShape::Aggregate {
+                functions: vec![
+                    AggregateFn::Min(AggregateColumn::C1),
+                    AggregateFn::Max(AggregateColumn::C1),
+                ],
+            },
+        )],
+    );
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("deleting the current min/max must still converge via recompute");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+
+    let snapshot = backend.snapshot().await.expect("snapshot after the run");
+    let target = &snapshot[&program.defs[0].target];
+    let group = group_key(&[Some("0".to_string())]);
+    let row = &target[&group];
+    assert_eq!(
+        row["min_c1"],
+        Some("5".to_string()),
+        "min must recompute to the one surviving row (5), not stay stale at 1"
+    );
+    assert_eq!(
+        row["max_c1"],
+        Some("5".to_string()),
+        "max must recompute to the one surviving row (5), not stay stale at 20"
+    );
+}
+
+/// Improvement-plan task B4: `AVG`'s hidden sum/count partials
+/// (`engine::defs::invertibility::PartialField`), and — since this def's
+/// `SUM` and `AVG` both aggregate the exact same column — the shared hidden
+/// running-count column `engine::defs::ddl::count_column_names` gives them
+/// (`engine/tests/apply_aggregate.rs` covers the shared-count-column shape by
+/// hand; this drives the same shape through the generative harness). An
+/// insert, an update that changes the aggregated value, and a delete all
+/// land in the same group, so every fold path (insert delta, update delta,
+/// delete delta) exercises both fields' partials in one run.
+#[tokio::test(flavor = "multi_thread")]
+async fn avg_and_sum_over_the_same_column_share_a_partial_and_stay_correct_through_mutation() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program_multi_with_shapes(
+        &[TableSpec {
+            seed_values: vec![(Some(10), Some(0)), (Some(30), Some(0))],
+            text_values: vec![None, None],
+            bool_values: vec![None, None],
+            uuid_values: vec![None, None],
+            grain_values: vec![Some("0".to_string()), Some("0".to_string())],
+            mutates: vec![
+                // Group "0" starts as {10, 30} (sum 40, avg 20). Update pk 1
+                // to 50 (sum 80, avg 40), then delete pk 2 (sum 50, avg 50).
+                Mutate::Update {
+                    pk: 1,
+                    c1: Some(50),
+                    c2: Some(0),
+                },
+                Mutate::Delete { pk: 2 },
+            ],
+        }],
+        &[(
+            0,
+            DefShape::Aggregate {
+                functions: vec![
+                    AggregateFn::Sum(AggregateColumn::C1),
+                    AggregateFn::Avg(AggregateColumn::C1),
+                ],
+            },
+        )],
+    );
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("AVG/SUM sharing a partial must still converge through insert/update/delete");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+
+    let snapshot = backend.snapshot().await.expect("snapshot after the run");
+    let target = &snapshot[&program.defs[0].target];
+    let group = group_key(&[Some("0".to_string())]);
+    let row = &target[&group];
+    assert_eq!(row["sum_c1"], Some("50".to_string()), "final sum");
+    // Postgres's numeric division picks its own display scale (e.g.
+    // `50.0000000000000000`), which this grammar's `AVG` inherits rather
+    // than reformats — compare by parsed value, not exact text, matching
+    // `engine/tests/apply_aggregate.rs`'s own `assert_count_and_avg` helper.
+    let avg: f64 = row["avg_c1"]
+        .as_deref()
+        .expect("avg_c1 must not be NULL")
+        .parse()
+        .expect("avg_c1 must parse as a number");
+    assert!(
+        (avg - 50.0).abs() < 1e-9,
+        "final avg: expected 50, got {avg}"
+    );
 }

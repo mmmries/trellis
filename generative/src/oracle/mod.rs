@@ -40,10 +40,11 @@ use std::fmt;
 
 use engine::Pool;
 use engine::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use engine::defs::oracle::{OracleError, recompute};
+use engine::defs::oracle::{OracleError, recompute, recompute_aggregate};
+use engine::defs::registry;
 use engine::numeric::Numeric;
 
-use crate::model::Program;
+use crate::model::{Program, group_key};
 
 /// One logical target's rows: `pk (rendered text) -> column -> value
 /// (rendered text, `None` is SQL `NULL`)`. Matches the inner shape of
@@ -237,87 +238,151 @@ fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
-/// Renders a numeric calculated-field expression back to Postgres SQL text.
+/// Renders a calculated-field expression back to Postgres SQL text.
 ///
 /// Deliberately independent of the engine's evaluator *and* of
 /// `engine::defs::oracle::render_expr_sql` — the oracle's whole value is that
-/// its `SELECT` shares no code with the thing it checks. Scoped to the
-/// numeric-`+` slice (issue #5): anything beyond it panics naming the missing
-/// work rather than guessing (design doc §2 "refuse to guess"), so the day
-/// the generator widens, this fails loudly instead of emitting false
-/// differentials.
+/// its `SELECT` shares no code with the thing it checks (both happen to
+/// choose the same idiomatic rendering — quoted identifiers, an explicit cast
+/// on every literal, `name(args)` for a function call — independently, not by
+/// sharing an implementation). Improvement-plan task B2 widened this past the
+/// original numeric-`+` slice (issue #5) to `Operator::GreaterThan`,
+/// `Expr::StringLiteral`, and the five scalar functions
+/// (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/`REGEXP_COUNT`/`COALESCE`) the
+/// generator now draws (see `crate::generate::DerivedShape`); task B4 widens
+/// it again to the five `KeySpace::Aggregate` functions
+/// (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`, see `crate::generate::AggregateFn`).
+/// Every one of those renders as the same generic `name(args)` Postgres call
+/// syntax (the fallthrough `FunctionCall` arm below) except `COUNT`'s
+/// argument-less `COUNT(*)`, which the grammar's AST carries with an empty
+/// `args` list — special-cased so it doesn't fall through to the generic arm
+/// and emit the invalid `count()`. Anything still beyond that (a relationship
+/// path) panics naming the missing work rather than guessing (design doc §2
+/// "refuse to guess"), so a future widening fails loudly instead of emitting
+/// a false differential.
+///
+/// **Collation.** `>` here is `Numeric, Numeric -> Boolean`
+/// (`engine::defs::registry::OPERATORS` never gives it a `Text` operand), and
+/// none of the five scalar functions performs a collation-sensitive
+/// comparison: `STRPOS` is a plain substring search (byte/character match,
+/// not locale ordering), `OCTET_LENGTH`/`CHAR_LENGTH` just count,
+/// `REGEXP_COUNT`'s patterns are drawn only from
+/// `generate::strategy::REGEXP_COUNT_PATTERN_POOL` (literal text and
+/// `.`/`*`/`+`/`?`/`[...]`/`|`/`^`/`$` — no locale-dependent POSIX bracket
+/// classes like `[[:alpha:]]`), and `COALESCE` does no comparison at all (it
+/// just returns its first non-`NULL` argument). `SUM`/`COUNT`/`AVG`/`MIN`/
+/// `MAX` are likewise all numeric aggregation with no text/collation
+/// involvement. So unlike task B1's text *ordering* concern (which that
+/// task's own plan flags as the load-bearing collation risk), nothing B2 or
+/// B4 adds needs the oracle and the engine's underlying Postgres session
+/// pinned to the same collation — there is no ordering comparison in this
+/// grammar for the two to disagree about.
 fn render_expr(expr: &Expr) -> String {
     match expr {
         Expr::Column(name) => quote_ident(name),
         Expr::NumberLiteral(text) => text.clone(),
-        Expr::BinaryOp {
-            op: Operator::Add,
-            lhs,
-            rhs,
-        } => format!("({} + {})", render_expr(lhs), render_expr(rhs)),
-        Expr::BinaryOp {
-            op: Operator::GreaterThan,
-            ..
-        } => panic!(
-            "oracle: `>` comparison rendering is out of scope for the numeric-+ slice \
-             (issue #65 widens the grammar); extend `render_expr` when the generator emits it"
-        ),
-        Expr::StringLiteral(_) => panic!(
-            "oracle: text-literal rendering is out of scope for the numeric-+ slice \
-             (issue #63 widens the value model); extend `render_expr` when the generator emits it"
-        ),
-        Expr::FunctionCall { name, .. } => panic!(
-            "oracle: function-call rendering ({name}) is out of scope for the numeric-+ slice \
-             (issue #64 adds functions); extend `render_expr` when the generator emits it"
-        ),
+        Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::BinaryOp { op, lhs, rhs } => {
+            let symbol = match op {
+                Operator::Add => "+",
+                Operator::GreaterThan => ">",
+            };
+            format!("({} {symbol} {})", render_expr(lhs), render_expr(rhs))
+        }
+        // `COUNT(*)` (task B4, mirroring `engine::defs::oracle::render_expr_sql`'s
+        // own special case): the parser's only accepted `COUNT` shape has no
+        // argument at all in the AST (`args` is empty), so `*` is rendered
+        // back explicitly rather than falling through to the generic
+        // `name(args)` arm below, which would emit the invalid `count()`.
+        Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
+            "count(*)".to_string()
+        }
+        Expr::FunctionCall { name, args } => {
+            let rendered_args: Vec<String> = args.iter().map(render_expr).collect();
+            format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
+        }
         Expr::RelationshipPath { rel, column } => panic!(
-            "oracle: relationship-path rendering ('{rel}.{column}') is out of scope for the \
-             numeric-+ slice (issue #25 is grammar + AST only; no generator support yet); \
-             extend `render_expr` when the generator emits it"
+            "oracle: relationship-path rendering ('{rel}.{column}') is out of scope for this \
+             generator (issue #25 is grammar + AST only; no generator support yet); extend \
+             `render_expr` when the generator emits it"
         ),
     }
 }
 
 /// Renders a 1-1 `def` back to `SELECT <pk>, (<expr>) AS <field>, ... FROM
-/// <source>`. Every projection is cast to `text` so the read-back matches the
-/// rendered-text shape [`crate::backend::Snapshot`] uses.
+/// <source>`, or (task B4) an `Aggregate` `def` back to `SELECT (<expr>) AS
+/// <field>, ... FROM <source> GROUP BY <group_by>`. Every projection is cast
+/// to `text` so the read-back matches the rendered-text shape
+/// [`crate::backend::Snapshot`] uses. The `Aggregate` arm renders every field
+/// through the same per-field loop as the 1-1 arm — including the
+/// grouping-column passthrough field(s) (`SELECT order_id AS order_id, ...`)
+/// — rather than special-casing them out of the select list: [`sql_oracle`]
+/// is what picks the grouping columns back out of the result by name to build
+/// each row's key (see its doc comment), so no separate "leading pk
+/// expression" is needed here the way the 1-1 arm needs one for `pk_column`.
 ///
 /// # Panics
 ///
-/// On any shape beyond the numeric-`+` 1-1 slice (issue #5), naming the
-/// follow-up that widens it — an aggregate `GROUP BY` is issue #10; a
-/// non-trivial predicate is a later slice.
+/// On any shape beyond the numeric-`+`/aggregate slice this oracle models
+/// (a non-trivial predicate is a later slice), naming the follow-up that
+/// widens it.
 fn render_select(def: &TransformDef, pk_column: &str) -> String {
-    match &def.key_space {
-        KeySpace::OneToOne => {}
-        KeySpace::Aggregate { .. } => panic!(
-            "oracle: aggregate GROUP BY rendering is the aggregate slice (issue #10), not the \
-             numeric-+ 1-1 slice (issue #5); the oracle refuses to guess at an unmodeled shape"
-        ),
-    }
     match def.predicate {
         Predicate::True => {}
     }
 
-    let mut select_list = vec![format!("{}::text", quote_ident(pk_column))];
-    for field in &def.fields {
-        select_list.push(format!(
-            "({})::text as {}",
-            render_expr(&field.expr),
-            quote_ident(&field.name)
-        ));
+    match &def.key_space {
+        KeySpace::OneToOne => {
+            let mut select_list = vec![format!("{}::text", quote_ident(pk_column))];
+            for field in &def.fields {
+                select_list.push(format!(
+                    "({})::text as {}",
+                    render_expr(&field.expr),
+                    quote_ident(&field.name)
+                ));
+            }
+            format!(
+                "select {} from {}",
+                select_list.join(", "),
+                quote_ident(&def.source)
+            )
+        }
+        KeySpace::Aggregate { group_by } => {
+            let select_list: Vec<String> = def
+                .fields
+                .iter()
+                .map(|field| {
+                    format!(
+                        "({})::text as {}",
+                        render_expr(&field.expr),
+                        quote_ident(&field.name)
+                    )
+                })
+                .collect();
+            let group_cols: Vec<String> = group_by.iter().map(|c| quote_ident(c)).collect();
+            format!(
+                "select {} from {} group by {}",
+                select_list.join(", "),
+                quote_ident(&def.source),
+                group_cols.join(", ")
+            )
+        }
     }
-
-    format!(
-        "select {} from {}",
-        select_list.join(", "),
-        quote_ident(&def.source)
-    )
 }
 
 /// Runs `def` rendered as a `SELECT` (see [`render_select`]) in `pool`'s
 /// cluster and reads the result back into field-only [`Rows`] keyed by the
-/// primary key. The authority side of the three-way comparison.
+/// primary key (1-1) or the grouping columns' composite [`group_key`]
+/// (`Aggregate`, task B4). The authority side of the three-way comparison.
+///
+/// For an `Aggregate` def, `pk_column` is unused: there is no single leading
+/// pk expression in the rendered `SELECT` (see [`render_select`]'s doc
+/// comment), so this instead locates each `group_by` column by name among
+/// `def.fields` (every grouping column has a passthrough field of the same
+/// name — enforced by `engine::defs::validate::validate`'s
+/// `GroupingColumnFieldMustBePassthrough` check) and excludes it from the
+/// row's own `by_column` map, exactly as [`target_fields`] excludes the 1-1
+/// pk column.
 pub async fn sql_oracle(
     pool: &Pool,
     def: &TransformDef,
@@ -327,24 +392,74 @@ pub async fn sql_oracle(
     let client = pool.get().await?;
     let db_rows = client.query(sql.as_str(), &[]).await?;
 
-    let mut rows: Rows = BTreeMap::new();
-    for db_row in db_rows {
-        let pk: Option<String> = db_row.get(0);
-        let pk = pk.expect("primary key column is never NULL");
-        let mut by_column = BTreeMap::new();
-        for (i, field) in def.fields.iter().enumerate() {
-            by_column.insert(field.name.clone(), db_row.get::<_, Option<String>>(i + 1));
+    match &def.key_space {
+        KeySpace::OneToOne => {
+            let mut rows: Rows = BTreeMap::new();
+            for db_row in db_rows {
+                let pk: Option<String> = db_row.get(0);
+                let pk = pk.expect("primary key column is never NULL");
+                let mut by_column = BTreeMap::new();
+                for (i, field) in def.fields.iter().enumerate() {
+                    by_column.insert(field.name.clone(), db_row.get::<_, Option<String>>(i + 1));
+                }
+                rows.insert(pk, by_column);
+            }
+            Ok(rows)
         }
-        rows.insert(pk, by_column);
+        KeySpace::Aggregate { group_by } => {
+            let mut rows: Rows = BTreeMap::new();
+            for db_row in db_rows {
+                let values: Vec<Option<String>> = (0..def.fields.len())
+                    .map(|i| db_row.get::<_, Option<String>>(i))
+                    .collect();
+                let group_values: Vec<Option<String>> = group_by
+                    .iter()
+                    .map(|column| {
+                        let index = def
+                            .fields
+                            .iter()
+                            .position(|f| &f.name == column)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "oracle: GROUP BY column {column:?} has no matching \
+                                     passthrough field on {:?} — a generator bug, or a \
+                                     definition that should have failed validation",
+                                    def.target
+                                )
+                            });
+                        values[index].clone()
+                    })
+                    .collect();
+                let key = group_key(&group_values);
+                let mut by_column = BTreeMap::new();
+                for (field, value) in def.fields.iter().zip(values) {
+                    if group_by.contains(&field.name) {
+                        continue;
+                    }
+                    by_column.insert(field.name.clone(), value);
+                }
+                rows.insert(key, by_column);
+            }
+            Ok(rows)
+        }
     }
-    Ok(rows)
 }
 
 /// Recomputes `def`'s target with the engine's own evaluator
-/// ([`engine::defs::oracle::recompute`]) and renders each [`Value`] to text,
-/// into field-only [`Rows`] keyed by the primary key. The evaluator side of
-/// the three-way comparison — a secondary parity check on the mirror-Postgres
+/// ([`engine::defs::oracle::recompute`] for 1-1,
+/// [`engine::defs::oracle::recompute_aggregate`] for `Aggregate` — task B4)
+/// and renders each [`Value`] to text, into field-only [`Rows`] keyed by the
+/// primary key (1-1) or the grouping columns' composite [`group_key`]
+/// (`Aggregate`, already computed by `recompute_aggregate` itself, since it's
+/// the engine's own private convention this generative-suite key deliberately
+/// mirrors — see [`group_key`]'s doc comment). The evaluator side of the
+/// three-way comparison — a secondary parity check on the mirror-Postgres
 /// claim, never the authority.
+///
+/// For an `Aggregate` def, `pk_column` is unused (there is no single source
+/// primary key to key an aggregate target by), and each group's grouping
+/// column(s) are excluded from `by_column`, matching [`sql_oracle`]'s
+/// `Aggregate` arm.
 ///
 /// [`Value`]: engine::defs::eval::Value
 pub async fn evaluator_oracle(
@@ -353,16 +468,33 @@ pub async fn evaluator_oracle(
     pk_column: &str,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<Rows, OracleError> {
-    let recomputed = recompute(pool, def, pk_column, source_columns).await?;
-    let mut rows: Rows = BTreeMap::new();
-    for (pk, fields) in recomputed {
-        let by_column = fields
-            .into_iter()
-            .map(|(column, value)| (column, value.map(|v| v.to_string())))
-            .collect();
-        rows.insert(pk, by_column);
+    match &def.key_space {
+        KeySpace::OneToOne => {
+            let recomputed = recompute(pool, def, pk_column, source_columns).await?;
+            let mut rows: Rows = BTreeMap::new();
+            for (pk, fields) in recomputed {
+                let by_column = fields
+                    .into_iter()
+                    .map(|(column, value)| (column, value.map(|v| v.to_string())))
+                    .collect();
+                rows.insert(pk, by_column);
+            }
+            Ok(rows)
+        }
+        KeySpace::Aggregate { group_by } => {
+            let recomputed = recompute_aggregate(pool, def, source_columns).await?;
+            let mut rows: Rows = BTreeMap::new();
+            for (key, fields) in recomputed {
+                let by_column = fields
+                    .into_iter()
+                    .filter(|(column, _)| !group_by.contains(column))
+                    .map(|(column, value)| (column, value.map(|v| v.to_string())))
+                    .collect();
+                rows.insert(key, by_column);
+            }
+            Ok(rows)
+        }
     }
-    Ok(rows)
 }
 
 /// Strips the primary-key column from a target's rows as read back by
@@ -493,8 +625,26 @@ pub fn three_way(
 /// `Expr::Column` passthrough fields over `Text`/`Boolean`/`Uuid` source
 /// columns (`SELECT <col> AS <col>`), not just the numeric operands of
 /// `total = c1 + c2` — so a `Column` reference is no longer always Numeric;
-/// this now looks its actual type up on the source schema, exactly as the
-/// comment this replaces said would eventually be needed.
+/// this now looks its actual type up on the source schema.
+///
+/// Task B2 widens it again: `BinaryOp`/`FunctionCall`'s return type is no
+/// longer hardcoded `Numeric` either — it's read off
+/// `engine::defs::registry::operator_spec`/`lookup_function`, the same
+/// source of truth the parser/validator/evaluator all already share
+/// (ADR-0004), rather than this oracle keeping its own separate copy of
+/// "which operator/function returns which type" that could silently drift
+/// from the registry's. `COALESCE` is the one function whose return type
+/// isn't a fixed registry entry (it types as its *arguments'* common type,
+/// exactly as `validate.rs`'s `infer_expr` computes it) — self-recursing into
+/// the first argument mirrors that.
+///
+/// Task B4 widens it once more: a `FunctionCall` that isn't registered in
+/// `registry::FUNCTIONS` (the scalar functions) is also checked against
+/// `registry::lookup_aggregate_function` (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`,
+/// `registry::AGGREGATE_FUNCTION_SPECS`) before giving up — both registries'
+/// entries happen to return `Numeric` today, but this looks each one up
+/// rather than hardcoding that, for the same "don't keep a second, driftable
+/// copy of the registry's answer" reason as the scalar-function case above.
 fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) -> ValueType {
     match expr {
         Expr::Column(name) => *source_columns.get(name).unwrap_or_else(|| {
@@ -505,11 +655,24 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
             )
         }),
         Expr::NumberLiteral(_) => ValueType::Numeric,
-        Expr::BinaryOp {
-            op: Operator::Add, ..
-        } => ValueType::Numeric,
-        _ => {
-            // render_expr already panics on these with the follow-up issue
+        Expr::StringLiteral(_) => ValueType::Text,
+        Expr::BinaryOp { op, .. } => registry::operator_spec(*op).return_type,
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            field_value_type(&args[0], source_columns)
+        }
+        Expr::FunctionCall { name, .. } => registry::lookup_function(name)
+            .or_else(|| registry::lookup_aggregate_function(name))
+            .map(|spec| spec.return_type)
+            .unwrap_or_else(|| {
+                panic!(
+                    "oracle: unknown function {name:?} — the generator only ever builds calls \
+                     registered in engine::defs::registry::FUNCTIONS or \
+                     AGGREGATE_FUNCTION_SPECS; extend field_value_type (and render_expr) if \
+                     that set ever widens"
+                )
+            }),
+        Expr::RelationshipPath { .. } => {
+            // render_expr already panics on this with the follow-up issue
             // named; reaching here would mean the two drifted out of sync.
             render_expr(expr);
             unreachable!("render_expr panics on every shape field_value_type does not model")
@@ -681,18 +844,238 @@ mod tests {
         );
     }
 
+    /// Task B4: `render_select` now renders a real `GROUP BY` instead of
+    /// panicking (the old pin here, `render_select_panics_on_an_aggregate_key_space`,
+    /// asserted the pre-B4 refuse-to-guess behavior; this is its
+    /// replacement now that the real thing works). Mirrors the
+    /// `order_summary` shape `engine/tests/apply_aggregate.rs` uses as its
+    /// own model aggregate definition.
     #[test]
-    #[should_panic(expected = "aggregate GROUP BY rendering is the aggregate slice (issue #10)")]
-    fn render_select_panics_on_an_aggregate_key_space() {
+    fn render_select_renders_a_group_by_aggregate() {
         let def = TransformDef {
             target: "d0".into(),
             source: "t0".into(),
             key_space: KeySpace::Aggregate {
-                group_by: vec!["c1".into()],
+                group_by: vec!["grain".into()],
             },
-            fields: Vec::new(),
+            fields: vec![
+                engine::defs::ast::FieldDef {
+                    name: "grain".into(),
+                    expr: Expr::Column("grain".into()),
+                },
+                engine::defs::ast::FieldDef {
+                    name: "total".into(),
+                    expr: Expr::FunctionCall {
+                        name: "SUM".into(),
+                        args: vec![Expr::Column("c1".into())],
+                    },
+                },
+                engine::defs::ast::FieldDef {
+                    name: "cnt".into(),
+                    expr: Expr::FunctionCall {
+                        name: "COUNT".into(),
+                        args: Vec::new(),
+                    },
+                },
+            ],
             predicate: Predicate::True,
         };
-        let _ = render_select(&def, "c0");
+        assert_eq!(
+            render_select(&def, "c0"),
+            "select (\"grain\")::text as \"grain\", (sum(\"c1\"))::text as \"total\", \
+             (count(*))::text as \"cnt\" from \"t0\" group by \"grain\""
+        );
+    }
+
+    /// Task B4: `render_expr` now renders `MIN`/`MAX`/`AVG` too, not just
+    /// `SUM`/`COUNT` (the two above already get end-to-end coverage via
+    /// `render_select_renders_a_group_by_aggregate` and
+    /// `field_value_type_classifies_every_aggregate_function_as_numeric`
+    /// below) — a direct, narrow pin on the rendering itself, independent of
+    /// a full `TransformDef`.
+    #[test]
+    fn render_expr_renders_min_max_avg_over_a_column() {
+        for (name, expected) in [
+            ("MIN", "min(\"c1\")"),
+            ("MAX", "max(\"c1\")"),
+            ("AVG", "avg(\"c1\")"),
+        ] {
+            let expr = Expr::FunctionCall {
+                name: name.to_string(),
+                args: vec![Expr::Column("c1".into())],
+            };
+            assert_eq!(render_expr(&expr), expected);
+        }
+    }
+
+    /// Post-merge coherence note: the pre-merge B4 pin here
+    /// (`render_expr_still_panics_on_a_non_aggregate_function_call`) asserted
+    /// that `render_expr` panicked on `STRPOS` — true on the B4 branch in
+    /// isolation, where B2's scalar-function rendering didn't exist yet, but
+    /// false now that it's merged in (`render_expr`'s `FunctionCall` arm is
+    /// fully generic, see its doc comment). `render_expr` itself no longer
+    /// refuses *any* function name — the real "refuse to guess" boundary
+    /// moved to [`field_value_type`], which panics on a function name absent
+    /// from *both* `registry::FUNCTIONS` and `registry::AGGREGATE_FUNCTION_SPECS`
+    /// (nothing in this grammar reaches `render_expr` with such a name
+    /// without `field_value_type` refusing it first via `check`'s call
+    /// sequence) — that's what this test pins instead.
+    #[test]
+    #[should_panic(expected = "unknown function \"NOT_A_REAL_FUNCTION\"")]
+    fn field_value_type_panics_on_an_unregistered_function_name() {
+        let expr = Expr::FunctionCall {
+            name: "NOT_A_REAL_FUNCTION".into(),
+            args: vec![Expr::Column("c1".into())],
+        };
+        let source_columns = HashMap::from([("c1".to_string(), ValueType::Numeric)]);
+        let _ = field_value_type(&expr, &source_columns);
+    }
+
+    /// Task B4's invertibility-split coverage claim only means something if
+    /// `field_value_type` (which drives per-cell comparison choice) actually
+    /// agrees that every one of the five aggregate functions — both the
+    /// `Invertible` ones (`SUM`/`COUNT`/`AVG`) and the `RecomputeOnly` ones
+    /// (`MIN`/`MAX`, see `engine::defs::invertibility`) — produces a Numeric
+    /// result, since that's what selects `Comparison::DecimalByValue` over
+    /// `Comparison::Exact` for the field.
+    #[test]
+    fn field_value_type_classifies_every_aggregate_function_as_numeric() {
+        let source_columns = HashMap::from([("c1".to_string(), ValueType::Numeric)]);
+        let count_expr = Expr::FunctionCall {
+            name: "COUNT".into(),
+            args: Vec::new(),
+        };
+        assert_eq!(
+            field_value_type(&count_expr, &source_columns),
+            ValueType::Numeric
+        );
+        for name in ["SUM", "AVG", "MIN", "MAX"] {
+            let expr = Expr::FunctionCall {
+                name: name.to_string(),
+                args: vec![Expr::Column("c1".into())],
+            };
+            assert_eq!(
+                field_value_type(&expr, &source_columns),
+                ValueType::Numeric,
+                "{name} must classify as Numeric"
+            );
+        }
+    }
+
+    /// Improvement-plan task B2: `>` renders like `+` (parenthesized,
+    /// operator between the two rendered operands) — the oracle no longer
+    /// panics on `Operator::GreaterThan` the way it did before this task.
+    #[test]
+    fn render_expr_renders_greater_than() {
+        let expr = Expr::BinaryOp {
+            op: Operator::GreaterThan,
+            lhs: Box::new(Expr::Column("c1".into())),
+            rhs: Box::new(Expr::Column("c2".into())),
+        };
+        assert_eq!(render_expr(&expr), "(\"c1\" > \"c2\")");
+    }
+
+    /// A string literal renders as a single-quote-escaped, explicitly
+    /// `::text`-cast Postgres literal — the same explicit-cast convention
+    /// `engine::defs::oracle::render_expr_sql` independently uses for the
+    /// same reason (an unadorned string constant leaves Postgres to infer a
+    /// type, and an explicit cast removes that ambiguity).
+    #[test]
+    fn render_expr_renders_a_string_literal_with_an_escaped_quote() {
+        let expr = Expr::StringLiteral("o'clock".into());
+        assert_eq!(render_expr(&expr), "'o''clock'::text");
+    }
+
+    /// A function call renders as `<lowercased name>(<rendered args>)` —
+    /// Postgres's own function-call syntax, matching every function name the
+    /// grammar accepts case-insensitively either way.
+    #[test]
+    fn render_expr_renders_a_function_call() {
+        let expr = Expr::FunctionCall {
+            name: "STRPOS".into(),
+            args: vec![
+                Expr::Column("text_col".into()),
+                Expr::StringLiteral("x".into()),
+            ],
+        };
+        assert_eq!(render_expr(&expr), "strpos(\"text_col\", 'x'::text)");
+    }
+
+    /// A nested, mixed operator-and-function expression renders with every
+    /// `BinaryOp` operand parenthesized and the function call nested inside —
+    /// `STRPOS(text_col, 'x') > 0`, the exact shape
+    /// `generate::DerivedShape::StrposGreaterThan` draws and
+    /// `tests/convergence.rs`'s hand-built pin exercises end-to-end.
+    #[test]
+    fn render_expr_renders_a_nested_function_and_operator_expression() {
+        let expr = Expr::BinaryOp {
+            op: Operator::GreaterThan,
+            lhs: Box::new(Expr::FunctionCall {
+                name: "STRPOS".into(),
+                args: vec![
+                    Expr::Column("text_col".into()),
+                    Expr::StringLiteral("x".into()),
+                ],
+            }),
+            rhs: Box::new(Expr::NumberLiteral("0".into())),
+        };
+        assert_eq!(render_expr(&expr), "(strpos(\"text_col\", 'x'::text) > 0)");
+    }
+
+    /// [`field_value_type`] reads `>`'s return type off the shared registry
+    /// (`engine::defs::registry::operator_spec`) rather than hardcoding it —
+    /// this pins that it actually gets `Boolean`, not the `Numeric` every
+    /// prior operator (`+`) happened to return.
+    #[test]
+    fn field_value_type_of_greater_than_is_boolean() {
+        let expr = Expr::BinaryOp {
+            op: Operator::GreaterThan,
+            lhs: Box::new(Expr::Column("c1".into())),
+            rhs: Box::new(Expr::Column("c2".into())),
+        };
+        let source_columns = HashMap::from([
+            ("c1".to_string(), ValueType::Numeric),
+            ("c2".to_string(), ValueType::Numeric),
+        ]);
+        assert_eq!(field_value_type(&expr, &source_columns), ValueType::Boolean);
+    }
+
+    /// Every one of the five scalar functions type-checks to its registered
+    /// return type (all `Numeric` today) via [`field_value_type`], and
+    /// `COALESCE` specifically types as its first argument's type rather
+    /// than a fixed registry entry.
+    #[test]
+    fn field_value_type_of_each_scalar_function_matches_its_registry_return_type() {
+        let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
+        for name in ["STRPOS", "OCTET_LENGTH", "CHAR_LENGTH", "REGEXP_COUNT"] {
+            let args = match name {
+                "STRPOS" | "REGEXP_COUNT" => vec![
+                    Expr::Column("text_col".into()),
+                    Expr::StringLiteral("x".into()),
+                ],
+                _ => vec![Expr::Column("text_col".into())],
+            };
+            let expr = Expr::FunctionCall {
+                name: name.to_string(),
+                args,
+            };
+            assert_eq!(
+                field_value_type(&expr, &source_columns),
+                ValueType::Numeric,
+                "{name} must type-check as Numeric"
+            );
+        }
+
+        let coalesce = Expr::FunctionCall {
+            name: "COALESCE".into(),
+            args: vec![
+                Expr::Column("text_col".into()),
+                Expr::StringLiteral("x".into()),
+            ],
+        };
+        assert_eq!(
+            field_value_type(&coalesce, &source_columns),
+            ValueType::Text
+        );
     }
 }

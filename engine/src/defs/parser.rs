@@ -13,7 +13,9 @@
 //! cross-join (`JOIN <other> ON <cond>`) key-space clause will slot in;
 //! this slice only accepts the 1-1 case (clause absent) and rejects both
 //! keywords by name if present. `<expr>` supports column references,
-//! numeric and string literals, `+`, `>` (issue #65), `name(args)`
+//! numeric and string literals, `+`, `>` (issue #65), parenthesized
+//! grouping (`(<expr>)`, issue #67 — needed once a caller composes `+` and
+//! `>` and must override the precedence table's own grouping), `name(args)`
 //! function calls against [`super::registry::FUNCTIONS`] (issue #64), and
 //! `<rel>.<column>` relationship-path references (issue #25, ADR-0006) —
 //! whose head is a relationship name, resolved and cardinality-checked by
@@ -38,7 +40,7 @@ use super::error::ParseError;
 use super::lexer::{Token, lex};
 use super::registry::{
     AGGREGATE_FUNCTIONS, NON_IMMUTABLE_NAMES, lookup_aggregate_function, lookup_function,
-    lookup_operator,
+    lookup_operator, operator_spec,
 };
 
 const OPERATOR_CHARS: &[char] = &['+', '-', '*', '/', '%', '>', '<', '='];
@@ -312,26 +314,53 @@ impl Parser {
         Ok(fields)
     }
 
-    /// Parses a binary-operator expression flat and left-associative: there
-    /// is no precedence table, so `a OP1 b OP2 c` always builds
-    /// `(a OP1 b) OP2 c`. See the precedence-invariant doc-comment on
-    /// [`super::registry::OPERATORS`] (issue #67) before adding an operator
-    /// — this is currently safe only because the type lattice happens to
-    /// reject every regrouping that would otherwise silently diverge from
-    /// Postgres's real precedence.
+    /// Parses a binary-operator expression via precedence climbing (a
+    /// standard hand-rolled Pratt-parser loop, see [`Self::parse_binary_expr`]),
+    /// so `a OP1 b OP2 c` groups the way [`super::registry::OPERATORS`]'s
+    /// precedence table (issue #67) says it should, matching a
+    /// precedence-aware grammar like Postgres's rather than flat
+    /// left-to-right.
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        self.parse_binary_expr(0)
+    }
+
+    /// Precedence-climbing loop: parses a primary term, then repeatedly
+    /// consumes a binary operator whose precedence is `>= min_precedence`,
+    /// recursing into the rhs with that operator's precedence + 1.
+    ///
+    /// Every operator in [`super::registry::OPERATORS`] is left-associative,
+    /// so raising the rhs's minimum precedence by 1 (rather than reusing the
+    /// same level) stops that recursive call from also swallowing a
+    /// same-precedence operator to its right — leaving it for *this* call's
+    /// loop instead, which folds it onto the already-built lhs. That's what
+    /// keeps a same-precedence chain left-associative (`a + b + c` ->
+    /// `(a + b) + c`) while still letting a strictly higher-precedence
+    /// operator further right bind its operands first (`a > b + c` ->
+    /// `a > (b + c)`, since `+` outranks `>` and so gets pulled into the
+    /// `parse_binary_expr(COMPARISON + 1)` call parsing `>`'s rhs).
+    fn parse_binary_expr(&mut self, min_precedence: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_primary()?;
         loop {
             let symbol = match self.peek() {
                 Token::Symbol(c) if OPERATOR_CHARS.contains(c) => *c,
                 _ => break,
             };
-            self.advance();
             let symbol_str = symbol.to_string();
-            let op = lookup_operator(&symbol_str).ok_or(ParseError::UnsupportedOperator {
-                operator: symbol_str,
-            })?;
-            let rhs = self.parse_primary()?;
+            let op = match lookup_operator(&symbol_str) {
+                Some(op) => op,
+                None => {
+                    self.advance();
+                    return Err(ParseError::UnsupportedOperator {
+                        operator: symbol_str,
+                    });
+                }
+            };
+            let precedence = operator_spec(op).precedence;
+            if precedence < min_precedence {
+                break;
+            }
+            self.advance();
+            let rhs = self.parse_binary_expr(precedence + 1)?;
             lhs = Expr::BinaryOp {
                 op,
                 lhs: Box::new(lhs),
@@ -343,6 +372,20 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         match self.advance() {
+            Token::Symbol('(') => {
+                // Parenthesized grouping (issue #67's precedence-climbing
+                // parser needs this for the rare case a caller must override
+                // the precedence table's own grouping — e.g. wrapping a
+                // `>` comparison as an operand of `+`, which the precedence
+                // table alone would never produce since `+` binds tighter).
+                // No new `Expr` variant: a grouping paren only steers which
+                // subtree `parse_binary_expr` builds around it, it carries no
+                // information of its own once parsing is done, so the
+                // parenthesized expression's own tree is returned unwrapped.
+                let expr = self.parse_expr()?;
+                self.expect_symbol(')')?;
+                Ok(expr)
+            }
             Token::Number(n) => Ok(Expr::NumberLiteral(n)),
             Token::String(s) => Ok(Expr::StringLiteral(s)),
             Token::Ident(name) => {
