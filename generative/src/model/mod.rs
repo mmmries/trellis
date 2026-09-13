@@ -140,6 +140,91 @@ pub struct Program {
     pub ops: Vec<Op>,
 }
 
+/// One action against a workstream-E, task-E1 "noise" table: a table
+/// [`crate::backend::ManualBackend::install_noise_table`] creates (a real
+/// Postgres table, so DDL/DML against it behaves exactly like against any
+/// other) but never registers as tracked — never in a [`Program`]'s own
+/// `tables`, so `run::check_program`'s oracle can never resolve a
+/// definition's source/target against it (that function only ever walks
+/// `Program.tables`/`Program.defs`), and never handed to the engine's
+/// `ClientOptions.source_tables`, so CDC intake never watches it either.
+/// Values follow the same rendered-text convention [`Op`] uses (`None` is
+/// SQL `NULL`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum NoiseAction {
+    Insert {
+        pk: i64,
+        value: Option<String>,
+    },
+    Update {
+        pk: i64,
+        value: Option<String>,
+    },
+    Delete {
+        pk: i64,
+    },
+    /// `ALTER TABLE ... ADD COLUMN` — DDL noise, not just DML (task E1's
+    /// "ideally also some DDL" ask).
+    AddColumn {
+        name: String,
+        value_type: ValueType,
+    },
+    /// `ALTER TABLE ... DROP COLUMN`.
+    DropColumn {
+        name: String,
+    },
+}
+
+/// What a [`NoiseEvent`] fires: either a [`NoiseAction`] against the
+/// [`NoisePlan`]'s own noise table (task E1), or a bare administrative SQL
+/// statement with no table involved at all (task E5, e.g. `"CHECKPOINT"`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum NoiseEventKind {
+    Table(NoiseAction),
+    Admin(String),
+}
+
+/// One point in a program's op stream where a [`NoiseEventKind`] fires,
+/// interleaved with the real ops by
+/// [`crate::run::run_convergence_with_noise`]. `before_op` is
+/// `0..=ops.len()`: `0` fires once, immediately after install and before
+/// `ops[0]`; `i` (`i >= 1`) fires once, immediately after `ops[i - 1]`'s own
+/// apply -> quiesce -> snapshot -> compare cycle completes. Multiple events
+/// may share the same `before_op` and fire in the order they appear in
+/// [`NoisePlan::events`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoiseEvent {
+    pub before_op: usize,
+    pub kind: NoiseEventKind,
+}
+
+/// A full noise/administration schedule for one program run (workstream E,
+/// tasks E1 and E5): an optional untracked table to create once at install
+/// time (`None` for an administration-only schedule, e.g. a `CHECKPOINT`-only
+/// plan that needs no table at all — task E5), plus the [`NoiseEvent`]s to
+/// fire against it (or standalone) as the real op stream plays out.
+///
+/// Deliberately never checked against the oracle, and — by construction,
+/// since neither the noise table nor a bare admin statement is ever named in
+/// a [`Program`]'s own `tables`/`defs` — structurally unable to perturb
+/// `run::check_program`'s per-op comparison (see that function's doc
+/// comment: it only ever resolves a definition's source/target through
+/// `Program.tables`/`Program.defs`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NoisePlan {
+    pub table: Option<Table>,
+    pub events: Vec<NoiseEvent>,
+}
+
+impl NoisePlan {
+    /// A schedule with no table and no events — the property/harness case
+    /// where a draw happens to produce zero noise, and a convenient base for
+    /// a hand-built pin that only needs `events.push`.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
 /// The composite row-key convention for an [`engine::defs::ast::KeySpace::Aggregate`]
 /// target (improvement-plan task B4): every row in a `GROUP BY` target is
 /// keyed by its grouping column(s)' rendered text values, but unlike a 1-1

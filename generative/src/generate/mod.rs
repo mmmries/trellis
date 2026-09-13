@@ -201,7 +201,10 @@ use std::collections::{HashMap, HashSet};
 
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 
-use crate::model::{NamePool, Op, OpOutcome, Program, Table};
+use crate::model::{
+    Column, NamePool, NoiseAction, NoiseEvent, NoiseEventKind, NoisePlan, Op, OpOutcome, Program,
+    Table,
+};
 
 /// The inclusive upper bound of the calculated-field value domain.
 ///
@@ -1423,6 +1426,51 @@ pub fn reordered_by_commute_groups(program: &Program) -> Program {
     }
 }
 
+/// A noise table's fixed shape (improvement-plan Workstream E, task E1:
+/// untracked-object noise): a `Numeric` primary key column plus one extra
+/// column of `extra_type`. Kept to exactly two columns (pk + one extra) —
+/// noise doesn't need [`Table`]'s full multi-type-column richness, just
+/// enough shape for DML (`Insert`/`Update`/`Delete`) and DDL
+/// (`AddColumn`/`DropColumn`) noise to have somewhere to land. Never routed
+/// through [`NamePool`]: a noise table's name/columns must stay stable and
+/// caller-chosen (see [`adversarial_noise_table`]), not drawn from the same
+/// counter a real [`Program`]'s tables use.
+pub fn noise_table(name: &str, pk_col: &str, extra_col: &str, extra_type: ValueType) -> Table {
+    Table {
+        name: name.to_string(),
+        pk_col: pk_col.to_string(),
+        columns: vec![
+            Column {
+                name: pk_col.to_string(),
+                value_type: ValueType::Numeric,
+            },
+            Column {
+                name: extra_col.to_string(),
+                value_type: extra_type,
+            },
+        ],
+    }
+}
+
+/// A fixed, deliberately adversarial default noise table (task E1): named
+/// `"noise_untracked"` so it can never collide with a drawn [`Program`]'s own
+/// table/def names — [`NamePool`] only ever produces `t0`, `t1`, ... and
+/// `d0`, `d1`, ..., and `"noise_untracked"` matches neither pattern — but
+/// whose pk column is deliberately named `"c0"` (the exact name `NamePool`
+/// gives the very first table's pk column) and whose extra column is
+/// deliberately named `"total"` (a common def target field name — see
+/// [`build_program`]'s `total = c1 + c2` field), so a hand-built pin can
+/// demonstrate that even a noise table shaped to collide with a real table's
+/// *column* names causes no oracle confusion:
+/// `crate::backend::ManualBackend::snapshot`/`crate::run::check_program`
+/// only ever key off table *name*, and
+/// `crate::backend::ManualBackend::install_noise_table` never touches
+/// `self.tables`/`ClientOptions.source_tables` at all — a same-named column
+/// on an entirely different, untracked table cannot collide with anything.
+pub fn adversarial_noise_table() -> Table {
+    noise_table("noise_untracked", "c0", "total", ValueType::Text)
+}
+
 #[cfg(feature = "proptest")]
 mod strategy {
     use super::*;
@@ -1921,10 +1969,89 @@ mod strategy {
     pub fn trivial_program() -> impl Strategy<Value = Program> {
         trivial_program_with(true)
     }
+
+    /// A single [`NoiseAction`] against [`adversarial_noise_table`]'s shape
+    /// (task E1): a small pk domain (so `Update`/`Delete` sometimes land on a
+    /// row an earlier `Insert` in the same draw actually seeded, and
+    /// sometimes miss — mirroring [`mutate`]'s own pk-liveness-agnostic
+    /// design, since nothing here checks a noise op's outcome either way),
+    /// an occasional `NULL` value, and a small fixed pool of column names for
+    /// `AddColumn`/`DropColumn` that includes both a plausible fresh name
+    /// (`"extra1"`/`"extra2"`) and the noise table's own real column names
+    /// (`"c0"`/`"total"`) — so a drawn program sometimes tries to add a
+    /// column that already exists, or drop the pk itself, both of which
+    /// Postgres rejects and [`ManualBackend::fire_noise_event`]'s error
+    /// swallowing must tolerate.
+    ///
+    /// [`ManualBackend::fire_noise_event`]: crate::backend::ManualBackend::fire_noise_event
+    fn noise_pk() -> impl Strategy<Value = i64> {
+        1i64..=6
+    }
+
+    fn noise_value() -> impl Strategy<Value = Option<String>> {
+        prop_oneof![
+            3 => "[a-zA-Z0-9]{0,6}".prop_map(Some),
+            1 => Just(None),
+        ]
+    }
+
+    fn noise_column_name() -> impl Strategy<Value = String> {
+        proptest::sample::select(&["extra1", "extra2", "total", "c0"][..]).prop_map(str::to_string)
+    }
+
+    fn noise_extra_type() -> impl Strategy<Value = ValueType> {
+        prop_oneof![Just(ValueType::Numeric), Just(ValueType::Text)]
+    }
+
+    fn noise_action() -> impl Strategy<Value = NoiseAction> {
+        prop_oneof![
+            (noise_pk(), noise_value()).prop_map(|(pk, value)| NoiseAction::Insert { pk, value }),
+            (noise_pk(), noise_value()).prop_map(|(pk, value)| NoiseAction::Update { pk, value }),
+            noise_pk().prop_map(|pk| NoiseAction::Delete { pk }),
+            (noise_column_name(), noise_extra_type())
+                .prop_map(|(name, value_type)| NoiseAction::AddColumn { name, value_type }),
+            noise_column_name().prop_map(|name| NoiseAction::DropColumn { name }),
+        ]
+    }
+
+    /// Draws a task-E1 noise plan sized to a program with `op_count` real
+    /// ops: [`adversarial_noise_table`] (shared across every draw — task E1
+    /// only asks for "one extra noise table", not a whole drawn-table-shape
+    /// dimension) plus 0-5 [`NoiseEvent`]s at random positions in
+    /// `0..=op_count`, so a drawn plan sometimes fires before the very first
+    /// op, sometimes after the very last, and sometimes not at all.
+    pub fn noise_plan_for(op_count: usize) -> impl Strategy<Value = NoisePlan> {
+        prop::collection::vec((0..=op_count, noise_action()), 0..=5).prop_map(|events| NoisePlan {
+            table: Some(adversarial_noise_table()),
+            events: events
+                .into_iter()
+                .map(|(before_op, action)| NoiseEvent {
+                    before_op,
+                    kind: NoiseEventKind::Table(action),
+                })
+                .collect(),
+        })
+    }
+
+    /// Draws a task-E5 administration-only noise plan: no noise table at
+    /// all, just 0-3 bare `CHECKPOINT` statements at random positions in
+    /// `0..=op_count`.
+    pub fn checkpoint_plan_for(op_count: usize) -> impl Strategy<Value = NoisePlan> {
+        prop::collection::vec(0..=op_count, 0..=3).prop_map(|positions| NoisePlan {
+            table: None,
+            events: positions
+                .into_iter()
+                .map(|before_op| NoiseEvent {
+                    before_op,
+                    kind: NoiseEventKind::Admin("CHECKPOINT".to_string()),
+                })
+                .collect(),
+        })
+    }
 }
 
 #[cfg(feature = "proptest")]
-pub use strategy::{trivial_program, trivial_program_with};
+pub use strategy::{checkpoint_plan_for, noise_plan_for, trivial_program, trivial_program_with};
 
 #[cfg(test)]
 mod tests {
