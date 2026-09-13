@@ -25,27 +25,63 @@
 //! still-active segment, silently double-counting an `Aggregate` target's
 //! `SUM`/`COUNT` once the original segment had already sealed and drained.
 //! See `engine::intake::Intake::connect`'s doc comment for the fix (pass
-//! `last_confirmed` as `start_lsn` explicitly) and
-//! `generative::generate::strategy::program_with_client_restart`'s doc
-//! comment for the full writeup, including a **rarer residual case that
-//! remains open** post-fix — which is why that strategy (and every restart
-//! pin in this file) is scoped to `KeySpace::OneToOne` definitions only,
-//! mirroring `generate::strategy::grain_value`'s own precedent for a
-//! found-but-out-of-scope engine bug.
+//! `last_confirmed` as `start_lsn` explicitly).
 //!
-//! **Independent-review update:** the residual case is *not* confined to
-//! `Aggregate` targets, and it is not rare. An independent re-review of this
-//! branch found that [`a_restart_and_a_scale_out_interleaved_mid_stream_still_converge`]
-//! below — a fixed, non-adversarial hand-built pin scoped to `OneToOne`,
-//! previously believed to be reliable, always-green coverage — reproduces a
-//! genuine lost write (a brand-new row's target `MissingRow`, not a stale
-//! value) in roughly 1 of every 4 runs, including with zero other tests
-//! running concurrently (2 failures in 10 consecutive isolated runs; a
-//! separate, expanded 40-case run of the ignored property below produced one
-//! more). The pin is now `#[ignore]`d for the same reason. See its own doc
-//! comment for the measured rate and the emerging pattern (every observed
-//! failure: a brand-new key's `Op::Insert` landing on the op immediately
-//! after `Backend::restart`, against a `OneToOne` target).
+//! **Independent-review update, since resolved:** a second, deeper bug
+//! survived that fix, and for a while was believed to be a rarer residual
+//! case scoped to `KeySpace::OneToOne` definitions
+//! (`generate::strategy::program_with_client_restart` was narrowed to
+//! `OneToOne` for this reason, mirroring `generate::strategy::grain_value`'s
+//! own precedent for a found-but-out-of-scope engine bug — that narrowing is
+//! now vestigial but harmless, left in place rather than churned). An
+//! independent re-review found it was neither rare nor `OneToOne`-specific:
+//! [`a_restart_and_a_scale_out_interleaved_mid_stream_still_converge`] below
+//! reproduced a genuine lost write (a brand-new row's target `MissingRow`,
+//! not a stale value) in roughly 1 of every 4 runs, and
+//! `convergence_holds_across_a_mid_stream_scale_out` reproduced the same
+//! *lost-group* shape on an `Aggregate` target with no restart involved at
+//! all, on the very first randomly-generated case in one run. **Root
+//! cause, confirmed by direct tracing of a failing run:** nothing to do with
+//! replication redelivery, and nothing to do with `claim`'s bucket-share
+//! math either (the leading hypothesis this comment previously carried, laid
+//! to rest below) — a genuine seal/append race in
+//! `engine::staging::seal::seal_if_active_nonempty`, latent regardless of
+//! restart or scale-out, that both simply made common by perturbing timing.
+//! `engine::staging::append::append` resolves the active ring slot with a
+//! plain, unlocked read (by design — "you cannot fix this by locking the
+//! pointer," docs/staging-and-claiming/03-sealing-and-the-fence.md), so a
+//! writer can still be resolving slot *k* at the exact moment a concurrent
+//! seal flips the pointer away from it and — for a batch small enough to
+//! drain almost instantly, the common case in this suite's tiny programs —
+//! fully drains it. The writer's row then lands, after the fact, in a slot
+//! whose owning segment already reports `state = 'drained'`: a genuine
+//! **phase-gap straggler** the design's both-slots read is *supposed* to
+//! recover via the immediate successor's own fenced read (`fenced_window`'s
+//! predecessor-half union clause) — but that read only ever runs once the
+//! successor itself gets sealed, and `seal_if_active_nonempty`'s "only seal
+//! a non-empty active segment" busy-loop guard meant nothing ever forced
+//! that seal if the ring went quiet right after (exactly what a `quiesce()`
+//! poll immediately following the triggering op does). The straggler was
+//! stranded permanently, and `engine::staging::converge::converged_through`
+//! compounded it into a *false positive*: condition 3 treated any
+//! `'drained'` segment's slot as fully resolved, so the run reported
+//! `converged` while the write was still missing. **Fixed** in two places
+//! that close both halves of the gap — see each function's own updated doc
+//! comment for the exact mechanism: `seal_if_active_nonempty` now also
+//! seals an empty active segment when its immediate predecessor is
+//! genuinely stranding an unfenced row (self-limiting — it only ever fires
+//! for a real straggler, never on an ordinary idle ring, so it cannot
+//! regress into the busy loop the emptiness guard exists to prevent); and
+//! `converged_through`'s condition 3 no longer treats a `'drained'` owner as
+//! sufficient on its own — a row must actually have been visible in that
+//! segment's own published fence to stop gating. `engine/tests/sealing.rs`'s
+//! `an_empty_active_segment_still_seals_to_catch_a_stranded_straggler`/
+//! `an_empty_active_segment_with_a_fully_fenced_predecessor_does_not_seal`
+//! and `engine/tests/converge.rs`'s
+//! `a_drained_slots_unfenced_straggler_still_gates_convergence` cover both
+//! sides directly, deterministically, at the unit level — no timing race
+//! needed. Every test in this file that this bug affected is un-`#[ignore]`d
+//! below.
 
 use engine::{Config, Pool};
 use generative::backend::{Backend, ManualBackend};
@@ -126,44 +162,20 @@ proptest! {
     /// the engine picks back up against the same, durable Postgres-backed
     /// ring and convergence still holds for the whole program.
     ///
-    /// **`#[ignore]`d — a known, still-open engine bug, not a flaky test.**
-    /// This property is exactly what surfaced a real bug (see this file's and
-    /// `program_with_client_restart`'s own doc comments): an unqualified
-    /// restart at an adversarially-chosen mid-stream point reproduces a
-    /// duplicate/lost-work divergence at a low but real rate even after
-    /// fixing `engine::intake::Intake::connect`'s missing `start_lsn` (the
-    /// fix that closed the *majority*, most easily reproduced instance of
-    /// it) and after restricting the strategy to `OneToOne` definitions
-    /// (which cut out the double-counting `Aggregate` case but not a rarer
-    /// still-unexplained one — confirmed via a 40-case sweep after that
-    /// restriction landing one `OneToOne` divergence, a genuine data loss
-    /// this time, not a duplicate). Root-causing the residual gap needs
-    /// deeper engine-internals investigation (claim/heartbeat/reclaim timing
-    /// around `Client`'s abrupt teardown, or a subtler replication-resume
-    /// edge) that is out of scope for this generative-suite-widening task.
-    /// Left in place, `#[ignore]`d with this explanation, for whoever picks
-    /// up that follow-up — `cargo test ... -- --ignored` still runs it.
-    ///
-    /// **Independent-review correction:** this paragraph originally claimed
-    /// [`restart_then_scale_out_are_independently_usable_against_a_live_backend`]
-    /// and [`a_restart_and_a_scale_out_interleaved_mid_stream_still_converge`]
-    /// below were reliable, always-green coverage that had "not reproduced a
-    /// divergence in any run of this session's validation." That claim was
-    /// based on a single run of each and does not hold up: an independent
-    /// re-review re-ran the latter 10 consecutive times in complete
-    /// isolation (no other tests running) and saw it fail twice, with the
-    /// exact same `MissingRow` divergence this property exists to catch —
-    /// see that test's own doc comment, which is now `#[ignore]`d too.
-    /// [`restart_then_scale_out_are_independently_usable_against_a_live_backend`]
-    /// held up under the same treatment (10/10) and is the one hand-built
-    /// pin here still trustworthy as always-green restart coverage; the
-    /// difference appears to be that it applies an `Update` to an
-    /// already-converged, pre-existing key after the restart rather than an
-    /// `Insert` of a brand-new one (see the other pin's doc comment).
+    /// **Formerly `#[ignore]`d for a known engine bug — root-caused and
+    /// fixed.** This property is exactly what surfaced the bug, in two
+    /// layers: first `engine::intake::Intake::connect`'s missing `start_lsn`
+    /// (fixed, see its own doc comment), then a second, deeper one this
+    /// property (and [`a_restart_and_a_scale_out_interleaved_mid_stream_still_converge`]
+    /// below) kept reproducing even after that fix — a genuine `MissingRow`
+    /// divergence at a real, not-rare rate. That second bug turned out to
+    /// have nothing to do with restart specifically, or with replication at
+    /// all: see this file's own top-of-file doc comment for the full,
+    /// confirmed root cause (a seal/append race in
+    /// `engine::staging::seal::seal_if_active_nonempty`, compounded by a
+    /// false-positive gap in `engine::staging::converge::converged_through`)
+    /// and the fix, now landed in both places. Re-enabled.
     #[test]
-    #[ignore = "known open engine bug: an adversarially-timed client restart can rarely still \
-                duplicate or lose work even after fixing intake's missing start_lsn — see this \
-                test's own doc comment"]
     fn convergence_holds_across_a_mid_stream_client_restart(
         program in program_with_client_restart(true)
     ) {
@@ -175,37 +187,29 @@ proptest! {
     /// coexisting and draining the same ring, per `engine::Client`'s own
     /// module doc comment.
     ///
-    /// **`#[ignore]`d — independent review found this is not the clean
-    /// property it was believed to be.** This file's original doc comment
-    /// claimed scale-out "never touches intake/replication at all" and "has
-    /// not reproduced any divergence in any of this session's testing," and
-    /// this property ran green (16/16) once during that validation. An
-    /// independent re-review re-ran it fresh and it failed on the *first*
-    /// case generated (`successes: 0`, no shrinking needed): a brand-new
-    /// `Aggregate` group (source row `c6 = 2`, never seen before in the
-    /// program) inserted shortly after `schedule_scale_out` never appeared
-    /// in its target at all — `present in SQL oracle, absent in candidate`,
-    /// the same *lost write* shape (not a duplicate/over-count) as the
-    /// restart bug above, but this time with no restart and no replication
-    /// reconnect involved at all. That rules out `Intake::connect`'s
-    /// `start_lsn` path as the (sole) mechanism and points somewhere shared
-    /// between "a new client joins" (restart *and* scale-out both start a
-    /// fresh `engine::Client`) — a plausible, concrete, unverified lead:
-    /// `docs/staging-and-claiming/04-claiming-and-the-fold.md` documents
-    /// that a batch's bucket count and split are fixed once at seal time
-    /// from configuration and batch size alone, while *how large a share*
-    /// one claim takes adapts to `count_live_drainers`'s live-worker count
-    /// — if a worker that just joined (or one that just left, via restart's
-    /// old-client drop) is transiently miscounted in that live-worker
-    /// tally right as a batch seals or claims, the doc's own stated worst
-    /// case ("none in zero — silently lost work") is exactly this
-    /// symptom. Not confirmed — flagged for whoever picks up the
-    /// restart-bug follow-up, since both now look like the same family of
-    /// bug. Seed saved in `client_lifecycle.proptest-regressions`.
+    /// **Formerly `#[ignore]`d for a known engine bug — root-caused and
+    /// fixed.** This property reproduced the same lost-write bug as
+    /// [`convergence_holds_across_a_mid_stream_client_restart`] above, but
+    /// with no restart involved at all — a brand-new `Aggregate` group
+    /// (source row `c6 = 2`) inserted shortly after `schedule_scale_out`
+    /// never appeared in its target. That ruled out `Intake::connect`'s
+    /// `start_lsn` path as the mechanism (scale-out never touches
+    /// intake/replication) and — once traced — also ruled out the
+    /// once-leading hypothesis that `claim`'s live-worker-count bucket-share
+    /// math was miscounting a joining/leaving worker: every program this
+    /// suite generates stays far below `claim::MIN_ROWS_TO_SPLIT`, so every
+    /// batch seals to exactly one bucket, and `ceil(1 / live_workers)` is `1`
+    /// regardless of how `live_workers` is counted — there is no share to
+    /// miscompute. See this file's own top-of-file doc comment for the real,
+    /// confirmed root cause and fix (a seal/append race, unrelated to
+    /// restart or scale-out specifically — both simply perturb timing enough
+    /// to make it common). Re-enabled. The seeds saved in
+    /// `client_lifecycle.proptest-regressions` (this property's and
+    /// [`convergence_holds_across_a_mid_stream_client_restart`]'s) are kept,
+    /// not stale: proptest replays them on every run precisely so a
+    /// regression in this fix would be caught immediately, before any
+    /// randomly-generated case even runs.
     #[test]
-    #[ignore = "known open engine bug, found during independent review: a scale-out can also lose \
-                a brand-new row/group with no restart involved at all — see this test's own doc \
-                comment"]
     fn convergence_holds_across_a_mid_stream_scale_out(
         program in program_with_scale_out(true)
     ) {
@@ -220,36 +224,30 @@ proptest! {
 /// holds" scenario the task calls for, all in one program so both events are
 /// proven to compose with each other, not just individually.
 ///
-/// **`#[ignore]`d — independent review found this is the *same* known-open
-/// engine bug `convergence_holds_across_a_mid_stream_client_restart` above
-/// is ignored for, not a one-off flake and not specific to this pin's own
-/// logic.** The original validation ran this once and it passed, and the
-/// file's doc comments described it as reliable, always-green coverage. A
-/// later independent re-review ran it 10 consecutive times with no other
-/// tests executing concurrently (so not a resource-contention artifact) and
-/// saw 2 failures, both the identical divergence: `MissingRow { table: "t1",
-/// pk: "3" }` at `op_index: 2` — the row inserted by the very op scheduled
-/// immediately after `schedule_restart`, never appearing in the `OneToOne`
-/// target at all (a lost write, not a stale or duplicated value). Restarting
-/// this file's *other* hand-built pin
+/// **Formerly `#[ignore]`d for the same known-open engine bug
+/// `convergence_holds_across_a_mid_stream_client_restart` above was ignored
+/// for — root-caused and fixed.** This small, fixed, non-adversarial
+/// sequence was in fact the fastest, cheapest repro of the whole
+/// investigation: reliably reproducing `MissingRow { table: "t1", pk: "3" }`
+/// at `op_index: 2` (the row inserted by the very op scheduled immediately
+/// after `schedule_restart`) in roughly 1 of every 3-4 isolated runs, with
+/// no proptest machinery needed at all. Direct `TRELLIS_DEBUG_TRACE`-style
+/// tracing of a failing run (added and removed during this investigation;
+/// not checked in) against exactly this pin is what pinned the root cause
+/// down to a seal/append race — see this file's own top-of-file doc comment
+/// for the full mechanism and the fix, now landed in
+/// `engine::staging::seal::seal_if_active_nonempty` and
+/// `engine::staging::converge::converged_through`. Restarting this file's
+/// *other* hand-built pin
 /// ([`restart_then_scale_out_are_independently_usable_against_a_live_backend`])
-/// the same way (10/10) never failed — the difference is that pin applies an
-/// `Update` to an already-converged, pre-existing key right after the
-/// restart, while this one applies an `Insert` of a brand-new key. That
-/// pattern (a fresh key's first write landing on the op immediately after a
-/// restart) is a plausible, concrete lead for whoever picks up the root
-/// cause: the new replication connection's per-session relation/key cache
-/// (`engine::intake::Intake`'s `RelationCache`/`primary_keys`, both reset
-/// empty on every fresh `connect`) starts cold, so the first row Postgres
-/// ever sends for a table over the new connection is also the first place a
-/// caching or ordering bug in that cold-start path would show up — not
-/// verified here, just flagged as where to look first. Left `#[ignore]`d
-/// rather than deleted or silently weakened, same rationale as the property
-/// above.
+/// never reproduced it because that pin applies an `Update` to an
+/// already-converged, pre-existing key right after the restart rather than
+/// an `Insert` of a brand-new one — consistent with the confirmed
+/// mechanism: only a *new* key's first write can ever land as an unfenced
+/// phase-gap straggler in a segment nothing else is about to touch. Stress-
+/// tested at 40+ consecutive isolated runs post-fix with zero failures (see
+/// the commit introducing this fix for the exact count). Re-enabled.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "known open engine bug (same as convergence_holds_across_a_mid_stream_client_restart): \
-            reproduced in 2 of 10 consecutive isolated runs during independent review, not a \
-            one-off — see this test's own doc comment"]
 async fn a_restart_and_a_scale_out_interleaved_mid_stream_still_converge() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;

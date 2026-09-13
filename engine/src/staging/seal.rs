@@ -250,33 +250,111 @@ pub async fn seal_phase2(client: &Client, seg_seq: i64) -> Result<(), StagingErr
     Ok(())
 }
 
+/// Whether `predecessor_seg_seq`'s own physical ring table still holds a row
+/// that was never visible in its own already-published fence — a genuine
+/// **phase-gap straggler** (docs/staging-and-claiming/03-sealing-and-the-fence.md,
+/// "The scoping bug worth knowing about"/"The `xmax` trap"): a writer that
+/// resolved the pointer as `predecessor_seg_seq` but committed into its slot
+/// only *after* that segment's own fence (`S_k`) was captured. By
+/// construction such a row can never become visible in `S_k` — that fence is
+/// immutable once published (`seal_phase2`'s doc comment) — so the *only*
+/// thing that can ever fold it in is the immediate successor's own fenced
+/// read, via [`fenced_window`]'s predecessor-half union clause. That read
+/// only ever runs once the successor itself gets sealed. Returns `false`
+/// (nothing to catch) for a genesis segment, an already-retired predecessor,
+/// or one still mid-crash-window (no fence published yet — a separate,
+/// already-tracked stall `recover_stuck_seals` owns) — none of those are
+/// this function's job to resolve.
+async fn predecessor_has_unfenced_row(
+    client: &impl GenericClient,
+    predecessor_seg_seq: i64,
+) -> Result<bool, StagingError> {
+    if predecessor_seg_seq <= 0 {
+        return Ok(false);
+    }
+    let Some(row) = client
+        .query_opt(
+            "select ring_slot, fence_snapshot::text from segments where seg_seq = $1",
+            &[&predecessor_seg_seq],
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let ring_slot: i16 = row.get(0);
+    let fence: Option<String> = row.get(1);
+    let Some(fence) = fence else {
+        return Ok(false);
+    };
+    let table = ring_table_name(ring_slot)?;
+    let exists: bool = client
+        .query_one(
+            &format!(
+                "select exists (select 1 from {table} \
+                 where not pg_visible_in_snapshot(row_txid, $1::text::pg_snapshot))"
+            ),
+            &[&fence],
+        )
+        .await?
+        .get(0);
+    Ok(exists)
+}
+
 /// Seal-on-demand (docs/staging-and-claiming/03-sealing-and-the-fence.md,
-/// "Who seals, and when"): seals the active segment if, and only if, it's
-/// non-empty — the busy-loop guard. At most one seal attempt per call,
-/// except that a `RingFull` guard is answered with exactly one retirement
-/// pass ([`super::retire::retire_drained_segments`], stage 06) plus one
-/// retry, per the design doc — this is also the liveness unblock for a
-/// saturated ring: without it, a ring full of drained-but-not-yet-retired
-/// slots wedges every subsequent seal forever (issue #58).
+/// "Who seals, and when"): seals the active segment if it's non-empty — the
+/// busy-loop guard — **or** if it's empty but its immediate predecessor is
+/// still stranding an unfenced phase-gap straggler ([`predecessor_has_unfenced_row`]):
+/// without this second case, a predecessor's straggler that lands right as
+/// the ring goes quiet (no further real traffic to seal the successor on its
+/// own account) is stranded forever — the predecessor already reports
+/// `state = 'drained'`, which `converge::converged_through`'s condition 3 no
+/// longer treats as pending, so nothing ever revisits it, and the straggler
+/// is silently never applied to any target (issue found via the generative
+/// suite's client-restart/scale-out lifecycle properties: both simply
+/// perturb timing enough to make this always-latent race common, though the
+/// race itself has nothing to do with a client joining or leaving — see
+/// `generative/tests/client_lifecycle.rs`'s doc comments for the full
+/// writeup). This still seals **at most one** segment per call, and the
+/// second case is self-limiting: it only ever fires while the *current*
+/// active segment's immediate predecessor genuinely has an unfenced row, so
+/// once that row is folded in by this seal's own successor read, the next
+/// active segment's own (different, now-fully-fenced) predecessor no longer
+/// qualifies and this stops recursing — it does not degrade into resealing
+/// empty segments forever on a truly idle ring.
+///
+/// A `RingFull` guard is answered with exactly one retirement pass
+/// ([`super::retire::retire_drained_segments`], stage 06) plus one retry, per
+/// the design doc — this is also the liveness unblock for a saturated ring:
+/// without it, a ring full of drained-but-not-yet-retired slots wedges every
+/// subsequent seal forever (issue #58). A `SealGateBlocked` guard is treated
+/// as this call simply having nothing to do yet (`Ok(None)`), never an
+/// error — the design doc calls both guards "backpressure, never overwrite,"
+/// and a refused seal here is always a correct, retryable outcome, not a
+/// reason to tear down and reconnect the maintenance loop's connection.
 pub async fn seal_if_active_nonempty(
     client: &mut Client,
 ) -> Result<Option<SealOutcome>, StagingError> {
-    let (_, ring_slot) = active_pointer(client).await?;
+    let (active_seq, ring_slot) = active_pointer(client).await?;
     let table = ring_table_name(ring_slot)?;
     let nonempty: bool = client
         .query_one(&format!("select exists (select 1 from {table})"), &[])
         .await?
         .get(0);
-    if !nonempty {
+    if !nonempty && !predecessor_has_unfenced_row(client, active_seq - 1).await? {
         return Ok(None);
     }
 
-    let outcome = match seal_phase1(client).await {
-        Ok(outcome) => outcome,
+    let attempt = match seal_phase1(client).await {
+        Ok(outcome) => Ok(outcome),
         Err(StagingError::RingFull { .. }) => {
             super::retire::retire_drained_segments(client).await?;
-            seal_phase1(client).await?
+            seal_phase1(client).await
         }
+        Err(other) => Err(other),
+    };
+    let outcome = match attempt {
+        Ok(outcome) => outcome,
+        Err(StagingError::SealGateBlocked) => return Ok(None),
         Err(other) => return Err(other),
     };
     seal_phase2(client, outcome.sealed_seg_seq).await?;

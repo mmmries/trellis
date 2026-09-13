@@ -2426,31 +2426,44 @@ mod strategy {
     /// `engine::intake::Intake::connect`'s own updated doc comment/code):
     /// `Intake::connect` now passes its own durably-read `last_confirmed` as
     /// `start_lsn` explicitly, which can never be behind the slot's own
-    /// position, closing the large majority of this race. **A residual case
-    /// remains open**, and this doc comment previously understated it — see
-    /// `generative/tests/client_lifecycle.rs`'s
-    /// `convergence_holds_across_a_mid_stream_client_restart` for the
-    /// up-to-date writeup. Restricting to `OneToOne` here does *not* avoid
-    /// it: a wider, independently-run 40-case sweep over exactly this
+    /// position, closing the large majority of this race.
+    ///
+    /// **A second, deeper bug survived that fix — since root-caused and
+    /// fixed too, unrelated to replication or to `OneToOne` at all.** A
+    /// wider, independently-run 40-case sweep over exactly this
     /// `OneToOne`-restricted strategy still failed after only 13 successes
     /// (a genuinely missing row, `present in SQL oracle, absent in
     /// candidate` — a lost write, not a duplicate), and a fixed, non-
     /// adversarial hand-built pin using this same restart primitive
-    /// reproduced the identical shape in 2 of 10 consecutive isolated runs.
-    /// This is not the rare, `OneToOne`-avoiding edge case earlier revisions
-    /// of this comment described.
+    /// reproduced the identical shape in roughly 1 of every 3-4 isolated
+    /// runs — see `generative/tests/client_lifecycle.rs`'s
+    /// `convergence_holds_across_a_mid_stream_client_restart`/
+    /// `a_restart_and_a_scale_out_interleaved_mid_stream_still_converge` doc
+    /// comments for the confirmed root cause: a seal/append race in
+    /// `engine::staging::seal::seal_if_active_nonempty`, latent regardless
+    /// of restart or `OneToOne` vs. `Aggregate`, that a restart's extra
+    /// timing perturbation (and a tiny test program's near-instant drain)
+    /// simply made likely to hit. The `OneToOne` restriction here predates
+    /// that finding and is no longer load-bearing for *this* bug — it is
+    /// left in place anyway (harmless, and this strategy has its own reasons
+    /// to stay narrow per [`trivial_one_to_one_program_with`]'s doc comment)
+    /// rather than churned as part of an unrelated bug fix.
     ///
-    /// **[`program_with_scale_out`] is *not* unaffected either.** An
+    /// **[`program_with_scale_out`] hit the same bug independently,
+    /// confirming it has nothing to do with restart specifically.** An
     /// independent re-review found scale-out — which never touches
-    /// intake/replication at all — can also lose a brand-new row/group
+    /// intake/replication at all — could also lose a brand-new row/group
     /// entirely (reproduced on the very first case generated in a fresh run,
-    /// no restart involved), so the "restart-only, replication-resume"
-    /// framing this comment used is too narrow. See
+    /// no restart involved). That ruled out both `Intake::connect`'s
+    /// `start_lsn` path *and* the next hypothesis considered
+    /// (`claim`'s live-worker-count bucket-share math miscounting a
+    /// joining/leaving worker — ruled out directly: every program this
+    /// generator draws stays far below `claim::MIN_ROWS_TO_SPLIT`, so every
+    /// batch seals to one bucket, and `ceil(1 / live_workers)` is `1`
+    /// regardless of the count). See
     /// `convergence_holds_across_a_mid_stream_scale_out`'s doc comment for
-    /// the concrete repro and a shared-root-cause hypothesis (a newly
-    /// joined/departed worker transiently miscounted by the live-worker
-    /// tally a batch's bucket claim sizes against). Both properties are now
-    /// `#[ignore]`d in `client_lifecycle.rs`.
+    /// the confirmed mechanism. Both properties are re-enabled in
+    /// `client_lifecycle.rs`.
     pub fn program_with_client_restart(awkward_values: bool) -> impl Strategy<Value = Program> {
         trivial_one_to_one_program_with(awkward_values).prop_flat_map(|program| {
             let ops_len = program.ops.len();
