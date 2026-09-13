@@ -10,8 +10,11 @@ use std::collections::HashSet;
 
 use engine::defs::ast::{Expr, KeySpace, Operator, ValueType};
 use engine::defs::invertibility::{AggregateArg, CountArg, Invertibility, classify};
-use generative::generate::{Mutate, build_program, trivial_program, trivial_program_with};
-use generative::model::{Op, Program, Table};
+use generative::generate::{
+    Mutate, build_program, checkpoint_plan_for, noise_plan_for, trivial_program,
+    trivial_program_with,
+};
+use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
 
@@ -743,5 +746,164 @@ fn trivial_program_sometimes_draws_an_aggregate_key_space() {
     assert!(
         saw_aggregate,
         "the generator must sometimes draw a KeySpace::Aggregate definition across 500 samples"
+    );
+}
+
+/// Workstream E, task E1: `noise_plan_for` must sometimes draw a non-empty
+/// plan at all (as opposed to always drawing zero events, which would make
+/// `tests/noise.rs`'s property vacuous) — sampled at a representative op
+/// count (4, `generate::MAX_MUTATES`'s own ceiling) the same way every other
+/// floor test here samples `trivial_program()`.
+#[test]
+fn noise_plan_for_sometimes_draws_at_least_one_event() {
+    let mut runner = TestRunner::default();
+    let strategy = noise_plan_for(4);
+    let saw_nonempty = (0..500).any(|_| {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        !plan.events.is_empty()
+    });
+    assert!(
+        saw_nonempty,
+        "noise_plan_for must sometimes draw at least one event across 500 samples"
+    );
+}
+
+/// E1: every [`NoiseAction`] variant — both DML (`Insert`/`Update`/`Delete`)
+/// and DDL (`AddColumn`/`DropColumn`) — must be reachable across enough
+/// samples, matching this suite's own "every shape reachable across a
+/// bounded number of samples" convention (e.g.
+/// `trivial_program_draws_every_scalar_function_at_least_once` above). If
+/// `AddColumn`/`DropColumn` silently stopped being drawn, the DDL half of
+/// E1's "ideally also some DDL" ask would quietly regress to DML-only noise
+/// without any test noticing.
+#[test]
+fn noise_plan_for_draws_every_action_variant_across_enough_samples() {
+    let mut runner = TestRunner::default();
+    let strategy = noise_plan_for(4);
+    let mut saw_insert = false;
+    let mut saw_update = false;
+    let mut saw_delete = false;
+    let mut saw_add_column = false;
+    let mut saw_drop_column = false;
+    for _ in 0..500 {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        for event in &plan.events {
+            let NoiseEventKind::Table(action) = &event.kind else {
+                panic!("noise_plan_for must only ever draw Table(..) events, got {event:?}");
+            };
+            match action {
+                NoiseAction::Insert { .. } => saw_insert = true,
+                NoiseAction::Update { .. } => saw_update = true,
+                NoiseAction::Delete { .. } => saw_delete = true,
+                NoiseAction::AddColumn { .. } => saw_add_column = true,
+                NoiseAction::DropColumn { .. } => saw_drop_column = true,
+            }
+        }
+        if saw_insert && saw_update && saw_delete && saw_add_column && saw_drop_column {
+            break;
+        }
+    }
+    assert!(
+        saw_insert,
+        "expected an Insert noise action across 500 samples"
+    );
+    assert!(
+        saw_update,
+        "expected an Update noise action across 500 samples"
+    );
+    assert!(
+        saw_delete,
+        "expected a Delete noise action across 500 samples"
+    );
+    assert!(
+        saw_add_column,
+        "expected an AddColumn noise action across 500 samples"
+    );
+    assert!(
+        saw_drop_column,
+        "expected a DropColumn noise action across 500 samples"
+    );
+}
+
+/// E1: `noise_plan_for` must sometimes draw an event at position `0` (fires
+/// before any real op) and sometimes at the last legal position (`op_count`,
+/// fires after the very last real op) — both ends of the interleaving range
+/// need real coverage, not just the middle.
+#[test]
+fn noise_plan_for_sometimes_fires_at_both_ends_of_the_op_stream() {
+    let mut runner = TestRunner::default();
+    let op_count = 4;
+    let strategy = noise_plan_for(op_count);
+    let mut saw_start = false;
+    let mut saw_end = false;
+    for _ in 0..500 {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        if plan.events.iter().any(|e| e.before_op == 0) {
+            saw_start = true;
+        }
+        if plan.events.iter().any(|e| e.before_op == op_count) {
+            saw_end = true;
+        }
+        if saw_start && saw_end {
+            break;
+        }
+    }
+    assert!(
+        saw_start,
+        "expected a noise event at position 0 (before any real op) across 500 samples"
+    );
+    assert!(
+        saw_end,
+        "expected a noise event at the last position (after the last real op) across 500 samples"
+    );
+}
+
+/// Workstream E, task E5: `checkpoint_plan_for` must sometimes draw at least
+/// one `CHECKPOINT` event (not always zero, which would make
+/// `tests/noise.rs`'s checkpoint property vacuous), and every drawn event
+/// must actually be the `CHECKPOINT` admin statement (task E5's whole
+/// point), never a `Table(..)` event (this plan never installs a table at
+/// all).
+#[test]
+fn checkpoint_plan_for_sometimes_draws_at_least_one_checkpoint() {
+    let mut runner = TestRunner::default();
+    let strategy = checkpoint_plan_for(4);
+    let mut saw_checkpoint = false;
+    for _ in 0..500 {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        assert!(
+            plan.table.is_none(),
+            "checkpoint_plan_for must never install a noise table: {plan:?}"
+        );
+        for event in &plan.events {
+            match &event.kind {
+                NoiseEventKind::Admin(sql) => {
+                    assert_eq!(
+                        sql, "CHECKPOINT",
+                        "checkpoint_plan_for must only draw CHECKPOINT"
+                    );
+                    saw_checkpoint = true;
+                }
+                NoiseEventKind::Table(action) => {
+                    panic!("checkpoint_plan_for must never draw a Table(..) event, got {action:?}")
+                }
+            }
+        }
+    }
+    assert!(
+        saw_checkpoint,
+        "checkpoint_plan_for must sometimes draw at least one CHECKPOINT across 500 samples"
     );
 }

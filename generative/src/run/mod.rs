@@ -17,8 +17,10 @@
 //! programs can reuse it.
 
 mod coverage;
+mod noise;
 
 pub use coverage::Coverage;
+pub use noise::run_convergence_with_noise;
 
 use std::collections::HashMap;
 use std::fmt;

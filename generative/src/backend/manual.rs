@@ -20,7 +20,9 @@ use engine::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
 use tokio_postgres::NoTls;
 
 use super::Snapshot;
-use crate::model::{Column, Op, Program, Table, group_key};
+use crate::model::{
+    Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Table, group_key,
+};
 
 /// How long [`ManualBackend::quiesce`] waits for convergence before giving
 /// up. Generous: this backend targets correctness, not latency, and a
@@ -188,6 +190,68 @@ fn render_operator(op: Operator) -> &'static str {
     }
 }
 
+/// Renders one [`NoiseAction`] to the SQL text [`ManualBackend::fire_noise_event`]
+/// runs directly (task E1) — the noise-table analog of [`render_definition`]/
+/// [`render_expr`], but for plain DDL/DML rather than a `TRANSFORM`
+/// definition. `Insert`/`Update` target `table.columns[1]` by name (falling
+/// back to the pk column if `table` is somehow columnless) — the one non-pk
+/// column every noise table `crate::generate::noise_table` builds gives it —
+/// so this works for any single-extra-column noise table shape without
+/// needing to know that column's name in advance.
+fn render_noise_action(table: &Table, action: &NoiseAction) -> String {
+    let value_col = table
+        .columns
+        .get(1)
+        .map(|c| c.name.as_str())
+        .unwrap_or(&table.pk_col);
+    match action {
+        NoiseAction::Insert { pk, value } => format!(
+            "insert into {} ({}, {}) values ({pk}, {})",
+            quote_ident(&table.name),
+            quote_ident(&table.pk_col),
+            quote_ident(value_col),
+            noise_sql_literal(value),
+        ),
+        NoiseAction::Update { pk, value } => format!(
+            "update {} set {} = {} where {} = {pk}",
+            quote_ident(&table.name),
+            quote_ident(value_col),
+            noise_sql_literal(value),
+            quote_ident(&table.pk_col),
+        ),
+        NoiseAction::Delete { pk } => format!(
+            "delete from {} where {} = {pk}",
+            quote_ident(&table.name),
+            quote_ident(&table.pk_col),
+        ),
+        NoiseAction::AddColumn { name, value_type } => format!(
+            "alter table {} add column {} {}",
+            quote_ident(&table.name),
+            quote_ident(name),
+            pg_type_name(*value_type),
+        ),
+        NoiseAction::DropColumn { name } => format!(
+            "alter table {} drop column {}",
+            quote_ident(&table.name),
+            quote_ident(name),
+        ),
+    }
+}
+
+/// A SQL literal for a noise [`NoiseAction`] value: `NULL`, or a
+/// single-quoted, escaped text literal. Used unconditionally regardless of
+/// the target column's declared type: an untyped string literal in an
+/// `INSERT`/`UPDATE`'s value position is coerced to whatever the target
+/// column's real type is (standard Postgres literal-type inference), so this
+/// needs no type dispatch of its own the way [`Assignment`]'s real-op
+/// rendering does with its explicit `::text::<type>` casts.
+fn noise_sql_literal(value: &Option<String>) -> String {
+    match value {
+        None => "NULL".to_string(),
+        Some(text) => format!("'{}'", text.replace('\'', "''")),
+    }
+}
+
 /// One row's placeholder assignment for an `INSERT`/`UPDATE` statement:
 /// `column = $n::type` (or `column` for the column list), plus the bound
 /// text value at that position.
@@ -346,6 +410,63 @@ impl ManualBackend {
                 pg_type_name(value_type)
             ),
             value: value.clone(),
+        }
+    }
+
+    /// Creates a table with the exact same DDL shape [`ManualBackend::install`]
+    /// gives a real source table (task E1: untracked-object noise) —
+    /// including the same unconditional `replica identity full` (harmless,
+    /// and keeps this table indistinguishable from a real one at the DDL
+    /// level) — but never registers it in `self.tables` and never hands its
+    /// name to the engine's `ClientOptions.source_tables`. Those are the
+    /// only two places a table needs to appear to be "tracked" by this
+    /// backend or watched by the engine (see [`ManualBackend::install`]/
+    /// [`ManualBackend::snapshot`]), and `run::check_program`'s oracle never
+    /// looks at "every table in the schema" either — it only ever resolves a
+    /// definition's source/target through `Program.tables`/`Program.defs`
+    /// (see that function's own doc comment) — so a table installed this way
+    /// is structurally invisible to every check this suite runs, regardless
+    /// of what DML/DDL later targets it, or what its name/columns happen to
+    /// look like.
+    pub async fn install_noise_table(&mut self, table: &Table) -> Result<(), ManualBackendError> {
+        self.create_source_table(table).await
+    }
+
+    /// Runs one arbitrary SQL statement directly against this backend's own
+    /// connection, bypassing [`ManualBackend::apply`]'s op-shaped DML
+    /// entirely (task E1 noise DDL/DML; task E5's `CHECKPOINT`). Returns the
+    /// statement's affected-row count (`0` for a DDL statement or
+    /// `CHECKPOINT`, same as any other statement that doesn't affect table
+    /// rows).
+    pub async fn execute_raw(&self, sql: &str) -> Result<u64, ManualBackendError> {
+        Ok(self.raw.execute(sql, &[]).await?)
+    }
+
+    /// Fires one [`NoiseEvent`]'s [`NoiseEventKind`]: renders it to SQL text
+    /// ([`render_noise_action`] for a `Table` event, used as-is for an
+    /// `Admin` one) and runs it via [`ManualBackend::execute_raw`]. Errors
+    /// are swallowed (logged to stderr, never returned) — noise/
+    /// administration is deliberately allowed to fail (e.g. a `DROP COLUMN`
+    /// on a column an earlier event already dropped) without that ever
+    /// counting as a run failure; the whole point of tasks E1/E5 is that
+    /// nothing here can affect the tracked convergence check regardless of
+    /// whether it succeeds.
+    pub async fn fire_noise_event(&self, table: Option<&Table>, event: &NoiseEvent) {
+        let sql = match &event.kind {
+            NoiseEventKind::Admin(sql) => sql.clone(),
+            NoiseEventKind::Table(action) => {
+                let Some(table) = table else {
+                    eprintln!(
+                        "generative: noise event {event:?} names a Table(..) action but no \
+                         noise table was installed — skipping"
+                    );
+                    return;
+                };
+                render_noise_action(table, action)
+            }
+        };
+        if let Err(err) = self.execute_raw(&sql).await {
+            eprintln!("generative: noise statement {sql:?} failed (expected/ignored): {err:?}");
         }
     }
 }
