@@ -433,8 +433,42 @@ impl Intake {
                 slot: config.slot.clone(),
             })?;
         publication::require_slot_healthy(session.client(), &config.slot, last_confirmed).await?;
+        // Improvement-plan task E3 (generative-suite-e-hard) uncovered this via a
+        // simulated in-process client crash-and-restart: without an explicit
+        // `start_lsn`, `pgwire_replication`'s default (`Lsn(0)`) resumes from
+        // the *replication slot's own* server-tracked `confirmed_flush_lsn`,
+        // which only advances when a Standby Status Update actually reaches
+        // the server — an async, batched/periodic acknowledgment
+        // (`Intake::commit_transaction`'s `update_applied_lsn` only updates
+        // the in-memory value pgwire_replication reports "on its next" status
+        // update, per that function's own doc comment). `replication_progress.confirmed_lsn`
+        // (`last_confirmed`, fetched above) is strictly durable and at least as
+        // fresh — it is persisted in the *same* database transaction as the
+        // staged rows themselves (`stage_and_advance`/`advance_watermark_and_notify`).
+        // A crash between "stage a transaction" and "the next Standby Status
+        // Update actually reaching Postgres" therefore leaves the slot's own
+        // position stale; a fresh connection that trusted it (the previous
+        // behavior here) would have Postgres *redeliver* one or more
+        // already-staged-and-fully-applied transactions. The ring's fold only
+        // collapses such a duplicate when it lands before the original
+        // segment seals (`intake::stage_and_advance`'s "Monotonic guard" doc
+        // comment) — once draining has already applied it to a target, a
+        // redelivered duplicate is a second, independent delta, which
+        // silently double-counts an `Aggregate` target's `SUM`/`COUNT` (and,
+        // more rarely, can regress a `OneToOne` target if the duplicate's
+        // stale image lands after a genuinely newer write to the same key —
+        // observed directly via `generative`'s new restart-lifecycle property
+        // and hand-built pin). Passing our own durably-persisted
+        // `last_confirmed` explicitly closes this: it can never be *behind*
+        // the slot's own tracked position (it only ever advances after a
+        // commit durably records it), so resuming from it can redeliver
+        // nothing already staged, while still replaying anything genuinely
+        // unstaged at crash time — no lost work, no duplicate processing.
+        let replication_config = config
+            .replication_config()
+            .with_start_lsn(pgwire_replication::Lsn::from(u64::from(last_confirmed)));
         let replication =
-            pgwire_replication::ReplicationClient::connect(config.replication_config()).await?;
+            pgwire_replication::ReplicationClient::connect(replication_config).await?;
         Ok(Self {
             replication,
             session,

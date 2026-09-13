@@ -801,7 +801,10 @@ mod tests {
         let program = Program {
             tables: Vec::new(),
             defs: Vec::new(),
+            def_install_after_op: Vec::new(),
             ops: Vec::new(),
+            restart_after_ops: Vec::new(),
+            scale_out_after_ops: Vec::new(),
         };
         let report = ThreeWayReport {
             target_vs_sql: vec![Divergence::Cell {
