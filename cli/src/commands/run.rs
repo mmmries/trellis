@@ -39,7 +39,7 @@ migrated database.
 
 Options:
   --staging                  Run the CDC/staging worker. Default.
-  --no-staging                Don't run the CDC/staging worker. Mutually
+  --no-staging               Don't run the CDC/staging worker. Mutually
                              exclusive with --staging.
   --drain-threads <N>        Number of drain (application) worker threads to
                              run. Must be a non-negative integer. Default: 2.
@@ -173,7 +173,7 @@ pub async fn run(args: Args, database_url: Option<String>) -> Result<String, Str
             // started rather than leaking them.
             let shutdown_outcome = trellis.shutdown().await;
             return Err(format!(
-                "error: failed to listen for Ctrl-C: {err}{}",
+                "failed to listen for Ctrl-C: {err}{}",
                 match shutdown_outcome {
                     Ok(()) => String::new(),
                     Err(shutdown_err) => format!("; additionally, shutdown failed: {shutdown_err}"),
