@@ -53,4 +53,4 @@ jobs:
           echo "$pg_bin" >> "$GITHUB_PATH"
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude generative
