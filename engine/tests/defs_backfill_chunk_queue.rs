@@ -170,9 +170,15 @@ async fn a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another
         "the fresh worker must win exactly the reclaimed chunk"
     );
 
-    chunk_queue::run_claimed_chunk(&db.pool, &re_claimed[0], "public")
-        .await
-        .expect("run_claimed_chunk");
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &re_claimed[0],
+        "public",
+        "fresh-worker",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("run_claimed_chunk");
     chunk_queue::finish_chunk(&db.pool, &re_claimed[0], "fresh-worker")
         .await
         .expect("finish_chunk");
@@ -203,6 +209,138 @@ async fn a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another
         status, "live",
         "finishing the one remaining chunk must flip the definition to live"
     );
+}
+
+/// public-api-design review gap #1: a chunk's entire write must not have to
+/// complete inside `reclaim_ttl` to avoid being falsely reclaimed —
+/// `run_claimed_chunk` must heartbeat the claim out-of-band for the whole
+/// duration of the write, exactly as `staging::liveness::HeartbeatDaemon`
+/// does for segment claims.
+///
+/// Simulated via a statement-level `before insert` trigger on the target
+/// table that sleeps for longer than the (deliberately short) test
+/// `reclaim_ttl` used here: the chunk's `insert ... select ... on conflict`
+/// is one statement, so the trigger fires exactly once regardless of how
+/// many rows it touches, making the whole write take ~10x the reclaim TTL.
+/// While that write is in flight, a concurrent loop sweeps for stale claims
+/// far more often than the TTL requires — mirroring the cadence
+/// `maintenance_loop`/`sweep_stale_chunks_if_due` run in production — and
+/// must never actually reclaim anything, because the heartbeat spawned
+/// inside `run_claimed_chunk` keeps refreshing `claimed_at` well within the
+/// TTL the whole time.
+#[tokio::test]
+async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) values (1, 10), (2, 20), (3, 30)",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = numeric(&["a"]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT a + a AS x",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition enumerates chunk work and returns");
+
+    // A statement-level trigger that sleeps once per `insert` statement,
+    // simulating a chunk write slow enough (~600ms) to outlast several
+    // multiples of the short `reclaim_ttl` this test uses below (150ms).
+    client
+        .batch_execute(
+            "create function _slow_backfill_write() returns trigger as $$ \
+             begin perform pg_sleep(0.6); return null; end; \
+             $$ language plpgsql; \
+             create trigger _slow_backfill_write_trigger \
+             before insert on t for each statement \
+             execute function _slow_backfill_write()",
+        )
+        .await
+        .expect("install a slow-write trigger on the target table");
+
+    let claimed = chunk_queue::claim_chunks(&client, "slow-worker", 10)
+        .await
+        .expect("claim_chunks");
+    assert_eq!(claimed.len(), 1, "one chunk covers this small source table");
+    let chunk = claimed[0].clone();
+
+    let ttl = Duration::from_millis(150);
+    // Far below `ttl`, the same margin `HeartbeatDaemon`'s own interval
+    // keeps under `reclaim_ttl` in production.
+    let heartbeat_interval = Duration::from_millis(20);
+
+    let pool = db.pool.clone();
+    let chunk_for_task = chunk.clone();
+    let run_task = tokio::spawn(async move {
+        chunk_queue::run_claimed_chunk(
+            &pool,
+            &chunk_for_task,
+            "public",
+            "slow-worker",
+            heartbeat_interval,
+        )
+        .await
+    });
+
+    // While the chunk write is (slowly) in flight, repeatedly sweep for
+    // stale claims at a cadence much faster than the write's own runtime.
+    // Without Fix 1's heartbeat, this would reclaim the still-in-flight
+    // claim well before the write finishes.
+    let mut total_reclaimed = 0u64;
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        total_reclaimed += chunk_queue::reclaim_stale_chunks(&client, ttl)
+            .await
+            .expect("reclaim_stale_chunks");
+    }
+
+    run_task
+        .await
+        .expect("run_claimed_chunk task panicked")
+        .expect("run_claimed_chunk");
+
+    assert_eq!(
+        total_reclaimed, 0,
+        "the heartbeat must keep the claim fresh for the whole chunk write, even though the \
+         write itself takes several multiples of the reclaim TTL"
+    );
+
+    chunk_queue::finish_chunk(&db.pool, &chunk, "slow-worker")
+        .await
+        .expect("finish_chunk by the original (never-reclaimed) claimant");
+
+    let mismatches: i64 = client
+        .query_one(
+            "select count(*) from s left join t on t.id = s.id \
+             where t.id is null or t.x is distinct from s.a + s.a",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        mismatches, 0,
+        "the never-reclaimed worker must have built the target correctly"
+    );
+
+    let status: String = client
+        .query_one(
+            "select status from transform_definitions where target_table = 't'",
+            &[],
+        )
+        .await
+        .expect("read back status")
+        .get(0);
+    assert_eq!(status, "live");
 }
 
 /// A chunk already marked done cannot be double-completed by its original
@@ -249,9 +387,15 @@ async fn a_stale_claimants_late_finish_after_reclaim_is_a_no_op() {
         .await
         .expect("re-claim");
     assert_eq!(re_claimed.len(), 1);
-    chunk_queue::run_claimed_chunk(&db.pool, &re_claimed[0], "public")
-        .await
-        .expect("run_claimed_chunk");
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &re_claimed[0],
+        "public",
+        "fresh-worker",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("run_claimed_chunk");
     chunk_queue::finish_chunk(&db.pool, &re_claimed[0], "fresh-worker")
         .await
         .expect("finish_chunk by the fresh worker");
@@ -313,9 +457,15 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
         .await
         .expect("claim A's chunk");
     assert_eq!(claimed_a.len(), 1);
-    chunk_queue::run_claimed_chunk(&db.pool, &claimed_a[0], "public")
-        .await
-        .expect("run A's chunk");
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &claimed_a[0],
+        "public",
+        "worker-a",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("run A's chunk");
     chunk_queue::finish_chunk(&db.pool, &claimed_a[0], "worker-a")
         .await
         .expect("finish A's chunk");
@@ -350,9 +500,15 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
         .await
         .expect("claim B's chunk");
     assert_eq!(claimed_b.len(), 1);
-    chunk_queue::run_claimed_chunk(&db.pool, &claimed_b[0], "public")
-        .await
-        .expect("run B's chunk");
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &claimed_b[0],
+        "public",
+        "worker-b",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("run B's chunk");
     // Deliberately not finished yet.
 
     let pre_delta_y: i64 = client

@@ -22,8 +22,8 @@ use engine::Pool;
 use engine::config::DEFAULT_SCHEMA;
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use engine::defs::{
-    TransformStatus, create_definition, create_target_table, install_definition, recompute,
-    source_primary_key,
+    TransformStatus, chunk_queue, create_definition, create_target_table, install_definition,
+    recompute, source_primary_key,
 };
 use engine::{Client as TrellisClient, ClientOptions};
 use testkit::TestCluster;
@@ -586,6 +586,105 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
     assert_eq!(
         mismatches, 0,
         "a running drain worker must have built the target correctly"
+    );
+
+    client.shutdown().await.expect("clean shutdown");
+}
+
+/// public-api-design review gap #2: `chunk_queue::reclaim_stale_chunks` used
+/// to run only from `maintenance_loop`, which only spawns `if
+/// options.staging_worker`. A drain-only client (`staging_worker: false`,
+/// `application_threads > 0` — a normal, documented fleet topology) had no
+/// self-healing for a crashed drain worker's stale chunk claim, since nothing
+/// else in a fleet running *no* `staging_worker: true` client anywhere would
+/// ever sweep it.
+///
+/// This simulates exactly that crash: a chunk is claimed by a `"dead-worker"`
+/// that never executes or finishes it — *before* any `Client` exists at
+/// all — then a single `staging_worker: false` client is started (with a
+/// short `reclaim_ttl`/`maintenance_interval` so the test doesn't wait out
+/// production-sized defaults) and must, entirely on its own, reclaim that
+/// stale claim, execute it, and flip the definition to `Live`.
+#[tokio::test]
+async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker_anywhere() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+
+    raw.batch_execute(
+        "create table gadgets (id bigint primary key, price numeric); \
+         insert into gadgets (id, price) select g, g from generate_series(1, 50) g",
+    )
+    .await
+    .expect("seed gadgets");
+
+    let gadgets_columns = numeric_columns(&["id", "price"]);
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM gadgets_calc FROM gadgets SELECT price + price AS double_price",
+        &gadgets_columns,
+        "public",
+    )
+    .await
+    .expect("install_definition enumerates chunk work and returns");
+    assert_eq!(def.status, TransformStatus::Backfilling);
+
+    // Simulate a drain worker that claimed this definition's one chunk and
+    // then crashed before ever executing or finishing it. No `Client` is
+    // running yet at all, so this really is durable state a crashed process
+    // left behind, not an artifact of racing a live worker.
+    let claimed = chunk_queue::claim_chunks(&raw, "dead-worker", 10)
+        .await
+        .expect("claim_chunks (simulating a crashed worker)");
+    assert_eq!(claimed.len(), 1, "one chunk covers this small source table");
+
+    // A drain-only client — no staging worker anywhere in this test, and
+    // this is the *only* client instance running. Without the app-worker
+    // loop's own reclaim sweep, nothing would ever free the stale claim
+    // above.
+    let options = ClientOptions {
+        staging_worker: false,
+        application_threads: 2,
+        reclaim_ttl: Duration::from_millis(200),
+        maintenance_interval: Duration::from_millis(50),
+        poll_interval: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let client = TrellisClient::start(db.dsn(), options).expect("client start");
+
+    poll_until(
+        Duration::from_secs(20),
+        Duration::from_millis(100),
+        "a drain-only client (staging_worker: false) never reclaimed and finished the stale \
+         chunk claim left behind by a simulated crashed worker",
+        async || {
+            let status: Option<String> = raw
+                .query_opt(
+                    "select status from transform_definitions where target_table = 'gadgets_calc'",
+                    &[],
+                )
+                .await
+                .expect("read status")
+                .map(|row| row.get(0));
+            status.as_deref() == Some("live")
+        },
+    )
+    .await;
+
+    let mismatches: i64 = raw
+        .query_one(
+            "select count(*) from gadgets \
+             left join gadgets_calc on gadgets_calc.id = gadgets.id \
+             where gadgets_calc.id is null \
+                or gadgets_calc.double_price is distinct from gadgets.price + gadgets.price",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        mismatches, 0,
+        "the reclaiming drain-only client must have built the target correctly"
     );
 
     client.shutdown().await.expect("clean shutdown");

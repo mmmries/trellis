@@ -13,12 +13,16 @@
 //! claim/reclaim-stale/release-on-error idiom for sealed ring segments,
 //! collapsed onto one table (a chunk, unlike a segment, is never bucket-split
 //! across several workers at once — see the migration's own doc comment).
-//! [`run_claimed_chunk`] executes one claimed chunk's write, and
-//! [`finish_chunk`] marks it done, flipping the owning definition
-//! `backfilling` -> `live` (via [`super::catalog::complete_direct_backfill`])
-//! the moment every one of its chunks is done — race-free under concurrent
-//! finishers via a `for update` lock on the definition's own row (see that
-//! function's doc comment).
+//! [`run_claimed_chunk`] executes one claimed chunk's write — heartbeating
+//! the claim out-of-band for the write's whole duration via the internal
+//! `ChunkHeartbeat`, the same "keep a claim alive against wall-clock time,
+//! not against how much work is left" idiom `staging::liveness::HeartbeatDaemon`
+//! uses for segment claims, so a chunk write that outlives `reclaim_ttl`
+//! isn't falsely reclaimed mid-write — and [`finish_chunk`] marks it done,
+//! flipping the owning definition `backfilling` -> `live` (via
+//! [`super::catalog::complete_direct_backfill`]) the moment every one of its
+//! chunks is done — race-free under concurrent finishers via a `for update`
+//! lock on the definition's own row (see that function's doc comment).
 //!
 //! A relationship-enriched 1-1 definition is *not* enqueued here at all: its
 //! per-relationship staging tables are connection-scoped `TEMP TABLE`s, which
@@ -32,6 +36,7 @@
 
 use std::time::Duration;
 
+use tokio::time::MissedTickBehavior;
 use tokio_postgres::GenericClient;
 
 use crate::error_code::{self, ErrorCode};
@@ -281,16 +286,39 @@ pub async fn release_chunk(
 /// rather than caching it across chunks, since chunks of the same definition
 /// may be claimed and run by entirely different processes with no shared
 /// in-memory state.
+///
+/// Runs a [`ChunkHeartbeat`] for the duration of the write so a chunk whose
+/// `INSERT … SELECT` takes longer than the fleet's `reclaim_ttl` (the whole
+/// reason [`super::backfill::BACKFILL_CHUNK_ROWS`] bounds a chunk rather than
+/// leaving it unbounded — a bound on *cost*, not on *wall-clock time*, which
+/// can still grow with row width, index maintenance, or a loaded server)
+/// isn't falsely reclaimed and concurrently re-executed by another worker
+/// while this one is still working it. `heartbeat_interval` should be well
+/// under whatever `reclaim_ttl` the caller's fleet uses — callers driven by
+/// [`crate::client::Client`] pass its `ClientOptions::heartbeat`'s own
+/// interval, matching the same margin the ring's own
+/// [`crate::staging::HeartbeatDaemon`] keeps against `reclaim_ttl` there.
 pub async fn run_claimed_chunk(
     pool: &Pool,
     chunk: &ClaimedChunk,
     target_schema: &str,
+    claimed_by: &str,
+    heartbeat_interval: Duration,
 ) -> Result<(), ChunkQueueError> {
     let definition = catalog::definition_by_id(pool, chunk.definition_id)
         .await?
         .ok_or(ChunkQueueError::DefinitionNotFound {
             definition_id: chunk.definition_id,
         })?;
+
+    // Dropped (aborting the background task) as soon as this function
+    // returns, one way or another — see [`ChunkHeartbeat`]'s doc comment.
+    let _heartbeat = ChunkHeartbeat::spawn(
+        pool.clone(),
+        chunk.id,
+        claimed_by.to_string(),
+        heartbeat_interval,
+    );
 
     backfill::execute_one_to_one_chunk(
         pool,
@@ -301,6 +329,67 @@ pub async fn run_claimed_chunk(
     )
     .await?;
     Ok(())
+}
+
+/// Refreshes `claimed_at` for one in-flight chunk claim on a fresh pooled
+/// connection — the chunk-queue analogue of [`super::backfill`]'s own
+/// per-chunk write, but for the claim row rather than the target. Scoped
+/// `claimed_by = $2 and not done` for the same reason every other
+/// claim-scoped statement in this module is: a claim already reclaimed out
+/// from under this caller (the TTL sweep, or another worker) or already
+/// finished is left untouched rather than resurrected. Best-effort: a failed
+/// refresh costs one heartbeat interval of staleness, not correctness — see
+/// [`ChunkHeartbeat`].
+async fn touch_chunk_claim(pool: &Pool, id: i64, claimed_by: &str) {
+    if let Ok(client) = pool.get().await {
+        let _ = client
+            .execute(
+                "update backfill_chunks set claimed_at = now() \
+                 where id = $1 and claimed_by = $2 and not done",
+                &[&id, &claimed_by],
+            )
+            .await;
+    }
+}
+
+/// Keeps one claimed chunk's `claimed_at` fresh out-of-band for the whole
+/// lifetime of one [`run_claimed_chunk`] call — the chunk-queue counterpart
+/// of `staging::liveness::HeartbeatDaemon`, which does the same job for
+/// `seg_claims` rows so a long-running segment drain isn't falsely reclaimed
+/// mid-write (see doc 04, "Keeping a claim alive").
+///
+/// A sibling rather than a direct reuse of `HeartbeatDaemon`: that daemon's
+/// refresh statement (`DAEMON_REFRESH_SQL`) is hardwired to `seg_claims`, and
+/// its registry/lazy-connect/idle-exit design exists to amortize *many*
+/// concurrently-registered claims sharing one process-wide dedicated
+/// connection across a whole app-worker task's entire lifetime — machinery a
+/// single chunk execution (exactly one claim, one bounded call with a clear
+/// start and end) has no use for. This instead spawns a plain periodic task
+/// scoped to exactly one chunk's execution, refreshing through the caller's
+/// own connection pool rather than a dedicated connection, and stops simply
+/// by being dropped (which aborts the task) once that call returns.
+struct ChunkHeartbeat {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ChunkHeartbeat {
+    fn spawn(pool: Pool, id: i64, claimed_by: String, interval: Duration) -> Self {
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                touch_chunk_claim(&pool, id, &claimed_by).await;
+            }
+        });
+        ChunkHeartbeat { task }
+    }
+}
+
+impl Drop for ChunkHeartbeat {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// Marks `chunk` done — scoped `claimed_by = $2 and not done` so a claim

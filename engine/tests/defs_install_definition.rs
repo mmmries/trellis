@@ -18,6 +18,7 @@
 //! those files for the ring/seal mechanics.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use engine::config::DEFAULT_SCHEMA;
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Predicate, RelationshipDef, TransformDef};
@@ -53,9 +54,15 @@ async fn drain_backfill_chunks(pool: &engine::Pool, target_schema: &str) {
             return;
         }
         for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(pool, chunk, target_schema)
-                .await
-                .expect("run_claimed_chunk");
+            chunk_queue::run_claimed_chunk(
+                pool,
+                chunk,
+                target_schema,
+                CLAIMED_BY,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("run_claimed_chunk");
             chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
                 .await
                 .expect("finish_chunk");

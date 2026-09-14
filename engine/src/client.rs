@@ -472,6 +472,8 @@ async fn run(
             drainer_window: options.drainer_window,
             heartbeat_config: options.heartbeat.clone(),
             poll_interval: options.poll_interval,
+            reclaim_ttl: options.reclaim_ttl,
+            chunk_reclaim_interval: options.maintenance_interval,
         };
         app_worker_tasks.push(tokio::spawn(app_worker_loop(
             worker_config,
@@ -871,6 +873,21 @@ struct AppWorkerConfig {
     drainer_window: Duration,
     heartbeat_config: HeartbeatDaemonConfig,
     poll_interval: Duration,
+    /// How long a backfill-chunk claim may sit unrefreshed before it's swept
+    /// as stale — the same value [`MaintenanceConfig::reclaim_ttl`] uses for
+    /// the ring's own claims. Passed here too (issue: chunk-reclaim sweep
+    /// availability) so this sweep runs at the fleet's one configured TTL
+    /// regardless of whether this particular client also happens to run the
+    /// staging worker.
+    reclaim_ttl: Duration,
+    /// How often this app-worker task sweeps `backfill_chunks` for a stale
+    /// claim (see [`sweep_stale_chunks_if_due`]) — independent of
+    /// `ClientOptions::staging_worker`, since a stale backfill-chunk claim
+    /// isn't a CDC-intake/ring concern the way segment maintenance is (see
+    /// this field's own call site's doc comment). Reuses
+    /// `ClientOptions::maintenance_interval`'s cadence rather than inventing
+    /// a third interval knob.
+    chunk_reclaim_interval: Duration,
 }
 
 /// How many pending backfill chunks one [`app_worker_loop`] iteration claims
@@ -907,22 +924,52 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         drainer_window,
         heartbeat_config,
         poll_interval,
+        reclaim_ttl,
+        chunk_reclaim_interval,
     } = config;
 
+    // Captured before `heartbeat_config` is moved into `HeartbeatDaemon::spawn`
+    // below: `drain_backfill_chunks` needs this same cadence for its own
+    // per-chunk-claim heartbeat (see its doc comment) — a chunk write and a
+    // segment drain should heartbeat at the same margin under `reclaim_ttl`.
+    let chunk_heartbeat_interval = heartbeat_config.interval;
     let heartbeat = HeartbeatDaemon::spawn(dsn.clone(), schema.clone(), heartbeat_config);
     let mut wake = wake_listener(&dsn, &schema, &wake_channel).await.ok();
+
+    // Due immediately on the very first tick, same as `maintenance_loop`'s
+    // own `next_reconcile` — see `sweep_stale_chunks_if_due`.
+    let mut next_chunk_reclaim = Instant::now();
 
     loop {
         if *shutdown_rx.borrow() {
             break;
         }
 
+        // Backfill-chunk reclaim sweep (independent of `staging_worker` —
+        // see `AppWorkerConfig::chunk_reclaim_interval`'s doc comment): a
+        // drain-only fleet (`staging_worker: false`, `application_threads` >
+        // 0, no other client running `staging_worker: true` anywhere) would
+        // otherwise have nothing to free a crashed drain worker's claimed
+        // chunk — `maintenance_loop`'s own sweep only ever runs alongside the
+        // staging worker. Cheap/idempotent to also run this when a staging
+        // worker *is* present in the same process (its `maintenance_loop`
+        // sweeps too): a no-op UPDATE matching zero rows either way.
+        sweep_stale_chunks_if_due(
+            &pool,
+            reclaim_ttl,
+            chunk_reclaim_interval,
+            &mut next_chunk_reclaim,
+        )
+        .await;
+
         // Claim and execute pending direct-build backfill chunks before this
         // iteration's ring-segment work, so a fleet running only backfill (no
         // sealed segments yet) still makes progress every tick rather than
         // getting stuck behind the segment path's own early `continue`s
         // below.
-        let backfill_progress = drain_backfill_chunks(&pool, &claimed_by, &target_schema).await;
+        let backfill_progress =
+            drain_backfill_chunks(&pool, &claimed_by, &target_schema, chunk_heartbeat_interval)
+                .await;
 
         // `register_drainer` doubles as the liveness refresh
         // `count_live_drainers` reads below (see its own doc comment), so it
@@ -1019,6 +1066,36 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
     }
 }
 
+/// Runs [`chunk_queue::reclaim_stale_chunks`] if `interval` has elapsed since
+/// `next_due` (mutated in place to the next due time, mirroring
+/// `maintenance_loop`'s own `next_reconcile` throttle), else does nothing.
+///
+/// Gap this closes (public-api-design review): `reclaim_stale_chunks` used to
+/// only ever run from [`maintenance_loop`], which is only spawned `if
+/// options.staging_worker`. A drain-only client (`staging_worker: false`,
+/// `application_threads > 0` — a normal, documented fleet topology) had no
+/// self-healing for a crashed drain worker's claimed chunk: it would sit
+/// stuck at `Backfilling` forever unless some *other* client instance in the
+/// fleet happened to also run with `staging_worker: true`. Unlike segment
+/// maintenance (legitimately tied to owning the replication slot), reclaiming
+/// a stale backfill-chunk claim has nothing to do with CDC intake, so it's
+/// wired here instead — into the one loop every client with
+/// `application_threads > 0` runs regardless of `staging_worker`.
+async fn sweep_stale_chunks_if_due(
+    pool: &Pool,
+    reclaim_ttl: Duration,
+    interval: Duration,
+    next_due: &mut Instant,
+) {
+    if Instant::now() < *next_due {
+        return;
+    }
+    if let Ok(client) = pool.get().await {
+        let _ = chunk_queue::reclaim_stale_chunks(&**client, reclaim_ttl).await;
+    }
+    *next_due = Instant::now() + interval;
+}
+
 /// Claims up to [`MAX_BACKFILL_CHUNK_CLAIM`] pending direct-build backfill
 /// chunks (`defs::chunk_queue`, docs/decisions/0007's amendment) and executes
 /// each one, marking it done (flipping its definition `backfilling` ->
@@ -1028,7 +1105,18 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
 /// wait out the TTL" discipline [`app_worker_loop`]'s segment path uses.
 /// Returns whether it claimed anything, so the caller's own idle-wait
 /// decision treats a tick that only did backfill work as progress too.
-async fn drain_backfill_chunks(pool: &Pool, claimed_by: &str, target_schema: &str) -> bool {
+///
+/// `heartbeat_interval` is threaded straight through to
+/// [`chunk_queue::run_claimed_chunk`] — this app-worker's own
+/// [`HeartbeatDaemonConfig::interval`] (the same cadence its segment claims
+/// heartbeat at), so a chunk write outliving `reclaim_ttl` isn't falsely
+/// reclaimed mid-write (see `chunk_queue::run_claimed_chunk`'s doc comment).
+async fn drain_backfill_chunks(
+    pool: &Pool,
+    claimed_by: &str,
+    target_schema: &str,
+    heartbeat_interval: Duration,
+) -> bool {
     let claimed = match pool.get().await {
         Ok(client) => {
             chunk_queue::claim_chunks(&**client, claimed_by, MAX_BACKFILL_CHUNK_CLAIM).await
@@ -1041,7 +1129,15 @@ async fn drain_backfill_chunks(pool: &Pool, claimed_by: &str, target_schema: &st
     };
 
     for chunk in &claimed {
-        match chunk_queue::run_claimed_chunk(pool, chunk, target_schema).await {
+        match chunk_queue::run_claimed_chunk(
+            pool,
+            chunk,
+            target_schema,
+            claimed_by,
+            heartbeat_interval,
+        )
+        .await
+        {
             Ok(()) => {
                 let _ = chunk_queue::finish_chunk(pool, chunk, claimed_by).await;
             }
