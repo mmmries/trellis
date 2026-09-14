@@ -2,9 +2,14 @@
 //!
 //! Kept as a plain enum implementing [`std::error::Error`] (no `thiserror`/
 //! `anyhow`) per the crate's dependency policy: pull in only what's on the
-//! approved list for this issue.
+//! approved list for this issue. [`Error::code`] additionally reports a
+//! stable [`crate::ErrorCode`] category for this error, alongside the
+//! existing `Display`-driven message — see `docs/decisions/0008-public-api-design.md`,
+//! decision 3.
 
 use std::fmt;
+
+use crate::error_code::{self, ErrorCode};
 
 /// Errors that can occur while resolving configuration, connecting to
 /// Postgres, or running migrations.
@@ -26,6 +31,29 @@ pub enum Error {
     /// pre-existing, non-Trellis schema with no marker at all. See
     /// `crate::identity`.
     IncompatibleInstance(String),
+}
+
+impl Error {
+    /// This error's stable, coarse [`ErrorCode`] category — see
+    /// `docs/decisions/0008-public-api-design.md`, decision 3. The message itself is still
+    /// only available via `Display`/`to_string()`; this is purely the
+    /// category alongside it.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            // Invalid configuration (DSN, schema name, ...) is a rejected
+            // input, the same category a definition's own validation
+            // failure reports.
+            Error::Config(_) => ErrorCode::Validation,
+            Error::BuildPool(_) | Error::Pool(_) => ErrorCode::Connectivity,
+            Error::Connect(err) => error_code::classify_pg_error(err),
+            // A migration failure is an engine/deployment problem, not a
+            // reachability one.
+            Error::Migrate(_) => ErrorCode::Internal,
+            // A mismatched/incompatible/foreign schema marker is this
+            // instance colliding with existing state.
+            Error::IncompatibleInstance(_) => ErrorCode::Conflict,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -94,4 +122,25 @@ pub fn write_pg_error(f: &mut fmt::Formatter<'_>, err: &tokio_postgres::Error) -
         write!(f, ": {db_err}")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_error_is_validation() {
+        assert_eq!(
+            Error::Config("bad dsn".to_string()).code(),
+            ErrorCode::Validation
+        );
+    }
+
+    #[test]
+    fn incompatible_instance_is_conflict() {
+        assert_eq!(
+            Error::IncompatibleInstance("schema already claimed".to_string()).code(),
+            ErrorCode::Conflict
+        );
+    }
 }

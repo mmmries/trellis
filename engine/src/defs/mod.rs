@@ -27,6 +27,7 @@
 pub mod ast;
 pub mod backfill;
 pub mod catalog;
+pub mod chunk_queue;
 pub mod ddl;
 pub mod error;
 pub mod eval;
@@ -56,7 +57,7 @@ pub use eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
 pub use invertibility::{AggregateArg, CountArg, Invertibility, PartialField, Verdict, classify};
 pub use model::{
     Definition, EdgeKind, NodeKind, RelationshipCardinality, RelationshipDefinition, SchemaEdge,
-    SchemaNode,
+    SchemaNode, TransformStatus,
 };
 pub use oracle::{
     OracleError, Recomputed, recompute, recompute_aggregate, render_aggregate_select_sql,

@@ -19,7 +19,7 @@ front and has no concurrent deltas to reconcile.
 
 **Amendment (2026-09-12):** "The build is synchronous and complete on return"
 (below) doesn't scale to the sizes the public API design
-([docs/public-api-design.md](../public-api-design.md)) needs to support — a
+([ADR-0008](0008-public-api-design.md)) needs to support — a
 1B-row table's direct build still takes real wall-clock time, and a
 synchronous in-call loop means an interrupted process (the caller's, or the
 one running the loop) loses everything and starts over. This amendment keeps

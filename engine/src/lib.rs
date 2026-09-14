@@ -8,7 +8,9 @@
 //! everything below into one interface so callers never stitch the
 //! primitives together themselves; [`client::Client`] is the runtime it
 //! starts, still public for embedders that want to drive it directly.
-//! Everything else in the crate is machinery these compose:
+//! [`blocking::BlockingTrellis`] wraps the same facade for callers that
+//! can't assume a `tokio` runtime on their own thread (issue #87's future
+//! FFI embedding). Everything else in the crate is machinery these compose:
 //!
 //! - [`config`] resolves a [`Config`] from CLI args + environment.
 //! - [`pool`] manages a `deadpool-postgres` connection pool and exposes the
@@ -22,6 +24,10 @@
 //!   apply path — see `docs/staging-and-claiming/README.md`.
 //! - [`defs`] parses, validates, and catalogs transform definitions (today:
 //!   the 1-1, `+`-only grammar — see `docs/decisions/0004-transform-definition-grammar.md`).
+//! - [`error_code`] is a small, stable [`error_code::ErrorCode`] taxonomy
+//!   every error type in this crate can report via a `code()` method,
+//!   independent of its own (freely growing) internal variants — see
+//!   `docs/decisions/0008-public-api-design.md`, decision 3.
 //!
 //! **Current subset**: 1-1 scalar transforms only end to end (issue #11's
 //! 1-1 slice). Aggregate/invertible-delta maintenance is not yet wired up —
@@ -37,10 +43,12 @@
 //! Quarantine, stage 06's other half, is not yet implemented.
 
 pub mod app;
+pub mod blocking;
 pub mod client;
 pub mod config;
 pub mod defs;
 pub mod error;
+pub mod error_code;
 pub mod identity;
 pub mod intake;
 pub mod migrate;
@@ -49,12 +57,15 @@ pub mod pool;
 pub mod staging;
 
 pub use app::{
-    DefinitionSummary, PoisonEntry, RelationshipSummary, Trellis, TrellisError, TrellisOptions,
+    DefinitionSummary, PoisonEntry, PoisonSample, QuarantineEntry, QuarantineState,
+    QuarantineTarget, RelationshipSummary, Trellis, TrellisError, TrellisOptions,
 };
+pub use blocking::BlockingTrellis;
 pub use client::{Client, ClientError, ClientOptions};
 pub use config::Config;
-pub use defs::{Definition, RelationshipCardinality, RelationshipDefinition};
+pub use defs::{Definition, RelationshipCardinality, RelationshipDefinition, TransformStatus};
 pub use error::Error;
+pub use error_code::ErrorCode;
 pub use identity::Identity;
 pub use migrate::migrate;
 pub use numeric::Numeric;

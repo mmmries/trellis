@@ -45,7 +45,9 @@ use tokio_postgres::NoTls;
 use tokio_postgres::config::Host;
 
 use crate::config::Config;
+use crate::defs::chunk_queue;
 use crate::defs::{self, CatalogError};
+use crate::error_code::{self, ErrorCode};
 use crate::intake::{self, IntakeConfig, IntakeError};
 use crate::pool::{Pool, quote_ident};
 use crate::staging::{
@@ -149,7 +151,9 @@ impl Default for ClientOptions {
 /// Failure modes for [`Client::start`] and [`Client::shutdown`]. Composes
 /// the crate's other error types via `From`, matching
 /// [`StagingError`]/[`IntakeError`]/[`ApplyError`]/[`crate::error::Error`]'s
-/// own hand-rolled-enum convention.
+/// own hand-rolled-enum convention. [`ClientError::code`] reports a stable,
+/// coarse [`ErrorCode`] category for this error alongside its `Display`
+/// message — see `docs/decisions/0008-public-api-design.md`, decision 3.
 #[derive(Debug)]
 pub enum ClientError {
     /// `staging_worker` was set but `source_tables` was empty — nothing to
@@ -175,6 +179,28 @@ pub enum ClientError {
     Intake(IntakeError),
     /// A failure from apply (drain_once).
     Apply(ApplyError),
+}
+
+impl ClientError {
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
+    /// decision 3). Delegates to the wrapped error's own `code()` wherever
+    /// one nests here, so the mapping composes rather than re-deriving a
+    /// category this crate already has one for.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            // `staging_worker` set with no source tables is a rejected
+            // call, same category as any other invalid-configuration error.
+            ClientError::NoSourceTables => ErrorCode::Validation,
+            ClientError::Spawn(_)
+            | ClientError::ThreadExitedBeforeReady
+            | ClientError::ThreadPanicked => ErrorCode::Internal,
+            ClientError::Config(err) => err.code(),
+            ClientError::Db(err) => error_code::classify_pg_error(err),
+            ClientError::Staging(err) => err.code(),
+            ClientError::Intake(err) => err.code(),
+            ClientError::Apply(err) => err.code(),
+        }
+    }
 }
 
 impl fmt::Display for ClientError {
@@ -440,11 +466,14 @@ async fn run(
             pool: pool.clone(),
             dsn: dsn.clone(),
             schema: config.schema().to_string(),
+            target_schema: config.target_schema().to_string(),
             claimed_by,
             wake_channel: options.wake_channel.clone(),
             drainer_window: options.drainer_window,
             heartbeat_config: options.heartbeat.clone(),
             poll_interval: options.poll_interval,
+            reclaim_ttl: options.reclaim_ttl,
+            chunk_reclaim_interval: options.maintenance_interval,
         };
         app_worker_tasks.push(tokio::spawn(app_worker_loop(
             worker_config,
@@ -690,6 +719,15 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 failed = staging::reclaim_stale(c, reclaim_ttl).await.is_err();
             }
             if !failed {
+                // Backfill chunks' own reclaim-stale sweep (docs/decisions/0007's
+                // amendment): a drain worker that died mid-chunk leaves a
+                // stale claim here, freed the same way a stale `seg_claims`
+                // row is above.
+                failed = chunk_queue::reclaim_stale_chunks(c, reclaim_ttl)
+                    .await
+                    .is_err();
+            }
+            if !failed {
                 failed = staging::retire_drained_segments(c).await.is_err();
             }
             if !failed && Instant::now() >= next_reconcile {
@@ -823,42 +861,115 @@ struct AppWorkerConfig {
     pool: Pool,
     dsn: String,
     schema: String,
+    /// Schema `defs::chunk_queue::run_claimed_chunk` renders a claimed
+    /// backfill chunk's target-table SQL against — the same value
+    /// `install_definition` was called with (`Config::target_schema`), not
+    /// `schema` above (the Trellis catalog schema). Every drain worker in a
+    /// fleet is expected to share this, exactly like `MaintenanceConfig`'s
+    /// own `target_schema` field.
+    target_schema: String,
     claimed_by: String,
     wake_channel: String,
     drainer_window: Duration,
     heartbeat_config: HeartbeatDaemonConfig,
     poll_interval: Duration,
+    /// How long a backfill-chunk claim may sit unrefreshed before it's swept
+    /// as stale — the same value [`MaintenanceConfig::reclaim_ttl`] uses for
+    /// the ring's own claims. Passed here too (issue: chunk-reclaim sweep
+    /// availability) so this sweep runs at the fleet's one configured TTL
+    /// regardless of whether this particular client also happens to run the
+    /// staging worker.
+    reclaim_ttl: Duration,
+    /// How often this app-worker task sweeps `backfill_chunks` for a stale
+    /// claim (see [`sweep_stale_chunks_if_due`]) — independent of
+    /// `ClientOptions::staging_worker`, since a stale backfill-chunk claim
+    /// isn't a CDC-intake/ring concern the way segment maintenance is (see
+    /// this field's own call site's doc comment). Reuses
+    /// `ClientOptions::maintenance_interval`'s cadence rather than inventing
+    /// a third interval knob.
+    chunk_reclaim_interval: Duration,
 }
 
+/// How many pending backfill chunks one [`app_worker_loop`] iteration claims
+/// at a time — small enough that one worker doesn't hoard a huge definition's
+/// whole queue while peers sit idle, matching the spirit of
+/// `staging::MAX_COALESCE_SEGMENTS`'s own per-tick batch cap.
+const MAX_BACKFILL_CHUNK_CLAIM: i64 = 4;
+
 /// One application-worker task: registers itself as a drainer, runs an
-/// out-of-band heartbeat daemon for its claims, then loops claiming and
-/// draining sealed batches until shutdown.
+/// out-of-band heartbeat daemon for its ring-segment claims, then loops
+/// claiming and draining sealed batches *and* claiming and executing pending
+/// direct-build backfill chunks (docs/decisions/0007's amendment) until
+/// shutdown — both kinds of claimable work share this one loop/worker pool,
+/// per `docs/decisions/0008-public-api-design.md`'s decision 1 ("it's `application_threads`
+/// that finishes transform work, backfill included").
 ///
 /// On a non-retryable error from [`staging::drain_once`] (anything
 /// `drain_once` itself gave up retrying — a fence miss and a serialization
 /// failure are already retried internally up to its own attempt cap), this
 /// releases the claim immediately (see [`staging::release`]) rather than
 /// leaving it to the reclaim TTL, then deregisters the heartbeat and
-/// continues: one bad batch never crashes the worker.
+/// continues: one bad batch never crashes the worker. A backfill chunk that
+/// fails to execute is released the same way (see [`drain_backfill_chunks`]),
+/// left for the reclaim-stale sweep or a retry by whichever worker claims it
+/// next.
 async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiver<bool>) {
     let AppWorkerConfig {
         pool,
         dsn,
         schema,
+        target_schema,
         claimed_by,
         wake_channel,
         drainer_window,
         heartbeat_config,
         poll_interval,
+        reclaim_ttl,
+        chunk_reclaim_interval,
     } = config;
 
+    // Captured before `heartbeat_config` is moved into `HeartbeatDaemon::spawn`
+    // below: `drain_backfill_chunks` needs this same cadence for its own
+    // per-chunk-claim heartbeat (see its doc comment) — a chunk write and a
+    // segment drain should heartbeat at the same margin under `reclaim_ttl`.
+    let chunk_heartbeat_interval = heartbeat_config.interval;
     let heartbeat = HeartbeatDaemon::spawn(dsn.clone(), schema.clone(), heartbeat_config);
     let mut wake = wake_listener(&dsn, &schema, &wake_channel).await.ok();
+
+    // Due immediately on the very first tick, same as `maintenance_loop`'s
+    // own `next_reconcile` — see `sweep_stale_chunks_if_due`.
+    let mut next_chunk_reclaim = Instant::now();
 
     loop {
         if *shutdown_rx.borrow() {
             break;
         }
+
+        // Backfill-chunk reclaim sweep (independent of `staging_worker` —
+        // see `AppWorkerConfig::chunk_reclaim_interval`'s doc comment): a
+        // drain-only fleet (`staging_worker: false`, `application_threads` >
+        // 0, no other client running `staging_worker: true` anywhere) would
+        // otherwise have nothing to free a crashed drain worker's claimed
+        // chunk — `maintenance_loop`'s own sweep only ever runs alongside the
+        // staging worker. Cheap/idempotent to also run this when a staging
+        // worker *is* present in the same process (its `maintenance_loop`
+        // sweeps too): a no-op UPDATE matching zero rows either way.
+        sweep_stale_chunks_if_due(
+            &pool,
+            reclaim_ttl,
+            chunk_reclaim_interval,
+            &mut next_chunk_reclaim,
+        )
+        .await;
+
+        // Claim and execute pending direct-build backfill chunks before this
+        // iteration's ring-segment work, so a fleet running only backfill (no
+        // sealed segments yet) still makes progress every tick rather than
+        // getting stuck behind the segment path's own early `continue`s
+        // below.
+        let backfill_progress =
+            drain_backfill_chunks(&pool, &claimed_by, &target_schema, chunk_heartbeat_interval)
+                .await;
 
         // `register_drainer` doubles as the liveness refresh
         // `count_live_drainers` reads below (see its own doc comment), so it
@@ -889,14 +1000,14 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
 
         let seg_seqs = match seg_seqs {
             Ok(seqs) if !seqs.is_empty() => seqs,
-            Ok(_) => {
-                if wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await {
-                    break;
-                }
-                continue;
-            }
-            Err(_) => {
-                if wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await {
+            Ok(_) | Err(_) => {
+                // No claimable segment this tick (or the lookup itself
+                // failed): only actually wait if the backfill-chunk claim
+                // above also made no progress — otherwise loop straight back
+                // around to claim more chunks without an idle wait.
+                if !backfill_progress
+                    && wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await
+                {
                     break;
                 }
                 continue;
@@ -948,11 +1059,96 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         //     peer finishes.
         // Only `Ok(Some(_))` re-loops immediately, to grab the next batch
         // promptly. The poll floor (or a wake/shutdown) bounds the idle wait.
-        let made_progress = matches!(outcome, Ok(Some(_)));
+        let made_progress = matches!(outcome, Ok(Some(_))) || backfill_progress;
         if !made_progress && wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await {
             break;
         }
     }
+}
+
+/// Runs [`chunk_queue::reclaim_stale_chunks`] if `interval` has elapsed since
+/// `next_due` (mutated in place to the next due time, mirroring
+/// `maintenance_loop`'s own `next_reconcile` throttle), else does nothing.
+///
+/// Gap this closes (public-api-design review): `reclaim_stale_chunks` used to
+/// only ever run from [`maintenance_loop`], which is only spawned `if
+/// options.staging_worker`. A drain-only client (`staging_worker: false`,
+/// `application_threads > 0` — a normal, documented fleet topology) had no
+/// self-healing for a crashed drain worker's claimed chunk: it would sit
+/// stuck at `Backfilling` forever unless some *other* client instance in the
+/// fleet happened to also run with `staging_worker: true`. Unlike segment
+/// maintenance (legitimately tied to owning the replication slot), reclaiming
+/// a stale backfill-chunk claim has nothing to do with CDC intake, so it's
+/// wired here instead — into the one loop every client with
+/// `application_threads > 0` runs regardless of `staging_worker`.
+async fn sweep_stale_chunks_if_due(
+    pool: &Pool,
+    reclaim_ttl: Duration,
+    interval: Duration,
+    next_due: &mut Instant,
+) {
+    if Instant::now() < *next_due {
+        return;
+    }
+    if let Ok(client) = pool.get().await {
+        let _ = chunk_queue::reclaim_stale_chunks(&**client, reclaim_ttl).await;
+    }
+    *next_due = Instant::now() + interval;
+}
+
+/// Claims up to [`MAX_BACKFILL_CHUNK_CLAIM`] pending direct-build backfill
+/// chunks (`defs::chunk_queue`, docs/decisions/0007's amendment) and executes
+/// each one, marking it done (flipping its definition `backfilling` ->
+/// `live` once every chunk is done — see `chunk_queue::finish_chunk`) or,
+/// on a write error, releasing the claim immediately for the reclaim-stale
+/// sweep or another worker to retry — the same "release on error rather than
+/// wait out the TTL" discipline [`app_worker_loop`]'s segment path uses.
+/// Returns whether it claimed anything, so the caller's own idle-wait
+/// decision treats a tick that only did backfill work as progress too.
+///
+/// `heartbeat_interval` is threaded straight through to
+/// [`chunk_queue::run_claimed_chunk`] — this app-worker's own
+/// [`HeartbeatDaemonConfig::interval`] (the same cadence its segment claims
+/// heartbeat at), so a chunk write outliving `reclaim_ttl` isn't falsely
+/// reclaimed mid-write (see `chunk_queue::run_claimed_chunk`'s doc comment).
+async fn drain_backfill_chunks(
+    pool: &Pool,
+    claimed_by: &str,
+    target_schema: &str,
+    heartbeat_interval: Duration,
+) -> bool {
+    let claimed = match pool.get().await {
+        Ok(client) => {
+            chunk_queue::claim_chunks(&**client, claimed_by, MAX_BACKFILL_CHUNK_CLAIM).await
+        }
+        Err(err) => Err(err.into()),
+    };
+    let claimed = match claimed {
+        Ok(chunks) if !chunks.is_empty() => chunks,
+        _ => return false,
+    };
+
+    for chunk in &claimed {
+        match chunk_queue::run_claimed_chunk(
+            pool,
+            chunk,
+            target_schema,
+            claimed_by,
+            heartbeat_interval,
+        )
+        .await
+        {
+            Ok(()) => {
+                let _ = chunk_queue::finish_chunk(pool, chunk, claimed_by).await;
+            }
+            Err(_) => {
+                if let Ok(client) = pool.get().await {
+                    let _ = chunk_queue::release_chunk(&**client, chunk.id, claimed_by).await;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Waits for a wake notification, the poll-interval floor, or shutdown —
@@ -1027,4 +1223,34 @@ async fn wake_listener(
         _client: client,
         _task: task,
     })
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    #[test]
+    fn no_source_tables_is_validation() {
+        assert_eq!(ClientError::NoSourceTables.code(), ErrorCode::Validation);
+    }
+
+    #[test]
+    fn thread_panicked_is_internal() {
+        assert_eq!(ClientError::ThreadPanicked.code(), ErrorCode::Internal);
+    }
+
+    /// [`ClientError::Config`] must delegate to [`crate::error::Error::code`]
+    /// rather than hardcoding a category — this is the same nested-error a
+    /// wrapped [`crate::error::Error::IncompatibleInstance`] should still
+    /// report as [`ErrorCode::Conflict`] through the wrapper, not whatever a
+    /// blanket "Config variant" category would be.
+    #[test]
+    fn config_delegates_to_the_wrapped_engine_error() {
+        let inner = crate::error::Error::IncompatibleInstance("mismatched marker".to_string());
+        let expected = inner.code();
+        let wrapped = ClientError::Config(inner);
+
+        assert_eq!(wrapped.code(), expected);
+        assert_eq!(wrapped.code(), ErrorCode::Conflict);
+    }
 }

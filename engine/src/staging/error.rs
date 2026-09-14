@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use tokio_postgres::types::PgLsn;
 
+use crate::error_code::{self, ErrorCode};
+
 /// Failure modes specific to the staging ring (issue #6): resolving the
 /// active ring slot, appending, and the session guards a producer must
 /// hold before it may append.
@@ -60,6 +62,34 @@ pub enum StagingError {
     ConvergenceTimeout { token: PgLsn, waited: Duration },
     /// A direct Postgres protocol/query error.
     Db(tokio_postgres::Error),
+}
+
+impl StagingError {
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
+    /// decision 3). [`StagingError::ProducerAlreadyRunning`] is the one
+    /// variant that's a genuine collision with existing state (a singleton
+    /// lock already held) -> [`ErrorCode::Conflict`]; everything else here
+    /// is either an internal ring-mechanics condition (a race lost, a full
+    /// slot, a blocked seal gate, an unfenced segment, a convergence
+    /// timeout, an invalid slot index) that a caller can't act on any
+    /// differently than "internal failure, maybe retry", or a Postgres
+    /// error classified generically.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            StagingError::ProducerAlreadyRunning => ErrorCode::Conflict,
+            // A misconfigured connection's `synchronous_commit` setting is
+            // an environment precondition not met, same category as other
+            // config-rejection errors.
+            StagingError::SynchronousCommitOff => ErrorCode::Validation,
+            StagingError::InvalidRingSlot(_)
+            | StagingError::RingFull { .. }
+            | StagingError::SealGateBlocked
+            | StagingError::Raced
+            | StagingError::UnfencedSealedSegment { .. }
+            | StagingError::ConvergenceTimeout { .. } => ErrorCode::Internal,
+            StagingError::Db(err) => error_code::classify_pg_error(err),
+        }
+    }
 }
 
 impl fmt::Display for StagingError {

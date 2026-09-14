@@ -22,22 +22,26 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use crate::error_code::{self, ErrorCode};
 use crate::pool::Pool;
 
-use super::ast::{KeySpace, RelationshipDef, TransformDef, ValueType};
+use super::ast::{Expr, KeySpace, RelationshipDef, TransformDef, ValueType};
 use super::backfill::{self, BackfillError};
+use super::chunk_queue;
 use super::ddl::{self, DdlError};
 use super::error::ParseError;
 use super::model::{
     Definition, EdgeKind, NodeKind, RelationshipCardinality, RelationshipDefinition, SchemaEdge,
-    SchemaNode,
+    SchemaNode, TransformStatus,
 };
 use super::parser::{parse, parse_relationship};
 use super::validate::{
     RelationshipTypeMismatch, RelationshipWarning, ResolvedRelationship, ValidationError, validate,
 };
 
-/// Why creating or reading a definition failed.
+/// Why creating or reading a definition failed. [`CatalogError::code`]
+/// reports a stable, coarse [`ErrorCode`] category for this error alongside
+/// its `Display` message — see `docs/decisions/0008-public-api-design.md`, decision 3.
 #[derive(Debug)]
 pub enum CatalogError {
     /// The source text failed to parse (issue #22's grammar).
@@ -80,6 +84,34 @@ pub enum CatalogError {
     /// [`BackfillError::Unsupported`] — an `Unsupported` shape instead falls
     /// back to the ring ([`create_definition`]) rather than surfacing here.
     DirectBackfill(BackfillError),
+}
+
+impl CatalogError {
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
+    /// decision 3). Delegates to the wrapped error's own `code()` wherever
+    /// one nests here ([`CatalogError::Parse`], [`CatalogError::Validate`],
+    /// [`CatalogError::Pool`], [`CatalogError::Backfill`],
+    /// [`CatalogError::ReplicaIdentityRequired`], [`CatalogError::Ddl`],
+    /// [`CatalogError::DirectBackfill`]) rather than hardcoding one category
+    /// for a whole variant — so, for instance, a
+    /// [`CatalogError::Validate`]`(`[`ValidationError::DuplicateRelationshipName`]`)`
+    /// still reports [`ErrorCode::Conflict`], not [`ErrorCode::Validation`].
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            CatalogError::Parse(err) => err.code(),
+            CatalogError::Validate(err) => err.code(),
+            CatalogError::Db(err) => error_code::classify_pg_error(err),
+            CatalogError::Pool(err) => err.code(),
+            // Persisted data corruption — written by something other than
+            // this module's own writer.
+            CatalogError::UnknownValueType { .. } => ErrorCode::Internal,
+            CatalogError::Backfill(err) => err.code(),
+            CatalogError::SourceTableNotFound(_) => ErrorCode::NotFound,
+            CatalogError::ReplicaIdentityRequired(err) => err.code(),
+            CatalogError::Ddl(err) => err.code(),
+            CatalogError::DirectBackfill(err) => err.code(),
+        }
+    }
 }
 
 impl fmt::Display for CatalogError {
@@ -168,7 +200,20 @@ pub async fn create_definition(
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<Definition, CatalogError> {
-    create_definition_inner(pool, source_text, source_columns, true).await
+    // `Live`, not `Backfilling`: by the time this call returns, the source
+    // table's pre-existing rows are already enumerated into the ring in the
+    // very same transaction the row is inserted in (see `create_definition_inner`),
+    // so there's no separate, awaited step for a caller to observe this row
+    // sitting through first. Only `install_definition`'s direct-build path
+    // has such a step — see its own `TransformStatus::Backfilling` use.
+    create_definition_inner(
+        pool,
+        source_text,
+        source_columns,
+        true,
+        TransformStatus::Live,
+    )
+    .await
 }
 
 /// Like [`create_definition`], but stages *no* ring-enumeration backfill: the
@@ -185,7 +230,14 @@ pub async fn create_definition_without_backfill(
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<Definition, CatalogError> {
-    create_definition_inner(pool, source_text, source_columns, false).await
+    create_definition_inner(
+        pool,
+        source_text,
+        source_columns,
+        false,
+        TransformStatus::Live,
+    )
+    .await
 }
 
 /// The front door real callers use to stand up a new definition (issue #63
@@ -197,13 +249,61 @@ pub async fn create_definition_without_backfill(
 /// Target-table creation always runs first, unconditionally — before either
 /// backfill path is attempted — because neither `backfill_definition` nor
 /// `create_definition` creates it themselves; both assume it already exists
-/// (see their own doc comments). Doing it once here, ahead of both branches,
-/// preserves the fast path's build/CDC fence: the table exists and is fully
-/// built by the direct backfill *before* the definition is ever persisted to
-/// the catalog via [`create_definition_without_backfill`], so nothing can
-/// fold a CDC delta onto this target before the build has run. The ring
-/// fallback branch also benefits from the table already existing, though it
-/// has no comparable fence requirement of its own.
+/// (see their own doc comments).
+///
+/// **Status lifecycle (issue #55).** Once the target exists and the coverage
+/// plan is captured, the definition row is persisted *speculatively* with
+/// [`TransformStatus::Backfilling`] — before [`backfill::backfill_definition`]
+/// runs, not after — so a status-polling caller (the pattern issue #82's
+/// public API design settles on) can observe the row the moment it exists
+/// rather than only once its backfill has already finished. Three things can
+/// happen next:
+///
+/// * The direct build succeeds: the coverage plan is committed and the row
+///   is flipped to [`TransformStatus::Live`] in place (same id, same
+///   `target_table`).
+/// * The direct build reports [`BackfillError::Unsupported`] (this shape
+///   can't be rendered directly): the speculative row is deleted and
+///   [`create_definition`] runs exactly as it did before this row existed,
+///   inserting its own — now `Live` — row via the ring path.  Deleting first
+///   frees `target_table`'s uniqueness constraint back up; re-running
+///   [`resolve_node_in_txn`]/[`persist_edge_in_txn`]/the `source_table_versions`
+///   bump for the same source/target pair is harmless — nodes upsert, edges
+///   dedupe on conflict, and an extra version bump only costs a downstream
+///   drain worker a routine, self-healing version-fence retry (see
+///   `staging::apply::ApplyError::VersionFenceMiss`).
+/// * The direct build fails for a real reason: the speculative row is
+///   deleted and the error propagates, matching this function's existing
+///   discipline of not rolling back the target-table DDL on failure either —
+///   a failed install leaves no catalog row and an unbuilt (or partially
+///   built), uncatalogued target table behind either way.
+///
+/// **Backgrounding (docs/decisions/0007's amendment).** A plain
+/// (non-relationship) `KeySpace::OneToOne` definition's backfill is no longer
+/// run in-call at all: once the speculative `Backfilling` row exists, its
+/// PK-range chunk boundaries are enumerated and persisted as durable
+/// `backfill_chunks` work items (`chunk_queue::enqueue_one_to_one`), and this
+/// function returns *before a single row of the target is built* — a running
+/// drain worker (`engine::client`'s `app_worker_loop`) claims and executes
+/// those chunks independently, flipping the definition to
+/// [`TransformStatus::Live`] once every one is done
+/// (`chunk_queue::finish_chunk` / [`complete_direct_backfill`]). A
+/// relationship-enriched 1-1 definition or an aggregate definition still runs
+/// its (still fully synchronous) direct build in-call exactly as before —
+/// see [`super::backfill`]'s module docs for why those two shapes aren't
+/// chunked into the durable queue yet.
+///
+/// **The CDC race this closes.** Before this change, persisting the row (and
+/// its `schema_nodes`/`schema_edges`) before the direct build completed meant
+/// a running drain worker's [`transforms_for_source`] could, in principle,
+/// observe this transform and attempt to apply a live CDC delta against the
+/// target while the build was still writing it — corrupting a field an
+/// incremental accumulator (e.g. `AVG`) folds against an existing baseline,
+/// not just racing harmlessly. [`dependents_of`]/[`transforms_for_source`]
+/// now filter to `status = 'live'`, so no build path (backgrounded or still
+/// synchronous) can have a delta folded into it while non-`live` — see
+/// [`complete_direct_backfill`] for how a delta skipped during that window is
+/// recovered rather than lost once the definition does go live.
 pub async fn install_definition(
     pool: &Pool,
     source_text: &str,
@@ -228,26 +328,177 @@ pub async fn install_definition(
         }
     }
 
+    if let KeySpace::OneToOne = &def.key_space
+        && !backfill::uses_relationships(&def)
+    {
+        return install_plain_one_to_one(pool, source_text, source_columns, &def).await;
+    }
+
     // Issue #79 (bug B): capture each table's coverage fence *before* the
     // build reads it. The fence must precede every build read — a fence taken
     // after the build could vouch for a row the build never folded (see
     // `plan_direct_backfill_coverage` / `capture_backfill_coverage_fence`).
     let coverage_plan = plan_direct_backfill_coverage(pool, &def).await?;
 
+    // Issue #55: persist *before* running the backfill, not after — see this
+    // function's doc comment for the full status-lifecycle rationale and the
+    // cleanup story for each of the three outcomes below. No ring
+    // enumeration (`backfill: false`): the direct build below is what's about
+    // to fold the source's pre-existing rows in.
+    let mut definition = create_definition_inner(
+        pool,
+        source_text,
+        source_columns,
+        false,
+        TransformStatus::Backfilling,
+    )
+    .await?;
+
     match backfill::backfill_definition(pool, &def, target_schema, source_columns).await {
         Ok(()) => {
             // The build folded each planned table's pre-build contents into the
-            // target. Persist that coverage *before* the definition is
-            // persisted, so the redundant publication-join catch-up enumeration
-            // of those tables can be skipped.
+            // target. Persist that coverage *before* the definition is marked
+            // live, so the redundant publication-join catch-up enumeration of
+            // those tables can be skipped.
             commit_direct_backfill_coverage(pool, &coverage_plan).await?;
-            create_definition_without_backfill(pool, source_text, source_columns).await
+            mark_definition_status(pool, definition.id, TransformStatus::Live).await?;
+            definition.status = TransformStatus::Live;
+            Ok(definition)
         }
         Err(BackfillError::Unsupported(_)) => {
+            // This shape can't be built directly after all — discard the
+            // speculative row (see doc comment: safe, since the ring path
+            // below recreates every one of its side effects idempotently)
+            // and fall back exactly as if the speculative row never existed.
+            delete_definition_row(pool, definition.id).await?;
             create_definition(pool, source_text, source_columns).await
         }
-        Err(err) => Err(CatalogError::DirectBackfill(err)),
+        Err(err) => {
+            delete_definition_row(pool, definition.id).await?;
+            Err(CatalogError::DirectBackfill(err))
+        }
     }
+}
+
+/// The plain (non-relationship) `KeySpace::OneToOne` half of
+/// [`install_definition`]'s dispatch (see its doc comment): persists the
+/// speculative `Backfilling` row exactly as the still-synchronous shapes do,
+/// then either enumerates its chunk work into the durable queue
+/// (`chunk_queue::enqueue_one_to_one`) or — a plain 1-1 definition can still
+/// be `Unsupported` (a cyclic cross-field-alias chain, or a substitution
+/// output past [`backfill::MAX_SUBSTITUTED_NODES`]) — falls back to the ring
+/// exactly like the synchronous path does. `def.target`'s table already
+/// exists (the caller's DDL step); no coverage-fence bookkeeping runs here —
+/// see [`chunk_queue::enqueue_one_to_one`]'s doc comment for why this path
+/// doesn't bother recording `backfill_coverage` for its own source table (a
+/// pure performance optimization elsewhere, never a correctness requirement).
+async fn install_plain_one_to_one(
+    pool: &Pool,
+    source_text: &str,
+    source_columns: &HashMap<String, ValueType>,
+    def: &TransformDef,
+) -> Result<Definition, CatalogError> {
+    let mut definition = create_definition_inner(
+        pool,
+        source_text,
+        source_columns,
+        false,
+        TransformStatus::Backfilling,
+    )
+    .await?;
+
+    match chunk_queue::enqueue_one_to_one(pool, definition.id, def).await {
+        Ok(status) => {
+            definition.status = status;
+            Ok(definition)
+        }
+        Err(BackfillError::Unsupported(_)) => {
+            delete_definition_row(pool, definition.id).await?;
+            create_definition(pool, source_text, source_columns).await
+        }
+        Err(err) => {
+            delete_definition_row(pool, definition.id).await?;
+            Err(CatalogError::DirectBackfill(err))
+        }
+    }
+}
+
+/// Flips an already-persisted definition row to `status` in place (issue
+/// #55) — used by [`install_definition`] once its direct build finishes.
+async fn mark_definition_status(
+    pool: &Pool,
+    id: i64,
+    status: TransformStatus,
+) -> Result<(), CatalogError> {
+    let client = pool.get().await?;
+    client
+        .execute(
+            "update transform_definitions set status = $1 where id = $2",
+            &[&status.as_str(), &id],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Flips `definition_id` from [`TransformStatus::Backfilling`] to
+/// [`TransformStatus::Live`] and parks a catch-up marker for its source table
+/// — the "every chunk done" completion event
+/// `chunk_queue::finish_chunk` calls once every `backfill_chunks` row for
+/// `definition_id` is done (docs/decisions/0007's amendment). Runs inside the
+/// caller's transaction, which must already hold a `for update` lock on
+/// `definition_id`'s `transform_definitions` row (see `finish_chunk`) — that
+/// lock is what makes two workers finishing different chunks of the same
+/// definition near-simultaneously unable to race this completion in either
+/// direction (both flipping it, or neither).
+///
+/// The parked marker (reusing the exact `pending_backfill` mechanism the
+/// ring-fallback path already relies on — see
+/// [`crate::intake::publication::park_backfill_catchup`]) is what makes
+/// excluding a non-`live` definition from [`dependents_of`]/[`transforms_for_source`]
+/// safe rather than lossy: any CDC delta for this source table that arrived
+/// while this definition sat `backfilling` was never folded into its target
+/// (the exclusion), but this marker's later discharge re-derives the target
+/// from current source state, folding that delta in after all.
+///
+/// Only ever called for the plain (non-relationship) 1-1 chunk-queue path
+/// today — a relationship-enriched 1-1 or aggregate definition still flips
+/// `Backfilling` -> `Live` synchronously inside [`install_definition`] itself
+/// via [`mark_definition_status`], since neither is chunked into
+/// `backfill_chunks` (see this crate's `defs::backfill` module docs on why).
+pub(crate) async fn complete_direct_backfill(
+    txn: &tokio_postgres::Transaction<'_>,
+    definition_id: i64,
+) -> Result<(), CatalogError> {
+    txn.execute(
+        "update transform_definitions set status = $1 where id = $2",
+        &[&TransformStatus::Live.as_str(), &definition_id],
+    )
+    .await?;
+
+    let source_table: String = txn
+        .query_one(
+            "select source_table from transform_definitions where id = $1",
+            &[&definition_id],
+        )
+        .await?
+        .get(0);
+    let schema = resolve_source_schema_in_txn(txn, &source_table).await?;
+    let qualified = crate::intake::publication::qualify(&schema, &source_table)?;
+    crate::intake::publication::park_backfill_catchup(txn, &qualified).await?;
+    Ok(())
+}
+
+/// Deletes a definition row by id (issue #55) — used by [`install_definition`]
+/// to discard the speculative `Backfilling` row it persists ahead of its
+/// direct build when that build doesn't pan out (falls back to the ring, or
+/// fails outright). Only ever targets a row this same call just inserted, so
+/// there's nothing else in the catalog yet that could reference it.
+async fn delete_definition_row(pool: &Pool, id: i64) -> Result<(), CatalogError> {
+    let client = pool.get().await?;
+    client
+        .execute("delete from transform_definitions where id = $1", &[&id])
+        .await?;
+    Ok(())
 }
 
 /// What to do with one table's coverage once a direct build succeeds: either
@@ -364,6 +615,7 @@ async fn create_definition_inner(
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
     backfill: bool,
+    status: TransformStatus,
 ) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse(source_text)?;
     // Issue #40: enrichment fields (`<rel>.<col>`) are validated against
@@ -455,11 +707,13 @@ async fn create_definition_inner(
 
     let (type_keys, type_vals) = encode_type_map(source_columns);
 
+    let status_text = status.as_str();
+
     let id: i64 = txn
         .query_one(
             "insert into transform_definitions
-                (target_table, source_table, source_version, definition_text, source_columns)
-             values ($1, $2, $3, $4, jsonb_object($5::text[], $6::text[]))
+                (target_table, source_table, source_version, definition_text, source_columns, status)
+             values ($1, $2, $3, $4, jsonb_object($5::text[], $6::text[]), $7)
              returning id",
             &[
                 &def.target,
@@ -468,6 +722,7 @@ async fn create_definition_inner(
                 &source_text,
                 &type_keys,
                 &type_vals,
+                &status_text,
             ],
         )
         .await?
@@ -480,6 +735,7 @@ async fn create_definition_inner(
         source_version: version,
         def,
         source_columns: source_columns.clone(),
+        status,
     })
 }
 
@@ -1434,6 +1690,7 @@ fn encode_type_map(source_columns: &HashMap<String, ValueType>) -> (Vec<&str>, V
 struct PendingDefinition {
     source_version: i64,
     text: String,
+    status: TransformStatus,
     source_columns: HashMap<String, ValueType>,
 }
 
@@ -1453,6 +1710,22 @@ struct PendingDefinition {
 /// per definition. The `left join` (rather than an inner join/`cross join
 /// lateral`) matters: a definition whose `source_columns` is `{}` must still
 /// come back with zero entries, not disappear from the result entirely.
+///
+/// **`status = 'live'` only** (the public API design's ADR-0007 amendment,
+/// closing the CDC race commit 1fa8570 reopened): a `waiting_to_backfill`/
+/// `backfilling`/`quarantined` definition's target may not yet reflect every
+/// pre-existing source row (the direct-build chunk queue, or a
+/// still-in-flight ring enumeration, hasn't necessarily finished), so a live
+/// CDC delta folded into it now — via [`transforms_for_source`], the apply
+/// path's read of this function — could permanently corrupt a value an
+/// incremental accumulator (e.g. `AVG`) computes against a baseline. Excluding
+/// non-`live` rows here means the apply path simply never attempts them; the
+/// delta is not lost, though — [`crate::intake::publication::run_pending_backfills`]'s
+/// discharge (parked via the same `pending_backfill` marker the ring-fallback
+/// path already relies on, inserted when a definition flips to
+/// [`TransformStatus::Live`] — see `chunk_queue::complete_direct_backfill`)
+/// re-derives the definition's target from current source state once it goes
+/// live, folding in anything skipped while it wasn't.
 pub async fn dependents_of(
     pool: &Pool,
     node_table: &str,
@@ -1461,13 +1734,13 @@ pub async fn dependents_of(
     let client = pool.get().await?;
     let rows = client
         .query(
-            "select t.id, t.source_version, t.definition_text, e.key, e.value
+            "select t.id, t.source_version, t.definition_text, t.status, e.key, e.value
              from schema_nodes from_node
              join schema_edges se on se.from_node_id = from_node.id and se.kind = $2
              join schema_nodes to_node on to_node.id = se.to_node_id
              join transform_definitions t on t.target_table = to_node.table_name
              left join lateral jsonb_each_text(t.source_columns) e on true
-             where from_node.table_name = $1
+             where from_node.table_name = $1 and t.status = 'live'
              order by t.id",
             &[&node_table, &kind.as_str()],
         )
@@ -1480,14 +1753,19 @@ pub async fn dependents_of(
 
     for row in rows {
         let id: i64 = row.get(0);
-        let key: Option<String> = row.get(3);
-        let value: Option<String> = row.get(4);
+        let key: Option<String> = row.get(4);
+        let value: Option<String> = row.get(5);
 
         let pending = by_id.entry(id).or_insert_with(|| {
             order.push(id);
+            let status_text: String = row.get(3);
+            let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+                panic!("transform_definitions.status held unrecognized value '{status_text}'")
+            });
             PendingDefinition {
                 source_version: row.get(1),
                 text: row.get(2),
+                status,
                 source_columns: HashMap::new(),
             }
         });
@@ -1518,6 +1796,7 @@ pub async fn dependents_of(
             source_version: pending.source_version,
             def,
             source_columns: pending.source_columns,
+            status: pending.status,
         });
     }
     Ok(result)
@@ -1595,4 +1874,323 @@ pub async fn source_table_version(
         )
         .await?;
     Ok(row.map(|row| row.get(0)))
+}
+
+/// Reads back one definition by its catalog id, re-parsing `definition_text`
+/// exactly like every other read path in this module — used by
+/// `chunk_queue`'s claim loop to reconstruct the [`super::ast::TransformDef`]
+/// a claimed `backfill_chunks` row's `definition_id` names, so it can render
+/// that chunk's write SQL. Returns `None` for an id nothing has ever
+/// inserted (or already deleted, e.g. a definition dropped mid-backfill —
+/// not exposed by any API yet, but `backfill_chunks`' `on delete cascade`
+/// means this can legitimately come back empty for a stale claim).
+pub(crate) async fn definition_by_id(
+    pool: &Pool,
+    id: i64,
+) -> Result<Option<Definition>, CatalogError> {
+    let client = pool.get().await?;
+    // `left join lateral jsonb_each_text(...)` — same "decode JSON via SQL, no
+    // serde_json dependency" convention `dependents_of` uses, just for one
+    // row instead of a batch.
+    let rows = client
+        .query(
+            "select t.source_version, t.definition_text, t.status, e.key, e.value \
+             from transform_definitions t \
+             left join lateral jsonb_each_text(t.source_columns) e on true \
+             where t.id = $1",
+            &[&id],
+        )
+        .await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let source_version: i64 = rows[0].get(0);
+    let text: String = rows[0].get(1);
+    let status_text: String = rows[0].get(2);
+    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+        panic!("transform_definitions.status held unrecognized value '{status_text}'")
+    });
+    let def = parse(&text)?;
+
+    let mut source_columns = HashMap::new();
+    for row in &rows {
+        let key: Option<String> = row.get(3);
+        let value: Option<String> = row.get(4);
+        if let (Some(key), Some(value)) = (key, value) {
+            let value_type = match value.as_str() {
+                "numeric" => ValueType::Numeric,
+                "text" => ValueType::Text,
+                "boolean" => ValueType::Boolean,
+                "uuid" => ValueType::Uuid,
+                other => {
+                    return Err(CatalogError::UnknownValueType {
+                        column: key,
+                        text: other.to_string(),
+                    });
+                }
+            };
+            source_columns.insert(key, value_type);
+        }
+    }
+
+    Ok(Some(Definition {
+        id,
+        source_version,
+        def,
+        source_columns,
+        status,
+    }))
+}
+
+/// Reads back one definition by its target table name — [`definition_by_id`]
+/// keyed the other way, for callers that only have the address a `Trellis`
+/// caller would use (`docs/decisions/0003-quarantine-storage-and-api.md`'s
+/// amendment: a quarantine target is `transform` or `transform.column`,
+/// where `transform` is this crate's `target_table`). Used by
+/// `staging::quarantine`'s column-resume path to reconstruct the
+/// [`super::ast::TransformDef`] whose column it's re-deriving.
+pub async fn definition_by_target(
+    pool: &Pool,
+    target_table: &str,
+) -> Result<Option<Definition>, CatalogError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "select t.id, t.source_version, t.definition_text, t.status, e.key, e.value \
+             from transform_definitions t \
+             left join lateral jsonb_each_text(t.source_columns) e on true \
+             where t.target_table = $1",
+            &[&target_table],
+        )
+        .await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let id: i64 = rows[0].get(0);
+    let source_version: i64 = rows[0].get(1);
+    let text: String = rows[0].get(2);
+    let status_text: String = rows[0].get(3);
+    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+        panic!("transform_definitions.status held unrecognized value '{status_text}'")
+    });
+    let def = parse(&text)?;
+
+    let mut source_columns = HashMap::new();
+    for row in &rows {
+        let key: Option<String> = row.get(4);
+        let value: Option<String> = row.get(5);
+        if let (Some(key), Some(value)) = (key, value) {
+            let value_type = match value.as_str() {
+                "numeric" => ValueType::Numeric,
+                "text" => ValueType::Text,
+                "boolean" => ValueType::Boolean,
+                "uuid" => ValueType::Uuid,
+                other => {
+                    return Err(CatalogError::UnknownValueType {
+                        column: key,
+                        text: other.to_string(),
+                    });
+                }
+            };
+            source_columns.insert(key, value_type);
+        }
+    }
+
+    Ok(Some(Definition {
+        id,
+        source_version,
+        def,
+        source_columns,
+        status,
+    }))
+}
+
+/// Every `(downstream_target_table, downstream_field_name)` pair whose
+/// calculated-field expression reads `(upstream_table, upstream_column)` —
+/// either directly (a chained 1-1 transform whose `FROM` *is*
+/// `upstream_table`, referencing the column by its bare name) or through a
+/// declared relationship whose `to_table` is `upstream_table` (a
+/// relationship-enriched field's `<rel>.<column>` path). This is column-level
+/// lineage, deliberately *not* [`dependents_of`]'s table-level
+/// `schema_edges` walk: that graph answers "does transform X read table Y at
+/// all," which is too coarse for ADR-0003's amendment — cascading a paused
+/// *column* must not pause a downstream transform's *other* fields that don't
+/// actually reference it. Scanning every definition's own field expressions
+/// (rather than a persisted edge) is what makes this precise.
+///
+/// Direct (one-hop) dependents only; `staging::quarantine`'s cascade walks
+/// this transitively itself, relying on the same cycle-freedom
+/// `docs/transforms.md#chaining-and-cycle-detection` guarantees for the
+/// table-level graph (a column-level reference can only exist where a
+/// table-level dependency edge already does, so the same DAG property
+/// applies).
+///
+/// Filtered to [`KeySpace::OneToOne`] downstream definitions only — column-
+/// level pause/cascade/resume is explicitly scoped to the 1-1 tier (see this
+/// module's callers in `staging::quarantine` and that module's "Column-level
+/// fuse" section doc comment: `staging::apply_aggregate`'s incremental-delta
+/// path has no notion of `column_status` at all). Without this filter, a
+/// downstream [`KeySpace::Aggregate`] transform whose field happens to read a
+/// just-paused upstream column would get a `column_status` row cascaded onto
+/// it that nothing in the aggregate write path ever consults or clears, and
+/// that `resume_column`'s cascade walk would later try (and fail) to
+/// recompute via `staging::quarantine::recompute_column`'s single-row 1-1
+/// recompute path.
+pub(crate) async fn column_dependents(
+    pool: &Pool,
+    upstream_table: &str,
+    upstream_column: &str,
+) -> Result<Vec<(String, String)>, CatalogError> {
+    let client = pool.get().await?;
+    let def_rows = client
+        .query(
+            "select target_table, source_table, definition_text from transform_definitions",
+            &[],
+        )
+        .await?;
+    let rel_rows = client
+        .query(
+            "select from_table, name, to_table from relationship_definitions",
+            &[],
+        )
+        .await?;
+
+    let mut rel_to_table: HashMap<(String, String), String> = HashMap::new();
+    for row in rel_rows {
+        let from_table: String = row.get(0);
+        let name: String = row.get(1);
+        let to_table: String = row.get(2);
+        rel_to_table.insert((from_table, name), to_table);
+    }
+
+    let mut deps = Vec::new();
+    for row in def_rows {
+        let target: String = row.get(0);
+        let source: String = row.get(1);
+        let text: String = row.get(2);
+        // A definition already persisted here is expected to always re-parse
+        // (the same assumption every other read path in this module makes);
+        // skip rather than fail this best-effort lineage scan on the
+        // unexpected chance it doesn't, rather than let one bad row prevent
+        // cascading a pause to every other, healthy dependent.
+        let Ok(def) = parse(&text) else { continue };
+        if !matches!(def.key_space, KeySpace::OneToOne) {
+            continue;
+        }
+        for field in &def.fields {
+            if expr_references_column(
+                &field.expr,
+                &source,
+                upstream_table,
+                upstream_column,
+                &rel_to_table,
+            ) {
+                deps.push((target.clone(), field.name.clone()));
+            }
+        }
+    }
+    Ok(deps)
+}
+
+/// Whether `expr` (one calculated field's expression, belonging to a
+/// definition whose `FROM` is `def_source`) reads `(upstream_table,
+/// upstream_column)` — see [`column_dependents`].
+fn expr_references_column(
+    expr: &Expr,
+    def_source: &str,
+    upstream_table: &str,
+    upstream_column: &str,
+    rel_to_table: &HashMap<(String, String), String>,
+) -> bool {
+    match expr {
+        Expr::Column(name) => def_source == upstream_table && name == upstream_column,
+        Expr::RelationshipPath { rel, column } => {
+            column == upstream_column
+                && rel_to_table
+                    .get(&(def_source.to_string(), rel.clone()))
+                    .is_some_and(|to_table| to_table == upstream_table)
+        }
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            expr_references_column(
+                lhs,
+                def_source,
+                upstream_table,
+                upstream_column,
+                rel_to_table,
+            ) || expr_references_column(
+                rhs,
+                def_source,
+                upstream_table,
+                upstream_column,
+                rel_to_table,
+            )
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(|arg| {
+            expr_references_column(
+                arg,
+                def_source,
+                upstream_table,
+                upstream_column,
+                rel_to_table,
+            )
+        }),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    #[test]
+    fn source_table_not_found_is_not_found() {
+        assert_eq!(
+            CatalogError::SourceTableNotFound("widgets".to_string()).code(),
+            ErrorCode::NotFound
+        );
+    }
+
+    #[test]
+    fn unknown_value_type_is_internal() {
+        assert_eq!(
+            CatalogError::UnknownValueType {
+                column: "price".to_string(),
+                text: "money".to_string(),
+            }
+            .code(),
+            ErrorCode::Internal
+        );
+    }
+
+    /// [`CatalogError::Parse`] must delegate to [`ParseError::code`] rather
+    /// than hardcoding a category.
+    #[test]
+    fn parse_delegates_to_the_wrapped_parse_error() {
+        let inner = ParseError::UnterminatedString;
+        let expected = inner.code();
+        let wrapped = CatalogError::Parse(inner);
+
+        assert_eq!(wrapped.code(), expected);
+        assert_eq!(wrapped.code(), ErrorCode::Parse);
+    }
+
+    /// [`CatalogError::Validate`] must delegate to [`ValidationError::code`]
+    /// rather than hardcoding a category — [`ValidationError::DuplicateRelationshipName`]
+    /// is the one variant that isn't plain [`ErrorCode::Validation`], so this
+    /// also exercises that [`ValidationError`]'s own special case survives
+    /// the extra layer of nesting.
+    #[test]
+    fn validate_delegates_to_the_wrapped_validation_error() {
+        let inner = ValidationError::DuplicateRelationshipName {
+            from_table: "orders".to_string(),
+            name: "customer".to_string(),
+        };
+        let expected = inner.code();
+        let wrapped = CatalogError::Validate(inner);
+
+        assert_eq!(wrapped.code(), expected);
+        assert_eq!(wrapped.code(), ErrorCode::Conflict);
+    }
 }

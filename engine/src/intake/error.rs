@@ -9,6 +9,7 @@
 use std::fmt;
 
 use super::pgoutput::DecodeError;
+use crate::error_code::{self, ErrorCode};
 use crate::staging::StagingError;
 
 /// Failure modes specific to intake.
@@ -96,6 +97,40 @@ pub enum IntakeError {
     /// action this crate never takes on its own — so this names the exact
     /// operator recovery instead.
     OrphanedSlot { slot: String },
+}
+
+impl IntakeError {
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
+    /// decision 3). Delegates to [`StagingError::code`] for
+    /// [`IntakeError::Staging`] and [`error_code::classify_pg_error`] for a
+    /// raw Postgres error. [`IntakeError::ReplicaIdentityRequired`] is an
+    /// actionable configuration precondition on the source table
+    /// (`ErrorCode::Validation`, the same category
+    /// [`crate::defs::validate::ValidationError`] itself uses for a
+    /// rejected-but-fixable definition); [`IntakeError::MissingProgressRow`],
+    /// [`IntakeError::OrphanedSlot`], and [`IntakeError::SlotLost`] are all
+    /// "an expected record isn't there" -> [`ErrorCode::NotFound`]; every
+    /// other variant is a protocol/data-integrity or resource-limit
+    /// condition this crate can't attribute to a specific caller mistake, so
+    /// it reports [`ErrorCode::Internal`].
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            IntakeError::Transport(_) => ErrorCode::Connectivity,
+            IntakeError::Staging(err) => err.code(),
+            IntakeError::Db(err) => error_code::classify_pg_error(err),
+            IntakeError::ReplicaIdentityRequired { .. } => ErrorCode::Validation,
+            IntakeError::MissingProgressRow { .. }
+            | IntakeError::OrphanedSlot { .. }
+            | IntakeError::SlotLost { .. } => ErrorCode::NotFound,
+            IntakeError::Decode(_)
+            | IntakeError::MissingKeyValue { .. }
+            | IntakeError::TransactionTooLarge { .. }
+            | IntakeError::Io(_)
+            | IntakeError::InvalidTableName(_)
+            | IntakeError::DottedIdentifierComponent { .. }
+            | IntakeError::InvalidSnapshot(_) => ErrorCode::Internal,
+        }
+    }
 }
 
 impl fmt::Display for IntakeError {

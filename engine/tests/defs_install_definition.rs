@@ -18,17 +18,57 @@
 //! those files for the ring/seal mechanics.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use engine::config::DEFAULT_SCHEMA;
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Predicate, RelationshipDef, TransformDef};
 use engine::defs::{
-    ValueType, create_relationship, install_definition, render_relationship_select_sql,
+    TransformStatus, ValueType, chunk_queue, create_relationship, install_definition,
+    render_relationship_select_sql,
 };
 use engine::staging::apply;
 use engine::staging::{has_pending, retire_drained_segments};
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
+
+/// Claims and executes every pending direct-build backfill chunk
+/// (`engine::defs::chunk_queue`, docs/decisions/0007's amendment) until none
+/// remain — the test-harness stand-in for a running `application_threads`
+/// drain worker, since `install_definition` no longer runs a plain
+/// (non-relationship) 1-1 definition's backfill in-call: it now returns as
+/// soon as the chunk work is enumerated and persisted, `Backfilling` until a
+/// drain worker actually claims and finishes each chunk. Panics (via
+/// `expect`) rather than swallowing an error, matching this file's other
+/// harness helpers (`drain_to_quiescence`) — a chunk-execution failure here
+/// means the test itself is broken, not something to retry past.
+async fn drain_backfill_chunks(pool: &engine::Pool, target_schema: &str) {
+    const CLAIMED_BY: &str = "install_def_test_backfill_worker";
+    loop {
+        let client = pool.get().await.expect("acquire connection");
+        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
+            .await
+            .expect("claim_chunks");
+        drop(client);
+        if claimed.is_empty() {
+            return;
+        }
+        for chunk in &claimed {
+            chunk_queue::run_claimed_chunk(
+                pool,
+                chunk,
+                target_schema,
+                CLAIMED_BY,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("run_claimed_chunk");
+            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
+                .await
+                .expect("finish_chunk");
+        }
+    }
+}
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -157,6 +197,12 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
     .await
     .expect("install_definition via the fast path");
 
+    // The direct build's chunk work is now enumerated and persisted, not
+    // executed in-call (docs/decisions/0007's amendment) — drive it to
+    // completion the way a running `application_threads` drain worker would
+    // before asserting on the target's contents.
+    drain_backfill_chunks(&db.pool, "public").await;
+
     let mismatches: i64 = client
         .query_one(
             "select count(*) from s left join t on t.id = s.id \
@@ -180,6 +226,150 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
         0,
         "fast path must not enumerate the source into the ring"
     );
+}
+
+// ---------------------------------------------------------------------
+// Status lifecycle (issue #55): a definition that completes its backfill via
+// `install_definition` must come back — and be persisted — as `Live`, not
+// left sitting in the speculative `Backfilling` row the direct-build path
+// inserts ahead of the build (see `catalog::install_definition`'s doc
+// comment). Covers both the fast direct-build path and the ring-fallback
+// path, since each takes a different route to `Live` (an in-place status
+// flip vs. a fresh row from `create_definition` after the speculative row is
+// discarded).
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn install_definition_fast_path_ends_up_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) select g, g from generate_series(1, 50) g",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = numeric(&["a"]);
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT a + a AS x",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition via the fast path");
+
+    // docs/decisions/0007's amendment: `install_definition` now returns once
+    // the plain 1-1 direct build's chunk work is enumerated/persisted, not
+    // once it's fully built — so the definition it hands back (and the
+    // persisted row) must still be `Backfilling` right here, before any
+    // drain worker has claimed a single chunk.
+    assert_eq!(
+        def.status,
+        TransformStatus::Backfilling,
+        "install_definition must return before the backgrounded chunk work completes"
+    );
+    let rows = client
+        .query(
+            "select status from transform_definitions where target_table = 't'",
+            &[],
+        )
+        .await
+        .expect("read back persisted status");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one row for `t` — no leftover speculative row"
+    );
+    let persisted_status: String = rows[0].get(0);
+    assert_eq!(
+        persisted_status, "backfilling",
+        "the persisted row sits at backfilling until a drain worker finishes its chunks"
+    );
+
+    // Driving the chunk queue to completion (the `application_threads` drain
+    // worker's job in a real fleet) must flip it the rest of the way to live.
+    drain_backfill_chunks(&db.pool, "public").await;
+    let rows = client
+        .query(
+            "select status from transform_definitions where target_table = 't'",
+            &[],
+        )
+        .await
+        .expect("read back persisted status");
+    assert_eq!(rows.len(), 1);
+    let persisted_status: String = rows[0].get(0);
+    assert_eq!(
+        persisted_status, "live",
+        "the persisted row must have been flipped to live once every chunk finished"
+    );
+}
+
+#[tokio::test]
+async fn install_definition_ring_fallback_ends_up_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table categories (id integer primary key, name text); \
+             create table articles (id integer primary key, category_id integer, title text); \
+             insert into categories (id, name) values (10, 'Tech'); \
+             insert into articles (id, category_id, title) values (1, 10, 'a1')",
+        )
+        .await
+        .expect("create + seed tables");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP category FROM articles.category_id TO categories.id",
+    )
+    .await
+    .expect("create to-one relationship");
+
+    let source_columns = columns(&[
+        ("id", ValueType::Numeric),
+        ("category_id", ValueType::Numeric),
+        ("title", ValueType::Text),
+    ]);
+
+    // Same `Unsupported` shape as the fallback test below: routes through
+    // the speculative-insert-then-delete-then-ring-recreate path in
+    // `install_definition`.
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM article_cat FROM articles SELECT category.name AS category_name",
+        &source_columns,
+        "public",
+    )
+    .await
+    .expect("install_definition falls back to the ring path");
+
+    assert_eq!(
+        def.status,
+        TransformStatus::Live,
+        "the ring-fallback path also persists Live, not Backfilling"
+    );
+
+    let rows = client
+        .query(
+            "select status from transform_definitions where target_table = 'article_cat'",
+            &[],
+        )
+        .await
+        .expect("read back persisted status");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the speculative row must have been deleted, leaving exactly the ring path's own row"
+    );
+    let persisted_status: String = rows[0].get(0);
+    assert_eq!(persisted_status, "live");
 }
 
 // ---------------------------------------------------------------------
@@ -220,8 +410,12 @@ async fn install_definition_fast_path_builds_a_plain_cross_field_alias_chain() {
     .await
     .expect("install_definition builds the alias chain directly");
 
-    // The direct build populates the target synchronously and stages nothing
-    // in the ring — the fast-path signature (see the sibling fast-path test).
+    // The direct build's chunk work is enumerated/persisted, not executed
+    // in-call — drive it to completion before reading the target.
+    drain_backfill_chunks(&db.pool, "public").await;
+
+    // The direct build populates the target and stages nothing in the ring
+    // — the fast-path signature (see the sibling fast-path test).
     let mut rows: Vec<(i64, String, String)> = client
         .query(
             "select id, double_price::text, total::text from t order by id",
