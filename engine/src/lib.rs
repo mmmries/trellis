@@ -8,7 +8,9 @@
 //! everything below into one interface so callers never stitch the
 //! primitives together themselves; [`client::Client`] is the runtime it
 //! starts, still public for embedders that want to drive it directly.
-//! Everything else in the crate is machinery these compose:
+//! [`blocking::BlockingTrellis`] wraps the same facade for callers that
+//! can't assume a `tokio` runtime on their own thread (issue #87's future
+//! FFI embedding). Everything else in the crate is machinery these compose:
 //!
 //! - [`config`] resolves a [`Config`] from CLI args + environment.
 //! - [`pool`] manages a `deadpool-postgres` connection pool and exposes the
@@ -41,6 +43,7 @@
 //! Quarantine, stage 06's other half, is not yet implemented.
 
 pub mod app;
+pub mod blocking;
 pub mod client;
 pub mod config;
 pub mod defs;
@@ -56,6 +59,7 @@ pub mod staging;
 pub use app::{
     DefinitionSummary, PoisonEntry, RelationshipSummary, Trellis, TrellisError, TrellisOptions,
 };
+pub use blocking::BlockingTrellis;
 pub use client::{Client, ClientError, ClientOptions};
 pub use config::Config;
 pub use defs::{Definition, RelationshipCardinality, RelationshipDefinition, TransformStatus};

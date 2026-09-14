@@ -539,6 +539,17 @@ pub enum TrellisError {
     /// [`Trellis::request_backfill`] was asked to backfill a table that isn't
     /// a member of the publication yet.
     TableNotPublished { table: String, publication: String },
+    /// [`crate::blocking::BlockingTrellis::connect`]'s background thread
+    /// failed to spawn.
+    BlockingSpawn(std::io::Error),
+    /// [`crate::blocking::BlockingTrellis::connect`]'s background thread
+    /// exited (panicked, or its setup future dropped its ready-sender)
+    /// before ever signalling ready.
+    BlockingThreadExitedBeforeReady,
+    /// A [`crate::blocking::BlockingTrellis`] method's background thread was
+    /// no longer there to service the call (it panicked after connecting
+    /// successfully) — the job channel send or reply recv failed.
+    BlockingThreadGone,
 }
 
 impl TrellisError {
@@ -565,6 +576,12 @@ impl TrellisError {
                 ErrorCode::Validation
             }
             TrellisError::SourceTableNotFound(_) => ErrorCode::NotFound,
+            // Same category as `ClientError`'s equivalent thread-lifecycle
+            // variants — an embedder can't do anything about these beyond
+            // retrying the whole connection.
+            TrellisError::BlockingSpawn(_)
+            | TrellisError::BlockingThreadExitedBeforeReady
+            | TrellisError::BlockingThreadGone => ErrorCode::Internal,
         }
     }
 }
@@ -593,6 +610,17 @@ impl std::fmt::Display for TrellisError {
                 "\"{table}\" isn't in publication \"{publication}\" yet; run with staging enabled \
                  and it will be backfilled automatically on first contact"
             ),
+            TrellisError::BlockingSpawn(err) => {
+                write!(f, "failed to spawn BlockingTrellis's runtime thread: {err}")
+            }
+            TrellisError::BlockingThreadExitedBeforeReady => write!(
+                f,
+                "BlockingTrellis's runtime thread exited before signalling that setup completed"
+            ),
+            TrellisError::BlockingThreadGone => write!(
+                f,
+                "BlockingTrellis's runtime thread was no longer running to service this call"
+            ),
         }
     }
 }
@@ -607,7 +635,10 @@ impl std::error::Error for TrellisError {
             TrellisError::Db(err) => Some(err),
             TrellisError::NoDefinitions
             | TrellisError::SourceTableNotFound(_)
-            | TrellisError::TableNotPublished { .. } => None,
+            | TrellisError::TableNotPublished { .. }
+            | TrellisError::BlockingThreadExitedBeforeReady
+            | TrellisError::BlockingThreadGone => None,
+            TrellisError::BlockingSpawn(err) => Some(err),
         }
     }
 }
