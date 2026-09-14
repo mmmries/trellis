@@ -212,6 +212,17 @@ pub async fn install_definition(
 ) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse(source_text)?;
 
+    // Validate *before* any DDL is generated or executed, for every key-space
+    // (issue #94). DDL generation type-infers each target column from the same
+    // expressions the validator checks, so an invalid definition reaching DDL
+    // first surfaces whatever incidental error inference happens to hit —
+    // masking the real validation error — and, worse, can leave a target table
+    // behind for a definition that is then rejected. `create_definition`/
+    // `create_definition_without_backfill` validate again below; that repeat is
+    // cheap and keeps those entry points safe when called directly.
+    let relationships = resolve_relationships(pool, &def).await?;
+    validate(&def, source_columns, &relationships)?;
+
     match &def.key_space {
         KeySpace::OneToOne => {
             let pk = ddl::source_primary_key(pool, &def.source)
@@ -232,7 +243,7 @@ pub async fn install_definition(
     // build reads it. The fence must precede every build read — a fence taken
     // after the build could vouch for a row the build never folded (see
     // `plan_direct_backfill_coverage` / `capture_backfill_coverage_fence`).
-    let coverage_plan = plan_direct_backfill_coverage(pool, &def).await?;
+    let coverage_plan = plan_direct_backfill_coverage(pool, &def, &relationships).await?;
 
     match backfill::backfill_definition(pool, &def, target_schema, source_columns).await {
         Ok(()) => {
@@ -280,12 +291,15 @@ enum CoveragePlan {
 ///
 /// Also runs before the new definition is persisted, so [`table_has_other_reader`]
 /// sees only the *pre-existing* readers of each table.
+/// `resolved` is the caller's already-resolved relationship map (the same one
+/// it validated against), passed in rather than re-resolved here: `install_definition`
+/// needs it up front anyway to validate ahead of DDL.
 async fn plan_direct_backfill_coverage(
     pool: &Pool,
     def: &TransformDef,
+    resolved: &HashMap<String, ResolvedRelationship>,
 ) -> Result<Vec<CoveragePlan>, CatalogError> {
     // Distinct to-side tables this definition reads through a relationship.
-    let resolved = resolve_relationships(pool, def).await?;
     let mut tables: HashSet<String> = resolved.values().map(|r| r.to_table.clone()).collect();
     tables.insert(def.source.clone());
 
