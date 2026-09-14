@@ -550,6 +550,14 @@ pub enum TrellisError {
     /// no longer there to service the call (it panicked after connecting
     /// successfully) — the job channel send or reply recv failed.
     BlockingThreadGone,
+    /// A [`crate::blocking::BlockingTrellis`] method was called from a thread
+    /// that already has a `tokio` runtime entered (e.g. from inside
+    /// `#[tokio::test]` or a `tokio::spawn`ed task). Blocking such a thread
+    /// on the reply would panic inside `tokio`, so this is reported as a
+    /// normal error instead — call the async [`Trellis`] directly in that
+    /// context, `BlockingTrellis` is only for threads with no runtime of
+    /// their own.
+    CalledFromAsyncContext,
 }
 
 impl TrellisError {
@@ -582,6 +590,8 @@ impl TrellisError {
             TrellisError::BlockingSpawn(_)
             | TrellisError::BlockingThreadExitedBeforeReady
             | TrellisError::BlockingThreadGone => ErrorCode::Internal,
+            // Caller misuse (wrong calling context), not an engine fault.
+            TrellisError::CalledFromAsyncContext => ErrorCode::Validation,
         }
     }
 }
@@ -621,6 +631,11 @@ impl std::fmt::Display for TrellisError {
                 f,
                 "BlockingTrellis's runtime thread was no longer running to service this call"
             ),
+            TrellisError::CalledFromAsyncContext => write!(
+                f,
+                "BlockingTrellis was called from a thread that already has a tokio runtime \
+                 entered; call the async Trellis directly in that context instead"
+            ),
         }
     }
 }
@@ -637,7 +652,8 @@ impl std::error::Error for TrellisError {
             | TrellisError::SourceTableNotFound(_)
             | TrellisError::TableNotPublished { .. }
             | TrellisError::BlockingThreadExitedBeforeReady
-            | TrellisError::BlockingThreadGone => None,
+            | TrellisError::BlockingThreadGone
+            | TrellisError::CalledFromAsyncContext => None,
             TrellisError::BlockingSpawn(err) => Some(err),
         }
     }

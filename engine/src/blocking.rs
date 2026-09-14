@@ -66,6 +66,14 @@ enum Job {
 /// `Trellis` it owns, best-effort — but doesn't wait for that thread to
 /// exit; call `shutdown` for a clean, joined stop, exactly like
 /// [`crate::client::Client`]'s own documented `Drop` discipline.
+///
+/// The reverse also matters: calling a `BlockingTrellis` method from a
+/// thread that *does* already have a `tokio` runtime entered (a
+/// `#[tokio::test]` fn, a `tokio::spawn`ed task) is a usage error, not
+/// something this type can silently support — it returns
+/// [`TrellisError::CalledFromAsyncContext`] rather than blocking, since
+/// blocking such a thread would deadlock/panic inside `tokio` itself. Use
+/// the async [`Trellis`] directly in that context instead.
 pub struct BlockingTrellis {
     job_tx: mpsc::UnboundedSender<Job>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -194,6 +202,14 @@ impl BlockingTrellis {
         &self,
         make_job: impl FnOnce(oneshot::Sender<Result<T, TrellisError>>) -> Job,
     ) -> Result<T, TrellisError> {
+        // `reply_rx.blocking_recv()` below panics (not returns an error) if
+        // the calling thread already has a tokio runtime entered — guard it
+        // here so misuse (e.g. calling from `#[tokio::test]` or a
+        // `tokio::spawn`ed task) surfaces as a normal `TrellisError` instead
+        // of an opaque tokio panic.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(TrellisError::CalledFromAsyncContext);
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         self.job_tx
             .send(make_job(reply_tx))

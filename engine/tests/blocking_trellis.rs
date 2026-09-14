@@ -15,7 +15,7 @@
 //! No `.await` appears anywhere in the `BlockingTrellis`-driving portion of
 //! any test below.
 
-use engine::{BlockingTrellis, Config, TransformStatus, TrellisOptions};
+use engine::{BlockingTrellis, Config, TransformStatus, TrellisError, TrellisOptions};
 use testkit::TestCluster;
 
 /// (a) + (c): a full lifecycle — connect, migrate, define, definitions(), a
@@ -131,5 +131,37 @@ fn define_returns_before_backfill_completes() {
          possibly have built the target"
     );
 
+    trellis.shutdown().expect("shutdown (sync)");
+}
+
+/// A `BlockingTrellis` method called from a thread that already has a
+/// `tokio` runtime entered must return
+/// [`TrellisError::CalledFromAsyncContext`] rather than panicking —
+/// `oneshot::Receiver::blocking_recv()` panics if called from inside an
+/// async execution context, so `submit()` must guard against that case
+/// itself. `BlockingTrellis::connect` is unaffected (it signals readiness
+/// over a plain `std::sync::mpsc` channel, not `blocking_recv()`) — this
+/// test connects normally first, then makes the *next* call from inside a
+/// runtime.
+#[test]
+fn calling_from_inside_a_tokio_runtime_errors_instead_of_panicking() {
+    let cluster = TestCluster::start();
+
+    let setup_runtime = tokio::runtime::Runtime::new().expect("build scratch setup runtime");
+    let db = setup_runtime.block_on(cluster.create_empty_database());
+    drop(setup_runtime);
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis =
+        BlockingTrellis::connect(config, TrellisOptions::default()).expect("connect (sync)");
+
+    let caller_runtime = tokio::runtime::Runtime::new().expect("build caller runtime");
+    let result = caller_runtime.block_on(async { trellis.migrate() });
+    assert!(
+        matches!(result, Err(TrellisError::CalledFromAsyncContext)),
+        "expected CalledFromAsyncContext, got {result:?}"
+    );
+
+    drop(caller_runtime);
     trellis.shutdown().expect("shutdown (sync)");
 }
