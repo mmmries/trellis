@@ -1121,21 +1121,12 @@ async fn truncating_a_relationship_to_side_table_leaves_a_stale_enrichment() {
             kind: RelFieldKind::ToOneBare,
         })],
     );
-    // The generator steers around this shape by default (see
-    // `without_truncates_on_relationship_to_sides`); re-adding the truncate
-    // here is what makes this pin reproduce the finding.
-    let program = generative::model::Program {
-        ops: program
-            .ops
-            .iter()
-            .cloned()
-            .chain(std::iter::once(generative::model::Op::Truncate {
-                table: program.tables[1].name.clone(),
-                expect: generative::model::OpOutcome::Succeeds,
-            }))
-            .collect(),
-        ..program
-    };
+    // `t1`'s `mutates: vec![Mutate::Truncate]` above is enough to generate
+    // the triggering truncate directly now — the generator no longer steers
+    // around this shape (issue #98 removed
+    // `without_truncates_on_relationship_to_sides`, the workaround that used
+    // to require manually re-chaining a `Truncate` op here to reproduce the
+    // finding).
 
     let mut backend = ManualBackend::connect(db.dsn())
         .await

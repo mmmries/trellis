@@ -1660,69 +1660,8 @@ pub fn build_program_multi_with_relationships(
     derived: &[Option<DerivedShape>],
     rel_fields: &[Option<RelFieldSpec>],
 ) -> Program {
-    let tables = without_truncates_on_relationship_to_sides(tables, defs, rel_fields);
-    let program = build_program_multi_with_shapes_and_derived(&tables, defs, derived);
+    let program = build_program_multi_with_shapes_and_derived(tables, defs, derived);
     attach_relationship_fields(program, rel_fields)
-}
-
-/// Drops [`Mutate::Truncate`] from any table that some relationship points
-/// *at* — a deliberate, narrow scope cut around a **live engine defect this
-/// suite found** (see
-/// `tests/convergence.rs`'s `truncating_a_relationship_to_side_table_leaves_a_stale_enrichment`,
-/// which pins it, and the passing `Delete` control beside it).
-///
-/// The defect: `engine::staging::apply`'s truncate-clear path resolves the
-/// affected targets with `catalog::transforms_for_source` — definitions whose
-/// **source** is the truncated table — while reverse propagation into
-/// definitions that merely *read* that table through a relationship lives in
-/// the separate keyed by-source loop, driven by per-row change images and
-/// `catalog::relationships_to_table`. A `TRUNCATE` produces one key-less
-/// sentinel row rather than per-row images, so it never reaches that loop:
-/// deleting a related row correctly clears the enrichment that read it, but
-/// truncating the table that row lived in leaves the enrichment stale
-/// forever.
-///
-/// Filtering happens on the `TableSpec` *before* the program is built, not
-/// on the finished op stream, and that ordering is the whole point: each
-/// table's `OpOutcome` expectations come from a pk-liveness simulation over
-/// its mutate stream ([`render_mutate`]), so removing a `Truncate` after the
-/// fact would leave every later op on that table expecting the wrong
-/// outcome. Removing it beforehand just means the simulation never saw it.
-///
-/// `Truncate` coverage is unaffected for every table that is *not* a
-/// relationship to-side — including a relationship's from-side, whose
-/// truncate goes down the `transforms_for_source` path that does work.
-///
-/// **Delete this function when the engine defect is fixed.** It is the one
-/// place the generator deliberately steers around a real bug rather than a
-/// genuinely-unsupported shape, and leaving it in place after the fix would
-/// silently cost the suite coverage of exactly the interaction that found
-/// the bug.
-fn without_truncates_on_relationship_to_sides(
-    tables: &[TableSpec],
-    defs: &[(usize, DefShape)],
-    rel_fields: &[Option<RelFieldSpec>],
-) -> Vec<TableSpec> {
-    let to_sides: HashSet<usize> = defs
-        .iter()
-        .zip(rel_fields)
-        .filter_map(|(_, spec)| spec.map(|s| s.to_table))
-        .collect();
-    if to_sides.is_empty() {
-        return tables.to_vec();
-    }
-    tables
-        .iter()
-        .enumerate()
-        .map(|(index, spec)| {
-            if !to_sides.contains(&index) {
-                return spec.clone();
-            }
-            let mut spec = spec.clone();
-            spec.mutates.retain(|m| !matches!(m, Mutate::Truncate));
-            spec
-        })
-        .collect()
 }
 
 /// [`build_program_multi_with_derived`] is [`build_program_multi_with_shapes_and_derived`]'s
@@ -3251,13 +3190,14 @@ mod tests {
         assert_eq!(reordered.relationships, program.relationships);
     }
 
-    /// Issue #34's `TRUNCATE` scope cut (see
-    /// `without_truncates_on_relationship_to_sides`): a truncate is stripped
-    /// from a table some relationship points *at*, and left alone
-    /// everywhere else — including that relationship's own from-side, whose
-    /// truncate goes down an engine path that works.
+    /// Issue #98 removed the `TRUNCATE`-on-relationship-to-side scope cut
+    /// (formerly `without_truncates_on_relationship_to_sides`) once the
+    /// engine defect it steered around was fixed: a relationship to-side
+    /// table's truncate is now generated like any other table's, and its
+    /// reverse-propagation is exercised for real by the property suite
+    /// rather than being excluded from it.
     #[test]
-    fn a_truncate_is_dropped_only_from_a_relationship_to_side_table() {
+    fn a_truncate_is_generated_on_a_relationship_to_side_table_like_any_other() {
         let spec = || TableSpec {
             seed_values: vec![(Some(1), Some(2))],
             text_values: vec![None],
@@ -3286,8 +3226,11 @@ mod tests {
             .collect();
         assert_eq!(
             truncated,
-            vec![program.tables[0].name.as_str()],
-            "only the to-side table's truncate is dropped: {:?}",
+            vec![
+                program.tables[0].name.as_str(),
+                program.tables[1].name.as_str(),
+            ],
+            "both tables' truncates are generated, including the relationship to-side: {:?}",
             program.ops
         );
     }
