@@ -2193,7 +2193,12 @@ pub fn reordered_by_commute_groups(program: &Program) -> Program {
     }
     Program {
         tables: program.tables.clone(),
-        relationships: Vec::new(),
+        // Carried through unchanged: a relationship is a schema-level
+        // declaration, not an op, so reordering the op stream cannot affect
+        // it — and dropping it would leave every definition that reads one
+        // referencing an undeclared relationship, which the engine rejects
+        // at install time.
+        relationships: program.relationships.clone(),
         defs: program.defs.clone(),
         // Carried over unchanged, not reinterpreted against the new op
         // order: this function is only ever exercised (`tests/order_insensitivity.rs`)
@@ -3183,6 +3188,109 @@ pub use strategy::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two tables, one definition, one relationship — the smallest program
+    /// that can carry a relationship at all, reused by the tests below.
+    fn two_table_rel_program(kind: RelFieldKind) -> Program {
+        let shape = match kind {
+            RelFieldKind::ToOneAggregate(_) => DefShape::Aggregate {
+                functions: vec![AggregateFn::Count],
+            },
+            _ => DefShape::OneToOne,
+        };
+        let spec = || TableSpec {
+            seed_values: vec![(Some(1), Some(2))],
+            text_values: vec![None],
+            bool_values: vec![None],
+            uuid_values: vec![None],
+            grain_values: vec![Some("0".to_string())],
+            rel_fk_values: vec![Some("k1".to_string())],
+            mutates: vec![Mutate::Delete { pk: 1 }],
+        };
+        build_program_multi_with_relationships(
+            &[spec(), spec()],
+            &[(0, shape)],
+            &[None],
+            &[Some(RelFieldSpec { to_table: 1, kind })],
+        )
+    }
+
+    /// Issue #34: a to-one relationship joins the from-side's foreign key to
+    /// the to-side's *unique* key column — that uniqueness is the whole
+    /// reason the engine resolves it as to-one — and a to-many one is the
+    /// same declaration with the endpoints swapped so the to-side column is
+    /// the non-unique one.
+    #[test]
+    fn a_relationships_endpoints_follow_its_cardinality() {
+        let one = two_table_rel_program(RelFieldKind::ToOneBare);
+        let rel = &one.relationships[0];
+        assert_eq!(rel.cardinality, Cardinality::ToOne);
+        assert_eq!(rel.from_col, one.tables[0].columns[REL_FK_COLUMN].name);
+        assert_eq!(rel.to_col, one.tables[1].columns[REL_KEY_COLUMN].name);
+        assert!(one.tables[1].unique_cols.contains(&rel.to_col));
+
+        let many = two_table_rel_program(RelFieldKind::ToManyAggregate(RelAggregateFn::Sum));
+        let rel = &many.relationships[0];
+        assert_eq!(rel.cardinality, Cardinality::ToMany);
+        assert_eq!(rel.from_col, many.tables[0].columns[REL_KEY_COLUMN].name);
+        assert_eq!(rel.to_col, many.tables[1].columns[REL_FK_COLUMN].name);
+        assert!(!many.tables[1].unique_cols.contains(&rel.to_col));
+    }
+
+    /// A relationship is a schema-level declaration, so reordering the op
+    /// stream must carry it through untouched. Regression pin: an earlier
+    /// version of `reordered_by_commute_groups` rebuilt the `Program` with
+    /// an empty relationship list, which left every definition referencing
+    /// an undeclared relationship and made the order-insensitivity property
+    /// fail at *install* time rather than on a real ordering difference.
+    #[test]
+    fn reordering_a_program_preserves_its_relationship_declarations() {
+        let program = two_table_rel_program(RelFieldKind::ToOneBare);
+        assert_eq!(program.relationships.len(), 1);
+        let reordered = reordered_by_commute_groups(&program);
+        assert_eq!(reordered.relationships, program.relationships);
+    }
+
+    /// Issue #34's `TRUNCATE` scope cut (see
+    /// `without_truncates_on_relationship_to_sides`): a truncate is stripped
+    /// from a table some relationship points *at*, and left alone
+    /// everywhere else — including that relationship's own from-side, whose
+    /// truncate goes down an engine path that works.
+    #[test]
+    fn a_truncate_is_dropped_only_from_a_relationship_to_side_table() {
+        let spec = || TableSpec {
+            seed_values: vec![(Some(1), Some(2))],
+            text_values: vec![None],
+            bool_values: vec![None],
+            uuid_values: vec![None],
+            grain_values: vec![Some("0".to_string())],
+            rel_fk_values: vec![Some("k1".to_string())],
+            mutates: vec![Mutate::Truncate],
+        };
+        let program = build_program_multi_with_relationships(
+            &[spec(), spec()],
+            &[(0, DefShape::OneToOne)],
+            &[None],
+            &[Some(RelFieldSpec {
+                to_table: 1,
+                kind: RelFieldKind::ToOneBare,
+            })],
+        );
+        let truncated: Vec<&str> = program
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Truncate { table, .. } => Some(table.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            truncated,
+            vec![program.tables[0].name.as_str()],
+            "only the to-side table's truncate is dropped: {:?}",
+            program.ops
+        );
+    }
 
     #[test]
     fn build_program_seeds_before_mutating() {
