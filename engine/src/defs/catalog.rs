@@ -2026,6 +2026,18 @@ pub async fn definition_by_target(
 /// table-level graph (a column-level reference can only exist where a
 /// table-level dependency edge already does, so the same DAG property
 /// applies).
+///
+/// Filtered to [`KeySpace::OneToOne`] downstream definitions only — column-
+/// level pause/cascade/resume is explicitly scoped to the 1-1 tier (see this
+/// module's callers in `staging::quarantine` and that module's "Column-level
+/// fuse" section doc comment: `staging::apply_aggregate`'s incremental-delta
+/// path has no notion of `column_status` at all). Without this filter, a
+/// downstream [`KeySpace::Aggregate`] transform whose field happens to read a
+/// just-paused upstream column would get a `column_status` row cascaded onto
+/// it that nothing in the aggregate write path ever consults or clears, and
+/// that `resume_column`'s cascade walk would later try (and fail) to
+/// recompute via `staging::quarantine::recompute_column`'s single-row 1-1
+/// recompute path.
 pub(crate) async fn column_dependents(
     pool: &Pool,
     upstream_table: &str,
@@ -2064,6 +2076,9 @@ pub(crate) async fn column_dependents(
         // unexpected chance it doesn't, rather than let one bad row prevent
         // cascading a pause to every other, healthy dependent.
         let Ok(def) = parse(&text) else { continue };
+        if !matches!(def.key_space, KeySpace::OneToOne) {
+            continue;
+        }
         for field in &def.fields {
             if expr_references_column(
                 &field.expr,

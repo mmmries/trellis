@@ -481,6 +481,34 @@ async fn backfill_one_to_one(
     Ok(())
 }
 
+/// The same `column_status` lookup `staging::quarantine::paused_columns_for`
+/// runs from inside a batch's live-CDC apply, reused here (as a plain query
+/// against an already-open `&Client`, not a call to that function) for the
+/// exact same reason: a durable backfill chunk can be reclaimed and
+/// re-executed after a crash (`chunk_queue::reclaim_stale_chunks`), and if
+/// live CDC has paused one of this definition's columns in the meantime, a
+/// (re-)executed chunk must not silently overwrite that column's frozen
+/// value with a freshly (mis)computed one — that would undo the freeze that
+/// is the entire point of column-level quarantine (ADR-0003's amendment).
+/// Not a call to `staging::quarantine::paused_columns_for` itself: that
+/// function takes a `&Pool`, every call site here already holds a `&Client`,
+/// and `defs` sits below `staging` in this crate's layering
+/// (`staging::apply` already depends on `defs::backfill`, so the reverse
+/// dependency would be circular). Empty (the overwhelmingly common case) for
+/// a definition with nothing currently paused.
+async fn paused_columns_for(
+    client: &Client,
+    transform_table: &str,
+) -> Result<HashSet<String>, BackfillError> {
+    let rows = client
+        .query(
+            "select column_name from column_status where transform_table = $1",
+            &[&transform_table],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+}
+
 /// One `(lo, hi]` PK-range chunk's write — the body [`backfill_one_to_one`]'s
 /// loop runs for every range in one call, and the durable chunk queue's
 /// [`execute_one_to_one_chunk`] runs for exactly one range claimed off
@@ -503,8 +531,25 @@ async fn write_one_to_one_range(
     let pk_ident = quote_ident(&pk.name);
     let pk_cast = pk.data_type.as_str();
 
-    let field_idents: Vec<String> = def.fields.iter().map(|f| quote_ident(&f.name)).collect();
-    let field_exprs: Vec<String> = substituted.iter().map(render_expr_sql).collect();
+    // ADR-0003's amendment (column-level quarantine): exclude any column
+    // this definition currently has paused from both the computed column
+    // list and the `ON CONFLICT` update set — see `paused_columns_for`'s doc
+    // comment for why a durable, re-executable chunk write can't skip this.
+    let paused = paused_columns_for(client, &def.target).await?;
+
+    let field_idents: Vec<String> = def
+        .fields
+        .iter()
+        .filter(|f| !paused.contains(&f.name))
+        .map(|f| quote_ident(&f.name))
+        .collect();
+    let field_exprs: Vec<String> = def
+        .fields
+        .iter()
+        .zip(substituted)
+        .filter(|(f, _)| !paused.contains(&f.name))
+        .map(|(_, expr)| render_expr_sql(expr))
+        .collect();
 
     let insert_cols = std::iter::once(pk_ident.clone())
         .chain(field_idents.iter().cloned())
@@ -514,20 +559,29 @@ async fn write_one_to_one_range(
         .chain(field_exprs.iter().cloned())
         .collect::<Vec<_>>()
         .join(", ");
-    let update_sets = field_idents
-        .iter()
-        .map(|f| format!("{f} = excluded.{f}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    // A field-less 1-1 definition can't exist (the grammar requires at least
-    // one SELECT field), so `update_sets` is always non-empty.
-    debug_assert!(!update_sets.is_empty());
+    // Every column of this definition can be paused at once (a single-field
+    // definition whose lone column's fuse has tripped is the simplest such
+    // case) — mirrors `staging::apply::apply_target`'s identical edge case:
+    // `do update set` with an empty set list is invalid SQL, and there is
+    // genuinely nothing to update on an existing row anyway; a brand-new key
+    // still gets its bare row inserted via the same statement's `insert`
+    // half.
+    let on_conflict = if field_idents.is_empty() {
+        format!("on conflict ({pk_ident}) do nothing")
+    } else {
+        let update_sets = field_idents
+            .iter()
+            .map(|f| format!("{f} = excluded.{f}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("on conflict ({pk_ident}) do update set {update_sets}")
+    };
 
     let where_clause = pk_range_where(&pk_ident, pk_cast, lo);
     let insert_sql = format!(
         "insert into {target} ({insert_cols}) \
          select {select_exprs} from {source} where {where_clause} \
-         on conflict ({pk_ident}) do update set {update_sets}"
+         {on_conflict}"
     );
     match lo {
         None => {
@@ -1300,14 +1354,28 @@ async fn backfill_relationship_one_to_one(
         rel_stage.insert(rel.clone(), stage);
     }
 
+    // ADR-0003's amendment (column-level quarantine): exclude any column
+    // this definition currently has paused, same as `write_one_to_one_range`
+    // — see that function's `paused_columns_for` doc comment.
+    let paused = paused_columns_for(&client, &def.target).await?;
+
     // Build the INSERT's column list, its per-field SELECT expression, and the
     // ON CONFLICT update set. The primary key comes first, then one column per
-    // field in definition order (mirroring `backfill_one_to_one`). Each field's
-    // (substituted) expression renders against the staged aggregate columns.
-    let field_idents: Vec<String> = def.fields.iter().map(|f| quote_ident(&f.name)).collect();
-    let select_field_exprs: Vec<String> = substituted
+    // (non-paused) field in definition order (mirroring `backfill_one_to_one`).
+    // Each field's (substituted) expression renders against the staged
+    // aggregate columns.
+    let field_idents: Vec<String> = def
+        .fields
         .iter()
-        .map(|expr| {
+        .filter(|f| !paused.contains(&f.name))
+        .map(|f| quote_ident(&f.name))
+        .collect();
+    let select_field_exprs: Vec<String> = def
+        .fields
+        .iter()
+        .zip(substituted.iter())
+        .filter(|(f, _)| !paused.contains(&f.name))
+        .map(|(_, expr)| {
             render_rel_field_direct(expr, &def.source, &rel_stage, &leaf_cols).ok_or_else(|| {
                 BackfillError::Unsupported(
                     "a relationship-enriched 1-1 field the direct build can't render".to_string(),
@@ -1324,12 +1392,21 @@ async fn backfill_relationship_one_to_one(
         .chain(select_field_exprs.iter().cloned())
         .collect::<Vec<_>>()
         .join(", ");
-    let update_sets = field_idents
-        .iter()
-        .map(|f| format!("{f} = excluded.{f}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    debug_assert!(!update_sets.is_empty());
+    // Every column of this definition can be paused at once — mirrors
+    // `write_one_to_one_range`'s identical edge case (see its own doc
+    // comment): `do update set` with an empty set list is invalid SQL, and a
+    // brand-new key still gets its bare row inserted via the same
+    // statement's `insert` half.
+    let on_conflict = if field_idents.is_empty() {
+        format!("on conflict ({pk_ident}) do nothing")
+    } else {
+        let update_sets = field_idents
+            .iter()
+            .map(|f| format!("{f} = excluded.{f}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("on conflict ({pk_ident}) do update set {update_sets}")
+    };
 
     // Each relationship's staging table LEFT JOINed to the source on its join
     // key, so a source row with no matching to-side rows survives with NULL
@@ -1349,7 +1426,7 @@ async fn backfill_relationship_one_to_one(
         let insert_sql = format!(
             "insert into {target} ({insert_cols}) \
              select {select_exprs} from {source} {joins} where {where_clause} \
-             on conflict ({pk_ident}) do update set {update_sets}"
+             {on_conflict}"
         );
         match &lo {
             None => {

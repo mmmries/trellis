@@ -14,9 +14,13 @@
 //! replication slot).
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use engine::defs::{create_definition, create_target_table, source_primary_key};
+use engine::defs::{
+    TransformStatus, chunk_queue, create_aggregate_target_table, create_definition,
+    create_target_table, install_definition, source_primary_key,
+};
 use engine::staging::apply::{self, ApplyError};
 use engine::staging::quarantine::{self, DEFAULT_COLUMN_DEATH_THRESHOLD};
 use engine::{BlockingTrellis, Config, Trellis, TrellisOptions};
@@ -808,4 +812,542 @@ async fn an_existing_row_level_fuse_scenario_is_unaffected() {
         None,
         "a single stubborn row must never trip the column fuse on its own"
     );
+}
+
+// ---------------------------------------------------------------------
+// (g) Regression: a re-executed durable backfill chunk must leave a paused
+//     column untouched (must-fix 1).
+// ---------------------------------------------------------------------
+
+/// A durable backfill chunk (`defs::chunk_queue`, ADR-0007's amendment) is
+/// claimable and crash-recoverable: a chunk already marked `done` can still
+/// be re-executed (e.g. after a reclaim following a crash — see
+/// `engine/tests/defs_backfill_chunk_queue.rs`'s own reclaim-and-redo
+/// tests), and `defs::backfill::write_one_to_one_range`/
+/// `execute_one_to_one_chunk` had zero awareness of `column_status`: a
+/// re-executed chunk's `ON CONFLICT DO UPDATE` blindly overwrote *every*
+/// field, including one live CDC had since paused, silently undoing the
+/// freeze. This drives the chunk-queue execution path directly (as the task
+/// suggests, in lieu of orchestrating a real crash) to prove the fix: a
+/// paused column's value must survive a re-executed chunk write untouched,
+/// while a sibling, non-paused column in the very same row must still pick
+/// up the re-executed chunk's freshly computed value.
+#[tokio::test]
+async fn a_reexecuted_backfill_chunk_leaves_a_paused_column_untouched() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, a numeric, b numeric); \
+             insert into s (id, a, b) values (1, 10, 100), (2, 20, 200)",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = numeric_columns(&["a", "b"]);
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT a + a AS x, b + b AS y",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition enumerates chunk work and returns");
+    assert_eq!(
+        def.status,
+        TransformStatus::Backfilling,
+        "a plain 1-1 definition sits at backfilling until its chunk is claimed and finished"
+    );
+
+    let claimed = chunk_queue::claim_chunks(&client, "worker-1", 10)
+        .await
+        .expect("claim_chunks");
+    assert_eq!(claimed.len(), 1, "one chunk covers this small source table");
+
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &claimed[0],
+        "public",
+        "worker-1",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("run_claimed_chunk (initial build)");
+    chunk_queue::finish_chunk(&db.pool, &claimed[0], "worker-1")
+        .await
+        .expect("finish_chunk");
+
+    let initial = client
+        .query_one("select x::text, y::text from t where id = 1", &[])
+        .await
+        .expect("read t after initial build");
+    let (x_initial, y_initial): (String, String) = (initial.get(0), initial.get(1));
+    assert_eq!(x_initial, "20");
+    assert_eq!(y_initial, "200");
+
+    // Simulate live CDC having since paused column `x` — reached past the
+    // mechanism, inserted directly, the same convention the rest of this
+    // file uses for whichever half of a scenario isn't the mechanism under
+    // test (here, *how* the pause happened is irrelevant; only its effect
+    // on a re-executed chunk is).
+    client
+        .execute(
+            "insert into column_status (transform_table, column_name, last_error, local_fuse) \
+             values ('t', 'x', 'synthetic pause for backfill freeze test', true)",
+            &[],
+        )
+        .await
+        .expect("seed column_status directly");
+
+    // Mutate the source row so a naive re-execution would compute different
+    // values for *both* columns — `x` must stay frozen; `y` must not.
+    client
+        .execute("update s set a = 999, b = 500 where id = 1", &[])
+        .await
+        .expect("mutate source row 1");
+
+    // Simulate the chunk being reclaimed (e.g. after a crash) and
+    // re-executed by a different worker — driving the chunk-queue execution
+    // path directly, exactly as it would be after
+    // `chunk_queue::reclaim_stale_chunks` frees a dead claim.
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &claimed[0],
+        "public",
+        "worker-2",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("run_claimed_chunk (re-executed after simulated reclaim)");
+
+    let after = client
+        .query_one("select x::text, y::text from t where id = 1", &[])
+        .await
+        .expect("read t after re-executed chunk");
+    let (x_after, y_after): (String, String) = (after.get(0), after.get(1));
+    assert_eq!(
+        x_after, x_initial,
+        "a paused column's value must be untouched by a re-executed backfill chunk"
+    );
+    assert_eq!(
+        y_after, "1000",
+        "a non-paused column in the very same row must still be updated by the re-executed chunk"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (h) Regression: cascade must never reach a KeySpace::Aggregate transform
+//     (must-fix 2).
+// ---------------------------------------------------------------------
+
+/// `column_dependents` used to scan every `transform_definitions` row with
+/// no `KeySpace` filter, so a downstream aggregate transform whose field
+/// happens to read a just-paused upstream 1-1 column would get a wrongly
+/// cascaded `column_status` row — one `staging::apply_aggregate`'s
+/// incremental-delta path has no notion of and would never clear, and one
+/// `resume_column`'s cascade walk would later mishandle via the 1-1-only
+/// `recompute_column`. Proves the fix: pausing the upstream column must
+/// never create a `column_status` row for the aggregate, and the aggregate's
+/// own write path must keep functioning normally afterward.
+#[tokio::test]
+async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    seed_order_totals(&db, &client).await;
+    client
+        .batch_execute("alter table order_totals replica identity full")
+        .await
+        .expect("set replica identity full (an aggregate source needs full pre-images)");
+
+    // A downstream aggregate transform reading `order_totals.total` — the
+    // scope-cut this fix enforces: column-level pause/cascade/resume never
+    // touches an aggregate transform.
+    let order_totals_columns = numeric_columns(&["id", "total"]);
+    let stats_def = create_definition(
+        &db.pool,
+        "TRANSFORM order_stats FROM order_totals GROUP BY id SELECT id AS id, \
+         SUM(total) AS total_sum",
+        &order_totals_columns,
+    )
+    .await
+    .expect("create order_stats definition");
+    create_aggregate_target_table(&db.pool, &stats_def.def, "public", &order_totals_columns)
+        .await
+        .expect("create order_stats table");
+
+    let bad_ids: Vec<i64> = (1..=DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    stage_bad_orders(&mut client, &db.pool, &bad_ids).await;
+
+    assert!(
+        column_status_row(&client, "order_totals", "total")
+            .await
+            .is_some(),
+        "the upstream column must have paused"
+    );
+    assert_eq!(
+        column_status_row(&client, "order_stats", "total_sum").await,
+        None,
+        "an aggregate transform must never get a column_status row via cascade — aggregates are \
+         out of scope for column-level pause/cascade/resume"
+    );
+
+    // A subsequent, healthy batch flowing all the way through to the
+    // aggregate: the write path must still complete normally (no error, no
+    // wedge) — proving the (correctly withheld) cascade never left the
+    // aggregate's own status or write path in a broken state.
+    client
+        .batch_execute("insert into orders (id, price, tax) values (999, 5.00, 1.00)")
+        .await
+        .expect("seed a healthy order row");
+    let table = active_segment_table(&client).await;
+    insert_cdc_row(
+        &client,
+        &table,
+        "orders",
+        "999",
+        "insert",
+        None,
+        Some(r#"{"price":"5.00","tax":"1.00"}"#),
+    )
+    .await;
+    let seg_seq = seal_active_segment(&mut client).await;
+    apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+    )
+    .await
+    .expect("drain_once")
+    .expect("a healthy batch must still drain normally through order_totals");
+
+    // The write to `order_totals` above stages a downstream `Recompute`
+    // marker for `order_stats` into the (still-open) active ring segment —
+    // seal and drain once more to actually run the aggregate's own write
+    // path against it.
+    let seg_seq2 = seal_active_segment(&mut client).await;
+    apply::drain_once(
+        &db.pool,
+        seg_seq2,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+    )
+    .await
+    .expect("drain_once")
+    .expect(
+        "the aggregate's own batch must still drain normally, unaffected by the upstream \
+             (correctly non-cascaded) pause",
+    );
+
+    let stats_row = client
+        .query_opt(
+            "select total_sum::text from order_stats where id = 999",
+            &[],
+        )
+        .await
+        .expect("read order_stats");
+    assert!(
+        stats_row.is_some(),
+        "the aggregate transform must still write a row normally, unaffected by the upstream \
+         (correctly non-cascaded) pause"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (i) Regression: resuming a column must not silently no-op because a
+//     sibling column on the same transform is also paused (must-fix 3).
+// ---------------------------------------------------------------------
+
+/// `resume_column`'s `recompute_column` used to call the un-excluding
+/// `eval::evaluate_with_relationships`, so a still-paused sibling column
+/// (`busted` below, whose formula throws for every row given the malformed —
+/// but genuinely persisted — source data) made the *whole* per-row
+/// evaluation fail, and the resumed column (`doubled`) silently never got
+/// recomputed for any row, even though its own formula is perfectly healthy.
+/// Proves the fix: excluding the still-paused sibling from evaluation lets
+/// the resumed column recompute correctly for every row regardless.
+#[tokio::test]
+async fn resume_recomputes_correctly_even_when_a_sibling_column_still_throws() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    // `tax` is a real Postgres `text` column holding a permanently
+    // non-numeric value — `busted`'s formula (declared `Numeric` via
+    // `source_columns`, same "reach past the mechanism" trick the rest of
+    // this file uses for a malformed CDC image, just baked into real,
+    // persisted source data here since `recompute_column` reads the live
+    // table directly rather than a staged image) throws on every row, for
+    // every recompute attempt, indefinitely.
+    client
+        .batch_execute(
+            "create table calc_src (id integer primary key, price numeric, tax text); \
+             insert into calc_src (id, price, tax) values \
+             (1, 10, 'not-a-number'), (2, 20, 'not-a-number'), (3, 30, 'not-a-number')",
+        )
+        .await
+        .expect("seed source table");
+
+    let source_columns = numeric_columns(&["id", "price", "tax"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM calc FROM calc_src SELECT price + price AS doubled, tax + tax AS busted",
+        &source_columns,
+    )
+    .await
+    .expect("create calc definition");
+    let calc_def = TransformDef {
+        target: "calc".to_string(),
+        source: "calc_src".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![
+            FieldDef {
+                name: "doubled".to_string(),
+                expr: Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(Expr::Column("price".to_string())),
+                    rhs: Box::new(Expr::Column("price".to_string())),
+                },
+            },
+            FieldDef {
+                name: "busted".to_string(),
+                expr: Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(Expr::Column("tax".to_string())),
+                    rhs: Box::new(Expr::Column("tax".to_string())),
+                },
+            },
+        ],
+        predicate: Predicate::True,
+    };
+    let pk = source_primary_key(&db.pool, "calc_src")
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &calc_def, "public", &pk, &source_columns)
+        .await
+        .expect("create calc table");
+
+    // Seed the target with sentinel values distinct from any real
+    // recomputed result, so a successful recompute is unambiguous.
+    client
+        .batch_execute(
+            "insert into calc (id, doubled, busted) values \
+             (1, -999, -999), (2, -999, -999), (3, -999, -999)",
+        )
+        .await
+        .expect("seed sentinel target rows");
+
+    // Both columns independently paused — reached past the mechanism,
+    // inserted directly (same convention as this file's other tests).
+    client
+        .batch_execute(
+            "insert into column_status (transform_table, column_name, last_error, local_fuse) \
+             values ('calc', 'doubled', 'synthetic pause A', true), \
+                    ('calc', 'busted', 'synthetic pause B (always throws)', true)",
+        )
+        .await
+        .expect("seed column_status for both columns");
+
+    let resumed = quarantine::resume_column(&db.pool, "calc", "doubled")
+        .await
+        .expect("resume_column");
+    assert_eq!(
+        resumed,
+        vec![("calc".to_string(), "doubled".to_string())],
+        "only the resumed column itself, nothing cascaded"
+    );
+
+    assert_eq!(
+        column_status_row(&client, "calc", "doubled").await,
+        None,
+        "the resumed column must no longer be paused"
+    );
+    assert!(
+        column_status_row(&client, "calc", "busted").await.is_some(),
+        "the still-broken sibling must remain paused — resuming `doubled` must not touch it"
+    );
+
+    for (id, expected_doubled) in [(1, "20"), (2, "40"), (3, "60")] {
+        let row = client
+            .query_one(
+                "select doubled::text, busted::text from calc where id = $1",
+                &[&id],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("read calc for id {id}: {e}"));
+        let doubled: String = row.get(0);
+        let busted: String = row.get(1);
+        assert_eq!(
+            doubled, expected_doubled,
+            "the resumed column must be correctly recomputed for id {id}, even though the \
+             still-paused sibling's formula throws on every row"
+        );
+        assert_eq!(
+            busted, "-999",
+            "the still-paused sibling's own value must be left untouched by this resume"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// (j) Regression: ambiguous field-name attribution must fall back to no
+//     column-level attribution (should-fix 4).
+// ---------------------------------------------------------------------
+
+/// Two sibling `KeySpace::OneToOne` transforms on the same source table,
+/// both declaring a field named `total` — only `sib_b`'s formula is
+/// actually broken (it reads `qty`, staged as unparseable below; `sib_a`
+/// only reads `price`/`tax`, both fine). `attribute_column_failure` used to
+/// resolve the ambiguity by picking whichever candidate
+/// `transforms_for_source` happened to return first (lowest id), a
+/// deterministic misattribution: it could freeze `sib_a`'s perfectly
+/// healthy `total` while `sib_b`'s actually-broken one never accumulates a
+/// `column_status` entry at all. Proves the fix: neither sibling gets a
+/// column-level attribution, while the pre-existing row-level/transform-wide
+/// fuse still evicts the stubborn key exactly as it did before this
+/// feature.
+#[tokio::test]
+async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribution() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table shared_src (id integer primary key, price numeric, tax numeric, \
+             qty numeric)",
+        )
+        .await
+        .expect("seed source table");
+    let source_columns = numeric_columns(&["id", "price", "tax", "qty"]);
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM sib_a FROM shared_src SELECT price + tax AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create sib_a definition");
+    create_definition(
+        &db.pool,
+        "TRANSFORM sib_b FROM shared_src SELECT qty + qty AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create sib_b definition");
+
+    let pk = source_primary_key(&db.pool, "shared_src")
+        .await
+        .expect("introspect source primary key");
+    let def_a = TransformDef {
+        target: "sib_a".to_string(),
+        source: "shared_src".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "total".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::Column("price".to_string())),
+                rhs: Box::new(Expr::Column("tax".to_string())),
+            },
+        }],
+        predicate: Predicate::True,
+    };
+    create_target_table(&db.pool, &def_a, "public", &pk, &source_columns)
+        .await
+        .expect("create sib_a table");
+    let def_b = TransformDef {
+        target: "sib_b".to_string(),
+        source: "shared_src".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "total".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::Column("qty".to_string())),
+                rhs: Box::new(Expr::Column("qty".to_string())),
+            },
+        }],
+        predicate: Predicate::True,
+    };
+    create_target_table(&db.pool, &def_b, "public", &pk, &source_columns)
+        .await
+        .expect("create sib_b table");
+
+    // `DEFAULT_COLUMN_DEATH_THRESHOLD` distinct bad rows, all in one batch —
+    // the same "breadth of distinct rows, not one row retried" shape
+    // `stage_bad_orders`/`column_fuse_trips_only_once_the_threshold_is_crossed`
+    // use elsewhere in this file, chosen deliberately here too: it's enough
+    // volume to actually cross a column fuse's threshold, so this test would
+    // catch the old deterministic-misattribution bug (which would have
+    // tripped `sib_a`'s fuse — the healthy sibling, since it's the
+    // lower-`id` candidate `transforms_for_source` returns first) rather
+    // than vacuously passing because nothing ever reached threshold.
+    let table = active_segment_table(&client).await;
+    let bad_ids: Vec<i64> = (1..=DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    for id in &bad_ids {
+        insert_cdc_row(
+            &client,
+            &table,
+            "shared_src",
+            &id.to_string(),
+            "insert",
+            None,
+            Some(r#"{"price":"10.00","tax":"1.50","qty":"not-a-number"}"#),
+        )
+        .await;
+    }
+    let seg_seq = seal_active_segment(&mut client).await;
+    let result = apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+    )
+    .await;
+    assert!(
+        matches!(result, Err(ApplyError::Eval(_))),
+        "the malformed qty must still surface as an evaluator failure, got {result:?}"
+    );
+
+    assert_eq!(
+        column_status_row(&client, "sib_a", "total").await,
+        None,
+        "the healthy sibling must never be attributed to, even though its field name matches \
+         the actually-broken sibling's"
+    );
+    assert_eq!(
+        column_status_row(&client, "sib_b", "total").await,
+        None,
+        "the actually-broken sibling must also get no column-level attribution — ambiguous \
+         attribution must fall back to no attribution at all, not a guess"
+    );
+
+    // The pre-existing row-level fuse's own bookkeeping must be completely
+    // unaffected by the ambiguity fallback: every distinct bad row is still
+    // charged toward its own key-level counter exactly as it would be
+    // without this feature (`tests/quarantine.rs`'s own fuse, untouched).
+    for id in &bad_ids {
+        let deaths: Option<i32> = client
+            .query_opt(
+                "select deaths from key_deaths where src_table = 'shared_src' and key = $1",
+                &[&id.to_string()],
+            )
+            .await
+            .expect("read key_deaths")
+            .map(|row| row.get(0));
+        assert_eq!(
+            deaths,
+            Some(1),
+            "row-level key_deaths bookkeeping for id {id} must proceed normally, unaffected by \
+             the ambiguity fallback"
+        );
+    }
 }

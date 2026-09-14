@@ -333,22 +333,11 @@ async fn evict_key(
     last_error: &str,
     contribution: Option<&FoldedChange>,
 ) -> Result<(), ApplyError> {
-    // `failures` records this eviction too, per ADR-0003's amendment —
-    // `transform`/`column` are both null since a whole-key eviction (unlike
-    // the column fuse below) is never attributable to one calculated field:
-    // by the time isolation reaches here, the failure has already survived
-    // a solo probe of this exact key, which is only possible for a
-    // key-shape/DDL-level failure or a genuinely malformed row — the same
-    // "column is null for a failure that isn't attributable to one
-    // calculated field" carve-out the storage doc describes.
     txn.execute(
-        "insert into poison (src_table, key, last_error, failures) \
-         values ($1, $2, $3, jsonb_build_array( \
-             jsonb_build_object('transform', null, 'column', null, \
-                                 'error', $3::text, 'failed_at', now()))) \
+        "insert into poison (src_table, key, last_error) \
+         values ($1, $2, $3) \
          on conflict (src_table, key) do update set \
-             last_error = excluded.last_error, poisoned_at = now(), \
-             failures = poison.failures || excluded.failures",
+             last_error = excluded.last_error, poisoned_at = now()",
         &[&src_table, &key, &last_error],
     )
     .await?;
@@ -427,7 +416,13 @@ pub async fn isolate_and_evict(
                     // [`attribute_column_failure`]'s doc comment for why
                     // this never changes what gets returned from *this*
                     // function — the existing row-level fuse below is
-                    // completely unmodified by this call.
+                    // completely unmodified by this call. Also see that same
+                    // doc comment's "Ambiguous match -> no attribution,
+                    // deliberately": if the failing field name matches more
+                    // than one sibling transform on this source, this call
+                    // intentionally attributes nothing rather than guess,
+                    // and the row-level fuse below is exactly what still
+                    // protects against the failure going otherwise unhandled.
                     attribute_column_failure(pool, &change.src_table, &change.key, &err).await?;
                     poisoned.push((
                         change.src_table.clone(),
@@ -537,17 +532,26 @@ pub async fn isolate_and_evict(
 /// existing row-level fuse — this function is a no-op for it.
 ///
 /// Attribution is by field-name match against every definition
-/// [`crate::defs::catalog::transforms_for_source`] returns for
-/// `src_table` (the first one declaring a field named
-/// [`crate::defs::eval::EvalError::field`] wins) — [`super::apply::compute`]
-/// evaluates one definition's fields inside one `eval::evaluate*` call and
-/// doesn't itself thread transform identity through
-/// [`crate::defs::eval::EvalError`] (which would mean widening that error
-/// type's public shape, and every existing construction site/test of it,
-/// just for this one caller). Two sibling definitions reading the same
-/// source table with an identically-named field is the one case this
-/// heuristic can misattribute; accepted as a documented limitation rather
-/// than a reason to thread more state through the evaluator.
+/// [`crate::defs::catalog::transforms_for_source`] returns for `src_table`
+/// — [`super::apply::compute`] evaluates one definition's fields inside one
+/// `eval::evaluate*` call and doesn't itself thread transform identity
+/// through [`crate::defs::eval::EvalError`] (which would mean widening that
+/// error type's public shape, and every existing construction site/test of
+/// it, just for this one caller).
+///
+/// **Ambiguous match -> no attribution, deliberately.** If more than one
+/// sibling `KeySpace::OneToOne` definition on `src_table` declares a field
+/// named [`crate::defs::eval::EvalError::field`], there is no reliable way
+/// to tell here which one actually produced `err` (only one may even be the
+/// one that's broken). Guessing — e.g. "lowest id wins" — would be a
+/// *deterministic misattribution*: every failure would land on the same
+/// (possibly perfectly healthy) column every time, potentially freezing it
+/// while the actually-broken sibling never accumulates a `column_status`
+/// entry at all. That's worse than doing nothing, so this falls through to
+/// the existing whole-row/transform-wide fuse (the row-level charge
+/// [`isolate_and_evict`] already runs alongside this call, unaffected by
+/// this function's return value either way) instead of attempting a fancier
+/// disambiguation heuristic.
 async fn attribute_column_failure(
     pool: &Pool,
     src_table: &str,
@@ -560,12 +564,21 @@ async fn attribute_column_failure(
     let field = eval_err.field();
 
     let candidates = catalog::transforms_for_source(pool, src_table).await?;
-    let Some(def) = candidates.into_iter().find(|def| {
+    let mut matches = candidates.into_iter().filter(|def| {
         matches!(def.def.key_space, KeySpace::OneToOne)
             && def.def.fields.iter().any(|f| f.name == field)
-    }) else {
+    });
+    let Some(def) = matches.next() else {
         return Ok(());
     };
+    // See this function's doc comment ("Ambiguous match -> no attribution,
+    // deliberately"): a second sibling definition matching the same field
+    // name means attribution would be a guess, not a fact, so fall back to
+    // the pre-existing row-level fuse rather than risk freezing the wrong
+    // column.
+    if matches.next().is_some() {
+        return Ok(());
+    }
     let transform = def.def.target;
 
     charge_column_failure(pool, &transform, field, src_table, key, &err.to_string()).await
@@ -578,6 +591,16 @@ async fn attribute_column_failure(
 /// paused column out, never keep reattempting its already-fused formula).
 /// Empty (the overwhelmingly common case) for a transform with nothing
 /// paused.
+///
+/// `defs::backfill`'s durable chunk-queue write path
+/// (`write_one_to_one_range`/`backfill_relationship_one_to_one`) needs this
+/// same exclusion for the same reason (a (re-)executed backfill chunk must
+/// not overwrite a column live CDC has since paused) but runs its own copy
+/// of the identical query (`defs::backfill::paused_columns_for`) rather than
+/// calling this function — `defs` sits below `staging` in this crate's
+/// layering (`staging::apply` already depends on `defs::backfill`, so the
+/// reverse dependency would be circular) and that call site already holds a
+/// plain `&Client` rather than a `&Pool`.
 pub(super) async fn paused_columns_for(
     pool: &Pool,
     transform_table: &str,
@@ -960,14 +983,30 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
     let col_ident = quote_ident(column);
     let mut regex_cache = eval::RegexCache::new();
 
+    // Exclude every *other* column of this same definition that's still
+    // paused (a sibling with its own independent, still-broken formula) from
+    // this evaluation — `column` itself is still marked paused in
+    // `column_status` at this point (`resume_column` only deletes that row
+    // *after* this call returns), so a plain `paused_columns_for` read would
+    // otherwise exclude `column` too and this recompute would silently
+    // evaluate nothing for it. Without this exclusion, a still-broken
+    // sibling's formula throwing on some row would fail the whole
+    // `evaluate_with_relationships` call for that row (the un-excluding
+    // form used to be called here), and the `let Ok(...) else { continue; }`
+    // guard below would then skip recomputing `column` for that row too —
+    // silently leaving it frozen even though `column`'s own formula is fine.
+    let mut excluded = paused_columns_for(pool, &def.def.target).await?;
+    excluded.remove(column);
+
     for pk_text in &order {
         let row = &rows_by_pk[pk_text];
-        let Ok(mut evaluated) = eval::evaluate_with_relationships(
+        let Ok(mut evaluated) = eval::evaluate_with_relationships_excluding(
             &def.def,
             row,
             &def.source_columns,
             &rel_ctx,
             &mut regex_cache,
+            &excluded,
         ) else {
             continue;
         };

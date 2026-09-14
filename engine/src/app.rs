@@ -487,7 +487,7 @@ impl Trellis {
     /// For a `transform.column` target, pulls from `column_failures` — the
     /// column fuse's own per-row bookkeeping (see
     /// `staging::quarantine`'s module doc comment for why that's a
-    /// dedicated table rather than `poison.failures`: a column-level failure
+    /// dedicated table rather than reusing `poison`: a column-level failure
     /// never evicts the row, so it can't live in the same table whose row
     /// presence means "excluded from folding entirely"). For a whole
     /// `transform` target, pulls from `poison` filtered to that transform's

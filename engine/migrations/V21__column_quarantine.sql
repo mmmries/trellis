@@ -8,45 +8,20 @@
 -- aren't attributable to one column (a key-shape/DDL failure that dooms a
 -- whole row).
 --
--- `poison.failures` (this migration's ADR-literal piece): a `jsonb` array,
--- one element per `(transform, column)` pair that failed while propagating a
--- poisoned source row, extending (not replacing) `last_error`. `column` is
--- null for a failure that isn't attributable to one calculated field, same
--- as `evict_key`'s own eviction (a key-shape/DDL failure that dooms the
--- whole row for that transform). Existing `last_error` values are migrated
--- into one such (transform-less, column-less) entry so no history is lost.
+-- The ADR's literal proposal also sketched a `poison.failures` jsonb array +
+-- GIN index for per-`(transform, column)` failure detail on the whole-key
+-- eviction path. Dropped from this migration (post-review, before this
+-- feature ever shipped outside this branch): nothing reads it — the
+-- column-fuse's own per-row bookkeeping and the "sample quarantined rows for
+-- transform.column" read both use the dedicated `column_failures` table
+-- below instead, precisely *because* a row landing in `poison` at all means
+-- "globally excluded from folding" (`poisoned_keys_among`) — which is
+-- correct for a whole-key eviction but would be wrong for a column-only
+-- failure (decision: a paused column freezes its value; it must not evict
+-- the row from every other column/transform that still computes cleanly).
+-- `column_failures` already serves the actual need, so `poison.failures`
+-- would have been pure write-once, read-never overhead.
 --
--- The GIN index is sized for the containment queries a `(transform, column)`
--- pair needs (`failures @> jsonb_build_array(jsonb_build_object('transform',
--- $1, 'column', $2))`). In practice (see `engine/src/staging/quarantine.rs`'s
--- module doc comment on this migration) the column-fuse's own per-row
--- bookkeeping and the "sample quarantined rows for transform.column" read use
--- the dedicated `column_failures` table below instead, precisely *because* a
--- row landing in `poison` at all means "globally excluded from folding"
--- (`poisoned_keys_among`) — which is correct for a whole-key eviction but
--- would be wrong for a column-only failure (decision: a paused column
--- freezes its value; it must not evict the row from every other column/
--- transform that still computes cleanly). `poison.failures`/this index stay
--- as literal ADR-0003 storage and back today's whole-key eviction path
--- (`evict_key`, updated to append an entry here too), not the new per-column
--- path.
-alter table poison
-    add column if not exists failures jsonb not null default '[]'::jsonb;
-
-update poison
-set failures = jsonb_build_array(
-    jsonb_build_object(
-        'transform', null,
-        'column', null,
-        'error', last_error,
-        'failed_at', poisoned_at
-    )
-)
-where failures = '[]'::jsonb;
-
-create index if not exists poison_failures_gin
-    on poison using gin (failures jsonb_path_ops);
-
 -- The column-status table (ADR-0003 amendment, "Column status table"): a
 -- small, dense table recording each transform's currently-paused columns —
 -- "is anything paused right now" is a cheap read over a handful of rows. A
