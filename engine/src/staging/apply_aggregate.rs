@@ -59,6 +59,24 @@
 //!   so the probe is *literally* the same SQL the correctness oracle would
 //!   run — never an approximated inverse.
 //!
+//! # Relationship-reading aggregates (issue #94)
+//!
+//! A definition whose fields aggregate a **to-one** relationship path
+//! (`SUM(post.word_count)`) opts out of the delta model entirely: every group
+//! any change touches is marked [`GroupPlan::force_full_recompute`], so Phase
+//! 3 re-derives it from the source `LEFT JOIN`ed to the to-side table (see
+//! [`apply_forced_groups_bulk`]) rather than folding per-row contributions.
+//!
+//! The delta model can't be used as-is here: a source row's contribution
+//! depends on a *related* row that is not in the change stream at all, so
+//! [`row_contribution`]'s purely-local per-row evaluation can't produce it.
+//! And a change to that related row arrives — via reverse propagation
+//! ([`super::apply::compute`]'s inbound-relationship pass, issue #30) — as an
+//! image-less recompute trigger on the from-side row, which is on the forced
+//! path regardless. Forcing both directions keeps one code path correct for
+//! both, instead of two that would have to agree. The cost is a group-scoped
+//! regrouping scan per touched group per batch in place of an O(1) increment.
+//!
 //! # Grain migration
 //!
 //! An `UPDATE` whose old and new images carry different `GROUP BY` column
@@ -98,7 +116,7 @@ use crate::defs::ddl::{self, avg_sum_column};
 use crate::defs::eval::{self, RegexCache, Row};
 use crate::defs::invertibility::{self, AggregateArg, CountArg};
 use crate::defs::oracle;
-use crate::defs::validate;
+use crate::defs::validate::{self, ResolvedRelationship};
 use crate::pool::quote_ident;
 
 use super::apply::ApplyError;
@@ -175,10 +193,13 @@ pub(super) fn classify_fields(
     group_by: &[String],
     source_columns: &HashMap<String, ValueType>,
     field_exprs: &HashMap<String, Expr>,
+    relationships: &HashMap<String, ResolvedRelationship>,
 ) -> Result<Vec<AggFieldPlan>, ApplyError> {
-    // GROUP BY aggregate fields never reference a relationship path (that's
-    // OneToOne enrichment, issue #40), so inference uses an empty map.
-    let field_types = validate::infer_field_types(def, source_columns, &HashMap::new())?;
+    // A field aggregating a to-one relationship path (issue #94) takes its
+    // type from the *to-side* column, which only `relationships` carries;
+    // a relationship-free definition passes an empty map and infers exactly
+    // as before.
+    let field_types = validate::infer_field_types(def, source_columns, relationships)?;
     let mut plans = Vec::with_capacity(def.fields.len());
     for field in &def.fields {
         if group_by.contains(&field.name) {
@@ -304,6 +325,27 @@ pub(super) struct AggregateTargetPlan {
     /// creates. See that function's doc comment for why two fields only ever
     /// share a column when they aggregate the identical argument expression.
     pub count_column_names: HashMap<String, String>,
+    /// Every **to-one** relationship this definition's fields read (issue
+    /// #94), as `(relationship name, to_table, to_col, from_col)`, sorted by
+    /// name for deterministic SQL. Empty for the overwhelmingly common
+    /// relationship-free aggregate, in which case every SQL statement this
+    /// module emits is byte-identical to what it emitted before #94.
+    ///
+    /// Non-empty also *means* "this target is on the forced-recompute path"
+    /// — see the module doc comment and [`accumulate_changes`].
+    pub rel_joins: Vec<RelJoin>,
+}
+
+/// One to-one relationship join an aggregate target needs to resolve its
+/// fields: the relationship's name (which doubles as the SQL alias for the
+/// joined to-side table, matching `defs::oracle`'s convention) and its
+/// endpoints.
+#[derive(Debug, Clone)]
+pub(super) struct RelJoin {
+    pub name: String,
+    pub to_table: String,
+    pub to_col: String,
+    pub from_col: String,
 }
 
 impl AggregateTargetPlan {
@@ -313,6 +355,7 @@ impl AggregateTargetPlan {
         fields: Vec<AggFieldPlan>,
         source: String,
         field_exprs: HashMap<String, Expr>,
+        rel_joins: Vec<RelJoin>,
     ) -> Self {
         let count_column_names = ddl::count_column_names_from(fields.iter().filter_map(|f| {
             if !matches!(f.kind, AggFieldKind::Sum | AggFieldKind::Avg) {
@@ -333,6 +376,7 @@ impl AggregateTargetPlan {
             source,
             field_exprs,
             count_column_names,
+            rel_joins,
         }
     }
 }
@@ -483,10 +527,29 @@ pub(super) fn accumulate_changes(
     // field is evaluated as the equivalent `SUM` here.
     let contribution_def = contribution_def(def);
 
+    // Issue #94: a definition reading a to-one relationship path can't be
+    // maintained by per-row deltas at all (see the module doc comment), so
+    // every group any change touches — on either side of a grain migration —
+    // goes on the full-recompute path, exactly as an image-less change would.
+    let force_every_group = !plan.rel_joins.is_empty();
+
     for (i, change) in changes.iter().enumerate() {
         let is_image_less = change.old_image.is_none() && change.new_image.is_none();
         let old_row = &old_rows[i];
         let new_row = &rows[i];
+
+        if force_every_group {
+            for row in [old_row, new_row].into_iter().flatten() {
+                let (values, key) = derive_group_key(row, group_by);
+                let group = plan
+                    .groups
+                    .entry(key)
+                    .or_insert_with(|| GroupPlan::new(values));
+                group.force_full_recompute = true;
+                group.hop_gen = group.hop_gen.max(change.hop_gen);
+            }
+            continue;
+        }
 
         if is_image_less {
             if let Some(row) = new_row {
@@ -1353,6 +1416,23 @@ async fn apply_forced_groups_bulk(
     let source_ident = quote_ident(&plan.source);
     let target_ident = quote_ident(target);
     let group_idents: Vec<String> = plan.group_by.iter().map(|c| quote_ident(c)).collect();
+    // Issue #94: to-one relationship joins onto the recompute's source scan,
+    // so a `SUM(post.word_count)` field reads the joined to-side column. The
+    // survivor probe and the extinct-group DELETE need no join (a LEFT JOIN
+    // can neither add nor remove source rows, and the DELETE never reads the
+    // source), so only the recomputing INSERT below carries them. Empty for a
+    // relationship-free aggregate, leaving its SQL byte-identical.
+    let rel_joins_sql = oracle::to_one_join_clauses(
+        plan.rel_joins.iter().map(|j| {
+            (
+                j.name.as_str(),
+                j.to_table.as_str(),
+                j.to_col.as_str(),
+                j.from_col.as_str(),
+            )
+        }),
+        "s",
+    );
 
     // 1. Survivor ordinals: which forced groups still have a source row.
     let survivor_sql = format!(
@@ -1424,7 +1504,7 @@ async fn apply_forced_groups_bulk(
                     select_exprs.push("count(*)::numeric".to_string());
                 }
                 AggFieldKind::RecomputeOnly => {
-                    let expr = oracle::render_expr_sql(&plan.field_exprs[field.name.as_str()]);
+                    let expr = render_agg_expr(plan, &plan.field_exprs[field.name.as_str()]);
                     insert_cols.push(col.clone());
                     select_exprs.push(format!("({expr})"));
                 }
@@ -1447,7 +1527,7 @@ async fn apply_forced_groups_bulk(
         // than rebuilding the identical list.
         let insert_sql = format!(
             "insert into {target_ident} ({}) \
-             select {} from {} join {source_ident} s on {} \
+             select {} from {} join {source_ident} s on {}{rel_joins_sql} \
              group by {} \
              on conflict ({}) do update set {}",
             insert_cols.join(", "),
@@ -1491,14 +1571,35 @@ async fn apply_forced_groups_bulk(
 }
 
 /// The rendered SQL for a `SUM`/`AVG` field's single argument expression —
-/// [`oracle::render_expr_sql`] over the call's one argument, exactly as
+/// [`render_agg_expr`] over the call's one argument, exactly as
 /// [`probe_sum_and_count`] renders it, so the bulk path computes the same
 /// `sum(arg)`/`count(arg)` the per-group probe would.
 fn agg_arg_sql(plan: &AggregateTargetPlan, field_name: &str) -> String {
     let Expr::FunctionCall { args, .. } = &plan.field_exprs[field_name] else {
         panic!("agg_arg_sql called on a non-SUM/AVG field");
     };
-    oracle::render_expr_sql(&args[0])
+    render_agg_expr(plan, &args[0])
+}
+
+/// One aggregate field's (or field argument's) expression as SQL over this
+/// plan's recompute scan, where the source is aliased `s`.
+///
+/// A relationship-free plan renders through [`oracle::render_expr_sql`]
+/// unchanged — unqualified column names, exactly as before #94, which matters
+/// because the per-group probes ([`probe_field_value`],
+/// [`probe_sum_and_count`]) render the same expressions against an *unaliased*
+/// source. A plan with to-one relationship joins renders through
+/// [`oracle::render_to_one_rel_expr_sql`] instead, qualifying source columns
+/// with `s` (they'd otherwise be ambiguous against the joined to-side table)
+/// and resolving each `<rel>.<column>` path off its join alias. Those per-group
+/// probes are unreachable for such a plan: every one of its groups is forced
+/// onto this bulk recompute path (see [`accumulate_changes`]).
+fn render_agg_expr(plan: &AggregateTargetPlan, expr: &Expr) -> String {
+    if plan.rel_joins.is_empty() {
+        oracle::render_expr_sql(expr)
+    } else {
+        oracle::render_to_one_rel_expr_sql(expr, "s")
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -2283,6 +2384,7 @@ mod tests {
                     args: vec![Expr::Column("amount".to_string())],
                 },
             )]),
+            Vec::new(),
         );
 
         let mut group = GroupPlan::new(vec![Some("10".to_string())]);
@@ -2363,6 +2465,7 @@ mod tests {
                     args: vec![Expr::Column("amount".to_string())],
                 },
             )]),
+            Vec::new(),
         );
 
         // A forced group keyed by NULL (`group_values = [None]`).
@@ -2459,6 +2562,7 @@ mod tests {
             fields,
             "order_items".to_string(),
             exprs,
+            Vec::new(),
         )
     }
 

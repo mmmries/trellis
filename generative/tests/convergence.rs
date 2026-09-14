@@ -27,9 +27,9 @@ use engine::defs::qualified_target_table;
 use engine::{Config, Pool};
 use generative::backend::{Backend, ManualBackend};
 use generative::generate::{
-    AggregateColumn, AggregateFn, DefShape, DerivedShape, Mutate, TableSpec, build_program,
-    build_program_multi, build_program_multi_with_derived, build_program_multi_with_shapes,
-    trivial_program,
+    AggregateColumn, AggregateFn, DefShape, DerivedShape, Mutate, RelAggregateFn, RelFieldKind,
+    RelFieldSpec, TableSpec, build_program, build_program_multi, build_program_multi_with_derived,
+    build_program_multi_with_relationships, build_program_multi_with_shapes, trivial_program,
 };
 use generative::model::group_key;
 use generative::run::{RunError, check_program, run_convergence};
@@ -476,6 +476,7 @@ async fn a_text_boolean_uuid_program_converges_end_to_end() {
                 Some("00000000-0000-4000-8000-000000000000".to_string()),
             ],
             grain_values: vec![None, None],
+            rel_fk_values: vec![None, None],
             mutates: vec![],
         }],
         &[0],
@@ -529,6 +530,7 @@ async fn a_nested_mixed_operator_and_function_expression_converges_end_to_end() 
                 Some("00000000-0000-4000-8000-000000000000".to_string()),
             ],
             grain_values: vec![None, None],
+            rel_fk_values: vec![None, None],
             mutates: vec![],
         }],
         &[0],
@@ -604,6 +606,7 @@ async fn an_aggregate_group_emptied_by_deletes_converges_and_the_row_disappears(
                 Some("0".to_string()),
                 Some("1".to_string()),
             ],
+            rel_fk_values: vec![None, None, None],
             mutates: vec![Mutate::Delete { pk: 1 }, Mutate::Delete { pk: 2 }],
         }],
         &[(
@@ -673,6 +676,7 @@ async fn deleting_a_groups_current_min_and_max_forces_a_real_recompute() {
             bool_values: vec![None, None, None],
             uuid_values: vec![None, None, None],
             grain_values: vec![Some("0".to_string()); 3],
+            rel_fk_values: vec![None; 3],
             // Delete the current max (pk 2, c1=20) and the current min
             // (pk 3, c1=1); only pk 1 (c1=5) survives.
             mutates: vec![Mutate::Delete { pk: 2 }, Mutate::Delete { pk: 3 }],
@@ -735,6 +739,7 @@ async fn avg_and_sum_over_the_same_column_share_a_partial_and_stay_correct_throu
             bool_values: vec![None, None],
             uuid_values: vec![None, None],
             grain_values: vec![Some("0".to_string()), Some("0".to_string())],
+            rel_fk_values: vec![None, None],
             mutates: vec![
                 // Group "0" starts as {10, 30} (sum 40, avg 20). Update pk 1
                 // to 50 (sum 80, avg 40), then delete pk 2 (sum 50, avg 50).
@@ -784,5 +789,415 @@ async fn avg_and_sum_over_the_same_column_share_a_partial_and_stay_correct_throu
     assert!(
         (avg - 50.0).abs() < 1e-9,
         "final avg: expected 50, got {avg}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Issue #34: relationship edges (ADR-0006), one hand-built pin per
+// engine-supported shape. Each drives the same per-op convergence property
+// the property test does, so a reader has a legible, minimal case for each
+// of the three shapes and a regression names the shape it broke.
+// ---------------------------------------------------------------------
+
+/// A [`TableSpec`] with `rel_fk_values` and `grain_values` spelled out and
+/// every other non-numeric column `NULL` — the relationship pins below only
+/// vary along those two axes, so spelling the other three out five times
+/// apiece would bury what actually differs.
+fn rel_spec(
+    seed_values: Vec<(Option<i64>, Option<i64>)>,
+    grain_values: Vec<Option<String>>,
+    rel_fk_values: Vec<Option<String>>,
+    mutates: Vec<Mutate>,
+) -> TableSpec {
+    let n = seed_values.len();
+    TableSpec {
+        seed_values,
+        text_values: vec![None; n],
+        bool_values: vec![None; n],
+        uuid_values: vec![None; n],
+        grain_values,
+        rel_fk_values,
+        mutates,
+    }
+}
+
+/// A bare to-one enrichment (`rel_enrich = <rel>.<c1>`) on a row-grain
+/// definition, exercising all three join outcomes ADR-0006 distinguishes in
+/// one program: `t0`'s three rows carry a foreign key that **matches** a
+/// related row (`k1`), one that **matches nothing** (`k9`), and one that is
+/// **`NULL`**. Every one of the three source rows must survive with its own
+/// enrichment (`NULL` for the latter two) — a `LEFT JOIN`, never an inner
+/// one.
+///
+/// It also exercises **reverse propagation**, for free and unavoidably: ops
+/// are emitted one table at a time, so every `t0` row is inserted and
+/// converged *before* `t1` exists at all. The matching row's enrichment
+/// therefore starts `NULL` and must be re-derived when the related row
+/// arrives, and re-derived again when that related row is updated and then
+/// deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_to_one_relationship_enrichment_converges_end_to_end() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program_multi_with_relationships(
+        &[
+            rel_spec(
+                vec![(Some(1), Some(2)), (Some(3), Some(4)), (Some(5), Some(6))],
+                vec![None, None, None],
+                vec![Some("k1".to_string()), Some("k9".to_string()), None],
+                Vec::new(),
+            ),
+            rel_spec(
+                vec![(Some(100), Some(0)), (Some(200), Some(0))],
+                vec![None, None],
+                vec![None, None],
+                vec![
+                    // The related row `t0`'s first row joins to changes,
+                    // then vanishes: both must propagate back.
+                    Mutate::Update {
+                        pk: 1,
+                        c1: Some(111),
+                        c2: Some(0),
+                    },
+                    Mutate::Delete { pk: 1 },
+                ],
+            ),
+        ],
+        &[(0, DefShape::OneToOne)],
+        &[None],
+        &[Some(RelFieldSpec {
+            to_table: 1,
+            kind: RelFieldKind::ToOneBare,
+        })],
+    );
+    assert_eq!(program.relationships.len(), 1);
+    assert_eq!(
+        program.relationships[0].cardinality,
+        generative::model::Cardinality::ToOne
+    );
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("a to-one relationship enrichment must converge end-to-end");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+
+    // The related row was deleted by the last op, so every enrichment is
+    // back to NULL — and, critically, all three source rows are still there.
+    let snapshot = backend.snapshot().await.expect("snapshot after the run");
+    let target = &snapshot[&program.defs[0].target];
+    assert_eq!(
+        target.len(),
+        3,
+        "a LEFT JOIN keeps every source row alive regardless of whether its FK resolves: \
+         {target:?}"
+    );
+    for pk in ["1", "2", "3"] {
+        assert_eq!(
+            target[pk]["rel_enrich"], None,
+            "pk {pk}'s enrichment must be NULL once the related row is gone: {target:?}"
+        );
+    }
+}
+
+/// A to-many aggregate (`rel_agg = COUNT(<rel>.<c1>)`) on a row-grain
+/// definition: `t0`'s unique key column is the *from* side, `t1`'s
+/// non-unique FK column the *to* side, so one source row fans out to many
+/// related rows. `COUNT` specifically, because it is the one aggregate whose
+/// empty-related-set answer is `0` rather than `NULL` — the to-many half of
+/// ADR-0006's nullability rule, and the half a naive `NULL`-propagating
+/// implementation gets wrong.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_to_many_relationship_aggregate_converges_end_to_end() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program_multi_with_relationships(
+        &[
+            // `t0`'s key column is `k1`/`k2` (derived from the pk), so row 1
+            // has two related rows below, row 2 has one, and row 3 has none.
+            rel_spec(
+                vec![(Some(1), Some(2)), (Some(3), Some(4)), (Some(5), Some(6))],
+                vec![None, None, None],
+                vec![None, None, None],
+                Vec::new(),
+            ),
+            rel_spec(
+                vec![
+                    (Some(10), Some(0)),
+                    (Some(20), Some(0)),
+                    (Some(30), Some(0)),
+                ],
+                vec![None, None, None],
+                vec![
+                    Some("k1".to_string()),
+                    Some("k1".to_string()),
+                    Some("k2".to_string()),
+                ],
+                vec![Mutate::Delete { pk: 1 }],
+            ),
+        ],
+        &[(0, DefShape::OneToOne)],
+        &[None],
+        &[Some(RelFieldSpec {
+            to_table: 1,
+            kind: RelFieldKind::ToManyAggregate(RelAggregateFn::Count),
+        })],
+    );
+    assert_eq!(
+        program.relationships[0].cardinality,
+        generative::model::Cardinality::ToMany
+    );
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("a to-many relationship aggregate must converge end-to-end");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+
+    let snapshot = backend.snapshot().await.expect("snapshot after the run");
+    let target = &snapshot[&program.defs[0].target];
+    assert_eq!(
+        target["1"]["rel_agg"],
+        Some("1".to_string()),
+        "pk 1 had two related rows, one of which was deleted: {target:?}"
+    );
+    assert_eq!(
+        target["2"]["rel_agg"],
+        Some("1".to_string()),
+        "pk 2 has exactly one related row: {target:?}"
+    );
+    assert_eq!(
+        target["3"]["rel_agg"],
+        Some("0".to_string()),
+        "pk 3 has no related rows at all, and COUNT over the empty set is 0 (not NULL): \
+         {target:?}"
+    );
+}
+
+/// A to-one relationship path aggregated **inside a `GROUP BY`** — the shape
+/// this branch's engine work (issue #94) made legal, and the one the
+/// generator would previously have had to steer around. `SUM(<rel>.<c1>)`
+/// folds one related value per source row across each group, so it is an
+/// ordinary aggregate over a `LEFT JOIN`, not nested aggregation.
+///
+/// Both grain groups contain a row whose foreign key resolves and one whose
+/// does not, so the test pins the interaction the two features have with
+/// each other: an unmatched row must still *belong* to its group (it counts
+/// toward `COUNT(*)`) while contributing nothing to `SUM`'s value set.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_to_one_relationship_aggregated_inside_a_group_by_converges_end_to_end() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program_multi_with_relationships(
+        &[
+            rel_spec(
+                vec![
+                    (Some(1), Some(0)),
+                    (Some(2), Some(0)),
+                    (Some(3), Some(0)),
+                    (Some(4), Some(0)),
+                ],
+                vec![
+                    Some("0".to_string()),
+                    Some("0".to_string()),
+                    Some("1".to_string()),
+                    Some("1".to_string()),
+                ],
+                vec![
+                    Some("k1".to_string()),
+                    Some("k9".to_string()),
+                    Some("k2".to_string()),
+                    None,
+                ],
+                Vec::new(),
+            ),
+            rel_spec(
+                vec![(Some(10), Some(0)), (Some(20), Some(0))],
+                vec![None, None],
+                vec![None, None],
+                Vec::new(),
+            ),
+        ],
+        &[(
+            0,
+            DefShape::Aggregate {
+                functions: vec![AggregateFn::Count],
+            },
+        )],
+        &[None],
+        &[Some(RelFieldSpec {
+            to_table: 1,
+            kind: RelFieldKind::ToOneAggregate(RelAggregateFn::Sum),
+        })],
+    );
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("a to-one relationship aggregated inside a GROUP BY must converge end-to-end");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+
+    let snapshot = backend.snapshot().await.expect("snapshot after the run");
+    let target = &snapshot[&program.defs[0].target];
+    for (grain, expected_sum) in [("0", "10"), ("1", "20")] {
+        let row = &target[&group_key(&[Some(grain.to_string())])];
+        assert_eq!(
+            row["cnt"],
+            Some("2".to_string()),
+            "grain {grain}: an unmatched FK must still count toward COUNT(*): {target:?}"
+        );
+        assert_eq!(
+            row["rel_agg"],
+            Some(expected_sum.to_string()),
+            "grain {grain}: only the matched row contributes to SUM: {target:?}"
+        );
+    }
+}
+
+/// **A live engine defect, found by this suite.** `TRUNCATE` on a table some
+/// definition reads *through a relationship* leaves that definition's
+/// enrichment permanently stale.
+///
+/// Mechanism (`engine::staging::apply`): the truncate-clear path resolves
+/// affected targets with `catalog::transforms_for_source` — definitions whose
+/// **source** is the truncated table — while reverse propagation into
+/// definitions that merely *read* the table lives in the separate keyed
+/// by-source loop, driven by per-row change images and
+/// `catalog::relationships_to_table`. A `TRUNCATE` stages one key-less
+/// sentinel row (`append::TRUNCATE_SENTINEL_KEY`), not per-row images, so it
+/// never reaches that loop at all. Exactly the "its own logical-decoding
+/// message, not a bulk delete" hazard the design doc §7 flags.
+///
+/// The program: `t0`'s single row has a foreign key resolving to `t1`'s
+/// single row, so `rel_enrich` is `22`. Then `t1` is truncated. The oracle's
+/// `LEFT JOIN` finds nothing and says `NULL`; the maintained target still
+/// says `22`.
+///
+/// `#[ignore]`d rather than deleted: this is the durable, minimized pin the
+/// design doc §6 asks a generative finding to terminate as, and it must fail
+/// the day someone thinks the bug is fixed. `un-ignore` it then, and delete
+/// `generate::without_truncates_on_relationship_to_sides`, which is what
+/// currently keeps the property suite from drawing this shape.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "known engine defect: TRUNCATE of a relationship to-side table does not reverse-propagate"]
+async fn truncating_a_relationship_to_side_table_leaves_a_stale_enrichment() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program_multi_with_relationships(
+        &[
+            rel_spec(
+                vec![(Some(1), Some(2))],
+                vec![None],
+                vec![Some("k1".to_string())],
+                Vec::new(),
+            ),
+            rel_spec(
+                vec![(Some(22), Some(0))],
+                vec![None],
+                vec![None],
+                vec![Mutate::Truncate],
+            ),
+        ],
+        &[(0, DefShape::OneToOne)],
+        &[None],
+        &[Some(RelFieldSpec {
+            to_table: 1,
+            kind: RelFieldKind::ToOneBare,
+        })],
+    );
+    // The generator steers around this shape by default (see
+    // `without_truncates_on_relationship_to_sides`); re-adding the truncate
+    // here is what makes this pin reproduce the finding.
+    let program = generative::model::Program {
+        ops: program
+            .ops
+            .iter()
+            .cloned()
+            .chain(std::iter::once(generative::model::Op::Truncate {
+                table: program.tables[1].name.clone(),
+                expect: generative::model::OpOutcome::Succeeds,
+            }))
+            .collect(),
+        ..program
+    };
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("truncating a relationship's to-side table must clear the enrichment it fed");
+}
+
+/// The control beside the finding above (design doc §6: "a control test
+/// beside each finding — a case that must *converge* — proving the harness
+/// can tell green from red").
+///
+/// Byte-for-byte the same program except the last op `DELETE`s `t1`'s only
+/// row instead of `TRUNCATE`ing the table. The end state of the source is
+/// identical — `t1` is empty either way — so any oracle that judged the two
+/// differently would be wrong. This one converges, which localizes the
+/// defect precisely: not reverse propagation in general, but the
+/// `TRUNCATE`-shaped change specifically.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_relationship_to_side_row_does_clear_the_enrichment() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program_multi_with_relationships(
+        &[
+            rel_spec(
+                vec![(Some(1), Some(2))],
+                vec![None],
+                vec![Some("k1".to_string())],
+                Vec::new(),
+            ),
+            rel_spec(
+                vec![(Some(22), Some(0))],
+                vec![None],
+                vec![None],
+                vec![Mutate::Delete { pk: 1 }],
+            ),
+        ],
+        &[(0, DefShape::OneToOne)],
+        &[None],
+        &[Some(RelFieldSpec {
+            to_table: 1,
+            kind: RelFieldKind::ToOneBare,
+        })],
+    );
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("deleting the related row must clear the enrichment it fed");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+
+    let snapshot = backend.snapshot().await.expect("snapshot after the run");
+    assert_eq!(
+        snapshot[&program.defs[0].target]["1"]["rel_enrich"], None,
+        "the related row is gone, so the enrichment must be NULL: {snapshot:#?}"
     );
 }

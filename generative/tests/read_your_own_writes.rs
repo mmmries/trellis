@@ -46,7 +46,10 @@
 
 use engine::{Config, Pool};
 use generative::backend::{Backend, ManualBackend};
-use generative::generate::build_program;
+use generative::generate::{
+    DefShape, RelFieldKind, RelFieldSpec, TableSpec, build_program,
+    build_program_multi_with_relationships,
+};
 use generative::model::{Op, OpOutcome};
 use generative::run::check_program;
 use testkit::TestCluster;
@@ -157,5 +160,115 @@ async fn reading_without_quiesce_can_observe_state_that_has_not_caught_up_yet() 
     assert!(
         divergence.is_none(),
         "after a real quiesce, the target must have fully caught up: {divergence:?}"
+    );
+}
+
+/// Read-your-own-writes across a **relationship** (issue #34, ADR-0006).
+///
+/// The positive half of the property, on the shape that makes it hardest:
+/// the write lands on the *related* row, not on the row whose derived value
+/// changes. Trellis has to resolve — from the dependency graph — which
+/// definitions read the changed table, find the referencing rows by join
+/// key, and re-derive them (ADR-0006's "reverse" direction), all
+/// asynchronously. So `quiesce()`'s promise here covers a write the client
+/// never made against the target's own source table at all.
+///
+/// Both cardinalities are exercised in one program: `d0` reads `t1` through
+/// a to-one enrichment, `d1` reads `t1` through a to-many aggregate. One
+/// update to a single `t1` row must, after one `quiesce()`, be visible in
+/// both.
+#[tokio::test(flavor = "multi_thread")]
+async fn awaiting_after_a_write_to_a_related_row_makes_the_enrichment_visible() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let spec = |seeds: Vec<(Option<i64>, Option<i64>)>, fks: Vec<Option<String>>| {
+        let n = seeds.len();
+        TableSpec {
+            seed_values: seeds,
+            text_values: vec![None; n],
+            bool_values: vec![None; n],
+            uuid_values: vec![None; n],
+            grain_values: vec![None; n],
+            rel_fk_values: fks,
+            mutates: Vec::new(),
+        }
+    };
+
+    let program = build_program_multi_with_relationships(
+        // `t1`'s key column is `k1` (derived from its pk), so `t0`'s first
+        // row joins to it both ways: `t0.fk = "k1"` for the to-one
+        // direction, and `t1.fk = "k1"` (matching `t0`'s own key) for the
+        // to-many one.
+        &[
+            spec(vec![(Some(1), Some(2))], vec![Some("k1".to_string())]),
+            spec(vec![(Some(10), Some(0))], vec![Some("k1".to_string())]),
+        ],
+        &[(0, DefShape::OneToOne), (0, DefShape::OneToOne)],
+        &[None, None],
+        &[
+            Some(RelFieldSpec {
+                to_table: 1,
+                kind: RelFieldKind::ToOneBare,
+            }),
+            Some(RelFieldSpec {
+                to_table: 1,
+                kind: RelFieldKind::ToManyAggregate(generative::generate::RelAggregateFn::Sum),
+            }),
+        ],
+    );
+
+    let related_table = program.tables[1].name.clone();
+    let related_c1 = program.tables[1].columns[1].name.clone();
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    backend.install(&program).await.expect("install program");
+    for op in &program.ops {
+        backend.apply(op).await.expect("seed op must succeed");
+    }
+    backend.quiesce().await.expect("quiesce after seeding");
+
+    // The write: a *related* row changes. Nothing touches `t0`, yet both of
+    // `t0`'s targets must move.
+    let update = Op::Update {
+        table: related_table,
+        pk: "1".to_string(),
+        changes: vec![(related_c1, Some("777".to_string()))],
+        expect: OpOutcome::Succeeds,
+    };
+    backend
+        .apply(&update)
+        .await
+        .expect("update to the related row must succeed");
+    backend
+        .quiesce()
+        .await
+        .expect("quiesce must cover reverse propagation, not just forward");
+
+    let snapshot = backend.snapshot().await.expect("snapshot after quiesce");
+    assert_eq!(
+        snapshot[&program.defs[0].target]["1"]["rel_enrich"],
+        Some("777".to_string()),
+        "the to-one enrichment must reflect the related row's new value after quiesce: \
+         {snapshot:#?}"
+    );
+    assert_eq!(
+        snapshot[&program.defs[1].target]["1"]["rel_agg"],
+        Some("777".to_string()),
+        "the to-many aggregate must reflect the related row's new value after quiesce: \
+         {snapshot:#?}"
+    );
+
+    // And the full oracle agrees, not just the two cells spelled out above.
+    let divergence = check_program(&pool, &program, &snapshot)
+        .await
+        .expect("oracle check must run");
+    assert!(
+        divergence.is_none(),
+        "after quiesce, every relationship-enriched target must match the oracle: {divergence:?}"
     );
 }

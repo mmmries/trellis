@@ -177,6 +177,29 @@
 //!   binding, `::text` casts, this harness's own snapshot diffing) — just not
 //!   of that specific key-encoding risk, which remains open.
 //!
+//! Issue **#34** ("relationship edges in the program generator", ADR-0006)
+//! adds the first *cross-table* derivations. Every table gains two more
+//! `Text` columns — a `UNIQUE` relationship key ([`REL_KEY_COLUMN`]) and a
+//! nullable foreign key ([`REL_FK_COLUMN`]) — and a definition may draw an
+//! extra field that reads a *related* table through a named relationship.
+//! The three shapes drawn are exactly the three the engine supports; see
+//! [`RelFieldKind`] for the full shape table and
+//! [`attach_relationship_fields`] for how a declaration's endpoints are
+//! fixed. Two invariants are worth naming here because they are what keep
+//! "only valid programs" structural rather than probabilistic:
+//!
+//! - **A relationship's join key must be text-stable** (see
+//!   [`TEXT_STABLE_JOIN_KEY_TYPES`]), which is why both endpoint columns are
+//!   `Text` and not the numeric primary key.
+//! - **Relationships always point from a lower-indexed table to a
+//!   higher-indexed one**, so the cross-table dependency graph ADR-0006
+//!   requires to be acyclic is acyclic by construction.
+//!
+//! Like the grain column, the relationship columns are seeded once and never
+//! mutated — but unlike it, the *related* table's own `c1` is freely mutated
+//! and deleted, which is what makes a generated program exercise ADR-0006's
+//! reverse propagation rather than only the forward direction.
+//!
 //! # Awkward values (issue #7, design doc §3)
 //!
 //! Of the four awkward-value classes the design doc calls out:
@@ -202,8 +225,8 @@ use std::collections::{HashMap, HashSet};
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 
 use crate::model::{
-    Column, NamePool, NoiseAction, NoiseEvent, NoiseEventKind, NoisePlan, Op, OpOutcome, Program,
-    Table,
+    Cardinality, Column, NamePool, NoiseAction, NoiseEvent, NoiseEventKind, NoisePlan, Op,
+    OpOutcome, Program, Relationship, Table,
 };
 
 /// The inclusive upper bound of the calculated-field value domain.
@@ -258,6 +281,70 @@ pub const MAX_DEFS: usize = 3;
 /// `Delete` mutates has real odds of emptying a group entirely — see the
 /// module doc comment's B4 section.
 pub const GRAIN_MAX: i64 = 2;
+
+/// Index, within every generated source table's `columns`, of the
+/// relationship **key** column (issue #34): a `Text` column carrying a real
+/// single-column `UNIQUE` constraint (`crate::model::Table::unique_cols`),
+/// so a relationship whose *to*-side is this column is **to-one** under
+/// ADR-0006's cardinality rule.
+///
+/// `Text` specifically, not the numeric primary key, because a
+/// relationship's join key must be a *text-stable* type — see
+/// [`TEXT_STABLE_JOIN_KEY_TYPES`].
+pub const REL_KEY_COLUMN: usize = 7;
+
+/// Index, within every generated source table's `columns`, of the
+/// relationship **foreign-key** column (issue #34): a nullable `Text` column
+/// with no unique constraint, so a relationship whose *to*-side is this
+/// column is **to-many**. As a *from*-side it is the ordinary FK of a to-one
+/// relationship.
+pub const REL_FK_COLUMN: usize = 8;
+
+/// The Postgres type names whose equality is *text-stable* — the engine
+/// rejects any relationship whose join key isn't one of these
+/// (`ValidationError::RelationshipUnsupportedJoinKeyType`), because Trellis's
+/// join is `a::text = b::text` while the Postgres oracle's is the type's
+/// native `=`, and the two disagree for `numeric`/`real` (scale:
+/// `1.0::text != 1.00::text`), `character(n)` (blank padding), `citext`
+/// (case), and the date/time types (session-dependent rendering).
+///
+/// **Deliberately duplicated here rather than imported.** The engine's own
+/// copy (`engine::defs::catalog`'s `TEXT_STABLE_JOIN_KEY_TYPES`) is private
+/// to that module, and the design doc's seam (§1/§2) says this crate should
+/// not reach into engine internals to decide what a valid program is — the
+/// generator's job is to *independently* know the rules and only emit
+/// programs that satisfy them, exactly as [`crate::oracle`] independently
+/// renders SQL rather than calling the engine's renderer. Exposing the
+/// engine's constant would also be an `engine/` change, which issue #34 is
+/// explicitly scoped out of. The cost of the duplication is bounded: if the
+/// two ever drift, the generator emits a relationship the engine rejects,
+/// and an install rejection is a **hard failure, never a skip** (design
+/// doc §3) — so the drift surfaces as a loud test failure on the very next
+/// run, not as silently-lost coverage.
+///
+/// Only [`engine::defs::ast::ValueType::Text`] and
+/// [`engine::defs::ast::ValueType::Uuid`] of this crate's four value types
+/// map into this set (`Numeric` renders as `numeric` and `Boolean` as
+/// `boolean`, neither of which is listed), which is why the relationship
+/// key/FK columns are `Text`.
+pub const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
+    "smallint",
+    "integer",
+    "bigint",
+    "uuid",
+    "text",
+    "character varying",
+];
+
+/// The relationship **key** column's value for seeded primary key `pk`
+/// (issue #34): derived from the pk rather than drawn, so it is distinct for
+/// every row of a table by construction and its `UNIQUE` constraint can
+/// never be violated by any draw. Shares its `k`-prefixed shape with
+/// [`strategy::rel_fk_value`]'s pool so a foreign key really does find
+/// matching related rows some of the time.
+pub fn rel_key_value(pk: i64) -> String {
+    format!("k{pk}")
+}
 
 /// Renders an `Option<i64>` value to the rendered-text form
 /// [`crate::model::Op`] wants: `None` (SQL `NULL`) stays `None`.
@@ -455,6 +542,22 @@ pub struct TableSpec {
     /// `text_values`. Never touched by [`Mutate`] — see the module doc
     /// comment's B4 scope cuts.
     pub grain_values: Vec<Option<String>>,
+    /// `rel_fk_values[i]` is the rendered value for seeded primary key
+    /// `i + 1`'s relationship **foreign-key** column (issue #34) — the
+    /// non-unique `Text` column at index [`REL_FK_COLUMN`]. Drawn from
+    /// [`strategy::rel_fk_value`]'s tiny pool so a generated relationship
+    /// really exercises all three join outcomes: a value that matches a
+    /// related row's key, a value that matches nothing, and SQL `NULL`.
+    /// Same length contract as `text_values`. Never touched by [`Mutate`],
+    /// like every other non-numeric column here.
+    ///
+    /// The matching relationship **key** column ([`REL_KEY_COLUMN`]) has no
+    /// field here on purpose: it is derived from the row's own primary key
+    /// ([`rel_key_value`]) rather than drawn, which is what makes its
+    /// `UNIQUE` constraint unfalsifiable by any draw — a drawn key column
+    /// could collide across two seed rows and turn a legal program into an
+    /// insert that Postgres rejects.
+    pub rel_fk_values: Vec<Option<String>>,
     /// Mutates appended after this table's seed inserts (seed-before-mutate,
     /// design doc §3), targeting only this table's own pks. Never touches
     /// the `Text`/`Boolean`/`Uuid`/grain columns above — see the module doc
@@ -480,6 +583,7 @@ impl TableSpec {
             bool_values: vec![None; row_count],
             uuid_values: vec![None; row_count],
             grain_values: vec![None; row_count],
+            rel_fk_values: vec![None; row_count],
             mutates,
         }
     }
@@ -573,6 +677,22 @@ fn render_mutate(mutate: &Mutate, table: &Table, spec: &TableSpec, live: &mut Ha
                     (
                         table.columns[6].name.clone(),
                         spec.grain_values[seed_index].clone(),
+                    ),
+                    // Issue #34: the relationship key/foreign-key columns
+                    // are seeded once and never mutated either, so a
+                    // revival carries them forward for the same reason.
+                    // The key column specifically *must* come back with its
+                    // original value: it carries a real `UNIQUE` constraint
+                    // (see `crate::model::Table::unique_cols`), and a
+                    // revival that defaulted it to `NULL` would silently
+                    // stop being the row a to-many relationship joins to.
+                    (
+                        table.columns[REL_KEY_COLUMN].name.clone(),
+                        Some(rel_key_value(*pk)),
+                    ),
+                    (
+                        table.columns[REL_FK_COLUMN].name.clone(),
+                        spec.rel_fk_values[seed_index].clone(),
                     ),
                 ],
                 expect,
@@ -743,6 +863,13 @@ pub fn build_program_multi_with_shapes(
              ({row_count} seed rows, {} grain values) — a generator bug",
             spec.grain_values.len()
         );
+        assert_eq!(
+            spec.rel_fk_values.len(),
+            row_count,
+            "build_program_multi_with_shapes: rel_fk_values must have one entry per seed row \
+             ({row_count} seed rows, {} relationship FK values) — a generator bug",
+            spec.rel_fk_values.len()
+        );
 
         // Tasks B1/B4: every table gets a Text/Boolean/Uuid column and a
         // grain column, always — see the module doc comment. `Table::new`
@@ -752,7 +879,7 @@ pub fn build_program_multi_with_shapes(
         // column is appended last (rather than interleaved) so every
         // existing `columns[1..=5]` index above is untouched by this
         // widening.
-        let source = Table::new(
+        let mut source = Table::new(
             &mut pool,
             &[
                 ValueType::Numeric,
@@ -761,14 +888,31 @@ pub fn build_program_multi_with_shapes(
                 ValueType::Boolean,
                 ValueType::Uuid,
                 ValueType::Numeric,
+                // Issue #34: the relationship key (index `REL_KEY_COLUMN`)
+                // and foreign key (index `REL_FK_COLUMN`) columns, appended
+                // last for the same "leave every existing index untouched"
+                // reason the grain column was.
+                ValueType::Text,
+                ValueType::Text,
             ],
         );
+        // The key column is what makes a to-one relationship *provably*
+        // to-one: ADR-0006 derives cardinality from a primary-key/UNIQUE
+        // index on the to-side column, introspected live at
+        // `create_relationship` time. Without this the engine would resolve
+        // every generated relationship as to-many and reject the bare
+        // enrichment shape outright.
+        source
+            .unique_cols
+            .push(source.columns[REL_KEY_COLUMN].name.clone());
         let c1 = source.columns[1].name.clone();
         let c2 = source.columns[2].name.clone();
         let text_col = source.columns[3].name.clone();
         let bool_col = source.columns[4].name.clone();
         let uuid_col = source.columns[5].name.clone();
         let grain_col = source.columns[6].name.clone();
+        let rel_key_col = source.columns[REL_KEY_COLUMN].name.clone();
+        let rel_fk_col = source.columns[REL_FK_COLUMN].name.clone();
 
         // This table's own pk-liveness simulation, independent of every
         // other table's — see [`render_mutate`] and the function doc
@@ -793,6 +937,12 @@ pub fn build_program_multi_with_shapes(
                     // Task B4: likewise seeded once and never mutated — see
                     // the module doc comment's B4 scope cuts.
                     (grain_col.clone(), spec.grain_values[i].clone()),
+                    // Issue #34: the key column is derived from the pk (so
+                    // its UNIQUE constraint holds by construction), the
+                    // foreign key is drawn (so it matches, misses, or is
+                    // NULL) — see `TableSpec::rel_fk_values`.
+                    (rel_key_col.clone(), Some(rel_key_value(pk))),
+                    (rel_fk_col.clone(), spec.rel_fk_values[i].clone()),
                 ],
                 expect: OpOutcome::Succeeds,
             });
@@ -910,6 +1060,12 @@ pub fn build_program_multi_with_shapes(
 
     Program {
         tables: built_tables,
+        // Relationships are layered on afterward by
+        // [`attach_relationship_fields`], the same "layer a widening on top
+        // rather than thread it through the base builder" idiom
+        // [`build_program_multi_with_shapes_and_derived`] uses for derived
+        // fields.
+        relationships: Vec::new(),
         defs,
         def_install_after_op,
         ops,
@@ -1214,6 +1370,361 @@ pub fn build_program_multi_with_shapes_and_derived(
     program
 }
 
+// ---------------------------------------------------------------------
+// Issue #34: relationship edges in the program generator (ADR-0006).
+// ---------------------------------------------------------------------
+
+/// The aggregate functions a generated relationship path may be wrapped in
+/// (issue #34). A deliberately narrower set than [`AggregateFn`]: the
+/// argument is always a `<rel>.<column>` path, never `c1`/`c2`, and
+/// `COUNT(*)` has no relationship form at all (`COUNT(<rel>.<column>)` — the
+/// per-related-row count — is a separate shape carried by
+/// [`RelAggregateFn::Count`], and is the *only* `COUNT` shape
+/// `engine::defs::parser` accepts over a path).
+///
+/// `Count` is legal only over a **to-many** path in a row-grain (`OneToOne`)
+/// definition. Inside a `GROUP BY` definition the parser routes `COUNT(...)`
+/// through its `COUNT(*)`-only branch and rejects anything else outright, so
+/// [`RelFieldKind::ToOneAggregate`] never draws it — see
+/// [`strategy::rel_aggregate_fn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelAggregateFn {
+    Sum,
+    Min,
+    Max,
+    Avg,
+    Count,
+}
+
+impl RelAggregateFn {
+    /// This function's canonical uppercased name, as
+    /// `engine::defs::registry::AGGREGATE_FUNCTIONS` spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            RelAggregateFn::Sum => "SUM",
+            RelAggregateFn::Min => "MIN",
+            RelAggregateFn::Max => "MAX",
+            RelAggregateFn::Avg => "AVG",
+            RelAggregateFn::Count => "COUNT",
+        }
+    }
+}
+
+/// Which of the three **engine-supported** relationship-reference shapes a
+/// generated definition takes (issue #34). Every other combination of
+/// cardinality × wrapping × key-space is rejected by
+/// `engine::defs::validate`, and an install rejection is a hard failure,
+/// never a skip (design doc §3), so those are structurally unrepresentable
+/// here rather than merely undrawn:
+///
+/// | key-space | to-one bare | to-one in aggregate | to-many bare | to-many in aggregate |
+/// |---|---|---|---|---|
+/// | `OneToOne` | [`RelFieldKind::ToOneBare`] | rejected (`RelationshipToOneWrappedInAggregate`) | rejected (`RelationshipToManyRequiresAggregate`) | [`RelFieldKind::ToManyAggregate`] |
+/// | `Aggregate` | rejected (`UngroupedRelationshipReference`) | [`RelFieldKind::ToOneAggregate`] | rejected | rejected (`RelationshipPathInAggregate`) |
+///
+/// The `Aggregate` row's rejected corners are worth naming explicitly
+/// because they are the *newest* boundary: aggregating a to-one path inside
+/// a `GROUP BY` only became legal on this branch, while a bare path and a
+/// nested to-many-inside-`GROUP BY` (aggregating an aggregate) both remain
+/// unimplemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelFieldKind {
+    /// A bare `<rel>.<column>` enrichment on a `OneToOne` definition: a
+    /// `LEFT JOIN` to the related row, `NULL` when the FK matches nothing or
+    /// is itself `NULL` (ADR-0006's to-one nullability rule).
+    ToOneBare,
+    /// `<fn>(<rel>.<column>)` over a **to-many** relationship on a
+    /// `OneToOne` definition: a correlated aggregate over the related rows,
+    /// with Postgres's empty-set semantics (`COUNT` → `0`, everything else →
+    /// `NULL`).
+    ToManyAggregate(RelAggregateFn),
+    /// `<fn>(<rel>.<column>)` over a **to-one** relationship inside a
+    /// `GROUP BY` definition: an ordinary aggregate over the `LEFT JOIN`ed
+    /// column, folding one related value per source row.
+    ToOneAggregate(RelAggregateFn),
+}
+
+impl RelFieldKind {
+    /// The [`Cardinality`] the relationship this field reads must have.
+    fn cardinality(self) -> Cardinality {
+        match self {
+            RelFieldKind::ToOneBare | RelFieldKind::ToOneAggregate(_) => Cardinality::ToOne,
+            RelFieldKind::ToManyAggregate(_) => Cardinality::ToMany,
+        }
+    }
+
+    /// Whether this shape belongs on a `GROUP BY` definition (`true`) or a
+    /// row-grain one (`false`) — see the variant table on [`RelFieldKind`].
+    fn wants_aggregate_key_space(self) -> bool {
+        matches!(self, RelFieldKind::ToOneAggregate(_))
+    }
+}
+
+/// One definition's optional relationship enrichment (issue #34):
+/// *which* other table it relates to, and *how* it reads it.
+///
+/// `to_table` is an index into the program's `tables`, and must be **greater
+/// than the definition's own source table's index**. That ordering rule is
+/// what keeps the cross-table dependency graph acyclic without any cycle
+/// detection of this crate's own: ADR-0006 makes every relationship an edge
+/// in the same graph as transforms, and cycles are rejected at definition
+/// time — so two relationships pointing at each other (`t0 → t1` and
+/// `t1 → t0`) would be an install rejection, i.e. a hard failure. Ordering
+/// every edge low-index → high-index makes a cycle unrepresentable.
+/// [`attach_relationship_fields`] asserts it rather than trusting callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelFieldSpec {
+    pub to_table: usize,
+    pub kind: RelFieldKind,
+}
+
+/// Layers relationship declarations and the calculated fields that read them
+/// onto an already-built `program` (issue #34): `rel_fields[j]` is
+/// definition `j`'s optional enrichment, index-aligned with `program.defs`
+/// exactly as [`build_program_multi_with_shapes_and_derived`]'s `derived` is.
+///
+/// Relationships are **deduplicated by endpoint**: two definitions reading
+/// the same `(from_table, from_col, to_table, to_col)` share one declaration
+/// rather than each minting a differently-named duplicate. That is both more
+/// realistic (ADR-0006's whole point is that a relationship is reusable
+/// across transforms) and closer to the interesting engine path — one
+/// relationship's reverse propagation feeding several targets.
+///
+/// Each relationship's endpoints are fixed by the drawn [`RelFieldKind`]'s
+/// cardinality, using the two columns issue #34 gives every table:
+///
+/// * **to-one** — `FROM <source>.<fk> TO <to>.<key>`; the to-side key column
+///   carries a real `UNIQUE` constraint ([`crate::model::Table::unique_cols`]),
+///   which is what makes the engine's live `pg_catalog` introspection resolve
+///   it as to-one.
+/// * **to-many** — `FROM <source>.<key> TO <to>.<fk>`; the to-side FK column
+///   has no unique constraint, so the same introspection resolves it as
+///   to-many. The to-side table needs `REPLICA IDENTITY FULL` for reverse
+///   propagation over a non-PK join key (ADR-0006, enforced at define time
+///   by `ValidationError::RelationshipToManyRequiresReplicaIdentity`);
+///   `crate::backend::ManualBackend::create_source_table` already sets it on
+///   every table it creates.
+///
+/// Both endpoints are `Text`, the only one of this crate's value types that
+/// is both in [`TEXT_STABLE_JOIN_KEY_TYPES`] and freely drawable — see that
+/// constant for why the engine rejects anything else.
+///
+/// The referenced to-side column is always that table's `c1` (Numeric), so
+/// every shape — bare enrichment and all five aggregate functions — is
+/// type-correct without the spec having to carry a column choice too.
+///
+/// # Panics
+///
+/// On any index/shape mismatch — an out-of-range or non-increasing
+/// `to_table`, a `rel_fields` list of the wrong length, or a [`RelFieldKind`]
+/// paired with the wrong key-space. All generator bugs, all of which would
+/// otherwise reach the engine as an install rejection.
+pub fn attach_relationship_fields(
+    mut program: Program,
+    rel_fields: &[Option<RelFieldSpec>],
+) -> Program {
+    assert_eq!(
+        rel_fields.len(),
+        program.defs.len(),
+        "attach_relationship_fields: rel_fields must have one entry per definition ({} \
+         definitions, {} relationship slots) — a generator bug",
+        program.defs.len(),
+        rel_fields.len()
+    );
+
+    // Snapshotted up front so the mutable loop over `program.defs` below
+    // doesn't need to borrow `program.tables` at the same time.
+    let table_index: HashMap<String, usize> = program
+        .tables
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.name.clone(), i))
+        .collect();
+    let tables = program.tables.clone();
+
+    let mut relationships: Vec<Relationship> = std::mem::take(&mut program.relationships);
+
+    for (def, spec) in program.defs.iter_mut().zip(rel_fields) {
+        let Some(spec) = spec else {
+            continue;
+        };
+        let from_index = *table_index.get(&def.source).unwrap_or_else(|| {
+            panic!(
+                "attach_relationship_fields: def.source {:?} names no table in the program — a \
+                 generator bug",
+                def.source
+            )
+        });
+        assert!(
+            spec.to_table < tables.len(),
+            "attach_relationship_fields: to_table index {} out of range for {} tables — a \
+             generator bug",
+            spec.to_table,
+            tables.len()
+        );
+        assert!(
+            spec.to_table > from_index,
+            "attach_relationship_fields: a relationship must point from a lower-indexed table \
+             to a higher-indexed one (got {from_index} -> {}), so the cross-table dependency \
+             graph stays acyclic by construction — a generator bug (see RelFieldSpec)",
+            spec.to_table
+        );
+        let is_aggregate_def = matches!(def.key_space, KeySpace::Aggregate { .. });
+        assert_eq!(
+            spec.kind.wants_aggregate_key_space(),
+            is_aggregate_def,
+            "attach_relationship_fields: relationship shape {:?} does not belong on a \
+             definition whose key_space is {:?} (target {:?}) — see RelFieldKind's shape table; \
+             the engine would reject this at validation time, and an install rejection is a \
+             hard failure, never a skip",
+            spec.kind,
+            def.key_space,
+            def.target
+        );
+
+        let from_table = &tables[from_index];
+        let to_table = &tables[spec.to_table];
+        let cardinality = spec.kind.cardinality();
+        let (from_col, to_col) = match cardinality {
+            Cardinality::ToOne => (
+                from_table.columns[REL_FK_COLUMN].name.clone(),
+                to_table.columns[REL_KEY_COLUMN].name.clone(),
+            ),
+            Cardinality::ToMany => (
+                from_table.columns[REL_KEY_COLUMN].name.clone(),
+                to_table.columns[REL_FK_COLUMN].name.clone(),
+            ),
+        };
+
+        let existing = relationships.iter().find(|r| {
+            r.from_table == from_table.name
+                && r.from_col == from_col
+                && r.to_table == to_table.name
+                && r.to_col == to_col
+        });
+        let rel_name = match existing {
+            Some(rel) => rel.name.clone(),
+            None => {
+                let name = format!("r{}", relationships.len());
+                relationships.push(Relationship {
+                    name: name.clone(),
+                    from_table: from_table.name.clone(),
+                    from_col,
+                    to_table: to_table.name.clone(),
+                    to_col,
+                    cardinality,
+                });
+                name
+            }
+        };
+
+        // Always the to-side table's `c1`: Numeric, nullable, and mutated by
+        // the op stream, so a to-side update really does have to propagate
+        // back into this field (ADR-0006's reverse propagation).
+        let path = Expr::RelationshipPath {
+            rel: rel_name,
+            column: to_table.columns[1].name.clone(),
+        };
+        let field = match spec.kind {
+            RelFieldKind::ToOneBare => FieldDef {
+                name: "rel_enrich".to_string(),
+                expr: path,
+            },
+            RelFieldKind::ToManyAggregate(func) | RelFieldKind::ToOneAggregate(func) => FieldDef {
+                name: "rel_agg".to_string(),
+                expr: Expr::FunctionCall {
+                    name: func.name().to_string(),
+                    args: vec![path],
+                },
+            },
+        };
+        def.fields.push(field);
+    }
+
+    program.relationships = relationships;
+    program
+}
+
+/// [`build_program_multi_with_shapes_and_derived`]'s relationship-aware form
+/// (issue #34): the same three lists, plus `rel_fields[j]` giving definition
+/// `j`'s optional relationship enrichment (see [`RelFieldSpec`]).
+///
+/// A thin composition — build, layer derived fields, layer relationship
+/// fields — kept as its own entry point so `rel_fields` doesn't have to be
+/// threaded through the two dozen existing call sites of the narrower
+/// builders, exactly as [`build_program_multi_with_derived`]'s doc comment
+/// argues for its own signature.
+pub fn build_program_multi_with_relationships(
+    tables: &[TableSpec],
+    defs: &[(usize, DefShape)],
+    derived: &[Option<DerivedShape>],
+    rel_fields: &[Option<RelFieldSpec>],
+) -> Program {
+    let tables = without_truncates_on_relationship_to_sides(tables, defs, rel_fields);
+    let program = build_program_multi_with_shapes_and_derived(&tables, defs, derived);
+    attach_relationship_fields(program, rel_fields)
+}
+
+/// Drops [`Mutate::Truncate`] from any table that some relationship points
+/// *at* — a deliberate, narrow scope cut around a **live engine defect this
+/// suite found** (see
+/// `tests/convergence.rs`'s `truncating_a_relationship_to_side_table_leaves_a_stale_enrichment`,
+/// which pins it, and the passing `Delete` control beside it).
+///
+/// The defect: `engine::staging::apply`'s truncate-clear path resolves the
+/// affected targets with `catalog::transforms_for_source` — definitions whose
+/// **source** is the truncated table — while reverse propagation into
+/// definitions that merely *read* that table through a relationship lives in
+/// the separate keyed by-source loop, driven by per-row change images and
+/// `catalog::relationships_to_table`. A `TRUNCATE` produces one key-less
+/// sentinel row rather than per-row images, so it never reaches that loop:
+/// deleting a related row correctly clears the enrichment that read it, but
+/// truncating the table that row lived in leaves the enrichment stale
+/// forever.
+///
+/// Filtering happens on the `TableSpec` *before* the program is built, not
+/// on the finished op stream, and that ordering is the whole point: each
+/// table's `OpOutcome` expectations come from a pk-liveness simulation over
+/// its mutate stream ([`render_mutate`]), so removing a `Truncate` after the
+/// fact would leave every later op on that table expecting the wrong
+/// outcome. Removing it beforehand just means the simulation never saw it.
+///
+/// `Truncate` coverage is unaffected for every table that is *not* a
+/// relationship to-side — including a relationship's from-side, whose
+/// truncate goes down the `transforms_for_source` path that does work.
+///
+/// **Delete this function when the engine defect is fixed.** It is the one
+/// place the generator deliberately steers around a real bug rather than a
+/// genuinely-unsupported shape, and leaving it in place after the fix would
+/// silently cost the suite coverage of exactly the interaction that found
+/// the bug.
+fn without_truncates_on_relationship_to_sides(
+    tables: &[TableSpec],
+    defs: &[(usize, DefShape)],
+    rel_fields: &[Option<RelFieldSpec>],
+) -> Vec<TableSpec> {
+    let to_sides: HashSet<usize> = defs
+        .iter()
+        .zip(rel_fields)
+        .filter_map(|(_, spec)| spec.map(|s| s.to_table))
+        .collect();
+    if to_sides.is_empty() {
+        return tables.to_vec();
+    }
+    tables
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            if !to_sides.contains(&index) {
+                return spec.clone();
+            }
+            let mut spec = spec.clone();
+            spec.mutates.retain(|m| !matches!(m, Mutate::Truncate));
+            spec
+        })
+        .collect()
+}
+
 /// [`build_program_multi_with_derived`] is [`build_program_multi_with_shapes_and_derived`]'s
 /// convenience wrapper for the common "every def is `OneToOne`" case
 /// (improvement-plan task B2, kept at its original `&[usize]`/`&[DerivedShape]`
@@ -1442,6 +1953,7 @@ pub fn build_bulk_insert_program(row_count: usize) -> Program {
 
     Program {
         tables: vec![table],
+        relationships: Vec::new(),
         defs,
         def_install_after_op,
         ops,
@@ -1681,6 +2193,12 @@ pub fn reordered_by_commute_groups(program: &Program) -> Program {
     }
     Program {
         tables: program.tables.clone(),
+        // Carried through unchanged: a relationship is a schema-level
+        // declaration, not an op, so reordering the op stream cannot affect
+        // it — and dropping it would leave every definition that reads one
+        // referencing an undeclared relationship, which the engine rejects
+        // at install time.
+        relationships: program.relationships.clone(),
         defs: program.defs.clone(),
         // Carried over unchanged, not reinterpreted against the new op
         // order: this function is only ever exercised (`tests/order_insensitivity.rs`)
@@ -1718,6 +2236,7 @@ pub fn noise_table(name: &str, pk_col: &str, extra_col: &str, extra_type: ValueT
                 value_type: extra_type,
             },
         ],
+        unique_cols: Vec::new(),
     }
 }
 
@@ -2105,6 +2624,144 @@ mod strategy {
         ]
     }
 
+    /// One seed row's relationship **foreign-key** value (issue #34):
+    /// drawn from a tiny fixed pool so all three join outcomes ADR-0006
+    /// distinguishes really occur across a run, rather than only the happy
+    /// one:
+    ///
+    /// * `"k1"`/`"k2"`/`"k3"` — match a related row, since a table's
+    ///   relationship *key* column is [`rel_key_value`] of its primary key
+    ///   and seeded pks run `1..=MAX_SEED_ROWS`;
+    /// * `"k9"` — syntactically fine, matches nothing (no program ever seeds
+    ///   pk 9), so a to-one enrichment must come back `NULL` and a to-many
+    ///   aggregate must see the empty set;
+    /// * `None` — a `NULL` foreign key, which under `LEFT JOIN` semantics
+    ///   also matches nothing but reaches that answer down a different code
+    ///   path (`NULL = anything` is `NULL`, not `false`).
+    ///
+    /// The "matches nothing" case is deliberately *not* rare: together with
+    /// the `NULL` case it is the whole nullability contract issue #33
+    /// pinned on the engine side, and a run that only ever drew matching
+    /// keys would never check it.
+    ///
+    /// `awkward_values` gates the `NULL` draw only, exactly as it does for
+    /// [`value`]/[`text_value`]/[`bool_value`]/[`uuid_value`] — a `NULL`
+    /// foreign key is an awkward value like any other. The `"k9"`
+    /// matches-nothing case is *not* gated: it is an ordinary non-`NULL`
+    /// text value that simply happens to resolve to no related row, so the
+    /// unmatched-join half of the nullability contract stays covered even
+    /// with awkward values off.
+    fn rel_fk_value(awkward_values: bool) -> BoxedStrategy<Option<String>> {
+        let present = prop_oneof![
+            2 => Just(Some("k1".to_string())),
+            2 => Just(Some("k2".to_string())),
+            2 => Just(Some("k3".to_string())),
+            1 => Just(Some("k9".to_string())),
+        ];
+        if !awkward_values {
+            return present.boxed();
+        }
+        prop_oneof![
+            NULL_WEIGHT => Just(None),
+            VALUE_WEIGHT => present,
+        ]
+        .boxed()
+    }
+
+    /// Which aggregate function wraps a generated relationship path.
+    ///
+    /// `in_aggregate_def` excludes [`RelAggregateFn::Count`]: inside a
+    /// `GROUP BY` definition `engine::defs::parser` routes every `COUNT(...)`
+    /// through its `COUNT(*)`-only branch and rejects `COUNT(<rel>.<col>)`
+    /// outright (`UnsupportedAggregateFunction`), so drawing it there would
+    /// be a parse-time install rejection — a hard failure, never a skip
+    /// (design doc §3). In a row-grain definition `COUNT(<rel>.<col>)` is
+    /// legal and valuable: it is the one aggregate whose empty-set answer is
+    /// `0` rather than `NULL`, which is exactly the to-many half of
+    /// ADR-0006's nullability rule.
+    fn rel_aggregate_fn(in_aggregate_def: bool) -> impl Strategy<Value = RelAggregateFn> {
+        let mut options = vec![
+            Just(RelAggregateFn::Sum),
+            Just(RelAggregateFn::Min),
+            Just(RelAggregateFn::Max),
+            Just(RelAggregateFn::Avg),
+        ];
+        if !in_aggregate_def {
+            options.push(Just(RelAggregateFn::Count));
+        }
+        proptest::strategy::Union::new(options)
+    }
+
+    /// The optional relationship enrichment for a definition sourced from
+    /// table `source_index` of `table_count` (issue #34).
+    ///
+    /// Always `None` when `source_index` is the last table: a relationship
+    /// must point at a strictly higher-indexed table so the cross-table
+    /// dependency graph stays acyclic by construction (see [`RelFieldSpec`]).
+    ///
+    /// Otherwise the shape is fully determined by the definition's
+    /// key-space, because only one of the three legal shapes fits each (see
+    /// [`RelFieldKind`]'s table): a `GROUP BY` definition can only aggregate
+    /// a *to-one* path, while a row-grain one can either read a to-one path
+    /// bare or aggregate a *to-many* one. Drawing the shape from the
+    /// already-drawn key-space — rather than independently, then filtering —
+    /// is what keeps "the generator emits only valid programs" structural
+    /// rather than probabilistic.
+    ///
+    /// Weighted 2:1 toward drawing a relationship at all, so the three
+    /// relationship shapes get real coverage across a 16-case default run
+    /// while plain relationship-free programs stay common.
+    fn rel_field_spec(
+        source_index: usize,
+        table_count: usize,
+        is_aggregate_def: bool,
+    ) -> BoxedStrategy<Option<RelFieldSpec>> {
+        if source_index + 1 >= table_count {
+            return Just(None).boxed();
+        }
+        let kind = if is_aggregate_def {
+            rel_aggregate_fn(true)
+                .prop_map(RelFieldKind::ToOneAggregate)
+                .boxed()
+        } else {
+            prop_oneof![
+                1 => Just(RelFieldKind::ToOneBare),
+                1 => rel_aggregate_fn(false).prop_map(RelFieldKind::ToManyAggregate),
+            ]
+            .boxed()
+        };
+        let present = ((source_index + 1)..table_count, kind)
+            .prop_map(|(to_table, kind)| Some(RelFieldSpec { to_table, kind }));
+        prop_oneof![
+            1 => Just(None),
+            2 => present,
+        ]
+        .boxed()
+    }
+
+    /// One definition's full draw (issue #34): which table it sources from,
+    /// its [`DefShape`], its optional [`DerivedShape`], and its optional
+    /// [`RelFieldSpec`]. Drawn as one unit — rather than four independent
+    /// vectors zipped up later — so an illegal pairing (a derived field on
+    /// an `Aggregate` def, a to-many relationship inside a `GROUP BY`, a
+    /// relationship pointing at a table that can't be a to-side) is
+    /// unrepresentable rather than merely unlikely.
+    fn def_draw(
+        table_count: usize,
+    ) -> impl Strategy<Value = (usize, DefShape, Option<DerivedShape>, Option<RelFieldSpec>)> {
+        (0..table_count, def_shape_and_derived()).prop_flat_map(
+            move |(source_index, (shape, derived))| {
+                let is_aggregate = matches!(shape, DefShape::Aggregate { .. });
+                (
+                    Just(source_index),
+                    Just(shape),
+                    Just(derived),
+                    rel_field_spec(source_index, table_count, is_aggregate),
+                )
+            },
+        )
+    }
+
     /// Pairs a drawn [`DefShape`] with the optional [`DerivedShape`]
     /// (improvement-plan task B2) that rides along with it: `Some` when the
     /// shape is `OneToOne` (every `OneToOne` def always gets one derived
@@ -2179,18 +2836,28 @@ mod strategy {
                 let bools = prop::collection::vec(bool_value(awkward_values), seed_count);
                 let uuids = prop::collection::vec(uuid_value(awkward_values), seed_count);
                 let grains = prop::collection::vec(grain_value(), seed_count);
+                let rel_fks = prop::collection::vec(rel_fk_value(awkward_values), seed_count);
                 let mutates =
                     prop::collection::vec(mutate(seed_count, awkward_values), 0..=MAX_MUTATES);
-                (seeds, texts, bools, uuids, grains, mutates)
+                (seeds, texts, bools, uuids, grains, rel_fks, mutates)
             })
             .prop_map(
-                |(seed_values, text_values, bool_values, uuid_values, grain_values, mutates)| {
+                |(
+                    seed_values,
+                    text_values,
+                    bool_values,
+                    uuid_values,
+                    grain_values,
+                    rel_fk_values,
+                    mutates,
+                )| {
                     TableSpec {
                         seed_values,
                         text_values,
                         bool_values,
                         uuid_values,
                         grain_values,
+                        rel_fk_values,
                         mutates,
                     }
                 },
@@ -2216,8 +2883,16 @@ mod strategy {
     /// reproducing program — a 1-table/1-def counterexample is the readable
     /// one.
     ///
+    /// Issue #34: each definition additionally draws an optional
+    /// relationship enrichment ([`rel_field_spec`]), so a multi-table
+    /// program's definitions sometimes read a *related* table too. The
+    /// relationship's shape is derived from the definition's already-drawn
+    /// key-space rather than drawn independently, so an illegal pairing is
+    /// unrepresentable — see [`def_draw`].
+    ///
     /// `awkward_values` gates every other column's `NULL` draw (see
-    /// [`value`], [`text_value`], [`bool_value`], [`uuid_value`]); it does
+    /// [`value`], [`text_value`], [`bool_value`], [`uuid_value`],
+    /// [`rel_fk_value`]); it does
     /// not gate [`grain_value`] (which never draws `NULL` at all — see its
     /// own doc comment for the engine bug that finding forced this scope cut
     /// over), nor does it affect [`Mutate::DuplicateInsert`], [`def_shape`]
@@ -2229,17 +2904,19 @@ mod strategy {
         prop::collection::vec(table_spec(awkward_values), 1..=MAX_TABLES)
             .prop_flat_map(|tables| {
                 let table_count = tables.len();
-                let defs =
-                    prop::collection::vec((0..table_count, def_shape_and_derived()), 1..=MAX_DEFS);
+                let defs = prop::collection::vec(def_draw(table_count), 1..=MAX_DEFS);
                 (Just(tables), defs)
             })
-            .prop_map(|(tables, defs_and_derived)| {
-                let (defs, derived): (Vec<(usize, DefShape)>, Vec<Option<DerivedShape>>) =
-                    defs_and_derived
-                        .into_iter()
-                        .map(|(idx, (shape, derived))| ((idx, shape), derived))
-                        .unzip();
-                build_program_multi_with_shapes_and_derived(&tables, &defs, &derived)
+            .prop_map(|(tables, draws)| {
+                let mut defs: Vec<(usize, DefShape)> = Vec::with_capacity(draws.len());
+                let mut derived: Vec<Option<DerivedShape>> = Vec::with_capacity(draws.len());
+                let mut rel_fields: Vec<Option<RelFieldSpec>> = Vec::with_capacity(draws.len());
+                for (idx, shape, derived_shape, rel_field) in draws {
+                    defs.push((idx, shape));
+                    derived.push(derived_shape);
+                    rel_fields.push(rel_field);
+                }
+                build_program_multi_with_relationships(&tables, &defs, &derived, &rel_fields)
             })
     }
 
@@ -2511,6 +3188,109 @@ pub use strategy::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two tables, one definition, one relationship — the smallest program
+    /// that can carry a relationship at all, reused by the tests below.
+    fn two_table_rel_program(kind: RelFieldKind) -> Program {
+        let shape = match kind {
+            RelFieldKind::ToOneAggregate(_) => DefShape::Aggregate {
+                functions: vec![AggregateFn::Count],
+            },
+            _ => DefShape::OneToOne,
+        };
+        let spec = || TableSpec {
+            seed_values: vec![(Some(1), Some(2))],
+            text_values: vec![None],
+            bool_values: vec![None],
+            uuid_values: vec![None],
+            grain_values: vec![Some("0".to_string())],
+            rel_fk_values: vec![Some("k1".to_string())],
+            mutates: vec![Mutate::Delete { pk: 1 }],
+        };
+        build_program_multi_with_relationships(
+            &[spec(), spec()],
+            &[(0, shape)],
+            &[None],
+            &[Some(RelFieldSpec { to_table: 1, kind })],
+        )
+    }
+
+    /// Issue #34: a to-one relationship joins the from-side's foreign key to
+    /// the to-side's *unique* key column — that uniqueness is the whole
+    /// reason the engine resolves it as to-one — and a to-many one is the
+    /// same declaration with the endpoints swapped so the to-side column is
+    /// the non-unique one.
+    #[test]
+    fn a_relationships_endpoints_follow_its_cardinality() {
+        let one = two_table_rel_program(RelFieldKind::ToOneBare);
+        let rel = &one.relationships[0];
+        assert_eq!(rel.cardinality, Cardinality::ToOne);
+        assert_eq!(rel.from_col, one.tables[0].columns[REL_FK_COLUMN].name);
+        assert_eq!(rel.to_col, one.tables[1].columns[REL_KEY_COLUMN].name);
+        assert!(one.tables[1].unique_cols.contains(&rel.to_col));
+
+        let many = two_table_rel_program(RelFieldKind::ToManyAggregate(RelAggregateFn::Sum));
+        let rel = &many.relationships[0];
+        assert_eq!(rel.cardinality, Cardinality::ToMany);
+        assert_eq!(rel.from_col, many.tables[0].columns[REL_KEY_COLUMN].name);
+        assert_eq!(rel.to_col, many.tables[1].columns[REL_FK_COLUMN].name);
+        assert!(!many.tables[1].unique_cols.contains(&rel.to_col));
+    }
+
+    /// A relationship is a schema-level declaration, so reordering the op
+    /// stream must carry it through untouched. Regression pin: an earlier
+    /// version of `reordered_by_commute_groups` rebuilt the `Program` with
+    /// an empty relationship list, which left every definition referencing
+    /// an undeclared relationship and made the order-insensitivity property
+    /// fail at *install* time rather than on a real ordering difference.
+    #[test]
+    fn reordering_a_program_preserves_its_relationship_declarations() {
+        let program = two_table_rel_program(RelFieldKind::ToOneBare);
+        assert_eq!(program.relationships.len(), 1);
+        let reordered = reordered_by_commute_groups(&program);
+        assert_eq!(reordered.relationships, program.relationships);
+    }
+
+    /// Issue #34's `TRUNCATE` scope cut (see
+    /// `without_truncates_on_relationship_to_sides`): a truncate is stripped
+    /// from a table some relationship points *at*, and left alone
+    /// everywhere else — including that relationship's own from-side, whose
+    /// truncate goes down an engine path that works.
+    #[test]
+    fn a_truncate_is_dropped_only_from_a_relationship_to_side_table() {
+        let spec = || TableSpec {
+            seed_values: vec![(Some(1), Some(2))],
+            text_values: vec![None],
+            bool_values: vec![None],
+            uuid_values: vec![None],
+            grain_values: vec![Some("0".to_string())],
+            rel_fk_values: vec![Some("k1".to_string())],
+            mutates: vec![Mutate::Truncate],
+        };
+        let program = build_program_multi_with_relationships(
+            &[spec(), spec()],
+            &[(0, DefShape::OneToOne)],
+            &[None],
+            &[Some(RelFieldSpec {
+                to_table: 1,
+                kind: RelFieldKind::ToOneBare,
+            })],
+        );
+        let truncated: Vec<&str> = program
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Truncate { table, .. } => Some(table.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            truncated,
+            vec![program.tables[0].name.as_str()],
+            "only the to-side table's truncate is dropped: {:?}",
+            program.ops
+        );
+    }
 
     #[test]
     fn build_program_seeds_before_mutating() {

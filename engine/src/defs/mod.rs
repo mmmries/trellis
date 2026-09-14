@@ -60,8 +60,9 @@ pub use model::{
     SchemaNode, TransformStatus,
 };
 pub use oracle::{
-    OracleError, Recomputed, recompute, recompute_aggregate, render_aggregate_select_sql,
-    render_expr_sql, render_relationship_select_sql,
+    OracleError, Recomputed, recompute, recompute_aggregate,
+    render_aggregate_relationship_select_sql, render_aggregate_select_sql, render_expr_sql,
+    render_relationship_select_sql,
 };
 pub use parser::{parse, parse_relationship};
 pub use validate::{RelationshipTypeMismatch, RelationshipWarning, ValidationError, validate};

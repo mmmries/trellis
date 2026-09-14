@@ -12,9 +12,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use engine::defs::ast::{Expr, KeySpace, Operator, ValueType};
+use engine::defs::ast::{Expr, KeySpace, Operator, TransformDef, ValueType};
 
-use crate::model::{Op, OpOutcome, Program};
+use crate::model::{Cardinality, Op, OpOutcome, Program, Relationship};
 
 /// Per-run coverage tallies over any number of [`Program`]s. Every field is
 /// keyed on the `&'static str` name of the variant it tallies, not the
@@ -73,6 +73,34 @@ pub struct Coverage {
     /// program (improvement-plan task E3) — how many scheduled scale-outs
     /// were actually drawn.
     pub client_scale_outs: usize,
+    /// Total [`Program::relationships`] declared across every recorded
+    /// program (issue #34) — how many `RELATIONSHIP` declarations the
+    /// generator actually emitted, as opposed to merely being able to.
+    pub relationships_declared: usize,
+    /// `"to_one"` / `"to_many"`, tallied from each declared relationship's
+    /// [`Cardinality`] (issue #34). Both cardinalities have materially
+    /// different engine paths — a `LEFT JOIN`-shaped lookup versus an
+    /// aggregate over related rows, with different reverse-propagation and
+    /// replica-identity requirements — so a run that drew only one of them
+    /// is only half-covered.
+    pub relationship_cardinalities: HashMap<&'static str, usize>,
+    /// Which of the three engine-supported relationship *reference* shapes
+    /// appear across every recorded program's calculated fields (issue #34):
+    /// `"to_one_bare"`, `"to_many_in_aggregate"`, and
+    /// `"to_one_in_aggregate_def"` — see
+    /// [`crate::generate::RelFieldKind`]'s shape table. Tracked separately
+    /// from `relationship_cardinalities` because cardinality alone doesn't
+    /// say how a field *reads* the relationship, and the third shape in
+    /// particular (a to-one path aggregated inside a `GROUP BY`) is a
+    /// distinct engine code path from the other two.
+    ///
+    /// A shape this accumulator can't classify is tallied as `"other"`
+    /// rather than panicking — like [`function_name`], this has no failure
+    /// mode of its own. A nonzero `"other"` in a coverage report is itself
+    /// the signal: it means the generator drew a shape nobody taught this
+    /// accumulator about, which is exactly the "coverage that silently drops
+    /// out" case a floor test should catch.
+    pub relationship_shapes: HashMap<&'static str, usize>,
     /// The largest [`Op::BulkInsert`] row count seen across every recorded
     /// program (improvement-plan task E6) — a floor test asserts this
     /// actually gets large across enough samples of
@@ -131,6 +159,68 @@ impl Coverage {
         for op in &program.ops {
             if let Op::BulkInsert { rows, .. } = op {
                 self.max_bulk_insert_rows = self.max_bulk_insert_rows.max(rows.len());
+            }
+        }
+
+        // Issue #34.
+        self.relationships_declared += program.relationships.len();
+        for rel in &program.relationships {
+            *self
+                .relationship_cardinalities
+                .entry(cardinality_name(rel.cardinality))
+                .or_insert(0) += 1;
+        }
+        let by_name: HashMap<&str, &Relationship> = program
+            .relationships
+            .iter()
+            .map(|r| (r.name.as_str(), r))
+            .collect();
+        for def in &program.defs {
+            for field in &def.fields {
+                self.record_relationship_shapes(&field.expr, def, &by_name, false);
+            }
+        }
+    }
+
+    /// Walks `expr` tallying every relationship *reference* shape it reads
+    /// into [`Self::relationship_shapes`] (issue #34). `wrapped` tracks
+    /// whether the current subexpression sits directly under an aggregate
+    /// call, since that — together with the relationship's cardinality and
+    /// the definition's key-space — is exactly what distinguishes the three
+    /// legal shapes from each other.
+    fn record_relationship_shapes(
+        &mut self,
+        expr: &Expr,
+        def: &TransformDef,
+        by_name: &HashMap<&str, &Relationship>,
+        wrapped: bool,
+    ) {
+        match expr {
+            Expr::RelationshipPath { rel, .. } => {
+                let cardinality = by_name.get(rel.as_str()).map(|r| r.cardinality);
+                let in_aggregate_def = matches!(def.key_space, KeySpace::Aggregate { .. });
+                let name = match (cardinality, wrapped, in_aggregate_def) {
+                    (Some(Cardinality::ToOne), false, false) => "to_one_bare",
+                    (Some(Cardinality::ToMany), true, false) => "to_many_in_aggregate",
+                    (Some(Cardinality::ToOne), true, true) => "to_one_in_aggregate_def",
+                    _ => "other",
+                };
+                *self.relationship_shapes.entry(name).or_insert(0) += 1;
+            }
+            Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                self.record_relationship_shapes(lhs, def, by_name, false);
+                self.record_relationship_shapes(rhs, def, by_name, false);
+            }
+            Expr::FunctionCall { args, .. } => {
+                // Only a *single*-argument call can be the aggregate-over-a-
+                // path shape (ADR-0006: "wrapped in exactly one aggregate
+                // function"), so a path buried among several arguments of a
+                // scalar call is deliberately not counted as wrapped.
+                let wrapped = args.len() == 1;
+                for arg in args {
+                    self.record_relationship_shapes(arg, def, by_name, wrapped);
+                }
             }
         }
     }
@@ -213,6 +303,13 @@ fn value_type_name(value_type: ValueType) -> &'static str {
         ValueType::Text => "text",
         ValueType::Boolean => "boolean",
         ValueType::Uuid => "uuid",
+    }
+}
+
+fn cardinality_name(cardinality: Cardinality) -> &'static str {
+    match cardinality {
+        Cardinality::ToOne => "to_one",
+        Cardinality::ToMany => "to_many",
     }
 }
 
@@ -303,7 +400,19 @@ impl fmt::Display for Coverage {
         )?;
         writeln!(f, "client_restarts: {}", self.client_restarts)?;
         writeln!(f, "client_scale_outs: {}", self.client_scale_outs)?;
-        writeln!(f, "max_bulk_insert_rows: {}", self.max_bulk_insert_rows)
+        writeln!(f, "max_bulk_insert_rows: {}", self.max_bulk_insert_rows)?;
+
+        writeln!(f, "relationships_declared: {}", self.relationships_declared)?;
+        write!(f, "relationship_cardinalities:")?;
+        for (name, count) in sorted_counts(&self.relationship_cardinalities) {
+            write!(f, " {name}={count}")?;
+        }
+        writeln!(f)?;
+        write!(f, "relationship_shapes:")?;
+        for (name, count) in sorted_counts(&self.relationship_shapes) {
+            write!(f, " {name}={count}")?;
+        }
+        writeln!(f)
     }
 }
 
