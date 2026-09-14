@@ -38,6 +38,7 @@ async fn installs_a_trivial_def_and_converges_dml_to_the_expected_snapshot() {
 
     let program = Program {
         tables: vec![source.clone()],
+        relationships: Vec::new(),
         defs: vec![def],
         def_install_after_op: vec![0],
         ops: vec![

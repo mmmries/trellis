@@ -31,8 +31,8 @@ use std::time::Duration;
 use engine::config::DEFAULT_SCHEMA;
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use engine::defs::{
-    CatalogError, DdlError, TransformStatus, install_definition, qualified_target_table,
-    source_primary_key,
+    CatalogError, DdlError, TransformStatus, create_relationship, install_definition,
+    qualified_target_table, source_primary_key,
 };
 use engine::staging::{StagingError, await_converged, watermark_token};
 use engine::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
@@ -40,7 +40,7 @@ use tokio_postgres::NoTls;
 
 use super::Snapshot;
 use crate::model::{
-    Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Table, group_key,
+    Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Relationship, Table, group_key,
 };
 
 /// How long [`ManualBackend::quiesce`] waits for convergence before giving
@@ -214,12 +214,33 @@ fn render_expr(expr: &Expr) -> String {
             let args: Vec<String> = args.iter().map(render_expr).collect();
             format!("{name}({})", args.join(", "))
         }
-        Expr::RelationshipPath { .. } => {
-            unreachable!(
-                "the generator never constructs a RelationshipPath (issue #25 is grammar + AST only; no generator support yet)"
-            )
-        }
+        // Issue #34: a `<rel>.<column>` path renders back to exactly the
+        // concrete syntax ADR-0006 specifies — the *relationship* name as
+        // the head, never a table name or alias. The parser resolves an
+        // `ident.ident` in expression position straight to
+        // `Expr::RelationshipPath`, so this round-trips.
+        Expr::RelationshipPath { rel, column } => format!("{rel}.{column}"),
     }
+}
+
+/// Renders a [`Relationship`] back to the concrete
+/// `RELATIONSHIP <name> FROM <table>.<col> TO <table>.<col>` syntax
+/// [`create_relationship`] parses (ADR-0006) — the relationship analog of
+/// [`render_definition`], for the same reason: [`crate::model::Program`]
+/// stores plain data, and the engine's front door takes source text.
+///
+/// Cardinality is deliberately **not** rendered: ADR-0006's grammar has no
+/// cardinality keyword, because the engine derives it by introspecting
+/// whether the to-side column is provably unique. The model's recorded
+/// [`crate::model::Cardinality`] is the generator's claim about what that
+/// introspection will conclude; this is the point where the engine gets to
+/// disagree, and a disagreement surfaces as a definition-time rejection
+/// (a hard failure, never a skip).
+fn render_relationship(rel: &Relationship) -> String {
+    format!(
+        "RELATIONSHIP {} FROM {}.{} TO {}.{}",
+        rel.name, rel.from_table, rel.from_col, rel.to_table, rel.to_col
+    )
 }
 
 fn render_operator(op: Operator) -> &'static str {
@@ -458,6 +479,14 @@ impl ManualBackend {
             sql.push_str(pg_type_name(column.value_type));
             if column.name == table.pk_col {
                 sql.push_str(" primary key");
+            } else if table.unique_cols.iter().any(|c| c == &column.name) {
+                // Issue #34: a real single-column UNIQUE constraint, which
+                // is what makes `engine::defs::catalog`'s live `pg_catalog`
+                // introspection resolve a relationship whose *to*-side is
+                // this column as to-one (ADR-0006's cardinality rule). A
+                // generated to-one relationship is otherwise rejected as a
+                // bare reference to a to-many relationship.
+                sql.push_str(" unique");
             }
         }
         sql.push(')');
@@ -703,6 +732,17 @@ impl super::Backend for ManualBackend {
         for table in &program.tables {
             self.create_source_table(table).await?;
             self.tables.insert(table.name.clone(), table.clone());
+        }
+        // Issue #34: every relationship is declared before any definition,
+        // since a definition naming an undeclared relationship is rejected
+        // at validation time. Both endpoints already exist by now — a
+        // program's relationships only ever join two of its own tables, and
+        // every one of those was just created above (or, for a mid-stream
+        // definition install, in the very first `install` call — see
+        // `crate::run::run_convergence`, which passes relationships only
+        // alongside the tables).
+        for rel in &program.relationships {
+            create_relationship(&self.pool, &render_relationship(rel)).await?;
         }
         for def in &program.defs {
             self.install_definition(def).await?;
