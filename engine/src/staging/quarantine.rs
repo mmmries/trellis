@@ -30,14 +30,19 @@
 //! quarantining it individually cannot help — the fix is schema-shaped, not
 //! key-shaped.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::SystemTime;
 
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{GenericClient, Transaction};
 
-use crate::defs::ddl::DdlError;
-use crate::pool::Pool;
+use crate::defs::ast::{KeySpace, ValueType};
+use crate::defs::catalog;
+use crate::defs::ddl::{self, DdlError};
+use crate::defs::eval::{self, RelationshipContext, Row};
+use crate::defs::model::Definition;
+use crate::defs::validate;
+use crate::pool::{Pool, quote_ident};
 
 use super::append::{self, CdcOp, RING_SIZE, StagedChange, ring_table_name};
 use super::apply::{self, ApplyError};
@@ -54,6 +59,18 @@ use super::fold::FoldedChange;
 /// has none today — so every call site uses this constant directly; see
 /// docs/open-questions.md's "Quarantine policy details" for the follow-up.
 pub const DEFAULT_DEATH_THRESHOLD: i32 = 5;
+
+/// The column-fuse's threshold (`docs/decisions/0003-quarantine-storage-and-api.md`'s
+/// amendment, "Undecided" -> now decided): a sibling of
+/// [`DEFAULT_DEATH_THRESHOLD`], same value, named separately because the two
+/// fuses count different things and are meant to stay independently
+/// tunable if either is ever wired to real config — [`DEFAULT_DEATH_THRESHOLD`]
+/// counts *repeated attempts against one key*; this counts *distinct
+/// poisoned rows for one `(transform, column)` pair* (see
+/// `column_failures`' migration comment). Fixed count, not a percentage —
+/// same reasoning [`DEFAULT_DEATH_THRESHOLD`] documents, not yet configurable
+/// per transform/column.
+pub const DEFAULT_COLUMN_DEATH_THRESHOLD: i32 = DEFAULT_DEATH_THRESHOLD;
 
 // ---------------------------------------------------------------------
 // Failure classification
@@ -316,11 +333,22 @@ async fn evict_key(
     last_error: &str,
     contribution: Option<&FoldedChange>,
 ) -> Result<(), ApplyError> {
+    // `failures` records this eviction too, per ADR-0003's amendment —
+    // `transform`/`column` are both null since a whole-key eviction (unlike
+    // the column fuse below) is never attributable to one calculated field:
+    // by the time isolation reaches here, the failure has already survived
+    // a solo probe of this exact key, which is only possible for a
+    // key-shape/DDL-level failure or a genuinely malformed row — the same
+    // "column is null for a failure that isn't attributable to one
+    // calculated field" carve-out the storage doc describes.
     txn.execute(
-        "insert into poison (src_table, key, last_error) \
-         values ($1, $2, $3) \
+        "insert into poison (src_table, key, last_error, failures) \
+         values ($1, $2, $3, jsonb_build_array( \
+             jsonb_build_object('transform', null, 'column', null, \
+                                 'error', $3::text, 'failed_at', now()))) \
          on conflict (src_table, key) do update set \
-             last_error = excluded.last_error, poisoned_at = now()",
+             last_error = excluded.last_error, poisoned_at = now(), \
+             failures = poison.failures || excluded.failures",
         &[&src_table, &key, &last_error],
     )
     .await?;
@@ -389,6 +417,18 @@ pub async fn isolate_and_evict(
                     return Err(err);
                 }
                 if class == FailureClass::Isolate {
+                    // ADR-0003's amendment, layered alongside (not instead
+                    // of) the row-level charge just below: a probe failure
+                    // that's specifically an evaluator error names the
+                    // calculated field it broke on
+                    // ([`crate::defs::eval::EvalError::field`]), which this
+                    // attributes to a `(transform, column)` pair and charges
+                    // toward that pair's own, independent fuse. See
+                    // [`attribute_column_failure`]'s doc comment for why
+                    // this never changes what gets returned from *this*
+                    // function — the existing row-level fuse below is
+                    // completely unmodified by this call.
+                    attribute_column_failure(pool, &change.src_table, &change.key, &err).await?;
                     poisoned.push((
                         change.src_table.clone(),
                         change.key.clone(),
@@ -411,6 +451,7 @@ pub async fn isolate_and_evict(
                 return Err(err);
             }
             if class == FailureClass::Isolate {
+                attribute_column_failure(pool, &change.src_table, &change.key, &err).await?;
                 poisoned.push((
                     change.src_table.clone(),
                     change.key.clone(),
@@ -459,6 +500,490 @@ pub async fn isolate_and_evict(
         .cloned()
         .collect();
     Ok(Some(retry_folded))
+}
+
+// ---------------------------------------------------------------------
+// Column-level fuse (docs/decisions/0003-quarantine-storage-and-api.md's
+// 2026-09-12 amendment)
+// ---------------------------------------------------------------------
+//
+// Everything below is a second, independent fuse tier, finer-grained than
+// the row-level one above: it trips per `(transform, column)` instead of
+// per key, so one broken calculated-field formula doesn't force every other
+// healthy column on the same transform into quarantine. It never changes
+// [`isolate_and_evict`]'s own return value or the row-level fuse's
+// behavior — [`attribute_column_failure`] is pure side-effecting bookkeeping
+// called *alongside* the existing per-key charge, and a definition with
+// nothing currently paused pays only one extra small indexed lookup per
+// batch (`paused_columns_for`, called from [`super::apply::compute`]).
+//
+// **Scope, stated up front**: this tier only ever activates for
+// [`crate::defs::ast::KeySpace::OneToOne`] definitions (plain or
+// relationship-enriched). [`crate::defs::ast::KeySpace::Aggregate`] fields
+// are never attributed here and can never be paused by the automatic fuse —
+// `staging::apply_aggregate`'s incremental delta model (recently the subject
+// of its own delicate bug fixes) has no notion of "skip this one column and
+// keep accumulating the others," and inventing one is a materially bigger
+// project than this amendment. An aggregate transform's overall lifecycle
+// status (the existing whole-transform fuse) is completely unaffected by
+// this scope cut.
+
+/// Attributes `err` to a `(transform, column)` pair and charges it toward
+/// that pair's fuse, if `err` is specifically
+/// [`crate::defs::eval::EvalError`] (a calculated-field failure — the only
+/// kind [`crate::defs::eval::EvalError::field`] can name) coming from a
+/// [`crate::defs::ast::KeySpace::OneToOne`] definition. Anything else (a DDL/
+/// key-shape failure, a plain database error) is left entirely to the
+/// existing row-level fuse — this function is a no-op for it.
+///
+/// Attribution is by field-name match against every definition
+/// [`crate::defs::catalog::transforms_for_source`] returns for
+/// `src_table` (the first one declaring a field named
+/// [`crate::defs::eval::EvalError::field`] wins) — [`super::apply::compute`]
+/// evaluates one definition's fields inside one `eval::evaluate*` call and
+/// doesn't itself thread transform identity through
+/// [`crate::defs::eval::EvalError`] (which would mean widening that error
+/// type's public shape, and every existing construction site/test of it,
+/// just for this one caller). Two sibling definitions reading the same
+/// source table with an identically-named field is the one case this
+/// heuristic can misattribute; accepted as a documented limitation rather
+/// than a reason to thread more state through the evaluator.
+async fn attribute_column_failure(
+    pool: &Pool,
+    src_table: &str,
+    key: &str,
+    err: &ApplyError,
+) -> Result<(), ApplyError> {
+    let ApplyError::Eval(eval_err) = err else {
+        return Ok(());
+    };
+    let field = eval_err.field();
+
+    let candidates = catalog::transforms_for_source(pool, src_table).await?;
+    let Some(def) = candidates.into_iter().find(|def| {
+        matches!(def.def.key_space, KeySpace::OneToOne)
+            && def.def.fields.iter().any(|f| f.name == field)
+    }) else {
+        return Ok(());
+    };
+    let transform = def.def.target;
+
+    charge_column_failure(pool, &transform, field, src_table, key, &err.to_string()).await
+}
+
+/// Every column [`super::apply::compute`] must currently exclude from
+/// evaluation/writes for `transform_table` — the read
+/// [`super::apply::compute`] does once per definition per batch to implement
+/// "freeze at the last successfully computed value" (decision: never null a
+/// paused column out, never keep reattempting its already-fused formula).
+/// Empty (the overwhelmingly common case) for a transform with nothing
+/// paused.
+pub(super) async fn paused_columns_for(
+    pool: &Pool,
+    transform_table: &str,
+) -> Result<HashSet<String>, ApplyError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "select column_name from column_status where transform_table = $1",
+            &[&transform_table],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+}
+
+/// Records one distinct poisoned row's failure for `(transform, column)` and
+/// charges its counter — but only if `(src_table, key)` hasn't already been
+/// recorded for this exact pair (`column_failures`' primary key makes the
+/// insert idempotent). This is what makes the column fuse count *distinct
+/// poisoned rows*, not raw retry attempts: a single stubborn key retried
+/// across several `drain_once` attempts (the row-level fuse's own bread and
+/// butter — see `quarantine.rs`'s existing
+/// `repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still_drains`
+/// test) charges this counter exactly once, no matter how many times it's
+/// probed, so it can never cross this fuse's threshold alone — only a real
+/// *breadth* of distinct failing rows can. Trips the fuse
+/// ([`trip_column_fuse`]) once the count reaches
+/// [`DEFAULT_COLUMN_DEATH_THRESHOLD`].
+async fn charge_column_failure(
+    pool: &Pool,
+    transform: &str,
+    column: &str,
+    src_table: &str,
+    key: &str,
+    error: &str,
+) -> Result<(), ApplyError> {
+    let client = pool.get().await?;
+    let inserted = client
+        .execute(
+            "insert into column_failures (transform_table, column_name, src_table, key, error) \
+             values ($1, $2, $3, $4, $5) \
+             on conflict (transform_table, column_name, src_table, key) do nothing",
+            &[&transform, &column, &src_table, &key, &error],
+        )
+        .await?;
+    if inserted == 0 {
+        return Ok(());
+    }
+
+    let row = client
+        .query_one(
+            "insert into column_deaths (transform_table, column_name, deaths, last_error, last_death_at) \
+             values ($1, $2, 1, $3, now()) \
+             on conflict (transform_table, column_name) do update set \
+                 deaths = column_deaths.deaths + 1, \
+                 last_error = excluded.last_error, \
+                 last_death_at = now() \
+             returning deaths",
+            &[&transform, &column, &error],
+        )
+        .await?;
+    let deaths: i32 = row.get(0);
+    if deaths >= DEFAULT_COLUMN_DEATH_THRESHOLD {
+        trip_column_fuse(pool, transform, column, error).await?;
+    }
+    Ok(())
+}
+
+/// Trips the column fuse for `(transform, column)`: pauses it
+/// (`column_status`, `local_fuse = true` — this pair's *own* fuse tripped,
+/// as opposed to a pause it only inherited via [`cascade_pause`]), resets
+/// its counter, and cascades the pause to every dependent reader
+/// (decision #5).
+///
+/// Deliberately does **not** clear `column_failures` here (unlike the
+/// row-level fuse's `key_deaths`, which the counter reset above otherwise
+/// mirrors): those rows are [`Trellis::sample_quarantined`]'s data source
+/// for a `transform.column` target, and clearing them at the exact moment
+/// the fuse trips would erase the evidence right when a caller most wants to
+/// see it (diagnosing *why* it paused). Nothing needs them cleared to stay
+/// correct either — once paused, [`super::apply::compute`] excludes this
+/// column from evaluation entirely, so no *new* failure can be attributed to
+/// it while it stays paused. [`resume_column`] is what actually clears
+/// `column_failures`, once the column is live again and eligible to start
+/// accumulating a fresh set.
+async fn trip_column_fuse(
+    pool: &Pool,
+    transform: &str,
+    column: &str,
+    last_error: &str,
+) -> Result<(), ApplyError> {
+    let client = pool.get().await?;
+    client
+        .execute(
+            "insert into column_status (transform_table, column_name, paused_at, last_error, local_fuse) \
+             values ($1, $2, now(), $3, true) \
+             on conflict (transform_table, column_name) do update set \
+                 local_fuse = true, last_error = excluded.last_error",
+            &[&transform, &column, &last_error],
+        )
+        .await?;
+    client
+        .execute(
+            "delete from column_deaths where transform_table = $1 and column_name = $2",
+            &[&transform, &column],
+        )
+        .await?;
+
+    cascade_pause(pool, transform, column).await
+}
+
+/// Pauses every direct and transitive dependent of `(transform, column)`
+/// (decision #5: a transform reading a paused column's output must also
+/// pause, rather than silently consume a frozen/stale value with no
+/// signal) — a breadth-first walk over
+/// [`crate::defs::catalog::column_dependents`], recorded into
+/// `column_pause_cascades` so [`resume_column`] can later tell a purely
+/// cascaded pause apart from one with its own independent (`local_fuse`)
+/// reason to stay paused. Iterative, not recursive: `docs/transforms.md`'s
+/// "Chaining and cycle detection" guarantees the underlying dependency graph
+/// is acyclic, so a queue-based walk always terminates, without needing
+/// `async fn` self-recursion's `Box::pin` boilerplate.
+///
+/// A dependent already paused (by an earlier cascade, or its own
+/// `local_fuse`) still gets this new cascade edge recorded (so un-cascading
+/// `transform`/`column` later can't wrongly resume it out from under a
+/// *different* still-live reason), but its own further dependents are not
+/// re-walked — they were already reached when this dependent first paused.
+async fn cascade_pause(pool: &Pool, transform: &str, column: &str) -> Result<(), ApplyError> {
+    let mut queue: VecDeque<(String, String)> = VecDeque::new();
+    queue.push_back((transform.to_string(), column.to_string()));
+
+    while let Some((upstream_transform, upstream_column)) = queue.pop_front() {
+        let deps = catalog::column_dependents(pool, &upstream_transform, &upstream_column).await?;
+        for (downstream_transform, downstream_column) in deps {
+            let client = pool.get().await?;
+            client
+                .execute(
+                    "insert into column_pause_cascades \
+                         (downstream_transform, downstream_column, upstream_transform, upstream_column) \
+                     values ($1, $2, $3, $4) \
+                     on conflict do nothing",
+                    &[
+                        &downstream_transform,
+                        &downstream_column,
+                        &upstream_transform,
+                        &upstream_column,
+                    ],
+                )
+                .await?;
+
+            let newly_paused = client
+                .execute(
+                    "insert into column_status (transform_table, column_name, paused_at, last_error, local_fuse) \
+                     values ($1, $2, now(), $3, false) \
+                     on conflict (transform_table, column_name) do nothing",
+                    &[
+                        &downstream_transform,
+                        &downstream_column,
+                        &format!(
+                            "paused because upstream column '{upstream_transform}.{upstream_column}' \
+                             is paused"
+                        ),
+                    ],
+                )
+                .await?;
+            if newly_paused > 0 {
+                queue.push_back((downstream_transform, downstream_column));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resumes a paused column: clears its counter, recomputes its value across
+/// every existing row ([`recompute_column`]), clears its `column_status` row
+/// and outgoing cascade edges, then un-cascades every dependent this pause
+/// reached — but only a dependent with *no other* remaining reason to stay
+/// paused (no `local_fuse` of its own, and no other live
+/// `column_pause_cascades` edge into it — decision: careful not to un-pause
+/// a dependent that has its own independent reason to stay paused). Returns
+/// every `(transform, column)` pair actually resumed, `transform`/`column`
+/// itself first, in the order resumed.
+///
+/// Errors with [`ApplyError::ColumnNotPaused`] if `(transform, column)`
+/// isn't currently paused — resuming a live column is caller error, not a
+/// silent no-op.
+pub async fn resume_column(
+    pool: &Pool,
+    transform: &str,
+    column: &str,
+) -> Result<Vec<(String, String)>, ApplyError> {
+    {
+        let client = pool.get().await?;
+        let exists = client
+            .query_opt(
+                "select 1 from column_status where transform_table = $1 and column_name = $2",
+                &[&transform, &column],
+            )
+            .await?
+            .is_some();
+        if !exists {
+            return Err(ApplyError::ColumnNotPaused {
+                transform: transform.to_string(),
+                column: column.to_string(),
+            });
+        }
+        client
+            .execute(
+                "delete from column_deaths where transform_table = $1 and column_name = $2",
+                &[&transform, &column],
+            )
+            .await?;
+        client
+            .execute(
+                "delete from column_failures where transform_table = $1 and column_name = $2",
+                &[&transform, &column],
+            )
+            .await?;
+    }
+
+    let mut resumed = Vec::new();
+    let mut queue: VecDeque<(String, String)> = VecDeque::new();
+    queue.push_back((transform.to_string(), column.to_string()));
+
+    while let Some((t, c)) = queue.pop_front() {
+        let Some(def) = catalog::definition_by_target(pool, &t).await? else {
+            continue;
+        };
+        recompute_column(pool, &def, &c).await?;
+
+        let client = pool.get().await?;
+        client
+            .execute(
+                "delete from column_status where transform_table = $1 and column_name = $2",
+                &[&t, &c],
+            )
+            .await?;
+        let affected = client
+            .query(
+                "delete from column_pause_cascades \
+                 where upstream_transform = $1 and upstream_column = $2 \
+                 returning downstream_transform, downstream_column",
+                &[&t, &c],
+            )
+            .await?;
+        resumed.push((t.clone(), c.clone()));
+
+        for row in affected {
+            let downstream_transform: String = row.get(0);
+            let downstream_column: String = row.get(1);
+            let status = client
+                .query_opt(
+                    "select local_fuse from column_status \
+                     where transform_table = $1 and column_name = $2",
+                    &[&downstream_transform, &downstream_column],
+                )
+                .await?;
+            let Some(status) = status else {
+                // Already resumed by some other path (shouldn't happen
+                // within one resume walk, but tolerate it rather than panic).
+                continue;
+            };
+            let local_fuse: bool = status.get(0);
+            if local_fuse {
+                continue;
+            }
+            let remaining: i64 = client
+                .query_one(
+                    "select count(*) from column_pause_cascades \
+                     where downstream_transform = $1 and downstream_column = $2",
+                    &[&downstream_transform, &downstream_column],
+                )
+                .await?
+                .get(0);
+            if remaining == 0 {
+                queue.push_back((downstream_transform, downstream_column));
+            }
+        }
+    }
+
+    Ok(resumed)
+}
+
+/// Re-derives `column`'s value across every current row of `def.def.source`
+/// and writes it into `def.def.target`, freshly evaluated against live
+/// source data — [`resume_column`]'s "re-run the backfill for just this
+/// column's formula against already-built rows" (ADR-0003's amendment).
+///
+/// **Judgment call, flagged rather than silently made**: this deliberately
+/// does *not* reuse the chunked/durable `backfill_chunks` queue
+/// (ADR-0007's amendment) or `defs::oracle::render_expr_sql`'s pure-SQL
+/// rendering. A resume is a rare, operator-driven action (not a hot path,
+/// and not something correctness elsewhere depends on completing
+/// quickly), so a single straightforward pass — read every row, evaluate
+/// this one definition's fields in Rust (reusing the exact evaluator the
+/// live apply path already trusts, relationships included), write back only
+/// `column` — is a much smaller, lower-risk surface than either
+/// alternative: the chunk queue is built for *initial* backfill's
+/// crash-resumability at billion-row scale, over-built for a single-column
+/// recompute; and `render_expr_sql`'s bare-identifier rendering is only
+/// safe in a plain `select ... from source` (its one real caller,
+/// `defs::backfill::write_one_to_one_range`) — reusing it inside an `update
+/// target ... from source` would risk an ambiguous-column error whenever a
+/// passthrough field shares its name with a source column that also exists
+/// on the target. Trade-off: no chunking, so a resume against a very large
+/// source table runs as one long-lived pass rather than resumable steps —
+/// acceptable for a rare, bounded, operator-invoked action; flagged here as
+/// a follow-up if that ever stops being true.
+///
+/// A row that still fails to evaluate (the underlying data problem isn't
+/// actually fixed for it) is skipped rather than aborting the whole resume —
+/// its column stays at whatever it was frozen to, and it remains eligible to
+/// re-trip the fuse later via ordinary live CDC if it keeps failing.
+async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result<(), ApplyError> {
+    if !def.def.fields.iter().any(|f| f.name == column) {
+        return Err(ApplyError::ColumnNotPaused {
+            transform: def.def.target.clone(),
+            column: column.to_string(),
+        });
+    }
+
+    let pk = ddl::source_primary_key(pool, &def.def.source).await?;
+    let source_ident = quote_ident(&def.def.source);
+    let pk_ident = quote_ident(&pk.name);
+
+    let client = pool.get().await?;
+    let db_rows = client
+        .query(
+            &format!(
+                "select {pk_ident}::text as pk_text, e.key, e.value \
+                 from {source_ident} t \
+                 cross join lateral jsonb_each_text(to_jsonb(t.*)) e"
+            ),
+            &[],
+        )
+        .await?;
+
+    let mut order: Vec<String> = Vec::new();
+    let mut rows_by_pk: HashMap<String, Row> = HashMap::new();
+    for db_row in db_rows {
+        let pk_text: String = db_row.get(0);
+        let key: String = db_row.get(1);
+        let value: Option<String> = db_row.get(2);
+        rows_by_pk
+            .entry(pk_text.clone())
+            .or_insert_with(|| {
+                order.push(pk_text.clone());
+                Row::new()
+            })
+            .insert(key, value);
+    }
+
+    let rel_refs = eval::relationship_references(&def.def);
+    let rel_ctx = if rel_refs.is_empty() {
+        RelationshipContext::default()
+    } else {
+        let rows: Vec<Option<Row>> = order
+            .iter()
+            .map(|pk_text| Some(rows_by_pk[pk_text].clone()))
+            .collect();
+        apply::build_relationship_context(pool, &def.def.source, &def.def, &rows).await?
+    };
+
+    let field_type = if rel_refs.is_empty() {
+        let inferred = validate::infer_field_types(&def.def, &def.source_columns, &HashMap::new())?;
+        inferred.get(column).copied().unwrap_or(ValueType::Numeric)
+    } else {
+        let col_names = vec![column.to_string()];
+        let types = apply::to_column_types(pool, &def.def.target, &col_names).await?;
+        types.get(column).copied().unwrap_or(ValueType::Numeric)
+    };
+    let pg_type = match field_type {
+        ValueType::Numeric => "numeric",
+        ValueType::Text => "text",
+        ValueType::Boolean => "boolean",
+        ValueType::Uuid => "uuid",
+    };
+
+    let target_ident = quote_ident(&def.def.target);
+    let col_ident = quote_ident(column);
+    let mut regex_cache = eval::RegexCache::new();
+
+    for pk_text in &order {
+        let row = &rows_by_pk[pk_text];
+        let Ok(mut evaluated) = eval::evaluate_with_relationships(
+            &def.def,
+            row,
+            &def.source_columns,
+            &rel_ctx,
+            &mut regex_cache,
+        ) else {
+            continue;
+        };
+        let value: Option<String> = evaluated.remove(column).flatten().map(|v| v.to_string());
+        client
+            .execute(
+                &format!(
+                    "update {target_ident} set {col_ident} = $1::text::{pg_type} \
+                     where {pk_ident}::text = $2"
+                ),
+                &[&value, pk_text],
+            )
+            .await?;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------

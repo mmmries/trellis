@@ -128,6 +128,14 @@ pub enum ApplyError {
     /// [`drain_once`] routes this to [`quarantine::purge_dropped_table`]
     /// rather than the ordinary isolate/evict path.
     SourceTableDropped { source_table: String },
+    /// [`super::quarantine::resume_column`] (or, indirectly,
+    /// [`crate::app::Trellis::resume_column`]) was asked to resume a
+    /// `(transform, column)` pair with no currently-paused `column_status`
+    /// row — resuming a column that isn't paused is caller error, not a
+    /// silent no-op. Also reused for "no such column on this definition at
+    /// all," so an address naming a real transform but the wrong field name
+    /// gets a specific error rather than silently doing nothing.
+    ColumnNotPaused { transform: String, column: String },
 }
 
 impl ApplyError {
@@ -154,6 +162,7 @@ impl ApplyError {
             | ApplyError::VersionFenceMiss { .. }
             | ApplyError::HopBoundExceeded { .. } => ErrorCode::Internal,
             ApplyError::SourceTableDropped { .. } => ErrorCode::NotFound,
+            ApplyError::ColumnNotPaused { .. } => ErrorCode::NotFound,
         }
     }
 }
@@ -195,6 +204,11 @@ impl fmt::Display for ApplyError {
                 f,
                 "source table '{source_table}' no longer exists; purging its staged rows"
             ),
+            ApplyError::ColumnNotPaused { transform, column } => write!(
+                f,
+                "'{transform}.{column}' is not currently paused (or is not a column of that \
+                 definition)"
+            ),
         }
     }
 }
@@ -213,7 +227,8 @@ impl std::error::Error for ApplyError {
             ApplyError::ClaimLost
             | ApplyError::VersionFenceMiss { .. }
             | ApplyError::HopBoundExceeded { .. }
-            | ApplyError::SourceTableDropped { .. } => None,
+            | ApplyError::SourceTableDropped { .. }
+            | ApplyError::ColumnNotPaused { .. } => None,
         }
     }
 }
@@ -406,7 +421,7 @@ async fn from_side_keys_for_join(
 /// evaluate — so only the related rows those rows actually need are fetched.
 /// `from_table` is the definition's own source table (a relationship's
 /// `from_table`).
-async fn build_relationship_context(
+pub(crate) async fn build_relationship_context(
     pool: &Pool,
     from_table: &str,
     def: &TransformDef,
@@ -534,7 +549,7 @@ async fn fetch_to_side_rows(
 /// a to-side relationship column's text is typed the same way the from-side
 /// source columns are. A column not found is simply absent — the evaluator
 /// defaults an absent to-side column to `Numeric`.
-async fn to_column_types(
+pub(crate) async fn to_column_types(
     pool: &Pool,
     table: &str,
     columns: &[String],
@@ -993,6 +1008,31 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         })
                         .collect()
                 };
+
+                // ADR-0003's amendment (column-level quarantine): a column
+                // the fuse has paused is excluded from both this plan's
+                // column list (so `apply_target`'s generated SQL never
+                // mentions it at all — decision: freeze at the last
+                // successfully computed value, don't null it out or keep
+                // reattempting a formula that's already fused off) and from
+                // evaluation itself below (so a still-broken paused formula
+                // doesn't keep reproducing the same failure on every batch).
+                // Empty for every definition with nothing currently paused —
+                // the overwhelmingly common case — so this is a cheap,
+                // indexed no-op read then, behavior-identical to before this
+                // amendment.
+                let paused = quarantine::paused_columns_for(pool, &def.def.target).await?;
+                let (field_names, field_types): (Vec<String>, Vec<ValueType>) = if paused.is_empty()
+                {
+                    (field_names, field_types)
+                } else {
+                    field_names
+                        .into_iter()
+                        .zip(field_types)
+                        .filter(|(name, _)| !paused.contains(name))
+                        .unzip()
+                };
+
                 let plan = targets
                     .entry(def.def.target.clone())
                     .or_insert_with(|| TargetPlan {
@@ -1048,18 +1088,20 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             // definition — see `catalog::create_definition` —
                             // rather than defaulting every column to Numeric).
                             let mut evaluated = match &rel_ctx {
-                                Some(ctx) => eval::evaluate_with_relationships(
+                                Some(ctx) => eval::evaluate_with_relationships_excluding(
                                     &def.def,
                                     row,
                                     &def.source_columns,
                                     ctx,
                                     &mut regex_cache,
+                                    &paused,
                                 )?,
-                                None => eval::evaluate(
+                                None => eval::evaluate_excluding(
                                     &def.def,
                                     row,
                                     &def.source_columns,
                                     &mut regex_cache,
+                                    &paused,
                                 )?,
                             };
                             let values: Vec<Option<String>> = field_names
@@ -1307,21 +1349,40 @@ async fn apply_target(
         let cols_per_row = 1 + plan.field_names.len();
         let rows_per_chunk = (MAX_WRITE_PARAMS_PER_STATEMENT / cols_per_row).max(1);
 
-        let set_list = field_idents
-            .iter()
-            .map(|f| format!("{f} = excluded.{f}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let target_cols = field_idents
-            .iter()
-            .map(|f| format!("{target_ident}.{f}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let excluded_cols = field_idents
-            .iter()
-            .map(|f| format!("excluded.{f}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        // Every one of this target's calculated columns can be paused at
+        // once (ADR-0003's amendment) — a single-field definition whose lone
+        // column's fuse has tripped is the simplest such case. There is then
+        // nothing for a conflicting key to update at all: `do update set`
+        // with an empty set list is invalid SQL, and an empty-tuple `is
+        // distinct from` comparison is too. `do nothing` is also the
+        // semantically right behavior, not just the SQL-valid one — an
+        // existing row with every column frozen genuinely has no physical
+        // change to make; a brand-new key still gets its bare row inserted
+        // (frozen at the column defaults) via the same statement's `insert`
+        // half.
+        let on_conflict = if field_idents.is_empty() {
+            format!("on conflict ({pk_ident}) do nothing")
+        } else {
+            let set_list = field_idents
+                .iter()
+                .map(|f| format!("{f} = excluded.{f}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let target_cols = field_idents
+                .iter()
+                .map(|f| format!("{target_ident}.{f}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let excluded_cols = field_idents
+                .iter()
+                .map(|f| format!("excluded.{f}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "on conflict ({pk_ident}) do update set {set_list} \
+                 where ({target_cols}) is distinct from ({excluded_cols})"
+            )
+        };
 
         for chunk in plan.writes.chunks(rows_per_chunk) {
             let mut rows_sql = Vec::with_capacity(chunk.len());
@@ -1341,8 +1402,7 @@ async fn apply_target(
             let sql = format!(
                 "insert into {target_ident} ({col_list}) \
                  select * from (values {}) as v({col_list}) \
-                 on conflict ({pk_ident}) do update set {set_list} \
-                 where ({target_cols}) is distinct from ({excluded_cols}) \
+                 {on_conflict} \
                  returning {pk_ident}::text as pk",
                 rows_sql.join(", "),
             );

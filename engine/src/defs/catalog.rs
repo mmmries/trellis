@@ -25,7 +25,7 @@ use std::fmt;
 use crate::error_code::{self, ErrorCode};
 use crate::pool::Pool;
 
-use super::ast::{KeySpace, RelationshipDef, TransformDef, ValueType};
+use super::ast::{Expr, KeySpace, RelationshipDef, TransformDef, ValueType};
 use super::backfill::{self, BackfillError};
 use super::chunk_queue;
 use super::ddl::{self, DdlError};
@@ -1941,6 +1941,188 @@ pub(crate) async fn definition_by_id(
         source_columns,
         status,
     }))
+}
+
+/// Reads back one definition by its target table name — [`definition_by_id`]
+/// keyed the other way, for callers that only have the address a `Trellis`
+/// caller would use (`docs/decisions/0003-quarantine-storage-and-api.md`'s
+/// amendment: a quarantine target is `transform` or `transform.column`,
+/// where `transform` is this crate's `target_table`). Used by
+/// `staging::quarantine`'s column-resume path to reconstruct the
+/// [`super::ast::TransformDef`] whose column it's re-deriving.
+pub async fn definition_by_target(
+    pool: &Pool,
+    target_table: &str,
+) -> Result<Option<Definition>, CatalogError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "select t.id, t.source_version, t.definition_text, t.status, e.key, e.value \
+             from transform_definitions t \
+             left join lateral jsonb_each_text(t.source_columns) e on true \
+             where t.target_table = $1",
+            &[&target_table],
+        )
+        .await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let id: i64 = rows[0].get(0);
+    let source_version: i64 = rows[0].get(1);
+    let text: String = rows[0].get(2);
+    let status_text: String = rows[0].get(3);
+    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+        panic!("transform_definitions.status held unrecognized value '{status_text}'")
+    });
+    let def = parse(&text)?;
+
+    let mut source_columns = HashMap::new();
+    for row in &rows {
+        let key: Option<String> = row.get(4);
+        let value: Option<String> = row.get(5);
+        if let (Some(key), Some(value)) = (key, value) {
+            let value_type = match value.as_str() {
+                "numeric" => ValueType::Numeric,
+                "text" => ValueType::Text,
+                "boolean" => ValueType::Boolean,
+                "uuid" => ValueType::Uuid,
+                other => {
+                    return Err(CatalogError::UnknownValueType {
+                        column: key,
+                        text: other.to_string(),
+                    });
+                }
+            };
+            source_columns.insert(key, value_type);
+        }
+    }
+
+    Ok(Some(Definition {
+        id,
+        source_version,
+        def,
+        source_columns,
+        status,
+    }))
+}
+
+/// Every `(downstream_target_table, downstream_field_name)` pair whose
+/// calculated-field expression reads `(upstream_table, upstream_column)` —
+/// either directly (a chained 1-1 transform whose `FROM` *is*
+/// `upstream_table`, referencing the column by its bare name) or through a
+/// declared relationship whose `to_table` is `upstream_table` (a
+/// relationship-enriched field's `<rel>.<column>` path). This is column-level
+/// lineage, deliberately *not* [`dependents_of`]'s table-level
+/// `schema_edges` walk: that graph answers "does transform X read table Y at
+/// all," which is too coarse for ADR-0003's amendment — cascading a paused
+/// *column* must not pause a downstream transform's *other* fields that don't
+/// actually reference it. Scanning every definition's own field expressions
+/// (rather than a persisted edge) is what makes this precise.
+///
+/// Direct (one-hop) dependents only; `staging::quarantine`'s cascade walks
+/// this transitively itself, relying on the same cycle-freedom
+/// `docs/transforms.md#chaining-and-cycle-detection` guarantees for the
+/// table-level graph (a column-level reference can only exist where a
+/// table-level dependency edge already does, so the same DAG property
+/// applies).
+pub(crate) async fn column_dependents(
+    pool: &Pool,
+    upstream_table: &str,
+    upstream_column: &str,
+) -> Result<Vec<(String, String)>, CatalogError> {
+    let client = pool.get().await?;
+    let def_rows = client
+        .query(
+            "select target_table, source_table, definition_text from transform_definitions",
+            &[],
+        )
+        .await?;
+    let rel_rows = client
+        .query(
+            "select from_table, name, to_table from relationship_definitions",
+            &[],
+        )
+        .await?;
+
+    let mut rel_to_table: HashMap<(String, String), String> = HashMap::new();
+    for row in rel_rows {
+        let from_table: String = row.get(0);
+        let name: String = row.get(1);
+        let to_table: String = row.get(2);
+        rel_to_table.insert((from_table, name), to_table);
+    }
+
+    let mut deps = Vec::new();
+    for row in def_rows {
+        let target: String = row.get(0);
+        let source: String = row.get(1);
+        let text: String = row.get(2);
+        // A definition already persisted here is expected to always re-parse
+        // (the same assumption every other read path in this module makes);
+        // skip rather than fail this best-effort lineage scan on the
+        // unexpected chance it doesn't, rather than let one bad row prevent
+        // cascading a pause to every other, healthy dependent.
+        let Ok(def) = parse(&text) else { continue };
+        for field in &def.fields {
+            if expr_references_column(
+                &field.expr,
+                &source,
+                upstream_table,
+                upstream_column,
+                &rel_to_table,
+            ) {
+                deps.push((target.clone(), field.name.clone()));
+            }
+        }
+    }
+    Ok(deps)
+}
+
+/// Whether `expr` (one calculated field's expression, belonging to a
+/// definition whose `FROM` is `def_source`) reads `(upstream_table,
+/// upstream_column)` — see [`column_dependents`].
+fn expr_references_column(
+    expr: &Expr,
+    def_source: &str,
+    upstream_table: &str,
+    upstream_column: &str,
+    rel_to_table: &HashMap<(String, String), String>,
+) -> bool {
+    match expr {
+        Expr::Column(name) => def_source == upstream_table && name == upstream_column,
+        Expr::RelationshipPath { rel, column } => {
+            column == upstream_column
+                && rel_to_table
+                    .get(&(def_source.to_string(), rel.clone()))
+                    .is_some_and(|to_table| to_table == upstream_table)
+        }
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            expr_references_column(
+                lhs,
+                def_source,
+                upstream_table,
+                upstream_column,
+                rel_to_table,
+            ) || expr_references_column(
+                rhs,
+                def_source,
+                upstream_table,
+                upstream_column,
+                rel_to_table,
+            )
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(|arg| {
+            expr_references_column(
+                arg,
+                def_source,
+                upstream_table,
+                upstream_column,
+                rel_to_table,
+            )
+        }),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => false,
+    }
 }
 
 #[cfg(test)]

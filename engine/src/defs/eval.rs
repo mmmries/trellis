@@ -235,6 +235,26 @@ impl EvalError {
     pub fn code(&self) -> ErrorCode {
         ErrorCode::Internal
     }
+
+    /// The calculated-field name this failure is attributed to — every
+    /// variant carries one (see each variant's `field`). ADR-0003's amendment
+    /// (column-level quarantine) uses this to attribute a failure to a
+    /// `(transform, column)` pair: `staging::quarantine`'s isolate-before-
+    /// blaming probe knows which [`TransformDef`] it just evaluated, and
+    /// pairs that with this field name rather than needing this error type
+    /// (or [`evaluate`]/[`evaluate_with_relationships`]'s signature) to carry
+    /// transform identity itself.
+    pub fn field(&self) -> &str {
+        match self {
+            EvalError::MissingColumn { field, .. }
+            | EvalError::InvalidNumber { field, .. }
+            | EvalError::InvalidBoolean { field, .. }
+            | EvalError::UnsupportedRelationshipPath { field, .. }
+            | EvalError::UnknownRelationship { field, .. }
+            | EvalError::AggregateRequiredForToMany { field, .. } => field,
+            EvalError::Cycle(field) => field,
+        }
+    }
 }
 
 impl fmt::Display for EvalError {
@@ -324,6 +344,30 @@ pub fn evaluate(
     )
 }
 
+/// [`evaluate`], skipping every field named in `excluded` — ADR-0003's
+/// amendment (column-level quarantine): a paused column must not be
+/// re-evaluated (it would just reproduce the same failure that paused it
+/// forever), and its target value freezes at whatever it last held rather
+/// than being overwritten. See [`evaluate_with_relationships_excluding`] for
+/// the full contract; this is its no-relationships convenience form, mirroring
+/// [`evaluate`]'s own relationship to [`evaluate_with_relationships`].
+pub fn evaluate_excluding(
+    def: &TransformDef,
+    row: &Row,
+    source_columns: &HashMap<String, ValueType>,
+    regex_cache: &mut RegexCache,
+    excluded: &HashSet<String>,
+) -> Result<HashMap<String, Option<Value>>, EvalError> {
+    evaluate_with_relationships_excluding(
+        def,
+        row,
+        source_columns,
+        &RelationshipContext::default(),
+        regex_cache,
+        excluded,
+    )
+}
+
 /// Like [`evaluate`], but with [`RelationshipContext`] read-side data so a
 /// field's `<rel>.<column>` to-one relationship path (issue #28) resolves the
 /// single related row and reads the referenced column. A path whose `rel` has
@@ -337,12 +381,49 @@ pub fn evaluate_with_relationships(
     relationships: &RelationshipContext,
     regex_cache: &mut RegexCache,
 ) -> Result<HashMap<String, Option<Value>>, EvalError> {
+    evaluate_with_relationships_excluding(
+        def,
+        row,
+        source_columns,
+        relationships,
+        regex_cache,
+        &HashSet::new(),
+    )
+}
+
+/// [`evaluate_with_relationships`], skipping every field named in `excluded`.
+///
+/// A field in `excluded` is never handed to [`eval_field`] at all — its cache
+/// slot is pre-seeded `None` instead, so any *other* field that references it
+/// (a same-table calculated-field alias) sees a plain absent value rather than
+/// re-triggering the excluded field's own broken expression, and the excluded
+/// field itself is omitted from the returned map entirely (not present as
+/// `None`) so [`super::super::staging::apply::compute`]'s write plan can tell
+/// "paused, don't touch this column" apart from "genuinely evaluated to
+/// NULL." `excluded` is normally empty (every existing caller stays on this
+/// behavior via [`evaluate_with_relationships`]/[`evaluate`]); it's non-empty
+/// only when the caller has already looked up which of this definition's
+/// columns are currently paused (ADR-0003's amendment).
+pub fn evaluate_with_relationships_excluding(
+    def: &TransformDef,
+    row: &Row,
+    source_columns: &HashMap<String, ValueType>,
+    relationships: &RelationshipContext,
+    regex_cache: &mut RegexCache,
+    excluded: &HashSet<String>,
+) -> Result<HashMap<String, Option<Value>>, EvalError> {
     let fields_by_name: HashMap<&str, &FieldDef> =
         def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
 
     let mut cache: HashMap<String, Option<Value>> = HashMap::with_capacity(def.fields.len());
     let mut in_progress: HashSet<String> = HashSet::new();
+    for excluded_name in excluded {
+        cache.insert(excluded_name.clone(), None);
+    }
     for field in &def.fields {
+        if excluded.contains(&field.name) {
+            continue;
+        }
         if !cache.contains_key(&field.name) {
             let value = eval_field(
                 field,
@@ -358,6 +439,9 @@ pub fn evaluate_with_relationships(
         }
     }
 
+    for excluded_name in excluded {
+        cache.remove(excluded_name);
+    }
     Ok(cache)
 }
 
