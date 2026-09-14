@@ -1069,32 +1069,32 @@ async fn a_to_one_relationship_aggregated_inside_a_group_by_converges_end_to_end
     }
 }
 
-/// **A live engine defect, found by this suite.** `TRUNCATE` on a table some
-/// definition reads *through a relationship* leaves that definition's
-/// enrichment permanently stale.
+/// **Issue #98 regression pin.** `TRUNCATE` on a table some definition reads
+/// *through a relationship* used to leave that definition's enrichment
+/// permanently stale.
 ///
 /// Mechanism (`engine::staging::apply`): the truncate-clear path resolves
 /// affected targets with `catalog::transforms_for_source` — definitions whose
 /// **source** is the truncated table — while reverse propagation into
-/// definitions that merely *read* the table lives in the separate keyed
+/// definitions that merely *read* the table lived in the separate keyed
 /// by-source loop, driven by per-row change images and
 /// `catalog::relationships_to_table`. A `TRUNCATE` stages one key-less
 /// sentinel row (`append::TRUNCATE_SENTINEL_KEY`), not per-row images, so it
-/// never reaches that loop at all. Exactly the "its own logical-decoding
+/// never reached that loop at all. Exactly the "its own logical-decoding
 /// message, not a bulk delete" hazard the design doc §7 flags.
 ///
 /// The program: `t0`'s single row has a foreign key resolving to `t1`'s
 /// single row, so `rel_enrich` is `22`. Then `t1` is truncated. The oracle's
-/// `LEFT JOIN` finds nothing and says `NULL`; the maintained target still
-/// says `22`.
+/// `LEFT JOIN` finds nothing and says `NULL`; the maintained target used to
+/// still say `22`.
 ///
-/// `#[ignore]`d rather than deleted: this is the durable, minimized pin the
-/// design doc §6 asks a generative finding to terminate as, and it must fail
-/// the day someone thinks the bug is fixed. `un-ignore` it then, and delete
-/// `generate::without_truncates_on_relationship_to_sides`, which is what
-/// currently keeps the property suite from drawing this shape.
+/// Fixed by having the truncate-clear path (`engine/src/staging/apply.rs`)
+/// also resolve `catalog::relationships_to_table` for the truncated table and
+/// stage every from-side row with a non-`NULL` join column as a reverse
+/// recompute, through the same `reverse_recomputes` accumulator the
+/// row-driven path (issue #30) already feeds. Kept as a permanent regression
+/// pin (design doc §6) rather than deleted now that it passes.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "known engine defect: TRUNCATE of a relationship to-side table does not reverse-propagate"]
 async fn truncating_a_relationship_to_side_table_leaves_a_stale_enrichment() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
