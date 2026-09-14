@@ -154,14 +154,31 @@ pub enum ValidationError {
         column: String,
     },
     /// An [`super::ast::KeySpace::Aggregate`] (GROUP BY) definition's field
-    /// references a `<rel>.<column>` relationship path. ADR-0006 relationship
-    /// enrichment is a row-grain (OneToOne) construct: a path folds over
-    /// *related* rows, orthogonal to a GROUP BY that folds over *source*
-    /// rows, and combining the two grains is unsupported. Rejected here so
-    /// the aggregate DDL/apply paths — which type-infer with no relationship
-    /// metadata — never have to (they'd otherwise accept it at define time
-    /// and fail unmaterializably at staging).
+    /// references a **to-many** `<rel>.<column>` relationship path inside an
+    /// aggregate call. That is a nested aggregation — folding an aggregate
+    /// over *related* rows into an aggregate over *source* rows — and has no
+    /// settled semantics (which fold runs first? does a source row with no
+    /// related rows contribute `NULL` or the inner aggregate's empty result?),
+    /// so it stays rejected until one is chosen. A **to-one** path inside an
+    /// aggregate is *not* this case: it resolves to exactly one related value
+    /// per source row, so `SUM(post.word_count)` is simply a `LEFT JOIN`
+    /// followed by `GROUP BY`, and is accepted (issue #94).
     RelationshipPathInAggregate {
+        field: String,
+        rel: String,
+        column: String,
+    },
+    /// An [`super::ast::KeySpace::Aggregate`] (GROUP BY) definition's field
+    /// references a to-one `<rel>.<column>` relationship path **bare**, not
+    /// wrapped in an aggregate call. A to-one path resolves per *source* row,
+    /// exactly like a source column does, so within a GROUP BY it names one
+    /// value per row of the group rather than one value for the group —
+    /// there's nothing to write into the group's single target row. Wrap it in
+    /// `SUM`/`MIN`/`MAX`/`AVG`/`COUNT` to fold it down. The relationship-path
+    /// twin of [`ValidationError::UngroupedColumnReference`], kept separate so
+    /// the message can name `<rel>.<column>` rather than pretend the path is a
+    /// source column name (issue #94).
+    UngroupedRelationshipReference {
         field: String,
         rel: String,
         column: String,
@@ -328,10 +345,17 @@ impl fmt::Display for ValidationError {
             ),
             ValidationError::RelationshipPathInAggregate { field, rel, column } => write!(
                 f,
-                "calculated field '{field}' references relationship path '{rel}.{column}' in a \
-                 GROUP BY (aggregate) definition; relationship enrichment is a row-grain \
-                 construct that can't be combined with a GROUP BY grain — use it in a \
-                 OneToOne definition instead (ADR-0006)"
+                "calculated field '{field}' aggregates to-many relationship path \
+                 '{rel}.{column}' inside a GROUP BY (aggregate) definition; aggregating an \
+                 aggregate is not supported — a to-one relationship path may be aggregated \
+                 here, but a to-many one may not"
+            ),
+            ValidationError::UngroupedRelationshipReference { field, rel, column } => write!(
+                f,
+                "calculated field '{field}' references relationship path '{rel}.{column}' \
+                 outside of SUM/COUNT/MIN/MAX/AVG; in a GROUP BY definition a to-one \
+                 relationship path resolves once per source row, so it must be aggregated \
+                 (e.g. SUM({rel}.{column})), not referenced bare"
             ),
             ValidationError::UnknownRelationshipColumn { table, column } => write!(
                 f,
@@ -495,6 +519,7 @@ pub fn validate(
                     &field.name,
                     &group_by,
                     source_columns,
+                    relationships,
                     false,
                 )?;
             }
@@ -558,8 +583,9 @@ pub fn validate(
     // enriched by a bare `<rel>.<column>`; a to-many by an aggregate over the
     // path. Checked here (with catalog-resolved cardinalities) before type
     // inference, which relies on the relationship being resolvable.
+    let is_aggregate = matches!(def.key_space, KeySpace::Aggregate { .. });
     for field in &def.fields {
-        validate_relationship_refs(&field.expr, &field.name, relationships, false)?;
+        validate_relationship_refs(&field.expr, &field.name, relationships, is_aggregate, false)?;
     }
 
     infer_field_types(def, source_columns, relationships)?;
@@ -579,12 +605,23 @@ pub fn validate(
 /// - bare to-many path (not under an aggregate) →
 ///   [`ValidationError::RelationshipToManyRequiresAggregate`].
 ///
+/// `in_group_by_def` is whether this definition is a
+/// [`KeySpace::Aggregate`] one. In that key-space the first rule above is
+/// *inverted*, so it is skipped here: a to-one path must be aggregate-wrapped
+/// (folded over the group's source rows — see
+/// [`ValidationError::UngroupedRelationshipReference`]) rather than referenced
+/// bare, and [`validate_aggregate_field_expr`] enforces that instead. The
+/// to-many rule is unchanged either way, though in an aggregate definition
+/// [`validate_aggregate_field_expr`] rejects a to-many path first, wrapped or
+/// not.
+///
 /// The referenced column's existence and type are checked separately by
 /// [`infer_expr`], which resolves the path against `column_types`.
 fn validate_relationship_refs(
     expr: &Expr,
     field_name: &str,
     relationships: &HashMap<String, ResolvedRelationship>,
+    in_group_by_def: bool,
     in_aggregate: bool,
 ) -> Result<(), ValidationError> {
     match expr {
@@ -597,7 +634,7 @@ fn validate_relationship_refs(
                 });
             };
             match resolved.cardinality {
-                RelationshipCardinality::ToOne if in_aggregate => {
+                RelationshipCardinality::ToOne if in_aggregate && !in_group_by_def => {
                     Err(ValidationError::RelationshipToOneWrappedInAggregate {
                         field: field_name.to_string(),
                         rel: rel.clone(),
@@ -618,13 +655,19 @@ fn validate_relationship_refs(
             // A relationship path never appears directly under a binary
             // operator as an aggregate argument, so the aggregate context does
             // not propagate across an operator.
-            validate_relationship_refs(lhs, field_name, relationships, false)?;
-            validate_relationship_refs(rhs, field_name, relationships, false)
+            validate_relationship_refs(lhs, field_name, relationships, in_group_by_def, false)?;
+            validate_relationship_refs(rhs, field_name, relationships, in_group_by_def, false)
         }
         Expr::FunctionCall { name, args } => {
             let is_aggregate = super::registry::lookup_aggregate_function(name).is_some();
             for arg in args {
-                validate_relationship_refs(arg, field_name, relationships, is_aggregate)?;
+                validate_relationship_refs(
+                    arg,
+                    field_name,
+                    relationships,
+                    in_group_by_def,
+                    is_aggregate,
+                )?;
             }
             Ok(())
         }
@@ -638,11 +681,24 @@ fn validate_relationship_refs(
 /// reference is checked — a reference to another calculated field (already
 /// a single value per group by the time it's used) is unaffected, the same
 /// as inter-field composition in a 1-1 definition.
+///
+/// A `<rel>.<column>` relationship path (issue #94) is held to the same rule,
+/// for the same reason: a **to-one** path resolves to exactly one related
+/// value per *source* row (a `LEFT JOIN`, evaluated before the group folds),
+/// so it is accepted when — and only when — it is wrapped in an aggregate
+/// call, and otherwise rejected as
+/// [`ValidationError::UngroupedRelationshipReference`]. A **to-many** path is
+/// rejected outright ([`ValidationError::RelationshipPathInAggregate`]):
+/// aggregating it inside a GROUP BY aggregate is a nested aggregation with no
+/// settled semantics. An *unresolvable* relationship name is passed over here
+/// so [`validate_relationship_refs`] can report the more specific
+/// [`ValidationError::UnknownRelationship`] against the same field.
 fn validate_aggregate_field_expr(
     expr: &Expr,
     field_name: &str,
     group_by: &HashSet<&str>,
     source_columns: &HashMap<String, ValueType>,
+    relationships: &HashMap<String, ResolvedRelationship>,
     in_aggregate_call: bool,
 ) -> Result<(), ValidationError> {
     match expr {
@@ -659,18 +715,28 @@ fn validate_aggregate_field_expr(
             Ok(())
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) => Ok(()),
-        // ADR-0006 relationship enrichment is a row-grain (OneToOne)
-        // construct; it can't share a field with a GROUP BY grain. Reject a
-        // path in an aggregate definition outright, so the aggregate DDL/apply
-        // paths (which type-infer with an empty relationship map) never see
-        // one — otherwise it would validate at define time yet fail
-        // unmaterializably at staging.
         Expr::RelationshipPath { rel, column } => {
-            Err(ValidationError::RelationshipPathInAggregate {
-                field: field_name.to_string(),
-                rel: rel.clone(),
-                column: column.clone(),
-            })
+            let Some(resolved) = relationships.get(rel) else {
+                // Unknown name: `validate_relationship_refs` reports it.
+                return Ok(());
+            };
+            match resolved.cardinality {
+                RelationshipCardinality::ToMany => {
+                    Err(ValidationError::RelationshipPathInAggregate {
+                        field: field_name.to_string(),
+                        rel: rel.clone(),
+                        column: column.clone(),
+                    })
+                }
+                RelationshipCardinality::ToOne if !in_aggregate_call => {
+                    Err(ValidationError::UngroupedRelationshipReference {
+                        field: field_name.to_string(),
+                        rel: rel.clone(),
+                        column: column.clone(),
+                    })
+                }
+                RelationshipCardinality::ToOne => Ok(()),
+            }
         }
         Expr::BinaryOp { lhs, rhs, .. } => {
             validate_aggregate_field_expr(
@@ -678,6 +744,7 @@ fn validate_aggregate_field_expr(
                 field_name,
                 group_by,
                 source_columns,
+                relationships,
                 in_aggregate_call,
             )?;
             validate_aggregate_field_expr(
@@ -685,6 +752,7 @@ fn validate_aggregate_field_expr(
                 field_name,
                 group_by,
                 source_columns,
+                relationships,
                 in_aggregate_call,
             )
         }
@@ -696,6 +764,7 @@ fn validate_aggregate_field_expr(
                     field_name,
                     group_by,
                     source_columns,
+                    relationships,
                     in_aggregate_call || is_aggregate_call,
                 )?;
             }
@@ -1607,13 +1676,14 @@ mod tests {
     }
 
     #[test]
-    fn a_relationship_path_in_an_aggregate_definition_is_rejected() {
-        // A GROUP BY (aggregate) definition can't carry row-grain relationship
-        // enrichment (ADR-0006). Even with the relationship resolved and the
-        // path aggregate-wrapped (so per-field cardinality would pass), the
-        // aggregate-keyspace grain rejects it — this keeps the aggregate
-        // DDL/apply paths' empty-relationship-map assumption sound (Finding 1
-        // of #40's review).
+    fn a_to_many_relationship_path_in_an_aggregate_definition_is_rejected() {
+        // A *to-many* path inside a GROUP BY (aggregate) definition is a
+        // nested aggregation — an aggregate over related rows, itself folded
+        // over the group's source rows — with no settled semantics, so it is
+        // rejected even though the path is aggregate-wrapped (which is what
+        // ADR-0006's per-field cardinality rule asks of a to-many path). Only
+        // the *to-one* case was opened up by issue #94; see
+        // `a_to_one_relationship_path_aggregated_in_a_group_by_is_accepted`.
         let d = aggregate_def(
             &["order_id"],
             vec![
@@ -1649,6 +1719,88 @@ mod tests {
             ValidationError::RelationshipPathInAggregate {
                 field: "total_words".to_string(),
                 rel: "comments".to_string(),
+                column: "word_count".to_string(),
+            }
+        );
+    }
+
+    /// A resolved *to-one* relationship whose column is read by `rel.column`.
+    fn to_one_rel(
+        name: &str,
+        to_table: &str,
+        column: &str,
+    ) -> HashMap<String, ResolvedRelationship> {
+        HashMap::from([(
+            name.to_string(),
+            ResolvedRelationship {
+                cardinality: RelationshipCardinality::ToOne,
+                to_table: to_table.to_string(),
+                to_col: "id".to_string(),
+                column_types: HashMap::from([(column.to_string(), ValueType::Numeric)]),
+            },
+        )])
+    }
+
+    #[test]
+    fn a_to_one_relationship_path_aggregated_in_a_group_by_is_accepted() {
+        // Issue #94's headline shape: `SUM(post.word_count)` over a to-one
+        // relationship is a LEFT JOIN followed by a GROUP BY — one related
+        // value per source row, folded over the group — so it validates,
+        // exactly like `SUM(<source column>)` does.
+        let d = aggregate_def(
+            &["tag"],
+            vec![
+                FieldDef {
+                    name: "tag".to_string(),
+                    expr: col("tag"),
+                },
+                FieldDef {
+                    name: "total_words".to_string(),
+                    expr: Expr::FunctionCall {
+                        name: "SUM".to_string(),
+                        args: vec![Expr::RelationshipPath {
+                            rel: "post".to_string(),
+                            column: "word_count".to_string(),
+                        }],
+                    },
+                },
+            ],
+        );
+        let source_columns = numeric_columns(&["tag", "post"]);
+        let relationships = to_one_rel("post", "posts", "word_count");
+        assert_eq!(validate(&d, &source_columns, &relationships), Ok(()));
+    }
+
+    #[test]
+    fn a_bare_to_one_relationship_path_in_a_group_by_is_rejected() {
+        // Unwrapped, the path names one value per *row* of the group, with
+        // nowhere to go in the group's single target row — the same objection
+        // `UngroupedColumnReference` raises for a bare non-grouping-key source
+        // column, reported against the path rather than a column name.
+        let d = aggregate_def(
+            &["tag"],
+            vec![
+                FieldDef {
+                    name: "tag".to_string(),
+                    expr: col("tag"),
+                },
+                FieldDef {
+                    name: "wc".to_string(),
+                    expr: Expr::RelationshipPath {
+                        rel: "post".to_string(),
+                        column: "word_count".to_string(),
+                    },
+                },
+            ],
+        );
+        let source_columns = numeric_columns(&["tag", "post"]);
+        let relationships = to_one_rel("post", "posts", "word_count");
+        let err = validate(&d, &source_columns, &relationships).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::UngroupedRelationshipReference {
+                field: "wc".to_string(),
+                rel: "post".to_string(),
                 column: "word_count".to_string(),
             }
         );

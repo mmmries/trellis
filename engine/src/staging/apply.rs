@@ -1076,12 +1076,37 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // `defs::backfill::substituted_field_exprs`'s doc comment for why
             // the raw, un-substituted `Expr` can't be rendered as SQL.
             let substituted_exprs = crate::defs::backfill::substituted_field_exprs(&def.def)?;
+            // Issue #94: a to-one relationship path an aggregate field folds
+            // (`SUM(post.word_count)`) needs its relationship's endpoints (to
+            // build the recompute's LEFT JOIN) and its to-side column's type
+            // (to type the target column). Both come from the same catalog
+            // resolution `defs::catalog` validates against; a relationship-free
+            // aggregate resolves to an empty map and costs one cheap no-op.
+            let relationships = catalog::resolve_relationships(pool, &def.def).await?;
             let field_plans = apply_aggregate::classify_fields(
                 &def.def,
                 group_by,
                 &def.source_columns,
                 &substituted_exprs,
+                &relationships,
             )?;
+            let mut rel_joins: Vec<apply_aggregate::RelJoin> = Vec::new();
+            for rel_name in relationships.keys() {
+                // Endpoints (`from_col` especially) come from the stored
+                // relationship row; `ResolvedRelationship` carries only the
+                // to-side, since that's all the validator needs.
+                if let Some(reldef) =
+                    catalog::relationship_by_name(pool, &def.def.source, rel_name).await?
+                {
+                    rel_joins.push(apply_aggregate::RelJoin {
+                        name: rel_name.clone(),
+                        to_table: reldef.def.to_table,
+                        to_col: reldef.def.to_col,
+                        from_col: reldef.def.from_col,
+                    });
+                }
+            }
+            rel_joins.sort_by(|a, b| a.name.cmp(&b.name));
             let field_exprs: HashMap<String, crate::defs::ast::Expr> = substituted_exprs
                 .into_iter()
                 .filter(|(name, _)| !group_by.contains(name))
@@ -1095,6 +1120,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         field_plans,
                         source_key.to_string(),
                         field_exprs,
+                        rel_joins,
                     )
                 });
 

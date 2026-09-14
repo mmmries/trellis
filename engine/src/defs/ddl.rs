@@ -586,10 +586,16 @@ pub async fn create_aggregate_target_table(
     // this DDL creates diverge from the columns those paths later write to.
     let substituted = super::backfill::substituted_field_exprs(def)?;
 
-    // A GROUP BY aggregate target never reads a relationship path (those are
-    // OneToOne enrichment, issue #40), so it type-infers against an empty
-    // relationship map.
-    let field_types = super::validate::infer_field_types(def, source_columns, &HashMap::new())?;
+    // Issue #94: a GROUP BY aggregate field may aggregate a *to-one*
+    // relationship path (`SUM(post.word_count)`), whose type is the to-side
+    // column's, not any column of `source_columns`. Resolve the relationship
+    // metadata the same way [`create_target_table`] does so type inference can
+    // reach it; a relationship-free aggregate resolves to an empty map and
+    // behaves exactly as before.
+    let relationships = super::catalog::resolve_relationships(pool, def)
+        .await
+        .map_err(map_resolve_error)?;
+    let field_types = super::validate::infer_field_types(def, source_columns, &relationships)?;
 
     let mut sql = format!(
         "create table if not exists {} (",

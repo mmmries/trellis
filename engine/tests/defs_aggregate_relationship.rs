@@ -1,0 +1,524 @@
+//! Front-door integration tests for issue #94: aggregating a **to-one**
+//! relationship path inside a `GROUP BY` definition
+//! (`TRANSFORM tag_totals FROM post_tags GROUP BY tag SELECT COUNT(*) AS
+//! post_count, SUM(post.word_count) AS total_words`).
+//!
+//! Everything goes through the public front door — `create_relationship` +
+//! `install_definition` — rather than the placeholder-def/`definition_text`
+//! rewrite hack older tests used, so the DDL, direct backfill, and incremental
+//! apply paths are all exercised exactly as a real caller would hit them.
+//!
+//! The positive cases converge the real staging pipeline and compare the
+//! target against Postgres's own `LEFT JOIN … GROUP BY`
+//! (`render_aggregate_relationship_select_sql`), in both propagation
+//! directions: a from-side (`post_tags`) row changing, and a to-side (`posts`)
+//! row changing, the latter travelling through ADR-0006's reverse recompute.
+//!
+//! The staging harness (connect, stage a CDC row, seal/drain to quiescence)
+//! mirrors `defs_relationship_frontdoor.rs`; see that file for the ring/seal
+//! mechanics.
+
+use std::collections::HashMap;
+
+use engine::config::DEFAULT_SCHEMA;
+use engine::defs::ast::{
+    Expr, FieldDef, KeySpace, Predicate, RelationshipDef, TransformDef, ValueType,
+};
+use engine::defs::{
+    CatalogError, ValidationError, create_relationship, install_definition,
+    render_aggregate_relationship_select_sql,
+};
+use engine::staging::apply;
+use engine::staging::{has_pending, retire_drained_segments};
+use testkit::TestCluster;
+use tokio_postgres::types::PgLsn;
+use tokio_postgres::{Client, NoTls};
+
+async fn connect_raw(dsn: &str) -> Client {
+    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
+        .await
+        .expect("set search_path");
+    client
+}
+
+async fn seal_active_segment(client: &mut Client) -> i64 {
+    use engine::staging::seal;
+    let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+    seal::seal_phase2(client, outcome.sealed_seg_seq)
+        .await
+        .expect("seal phase 2");
+    outcome.sealed_seg_seq
+}
+
+async fn active_seg_table(client: &Client) -> String {
+    let ring_slot: i16 = client
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment pointer")
+        .get(0);
+    format!("seg_{ring_slot}")
+}
+
+/// Stages one image-bearing (CDC-shaped) change into the active ring segment.
+async fn stage_cdc(
+    client: &Client,
+    src_table: &str,
+    key: &str,
+    op: &str,
+    old_image: Option<&str>,
+    new_image: Option<&str>,
+) {
+    let table = active_seg_table(client).await;
+    let lsn = PgLsn::from(1u64);
+    client
+        .execute(
+            &format!(
+                "insert into {table} (src_table, key, op, lsn, old_image, new_image, hop_gen) \
+                 values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0)"
+            ),
+            &[&src_table, &key, &op, &lsn, &old_image, &new_image],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
+}
+
+/// Seals and drains repeatedly until nothing is pending anywhere in the ring.
+/// Reverse recompute appends fresh `Recompute` rows into the (new) active
+/// segment as it drains, so convergence takes more than one seal.
+async fn drain_to_quiescence(pool: &engine::Pool, client: &mut Client) {
+    for _ in 0..16 {
+        let seg = seal_active_segment(client).await;
+        while apply::drain_once(pool, seg, "agg_rel_test", 1, "trellis_agg_rel_test")
+            .await
+            .expect("drain_once")
+            .is_some()
+        {}
+        retire_drained_segments(client)
+            .await
+            .expect("retire drained segments");
+        if !has_pending(client).await.expect("has_pending") {
+            return;
+        }
+    }
+    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
+}
+
+fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
+    pairs
+        .iter()
+        .map(|(name, ty)| (name.to_string(), *ty))
+        .collect()
+}
+
+fn post_tags_columns() -> HashMap<String, ValueType> {
+    columns(&[
+        ("id", ValueType::Numeric),
+        ("post", ValueType::Numeric),
+        ("tag", ValueType::Text),
+    ])
+}
+
+const TAG_TOTALS: &str = "TRANSFORM tag_totals FROM post_tags GROUP BY tag \
+     SELECT COUNT(*) AS post_count, SUM(post.word_count) AS total_words";
+
+/// Issue #94's exact schema. `post_tags` needs `REPLICA IDENTITY FULL` because
+/// it is an *aggregate* source (the delta/recompute path needs the old image to
+/// locate the group a changed row is leaving) — unrelated to the relationship.
+async fn create_schema(client: &Client) {
+    client
+        .batch_execute(
+            "create table posts (id integer primary key, word_count integer); \
+             create table post_tags (id integer primary key, post integer, tag text); \
+             alter table post_tags replica identity full; \
+             create index on post_tags (post); \
+             insert into posts (id, word_count) values (1, 100), (2, 250), (3, null); \
+             insert into post_tags (id, post, tag) values \
+               (10, 1, 'rust'), (11, 2, 'rust'), (12, 1, 'db'), \
+               (13, 999, 'rust'), (14, 3, 'db')",
+        )
+        .await
+        .expect("create + seed issue #94's schema");
+}
+
+/// The oracle's version of the definition: identical, plus the grouping column
+/// projected so the wrapper can key rows by it (the target table carries `tag`
+/// as its primary key, added by the aggregate DDL).
+fn oracle_def() -> TransformDef {
+    TransformDef {
+        target: "tag_totals".to_string(),
+        source: "post_tags".to_string(),
+        key_space: KeySpace::Aggregate {
+            group_by: vec!["tag".to_string()],
+        },
+        fields: vec![
+            FieldDef {
+                name: "tag".to_string(),
+                expr: Expr::Column("tag".to_string()),
+            },
+            FieldDef {
+                name: "post_count".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "COUNT".to_string(),
+                    args: Vec::new(),
+                },
+            },
+            FieldDef {
+                name: "total_words".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![Expr::RelationshipPath {
+                        rel: "post".to_string(),
+                        column: "word_count".to_string(),
+                    }],
+                },
+            },
+        ],
+        predicate: Predicate::True,
+    }
+}
+
+fn post_rel() -> HashMap<String, RelationshipDef> {
+    HashMap::from([(
+        "post".to_string(),
+        RelationshipDef {
+            name: "post".to_string(),
+            from_table: "post_tags".to_string(),
+            from_col: "post".to_string(),
+            to_table: "posts".to_string(),
+            to_col: "id".to_string(),
+        },
+    )])
+}
+
+type Totals = HashMap<String, (Option<String>, Option<String>)>;
+
+async fn oracle_totals(client: &Client) -> Totals {
+    let base = render_aggregate_relationship_select_sql(&oracle_def(), &post_rel());
+    let sql = format!("select tag, post_count::text, total_words::text from ({base}) t");
+    client
+        .query(sql.as_str(), &[])
+        .await
+        .expect("query aggregate relationship oracle")
+        .into_iter()
+        .map(|r| (r.get(0), (r.get(1), r.get(2))))
+        .collect()
+}
+
+async fn target_totals(client: &Client) -> Totals {
+    client
+        .query(
+            "select tag, post_count::text, total_words::text from tag_totals",
+            &[],
+        )
+        .await
+        .expect("read tag_totals")
+        .into_iter()
+        .map(|r| (r.get(0), (r.get(1), r.get(2))))
+        .collect()
+}
+
+async fn table_exists(client: &Client, table: &str) -> bool {
+    client
+        .query_one(
+            "select pg_catalog.to_regclass($1) is not null",
+            &[&format!("public.{table}")],
+        )
+        .await
+        .expect("to_regclass probe")
+        .get(0)
+}
+
+// ---------------------------------------------------------------------
+// The issue's shape, end to end.
+// ---------------------------------------------------------------------
+
+/// Issue #94's headline case: a to-one relationship path folded by `SUM` in a
+/// `GROUP BY` definition installs, and its backfill over pre-existing data
+/// matches Postgres's own `LEFT JOIN … GROUP BY`.
+///
+/// The seed data deliberately covers ADR-0006's nullability rules inside the
+/// fold: tag `rust` includes a row whose FK (`post = 999`) resolves to no post
+/// at all, and tag `db` includes a row whose post exists but has a `NULL`
+/// `word_count`. Both contribute `NULL` to `SUM` — skipped, per Postgres's
+/// aggregate semantics — rather than erroring or nulling out the whole group,
+/// while still counting toward `COUNT(*)`.
+#[tokio::test]
+async fn aggregate_over_a_to_one_relationship_backfills_to_the_oracle() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(totals, oracle_totals(&client).await, "after backfill");
+    // Pinned explicitly, not just against the oracle, so a change that broke
+    // *both* identically would still be caught: `rust` = 100 + 250 + (no such
+    // post -> NULL); `db` = 100 + (post 3's NULL word_count -> NULL).
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("350".to_string())))
+    );
+    assert_eq!(
+        totals.get("db"),
+        Some(&(Some("2".to_string()), Some("100".to_string())))
+    );
+}
+
+/// Forward propagation: a new `post_tags` row folds its related post's
+/// `word_count` into the right group.
+#[tokio::test]
+async fn inserting_a_from_side_row_updates_its_groups_total() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    client
+        .execute(
+            "insert into post_tags (id, post, tag) values (15, 2, 'db')",
+            &[],
+        )
+        .await
+        .expect("insert a new post_tag");
+    stage_cdc(
+        &client,
+        "post_tags",
+        "15",
+        "insert",
+        None,
+        Some("{\"id\":15,\"post\":2,\"tag\":\"db\"}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals,
+        oracle_totals(&client).await,
+        "after inserting a from-side row"
+    );
+    // `db` gains post 2's 250 words and one more row.
+    assert_eq!(
+        totals.get("db"),
+        Some(&(Some("3".to_string()), Some("350".to_string())))
+    );
+}
+
+/// Reverse propagation (ADR-0006's to-side direction, issue #30's mechanism):
+/// changing the *related* `posts` row's `word_count` must re-derive every group
+/// whose members read it — here post 1 is referenced by both the `rust` and
+/// `db` groups, so both move.
+#[tokio::test]
+async fn updating_a_to_side_row_updates_every_dependent_group() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("update the related post");
+    stage_cdc(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals,
+        oracle_totals(&client).await,
+        "after updating a to-side row"
+    );
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("650".to_string())))
+    );
+    assert_eq!(
+        totals.get("db"),
+        Some(&(Some("2".to_string()), Some("400".to_string())))
+    );
+}
+
+// ---------------------------------------------------------------------
+// Rejections that must still fire.
+// ---------------------------------------------------------------------
+
+/// A to-one path referenced *bare* in an aggregate definition is still
+/// per-source-row within its group, so it has nowhere to go in the group's
+/// single target row — the relationship-path twin of `UngroupedColumnReference`.
+#[tokio::test]
+async fn a_bare_to_one_path_in_an_aggregate_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+
+    let err = install_definition(
+        &db.pool,
+        "TRANSFORM tag_totals FROM post_tags GROUP BY tag SELECT post.word_count AS wc",
+        &post_tags_columns(),
+        "public",
+    )
+    .await
+    .unwrap_err();
+    match err {
+        CatalogError::Validate(ValidationError::UngroupedRelationshipReference {
+            field,
+            rel,
+            column,
+        }) => {
+            assert_eq!(field, "wc");
+            assert_eq!(rel, "post");
+            assert_eq!(column, "word_count");
+        }
+        other => panic!("expected UngroupedRelationshipReference, got {other:?}"),
+    }
+    assert!(
+        !table_exists(&client, "tag_totals").await,
+        "a rejected definition must leave no target table behind"
+    );
+}
+
+/// A *to-many* path inside a `GROUP BY` aggregate is aggregating an aggregate —
+/// out of scope for #94 and still rejected outright.
+#[tokio::test]
+async fn a_to_many_path_in_an_aggregate_is_still_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table posts (id integer primary key, word_count integer, tag text); \
+             create table comments (id integer primary key, post_id integer, length integer); \
+             alter table posts replica identity full; \
+             alter table comments replica identity full",
+        )
+        .await
+        .expect("create tables");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP comments FROM posts.id TO comments.post_id",
+    )
+    .await
+    .expect("create to-many relationship");
+
+    let err = install_definition(
+        &db.pool,
+        "TRANSFORM tag_lengths FROM posts GROUP BY tag SELECT sum(comments.length) AS total",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("word_count", ValueType::Numeric),
+            ("tag", ValueType::Text),
+        ]),
+        "public",
+    )
+    .await
+    .unwrap_err();
+    match err {
+        CatalogError::Validate(ValidationError::RelationshipPathInAggregate {
+            field,
+            rel,
+            column,
+        }) => {
+            assert_eq!(field, "total");
+            assert_eq!(rel, "comments");
+            assert_eq!(column, "length");
+        }
+        other => panic!("expected RelationshipPathInAggregate, got {other:?}"),
+    }
+    assert!(
+        !table_exists(&client, "tag_lengths").await,
+        "a rejected definition must leave no target table behind"
+    );
+}
+
+/// Regression for the DDL-before-validate ordering bug #94 also turned up:
+/// `install_definition` used to emit the target table's DDL *before* running
+/// `validate()`, so a definition rejected for any reason still left an orphan
+/// table behind (and, for a relationship path, reported a misleading
+/// `UnknownRelationship` DDL error instead of the real validation error). The
+/// failure here is plain `UngroupedColumnReference` — nothing to do with
+/// relationships — precisely because the fix is about ordering for *every*
+/// key-space, not a special case for this feature.
+#[tokio::test]
+async fn an_invalid_aggregate_definition_leaves_no_target_table() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let err = install_definition(
+        &db.pool,
+        "TRANSFORM tag_totals FROM post_tags GROUP BY tag SELECT post AS p",
+        &post_tags_columns(),
+        "public",
+    )
+    .await
+    .unwrap_err();
+    match err {
+        CatalogError::Validate(ValidationError::UngroupedColumnReference { field, column }) => {
+            assert_eq!(field, "p");
+            assert_eq!(column, "post");
+        }
+        other => panic!("expected UngroupedColumnReference, got {other:?}"),
+    }
+    assert!(
+        !table_exists(&client, "tag_totals").await,
+        "validation must run before any DDL is issued"
+    );
+}

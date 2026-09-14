@@ -322,9 +322,13 @@ fn collect_columns(
             }
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
-        // Not a source-column reference by name; the validator (#23)
-        // rejects relationship paths outright, so `render_expr_sql` never
-        // has to render one (issue #25 is grammar + AST only).
+        // Not a source-column reference by name — a path's columns live on
+        // the *to-side* table, which [`recompute`]/[`recompute_aggregate`]'s
+        // source SELECT doesn't read. Those two evaluator-driven recomputes
+        // therefore only handle relationship-free definitions; the SQL oracles
+        // ([`render_relationship_select_sql`],
+        // [`render_aggregate_relationship_select_sql`]) are what cross-check a
+        // relationship-reading one.
         Expr::RelationshipPath { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_columns(lhs, field_name, field_names, out);
@@ -379,6 +383,172 @@ pub fn render_expr_sql(expr: &Expr) -> String {
         Expr::FunctionCall { name, args } => {
             let rendered_args: Vec<String> = args.iter().map(render_expr_sql).collect();
             format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
+        }
+    }
+}
+
+/// Renders an expression that may read **to-one** relationship paths, against
+/// a source aliased as `source_sql` (already-quoted SQL text — a quoted table
+/// name, or a query alias such as `s`) `LEFT JOIN`ed to each referenced
+/// relationship's to-side table under an alias equal to the relationship's
+/// quoted name.
+///
+/// This is the shared renderer for every place a to-one path has to become SQL
+/// over a real `LEFT JOIN` rather than a correlated subquery: the aggregate
+/// direct build (`super::backfill::backfill_aggregate`), the aggregate
+/// incremental recompute (`staging::apply_aggregate::apply_forced_groups_bulk`),
+/// and this module's own [`render_aggregate_relationship_select_sql`] oracle.
+/// Unlike [`render_rel_expr_sql`], an aggregate call whose sole argument is a
+/// relationship path is *not* special-cased into a correlated subquery — under
+/// a to-one join `sum(rel.col)` is an ordinary aggregate over the joined
+/// column, which is exactly issue #94's semantics.
+///
+/// Source columns are qualified with `source_sql` so they can't collide with a
+/// joined to-side column of the same name.
+pub(crate) fn render_to_one_rel_expr_sql(expr: &Expr, source_sql: &str) -> String {
+    match expr {
+        Expr::Column(name) => format!("{source_sql}.{}", quote_ident(name)),
+        Expr::NumberLiteral(text) => format!("{text}::numeric"),
+        Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::RelationshipPath { rel, column } => {
+            format!("{}.{}", quote_ident(rel), quote_ident(column))
+        }
+        Expr::BinaryOp { op, lhs, rhs } => {
+            let symbol = match op {
+                Operator::Add => "+",
+                Operator::GreaterThan => ">",
+            };
+            format!(
+                "({} {symbol} {})",
+                render_to_one_rel_expr_sql(lhs, source_sql),
+                render_to_one_rel_expr_sql(rhs, source_sql)
+            )
+        }
+        Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
+            "count(*)".to_string()
+        }
+        Expr::FunctionCall { name, args } => {
+            let rendered: Vec<String> = args
+                .iter()
+                .map(|arg| render_to_one_rel_expr_sql(arg, source_sql))
+                .collect();
+            format!("{}({})", name.to_lowercase(), rendered.join(", "))
+        }
+    }
+}
+
+/// The ` left join <to_table> as <rel> on <rel>.<to_col> = <source_sql>.<from_col>`
+/// clauses a [`render_to_one_rel_expr_sql`]-rendered expression needs, one per
+/// entry of `joins` (relationship name → `(to_table, to_col, from_col)`), in
+/// the iterator's order. Left (not inner) join so a source row whose FK doesn't
+/// resolve still reaches the `GROUP BY` and contributes `NULL` — ADR-0006's
+/// to-one nullability rule, and the same shape
+/// [`render_relationship_select_sql`] already uses for a 1-1 target.
+pub(crate) fn to_one_join_clauses<'a>(
+    joins: impl Iterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
+    source_sql: &str,
+) -> String {
+    joins
+        .map(|(rel, to_table, to_col, from_col)| {
+            format!(
+                " left join {} as {alias} on {alias}.{} = {source_sql}.{}",
+                quote_ident(to_table),
+                quote_ident(to_col),
+                quote_ident(from_col),
+                alias = quote_ident(rel),
+            )
+        })
+        .collect()
+}
+
+/// Renders an [`KeySpace::Aggregate`] `def` whose fields aggregate over to-one
+/// relationship paths (issue #94) back to the equivalent Postgres `SELECT …
+/// LEFT JOIN … GROUP BY …`, the relationship-aware counterpart of
+/// [`render_aggregate_select_sql`] — a test/benchmark oracle only, like that
+/// one.
+///
+/// `relationships` is keyed by relationship name, exactly as
+/// [`render_relationship_select_sql`] takes it.
+///
+/// # Panics
+///
+/// If `def.key_space` is not [`KeySpace::Aggregate`], if substitution fails
+/// (see [`render_aggregate_select_sql`]), or if a referenced relationship is
+/// missing from `relationships`.
+pub fn render_aggregate_relationship_select_sql(
+    def: &TransformDef,
+    relationships: &HashMap<String, RelationshipDef>,
+) -> String {
+    let KeySpace::Aggregate { group_by } = &def.key_space else {
+        panic!("render_aggregate_relationship_select_sql called on a non-aggregate definition");
+    };
+    let substituted = super::backfill::substituted_field_exprs(def)
+        .expect("aggregate oracle rendering requires a substitutable definition");
+
+    let source_sql = quote_ident(&def.source);
+    let select_list: Vec<String> = def
+        .fields
+        .iter()
+        .map(|field| {
+            format!(
+                "{} as {}",
+                render_to_one_rel_expr_sql(&substituted[&field.name], &source_sql),
+                quote_ident(&field.name)
+            )
+        })
+        .collect();
+    let group_cols: Vec<String> = group_by
+        .iter()
+        .map(|c| format!("{source_sql}.{}", quote_ident(c)))
+        .collect();
+
+    // Deterministic JOIN order, deduped: a relationship read by several fields
+    // is joined once.
+    let mut rel_names: BTreeSet<&str> = BTreeSet::new();
+    for expr in substituted.values() {
+        collect_rel_names(expr, &mut rel_names);
+    }
+    let joins = to_one_join_clauses(
+        rel_names.iter().map(|rel| {
+            let r = relationships.get(*rel).unwrap_or_else(|| {
+                panic!("render_aggregate_relationship_select_sql: unknown relationship '{rel}'")
+            });
+            (
+                *rel,
+                r.to_table.as_str(),
+                r.to_col.as_str(),
+                r.from_col.as_str(),
+            )
+        }),
+        &source_sql,
+    );
+
+    format!(
+        "select {} from {source_sql}{joins} group by {}",
+        select_list.join(", "),
+        group_cols.join(", ")
+    )
+}
+
+/// Every relationship name a (substituted) expression reads, regardless of
+/// where in the tree the path sits — unlike [`collect_to_one_rels`], which
+/// stops at an aggregate-wrapped path because that shape means *to-many* in a
+/// 1-1 definition. In an aggregate definition every path is to-one (the
+/// validator rejects to-many there), so every one of them needs a `LEFT JOIN`.
+fn collect_rel_names<'a>(expr: &'a Expr, out: &mut BTreeSet<&'a str>) {
+    match expr {
+        Expr::RelationshipPath { rel, .. } => {
+            out.insert(rel.as_str());
+        }
+        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            collect_rel_names(lhs, out);
+            collect_rel_names(rhs, out);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_rel_names(arg, out);
+            }
         }
     }
 }

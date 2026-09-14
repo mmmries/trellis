@@ -596,14 +596,58 @@ fn classify_field(expr: &Expr) -> FieldKind {
     }
 }
 
-/// The rendered SQL for a one-argument aggregate call's argument — mirrors
+/// A one-argument aggregate call's argument expression — the input to
+/// whichever renderer the caller is using, mirroring
 /// `staging::apply_aggregate::agg_arg_sql` so `SUM`/`AVG` compute the same
 /// `sum(arg)`/`count(arg)` the incremental path's probes do.
-fn agg_arg_sql(expr: &Expr) -> String {
+fn agg_arg_expr(expr: &Expr) -> &Expr {
     let Expr::FunctionCall { args, .. } = expr else {
-        panic!("agg_arg_sql called on a non-function-call field");
+        panic!("agg_arg_expr called on a non-function-call field");
     };
-    render_expr_sql(&args[0])
+    &args[0]
+}
+
+/// Every **to-one** relationship `def`'s fields reference, resolved against the
+/// catalog to its stored [`RelationshipDef`] and keyed by relationship name, in
+/// sorted order so the emitted JOINs (and therefore the SQL text) are
+/// deterministic. Issue #94: this is what lets an aggregate build join the
+/// to-side before grouping.
+///
+/// A referenced relationship that is unknown, or resolves to *to-many*, is a
+/// shape this build must not render — the validator rejects both in an
+/// aggregate definition, so reaching either here means a stored definition
+/// predating (or bypassing) that check. Both fall back to the ring with
+/// [`BackfillError::Unsupported`] rather than emitting SQL with different
+/// semantics.
+async fn resolve_to_one_joins(
+    pool: &Pool,
+    def: &TransformDef,
+) -> Result<Vec<(String, RelationshipDef)>, BackfillError> {
+    let mut names: Vec<String> = super::eval::relationship_references(def)
+        .into_iter()
+        .map(|(rel, _column)| rel)
+        .collect();
+    names.sort();
+    names.dedup();
+
+    let mut resolved = Vec::with_capacity(names.len());
+    for rel in names {
+        let Some(reldef) = super::catalog::relationship_by_name(pool, &def.source, &rel)
+            .await
+            .map_err(map_rel_lookup_err)?
+        else {
+            return Err(BackfillError::Unsupported(
+                "a definition referencing an unknown relationship".to_string(),
+            ));
+        };
+        if reldef.cardinality != RelationshipCardinality::ToOne {
+            return Err(BackfillError::Unsupported(
+                "an aggregate over a to-many relationship".to_string(),
+            ));
+        }
+        resolved.push((rel, reldef.def));
+    }
+    Ok(resolved)
 }
 
 /// The aggregate build: aggregate the whole source in a **single** full-table
@@ -655,7 +699,49 @@ async fn backfill_aggregate(
 
     let source = quote_ident(&def.source);
     let target = qualified_target_table(target_schema, def);
+
+    // Issue #94: an aggregate field may fold a *to-one* relationship path
+    // (`SUM(post.word_count)`). Each referenced relationship becomes a LEFT
+    // JOIN of its to-side table (aliased by the relationship's name) onto the
+    // single source scan below, so the path resolves per source row *before*
+    // the GROUP BY folds it — exactly the `LEFT JOIN … GROUP BY` the oracle
+    // (`oracle::render_aggregate_relationship_select_sql`) renders. A to-many
+    // path here would be a nested aggregation, which the validator rejects; a
+    // stored definition that somehow carries one falls back to the ring rather
+    // than emitting SQL with different semantics.
+    let rel_joins = resolve_to_one_joins(pool, def).await?;
+    let joins_sql = super::oracle::to_one_join_clauses(
+        rel_joins.iter().map(|(rel, d)| {
+            (
+                rel.as_str(),
+                d.to_table.as_str(),
+                d.to_col.as_str(),
+                d.from_col.as_str(),
+            )
+        }),
+        &source,
+    );
+    // With a join in play every source column must be qualified, or a to-side
+    // column of the same name makes the reference ambiguous. Without one,
+    // render exactly as before so a relationship-free aggregate's SQL is
+    // byte-identical to what it has always been.
+    let render_field = |expr: &Expr| -> String {
+        if rel_joins.is_empty() {
+            render_expr_sql(expr)
+        } else {
+            super::oracle::render_to_one_rel_expr_sql(expr, &source)
+        }
+    };
+    let qualify = |ident: &str| -> String {
+        if rel_joins.is_empty() {
+            ident.to_string()
+        } else {
+            format!("{source}.{ident}")
+        }
+    };
+
     let group_idents: Vec<String> = group_by.iter().map(|c| quote_ident(c)).collect();
+    let group_refs: Vec<String> = group_idents.iter().map(|c| qualify(c)).collect();
     let group_casts: Vec<&'static str> = group_by
         .iter()
         .map(|c| ddl::pg_type_name(source_columns.get(c).copied().unwrap_or(ValueType::Numeric)))
@@ -689,7 +775,7 @@ async fn backfill_aggregate(
         }
     }));
     let mut insert_cols: Vec<String> = group_idents.clone();
-    let mut stage_exprs: Vec<String> = group_idents.clone();
+    let mut stage_exprs: Vec<String> = group_refs.clone();
     // Issue #48: two fields (e.g. `SUM(amount)`/`AVG(amount)`) can share one
     // hidden count column (`count_cols`) — track which shared names have
     // already been emitted into this staging table's column list, so a
@@ -706,7 +792,7 @@ async fn backfill_aggregate(
         let expr = &substituted[&field.name];
         match classify_field(expr) {
             FieldKind::Sum => {
-                let arg = agg_arg_sql(expr);
+                let arg = render_field(agg_arg_expr(expr));
                 insert_cols.push(col);
                 stage_exprs.push(format!("sum({arg})"));
                 let count_col_name = count_cols[&field.name].clone();
@@ -716,7 +802,7 @@ async fn backfill_aggregate(
                 }
             }
             FieldKind::Avg => {
-                let arg = agg_arg_sql(expr);
+                let arg = render_field(agg_arg_expr(expr));
                 let sum_col = avg_sum_column(&field.name);
                 let count_col_name = count_cols[&field.name].clone();
                 insert_cols.push(quote_ident(&sum_col));
@@ -737,7 +823,7 @@ async fn backfill_aggregate(
             }
             FieldKind::RecomputeOnly => {
                 insert_cols.push(col);
-                stage_exprs.push(format!("({})", render_expr_sql(expr)));
+                stage_exprs.push(format!("({})", render_field(expr)));
             }
         }
     }
@@ -751,11 +837,15 @@ async fn backfill_aggregate(
     debug_assert!(!update_sets.is_empty());
 
     let insert_cols_sql = insert_cols.join(", ");
-    let group_by_sql = group_idents.join(", ");
+    // `group_by_sql`/`not_null_pred` run against the *source* (possibly joined,
+    // hence qualified); `group_tuple`/`conflict_sql`/the boundary query all run
+    // against the staging table or the target, whose columns are the bare
+    // target column names.
+    let group_by_sql = group_refs.join(", ");
     let group_tuple = group_idents.join(", ");
     let conflict_sql = group_idents.join(", ");
     let update_sets_sql = update_sets.join(", ");
-    let not_null_pred = group_idents
+    let not_null_pred = group_refs
         .iter()
         .map(|c| format!("{c} is not null"))
         .collect::<Vec<_>>()
@@ -783,7 +873,7 @@ async fn backfill_aggregate(
         .execute(
             &format!(
                 "create temp table {STAGE_TABLE} as \
-                 select {stage_select_sql} from {source} \
+                 select {stage_select_sql} from {source}{joins_sql} \
                  where {not_null_pred} group by {group_by_sql}"
             ),
             &[],
