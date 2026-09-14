@@ -1351,3 +1351,106 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// (k) Regression: `resume_column` must refuse a column whose definition
+//     isn't live yet (the mid-backfill cascade bug a final holistic review
+//     agent found).
+// ---------------------------------------------------------------------
+
+/// A pause reaching `(transform, column)` while `transform` is still
+/// `Backfilling` — most concretely via this branch's cascade pause
+/// (`defs::catalog::column_dependents`, unlike the `status = 'live'`
+/// filtered lookups ordinary CDC apply uses, does *not* require the
+/// downstream dependent to be live before cascading a pause onto it) —
+/// must not be resumable. `recompute_column` takes exactly one snapshot of
+/// the *source* table and writes back only via `update ... where pk = $2`
+/// (no `insert`/upsert fallback); `column_status` for the paused column
+/// stays present for the entire duration of that recompute and is only
+/// deleted afterward. If the target definition is still mid-backfill, its
+/// own `backfill_chunks` queue can be actively inserting brand-new rows
+/// into the target the whole time `paused_columns_for` (backfill) and
+/// `compute` (live CDC apply) are excluding this column from — a row
+/// inserted after `recompute_column`'s snapshot was taken is never in its
+/// `rows_by_pk` map and is never revisited once `column_status` is cleared,
+/// permanently stranding that row's column even though `resume_column`
+/// reports success. Proves the fix instead: `resume_column` returns
+/// [`ApplyError::DefinitionNotLive`] and leaves everything untouched.
+#[tokio::test]
+async fn resume_column_refuses_a_column_on_a_not_yet_live_definition() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table stuck_src (id bigint primary key, a numeric); \
+             insert into stuck_src (id, a) values (1, 10), (2, 20), (3, 30)",
+        )
+        .await
+        .expect("seed source table");
+
+    let cols = numeric_columns(&["a"]);
+    // `install_definition`'s plain-1-1 path (`defs::catalog::install_plain_one_to_one`)
+    // persists the definition as `Backfilling` and enqueues its build as a
+    // `backfill_chunks` row *before* returning — nothing in this test ever
+    // claims/runs/finishes that chunk, so the definition is genuinely,
+    // deterministically stuck in `Backfilling` for the rest of the test.
+    // Same "nothing is watching the queue" determinism
+    // `engine/tests/defs_backfill_chunk_queue.rs`'s
+    // `a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another_worker`
+    // and `engine/tests/blocking_trellis.rs`'s
+    // `define_returns_before_backfill_completes` both rely on.
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM stuck FROM stuck_src SELECT a + a AS doubled",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition enumerates chunk work and returns");
+    assert_eq!(
+        def.status,
+        TransformStatus::Backfilling,
+        "nothing drains the chunk queue in this test, so the definition must still be \
+         backfilling"
+    );
+
+    // Simulate a pause landing on `stuck.doubled` while it's mid-backfill —
+    // reached past the mechanism, inserted directly (this file's own
+    // convention throughout; a real cascade would populate the same rows
+    // via `cascade_pause`). Seed `column_deaths` too, so this test can also
+    // prove the gate is all-or-nothing rather than partially cleaning up.
+    client
+        .batch_execute(
+            "insert into column_status (transform_table, column_name, last_error, local_fuse) \
+             values ('stuck', 'doubled', 'paused because upstream column X is paused', false); \
+             insert into column_deaths (transform_table, column_name, deaths) \
+             values ('stuck', 'doubled', 3)",
+        )
+        .await
+        .expect("seed column_status/column_deaths for the cascaded pause");
+
+    let result = quarantine::resume_column(&db.pool, "stuck", "doubled").await;
+    assert!(
+        matches!(
+            &result,
+            Err(ApplyError::DefinitionNotLive { transform }) if transform == "stuck"
+        ),
+        "resuming a column on a not-yet-live definition must be refused, got {result:?}"
+    );
+
+    assert_eq!(
+        column_status_row(&client, "stuck", "doubled").await,
+        Some((
+            false,
+            Some("paused because upstream column X is paused".to_string())
+        )),
+        "a refused resume must leave column_status completely untouched"
+    );
+    assert_eq!(
+        column_deaths_count(&client, "stuck", "doubled").await,
+        Some(3),
+        "a refused resume must be all-or-nothing: column_deaths must not be cleared either"
+    );
+}

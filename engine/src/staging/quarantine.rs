@@ -40,7 +40,7 @@ use crate::defs::ast::{KeySpace, ValueType};
 use crate::defs::catalog;
 use crate::defs::ddl::{self, DdlError};
 use crate::defs::eval::{self, RelationshipContext, Row};
-use crate::defs::model::Definition;
+use crate::defs::model::{Definition, TransformStatus};
 use crate::defs::validate;
 use crate::pool::{Pool, quote_ident};
 
@@ -787,6 +787,21 @@ async fn cascade_pause(pool: &Pool, transform: &str, column: &str) -> Result<(),
 /// Errors with [`ApplyError::ColumnNotPaused`] if `(transform, column)`
 /// isn't currently paused — resuming a live column is caller error, not a
 /// silent no-op.
+///
+/// Errors with [`ApplyError::DefinitionNotLive`] — with no side effects at
+/// all, checked before any of this function's deletes run — if `transform`
+/// isn't currently [`TransformStatus::Live`] (most concretely, still
+/// `Backfilling` behind an in-flight `backfill_chunks` queue). See that
+/// variant's doc comment for why: [`recompute_column`] takes one snapshot of
+/// the source table, and a row a still-running backfill chunk inserts into
+/// the target during that window would never be revisited once
+/// `column_status` is cleared, permanently stranding it. The same check
+/// applies per-pair inside the cascade queue below; a downstream pair
+/// blocked on its own definition not being live yet is simply left paused
+/// (not resumed, not an abort of the whole call) rather than risking the
+/// same bug one hop down — by the time a downstream pair is reached, any
+/// upstream pairs earlier in the queue have already been fully resumed and
+/// committed, so there is nothing left to roll back.
 pub async fn resume_column(
     pool: &Pool,
     transform: &str,
@@ -807,6 +822,22 @@ pub async fn resume_column(
                 column: column.to_string(),
             });
         }
+
+        // Gate before any mutation: resuming is all-or-nothing, so a
+        // blocked resume must leave `column_deaths`/`column_failures`/
+        // `column_status` untouched, not partially cleaned up. A missing
+        // definition (a dangling `column_status` row with nothing left in
+        // the catalog) isn't this function's problem to police — fall
+        // through and let the loop below's own lookup handle it the way it
+        // already does.
+        if let Some(def) = catalog::definition_by_target(pool, transform).await?
+            && def.status != TransformStatus::Live
+        {
+            return Err(ApplyError::DefinitionNotLive {
+                transform: transform.to_string(),
+            });
+        }
+
         client
             .execute(
                 "delete from column_deaths where transform_table = $1 and column_name = $2",
@@ -829,6 +860,19 @@ pub async fn resume_column(
         let Some(def) = catalog::definition_by_target(pool, &t).await? else {
             continue;
         };
+        if def.status != TransformStatus::Live {
+            // Reached via cascade (the initial pair was already gated above
+            // before any side effects ran): a downstream dependent this
+            // pause cascaded onto (`column_dependents`, unlike the
+            // `status = 'live'`-filtered lookups CDC apply uses, does not
+            // require the dependent to be live) can still be mid-backfill.
+            // Aborting the whole call here would misrepresent what already
+            // happened, since earlier pairs in this queue may already be
+            // fully resumed and committed — instead this pair alone is left
+            // exactly as it was, still paused, to be resumed on a later
+            // call once its own definition reaches live.
+            continue;
+        }
         recompute_column(pool, &def, &c).await?;
 
         let client = pool.get().await?;

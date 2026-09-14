@@ -136,6 +136,22 @@ pub enum ApplyError {
     /// all," so an address naming a real transform but the wrong field name
     /// gets a specific error rather than silently doing nothing.
     ColumnNotPaused { transform: String, column: String },
+    /// [`super::quarantine::resume_column`] was asked to resume a column
+    /// whose owning definition is not currently [`crate::defs::model::TransformStatus::Live`]
+    /// — most concretely, a definition still `Backfilling` behind an
+    /// in-flight `backfill_chunks` queue nothing is draining. `resume_column`
+    /// takes one snapshot of the *source* table and only clears
+    /// `column_status` after writing it back, so any row a still-running
+    /// backfill chunk inserts into the target *during* that window is never
+    /// in the snapshot and never revisited once the column is unpaused —
+    /// permanently stranding that row's column at NULL/default while
+    /// `resume_column` reports success. This branch's cascade pause
+    /// (`defs::catalog::column_dependents`, unlike the `status = 'live'`
+    /// filtered paths CDC apply uses) can reach a downstream definition in
+    /// exactly this state, so the gate is not just theoretical. Refusing to
+    /// resume until the definition reaches `Live` closes the window instead
+    /// of racing it.
+    DefinitionNotLive { transform: String },
 }
 
 impl ApplyError {
@@ -163,6 +179,14 @@ impl ApplyError {
             | ApplyError::HopBoundExceeded { .. } => ErrorCode::Internal,
             ApplyError::SourceTableDropped { .. } => ErrorCode::NotFound,
             ApplyError::ColumnNotPaused { .. } => ErrorCode::NotFound,
+            // The definition's persisted status conflicts with what
+            // `resume_column` was asked to do, the same category
+            // `ValidationError::DuplicateRelationshipName` and
+            // `StagingError::ProducerAlreadyRunning` use for "existing state
+            // blocks this request" rather than "the request itself is
+            // malformed" (-> Validation) or "nothing by that name exists"
+            // (-> NotFound).
+            ApplyError::DefinitionNotLive { .. } => ErrorCode::Conflict,
         }
     }
 }
@@ -209,6 +233,11 @@ impl fmt::Display for ApplyError {
                 "'{transform}.{column}' is not currently paused (or is not a column of that \
                  definition)"
             ),
+            ApplyError::DefinitionNotLive { transform } => write!(
+                f,
+                "'{transform}' is not currently live (it may still be backfilling); resuming a \
+                 paused column requires its definition to be live first"
+            ),
         }
     }
 }
@@ -228,7 +257,8 @@ impl std::error::Error for ApplyError {
             | ApplyError::VersionFenceMiss { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::SourceTableDropped { .. }
-            | ApplyError::ColumnNotPaused { .. } => None,
+            | ApplyError::ColumnNotPaused { .. }
+            | ApplyError::DefinitionNotLive { .. } => None,
         }
     }
 }
