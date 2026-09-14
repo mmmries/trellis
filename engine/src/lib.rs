@@ -57,7 +57,8 @@ pub mod pool;
 pub mod staging;
 
 pub use app::{
-    DefinitionSummary, PoisonEntry, RelationshipSummary, Trellis, TrellisError, TrellisOptions,
+    DefinitionSummary, PoisonEntry, PoisonSample, QuarantineEntry, QuarantineState,
+    QuarantineTarget, RelationshipSummary, Trellis, TrellisError, TrellisOptions,
 };
 pub use blocking::BlockingTrellis;
 pub use client::{Client, ClientError, ClientOptions};

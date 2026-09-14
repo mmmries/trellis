@@ -78,6 +78,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::SystemTime;
 
 use crate::client::{Client, ClientError, ClientOptions};
@@ -87,6 +88,8 @@ use crate::defs::{
 };
 use crate::error_code::{self, ErrorCode};
 use crate::pool::Pool;
+use crate::staging::apply::ApplyError;
+use crate::staging::quarantine;
 
 /// Options a client sets when it [`connect`](Trellis::connect)s.
 ///
@@ -361,6 +364,235 @@ impl Trellis {
             .collect())
     }
 
+    /// Every currently paused/quarantined target, across every transform —
+    /// `docs/decisions/0003-quarantine-storage-and-api.md`'s amendment,
+    /// "Client library API" read 1. Cheap: reads `transform_definitions`'
+    /// lifecycle status plus the small, sparse `column_status` table, no
+    /// join against poisoned-row detail. The read a dashboard/health-check
+    /// polls.
+    pub async fn quarantined(&self) -> Result<Vec<QuarantineEntry>, TrellisError> {
+        let client = self.pool.get().await?;
+        let mut entries = Vec::new();
+
+        let quarantined_transforms = client
+            .query(
+                "select target_table from transform_definitions where status = 'quarantined' \
+                 order by target_table",
+                &[],
+            )
+            .await?;
+        entries.extend(
+            quarantined_transforms
+                .into_iter()
+                .map(|row| QuarantineEntry {
+                    target: QuarantineTarget::Transform(row.get(0)),
+                    state: QuarantineState::Quarantined,
+                    paused_at: None,
+                    last_error: None,
+                }),
+        );
+
+        let paused_columns = client
+            .query(
+                "select transform_table, column_name, paused_at, last_error from column_status \
+                 order by transform_table, column_name",
+                &[],
+            )
+            .await?;
+        entries.extend(paused_columns.into_iter().map(|row| QuarantineEntry {
+            target: QuarantineTarget::Column(row.get(0), row.get(1)),
+            state: QuarantineState::Paused,
+            paused_at: Some(row.get(2)),
+            last_error: row.get(3),
+        }));
+
+        Ok(entries)
+    }
+
+    /// The current state of one target (`transform` or `transform.column`,
+    /// per ADR-0003's amendment addressing scheme) — read 2. Errors with
+    /// [`TrellisError::TransformNotFound`] if the named transform doesn't
+    /// exist at all; a `transform.column` address for a real transform whose
+    /// named column simply isn't paused reports [`QuarantineState::Live`],
+    /// not an error (this call doesn't validate that the column name is one
+    /// of the transform's actual fields — a paused column always is one, by
+    /// construction, but a live one is reported the same way regardless of
+    /// whether the name is real, matching "no rows here means live" for
+    /// every column not individually tracked).
+    pub async fn quarantine_status(&self, target: &str) -> Result<QuarantineEntry, TrellisError> {
+        let target = QuarantineTarget::parse(target);
+        let client = self.pool.get().await?;
+        match &target {
+            QuarantineTarget::Transform(t) => {
+                let row = client
+                    .query_opt(
+                        "select status from transform_definitions where target_table = $1",
+                        &[t],
+                    )
+                    .await?
+                    .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?;
+                let status_text: String = row.get(0);
+                let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+                    panic!("transform_definitions.status held unrecognized value '{status_text}'")
+                });
+                Ok(QuarantineEntry {
+                    target,
+                    state: QuarantineState::from(status),
+                    paused_at: None,
+                    last_error: None,
+                })
+            }
+            QuarantineTarget::Column(t, c) => {
+                let transform_exists: bool = client
+                    .query_one(
+                        "select exists(select 1 from transform_definitions where target_table = $1)",
+                        &[t],
+                    )
+                    .await?
+                    .get(0);
+                if !transform_exists {
+                    return Err(TrellisError::TransformNotFound(t.clone()));
+                }
+                let row = client
+                    .query_opt(
+                        "select paused_at, last_error from column_status \
+                         where transform_table = $1 and column_name = $2",
+                        &[t, c],
+                    )
+                    .await?;
+                Ok(match row {
+                    Some(row) => QuarantineEntry {
+                        target,
+                        state: QuarantineState::Paused,
+                        paused_at: Some(row.get(0)),
+                        last_error: row.get(1),
+                    },
+                    None => QuarantineEntry {
+                        target,
+                        state: QuarantineState::Live,
+                        paused_at: None,
+                        last_error: None,
+                    },
+                })
+            }
+        }
+    }
+
+    /// A paginated batch of `(src_table, key, error_message)` triples for
+    /// `target` — read 3, to diagnose and clear a quarantine's cause.
+    /// `after` is a keyset cursor (the last row's `(src_table, key)` from a
+    /// previous page); `None` starts from the beginning. Ordered by
+    /// `(src_table, key)`.
+    ///
+    /// For a `transform.column` target, pulls from `column_failures` — the
+    /// column fuse's own per-row bookkeeping (see
+    /// `staging::quarantine`'s module doc comment for why that's a
+    /// dedicated table rather than `poison.failures`: a column-level failure
+    /// never evicts the row, so it can't live in the same table whose row
+    /// presence means "excluded from folding entirely"). For a whole
+    /// `transform` target, pulls from `poison` filtered to that transform's
+    /// own source table — the coarser, whole-key fuse's own detail.
+    pub async fn sample_quarantined(
+        &self,
+        target: &str,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<PoisonSample>, TrellisError> {
+        let target = QuarantineTarget::parse(target);
+        let client = self.pool.get().await?;
+        let rows = match &target {
+            QuarantineTarget::Column(t, c) => match &after {
+                Some((after_src, after_key)) => {
+                    client
+                        .query(
+                            "select src_table, key, error from column_failures \
+                             where transform_table = $1 and column_name = $2 \
+                               and (src_table, key) > ($3, $4) \
+                             order by src_table, key limit $5",
+                            &[t, c, after_src, after_key, &limit],
+                        )
+                        .await?
+                }
+                None => {
+                    client
+                        .query(
+                            "select src_table, key, error from column_failures \
+                             where transform_table = $1 and column_name = $2 \
+                             order by src_table, key limit $3",
+                            &[t, c, &limit],
+                        )
+                        .await?
+                }
+            },
+            QuarantineTarget::Transform(t) => {
+                let source_row = client
+                    .query_opt(
+                        "select source_table from transform_definitions where target_table = $1",
+                        &[t],
+                    )
+                    .await?
+                    .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?;
+                let source_table: String = source_row.get(0);
+                match &after {
+                    Some((after_src, after_key)) => {
+                        client
+                            .query(
+                                "select src_table, key, last_error from poison \
+                                 where src_table = $1 and (src_table, key) > ($2, $3) \
+                                 order by src_table, key limit $4",
+                                &[&source_table, after_src, after_key, &limit],
+                            )
+                            .await?
+                    }
+                    None => {
+                        client
+                            .query(
+                                "select src_table, key, last_error from poison \
+                                 where src_table = $1 \
+                                 order by src_table, key limit $2",
+                                &[&source_table, &limit],
+                            )
+                            .await?
+                    }
+                }
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .map(|row| PoisonSample {
+                src_table: row.get(0),
+                key: row.get(1),
+                error_message: row.get(2),
+            })
+            .collect())
+    }
+
+    /// Resumes a paused column: clears its pause, re-derives its value
+    /// across every existing row, and un-cascades any dependent transform
+    /// that was only paused because of this one (see
+    /// [`crate::staging::quarantine::resume_column`] for the full contract,
+    /// including why a dependent with its own independent reason to stay
+    /// paused is left alone). `target` must address a column
+    /// (`transform.column`) — [`TrellisError::ColumnAddressRequired`] if
+    /// given a bare transform name, since there is no whole-transform
+    /// "resume" action in this API (a `quarantined` transform resumes by
+    /// re-running its full backfill, a different operation entirely — see
+    /// `docs/transforms.md#status`).
+    ///
+    /// Returns every `(transform, column)` pair actually resumed —
+    /// `target` itself first, then any dependents whose pause was purely
+    /// this one's cascade.
+    pub async fn resume_column(&self, target: &str) -> Result<Vec<(String, String)>, TrellisError> {
+        match QuarantineTarget::parse(target) {
+            QuarantineTarget::Column(transform, column) => {
+                quarantine::resume_column(&self.pool, &transform, &column)
+                    .await
+                    .map_err(TrellisError::Apply)
+            }
+            QuarantineTarget::Transform(_) => Err(TrellisError::ColumnAddressRequired),
+        }
+    }
+
     /// Stops any background work this connection started (staging worker and
     /// drain workers) and waits for it to exit cleanly. A no-op for a
     /// connection that started none.
@@ -513,6 +745,116 @@ pub struct PoisonEntry {
     pub poisoned_at: SystemTime,
 }
 
+/// A quarantine/status address (`docs/decisions/0003-quarantine-storage-and-api.md`'s
+/// amendment, "Addressing"): either a whole transform (its whole keyspace,
+/// from the transform-wide lifecycle/fuse) or one of its columns (from the
+/// column-status table). Reuses the `table.column` shape the grammar already
+/// has elsewhere for qualified column references, rather than inventing a
+/// new addressing idiom.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuarantineTarget {
+    /// The whole transform, named by its target table.
+    Transform(String),
+    /// One column of a transform, named `(target_table, column_name)`.
+    Column(String, String),
+}
+
+impl QuarantineTarget {
+    /// Parses `"transform"` or `"transform.column"`. A dotted address splits
+    /// on the *first* `.`, so a target table name that itself contains a dot
+    /// (unusual, but not forbidden by this crate) still parses as intended:
+    /// everything after the first dot is the column name, matching how a
+    /// calculated field's own qualified references work elsewhere in this
+    /// crate. An address with either half empty (`"."`, `"orders."`,
+    /// `".total"`) is treated as a bare transform name — [`fmt::Display`]
+    /// never produces such a string, so this only matters for a
+    /// caller-supplied one.
+    pub fn parse(address: &str) -> Self {
+        match address.split_once('.') {
+            Some((transform, column)) if !transform.is_empty() && !column.is_empty() => {
+                QuarantineTarget::Column(transform.to_string(), column.to_string())
+            }
+            _ => QuarantineTarget::Transform(address.to_string()),
+        }
+    }
+
+    /// The transform this target names, regardless of whether it addresses
+    /// the whole thing or one column.
+    pub fn transform(&self) -> &str {
+        match self {
+            QuarantineTarget::Transform(t) | QuarantineTarget::Column(t, _) => t,
+        }
+    }
+}
+
+impl fmt::Display for QuarantineTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QuarantineTarget::Transform(t) => write!(f, "{t}"),
+            QuarantineTarget::Column(t, c) => write!(f, "{t}.{c}"),
+        }
+    }
+}
+
+/// A target's current state, as [`Trellis::quarantined`]/[`Trellis::quarantine_status`]
+/// report it — [`TransformStatus`]'s four lifecycle states for a
+/// [`QuarantineTarget::Transform`] address, plus [`QuarantineState::Paused`]
+/// for a [`QuarantineTarget::Column`] address (a state [`TransformStatus`]
+/// has no equivalent of, since column pausing doesn't touch a transform's
+/// overall lifecycle status at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantineState {
+    Live,
+    WaitingToBackfill,
+    Backfilling,
+    /// A whole transform's keyspace fuse has tripped (mirrors
+    /// [`TransformStatus::Quarantined`]).
+    Quarantined,
+    /// One column's fuse has tripped, or it's paused only because an
+    /// upstream column it reads is (decision #5's cascade) — both look the
+    /// same from this read; see [`Trellis::quarantine_status`] for whether a
+    /// caller needs to distinguish them (today, [`QuarantineEntry::last_error`]
+    /// is `None` for a purely cascaded pause, since it never itself failed).
+    Paused,
+}
+
+impl From<TransformStatus> for QuarantineState {
+    fn from(status: TransformStatus) -> Self {
+        match status {
+            TransformStatus::WaitingToBackfill => QuarantineState::WaitingToBackfill,
+            TransformStatus::Backfilling => QuarantineState::Backfilling,
+            TransformStatus::Live => QuarantineState::Live,
+            TransformStatus::Quarantined => QuarantineState::Quarantined,
+        }
+    }
+}
+
+/// One target's quarantine/status entry, as [`Trellis::quarantined`] (a
+/// whole list) and [`Trellis::quarantine_status`] (one target) both report
+/// it.
+#[derive(Debug, Clone)]
+pub struct QuarantineEntry {
+    pub target: QuarantineTarget,
+    pub state: QuarantineState,
+    /// When this target's pause tripped — `Some` only for a
+    /// [`QuarantineTarget::Column`] currently in [`QuarantineState::Paused`].
+    pub paused_at: Option<SystemTime>,
+    /// The most recent failure's message — `Some` only for a
+    /// [`QuarantineTarget::Column`] currently in [`QuarantineState::Paused`]
+    /// whose pause has an error of its own (a purely cascaded pause has
+    /// none).
+    pub last_error: Option<String>,
+}
+
+/// One sampled quarantined row, as [`Trellis::sample_quarantined`] reports
+/// it — the ADR's `(src_table, key, error_message)` triple.
+#[derive(Debug, Clone)]
+pub struct PoisonSample {
+    pub src_table: String,
+    pub key: String,
+    pub error_message: String,
+}
+
 /// Why a [`Trellis`] operation failed. Composes the crate's lower-level error
 /// types via `From`, matching the hand-rolled-enum convention the rest of the
 /// crate uses. [`TrellisError::code`] reports a stable, coarse [`ErrorCode`]
@@ -558,6 +900,19 @@ pub enum TrellisError {
     /// context, `BlockingTrellis` is only for threads with no runtime of
     /// their own.
     CalledFromAsyncContext,
+    /// A quarantine/status/resume call failed inside the staging layer's
+    /// column-fuse machinery (`staging::quarantine`) — resuming a column
+    /// that isn't paused, or a lower-level DB/catalog failure encountered
+    /// while listing, reading, sampling, or resuming.
+    Apply(ApplyError),
+    /// A [`QuarantineTarget`] named a transform (whole or `.column`) that
+    /// doesn't exist in `transform_definitions` at all.
+    TransformNotFound(String),
+    /// [`Trellis::resume_column`] was given a bare transform address
+    /// (no `.column`) — there is no whole-transform "resume" action in this
+    /// API; a `quarantined` transform's remedy is a full backfill, not this
+    /// call.
+    ColumnAddressRequired,
 }
 
 impl TrellisError {
@@ -592,6 +947,9 @@ impl TrellisError {
             | TrellisError::BlockingThreadGone => ErrorCode::Internal,
             // Caller misuse (wrong calling context), not an engine fault.
             TrellisError::CalledFromAsyncContext => ErrorCode::Validation,
+            TrellisError::Apply(err) => err.code(),
+            TrellisError::TransformNotFound(_) => ErrorCode::NotFound,
+            TrellisError::ColumnAddressRequired => ErrorCode::Validation,
         }
     }
 }
@@ -636,6 +994,15 @@ impl std::fmt::Display for TrellisError {
                 "BlockingTrellis was called from a thread that already has a tokio runtime \
                  entered; call the async Trellis directly in that context instead"
             ),
+            TrellisError::Apply(err) => write!(f, "{err}"),
+            TrellisError::TransformNotFound(target) => {
+                write!(f, "no transform named \"{target}\" is registered")
+            }
+            TrellisError::ColumnAddressRequired => write!(
+                f,
+                "resume_column needs a \"transform.column\" address; a bare transform name has \
+                 no whole-transform resume action (re-run its backfill instead)"
+            ),
         }
     }
 }
@@ -655,7 +1022,15 @@ impl std::error::Error for TrellisError {
             | TrellisError::BlockingThreadGone
             | TrellisError::CalledFromAsyncContext => None,
             TrellisError::BlockingSpawn(err) => Some(err),
+            TrellisError::Apply(err) => Some(err),
+            TrellisError::TransformNotFound(_) | TrellisError::ColumnAddressRequired => None,
         }
+    }
+}
+
+impl From<ApplyError> for TrellisError {
+    fn from(err: ApplyError) -> Self {
+        TrellisError::Apply(err)
     }
 }
 

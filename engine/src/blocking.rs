@@ -25,7 +25,8 @@ use std::time::SystemTime;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::app::{
-    DefinitionSummary, PoisonEntry, RelationshipSummary, Trellis, TrellisError, TrellisOptions,
+    DefinitionSummary, PoisonEntry, PoisonSample, QuarantineEntry, RelationshipSummary, Trellis,
+    TrellisError, TrellisOptions,
 };
 use crate::config::Config;
 use crate::defs::{Definition, RelationshipDefinition, TransformStatus};
@@ -52,6 +53,21 @@ enum Job {
     Status(
         String,
         oneshot::Sender<Result<Option<TransformStatus>, TrellisError>>,
+    ),
+    Quarantined(oneshot::Sender<Result<Vec<QuarantineEntry>, TrellisError>>),
+    QuarantineStatus(
+        String,
+        oneshot::Sender<Result<QuarantineEntry, TrellisError>>,
+    ),
+    SampleQuarantined(
+        String,
+        Option<(String, String)>,
+        i64,
+        oneshot::Sender<Result<Vec<PoisonSample>, TrellisError>>,
+    ),
+    ResumeColumn(
+        String,
+        oneshot::Sender<Result<Vec<(String, String)>, TrellisError>>,
     ),
     Shutdown(oneshot::Sender<Result<(), TrellisError>>),
 }
@@ -179,6 +195,36 @@ impl BlockingTrellis {
         self.submit(|reply| Job::Status(target_table, reply))
     }
 
+    /// Every currently paused/quarantined target. See [`Trellis::quarantined`].
+    pub fn quarantined(&self) -> Result<Vec<QuarantineEntry>, TrellisError> {
+        self.submit(Job::Quarantined)
+    }
+
+    /// The current state of one target (`transform` or `transform.column`).
+    /// See [`Trellis::quarantine_status`].
+    pub fn quarantine_status(&self, target: &str) -> Result<QuarantineEntry, TrellisError> {
+        let target = target.to_string();
+        self.submit(|reply| Job::QuarantineStatus(target, reply))
+    }
+
+    /// A paginated batch of poisoned rows for `target`. See
+    /// [`Trellis::sample_quarantined`].
+    pub fn sample_quarantined(
+        &self,
+        target: &str,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<PoisonSample>, TrellisError> {
+        let target = target.to_string();
+        self.submit(|reply| Job::SampleQuarantined(target, after, limit, reply))
+    }
+
+    /// Resumes a paused column. See [`Trellis::resume_column`].
+    pub fn resume_column(&self, target: &str) -> Result<Vec<(String, String)>, TrellisError> {
+        let target = target.to_string();
+        self.submit(|reply| Job::ResumeColumn(target, reply))
+    }
+
     /// Stops any background work this connection started and waits for the
     /// background thread to exit cleanly. See [`Trellis::shutdown`].
     pub fn shutdown(mut self) -> Result<(), TrellisError> {
@@ -269,6 +315,18 @@ async fn run(
             }
             Job::Status(table, reply) => {
                 let _ = reply.send(trellis.status(&table).await);
+            }
+            Job::Quarantined(reply) => {
+                let _ = reply.send(trellis.quarantined().await);
+            }
+            Job::QuarantineStatus(target, reply) => {
+                let _ = reply.send(trellis.quarantine_status(&target).await);
+            }
+            Job::SampleQuarantined(target, after, limit, reply) => {
+                let _ = reply.send(trellis.sample_quarantined(&target, after, limit).await);
+            }
+            Job::ResumeColumn(target, reply) => {
+                let _ = reply.send(trellis.resume_column(&target).await);
             }
             Job::Shutdown(reply) => {
                 let _ = reply.send(trellis.shutdown().await);
