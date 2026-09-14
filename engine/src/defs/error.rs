@@ -48,7 +48,7 @@ pub enum ParseError {
 }
 
 impl ParseError {
-    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). Every variant here is a rejection of the input text
     /// itself, so this is always [`ErrorCode::Parse`].
     pub fn code(&self) -> ErrorCode {

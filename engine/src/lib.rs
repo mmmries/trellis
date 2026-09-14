@@ -27,7 +27,7 @@
 //! - [`error_code`] is a small, stable [`error_code::ErrorCode`] taxonomy
 //!   every error type in this crate can report via a `code()` method,
 //!   independent of its own (freely growing) internal variants — see
-//!   `docs/public-api-design.md`, decision 3.
+//!   `docs/decisions/0008-public-api-design.md`, decision 3.
 //!
 //! **Current subset**: 1-1 scalar transforms only end to end (issue #11's
 //! 1-1 slice). Aggregate/invertible-delta maintenance is not yet wired up —

@@ -100,7 +100,7 @@ pub enum IntakeError {
 }
 
 impl IntakeError {
-    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). Delegates to [`StagingError::code`] for
     /// [`IntakeError::Staging`] and [`error_code::classify_pg_error`] for a
     /// raw Postgres error. [`IntakeError::ReplicaIdentityRequired`] is an

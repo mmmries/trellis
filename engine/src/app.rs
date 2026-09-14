@@ -22,11 +22,11 @@
 //! for any failure this facade can return, on top of the existing `Display`
 //! message — settled ahead of issue #87's FFI embedding work so a host
 //! language on the other side of that boundary has something stable to
-//! match on instead of every internal Rust error variant (`docs/public-api-design.md`,
+//! match on instead of every internal Rust error variant (`docs/decisions/0008-public-api-design.md`,
 //! decision 3).
 //!
 //! **[`define`](Trellis::define) doesn't block on backfill.** Per
-//! `docs/public-api-design.md`'s decision 1 and
+//! `docs/decisions/0008-public-api-design.md`'s decision 1 and
 //! [ADR-0007's amendment](../../docs/decisions/0007-direct-set-based-backfill.md#backgrounding-and-resumability-amendment),
 //! a plain (non-relationship) 1-1 transform's initial backfill runs as a
 //! durable, claimable queue of chunks that running drain
@@ -241,7 +241,7 @@ impl Trellis {
     /// One registered transform definition's current [`TransformStatus`]
     /// (issue #55), by target table name — the read a host-language embedder
     /// polls after [`define`](Trellis::define) returns, per
-    /// `docs/public-api-design.md`'s decision 1 ("define, then poll status
+    /// `docs/decisions/0008-public-api-design.md`'s decision 1 ("define, then poll status
     /// until live"). A thin convenience over [`definitions`](Trellis::definitions)
     /// for callers that only want one row rather than the full list.
     pub async fn status(
@@ -859,7 +859,7 @@ pub struct PoisonSample {
 /// types via `From`, matching the hand-rolled-enum convention the rest of the
 /// crate uses. [`TrellisError::code`] reports a stable, coarse [`ErrorCode`]
 /// category for this error alongside its `Display` message — see
-/// `docs/public-api-design.md`, decision 3.
+/// `docs/decisions/0008-public-api-design.md`, decision 3.
 #[derive(Debug)]
 pub enum TrellisError {
     /// A definition failed to parse before it could be registered.
@@ -917,7 +917,7 @@ pub enum TrellisError {
 
 impl TrellisError {
     /// This error's stable, coarse [`ErrorCode`] category
-    /// (`docs/public-api-design.md`, decision 3). Delegates to the wrapped
+    /// (`docs/decisions/0008-public-api-design.md`, decision 3). Delegates to the wrapped
     /// error's own `code()` wherever one nests here
     /// ([`TrellisError::Parse`], [`TrellisError::Catalog`],
     /// [`TrellisError::Client`], [`TrellisError::Engine`]) rather than
@@ -1083,7 +1083,7 @@ mod error_code_tests {
 
     /// [`TrellisError::Catalog`] must delegate to [`CatalogError::code`]
     /// rather than hardcoding a category — the exact composition-through-
-    /// nesting case `docs/public-api-design.md`'s decision 3 calls out.
+    /// nesting case `docs/decisions/0008-public-api-design.md`'s decision 3 calls out.
     #[test]
     fn catalog_delegates_to_the_wrapped_catalog_error() {
         let inner = CatalogError::SourceTableNotFound("orders".to_string());

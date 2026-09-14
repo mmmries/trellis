@@ -1,6 +1,6 @@
 //! The durable, claimable backfill-chunk work queue (public API design's
 //! ADR-0007 amendment — see `docs/decisions/0007-direct-set-based-backfill.md`'s
-//! "Backgrounding and resumability" section and `docs/public-api-design.md`'s
+//! "Backgrounding and resumability" section and `docs/decisions/0008-public-api-design.md`'s
 //! decision 1).
 //!
 //! [`install_definition`](super::catalog::install_definition) no longer runs
@@ -50,7 +50,7 @@ use super::model::TransformStatus;
 /// Why claiming, executing, or completing a durable backfill chunk failed.
 /// Composes [`BackfillError`] (the actual chunk write) and [`CatalogError`]
 /// (definition lookup/status-flip) rather than reinventing either, matching
-/// this crate's nested-`code()`-delegation convention (`docs/public-api-design.md`,
+/// this crate's nested-`code()`-delegation convention (`docs/decisions/0008-public-api-design.md`,
 /// decision 3).
 #[derive(Debug)]
 pub enum ChunkQueueError {
@@ -74,7 +74,7 @@ pub enum ChunkQueueError {
 }
 
 impl ChunkQueueError {
-    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). Delegates to the wrapped error's own `code()` wherever one
     /// nests here.
     pub fn code(&self) -> ErrorCode {

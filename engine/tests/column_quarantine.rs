@@ -1,6 +1,6 @@
 //! Integration tests for column-level quarantine
 //! (`docs/decisions/0003-quarantine-storage-and-api.md`'s 2026-09-12
-//! amendment, `docs/public-api-design.md` decision 5): the per-`(transform,
+//! amendment, `docs/decisions/0008-public-api-design.md` decision 5): the per-`(transform,
 //! column)` fuse layered alongside the pre-existing row-level/transform-wide
 //! one (`engine/tests/quarantine.rs`, unmodified by this feature — see
 //! `an_existing_row_level_fuse_scenario_is_unaffected` below for a targeted

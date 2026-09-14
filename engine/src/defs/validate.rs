@@ -232,7 +232,7 @@ pub struct RelationshipTypeMismatch {
 }
 
 impl ValidationError {
-    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). Almost every variant here is a rejected definition —
     /// [`ErrorCode::Validation`] — with one exception:
     /// [`ValidationError::DuplicateRelationshipName`] is a naming collision

@@ -1,4 +1,4 @@
-//! A small, stable set of coarse error categories (`docs/public-api-design.md`,
+//! A small, stable set of coarse error categories (`docs/decisions/0008-public-api-design.md`,
 //! decision 3) that every error type in this crate can report via a `code()`
 //! method, independent of whichever internal Rust enum variant actually
 //! produced the failure.

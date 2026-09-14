@@ -117,7 +117,7 @@ pub enum BackfillError {
 }
 
 impl BackfillError {
-    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). Delegates to [`DdlError::code`] for
     /// [`BackfillError::Ddl`] and [`error_code::classify_pg_error`] for a raw
     /// Postgres error, so the mapping composes through nesting rather than

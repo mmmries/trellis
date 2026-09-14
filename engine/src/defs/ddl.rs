@@ -135,7 +135,7 @@ pub enum DdlError {
 }
 
 impl DdlError {
-    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). Delegates to the wrapped error's own `code()` where one
     /// nests here ([`DdlError::InvalidDefinition`], [`DdlError::AliasSubstitution`],
     /// [`DdlError::Pool`]) or to [`error_code::classify_pg_error`] for a raw

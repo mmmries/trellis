@@ -2,7 +2,7 @@
 //! `tokio` runtime already exists on the calling thread — chiefly issue
 //! #87's future FFI embedding (Rustler/Magnus-style NIF bindings), whose
 //! calling convention is fundamentally synchronous: a call blocks until it
-//! returns. See `docs/public-api-design.md`'s decision 1.
+//! returns. See `docs/decisions/0008-public-api-design.md`'s decision 1.
 //!
 //! [`BlockingTrellis`] mirrors the pattern [`crate::client::Client::start`]
 //! already uses: a dedicated background thread builds its own `tokio`

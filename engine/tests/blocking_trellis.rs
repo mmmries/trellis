@@ -1,4 +1,4 @@
-//! Integration tests for [`engine::BlockingTrellis`] (`docs/public-api-design.md`,
+//! Integration tests for [`engine::BlockingTrellis`] (`docs/decisions/0008-public-api-design.md`,
 //! decision 1): the synchronous wrapper around [`engine::Trellis`] built for
 //! issue #87's future FFI embedding, where the calling convention can't
 //! assume a `tokio` runtime already exists on the calling thread.
@@ -68,7 +68,7 @@ fn full_lifecycle_is_synchronous_start_to_finish() {
 }
 
 /// (b): `BlockingTrellis::define` must return before a plain (non-relationship)
-/// 1-1 transform's backfill actually runs — per `docs/public-api-design.md`'s
+/// 1-1 transform's backfill actually runs — per `docs/decisions/0008-public-api-design.md`'s
 /// decision 1 and the `app` module's doc comment, `define()` only enumerates
 /// and persists the backfill's chunk work; some running drain
 /// (`application_threads`) worker elsewhere in the fleet is what actually

@@ -65,7 +65,7 @@ pub enum StagingError {
 }
 
 impl StagingError {
-    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). [`StagingError::ProducerAlreadyRunning`] is the one
     /// variant that's a genuine collision with existing state (a singleton
     /// lock already held) -> [`ErrorCode::Conflict`]; everything else here

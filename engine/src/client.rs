@@ -153,7 +153,7 @@ impl Default for ClientOptions {
 /// [`StagingError`]/[`IntakeError`]/[`ApplyError`]/[`crate::error::Error`]'s
 /// own hand-rolled-enum convention. [`ClientError::code`] reports a stable,
 /// coarse [`ErrorCode`] category for this error alongside its `Display`
-/// message — see `docs/public-api-design.md`, decision 3.
+/// message — see `docs/decisions/0008-public-api-design.md`, decision 3.
 #[derive(Debug)]
 pub enum ClientError {
     /// `staging_worker` was set but `source_tables` was empty — nothing to
@@ -182,7 +182,7 @@ pub enum ClientError {
 }
 
 impl ClientError {
-    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). Delegates to the wrapped error's own `code()` wherever
     /// one nests here, so the mapping composes rather than re-deriving a
     /// category this crate already has one for.
@@ -901,7 +901,7 @@ const MAX_BACKFILL_CHUNK_CLAIM: i64 = 4;
 /// claiming and draining sealed batches *and* claiming and executing pending
 /// direct-build backfill chunks (docs/decisions/0007's amendment) until
 /// shutdown — both kinds of claimable work share this one loop/worker pool,
-/// per `docs/public-api-design.md`'s decision 1 ("it's `application_threads`
+/// per `docs/decisions/0008-public-api-design.md`'s decision 1 ("it's `application_threads`
 /// that finishes transform work, backfill included").
 ///
 /// On a non-retryable error from [`staging::drain_once`] (anything

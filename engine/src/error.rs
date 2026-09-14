@@ -4,7 +4,7 @@
 //! `anyhow`) per the crate's dependency policy: pull in only what's on the
 //! approved list for this issue. [`Error::code`] additionally reports a
 //! stable [`crate::ErrorCode`] category for this error, alongside the
-//! existing `Display`-driven message — see `docs/public-api-design.md`,
+//! existing `Display`-driven message — see `docs/decisions/0008-public-api-design.md`,
 //! decision 3.
 
 use std::fmt;
@@ -35,7 +35,7 @@ pub enum Error {
 
 impl Error {
     /// This error's stable, coarse [`ErrorCode`] category — see
-    /// `docs/public-api-design.md`, decision 3. The message itself is still
+    /// `docs/decisions/0008-public-api-design.md`, decision 3. The message itself is still
     /// only available via `Display`/`to_string()`; this is purely the
     /// category alongside it.
     pub fn code(&self) -> ErrorCode {

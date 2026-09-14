@@ -41,7 +41,7 @@ use super::validate::{
 
 /// Why creating or reading a definition failed. [`CatalogError::code`]
 /// reports a stable, coarse [`ErrorCode`] category for this error alongside
-/// its `Display` message — see `docs/public-api-design.md`, decision 3.
+/// its `Display` message — see `docs/decisions/0008-public-api-design.md`, decision 3.
 #[derive(Debug)]
 pub enum CatalogError {
     /// The source text failed to parse (issue #22's grammar).
@@ -87,7 +87,7 @@ pub enum CatalogError {
 }
 
 impl CatalogError {
-    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). Delegates to the wrapped error's own `code()` wherever
     /// one nests here ([`CatalogError::Parse`], [`CatalogError::Validate`],
     /// [`CatalogError::Pool`], [`CatalogError::Backfill`],

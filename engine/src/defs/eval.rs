@@ -226,7 +226,7 @@ pub enum EvalError {
 }
 
 impl EvalError {
-    /// This error's stable, coarse [`ErrorCode`] category (`docs/public-api-design.md`,
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). Every variant here is defense-in-depth for an invariant
     /// [`super::validate::validate`] is supposed to have already enforced
     /// before evaluation runs (see this type's own doc comment) — reaching
