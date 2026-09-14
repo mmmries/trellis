@@ -98,9 +98,16 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
             }
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
-        Expr::RelationshipPath { .. } => {
+        // Issue #34: a relationship path's column lives on another table
+        // entirely, so there is no type to collect from `source`. The one
+        // caller feeds this a `build_program` program — a single table, one
+        // definition, no relationships declared at all, so no path can
+        // reach here. Refusing rather than returning nothing keeps that
+        // precondition enforced instead of assumed.
+        Expr::RelationshipPath { rel, column } => {
             unreachable!(
-                "the generator never constructs a RelationshipPath (issue #25 is grammar + AST only; no generator support yet)"
+                "collect_column_types is only ever called on `build_program`'s single-table, \
+                 relationship-free program, which cannot contain the path '{rel}.{column}'"
             )
         }
     }
@@ -1100,5 +1107,143 @@ fn bulk_insert_row_count_gets_meaningfully_large() {
         coverage.max_bulk_insert_rows > 100,
         "coverage floor failed: expected a bulk insert of more than 100 rows across 500 \
          samples:\n{coverage}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Issue #34: relationship coverage floors (ADR-0006).
+// ---------------------------------------------------------------------
+
+/// Accumulates [`generative::run::Coverage`] over `samples` draws of the
+/// default strategy — the shape the three relationship floors below share.
+/// Uses the same accumulator the live convergence property reports with, so
+/// these floors and that report can never disagree about what a shape is
+/// called.
+fn sampled_coverage(samples: usize) -> generative::run::Coverage {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..samples {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    coverage
+}
+
+/// The generator must actually *declare* relationships, not merely be
+/// capable of it. A program needs two or more tables for a relationship to
+/// have anywhere to point (see `generate::strategy::rel_field_spec`), so
+/// this is a floor on the composition of two independent draws, not one.
+#[test]
+fn trivial_program_sometimes_declares_a_relationship() {
+    let coverage = sampled_coverage(500);
+    assert!(
+        coverage.relationships_declared > 0,
+        "the generator must sometimes declare a relationship across 500 samples: {coverage}"
+    );
+}
+
+/// Both cardinalities must appear. They are not two spellings of one
+/// feature: a to-one relationship resolves through a unique to-side column
+/// and reverse-propagates off the to-side's own key, while a to-many one
+/// folds many related rows and requires `REPLICA IDENTITY FULL` on the
+/// to-side for its non-PK join key (ADR-0006). A run that drew only to-one
+/// relationships would leave the whole to-many path untested while still
+/// reporting relationship coverage.
+#[test]
+fn trivial_program_draws_both_relationship_cardinalities() {
+    let coverage = sampled_coverage(500);
+    for cardinality in ["to_one", "to_many"] {
+        assert!(
+            coverage
+                .relationship_cardinalities
+                .get(cardinality)
+                .is_some_and(|&n| n > 0),
+            "the generator must sometimes declare a {cardinality} relationship across 500 \
+             samples: {coverage}"
+        );
+    }
+}
+
+/// Each of the three engine-supported relationship *reference* shapes must
+/// be drawn — this is the floor that would catch any one of them silently
+/// ceasing to be generated (design doc §3's "coverage that silently drops
+/// out is otherwise invisible"):
+///
+/// * `to_one_bare` — a bare `<rel>.<col>` enrichment on a row-grain def;
+/// * `to_many_in_aggregate` — an aggregate over a to-many path on a
+///   row-grain def;
+/// * `to_one_in_aggregate_def` — an aggregate over a to-one path inside a
+///   `GROUP BY` def, the newest of the three.
+///
+/// `other` must stay at zero: it is the accumulator's catch-all for a shape
+/// nobody taught it about, which in this generator can only mean a shape the
+/// engine's validator would have rejected.
+#[test]
+fn trivial_program_draws_every_supported_relationship_reference_shape() {
+    let coverage = sampled_coverage(500);
+    for shape in [
+        "to_one_bare",
+        "to_many_in_aggregate",
+        "to_one_in_aggregate_def",
+    ] {
+        assert!(
+            coverage
+                .relationship_shapes
+                .get(shape)
+                .is_some_and(|&n| n > 0),
+            "the generator must sometimes draw the {shape} relationship shape across 500 \
+             samples: {coverage}"
+        );
+    }
+    assert_eq!(
+        coverage.relationship_shapes.get("other").copied(),
+        None,
+        "the generator drew a relationship reference shape the coverage accumulator cannot \
+         classify — in this generator that can only be a shape validate() rejects: {coverage}"
+    );
+}
+
+/// The relationship key/foreign-key columns must really exercise all three
+/// join outcomes ADR-0006 distinguishes, not just the matching one: a
+/// foreign key that resolves, one that resolves to nothing, and a `NULL`
+/// one. The two miss cases are the entire nullability contract (issue #33),
+/// so a run that only ever drew matching keys would check none of it.
+#[test]
+fn trivial_program_draws_matching_missing_and_null_relationship_foreign_keys() {
+    let mut runner = TestRunner::default();
+    let strategy = trivial_program();
+    let mut saw_match = false;
+    let mut saw_miss = false;
+    let mut saw_null = false;
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        for table in &program.tables {
+            let fk_col = &table.columns[generative::generate::REL_FK_COLUMN].name;
+            for op in &program.ops {
+                let Op::Insert { row, .. } = op else { continue };
+                let Some((_, value)) = row.iter().find(|(c, _)| c == fk_col) else {
+                    continue;
+                };
+                match value.as_deref() {
+                    None => saw_null = true,
+                    // `rel_key_value` of a seeded pk; pks run from 1, and no
+                    // program seeds anywhere near 9 rows.
+                    Some("k9") => saw_miss = true,
+                    Some(_) => saw_match = true,
+                }
+            }
+        }
+    }
+    assert!(
+        saw_match && saw_miss && saw_null,
+        "relationship foreign keys must cover all three join outcomes across 500 samples \
+         (matching={saw_match}, missing={saw_miss}, null={saw_null})"
     );
 }

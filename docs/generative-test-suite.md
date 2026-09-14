@@ -73,9 +73,12 @@ shrunk counterexample you can read at a glance beats one that is technically
 smaller. Give every table its primary-key column **unconditionally**, so no
 shrink step can strand a definition that references it.
 
-Today `defs` is 1-1 / numeric-`+` only (`engine::defs::ast::TransformDef`). The
-model is shaped so aggregate and cross-join definitions, relationships, and
-non-DML actions slot in later.
+`defs` reuses `engine::defs::ast::TransformDef` directly. It started 1-1 /
+numeric-`+` only; it now also covers `GROUP BY` aggregate definitions and —
+per issue #34 — named relationship declarations (a `relationships` list
+installed ahead of every definition) with the three relationship-reading
+field shapes ADR-0006 and the engine support. The model is shaped so
+cross-join definitions and non-DML actions slot in later.
 
 ### The backend seam
 

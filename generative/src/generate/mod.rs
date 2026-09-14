@@ -177,6 +177,29 @@
 //!   binding, `::text` casts, this harness's own snapshot diffing) — just not
 //!   of that specific key-encoding risk, which remains open.
 //!
+//! Issue **#34** ("relationship edges in the program generator", ADR-0006)
+//! adds the first *cross-table* derivations. Every table gains two more
+//! `Text` columns — a `UNIQUE` relationship key ([`REL_KEY_COLUMN`]) and a
+//! nullable foreign key ([`REL_FK_COLUMN`]) — and a definition may draw an
+//! extra field that reads a *related* table through a named relationship.
+//! The three shapes drawn are exactly the three the engine supports; see
+//! [`RelFieldKind`] for the full shape table and
+//! [`attach_relationship_fields`] for how a declaration's endpoints are
+//! fixed. Two invariants are worth naming here because they are what keep
+//! "only valid programs" structural rather than probabilistic:
+//!
+//! - **A relationship's join key must be text-stable** (see
+//!   [`TEXT_STABLE_JOIN_KEY_TYPES`]), which is why both endpoint columns are
+//!   `Text` and not the numeric primary key.
+//! - **Relationships always point from a lower-indexed table to a
+//!   higher-indexed one**, so the cross-table dependency graph ADR-0006
+//!   requires to be acyclic is acyclic by construction.
+//!
+//! Like the grain column, the relationship columns are seeded once and never
+//! mutated — but unlike it, the *related* table's own `c1` is freely mutated
+//! and deleted, which is what makes a generated program exercise ADR-0006's
+//! reverse propagation rather than only the forward direction.
+//!
 //! # Awkward values (issue #7, design doc §3)
 //!
 //! Of the four awkward-value classes the design doc calls out:
@@ -2550,17 +2573,33 @@ mod strategy {
     ///   also matches nothing but reaches that answer down a different code
     ///   path (`NULL = anything` is `NULL`, not `false`).
     ///
-    /// The two miss cases are deliberately *not* rare: they are the whole
-    /// nullability contract issue #33 pinned on the engine side, and a run
-    /// that only ever drew matching keys would never check it.
-    fn rel_fk_value() -> impl Strategy<Value = Option<String>> {
-        prop_oneof![
+    /// The "matches nothing" case is deliberately *not* rare: together with
+    /// the `NULL` case it is the whole nullability contract issue #33
+    /// pinned on the engine side, and a run that only ever drew matching
+    /// keys would never check it.
+    ///
+    /// `awkward_values` gates the `NULL` draw only, exactly as it does for
+    /// [`value`]/[`text_value`]/[`bool_value`]/[`uuid_value`] — a `NULL`
+    /// foreign key is an awkward value like any other. The `"k9"`
+    /// matches-nothing case is *not* gated: it is an ordinary non-`NULL`
+    /// text value that simply happens to resolve to no related row, so the
+    /// unmatched-join half of the nullability contract stays covered even
+    /// with awkward values off.
+    fn rel_fk_value(awkward_values: bool) -> BoxedStrategy<Option<String>> {
+        let present = prop_oneof![
             2 => Just(Some("k1".to_string())),
             2 => Just(Some("k2".to_string())),
             2 => Just(Some("k3".to_string())),
             1 => Just(Some("k9".to_string())),
-            1 => Just(None),
+        ];
+        if !awkward_values {
+            return present.boxed();
+        }
+        prop_oneof![
+            NULL_WEIGHT => Just(None),
+            VALUE_WEIGHT => present,
         ]
+        .boxed()
     }
 
     /// Which aggregate function wraps a generated relationship path.
@@ -2731,7 +2770,7 @@ mod strategy {
                 let bools = prop::collection::vec(bool_value(awkward_values), seed_count);
                 let uuids = prop::collection::vec(uuid_value(awkward_values), seed_count);
                 let grains = prop::collection::vec(grain_value(), seed_count);
-                let rel_fks = prop::collection::vec(rel_fk_value(), seed_count);
+                let rel_fks = prop::collection::vec(rel_fk_value(awkward_values), seed_count);
                 let mutates =
                     prop::collection::vec(mutate(seed_count, awkward_values), 0..=MAX_MUTATES);
                 (seeds, texts, bools, uuids, grains, rel_fks, mutates)
@@ -2778,8 +2817,16 @@ mod strategy {
     /// reproducing program — a 1-table/1-def counterexample is the readable
     /// one.
     ///
+    /// Issue #34: each definition additionally draws an optional
+    /// relationship enrichment ([`rel_field_spec`]), so a multi-table
+    /// program's definitions sometimes read a *related* table too. The
+    /// relationship's shape is derived from the definition's already-drawn
+    /// key-space rather than drawn independently, so an illegal pairing is
+    /// unrepresentable — see [`def_draw`].
+    ///
     /// `awkward_values` gates every other column's `NULL` draw (see
-    /// [`value`], [`text_value`], [`bool_value`], [`uuid_value`]); it does
+    /// [`value`], [`text_value`], [`bool_value`], [`uuid_value`],
+    /// [`rel_fk_value`]); it does
     /// not gate [`grain_value`] (which never draws `NULL` at all — see its
     /// own doc comment for the engine bug that finding forced this scope cut
     /// over), nor does it affect [`Mutate::DuplicateInsert`], [`def_shape`]
