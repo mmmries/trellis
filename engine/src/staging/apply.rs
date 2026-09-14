@@ -1199,6 +1199,18 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 if let Some(reldef) =
                     catalog::relationship_by_name(pool, &def.def.source, rel_name).await?
                 {
+                    // Mirrors `defs::backfill::resolve_to_one_joins`'s guard:
+                    // the validator makes a to-many path in an aggregate
+                    // unreachable today, but this loop has no other cardinality
+                    // check of its own, and a silent to-many LEFT JOIN here
+                    // would fan out source rows and inflate every SUM instead
+                    // of failing loudly like the direct-build path does.
+                    if reldef.cardinality != RelationshipCardinality::ToOne {
+                        return Err(crate::defs::backfill::BackfillError::Unsupported(
+                            "an aggregate over a to-many relationship".to_string(),
+                        )
+                        .into());
+                    }
                     rel_joins.push(apply_aggregate::RelJoin {
                         name: rel_name.clone(),
                         to_table: reldef.def.to_table,
