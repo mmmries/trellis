@@ -10,17 +10,17 @@
 //! does not exist" error is left to surface as-is rather than papering over
 //! it by migrating on this command's behalf.
 //!
-//! What this prints today is deliberately narrow: every registered transform
-//! definition ([`Trellis::definitions`]) and relationship
-//! ([`Trellis::relationships`]) — id, tables/columns, and `created_at`. The
-//! eventual plan (see docs/public-api-design.md's "Decision 5" and the
-//! amendment to docs/decisions/0003-quarantine-storage-and-api.md) is a
-//! per-`(transform, column)` lifecycle status —
-//! `waiting_to_backfill`/`backfilling`/`live`/`quarantined`, plus
-//! finer-grained per-column pause state — tracked as issue #55. None of that
-//! is implemented on the engine yet, and `DefinitionSummary` doesn't carry
-//! enough information to guess at it, so this command says so plainly rather
-//! than fake a status column.
+//! What this prints today: every registered transform definition
+//! ([`Trellis::definitions`]) — id, tables, `created_at`, and its whole-
+//! keyspace lifecycle status (issue #55's `TransformStatus`:
+//! `waiting_to_backfill`/`backfilling`/`live`/`quarantined`) — and every
+//! relationship ([`Trellis::relationships`]). Finer-grained per-`(transform,
+//! column)` pause state (docs/decisions/0008-public-api-design.md's
+//! "Decision 5" and the amendment to
+//! docs/decisions/0003-quarantine-storage-and-api.md) is implemented on the
+//! engine (`Trellis::quarantined`/`quarantine_status`/`sample_quarantined`)
+//! but not yet surfaced by this command — still a real gap, just a smaller
+//! one than "no status at all."
 //!
 //! [`Trellis::poisoned_since`] *is* surfaced here, called with `UNIX_EPOCH`
 //! as the watermark. Despite its name suggesting a point-in-time delta, the
@@ -99,14 +99,13 @@ pub async fn run(_args: Args, database_url: Option<String>) -> Result<String, St
     Ok(message)
 }
 
-/// The note appended to every `status` listing, explaining what's not
-/// tracked yet and why `poisoned_since` isn't part of the output. See the
-/// module doc comment for the full reasoning.
+/// The note appended to every `status` listing, explaining the remaining gap
+/// now that whole-transform lifecycle status (issue #55) is shown per
+/// definition below. See the module doc comment for the full reasoning.
 const STATUS_NOTE: &str = "\
-Note: per-transform/per-column lifecycle status (live/backfilling/quarantined/\
-paused) is not implemented yet — tracked as issue #55. This listing only \
-shows what is registered and what is currently quarantined, not whether a \
-definition has finished backfilling.";
+Note: the status shown per definition above is whole-transform (issue #55). \
+Finer-grained per-column pause state is not yet surfaced by this command, \
+even though the engine tracks it.";
 
 /// Builds the full human-readable status report: definitions, relationships,
 /// then [`STATUS_NOTE`].
@@ -157,10 +156,11 @@ fn format_definitions(definitions: &[DefinitionSummary]) -> String {
         .iter()
         .map(|def| {
             format!(
-                "  id={} source={} target={} created_at={}\n",
+                "  id={} source={} target={} status={} created_at={}\n",
                 def.id,
                 def.source_table,
                 def.target_table,
+                def.status.as_str(),
                 format_timestamp(def.created_at)
             )
         })
@@ -298,12 +298,14 @@ mod tests {
             target_table: "order_totals".to_string(),
             source_table: "orders".to_string(),
             source_version: 1,
+            status: engine::TransformStatus::Live,
             created_at: UNIX_EPOCH,
         };
         let formatted = format_definitions(std::slice::from_ref(&def));
         assert!(formatted.contains("id=7"));
         assert!(formatted.contains("source=orders"));
         assert!(formatted.contains("target=order_totals"));
+        assert!(formatted.contains("status=live"));
         assert!(formatted.contains("1970-01-01 00:00:00 UTC"));
     }
 

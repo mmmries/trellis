@@ -19,6 +19,7 @@ use regex::Regex;
 
 use super::ast::{Expr, KeySpace, Predicate, TransformDef, ValueType};
 use super::model::RelationshipCardinality;
+use crate::error_code::ErrorCode;
 
 /// A relationship referenced by a definition, resolved by the caller
 /// ([`super::catalog`]) against the persisted relationship catalog and live
@@ -245,6 +246,22 @@ pub struct RelationshipTypeMismatch {
     pub to_table: String,
     pub to_col: String,
     pub to_type: String,
+}
+
+impl ValidationError {
+    /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
+    /// decision 3). Almost every variant here is a rejected definition —
+    /// [`ErrorCode::Validation`] — with one exception:
+    /// [`ValidationError::DuplicateRelationshipName`] is a naming collision
+    /// with an already-declared relationship, so it reports
+    /// [`ErrorCode::Conflict`] instead, the same category a uniqueness
+    /// violation from Postgres itself would report.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            ValidationError::DuplicateRelationshipName { .. } => ErrorCode::Conflict,
+            _ => ErrorCode::Validation,
+        }
+    }
 }
 
 impl fmt::Display for ValidationError {

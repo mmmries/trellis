@@ -1,19 +1,21 @@
 ---
-status: draft
+status: accepted
 date: 2026-09-12
 deciders: Michael Ries
 ---
 
-# Public API Design (working doc)
+# Public API Design
 
-This is a **temporary, living document**, not an ADR. Issue #82 ("Design
-Public API") is where this work is tracked on GitHub, but a personal access
-token with write access to `salesforce-misc/trellis` hasn't been approved yet,
-so decisions that would normally become issues/comments there are recorded
-here instead. Once that access lands, the content below should be split out
-into real issues (and any settled, load-bearing decisions promoted into their
-own numbered ADRs) and this file deleted — it's scaffolding, not a permanent
-part of the docs tree.
+Issue #82 ("Design Public API") asked for this design; this document is now
+its permanent record, promoted from a temporary working doc (originally
+`docs/public-api-design.md`, outside `docs/decisions/`) once a personal
+access token with write access to `salesforce-misc/trellis` turned out not to
+be available and the 5 decisions below were settled and implemented directly
+in this session instead of being split into separate GitHub issues. All 5
+decisions are implemented; see each section for what shipped. The "Open
+questions not yet worked through" section at the end lists items that remain
+genuinely open — future scope for adjacent issues (#87, #49, #12), not this
+document's own decisions.
 
 ## Why now
 
@@ -77,7 +79,7 @@ behavior. That reasoning doesn't survive contact with scale: even the fast,
 chunked direct-build path (ADR-0007) takes real wall-clock time on a
 billion-row table, and blocking a call — or an in-call loop — for however long
 that takes means an interrupted process (the FFI caller's, or the one doing
-the building) loses all progress. [ADR-0007's amendment](decisions/0007-direct-set-based-backfill.md#backgrounding-and-resumability-amendment)
+the building) loses all progress. [ADR-0007's amendment](0007-direct-set-based-backfill.md#backgrounding-and-resumability-amendment)
 now makes backfill *always* background and resumable for both build paths: the
 chunked writes ADR-0007 already breaks the direct build into become a durable,
 claimable work queue that running drain (application) threads execute — the
@@ -98,11 +100,15 @@ worker running *somewhere* in the fleet; a connection that only ever calls
 its definition sit in `waiting_to_backfill` indefinitely — worth calling out
 in whatever documentation eventually covers this for embedders.
 
-Still open: whether the synchronous wrapper lives directly on `Trellis` in the
-`engine` crate, or in a separate shim crate built specifically for #87's FFI
-work. Leaning toward the latter (keep `engine` async-native for in-process
-Rust embedders, add a thin blocking wrapper crate only where FFI needs it) but
-not settled.
+**Settled:** the synchronous wrapper (`BlockingTrellis`, `engine/src/blocking.rs`)
+lives directly in the `engine` crate alongside `Trellis`, not in a separate
+shim crate — despite this doc's earlier leaning toward a separate crate.
+`engine` remains async-native (`Trellis`'s own methods are untouched);
+`BlockingTrellis` is an additive wrapper that owns a dedicated thread running
+its own Tokio runtime (the same pattern `Client::start` already uses
+internally) and guards against being called from a thread that already has a
+runtime entered (`TrellisError::CalledFromAsyncContext`), rather than
+panicking.
 
 ### 2. Grammar scope: definitional statements only
 
@@ -147,9 +153,17 @@ Rust-idiomatic nested enums in place and translating only at the FFI shim
 later. Settling this now avoids the FFI shim work in #87 turning into a giant
 `match` over every internal error variant that ever gets added.
 
-Not yet settled: the actual code taxonomy (how coarse/fine-grained), and
-whether `source()`/error chaining survives in any form across the boundary or
-collapses to "one message string with context baked in."
+**Settled:** `ErrorCode` (`engine/src/error_code.rs`) is a small,
+`#[non_exhaustive]` enum of coarse categories (`Parse`, `Validation`,
+`Connectivity`, `Conflict`, `NotFound`, `Internal`) — one code per broad kind
+of failure an FFI caller would actually branch on, not one per internal Rust
+error variant. Every error type in the crate that can surface to a caller
+(`TrellisError`, `ClientError`, `CatalogError`, `ApplyError`, and others) gained
+a `code()` method mapping itself into this taxonomy, with SQLSTATE-based
+classification (`classify_pg_error`) for raw Postgres errors. `source()`/error
+chaining stays Rust-idiomatic internally (`std::error::Error`, `#[from]` via
+`thiserror`) — it does not itself cross the FFI boundary; a caller gets the
+stable `code()` plus the `Display` message, not a chain to walk.
 
 ### 4. Resource caps: out of scope for the API shape
 
@@ -174,15 +188,15 @@ planned interaction patterns. Working through it surfaced that table-level
 calculated columns, and one broken formula shouldn't force every other healthy
 column into quarantine.
 
-**Decision:** see the amendment to
-[ADR-0003](decisions/0003-quarantine-storage-and-api.md) for the full storage
-and fuse design. Summary of what it settles:
+**Decision:** see the amendments to
+[ADR-0003](0003-quarantine-storage-and-api.md) for the full storage and fuse
+design. Summary of what it settles (all now implemented, `V21__column_quarantine.sql`):
 
-* Exception detail stays one record per poisoned **source row** (matching
-  what's actually implemented, not the ADR's original `(target_row_pk,
-  transform_id)` proposal), extended with a `failures` JSONB array naming
-  which `(transform, column)` pairs failed for that row.
-* A new column-status table tracks which columns are currently `paused`,
+* Exception detail for the existing whole-key fuse stays one record per
+  poisoned **source row** (`poison`, unchanged). Column-grain failure detail
+  is tracked separately in a dedicated `column_failures` table, one row per
+  `(transform, column, src_table, key)` that failed.
+* A new `column_status` table tracks which columns are currently `paused`,
   separate from — and finer-grained than — a transform's overall lifecycle
   status (`waiting_to_backfill`/`backfilling`/`live`/`quarantined`). A `live`
   transform can have individually paused columns.
@@ -195,11 +209,12 @@ and fuse design. Summary of what it settles:
 * **Client library API** (typed methods, per decision #2 above): list
   everything currently paused/quarantined across every transform and column;
   get status for one address; page sample poisoned rows for one address.
-
-Open questions (threshold tuning, whether paused-column count should ever
-escalate a transform to full quarantine, frozen-vs-null value semantics for a
-paused column's target data) are tracked in that ADR's "Undecided" section
-rather than duplicated here.
+  Implemented on `Trellis`/`BlockingTrellis` as `quarantined()`,
+  `quarantine_status()`, `sample_quarantined()`, `resume_column()`.
+* Threshold, counter mechanism, escalation, paused-value semantics, and
+  propagation to dependents were all open when this document was first
+  written; all are now settled — see ADR-0003's "Amendment (2026-09-13): open
+  questions resolved."
 
 ## Open questions not yet worked through
 

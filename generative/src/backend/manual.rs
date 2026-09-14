@@ -31,7 +31,8 @@ use std::time::Duration;
 use engine::config::DEFAULT_SCHEMA;
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use engine::defs::{
-    CatalogError, DdlError, install_definition, qualified_target_table, source_primary_key,
+    CatalogError, DdlError, TransformStatus, install_definition, qualified_target_table,
+    source_primary_key,
 };
 use engine::staging::{StagingError, await_converged, watermark_token};
 use engine::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
@@ -69,6 +70,19 @@ pub enum ManualBackendError {
     /// always starts a client before any restart point is reached), not a
     /// condition a caller should need to handle gracefully.
     NoClientStarted,
+    /// [`ManualBackend::quiesce`] waited [`QUIESCE_TIMEOUT`] for every
+    /// installed definition to reach a terminal backfill outcome (`live` or
+    /// `quarantined`) and at least one never did — `unsettled` names every
+    /// target table still short of that. Distinct from
+    /// [`StagingError::ConvergenceTimeout`] (surfaced as
+    /// [`ManualBackendError::Staging`]): that one covers the ring's own CDC
+    /// convergence, this one covers a direct-build 1-1 definition's
+    /// `defs::chunk_queue`-driven backfill, which the ring has no visibility
+    /// into at all (docs/decisions/0007's amendment).
+    DefinitionSettleTimeout {
+        unsettled: Vec<String>,
+        waited: Duration,
+    },
     Config(engine::Error),
     Client(ClientError),
     Catalog(CatalogError),
@@ -592,6 +606,94 @@ impl ManualBackend {
             eprintln!("generative: noise statement {sql:?} failed (expected/ignored): {err:?}");
         }
     }
+
+    /// Polls every installed definition's status
+    /// (`transform_definitions.status`) until each has reached a terminal
+    /// backfill outcome — [`TransformStatus::Live`] (the ordinary case) or
+    /// [`TransformStatus::Quarantined`] — or `timeout` elapses. Matches
+    /// `engine::staging::await_converged`'s own backoff shape (5ms initial,
+    /// doubling to a 250ms ceiling, never resetting within one call) so both
+    /// halves of [`ManualBackend::quiesce`] share one polling discipline.
+    ///
+    /// `Quarantined` stops the wait rather than being treated as "not yet
+    /// settled": per `docs/transforms.md`'s "Status" section, a quarantined
+    /// transform "is broken and no longer maintained" — it never becomes
+    /// `Live` on its own, only by an explicit resume that restarts its
+    /// backfill from `waiting_to_backfill`. Waiting past it here would just
+    /// hang until `timeout` for no reason; it's as settled as this call can
+    /// ever observe it.
+    ///
+    /// Closes a real gap in [`ManualBackend::quiesce`] (public-api-design
+    /// review): a direct-build 1-1 definition's backfill runs through
+    /// `engine::defs::chunk_queue`'s durable claim/execute/finish queue
+    /// entirely outside the ring (docs/decisions/0007's "Backgrounding and
+    /// resumability" amendment) — `await_converged`'s CDC-ring convergence
+    /// wait has no visibility into that queue at all. Before this,
+    /// `quiesce` only *appeared* to wait for such a backfill to finish by
+    /// accident: a large, unrelated ~10s ring-seal age-gate stall happened
+    /// to give drain workers enough real wall-clock time to finish the
+    /// suite's small test backfills before the harness ever snapshotted
+    /// state. Shortening that stall, or a scenario installing a definition
+    /// needing more than one chunk, would have started producing flaky/wrong
+    /// convergence results with no real product bug behind them.
+    async fn await_definitions_settled(&self, timeout: Duration) -> Result<(), ManualBackendError> {
+        const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
+        const MAX_BACKOFF: Duration = Duration::from_millis(250);
+
+        let started = std::time::Instant::now();
+        let mut backoff = INITIAL_BACKOFF;
+        loop {
+            let unsettled = self.unsettled_definitions().await?;
+            if unsettled.is_empty() {
+                return Ok(());
+            }
+            let waited = started.elapsed();
+            if waited >= timeout {
+                return Err(ManualBackendError::DefinitionSettleTimeout { unsettled, waited });
+            }
+            tokio::time::sleep(backoff.min(timeout - waited)).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
+    }
+
+    /// The target tables of every definition [`ManualBackend::install`] has
+    /// installed (`self.defs`) whose current `transform_definitions.status`
+    /// is neither `live` nor `quarantined` — i.e. still `waiting_to_backfill`
+    /// or `backfilling`. Reads directly against `self.raw` (the same table
+    /// `engine::Trellis::definitions`/`engine::Trellis::status` query) rather
+    /// than through a `Trellis` handle: `ManualBackend` never holds one — it
+    /// drives `engine::defs`/`engine::Client` directly — so re-running the
+    /// same simple by-target-table lookup here is the one query path this
+    /// backend already has, not a new one invented for this.
+    async fn unsettled_definitions(&self) -> Result<Vec<String>, ManualBackendError> {
+        let mut unsettled = Vec::new();
+        for def in &self.defs {
+            let Some(row) = self
+                .raw
+                .query_opt(
+                    "select status from transform_definitions where target_table = $1",
+                    &[&def.target],
+                )
+                .await?
+            else {
+                // No row yet for a definition `install_definition` is still
+                // in the middle of creating is the same "not settled" case
+                // as an explicit non-terminal status — keep waiting rather
+                // than treating a momentarily-missing row as vacuously
+                // settled.
+                unsettled.push(def.target.clone());
+                continue;
+            };
+            let status_text: String = row.get(0);
+            let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+                panic!("transform_definitions.status held unrecognized value '{status_text}'")
+            });
+            if !matches!(status, TransformStatus::Live | TransformStatus::Quarantined) {
+                unsettled.push(def.target.clone());
+            }
+        }
+        Ok(unsettled)
+    }
 }
 
 impl super::Backend for ManualBackend {
@@ -839,6 +941,13 @@ impl super::Backend for ManualBackend {
             eprintln!("QUIESCE_TIMING {}", start.elapsed().as_millis());
         }
         result?;
+
+        // public-api-design review gap: ring convergence alone says nothing
+        // about a still-backgrounded direct-build backfill (docs/decisions/0007's
+        // amendment) — see `await_definitions_settled`'s own doc comment for
+        // why this second wait is load-bearing, not redundant.
+        self.await_definitions_settled(QUIESCE_TIMEOUT).await?;
+
         Ok(())
     }
 

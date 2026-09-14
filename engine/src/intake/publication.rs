@@ -156,6 +156,45 @@ pub async fn reconcile_publication(
     Ok(())
 }
 
+/// Parks a fresh catch-up marker for `qualified_table`, reusing the exact
+/// `pending_backfill` mechanism [`reconcile_publication`] already relies on
+/// for a table newly joining the publication (docs/decisions/0007's
+/// amendment). `defs::chunk_queue::complete_direct_backfill` calls this the
+/// moment a direct-build definition flips `backfilling` -> `live`: while it
+/// sat non-`live`, [`super::super::defs::dependents_of`]'s status filter kept
+/// any live CDC delta for `qualified_table` from being folded into its
+/// target, so the definition's target may be missing whatever changed on
+/// that table during the build. This marker's later discharge
+/// ([`run_pending_backfills`]) re-derives every definition on `qualified_table`
+/// (now including the newly-`live` one) from current source state, folding
+/// in anything skipped meanwhile — the same `run_pending_backfills`-shaped
+/// event the amendment describes, just triggered by "every chunk done"
+/// instead of "a table newly joined the publication."
+///
+/// `on conflict (table_name) do nothing`: if a marker already exists for this
+/// table (a concurrent publication-join, or another definition on the same
+/// table finishing its own build around the same time), that marker's own
+/// discharge already re-derives every current definition on the table once
+/// its fence settles — a second marker would only add a redundant round trip,
+/// not any missed coverage, so first-writer-wins is correct here.
+pub(crate) async fn park_backfill_catchup(
+    client: &impl GenericClient,
+    qualified_table: &str,
+) -> Result<(), IntakeError> {
+    let fence: String = client
+        .query_one("select pg_current_snapshot()::text", &[])
+        .await?
+        .get(0);
+    client
+        .execute(
+            "insert into pending_backfill (table_name, fence_snapshot) \
+             values ($1, $2::text::pg_snapshot) on conflict (table_name) do nothing",
+            &[&qualified_table, &fence],
+        )
+        .await?;
+    Ok(())
+}
+
 /// A parsed `pg_snapshot` text representation (`"xmin:xmax:xip,..."`) — only
 /// `xmin`/`xmax` matter for fence settlement, so the in-progress list is
 /// parsed for validity and otherwise discarded.
