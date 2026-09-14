@@ -1454,3 +1454,145 @@ async fn resume_column_refuses_a_column_on_a_not_yet_live_definition() {
         "a refused resume must be all-or-nothing: column_deaths must not be cleared either"
     );
 }
+
+/// The end-to-end version of the same bug, through the *real*
+/// `trip_column_fuse` -> `cascade_pause` path rather than a hand-seeded
+/// `column_status` row: `order_totals.total` (live) pauses and cascades onto
+/// `order_summaries.grand_total`, whose definition is genuinely stuck
+/// `Backfilling` behind its own never-drained `backfill_chunks` queue
+/// (`install_definition`, same determinism as the test above). Proves the
+/// cascade-queue's per-pair check (the second gate inside `resume_column`'s
+/// `while` loop, distinct from the initial-pair gate the test above
+/// exercises): resuming the upstream column must still succeed and commit,
+/// while the downstream pair it cascaded onto is left exactly as it was —
+/// still paused, not resumed, and the call does not error out just because
+/// one pair deep in the queue isn't live yet.
+#[tokio::test]
+async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_erroring() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    seed_order_totals(&db, &client).await;
+
+    // Real, valid source rows, drained so `order_totals` has actual target
+    // rows for `install_definition` (below) to enumerate chunk work over —
+    // an empty source table would enqueue zero chunks and `order_summaries`
+    // would complete its (trivial) backfill synchronously instead of
+    // sticking in `Backfilling` the way this test needs.
+    client
+        .batch_execute(
+            "insert into orders (id, price, tax) values \
+             (1, 10.00, 1.00), (2, 20.00, 2.00), (3, 30.00, 3.00)",
+        )
+        .await
+        .expect("seed valid orders rows");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"price":"10.00","tax":"1.00"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "2",
+        "insert",
+        None,
+        Some(r#"{"price":"20.00","tax":"2.00"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "3",
+        "insert",
+        None,
+        Some(r#"{"price":"30.00","tax":"3.00"}"#),
+    )
+    .await;
+    let seg_seq = seal_active_segment(&mut client).await;
+    apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+    )
+    .await
+    .expect("drain_once")
+    .expect("must claim and drain the seed rows into order_totals");
+
+    // `order_summaries`, reading straight from `order_totals` (mirrors
+    // `seed_order_summaries`), but installed via `install_definition` so it
+    // enumerates real chunk work and is left `Backfilling` — nothing here
+    // ever drains that queue, the same determinism
+    // `resume_column_refuses_a_column_on_a_not_yet_live_definition` (above)
+    // and `engine/tests/defs_backfill_chunk_queue.rs` rely on.
+    let order_totals_columns = numeric_columns(&["id", "total"]);
+    let summary_def = install_definition(
+        &db.pool,
+        "TRANSFORM order_summaries FROM order_totals SELECT total + total AS grand_total",
+        &order_totals_columns,
+        "public",
+    )
+    .await
+    .expect("install_definition enumerates chunk work and returns");
+    assert_eq!(
+        summary_def.status,
+        TransformStatus::Backfilling,
+        "nothing drains the chunk queue in this test, so order_summaries must still be \
+         backfilling"
+    );
+
+    // Trip `order_totals.total`'s own fuse (distinct ids from the 3 seeded
+    // above, so as not to disturb them) — the real cascade path,
+    // `defs::catalog::column_dependents`, must reach `order_summaries` here
+    // exactly as it does in `a_dependent_transforms_column_cascades_to_paused_when_its_upstream_column_pauses`,
+    // regardless of `order_summaries` still being `Backfilling`.
+    let bad_ids: Vec<i64> = (101..=100 + DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    stage_bad_orders(&mut client, &db.pool, &bad_ids).await;
+
+    assert!(
+        column_status_row(&client, "order_totals", "total")
+            .await
+            .is_some(),
+        "the upstream column must have tripped its own fuse"
+    );
+    let downstream_status = column_status_row(&client, "order_summaries", "grand_total")
+        .await
+        .expect(
+            "the cascade must reach order_summaries even though its definition is still \
+             backfilling",
+        );
+    assert!(
+        !downstream_status.0,
+        "a purely cascaded pause is not order_summaries's own local fuse"
+    );
+
+    let result = quarantine::resume_column(&db.pool, "order_totals", "total").await;
+    assert_eq!(
+        result.expect("resuming the live upstream column must succeed"),
+        vec![("order_totals".to_string(), "total".to_string())],
+        "the cascaded dependent must NOT be resumed alongside it: its definition isn't live yet"
+    );
+
+    assert_eq!(
+        column_status_row(&client, "order_totals", "total").await,
+        None,
+        "the resumed upstream column itself must no longer be paused"
+    );
+    assert!(
+        column_status_row(&client, "order_summaries", "grand_total")
+            .await
+            .is_some(),
+        "the cascaded-onto column must remain paused: its definition still isn't live, so \
+         resume_column must have left it exactly as it was rather than stranding or dropping it"
+    );
+}
