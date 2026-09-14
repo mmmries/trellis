@@ -1061,6 +1061,7 @@ pub async fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Column;
 
     // A nested slice of literals is the most legible way to spell a fixture
     // inline; the complexity lint isn't worth a wrapper type for a test.
@@ -1335,6 +1336,244 @@ mod tests {
                 "{name} must classify as Numeric"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #34: relationship rendering pins.
+    // -----------------------------------------------------------------
+
+    /// A two-table program whose `t1` has a UNIQUE key column `k` and a
+    /// plain FK column `f`, plus one relationship of `cardinality` joining
+    /// `t0` to `t1`. The endpoints mirror `crate::generate`'s own choice:
+    /// to-one joins `t0.f` to `t1.k`, to-many joins `t0.k` to `t1.f`.
+    fn rel_program(cardinality: Cardinality) -> Program {
+        let table = |name: &str| Table {
+            name: name.to_string(),
+            pk_col: "pk".to_string(),
+            columns: vec![
+                Column {
+                    name: "pk".to_string(),
+                    value_type: ValueType::Numeric,
+                },
+                Column {
+                    name: "c1".to_string(),
+                    value_type: ValueType::Numeric,
+                },
+                Column {
+                    name: "k".to_string(),
+                    value_type: ValueType::Text,
+                },
+                Column {
+                    name: "f".to_string(),
+                    value_type: ValueType::Text,
+                },
+            ],
+            unique_cols: vec!["k".to_string()],
+        };
+        let (from_col, to_col) = match cardinality {
+            Cardinality::ToOne => ("f", "k"),
+            Cardinality::ToMany => ("k", "f"),
+        };
+        Program {
+            tables: vec![table("t0"), table("t1")],
+            relationships: vec![Relationship {
+                name: "r0".to_string(),
+                from_table: "t0".to_string(),
+                from_col: from_col.to_string(),
+                to_table: "t1".to_string(),
+                to_col: to_col.to_string(),
+                cardinality,
+            }],
+            defs: Vec::new(),
+            def_install_after_op: Vec::new(),
+            ops: Vec::new(),
+            restart_after_ops: Vec::new(),
+            scale_out_after_ops: Vec::new(),
+        }
+    }
+
+    fn path() -> Expr {
+        Expr::RelationshipPath {
+            rel: "r0".to_string(),
+            column: "c1".to_string(),
+        }
+    }
+
+    /// A bare to-one enrichment renders as a `LEFT JOIN` aliased by the
+    /// *relationship* name, with the source's own columns qualified so they
+    /// can't be ambiguous against the joined table's identically-named ones.
+    /// `LEFT`, not inner, is the load-bearing word: an inner join would drop
+    /// a source row whose FK resolves to nothing, which is precisely the
+    /// ADR-0006 rule this oracle exists to check.
+    #[test]
+    fn render_select_renders_a_to_one_enrichment_as_a_left_join() {
+        let program = rel_program(Cardinality::ToOne);
+        let def = TransformDef {
+            target: "d0".into(),
+            source: "t0".into(),
+            key_space: KeySpace::OneToOne,
+            fields: vec![engine::defs::ast::FieldDef {
+                name: "rel_enrich".into(),
+                expr: path(),
+            }],
+            predicate: Predicate::True,
+        };
+        assert_eq!(
+            render_select(&def, "pk", &RelIndex::new(&program)),
+            "select \"t0\".\"pk\"::text, (\"r0\".\"c1\")::text as \"rel_enrich\" \
+             from \"t0\" left join \"t1\" as \"r0\" on \"r0\".\"k\" = \"t0\".\"f\""
+        );
+    }
+
+    /// A to-many aggregate renders as a correlated subquery — no JOIN at
+    /// all, since the related rows are folded rather than multiplied into
+    /// the result. Postgres's empty-set semantics then give the ADR-0006
+    /// answer for free (`COUNT` → `0`, the rest → `NULL`).
+    #[test]
+    fn render_select_renders_a_to_many_aggregate_as_a_correlated_subquery() {
+        let program = rel_program(Cardinality::ToMany);
+        let def = TransformDef {
+            target: "d0".into(),
+            source: "t0".into(),
+            key_space: KeySpace::OneToOne,
+            fields: vec![engine::defs::ast::FieldDef {
+                name: "rel_agg".into(),
+                expr: Expr::FunctionCall {
+                    name: "SUM".into(),
+                    args: vec![path()],
+                },
+            }],
+            predicate: Predicate::True,
+        };
+        let sql = render_select(&def, "pk", &RelIndex::new(&program));
+        assert_eq!(
+            sql,
+            "select \"t0\".\"pk\"::text, ((select sum(\"r0\".\"c1\") from \"t1\" as \"r0\" \
+             where \"r0\".\"f\" = \"t0\".\"k\"))::text as \"rel_agg\" from \"t0\""
+        );
+        assert!(
+            !sql.contains("join"),
+            "a to-many path folds related rows in a subquery; joining would multiply the \
+             source rows instead: {sql}"
+        );
+    }
+
+    /// A to-one path *aggregated inside a `GROUP BY`* still needs its
+    /// `LEFT JOIN` — cardinality decides whether a join is needed, not
+    /// whether the path happens to sit under an aggregate call. Getting this
+    /// backwards (stopping the join walk at any aggregate, as the to-many
+    /// case requires) would silently render `sum(r0.c1)` against nothing.
+    #[test]
+    fn render_select_joins_a_to_one_path_even_when_it_is_aggregated() {
+        let program = rel_program(Cardinality::ToOne);
+        let def = TransformDef {
+            target: "d0".into(),
+            source: "t0".into(),
+            key_space: KeySpace::Aggregate {
+                group_by: vec!["k".into()],
+            },
+            fields: vec![
+                engine::defs::ast::FieldDef {
+                    name: "k".into(),
+                    expr: Expr::Column("k".into()),
+                },
+                engine::defs::ast::FieldDef {
+                    name: "rel_agg".into(),
+                    expr: Expr::FunctionCall {
+                        name: "SUM".into(),
+                        args: vec![path()],
+                    },
+                },
+            ],
+            predicate: Predicate::True,
+        };
+        assert_eq!(
+            render_select(&def, "pk", &RelIndex::new(&program)),
+            "select (\"t0\".\"k\")::text as \"k\", (sum(\"r0\".\"c1\"))::text as \"rel_agg\" \
+             from \"t0\" left join \"t1\" as \"r0\" on \"r0\".\"k\" = \"t0\".\"f\" \
+             group by \"t0\".\"k\""
+        );
+    }
+
+    /// Design doc §2's "refuse to guess": a bare reference to a to-many path
+    /// is a shape ADR-0006 forbids and the generator never emits, so the
+    /// renderer refuses rather than picking one of the related rows.
+    #[test]
+    #[should_panic(expected = "bare reference to to-many relationship path 'r0.c1'")]
+    fn render_select_refuses_a_bare_to_many_path() {
+        let program = rel_program(Cardinality::ToMany);
+        let def = TransformDef {
+            target: "d0".into(),
+            source: "t0".into(),
+            key_space: KeySpace::OneToOne,
+            fields: vec![engine::defs::ast::FieldDef {
+                name: "rel_enrich".into(),
+                expr: path(),
+            }],
+            predicate: Predicate::True,
+        };
+        let _ = render_select(&def, "pk", &RelIndex::new(&program));
+    }
+
+    /// An undeclared relationship is a generator bug, not something to
+    /// render around: the engine rejects such a definition at validation
+    /// time, so a program containing one could never have installed.
+    #[test]
+    #[should_panic(expected = "relationship \"nope\", which the program does not declare")]
+    fn render_select_refuses_an_undeclared_relationship() {
+        let program = rel_program(Cardinality::ToOne);
+        let def = TransformDef {
+            target: "d0".into(),
+            source: "t0".into(),
+            key_space: KeySpace::OneToOne,
+            fields: vec![engine::defs::ast::FieldDef {
+                name: "rel_enrich".into(),
+                expr: Expr::RelationshipPath {
+                    rel: "nope".into(),
+                    column: "c1".into(),
+                },
+            }],
+            predicate: Predicate::True,
+        };
+        let _ = render_select(&def, "pk", &RelIndex::new(&program));
+    }
+
+    /// A relationship path types as the *to-side* column's type, not
+    /// anything on the definition's own source — which is what selects the
+    /// right per-cell comparison (decimal-by-value vs. byte-exact) for the
+    /// enrichment field.
+    #[test]
+    fn field_value_type_of_a_relationship_path_comes_from_the_to_side_table() {
+        let program = rel_program(Cardinality::ToOne);
+        let rels = RelIndex::new(&program);
+        let source_columns = HashMap::new();
+        assert_eq!(
+            field_value_type(&path(), &source_columns, &rels),
+            ValueType::Numeric
+        );
+        let text_path = Expr::RelationshipPath {
+            rel: "r0".into(),
+            column: "k".into(),
+        };
+        assert_eq!(
+            field_value_type(&text_path, &source_columns, &rels),
+            ValueType::Text
+        );
+    }
+
+    /// `evaluator_checked: false` must read as "never asked", not "agreed":
+    /// an empty `evaluator_vs_sql` means opposite things in the two cases,
+    /// so the report says which one it is.
+    #[test]
+    fn a_report_says_so_when_the_evaluator_leg_did_not_run() {
+        let report = ThreeWayReport {
+            target_vs_sql: Vec::new(),
+            evaluator_vs_sql: Vec::new(),
+            evaluator_checked: false,
+            program: String::new(),
+        };
+        assert!(!report.diverged());
+        assert!(report.to_string().contains("evaluator leg not run"));
     }
 
     /// Improvement-plan task B2: `>` renders like `+` (parenthesized,
