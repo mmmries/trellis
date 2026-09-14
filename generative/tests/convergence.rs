@@ -1069,6 +1069,85 @@ async fn a_to_one_relationship_aggregated_inside_a_group_by_converges_end_to_end
     }
 }
 
+/// **Issue #98 coverage: the aggregate case.** The pinned finding above is a
+/// `OneToOne` enrichment reading a to-one relationship; this is the same
+/// root cause on a `GROUP BY` definition whose aggregated field reads a
+/// to-one relationship path (issue #94's `SUM(post.word_count)` shape,
+/// mirrored here by `a_to_one_relationship_aggregated_inside_a_group_by_converges_end_to_end`'s
+/// `rel_agg = SUM(<rel>.c1)`).
+///
+/// Byte-for-byte that test's two-row-per-group shape, restricted to one
+/// grain group to keep the finding minimal, with `t1` (the to-side)
+/// `TRUNCATE`d instead of left alone. `t0`'s two rows stay in their group
+/// either way (`COUNT(*)` must hold at `2`), but the `SUM` must fall back to
+/// `NULL` once the to-side has no rows left for it to match.
+///
+/// Whether this passes tells us whether the `apply.rs` fix above already
+/// generalizes to the aggregate path: the reverse-recompute it stages is an
+/// ordinary image-less `Recompute` on the from-side (`t0`) row, and
+/// `apply_aggregate::accumulate_changes` already forces *any* image-less
+/// change's group onto the full-recompute path (a `force_full_recompute`
+/// group is re-derived by `apply_forced_groups_bulk`'s `LEFT JOIN`
+/// unconditionally, not only when `accumulate_changes`'s own
+/// `force_every_group` — driven by a non-empty `rel_joins` — set it) — so no
+/// aggregate-specific code needed to change for this to converge.
+#[tokio::test(flavor = "multi_thread")]
+async fn truncating_a_relationship_to_side_table_leaves_a_stale_aggregate_enrichment() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program_multi_with_relationships(
+        &[
+            rel_spec(
+                vec![(Some(1), Some(0)), (Some(2), Some(0))],
+                vec![Some("0".to_string()), Some("0".to_string())],
+                vec![Some("k1".to_string()), Some("k9".to_string())],
+                Vec::new(),
+            ),
+            rel_spec(
+                vec![(Some(10), Some(0))],
+                vec![None],
+                vec![None],
+                vec![Mutate::Truncate],
+            ),
+        ],
+        &[(
+            0,
+            DefShape::Aggregate {
+                functions: vec![AggregateFn::Count],
+            },
+        )],
+        &[None],
+        &[Some(RelFieldSpec {
+            to_table: 1,
+            kind: RelFieldKind::ToOneAggregate(RelAggregateFn::Sum),
+        })],
+    );
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("truncating a relationship's to-side table must clear the aggregate it fed");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+
+    let snapshot = backend.snapshot().await.expect("snapshot after the run");
+    let target = &snapshot[&program.defs[0].target];
+    let row = &target[&group_key(&[Some("0".to_string())])];
+    assert_eq!(
+        row["cnt"],
+        Some("2".to_string()),
+        "both source rows must still count toward COUNT(*) after the truncate: {target:?}"
+    );
+    assert_eq!(
+        row["rel_agg"], None,
+        "the to-side table is empty, so the SUM must fall back to NULL: {target:?}"
+    );
+}
+
 /// **Issue #98 regression pin.** `TRUNCATE` on a table some definition reads
 /// *through a relationship* used to leave that definition's enrichment
 /// permanently stale.
