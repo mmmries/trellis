@@ -83,4 +83,4 @@ pub use seal::{
     seal_phase1, seal_phase2,
 };
 pub use session::{PRODUCER_SINGLETON_LOCK_KEY, ProducerSession};
-pub use state::SegmentState;
+pub use state::{SegmentState, segment_state_counts};

@@ -730,6 +730,17 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
             if !failed {
                 failed = staging::retire_drained_segments(c).await.is_err();
             }
+            if !failed {
+                // ADR-0009 decision 5's staging_segments{state} gauge: cheap
+                // to read here since maintenance_loop already ticks on this
+                // connection regardless, and a failed read just skips a
+                // gauge refresh rather than derailing the tick's other work.
+                if let Ok(counts) = staging::segment_state_counts(c).await {
+                    for (state, count) in counts {
+                        crate::metrics::set_staging_segments(state.as_sql(), count as u64);
+                    }
+                }
+            }
             if !failed && Instant::now() >= next_reconcile {
                 failed = reconcile_source_tables(
                     c,

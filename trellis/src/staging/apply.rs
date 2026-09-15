@@ -1359,6 +1359,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         });
                 }
             }
+            // A TRUNCATE is a genuine applied change to every direct
+            // downstream target, same as a row-driven change — recorded
+            // once per def per truncated source, mirroring the row-driven
+            // by_source loop above (issue #51/ADR-0009 decision 5).
+            record_transform_apply_metrics(&def.def.target, change.src_changed);
         }
 
         // Issue #98: a TRUNCATE clears definitions reading this table
