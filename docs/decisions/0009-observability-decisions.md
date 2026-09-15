@@ -119,21 +119,35 @@ existing `transform_definitions.status` column — the `TransformStatus` enum
 This was an open question in `docs/observability.md`'s "Where transform
 status is stored and read" bullet: whether the lifecycle status should live
 alongside [ADR-0003](0003-quarantine-storage-and-api.md)'s quarantine model
-or in its own row. It's already the same field: ADR-0003's whole-transform
-fuse tier already writes `Quarantined` into this column today, so quarantine
-and the backfill lifecycle are two arcs of one state machine sharing one
-field, exactly as `docs/observability.md`'s "Transform status lifecycle"
-diagram already depicts. ADR-0003's *column*-level quarantine tier
+or in its own row. It's already the same field: `Quarantined` is a value the
+`TransformStatus` enum reserves for ADR-0003's whole-transform fuse tier, so
+quarantine and the backfill lifecycle are designed as two arcs of one state
+machine sharing one field, exactly as `docs/observability.md`'s "Transform
+status lifecycle" diagram depicts. ADR-0003's *column*-level quarantine tier
 (`column_status`/`column_failures`) is intentionally a separate, finer-grained
 mechanism that does not touch this field — a `live` transform can carry
 individually paused columns without its overall `status` moving, so there is
 no conflict between the two tiers sharing this column's semantics.
 
-`WaitingToBackfill` and `Backfilling` exist in the enum today but no writer
-sets them yet. Issue #55 wires the actual transitions: the `xmin`-fence wait
-(`trellis/src/intake/publication.rs`, `Snapshot::settled_since`) and
-backfill-enumeration path both become transitions on this same field, rather
-than introducing a parallel status source.
+**Correction (issue #55 review):** at the time of this decision, no code
+path actually *wrote* `Quarantined` to this field — only the per-key
+(`poison`) and per-column (`column_status`) tiers had real writers; a
+whole-transform fuse-trip condition was designed for but never implemented.
+Issue #55 wired the `waiting_to_backfill`/`backfilling`/`live` transitions
+(the `xmin`-fence wait, `trellis/src/intake/publication.rs`'s
+`Snapshot::settled_since`, and both backfill-enumeration paths) plus a
+`quarantined → waiting_to_backfill` resume function
+(`staging::quarantine::resume_transform`), but a whole-transform trip
+condition is still unwritten — tracked as a follow-up (see epic #49).
+`resume_transform` is correct but currently unreachable in production until
+that trip condition exists.
+
+`WaitingToBackfill` and `Backfilling` exist in the enum today but, before
+issue #55, no writer set them. Issue #55 wires the actual transitions: the
+`xmin`-fence wait (`trellis/src/intake/publication.rs`,
+`Snapshot::settled_since`) and backfill-enumeration path both become
+transitions on this same field, rather than introducing a parallel status
+source.
 
 ### 5. Staging-ring metrics: drop the per-transform depth gauge, add a cheap segment-state gauge
 
