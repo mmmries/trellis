@@ -66,6 +66,15 @@ const TRANSFORM_LATENCY_METRIC: &str = "trellis_transform_latency_seconds";
 /// recorded at the same call site as the latency observation.
 const CHANGES_APPLIED_METRIC: &str = "trellis_changes_applied_total";
 
+/// End-to-end latency: time from the *source* commit to the *terminal*
+/// transform's apply (`docs/observability.md`'s "What 'latency' means",
+/// ADR-0009 decision 2). Labeled `transform` — same convention as
+/// [`TRANSFORM_LATENCY_METRIC`] — but only ever recorded for a transform
+/// whose target has no downstream reader of its own (a DAG sink), never for
+/// an intermediate hop: keyed by terminal transform only, summed across
+/// every source feeding it, not by source->sink pair (issue #52).
+const END_TO_END_LATENCY_METRIC: &str = "trellis_end_to_end_latency_seconds";
+
 /// ADR-0009 decision 5's cheap, system-level gauge: a count of `segments`
 /// rows by [`crate::staging::SegmentState`], labeled `state`.
 const STAGING_SEGMENTS_METRIC: &str = "trellis_staging_segments";
@@ -106,6 +115,23 @@ pub fn ensure_installed() {
 pub fn record_transform_latency(transform: &str, latency: Duration) {
     ensure_installed();
     metrics::histogram!(TRANSFORM_LATENCY_METRIC, "transform" => transform.to_string())
+        .record(latency.as_secs_f64());
+}
+
+/// Records one observation of [`END_TO_END_LATENCY_METRIC`] for `transform`
+/// — issue #52. Called from [`crate::staging::apply::compute`] once per
+/// applied change whose *consuming* transform is terminal (no downstream
+/// reader — see [`crate::defs::catalog::transforms_for_source`]) and that
+/// carries an origin timestamp, mirroring
+/// [`record_transform_latency`]'s `src_changed` gate exactly: the value
+/// observed is the same `now - src_changed` duration, just gated to
+/// terminal transforms and recorded under a different metric name. Reuses
+/// [`LATENCY_BUCKETS`], the same global bucket set every histogram in this
+/// module shares (ADR-0009 decision 6) — no separate boundary set for this
+/// metric.
+pub fn record_end_to_end_latency(transform: &str, latency: Duration) {
+    ensure_installed();
+    metrics::histogram!(END_TO_END_LATENCY_METRIC, "transform" => transform.to_string())
         .record(latency.as_secs_f64());
 }
 
@@ -159,6 +185,30 @@ mod tests {
         assert!(
             rendered.contains("metrics_facade_test_target"),
             "rendered output missing the transform label: {rendered}"
+        );
+    }
+
+    #[test]
+    fn end_to_end_latency_is_recorded_and_renders_with_the_shared_bucket_set() {
+        record_end_to_end_latency("metrics_facade_test_terminal", Duration::from_millis(250));
+
+        let rendered = render_for_test();
+        assert!(
+            rendered.contains("trellis_end_to_end_latency_seconds"),
+            "rendered output missing the end-to-end latency histogram: {rendered}"
+        );
+        assert!(
+            rendered.contains("metrics_facade_test_terminal"),
+            "rendered output missing the transform label: {rendered}"
+        );
+        // ADR-0009 decision 6: this histogram reuses LATENCY_BUCKETS, the
+        // same global default the per-transform histogram uses — spot-check
+        // one boundary shared by both rather than asserting the whole set,
+        // since `render_for_test` renders every histogram's buckets
+        // interleaved.
+        assert!(
+            rendered.contains("le=\"0.25\""),
+            "rendered output missing a LATENCY_BUCKETS boundary: {rendered}"
         );
     }
 
