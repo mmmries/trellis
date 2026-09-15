@@ -633,6 +633,32 @@ impl Intake {
     /// and lets `pgwire_replication` report it as flushed on its next
     /// Standby Status Update. Confirms `end_lsn` (the position *after* the
     /// commit record), not `commit_lsn`, per the design doc.
+    ///
+    /// Issue #56: this is the root of the propagation span tree ADR-0009
+    /// decision 3 calls for — the source-commit span every downstream hop
+    /// (`staging::apply::compute`'s per-source evaluation,
+    /// `staging::apply::apply_target`'s per-transform apply) traces back to
+    /// in spirit, even though the two signals aren't wired together as
+    /// parent/child spans: a source commit and the batch(es) it eventually
+    /// lands in are separated by staging/fold/claim, crossing worker and
+    /// even process boundaries, so there is no single in-process span this
+    /// span could parent. `commit_time_micros` — this span's whole reason
+    /// for existing — is the exact same origin timestamp
+    /// `StagedChange::Cdc::src_changed`/`StagedChange::Truncate::src_changed`
+    /// carry forward for #51/#52's `SystemTime`-based latency histograms
+    /// (see [`stamp_commit_metadata`]); this span models the same journey
+    /// as a `tracing` span rather than *computing* those histograms from it
+    /// (see this module's own doc comment's "Still deferred" list — #51/#52
+    /// predate `tracing` existing in this crate at all).
+    #[tracing::instrument(
+        name = "intake.commit_transaction",
+        skip(self, end_lsn),
+        fields(
+            slot = %self.slot,
+            end_lsn = end_lsn.as_u64(),
+            changes = tracing::field::Empty,
+        )
+    )]
     async fn commit_transaction(
         &mut self,
         end_lsn: pgwire_replication::Lsn,
@@ -644,6 +670,8 @@ impl Intake {
             &mut self.buffer,
             spill::TxnBuffer::new(self.spill_threshold, self.hard_cap),
         );
+        let change_count = buffer.len();
+        tracing::Span::current().record("changes", change_count);
         let lsn = PgLsn::from(end_lsn.as_u64());
         let changed_at = pg_commit_time_to_system_time(commit_time_micros);
 
@@ -661,9 +689,16 @@ impl Intake {
                 // connection resumes at the old position and the server
                 // replays.
                 let _ = txn.rollback().await;
+                tracing::error!(
+                    slot = %self.slot,
+                    changes = change_count,
+                    error = %err,
+                    "failed to stage a committed transaction"
+                );
                 return Err(err);
             }
         }
+        tracing::debug!(changes = change_count, "staged a committed transaction");
 
         // The acknowledgment: strictly after the commit returned, never
         // inside it.

@@ -1075,6 +1075,26 @@ pub struct ApplyPlan {
 /// Reloads the catalog fresh on every call, including retries: this is
 /// what makes [`drain_once`]'s retry-on-fence-miss loop "reload, recompute"
 /// rather than needing any separate invalidation path.
+///
+/// Issue #56/ADR-0009 decision 3: this span is the "hop" half of the
+/// source-commit → hop → hop → apply tree — one span per compute pass over
+/// a folded batch, with a per-source-table [`tracing::debug!`] event inside
+/// the loop below (not a nested span: the loop body's accumulators
+/// (`targets`, `versions`, `end_to_end_origins`, ...) are threaded through
+/// by mutable reference across many `.await` points, and a held span guard
+/// across those would make this function's future non-`Send` for no benefit
+/// — an event carries the same `src_table`/`changes` information without
+/// that cost). [`apply_target`] (Phase 3) is this tree's next, more
+/// fine-grained span, one per consuming transform.
+#[tracing::instrument(
+    name = "staging.compute",
+    skip(pool, folded),
+    fields(
+        folded = folded.len(),
+        poisoned = tracing::field::Empty,
+        sources = tracing::field::Empty,
+    )
+)]
 pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, ApplyError> {
     // Issue #16: exclude already-poisoned keys before anything else touches
     // them — the fold excludes a poisoned key globally, not just from this
@@ -1087,6 +1107,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         .map(|c| (c.src_table.as_str(), c.key.as_str()))
         .collect();
     let poisoned = quarantine::poisoned_keys_among(pool, &candidates).await?;
+    tracing::Span::current().record("poisoned", poisoned.len());
 
     let mut by_source: HashMap<&str, Vec<&FoldedChange>> = HashMap::new();
     // Truncate sentinels (issue #60) never enter the keyed by-source
@@ -1111,6 +1132,13 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             .or_default()
             .push(change);
     }
+    if !poisoned_park.is_empty() {
+        tracing::warn!(
+            excluded = poisoned_park.len(),
+            "batch excludes already-poisoned keys, parking this batch's own contribution"
+        );
+    }
+    tracing::Span::current().record("sources", by_source.len());
 
     let mut versions: HashMap<String, Option<i64>> = HashMap::new();
     let mut targets: HashMap<String, TargetPlan> = HashMap::new();
@@ -1139,6 +1167,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         HashMap::new();
 
     for (source_key, changes) in by_source {
+        tracing::debug!(
+            src_table = %source_key,
+            changes = changes.len(),
+            "evaluating a source table's folded changes"
+        );
         let version = catalog::source_table_version(pool, source_key).await?;
         versions.insert(source_key.to_string(), version);
 
@@ -1850,6 +1883,28 @@ type ChangedKey = (String, i32, Option<std::time::SystemTime>);
 /// pre-lock exists to close: two transactions racing on overlapping keys
 /// still each take every lock, in the same ascending order, before either
 /// writes anything.
+///
+/// Issue #56/ADR-0009 decision 3: the finest-grained span in the
+/// propagation tree — one per consuming transform per batch, downstream of
+/// fold (`docs/observability.md`'s "Logs and traces" section), the exact
+/// same grouping #51's `record_transform_apply_metrics` observes its
+/// per-transform latency histogram from. `transform` (this target's own
+/// name — this crate's one "transform name," per
+/// `ApplyError::ColumnNotPaused`/`DefinitionNotLive`'s own `transform`
+/// fields) matches the metrics facade's `transform` label exactly, so a
+/// trace and a Prometheus series for the same transform are easy to
+/// cross-reference by eye.
+#[tracing::instrument(
+    name = "staging.apply_target",
+    skip(txn, plan),
+    fields(
+        transform = %target,
+        proposed_writes = plan.writes.len(),
+        proposed_deletes = plan.deletes.len(),
+        written = tracing::field::Empty,
+        deleted = tracing::field::Empty,
+    )
+)]
 async fn apply_target(
     txn: &Transaction<'_>,
     plan: &TargetPlan,
@@ -2006,6 +2061,9 @@ async fn apply_target(
         deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
     }
 
+    let span = tracing::Span::current();
+    span.record("written", written.len());
+    span.record("deleted", deleted.len());
     Ok((written, deleted))
 }
 
@@ -2092,6 +2150,23 @@ pub async fn apply_and_mark_drained(
 /// see [`drain_many`]'s `owned` filtering), and, since [`ApplyPlan::versions`]
 /// etc. are shared across all of them, must never mix a truncate-bearing
 /// segment with any other (see [`next_claimable_segments`]'s barrier).
+///
+/// Issue #56/ADR-0009 decision 3: the batch-level span in the propagation
+/// tree's apply phase — parent of every [`apply_target`]/
+/// [`apply_aggregate::apply_aggregate_target`] span this call makes (one per
+/// consuming transform), since each of those runs inside this async fn's own
+/// `#[tracing::instrument]`-created span.
+#[tracing::instrument(
+    name = "staging.apply_and_mark_drained",
+    skip(txn, plan, wake_channel),
+    fields(
+        segments = seg_seqs.len(),
+        targets = plan.targets.len(),
+        aggregate_targets = plan.aggregate_targets.len(),
+        keys_written = tracing::field::Empty,
+        keys_deleted = tracing::field::Empty,
+    )
+)]
 pub async fn apply_and_mark_drained_many(
     txn: &Transaction<'_>,
     seg_seqs: &[i64],
@@ -2117,6 +2192,10 @@ pub async fn apply_and_mark_drained_many(
             .await?;
         let current: Option<i64> = row.map(|r| r.get(0));
         if current != *loaded_version {
+            tracing::debug!(
+                src_table = %source_key,
+                "version fence miss: source table's definitions changed mid-drain"
+            );
             return Err(ApplyError::VersionFenceMiss {
                 src_table: source_key.clone(),
             });
@@ -2315,12 +2394,23 @@ pub async fn apply_and_mark_drained_many(
     if !hop_bound_tables.is_empty() {
         hop_bound_tables.sort();
         hop_bound_tables.dedup();
+        tracing::error!(
+            hop_gen = worst_hop_gen,
+            tables = ?hop_bound_tables,
+            "downstream propagation exceeded the hop bound; a wave may have run away"
+        );
         return Err(ApplyError::HopBoundExceeded {
             hop_gen: worst_hop_gen,
             tables: hop_bound_tables,
         });
     }
 
+    if !recompute_changes.is_empty() {
+        tracing::debug!(
+            count = recompute_changes.len(),
+            "staged downstream recomputes from this batch's physically-changed keys"
+        );
+    }
     append::append(txn, &recompute_changes).await?;
 
     // 4b. Issue #16: a clean drain clears the death counters for every key
@@ -2353,6 +2443,12 @@ pub async fn apply_and_mark_drained_many(
             .collect();
 
         if claimed_buckets.is_empty() {
+            tracing::warn!(
+                seg_seq,
+                claimed_by = %claimed_by,
+                "claim was gone by completion time; nothing applied twice, but its buckets \
+                 must be reclaimed by whoever holds them now"
+            );
             return Err(ApplyError::ClaimLost);
         }
 
@@ -2384,6 +2480,9 @@ pub async fn apply_and_mark_drained_many(
     txn.execute("select pg_notify($1, '')", &[&wake_channel])
         .await?;
 
+    let span = tracing::Span::current();
+    span.record("keys_written", keys_written);
+    span.record("keys_deleted", keys_deleted);
     Ok(ManyApplyOutcome {
         keys_written,
         keys_deleted,
@@ -2436,6 +2535,19 @@ const MAX_APPLY_ATTEMPTS: u32 = 5;
 /// — the buckets were all already claimed by someone else — without
 /// folding or computing anything. Otherwise returns the winning attempt's
 /// [`ApplyOutcome`].
+///
+/// Issue #56/ADR-0009 decision 3: the outermost span in the propagation
+/// tree's apply phase — parent, across however many retries this call
+/// takes, of every [`compute`]/[`apply_and_mark_drained`] span (and, through
+/// those, every per-transform [`apply_target`] span) a winning attempt
+/// makes. `attempt` is recorded once per loop iteration, so its final
+/// exported value is however many attempts this call actually took, not
+/// just the first.
+#[tracing::instrument(
+    name = "staging.drain_once",
+    skip(pool, wake_channel),
+    fields(claimed_by = %claimed_by, attempt = tracing::field::Empty)
+)]
 pub async fn drain_once(
     pool: &Pool,
     seg_seq: i64,
@@ -2461,6 +2573,7 @@ pub async fn drain_once(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
+        tracing::Span::current().record("attempt", attempt);
         let plan = match compute(pool, &folded).await {
             Ok(plan) => plan,
             Err(ApplyError::SourceTableDropped { source_table }) => {
@@ -2471,6 +2584,12 @@ pub async fn drain_once(
                 // with it excluded. Not counted against
                 // `MAX_APPLY_ATTEMPTS` — this corrects `folded` itself
                 // rather than retrying the same input.
+                tracing::warn!(
+                    seg_seq,
+                    source_table = %source_table,
+                    "source table no longer exists; purging its staged rows and retrying \
+                     without it"
+                );
                 quarantine::purge_dropped_table(pool, &source_table).await?;
                 folded.retain(|c| c.src_table != source_table);
                 attempt -= 1;
@@ -2568,6 +2687,19 @@ pub const MAX_COALESCE_SEGMENTS: usize = 32;
 /// claimed at least one bucket from — never a segment it claimed nothing
 /// on, which [`apply_and_mark_drained_many`]'s completion step would
 /// otherwise misreport as [`ApplyError::ClaimLost`].
+///
+/// Issue #56/ADR-0009 decision 3: [`drain_once`]'s doc comment describes the
+/// span this creates — same role, just parenting a coalesced batch's spans
+/// instead of a single segment's.
+#[tracing::instrument(
+    name = "staging.drain_many",
+    skip(pool, wake_channel),
+    fields(
+        claimed_by = %claimed_by,
+        segments = seg_seqs.len(),
+        attempt = tracing::field::Empty,
+    )
+)]
 pub async fn drain_many(
     pool: &Pool,
     seg_seqs: &[i64],
@@ -2615,9 +2747,15 @@ pub async fn drain_many(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
+        tracing::Span::current().record("attempt", attempt);
         let plan = match compute(pool, &folded).await {
             Ok(plan) => plan,
             Err(ApplyError::SourceTableDropped { source_table }) => {
+                tracing::warn!(
+                    source_table = %source_table,
+                    "source table no longer exists; purging its staged rows and retrying \
+                     without it"
+                );
                 quarantine::purge_dropped_table(pool, &source_table).await?;
                 folded.retain(|c| c.src_table != source_table);
                 attempt -= 1;
@@ -2702,8 +2840,15 @@ async fn classify_and_retry(
         // machine, reused as-is.
         quarantine::FailureClass::VersionFenceMiss => {
             if attempt >= MAX_APPLY_ATTEMPTS {
+                tracing::warn!(
+                    seg_seq,
+                    attempt,
+                    error = %err,
+                    "version fence miss retries exhausted; surfacing the failure"
+                );
                 return Err(err);
             }
+            tracing::debug!(seg_seq, attempt, error = %err, "version fence miss; retrying");
             let delay = backoff.next_delay();
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
@@ -2716,13 +2861,25 @@ async fn classify_and_retry(
         // consecutive fence misses specifically (doc 06).
         quarantine::FailureClass::Transient => {
             if attempt >= MAX_APPLY_ATTEMPTS {
+                tracing::warn!(
+                    seg_seq,
+                    attempt,
+                    error = %err,
+                    "transient failure retries exhausted; surfacing the failure"
+                );
                 return Err(err);
             }
+            tracing::debug!(seg_seq, attempt, error = %err, "transient apply failure; retrying");
             Ok(None)
         }
         // Halting schema diagnosis: never quarantine, propagate loudly
         // after recording the stop metric.
         quarantine::FailureClass::Halting => {
+            tracing::error!(
+                seg_seq,
+                error = %err,
+                "halting failure classification; never quarantined, propagating loudly"
+            );
             quarantine::record_halting_stop(pool, &err.to_string()).await?;
             Err(err)
         }
@@ -2732,6 +2889,12 @@ async fn classify_and_retry(
         // the error is surfaced, not blamed.
         quarantine::FailureClass::Isolate => {
             if attempt >= MAX_APPLY_ATTEMPTS {
+                tracing::warn!(
+                    seg_seq,
+                    attempt,
+                    error = %err,
+                    "isolate-eligible failure retries exhausted; surfacing the failure"
+                );
                 return Err(err);
             }
             match quarantine::isolate_and_evict(
@@ -2744,8 +2907,22 @@ async fn classify_and_retry(
             )
             .await?
             {
-                Some(retry_folded) => Ok(Some(retry_folded)),
-                None => Err(err),
+                Some(retry_folded) => {
+                    tracing::warn!(
+                        seg_seq,
+                        remaining = retry_folded.len(),
+                        "isolated and evicted at least one poisoned key; retrying without it"
+                    );
+                    Ok(Some(retry_folded))
+                }
+                None => {
+                    tracing::debug!(
+                        seg_seq,
+                        error = %err,
+                        "isolation reproduced nothing; surfacing the original failure"
+                    );
+                    Err(err)
+                }
             }
         }
     }

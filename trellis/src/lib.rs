@@ -33,6 +33,15 @@
 //!   exposition (issue #53, [`app::Trellis::metrics`]) — see
 //!   `docs/observability.md` and
 //!   `docs/decisions/0009-observability-decisions.md`.
+//! - Logs/traces (issue #56, epic #49) flow through the plain `tracing`
+//!   facade — spans modeling the propagation path (source commit → hop →
+//!   hop → apply, ADR-0009 decision 3) and events at operationally
+//!   meaningful points, in [`intake`] and [`staging`] directly, not a
+//!   separate module of their own. [`otel`] (behind the optional `otlp`
+//!   Cargo feature, off by default) is the OTLP export layer an embedder can
+//!   add to their own subscriber; with the feature off, or with no
+//!   subscriber installed at all, spans/events cost only `tracing`'s own
+//!   near-zero no-subscriber overhead.
 //!
 //! **Current subset**: 1-1 scalar transforms only end to end (issue #11's
 //! 1-1 slice). Aggregate/invertible-delta maintenance is not yet wired up —
@@ -59,6 +68,8 @@ pub mod intake;
 pub mod metrics;
 pub mod migrate;
 pub mod numeric;
+#[cfg(feature = "otlp")]
+pub mod otel;
 pub mod pool;
 pub mod rollup;
 pub mod staging;

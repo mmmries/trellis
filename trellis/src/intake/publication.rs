@@ -624,20 +624,37 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// definition's own catch-up marker, or a concurrently-running
 /// `backfill_chunks` build), since those were never `waiting_to_backfill` in
 /// the first place.
+#[tracing::instrument(
+    name = "intake.run_pending_backfills",
+    skip(client, wake_channel),
+    fields(pending = tracing::field::Empty, settled = tracing::field::Empty)
+)]
 pub async fn run_pending_backfills(
     client: &mut tokio_postgres::Client,
     wake_channel: &str,
 ) -> Result<(), IntakeError> {
     let pending = fetch_pending_backfills(client).await?;
+    tracing::Span::current().record("pending", pending.len());
     if pending.is_empty() {
         return Ok(());
     }
     let now = current_snapshot(client).await?;
 
+    let mut settled = 0usize;
     for marker in pending {
         if !now.settled_since(&marker.fence) {
+            // Issue #56/`docs/observability.md`'s "Backfill status and the
+            // `xmin` caveat": deliberately *not* a warning — sitting here is
+            // safe, not a fault, per that section's explicit "we do not
+            // emit a stall metric, a periodic warning log" decision. `debug`
+            // only, for someone tracing this loop's own behavior.
+            tracing::debug!(
+                table = %marker.table,
+                "backfill marker not yet settled; still waiting on the xmin fence"
+            );
             continue;
         }
+        settled += 1;
         let advancing = advance_deferred_definitions(
             client,
             &marker.table,
@@ -666,6 +683,7 @@ pub async fn run_pending_backfills(
 
         mark_definitions_live(client, &advancing).await?;
     }
+    tracing::Span::current().record("settled", settled);
     Ok(())
 }
 
@@ -698,7 +716,24 @@ async fn advance_deferred_definitions(
             &[&to.as_str(), &bare_table, &from.as_str()],
         )
         .await?;
-    Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    let ids: Vec<i64> = rows.into_iter().map(|r| r.get(0)).collect();
+    if !ids.is_empty() {
+        // Issue #56: a backfill status transition (#55's lifecycle,
+        // `docs/observability.md`'s "Transform status lifecycle" diagram) —
+        // operationally meaningful, since a transform sitting in
+        // `waiting_to_backfill` can mean either "about to advance" or "the
+        // xmin fence is pinned by an unrelated long-running transaction
+        // cluster-wide" (see that diagram's caveat), and this event is the
+        // moment that ambiguity resolves.
+        tracing::info!(
+            table = %bare_table,
+            ids = ?ids,
+            from = %from.as_str(),
+            to = %to.as_str(),
+            "transform status transition"
+        );
+    }
+    Ok(ids)
 }
 
 /// Flips exactly `ids` to [`TransformStatus::Live`] (issue #55) — the second
@@ -719,6 +754,11 @@ async fn mark_definitions_live(
             &[&TransformStatus::Live.as_str(), &ids],
         )
         .await?;
+    tracing::info!(
+        ids = ?ids,
+        to = %TransformStatus::Live.as_str(),
+        "transform status transition: backfill enumeration committed"
+    );
     Ok(())
 }
 

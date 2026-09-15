@@ -98,6 +98,19 @@ impl TxnBuffer {
         Ok(())
     }
 
+    /// This transaction's total buffered change count so far (head plus
+    /// whatever has already spilled) — issue #56's `intake.commit_transaction`
+    /// span reads this once, before [`Self::stage_and_advance`] consumes
+    /// `self`, to record how large a commit's `changes` field was.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Clippy's `len_without_is_empty` companion — not otherwise used today.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     /// Discards everything buffered — a fresh transaction (`Begin`) starts
     /// from empty, and dropping any spill file unlinks it.
     pub fn clear(&mut self) {
