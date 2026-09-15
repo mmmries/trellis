@@ -9,11 +9,18 @@
 //! site.
 //!
 //! **What this module does not do** (see the ADR): persist rollups to
-//! Postgres (issue #54). It builds and populates the in-process registry,
-//! and — issue #53 — exposes it for Prometheus text-format reading via
-//! [`Metrics::render_prometheus`], obtained through [`crate::app::Trellis::metrics`]
-//! (or [`crate::blocking::BlockingTrellis::metrics`]), matching
-//! `docs/observability.md`'s `trellis.metrics().render_prometheus()` sketch.
+//! Postgres — that's `crate::rollup` (issue #54), which reads this module's
+//! [`snapshot`] but owns the write/prune SQL itself, keeping this module a
+//! pure registry facade with no Postgres dependency of its own. This module
+//! builds and populates the in-process registry, and exposes it two ways:
+//! issue #53's [`Metrics::render_prometheus`] (Prometheus text exposition,
+//! obtained through [`crate::app::Trellis::metrics`] or
+//! [`crate::blocking::BlockingTrellis::metrics`], matching
+//! `docs/observability.md`'s `trellis.metrics().render_prometheus()` sketch),
+//! and issue #54's [`snapshot`] (structured rows, for
+//! `crate::rollup`'s periodic Postgres write — see that function's doc
+//! comment for why it's built by parsing [`PrometheusHandle::render`]'s text
+//! output rather than a lower-level structured API).
 //!
 //! ## Recorder installation
 //!
@@ -34,6 +41,7 @@
 //! process installs a recorder yet. A real multi-installer story is out of
 //! scope for this issue.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -230,12 +238,352 @@ impl Metrics {
     pub fn render_prometheus(&self) -> String {
         handle().render()
     }
+
+    /// A structured snapshot of the registry's current contents — issue
+    /// #54's read path for `crate::rollup`'s periodic Postgres write. See
+    /// the free function [`snapshot`] for why this parses
+    /// [`Self::render_prometheus`]'s text output rather than reading some
+    /// lower-level structured API.
+    pub fn snapshot(&self) -> Vec<MetricSample> {
+        snapshot()
+    }
 }
 
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------
+// Structured snapshot (issue #54): read path for `crate::rollup`
+// ---------------------------------------------------------------------
+
+/// A metric's shape, mirroring the three kinds `metrics`/
+/// `metrics-exporter-prometheus` themselves record (ADR-0009 decision 1),
+/// and the same three strings `V22__metric_rollup.sql`'s `metric_kind`
+/// check constraint accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricKind {
+    Counter,
+    Gauge,
+    Histogram,
+}
+
+impl MetricKind {
+    /// The lowercase text this kind persists as — the same string
+    /// Prometheus's own `# TYPE` line already carries (parsed back out of
+    /// exactly that line by [`snapshot`]), and what
+    /// `V22__metric_rollup.sql`'s `metric_kind` column stores.
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            MetricKind::Counter => "counter",
+            MetricKind::Gauge => "gauge",
+            MetricKind::Histogram => "histogram",
+        }
+    }
+}
+
+/// One metric series' current reading, as read back out of the registry by
+/// [`snapshot`] — one entry per distinct `(name, labels)` pair the registry
+/// currently holds. `crate::rollup::write_snapshot` turns each of these
+/// into one `metric_rollup` row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricSample {
+    /// The metric's name, e.g. `trellis_transform_latency_seconds` — for a
+    /// [`MetricKind::Histogram`] sample, the *base* name (never carrying a
+    /// `_bucket`/`_sum`/`_count` suffix; those three lines are folded back
+    /// into `buckets`/`sum`/`count` below rather than kept as separate
+    /// samples).
+    pub name: String,
+    pub kind: MetricKind,
+    /// This series' label set as `(key, value)` pairs, sorted by key for
+    /// deterministic output independent of
+    /// `metrics-exporter-prometheus`'s own internal iteration order —
+    /// `crate::rollup::write_snapshot` JSON-encodes them in this same
+    /// order.
+    pub labels: Vec<(String, String)>,
+    /// Set for [`MetricKind::Counter`]/[`MetricKind::Gauge`] samples
+    /// (a counter's cumulative total, a gauge's instantaneous reading);
+    /// `None` for [`MetricKind::Histogram`] (see `buckets`/`sum`/`count`
+    /// below instead).
+    pub value: Option<f64>,
+    /// Set for [`MetricKind::Histogram`] samples only: `(le, cumulative_count)`
+    /// pairs in ascending `le` order, excluding the implicit `+Inf` bucket
+    /// every Prometheus histogram carries (`count` below already *is* that
+    /// `+Inf` cumulative count — see `V22__metric_rollup.sql`'s column doc
+    /// comment for why storing it twice would be redundant). Empty for
+    /// `Counter`/`Gauge`.
+    pub buckets: Vec<(f64, u64)>,
+    /// Set for [`MetricKind::Histogram`] samples only.
+    pub sum: Option<f64>,
+    /// Set for [`MetricKind::Histogram`] samples only.
+    pub count: Option<u64>,
+}
+
+/// A structured snapshot of the registry's current contents — issue #54's
+/// read path for `crate::rollup`'s periodic Postgres write.
+///
+/// **Why this parses rendered text rather than reading a structured API.**
+/// [`PrometheusHandle`] (the handle `metrics-exporter-prometheus` hands back
+/// for the recorder installed as this process's global recorder — see the
+/// module doc comment's "Recorder installation" section) exposes exactly
+/// four public methods: `render`/`render_to_write` (Prometheus text) and
+/// `render_protobuf`/`render_protobuf_to_write` (Prometheus protobuf, gated
+/// behind the exporter's `protobuf` Cargo feature, off by default and not
+/// enabled in this crate's `Cargo.toml`). There is no third, lower-level
+/// "hand back the raw counters/gauges/histograms as Rust values" method —
+/// every render path only ever produces an already-*encoded* exposition
+/// payload; the structured registry/distribution types the encoder reads
+/// from internally (`metrics_util::registry::Registry`,
+/// `metrics_exporter_prometheus`'s own private `Distribution` type) are not
+/// part of the handle's public surface.
+///
+/// Two ways to get structured data back out, then, weighed against each
+/// other:
+///
+/// 1. **Enable the `protobuf` feature and decode `render_protobuf()`.**
+///    Genuinely structured — it decodes into `MetricFamily` protobuf
+///    messages with real bucket/counter/gauge fields, no text parsing
+///    needed. Rejected here because the feature pulls in
+///    `prost`/`prost-types`/`prost-build` — a build-time `.proto`
+///    compilation step — for what this crate has otherwise kept a
+///    dependency-light, no-build-script pair of crates (ADR-0009 decision 1
+///    is explicit about that minimalism: "neither adds an HTTP server to
+///    the core `trellis` crate", the same spirit that keeps the exporter's
+///    own Hyper-listener feature off). That's a heavier cost than one read
+///    path justifies, especially since this crate only ever emits four
+///    known, simple metric shapes.
+/// 2. **Parse `render()`'s text output (chosen here).** `render()`'s output
+///    is already fully specified, stable text (the Prometheus [exposition
+///    format](https://github.com/prometheus/docs/blob/main/content/docs/instrumenting/exposition_formats.md#text-format-details))
+///    generated deterministically, by this same dependency, from the exact
+///    same underlying registry `render_protobuf` would read — and the only
+///    shapes this crate's four recording functions
+///    ([`record_transform_latency`], [`record_end_to_end_latency`],
+///    [`increment_changes_applied`], [`set_staging_segments`]) ever produce
+///    are a small, fixed grammar (`# TYPE`/`# HELP` comments, a counter/
+///    gauge sample line, a histogram's `_bucket`/`_sum`/`_count` sample
+///    lines), not the general Prometheus text format's full generality. No
+///    new dependency, no build step, and it reuses the exact rendering
+///    [`Metrics::render_prometheus`] already calls — one encode path serves
+///    both readers, matching ADR-0009 decision 1's rationale for choosing
+///    the `metrics` facade in the first place ("both `render_prometheus()`
+///    and the rollup job can consume the registry through
+///    `metrics`/`metrics-exporter-prometheus`'s own inspection surface,
+///    rather than the rollup job reaching into [a lower-level crate's] own
+///    concrete... types directly").
+///
+/// Because of (2), this is **not** a general Prometheus text parser — it
+/// doesn't handle quantile summaries, native histograms, or every corner of
+/// the exposition format's grammar, only the shapes this module's own
+/// recording functions ever emit.
+pub fn snapshot() -> Vec<MetricSample> {
+    parse_prometheus_text(&Metrics::new().render_prometheus())
+}
+
+/// Accumulates one histogram series' `_bucket`/`_sum`/`_count` lines
+/// (encountered in whatever order [`parse_prometheus_text`] walks the
+/// rendered text) before it's turned into one [`MetricSample`].
+#[derive(Default)]
+struct HistogramAccum {
+    buckets: Vec<(f64, u64)>,
+    sum: Option<f64>,
+    count: Option<u64>,
+}
+
+/// The actual text -> [`MetricSample`] parser behind [`snapshot`]. Kept as
+/// a free function taking the text directly (rather than a method that
+/// re-renders internally) so unit tests can feed it fixed text without
+/// depending on this process's shared global registry.
+fn parse_prometheus_text(text: &str) -> Vec<MetricSample> {
+    // Pass 1: every `# TYPE <name> <kind>` line, keyed by the *base* metric
+    // name exactly as Prometheus's own `# TYPE` comment names it (for a
+    // histogram, that's the name *without* a `_bucket`/`_sum`/`_count`
+    // suffix — those suffixes only ever show up on the sample lines below).
+    let mut kinds: HashMap<&str, MetricKind> = HashMap::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("# TYPE ") else {
+            continue;
+        };
+        let Some((name, kind_str)) = rest.rsplit_once(' ') else {
+            continue;
+        };
+        let kind = match kind_str {
+            "counter" => MetricKind::Counter,
+            "gauge" => MetricKind::Gauge,
+            "histogram" => MetricKind::Histogram,
+            // A quantile summary or another kind this module never records
+            // (see the doc comment's "not a general parser" caveat).
+            _ => continue,
+        };
+        kinds.insert(name, kind);
+    }
+
+    let mut samples = Vec::new();
+    let mut histograms: BTreeMap<(String, Vec<(String, String)>), HistogramAccum> = BTreeMap::new();
+
+    // Pass 2: every sample line (comments and blank separator lines
+    // skipped), matched back against the `kinds` map built above.
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name_and_labels, value_str)) = line.rsplit_once(' ') else {
+            continue;
+        };
+        let Ok(value) = value_str.parse::<f64>() else {
+            continue;
+        };
+        let (full_name, mut labels) = match name_and_labels.split_once('{') {
+            Some((name, rest)) => {
+                let body = rest.strip_suffix('}').unwrap_or(rest);
+                (name, parse_labels(body))
+            }
+            None => (name_and_labels, Vec::new()),
+        };
+
+        // Counter/gauge: the sample's own name matches a TYPE line exactly.
+        if let Some(&kind) = kinds.get(full_name) {
+            labels.sort();
+            samples.push(MetricSample {
+                name: full_name.to_string(),
+                kind,
+                labels,
+                value: Some(value),
+                buckets: Vec::new(),
+                sum: None,
+                count: None,
+            });
+            continue;
+        }
+
+        // Histogram: the sample's name is the TYPE-declared base name plus
+        // one of the three suffixes `recorder.rs` always writes together.
+        for suffix in ["_bucket", "_sum", "_count"] {
+            let Some(base) = full_name.strip_suffix(suffix) else {
+                continue;
+            };
+            if kinds.get(base) != Some(&MetricKind::Histogram) {
+                continue;
+            }
+
+            if suffix == "_bucket" {
+                let Some(le_pos) = labels.iter().position(|(k, _)| k == "le") else {
+                    break;
+                };
+                let (_, le_str) = labels.remove(le_pos);
+                // The implicit +Inf bucket's cumulative count is exactly
+                // the `_count` line's value — see `V22__metric_rollup.sql`'s
+                // column doc comment for why keeping both would be
+                // redundant.
+                if le_str == "+Inf" {
+                    break;
+                }
+                let Ok(le) = le_str.parse::<f64>() else {
+                    break;
+                };
+                labels.sort();
+                histograms
+                    .entry((base.to_string(), labels))
+                    .or_default()
+                    .buckets
+                    .push((le, value as u64));
+            } else {
+                labels.sort();
+                let entry = histograms.entry((base.to_string(), labels)).or_default();
+                if suffix == "_sum" {
+                    entry.sum = Some(value);
+                } else {
+                    entry.count = Some(value as u64);
+                }
+            }
+            break;
+        }
+    }
+
+    for ((name, labels), accum) in histograms {
+        let mut buckets = accum.buckets;
+        buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+        samples.push(MetricSample {
+            name,
+            kind: MetricKind::Histogram,
+            labels,
+            value: None,
+            buckets,
+            sum: accum.sum,
+            count: accum.count,
+        });
+    }
+
+    samples
+}
+
+/// Splits a Prometheus label-list body (the text between `{` and `}`, e.g.
+/// `transform="orders",le="0.25"`) into `(key, value)` pairs, unescaping
+/// each value per the exposition format's own escaping rules (backslash,
+/// quote, and newline — the same three `sanitize_label_value` escapes when
+/// `metrics-exporter-prometheus` writes them). Splits only on commas
+/// outside a quoted value, so an escaped comma or quote embedded in a label
+/// value (a `transform` label is a target table name, and Postgres allows a
+/// quoted identifier to contain almost anything) doesn't corrupt the split.
+fn parse_labels(body: &str) -> Vec<(String, String)> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escape_next = false;
+    for c in body.chars() {
+        if escape_next {
+            current.push(c);
+            escape_next = false;
+            continue;
+        }
+        match c {
+            '\\' if in_quotes => {
+                current.push(c);
+                escape_next = true;
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(c);
+            }
+            ',' if !in_quotes => parts.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    parts
+        .into_iter()
+        .filter_map(|part| {
+            let (key, quoted) = part.split_once('=')?;
+            let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
+            Some((key.to_string(), unescape_label_value(inner)))
+        })
+        .collect()
+}
+
+/// Reverses `sanitize_label_value`'s escaping: `\n` -> a real newline, and
+/// `\"`/`\\` -> a literal `"`/`\` (any other escaped character is passed
+/// through as-is defensively, though `sanitize_label_value` never produces
+/// one).
+fn unescape_label_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -364,5 +712,182 @@ mod tests {
             rendered.contains("metrics_shape_test_state"),
             "rendered output missing the state label: {rendered}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Structured snapshot (issue #54)
+    // -------------------------------------------------------------------
+
+    /// Feeds [`parse_prometheus_text`] hand-written, fixed exposition text
+    /// (not the shared global registry, which every other test in this
+    /// binary also records into) so this test controls the input exactly
+    /// and can assert an exact [`MetricSample`] shape back out, covering
+    /// all three kinds in one pass.
+    #[test]
+    fn parse_prometheus_text_recovers_counter_gauge_and_histogram_samples() {
+        let text = "\
+# HELP snapshot_test_counter a counter
+# TYPE snapshot_test_counter counter
+snapshot_test_counter{transform=\"orders\"} 7
+# HELP snapshot_test_gauge a gauge
+# TYPE snapshot_test_gauge gauge
+snapshot_test_gauge{state=\"active\"} 3
+# HELP snapshot_test_hist a histogram
+# TYPE snapshot_test_hist histogram
+snapshot_test_hist_bucket{transform=\"orders\",le=\"0.01\"} 0
+snapshot_test_hist_bucket{transform=\"orders\",le=\"0.1\"} 2
+snapshot_test_hist_bucket{transform=\"orders\",le=\"1\"} 5
+snapshot_test_hist_bucket{transform=\"orders\",le=\"+Inf\"} 5
+snapshot_test_hist_sum{transform=\"orders\"} 3.5
+snapshot_test_hist_count{transform=\"orders\"} 5
+";
+
+        let samples = parse_prometheus_text(text);
+
+        let counter = samples
+            .iter()
+            .find(|s| s.name == "snapshot_test_counter")
+            .expect("counter sample present");
+        assert_eq!(counter.kind, MetricKind::Counter);
+        assert_eq!(
+            counter.labels,
+            vec![("transform".to_string(), "orders".to_string())]
+        );
+        assert_eq!(counter.value, Some(7.0));
+        assert!(counter.buckets.is_empty());
+        assert_eq!(counter.sum, None);
+        assert_eq!(counter.count, None);
+
+        let gauge = samples
+            .iter()
+            .find(|s| s.name == "snapshot_test_gauge")
+            .expect("gauge sample present");
+        assert_eq!(gauge.kind, MetricKind::Gauge);
+        assert_eq!(
+            gauge.labels,
+            vec![("state".to_string(), "active".to_string())]
+        );
+        assert_eq!(gauge.value, Some(3.0));
+
+        let hist = samples
+            .iter()
+            .find(|s| s.name == "snapshot_test_hist")
+            .expect("histogram sample present");
+        assert_eq!(hist.kind, MetricKind::Histogram);
+        assert_eq!(
+            hist.labels,
+            vec![("transform".to_string(), "orders".to_string())]
+        );
+        assert_eq!(hist.value, None);
+        // The +Inf bucket is dropped: its cumulative count is exactly
+        // `count` below, so keeping it as a fourth bucket would be
+        // redundant (V22__metric_rollup.sql's column doc comment).
+        assert_eq!(hist.buckets, vec![(0.01, 0), (0.1, 2), (1.0, 5)]);
+        assert_eq!(hist.sum, Some(3.5));
+        assert_eq!(hist.count, Some(5));
+    }
+
+    /// [`parse_labels`] must split only on commas *outside* a quoted value
+    /// and correctly unescape a value that itself contains an escaped
+    /// comma, quote, backslash, and newline — the four characters
+    /// `sanitize_label_value`/`sanitize_description` (in
+    /// `metrics-exporter-prometheus`) ever escape, and a plausible real
+    /// value here: a `transform` label is a target table name, and Postgres
+    /// allows a quoted identifier to contain almost any of them.
+    #[test]
+    fn parse_labels_handles_escaped_commas_quotes_backslashes_and_newlines() {
+        let body =
+            r#"transform="weird, name with \"quotes\", a \\backslash, and a \nnewline",le="0.25""#;
+        let labels = parse_labels(body);
+        assert_eq!(
+            labels,
+            vec![
+                (
+                    "transform".to_string(),
+                    "weird, name with \"quotes\", a \\backslash, and a \nnewline".to_string()
+                ),
+                ("le".to_string(), "0.25".to_string()),
+            ]
+        );
+    }
+
+    /// End-to-end wiring check: [`snapshot`] (which calls
+    /// [`Metrics::render_prometheus`] under the hood, same as
+    /// [`Metrics::snapshot`]) recovers real observations recorded through
+    /// this module's own public recording functions — not just
+    /// hand-written fixture text. Distinctive labels, per this file's other
+    /// tests' convention, since the registry is one shared global.
+    #[test]
+    fn snapshot_recovers_real_observations_recorded_through_this_module() {
+        record_transform_latency("metrics_snapshot_test_target", Duration::from_millis(120));
+        increment_changes_applied("metrics_snapshot_test_target");
+        set_staging_segments("metrics_snapshot_test_state", 4);
+
+        let samples = snapshot();
+
+        let hist = samples
+            .iter()
+            .find(|s| {
+                s.name == "trellis_transform_latency_seconds"
+                    && s.labels
+                        == vec![(
+                            "transform".to_string(),
+                            "metrics_snapshot_test_target".to_string(),
+                        )]
+            })
+            .unwrap_or_else(|| panic!("no per-transform latency sample in {samples:?}"));
+        assert_eq!(hist.kind, MetricKind::Histogram);
+        assert_eq!(
+            hist.count,
+            Some(1),
+            "exactly one observation for this test's own label"
+        );
+        assert_eq!(hist.sum, Some(0.12), "0.12s matches the 120ms observation");
+        assert!(
+            !hist.buckets.is_empty(),
+            "the shared LATENCY_BUCKETS set must show up as raw buckets"
+        );
+        // Buckets are cumulative and ascending — every later bucket's count
+        // must be >= every earlier one's.
+        for pair in hist.buckets.windows(2) {
+            assert!(
+                pair[0].0 < pair[1].0,
+                "bucket bounds must be strictly ascending: {:?}",
+                hist.buckets
+            );
+            assert!(
+                pair[0].1 <= pair[1].1,
+                "cumulative bucket counts must be non-decreasing: {:?}",
+                hist.buckets
+            );
+        }
+
+        let counter = samples
+            .iter()
+            .find(|s| {
+                s.name == "trellis_changes_applied_total"
+                    && s.labels
+                        == vec![(
+                            "transform".to_string(),
+                            "metrics_snapshot_test_target".to_string(),
+                        )]
+            })
+            .unwrap_or_else(|| panic!("no changes_applied sample in {samples:?}"));
+        assert_eq!(counter.kind, MetricKind::Counter);
+        assert_eq!(counter.value, Some(1.0));
+
+        let gauge = samples
+            .iter()
+            .find(|s| {
+                s.name == "trellis_staging_segments"
+                    && s.labels
+                        == vec![(
+                            "state".to_string(),
+                            "metrics_snapshot_test_state".to_string(),
+                        )]
+            })
+            .unwrap_or_else(|| panic!("no staging_segments sample in {samples:?}"));
+        assert_eq!(gauge.kind, MetricKind::Gauge);
+        assert_eq!(gauge.value, Some(4.0));
     }
 }

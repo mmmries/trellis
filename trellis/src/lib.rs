@@ -60,6 +60,7 @@ pub mod metrics;
 pub mod migrate;
 pub mod numeric;
 pub mod pool;
+pub mod rollup;
 pub mod staging;
 
 pub use app::{
