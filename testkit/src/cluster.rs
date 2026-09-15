@@ -28,13 +28,13 @@
 //! `trellis-testkit-*` dirs from dead prior runs, freeing each one's leaked
 //! segment before allocating a new one.
 
-use engine::{Config, Pool, migrate};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
+use trellis::{Config, Pool, migrate};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -221,7 +221,7 @@ impl TestCluster {
 
     /// Creates a fresh, uniquely-named, otherwise-empty database on this
     /// instance with its own connection pool. No migrations are applied —
-    /// useful for tests that exercise [`engine::migrate`] itself. Most
+    /// useful for tests that exercise [`trellis::migrate`] itself. Most
     /// callers want [`TestCluster::create_isolated_database`] instead.
     pub async fn create_empty_database(&self) -> TestDatabase {
         let name = format!("trellis_test_{}", unique_suffix());

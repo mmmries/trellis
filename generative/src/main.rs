@@ -1,4 +1,4 @@
-//! Generative correctness test suite for the `engine` crate — see
+//! Generative correctness test suite for the `trellis` crate — see
 //! `generative::lib` for the module layout.
 //!
 //! No bin-driven properties are registered yet (design doc §10's "bin vs.

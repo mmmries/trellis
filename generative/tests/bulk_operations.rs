@@ -19,8 +19,6 @@
 //! specific scenarios the task calls out directly, plus a dedicated property
 //! for the bulk-insert row-count dimension.
 
-use engine::defs::ast::ValueType;
-use engine::{Config, Pool};
 use generative::backend::{Backend, ManualBackend};
 use generative::generate::{Mutate, build_bulk_insert_program, build_program, bulk_insert_program};
 use generative::model::{NamePool, Op, OpOutcome, Program, Table};
@@ -28,6 +26,8 @@ use generative::run::{RunError, run_convergence};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
+use trellis::defs::ast::ValueType;
+use trellis::{Config, Pool};
 
 struct Harness {
     runtime: tokio::runtime::Runtime,

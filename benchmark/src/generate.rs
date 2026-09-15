@@ -6,8 +6,8 @@
 //! machines, and milestones. That's what lets M0's numbers be compared
 //! apples-to-apples against M2/M3/M4 later.
 
-use engine::Pool;
 use std::time::{Duration, Instant};
+use trellis::Pool;
 
 /// `author` is a pure function of `id` and the group count `g`: evenly
 /// distributes `n` rows across `g` groups (`id=1..n`, so `author` ranges
@@ -22,7 +22,7 @@ pub fn author_for(id: i64, g: i64) -> i64 {
 /// distribution gives every author at least one child, so the
 /// relationship-aggregate benchmark's `COUNT -> 0`/`SUM -> NULL` no-match
 /// path (already covered at small scale by
-/// `engine/tests/defs_backfill_relationship.rs`) would never be flexed at
+/// `trellis/tests/defs_backfill_relationship.rs`) would never be flexed at
 /// benchmark scale.
 const ZERO_CHILDREN_MODULUS: i64 = 1000;
 

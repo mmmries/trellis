@@ -1,10 +1,10 @@
 //! Improvement-plan task E3 (rescoped): engine lifecycle — in-process
-//! `engine::Client` restart/scale-out, **not** `testkit::CrashGuard`.
+//! `trellis::Client` restart/scale-out, **not** `testkit::CrashGuard`.
 //!
 //! `testkit::CrashGuard` is a SIGKILL-based subprocess crash primitive, the
-//! wrong tool here: the generative harness runs `engine::Client` in-process
+//! wrong tool here: the generative harness runs `trellis::Client` in-process
 //! (`generative::backend::ManualBackend` owns it directly), not as a separate
-//! OS process. Instead this exercises `engine::Client`'s own `Drop` impl — a
+//! OS process. Instead this exercises `trellis::Client`'s own `Drop` impl — a
 //! real client's `Drop` already performs a best-effort, non-graceful shutdown
 //! signal with no draining, a faithful, free stand-in for "the process died"
 //! (see `Backend::restart`'s doc comment) — plus "scale out": starting an
@@ -15,7 +15,7 @@
 //! from `tests/convergence.rs`.
 //!
 //! **This file's restart property found a real engine bug, and fixed the
-//! majority of it.** `engine::intake::Intake::connect` built its replication
+//! majority of it.** `trellis::intake::Intake::connect` built its replication
 //! connection with no explicit `start_lsn`, so a fresh connection (as a
 //! restart produces) resumed from the replication *slot's own*
 //! server-tracked position rather than this application's own durably
@@ -24,7 +24,7 @@
 //! and-applied transactions, which the ring's fold only dedupes within a
 //! still-active segment, silently double-counting an `Aggregate` target's
 //! `SUM`/`COUNT` once the original segment had already sealed and drained.
-//! See `engine::intake::Intake::connect`'s doc comment for the fix (pass
+//! See `trellis::intake::Intake::connect`'s doc comment for the fix (pass
 //! `last_confirmed` as `start_lsn` explicitly).
 //!
 //! **Independent-review update, since resolved:** a second, deeper bug
@@ -45,9 +45,9 @@
 //! replication redelivery, and nothing to do with `claim`'s bucket-share
 //! math either (the leading hypothesis this comment previously carried, laid
 //! to rest below) — a genuine seal/append race in
-//! `engine::staging::seal::seal_if_active_nonempty`, latent regardless of
+//! `trellis::staging::seal::seal_if_active_nonempty`, latent regardless of
 //! restart or scale-out, that both simply made common by perturbing timing.
-//! `engine::staging::append::append` resolves the active ring slot with a
+//! `trellis::staging::append::append` resolves the active ring slot with a
 //! plain, unlocked read (by design — "you cannot fix this by locking the
 //! pointer," docs/staging-and-claiming/03-sealing-and-the-fence.md), so a
 //! writer can still be resolving slot *k* at the exact moment a concurrent
@@ -62,7 +62,7 @@
 //! a non-empty active segment" busy-loop guard meant nothing ever forced
 //! that seal if the ring went quiet right after (exactly what a `quiesce()`
 //! poll immediately following the triggering op does). The straggler was
-//! stranded permanently, and `engine::staging::converge::converged_through`
+//! stranded permanently, and `trellis::staging::converge::converged_through`
 //! compounded it into a *false positive*: condition 3 treated any
 //! `'drained'` segment's slot as fully resolved, so the run reported
 //! `converged` while the write was still missing. **Fixed** in two places
@@ -74,16 +74,15 @@
 //! regress into the busy loop the emptiness guard exists to prevent); and
 //! `converged_through`'s condition 3 no longer treats a `'drained'` owner as
 //! sufficient on its own — a row must actually have been visible in that
-//! segment's own published fence to stop gating. `engine/tests/sealing.rs`'s
+//! segment's own published fence to stop gating. `trellis/tests/sealing.rs`'s
 //! `an_empty_active_segment_still_seals_to_catch_a_stranded_straggler`/
 //! `an_empty_active_segment_with_a_fully_fenced_predecessor_does_not_seal`
-//! and `engine/tests/converge.rs`'s
+//! and `trellis/tests/converge.rs`'s
 //! `a_drained_slots_unfenced_straggler_still_gates_convergence` cover both
 //! sides directly, deterministically, at the unit level — no timing race
 //! needed. Every test in this file that this bug affected is un-`#[ignore]`d
 //! below.
 
-use engine::{Config, Pool};
 use generative::backend::{Backend, ManualBackend};
 use generative::generate::{
     Mutate, build_program, program_with_client_restart, program_with_scale_out, schedule_restart,
@@ -93,6 +92,7 @@ use generative::run::{RunError, check_program, run_convergence};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
+use trellis::{Config, Pool};
 
 struct Harness {
     runtime: tokio::runtime::Runtime,
@@ -164,7 +164,7 @@ proptest! {
     ///
     /// **Formerly `#[ignore]`d for a known engine bug — root-caused and
     /// fixed.** This property is exactly what surfaced the bug, in two
-    /// layers: first `engine::intake::Intake::connect`'s missing `start_lsn`
+    /// layers: first `trellis::intake::Intake::connect`'s missing `start_lsn`
     /// (fixed, see its own doc comment), then a second, deeper one this
     /// property (and [`a_restart_and_a_scale_out_interleaved_mid_stream_still_converge`]
     /// below) kept reproducing even after that fix — a genuine `MissingRow`
@@ -172,8 +172,8 @@ proptest! {
     /// have nothing to do with restart specifically, or with replication at
     /// all: see this file's own top-of-file doc comment for the full,
     /// confirmed root cause (a seal/append race in
-    /// `engine::staging::seal::seal_if_active_nonempty`, compounded by a
-    /// false-positive gap in `engine::staging::converge::converged_through`)
+    /// `trellis::staging::seal::seal_if_active_nonempty`, compounded by a
+    /// false-positive gap in `trellis::staging::converge::converged_through`)
     /// and the fix, now landed in both places. Re-enabled.
     #[test]
     fn convergence_holds_across_a_mid_stream_client_restart(
@@ -184,7 +184,7 @@ proptest! {
 
     /// A scale-out (an additional application-worker-only client) started
     /// mid-stream must not break convergence either — multiple clients
-    /// coexisting and draining the same ring, per `engine::Client`'s own
+    /// coexisting and draining the same ring, per `trellis::Client`'s own
     /// module doc comment.
     ///
     /// **Formerly `#[ignore]`d for a known engine bug — root-caused and
@@ -236,8 +236,8 @@ proptest! {
 /// not checked in) against exactly this pin is what pinned the root cause
 /// down to a seal/append race — see this file's own top-of-file doc comment
 /// for the full mechanism and the fix, now landed in
-/// `engine::staging::seal::seal_if_active_nonempty` and
-/// `engine::staging::converge::converged_through`. Restarting this file's
+/// `trellis::staging::seal::seal_if_active_nonempty` and
+/// `trellis::staging::converge::converged_through`. Restarting this file's
 /// *other* hand-built pin
 /// ([`restart_then_scale_out_are_independently_usable_against_a_live_backend`])
 /// never reproduced it because that pin applies an `Update` to an

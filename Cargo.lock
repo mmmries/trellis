@@ -44,10 +44,10 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 name = "benchmark"
 version = "0.1.0"
 dependencies = [
- "engine",
  "testkit",
  "tokio",
  "tokio-postgres",
+ "trellis",
 ]
 
 [[package]]
@@ -219,19 +219,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "engine"
-version = "0.1.0"
-dependencies = [
- "deadpool-postgres",
- "pgwire-replication",
- "refinery",
- "regex",
- "testkit",
- "tokio",
- "tokio-postgres",
-]
-
-[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -313,12 +300,12 @@ dependencies = [
 name = "generative"
 version = "0.1.0"
 dependencies = [
- "engine",
  "generative",
  "proptest",
  "testkit",
  "tokio",
  "tokio-postgres",
+ "trellis",
 ]
 
 [[package]]
@@ -1123,9 +1110,9 @@ dependencies = [
 name = "testkit"
 version = "0.1.0"
 dependencies = [
- "engine",
  "tokio",
  "tokio-postgres",
+ "trellis",
 ]
 
 [[package]]
@@ -1325,8 +1312,21 @@ dependencies = [
 name = "trellis"
 version = "0.1.0"
 dependencies = [
- "engine",
+ "deadpool-postgres",
+ "pgwire-replication",
+ "refinery",
+ "regex",
+ "testkit",
  "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
+name = "trellis-cli"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "trellis",
 ]
 
 [[package]]

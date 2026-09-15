@@ -24,8 +24,8 @@
 //!
 //! [`Trellis::poisoned_since`] *is* surfaced here, called with `UNIX_EPOCH`
 //! as the watermark. Despite its name suggesting a point-in-time delta, the
-//! underlying `poison` table (see `engine/migrations/V13__quarantine.sql`
-//! and `engine::staging::quarantine`) is a live marker of which
+//! underlying `poison` table (see `trellis/migrations/V13__quarantine.sql`
+//! and `trellis::staging::quarantine`) is a live marker of which
 //! `(src_table, key)` pairs are *currently* evicted, not an append-only
 //! log — rows are deleted on release, not just inserted on poison. So
 //! `poisoned_since(UNIX_EPOCH)` returns exactly today's outstanding
@@ -33,8 +33,8 @@
 //! snapshot a status command wants; it isn't the unbounded historical log
 //! its watermark-shaped signature might suggest.
 
-use engine::{Config, DefinitionSummary, RelationshipSummary, Trellis, TrellisOptions};
 use std::time::{SystemTime, UNIX_EPOCH};
+use trellis::{Config, DefinitionSummary, RelationshipSummary, Trellis, TrellisOptions};
 
 /// Help text for `trellis status -h`/`--help`, and prefixed to any
 /// argument-parsing error so a mistake also shows correct usage.
@@ -134,7 +134,7 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
     Ok(out)
 }
 
-fn format_poisoned(poisoned: &[engine::PoisonEntry]) -> String {
+fn format_poisoned(poisoned: &[trellis::PoisonEntry]) -> String {
     if poisoned.is_empty() {
         return "Quarantined source rows: none\n".to_string();
     }
@@ -298,7 +298,7 @@ mod tests {
             target_table: "order_totals".to_string(),
             source_table: "orders".to_string(),
             source_version: 1,
-            status: engine::TransformStatus::Live,
+            status: trellis::TransformStatus::Live,
             created_at: UNIX_EPOCH,
         };
         let formatted = format_definitions(std::slice::from_ref(&def));
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn a_poisoned_entry_is_formatted_with_its_fields() {
-        use engine::PoisonEntry;
+        use trellis::PoisonEntry;
 
         let entry = PoisonEntry {
             src_table: "orders".to_string(),

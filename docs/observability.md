@@ -56,7 +56,7 @@ logs/spans ──► `tracing` facade ──► optional OTLP export layer
 
 Trellis has a natural clock already flowing in: the **source commit timestamp**
 rides in on the replication `Commit` event (`commit_time_micros`, see
-`engine/src/intake/mod.rs`). Every propagated change can be timestamped at each
+`trellis/src/intake/mod.rs`). Every propagated change can be timestamped at each
 stage relative to that origin. Two families of measurement follow:
 
 * **Per-transform latency** — time from a change becoming available at a
@@ -160,7 +160,7 @@ so backfill and quarantine are two arcs of one lifecycle:
 
 Adding a source table triggers a backfill of its pre-existing rows, gated on a
 conservative transaction-fence settlement (`now.xmin > fence.xmax`,
-`engine/src/intake/publication.rs`). Because `xmin` is **cluster-global**, any
+`trellis/src/intake/publication.rs`). Because `xmin` is **cluster-global**, any
 unrelated long-running transaction *anywhere in the cluster* pins it and holds
 every waiting backfill in `waiting_to_backfill` until that transaction commits or
 aborts.

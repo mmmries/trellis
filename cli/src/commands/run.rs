@@ -2,7 +2,7 @@
 //! CDC/apply pipeline until interrupted.
 //!
 //! Unlike `define`, this command can't just call `.migrate()` right after
-//! connecting: [`engine::Trellis::connect`] with `staging: true` derives the
+//! connecting: [`trellis::Trellis::connect`] with `staging: true` derives the
 //! source-table set from the catalog *during* connect, before this module
 //! ever gets a chance to run anything, and it errors immediately
 //! (`TrellisError::NoDefinitions`) if no definitions are registered yet.
@@ -25,7 +25,7 @@
 //! genuinely fresh database doesn't require a separate `migrate` step any
 //! more than `define` does.
 
-use engine::{Config, Trellis, TrellisOptions};
+use trellis::{Config, Trellis, TrellisOptions};
 
 /// Help text for `trellis run -h`/`--help`, and prefixed to any
 /// argument-parsing error so a mistake also shows correct usage.

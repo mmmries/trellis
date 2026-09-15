@@ -33,7 +33,7 @@ it has its own section (§6).
 
 **Target: make illegal states unrepresentable, so whole bug classes never reach a
 test.** The strongly-typed layer is the first oracle. `rustc` and `edition = 2024`
-across the workspace (`engine`, `benchmark`, `generative`, `testkit`) enforce
+across the workspace (`trellis`, `benchmark`, `generative`, `testkit`) enforce
 memory safety, exhaustive `match`, ownership/lifetime discipline, and `Result`
 propagation for free on every build.
 
@@ -89,7 +89,7 @@ regression pin lands here.
 ## 4. Integration tests
 
 **Target: real behavior against a real Postgres, scripted end-to-end.** These live
-in `engine/tests/*` and lean on `testkit`, which owns a disposable cluster
+in `trellis/tests/*` and lean on `testkit`, which owns a disposable cluster
 (`initdb`/`postgres`/`pg_ctl` on a private socket, `wal_level=logical`, torn down
 on `Drop`). CI provisions the Postgres server binaries so these run in the same
 pipeline as everything else. They own:

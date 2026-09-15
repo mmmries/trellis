@@ -74,7 +74,7 @@ evaluator is retained as a secondary cross-check against that Postgres oracle.
 
 ## Concrete syntax (1-1 slice, issues #22, #62)
 
-The 1-1 slice of the grammar (`engine/src/defs`) uses:
+The 1-1 slice of the grammar (`trellis/src/defs`) uses:
 
 ```text
 TRANSFORM <target>
@@ -115,7 +115,7 @@ parity — the accepted-language-is-the-spec goal makes the gaps worth naming:
   reference and is rejected as unresolved.
 
 These are tracked toward full compatibility; each is pinned by a divergence
-test in `engine/src/defs`.
+test in `trellis/src/defs`.
 
 `FROM <source>` is deliberately where a future key-space clause slots in —
 `GROUP BY <cols>` for the aggregate case, `JOIN <other> ON <cond>

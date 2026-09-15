@@ -8,13 +8,13 @@
 
 use std::collections::HashMap;
 
-use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use engine::defs::qualified_target_table;
-use engine::{Config, Pool};
 use generative::backend::{Backend, ManualBackend};
 use generative::model::{NamePool, Op, OpOutcome, Program, Table};
 use generative::oracle::{self, evaluator_oracle, sql_oracle, three_way};
 use testkit::TestCluster;
+use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use trellis::defs::qualified_target_table;
+use trellis::{Config, Pool};
 
 /// The same 1-1 numeric-`+` program the backend seam test uses, so the oracle
 /// is exercised against a shape the backend already proves it can maintain.

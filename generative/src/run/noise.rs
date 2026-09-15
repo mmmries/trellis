@@ -4,7 +4,7 @@
 //! against [`crate::backend::ManualBackend`]'s own connection with a
 //! program's real op stream — something [`super::run_convergence`]'s generic
 //! `Backend` trait deliberately never exposes (design doc §1: only `backend`
-//! may touch engine/connection internals, and the trait's four methods are
+//! may touch trellis/connection internals, and the trait's four methods are
 //! exactly "what a convergence run needs", nothing broader).
 //!
 //! This module is a narrow, explicitly-scoped exception to `run`'s own
@@ -22,7 +22,7 @@
 //! difference is that a [`crate::model::NoisePlan`]'s events are free to fire
 //! at the positions it names, interleaved with the real ops.
 
-use engine::Pool;
+use trellis::Pool;
 
 use crate::backend::{Backend, ManualBackend};
 use crate::model::{NoisePlan, OpOutcome, Program};

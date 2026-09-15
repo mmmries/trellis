@@ -1,14 +1,14 @@
 //! `trellis define <GRAMMAR>` — registers a transform or relationship
 //! definition against the configured database.
 //!
-//! The engine facade ([`engine::Trellis`]) keeps `define` (TRANSFORM text)
+//! The engine facade ([`trellis::Trellis`]) keeps `define` (TRANSFORM text)
 //! and `define_relationship` (RELATIONSHIP text) as two separate methods,
 //! but from an operator's shell there's one grammar and one command — see
 //! docs/public-api-design.md's "same grammar" intent. This module is the
 //! thin dispatch that picks the right facade method by sniffing the
 //! grammar's first keyword.
 
-use engine::{Config, Trellis, TrellisOptions};
+use trellis::{Config, Trellis, TrellisOptions};
 
 /// Help text for `trellis define -h`/`--help`, and prefixed to any
 /// argument-parsing error so a mistake also shows correct usage.

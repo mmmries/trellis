@@ -8,7 +8,7 @@
 //! `local_docs/generative-suite-improvement-plan.md`'s workstream E and this
 //! branch's own task description): "redefine" (altering an existing
 //! definition) and "remove" (dropping one) are not attempted here.
-//! `engine::defs::catalog` has no drop/alter-definition API today — only
+//! `trellis::defs::catalog` has no drop/alter-definition API today — only
 //! `create_definition`/`create_definition_without_backfill`/`install_definition`
 //! — so that half of definition lifecycle is blocked on missing engine
 //! functionality, a deferred follow-up, not something this file works around.
@@ -17,7 +17,6 @@
 //! from `tests/convergence.rs` (see that file's module doc comment for why
 //! the cluster is a `thread_local`).
 
-use engine::{Config, Pool};
 use generative::backend::ManualBackend;
 use generative::generate::{
     Mutate, build_program, defer_def_install, program_with_mid_stream_def_install, schedule_restart,
@@ -26,6 +25,7 @@ use generative::run::{RunError, run_convergence};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
+use trellis::{Config, Pool};
 
 struct Harness {
     runtime: tokio::runtime::Runtime,
@@ -155,9 +155,9 @@ async fn a_definition_installed_after_preexisting_rows_backfills_and_keeps_conve
 }
 
 /// Cross-cutting holistic-review pin: does a mid-stream definition install
-/// interact with the phase-gap-straggler fix (`engine::staging::seal::
+/// interact with the phase-gap-straggler fix (`trellis::staging::seal::
 /// seal_if_active_nonempty`'s straggler-catching case,
-/// `engine::staging::converge::converged_through`'s condition 3 — see
+/// `trellis::staging::converge::converged_through`'s condition 3 — see
 /// `generative/tests/client_lifecycle.rs`'s module doc comment for the full
 /// writeup) on a table whose definition was *just* installed? Neither of
 /// this task's own properties/pins above ever combine with a restart, and

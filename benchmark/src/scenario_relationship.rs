@@ -2,7 +2,7 @@
 //! #63, C3): a `KeySpace::OneToOne` `authors` transform that `SUM`/`COUNT`s
 //! over two to-many children (`posts`, `comments`), matching the real
 //! workload that motivated `backfill_relationship_one_to_one`
-//! (`engine::defs::backfill`) — 100k authors, 1M posts, 4.5M comments,
+//! (`trellis::defs::backfill`) — 100k authors, 1M posts, 4.5M comments,
 //! creating the target table took ~1 minute on the old ring path.
 //!
 //! Unlike [`crate::scenario`]'s plain `GROUP BY` pipeline, this measures the
@@ -14,9 +14,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use engine::defs::{ValueType, create_relationship, install_definition};
 use testkit::TestCluster;
 use tokio_postgres::Client as RawClient;
+use trellis::defs::{ValueType, create_relationship, install_definition};
 
 use crate::generate;
 use crate::scenario::connect_raw;
@@ -82,7 +82,7 @@ pub async fn run(
     // A to-many relationship's to-side table needs a way to identify a row
     // being deleted/updated in its CDC stream (`RelationshipToManyRequiresReplicaIdentity`);
     // full replica identity satisfies that, matching the fixture tables in
-    // `engine/tests/defs_backfill_relationship.rs`.
+    // `trellis/tests/defs_backfill_relationship.rs`.
     raw.batch_execute(
         "alter table posts replica identity full; alter table comments replica identity full",
     )
@@ -145,9 +145,9 @@ pub async fn run(
 }
 
 /// Compares the backfilled `author_totals` against an independently written
-/// `GROUP BY`/`LEFT JOIN` oracle (not [`engine::defs::render_relationship_select_sql`],
+/// `GROUP BY`/`LEFT JOIN` oracle (not [`trellis::defs::render_relationship_select_sql`],
 /// whose per-row correlated-subquery shape is meant for the small fixtures in
-/// `engine/tests` and doesn't scale to this benchmark's row counts) — an
+/// `trellis/tests` and doesn't scale to this benchmark's row counts) — an
 /// exact-value check over every author, not just a row count or a sample.
 /// Per-author `(word_sum, post_count, comment_count)`, keyed by author id.
 type AuthorTotals = HashMap<String, (Option<String>, Option<String>, Option<String>)>;

@@ -37,7 +37,7 @@ The initial build of a target is computed **directly, set-based, source→target
 bypassing the ring entirely. The ring is left to do only what it is uniquely good
 at: reconciling live CDC deltas after the build fence.
 
-Implemented in [`engine::defs::backfill`]:
+Implemented in [`trellis::defs::backfill`]:
 
 - **1-1 (calc) transforms** walk the source primary key in half-open `(lo, hi]`
   ranges, each range built with `INSERT INTO target SELECT <exprs> FROM source
@@ -119,7 +119,7 @@ rather than attempting to insert them.
 
 `create_definition` (bare ring enumeration) is unchanged and still exists, but it
 is no longer the primary entry point a real caller should reach for. That role
-belongs to `engine::defs::install_definition`: it creates the target table, tries
+belongs to `trellis::defs::install_definition`: it creates the target table, tries
 `backfill_definition` (the direct path), persists via
 `create_definition_without_backfill` on success, and falls back to
 `create_definition` (ring enumeration) on `BackfillError::Unsupported`. This
@@ -193,7 +193,7 @@ well before a single row of the target is built.
 (intake + ring maintenance); it is `application_threads` — the drain
 workers — that own finishing transform work, backfill included. Concretely,
 this reuses the exact claim/heartbeat/reclaim-stale machinery
-`engine/src/client.rs`'s app-worker loop already runs for sealed ring segments
+`trellis/src/client.rs`'s app-worker loop already runs for sealed ring segments
 (`register_drainer`, `next_claimable_segments`, `HeartbeatDaemon`,
 `staging::reclaim_stale`): a backfill chunk becomes a second kind of claimable
 unit alongside a sealed segment, claimed by whichever drain thread gets to it

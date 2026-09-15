@@ -12,17 +12,17 @@
 //! # E5 scope cut: `CHECKPOINT` only, not a full Postgres restart
 //!
 //! A full `TestCluster` restart was investigated and deliberately **not**
-//! built. `engine::intake::Intake::run` (the staging worker's logical-
+//! built. `trellis::intake::Intake::run` (the staging worker's logical-
 //! replication consumer) returns `Err` the instant its replication
-//! connection drops — confirmed by reading `engine/src/intake/mod.rs`
-//! directly, not assumed — and `engine::client::run` spawns it as
+//! connection drops — confirmed by reading `trellis/src/intake/mod.rs`
+//! directly, not assumed — and `trellis::client::run` spawns it as
 //! `let _ = intake.run().await;`, silently discarding that error with no
 //! reconnect logic at all. A live `ManualBackend`'s own `raw` connection
 //! (`ManualBackend::connect`) has the same shape: one `tokio_postgres::connect`
 //! call, no supervisor. A real Postgres restart severs every one of these
 //! connections at once, so recovering would need genuinely new machinery —
 //! a way to tear down and rebuild `ManualBackend`'s connection *and* a fresh
-//! `engine::Client` against the same already-installed schema (never
+//! `trellis::Client` against the same already-installed schema (never
 //! re-running `install`, which would try to recreate tables that already
 //! exist) — which is real, separate, engine-adjacent work, not a "bucket 1,
 //! converged-state-unchanged" widening. This mirrors exactly the reasoning
@@ -91,9 +91,10 @@ fn run_one(program: &Program, noise: &NoisePlan) -> Result<(), TestCaseError> {
             let mut backend = ManualBackend::connect(db.dsn())
                 .await
                 .expect("connect manual backend");
-            let pool =
-                engine::Pool::new(&engine::Config::from_dsn(db.dsn().to_string()).expect("config"))
-                    .expect("pool");
+            let pool = trellis::Pool::new(
+                &trellis::Config::from_dsn(db.dsn().to_string()).expect("config"),
+            )
+            .expect("pool");
 
             match run_convergence_with_noise(&mut backend, &pool, program, noise).await {
                 Ok(outcome) => {
@@ -206,7 +207,7 @@ async fn noise_on_an_adversarially_shaped_untracked_table_never_perturbs_converg
                 before_op: 2,
                 kind: NoiseEventKind::Table(NoiseAction::AddColumn {
                     name: "extra1".to_string(),
-                    value_type: engine::defs::ast::ValueType::Numeric,
+                    value_type: trellis::defs::ast::ValueType::Numeric,
                 }),
             },
             NoiseEvent {
@@ -239,8 +240,9 @@ async fn noise_on_an_adversarially_shaped_untracked_table_never_perturbs_converg
     let mut backend = ManualBackend::connect(db.dsn())
         .await
         .expect("connect manual backend");
-    let pool = engine::Pool::new(&engine::Config::from_dsn(db.dsn().to_string()).expect("config"))
-        .expect("pool");
+    let pool =
+        trellis::Pool::new(&trellis::Config::from_dsn(db.dsn().to_string()).expect("config"))
+            .expect("pool");
 
     let outcome = run_convergence_with_noise(&mut backend, &pool, &program, &noise)
         .await
@@ -283,8 +285,9 @@ async fn checkpoints_interleaved_with_every_op_never_perturb_convergence() {
     let mut backend = ManualBackend::connect(db.dsn())
         .await
         .expect("connect manual backend");
-    let pool = engine::Pool::new(&engine::Config::from_dsn(db.dsn().to_string()).expect("config"))
-        .expect("pool");
+    let pool =
+        trellis::Pool::new(&trellis::Config::from_dsn(db.dsn().to_string()).expect("config"))
+            .expect("pool");
 
     let outcome = run_convergence_with_noise(&mut backend, &pool, &program, &noise)
         .await

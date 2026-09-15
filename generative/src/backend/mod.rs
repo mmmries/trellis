@@ -1,7 +1,7 @@
 //! The backend seam (design doc §1 "The backend seam"): the ONLY module
 //! that drives the engine's maintenance pipeline and reads back derived
-//! state. Nothing outside this module may import `engine::client`,
-//! `engine::staging`, or `engine::defs::catalog`/`ddl` — the oracle
+//! state. Nothing outside this module may import `trellis::client`,
+//! `trellis::staging`, or `trellis::defs::catalog`/`ddl` — the oracle
 //! (`crate::oracle`) and generators (`crate::generate`) must stay reachable
 //! only through the shared, engine-independent pieces named in the design
 //! doc, so a second backend (a concurrent runtime, later a
@@ -59,7 +59,7 @@ pub trait Backend {
     /// Simulates an ungraceful crash-and-restart of the backend's primary
     /// engine client (improvement-plan task E3): drops whatever is currently
     /// running it and starts a fresh one against the same target. A real
-    /// `engine::Client`'s own `Drop` impl already performs a best-effort,
+    /// `trellis::Client`'s own `Drop` impl already performs a best-effort,
     /// non-graceful shutdown signal with no draining — this is deliberately
     /// *not* the graceful `shutdown().await` path — so simply dropping and
     /// replacing the client is a faithful, free stand-in for "the process
@@ -71,7 +71,7 @@ pub trait Backend {
 
     /// Starts an additional engine client alongside whatever is already
     /// running, application-worker-only (never a second staging worker —
-    /// see `engine::client`'s module doc comment: exactly one staging worker
+    /// see `trellis::client`'s module doc comment: exactly one staging worker
     /// per fleet), demonstrating multiple clients can coexist draining the
     /// same ring (improvement-plan task E3).
     fn scale_out(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;

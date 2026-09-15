@@ -1,0 +1,1598 @@
+//! Integration tests for column-level quarantine
+//! (`docs/decisions/0003-quarantine-storage-and-api.md`'s 2026-09-12
+//! amendment, `docs/decisions/0008-public-api-design.md` decision 5): the per-`(transform,
+//! column)` fuse layered alongside the pre-existing row-level/transform-wide
+//! one (`trellis/tests/quarantine.rs`, unmodified by this feature — see
+//! `an_existing_row_level_fuse_scenario_is_unaffected` below for a targeted
+//! regression check of that claim in this file too).
+//!
+//! Follows `trellis/tests/quarantine.rs`'s own conventions: a real, ephemeral
+//! Postgres instance per test (`testkit::TestCluster`), and "reach past the
+//! mechanism, insert directly" for whichever half of a scenario the
+//! mechanism under test doesn't itself produce (staging a malformed CDC
+//! image directly into the ring, rather than routing through a live
+//! replication slot).
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use testkit::{TestCluster, TestDatabase};
+use tokio_postgres::types::PgLsn;
+use tokio_postgres::{Client, NoTls};
+use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use trellis::defs::{
+    TransformStatus, chunk_queue, create_aggregate_target_table, create_definition,
+    create_target_table, install_definition, source_primary_key,
+};
+use trellis::staging::apply::{self, ApplyError};
+use trellis::staging::quarantine::{self, DEFAULT_COLUMN_DEATH_THRESHOLD};
+use trellis::{BlockingTrellis, Config, Trellis, TrellisOptions};
+
+// ---------------------------------------------------------------------
+// Shared scaffolding (mirrors `tests/quarantine.rs`)
+// ---------------------------------------------------------------------
+
+async fn connect_raw(dsn: &str) -> Client {
+    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute("set search_path to trellis, public")
+        .await
+        .expect("set search_path");
+    client
+}
+
+async fn seal_active_segment(client: &mut Client) -> i64 {
+    use trellis::staging::seal;
+    let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+    seal::seal_phase2(client, outcome.sealed_seg_seq)
+        .await
+        .expect("seal phase 2");
+    outcome.sealed_seg_seq
+}
+
+/// The ring table `insert_cdc_row` must target *right now* — `seg_0` is only
+/// correct for a test's first, never-yet-sealed batch; every batch after
+/// that has rotated the active ring slot forward (`seal_active_segment`
+/// advances `segment_pointer`), and inserting into a already-sealed table
+/// would silently stage into the wrong (already-closed) batch. Every test
+/// below that stages more than one batch reads this fresh before each one.
+async fn active_segment_table(client: &Client) -> String {
+    let ring_slot: i16 = client
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment_pointer")
+        .get(0);
+    match ring_slot {
+        0 => "seg_0",
+        1 => "seg_1",
+        2 => "seg_2",
+        3 => "seg_3",
+        other => panic!("unexpected ring slot {other}"),
+    }
+    .to_string()
+}
+
+fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
+    names
+        .iter()
+        .map(|n| (n.to_string(), ValueType::Numeric))
+        .collect()
+}
+
+async fn insert_cdc_row(
+    client: &Client,
+    table: &str,
+    src_table: &str,
+    key: &str,
+    op: &str,
+    old_image: Option<&str>,
+    new_image: Option<&str>,
+) {
+    let lsn = PgLsn::from(1u64);
+    client
+        .execute(
+            &format!(
+                "insert into {table} (src_table, key, op, lsn, old_image, new_image, hop_gen) \
+                 values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0)"
+            ),
+            &[&src_table, &key, &op, &lsn, &old_image, &new_image],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("insert cdc row {key:?} into {table} failed: {e}"));
+}
+
+fn order_totals_def() -> TransformDef {
+    TransformDef {
+        target: "order_totals".to_string(),
+        source: "orders".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "total".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::Column("price".to_string())),
+                rhs: Box::new(Expr::Column("tax".to_string())),
+            },
+        }],
+        predicate: Predicate::True,
+    }
+}
+
+/// Creates `orders` (unpopulated) plus the `order_totals` 1-1 definition and
+/// target table — the single-column fixture most tests below trip the
+/// column fuse against.
+async fn seed_order_totals(db: &TestDatabase, client: &Client) -> TransformDef {
+    client
+        .batch_execute("create table orders (id integer primary key, price numeric, tax numeric)")
+        .await
+        .expect("seed source table");
+    let source_columns = numeric_columns(&["id", "price", "tax"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM orders SELECT price + tax AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create definition");
+    let def = order_totals_def();
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+        .await
+        .expect("create target table");
+    def
+}
+
+/// Adds a second, chained 1-1 transform (`order_summaries`, reading straight
+/// from `order_totals`'s own `total` column) — the fixture the cascade tests
+/// use. Mirrors `tests/quarantine.rs`'s `order_summary` hop-bound fixture.
+async fn seed_order_summaries(db: &TestDatabase, orders_def: &TransformDef) {
+    let order_totals_columns = numeric_columns(&["id", "total"]);
+    let summary_def = create_definition(
+        &db.pool,
+        "TRANSFORM order_summaries FROM order_totals SELECT total + total AS grand_total",
+        &order_totals_columns,
+    )
+    .await
+    .expect("create order_summaries definition");
+    let pk = source_primary_key(&db.pool, &orders_def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(
+        &db.pool,
+        &summary_def.def,
+        "public",
+        &pk,
+        &order_totals_columns,
+    )
+    .await
+    .expect("create order_summaries table");
+}
+
+/// Stages one malformed (`price` = `"not-a-number"`) CDC insert per id in
+/// `ids`, all into the *same* segment, seals it, and drains it once —
+/// expecting an evaluator failure to surface (the drive-by-real-failures
+/// pattern `tests/quarantine.rs`'s own eviction test uses, just for the
+/// column fuse instead of the row-level one).
+///
+/// Deliberately one segment per call, not one per `id`: none of these
+/// batches ever actually reaches `drained` (a lone bad key's own
+/// `key_deaths` never crosses the *row-level* fuse's threshold on its own,
+/// so `drain_once` always gives up and propagates rather than evicting and
+/// retrying to success) — the ring only has `RING_SIZE` (4) physical slots,
+/// and nothing here ever retires a stuck segment, so batching every id this
+/// call needs into one segment keeps every test's total segment count under
+/// that ceiling instead of exhausting the ring.
+async fn stage_bad_orders(client: &mut Client, pool: &trellis::Pool, ids: &[i64]) {
+    let table = active_segment_table(client).await;
+    for id in ids {
+        insert_cdc_row(
+            client,
+            &table,
+            "orders",
+            &id.to_string(),
+            "insert",
+            None,
+            Some(r#"{"price":"not-a-number","tax":"1.50"}"#),
+        )
+        .await;
+    }
+    let seg_seq = seal_active_segment(client).await;
+    let result =
+        apply::drain_once(pool, seg_seq, "worker", 1, "trellis_column_quarantine_test").await;
+    assert!(
+        matches!(result, Err(ApplyError::Eval(_))),
+        "a malformed numeric field must still surface as an evaluator failure, got {result:?}"
+    );
+}
+
+async fn column_status_row(
+    client: &Client,
+    transform: &str,
+    column: &str,
+) -> Option<(bool, Option<String>)> {
+    client
+        .query_opt(
+            "select local_fuse, last_error from column_status \
+             where transform_table = $1 and column_name = $2",
+            &[&transform, &column],
+        )
+        .await
+        .expect("read column_status")
+        .map(|row| (row.get(0), row.get(1)))
+}
+
+async fn column_deaths_count(client: &Client, transform: &str, column: &str) -> Option<i32> {
+    client
+        .query_opt(
+            "select deaths from column_deaths where transform_table = $1 and column_name = $2",
+            &[&transform, &column],
+        )
+        .await
+        .expect("read column_deaths")
+        .map(|row| row.get(0))
+}
+
+async fn cascade_edge_exists(
+    client: &Client,
+    downstream_transform: &str,
+    downstream_column: &str,
+    upstream_transform: &str,
+    upstream_column: &str,
+) -> bool {
+    client
+        .query_opt(
+            "select 1 from column_pause_cascades \
+             where downstream_transform = $1 and downstream_column = $2 \
+               and upstream_transform = $3 and upstream_column = $4",
+            &[
+                &downstream_transform,
+                &downstream_column,
+                &upstream_transform,
+                &upstream_column,
+            ],
+        )
+        .await
+        .expect("read column_pause_cascades")
+        .is_some()
+}
+
+// ---------------------------------------------------------------------
+// (a) The column fuse trips after the threshold is crossed, and not before.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn column_fuse_trips_only_once_the_threshold_is_crossed() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    seed_order_totals(&db, &client).await;
+
+    assert_eq!(
+        DEFAULT_COLUMN_DEATH_THRESHOLD, 5,
+        "test assumes the default"
+    );
+
+    // `DEFAULT_COLUMN_DEATH_THRESHOLD - 1` distinct bad rows, one batch:
+    // charged, but not paused.
+    let below_threshold: Vec<i64> = (1..DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    stage_bad_orders(&mut client, &db.pool, &below_threshold).await;
+    assert_eq!(
+        column_deaths_count(&client, "order_totals", "total").await,
+        Some(DEFAULT_COLUMN_DEATH_THRESHOLD - 1),
+        "every distinct bad row below threshold must be charged exactly once"
+    );
+    assert_eq!(
+        column_status_row(&client, "order_totals", "total").await,
+        None,
+        "must not be paused before the threshold is reached"
+    );
+
+    // One more distinct bad row, its own batch: trips the fuse.
+    stage_bad_orders(
+        &mut client,
+        &db.pool,
+        &[DEFAULT_COLUMN_DEATH_THRESHOLD as i64],
+    )
+    .await;
+
+    let status = column_status_row(&client, "order_totals", "total")
+        .await
+        .expect("the column must be paused now that the threshold is crossed");
+    assert!(status.0, "a threshold trip is a local fuse, not a cascade");
+    assert!(status.1.is_some(), "the tripping error must be recorded");
+    assert_eq!(
+        column_deaths_count(&client, "order_totals", "total").await,
+        None,
+        "the counter must reset once the fuse trips"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (b) A paused column's value freezes across subsequent CDC deltas.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn paused_column_freezes_instead_of_going_null_or_being_overwritten() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    seed_order_totals(&db, &client).await;
+
+    // A healthy row, computed successfully before anything pauses.
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "100",
+        "insert",
+        None,
+        Some(r#"{"price":"10.00","tax":"1.50"}"#),
+    )
+    .await;
+    let seg_seq = seal_active_segment(&mut client).await;
+    apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+    )
+    .await
+    .expect("drain_once")
+    .expect("must claim and drain the healthy row");
+    let frozen_total: String = client
+        .query_one("select total::text from order_totals where id = 100", &[])
+        .await
+        .expect("read order_totals")
+        .get(0);
+    assert_eq!(frozen_total, "11.50");
+
+    // Trip the column fuse via `DEFAULT_COLUMN_DEATH_THRESHOLD` distinct bad
+    // rows, none of which is id 100.
+    let bad_ids: Vec<i64> = (1..=DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    stage_bad_orders(&mut client, &db.pool, &bad_ids).await;
+    assert!(
+        column_status_row(&client, "order_totals", "total")
+            .await
+            .is_some(),
+        "the fuse must have tripped"
+    );
+
+    // A brand-new, perfectly healthy delta to the *already-written* row: its
+    // `total` must stay exactly as it was, not be recomputed, not go null.
+    let table = active_segment_table(&client).await;
+    insert_cdc_row(
+        &client,
+        &table,
+        "orders",
+        "100",
+        "update",
+        Some(r#"{"price":"10.00","tax":"1.50"}"#),
+        Some(r#"{"price":"999.00","tax":"999.00"}"#),
+    )
+    .await;
+    let seg_seq2 = seal_active_segment(&mut client).await;
+    apply::drain_once(
+        &db.pool,
+        seg_seq2,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+    )
+    .await
+    .expect("drain_once")
+    .expect("must claim and drain the update, minus the paused column");
+
+    let total_after: Option<String> = client
+        .query_one("select total::text from order_totals where id = 100", &[])
+        .await
+        .expect("read order_totals")
+        .get(0);
+    assert_eq!(
+        total_after,
+        Some("11.50".to_string()),
+        "a paused column's value must freeze at its last successfully computed value, not go \
+         null and not be overwritten by new (even valid) source data"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (c) Cascading a paused column's pause to a dependent (chained) transform.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_dependent_transforms_column_cascades_to_paused_when_its_upstream_column_pauses() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    let orders_def = seed_order_totals(&db, &client).await;
+    seed_order_summaries(&db, &orders_def).await;
+
+    let bad_ids: Vec<i64> = (1..=DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    stage_bad_orders(&mut client, &db.pool, &bad_ids).await;
+
+    assert!(
+        column_status_row(&client, "order_totals", "total")
+            .await
+            .is_some(),
+        "the upstream column must have paused"
+    );
+    let downstream_status = column_status_row(&client, "order_summaries", "grand_total")
+        .await
+        .expect("the dependent column must have cascaded to paused");
+    assert!(
+        !downstream_status.0,
+        "a purely cascaded pause is not this column's own local fuse"
+    );
+    assert!(
+        cascade_edge_exists(
+            &client,
+            "order_summaries",
+            "grand_total",
+            "order_totals",
+            "total"
+        )
+        .await,
+        "the cascade edge must be recorded so resume can later un-cascade it correctly"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (d) Resume clears the pause, recomputes, and respects an independent
+//     reason a dependent has to stay paused.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    let orders_def = seed_order_totals(&db, &client).await;
+    seed_order_summaries(&db, &orders_def).await;
+
+    // Real, valid rows in the actual source table — the malformed CDC
+    // images below are purely staged/synthetic (as in every other test in
+    // this file), so resume's recompute (which reads the live table) finds
+    // clean data once the fuse trips and is resumed.
+    client
+        .batch_execute(
+            "insert into orders (id, price, tax) values \
+             (1, 10.00, 1.00), (2, 20.00, 2.00), (3, 30.00, 3.00), \
+             (4, 40.00, 4.00), (5, 50.00, 5.00)",
+        )
+        .await
+        .expect("seed valid orders rows");
+
+    let bad_ids: Vec<i64> = (1..=DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    stage_bad_orders(&mut client, &db.pool, &bad_ids).await;
+    assert!(
+        column_status_row(&client, "order_totals", "total")
+            .await
+            .is_some()
+    );
+    assert!(
+        column_status_row(&client, "order_summaries", "grand_total")
+            .await
+            .is_some()
+    );
+
+    // Give the dependent its *own*, independent reason to stay paused —
+    // reached past the mechanism directly, the same convention
+    // `tests/quarantine.rs` uses for seeding counters/markers by hand.
+    client
+        .execute(
+            "update column_status set local_fuse = true \
+             where transform_table = 'order_summaries' and column_name = 'grand_total'",
+            &[],
+        )
+        .await
+        .expect("mark the dependent as also independently paused");
+
+    // The batch that tripped the fuse rolled back entirely (it never
+    // resolved), so `order_totals` has no rows for ids 1-5 yet — retry them
+    // now that `total` is paused/excluded: this batch succeeds (nothing left
+    // to error on) and creates the bare rows resume's recompute will then
+    // fill in, exactly like a real drain loop retrying a previously-failing
+    // batch once the column that broke it is out of the way.
+    let table = active_segment_table(&client).await;
+    for id in 1..=DEFAULT_COLUMN_DEATH_THRESHOLD as i64 {
+        insert_cdc_row(
+            &client,
+            &table,
+            "orders",
+            &id.to_string(),
+            "insert",
+            None,
+            Some(&format!(
+                r#"{{"price":"{}.00","tax":"{}.00"}}"#,
+                id * 10,
+                id
+            )),
+        )
+        .await;
+    }
+    let seg_seq = seal_active_segment(&mut client).await;
+    apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+    )
+    .await
+    .expect("drain_once")
+    .expect("must claim and drain now that the broken column is excluded");
+
+    let resumed = quarantine::resume_column(&db.pool, "order_totals", "total")
+        .await
+        .expect("resume_column");
+    assert_eq!(
+        resumed,
+        vec![("order_totals".to_string(), "total".to_string())],
+        "the dependent must NOT be auto-resumed — it has its own independent reason"
+    );
+
+    assert_eq!(
+        column_status_row(&client, "order_totals", "total").await,
+        None,
+        "the resumed column itself must no longer be paused"
+    );
+    assert!(
+        column_status_row(&client, "order_summaries", "grand_total")
+            .await
+            .is_some(),
+        "the dependent must remain paused: its own local_fuse reason still holds"
+    );
+    assert!(
+        !cascade_edge_exists(
+            &client,
+            "order_summaries",
+            "grand_total",
+            "order_totals",
+            "total"
+        )
+        .await,
+        "the specific cascade edge from the now-resumed upstream must be gone"
+    );
+
+    for id in 1..=5i32 {
+        let total: String = client
+            .query_one("select total::text from order_totals where id = $1", &[&id])
+            .await
+            .unwrap_or_else(|e| panic!("read order_totals for id {id}: {e}"))
+            .get(0);
+        let expected = match id {
+            1 => "11.00",
+            2 => "22.00",
+            3 => "33.00",
+            4 => "44.00",
+            5 => "55.00",
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            total, expected,
+            "resume must have recomputed against the real (valid) source row for id {id}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// (e) The three read methods and the resume method, on both `Trellis` and
+//     `BlockingTrellis`.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn trellis_exposes_the_read_and_resume_methods() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    seed_order_totals(&db, &client).await;
+    let bad_ids: Vec<i64> = (1..=DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    stage_bad_orders(&mut client, &db.pool, &bad_ids).await;
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+
+    let list = trellis.quarantined().await.expect("quarantined");
+    assert!(
+        list.iter().any(|entry| entry.target
+            == trellis::app::QuarantineTarget::Column(
+                "order_totals".to_string(),
+                "total".to_string()
+            )),
+        "the paused column must appear in the flat list: {list:?}"
+    );
+
+    let status = trellis
+        .quarantine_status("order_totals.total")
+        .await
+        .expect("quarantine_status");
+    assert_eq!(
+        status.state,
+        trellis::app::QuarantineState::Paused,
+        "the column address must report paused"
+    );
+    assert!(status.paused_at.is_some());
+
+    let whole_transform_status = trellis
+        .quarantine_status("order_totals")
+        .await
+        .expect("quarantine_status for the bare transform");
+    assert_eq!(
+        whole_transform_status.state,
+        trellis::app::QuarantineState::Live,
+        "the transform's own lifecycle status is untouched by a column pause"
+    );
+
+    let sample = trellis
+        .sample_quarantined("order_totals.total", None, 10)
+        .await
+        .expect("sample_quarantined");
+    assert_eq!(
+        sample.len(),
+        DEFAULT_COLUMN_DEATH_THRESHOLD as usize,
+        "every distinct poisoned row that contributed to the trip must be sampleable: {sample:?}"
+    );
+
+    let resumed = trellis
+        .resume_column("order_totals.total")
+        .await
+        .expect("resume_column");
+    assert_eq!(
+        resumed,
+        vec![("order_totals".to_string(), "total".to_string())]
+    );
+
+    let status_after = trellis
+        .quarantine_status("order_totals.total")
+        .await
+        .expect("quarantine_status after resume");
+    assert_eq!(status_after.state, trellis::app::QuarantineState::Live);
+
+    let bare_transform_err = trellis.resume_column("order_totals").await;
+    assert!(
+        matches!(
+            bare_transform_err,
+            Err(trellis::TrellisError::ColumnAddressRequired)
+        ),
+        "resume_column must reject a bare transform address, got {bare_transform_err:?}"
+    );
+}
+
+#[test]
+fn blocking_trellis_exposes_the_read_and_resume_methods() {
+    let cluster = TestCluster::start();
+
+    let setup_runtime = tokio::runtime::Runtime::new().expect("build scratch setup runtime");
+    let db = setup_runtime.block_on(cluster.create_isolated_database());
+    setup_runtime.block_on(async {
+        let mut client = connect_raw(db.dsn()).await;
+        seed_order_totals(&db, &client).await;
+        let bad_ids: Vec<i64> = (1..=DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+        stage_bad_orders(&mut client, &db.pool, &bad_ids).await;
+    });
+    drop(setup_runtime);
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis =
+        BlockingTrellis::connect(config, TrellisOptions::default()).expect("connect (sync)");
+
+    let list = trellis.quarantined().expect("quarantined (sync)");
+    assert!(
+        list.iter().any(|entry| entry.target
+            == trellis::app::QuarantineTarget::Column(
+                "order_totals".to_string(),
+                "total".to_string()
+            )),
+        "the paused column must appear in the flat list: {list:?}"
+    );
+
+    let status = trellis
+        .quarantine_status("order_totals.total")
+        .expect("quarantine_status (sync)");
+    assert_eq!(status.state, trellis::app::QuarantineState::Paused);
+
+    let sample = trellis
+        .sample_quarantined("order_totals.total", None, 10)
+        .expect("sample_quarantined (sync)");
+    assert_eq!(sample.len(), DEFAULT_COLUMN_DEATH_THRESHOLD as usize);
+
+    let resumed = trellis
+        .resume_column("order_totals.total")
+        .expect("resume_column (sync)");
+    assert_eq!(
+        resumed,
+        vec![("order_totals".to_string(), "total".to_string())]
+    );
+
+    let status_after = trellis
+        .quarantine_status("order_totals.total")
+        .expect("quarantine_status after resume (sync)");
+    assert_eq!(status_after.state, trellis::app::QuarantineState::Live);
+
+    trellis.shutdown().expect("shutdown (sync)");
+}
+
+// ---------------------------------------------------------------------
+// (f) The existing row-level/transform-wide fuse still works unchanged.
+// ---------------------------------------------------------------------
+
+/// A targeted regression check living alongside the new feature's own
+/// tests, on top of `trellis/tests/quarantine.rs`'s full existing suite
+/// (unmodified, still green): a single stubborn key retried past the
+/// row-level threshold must still evict via `key_deaths`/`poison` exactly as
+/// before, and — the specific new-feature interaction this test is really
+/// about — must NOT also trip the column fuse, since it is one row failing
+/// repeatedly, not a breadth of distinct rows (see `column_failures`'
+/// migration comment / `charge_column_failure`'s doc comment on why the
+/// column fuse counts distinct rows, not attempts).
+#[tokio::test]
+async fn an_existing_row_level_fuse_scenario_is_unaffected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    seed_order_totals(&db, &client).await;
+    client
+        .batch_execute(
+            "insert into orders (id, price, tax) values (1, 10.00, 1.50), (2, 20.00, 2.00)",
+        )
+        .await
+        .expect("seed orders rows");
+
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"price":"not-a-number","tax":"1.50"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "2",
+        "insert",
+        None,
+        Some(r#"{"price":"20.00","tax":"2.00"}"#),
+    )
+    .await;
+    let seg_seq = seal_active_segment(&mut client).await;
+
+    let outcome = loop {
+        match apply::drain_once(
+            &db.pool,
+            seg_seq,
+            "worker",
+            1,
+            "trellis_column_quarantine_test",
+        )
+        .await
+        {
+            Ok(Some(outcome)) => break outcome,
+            Ok(None) => panic!("drain_once claimed nothing on a still-undrained segment"),
+            Err(_) => continue,
+        }
+    };
+    assert_eq!(outcome.keys_written, 1, "only the survivor, key 2, writes");
+
+    let poisoned: bool = client
+        .query_one(
+            "select exists(select 1 from poison where src_table = 'orders' and key = '1')",
+            &[],
+        )
+        .await
+        .expect("read poison")
+        .get(0);
+    assert!(poisoned, "the row-level fuse must still evict as before");
+
+    assert_eq!(
+        column_deaths_count(&client, "order_totals", "total").await,
+        Some(1),
+        "one repeatedly-retried key must charge the column counter exactly once, not once per \
+         attempt — it never crosses the column fuse's own threshold alone"
+    );
+    assert_eq!(
+        column_status_row(&client, "order_totals", "total").await,
+        None,
+        "a single stubborn row must never trip the column fuse on its own"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (g) Regression: a re-executed durable backfill chunk must leave a paused
+//     column untouched (must-fix 1).
+// ---------------------------------------------------------------------
+
+/// A durable backfill chunk (`defs::chunk_queue`, ADR-0007's amendment) is
+/// claimable and crash-recoverable: a chunk already marked `done` can still
+/// be re-executed (e.g. after a reclaim following a crash — see
+/// `trellis/tests/defs_backfill_chunk_queue.rs`'s own reclaim-and-redo
+/// tests), and `defs::backfill::write_one_to_one_range`/
+/// `execute_one_to_one_chunk` had zero awareness of `column_status`: a
+/// re-executed chunk's `ON CONFLICT DO UPDATE` blindly overwrote *every*
+/// field, including one live CDC had since paused, silently undoing the
+/// freeze. This drives the chunk-queue execution path directly (as the task
+/// suggests, in lieu of orchestrating a real crash) to prove the fix: a
+/// paused column's value must survive a re-executed chunk write untouched,
+/// while a sibling, non-paused column in the very same row must still pick
+/// up the re-executed chunk's freshly computed value.
+#[tokio::test]
+async fn a_reexecuted_backfill_chunk_leaves_a_paused_column_untouched() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, a numeric, b numeric); \
+             insert into s (id, a, b) values (1, 10, 100), (2, 20, 200)",
+        )
+        .await
+        .expect("seed source");
+
+    let cols = numeric_columns(&["a", "b"]);
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT a + a AS x, b + b AS y",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition enumerates chunk work and returns");
+    assert_eq!(
+        def.status,
+        TransformStatus::Backfilling,
+        "a plain 1-1 definition sits at backfilling until its chunk is claimed and finished"
+    );
+
+    let claimed = chunk_queue::claim_chunks(&client, "worker-1", 10)
+        .await
+        .expect("claim_chunks");
+    assert_eq!(claimed.len(), 1, "one chunk covers this small source table");
+
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &claimed[0],
+        "public",
+        "worker-1",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("run_claimed_chunk (initial build)");
+    chunk_queue::finish_chunk(&db.pool, &claimed[0], "worker-1")
+        .await
+        .expect("finish_chunk");
+
+    let initial = client
+        .query_one("select x::text, y::text from t where id = 1", &[])
+        .await
+        .expect("read t after initial build");
+    let (x_initial, y_initial): (String, String) = (initial.get(0), initial.get(1));
+    assert_eq!(x_initial, "20");
+    assert_eq!(y_initial, "200");
+
+    // Simulate live CDC having since paused column `x` — reached past the
+    // mechanism, inserted directly, the same convention the rest of this
+    // file uses for whichever half of a scenario isn't the mechanism under
+    // test (here, *how* the pause happened is irrelevant; only its effect
+    // on a re-executed chunk is).
+    client
+        .execute(
+            "insert into column_status (transform_table, column_name, last_error, local_fuse) \
+             values ('t', 'x', 'synthetic pause for backfill freeze test', true)",
+            &[],
+        )
+        .await
+        .expect("seed column_status directly");
+
+    // Mutate the source row so a naive re-execution would compute different
+    // values for *both* columns — `x` must stay frozen; `y` must not.
+    client
+        .execute("update s set a = 999, b = 500 where id = 1", &[])
+        .await
+        .expect("mutate source row 1");
+
+    // Simulate the chunk being reclaimed (e.g. after a crash) and
+    // re-executed by a different worker — driving the chunk-queue execution
+    // path directly, exactly as it would be after
+    // `chunk_queue::reclaim_stale_chunks` frees a dead claim.
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &claimed[0],
+        "public",
+        "worker-2",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("run_claimed_chunk (re-executed after simulated reclaim)");
+
+    let after = client
+        .query_one("select x::text, y::text from t where id = 1", &[])
+        .await
+        .expect("read t after re-executed chunk");
+    let (x_after, y_after): (String, String) = (after.get(0), after.get(1));
+    assert_eq!(
+        x_after, x_initial,
+        "a paused column's value must be untouched by a re-executed backfill chunk"
+    );
+    assert_eq!(
+        y_after, "1000",
+        "a non-paused column in the very same row must still be updated by the re-executed chunk"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (h) Regression: cascade must never reach a KeySpace::Aggregate transform
+//     (must-fix 2).
+// ---------------------------------------------------------------------
+
+/// `column_dependents` used to scan every `transform_definitions` row with
+/// no `KeySpace` filter, so a downstream aggregate transform whose field
+/// happens to read a just-paused upstream 1-1 column would get a wrongly
+/// cascaded `column_status` row — one `staging::apply_aggregate`'s
+/// incremental-delta path has no notion of and would never clear, and one
+/// `resume_column`'s cascade walk would later mishandle via the 1-1-only
+/// `recompute_column`. Proves the fix: pausing the upstream column must
+/// never create a `column_status` row for the aggregate, and the aggregate's
+/// own write path must keep functioning normally afterward.
+#[tokio::test]
+async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    seed_order_totals(&db, &client).await;
+    client
+        .batch_execute("alter table order_totals replica identity full")
+        .await
+        .expect("set replica identity full (an aggregate source needs full pre-images)");
+
+    // A downstream aggregate transform reading `order_totals.total` — the
+    // scope-cut this fix enforces: column-level pause/cascade/resume never
+    // touches an aggregate transform.
+    let order_totals_columns = numeric_columns(&["id", "total"]);
+    let stats_def = create_definition(
+        &db.pool,
+        "TRANSFORM order_stats FROM order_totals GROUP BY id SELECT id AS id, \
+         SUM(total) AS total_sum",
+        &order_totals_columns,
+    )
+    .await
+    .expect("create order_stats definition");
+    create_aggregate_target_table(&db.pool, &stats_def.def, "public", &order_totals_columns)
+        .await
+        .expect("create order_stats table");
+
+    let bad_ids: Vec<i64> = (1..=DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    stage_bad_orders(&mut client, &db.pool, &bad_ids).await;
+
+    assert!(
+        column_status_row(&client, "order_totals", "total")
+            .await
+            .is_some(),
+        "the upstream column must have paused"
+    );
+    assert_eq!(
+        column_status_row(&client, "order_stats", "total_sum").await,
+        None,
+        "an aggregate transform must never get a column_status row via cascade — aggregates are \
+         out of scope for column-level pause/cascade/resume"
+    );
+
+    // A subsequent, healthy batch flowing all the way through to the
+    // aggregate: the write path must still complete normally (no error, no
+    // wedge) — proving the (correctly withheld) cascade never left the
+    // aggregate's own status or write path in a broken state.
+    client
+        .batch_execute("insert into orders (id, price, tax) values (999, 5.00, 1.00)")
+        .await
+        .expect("seed a healthy order row");
+    let table = active_segment_table(&client).await;
+    insert_cdc_row(
+        &client,
+        &table,
+        "orders",
+        "999",
+        "insert",
+        None,
+        Some(r#"{"price":"5.00","tax":"1.00"}"#),
+    )
+    .await;
+    let seg_seq = seal_active_segment(&mut client).await;
+    apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+    )
+    .await
+    .expect("drain_once")
+    .expect("a healthy batch must still drain normally through order_totals");
+
+    // The write to `order_totals` above stages a downstream `Recompute`
+    // marker for `order_stats` into the (still-open) active ring segment —
+    // seal and drain once more to actually run the aggregate's own write
+    // path against it.
+    let seg_seq2 = seal_active_segment(&mut client).await;
+    apply::drain_once(
+        &db.pool,
+        seg_seq2,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+    )
+    .await
+    .expect("drain_once")
+    .expect(
+        "the aggregate's own batch must still drain normally, unaffected by the upstream \
+             (correctly non-cascaded) pause",
+    );
+
+    let stats_row = client
+        .query_opt(
+            "select total_sum::text from order_stats where id = 999",
+            &[],
+        )
+        .await
+        .expect("read order_stats");
+    assert!(
+        stats_row.is_some(),
+        "the aggregate transform must still write a row normally, unaffected by the upstream \
+         (correctly non-cascaded) pause"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (i) Regression: resuming a column must not silently no-op because a
+//     sibling column on the same transform is also paused (must-fix 3).
+// ---------------------------------------------------------------------
+
+/// `resume_column`'s `recompute_column` used to call the un-excluding
+/// `eval::evaluate_with_relationships`, so a still-paused sibling column
+/// (`busted` below, whose formula throws for every row given the malformed —
+/// but genuinely persisted — source data) made the *whole* per-row
+/// evaluation fail, and the resumed column (`doubled`) silently never got
+/// recomputed for any row, even though its own formula is perfectly healthy.
+/// Proves the fix: excluding the still-paused sibling from evaluation lets
+/// the resumed column recompute correctly for every row regardless.
+#[tokio::test]
+async fn resume_recomputes_correctly_even_when_a_sibling_column_still_throws() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    // `tax` is a real Postgres `text` column holding a permanently
+    // non-numeric value — `busted`'s formula (declared `Numeric` via
+    // `source_columns`, same "reach past the mechanism" trick the rest of
+    // this file uses for a malformed CDC image, just baked into real,
+    // persisted source data here since `recompute_column` reads the live
+    // table directly rather than a staged image) throws on every row, for
+    // every recompute attempt, indefinitely.
+    client
+        .batch_execute(
+            "create table calc_src (id integer primary key, price numeric, tax text); \
+             insert into calc_src (id, price, tax) values \
+             (1, 10, 'not-a-number'), (2, 20, 'not-a-number'), (3, 30, 'not-a-number')",
+        )
+        .await
+        .expect("seed source table");
+
+    let source_columns = numeric_columns(&["id", "price", "tax"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM calc FROM calc_src SELECT price + price AS doubled, tax + tax AS busted",
+        &source_columns,
+    )
+    .await
+    .expect("create calc definition");
+    let calc_def = TransformDef {
+        target: "calc".to_string(),
+        source: "calc_src".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![
+            FieldDef {
+                name: "doubled".to_string(),
+                expr: Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(Expr::Column("price".to_string())),
+                    rhs: Box::new(Expr::Column("price".to_string())),
+                },
+            },
+            FieldDef {
+                name: "busted".to_string(),
+                expr: Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(Expr::Column("tax".to_string())),
+                    rhs: Box::new(Expr::Column("tax".to_string())),
+                },
+            },
+        ],
+        predicate: Predicate::True,
+    };
+    let pk = source_primary_key(&db.pool, "calc_src")
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &calc_def, "public", &pk, &source_columns)
+        .await
+        .expect("create calc table");
+
+    // Seed the target with sentinel values distinct from any real
+    // recomputed result, so a successful recompute is unambiguous.
+    client
+        .batch_execute(
+            "insert into calc (id, doubled, busted) values \
+             (1, -999, -999), (2, -999, -999), (3, -999, -999)",
+        )
+        .await
+        .expect("seed sentinel target rows");
+
+    // Both columns independently paused — reached past the mechanism,
+    // inserted directly (same convention as this file's other tests).
+    client
+        .batch_execute(
+            "insert into column_status (transform_table, column_name, last_error, local_fuse) \
+             values ('calc', 'doubled', 'synthetic pause A', true), \
+                    ('calc', 'busted', 'synthetic pause B (always throws)', true)",
+        )
+        .await
+        .expect("seed column_status for both columns");
+
+    let resumed = quarantine::resume_column(&db.pool, "calc", "doubled")
+        .await
+        .expect("resume_column");
+    assert_eq!(
+        resumed,
+        vec![("calc".to_string(), "doubled".to_string())],
+        "only the resumed column itself, nothing cascaded"
+    );
+
+    assert_eq!(
+        column_status_row(&client, "calc", "doubled").await,
+        None,
+        "the resumed column must no longer be paused"
+    );
+    assert!(
+        column_status_row(&client, "calc", "busted").await.is_some(),
+        "the still-broken sibling must remain paused — resuming `doubled` must not touch it"
+    );
+
+    for (id, expected_doubled) in [(1, "20"), (2, "40"), (3, "60")] {
+        let row = client
+            .query_one(
+                "select doubled::text, busted::text from calc where id = $1",
+                &[&id],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("read calc for id {id}: {e}"));
+        let doubled: String = row.get(0);
+        let busted: String = row.get(1);
+        assert_eq!(
+            doubled, expected_doubled,
+            "the resumed column must be correctly recomputed for id {id}, even though the \
+             still-paused sibling's formula throws on every row"
+        );
+        assert_eq!(
+            busted, "-999",
+            "the still-paused sibling's own value must be left untouched by this resume"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// (j) Regression: ambiguous field-name attribution must fall back to no
+//     column-level attribution (should-fix 4).
+// ---------------------------------------------------------------------
+
+/// Two sibling `KeySpace::OneToOne` transforms on the same source table,
+/// both declaring a field named `total` — only `sib_b`'s formula is
+/// actually broken (it reads `qty`, staged as unparseable below; `sib_a`
+/// only reads `price`/`tax`, both fine). `attribute_column_failure` used to
+/// resolve the ambiguity by picking whichever candidate
+/// `transforms_for_source` happened to return first (lowest id), a
+/// deterministic misattribution: it could freeze `sib_a`'s perfectly
+/// healthy `total` while `sib_b`'s actually-broken one never accumulates a
+/// `column_status` entry at all. Proves the fix: neither sibling gets a
+/// column-level attribution, while the pre-existing row-level/transform-wide
+/// fuse still evicts the stubborn key exactly as it did before this
+/// feature.
+#[tokio::test]
+async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribution() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table shared_src (id integer primary key, price numeric, tax numeric, \
+             qty numeric)",
+        )
+        .await
+        .expect("seed source table");
+    let source_columns = numeric_columns(&["id", "price", "tax", "qty"]);
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM sib_a FROM shared_src SELECT price + tax AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create sib_a definition");
+    create_definition(
+        &db.pool,
+        "TRANSFORM sib_b FROM shared_src SELECT qty + qty AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create sib_b definition");
+
+    let pk = source_primary_key(&db.pool, "shared_src")
+        .await
+        .expect("introspect source primary key");
+    let def_a = TransformDef {
+        target: "sib_a".to_string(),
+        source: "shared_src".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "total".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::Column("price".to_string())),
+                rhs: Box::new(Expr::Column("tax".to_string())),
+            },
+        }],
+        predicate: Predicate::True,
+    };
+    create_target_table(&db.pool, &def_a, "public", &pk, &source_columns)
+        .await
+        .expect("create sib_a table");
+    let def_b = TransformDef {
+        target: "sib_b".to_string(),
+        source: "shared_src".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "total".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::Column("qty".to_string())),
+                rhs: Box::new(Expr::Column("qty".to_string())),
+            },
+        }],
+        predicate: Predicate::True,
+    };
+    create_target_table(&db.pool, &def_b, "public", &pk, &source_columns)
+        .await
+        .expect("create sib_b table");
+
+    // `DEFAULT_COLUMN_DEATH_THRESHOLD` distinct bad rows, all in one batch —
+    // the same "breadth of distinct rows, not one row retried" shape
+    // `stage_bad_orders`/`column_fuse_trips_only_once_the_threshold_is_crossed`
+    // use elsewhere in this file, chosen deliberately here too: it's enough
+    // volume to actually cross a column fuse's threshold, so this test would
+    // catch the old deterministic-misattribution bug (which would have
+    // tripped `sib_a`'s fuse — the healthy sibling, since it's the
+    // lower-`id` candidate `transforms_for_source` returns first) rather
+    // than vacuously passing because nothing ever reached threshold.
+    let table = active_segment_table(&client).await;
+    let bad_ids: Vec<i64> = (1..=DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    for id in &bad_ids {
+        insert_cdc_row(
+            &client,
+            &table,
+            "shared_src",
+            &id.to_string(),
+            "insert",
+            None,
+            Some(r#"{"price":"10.00","tax":"1.50","qty":"not-a-number"}"#),
+        )
+        .await;
+    }
+    let seg_seq = seal_active_segment(&mut client).await;
+    let result = apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+    )
+    .await;
+    assert!(
+        matches!(result, Err(ApplyError::Eval(_))),
+        "the malformed qty must still surface as an evaluator failure, got {result:?}"
+    );
+
+    assert_eq!(
+        column_status_row(&client, "sib_a", "total").await,
+        None,
+        "the healthy sibling must never be attributed to, even though its field name matches \
+         the actually-broken sibling's"
+    );
+    assert_eq!(
+        column_status_row(&client, "sib_b", "total").await,
+        None,
+        "the actually-broken sibling must also get no column-level attribution — ambiguous \
+         attribution must fall back to no attribution at all, not a guess"
+    );
+
+    // The pre-existing row-level fuse's own bookkeeping must be completely
+    // unaffected by the ambiguity fallback: every distinct bad row is still
+    // charged toward its own key-level counter exactly as it would be
+    // without this feature (`tests/quarantine.rs`'s own fuse, untouched).
+    for id in &bad_ids {
+        let deaths: Option<i32> = client
+            .query_opt(
+                "select deaths from key_deaths where src_table = 'shared_src' and key = $1",
+                &[&id.to_string()],
+            )
+            .await
+            .expect("read key_deaths")
+            .map(|row| row.get(0));
+        assert_eq!(
+            deaths,
+            Some(1),
+            "row-level key_deaths bookkeeping for id {id} must proceed normally, unaffected by \
+             the ambiguity fallback"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// (k) Regression: `resume_column` must refuse a column whose definition
+//     isn't live yet (the mid-backfill cascade bug a final holistic review
+//     agent found).
+// ---------------------------------------------------------------------
+
+/// A pause reaching `(transform, column)` while `transform` is still
+/// `Backfilling` — most concretely via this branch's cascade pause
+/// (`defs::catalog::column_dependents`, unlike the `status = 'live'`
+/// filtered lookups ordinary CDC apply uses, does *not* require the
+/// downstream dependent to be live before cascading a pause onto it) —
+/// must not be resumable. `recompute_column` takes exactly one snapshot of
+/// the *source* table and writes back only via `update ... where pk = $2`
+/// (no `insert`/upsert fallback); `column_status` for the paused column
+/// stays present for the entire duration of that recompute and is only
+/// deleted afterward. If the target definition is still mid-backfill, its
+/// own `backfill_chunks` queue can be actively inserting brand-new rows
+/// into the target the whole time `paused_columns_for` (backfill) and
+/// `compute` (live CDC apply) are excluding this column from — a row
+/// inserted after `recompute_column`'s snapshot was taken is never in its
+/// `rows_by_pk` map and is never revisited once `column_status` is cleared,
+/// permanently stranding that row's column even though `resume_column`
+/// reports success. Proves the fix instead: `resume_column` returns
+/// [`ApplyError::DefinitionNotLive`] and leaves everything untouched.
+#[tokio::test]
+async fn resume_column_refuses_a_column_on_a_not_yet_live_definition() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table stuck_src (id bigint primary key, a numeric); \
+             insert into stuck_src (id, a) values (1, 10), (2, 20), (3, 30)",
+        )
+        .await
+        .expect("seed source table");
+
+    let cols = numeric_columns(&["a"]);
+    // `install_definition`'s plain-1-1 path (`defs::catalog::install_plain_one_to_one`)
+    // persists the definition as `Backfilling` and enqueues its build as a
+    // `backfill_chunks` row *before* returning — nothing in this test ever
+    // claims/runs/finishes that chunk, so the definition is genuinely,
+    // deterministically stuck in `Backfilling` for the rest of the test.
+    // Same "nothing is watching the queue" determinism
+    // `trellis/tests/defs_backfill_chunk_queue.rs`'s
+    // `a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another_worker`
+    // and `trellis/tests/blocking_trellis.rs`'s
+    // `define_returns_before_backfill_completes` both rely on.
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM stuck FROM stuck_src SELECT a + a AS doubled",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition enumerates chunk work and returns");
+    assert_eq!(
+        def.status,
+        TransformStatus::Backfilling,
+        "nothing drains the chunk queue in this test, so the definition must still be \
+         backfilling"
+    );
+
+    // Simulate a pause landing on `stuck.doubled` while it's mid-backfill —
+    // reached past the mechanism, inserted directly (this file's own
+    // convention throughout; a real cascade would populate the same rows
+    // via `cascade_pause`). Seed `column_deaths` too, so this test can also
+    // prove the gate is all-or-nothing rather than partially cleaning up.
+    client
+        .batch_execute(
+            "insert into column_status (transform_table, column_name, last_error, local_fuse) \
+             values ('stuck', 'doubled', 'paused because upstream column X is paused', false); \
+             insert into column_deaths (transform_table, column_name, deaths) \
+             values ('stuck', 'doubled', 3)",
+        )
+        .await
+        .expect("seed column_status/column_deaths for the cascaded pause");
+
+    let result = quarantine::resume_column(&db.pool, "stuck", "doubled").await;
+    assert!(
+        matches!(
+            &result,
+            Err(ApplyError::DefinitionNotLive { transform }) if transform == "stuck"
+        ),
+        "resuming a column on a not-yet-live definition must be refused, got {result:?}"
+    );
+
+    assert_eq!(
+        column_status_row(&client, "stuck", "doubled").await,
+        Some((
+            false,
+            Some("paused because upstream column X is paused".to_string())
+        )),
+        "a refused resume must leave column_status completely untouched"
+    );
+    assert_eq!(
+        column_deaths_count(&client, "stuck", "doubled").await,
+        Some(3),
+        "a refused resume must be all-or-nothing: column_deaths must not be cleared either"
+    );
+}
+
+/// The end-to-end version of the same bug, through the *real*
+/// `trip_column_fuse` -> `cascade_pause` path rather than a hand-seeded
+/// `column_status` row: `order_totals.total` (live) pauses and cascades onto
+/// `order_summaries.grand_total`, whose definition is genuinely stuck
+/// `Backfilling` behind its own never-drained `backfill_chunks` queue
+/// (`install_definition`, same determinism as the test above). Proves the
+/// cascade-queue's per-pair check (the second gate inside `resume_column`'s
+/// `while` loop, distinct from the initial-pair gate the test above
+/// exercises): resuming the upstream column must still succeed and commit,
+/// while the downstream pair it cascaded onto is left exactly as it was —
+/// still paused, not resumed, and the call does not error out just because
+/// one pair deep in the queue isn't live yet.
+#[tokio::test]
+async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_erroring() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    seed_order_totals(&db, &client).await;
+
+    // Real, valid source rows, drained so `order_totals` has actual target
+    // rows for `install_definition` (below) to enumerate chunk work over —
+    // an empty source table would enqueue zero chunks and `order_summaries`
+    // would complete its (trivial) backfill synchronously instead of
+    // sticking in `Backfilling` the way this test needs.
+    client
+        .batch_execute(
+            "insert into orders (id, price, tax) values \
+             (1, 10.00, 1.00), (2, 20.00, 2.00), (3, 30.00, 3.00)",
+        )
+        .await
+        .expect("seed valid orders rows");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"price":"10.00","tax":"1.00"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "2",
+        "insert",
+        None,
+        Some(r#"{"price":"20.00","tax":"2.00"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "3",
+        "insert",
+        None,
+        Some(r#"{"price":"30.00","tax":"3.00"}"#),
+    )
+    .await;
+    let seg_seq = seal_active_segment(&mut client).await;
+    apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+    )
+    .await
+    .expect("drain_once")
+    .expect("must claim and drain the seed rows into order_totals");
+
+    // `order_summaries`, reading straight from `order_totals` (mirrors
+    // `seed_order_summaries`), but installed via `install_definition` so it
+    // enumerates real chunk work and is left `Backfilling` — nothing here
+    // ever drains that queue, the same determinism
+    // `resume_column_refuses_a_column_on_a_not_yet_live_definition` (above)
+    // and `trellis/tests/defs_backfill_chunk_queue.rs` rely on.
+    let order_totals_columns = numeric_columns(&["id", "total"]);
+    let summary_def = install_definition(
+        &db.pool,
+        "TRANSFORM order_summaries FROM order_totals SELECT total + total AS grand_total",
+        &order_totals_columns,
+        "public",
+    )
+    .await
+    .expect("install_definition enumerates chunk work and returns");
+    assert_eq!(
+        summary_def.status,
+        TransformStatus::Backfilling,
+        "nothing drains the chunk queue in this test, so order_summaries must still be \
+         backfilling"
+    );
+
+    // Trip `order_totals.total`'s own fuse (distinct ids from the 3 seeded
+    // above, so as not to disturb them) — the real cascade path,
+    // `defs::catalog::column_dependents`, must reach `order_summaries` here
+    // exactly as it does in `a_dependent_transforms_column_cascades_to_paused_when_its_upstream_column_pauses`,
+    // regardless of `order_summaries` still being `Backfilling`.
+    let bad_ids: Vec<i64> = (101..=100 + DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    stage_bad_orders(&mut client, &db.pool, &bad_ids).await;
+
+    assert!(
+        column_status_row(&client, "order_totals", "total")
+            .await
+            .is_some(),
+        "the upstream column must have tripped its own fuse"
+    );
+    let downstream_status = column_status_row(&client, "order_summaries", "grand_total")
+        .await
+        .expect(
+            "the cascade must reach order_summaries even though its definition is still \
+             backfilling",
+        );
+    assert!(
+        !downstream_status.0,
+        "a purely cascaded pause is not order_summaries's own local fuse"
+    );
+
+    let result = quarantine::resume_column(&db.pool, "order_totals", "total").await;
+    assert_eq!(
+        result.expect("resuming the live upstream column must succeed"),
+        vec![("order_totals".to_string(), "total".to_string())],
+        "the cascaded dependent must NOT be resumed alongside it: its definition isn't live yet"
+    );
+
+    assert_eq!(
+        column_status_row(&client, "order_totals", "total").await,
+        None,
+        "the resumed upstream column itself must no longer be paused"
+    );
+    assert!(
+        column_status_row(&client, "order_summaries", "grand_total")
+            .await
+            .is_some(),
+        "the cascaded-onto column must remain paused: its definition still isn't live, so \
+         resume_column must have left it exactly as it was rather than stranding or dropping it"
+    );
+}
