@@ -158,17 +158,23 @@ async fn a_relationship_appears_as_a_typed_edge_in_the_resolver() {
     .await
     .expect("valid relationship should be stored");
 
-    let relationship_edges = edges_from(&db.pool, "users", EdgeKind::Relationship)
+    // "trellis" (`Config::schema`, the default `TRELLIS_SCHEMA`), not
+    // "public" — issue #74, ADR-0007: `edges_from`/`node_for_table` now
+    // require a fully-qualified name, and `posts`/`users` above land under
+    // whatever schema is first in the pool's ambient `search_path` for a
+    // bare `CREATE TABLE`, which `pool::session_bootstrap` pins to the
+    // Trellis schema first.
+    let relationship_edges = edges_from(&db.pool, "trellis.users", EdgeKind::Relationship)
         .await
         .expect("query edges");
     assert_eq!(relationship_edges.len(), 1);
     assert_eq!(relationship_edges[0].kind, EdgeKind::Relationship);
 
-    let from_node = trellis::defs::node_for_table(&db.pool, "posts")
+    let from_node = trellis::defs::node_for_table(&db.pool, "trellis.posts")
         .await
         .expect("query node")
         .expect("posts node should exist");
-    let to_node = trellis::defs::node_for_table(&db.pool, "users")
+    let to_node = trellis::defs::node_for_table(&db.pool, "trellis.users")
         .await
         .expect("query node")
         .expect("users node should exist");
@@ -177,7 +183,7 @@ async fn a_relationship_appears_as_a_typed_edge_in_the_resolver() {
 
     // No `Source` edge was created by declaring a relationship — the two
     // edge kinds stay distinct in the graph.
-    let source_edges = edges_from(&db.pool, "users", EdgeKind::Source)
+    let source_edges = edges_from(&db.pool, "trellis.users", EdgeKind::Source)
         .await
         .expect("query edges");
     assert!(source_edges.is_empty());
@@ -1131,8 +1137,13 @@ async fn a_relationship_edge_that_would_close_a_cycle_is_rejected() {
 
     match err {
         CatalogError::Validate(ValidationError::TableCycle { cycle }) => {
-            assert!(cycle.contains(&"a".to_string()));
-            assert!(cycle.contains(&"b".to_string()));
+            // "trellis.a"/"trellis.b" (issue #74, ADR-0007): `a`/`b` above
+            // land under the Trellis schema, the first entry in a bare
+            // `CREATE TABLE`'s ambient `search_path` — see
+            // `a_relationship_appears_as_a_typed_edge_in_the_resolver`'s
+            // identical note.
+            assert!(cycle.contains(&"trellis.a".to_string()));
+            assert!(cycle.contains(&"trellis.b".to_string()));
         }
         other => panic!("expected TableCycle, got {other:?}"),
     }

@@ -19,6 +19,7 @@ use std::time::Duration;
 use testkit::{TestCluster, TestDatabase};
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
+use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     TransformStatus, chunk_queue, create_aggregate_target_table, create_definition,
@@ -82,6 +83,24 @@ fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
         .collect()
 }
 
+/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`] — where every bare
+/// `create table` in this file's own fixtures actually lands, since
+/// `connect_raw` pins `search_path` to `trellis, public` and never qualifies
+/// its own DDL. Matches `tests/quarantine.rs`'s (and `tests/apply.rs`'s) own
+/// `qualify_fixture_table` (issue #74, ADR-0007): a CDC-staged `src_table`
+/// must be fully qualified to match what a real CDC producer stages (issue
+/// #76) and what the dependency graph now keys on (issue #74), or
+/// `catalog::transforms_for_source` silently finds nothing and this whole
+/// file's column-fuse machinery never even gets exercised. Already-qualified
+/// input (containing a `.`) passes through unchanged.
+fn qualify_fixture_table(name: &str) -> String {
+    if name.contains('.') {
+        name.to_string()
+    } else {
+        format!("{DEFAULT_SCHEMA}.{name}")
+    }
+}
+
 async fn insert_cdc_row(
     client: &Client,
     table: &str,
@@ -91,6 +110,7 @@ async fn insert_cdc_row(
     old_image: Option<&str>,
     new_image: Option<&str>,
 ) {
+    let src_table = qualify_fixture_table(src_table);
     let lsn = PgLsn::from(1u64);
     client
         .execute(
@@ -794,10 +814,11 @@ async fn an_existing_row_level_fuse_scenario_is_unaffected() {
     };
     assert_eq!(outcome.keys_written, 1, "only the survivor, key 2, writes");
 
+    let orders = qualify_fixture_table("orders");
     let poisoned: bool = client
         .query_one(
-            "select exists(select 1 from poison where src_table = 'orders' and key = '1')",
-            &[],
+            "select exists(select 1 from poison where src_table = $1 and key = '1')",
+            &[&orders],
         )
         .await
         .expect("read poison")
@@ -1364,11 +1385,12 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
     // unaffected by the ambiguity fallback: every distinct bad row is still
     // charged toward its own key-level counter exactly as it would be
     // without this feature (`tests/quarantine.rs`'s own fuse, untouched).
+    let shared_src = qualify_fixture_table("shared_src");
     for id in &bad_ids {
         let deaths: Option<i32> = client
             .query_opt(
-                "select deaths from key_deaths where src_table = 'shared_src' and key = $1",
-                &[&id.to_string()],
+                "select deaths from key_deaths where src_table = $1 and key = $2",
+                &[&shared_src, &id.to_string()],
             )
             .await
             .expect("read key_deaths")

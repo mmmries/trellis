@@ -48,6 +48,23 @@ async fn seal_active_segment(client: &mut Client) -> i64 {
     outcome.sealed_seg_seq
 }
 
+/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`] — where every
+/// bare `create table` in this file's own fixtures actually lands, since
+/// `connect_raw` pins `search_path` to `{DEFAULT_SCHEMA}, public` and never
+/// qualifies its own DDL. Used by [`insert_cdc_row`] so a hand-staged ring
+/// row's `src_table` matches what a real CDC producer would actually stage
+/// (issue #76: always fully-qualified) and, as of issue #74, what
+/// `schema_nodes`/`schema_edges` now key on. Already-qualified input
+/// (containing a `.`) passes through unchanged. Mirrors `apply.rs`'s own
+/// `qualify_fixture_table` helper (test files can't share private helpers).
+fn qualify_fixture_table(name: &str) -> String {
+    if name.contains('.') {
+        name.to_string()
+    } else {
+        format!("{DEFAULT_SCHEMA}.{name}")
+    }
+}
+
 async fn insert_cdc_row(
     client: &Client,
     table: &str,
@@ -57,6 +74,7 @@ async fn insert_cdc_row(
     old_image: Option<&str>,
     new_image: Option<&str>,
 ) {
+    let src_table = qualify_fixture_table(src_table);
     let lsn = PgLsn::from(1u64);
     client
         .execute(

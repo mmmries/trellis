@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
+use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{
     CatalogError, ValidationError, ValueType, all_source_tables, create_definition,
     create_relationship, transforms_for_source,
@@ -15,6 +16,16 @@ fn columns(names: &[&str]) -> HashMap<String, ValueType> {
         .iter()
         .map(|s| (s.to_string(), ValueType::Numeric))
         .collect()
+}
+
+/// Bare `name` qualified under [`DEFAULT_SCHEMA`] — where
+/// `create_bare_source_table`/`create_authors_and_posts` actually land a
+/// bare `create table` (the pool's ambient `search_path`, Trellis schema
+/// first). `transforms_for_source` now requires its argument already
+/// fully-qualified (issue #74, ADR-0007); a bare name silently matches
+/// nothing rather than erroring.
+fn qualified(name: &str) -> String {
+    format!("{DEFAULT_SCHEMA}.{name}")
 }
 
 /// Creates a minimal backing relation for a definition's source table
@@ -66,7 +77,7 @@ async fn valid_definition_is_stored_and_retrievable() {
     assert_eq!(def.def.target, "order_totals");
     assert_eq!(def.def.source, "orders");
 
-    let subscribers = transforms_for_source(&db.pool, "orders")
+    let subscribers = transforms_for_source(&db.pool, &qualified("orders"))
         .await
         .expect("query mapping");
     assert_eq!(subscribers.len(), 1);
@@ -473,7 +484,7 @@ async fn transforms_for_source_returns_the_persisted_source_column_types() {
     .expect("valid definition should be stored");
     assert_eq!(created.source_columns, source_columns);
 
-    let subscribers = transforms_for_source(&db.pool, "orders")
+    let subscribers = transforms_for_source(&db.pool, &qualified("orders"))
         .await
         .expect("query mapping");
     assert_eq!(subscribers.len(), 1);
@@ -505,7 +516,7 @@ async fn a_definition_with_no_source_columns_survives_the_left_join_read() {
     .expect("a literal-only definition needs no source columns");
     assert!(def.source_columns.is_empty());
 
-    let subscribers = transforms_for_source(&db.pool, "widgets")
+    let subscribers = transforms_for_source(&db.pool, &qualified("widgets"))
         .await
         .expect("query mapping");
     assert_eq!(subscribers.len(), 1);
@@ -551,7 +562,7 @@ async fn transforms_for_source_groups_multiple_subscribers_by_id() {
 
     assert!(first.id < second.id);
 
-    let subscribers = transforms_for_source(&db.pool, "orders")
+    let subscribers = transforms_for_source(&db.pool, &qualified("orders"))
         .await
         .expect("query mapping");
     assert_eq!(subscribers.len(), 2);
@@ -800,7 +811,7 @@ async fn source_to_transform_mapping_reflects_a_newly_created_definition() {
     let db = cluster.create_isolated_database().await;
     create_bare_source_table(&db.pool, "orders").await;
 
-    let before = transforms_for_source(&db.pool, "orders")
+    let before = transforms_for_source(&db.pool, &qualified("orders"))
         .await
         .expect("query mapping before creation");
     assert!(before.is_empty());
@@ -813,7 +824,7 @@ async fn source_to_transform_mapping_reflects_a_newly_created_definition() {
     .await
     .expect("create definition");
 
-    let after = transforms_for_source(&db.pool, "orders")
+    let after = transforms_for_source(&db.pool, &qualified("orders"))
         .await
         .expect("query mapping after creation");
     assert_eq!(after.len(), 1);
@@ -1403,7 +1414,7 @@ async fn an_aggregate_transform_against_default_replica_identity_is_rejected() {
     );
 
     // The rejected attempt must not have left a row behind.
-    let subscribers = transforms_for_source(&db.pool, "posts")
+    let subscribers = transforms_for_source(&db.pool, &qualified("posts"))
         .await
         .expect("query mapping");
     assert_eq!(

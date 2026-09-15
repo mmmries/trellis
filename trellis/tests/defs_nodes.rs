@@ -11,10 +11,21 @@ use trellis::defs::{NodeKind, ValueType, create_definition, node_for_table, reso
 /// catalog lookup) — a bare PK column is enough, since `validate()` checks
 /// column references against the passed-in `source_columns` map, not the
 /// live schema.
+///
+/// Explicitly under `public` (issue #74, ADR-0007), not wherever a bare
+/// `CREATE TABLE` would land via the pool's ambient `search_path` —
+/// `a_definitions_target_matching_an_existing_source_node_merges_roles`
+/// below reuses "orders" both as a real source table here and as a later
+/// definition's bare `TRANSFORM orders ...` target, which always resolves
+/// against `Config::target_schema` (`public` by default); the two must
+/// agree on a schema or they resolve to two different qualified nodes
+/// instead of merging into one dual-role node.
 async fn create_bare_source_table(pool: &trellis::pool::Pool, name: &str) {
     let client = pool.get().await.expect("get connection");
     client
-        .batch_execute(&format!("create table {name} (id serial primary key)"))
+        .batch_execute(&format!(
+            "create table public.{name} (id serial primary key)"
+        ))
         .await
         .expect("create bare source table");
 }
@@ -33,19 +44,19 @@ async fn creating_a_definition_resolves_its_source_and_target_as_nodes() {
     .await
     .expect("valid definition should be stored");
 
-    let source = node_for_table(&db.pool, "orders")
+    let source = node_for_table(&db.pool, "public.orders")
         .await
         .expect("query source node")
         .expect("source node must exist after create_definition");
-    assert_eq!(source.table_name, "orders");
+    assert_eq!(source.table_name, "public.orders");
     assert!(source.is_source);
     assert!(!source.is_target);
 
-    let target = node_for_table(&db.pool, "order_totals")
+    let target = node_for_table(&db.pool, "public.order_totals")
         .await
         .expect("query target node")
         .expect("target node must exist after create_definition");
-    assert_eq!(target.table_name, "order_totals");
+    assert_eq!(target.table_name, "public.order_totals");
     assert!(target.is_target);
     assert!(!target.is_source);
 }
@@ -55,7 +66,7 @@ async fn a_table_with_no_definitions_has_no_node() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
-    let node = node_for_table(&db.pool, "nonexistent")
+    let node = node_for_table(&db.pool, "public.nonexistent")
         .await
         .expect("query mapping");
     assert!(node.is_none());
@@ -66,10 +77,10 @@ async fn resolving_the_same_table_and_kind_twice_is_idempotent() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
-    let first = resolve_node(&db.pool, "orders", NodeKind::Source)
+    let first = resolve_node(&db.pool, "public.orders", NodeKind::Source)
         .await
         .expect("first resolution");
-    let second = resolve_node(&db.pool, "orders", NodeKind::Source)
+    let second = resolve_node(&db.pool, "public.orders", NodeKind::Source)
         .await
         .expect("second resolution is idempotent");
 
@@ -89,11 +100,11 @@ async fn resolving_a_table_under_the_other_kind_merges_into_one_dual_role_node()
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
-    let first = resolve_node(&db.pool, "orders", NodeKind::Source)
+    let first = resolve_node(&db.pool, "public.orders", NodeKind::Source)
         .await
         .expect("first resolution as a source");
 
-    let second = resolve_node(&db.pool, "orders", NodeKind::Target)
+    let second = resolve_node(&db.pool, "public.orders", NodeKind::Target)
         .await
         .expect("resolving the other role merges rather than erroring");
 
@@ -129,7 +140,7 @@ async fn a_definitions_target_matching_an_existing_source_node_merges_roles() {
     .await
     .expect("second definition merges 'orders' into a dual-role node");
 
-    let node = node_for_table(&db.pool, "orders")
+    let node = node_for_table(&db.pool, "public.orders")
         .await
         .expect("query orders node")
         .expect("orders node must exist");

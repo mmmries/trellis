@@ -368,6 +368,45 @@ fn catalog_source_key(src_table: &str) -> &str {
     }
 }
 
+/// Resolves `src_table` to the fully-qualified identity
+/// [`catalog::transforms_for_source`]/[`catalog::dependents_of`] now require
+/// (issue #74, ADR-0007: `schema_nodes` keys on qualified identity, so a
+/// bare lookup there silently finds nothing rather than erroring).
+///
+/// A no-op for the common case — `src_table` already contains a `.` — which
+/// covers every real CDC-staged or backfill-enumerated change (issue #76
+/// qualifies `change.src_table` unconditionally at the point it's staged).
+/// Two different shapes of bare `src_table` reach this function, needing
+/// two different resolutions — both handled by delegating to
+/// [`catalog::resolve_graph_identity`] rather than this function choosing
+/// between them itself:
+///
+/// 1. A downstream `Recompute` trigger *this apply path itself* staged for
+///    a chained definition's target (`compute`'s "Downstream propagation"
+///    step, `apply_and_mark_drained`), carrying the plain, bare
+///    `def.def.target` as its `src_table` (qualifying every such row at the
+///    point it's staged is issue #75's emission-audit territory, not this
+///    one's — see `catalog_source_key`'s own doc comment on the same
+///    deliberate-bare convention). This is `resolve_graph_identity`'s
+///    bare-target-suffix fallback: the name can only be some other live
+///    definition's own target.
+/// 2. A reverse-recompute trigger for a relationship's from-side
+///    (`from_side_keys_for_join`/`from_side_keys_with_non_null_join`'s
+///    callers below, staging `rel.def.from_table` as `src_table`) —
+///    `relationship_definitions.from_table` is always bare (ADR-0007's
+///    "Scope" section leaves relationship endpoints unqualified) and is a
+///    genuine *source* table, never anyone's target, so the bare-target-
+///    suffix fallback above would never find it. This is
+///    `resolve_graph_identity`'s *first* step instead: a plain physical
+///    `search_path` lookup, exactly like resolving a fresh definition's own
+///    bare `FROM`.
+async fn qualified_schema_node_key(pool: &Pool, src_table: &str) -> Result<String, ApplyError> {
+    if src_table.contains('.') {
+        return Ok(src_table.to_string());
+    }
+    Ok(catalog::resolve_graph_identity(pool, src_table).await?)
+}
+
 /// Decodes a staged jsonb image (bound as text — this crate has no
 /// `serde_json` dependency, matching `append.rs`/`fold.rs`'s convention)
 /// into a [`Row`] via `jsonb_each_text`, so the evaluator never has to
@@ -963,7 +1002,23 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             }
         }
 
-        let defs = catalog::transforms_for_source(pool, source_key).await?;
+        // `qualified_source` (via `qualified_schema_node_key`), not
+        // `source_key`: `schema_nodes`/`schema_edges` now key on qualified
+        // identity (issue #74, ADR-0007), so `transforms_for_source` (a
+        // thin `dependents_of` wrapper) needs an exact qualified match
+        // here, not the bare catalog-lookup key `catalog_source_key`'s own
+        // doc comment already explains stays bare for
+        // `source_table_version`/`relationships_to_table` below (both still
+        // bare-suffix-keyed, unaffected by #74). `qualified_source` is
+        // usually already fully-qualified (real CDC/backfill), but a
+        // downstream-propagation hop's `src_table` is a bare target name
+        // this same apply path staged — `qualified_schema_node_key` resolves
+        // that case too; see its own doc comment.
+        let defs = catalog::transforms_for_source(
+            pool,
+            &qualified_schema_node_key(pool, qualified_source).await?,
+        )
+        .await?;
 
         // Aggregate definitions need each change's *old*-side row too (to
         // derive a grain-migrating change's old group key and its old
@@ -1351,7 +1406,18 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             }
             Err(err) => return Err(err.into()),
         };
-        let defs = catalog::transforms_for_source(pool, source_key).await?;
+        // `&change.src_table` (qualified), not `source_key` (bare) — see
+        // the by-source loop above's identical comment on its own
+        // `transforms_for_source` call. A `TRUNCATE` is always a real
+        // physical CDC event (never a bare, internally-synthesized
+        // `Recompute` row), so `qualified_schema_node_key` is a no-op here
+        // in practice — routed through it anyway for the same safety the
+        // by-source loop gets, at effectively no cost.
+        let defs = catalog::transforms_for_source(
+            pool,
+            &qualified_schema_node_key(pool, &change.src_table).await?,
+        )
+        .await?;
         for def in &defs {
             match &def.def.key_space {
                 KeySpace::Aggregate { .. } => {
@@ -1415,9 +1481,18 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     all_targets.extend(aggregate_targets.keys());
     all_targets.extend(aggregate_clears.keys());
     for target in all_targets {
-        let has_downstream = !catalog::transforms_for_source(pool, target)
-            .await?
-            .is_empty();
+        // `target` is bare (`def.def.target`) — `schema_nodes` now keys on
+        // qualified identity (issue #74, ADR-0007), so a bare lookup here
+        // would silently find nothing and permanently disable downstream
+        // propagation for every chained transform.
+        // `qualified_schema_node_key` resolves it the same way it resolves
+        // a bare `Recompute`-staged `src_table` above (this *is* exactly
+        // that case, one step earlier: `target` is about to become such a
+        // row's `src_table` the moment this loop's caller stages it).
+        let has_downstream =
+            !catalog::transforms_for_source(pool, &qualified_schema_node_key(pool, target).await?)
+                .await?
+                .is_empty();
         downstream_readers.insert(target.clone(), has_downstream);
     }
 

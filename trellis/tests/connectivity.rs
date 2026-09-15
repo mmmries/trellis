@@ -29,14 +29,18 @@ async fn migrate_up_is_idempotent() {
     assert_eq!(
         first_run,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
         ],
         // Issue #73 added V22 (drops `column_status`'s now-unenforceable
         // `target_table` foreign key). Its reviewer follow-up added V23
         // (the `transform_definitions_target_suffix_idx` expression unique
         // index — the DB-level backstop for `create_definition_inner`'s
-        // bare-target-suffix pre-check).
-        "expected exactly V1 through V23 to be applied"
+        // bare-target-suffix pre-check). Issue #74 added V24 (clears any
+        // bare-keyed `schema_nodes`/`schema_edges` rows now stale under the
+        // qualified-identity keying — see that migration's own doc comment
+        // for why this is a destructive, assume-empty migration rather than
+        // ADR-0007's literal canonicalize-in-place proposal).
+        "expected exactly V1 through V24 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.

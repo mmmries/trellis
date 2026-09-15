@@ -77,7 +77,31 @@ async fn drained_mask(client: &Client, seg_seq: i64) -> i64 {
         .get(0)
 }
 
+/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`] — where every
+/// bare `create table` in this file's own fixtures actually lands, since
+/// `connect_raw` pins `search_path` to `{DEFAULT_SCHEMA}, public` and never
+/// qualifies its own DDL. Used by [`insert_cdc_row`]/[`insert_truncate_row`]
+/// so a hand-staged ring row's `src_table` matches what a real CDC producer
+/// would actually stage (issue #76: always fully-qualified) and, as of
+/// issue #74, what `schema_nodes`/`schema_edges` now key on — before #74
+/// neither mattered, since `schema_nodes` was itself bare-keyed and the
+/// physical read paths (`ddl::source_primary_key`/`read_live_rows_batch`)
+/// tolerate a bare name fine via their own connection's `search_path`
+/// (Postgres resolves it live), so this file's fixtures got away with
+/// staging a bare `src_table` even after #76. Already-qualified input
+/// (containing a `.`) passes through unchanged — e.g. a target-table src
+/// under `public` some test builds by hand instead of through this helper.
+fn qualify_fixture_table(name: &str) -> String {
+    if name.contains('.') {
+        name.to_string()
+    } else {
+        format!("{DEFAULT_SCHEMA}.{name}")
+    }
+}
+
 /// Stages one image-bearing (CDC-shaped) change directly into `table`.
+/// `src_table` is qualified via [`qualify_fixture_table`] if it isn't
+/// already.
 async fn insert_cdc_row(
     client: &Client,
     table: &str,
@@ -87,6 +111,7 @@ async fn insert_cdc_row(
     old_image: Option<&str>,
     new_image: Option<&str>,
 ) {
+    let src_table = qualify_fixture_table(src_table);
     let lsn = PgLsn::from(1u64);
     client
         .execute(
@@ -102,6 +127,7 @@ async fn insert_cdc_row(
 
 /// Stages a truncate sentinel directly into `table`, for `src_table`.
 async fn insert_truncate_row(client: &Client, table: &str, src_table: &str) {
+    let src_table = qualify_fixture_table(src_table);
     client
         .execute(
             &format!(
@@ -1531,7 +1557,7 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
         client
             .execute(
                 "insert into seg_0 (src_table, key, op, hop_gen) \
-                 values ('orders', $1, 'recompute', 0)",
+                 values ('trellis.orders', $1, 'recompute', 0)",
                 &[&i.to_string()],
             )
             .await
@@ -1566,7 +1592,7 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
         std::fs::read_to_string(cluster.root().join("postgres.log")).expect("read postgres log");
     let refetch_queries: Vec<&str> = log
         .lines()
-        .filter(|line| line.contains("from \"orders\" t") && line.contains("\"id\" ="))
+        .filter(|line| line.contains("from \"trellis\".\"orders\" t") && line.contains("\"id\" ="))
         .collect();
     assert_eq!(
         refetch_queries.len(),
@@ -1648,7 +1674,7 @@ async fn a_write_batch_past_the_bind_parameter_cap_chunks_and_still_drains() {
     client
         .execute(
             "insert into seg_0 (src_table, key, op, hop_gen) \
-             select 'orders', i::text, 'recompute', 0 from generate_series(1, $1::bigint) as i",
+             select 'trellis.orders', i::text, 'recompute', 0 from generate_series(1, $1::bigint) as i",
             &[&N],
         )
         .await
@@ -1756,7 +1782,7 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
         client
             .execute(
                 "insert into seg_0 (src_table, key, op, hop_gen) \
-                 values ('orders', $1, 'recompute', 0)",
+                 values ('trellis.orders', $1, 'recompute', 0)",
                 &[&key],
             )
             .await
@@ -1791,7 +1817,7 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
     client
         .execute(
             "insert into seg_0 (src_table, key, op, hop_gen) \
-             values ('orders', '5', 'recompute', 0)",
+             values ('trellis.orders', '5', 'recompute', 0)",
             &[],
         )
         .await
@@ -1824,7 +1850,7 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
         std::fs::read_to_string(cluster.root().join("postgres.log")).expect("read postgres log");
     let refetch_queries: Vec<&str> = log
         .lines()
-        .filter(|line| line.contains("from \"orders\" t") && line.contains("\"id\" ="))
+        .filter(|line| line.contains("from \"trellis\".\"orders\" t") && line.contains("\"id\" ="))
         .collect();
     assert_eq!(
         refetch_queries.len(),

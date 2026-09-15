@@ -43,6 +43,16 @@ pub struct Definition {
     /// fragment; a `to_regclass($1)`-style introspection query can bind this
     /// string as-is.
     pub source_table: String,
+    /// The persisted, fully-qualified `"schema.table"` form of `def.target`
+    /// — `transform_definitions.target_table` read back verbatim (issue #73
+    /// resolved it once, at acceptance time, mirroring `source_table` above;
+    /// issue #74 additionally made this the exact identity `schema_nodes`'
+    /// target-side node is keyed on, so it now doubles as the qualified key
+    /// a caller with only `def.target` (bare) can use to re-enter the
+    /// `schema_nodes`/`schema_edges` graph — see
+    /// `staging::apply::compute`'s `downstream_readers` check for the one
+    /// call site that needs exactly this).
+    pub target_table: String,
 }
 
 /// A transform's lifecycle status (issue #55), persisted as
@@ -184,10 +194,10 @@ pub enum NodeKind {
 }
 
 /// A first-class identity for a table Trellis knows about — as a source, a
-/// target, or (via chained transforms) both — that transforms (and, later,
-/// relationships) resolve their endpoints against instead of a bare
-/// table-name string. One row per physical table: `is_source`/`is_target`
-/// each start `false` and are only ever set to `true` by
+/// target, or (via chained transforms) both — that transforms (and, as of
+/// issue #74, relationships too) resolve their endpoints against instead of
+/// a bare table-name string. One row per physical table: `is_source`/
+/// `is_target` each start `false` and are only ever set to `true` by
 /// [`super::catalog::resolve_node`], never back to `false`. Only identity is
 /// persisted ([`super::catalog`]'s `schema_nodes` table); a node's columns
 /// and types are introspected live from `pg_catalog`/`information_schema`
@@ -195,6 +205,14 @@ pub enum NodeKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaNode {
     pub id: i64,
+    /// The fully-qualified `"schema.table"` identity this node is keyed on
+    /// (issue #74, ADR-0007). `public.posts` and `archive.posts` are
+    /// distinct rows with independent `is_source`/`is_target` flags and
+    /// independent `schema_edges` — before issue #74 this held the bare
+    /// table name, so same-named tables in different schemas collided into
+    /// one node; every caller must now pass (and compare against) the
+    /// qualified form, never re-deriving it here (same resolve-once
+    /// discipline as `transform_definitions.source_table`/`target_table`).
     pub table_name: String,
     pub is_source: bool,
     pub is_target: bool,
