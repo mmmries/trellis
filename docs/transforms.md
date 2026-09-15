@@ -33,8 +33,9 @@ equivalent `GROUP BY` query against the source.
 * Many source rows can map to one target row.
 * The primary key is the tuple of grouping columns.
 * Calculated fields typically use aggregate functions over the grouped rows.
-  Today that's `SUM`, `AVG`, `MIN`, and `MAX` (numeric-only); `COUNT` is not
-  yet implemented (see ADR-0004).
+  Today that's `SUM`, `AVG`, `MIN`, and `MAX` (numeric-only) plus `COUNT(*)`
+  row-counting (#75); `COUNT(<column>)` in a `GROUP BY` is not yet implemented
+  (see ADR-0004).
 * Adding, removing, or changing a source row can change its group, inserting,
   deleting, or updating a target row.
 
@@ -119,7 +120,7 @@ columns:
 | Granularity | How a formula references source columns |
 | --- | --- |
 | 1-1 | Reference source columns and other calculated columns directly; each resolves against the single source row. |
-| Aggregate | Grouping-key columns may be referenced directly. Any other source column must be wrapped in exactly one of `SUM`, `AVG`, `MIN`, or `MAX` (numeric-only; `COUNT` is not yet implemented) over the group. |
+| Aggregate | Grouping-key columns may be referenced directly. Any other source column must be wrapped in exactly one of `SUM`, `AVG`, `MIN`, or `MAX` (numeric-only) over the group; `COUNT(*)` counts rows in the group (`COUNT(<column>)` is not yet implemented). |
 | Cross-join | Reference source columns through the qualified name of the side they come from (`a.column`, `b.column`). |
 
 Formulas may only use **immutable** functions and operators — those whose
