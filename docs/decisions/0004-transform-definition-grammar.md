@@ -88,9 +88,9 @@ literal, `<expr> + <expr>`, `<expr> > <expr>`, or a function call
 (`strpos`, `octet_length`, `char_length`, `regexp_count` — general
 `func(args)` call syntax landed with these four; adding another function
 means a registry entry plus a re-implemented evaluator arm, same bar as an
-operator). Values carry one of three types — `Numeric`, `Text`, `Boolean` —
-and every operator/function's argument and return types are type-checked at
-definition time (see [transforms](../transforms.md)). `<predicate>` accepts
+operator). Values carry one of four types — `Numeric`, `Text`, `Boolean`, `Uuid`
+(the last added in issue #79) — and every operator/function's argument and
+return types are type-checked at definition time (see [transforms](../transforms.md)). `<predicate>` accepts
 only the literal `TRUE` for now (the partial-data predicate is otherwise
 deferred).
 
@@ -132,9 +132,10 @@ same paired grammar-plus-evaluator bar every other addition here meets.
 **Aggregate function-call spelling is now settled**: it's the same
 `func(args)` call syntax general function calls already use, just resolved
 against a separate aggregate-function registry only reachable inside a
-`GROUP BY` definition. `COUNT` is deliberately excluded — it's recognized by
-name (inside or outside an aggregate definition) only to give a specific "not
-yet implemented" error, the same reservation-by-name pattern `JOIN` uses.
+`GROUP BY` definition. `COUNT(*)` (arity-0 row counting) has since landed
+(issue #75); `COUNT(<column>)` inside a `GROUP BY` is still recognized by name
+only to give a specific "not yet implemented" error, the same
+reservation-by-name pattern `JOIN` uses.
 Side-qualification for cross-joins (`a.column` vs. some other qualifier)
 remains genuinely open, since no join syntax is parsed at all yet.
 
@@ -151,9 +152,9 @@ Undecided:
 
 * Cross-join side-qualification syntax (`JOIN` is still only recognized and
   rejected by name, not parsed). Aggregate function-call spelling and general
-  non-aggregate function-call syntax are both settled — see above. `COUNT` is
-  a deliberate exclusion, not an open question: it's rejected by name with the
-  same "not yet implemented" spelling regardless of key-space.
+  non-aggregate function-call syntax are both settled — see above. `COUNT(*)`
+  row counting has landed (issue #75); `COUNT(<column>)` in a `GROUP BY`
+  remains rejected by name with the "not yet implemented" spelling.
 * Whether the grammar and its stored schema are versioned independently of the
   transform-redefinition scheme (see [open-questions](../open-questions.md)).
 * Operator precedence: the parser is currently flat left-associative with no
