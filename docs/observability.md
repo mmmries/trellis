@@ -226,22 +226,22 @@ The remedy is documentation, not a signal: a transform stays in
 idle-in-transaction connections, long analytics queries, `pg_dump`, or workload
 on another database sharing the cluster.
 
-## Approved dependencies
+## Dependencies
 
-None added to `Cargo.toml` yet (that's issue #51/#56's job, not this doc's),
-but the choice itself is now approved — see
+Approved and pinned in `trellis/Cargo.toml` (issues #51/#56) — see
 [ADR-0009](decisions/0009-observability-decisions.md#1-dependencies-metrics-facade-not-prometheus-directly)
 for the full rationale, including why the `metrics` facade was chosen over
 depending on the `prometheus` crate directly:
 
 * `metrics` + `metrics-exporter-prometheus` for the in-process metrics
   registry and Prometheus text rendering. `metrics-exporter-prometheus`'s
-  optional Hyper-listener feature will **not** be enabled — this stays a pure
+  optional Hyper-listener feature is **not** enabled — this stays a pure
   registry + text-encoder, matching "Exposition: a mountable handler, not a
   bound port" above.
-* `tracing` + `tracing-opentelemetry` + `opentelemetry-otlp` for logs/traces.
-
-Exact versions will be pinned when implementation starts.
+* `tracing` (unconditional) for spans/events; `tracing-opentelemetry` +
+  `opentelemetry-otlp` for OTLP export, both behind the `otlp` Cargo feature
+  (off by default, and genuinely absent from the dependency tree when
+  unused — not merely unused at runtime).
 
 ## Open questions
 
