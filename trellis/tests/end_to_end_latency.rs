@@ -57,21 +57,6 @@ async fn seal_active_segment(client: &mut Client) -> i64 {
     outcome.sealed_seg_seq
 }
 
-/// The ring table (`seg_0`..`seg_3`) currently active — needed by any test
-/// that stages more than one change across seals, since each seal rotates
-/// the active slot forward (`seal::seal_phase1`'s `next_ring_slot =
-/// (ring_slot + 1) % RING_SIZE`); hardcoding `"seg_0"` (fine for a single
-/// insert-then-seal, what every other helper's caller does today) would
-/// stage a later insert into a slot nothing is currently draining from.
-async fn active_segment_table(client: &Client) -> String {
-    let ring_slot: i16 = client
-        .query_one("select ring_slot from segment_pointer", &[])
-        .await
-        .expect("read active ring slot")
-        .get(0);
-    format!("seg_{ring_slot}")
-}
-
 /// Stages one image-bearing (CDC-shaped) change directly into `table`,
 /// mirroring `apply.rs`'s helper of the same name — except this one also
 /// sets `src_changed` to `now()` (`apply.rs`'s own helper leaves it `NULL`,
@@ -117,38 +102,46 @@ fn metric_mentions_transform(rendered: &str, metric: &str, target: &str) -> bool
         .any(|line| line.starts_with(metric) && line.contains(&format!("transform=\"{target}\"")))
 }
 
+/// The cumulative count in one histogram bucket (`le="<bound>"`) for
+/// `metric{transform="target"}` — used where presence alone
+/// ([`metric_mentions_transform`]) isn't enough and a test needs to pin down
+/// *which* bucket an observation actually landed in (proving a latency was
+/// traced through to a real, older origin rather than freshly stamped at
+/// the hop that recorded it).
+fn bucket_count(rendered: &str, metric: &str, target: &str, le: &str) -> u64 {
+    let bucket_metric = format!("{metric}_bucket");
+    rendered
+        .lines()
+        .find(|line| {
+            line.starts_with(&bucket_metric)
+                && line.contains(&format!("transform=\"{target}\""))
+                && line.contains(&format!("le=\"{le}\""))
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .unwrap_or_else(|| panic!("no {bucket_metric} bucket le={le} for {target} in: {rendered}"))
+        .parse()
+        .expect("bucket value parses as an integer")
+}
+
 /// Linear chain: `orders -> e2e_latency_chain_totals -> e2e_latency_chain_summary`,
 /// the second definition being the only terminal transform.
 ///
-/// **Why this test stages two separate `orders`-side-equivalent CDC rows
-/// instead of just following the one automatic hop-to-hop propagation:**
-/// `StagedChange::Recompute` — what `apply_and_mark_drained` automatically
-/// stages to propagate a change to a downstream reader
-/// (`trellis/src/staging/apply.rs`'s "4. Downstream propagation") — carries
-/// no `src_changed` of its own (see `staging::append::StagedChange`'s doc
-/// comment and `ChangeRow::from`'s `Recompute` arm: always `None`).
-/// ADR-0009 decision 5 is explicit that only `StagedChange::Cdc`/`Truncate`
-/// carry `src_changed` forward. So a transform reached purely through an
-/// automatically-staged recompute trigger — the common case for any hop
-/// beyond the first — folds to a [`FoldedChange`] with `src_changed: None`,
-/// and *neither* the per-transform histogram (#51) *nor* the end-to-end one
-/// (#52) can observe anything for it: there's no origin left to diff
-/// against. That's a pre-existing characteristic of #51's already-committed
-/// mechanism (not something this change alters or extends), reused as-is
-/// here rather than threading `src_changed` through `Recompute` too — see
-/// this crate's issue #52 implementation notes for why that's flagged as a
-/// follow-up rather than folded into this change.
-///
-/// This test exercises that first hop faithfully (proving the intermediate
-/// transform gets its own per-transform latency but never an end-to-end
-/// observation) and then, matching this whole test file's established
-/// "changes staged directly into the ring, intake is out of scope"
-/// convention, stages a second, independent CDC-shaped change directly
-/// against `e2e_latency_chain_totals` (exactly as the first hop's CDC row
-/// was staged directly against `orders`) to drive the terminal hop with a
-/// real origin timestamp — proving the terminal transform *does* get an
-/// end-to-end observation once one is reachable, while the intermediate
-/// transform still never does.
+/// This exercises the **real** automatic hop-to-hop propagation path — a
+/// single source-committed CDC row against `orders`, no manufactured second
+/// write anywhere. `apply_and_mark_drained`'s downstream propagation (step
+/// 4, `trellis/src/staging/apply.rs`) stages the second hop's
+/// `StagedChange::Recompute` row itself; prior to the multi-hop-gap fix
+/// (issues #51/#52, discovered during #52's review), `Recompute` carried no
+/// `src_changed` of its own (see `staging::append::StagedChange`'s doc
+/// comment), so a transform reached only through one — the common case for
+/// any hop beyond the first — folded to a `FoldedChange` with
+/// `src_changed: None`, and neither histogram could observe anything for
+/// it. `Recompute` now threads the triggering change's `src_changed`
+/// forward (`apply.rs`'s `ChangedKey`/`TargetWrite::src_changed`/
+/// `TargetDelete::src_changed`), so this test proves the terminal transform
+/// gets a genuine end-to-end observation — traced all the way back to the
+/// original `orders` commit — once it's reached purely through automatic
+/// propagation, with no second, independently-staged change involved.
 #[tokio::test]
 async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_chain() {
     let cluster = TestCluster::start();
@@ -246,55 +239,23 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
          observation: {after_hop0}"
     );
 
-    // Hop 1: chain_totals -> chain_summary (terminal), driven by the
-    // recompute trigger chain_totals' apply staged automatically — an
-    // image-less trigger with no `src_changed` of its own (see this test's
-    // doc comment). Drained here purely to move the ring forward before
-    // this test stages its own second hop below; neither latency histogram
-    // is expected to observe anything from it.
+    // A real (short, but non-trivial) delay before draining hop 1 below, so
+    // the assertions after it can tell a *traced-through* latency (which
+    // must be at least this old) apart from one a bug might freshly stamp
+    // at hop 1's own apply time (which would show up near-zero instead).
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Hop 1: chain_totals -> chain_summary (terminal), driven *purely* by
+    // the `Recompute` row chain_totals' own apply staged automatically
+    // (`apply_and_mark_drained`'s downstream propagation) — no second,
+    // independently-staged change anywhere. This is the real automatic
+    // hop-to-hop propagation path issues #51/#52's multi-hop gap was about:
+    // before the fix, this `Recompute` row carried no `src_changed`, so
+    // neither histogram could observe anything here; now it carries hop 0's
+    // own origin forward.
     let seg2 = seal_active_segment(&mut client).await;
     let outcome2 = drain(&db.pool, seg2, "worker").await;
     assert_eq!(outcome2.keys_written, 1);
-
-    let after_recompute_hop = trellis::metrics::render_for_test();
-    assert!(
-        !metric_mentions_transform(
-            &after_recompute_hop,
-            "trellis_end_to_end_latency_seconds",
-            "e2e_latency_chain_summary",
-        ),
-        "a terminal transform reached only through an origin-less recompute trigger must not \
-         get a spurious end-to-end observation: {after_recompute_hop}"
-    );
-    assert!(
-        !metric_mentions_transform(
-            &after_recompute_hop,
-            "trellis_transform_latency_seconds",
-            "e2e_latency_chain_summary",
-        ),
-        "same origin-less trigger: no per-transform latency either (issue #51's own existing \
-         behavior, unaffected by this change): {after_recompute_hop}"
-    );
-
-    // Now drive the terminal hop with a real origin: stage a second,
-    // independent CDC-shaped change directly against
-    // `e2e_latency_chain_totals` itself (this test file's own established
-    // "stage directly into the ring" convention, applied to the second hop
-    // exactly as it already was to the first).
-    let active_table = active_segment_table(&client).await;
-    insert_cdc_row(
-        &client,
-        &active_table,
-        "e2e_latency_chain_totals",
-        "1",
-        "update",
-        Some(r#"{"id":"1","total":"11.50"}"#),
-        Some(r#"{"id":"1","total":"20.00"}"#),
-    )
-    .await;
-    let seg3 = seal_active_segment(&mut client).await;
-    let outcome3 = drain(&db.pool, seg3, "worker").await;
-    assert_eq!(outcome3.keys_written, 1);
 
     let after_hop1 = trellis::metrics::render_for_test();
     assert!(
@@ -303,8 +264,20 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
             "trellis_end_to_end_latency_seconds",
             "e2e_latency_chain_summary",
         ),
-        "the terminal transform must get an end-to-end observation once it's reached with a \
-         real origin timestamp: {after_hop1}"
+        "the terminal transform must get an end-to-end observation once it's reached purely \
+         through automatic hop-to-hop propagation, with no manufactured second write: {after_hop1}"
+    );
+    assert_eq!(
+        bucket_count(
+            &after_hop1,
+            "trellis_end_to_end_latency_seconds",
+            "e2e_latency_chain_summary",
+            "0.1",
+        ),
+        0,
+        "the observation must be traced back to the original orders commit (at least the \
+         150ms this test slept before draining hop 1), not freshly stamped ~0 at hop 1's own \
+         apply time: {after_hop1}"
     );
     assert!(
         !metric_mentions_transform(
@@ -312,8 +285,9 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
             "trellis_end_to_end_latency_seconds",
             "e2e_latency_chain_totals",
         ),
-        "the intermediate hop must still never get an end-to-end observation, even after the \
-         terminal hop applies: {after_hop1}"
+        "the intermediate hop must still never get an end-to-end observation, even though it \
+         (like the terminal transform) now has a real `src_changed` to observe against: \
+         {after_hop1}"
     );
     assert!(
         metric_mentions_transform(
@@ -321,8 +295,8 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
             "trellis_transform_latency_seconds",
             "e2e_latency_chain_summary",
         ),
-        "the terminal transform's own per-transform latency (issue #51) must still be \
-         recorded too: {after_hop1}"
+        "the terminal transform's own per-transform latency (issue #51) must be recorded too, \
+         now that hop 2 — reached only via Recompute — carries a real origin: {after_hop1}"
     );
 }
 

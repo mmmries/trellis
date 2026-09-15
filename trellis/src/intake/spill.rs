@@ -326,12 +326,21 @@ fn write_change(w: &mut impl Write, change: &StagedChange) -> io::Result<()> {
             key,
             hop_gen,
             group_key,
+            src_changed,
         } => {
             w.write_all(&[TAG_RECOMPUTE])?;
             write_str(w, src_table)?;
             write_str(w, key)?;
             w.write_all(&hop_gen.to_le_bytes())?;
-            write_opt_str(w, group_key.as_deref())
+            write_opt_str(w, group_key.as_deref())?;
+            write_opt_u64(
+                w,
+                src_changed.map(|t| {
+                    t.duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_micros() as u64
+                }),
+            )
         }
         StagedChange::Truncate {
             src_table,
@@ -420,11 +429,14 @@ fn read_change(r: &mut impl Read) -> io::Result<Option<StagedChange>> {
             r.read_exact(&mut hop_gen_buf)?;
             let hop_gen = i32::from_le_bytes(hop_gen_buf);
             let group_key = read_opt_str(r)?;
+            let src_changed = read_opt_u64(r)?
+                .map(|micros| SystemTime::UNIX_EPOCH + Duration::from_micros(micros));
             StagedChange::Recompute {
                 src_table,
                 key,
                 hop_gen,
                 group_key,
+                src_changed,
             }
         }
         TAG_TRUNCATE => {
@@ -502,6 +514,7 @@ mod tests {
             key: "k2".into(),
             hop_gen: 1,
             group_key: None,
+            src_changed: Some(SystemTime::UNIX_EPOCH + Duration::from_micros(123_456)),
         };
         let mut buf = Vec::new();
         write_change(&mut buf, &change).unwrap();
@@ -511,11 +524,39 @@ mod tests {
                 key,
                 hop_gen,
                 group_key,
+                src_changed,
                 ..
             } => {
                 assert_eq!(key, "k2");
                 assert_eq!(hop_gen, 1);
                 assert!(group_key.is_none());
+                assert_eq!(
+                    src_changed,
+                    Some(SystemTime::UNIX_EPOCH + Duration::from_micros(123_456))
+                );
+            }
+            other => panic!("expected Recompute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trips_a_recompute_change_with_no_origin() {
+        let change = StagedChange::Recompute {
+            src_table: "public.widgets".into(),
+            key: "k3".into(),
+            hop_gen: 0,
+            group_key: None,
+            src_changed: None,
+        };
+        let mut buf = Vec::new();
+        write_change(&mut buf, &change).unwrap();
+        let decoded = read_change(&mut &buf[..]).unwrap().expect("one record");
+        match decoded {
+            StagedChange::Recompute { src_changed, .. } => {
+                assert!(
+                    src_changed.is_none(),
+                    "a backfill-shaped recompute with no origin must round-trip as None"
+                );
             }
             other => panic!("expected Recompute, got {other:?}"),
         }

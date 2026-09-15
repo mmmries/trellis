@@ -357,6 +357,10 @@ pub(crate) async fn enumerate_and_append(
                 key,
                 hop_gen: 0,
                 group_key: None,
+                // No meaningful origin for a backfill's cursor-enumerated
+                // pre-existing row — nothing "changed" it; see
+                // `StagedChange::Recompute`'s doc comment.
+                src_changed: None,
             });
         }
         append::append(txn, &page).await?;

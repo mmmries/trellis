@@ -1117,6 +1117,7 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
                     key: key.to_string(),
                     hop_gen,
                     group_key,
+                    src_changed,
                 }
             } else {
                 let cdc_op = match op.as_str() {
