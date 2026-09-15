@@ -1,0 +1,179 @@
+//! An internal facade over the `metrics`/`metrics-exporter-prometheus`
+//! in-process registry (issue #51, `docs/decisions/0009-observability-decisions.md`).
+//!
+//! Call sites elsewhere in this crate (`staging::apply::compute`, today)
+//! record through the plain functions below rather than reaching for the
+//! `metrics` crate's own macros/types directly — so a future change to the
+//! recording backend (a different facade, a second exporter, richer label
+//! sets) stays contained to this one module instead of touching every call
+//! site.
+//!
+//! **What this module does not do** (see the ADR): render Prometheus text
+//! exposition (`render_prometheus()`, issue #53) or persist rollups to
+//! Postgres (issue #54). It only builds and populates the in-process
+//! registry; [`render_for_test`] is a minimal, internal-only escape hatch
+//! this crate's own tests use to assert something landed in the registry —
+//! not the polished public exposition API #53 will build (that one will
+//! likely live on [`crate::app::Trellis`] itself, per
+//! `docs/observability.md`'s `trellis.metrics().render_prometheus()`
+//! sketch).
+//!
+//! ## Recorder installation
+//!
+//! `metrics`'s macros (`counter!`/`histogram!`/`gauge!`) record against
+//! whichever [`metrics::Recorder`] is currently installed as the process's
+//! *global* recorder — a single, process-wide registry, not one per
+//! [`crate::app::Trellis`] instance, matching `docs/observability.md`'s "one
+//! in-process registry" design. [`ensure_installed`] lazily builds a
+//! [`metrics_exporter_prometheus::PrometheusRecorder`] (recorder + text
+//! encoder only — the exporter's optional Hyper-listener feature is not
+//! enabled in `Cargo.toml`, so this never binds a socket) and installs it
+//! the first time any recording function in this module runs. Installation
+//! is idempotent and best-effort: if a global recorder is already installed
+//! (a second call racing the [`OnceLock`], or — someday — an embedder
+//! installing its own before this crate's first call), later attempts
+//! simply lose and every macro call below still records into *this*
+//! module's own handle instead of whatever won, since nothing else in this
+//! process installs a recorder yet. A real multi-installer story is out of
+//! scope for this issue.
+
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+/// ADR-0009 decision 6: exponential bucket boundaries spanning ~10ms-60s
+/// (`docs/observability.md`'s "sub-second to tens-of-seconds propagation
+/// range"), applied as a single global default to every histogram this
+/// crate records — per-transform latency today; end-to-end latency (issue
+/// #52) is expected to reuse the same set rather than introduce its own.
+pub const LATENCY_BUCKETS: &[f64] = &[
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 60.0,
+];
+
+/// Per-transform hop latency: time from a change becoming available at a
+/// transform's input to its output being applied (`docs/observability.md`'s
+/// "What 'latency' means"). Labeled `transform` — the transform's target
+/// table name, the same identifier `staging::quarantine::resume_column`'s
+/// `transform` parameter and `ApplyError::ColumnNotPaused`/`DefinitionNotLive`
+/// already use, not a separate "transform name" field (there isn't one —
+/// see [`crate::defs::ast::TransformDef`]).
+const TRANSFORM_LATENCY_METRIC: &str = "trellis_transform_latency_seconds";
+
+/// Throughput denominator for [`TRANSFORM_LATENCY_METRIC`]
+/// (`docs/observability.md`'s "Recommended supporting counters/gauges so
+/// the histograms are interpretable"): one increment per applied change,
+/// recorded at the same call site as the latency observation.
+const CHANGES_APPLIED_METRIC: &str = "trellis_changes_applied_total";
+
+/// ADR-0009 decision 5's cheap, system-level gauge: a count of `segments`
+/// rows by [`crate::staging::SegmentState`], labeled `state`.
+const STAGING_SEGMENTS_METRIC: &str = "trellis_staging_segments";
+
+/// The process-wide recorder handle, built and installed on first use. See
+/// the module doc comment's "Recorder installation" section.
+fn handle() -> &'static PrometheusHandle {
+    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+    HANDLE.get_or_init(|| {
+        let builder = PrometheusBuilder::new()
+            .set_buckets(LATENCY_BUCKETS)
+            .expect("LATENCY_BUCKETS is non-empty and every boundary is finite");
+        let recorder = builder.build_recorder();
+        let handle = recorder.handle();
+        // Best-effort install — see the module doc comment. `build_recorder`
+        // (rather than `install`/`install_recorder`) is used deliberately:
+        // those two are only compiled under the exporter's `http-listener`
+        // feature, which this crate does not enable (no bound socket).
+        let _ = metrics::set_global_recorder(recorder);
+        handle
+    })
+}
+
+/// Ensures the registry is installed. Every recording function below calls
+/// this too, so callers never need to call it explicitly — it's exposed
+/// purely so something that wants the registry ready before its first
+/// observation (an embedder, a test) can force that at a known point.
+pub fn ensure_installed() {
+    let _ = handle();
+}
+
+/// Records one observation of [`TRANSFORM_LATENCY_METRIC`] for `transform`.
+/// Called from [`crate::staging::apply::compute`] once per applied change
+/// that carries an origin timestamp (`FoldedChange::src_changed` is `None`
+/// for a bare recompute trigger with no source change behind it — nothing
+/// to measure latency against, so callers skip this and call only
+/// [`increment_changes_applied`] for such a change).
+pub fn record_transform_latency(transform: &str, latency: Duration) {
+    ensure_installed();
+    metrics::histogram!(TRANSFORM_LATENCY_METRIC, "transform" => transform.to_string())
+        .record(latency.as_secs_f64());
+}
+
+/// Increments [`CHANGES_APPLIED_METRIC`] by one for `transform`. Called
+/// once per applied change, at the same call site as
+/// [`record_transform_latency`] (when that change carries an origin
+/// timestamp) so the two series stay consistent.
+pub fn increment_changes_applied(transform: &str) {
+    ensure_installed();
+    metrics::counter!(CHANGES_APPLIED_METRIC, "transform" => transform.to_string()).increment(1);
+}
+
+/// Sets [`STAGING_SEGMENTS_METRIC`] for `state` to `count` — ADR-0009
+/// decision 5's cheap segment-state gauge, refreshed on-demand (today: once
+/// per [`crate::client`]'s maintenance tick) rather than incremented on the
+/// hot append/fold path.
+pub fn set_staging_segments(state: &str, count: u64) {
+    ensure_installed();
+    metrics::gauge!(STAGING_SEGMENTS_METRIC, "state" => state.to_string()).set(count as f64);
+}
+
+/// Renders the registry in Prometheus text format. **Not** the public
+/// exposition API — see the module doc comment. This exists only so this
+/// crate's own tests can assert an observation landed in the registry
+/// without reaching for `metrics`-crate-specific inspection types
+/// themselves; issue #53 owns designing the real, embedder-facing
+/// `render_prometheus()`.
+#[doc(hidden)]
+pub fn render_for_test() -> String {
+    handle().render()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transform_latency_and_changes_applied_are_recorded_and_render() {
+        record_transform_latency("metrics_facade_test_target", Duration::from_millis(120));
+        increment_changes_applied("metrics_facade_test_target");
+
+        let rendered = render_for_test();
+        assert!(
+            rendered.contains("trellis_transform_latency_seconds"),
+            "rendered output missing the latency histogram: {rendered}"
+        );
+        assert!(
+            rendered.contains("trellis_changes_applied_total"),
+            "rendered output missing the throughput counter: {rendered}"
+        );
+        assert!(
+            rendered.contains("metrics_facade_test_target"),
+            "rendered output missing the transform label: {rendered}"
+        );
+    }
+
+    #[test]
+    fn staging_segments_gauge_is_recorded_and_renders() {
+        set_staging_segments("metrics_facade_test_state", 3);
+
+        let rendered = render_for_test();
+        assert!(
+            rendered.contains("trellis_staging_segments"),
+            "rendered output missing the segment-state gauge: {rendered}"
+        );
+        assert!(
+            rendered.contains("metrics_facade_test_state"),
+            "rendered output missing the state label: {rendered}"
+        );
+    }
+}

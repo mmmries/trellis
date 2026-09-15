@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 deadpool-postgres = "0.14.1"
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 # Intake's (#7) replication transport: a pgwire-protocol logical replication
 # client (START_REPLICATION + pgoutput framing). `default-features = false`
 # drops the `scram`/`md5` auth and `tls-rustls` features — fine against

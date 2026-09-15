@@ -725,6 +725,33 @@ fn value_type_from_pg(pg_type: &str) -> ValueType {
 // Phase 2: compute
 // ---------------------------------------------------------------------
 
+/// Issue #51/ADR-0009 decision 5: records one applied change's per-transform
+/// hop latency and throughput, from data [`compute`]'s by-source grouping
+/// already has in hand — no new I/O, no new join. `transform` is the
+/// consuming definition's target table (this crate's one "transform name,"
+/// per `ApplyError::ColumnNotPaused`/`DefinitionNotLive`'s own `transform`
+/// fields). `src_changed` is [`FoldedChange::src_changed`]: `Some` for a
+/// change that traces back to a real source commit (the histogram's
+/// `.observe()` value is `now - src_changed`), `None` for a bare recompute
+/// trigger with no origin timestamp to measure against — such a change
+/// still counts toward throughput, just not latency.
+///
+/// Called once per applied change per consuming definition — both the 1-1
+/// write/delete dispatch and the aggregate accumulate path below call this
+/// at the point each of their per-change loops already visits every folded
+/// change, so this reuses grouping/iteration `compute` performs regardless
+/// of whether metrics are recorded, per the ADR's "effectively free"
+/// framing.
+fn record_transform_apply_metrics(transform: &str, src_changed: Option<std::time::SystemTime>) {
+    if let Some(src_changed) = src_changed {
+        let latency = std::time::SystemTime::now()
+            .duration_since(src_changed)
+            .unwrap_or(std::time::Duration::ZERO);
+        crate::metrics::record_transform_latency(transform, latency);
+    }
+    crate::metrics::increment_changes_applied(transform);
+}
+
 /// One key's write into a target table: the evaluated calculated-field
 /// values, rendered to their canonical text form (aligned with the owning
 /// [`TargetPlan::field_names`]/[`TargetPlan::field_types`]) plus the
@@ -1330,6 +1357,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             });
                         }
                     }
+                    record_transform_apply_metrics(&def.def.target, change.src_changed);
                 }
                 continue;
             };
@@ -1424,6 +1452,9 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 &def.source_columns,
                 &mut regex_cache,
             )?;
+            for change in &changes {
+                record_transform_apply_metrics(&def.def.target, change.src_changed);
+            }
         }
     }
 
