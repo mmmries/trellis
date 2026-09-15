@@ -28,6 +28,10 @@
 //!   every error type in this crate can report via a `code()` method,
 //!   independent of its own (freely growing) internal variants — see
 //!   `docs/decisions/0008-public-api-design.md`, decision 3.
+//! - [`metrics`] is a small internal facade over the `metrics`/
+//!   `metrics-exporter-prometheus` in-process registry (issue #51, epic
+//!   #49) — see `docs/observability.md` and
+//!   `docs/decisions/0009-observability-decisions.md`.
 //!
 //! **Current subset**: 1-1 scalar transforms only end to end (issue #11's
 //! 1-1 slice). Aggregate/invertible-delta maintenance is not yet wired up —
@@ -51,6 +55,7 @@ pub mod error;
 pub mod error_code;
 pub mod identity;
 pub mod intake;
+pub mod metrics;
 pub mod migrate;
 pub mod numeric;
 pub mod pool;
