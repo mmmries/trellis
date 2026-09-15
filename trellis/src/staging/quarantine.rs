@@ -333,6 +333,12 @@ async fn evict_key(
     last_error: &str,
     contribution: Option<&FoldedChange>,
 ) -> Result<(), ApplyError> {
+    tracing::warn!(
+        src_table = %src_table,
+        key = %key,
+        last_error = %last_error,
+        "evicting a key to the poison table; it crossed the row-level death threshold"
+    );
     txn.execute(
         "insert into poison (src_table, key, last_error) \
          values ($1, $2, $3) \
@@ -402,6 +408,13 @@ pub async fn isolate_and_evict(
             Err(err) => {
                 let class = classify(&err);
                 if class == FailureClass::Halting {
+                    tracing::error!(
+                        src_table = %change.src_table,
+                        key = %change.key,
+                        error = %err,
+                        "halting failure diagnosing a probed key's compute; propagating, \
+                         never quarantined"
+                    );
                     record_halting_stop(pool, &err.to_string()).await?;
                     return Err(err);
                 }
@@ -442,6 +455,13 @@ pub async fn isolate_and_evict(
         if let Err(err) = outcome {
             let class = classify(&err);
             if class == FailureClass::Halting {
+                tracing::error!(
+                    src_table = %change.src_table,
+                    key = %change.key,
+                    error = %err,
+                    "halting failure diagnosing a probed key's apply; propagating, never \
+                     quarantined"
+                );
                 record_halting_stop(pool, &err.to_string()).await?;
                 return Err(err);
             }
@@ -691,6 +711,12 @@ async fn trip_column_fuse(
     column: &str,
     last_error: &str,
 ) -> Result<(), ApplyError> {
+    tracing::warn!(
+        transform = %transform,
+        column = %column,
+        last_error = %last_error,
+        "column fuse tripped; pausing it and cascading the pause to its dependents"
+    );
     let client = pool.get().await?;
     client
         .execute(
@@ -767,6 +793,13 @@ async fn cascade_pause(pool: &Pool, transform: &str, column: &str) -> Result<(),
                 )
                 .await?;
             if newly_paused > 0 {
+                tracing::warn!(
+                    transform = %downstream_transform,
+                    column = %downstream_column,
+                    upstream_transform = %upstream_transform,
+                    upstream_column = %upstream_column,
+                    "column paused via cascade from an upstream pause"
+                );
                 queue.push_back((downstream_transform, downstream_column));
             }
         }
@@ -802,6 +835,11 @@ async fn cascade_pause(pool: &Pool, transform: &str, column: &str) -> Result<(),
 /// same bug one hop down — by the time a downstream pair is reached, any
 /// upstream pairs earlier in the queue have already been fully resumed and
 /// committed, so there is nothing left to roll back.
+#[tracing::instrument(
+    name = "quarantine.resume_column",
+    skip(pool),
+    fields(transform = %transform, column = %column, resumed = tracing::field::Empty)
+)]
 pub async fn resume_column(
     pool: &Pool,
     transform: &str,
@@ -925,6 +963,8 @@ pub async fn resume_column(
         }
     }
 
+    tracing::Span::current().record("resumed", resumed.len());
+    tracing::info!(resumed = ?resumed, "resumed paused column(s)");
     Ok(resumed)
 }
 
@@ -968,6 +1008,7 @@ pub async fn resume_column(
 /// half of the contract, correctly fence-gated, so whichever trip mechanism
 /// lands later has somewhere correct to call — it does not itself add the
 /// trip, and nothing here should be read as evidence one already exists.
+#[tracing::instrument(name = "quarantine.resume_transform", skip(pool), fields(transform = %target))]
 pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
@@ -1008,6 +1049,12 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     crate::intake::publication::park_backfill_catchup(&*txn, &qualified).await?;
 
     txn.commit().await?;
+    tracing::info!(
+        transform = %target,
+        from = %TransformStatus::Quarantined.as_str(),
+        to = %TransformStatus::WaitingToBackfill.as_str(),
+        "transform resumed from quarantine; re-parked for a fresh backfill"
+    );
     Ok(())
 }
 

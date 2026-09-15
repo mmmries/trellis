@@ -7,6 +7,38 @@ edition.workspace = true
 deadpool-postgres = "0.14.1"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+# Issue #56/ADR-0009 decision 3: the `tracing` facade every span/event in
+# this crate goes through. Unconditional (unlike the four crates below) —
+# emitting spans/events costs nothing when no subscriber is installed (a
+# `tracing` core design goal), so this crate always compiles them in; only
+# an OTLP *exporter* is feature-gated. This crate never installs a global
+# subscriber itself (see `src/otel.rs`'s module doc comment) — that stays
+# the embedder's job, same "library, not a binary" principle `src/metrics.rs`
+# follows for the `metrics` facade.
+tracing = "0.1"
+# Issue #56/ADR-0009 decision 1's OTLP export layer, feature-gated behind
+# `otlp` (off by default — see `src/otel.rs`). `optional = true` means none
+# of these four compile at all (not just "unused") when the feature is off;
+# `cargo build -p trellis --no-default-features` vs.
+# `cargo build -p trellis --features otlp` both succeed, confirming this.
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry-otlp = { version = "0.32", optional = true, default-features = false, features = [
+    "grpc-tonic",
+    "trace",
+] }
+opentelemetry_sdk = { version = "0.32", optional = true, default-features = false, features = [
+    "trace",
+] }
+tracing-opentelemetry = { version = "0.33", optional = true }
+# `otel::layer`'s return type is `impl tracing_subscriber::Layer<S>` — needs
+# the `Layer`/`LookupSpan` traits at compile time even though this crate
+# never constructs or installs a `tracing_subscriber::registry()` itself
+# (that stays the embedder's job — see `src/otel.rs`'s module doc comment).
+# `default-features = false` (plus the explicit `registry` feature only)
+# drops the `fmt`/`env-filter`/`ansi` layers this crate never uses.
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = [
+    "registry",
+] }
 # Intake's (#7) replication transport: a pgwire-protocol logical replication
 # client (START_REPLICATION + pgoutput framing). `default-features = false`
 # drops the `scram`/`md5` auth and `tls-rustls` features — fine against
@@ -20,5 +52,29 @@ regex = "1.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tokio-postgres = "0.7.13"
 
+[features]
+# Issue #56/ADR-0009 decision 1's optional OTLP export layer. Off by default
+# — `cargo build -p trellis` (no flags) compiles none of the four
+# OTLP-related dependencies above at all, so an embedder who never enables
+# this feature pays nothing, not even at compile time. See `src/otel.rs`.
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+]
+
 [dev-dependencies]
 testkit = { path = "../testkit" }
+# Dev-only: this crate's own tests capture spans/events emitted through
+# `tracing` to assert they fire with the right fields (see
+# `tests/tracing_instrumentation.rs`) — the same `tracing-subscriber`
+# `Registry` + `Layer` combinator an embedder composes their own subscriber
+# from (`docs/observability.md`'s "Logs and traces" section), so these tests
+# exercise a realistic subscriber shape rather than a bespoke test-only
+# stand-in. Never a production dependency — this crate itself never
+# constructs one (see `src/otel.rs`'s module doc comment for the `otlp`
+# feature's own, separate, non-dev use of `tracing-subscriber`'s `Layer`
+# trait).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
