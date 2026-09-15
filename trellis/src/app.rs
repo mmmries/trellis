@@ -646,10 +646,10 @@ impl Trellis {
     /// including why a dependent with its own independent reason to stay
     /// paused is left alone). `target` must address a column
     /// (`transform.column`) — [`TrellisError::ColumnAddressRequired`] if
-    /// given a bare transform name, since there is no whole-transform
-    /// "resume" action in this API (a `quarantined` transform resumes by
-    /// re-running its full backfill, a different operation entirely — see
-    /// `docs/transforms.md#status`).
+    /// given a bare transform name — a `quarantined` transform's
+    /// whole-transform remedy is [`Trellis::resume_transform`], a different
+    /// operation entirely (drops back to `waiting_to_backfill` and re-runs
+    /// the full backfill — see `docs/transforms.md#status`), not this call.
     ///
     /// Returns every `(transform, column)` pair actually resumed —
     /// `target` itself first, then any dependents whose pause was purely
@@ -1019,9 +1019,8 @@ pub enum TrellisError {
     /// doesn't exist in `transform_definitions` at all.
     TransformNotFound(String),
     /// [`Trellis::resume_column`] was given a bare transform address
-    /// (no `.column`) — there is no whole-transform "resume" action in this
-    /// API; a `quarantined` transform's remedy is a full backfill, not this
-    /// call.
+    /// (no `.column`) — a `quarantined` transform's whole-transform remedy
+    /// is [`Trellis::resume_transform`], not this call.
     ColumnAddressRequired,
 }
 
@@ -1110,8 +1109,8 @@ impl std::fmt::Display for TrellisError {
             }
             TrellisError::ColumnAddressRequired => write!(
                 f,
-                "resume_column needs a \"transform.column\" address; a bare transform name has \
-                 no whole-transform resume action (re-run its backfill instead)"
+                "resume_column needs a \"transform.column\" address; to resume a whole \
+                 quarantined transform, call resume_transform instead"
             ),
         }
     }
