@@ -2,7 +2,8 @@
 
 Which PostgreSQL data types Trellis supports, in **which role**. This is a
 living reference — updated as each type/role lands. The epic that drives it is
-[Epic: Data-type support](#) (issue TBD); the constraint that decides which
+[Epic: Data-type support (#123)](https://github.com/salesforce-misc/trellis/issues/123);
+the constraint that decides which
 types can even be candidates is
 [ADR-0004](decisions/0004-transform-definition-grammar.md).
 
