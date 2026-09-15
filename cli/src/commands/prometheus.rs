@@ -225,9 +225,12 @@ async fn handle_connection(mut stream: TcpStream) -> Result<(), String> {
          {body}",
         body.len(),
     );
-    stream
-        .write_all(response.as_bytes())
+    // Bounded the same way `read_request` is: a client that stops reading
+    // mid-response (TCP backpressure) shouldn't be able to pin this
+    // connection's spawned task open indefinitely.
+    tokio::time::timeout(READ_TIMEOUT, stream.write_all(response.as_bytes()))
         .await
+        .map_err(|_| "timed out writing response".to_string())?
         .map_err(|err| format!("failed to write response: {err}"))?;
     stream
         .shutdown()
