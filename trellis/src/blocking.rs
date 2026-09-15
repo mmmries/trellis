@@ -144,6 +144,17 @@ impl BlockingTrellis {
         self.submit(Job::Migrate)
     }
 
+    /// A handle onto this process's in-process metrics registry. See
+    /// [`Trellis::metrics`]. Unlike every other method here, this doesn't
+    /// round-trip through the background thread's job channel: the registry
+    /// is a process-wide global (see `trellis::metrics`'s module doc
+    /// comment), not state owned by the background thread's [`Trellis`], and
+    /// reading it is synchronous and side-effect-free, so there's nothing to
+    /// block on.
+    pub fn metrics(&self) -> crate::metrics::Metrics {
+        crate::metrics::Metrics::new()
+    }
+
     /// Registers a transform definition and creates its target table. See
     /// [`Trellis::define`] — in particular, this returns before a plain
     /// (non-relationship) 1-1 transform's backfill finishes; poll

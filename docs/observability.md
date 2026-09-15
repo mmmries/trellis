@@ -108,6 +108,39 @@ let body = trellis.metrics().render_prometheus(); // Prometheus text format
 No port binding, no HTTP framework, no bind-address config; wiring costs the
 operator a few lines.
 
+**Implemented (issue #53).** [`Trellis::metrics`](../trellis/src/app.rs) (and
+[`BlockingTrellis::metrics`](../trellis/src/blocking.rs), for callers without
+a `tokio` runtime of their own) returns a
+[`trellis::metrics::Metrics`](../trellis/src/metrics.rs) handle whose
+[`render_prometheus`](../trellis/src/metrics.rs) method is exactly the
+`String`-returning call sketched above — no HTTP framework or bound socket
+inside the `trellis` crate itself, per ADR-0009 decision 1. A minimal
+end-to-end example, an axum-style `/metrics` handler mounted alongside a
+running engine:
+
+```rust,no_run
+# async fn example(trellis: std::sync::Arc<trellis::Trellis>) -> String {
+// A route handler in the operator's own HTTP stack, closing over the
+// running `Trellis` (or just calling `trellis::metrics::Metrics::new()`
+// directly — the registry is process-wide, not scoped to one `Trellis`
+// connection, so any in-process handle reaches the same data).
+trellis.metrics().render_prometheus()
+# }
+```
+
+`cli/src/commands/prometheus.rs` is a second, complete (if deliberately
+minimal — no HTTP-parsing crate, see its module doc comment) example: a
+`trellis prometheus [--bind <ADDR>]` subcommand that hand-rolls a small
+TCP listener and answers every request with `Metrics::new().render_prometheus()`
+as a `200 OK`, `Content-Type: text/plain; version=0.0.4; charset=utf-8`
+response — worth reading as a template for wiring this into a real HTTP
+stack, though note its own doc comment's caveat: run standalone (its only
+mode), it renders *its own* process's registry, which stays empty unless
+that same process is also running the engine. A real deployment mounts
+`render_prometheus()` from inside the process actually running
+[`Trellis`]/[`Client`] (`staging`/`drain_threads` set), not from a separate
+scrape-only binary.
+
 ### Retention: Postgres rollup tables
 
 Trellis keeps its own history in a **pruned Postgres table** it owns (working

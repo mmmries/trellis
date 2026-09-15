@@ -8,7 +8,7 @@
 //! `apply.rs`'s `a_change_propagates_two_hops_downstream_then_stops` is the
 //! DAG-shape fixture these tests crib from — that test already proves
 //! propagation stops at a transform with no downstream reader; these tests
-//! layer `trellis::metrics::render_for_test()` assertions on top of the same
+//! layer `trellis::metrics::Metrics::new().render_prometheus()` assertions on top of the same
 //! shape to prove the *metric* also only fires there.
 //!
 //! Transform/target names below are deliberately distinctive
@@ -220,7 +220,7 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
     let outcome1 = drain(&db.pool, seg1, "worker").await;
     assert_eq!(outcome1.keys_written, 1);
 
-    let after_hop0 = trellis::metrics::render_for_test();
+    let after_hop0 = trellis::metrics::Metrics::new().render_prometheus();
     assert!(
         metric_mentions_transform(
             &after_hop0,
@@ -257,7 +257,7 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
     let outcome2 = drain(&db.pool, seg2, "worker").await;
     assert_eq!(outcome2.keys_written, 1);
 
-    let after_hop1 = trellis::metrics::render_for_test();
+    let after_hop1 = trellis::metrics::Metrics::new().render_prometheus();
     assert!(
         metric_mentions_transform(
             &after_hop1,
@@ -389,7 +389,7 @@ async fn end_to_end_latency_fires_for_every_terminal_transform_in_a_fan_out() {
     let outcome = drain(&db.pool, seg1, "worker").await;
     assert_eq!(outcome.keys_written, 2, "one write per fan-out branch");
 
-    let rendered = trellis::metrics::render_for_test();
+    let rendered = trellis::metrics::Metrics::new().render_prometheus();
     assert!(
         metric_mentions_transform(
             &rendered,

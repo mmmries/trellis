@@ -28,9 +28,10 @@
 //!   every error type in this crate can report via a `code()` method,
 //!   independent of its own (freely growing) internal variants — see
 //!   `docs/decisions/0008-public-api-design.md`, decision 3.
-//! - [`metrics`] is a small internal facade over the `metrics`/
-//!   `metrics-exporter-prometheus` in-process registry (issue #51, epic
-//!   #49) — see `docs/observability.md` and
+//! - [`metrics`] is a facade over the `metrics`/`metrics-exporter-prometheus`
+//!   in-process registry (issue #51, epic #49) and its Prometheus text
+//!   exposition (issue #53, [`app::Trellis::metrics`]) — see
+//!   `docs/observability.md` and
 //!   `docs/decisions/0009-observability-decisions.md`.
 //!
 //! **Current subset**: 1-1 scalar transforms only end to end (issue #11's
