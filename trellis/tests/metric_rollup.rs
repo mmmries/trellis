@@ -267,6 +267,37 @@ async fn prune_deletes_only_rows_older_than_retention() {
 }
 
 #[tokio::test]
+async fn prune_keeps_a_row_exactly_at_the_retention_cutoff() {
+    // `prune`'s query is `rolled_up_at < cutoff` (strict), so a row whose
+    // `rolled_up_at` lands exactly on `now - retention` is *not* older than
+    // retention and must survive — only strictly-older rows are deleted.
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    let retention = Duration::from_secs(60);
+    let now = SystemTime::now();
+    let cutoff = now - retention;
+
+    rollup::write_snapshot(&client, &synthetic_samples("at_cutoff"), cutoff)
+        .await
+        .expect("write snapshot exactly at cutoff");
+
+    let deleted = rollup::prune(&client, now, retention).await.expect("prune");
+    assert_eq!(
+        deleted, 0,
+        "a row exactly at cutoff is not older than retention"
+    );
+    assert_eq!(
+        fetch_rows(&client, "rollup_test_counter_at_cutoff")
+            .await
+            .len(),
+        1,
+        "the at-cutoff row must survive"
+    );
+}
+
+#[tokio::test]
 async fn prune_is_a_no_op_when_nothing_is_older_than_retention() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;

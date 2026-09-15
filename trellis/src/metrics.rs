@@ -789,11 +789,15 @@ snapshot_test_hist_count{transform=\"orders\"} 5
 
     /// [`parse_labels`] must split only on commas *outside* a quoted value
     /// and correctly unescape a value that itself contains an escaped
-    /// comma, quote, backslash, and newline — the four characters
+    /// quote, backslash, and newline — the three characters
     /// `sanitize_label_value`/`sanitize_description` (in
-    /// `metrics-exporter-prometheus`) ever escape, and a plausible real
-    /// value here: a `transform` label is a target table name, and Postgres
-    /// allows a quoted identifier to contain almost any of them.
+    /// `metrics-exporter-prometheus`) ever escape. A comma is never escaped
+    /// by that library — it doesn't need to be, since it's always safely
+    /// inside the quotes `parse_labels`'s quote-tracking (not comma
+    /// escaping) already respects — but this test includes one anyway
+    /// alongside the escaped characters, since a `transform` label is a
+    /// target table name and Postgres allows a quoted identifier to contain
+    /// almost any of them.
     #[test]
     fn parse_labels_handles_escaped_commas_quotes_backslashes_and_newlines() {
         let body =

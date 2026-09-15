@@ -101,6 +101,13 @@
 -- keeping a time series of snapshots, not the latest reading only — that's
 -- already what the live in-process registry (and `render_prometheus`) is
 -- for.
+-- Kind-dependent nullability, enforced the same way `V11__truncate_op.sql`
+-- conditions `old_image`/`new_image` on its own discriminator column
+-- (`op`): a `counter`/`gauge` row carries `value` and nothing else; a
+-- `histogram` row carries the four histogram columns and no `value`. Without
+-- this, the DB would silently accept a row whose shape contradicts its own
+-- `metric_kind` (e.g. `histogram` with `bucket_bounds is null`) — only the
+-- Rust write path would be preventing that, not the schema.
 create table if not exists metric_rollup (
     id bigint generated always as identity primary key,
     rolled_up_at timestamptz not null default now(),
@@ -111,7 +118,24 @@ create table if not exists metric_rollup (
     bucket_bounds double precision[],
     bucket_counts bigint[],
     histogram_sum double precision,
-    histogram_count bigint
+    histogram_count bigint,
+    constraint metric_rollup_kind_shape check (
+        case metric_kind
+            when 'histogram' then
+                value is null
+                and bucket_bounds is not null
+                and bucket_counts is not null
+                and histogram_sum is not null
+                and histogram_count is not null
+                and array_length(bucket_bounds, 1) = array_length(bucket_counts, 1)
+            else
+                value is not null
+                and bucket_bounds is null
+                and bucket_counts is null
+                and histogram_sum is null
+                and histogram_count is null
+        end
+    )
 );
 
 -- The prune job's own access path (`delete from metric_rollup where
