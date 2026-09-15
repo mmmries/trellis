@@ -141,16 +141,17 @@ than introducing a parallel status source.
 from `docs/observability.md`'s supporting-series list is **dropped as
 literally specified**. It's replaced by two independent pieces:
 
-* **Per-transform latency histogram** (#51/#52), computed at **fold
+* **Per-transform latency histogram** (#51/#52), computed at **apply
   completion**, not on a separate live-counter path. The origin timestamp
   already rides on every staged row — `src_changed: Option<SystemTime>` on
   `StagedChange::Cdc`/`Truncate` (`trellis/src/staging/append.rs`), sourced
   from the replication `Commit` event's `commit_time_micros`
-  (`trellis/src/intake/mod.rs`) — and fold already groups staged rows by
-  which transform(s) consume them (`trellis/src/staging/fold.rs`). Tagging
-  one histogram `.observe()` call per transform-group when a fold batch
-  completes is effectively free: it reuses data and grouping fold already
-  computes, with no new I/O and no new join.
+  (`trellis/src/intake/mod.rs`) — and the apply path already groups folded
+  changes by which transform(s) consume them (`compute()`'s `by_source` map
+  in `trellis/src/staging/apply.rs`, downstream of fold). Tagging one
+  histogram `.observe()` call per transform-group there is effectively free:
+  it reuses data and grouping apply already computes, with no new I/O and no
+  new join.
 * **`staging_segments{state}` gauge** (new, cheap, system-level): a count of
   segments by `SegmentState` (`Active`/`Sealed`/`Draining`/`Drained`, from
   `trellis/src/staging/state.rs` and the `segments` registry table), read
