@@ -443,6 +443,34 @@ async fn from_side_keys_for_join(
         .collect())
 }
 
+/// Every from-side key whose `from_col` is currently non-`NULL` (issue #98).
+/// A `TRUNCATE` stages one key-less sentinel (`append::TRUNCATE_SENTINEL_KEY`),
+/// not per-row images, so unlike [`from_side_keys_for_join`] there is no
+/// specific set of join-key *values* to match against — the to-side table is
+/// now completely empty. Every from-side row that still points at
+/// *something* must therefore re-derive to `NULL`: there's no way to tell,
+/// after the fact, which of those rows previously matched a real to-side row
+/// (and so must newly go stale) versus already pointed at nothing (and so
+/// were already `NULL`) — both converge to the same `NULL` result once the
+/// to-side is empty, so both are recomputed rather than trying to
+/// distinguish them.
+async fn from_side_keys_with_non_null_join(
+    pool: &Pool,
+    from_table: &str,
+    from_pk: &PrimaryKeyColumn,
+    from_col: &str,
+) -> Result<Vec<String>, ApplyError> {
+    let client = pool.get().await?;
+    let sql = format!(
+        "select {pk}::text from {tbl} where {col} is not null",
+        pk = quote_ident(&from_pk.name),
+        col = quote_ident(from_col),
+        tbl = quote_ident(from_table),
+    );
+    let rows = client.query(&sql, &[]).await?;
+    Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
+}
+
 /// Builds the [`RelationshipContext`] a relationship-enriched from-side target
 /// needs to re-evaluate (issue #30 wiring of the #28/#29 evaluator): for each
 /// relationship the definition references, the related to-side rows keyed by
@@ -1299,6 +1327,40 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             hop_gen: change.hop_gen,
                         });
                 }
+            }
+        }
+
+        // Issue #98: a TRUNCATE clears definitions reading this table
+        // directly (above), but definitions that read it only *through* a
+        // relationship — this table is some relationship's to-side — need
+        // clearing too, and the "truncate clears" mechanism above only
+        // resolves direct source readers via `transforms_for_source`. Reuse
+        // the reverse-recompute mechanism (issue #30) that the row-driven
+        // `by_source` loop above feeds for exactly this situation, staging
+        // every from-side row currently pointing at this (now-empty) table
+        // as an image-less recompute — see
+        // `from_side_keys_with_non_null_join`'s doc comment for why "every
+        // non-NULL join column", not a specific value list, is the right
+        // query for a TRUNCATE. Pushed into the same `reverse_recomputes`
+        // accumulator the row-driven path uses, so it's deduped the same way
+        // (issue #79) and drained through the same image-less `Recompute`
+        // pipeline below — no separate emission path needed.
+        let inbound_rels = catalog::relationships_to_table(pool, source_key).await?;
+        for rel in &inbound_rels {
+            let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
+            let from_keys = from_side_keys_with_non_null_join(
+                pool,
+                &rel.def.from_table,
+                &from_pk,
+                &rel.def.from_col,
+            )
+            .await?;
+            let hop = change.hop_gen + 1;
+            for from_key in from_keys {
+                reverse_recomputes
+                    .entry((rel.def.from_table.clone(), from_key))
+                    .and_modify(|h| *h = (*h).max(hop))
+                    .or_insert(hop);
             }
         }
     }

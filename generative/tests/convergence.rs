@@ -1069,32 +1069,111 @@ async fn a_to_one_relationship_aggregated_inside_a_group_by_converges_end_to_end
     }
 }
 
-/// **A live engine defect, found by this suite.** `TRUNCATE` on a table some
-/// definition reads *through a relationship* leaves that definition's
-/// enrichment permanently stale.
+/// **Issue #98 coverage: the aggregate case.** The pinned finding above is a
+/// `OneToOne` enrichment reading a to-one relationship; this is the same
+/// root cause on a `GROUP BY` definition whose aggregated field reads a
+/// to-one relationship path (issue #94's `SUM(post.word_count)` shape,
+/// mirrored here by `a_to_one_relationship_aggregated_inside_a_group_by_converges_end_to_end`'s
+/// `rel_agg = SUM(<rel>.c1)`).
+///
+/// Byte-for-byte that test's two-row-per-group shape, restricted to one
+/// grain group to keep the finding minimal, with `t1` (the to-side)
+/// `TRUNCATE`d instead of left alone. `t0`'s two rows stay in their group
+/// either way (`COUNT(*)` must hold at `2`), but the `SUM` must fall back to
+/// `NULL` once the to-side has no rows left for it to match.
+///
+/// Whether this passes tells us whether the `apply.rs` fix above already
+/// generalizes to the aggregate path: the reverse-recompute it stages is an
+/// ordinary image-less `Recompute` on the from-side (`t0`) row, and
+/// `apply_aggregate::accumulate_changes` already forces *any* image-less
+/// change's group onto the full-recompute path (a `force_full_recompute`
+/// group is re-derived by `apply_forced_groups_bulk`'s `LEFT JOIN`
+/// unconditionally, not only when `accumulate_changes`'s own
+/// `force_every_group` — driven by a non-empty `rel_joins` — set it) — so no
+/// aggregate-specific code needed to change for this to converge.
+#[tokio::test(flavor = "multi_thread")]
+async fn truncating_a_relationship_to_side_table_leaves_a_stale_aggregate_enrichment() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program_multi_with_relationships(
+        &[
+            rel_spec(
+                vec![(Some(1), Some(0)), (Some(2), Some(0))],
+                vec![Some("0".to_string()), Some("0".to_string())],
+                vec![Some("k1".to_string()), Some("k9".to_string())],
+                Vec::new(),
+            ),
+            rel_spec(
+                vec![(Some(10), Some(0))],
+                vec![None],
+                vec![None],
+                vec![Mutate::Truncate],
+            ),
+        ],
+        &[(
+            0,
+            DefShape::Aggregate {
+                functions: vec![AggregateFn::Count],
+            },
+        )],
+        &[None],
+        &[Some(RelFieldSpec {
+            to_table: 1,
+            kind: RelFieldKind::ToOneAggregate(RelAggregateFn::Sum),
+        })],
+    );
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("truncating a relationship's to-side table must clear the aggregate it fed");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+
+    let snapshot = backend.snapshot().await.expect("snapshot after the run");
+    let target = &snapshot[&program.defs[0].target];
+    let row = &target[&group_key(&[Some("0".to_string())])];
+    assert_eq!(
+        row["cnt"],
+        Some("2".to_string()),
+        "both source rows must still count toward COUNT(*) after the truncate: {target:?}"
+    );
+    assert_eq!(
+        row["rel_agg"], None,
+        "the to-side table is empty, so the SUM must fall back to NULL: {target:?}"
+    );
+}
+
+/// **Issue #98 regression pin.** `TRUNCATE` on a table some definition reads
+/// *through a relationship* used to leave that definition's enrichment
+/// permanently stale.
 ///
 /// Mechanism (`engine::staging::apply`): the truncate-clear path resolves
 /// affected targets with `catalog::transforms_for_source` — definitions whose
 /// **source** is the truncated table — while reverse propagation into
-/// definitions that merely *read* the table lives in the separate keyed
+/// definitions that merely *read* the table lived in the separate keyed
 /// by-source loop, driven by per-row change images and
 /// `catalog::relationships_to_table`. A `TRUNCATE` stages one key-less
 /// sentinel row (`append::TRUNCATE_SENTINEL_KEY`), not per-row images, so it
-/// never reaches that loop at all. Exactly the "its own logical-decoding
+/// never reached that loop at all. Exactly the "its own logical-decoding
 /// message, not a bulk delete" hazard the design doc §7 flags.
 ///
 /// The program: `t0`'s single row has a foreign key resolving to `t1`'s
 /// single row, so `rel_enrich` is `22`. Then `t1` is truncated. The oracle's
-/// `LEFT JOIN` finds nothing and says `NULL`; the maintained target still
-/// says `22`.
+/// `LEFT JOIN` finds nothing and says `NULL`; the maintained target used to
+/// still say `22`.
 ///
-/// `#[ignore]`d rather than deleted: this is the durable, minimized pin the
-/// design doc §6 asks a generative finding to terminate as, and it must fail
-/// the day someone thinks the bug is fixed. `un-ignore` it then, and delete
-/// `generate::without_truncates_on_relationship_to_sides`, which is what
-/// currently keeps the property suite from drawing this shape.
+/// Fixed by having the truncate-clear path (`engine/src/staging/apply.rs`)
+/// also resolve `catalog::relationships_to_table` for the truncated table and
+/// stage every from-side row with a non-`NULL` join column as a reverse
+/// recompute, through the same `reverse_recomputes` accumulator the
+/// row-driven path (issue #30) already feeds. Kept as a permanent regression
+/// pin (design doc §6) rather than deleted now that it passes.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "known engine defect: TRUNCATE of a relationship to-side table does not reverse-propagate"]
 async fn truncating_a_relationship_to_side_table_leaves_a_stale_enrichment() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -1121,21 +1200,12 @@ async fn truncating_a_relationship_to_side_table_leaves_a_stale_enrichment() {
             kind: RelFieldKind::ToOneBare,
         })],
     );
-    // The generator steers around this shape by default (see
-    // `without_truncates_on_relationship_to_sides`); re-adding the truncate
-    // here is what makes this pin reproduce the finding.
-    let program = generative::model::Program {
-        ops: program
-            .ops
-            .iter()
-            .cloned()
-            .chain(std::iter::once(generative::model::Op::Truncate {
-                table: program.tables[1].name.clone(),
-                expect: generative::model::OpOutcome::Succeeds,
-            }))
-            .collect(),
-        ..program
-    };
+    // `t1`'s `mutates: vec![Mutate::Truncate]` above is enough to generate
+    // the triggering truncate directly now — the generator no longer steers
+    // around this shape (issue #98 removed
+    // `without_truncates_on_relationship_to_sides`, the workaround that used
+    // to require manually re-chaining a `Truncate` op here to reproduce the
+    // finding).
 
     let mut backend = ManualBackend::connect(db.dsn())
         .await
