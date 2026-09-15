@@ -926,6 +926,118 @@ async fn image_less_recompute_trigger_still_probes_a_stale_sum_field() {
     );
 }
 
+/// Issue #77 / ADR-0007's same-named-decoy regression for the *aggregate*
+/// CDC-apply path — a distinct code path from the plain 1-1 case
+/// `apply.rs`'s `explicitly_qualified_source_reads_the_right_table_on_a_live_refetch`
+/// covers. `compute`'s own qualified-source threading (that 1-1 test, and
+/// this file's `image_less_recompute_trigger_still_probes_a_stale_sum_field`
+/// above, both already exercise it) only gets an aggregate definition as far
+/// as forcing a group onto the full-recompute path; the *live re-read* for
+/// that forced group runs through `apply_aggregate`'s own probes
+/// (`probe_sum_and_count`/`probe_recompute_fields_bulk` et al., see
+/// `AggregateTargetPlan::source`'s own doc comment) via
+/// `ddl::qualified_source_table` — separate code from `compute`'s
+/// `read_live_rows_batch`, so it needs its own coverage. Mirrors
+/// `image_less_recompute_trigger_still_probes_a_stale_sum_field`'s
+/// out-of-band-insert-then-image-less-recompute shape exactly, except
+/// `order_items` now has a same-named decoy sitting in `public` (this pool's
+/// own pinned `search_path`) while the definition explicitly names
+/// `custom.order_items` as its real source — the two hold different amounts,
+/// so a wrong-table probe is unmistakable in the resulting SUM.
+#[tokio::test]
+async fn explicitly_qualified_aggregate_source_probes_the_right_table_not_a_same_named_decoy() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table public.order_items (id integer primary key, order_id integer, amount numeric); \
+             insert into public.order_items (id, order_id, amount) values (1, 10, 999.00), (2, 10, 888.00); \
+             create schema custom; \
+             create table custom.order_items (id integer primary key, order_id integer, amount numeric); \
+             alter table custom.order_items replica identity full; \
+             insert into custom.order_items (id, order_id, amount) values (1, 10, 5.00);",
+        )
+        .await
+        .expect("seed the public.order_items decoy and the real custom.order_items");
+
+    const SOURCE: &str = "TRANSFORM order_summary FROM custom.order_items GROUP BY order_id \
+         SELECT order_id AS order_id, SUM(amount) AS total";
+    let def = parse(SOURCE).expect("parse the explicitly-qualified aggregate definition");
+    let source_columns = numeric_columns(&["id", "order_id", "amount"]);
+    create_definition(&db.pool, SOURCE, &source_columns)
+        .await
+        .expect("create aggregate definition against the explicitly-qualified source");
+    create_aggregate_target_table(&db.pool, &def, "public", &source_columns)
+        .await
+        .expect("create aggregate target table");
+
+    // Seed group 10's target row via an ordinary insert batch: total = 5.00.
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "custom.order_items",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"order_id":"10","amount":"5.00"}"#),
+    )
+    .await;
+    let seg0 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg0, "worker").await;
+
+    let total: Option<String> = client
+        .query_one(
+            "select total::text from order_summary where order_id = 10",
+            &[],
+        )
+        .await
+        .expect("read seeded group")
+        .get(0);
+    assert_eq!(total.as_deref(), Some("5.00"), "seed total");
+
+    // A second row lands in custom.order_items's group 10 entirely
+    // out-of-band (no CDC image staged for it), forcing the image-less
+    // recompute trigger below onto the full-recompute (probe) path.
+    client
+        .execute(
+            "insert into custom.order_items (id, order_id, amount) values (2, 10, 3.00)",
+            &[],
+        )
+        .await
+        .expect("out-of-band insert into custom.order_items's group 10");
+
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "custom.order_items",
+        "1",
+        "recompute",
+        None,
+        None,
+    )
+    .await;
+    let seg1 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg1, "worker").await;
+
+    let total: Option<String> = client
+        .query_one(
+            "select total::text from order_summary where order_id = 10",
+            &[],
+        )
+        .await
+        .expect("read probed group")
+        .get(0);
+    assert_eq!(
+        total.as_deref(),
+        Some("8.00"),
+        "the probe must read custom.order_items (5.00 + 3.00 = 8.00), not the \
+         same-named public.order_items decoy sitting on this pool's own \
+         pinned search_path"
+    );
+}
+
 /// Issue #11 review, finding #2 (MEDIUM): when a group keeps rows after a
 /// delete, but every remaining row's aggregated value is NULL, the SUM
 /// column must itself go `NULL` — matching Postgres's own "sum of zero
