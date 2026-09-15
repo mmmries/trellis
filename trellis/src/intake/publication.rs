@@ -21,6 +21,7 @@ use tokio_postgres::types::PgLsn;
 use tokio_postgres::{GenericClient, Transaction};
 
 use super::error::IntakeError;
+use crate::defs::model::TransformStatus;
 use crate::pool::quote_ident;
 use crate::staging::append::{self, StagedChange};
 use crate::staging::session::ProducerSession;
@@ -239,6 +240,45 @@ async fn current_snapshot(client: &impl GenericClient) -> Result<Snapshot, Intak
         .await?
         .get(0);
     Snapshot::parse(&text)
+}
+
+/// Whether `qualified_table` currently has a durable `pending_backfill`
+/// marker whose `xmin` fence has **not** yet settled (issue #55) — i.e.
+/// whether enumerating this table's rows right now would race a transaction
+/// the marker's fence was captured against.
+///
+/// `false` covers two different "safe to enumerate now" cases the caller
+/// doesn't need to distinguish: no marker at all (nothing pending for this
+/// table), and a marker whose fence has already settled but
+/// [`run_pending_backfills`] simply hasn't discharged it yet. Both mean a
+/// synchronous enumeration started right now would see a state
+/// [`run_pending_backfills`]'s later discharge is guaranteed to see too (or
+/// a strict superset of it), so there is nothing to defer.
+///
+/// Used at definition-creation time
+/// ([`crate::defs::catalog::create_definition_inner`],
+/// [`crate::defs::catalog::install_definition`]) to decide whether a fresh
+/// transform's initial backfill should run synchronously (the existing,
+/// unconditional behavior) or defer to `waiting_to_backfill` and ride this
+/// same marker's own discharge instead — see docs/observability.md's
+/// "Backfill status and the `xmin` caveat."
+pub(crate) async fn backfill_marker_unsettled(
+    client: &impl GenericClient,
+    qualified_table: &str,
+) -> Result<bool, IntakeError> {
+    let Some(row) = client
+        .query_opt(
+            "select fence_snapshot::text from pending_backfill where table_name = $1",
+            &[&qualified_table],
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let fence_text: String = row.get(0);
+    let fence = Snapshot::parse(&fence_text)?;
+    let now = current_snapshot(client).await?;
+    Ok(!now.settled_since(&fence))
 }
 
 struct PendingBackfill {
@@ -570,6 +610,20 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// re-derive already-correct values — so the marker is discharged with nothing
 /// staged. Any uncertainty falls back to the full enumeration this has always
 /// done, so the skip can never drop work.
+///
+/// Issue #55: a marker whose fence hasn't settled is where a transform sits
+/// in [`TransformStatus::WaitingToBackfill`] — but that status is written
+/// once, at creation time ([`backfill_marker_unsettled`]'s callers), not
+/// here on every unsettled pass; there is nothing left for this function to
+/// *set* for an unsettled marker; `continue` is unchanged. Once a marker
+/// *does* settle, [`advance_deferred_definitions`] promotes exactly the
+/// definitions that were deferred because of *this* marker —
+/// `waiting_to_backfill` -> `backfilling` before the enumeration below, then
+/// -> `live` after it commits — never a sibling definition on the same
+/// table that's `backfilling`/`live` for an unrelated reason (a live
+/// definition's own catch-up marker, or a concurrently-running
+/// `backfill_chunks` build), since those were never `waiting_to_backfill` in
+/// the first place.
 pub async fn run_pending_backfills(
     client: &mut tokio_postgres::Client,
     wake_channel: &str,
@@ -584,6 +638,14 @@ pub async fn run_pending_backfills(
         if !now.settled_since(&marker.fence) {
             continue;
         }
+        let advancing = advance_deferred_definitions(
+            client,
+            &marker.table,
+            TransformStatus::WaitingToBackfill,
+            TransformStatus::Backfilling,
+        )
+        .await?;
+
         let txn = client.transaction().await?;
         let staged = if coverage_covers(&txn, &marker.table).await? {
             false
@@ -601,7 +663,62 @@ pub async fn run_pending_backfills(
                 .await?;
         }
         txn.commit().await?;
+
+        mark_definitions_live(client, &advancing).await?;
     }
+    Ok(())
+}
+
+/// Promotes every `transform_definitions` row sourced from `table` (matched
+/// against `source_table`'s own bare, unqualified shape — see
+/// [`split_qualified`]) currently in `from` to `to`, returning the ids
+/// actually moved (issue #55).
+///
+/// Scoped by both `source_table` and current `status`, so a second,
+/// unrelated definition on the same table sitting in some other status for
+/// an unrelated reason (e.g. still `backfilling` behind its own independent
+/// `backfill_chunks` queue, or already `live`) is never touched. Returning
+/// the moved ids — rather than the caller re-deriving "which ones did I just
+/// touch" from a second, separately-timed query — is what lets
+/// [`run_pending_backfills`] flip *exactly* these rows to `live` afterward
+/// without also catching a sibling definition that happened to already be
+/// `backfilling` when this marker's discharge ran.
+async fn advance_deferred_definitions(
+    client: &impl GenericClient,
+    table: &str,
+    from: TransformStatus,
+    to: TransformStatus,
+) -> Result<Vec<i64>, IntakeError> {
+    let (_, bare_table) = split_qualified(table)?;
+    let rows = client
+        .query(
+            "update transform_definitions set status = $1 \
+             where source_table = $2 and status = $3 \
+             returning id",
+            &[&to.as_str(), &bare_table, &from.as_str()],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|r| r.get(0)).collect())
+}
+
+/// Flips exactly `ids` to [`TransformStatus::Live`] (issue #55) — the second
+/// half of [`advance_deferred_definitions`]'s `waiting_to_backfill` ->
+/// `backfilling` promotion, run once the marker's enumeration has committed.
+/// A no-op for an empty `ids` (the common case: no definition was deferred
+/// against this particular marker).
+async fn mark_definitions_live(
+    client: &impl GenericClient,
+    ids: &[i64],
+) -> Result<(), IntakeError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    client
+        .execute(
+            "update transform_definitions set status = $1 where id = any($2)",
+            &[&TransformStatus::Live.as_str(), &ids],
+        )
+        .await?;
     Ok(())
 }
 

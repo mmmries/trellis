@@ -69,6 +69,7 @@ enum Job {
         String,
         oneshot::Sender<Result<Vec<(String, String)>, TrellisError>>,
     ),
+    ResumeTransform(String, oneshot::Sender<Result<(), TrellisError>>),
     Shutdown(oneshot::Sender<Result<(), TrellisError>>),
 }
 
@@ -236,6 +237,13 @@ impl BlockingTrellis {
         self.submit(|reply| Job::ResumeColumn(target, reply))
     }
 
+    /// Resumes a whole-transform-quarantined transform. See
+    /// [`Trellis::resume_transform`].
+    pub fn resume_transform(&self, target: &str) -> Result<(), TrellisError> {
+        let target = target.to_string();
+        self.submit(|reply| Job::ResumeTransform(target, reply))
+    }
+
     /// Stops any background work this connection started and waits for the
     /// background thread to exit cleanly. See [`Trellis::shutdown`].
     pub fn shutdown(mut self) -> Result<(), TrellisError> {
@@ -338,6 +346,9 @@ async fn run(
             }
             Job::ResumeColumn(target, reply) => {
                 let _ = reply.send(trellis.resume_column(&target).await);
+            }
+            Job::ResumeTransform(target, reply) => {
+                let _ = reply.send(trellis.resume_transform(&target).await);
             }
             Job::Shutdown(reply) => {
                 let _ = reply.send(trellis.shutdown().await);

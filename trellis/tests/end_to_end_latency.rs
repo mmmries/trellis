@@ -166,6 +166,8 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = numeric_columns(&["id", "price", "tax"]);
     create_definition(
@@ -178,9 +180,16 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
     let pk = source_primary_key(&db.pool, &totals_def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &totals_def, "public", &pk, &source_columns)
-        .await
-        .expect("create chain_totals table");
+    create_target_table(
+        &db.pool,
+        &totals_def,
+        "public",
+        &pk,
+        &source_columns,
+        &totals_def.source,
+    )
+    .await
+    .expect("create chain_totals table");
 
     // The terminal hop: reads chain_totals, has no downstream reader itself.
     let totals_columns = numeric_columns(&["id", "total"]);
@@ -192,9 +201,16 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
     )
     .await
     .expect("create chain_summary definition");
-    create_target_table(&db.pool, &summary_def.def, "public", &pk, &totals_columns)
-        .await
-        .expect("create chain_summary table");
+    create_target_table(
+        &db.pool,
+        &summary_def.def,
+        "public",
+        &pk,
+        &totals_columns,
+        &summary_def.def.source,
+    )
+    .await
+    .expect("create chain_summary table");
 
     client
         .execute(
@@ -330,6 +346,8 @@ async fn end_to_end_latency_fires_for_every_terminal_transform_in_a_fan_out() {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     create_definition(
         &db.pool,
@@ -341,9 +359,16 @@ async fn end_to_end_latency_fires_for_every_terminal_transform_in_a_fan_out() {
     let pk = source_primary_key(&db.pool, &def_a.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def_a, "public", &pk, &source_columns)
-        .await
-        .expect("create fanout_a table");
+    create_target_table(
+        &db.pool,
+        &def_a,
+        "public",
+        &pk,
+        &source_columns,
+        &def_a.source,
+    )
+    .await
+    .expect("create fanout_a table");
 
     let def_b = TransformDef {
         target: "e2e_latency_fanout_b".to_string(),
@@ -354,6 +379,8 @@ async fn end_to_end_latency_fires_for_every_terminal_transform_in_a_fan_out() {
             expr: Expr::Column("price".to_string()),
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     create_definition(
         &db.pool,
@@ -362,9 +389,16 @@ async fn end_to_end_latency_fires_for_every_terminal_transform_in_a_fan_out() {
     )
     .await
     .expect("create fanout_b definition");
-    create_target_table(&db.pool, &def_b, "public", &pk, &source_columns)
-        .await
-        .expect("create fanout_b table");
+    create_target_table(
+        &db.pool,
+        &def_b,
+        "public",
+        &pk,
+        &source_columns,
+        &def_b.source,
+    )
+    .await
+    .expect("create fanout_b table");
 
     client
         .execute(

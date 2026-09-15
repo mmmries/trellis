@@ -152,6 +152,21 @@ pub enum ApplyError {
     /// resume until the definition reaches `Live` closes the window instead
     /// of racing it.
     DefinitionNotLive { transform: String },
+    /// A failure from [`crate::intake::publication`]'s backfill-marker
+    /// machinery (issue #55: [`super::quarantine::resume_transform`]
+    /// re-parking a catch-up marker, or clearing/qualifying its source
+    /// table).
+    Intake(crate::intake::IntakeError),
+    /// [`super::quarantine::resume_transform`] was asked to resume a target
+    /// with no corresponding `transform_definitions` row at all.
+    TransformNotFound { transform: String },
+    /// [`super::quarantine::resume_transform`] was asked to resume a
+    /// target whose current status isn't
+    /// [`crate::defs::model::TransformStatus::Quarantined`] — resuming a
+    /// transform that isn't quarantined is caller error, not a silent
+    /// no-op, mirroring [`ApplyError::ColumnNotPaused`]'s same discipline
+    /// for the column-level tier.
+    TransformNotQuarantined { transform: String },
 }
 
 impl ApplyError {
@@ -187,6 +202,9 @@ impl ApplyError {
             // malformed" (-> Validation) or "nothing by that name exists"
             // (-> NotFound).
             ApplyError::DefinitionNotLive { .. } => ErrorCode::Conflict,
+            ApplyError::Intake(err) => err.code(),
+            ApplyError::TransformNotFound { .. } => ErrorCode::NotFound,
+            ApplyError::TransformNotQuarantined { .. } => ErrorCode::Conflict,
         }
     }
 }
@@ -238,6 +256,15 @@ impl fmt::Display for ApplyError {
                 "'{transform}' is not currently live (it may still be backfilling); resuming a \
                  paused column requires its definition to be live first"
             ),
+            ApplyError::Intake(err) => write!(f, "backfill marker error: {err}"),
+            ApplyError::TransformNotFound { transform } => {
+                write!(f, "no transform named '{transform}' is registered")
+            }
+            ApplyError::TransformNotQuarantined { transform } => write!(
+                f,
+                "'{transform}' is not currently quarantined; resuming it re-runs its full \
+                 backfill, which is only valid from `quarantined`"
+            ),
         }
     }
 }
@@ -253,12 +280,15 @@ impl std::error::Error for ApplyError {
             ApplyError::Backfill(err) => Some(err),
             ApplyError::Db(err) => Some(err),
             ApplyError::Pool(err) => Some(err),
+            ApplyError::Intake(err) => Some(err),
             ApplyError::ClaimLost
             | ApplyError::VersionFenceMiss { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::SourceTableDropped { .. }
             | ApplyError::ColumnNotPaused { .. }
-            | ApplyError::DefinitionNotLive { .. } => None,
+            | ApplyError::DefinitionNotLive { .. }
+            | ApplyError::TransformNotFound { .. }
+            | ApplyError::TransformNotQuarantined { .. } => None,
         }
     }
 }
@@ -296,6 +326,12 @@ impl From<ValidationError> for ApplyError {
 impl From<crate::defs::backfill::BackfillError> for ApplyError {
     fn from(err: crate::defs::backfill::BackfillError) -> Self {
         ApplyError::Backfill(err)
+    }
+}
+
+impl From<crate::intake::IntakeError> for ApplyError {
+    fn from(err: crate::intake::IntakeError) -> Self {
+        ApplyError::Intake(err)
     }
 }
 

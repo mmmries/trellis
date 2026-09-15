@@ -665,6 +665,21 @@ impl Trellis {
         }
     }
 
+    /// Resumes a whole-transform-quarantined transform (issue #55; ADR-0003's
+    /// coarser, transform-wide fuse tier — the counterpart to
+    /// [`Trellis::resume_column`]'s per-column tier). `target` must be a bare
+    /// transform's target table, not a `transform.column` address — see
+    /// [`crate::staging::quarantine::resume_transform`] for the full
+    /// contract, including why this drops the transform to
+    /// [`TransformStatus::WaitingToBackfill`] and re-runs its backfill
+    /// through the same `xmin`-fence-respecting path a fresh transform's own
+    /// initial backfill uses, rather than a shortcut.
+    pub async fn resume_transform(&self, target: &str) -> Result<(), TrellisError> {
+        quarantine::resume_transform(&self.pool, target)
+            .await
+            .map_err(TrellisError::Apply)
+    }
+
     /// Stops any background work this connection started (staging worker and
     /// drain workers) and waits for it to exit cleanly. A no-op for a
     /// connection that started none.

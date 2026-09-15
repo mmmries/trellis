@@ -928,6 +928,91 @@ pub async fn resume_column(
     Ok(resumed)
 }
 
+/// Resumes a whole-transform-quarantined definition — ADR-0003's coarser,
+/// transform-wide fuse tier, distinct from [`resume_column`]'s per-column
+/// tier (which additionally requires the owning definition to already be
+/// `live`; a `quarantined` definition is, by construction, never that).
+///
+/// Requires `target`'s current status to be
+/// [`TransformStatus::Quarantined`] ([`ApplyError::TransformNotQuarantined`]
+/// otherwise, checked before any mutation — resuming a transform that isn't
+/// quarantined is caller error, not a silent no-op, matching
+/// [`resume_column`]'s [`ApplyError::ColumnNotPaused`] discipline). Drops
+/// the definition to [`TransformStatus::WaitingToBackfill`] and re-parks a
+/// fresh `pending_backfill` marker for its source table (reusing
+/// [`crate::intake::publication::park_backfill_catchup`] — the exact
+/// mechanism a chunked build's own post-completion catch-up already uses,
+/// see `defs::catalog::complete_direct_backfill`), so the actual re-backfill
+/// runs through [`crate::intake::publication::run_pending_backfills`]'s own
+/// `xmin`-fence-respecting discharge — never a shortcut that re-derives the
+/// target without waiting out a concurrent transaction that might still be
+/// pinning the fence (issue #55; docs/observability.md's "Backfill status
+/// and the `xmin` caveat" applies here exactly as it does to a fresh
+/// transform's own initial backfill: resuming can sit in
+/// `waiting_to_backfill` for as long as some unrelated transaction pins the
+/// cluster's `xmin`, and that is correct, not a fault).
+///
+/// Clears any stale `backfill_coverage` record for the source table first
+/// (issue #79, bug B's multi-reader contract): a quarantined definition's
+/// target may be broken or only partially written, so a coverage record
+/// that would otherwise let the discharge skip enumeration cannot be
+/// trusted here — full re-enumeration is the safe default.
+///
+/// **What this does not (yet) do.** As of this writing, nothing in this
+/// codebase actually *trips* a definition to `Quarantined` in the first
+/// place — the whole-transform fuse ADR-0003 describes ("if a failure isn't
+/// attributable to one column ... it trips the whole transform to
+/// `quarantined` exactly as before") has no writer; only the per-key
+/// ([`isolate_and_evict`]/`poison`) and per-column ([`trip_column_fuse`])
+/// tiers are wired today. `resume_transform` implements ADR-0003's *resume*
+/// half of the contract, correctly fence-gated, so whichever trip mechanism
+/// lands later has somewhere correct to call — it does not itself add the
+/// trip, and nothing here should be read as evidence one already exists.
+pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+
+    let row = txn
+        .query_opt(
+            "select id, source_table, status from transform_definitions \
+             where target_table = $1 for update",
+            &[&target],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Err(ApplyError::TransformNotFound {
+            transform: target.to_string(),
+        });
+    };
+    let id: i64 = row.get(0);
+    let source_table: String = row.get(1);
+    let status_text: String = row.get(2);
+    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+        panic!("transform_definitions.status held unrecognized value '{status_text}'")
+    });
+    if status != TransformStatus::Quarantined {
+        return Err(ApplyError::TransformNotQuarantined {
+            transform: target.to_string(),
+        });
+    }
+
+    txn.execute(
+        "update transform_definitions set status = $1 where id = $2",
+        &[&TransformStatus::WaitingToBackfill.as_str(), &id],
+    )
+    .await?;
+
+    // `transform_definitions.source_table` is already the fully-qualified
+    // `"schema.table"` form (issue #72) — re-resolving it via
+    // `resolve_source_schema_in_txn` (bare names only) or re-`qualify`-ing it
+    // would reject it outright (`DottedIdentifierComponent`).
+    crate::intake::publication::clear_backfill_coverage(&*txn, &source_table).await?;
+    crate::intake::publication::park_backfill_catchup(&*txn, &source_table).await?;
+
+    txn.commit().await?;
+    Ok(())
+}
+
 /// Re-derives `column`'s value across every current row of `def.def.source`
 /// and writes it into `def.def.target`, freshly evaluated against live
 /// source data — [`resume_column`]'s "re-run the backfill for just this
