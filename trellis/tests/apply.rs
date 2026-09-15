@@ -128,6 +128,8 @@ fn order_totals_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -170,7 +172,7 @@ async fn drain_matches_the_oracle_across_an_insert_update_and_delete() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -249,6 +251,98 @@ async fn drain_matches_the_oracle_across_an_insert_update_and_delete() {
     }
 }
 
+/// A reviewer's high-severity follow-up to issue #76's grammar work, at the
+/// CDC-apply layer this time (`defs_install_definition.rs`'s
+/// `install_definition_fast_path_reads_the_explicitly_qualified_source_not_a_same_named_decoy`
+/// covers the direct-build/backfill layer): a definition created with an
+/// explicit `FROM custom.orders` must have its *live* source reads —
+/// [`read_live_rows_batch`], reached whenever a folded change carries no
+/// image, e.g. every `Recompute` marker `create_definition`'s own initial
+/// ring-backfill enumeration stages for a pre-existing row — actually read
+/// `custom.orders`, not a same-named `orders` sitting in one of this pool's
+/// own pinned `search_path` schemas (`Config::schema`, `Config::target_schema`,
+/// `"public"` — `pool::session_bootstrap`). `public.orders` below is exactly
+/// that decoy, holding different rows than the real, explicitly-named
+/// `custom.orders`, so a wrong-table live read is unmistakable in the
+/// drained target's contents.
+#[tokio::test]
+async fn explicitly_qualified_source_reads_the_right_table_on_a_live_refetch() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table public.orders (id integer primary key, price numeric); \
+             insert into public.orders (id, price) values (1, 999), (2, 888); \
+             create schema custom; \
+             create table custom.orders (id integer primary key, price numeric); \
+             insert into custom.orders (id, price) values (1, 10), (2, 20), (3, 30);",
+        )
+        .await
+        .expect("seed the public.orders decoy and the real custom.orders");
+
+    let source_columns = numeric_columns(&["price"]);
+    let pk = source_primary_key(&db.pool, "custom.orders")
+        .await
+        .expect("introspect custom.orders' primary key");
+    let def =
+        trellis::defs::parse("TRANSFORM order_totals FROM custom.orders SELECT price AS total")
+            .expect("parse the explicitly-qualified definition");
+    create_target_table(
+        &db.pool,
+        &def,
+        "public",
+        &pk,
+        &source_columns,
+        "custom.orders",
+    )
+    .await
+    .expect("materialize order_totals ahead of create_definition");
+
+    // `create_definition` enumerates every one of `custom.orders`'s 3
+    // pre-existing rows into the active segment as image-less `Recompute`
+    // markers — exactly the shape that forces `compute`'s live-refetch path
+    // (`read_live_rows_batch`) once drained below.
+    create_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM custom.orders SELECT price AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create definition against the explicitly-qualified source");
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let outcome = drain(&db.pool, seg_seq, "worker").await;
+    assert_eq!(
+        outcome.keys_written, 3,
+        "all 3 of custom.orders's rows must be written"
+    );
+
+    let target_rows: Vec<(i32, Option<String>)> = client
+        .query("select id, total::text from order_totals", &[])
+        .await
+        .expect("read target table")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        target_rows.len(),
+        3,
+        "custom.orders has 3 rows; a count of 2 would mean the public.orders \
+         decoy was read instead"
+    );
+    let expected: HashMap<i32, &str> = HashMap::from([(1, "10"), (2, "20"), (3, "30")]);
+    for (id, total) in target_rows {
+        assert_eq!(
+            total.as_deref(),
+            expected.get(&id).copied(),
+            "order_totals must reflect custom.orders's prices for id {id}, \
+             not the same-named public.orders decoy"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_fully_drained_single_bucket_batch_flips_the_segment_to_drained() {
     let cluster = TestCluster::start();
@@ -276,7 +370,7 @@ async fn a_fully_drained_single_bucket_batch_flips_the_segment_to_drained() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -336,7 +430,7 @@ async fn a_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -437,7 +531,7 @@ async fn a_definition_change_on_a_touched_source_trips_the_version_fence() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -542,7 +636,7 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_fence() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -629,7 +723,7 @@ async fn a_write_that_changes_nothing_is_suppressed_as_a_no_op() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -697,7 +791,7 @@ async fn a_truncate_clears_every_target_row_but_a_same_batch_post_truncate_inser
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create order_totals table");
 
@@ -718,6 +812,7 @@ async fn a_truncate_clears_every_target_row_but_a_same_batch_post_truncate_inser
         "public",
         &pk,
         &order_totals_columns,
+        &summary_def.def.source,
     )
     .await
     .expect("create order_summary table");
@@ -933,7 +1028,7 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create order_totals table");
 
@@ -954,6 +1049,7 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
         "public",
         &pk,
         &order_totals_columns,
+        &summary_def.def.source,
     )
     .await
     .expect("create order_summary table");
@@ -1073,6 +1169,8 @@ async fn a_text_column_passthrough_round_trips_through_compute() {
             expr: Expr::Column("label".to_string()),
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = columns(&[("id", ValueType::Numeric), ("label", ValueType::Text)]);
     create_definition(
@@ -1085,7 +1183,7 @@ async fn a_text_column_passthrough_round_trips_through_compute() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -1161,6 +1259,8 @@ async fn a_string_literal_field_writes_its_value_through_compute() {
             expr: Expr::StringLiteral("hi".to_string()),
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = numeric_columns(&["id"]);
     create_definition(
@@ -1173,7 +1273,7 @@ async fn a_string_literal_field_writes_its_value_through_compute() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -1221,6 +1321,8 @@ async fn a_boolean_column_passthrough_round_trips_through_compute() {
             expr: Expr::Column("flag".to_string()),
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = columns(&[("id", ValueType::Numeric), ("flag", ValueType::Boolean)]);
     create_definition(
@@ -1233,7 +1335,7 @@ async fn a_boolean_column_passthrough_round_trips_through_compute() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -1317,6 +1419,8 @@ async fn a_function_call_composed_with_greater_than_round_trips_through_compute(
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = columns(&[("id", ValueType::Numeric), ("name", ValueType::Text)]);
     create_definition(
@@ -1329,7 +1433,7 @@ async fn a_function_call_composed_with_greater_than_round_trips_through_compute(
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -1417,7 +1521,7 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -1534,7 +1638,7 @@ async fn a_write_batch_past_the_bind_parameter_cap_chunks_and_still_drains() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -1623,7 +1727,7 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -1776,7 +1880,7 @@ async fn drain_many_coalesces_two_sealed_segments_into_one_apply_pass() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 

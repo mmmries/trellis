@@ -87,10 +87,12 @@ async fn valid_definition_is_stored_and_retrievable() {
 ///
 /// `def.def.source` (the in-memory [`trellis::Definition`] returned by
 /// [`create_definition`]) stays bare — it's re-parsed straight from
-/// `definition_text`, which the grammar never qualifies (issue #76) — so
-/// this test reads `transform_definitions.source_table` back directly to
-/// observe the persisted identity, rather than trusting the returned
-/// `Definition`.
+/// `definition_text`, and this definition's own `FROM` clause is bare too
+/// (see [`trellis::defs::TransformDef`]'s own doc comment for why `source`
+/// never carries a dotted spelling even for a definition that *did* qualify
+/// it explicitly, issue #76) — so this test reads
+/// `transform_definitions.source_table` back directly to observe the
+/// persisted identity, rather than trusting the returned `Definition`.
 #[tokio::test]
 async fn source_table_is_persisted_fully_qualified() {
     let cluster = TestCluster::start();
@@ -110,9 +112,9 @@ async fn source_table_is_persisted_fully_qualified() {
     )
     .await
     .expect("valid definition should be stored");
-    // The returned `Definition` re-parses `definition_text`, which the
-    // grammar never qualifies — this stays bare regardless of what's
-    // persisted (see this test's own doc comment).
+    // The returned `Definition` re-parses `definition_text`; this bare `FROM
+    // posts` never carries a dotted spelling regardless of what's persisted
+    // (see this test's own doc comment).
     assert_eq!(def.def.source, "posts");
 
     let source_table: String = client
@@ -160,9 +162,9 @@ async fn target_table_is_persisted_fully_qualified() {
     )
     .await
     .expect("valid definition should be stored");
-    // The returned `Definition` re-parses `definition_text`, which the
-    // grammar never qualifies — this stays bare regardless of what's
-    // persisted, exactly like `def.source` above.
+    // The returned `Definition` re-parses `definition_text`; this bare
+    // `TRANSFORM post_titles` never carries a dotted spelling regardless of
+    // what's persisted, exactly like `def.source` above.
     assert_eq!(def.def.target, "post_titles");
 
     let client = db.pool.get().await.expect("get connection");
@@ -216,6 +218,7 @@ async fn a_definitions_target_table_matches_a_chained_definitions_source_table()
         "public",
         &pk,
         &HashMap::from([("id".to_string(), ValueType::Numeric)]),
+        &b_def.source,
     )
     .await
     .expect("materialize b's target table");
@@ -252,6 +255,195 @@ async fn a_definitions_target_table_matches_a_chained_definitions_source_table()
         "c's source and a's target must resolve to the identical qualified \
          identity for the chain to actually connect"
     );
+}
+
+/// Issue #76 / ADR-0007 grammar clause 4: an explicit `FROM <schema>.<source>`
+/// resolves to *that exact relation*, never a `search_path` walk. Proven
+/// here by deliberately creating two same-named `orders` tables — one that
+/// bare resolution would win (landed in the Trellis-pinned schema, first on
+/// `search_path` — see `create_bare_source_table`'s own doc comment) and one
+/// in a schema nowhere near the front of the path — and confirming the
+/// explicitly-qualified spelling still resolves to the *non-default* one.
+/// If explicit qualification silently fell back to a `search_path` walk
+/// (the #72 bare-name behavior), this would instead persist the
+/// Trellis-schema `orders`, not `custom.orders`.
+#[tokio::test]
+async fn an_explicitly_qualified_source_resolves_to_that_exact_relation_not_search_path() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    // Lands in the Trellis-pinned schema (first on `search_path`) — the
+    // table bare resolution would pick.
+    create_bare_source_table(&db.pool, "orders").await;
+
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create schema custom; \
+             create table custom.orders (id serial primary key, price numeric)",
+        )
+        .await
+        .expect("create custom.orders");
+
+    let def = create_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM custom.orders SELECT price AS total",
+        &columns(&["price"]),
+    )
+    .await
+    .expect("explicitly-qualified source should resolve to custom.orders");
+    // The returned `Definition` re-parses `definition_text` — `def.source`
+    // itself always stays bare (see `TransformDef`'s own doc comment), but
+    // `explicit_source_schema` carries the qualification through.
+    assert_eq!(def.def.source, "orders");
+    assert_eq!(def.def.explicit_source_schema, Some("custom".to_string()));
+
+    let source_table: String = client
+        .query_one(
+            "select source_table from transform_definitions where id = $1",
+            &[&def.id],
+        )
+        .await
+        .expect("read back the persisted definition")
+        .get(0);
+    assert_eq!(
+        source_table, "custom.orders",
+        "must resolve to the explicitly-named schema, not whichever schema \
+         search_path would have picked for the bare name"
+    );
+}
+
+/// The rejection twin of the test above: an explicit `FROM <schema>.<source>`
+/// whose named schema doesn't actually contain a table by that name is
+/// rejected with [`ValidationError::QualifiedSourceTableNotFound`], not
+/// silently falling back to a `search_path` walk that might resolve some
+/// *other* `orders` table instead.
+#[tokio::test]
+async fn an_explicitly_qualified_source_naming_a_schema_without_that_table_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    // A same-named bare `orders` exists (and would win any search_path
+    // walk), but `custom` itself has no `orders` table at all.
+    create_bare_source_table(&db.pool, "orders").await;
+    {
+        let client = db.pool.get().await.expect("get connection");
+        client
+            .batch_execute("create schema custom")
+            .await
+            .expect("create the custom schema");
+    }
+
+    let err = create_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM custom.orders SELECT price AS total",
+        &columns(&["price"]),
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        CatalogError::Validate(ValidationError::QualifiedSourceTableNotFound { schema, table }) => {
+            assert_eq!(schema, "custom");
+            assert_eq!(table, "orders");
+        }
+        other => panic!("expected QualifiedSourceTableNotFound, got: {other:?}"),
+    }
+
+    let client = db.pool.get().await.expect("get connection");
+    let count: i64 = client
+        .query_one("select count(*) from transform_definitions", &[])
+        .await
+        .expect("count definitions")
+        .get(0);
+    assert_eq!(count, 0, "the rejected definition must not persist");
+}
+
+/// Issue #76's own follow-up to
+/// `a_target_table_colliding_on_bare_suffix_under_a_different_schema_is_rejected`
+/// (issue #73's guard): an explicitly-qualified `TRANSFORM <schema>.<target>`
+/// must trip the very same [`CatalogError::TargetTableSuffixCollision`] guard
+/// a resolved-bare target under a different `Config::target_schema` does —
+/// the check operates on the final qualified string and the bare suffix
+/// alone, with no branch on *how* the qualification was produced, so this
+/// proves that in practice rather than just by reading the code. Unlike the
+/// bare-resolution version of this test, `create_definition` never runs
+/// target-table DDL itself, so `custom.foo` is materialized by hand first
+/// (mirroring `a_definitions_target_table_matches_a_chained_definitions_source_table`'s
+/// `create_target_table` call) — otherwise the new
+/// `QualifiedTargetTableNotFound` existence check (also issue #76) would
+/// reject it before the collision guard is ever reached.
+#[tokio::test]
+async fn an_explicitly_qualified_target_still_triggers_the_suffix_collision_guard() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM foo FROM orders SELECT price AS total",
+        &columns(&["price"]),
+    )
+    .await
+    .expect("first definition (public.foo) should be stored");
+
+    {
+        let client = db.pool.get().await.expect("get connection");
+        client
+            .batch_execute("create schema custom")
+            .await
+            .expect("create the second target schema");
+    }
+
+    // Materialize `custom.foo` by hand — `create_definition` (the ring-path
+    // entry point) assumes its caller already created the physical target
+    // table, exactly like the chained-definition test above.
+    let pk = trellis::defs::source_primary_key(&db.pool, "orders")
+        .await
+        .expect("introspect orders' primary key");
+    let custom_foo_def =
+        trellis::defs::parse("TRANSFORM custom.foo FROM orders SELECT price AS total")
+            .expect("parse the explicitly-qualified definition");
+    trellis::defs::create_target_table(
+        &db.pool,
+        &custom_foo_def,
+        "custom",
+        &pk,
+        &columns(&["price"]),
+        &custom_foo_def.source,
+    )
+    .await
+    .expect("materialize custom.foo");
+
+    let err = create_definition(
+        &db.pool,
+        "TRANSFORM custom.foo FROM orders SELECT price AS total",
+        &columns(&["price"]),
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        CatalogError::TargetTableSuffixCollision {
+            target,
+            requested,
+            existing,
+        } => {
+            assert_eq!(target, "foo");
+            assert_eq!(requested, "custom.foo");
+            assert_eq!(existing, Some("public.foo".to_string()));
+        }
+        other => panic!("expected TargetTableSuffixCollision, got: {other:?}"),
+    }
+
+    let client = db.pool.get().await.expect("get connection");
+    let count: i64 = client
+        .query_one(
+            "select count(*) from transform_definitions where split_part(target_table, '.', 2) = 'foo'",
+            &[],
+        )
+        .await
+        .expect("count definitions")
+        .get(0);
+    assert_eq!(count, 1, "the rejected second definition must not persist");
 }
 
 /// Issue #63's write-path gap: the source-column type map a definition was
@@ -1249,4 +1441,105 @@ async fn an_aggregate_transform_against_replica_identity_full_is_accepted() {
     )
     .await
     .expect("aggregate transform with REPLICA IDENTITY FULL should be accepted");
+}
+
+/// Reviewer follow-up to issue #76: `assert_replica_identity_supports_aggregate`
+/// (issue #47's guard, in `create_definition_inner`) used to check
+/// `def.source` *bare* against `pg_class` via `to_regclass`'s own
+/// `search_path` walk — running before `qualified_source` resolution a few
+/// lines later, and never consulting `def.explicit_source_schema` at all.
+/// For an aggregate definition with an explicit `FROM <schema>.<source>`,
+/// that meant the check could silently examine the wrong relation whenever a
+/// same-named table also existed earlier on `search_path`.
+///
+/// This is the dangerous direction: a decoy `orders` (landed in the
+/// Trellis-pinned schema, first on `search_path` — see
+/// `create_bare_source_table`'s own doc comment) has `REPLICA IDENTITY
+/// FULL`, but the *real*, explicitly-qualified source `custom.orders` is
+/// left at the default (PK-only) identity. A bare `to_regclass` lookup would
+/// resolve to the decoy and wrongly *accept* this aggregate, silently
+/// reintroducing issue #47's aggregate-corruption bug (delta-maintenance
+/// can't recover the old row image on delete/non-key update) through this
+/// issue's own new grammar. Checking the real, qualified source must instead
+/// reject it.
+#[tokio::test]
+async fn an_aggregate_against_an_explicitly_qualified_source_is_rejected_despite_a_full_identity_decoy()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table orders (id serial primary key, customer integer not null); \
+             alter table orders replica identity full; \
+             create schema custom; \
+             create table custom.orders (id serial primary key, customer integer not null)",
+        )
+        .await
+        .expect("seed decoy orders (FULL) and real custom.orders (default)");
+
+    let source_columns: HashMap<String, ValueType> =
+        HashMap::from([("customer".to_string(), ValueType::Numeric)]);
+
+    let err = create_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM custom.orders GROUP BY customer SELECT customer AS customer, \
+         COUNT(*) AS order_count",
+        &source_columns,
+    )
+    .await
+    .unwrap_err();
+
+    match &err {
+        CatalogError::ReplicaIdentityRequired(_) => {}
+        other => panic!("expected ReplicaIdentityRequired, got {other:?}"),
+    }
+
+    let count: i64 = client
+        .query_one("select count(*) from transform_definitions", &[])
+        .await
+        .expect("count definitions")
+        .get(0);
+    assert_eq!(
+        count, 0,
+        "the wrongly-would-be-accepted definition must not persist"
+    );
+}
+
+/// The mirror of the test above: the real, explicitly-qualified source
+/// `custom.orders` has `REPLICA IDENTITY FULL`, while a same-named decoy
+/// `orders` (Trellis-pinned schema, first on `search_path`) is left at the
+/// default identity. A bare `to_regclass` lookup would resolve to the decoy
+/// and wrongly *reject* this otherwise-legitimate aggregate. Checking the
+/// real, qualified source must instead accept it.
+#[tokio::test]
+async fn an_aggregate_against_an_explicitly_qualified_source_is_accepted_despite_a_default_identity_decoy()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table orders (id serial primary key, customer integer not null); \
+             create schema custom; \
+             create table custom.orders (id serial primary key, customer integer not null); \
+             alter table custom.orders replica identity full",
+        )
+        .await
+        .expect("seed decoy orders (default) and real custom.orders (FULL)");
+
+    let source_columns: HashMap<String, ValueType> =
+        HashMap::from([("customer".to_string(), ValueType::Numeric)]);
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM custom.orders GROUP BY customer SELECT customer AS customer, \
+         COUNT(*) AS order_count",
+        &source_columns,
+    )
+    .await
+    .expect(
+        "aggregate against the explicitly-qualified custom.orders (REPLICA IDENTITY FULL) \
+         must be accepted even though a same-named decoy lacks it",
+    );
 }

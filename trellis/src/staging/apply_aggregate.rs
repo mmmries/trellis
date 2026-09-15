@@ -314,6 +314,16 @@ pub(super) struct AggregateTargetPlan {
     pub group_by_types: Vec<ValueType>,
     pub fields: Vec<AggFieldPlan>,
     pub groups: HashMap<String, GroupPlan>,
+    /// The source table's fully-qualified `"schema.table"` identity (issue
+    /// #76, ADR-0007) — `super::apply::compute`'s own already-qualified
+    /// `change.src_table`, not the bare `catalog_source_key`. Every probe
+    /// below (`probe_sum_and_count`, `probe_count_star`, `probe_field_value`,
+    /// `probe_group_exists`) and bulk-recompute builder
+    /// (`apply_forced_groups_bulk`, `probe_recompute_fields_bulk`) reads this
+    /// through [`ddl::qualified_source_table`] rather than a bare
+    /// `quote_ident`, so a same-named source table in a different schema
+    /// can't make a forced-recompute probe silently read the wrong physical
+    /// relation.
     pub source: String,
     pub field_exprs: HashMap<String, Expr>,
     /// Every [`AggFieldKind::Sum`]/[`AggFieldKind::Avg`] field's hidden
@@ -764,7 +774,7 @@ async fn probe_group_exists(
     let where_sql = group_where_clause(group_by, group_by_types, 1);
     let sql = format!(
         "select exists(select 1 from {} where {where_sql})",
-        quote_ident(source)
+        ddl::qualified_source_table(source)
     );
     let row = txn.query_one(&sql, &group_where_params(values)).await?;
     Ok(row.get(0))
@@ -806,7 +816,7 @@ async fn probe_field_value(
     let where_sql = group_where_clause(group_by, group_by_types, 1);
     let sql = format!(
         "select ({expr_sql})::text from {} where {where_sql}",
-        quote_ident(source)
+        ddl::qualified_source_table(source)
     );
     let row = txn.query_one(&sql, &group_where_params(values)).await?;
     Ok(row.get(0))
@@ -839,7 +849,7 @@ async fn probe_sum_and_count(
     let where_sql = group_where_clause(group_by, group_by_types, 1);
     let sql = format!(
         "select sum({arg_sql})::text, count({arg_sql}) from {} where {where_sql}",
-        quote_ident(source)
+        ddl::qualified_source_table(source)
     );
     let row = txn.query_one(&sql, &group_where_params(values)).await?;
     Ok((row.get(0), row.get(1)))
@@ -862,7 +872,7 @@ async fn probe_count_star(
     let where_sql = group_where_clause(group_by, group_by_types, 1);
     let sql = format!(
         "select count(*) from {} where {where_sql}",
-        quote_ident(source)
+        ddl::qualified_source_table(source)
     );
     let row = txn.query_one(&sql, &group_where_params(values)).await?;
     Ok(row.get(0))
@@ -1413,7 +1423,7 @@ async fn apply_forced_groups_bulk(
         .iter()
         .map(|a| a.iter().any(|v| v.is_none()))
         .collect();
-    let source_ident = quote_ident(&plan.source);
+    let source_ident = ddl::qualified_source_table(&plan.source);
     let target_ident = quote_ident(target);
     let group_idents: Vec<String> = plan.group_by.iter().map(|c| quote_ident(c)).collect();
     // Issue #94: to-one relationship joins onto the recompute's source scan,
@@ -1735,7 +1745,7 @@ async fn probe_recompute_fields_bulk(
         return Ok(Vec::new());
     }
 
-    let source_ident = quote_ident(&plan.source);
+    let source_ident = ddl::qualified_source_table(&plan.source);
     let select_exprs: Vec<String> = recompute_fields
         .iter()
         .map(|f| {

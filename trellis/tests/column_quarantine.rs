@@ -118,6 +118,8 @@ fn order_totals_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -141,7 +143,7 @@ async fn seed_order_totals(db: &TestDatabase, client: &Client) -> TransformDef {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
     def
@@ -168,6 +170,7 @@ async fn seed_order_summaries(db: &TestDatabase, orders_def: &TransformDef) {
         "public",
         &pk,
         &order_totals_columns,
+        &summary_def.def.source,
     )
     .await
     .expect("create order_summaries table");
@@ -1125,13 +1128,22 @@ async fn resume_recomputes_correctly_even_when_a_sibling_column_still_throws() {
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let pk = source_primary_key(&db.pool, "calc_src")
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &calc_def, "public", &pk, &source_columns)
-        .await
-        .expect("create calc table");
+    create_target_table(
+        &db.pool,
+        &calc_def,
+        "public",
+        &pk,
+        &source_columns,
+        &calc_def.source,
+    )
+    .await
+    .expect("create calc table");
 
     // Seed the target with sentinel values distinct from any real
     // recomputed result, so a successful recompute is unambiguous.
@@ -1258,10 +1270,19 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
-    create_target_table(&db.pool, &def_a, "public", &pk, &source_columns)
-        .await
-        .expect("create sib_a table");
+    create_target_table(
+        &db.pool,
+        &def_a,
+        "public",
+        &pk,
+        &source_columns,
+        &def_a.source,
+    )
+    .await
+    .expect("create sib_a table");
     let def_b = TransformDef {
         target: "sib_b".to_string(),
         source: "shared_src".to_string(),
@@ -1275,10 +1296,19 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
-    create_target_table(&db.pool, &def_b, "public", &pk, &source_columns)
-        .await
-        .expect("create sib_b table");
+    create_target_table(
+        &db.pool,
+        &def_b,
+        "public",
+        &pk,
+        &source_columns,
+        &def_b.source,
+    )
+    .await
+    .expect("create sib_b table");
 
     // `DEFAULT_COLUMN_DEATH_THRESHOLD` distinct bad rows, all in one batch —
     // the same "breadth of distinct rows, not one row retried" shape

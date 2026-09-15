@@ -76,6 +76,29 @@ impl From<EvalError> for OracleError {
 /// key (as text) mapped to its calculated columns.
 pub type Recomputed = HashMap<String, HashMap<String, Option<Value>>>;
 
+/// The `FROM`-clause identifier this test/benchmark-only oracle module
+/// should read `def`'s source through (issue #76, ADR-0007 grammar clause
+/// 4): `"schema"."table"`, each component quoted independently, when `def`
+/// wrote an explicit `FROM <schema>.<source>`
+/// ([`TransformDef::explicit_source_schema`]); the plain `"table"` quoted
+/// identifier every function here has always rendered, left to the executing
+/// connection's own `search_path`, for the far more common bare case.
+///
+/// Every function in this module is documented test/benchmark-only (see e.g.
+/// [`render_aggregate_select_sql`]'s own doc comment) and every caller runs
+/// its rendered SQL against the same connection/`search_path` the definition
+/// itself was accepted under, so the bare branch can't drift the way the
+/// real backfill/apply/quarantine paths' pinned-`search_path` reads could
+/// (`docs/decisions/0007`) — only the explicit-schema case needed a real fix
+/// here, and it needs no database round trip: the schema is already right on
+/// `def`.
+fn quoted_source_from(def: &TransformDef) -> String {
+    match &def.explicit_source_schema {
+        Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&def.source)),
+        None => quote_ident(&def.source),
+    }
+}
+
 /// Recomputes `def`'s entire target from `def.source`'s current contents,
 /// keyed by `pk_column` (the source table's primary key, e.g. from
 /// [`super::ddl::source_primary_key`]). `source_columns` gives each
@@ -104,7 +127,7 @@ pub async fn recompute(
     let sql = format!(
         "select {} from {}",
         select_list.join(", "),
-        quote_ident(&def.source)
+        quoted_source_from(def)
     );
 
     let client = pool.get().await?;
@@ -165,7 +188,7 @@ pub async fn recompute_aggregate(
     let sql = format!(
         "select {} from {}",
         select_list.join(", "),
-        quote_ident(&def.source)
+        quoted_source_from(def)
     );
 
     let client = pool.get().await?;
@@ -260,7 +283,7 @@ pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
     format!(
         "select {} from {} group by {}",
         select_list.join(", "),
-        quote_ident(&def.source),
+        quoted_source_from(def),
         group_cols.join(", ")
     )
 }
@@ -485,7 +508,7 @@ pub fn render_aggregate_relationship_select_sql(
     let substituted = super::backfill::substituted_field_exprs(def)
         .expect("aggregate oracle rendering requires a substitutable definition");
 
-    let source_sql = quote_ident(&def.source);
+    let source_sql = quoted_source_from(def);
     let select_list: Vec<String> = def
         .fields
         .iter()
@@ -625,7 +648,7 @@ pub fn render_relationship_select_sql(
     let mut sql = format!(
         "select {} from {}",
         select_list.join(", "),
-        quote_ident(&def.source)
+        quoted_source_from(def)
     );
     for rel_name in to_one_rels {
         let rel = relationships.get(rel_name).unwrap_or_else(|| {
@@ -772,6 +795,8 @@ mod tests {
                 },
             ],
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         }
     }
 
@@ -806,6 +831,8 @@ mod tests {
                 expr: Expr::Column("c".to_string()),
             }],
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         };
         let columns = referenced_source_columns(&def);
         assert_eq!(
@@ -896,6 +923,8 @@ mod tests {
                 },
             ],
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         };
         assert_eq!(
             render_relationship_select_sql(&def, &category_rel()),
@@ -924,6 +953,8 @@ mod tests {
                 },
             }],
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         };
         assert_eq!(
             render_relationship_select_sql(&def, &comments_rel()),

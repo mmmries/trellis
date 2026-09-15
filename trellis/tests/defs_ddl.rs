@@ -23,6 +23,8 @@ fn order_totals_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -57,6 +59,7 @@ async fn target_table_is_created_with_inherited_pk_and_numeric_calculated_column
         "public",
         &pk,
         &numeric_columns(&["price", "tax"]),
+        &def.source,
     )
     .await
     .expect("create target table");
@@ -120,6 +123,7 @@ async fn target_table_defaults_to_the_public_schema_not_the_trellis_instance_sch
         "public",
         &pk,
         &numeric_columns(&["price", "tax"]),
+        &def.source,
     )
     .await
     .expect("create target table");
@@ -164,6 +168,7 @@ async fn target_table_is_created_in_a_configured_non_default_schema() {
         "analytics",
         &pk,
         &numeric_columns(&["price", "tax"]),
+        &def.source,
     )
     .await
     .expect("create target table in the configured target schema");
@@ -203,6 +208,7 @@ async fn creating_the_target_table_twice_is_a_no_op() {
         "public",
         &pk,
         &numeric_columns(&["price", "tax"]),
+        &def.source,
     )
     .await
     .expect("first create");
@@ -212,6 +218,7 @@ async fn creating_the_target_table_twice_is_a_no_op() {
         "public",
         &pk,
         &numeric_columns(&["price", "tax"]),
+        &def.source,
     )
     .await
     .expect("second create is idempotent");
@@ -243,6 +250,8 @@ async fn text_and_boolean_calculated_fields_get_matching_target_column_types() {
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = HashMap::from([
         ("label".to_string(), ValueType::Text),
@@ -252,7 +261,7 @@ async fn text_and_boolean_calculated_fields_get_matching_target_column_types() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table with text/boolean columns");
 
@@ -308,6 +317,8 @@ async fn uuid_column_passthrough_gets_a_matching_target_column_type() {
             expr: Expr::Column("author".to_string()),
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = HashMap::from([("author".to_string(), ValueType::Uuid)]);
 
@@ -316,7 +327,7 @@ async fn uuid_column_passthrough_gets_a_matching_target_column_type() {
         .expect("introspect source primary key");
     assert_eq!(pk.data_type, "uuid");
 
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table with a uuid passthrough column");
 
@@ -399,13 +410,15 @@ async fn integer_family_passthrough_keeps_its_concrete_type_but_arithmetic_widen
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = numeric_columns(&["author", "views", "rank"]);
 
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -479,13 +492,15 @@ async fn numeric_family_passthrough_keeps_its_own_concrete_type() {
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = numeric_columns(&["price", "ratio", "amount"]);
 
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -555,6 +570,8 @@ async fn uuid_column_works_as_an_aggregate_group_by_key() {
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = HashMap::from([
         ("author".to_string(), ValueType::Uuid),
@@ -637,6 +654,8 @@ async fn aggregate_target_table_gets_a_composite_primary_key_from_the_grouping_c
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = HashMap::from([
         ("order_id".to_string(), ValueType::Numeric),
@@ -734,6 +753,8 @@ async fn aggregate_columns_sharing_an_argument_share_one_count_column() {
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = HashMap::from([
         ("order_id".to_string(), ValueType::Numeric),
@@ -822,6 +843,8 @@ async fn aggregate_columns_over_different_arguments_keep_separate_count_columns(
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = HashMap::from([
         ("author".to_string(), ValueType::Numeric),

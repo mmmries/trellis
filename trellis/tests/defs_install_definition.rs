@@ -228,6 +228,179 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
     );
 }
 
+/// A reviewer's high-severity follow-up to issue #76's own grammar work: the
+/// catalog correctly persists an explicitly-qualified source's fully-qualified
+/// identity (`defs_catalog.rs`'s
+/// `an_explicitly_qualified_source_resolves_to_that_exact_relation_not_search_path`
+/// already covers that), but every physical SQL builder that actually reads
+/// the *live* source table at backfill time used to still emit a bare,
+/// unqualified `def.source`, relying on this pool's own pinned `search_path`
+/// (`Config::schema`, `Config::target_schema`, `"public"` —
+/// `pool::session_bootstrap`) to resolve it. That's silently wrong the moment
+/// a same-named table sits in one of those pinned schemas while the
+/// definition explicitly named a *different* one — exactly the setup below:
+/// `public.orders` is a decoy (`public` is pinned, via this call's own
+/// `target_schema` argument), `custom.orders` is the real, explicitly-named
+/// source, and the two hold different row counts/values so a wrong-table read
+/// is unmistakable in the target's contents, not just in a persisted string.
+///
+/// Drives the definition all the way through the fast (non-relationship 1-1)
+/// path's durable chunk queue (`install_plain_one_to_one` ->
+/// `chunk_queue::enqueue_one_to_one` -> `backfill::plan_one_to_one_chunks`,
+/// claimed and executed by [`drain_backfill_chunks`] via
+/// `backfill::execute_one_to_one_chunk`) — the read-back leg that
+/// reconstructs a [`trellis::defs::model::Definition`] fresh via
+/// `catalog::definition_by_id` for every claimed chunk, so this also confirms
+/// that reconstruction actually carries the persisted qualified source
+/// through rather than re-deriving a bare one from re-parsed
+/// `definition_text`.
+#[tokio::test]
+async fn install_definition_fast_path_reads_the_explicitly_qualified_source_not_a_same_named_decoy()
+{
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table public.orders (id bigint primary key, price numeric); \
+             insert into public.orders (id, price) values (1, 999), (2, 888); \
+             create schema custom; \
+             create table custom.orders (id bigint primary key, price numeric); \
+             insert into custom.orders (id, price) values (1, 10), (2, 20), (3, 30);",
+        )
+        .await
+        .expect("seed the public.orders decoy and the real custom.orders");
+
+    let cols = numeric(&["price"]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM custom.orders SELECT price AS total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition against the explicitly-qualified source");
+
+    // The fast path's chunk work is enumerated, not executed in-call
+    // (docs/decisions/0007's amendment) — drive it to completion the way a
+    // real drain worker would.
+    drain_backfill_chunks(&db.pool, "public").await;
+
+    let row_count: i64 = client
+        .query_one("select count(*) from order_totals", &[])
+        .await
+        .expect("count order_totals rows")
+        .get(0);
+    assert_eq!(
+        row_count, 3,
+        "custom.orders has 3 rows; a count of 2 would mean the public.orders \
+         decoy was read instead"
+    );
+
+    let mismatches: i64 = client
+        .query_one(
+            "select count(*) from custom.orders left join order_totals \
+                 on order_totals.id = custom.orders.id \
+             where order_totals.id is null \
+                or order_totals.total is distinct from custom.orders.price",
+            &[],
+        )
+        .await
+        .expect("compare the target against custom.orders")
+        .get(0);
+    assert_eq!(
+        mismatches, 0,
+        "order_totals must be built from custom.orders's prices, not the \
+         same-named public.orders decoy sitting on this pool's own pinned \
+         search_path"
+    );
+}
+
+/// Issue #76 / ADR-0007 grammar clause 4, through the real front door: an
+/// explicitly-qualified `TRANSFORM <schema>.<target>` must override the
+/// `target_schema` argument this function is called with, for *every* step —
+/// the physical `CREATE TABLE` DDL, the direct-build `INSERT`s, and the
+/// persisted qualified identity all need to agree on `custom`, not the
+/// `"public"` this call still passes as its own `target_schema` argument
+/// (mirroring a real caller who never changed `Config::target_schema` but
+/// wants to redirect just this one definition). This is the regression this
+/// module's own bug would have reintroduced: an earlier draft of issue #76's
+/// change checked the target's existence *before* this function's DDL step
+/// ran, which would reject every legitimate explicit-target install outright
+/// (the table doesn't exist yet — DDL is what's about to create it) —
+/// exercising the fast path (not just `create_definition`'s ring path, which
+/// `defs_catalog.rs`'s own issue #76 tests already cover) is what catches
+/// that class of ordering bug.
+#[tokio::test]
+async fn install_definition_honors_an_explicitly_qualified_target_schema() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create schema custom; \
+             create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) select g, g from generate_series(1, 50) g",
+        )
+        .await
+        .expect("seed source and create the custom schema");
+
+    let cols = numeric(&["a"]);
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM custom.t FROM s SELECT a + a AS x",
+        &cols,
+        // Deliberately still "public": the explicit `custom.t` spelling must
+        // win over this argument, not merely happen to agree with it.
+        "public",
+    )
+    .await
+    .expect("install_definition should honor the explicit target schema");
+
+    drain_backfill_chunks(&db.pool, "custom").await;
+
+    let target_table: String = client
+        .query_one(
+            "select target_table from transform_definitions where id = $1",
+            &[&def.id],
+        )
+        .await
+        .expect("read back the persisted definition")
+        .get(0);
+    assert_eq!(target_table, "custom.t");
+
+    let mismatches: i64 = client
+        .query_one(
+            "select count(*) from s left join custom.t on custom.t.id = s.id \
+             where custom.t.id is null or custom.t.x is distinct from s.a + s.a",
+            &[],
+        )
+        .await
+        .expect("the target was actually built under the named schema")
+        .get(0);
+    assert_eq!(
+        mismatches, 0,
+        "target built directly under the explicit schema and matches every source row"
+    );
+
+    let public_t_exists: bool = client
+        .query_one(
+            "select exists (select 1 from information_schema.tables \
+             where table_schema = 'public' and table_name = 't')",
+            &[],
+        )
+        .await
+        .expect("check public.t")
+        .get(0);
+    assert!(
+        !public_t_exists,
+        "the explicit schema must fully override the passed-in target_schema argument, \
+         not just add to it"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Status lifecycle (issue #55): a definition that completes its backfill via
 // `install_definition` must come back — and be persisted — as `Live`, not
@@ -685,6 +858,8 @@ fn to_one_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 

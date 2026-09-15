@@ -159,8 +159,9 @@ pub(crate) async fn enqueue_one_to_one(
     pool: &Pool,
     definition_id: i64,
     def: &TransformDef,
+    source_table: &str,
 ) -> Result<TransformStatus, BackfillError> {
-    let ranges = backfill::plan_one_to_one_chunks(pool, def).await?;
+    let ranges = backfill::plan_one_to_one_chunks(pool, def, source_table).await?;
 
     if ranges.is_empty() {
         // Nothing to wait for — no chunk will ever be claimed-and-finished to
@@ -324,6 +325,7 @@ pub async fn run_claimed_chunk(
         pool,
         &definition.def,
         target_schema,
+        &definition.source_table,
         chunk.lo.as_deref(),
         &chunk.hi,
     )

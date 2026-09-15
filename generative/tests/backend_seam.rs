@@ -34,6 +34,8 @@ async fn installs_a_trivial_def_and_converges_dml_to_the_expected_snapshot() {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
 
     let program = Program {

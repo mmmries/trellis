@@ -34,10 +34,14 @@
 //! stay bare regardless — `column_dependents`, `definition_by_target`, and
 //! every `app.rs` read reachable through `docs/decisions/0003`'s
 //! `transform.column` addressing scheme — because their callers only ever
-//! have the bare name the grammar accepts back (issue #76 hasn't landed
-//! qualified-target syntax) or because re-exposing the qualified spelling
-//! through that addressing scheme would misparse a real transform address as
-//! a column one (see each function's own doc comment); these match
+//! have the bare name that addressing scheme itself accepts (issue #76
+//! taught the *grammar* an explicit `schema.table` spelling for `TRANSFORM`/
+//! `FROM`, but `transform.column` quarantine addressing is a separate,
+//! unrelated syntax this module's own read sites still speak, and it hasn't
+//! grown qualified-target syntax of its own) or because re-exposing the
+//! qualified spelling through that addressing scheme would misparse a real
+//! transform address as a column one (see each function's own doc comment);
+//! these match
 //! `target_table`'s bare table-name suffix via `split_part` rather than the
 //! qualified column directly. `schema_nodes`/`schema_edges` and
 //! `relationship_definitions`' endpoints are the one place this module still
@@ -57,7 +61,11 @@
 //! rejecting a new definition with [`CatalogError::TargetTableSuffixCollision`]
 //! if its qualified target would collide with another live definition's
 //! bare suffix under a different schema — see that check's own comment for
-//! why this is provisional pending issue #76. This is now double-enforced,
+//! why this stays provisional even now that issue #76's explicit
+//! `schema.table` grammar has landed (every bare-suffix reader above is
+//! still bare-keyed pending issue #74's migration, so the guard still
+//! applies uniformly regardless of whether a colliding target arrived via
+//! explicit qualification or bare resolution). This is now double-enforced,
 //! not merely application-level: `transform_definitions_target_suffix_idx`
 //! (`V23__transform_definitions_target_suffix_idx.sql`) is a real Postgres
 //! expression unique index on `split_part(target_table, '.', 2)`, the same
@@ -150,14 +158,16 @@ pub enum CatalogError {
     /// field's own doc comment) rather than letting it surface as a raw
     /// [`CatalogError::Db`].
     ///
-    /// Provisional: issue #76 will teach the grammar an explicit
-    /// `schema.table` spelling for `FROM`/`TARGET`, at which point an
-    /// operator will be able to unambiguously address `custom.foo` as
-    /// distinct from `public.foo` and this restriction may need to relax (or
-    /// a different addressing scheme adopted) — until then, every bare-
-    /// suffix reader above still only ever has the bare name to key off of,
-    /// so disallowing the collision outright is the only choice that
-    /// doesn't quietly corrupt one of them.
+    /// Still provisional even now that issue #76 has landed the grammar's
+    /// explicit `schema.table` spelling: an operator *can* now write
+    /// `TRANSFORM custom.foo FROM ...` to unambiguously address `custom.foo`
+    /// as distinct from `public.foo`, but every bare-suffix reader named
+    /// above is still bare-suffix-keyed pending issue #74's migration of the
+    /// whole graph to qualified identity — so this variant is still raised
+    /// for an explicitly-qualified target exactly as it is for a
+    /// resolved-bare one (the check it backs has no branch on how the target
+    /// was qualified, only on the final qualified string and bare suffix);
+    /// only issue #74 (or a different addressing scheme) can relax this.
     ///
     /// Raised from two different places, both folding into this one variant
     /// since callers only need one type to match on: `create_definition_inner`'s
@@ -481,14 +491,70 @@ pub async fn install_definition(
     let relationships = resolve_relationships(pool, &def).await?;
     validate(&def, source_columns, &relationships)?;
 
+    // Issue #76 / ADR-0007 grammar clause 4: an explicit schema on either
+    // side is trusted outright rather than resolved — checked here, before
+    // any DDL or coverage-planning work runs, so a bogus explicit spelling
+    // fails fast with a friendly `ValidationError` instead of surfacing as a
+    // confusing DDL/coverage-fence failure partway through this function.
+    // `create_definition_inner` (below) repeats both checks inside its own
+    // transaction; that repeat is the *authoritative* one — it's the only
+    // check the ring-path entry points ([`create_definition`]/
+    // [`create_definition_without_backfill`], which never call this
+    // function) ever run. This one is a pure fail-fast nicety for the far
+    // more common `install_definition` path, redundant-but-harmless on the
+    // path that also reaches `create_definition_inner`.
+    if let Some(schema) = &def.explicit_source_schema
+        && !confirm_qualified_table_exists(pool, schema, &def.source).await?
+    {
+        return Err(ValidationError::QualifiedSourceTableNotFound {
+            schema: schema.clone(),
+            table: def.source.clone(),
+        }
+        .into());
+    }
+
+    // An explicit `TRANSFORM <schema>.<target>` spelling overrides
+    // `target_schema` (`Config::target_schema`, or this function's own
+    // caller-supplied override) outright for the remainder of this call:
+    // every DDL/backfill/coverage step below, and `create_definition_inner`'s
+    // own persistence, all thread this (possibly-overridden) binding through
+    // rather than the original parameter — so the physical target table this
+    // function's DDL step is about to create and the qualified identity
+    // `create_definition_inner` persists can never name different schemas.
+    //
+    // No matching fail-fast existence check here, unlike the source block
+    // above: this function's own DDL step (just below) is what's about to
+    // *create* the physical target table — checking it exists first would
+    // always fail for exactly the case this is meant to support. The target
+    // still gets validated, just after DDL runs: `create_definition_inner`'s
+    // own copy of this check (its own doc comment on the identically-shaped
+    // block) confirms DDL actually landed the table under this schema, and
+    // is the *only* check the ring-path entry points
+    // ([`create_definition`]/[`create_definition_without_backfill`], whose
+    // callers must have already created the target themselves) ever get.
+    let target_schema = effective_target_schema(&def, target_schema);
+
+    // Issue #76, ADR-0007: resolved once, here, and threaded through every
+    // DDL/direct-build step below — see [`resolve_source_for_install`]'s own
+    // doc comment for why this function needs its own copy rather than
+    // waiting for `create_definition_inner`'s later, authoritative one.
+    let qualified_source = resolve_source_for_install(pool, &def).await?;
+
     match &def.key_space {
         KeySpace::OneToOne => {
-            let pk = ddl::source_primary_key(pool, &def.source)
+            let pk = ddl::source_primary_key(pool, &qualified_source)
                 .await
                 .map_err(CatalogError::Ddl)?;
-            ddl::create_target_table(pool, &def, target_schema, &pk, source_columns)
-                .await
-                .map_err(CatalogError::Ddl)?;
+            ddl::create_target_table(
+                pool,
+                &def,
+                target_schema,
+                &pk,
+                source_columns,
+                &qualified_source,
+            )
+            .await
+            .map_err(CatalogError::Ddl)?;
         }
         KeySpace::Aggregate { .. } => {
             ddl::create_aggregate_target_table(pool, &def, target_schema, source_columns)
@@ -533,7 +599,15 @@ pub async fn install_definition(
     )
     .await?;
 
-    match backfill::backfill_definition(pool, &def, target_schema, source_columns).await {
+    match backfill::backfill_definition(
+        pool,
+        &def,
+        target_schema,
+        &qualified_source,
+        source_columns,
+    )
+    .await
+    {
         Ok(()) => {
             // The build folded each planned table's pre-build contents into the
             // target. Persist that coverage *before* the definition is marked
@@ -592,7 +666,8 @@ async fn install_plain_one_to_one(
     )
     .await?;
 
-    match chunk_queue::enqueue_one_to_one(pool, definition.id, def).await {
+    match chunk_queue::enqueue_one_to_one(pool, definition.id, def, &definition.source_table).await
+    {
         Ok(status) => {
             definition.status = status;
             Ok(definition)
@@ -739,7 +814,28 @@ async fn plan_direct_backfill_coverage(
     let txn = client.transaction().await?;
     let mut plans = Vec::with_capacity(tables.len());
     for bare_table in tables {
-        let schema = resolve_source_schema_in_txn(&txn, &bare_table).await?;
+        // Issue #76: `def.source` specifically must resolve to the same
+        // schema `create_definition_inner`'s own `qualified_source` will
+        // independently compute a few steps later in this same call
+        // (`install_definition`) — an explicit `FROM <schema>.<source>`
+        // ([`super::ast::TransformDef::explicit_source_schema`]) is trusted
+        // here exactly as it is there, never re-walked through `search_path`,
+        // so the coverage fence below is captured (and later looked up) under
+        // the *actual* persisted qualified name rather than a different one
+        // `resolve_source_schema_in_txn` might independently pick. Every
+        // other table in this set is a relationship to-side
+        // ([`ResolvedRelationship::to_table`]), which ADR-0007's "Scope"
+        // section explicitly leaves bare-resolved for now (relationship
+        // endpoints aren't qualified syntax yet — a later issue's job), so
+        // only this one entry needs the branch.
+        let schema = if bare_table == def.source {
+            match &def.explicit_source_schema {
+                Some(schema) => schema.clone(),
+                None => resolve_source_schema_in_txn(&txn, &bare_table).await?,
+            }
+        } else {
+            resolve_source_schema_in_txn(&txn, &bare_table).await?
+        };
         let qualified = crate::intake::publication::qualify(&schema, &bare_table)?;
         if table_has_other_reader(&txn, &bare_table, &qualified).await? {
             plans.push(CoveragePlan::Clear { qualified });
@@ -918,13 +1014,26 @@ async fn create_definition_inner(
     // matching on `transform_definitions.source_table` string equality.
     persist_edge_in_txn(&txn, source_node.id, target_node.id, EdgeKind::Source).await?;
 
-    // Issue #72 / ADR-0007: resolve `def.source` — the bare name the
-    // grammar hands us (issue #76 will teach it an explicit `schema.table`
-    // spelling; it doesn't accept one yet) — to its fully-qualified
+    // Issue #72 / #76, ADR-0007: resolve `def.source` — always a bare table
+    // name (see [`super::ast::TransformDef`]'s own doc comment for why the
+    // dotted spelling never lands in this field) — to its fully-qualified
     // `schema.table` identity exactly once, here, at definition-acceptance
-    // time, via the same search-path walk [`resolve_source_schema_in_txn`]
-    // always used. From this point on, `qualified_source` — never
-    // `def.source` — is what gets persisted
+    // time. Two ways to get there, branching on
+    // [`super::ast::TransformDef::explicit_source_schema`]:
+    //
+    // * `Some(schema)` (issue #76): the definition wrote `FROM
+    //   <schema>.<source>` explicitly, so `schema` is trusted outright —
+    //   [`confirm_qualified_table_exists_in_txn`] checks that *exact*
+    //   relation is real, never walking `search_path` the way the bare case
+    //   does (ADR-0007 grammar clause 4: a qualified spelling resolves to
+    //   that one relation, full stop).
+    // * `None` (bare, the far more common case): unchanged from issue #72 —
+    //   [`resolve_source_schema_in_txn`] walks `search_path`
+    //   (`current_schemas(false)`) and takes the first schema with a table by
+    //   this name.
+    //
+    // Either way, from this point on `qualified_source` — never `def.source`
+    // — is what gets persisted
     // (`source_table_versions`/`transform_definitions.source_table` below)
     // and threaded into every side effect that must agree with the
     // persisted row (`enumerate_and_append`'s ring entries below,
@@ -933,34 +1042,59 @@ async fn create_definition_inner(
     // Deliberately placed *after* [`reject_if_table_cycle`], not before:
     // unlike the bare-keyed node/edge resolution above, this requires
     // `def.source` to name a table that actually, physically exists yet
-    // (`resolve_source_schema_in_txn` queries `information_schema.tables`) —
-    // a real chained definition's source (a previous definition's target)
-    // always does by the time it's created, but a cycle-rejected definition
-    // in this same call may not (its `FROM` names a table only ever
-    // registered as a `schema_nodes`/target row, never backfilled). Resolving
-    // before the cycle check would surface a confusing
-    // [`CatalogError::SourceTableNotFound`] for what's really a cycle,
-    // pre-empting the more specific [`ValidationError::TableCycle`] this
-    // definition should actually fail with.
+    // (both branches query `information_schema.tables`) — a real chained
+    // definition's source (a previous definition's target) always does by
+    // the time it's created, but a cycle-rejected definition in this same
+    // call may not (its `FROM` names a table only ever registered as a
+    // `schema_nodes`/target row, never backfilled). Resolving before the
+    // cycle check would surface a confusing [`CatalogError::SourceTableNotFound`]
+    // /[`ValidationError::QualifiedSourceTableNotFound`] for what's really a
+    // cycle, pre-empting the more specific [`ValidationError::TableCycle`]
+    // this definition should actually fail with.
     //
     // Resolving unconditionally (not just when `backfill` is set) matters:
     // both [`create_definition`] and [`create_definition_without_backfill`]
     // write the same `source_table` column, so both must qualify it the same
-    // way regardless of which one skips ring enumeration.
-    let source_schema = resolve_source_schema_in_txn(&txn, &def.source).await?;
-    let qualified_source = crate::intake::publication::qualify(&source_schema, &def.source)?;
+    // way regardless of which one skips ring enumeration. It also matters for
+    // the explicit-schema branch specifically: those two ring-path entry
+    // points never go through [`install_definition`]'s own fail-fast check
+    // (that function's own doc comment on its identically-shaped block), so
+    // this is the *only* place a bogus explicit source schema is ever caught
+    // for them.
+    let qualified_source = match &def.explicit_source_schema {
+        Some(schema) => {
+            if !confirm_qualified_table_exists_in_txn(&txn, schema, &def.source).await? {
+                return Err(ValidationError::QualifiedSourceTableNotFound {
+                    schema: schema.clone(),
+                    table: def.source.clone(),
+                }
+                .into());
+            }
+            crate::intake::publication::qualify(schema, &def.source)?
+        }
+        None => {
+            let source_schema = resolve_source_schema_in_txn(&txn, &def.source).await?;
+            crate::intake::publication::qualify(&source_schema, &def.source)?
+        }
+    };
 
-    // Issue #73 / ADR-0007: resolve `def.target` — likewise bare, the
-    // grammar's `TARGET`/transform-name clause has no qualification syntax
-    // either (issue #76) — to its fully-qualified identity exactly once,
-    // here, mirroring `qualified_source` immediately above. Unlike the
-    // source side, `def.target`'s schema is never search-path-resolved: a
-    // source table's schema is *discovered* (it already exists somewhere on
-    // the path), but a target table's schema is a config-time *decision*,
-    // `target_schema` — the exact value this function's own caller
-    // (`install_definition`, or `pool.target_schema()` for the ring-path
-    // entry points — see their own call sites) already used, or is about to
-    // use, for the physical `CREATE TABLE` (`ddl::qualified_target_table`).
+    // Issue #73 / #76, ADR-0007: resolve `def.target` — likewise always bare
+    // — to its fully-qualified identity exactly once, here, mirroring
+    // `qualified_source` immediately above. Unlike the source side,
+    // `def.target`'s schema was never search-path-resolved even before issue
+    // #76: a source table's schema is *discovered* (it already exists
+    // somewhere on the path), but a target table's schema is a
+    // config-time *decision*, `target_schema` — which, as of issue #76, is
+    // itself already `def`-aware: this function's caller passes
+    // [`effective_target_schema`]'s result (either `install_definition`'s own
+    // call, or `pool.target_schema()` unmodified for the ring-path entry
+    // points, which recompute the same override redundantly below since they
+    // never call `effective_target_schema` themselves). So `target_schema`
+    // here already *is* `def.explicit_target_schema` when that's `Some` —
+    // the `match` below re-derives that from `def` directly rather than
+    // trusting the parameter alone, so the existence check runs regardless of
+    // which entry point got here.
+    //
     // Built via the same `intake::publication::qualify` helper as
     // `qualified_source`, not `ddl::qualified_target_table` directly: the two
     // produce different shapes for different jobs — `qualify` returns the
@@ -972,7 +1106,18 @@ async fn create_definition_inner(
     // `"schema"."table"` string built for direct interpolation into DDL
     // text — never meant to be compared as a persisted identity string, and
     // never equal to `qualify`'s output byte-for-byte.
-    let qualified_target = crate::intake::publication::qualify(target_schema, &def.target)?;
+    let resolved_target_schema = effective_target_schema(&def, target_schema);
+    if let Some(schema) = &def.explicit_target_schema
+        && !confirm_qualified_table_exists_in_txn(&txn, schema, &def.target).await?
+    {
+        return Err(ValidationError::QualifiedTargetTableNotFound {
+            schema: schema.clone(),
+            table: def.target.clone(),
+        }
+        .into());
+    }
+    let qualified_target =
+        crate::intake::publication::qualify(resolved_target_schema, &def.target)?;
 
     // Reviewer follow-up to issue #73 / ADR-0007: reject this definition if
     // `qualified_target` shares a bare table-name suffix with a *different*
@@ -997,14 +1142,23 @@ async fn create_definition_inner(
     // `transaction`'s view of `transform_definitions` every other check in
     // this function already reads.
     //
-    // Provisional, not a permanent rule: issue #76 will teach the grammar an
-    // explicit `schema.table` spelling for `FROM`/`TARGET`, and once an
-    // operator can write e.g. `TRANSFORM ... FROM custom.foo` to disambiguate
-    // from `public.foo`, this restriction may need to relax (or a different
-    // addressing scheme adopted) — but until #76 lands, every read site
-    // above still only ever has the bare name to key off of, so allowing the
-    // collision to be created at all would just move the silent-corruption
-    // risk somewhere else.
+    // Still provisional, not relaxed by issue #76 landing: the grammar now
+    // accepts an explicit `TRANSFORM <schema>.<target>` spelling, so an
+    // operator *can* write `TRANSFORM custom.foo FROM ...` to disambiguate
+    // from an existing `public.foo` — but this check doesn't distinguish an
+    // explicit qualification from a resolved-bare one, and still rejects the
+    // collision either way. That's deliberate, not an oversight: every
+    // `split_part(target_table, '.', 2)`-keyed read site named above is still
+    // bare-suffix-keyed pending issue #74's migration of the whole graph to
+    // qualified identity, so `public.foo` and `custom.foo` coexisting would
+    // still silently corrupt those reads today regardless of whether the
+    // second one arrived via explicit qualification or bare resolution. This
+    // check runs purely against the *final* `qualified_target` string and
+    // `def.target`'s bare suffix — it has no branch on
+    // `def.explicit_target_schema` at all — so it protects an
+    // explicitly-qualified target exactly the same way it already protected
+    // a resolved-bare one; only issue #74's migration (or a different
+    // addressing scheme) can relax this.
     if let Some(row) = txn
         .query_opt(
             "select target_table from transform_definitions \
@@ -1113,6 +1267,7 @@ async fn create_definition_inner(
         def,
         source_columns: source_columns.clone(),
         status,
+        source_table: qualified_source,
     })
 }
 
@@ -1454,6 +1609,128 @@ async fn resolve_source_schema_in_txn(
         .ok_or_else(|| CatalogError::SourceTableNotFound(source_table.to_string()))
 }
 
+/// The target schema `def` actually resolves against (issue #76, ADR-0007
+/// grammar clause 4): an explicit `TRANSFORM <schema>.<target>` spelling
+/// ([`TransformDef::explicit_target_schema`]) overrides `target_schema`
+/// (`Config::target_schema`, or the caller's own override) outright — a
+/// qualified spelling names its own schema, it doesn't inherit the
+/// configured default. `None` (the bare, common case) keeps using
+/// `target_schema` exactly as issue #73 already did.
+fn effective_target_schema<'a>(def: &'a TransformDef, target_schema: &'a str) -> &'a str {
+    def.explicit_target_schema
+        .as_deref()
+        .unwrap_or(target_schema)
+}
+
+/// Pooled (non-transaction) counterpart to [`resolve_source_schema_in_txn`],
+/// for [`install_definition`]'s own DDL/direct-build steps ([`ddl::source_primary_key`],
+/// [`ddl::create_target_table`], [`backfill::backfill_definition`]/
+/// [`chunk_queue::enqueue_one_to_one`]), which run on plain pooled connections
+/// before that function's own [`create_definition_inner`] call opens a
+/// transaction and computes its own, independent, authoritative copy —
+/// mirrors [`column_type`]/[`column_type_in_txn`]'s same pool-vs-txn split.
+/// Same `search_path` walk, same [`CatalogError::SourceTableNotFound`] on no
+/// match.
+async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String, CatalogError> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "select table_schema from information_schema.tables \
+             where table_name = $1 and table_schema = any(current_schemas(false)) \
+             order by array_position(current_schemas(false), table_schema) \
+             limit 1",
+            &[&source_table],
+        )
+        .await?;
+    row.map(|row| row.get(0))
+        .ok_or_else(|| CatalogError::SourceTableNotFound(source_table.to_string()))
+}
+
+/// The fully-qualified source [`install_definition`]'s own DDL/direct-build
+/// steps read from (issue #76, ADR-0007 grammar clause 4) — computed once,
+/// early in that function, exactly like `target_schema`/[`effective_target_schema`]
+/// immediately above it, and threaded through every one of those steps
+/// (`ddl::source_primary_key`, `ddl::create_target_table`,
+/// `backfill::backfill_definition`, `chunk_queue::enqueue_one_to_one` ->
+/// `backfill::plan_one_to_one_chunks`) so none of them can independently
+/// re-derive a different answer, and so every physical SQL builder among them
+/// emits the qualified identity rather than a bare `def.source` left to the
+/// executing connection's own `search_path` — the gap a reviewer flagged
+/// against issue #76's own new explicit-schema grammar (ADR-0007's whole
+/// point: "every generated statement emits qualified names... never a bare
+/// name resolved against whatever search_path the executing session happens
+/// to carry").
+///
+/// `create_definition_inner` (further below) computes its *own* copy inside
+/// its own transaction rather than receiving this one as a parameter — see
+/// that function's doc comment on `qualified_source` for why: it's the sole,
+/// authoritative resolution the ring-path entry points ([`create_definition`]/
+/// [`create_definition_without_backfill`], which never call this function)
+/// ever get, so it must stand on its own regardless of what this function
+/// computed a few statements earlier. The two are expected to agree (same
+/// source text, same connection pool, no concurrent DDL moving `def.source`
+/// between the two calls) — matching this same function's caller's own
+/// fail-fast explicit-schema check just above it, also redundant-but-harmless
+/// against `create_definition_inner`'s copy.
+async fn resolve_source_for_install(
+    pool: &Pool,
+    def: &TransformDef,
+) -> Result<String, CatalogError> {
+    match &def.explicit_source_schema {
+        Some(schema) => Ok(crate::intake::publication::qualify(schema, &def.source)?),
+        None => {
+            let schema = resolve_source_schema(pool, &def.source).await?;
+            Ok(crate::intake::publication::qualify(&schema, &def.source)?)
+        }
+    }
+}
+
+/// Confirms `schema.table` is a real relation (issue #76, ADR-0007 grammar
+/// clause 4) — the existence check an explicitly-qualified `FROM`/`TRANSFORM`
+/// reference gets *instead of* [`resolve_source_schema_in_txn`]'s
+/// `search_path` walk: a qualified spelling names its schema directly, so
+/// this checks that one relation is real rather than asking which schema on
+/// the path would have won. Same `information_schema.tables` table that
+/// function itself queries, just filtered to the one named schema instead of
+/// `current_schemas(false)`.
+async fn confirm_qualified_table_exists_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    table: &str,
+) -> Result<bool, CatalogError> {
+    let exists: bool = txn
+        .query_one(
+            "select exists (select 1 from information_schema.tables \
+             where table_schema = $1 and table_name = $2)",
+            &[&schema, &table],
+        )
+        .await?
+        .get(0);
+    Ok(exists)
+}
+
+/// Pooled (non-transaction) counterpart to
+/// [`confirm_qualified_table_exists_in_txn`], for [`install_definition`]'s
+/// own fail-fast pass — run on a plain connection, before that function opens
+/// any transaction or runs any DDL, mirroring [`column_type`]/
+/// [`column_type_in_txn`]'s same pool-vs-txn split.
+async fn confirm_qualified_table_exists(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+) -> Result<bool, CatalogError> {
+    let client = pool.get().await?;
+    let exists: bool = client
+        .query_one(
+            "select exists (select 1 from information_schema.tables \
+             where table_schema = $1 and table_name = $2)",
+            &[&schema, &table],
+        )
+        .await?
+        .get(0);
+    Ok(exists)
+}
+
 /// Pooled (non-transaction) counterpart to [`column_type_in_txn`], for
 /// resolvers that run before `create_definition` opens its transaction (issue
 /// #40's [`resolve_relationships`]). Same query, same
@@ -1769,10 +2046,32 @@ async fn assert_replica_identity_supports_aggregate(
     txn: &tokio_postgres::Transaction<'_>,
     def: &TransformDef,
 ) -> Result<(), CatalogError> {
+    // Issue #76 follow-up: this runs *before* `create_definition_inner`
+    // resolves `qualified_source` (this function is called right at the top
+    // of that function, deliberately, per this function's own doc comment —
+    // ahead of any side effect, so a doomed aggregate never touches the
+    // schema graph), so it can't just reuse that value — it has to redo the
+    // same explicit-vs-bare branch here. An explicit `FROM <schema>.<source>`
+    // ([`TransformDef::explicit_source_schema`]) must be checked against
+    // *that* schema specifically: passing bare `def.source` to
+    // `to_regclass` instead would resolve it via this connection's pinned
+    // `search_path` (`pool::session_bootstrap`), which can silently name a
+    // same-suffixed decoy table in an earlier search-path schema instead of
+    // the real, explicitly-qualified source — either wrongly rejecting a
+    // fully-qualified source that has `REPLICA IDENTITY FULL` (if the decoy
+    // lacks it), or worse, wrongly accepting one that doesn't (if the decoy
+    // has it), reintroducing issue #47's aggregate-corruption bug through
+    // this issue's own new grammar. `to_regclass` accepts a qualified
+    // `"schema.table"` string directly, so no other logic changes.
+    let regclass_source = match &def.explicit_source_schema {
+        Some(schema) => crate::intake::publication::qualify(schema, &def.source)?,
+        None => def.source.clone(),
+    };
+
     let is_full: bool = txn
         .query_one(
             "select relreplident = 'f' from pg_class where oid = pg_catalog.to_regclass($1)",
-            &[&def.source],
+            &[&regclass_source],
         )
         .await?
         .get(0);
@@ -2102,6 +2401,7 @@ struct PendingDefinition {
     text: String,
     status: TransformStatus,
     source_columns: HashMap<String, ValueType>,
+    source_table: String,
 }
 
 /// The transform definitions that depend on `node_table` via a `kind` edge
@@ -2157,7 +2457,8 @@ pub async fn dependents_of(
     let client = pool.get().await?;
     let rows = client
         .query(
-            "select t.id, t.source_version, t.definition_text, t.status, e.key, e.value
+            "select t.id, t.source_version, t.definition_text, t.status, t.source_table, \
+                    e.key, e.value
              from schema_nodes from_node
              join schema_edges se on se.from_node_id = from_node.id and se.kind = $2
              join schema_nodes to_node on to_node.id = se.to_node_id
@@ -2176,8 +2477,8 @@ pub async fn dependents_of(
 
     for row in rows {
         let id: i64 = row.get(0);
-        let key: Option<String> = row.get(4);
-        let value: Option<String> = row.get(5);
+        let key: Option<String> = row.get(5);
+        let value: Option<String> = row.get(6);
 
         let pending = by_id.entry(id).or_insert_with(|| {
             order.push(id);
@@ -2190,6 +2491,7 @@ pub async fn dependents_of(
                 text: row.get(2),
                 status,
                 source_columns: HashMap::new(),
+                source_table: row.get(4),
             }
         });
 
@@ -2220,6 +2522,7 @@ pub async fn dependents_of(
             def,
             source_columns: pending.source_columns,
             status: pending.status,
+            source_table: pending.source_table,
         });
     }
     Ok(result)
@@ -2363,7 +2666,8 @@ pub(crate) async fn definition_by_id(
     // row instead of a batch.
     let rows = client
         .query(
-            "select t.source_version, t.definition_text, t.status, e.key, e.value \
+            "select t.source_version, t.definition_text, t.status, t.source_table, \
+                    e.key, e.value \
              from transform_definitions t \
              left join lateral jsonb_each_text(t.source_columns) e on true \
              where t.id = $1",
@@ -2377,81 +2681,7 @@ pub(crate) async fn definition_by_id(
     let source_version: i64 = rows[0].get(0);
     let text: String = rows[0].get(1);
     let status_text: String = rows[0].get(2);
-    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-        panic!("transform_definitions.status held unrecognized value '{status_text}'")
-    });
-    let def = parse(&text)?;
-
-    let mut source_columns = HashMap::new();
-    for row in &rows {
-        let key: Option<String> = row.get(3);
-        let value: Option<String> = row.get(4);
-        if let (Some(key), Some(value)) = (key, value) {
-            let value_type = match value.as_str() {
-                "numeric" => ValueType::Numeric,
-                "text" => ValueType::Text,
-                "boolean" => ValueType::Boolean,
-                "uuid" => ValueType::Uuid,
-                other => {
-                    return Err(CatalogError::UnknownValueType {
-                        column: key,
-                        text: other.to_string(),
-                    });
-                }
-            };
-            source_columns.insert(key, value_type);
-        }
-    }
-
-    Ok(Some(Definition {
-        id,
-        source_version,
-        def,
-        source_columns,
-        status,
-    }))
-}
-
-/// Reads back one definition by its target table name — [`definition_by_id`]
-/// keyed the other way, for callers that only have the address a `Trellis`
-/// caller would use (`docs/decisions/0003-quarantine-storage-and-api.md`'s
-/// amendment: a quarantine target is `transform` or `transform.column`,
-/// where `transform` is this crate's `target_table`). Used by
-/// `staging::quarantine`'s column-resume path to reconstruct the
-/// [`super::ast::TransformDef`] whose column it's re-deriving.
-///
-/// `target_table` is — and, per this doc comment, must stay — the *bare*
-/// name every caller here actually has: a `Trellis` API consumer only ever
-/// knows the bare name their `TRANSFORM <name> FROM ...` text declared (the
-/// grammar has no qualified-target syntax yet — issue #76), and
-/// `docs/decisions/0003`'s `transform.column` addressing scheme parses on the
-/// first `.` (`app::QuarantineTarget::parse`) — a qualified address here
-/// would misparse as a column reference the moment a target table lived
-/// outside the default schema. Matched against `target_table`'s bare
-/// table-name suffix (`split_part`), not the qualified column directly,
-/// since it's been fully-qualified since issue #73.
-pub async fn definition_by_target(
-    pool: &Pool,
-    target_table: &str,
-) -> Result<Option<Definition>, CatalogError> {
-    let client = pool.get().await?;
-    let rows = client
-        .query(
-            "select t.id, t.source_version, t.definition_text, t.status, e.key, e.value \
-             from transform_definitions t \
-             left join lateral jsonb_each_text(t.source_columns) e on true \
-             where split_part(t.target_table, '.', 2) = $1",
-            &[&target_table],
-        )
-        .await?;
-    if rows.is_empty() {
-        return Ok(None);
-    }
-
-    let id: i64 = rows[0].get(0);
-    let source_version: i64 = rows[0].get(1);
-    let text: String = rows[0].get(2);
-    let status_text: String = rows[0].get(3);
+    let source_table: String = rows[0].get(3);
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
@@ -2484,6 +2714,85 @@ pub async fn definition_by_target(
         def,
         source_columns,
         status,
+        source_table,
+    }))
+}
+
+/// Reads back one definition by its target table name — [`definition_by_id`]
+/// keyed the other way, for callers that only have the address a `Trellis`
+/// caller would use (`docs/decisions/0003-quarantine-storage-and-api.md`'s
+/// amendment: a quarantine target is `transform` or `transform.column`,
+/// where `transform` is this crate's `target_table`). Used by
+/// `staging::quarantine`'s column-resume path to reconstruct the
+/// [`super::ast::TransformDef`] whose column it's re-deriving.
+///
+/// `target_table` is — and, per this doc comment, must stay — the *bare*
+/// name every caller here actually has: a `Trellis` API consumer only ever
+/// knows the bare name their `TRANSFORM <name> FROM ...` text declared (the
+/// grammar has no qualified-target syntax yet — issue #76), and
+/// `docs/decisions/0003`'s `transform.column` addressing scheme parses on the
+/// first `.` (`app::QuarantineTarget::parse`) — a qualified address here
+/// would misparse as a column reference the moment a target table lived
+/// outside the default schema. Matched against `target_table`'s bare
+/// table-name suffix (`split_part`), not the qualified column directly,
+/// since it's been fully-qualified since issue #73.
+pub async fn definition_by_target(
+    pool: &Pool,
+    target_table: &str,
+) -> Result<Option<Definition>, CatalogError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "select t.id, t.source_version, t.definition_text, t.status, t.source_table, \
+                    e.key, e.value \
+             from transform_definitions t \
+             left join lateral jsonb_each_text(t.source_columns) e on true \
+             where split_part(t.target_table, '.', 2) = $1",
+            &[&target_table],
+        )
+        .await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let id: i64 = rows[0].get(0);
+    let source_version: i64 = rows[0].get(1);
+    let text: String = rows[0].get(2);
+    let status_text: String = rows[0].get(3);
+    let source_table: String = rows[0].get(4);
+    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+        panic!("transform_definitions.status held unrecognized value '{status_text}'")
+    });
+    let def = parse(&text)?;
+
+    let mut source_columns = HashMap::new();
+    for row in &rows {
+        let key: Option<String> = row.get(5);
+        let value: Option<String> = row.get(6);
+        if let (Some(key), Some(value)) = (key, value) {
+            let value_type = match value.as_str() {
+                "numeric" => ValueType::Numeric,
+                "text" => ValueType::Text,
+                "boolean" => ValueType::Boolean,
+                "uuid" => ValueType::Uuid,
+                other => {
+                    return Err(CatalogError::UnknownValueType {
+                        column: key,
+                        text: other.to_string(),
+                    });
+                }
+            };
+            source_columns.insert(key, value_type);
+        }
+    }
+
+    Ok(Some(Definition {
+        id,
+        source_version,
+        def,
+        source_columns,
+        status,
+        source_table,
     }))
 }
 

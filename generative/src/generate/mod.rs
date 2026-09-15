@@ -1047,6 +1047,8 @@ pub fn build_program_multi_with_shapes(
                 key_space,
                 fields,
                 predicate: Predicate::True,
+                explicit_source_schema: None,
+                explicit_target_schema: None,
             }
         })
         .collect();
@@ -1870,6 +1872,8 @@ pub fn build_bulk_insert_program(row_count: usize) -> Program {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let aggregate = TransformDef {
         target: pool.next_table_name(),
@@ -1886,6 +1890,8 @@ pub fn build_bulk_insert_program(row_count: usize) -> Program {
             aggregate_field_def(AggregateFn::Count, &c1, &c2),
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let defs = vec![one_to_one, aggregate];
     let def_install_after_op = vec![0; defs.len()];

@@ -1170,7 +1170,7 @@ async fn a_relationship_from_a_transform_target_back_to_its_own_source_is_accept
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("materialize chained target table");
 
@@ -1230,7 +1230,7 @@ async fn an_integer_passthrough_on_a_calculated_table_is_a_valid_join_key() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("materialize calculated target table");
 
@@ -1289,7 +1289,7 @@ async fn a_numeric_passthrough_on_a_calculated_table_is_still_rejected_as_a_join
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("materialize calculated target table");
 

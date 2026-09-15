@@ -1317,6 +1317,8 @@ mod tests {
             key_space: KeySpace::OneToOne,
             fields,
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         }
     }
 
@@ -1853,6 +1855,8 @@ mod tests {
             },
             fields,
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         }
     }
 

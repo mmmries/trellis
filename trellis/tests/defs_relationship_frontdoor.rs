@@ -131,6 +131,8 @@ fn to_one_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -228,9 +230,16 @@ async fn frontdoor_to_one_enrichment_converges_to_oracle() {
     let pk = source_primary_key(&db.pool, "articles")
         .await
         .expect("introspect articles pk");
-    create_target_table(&db.pool, &to_one_def(), "public", &pk, &source_columns)
-        .await
-        .expect("create target table for enrichment definition");
+    create_target_table(
+        &db.pool,
+        &to_one_def(),
+        "public",
+        &pk,
+        &source_columns,
+        &to_one_def().source,
+    )
+    .await
+    .expect("create target table for enrichment definition");
 
     // `create_definition`'s initial backfill staged a Recompute per article;
     // drain it and confirm the enrichment matches the LEFT JOIN oracle
@@ -290,6 +299,8 @@ fn to_many_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -384,9 +395,16 @@ async fn frontdoor_to_many_aggregate_enrichment_converges_to_oracle() {
     let pk = source_primary_key(&db.pool, "articles")
         .await
         .expect("introspect articles pk");
-    create_target_table(&db.pool, &to_many_def(), "public", &pk, &source_columns)
-        .await
-        .expect("create target table for aggregate enrichment");
+    create_target_table(
+        &db.pool,
+        &to_many_def(),
+        "public",
+        &pk,
+        &source_columns,
+        &to_many_def().source,
+    )
+    .await
+    .expect("create target table for aggregate enrichment");
 
     // Backfill: article 1 sums to 12, article 2 has no comments (SUM -> NULL).
     drain_to_quiescence(&db.pool, &mut client).await;

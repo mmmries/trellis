@@ -121,6 +121,8 @@ fn order_totals_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -143,7 +145,7 @@ async fn seed_order_totals(db: &TestDatabase, client: &Client) -> TransformDef {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
     def
@@ -534,6 +536,7 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
         "public",
         &pk,
         &order_totals_columns,
+        &summary_def.def.source,
     )
     .await
     .expect("create order_summary table");

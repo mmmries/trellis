@@ -9,6 +9,14 @@
 //! [WHERE <predicate>]
 //! ```
 //!
+//! `<target>` and `<source>` (issue #76, ADR-0007 grammar clause 4) each
+//! accept either a bare `<table>` (resolved once, later, via `search_path` —
+//! issues #72/#73) or an explicit `<schema>.<table>` spelling that names its
+//! schema directly and skips that resolution — see [`Self::parse_table_ref`]
+//! for the shared parsing logic and why it doesn't collide with
+//! `<rel>.<column>` relationship-path syntax elsewhere in this grammar despite
+//! reusing the same `ident '.' ident` token shape.
+//!
 //! `FROM <source>` is where a future aggregate (`GROUP BY <cols>`) or
 //! cross-join (`JOIN <other> ON <cond>`) key-space clause will slot in;
 //! this slice only accepts the 1-1 case (clause absent) and rejects both
@@ -167,12 +175,55 @@ impl Parser {
         Ok((table, column))
     }
 
+    /// Parses a `TRANSFORM`/`FROM` table reference (issue #76, ADR-0007
+    /// grammar clause 4): either a bare `<table>` — today's only form,
+    /// returned as `(table, None)` — or an explicit `<schema>.<table>`
+    /// spelling, returned as `(table, Some(schema))`. Rejects a third
+    /// component (`a.b.c`) with a dedicated error naming the whole
+    /// over-qualified reference, rather than leaving the trailing `.c`
+    /// dangling for a later parse step to trip over with a confusing
+    /// "expected end of input".
+    ///
+    /// **Not ambiguous with [`Expr::RelationshipPath`]'s own `a.b` handling**
+    /// in [`Self::parse_primary`], even though both recognize the same
+    /// `ident '.' ident` token shape: this method only ever runs immediately
+    /// after the `TRANSFORM`/`FROM` keyword, before `SELECT`'s field-expression
+    /// list is even reached, so the two never compete for the same tokens.
+    /// They *mean* different things by design too — a table reference's `.`
+    /// qualifies a table with its schema, while a relationship-path's `.`
+    /// addresses a column through a named relationship — but callers of this
+    /// method never need to care, since the grammar positions alone already
+    /// keep them apart.
+    fn parse_table_ref(&mut self) -> Result<(String, Option<String>), ParseError> {
+        let first = self.expect_ident()?;
+        if !self.peek_is_symbol('.') {
+            return Ok((first, None));
+        }
+        self.advance();
+        let second = self.expect_ident()?;
+        if !self.peek_is_symbol('.') {
+            return Ok((second, Some(first)));
+        }
+        // Over-qualified (`a.b.c...`): keep consuming `.`-separated
+        // components so the error message names the whole reference, instead
+        // of bailing after just the third part and leaving the rest to
+        // desync the rest of the parse.
+        let mut reference = format!("{first}.{second}");
+        while self.peek_is_symbol('.') {
+            self.advance();
+            let extra = self.expect_ident()?;
+            reference.push('.');
+            reference.push_str(&extra);
+        }
+        Err(ParseError::TooManyQualifiedNameParts { reference })
+    }
+
     fn parse_transform_def(&mut self) -> Result<TransformDef, ParseError> {
         self.expect_keyword("TRANSFORM")?;
-        let target = self.expect_ident()?;
+        let (target, explicit_target_schema) = self.parse_table_ref()?;
 
         self.expect_keyword("FROM")?;
-        let source = self.expect_ident()?;
+        let (source, explicit_source_schema) = self.parse_table_ref()?;
 
         let key_space = self.parse_key_space_clause()?;
 
@@ -200,7 +251,9 @@ impl Parser {
 
         Ok(TransformDef {
             target,
+            explicit_target_schema,
             source,
+            explicit_source_schema,
             key_space,
             fields,
             predicate,

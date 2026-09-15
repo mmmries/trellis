@@ -45,7 +45,7 @@ async fn materialize_chained_target(
     let pk = source_primary_key(pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(pool, &def, "public", &pk, source_columns)
+    create_target_table(pool, &def, "public", &pk, source_columns, &def.source)
         .await
         .expect("materialize chained target table");
 }

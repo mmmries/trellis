@@ -134,17 +134,30 @@ pub async fn run(name: &str, n: i64, g: i64, ceiling: Duration) -> BenchResult {
     let posts_pk = source_primary_key(&db.pool, "posts")
         .await
         .expect("introspect posts primary key");
-    create_target_table(&db.pool, &calc_def, "public", &posts_pk, &posts_columns)
-        .await
-        .expect("create posts_calc target table");
+    create_target_table(
+        &db.pool,
+        &calc_def,
+        "public",
+        &posts_pk,
+        &posts_columns,
+        &calc_def.source,
+    )
+    .await
+    .expect("create posts_calc target table");
 
     // M3: build the target directly from source in bounded key-range chunks,
     // bypassing the ring entirely (issue #63). Synchronous and complete on
     // return, so there's no ring to drain — the previous `Client` +
     // `has_pending` convergence poll this phase used is gone.
-    backfill_definition(&db.pool, &calc_def, "public", &posts_columns)
-        .await
-        .expect("direct backfill posts_calc");
+    backfill_definition(
+        &db.pool,
+        &calc_def,
+        "public",
+        &calc_def.source,
+        &posts_columns,
+    )
+    .await
+    .expect("direct backfill posts_calc");
     let calc_backfill_ms = calc_start.elapsed().as_millis();
 
     let calc_rows: i64 = raw
@@ -181,9 +194,15 @@ pub async fn run(name: &str, n: i64, g: i64, ceiling: Duration) -> BenchResult {
     // gates — and the one low-cardinality (few, large groups) vs high-cardinality
     // (many, small groups) now diverge on, since the number of group-key chunks
     // tracks group count directly.
-    backfill_definition(&db.pool, &totals_def, "public", &calc_columns)
-        .await
-        .expect("direct backfill posts_totals");
+    backfill_definition(
+        &db.pool,
+        &totals_def,
+        "public",
+        &totals_def.source,
+        &calc_columns,
+    )
+    .await
+    .expect("direct backfill posts_totals");
     let aggregate_backfill_ms = aggregate_start.elapsed().as_millis();
 
     let (correctness_ok, group_count) = check_correctness(&raw, &totals_def).await;

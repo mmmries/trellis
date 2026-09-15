@@ -251,10 +251,13 @@ impl Trellis {
         let client = self.pool.get().await?;
         // Issue #73: `transform_definitions.target_table` is persisted
         // fully-qualified, but every caller here only ever has the bare name
-        // their `TRANSFORM <name> FROM ...` text declared (the grammar has no
-        // qualified-target syntax yet — issue #76), so match against
-        // `target_table`'s bare table-name suffix rather than the qualified
-        // column directly.
+        // their `TRANSFORM <name> FROM ...` text declared — even once issue
+        // #76 taught the grammar an explicit `schema.table` spelling,
+        // `def.target` itself still always holds just the bare table name
+        // (see `defs::ast::TransformDef`'s own doc comment for why), so this
+        // API's callers never have anything but the bare name to poll with —
+        // match against `target_table`'s bare table-name suffix rather than
+        // the qualified column directly.
         let row = client
             .query_opt(
                 "select status from transform_definitions \

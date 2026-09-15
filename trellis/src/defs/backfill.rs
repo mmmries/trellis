@@ -178,24 +178,38 @@ impl From<ddl::DdlError> for BackfillError {
 /// [`super::ddl::create_target_table`] /
 /// [`super::ddl::create_aggregate_target_table`]) — this only writes rows, it
 /// does not create the table. `target_schema` and `source_columns` are the
-/// same values those DDL calls were given.
+/// same values those DDL calls were given. `source_table` is `def.source`'s
+/// fully-qualified `"schema.table"` identity (issue #76, ADR-0007) — the
+/// caller's own already-resolved value (`catalog::resolve_source_for_install`,
+/// or [`super::model::Definition::source_table`] for a durable chunk-queue
+/// caller) — threaded through every read of the live source below instead of
+/// a bare `def.source` left to the executing connection's own `search_path`.
 pub async fn backfill_definition(
     pool: &Pool,
     def: &TransformDef,
     target_schema: &str,
+    source_table: &str,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<(), BackfillError> {
     match &def.key_space {
         KeySpace::OneToOne => {
-            let pk = source_primary_key(pool, &def.source).await?;
+            let pk = source_primary_key(pool, source_table).await?;
             if uses_relationships(def) {
-                backfill_relationship_one_to_one(pool, def, target_schema, &pk).await
+                backfill_relationship_one_to_one(pool, def, target_schema, source_table, &pk).await
             } else {
-                backfill_one_to_one(pool, def, target_schema, &pk).await
+                backfill_one_to_one(pool, def, target_schema, source_table, &pk).await
             }
         }
         KeySpace::Aggregate { group_by } => {
-            backfill_aggregate(pool, def, target_schema, group_by, source_columns).await
+            backfill_aggregate(
+                pool,
+                def,
+                target_schema,
+                source_table,
+                group_by,
+                source_columns,
+            )
+            .await
         }
     }
 }
@@ -461,6 +475,7 @@ async fn backfill_one_to_one(
     pool: &Pool,
     def: &TransformDef,
     target_schema: &str,
+    source_table: &str,
     pk: &PrimaryKeyColumn,
 ) -> Result<(), BackfillError> {
     // Substitute any cross-field-alias reference (e.g. `total = double_price +
@@ -472,10 +487,20 @@ async fn backfill_one_to_one(
     // (issue #83 follow-up).
     let substituted = substitute_all_fields(def)?;
 
-    let source = quote_ident(&def.source);
+    let source = ddl::qualified_source_table(source_table);
     let client = pool.get().await?;
     for (lo, hi) in discover_pk_ranges(&client, &source, pk).await? {
-        write_one_to_one_range(&client, def, target_schema, pk, &substituted, &lo, &hi).await?;
+        write_one_to_one_range(
+            &client,
+            def,
+            target_schema,
+            source_table,
+            pk,
+            &substituted,
+            &lo,
+            &hi,
+        )
+        .await?;
     }
 
     Ok(())
@@ -517,16 +542,18 @@ async fn paused_columns_for(
 /// [`substitute_all_fields`] output, so a queue-driven caller charged the
 /// `Unsupported`-detecting cost once at plan time doesn't pay it again per
 /// chunk beyond re-deriving the (cheap, pure) substitution itself.
+#[allow(clippy::too_many_arguments)]
 async fn write_one_to_one_range(
     client: &Client,
     def: &TransformDef,
     target_schema: &str,
+    source_table: &str,
     pk: &PrimaryKeyColumn,
     substituted: &[Expr],
     lo: &Option<String>,
     hi: &str,
 ) -> Result<(), BackfillError> {
-    let source = quote_ident(&def.source);
+    let source = ddl::qualified_source_table(source_table);
     let target = qualified_target_table(target_schema, def);
     let pk_ident = quote_ident(&pk.name);
     let pk_cast = pk.data_type.as_str();
@@ -605,10 +632,11 @@ async fn write_one_to_one_range(
 pub(crate) async fn plan_one_to_one_chunks(
     pool: &Pool,
     def: &TransformDef,
+    source_table: &str,
 ) -> Result<Vec<(Option<String>, String)>, BackfillError> {
     let _ = substitute_all_fields(def)?;
-    let pk = source_primary_key(pool, &def.source).await?;
-    let source = quote_ident(&def.source);
+    let pk = source_primary_key(pool, source_table).await?;
+    let source = ddl::qualified_source_table(source_table);
     let client = pool.get().await?;
     discover_pk_ranges(&client, &source, &pk).await
 }
@@ -624,16 +652,18 @@ pub(crate) async fn execute_one_to_one_chunk(
     pool: &Pool,
     def: &TransformDef,
     target_schema: &str,
+    source_table: &str,
     lo: Option<&str>,
     hi: &str,
 ) -> Result<(), BackfillError> {
-    let pk = source_primary_key(pool, &def.source).await?;
+    let pk = source_primary_key(pool, source_table).await?;
     let substituted = substitute_all_fields(def)?;
     let client = pool.get().await?;
     write_one_to_one_range(
         &client,
         def,
         target_schema,
+        source_table,
         &pk,
         &substituted,
         &lo.map(|s| s.to_string()),
@@ -832,6 +862,7 @@ async fn backfill_aggregate(
     pool: &Pool,
     def: &TransformDef,
     target_schema: &str,
+    source_table: &str,
     group_by: &[String],
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<(), BackfillError> {
@@ -842,7 +873,7 @@ async fn backfill_aggregate(
     // [`substituted_field_exprs`]. A cyclic alias chain falls back to the ring.
     let substituted = substituted_field_exprs(def)?;
 
-    let source = quote_ident(&def.source);
+    let source = ddl::qualified_source_table(source_table);
     let target = qualified_target_table(target_schema, def);
 
     // Issue #94: an aggregate field may fold a *to-one* relationship path
@@ -1317,6 +1348,7 @@ async fn backfill_relationship_one_to_one(
     pool: &Pool,
     def: &TransformDef,
     target_schema: &str,
+    source_table: &str,
     pk: &PrimaryKeyColumn,
 ) -> Result<(), BackfillError> {
     // Resolve every referenced relationship to its endpoints + cardinality the
@@ -1382,7 +1414,7 @@ async fn backfill_relationship_one_to_one(
         .map(|(i, leaf)| (leaf.clone(), format!("_agg_{i}")))
         .collect();
 
-    let source = quote_ident(&def.source);
+    let source = ddl::qualified_source_table(source_table);
     let target = qualified_target_table(target_schema, def);
     let pk_ident = quote_ident(&pk.name);
     let pk_cast = pk.data_type.as_str();
@@ -1579,6 +1611,8 @@ mod tests {
             key_space: KeySpace::OneToOne,
             fields,
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         }
     }
 

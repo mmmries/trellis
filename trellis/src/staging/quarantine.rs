@@ -966,8 +966,8 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
         });
     }
 
-    let pk = ddl::source_primary_key(pool, &def.def.source).await?;
-    let source_ident = quote_ident(&def.def.source);
+    let pk = ddl::source_primary_key(pool, &def.source_table).await?;
+    let source_ident = ddl::qualified_source_table(&def.source_table);
     let pk_ident = quote_ident(&pk.name);
 
     let client = pool.get().await?;

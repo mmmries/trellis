@@ -35,6 +35,8 @@ fn add_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -269,6 +271,8 @@ async fn to_one_relationship_matches_postgres_left_join() {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
 
     // Each product's FK read back as text, matching a staged image.
@@ -390,6 +394,8 @@ async fn assert_to_many_matches_postgres(client: &tokio_postgres::Client) {
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
 
     for post in client

@@ -38,6 +38,8 @@ fn numeric_add_program() -> (Program, TransformDef, Table, String) {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
 
     let program = Program {

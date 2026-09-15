@@ -24,6 +24,25 @@ pub struct Definition {
     /// Where this transform is in its lifecycle (issue #55) — see
     /// [`TransformStatus`].
     pub status: TransformStatus,
+    /// The persisted, fully-qualified `"schema.table"` form of `def.source`
+    /// — `transform_definitions.source_table` read back verbatim (issue #72
+    /// resolved it once, at acceptance time, via `search_path` for a bare
+    /// `FROM`, or trusted an explicit `FROM <schema>.<source>` outright as of
+    /// issue #76; see `catalog::create_definition_inner`'s `qualified_source`).
+    ///
+    /// **This is the identity every physical SQL-builder that reads the live
+    /// source table at backfill/CDC-apply/quarantine-recompute time must use**
+    /// (ADR-0007) — never `def.source` alone, which is always bare (see
+    /// [`super::ast::TransformDef`]'s own doc comment) and, left unqualified
+    /// in emitted SQL, would silently resolve against whichever schema the
+    /// executing session's pinned `search_path` (`Config::schema`,
+    /// `Config::target_schema`, `"public"` — see `pool::session_bootstrap`)
+    /// happens to carry, not necessarily the schema this definition actually
+    /// resolved against at creation time. `defs::ddl::qualified_source_table`
+    /// turns this into a directly-interpolatable, independently-quoted DDL/DML
+    /// fragment; a `to_regclass($1)`-style introspection query can bind this
+    /// string as-is.
+    pub source_table: String,
 }
 
 /// A transform's lifecycle status (issue #55), persisted as

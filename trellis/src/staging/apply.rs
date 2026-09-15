@@ -318,10 +318,12 @@ impl From<crate::error::Error> for ApplyError {
 /// The catalog's lookup key for a folded record's `src_table`: everything
 /// after the last `.`, if any.
 ///
-/// A definition's `def.source` is always a *bare* table name — the grammar's
-/// `TRANSFORM ... FROM <table>` clause has no schema-qualification syntax
-/// yet (issue #76; see `defs::parser`'s grammar, and `defs/mod.rs`'s own
-/// doctest parsing `FROM orders` to `def.source == "orders"`). CDC intake's
+/// A definition's `def.source` is always a *bare* table name — even once
+/// issue #76 taught the grammar's `TRANSFORM ... FROM <table>` clause an
+/// explicit `schema.table` spelling, `def.source` itself still only ever
+/// holds the bare table part (see `defs::ast::TransformDef`'s own doc
+/// comment for why; `defs::parser`'s grammar and `defs/mod.rs`'s own tests
+/// cover both the bare and explicitly-qualified parses). CDC intake's
 /// own producer, though, always stages changes under the qualified
 /// `"schema.table"` shape `intake::publication::qualify` builds, which
 /// [`FoldedChange::src_table`] inherits directly from the ring. This is the
@@ -347,6 +349,18 @@ impl From<crate::error::Error> for ApplyError {
 /// this call site could now skip outright. Retiring the split entirely (by
 /// qualifying every emitted `src_table`, `Recompute` rows included) is issue
 /// #75's emission-audit territory.
+///
+/// This function's output stays purely a *lookup key* (issue #76's own
+/// reviewer follow-up): every catalog read below it (`source_table_version`,
+/// `transforms_for_source`, `relationships_to_table`) keeps using this bare
+/// form, matching the bare-suffix indexes those tables are keyed on. The
+/// *physical* SQL builders that actually read a live source row
+/// (`ddl::source_primary_key`, [`read_live_rows_batch`], the source string
+/// embedded in an [`AggregateTargetPlan`]) use the qualified
+/// `change.src_table` each bucket's own changes already carry instead — see
+/// `compute`'s `by_source` loop — never this bare key, so a same-named table
+/// in a different schema can't make one of those builders read the wrong
+/// physical relation.
 fn catalog_source_key(src_table: &str) -> &str {
     match src_table.rsplit_once('.') {
         Some((_, table)) => table,
@@ -411,7 +425,7 @@ async fn read_live_rows_batch(
          from (select {pk_ident}::text as k, to_jsonb(t.*) as doc from {} t \
                where {pk_ident} = any($1::text[]::{}[])) m \
          cross join lateral jsonb_each_text(m.doc) e",
-        quote_ident(source_table),
+        ddl::qualified_source_table(source_table),
         pk.data_type,
     );
     let db_rows = client.query(&sql, &[&keys]).await?;
@@ -879,6 +893,19 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         let version = catalog::source_table_version(pool, source_key).await?;
         versions.insert(source_key.to_string(), version);
 
+        // The fully-qualified source identity this batch's own CDC producer
+        // staged (issue #76, ADR-0007) — `change.src_table`, not `source_key`
+        // (that stays bare purely as the catalog lookup key, per
+        // `catalog_source_key`'s own doc comment). Every change in this
+        // bucket shares the same bare suffix by construction (`by_source`
+        // grouped on it); they're expected to also share this qualified form
+        // (the same physical table), so any one of them gives the right
+        // answer for the physical reads below — used in place of a bare
+        // `source_key` so `source_primary_key`/`read_live_rows_batch` don't
+        // leave the schema to resolve against whatever `search_path` the
+        // executing session happens to carry.
+        let qualified_source = changes[0].src_table.as_str();
+
         // `source_key` alone determines the source table's primary key, not
         // the individual definition (issue #69) — introspected once per
         // source here and reused both below (every definition subscribed to
@@ -886,7 +913,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // definition it's evaluated against). A live `42P01` here means
         // `source_key` no longer exists (issue #16's dropped-table purge,
         // not an ordinary DDL error) — see [`ApplyError::SourceTableDropped`].
-        let pk = match ddl::source_primary_key(pool, source_key).await {
+        let pk = match ddl::source_primary_key(pool, qualified_source).await {
             Ok(pk) => pk,
             Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
                 return Err(ApplyError::SourceTableDropped {
@@ -929,7 +956,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 .iter()
                 .map(|&i| changes[i].key.as_str())
                 .collect();
-            let mut live_rows = read_live_rows_batch(pool, source_key, &pk, &live_keys).await?;
+            let mut live_rows =
+                read_live_rows_batch(pool, qualified_source, &pk, &live_keys).await?;
             for &i in &live_refetch_indices {
                 rows[i] = live_rows.remove(changes[i].key.as_str());
             }
@@ -1275,7 +1303,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         group_by.clone(),
                         group_by_types,
                         field_plans,
-                        source_key.to_string(),
+                        qualified_source.to_string(),
                         field_exprs,
                         rel_joins,
                     )
@@ -1309,7 +1337,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         let version = catalog::source_table_version(pool, source_key).await?;
         versions.entry(source_key.to_string()).or_insert(version);
 
-        let pk = match ddl::source_primary_key(pool, source_key).await {
+        let pk = match ddl::source_primary_key(pool, &change.src_table).await {
             Ok(pk) => pk,
             Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
                 return Err(ApplyError::SourceTableDropped {

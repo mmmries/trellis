@@ -139,6 +139,8 @@ fn to_one_oracle_def() -> TransformDef {
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -156,6 +158,8 @@ fn to_one_placeholder_def() -> TransformDef {
             expr: Expr::Column("title".to_string()),
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -243,6 +247,7 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
         "public",
         &pk,
         &source_columns,
+        &to_one_placeholder_def().source,
     )
     .await
     .expect("create target table");
