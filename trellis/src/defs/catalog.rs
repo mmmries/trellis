@@ -18,6 +18,20 @@
 //!
 //! v1 definitions are immutable: this module only exposes creation and
 //! read, no update/delete.
+//!
+//! **Source identity is fully-qualified (issue #72, ADR-0007).**
+//! `transform_definitions.source_table` and `source_table_versions.source_table`
+//! hold `def.source` resolved to its `schema.table` identity exactly once, at
+//! definition-acceptance time (`create_definition_inner`'s
+//! [`resolve_source_schema_in_txn`] call), never the bare spelling the
+//! grammar parsed. Every read of either column downstream must treat the
+//! value as already-qualified and must not re-resolve it — see
+//! [`resolve_source_schema_in_txn`]'s own doc comment for exactly why
+//! re-resolving a qualified value fails outright rather than merely being
+//! redundant. `schema_nodes`/`schema_edges` and `relationship_definitions`'
+//! endpoints are the one place this module still keys on the bare name —
+//! that migration is issue #74's, not this one's (see the `TODO(#74)`s at
+//! `create_definition_inner`'s node/edge resolution).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -486,15 +500,22 @@ pub(crate) async fn complete_direct_backfill(
     )
     .await?;
 
-    let source_table: String = txn
+    // Issue #72 / ADR-0007: `transform_definitions.source_table` is already
+    // the fully-qualified `schema.table` identity persisted at
+    // definition-acceptance time (`create_definition_inner`) — read it back
+    // and use it as-is. It must *not* be re-resolved through
+    // [`resolve_source_schema_in_txn`] a second time here: that function
+    // matches `information_schema.tables.table_name` (a bare name) exactly,
+    // so handing it an already-qualified `"schema.table"` string would never
+    // match anything and this would fail every time with
+    // [`CatalogError::SourceTableNotFound`].
+    let qualified: String = txn
         .query_one(
             "select source_table from transform_definitions where id = $1",
             &[&definition_id],
         )
         .await?
         .get(0);
-    let schema = resolve_source_schema_in_txn(txn, &source_table).await?;
-    let qualified = crate::intake::publication::qualify(&schema, &source_table)?;
     crate::intake::publication::park_backfill_catchup(txn, &qualified).await?;
     Ok(())
 }
@@ -560,7 +581,7 @@ async fn plan_direct_backfill_coverage(
     for bare_table in tables {
         let schema = resolve_source_schema_in_txn(&txn, &bare_table).await?;
         let qualified = crate::intake::publication::qualify(&schema, &bare_table)?;
-        if table_has_other_reader(&txn, &bare_table).await? {
+        if table_has_other_reader(&txn, &bare_table, &qualified).await? {
             plans.push(CoveragePlan::Clear { qualified });
         } else {
             let fence =
@@ -604,9 +625,30 @@ async fn commit_direct_backfill_coverage(
 /// relationship, so it may report a reader where none truly exists. That only
 /// ever suppresses a coverage record (falling back to full enumeration), which
 /// is always safe — the direction the issue's safety valve demands.
+///
+/// Takes both `table`'s bare and fully-qualified (`qualified`) spellings
+/// (issue #72), because the two clauses below need different ones and
+/// neither can be derived from the other inside this query:
+///
+/// * The first clause compares against `transform_definitions.source_table`,
+///   which — since issue #72 — holds the *qualified* identity, so it needs
+///   `qualified` to ever match.
+/// * The second clause's join compares against `relationship_definitions.from_table`,
+///   which still holds a *bare* name (relationship endpoints aren't
+///   qualified yet — a later issue's job), so it's matched against
+///   `split_part(d.source_table, '.', 2)` (d.source_table's bare table-name
+///   suffix) rather than `d.source_table` itself, and `r.to_table = $2` needs
+///   the bare `table`. This bare/qualified split is exactly the same
+///   conservative-is-fine tradeoff the doc comment above already accepts for
+///   this whole function: `split_part` can only ever *widen* a match (two
+///   same-named tables in different schemas both count as "has a reader"),
+///   never narrow one, so it can't turn a real "no other reader" into a
+///   false positive strong enough to under-cover — it can only ever push
+///   toward the always-safe `Clear` side.
 async fn table_has_other_reader(
     txn: &tokio_postgres::Transaction<'_>,
     table: &str,
+    qualified: &str,
 ) -> Result<bool, CatalogError> {
     let exists: bool = txn
         .query_one(
@@ -614,10 +656,10 @@ async fn table_has_other_reader(
                exists(select 1 from transform_definitions where source_table = $1) \
                or exists( \
                  select 1 from relationship_definitions r \
-                 join transform_definitions d on d.source_table = r.from_table \
-                 where r.to_table = $1 \
+                 join transform_definitions d on split_part(d.source_table, '.', 2) = r.from_table \
+                 where r.to_table = $2 \
                )",
-            &[&table],
+            &[&qualified, &table],
         )
         .await?
         .get(0);
@@ -661,6 +703,22 @@ async fn create_definition_inner(
     // its owning definition is created) — a side effect alongside the
     // catalog writes below rather than a change to `TransformDef`'s shape,
     // per the issue's "prefer the smaller change" guidance.
+    //
+    // Keyed on the *bare* `def.source`/`def.target`, not
+    // `qualified_source`/a qualified target: `def.target` has no qualified
+    // form yet (target-table qualification is issue #73, not this one), and
+    // `schema_nodes` itself still keys on bare names pending issue #74's
+    // migration of the whole graph to qualified identity. Qualifying only
+    // the source side here would split one physical table's node in two
+    // whenever it's later chained (a downstream definition's bare
+    // `def.source` naming today's `def.target`) — the target-side insert
+    // would keep using the bare name while a source-side resolution of the
+    // same table would insert under its qualified spelling, so the two
+    // never share a `schema_nodes` row and `reject_if_table_cycle` stops
+    // seeing the real graph. Bare-for-now, consistent on both sides, is the
+    // safer half-step; issue #74 migrates both sides to qualified identity
+    // together. TODO(#74): pass `qualified_source`/a qualified target here
+    // once that lands.
     let source_node = resolve_node_in_txn(&txn, &def.source, NodeKind::Source).await?;
     let target_node = resolve_node_in_txn(&txn, &def.target, NodeKind::Target).await?;
 
@@ -677,6 +735,11 @@ async fn create_definition_inner(
     // SERIALIZABLE) — so a cycle could theoretically still persist. Same
     // class of race as any check-then-insert pattern; accepted for now,
     // out of scope for this issue.
+    //
+    // Bare `def.source`/`def.target`, matching the node resolution above —
+    // `schema_edges` is keyed by `schema_nodes.id`, so this walks the exact
+    // same bare-keyed graph those nodes were just resolved into (TODO(#74)
+    // applies here identically).
     reject_if_table_cycle(&txn, &def.source, &def.target).await?;
 
     // Issue #21: a transform's `FROM` is a `Source` dependency edge from its
@@ -685,25 +748,54 @@ async fn create_definition_inner(
     // matching on `transform_definitions.source_table` string equality.
     persist_edge_in_txn(&txn, source_node.id, target_node.id, EdgeKind::Source).await?;
 
+    // Issue #72 / ADR-0007: resolve `def.source` — the bare name the
+    // grammar hands us (issue #76 will teach it an explicit `schema.table`
+    // spelling; it doesn't accept one yet) — to its fully-qualified
+    // `schema.table` identity exactly once, here, at definition-acceptance
+    // time, via the same search-path walk [`resolve_source_schema_in_txn`]
+    // always used. From this point on, `qualified_source` — never
+    // `def.source` — is what gets persisted
+    // (`source_table_versions`/`transform_definitions.source_table` below)
+    // and threaded into every side effect that must agree with the
+    // persisted row (`enumerate_and_append`'s ring entries below,
+    // `complete_direct_backfill`'s catch-up marker elsewhere).
+    //
+    // Deliberately placed *after* [`reject_if_table_cycle`], not before:
+    // unlike the bare-keyed node/edge resolution above, this requires
+    // `def.source` to name a table that actually, physically exists yet
+    // (`resolve_source_schema_in_txn` queries `information_schema.tables`) —
+    // a real chained definition's source (a previous definition's target)
+    // always does by the time it's created, but a cycle-rejected definition
+    // in this same call may not (its `FROM` names a table only ever
+    // registered as a `schema_nodes`/target row, never backfilled). Resolving
+    // before the cycle check would surface a confusing
+    // [`CatalogError::SourceTableNotFound`] for what's really a cycle,
+    // pre-empting the more specific [`ValidationError::TableCycle`] this
+    // definition should actually fail with.
+    //
+    // Resolving unconditionally (not just when `backfill` is set) matters:
+    // both [`create_definition`] and [`create_definition_without_backfill`]
+    // write the same `source_table` column, so both must qualify it the same
+    // way regardless of which one skips ring enumeration.
+    let source_schema = resolve_source_schema_in_txn(&txn, &def.source).await?;
+    let qualified_source = crate::intake::publication::qualify(&source_schema, &def.source)?;
+
     // Issue #23: a definition's initial backfill is one enumeration of its
     // source table, staged as `Recompute` triggers into the active ring
     // segment via the same append path CDC/reverse-propagation use — one
     // call here regardless of how many calculated fields the definition
     // declares, not one per field, preserving the "N columns, one backfill"
-    // property as the definition model becomes first-class. Today the
-    // grammar's `FROM`/`TARGET` have no schema-qualification syntax, so
-    // `def.source` must be resolved live, exactly as Postgres itself would
-    // resolve the bare name: via `resolve_source_schema_in_txn`, which walks
+    // property as the definition model becomes first-class. `qualified_source`
+    // (resolved above, once) covers both a raw/CDC source (typically
+    // `public`) and a chained definition's source being a *previous*
+    // definition's target table (whatever schema `config.target_schema()`
+    // actually resolved to, which may not be the `DEFAULT_TARGET_SCHEMA`
+    // constant if overridden) without needing to special-case on
+    // `source_node.is_target` — `resolve_source_schema_in_txn` walks
     // `search_path` (`pool::session_bootstrap` pins it to the Trellis
-    // schema, then the target schema, then `public`, in that order). This
-    // covers both a raw/CDC source (typically `public`) and a chained
-    // definition's source being a *previous* definition's target table
-    // (whatever schema `config.target_schema()` actually resolved to,
-    // which may not be the `DEFAULT_TARGET_SCHEMA` constant if overridden)
-    // without needing to special-case on `source_node.is_target`.
+    // schema, then the target schema, then `public`, in that order)
+    // identically either way.
     if backfill {
-        let source_schema = resolve_source_schema_in_txn(&txn, &def.source).await?;
-        let qualified_source = crate::intake::publication::qualify(&source_schema, &def.source)?;
         crate::intake::publication::enumerate_and_append(&txn, &qualified_source).await?;
     }
 
@@ -714,7 +806,7 @@ async fn create_definition_inner(
              on conflict (source_table)
              do update set version = source_table_versions.version + 1
              returning version",
-            &[&def.source],
+            &[&qualified_source],
         )
         .await?
         .get(0);
@@ -731,7 +823,7 @@ async fn create_definition_inner(
              returning id",
             &[
                 &def.target,
-                &def.source,
+                &qualified_source,
                 &version,
                 &source_text,
                 &type_keys,
@@ -1041,6 +1133,17 @@ pub(crate) async fn resolve_relationships(
 /// `source_columns`/`qualified_source_tables` introspection — see
 /// [`create_definition`]'s call site for why this replaced an
 /// `is_target`-based guess.
+///
+/// **Only ever call this on a *bare* name freshly parsed from a
+/// definition's own source text** (ADR-0007) — `def.source`, never a value
+/// read back from `transform_definitions.source_table`/
+/// `source_table_versions.source_table`. Those columns hold the *qualified*
+/// result this function already produced once, at the definition's own
+/// acceptance time (issue #72); feeding a qualified `"schema.table"` string
+/// back in here wouldn't just be redundant, it would always fail — this
+/// query filters `information_schema.tables` by bare `table_name`, which a
+/// qualified string never matches, so every call would return
+/// [`CatalogError::SourceTableNotFound`].
 async fn resolve_source_schema_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
     source_table: &str,
@@ -1856,12 +1959,28 @@ pub async fn transforms_for_source(
 /// notice a transform (or now, a relationship reachable from one) registered
 /// against a table it hasn't seen before, so it can add that table to the
 /// publication and discharge its backfill without waiting for a restart.
+///
+/// Returns **bare** table names, deliberately — a pre-issue-#72 contract this
+/// keeps unchanged even though `transform_definitions.source_table` itself is
+/// now qualified (issue #72). This recursive CTE mixes anchors (from
+/// `transform_definitions.source_table`) with relationship-reachable tables
+/// (from `relationship_definitions.to_table`/`from_table`, still bare —
+/// relationship endpoints aren't qualified yet), so seeding it with anything
+/// but a bare name would break the `rd.from_table` join for every anchor and
+/// silently truncate the reachable set. The `split_part` below strips
+/// `source_table` back to its bare table-name suffix at the seed, matching
+/// what this function has always returned; both of this function's callers
+/// ([`crate::client::reconcile_source_tables`] via `intake::publication::qualify`,
+/// and [`crate::app::qualified_source_tables`] via its own `information_schema`
+/// resolution) already re-qualify each bare result themselves and would
+/// double-qualify (or, for `qualify`, hard-error on the embedded `.`) a
+/// qualified name passed straight through.
 pub async fn all_source_tables(pool: &Pool) -> Result<Vec<String>, CatalogError> {
     let client = pool.get().await?;
     let rows = client
         .query(
             "with recursive reachable(table_name) as (
-                select distinct source_table from transform_definitions
+                select distinct split_part(source_table, '.', 2) from transform_definitions
                 union
                 select rd.to_table
                 from relationship_definitions rd
@@ -1876,6 +1995,21 @@ pub async fn all_source_tables(pool: &Pool) -> Result<Vec<String>, CatalogError>
 
 /// The current version of `source_table`, or `None` if no definition has
 /// ever been created against it.
+///
+/// `source_table` is matched against `source_table_versions.source_table`'s
+/// bare table-name suffix (`split_part(..., '.', 2)`), not the qualified
+/// column directly, because this function's one caller
+/// (`staging::apply::apply_and_mark_drained_many`'s `plan.versions` loop, fed
+/// by `apply::catalog_source_key`) still hands it a bare name — see that
+/// function's own doc comment for why: a CDC-staged `FoldedChange::src_table`
+/// is qualified and gets stripped to bare before reaching here, and a
+/// downstream (target-table-as-source, issue #73, not qualified yet) one was
+/// already bare. Since `source_table_versions.source_table` is qualified as
+/// of issue #72, matching it exactly against that already-bare key would
+/// never succeed; the `split_part` match restores the pre-#72 bare-vs-bare
+/// comparison this call site depends on. TODO(#73): once target tables gain
+/// qualified identity too, `apply.rs` can pass a qualified key straight
+/// through and this can go back to an exact match.
 pub async fn source_table_version(
     pool: &Pool,
     source_table: &str,
@@ -1883,7 +2017,8 @@ pub async fn source_table_version(
     let client = pool.get().await?;
     let row = client
         .query_opt(
-            "select version from source_table_versions where source_table = $1",
+            "select version from source_table_versions \
+             where split_part(source_table, '.', 2) = $1",
             &[&source_table],
         )
         .await?;
@@ -2060,7 +2195,7 @@ pub(crate) async fn column_dependents(
     let client = pool.get().await?;
     let def_rows = client
         .query(
-            "select target_table, source_table, definition_text from transform_definitions",
+            "select target_table, definition_text from transform_definitions",
             &[],
         )
         .await?;
@@ -2082,8 +2217,7 @@ pub(crate) async fn column_dependents(
     let mut deps = Vec::new();
     for row in def_rows {
         let target: String = row.get(0);
-        let source: String = row.get(1);
-        let text: String = row.get(2);
+        let text: String = row.get(1);
         // A definition already persisted here is expected to always re-parse
         // (the same assumption every other read path in this module makes);
         // skip rather than fail this best-effort lineage scan on the
@@ -2093,10 +2227,16 @@ pub(crate) async fn column_dependents(
         if !matches!(def.key_space, KeySpace::OneToOne) {
             continue;
         }
+        // `def.source` (freshly re-parsed from `definition_text`), not the
+        // persisted `transform_definitions.source_table` column — issue #72
+        // made that column fully-qualified, but `upstream_table` here is
+        // always a bare *target* table name (target-table qualification is
+        // issue #73, not landed), so comparing against it needs the same
+        // bare spelling `def.source` already gives for free.
         for field in &def.fields {
             if expr_references_column(
                 &field.expr,
-                &source,
+                &def.source,
                 upstream_table,
                 upstream_column,
                 &rel_to_table,

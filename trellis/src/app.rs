@@ -532,15 +532,30 @@ impl Trellis {
                     )
                     .await?
                     .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?;
-                let source_table: String = source_row.get(0);
+                // Issue #72: `transform_definitions.source_table` is now
+                // fully qualified, but `poison.src_table` (what CDC intake
+                // actually stages) isn't uniformly so — a raw/CDC-sourced
+                // definition's poisoned rows are staged qualified (matching
+                // `qualified` directly), while a definition chained off
+                // another's target table are staged bare (target-table
+                // qualification is issue #73, not landed yet — see
+                // `defs::source_table_version`'s doc comment for the same
+                // split elsewhere). Matching against both forms keeps this
+                // query correct either way rather than picking one and
+                // silently going empty for the other.
+                let qualified: String = source_row.get(0);
+                let bare = qualified
+                    .split_once('.')
+                    .map(|(_, table)| table.to_string())
+                    .unwrap_or_else(|| qualified.clone());
                 match &after {
                     Some((after_src, after_key)) => {
                         client
                             .query(
                                 "select src_table, key, last_error from poison \
-                                 where src_table = $1 and (src_table, key) > ($2, $3) \
-                                 order by src_table, key limit $4",
-                                &[&source_table, after_src, after_key, &limit],
+                                 where src_table in ($1, $2) and (src_table, key) > ($3, $4) \
+                                 order by src_table, key limit $5",
+                                &[&qualified, &bare, after_src, after_key, &limit],
                             )
                             .await?
                     }
@@ -548,9 +563,9 @@ impl Trellis {
                         client
                             .query(
                                 "select src_table, key, last_error from poison \
-                                 where src_table = $1 \
-                                 order by src_table, key limit $2",
-                                &[&source_table, &limit],
+                                 where src_table in ($1, $2) \
+                                 order by src_table, key limit $3",
+                                &[&qualified, &bare, &limit],
                             )
                             .await?
                     }

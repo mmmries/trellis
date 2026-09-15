@@ -318,19 +318,29 @@ impl From<crate::error::Error> for ApplyError {
 /// The catalog's lookup key for a folded record's `src_table`: everything
 /// after the last `.`, if any.
 ///
-/// Definitions are stored — and their versions keyed — by the *unqualified*
-/// table name a `TRANSFORM ... FROM <table>` clause names (see
-/// `defs::parser`'s grammar; `defs/mod.rs`'s own doctest parses `FROM
-/// orders` to `def.source == "orders"`) — never schema-qualified. CDC
-/// intake's own producer, though, always stages changes under the
-/// qualified `"schema.table"` shape `intake::publication::qualify` builds,
-/// which [`FoldedChange::src_table`] inherits directly from the ring. This
-/// is the one seam that reconciles the two conventions: strip a schema
-/// prefix before ever asking the catalog about a folded record's source. A
-/// target table's own downstream `src_table` (the `Recompute` rows this
-/// module stages) is already unqualified —
-/// [`crate::defs::ddl::neighbor_table_name`] never adds a schema — so this
-/// is a no-op there.
+/// A definition's `def.source` is always a *bare* table name — the grammar's
+/// `TRANSFORM ... FROM <table>` clause has no schema-qualification syntax
+/// yet (issue #76; see `defs::parser`'s grammar, and `defs/mod.rs`'s own
+/// doctest parsing `FROM orders` to `def.source == "orders"`). CDC intake's
+/// own producer, though, always stages changes under the qualified
+/// `"schema.table"` shape `intake::publication::qualify` builds, which
+/// [`FoldedChange::src_table`] inherits directly from the ring. This is the
+/// one seam that reconciles the two conventions: strip a schema prefix
+/// before ever asking the catalog about a folded record's source.
+///
+/// Note this produces a *bare* key even though, as of issue #72,
+/// `transform_definitions.source_table`/`source_table_versions.source_table`
+/// themselves now persist the fully-qualified form — those columns' own
+/// read sites (e.g. [`crate::defs::source_table_version`]) match against
+/// their bare table-name suffix precisely so this function's output, and
+/// every internal key this whole apply path builds from it (`by_source`,
+/// `ApplyPlan::versions`, etc.), can stay unchanged rather than needing this
+/// hot path to thread real schema identity through. See
+/// [`crate::defs::source_table_version`]'s doc comment for the full
+/// bare-vs-qualified rationale and its TODO(#73). A target table's own
+/// downstream `src_table` (the `Recompute` rows this module stages) is
+/// already unqualified — [`crate::defs::ddl::neighbor_table_name`] never
+/// adds a schema — so stripping is a no-op there, same as before #72.
 fn catalog_source_key(src_table: &str) -> &str {
     match src_table.rsplit_once('.') {
         Some((_, table)) => table,
@@ -1670,11 +1680,16 @@ pub async fn apply_and_mark_drained_many(
     plan: &ApplyPlan,
     wake_channel: &str,
 ) -> Result<ManyApplyOutcome, ApplyError> {
-    // 1. Version fence.
+    // 1. Version fence. `source_key` is bare (see `catalog_source_key`'s doc
+    // comment); `source_table_versions.source_table` is qualified as of
+    // issue #72, so this matches against its bare table-name suffix, same
+    // as `defs::source_table_version`'s own read (TODO(#73) there applies
+    // here too).
     for (source_key, loaded_version) in &plan.versions {
         let row = txn
             .query_opt(
-                "select version from source_table_versions where source_table = $1 for share",
+                "select version from source_table_versions \
+                 where split_part(source_table, '.', 2) = $1 for share",
                 &[source_key],
             )
             .await?;

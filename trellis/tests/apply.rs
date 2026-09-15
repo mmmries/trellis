@@ -472,7 +472,14 @@ async fn a_definition_change_on_a_touched_source_trips_the_version_fence() {
     // definition text just to move the counter.
     client
         .execute(
-            "update source_table_versions set version = version + 1 where source_table = 'orders'",
+            // Issue #72: `source_table` is now persisted fully-qualified
+            // (`{schema}.orders`, not bare `orders`) — `orders` was created
+            // bare above, so it landed in the pool's default first
+            // search-path schema, `DEFAULT_SCHEMA`.
+            &format!(
+                "update source_table_versions set version = version + 1 \
+                 where source_table = '{DEFAULT_SCHEMA}.orders'"
+            ),
             &[],
         )
         .await
@@ -576,7 +583,11 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_fence() {
     // `widgets`, so it must not be in the fence set.
     client
         .execute(
-            "update source_table_versions set version = version + 1 where source_table = 'widgets'",
+            // Issue #72: `source_table` is persisted fully-qualified now.
+            &format!(
+                "update source_table_versions set version = version + 1 \
+                 where source_table = '{DEFAULT_SCHEMA}.widgets'"
+            ),
             &[],
         )
         .await

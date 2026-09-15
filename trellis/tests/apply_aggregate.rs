@@ -565,8 +565,11 @@ async fn a_definition_change_on_an_aggregate_only_source_trips_the_version_fence
 
     client
         .execute(
-            "update source_table_versions set version = version + 1 \
-             where source_table = 'order_items'",
+            // Issue #72: `source_table` is persisted fully-qualified now.
+            &format!(
+                "update source_table_versions set version = version + 1 \
+                 where source_table = '{DEFAULT_SCHEMA}.order_items'"
+            ),
             &[],
         )
         .await
@@ -649,7 +652,11 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_aggregate_
 
     client
         .execute(
-            "update source_table_versions set version = version + 1 where source_table = 'widgets'",
+            // Issue #72: `source_table` is persisted fully-qualified now.
+            &format!(
+                "update source_table_versions set version = version + 1 \
+                 where source_table = '{DEFAULT_SCHEMA}.widgets'"
+            ),
             &[],
         )
         .await

@@ -74,6 +74,68 @@ async fn valid_definition_is_stored_and_retrievable() {
     assert_eq!(subscribers[0].def.target, "order_totals");
 }
 
+/// Issue #72 / ADR-0007: `transform_definitions.source_table` (and its
+/// `source_table_versions` counterpart) must persist the *fully-qualified*
+/// `schema.table` identity a bare `FROM` clause resolves to — not the bare
+/// spelling the definition text names. `posts` is created explicitly in
+/// `public` here, a schema that isn't first on the pool's own `search_path`
+/// (`create_bare_source_table` lands a table in the Trellis schema instead —
+/// see its own doc comment), so a definition resolving it correctly to
+/// `public.posts` exercises real search-path resolution rather than just
+/// echoing back whatever schema an unqualified `CREATE TABLE` would have
+/// landed in by default.
+///
+/// `def.def.source` (the in-memory [`trellis::Definition`] returned by
+/// [`create_definition`]) stays bare — it's re-parsed straight from
+/// `definition_text`, which the grammar never qualifies (issue #76) — so
+/// this test reads `transform_definitions.source_table` back directly to
+/// observe the persisted identity, rather than trusting the returned
+/// `Definition`.
+#[tokio::test]
+async fn source_table_is_persisted_fully_qualified() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("create table public.posts (id serial primary key, title text)")
+        .await
+        .expect("create public.posts");
+
+    let source_columns: HashMap<String, ValueType> =
+        HashMap::from([("title".to_string(), ValueType::Text)]);
+    let def = create_definition(
+        &db.pool,
+        "TRANSFORM post_titles FROM posts SELECT title AS out",
+        &source_columns,
+    )
+    .await
+    .expect("valid definition should be stored");
+    // The returned `Definition` re-parses `definition_text`, which the
+    // grammar never qualifies — this stays bare regardless of what's
+    // persisted (see this test's own doc comment).
+    assert_eq!(def.def.source, "posts");
+
+    let source_table: String = client
+        .query_one(
+            "select source_table from transform_definitions where id = $1",
+            &[&def.id],
+        )
+        .await
+        .expect("read back the persisted definition")
+        .get(0);
+    assert_eq!(source_table, "public.posts");
+
+    let version: i64 = client
+        .query_one(
+            "select version from source_table_versions where source_table = $1",
+            &[&source_table],
+        )
+        .await
+        .expect("source_table_versions is keyed by the same qualified identity")
+        .get(0);
+    assert_eq!(version, 1);
+}
+
 /// Issue #63's write-path gap: the source-column type map a definition was
 /// validated against must be persisted, not just returned transiently from
 /// `create_definition` — `transforms_for_source` (what the physical apply
