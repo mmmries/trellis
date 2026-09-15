@@ -8,15 +8,12 @@
 //! sets) stays contained to this one module instead of touching every call
 //! site.
 //!
-//! **What this module does not do** (see the ADR): render Prometheus text
-//! exposition (`render_prometheus()`, issue #53) or persist rollups to
-//! Postgres (issue #54). It only builds and populates the in-process
-//! registry; [`render_for_test`] is a minimal, internal-only escape hatch
-//! this crate's own tests use to assert something landed in the registry —
-//! not the polished public exposition API #53 will build (that one will
-//! likely live on [`crate::app::Trellis`] itself, per
-//! `docs/observability.md`'s `trellis.metrics().render_prometheus()`
-//! sketch).
+//! **What this module does not do** (see the ADR): persist rollups to
+//! Postgres (issue #54). It builds and populates the in-process registry,
+//! and — issue #53 — exposes it for Prometheus text-format reading via
+//! [`Metrics::render_prometheus`], obtained through [`crate::app::Trellis::metrics`]
+//! (or [`crate::blocking::BlockingTrellis::metrics`]), matching
+//! `docs/observability.md`'s `trellis.metrics().render_prometheus()` sketch.
 //!
 //! ## Recorder installation
 //!
@@ -94,8 +91,40 @@ fn handle() -> &'static PrometheusHandle {
         // those two are only compiled under the exporter's `http-listener`
         // feature, which this crate does not enable (no bound socket).
         let _ = metrics::set_global_recorder(recorder);
+        describe_metrics();
         handle
     })
+}
+
+/// Registers a `# HELP` description for every metric this module records,
+/// once, right after [`handle`] installs the global recorder. Without this,
+/// `metrics-exporter-prometheus` still renders a `# TYPE` line per series
+/// (inferred from the macro used to record it — `histogram!`/`counter!`/
+/// `gauge!`) but omits `# HELP` entirely, since it has no description to
+/// put there; issue #53's exposition is meant to be self-documenting for an
+/// operator reading a raw scrape, so every series gets one.
+fn describe_metrics() {
+    metrics::describe_histogram!(
+        TRANSFORM_LATENCY_METRIC,
+        metrics::Unit::Seconds,
+        "Time from a change becoming available at a transform's input to its output being \
+         applied, labeled by transform."
+    );
+    metrics::describe_counter!(
+        CHANGES_APPLIED_METRIC,
+        "Count of changes applied, labeled by transform — the throughput denominator for \
+         trellis_transform_latency_seconds."
+    );
+    metrics::describe_histogram!(
+        END_TO_END_LATENCY_METRIC,
+        metrics::Unit::Seconds,
+        "Time from the source commit to a terminal (sink) transform's apply, labeled by that \
+         terminal transform and summed across every source feeding it."
+    );
+    metrics::describe_gauge!(
+        STAGING_SEGMENTS_METRIC,
+        "Count of staging ring segments, labeled by state (active/sealed/draining/drained)."
+    );
 }
 
 /// Ensures the registry is installed. Every recording function below calls
@@ -153,19 +182,66 @@ pub fn set_staging_segments(state: &str, count: u64) {
     metrics::gauge!(STAGING_SEGMENTS_METRIC, "state" => state.to_string()).set(count as f64);
 }
 
-/// Renders the registry in Prometheus text format. **Not** the public
-/// exposition API — see the module doc comment. This exists only so this
-/// crate's own tests can assert an observation landed in the registry
-/// without reaching for `metrics`-crate-specific inspection types
-/// themselves; issue #53 owns designing the real, embedder-facing
-/// `render_prometheus()`.
-#[doc(hidden)]
-pub fn render_for_test() -> String {
-    handle().render()
+/// A handle onto this process's in-process metrics registry — the public,
+/// embedder-facing entry point for Prometheus exposition (issue #53).
+///
+/// Obtained via [`crate::app::Trellis::metrics`] (or
+/// [`crate::blocking::BlockingTrellis::metrics`]), matching
+/// `docs/observability.md`'s `trellis.metrics().render_prometheus()` sketch.
+/// Carries no fields: per the module doc comment's "Recorder installation"
+/// section, recording happens against one process-wide global registry, not
+/// one scoped to a particular `Trellis` connection, so there's no per-instance
+/// state to hold. It's a named type rather than a bare free function so the
+/// `trellis.metrics().render_prometheus()` method chain reads naturally and
+/// so a future addition (another export format, say) has an obvious home;
+/// [`Metrics::new`] is public too since some callers (this crate's own
+/// integration tests, `cli/src/commands/prometheus.rs`) read the registry
+/// without going through a full [`crate::app::Trellis`] connection.
+#[derive(Debug, Clone, Copy)]
+pub struct Metrics {
+    _private: (),
+}
+
+impl Metrics {
+    /// Ensures the registry is installed (see [`ensure_installed`]) and
+    /// returns a handle onto it. Cheap and side-effect-free beyond that
+    /// first-call installation — safe to call as often as wanted.
+    pub fn new() -> Self {
+        ensure_installed();
+        Self { _private: () }
+    }
+
+    /// Renders the registry's current contents in Prometheus text exposition
+    /// format (`# HELP`/`# TYPE` lines followed by each series' samples).
+    ///
+    /// Just a `String` — no HTTP framework, no bound socket (ADR-0009
+    /// decision 1; `docs/observability.md`'s "Exposition: a mountable
+    /// handler, not a bound port"). The operator serves the result from
+    /// their own HTTP stack's `/metrics` route, e.g. with the `text/plain;
+    /// version=0.0.4` content type Prometheus's exposition format expects:
+    ///
+    /// ```no_run
+    /// # async fn example(trellis: &trellis::Trellis) {
+    /// let body = trellis.metrics().render_prometheus();
+    /// // ...serve `body` from an axum/actix/hyper (or hand-rolled, as
+    /// // `cli/src/commands/prometheus.rs` does) `/metrics` route...
+    /// # }
+    /// ```
+    pub fn render_prometheus(&self) -> String {
+        handle().render()
+    }
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use regex::Regex;
+
     use super::*;
 
     #[test]
@@ -173,7 +249,7 @@ mod tests {
         record_transform_latency("metrics_facade_test_target", Duration::from_millis(120));
         increment_changes_applied("metrics_facade_test_target");
 
-        let rendered = render_for_test();
+        let rendered = Metrics::new().render_prometheus();
         assert!(
             rendered.contains("trellis_transform_latency_seconds"),
             "rendered output missing the latency histogram: {rendered}"
@@ -192,7 +268,7 @@ mod tests {
     fn end_to_end_latency_is_recorded_and_renders_with_the_shared_bucket_set() {
         record_end_to_end_latency("metrics_facade_test_terminal", Duration::from_millis(250));
 
-        let rendered = render_for_test();
+        let rendered = Metrics::new().render_prometheus();
         assert!(
             rendered.contains("trellis_end_to_end_latency_seconds"),
             "rendered output missing the end-to-end latency histogram: {rendered}"
@@ -204,7 +280,7 @@ mod tests {
         // ADR-0009 decision 6: this histogram reuses LATENCY_BUCKETS, the
         // same global default the per-transform histogram uses — spot-check
         // one boundary shared by both rather than asserting the whole set,
-        // since `render_for_test` renders every histogram's buckets
+        // since `render_prometheus` renders every histogram's buckets
         // interleaved.
         assert!(
             rendered.contains("le=\"0.25\""),
@@ -216,13 +292,76 @@ mod tests {
     fn staging_segments_gauge_is_recorded_and_renders() {
         set_staging_segments("metrics_facade_test_state", 3);
 
-        let rendered = render_for_test();
+        let rendered = Metrics::new().render_prometheus();
         assert!(
             rendered.contains("trellis_staging_segments"),
             "rendered output missing the segment-state gauge: {rendered}"
         );
         assert!(
             rendered.contains("metrics_facade_test_state"),
+            "rendered output missing the state label: {rendered}"
+        );
+    }
+
+    /// Issue #53's acceptance criteria calls for "a snapshot test on the
+    /// rendered body." A byte-exact snapshot isn't a good fit here: the
+    /// registry is one process-wide global (see the module doc comment's
+    /// "Recorder installation" section) shared by every test in this binary,
+    /// so the exact set/order of series `render_prometheus()` returns
+    /// depends on whichever other tests happened to run first in this
+    /// process — not something this test controls or should pin to. Instead
+    /// this asserts the *shape* is valid Prometheus text exposition format:
+    /// every metric this crate records gets a `# HELP`/`# TYPE` pair, and
+    /// every non-comment sample line parses as `name{labels} value`.
+    #[test]
+    fn render_prometheus_produces_a_valid_exposition_format_body() {
+        record_transform_latency("metrics_shape_test_target", Duration::from_millis(42));
+        increment_changes_applied("metrics_shape_test_target");
+        record_end_to_end_latency("metrics_shape_test_target", Duration::from_millis(84));
+        set_staging_segments("metrics_shape_test_state", 7);
+
+        let rendered = Metrics::new().render_prometheus();
+
+        for metric in [
+            TRANSFORM_LATENCY_METRIC,
+            CHANGES_APPLIED_METRIC,
+            END_TO_END_LATENCY_METRIC,
+            STAGING_SEGMENTS_METRIC,
+        ] {
+            assert!(
+                rendered.contains(&format!("# HELP {metric} ")),
+                "rendered output missing a HELP line for {metric}: {rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("# TYPE {metric} ")),
+                "rendered output missing a TYPE line for {metric}: {rendered}"
+            );
+        }
+
+        // Shape-check every non-comment, non-blank line against the
+        // exposition format's sample-line grammar (metric name, optional
+        // `{label="value", ...}` block, whitespace, a value) — loose enough
+        // to tolerate metrics-exporter-prometheus's own label/bucket
+        // ordering, strict enough to catch a gross regression (labels or
+        // values landing somewhere they shouldn't).
+        let sample_line =
+            Regex::new(r#"^[a-zA-Z_:][a-zA-Z0-9_:]*(\{[^}]*\})?\s+\S+$"#).expect("valid regex");
+        for line in rendered.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            assert!(
+                sample_line.is_match(line),
+                "line does not look like a valid Prometheus sample: {line:?}"
+            );
+        }
+
+        assert!(
+            rendered.contains("metrics_shape_test_target"),
+            "rendered output missing the transform label: {rendered}"
+        );
+        assert!(
+            rendered.contains("metrics_shape_test_state"),
             "rendered output missing the state label: {rendered}"
         );
     }

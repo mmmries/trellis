@@ -161,6 +161,25 @@ impl Trellis {
         &self.config
     }
 
+    /// A handle onto this process's in-process metrics registry (issue #53),
+    /// for Prometheus exposition — see [`crate::metrics::Metrics::render_prometheus`]:
+    ///
+    /// ```no_run
+    /// # async fn example(trellis: &trellis::Trellis) {
+    /// let body = trellis.metrics().render_prometheus();
+    /// # }
+    /// ```
+    ///
+    /// The registry itself is process-wide, not scoped to this particular
+    /// connection (see `trellis::metrics`'s module doc comment) — this
+    /// method exists so callers reach it through the same facade as
+    /// everything else, matching `docs/observability.md`'s
+    /// `trellis.metrics().render_prometheus()` sketch, rather than because
+    /// `self` is actually consulted.
+    pub fn metrics(&self) -> crate::metrics::Metrics {
+        crate::metrics::Metrics::new()
+    }
+
     /// Applies Trellis's schema migrations. Idempotent — safe to call on
     /// every startup.
     pub async fn migrate(&self) -> Result<(), TrellisError> {
