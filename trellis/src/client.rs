@@ -443,7 +443,6 @@ async fn run(
         let maintenance_config = MaintenanceConfig {
             dsn: dsn.clone(),
             schema: config.schema().to_string(),
-            target_schema: config.target_schema().to_string(),
             pool: pool.clone(),
             publication: options.publication.clone(),
             base_source_tables: options.source_tables.clone(),
@@ -655,11 +654,6 @@ fn build_intake_config(
 struct MaintenanceConfig {
     dsn: String,
     schema: String,
-    /// Schema newly-discovered [`defs::all_source_tables`] entries qualify
-    /// against (issue #14's own connection/`LISTEN` setup still uses
-    /// `schema`, the Trellis catalog schema — source tables live under
-    /// `target_schema` instead, see [`Config::target_schema`]).
-    target_schema: String,
     pool: Pool,
     publication: String,
     base_source_tables: Vec<String>,
@@ -683,7 +677,6 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     let MaintenanceConfig {
         dsn,
         schema,
-        target_schema,
         pool,
         publication,
         base_source_tables,
@@ -734,7 +727,6 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 failed = reconcile_source_tables(
                     c,
                     &pool,
-                    &target_schema,
                     &publication,
                     &base_source_tables,
                     &wake_channel,
@@ -803,6 +795,17 @@ impl From<IntakeError> for ReconcileError {
 /// new table while this client is already running is picked up without a
 /// restart.
 ///
+/// Issue #75, ADR-0007: [`defs::all_source_tables`] returns each table's own
+/// actual, already-persisted qualified identity — this used to instead
+/// return bare suffixes and re-qualify every one of them against one assumed
+/// schema (`Config::target_schema`), which was simply wrong for a source
+/// living anywhere else (including, since issue #76, a definition's own
+/// explicit `FROM <schema>.<source>`): it would either publish/backfill a
+/// same-named decoy in the assumed schema instead of the real table, or fail
+/// outright if no such decoy existed. No re-qualification happens here
+/// anymore — every table `all_source_tables` returns is inserted into
+/// `desired` exactly as given.
+///
 /// Takes a plain `&mut tokio_postgres::Client`, not a [`ProducerSession`]:
 /// see [`intake::publication::reconcile_publication`]'s doc comment for why
 /// a fresh `ProducerSession` isn't available here (intake's own session
@@ -810,16 +813,13 @@ impl From<IntakeError> for ReconcileError {
 async fn reconcile_source_tables(
     client: &mut tokio_postgres::Client,
     pool: &Pool,
-    source_schema: &str,
     publication: &str,
     base_source_tables: &[String],
     wake_channel: &str,
 ) -> Result<(), ReconcileError> {
     let mut desired: std::collections::BTreeSet<String> =
         base_source_tables.iter().cloned().collect();
-    for table in defs::all_source_tables(pool).await? {
-        desired.insert(intake::publication::qualify(source_schema, &table)?);
-    }
+    desired.extend(defs::all_source_tables(pool).await?);
     let desired: Vec<String> = desired.into_iter().collect();
 
     intake::publication::reconcile_publication(client, publication, &desired).await?;

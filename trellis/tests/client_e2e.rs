@@ -472,6 +472,176 @@ async fn a_transform_registered_against_a_new_source_table_backfills_without_a_c
     client.shutdown().await.expect("clean shutdown");
 }
 
+/// The transform issue #75's regression test below exercises: identical to
+/// [`comments_calc_def`] except `explicit_source_schema` names `custom`
+/// (issue #76's grammar) — needed so [`oracle_snapshot`]'s own
+/// `quoted_source_from` reads `custom.comments`, not a bare `comments` that
+/// would resolve (wrongly, for this test) via this file's pinned
+/// `search_path`.
+fn comments_calc_custom_schema_def() -> TransformDef {
+    TransformDef {
+        explicit_source_schema: Some("custom".to_string()),
+        ..comments_calc_def()
+    }
+}
+
+/// Issue #75, ADR-0007's regression case: `client::reconcile_source_tables`
+/// (the same issue #14 periodic re-derivation the test above exercises) must
+/// reconcile the publication against each newly-registered source's own
+/// *actual* persisted qualified name — not a bare suffix re-guessed against
+/// `Config::target_schema` (`"public"` by default). Before the fix,
+/// `defs::all_source_tables` returned only `comments`'s bare suffix, and
+/// `reconcile_source_tables` re-qualified it as `public.comments` regardless
+/// of where the real table lived — silently publishing/backfilling a
+/// same-named decoy in `public` instead (or failing loudly if none existed).
+///
+/// Proven with exactly that shape: a same-named, same-shaped decoy sits in
+/// `public` — the schema the old bug guessed — while the real, registered
+/// source lives in `custom`, named explicitly via issue #76's `FROM
+/// custom.comments` grammar, registered *after* the client is already
+/// running (so its own initial `ClientOptions::source_tables` never named
+/// it — discovering it is exactly the periodic-reconcile job under test). A
+/// row inserted into `custom.comments` after registration must still reach
+/// `comments_calc`: that requires the periodic reconcile to have added
+/// `custom.comments` (not `public.comments`) to the publication, so CDC
+/// actually streams it. If the old bug were still present, `custom.comments`
+/// would never join the publication and this insert would simply never
+/// propagate, timing the `poll_until` below out.
+#[tokio::test]
+async fn a_transform_registered_against_an_explicitly_qualified_non_default_schema_source_reconciles_correctly()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+
+    setup_source_and_target(&db.pool, &raw).await;
+
+    let options = ClientOptions {
+        staging_worker: true,
+        application_threads: 2,
+        source_tables: vec![format!("{DEFAULT_SCHEMA}.orders")],
+        reconcile_interval: Duration::from_millis(200),
+        ..Default::default()
+    };
+    let client = TrellisClient::start(db.dsn(), options).expect("client start");
+
+    // The decoy: same bare name and shape, sitting in `public` — the schema
+    // the old bug's `reconcile_source_tables` would have (wrongly) assumed
+    // every newly-discovered source table lived under. Left empty: if the
+    // bug is present, this is the table that (wrongly) joins the publication
+    // instead of `custom.comments`, so `custom.comments`'s own writes simply
+    // never propagate — no row here should ever need to be read.
+    raw.batch_execute(
+        "create table public.comments (id integer primary key, x numeric, y numeric)",
+    )
+    .await
+    .expect("create decoy public.comments");
+
+    // The real source: explicitly qualified into a schema that's neither
+    // `public` nor the Trellis-pinned schema bare resolution would pick.
+    raw.batch_execute(
+        "create schema custom; \
+         create table custom.comments (id integer primary key, x numeric, y numeric); \
+         insert into custom.comments (id, x, y) values (1, 3.00, 4.00), (2, 1.00, 1.00)",
+    )
+    .await
+    .expect("create custom.comments and seed pre-existing rows");
+
+    let comments_columns = numeric_columns(&["id", "x", "y"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM comments_calc FROM custom.comments SELECT x + y AS total",
+        &comments_columns,
+    )
+    .await
+    .expect("register comments_calc against the explicitly-qualified source");
+    let comments_pk = trellis::defs::source_primary_key(&db.pool, "custom.comments")
+        .await
+        .expect("introspect custom.comments primary key");
+    create_target_table(
+        &db.pool,
+        &comments_calc_custom_schema_def(),
+        "public",
+        &comments_pk,
+        &comments_columns,
+        "custom.comments",
+    )
+    .await
+    .expect("create comments_calc target table");
+
+    let def = comments_calc_custom_schema_def();
+
+    // Proves the direct-enumeration initial backfill (unaffected by this
+    // bug, since it enumerates synchronously at registration time rather
+    // than through the publication).
+    poll_until(
+        Duration::from_secs(20),
+        Duration::from_millis(200),
+        "comments_calc never converged with the oracle after registering a transform \
+         against an explicitly-qualified, non-default-schema source table",
+        async || {
+            let target: HashMap<String, Option<String>> = raw
+                .query("select id::text, total::text from comments_calc", &[])
+                .await
+                .expect("read comments_calc")
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect();
+            target == oracle_snapshot(&db.pool, &def, "id", &comments_columns).await
+        },
+    )
+    .await;
+
+    // The part that actually depends on the fix: a write to `custom.comments`
+    // *after* registration only reaches `comments_calc` if the periodic
+    // reconcile added the correct (`custom.comments`, not `public.comments`)
+    // table to the publication.
+    raw.batch_execute("insert into custom.comments (id, x, y) values (3, 10.00, 5.00)")
+        .await
+        .expect("insert a post-registration row into custom.comments");
+
+    poll_until(
+        Duration::from_secs(20),
+        Duration::from_millis(200),
+        "a post-registration write to custom.comments never reached comments_calc — \
+         the periodic reconcile must have published the wrong table",
+        async || {
+            let target: HashMap<String, Option<String>> = raw
+                .query("select id::text, total::text from comments_calc", &[])
+                .await
+                .expect("read comments_calc")
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect();
+            target == oracle_snapshot(&db.pool, &def, "id", &comments_columns).await
+        },
+    )
+    .await;
+
+    let target_count: i64 = raw
+        .query_one("select count(*) from comments_calc", &[])
+        .await
+        .expect("count comments_calc rows")
+        .get(0);
+    assert_eq!(
+        target_count, 3,
+        "both pre-existing custom.comments rows plus the post-registration insert must \
+         have converged, and nothing from the public.comments decoy"
+    );
+
+    let decoy_count: i64 = raw
+        .query_one("select count(*) from public.comments", &[])
+        .await
+        .expect("count public.comments decoy rows")
+        .get(0);
+    assert_eq!(
+        decoy_count, 0,
+        "the decoy must never receive any of this test's writes"
+    );
+
+    client.shutdown().await.expect("clean shutdown");
+}
+
 #[tokio::test]
 async fn staging_and_application_threads_are_independent_knobs() {
     let cluster = TestCluster::start();

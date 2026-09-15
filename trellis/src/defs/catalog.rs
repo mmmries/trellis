@@ -1378,12 +1378,15 @@ pub async fn create_relationship(
     // `to_table` is marked `is_source` here too, even though a relationship's
     // to-side is often really a transform target: the flag is additive/OR'd
     // (a later `create_definition` call can still set `is_target` on the
-    // same node), and no consumer reads `schema_nodes.is_source` directly
-    // today — [`all_source_tables`] (the publication feeder) reads
-    // `transform_definitions`/`relationship_definitions` directly, not this
-    // flag (issue #65: it now also follows relationship edges transitively,
-    // but still via those tables, not `schema_nodes`). If a future
-    // `is_source` consumer reads `schema_nodes` directly, re-check this call.
+    // same node), and no consumer reads `schema_nodes.is_source` directly —
+    // [`all_source_tables`] (the publication feeder) walks `schema_edges`
+    // `Relationship` edges from `transform_definitions.source_table` anchors
+    // instead (issue #75), never the `is_source` flag itself: that flag is
+    // set on *every* relationship endpoint regardless of whether it's
+    // actually reachable from a registered transform, so reading it directly
+    // would leak an orphaned relationship's tables into the publication
+    // (issue #65's test case 4). If a future `is_source` consumer reads
+    // `schema_nodes` directly, re-check this call.
     let to_node = resolve_node_in_txn(&txn, &qualified_to, NodeKind::Source).await?;
 
     // The `Relationship` edge is persisted `to_table -> from_table` (parent
@@ -2717,31 +2720,45 @@ pub async fn transforms_for_source(
 /// against a table it hasn't seen before, so it can add that table to the
 /// publication and discharge its backfill without waiting for a restart.
 ///
-/// Returns **bare** table names, deliberately — a pre-issue-#72 contract this
-/// keeps unchanged even though `transform_definitions.source_table` itself is
-/// now qualified (issue #72). This recursive CTE mixes anchors (from
-/// `transform_definitions.source_table`) with relationship-reachable tables
-/// (from `relationship_definitions.to_table`/`from_table`, still bare —
-/// relationship endpoints aren't qualified yet), so seeding it with anything
-/// but a bare name would break the `rd.from_table` join for every anchor and
-/// silently truncate the reachable set. The `split_part` below strips
-/// `source_table` back to its bare table-name suffix at the seed, matching
-/// what this function has always returned; both of this function's callers
-/// ([`crate::client::reconcile_source_tables`] via `intake::publication::qualify`,
-/// and [`crate::app::qualified_source_tables`] via its own `information_schema`
-/// resolution) already re-qualify each bare result themselves and would
-/// double-qualify (or, for `qualify`, hard-error on the embedded `.`) a
-/// qualified name passed straight through.
+/// Returns **fully-qualified** `"schema.table"` names (issue #75, ADR-0007)
+/// — a change from this function's pre-#75 contract, which returned bare
+/// suffixes and left both callers to re-qualify them by re-guessing a single
+/// assumed schema (see git history for the details of that bug). Walks
+/// `schema_nodes`/`schema_edges` (issue #74's qualified graph) instead of
+/// `relationship_definitions`'s raw, still-bare `from_table`/`to_table`
+/// columns: every relationship endpoint already resolves into that graph at
+/// [`create_relationship`] time via the same [`resolve_graph_identity_in_txn`]
+/// a transform's own source/target does, so `schema_nodes.table_name` carries
+/// each relationship-reachable table's *actual* qualified identity — not a
+/// bare name this function (or a caller) would otherwise have to re-resolve
+/// against a guessed schema. Anchors are seeded from
+/// `transform_definitions.source_table` directly (already qualified as of
+/// issue #72), not `schema_nodes.is_source`: that flag is also set on every
+/// relationship endpoint regardless of whether it's transitively reachable
+/// from a registered transform, so seeding from it would leak an orphaned
+/// relationship's `to_table` the way issue #65's test case 4 (preserved
+/// below) specifically forbids.
+///
+/// The recursive step mirrors the pre-#75 walk's direction exactly, just
+/// against qualified nodes/edges: `create_relationship` persists a
+/// `Relationship` edge `from_node_id = to_table's node`, `to_node_id =
+/// from_table's node` (child depends on parent — see that function's own
+/// doc comment), so given a reachable node matching a `Relationship` edge's
+/// `to_node` (the child/`from_table` side), the edge's `from_node` (the
+/// parent/`to_table` side) is the newly-reachable table.
 pub async fn all_source_tables(pool: &Pool) -> Result<Vec<String>, CatalogError> {
     let client = pool.get().await?;
     let rows = client
         .query(
             "with recursive reachable(table_name) as (
-                select distinct split_part(source_table, '.', 2) from transform_definitions
+                select distinct source_table from transform_definitions
                 union
-                select rd.to_table
-                from relationship_definitions rd
-                join reachable r on r.table_name = rd.from_table
+                select from_node.table_name
+                from schema_edges se
+                join schema_nodes to_node on to_node.id = se.to_node_id
+                join schema_nodes from_node on from_node.id = se.from_node_id
+                join reachable r on r.table_name = to_node.table_name
+                where se.kind = 'relationship'
              )
              select table_name from reachable",
             &[],

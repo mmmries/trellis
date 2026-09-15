@@ -714,34 +714,22 @@ impl Trellis {
 
 /// The full transitive closure of source tables reachable from every
 /// registered definition — each definition's direct anchor table plus every
-/// relationship `to_table` reachable from one (see
-/// [`defs::all_source_tables`]) — each qualified as `"schema.table"` for
-/// [`ClientOptions::source_tables`]. `all_source_tables` returns bare table
-/// names, so this resolves each one's schema off `information_schema`.
+/// relationship `to_table` reachable from one — each already schema-qualified
+/// for [`ClientOptions::source_tables`].
+///
+/// Issue #75, ADR-0007: [`defs::all_source_tables`] itself now returns each
+/// table's actual, already-persisted qualified identity, so this is a thin
+/// pass-through — it used to re-resolve every bare result against
+/// `information_schema`/`current_schemas(false)` (a `search_path` walk of
+/// exactly the kind ADR-0007 forbids downstream of definition-acceptance
+/// time), which broke for a source living outside this connection's
+/// `search_path` (e.g. an issue #76 explicit-schema source).
 ///
 /// `pub` (rather than `pub(crate)`) only so `trellis/tests/app.rs` can exercise
 /// it directly as `trellis::app::qualified_source_tables`; not re-exported
 /// from the crate root, so it isn't part of [`Trellis`]'s public surface.
 pub async fn qualified_source_tables(pool: &Pool) -> Result<Vec<String>, TrellisError> {
-    let client = pool.get().await?;
-    let tables = defs::all_source_tables(pool).await?;
-
-    let mut qualified = Vec::with_capacity(tables.len());
-    for source_table in tables {
-        let schema_rows = client
-            .query(
-                "select table_schema from information_schema.tables \
-                 where table_name = $1 and table_schema = any(current_schemas(false))",
-                &[&source_table],
-            )
-            .await?;
-        let schema: String = schema_rows
-            .first()
-            .ok_or_else(|| TrellisError::SourceTableNotFound(source_table.clone()))?
-            .get(0);
-        qualified.push(format!("{schema}.{source_table}"));
-    }
-    Ok(qualified)
+    Ok(defs::all_source_tables(pool).await?)
 }
 
 /// Maps a Postgres `information_schema.columns.data_type` string to the

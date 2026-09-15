@@ -1150,7 +1150,8 @@ async fn a_concurrent_insert_racing_the_target_suffix_index_is_translated_to_a_c
 
 /// Issue #65, case 1: with no relationships declared at all, `all_source_tables`
 /// must still behave exactly as it did pre-#65 — just the anchor
-/// `source_table` of each registered transform.
+/// `source_table` of each registered transform. Issue #75, ADR-0007:
+/// fully-qualified, not the bare suffix this returned before.
 #[tokio::test]
 async fn all_source_tables_with_no_relationships_returns_only_anchor_tables() {
     let cluster = TestCluster::start();
@@ -1167,7 +1168,7 @@ async fn all_source_tables_with_no_relationships_returns_only_anchor_tables() {
 
     let mut tables = all_source_tables(&db.pool).await.expect("query mapping");
     tables.sort();
-    assert_eq!(tables, vec!["orders".to_string()]);
+    assert_eq!(tables, vec![qualified("orders")]);
 }
 
 /// Issue #65, case 2: a transform anchored on `a`, plus a relationship
@@ -1195,7 +1196,7 @@ async fn all_source_tables_follows_a_single_relationship_hop() {
 
     let mut tables = all_source_tables(&db.pool).await.expect("query mapping");
     tables.sort();
-    assert_eq!(tables, vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(tables, vec![qualified("a"), qualified("b")]);
 }
 
 /// Issue #65, case 3: a multi-hop chain — relationship `a -> b` and
@@ -1227,10 +1228,7 @@ async fn all_source_tables_follows_a_multi_hop_relationship_chain() {
 
     let mut tables = all_source_tables(&db.pool).await.expect("query mapping");
     tables.sort();
-    assert_eq!(
-        tables,
-        vec!["a".to_string(), "b".to_string(), "c".to_string()]
-    );
+    assert_eq!(tables, vec![qualified("a"), qualified("b"), qualified("c")]);
 }
 
 /// Issue #65, case 4: a relationship declared on a table that is not any
@@ -1261,7 +1259,62 @@ async fn all_source_tables_does_not_leak_relationships_unreachable_from_any_tran
     .expect("valid definition should be stored");
 
     let tables = all_source_tables(&db.pool).await.expect("query mapping");
-    assert_eq!(tables, vec!["z".to_string()]);
+    assert_eq!(tables, vec![qualified("z")]);
+}
+
+/// Issue #75, ADR-0007: `all_source_tables` must return each source's own
+/// *actual* persisted qualified name, not a bare suffix a caller then has to
+/// re-guess against one assumed schema. Before this fix it returned the bare
+/// `split_part(source_table, '.', 2)` suffix, and its one production caller
+/// (`client::reconcile_source_tables`) re-qualified every result against
+/// `Config::target_schema` (`"public"` by default) — wrong for a source
+/// living anywhere else, including via issue #76's explicit-schema grammar.
+///
+/// Proven the same way issue #76's own
+/// `an_explicitly_qualified_source_resolves_to_that_exact_relation_not_search_path`
+/// proves explicit qualification itself: a same-named decoy table sits in
+/// the schema the old bug would have guessed (`public`, `reconcile_source_tables`'s
+/// assumed `target_schema`), while the real, registered source lives in
+/// `custom`, named explicitly via `FROM custom.orders`. If the bare-suffix
+/// bug were still present, this would return `public.orders` (the decoy) —
+/// exactly the wrong table a publication reconcile would then add.
+#[tokio::test]
+async fn all_source_tables_returns_the_actual_schema_not_a_target_schema_guess() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+
+    // The decoy: same bare name, sitting in `public` — the schema
+    // `reconcile_source_tables` used to assume every source lived under.
+    client
+        .batch_execute("create table public.orders (id serial primary key, price numeric)")
+        .await
+        .expect("create decoy public.orders");
+    // The real source: explicitly qualified into a schema that is neither
+    // `public` nor the Trellis-pinned schema bare resolution would pick.
+    client
+        .batch_execute(
+            "create schema custom; \
+             create table custom.orders (id serial primary key, price numeric)",
+        )
+        .await
+        .expect("create custom.orders");
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM custom.orders SELECT price AS total",
+        &columns(&["price"]),
+    )
+    .await
+    .expect("explicitly-qualified source should resolve to custom.orders");
+
+    let tables = all_source_tables(&db.pool).await.expect("query mapping");
+    assert_eq!(
+        tables,
+        vec!["custom.orders".to_string()],
+        "must return the actually-registered custom.orders, not a bare suffix a caller \
+         would re-guess into the public.orders decoy"
+    );
 }
 
 /// Issue #36's exact repro: a 1-1 transform with a pass-through field named
