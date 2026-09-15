@@ -1,11 +1,11 @@
 //! `trellis` — the operator CLI for the Trellis engine.
 //!
-//! A thin argv-parsing/dispatch layer over [`engine::Trellis`]: this binary
+//! A thin argv-parsing/dispatch layer over [`trellis::Trellis`]: this binary
 //! exists so operators can register definitions, run the live pipeline, and
-//! inspect status without writing Rust against the engine crate directly.
+//! inspect status without writing Rust against the trellis crate directly.
 //! No `clap` (or any arg-parsing crate) and no `thiserror`/`anyhow`, matching
 //! the workspace's dependency-minimalism convention (see
-//! `engine/src/error.rs`'s doc comment) — argv parsing is hand-rolled and
+//! `trellis/src/error.rs`'s doc comment) — argv parsing is hand-rolled and
 //! small enough not to need a framework.
 //!
 //! Each subcommand lives in its own `commands::<name>` module; this file is

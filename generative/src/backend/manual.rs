@@ -28,15 +28,15 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use engine::config::DEFAULT_SCHEMA;
-use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use engine::defs::{
+use tokio_postgres::NoTls;
+use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use trellis::defs::{
     CatalogError, DdlError, TransformStatus, create_relationship, install_definition,
     qualified_target_table, source_primary_key,
 };
-use engine::staging::{StagingError, await_converged, watermark_token};
-use engine::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
-use tokio_postgres::NoTls;
+use trellis::staging::{StagingError, await_converged, watermark_token};
+use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
 
 use super::Snapshot;
 use crate::model::{
@@ -51,7 +51,7 @@ const QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Failure modes across the manual backend's lifecycle. Composes the
 /// engine's own error types via `From` rather than re-wrapping their
-/// messages, matching `engine::ClientError`'s own convention.
+/// messages, matching `trellis::ClientError`'s own convention.
 #[derive(Debug)]
 pub enum ManualBackendError {
     /// An op named a table [`ManualBackend::install`] was never given.
@@ -83,7 +83,7 @@ pub enum ManualBackendError {
         unsettled: Vec<String>,
         waited: Duration,
     },
-    Config(engine::Error),
+    Config(trellis::Error),
     Client(ClientError),
     Catalog(CatalogError),
     Ddl(DdlError),
@@ -91,8 +91,8 @@ pub enum ManualBackendError {
     Db(tokio_postgres::Error),
 }
 
-impl From<engine::Error> for ManualBackendError {
-    fn from(err: engine::Error) -> Self {
+impl From<trellis::Error> for ManualBackendError {
+    fn from(err: trellis::Error) -> Self {
         ManualBackendError::Config(err)
     }
 }
@@ -128,7 +128,7 @@ impl From<tokio_postgres::Error> for ManualBackendError {
 }
 
 /// Quotes a Postgres identifier for safe interpolation into SQL text,
-/// mirroring `engine::pool`'s own (crate-private) helper of the same name.
+/// mirroring `trellis::pool`'s own (crate-private) helper of the same name.
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
@@ -148,7 +148,7 @@ fn pg_type_name(value_type: ValueType) -> &'static str {
 /// to exist, since [`crate::model::Program`] stores the parsed AST
 /// directly rather than source text. [`KeySpace::OneToOne`] and (as of
 /// improvement-plan task B4) [`KeySpace::Aggregate`] are both supported,
-/// matching `engine::defs::parser`'s own `GROUP BY <cols>` clause, which sits
+/// matching `trellis::defs::parser`'s own `GROUP BY <cols>` clause, which sits
 /// directly after `FROM <source>` and before `SELECT` (ADR-0004's reserved
 /// slot).
 fn render_definition(def: &TransformDef) -> Result<String, ManualBackendError> {
@@ -171,12 +171,12 @@ fn render_definition(def: &TransformDef) -> Result<String, ManualBackendError> {
 }
 
 /// Renders a generator-built [`Expr`] back to the source text
-/// [`super::install_definition`]/`engine::defs::parser::parse` re-parses.
+/// [`super::install_definition`]/`trellis::defs::parser::parse` re-parses.
 ///
 /// A `BinaryOp`'s operands are *unconditionally* parenthesized (issue #67's
 /// reviewer follow-up), not only when the operand is itself a lower-
 /// precedence `BinaryOp`: with real operator precedence now in the parser
-/// (`engine::defs::registry::OPERATORS`), a flat render like `a + b > c`
+/// (`trellis::defs::registry::OPERATORS`), a flat render like `a + b > c`
 /// silently reconstructs a *different* tree than a nested one the generator
 /// might build — e.g. `Add(a, GreaterThan(b, c))` would round-trip as
 /// `a + b > c`, which `+`'s tighter binding re-parses as `Add(a,b) >
@@ -186,7 +186,7 @@ fn render_definition(def: &TransformDef) -> Result<String, ManualBackendError> {
 /// so it's the shape this renderer commits to before the generator ever
 /// nests `+` and `>` together (improvement-plan task B2). See
 /// `tests::render_expr_parenthesizes_nested_binary_ops_so_they_round_trip`
-/// for the regression pin, and `engine::defs::parser`'s grouping-paren
+/// for the regression pin, and `trellis::defs::parser`'s grouping-paren
 /// support (issue #67 follow-up) that makes the rendered text re-parseable
 /// at all.
 fn render_expr(expr: &Expr) -> String {
@@ -203,7 +203,7 @@ fn render_expr(expr: &Expr) -> String {
             )
         }
         // `COUNT(*)` (task B4): the AST carries no argument for this shape
-        // (`args` is empty) — `engine::defs::parser` only ever accepts the
+        // (`args` is empty) — `trellis::defs::parser` only ever accepts the
         // literal `*` here, not an empty argument list, so this must render
         // it back explicitly rather than falling through to the generic
         // `name(args)` arm below (which would emit the invalid `COUNT()`).
@@ -447,9 +447,9 @@ impl ManualBackend {
 
     /// Diagnostic-only (improvement-plan task D4): the largest `bucket_count`
     /// across every segment sealed so far, straight from
-    /// `engine::staging::claim`'s partition decision (`segments.bucket_count`,
+    /// `trellis::staging::claim`'s partition decision (`segments.bucket_count`,
     /// fixed at seal time from row count alone — see
-    /// `engine::staging::claim::MIN_ROWS_TO_SPLIT`/`SEG_BUCKETS`). `0` if no
+    /// `trellis::staging::claim::MIN_ROWS_TO_SPLIT`/`SEG_BUCKETS`). `0` if no
     /// segment has sealed yet.
     ///
     /// This module is the one place the backend seam (its own doc comment)
@@ -481,7 +481,7 @@ impl ManualBackend {
                 sql.push_str(" primary key");
             } else if table.unique_cols.iter().any(|c| c == &column.name) {
                 // Issue #34: a real single-column UNIQUE constraint, which
-                // is what makes `engine::defs::catalog`'s live `pg_catalog`
+                // is what makes `trellis::defs::catalog`'s live `pg_catalog`
                 // introspection resolve a relationship whose *to*-side is
                 // this column as to-one (ADR-0006's cardinality rule). A
                 // generated to-one relationship is otherwise rejected as a
@@ -494,12 +494,12 @@ impl ManualBackend {
 
         // Improvement-plan task B4: a `KeySpace::Aggregate` definition needs
         // a changed row's *old* image to know which group a deleted/
-        // re-parented row is leaving (`engine::intake::replica_identity`'s
+        // re-parented row is leaving (`trellis::intake::replica_identity`'s
         // `needs_old_image`), and the engine checks this eagerly — creating
         // an aggregate definition over a table with only the default replica
         // identity (old image limited to the pk) is rejected outright with
         // `CatalogError::ReplicaIdentityRequired`, exactly like
-        // `engine/tests/apply_aggregate.rs`'s own hand-built fixtures always
+        // `trellis/tests/apply_aggregate.rs`'s own hand-built fixtures always
         // `alter table ... replica identity full` up front. Every table this
         // backend creates gets it unconditionally, rather than only tables
         // an `Aggregate` def happens to source from: it's harmless for a
@@ -516,7 +516,7 @@ impl ManualBackend {
         Ok(())
     }
 
-    /// `source_columns` for `table`, as `engine::defs::install_definition`
+    /// `source_columns` for `table`, as `trellis::defs::install_definition`
     /// wants it.
     fn source_columns(table: &Table) -> HashMap<String, ValueType> {
         table
@@ -640,7 +640,7 @@ impl ManualBackend {
     /// (`transform_definitions.status`) until each has reached a terminal
     /// backfill outcome — [`TransformStatus::Live`] (the ordinary case) or
     /// [`TransformStatus::Quarantined`] — or `timeout` elapses. Matches
-    /// `engine::staging::await_converged`'s own backoff shape (5ms initial,
+    /// `trellis::staging::await_converged`'s own backoff shape (5ms initial,
     /// doubling to a 250ms ceiling, never resetting within one call) so both
     /// halves of [`ManualBackend::quiesce`] share one polling discipline.
     ///
@@ -654,7 +654,7 @@ impl ManualBackend {
     ///
     /// Closes a real gap in [`ManualBackend::quiesce`] (public-api-design
     /// review): a direct-build 1-1 definition's backfill runs through
-    /// `engine::defs::chunk_queue`'s durable claim/execute/finish queue
+    /// `trellis::defs::chunk_queue`'s durable claim/execute/finish queue
     /// entirely outside the ring (docs/decisions/0007's "Backgrounding and
     /// resumability" amendment) — `await_converged`'s CDC-ring convergence
     /// wait has no visibility into that queue at all. Before this,
@@ -689,9 +689,9 @@ impl ManualBackend {
     /// installed (`self.defs`) whose current `transform_definitions.status`
     /// is neither `live` nor `quarantined` — i.e. still `waiting_to_backfill`
     /// or `backfilling`. Reads directly against `self.raw` (the same table
-    /// `engine::Trellis::definitions`/`engine::Trellis::status` query) rather
+    /// `trellis::Trellis::definitions`/`trellis::Trellis::status` query) rather
     /// than through a `Trellis` handle: `ManualBackend` never holds one — it
-    /// drives `engine::defs`/`engine::Client` directly — so re-running the
+    /// drives `trellis::defs`/`trellis::Client` directly — so re-running the
     /// same simple by-target-table lookup here is the one query path this
     /// backend already has, not a new one invented for this.
     async fn unsettled_definitions(&self) -> Result<Vec<String>, ManualBackendError> {
@@ -1033,7 +1033,7 @@ impl super::Backend for ManualBackend {
         Ok(snapshot)
     }
 
-    /// Improvement-plan task E3: drops the current primary `engine::Client`
+    /// Improvement-plan task E3: drops the current primary `trellis::Client`
     /// (its own `Drop` impl fires here — best-effort shutdown signal, no
     /// draining, no join: see the `Backend::restart` doc comment) and starts
     /// a fresh one against the same dsn/options [`ManualBackend::install`]
@@ -1045,7 +1045,7 @@ impl super::Backend for ManualBackend {
             .clone()
             .ok_or(ManualBackendError::NoClientStarted)?;
         // Dropping the old value here — before starting the replacement —
-        // is what fires `engine::Client`'s `Drop` impl (the crash stand-in);
+        // is what fires `trellis::Client`'s `Drop` impl (the crash stand-in);
         // reassigning below wouldn't run it any differently, but doing it as
         // its own statement keeps the "crash, then restart" sequencing
         // explicit rather than implicit in the assignment.
@@ -1056,10 +1056,10 @@ impl super::Backend for ManualBackend {
     }
 
     /// Improvement-plan task E3: starts an additional, application-worker-only
-    /// (`staging_worker: false`) `engine::Client` against the same dsn,
+    /// (`staging_worker: false`) `trellis::Client` against the same dsn,
     /// alongside whatever primary client `install` already started —
     /// confirming multiple clients can coexist draining the same ring (the
-    /// module doc comment on `engine::Client` claims this is supported; this
+    /// module doc comment on `trellis::Client` claims this is supported; this
     /// is where the generative suite exercises that claim). Never touches
     /// `source_tables`: an application-only client doesn't consult it (see
     /// `ClientOptions::source_tables`'s own doc comment), so this needs no
@@ -1125,7 +1125,7 @@ async fn read_table(
 /// `fields` is `def.fields` — every field whose name matches one of
 /// `group_by`'s columns is excluded from the row's own value columns (it
 /// contributes no separate target column at all, mirroring
-/// `engine::defs::ddl::create_aggregate_target_table`'s own "a field named
+/// `trellis::defs::ddl::create_aggregate_target_table`'s own "a field named
 /// after a grouping column is that column's passthrough" rule), leaving only
 /// the real aggregate-measure columns.
 ///
@@ -1175,7 +1175,7 @@ async fn read_aggregate_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::defs::parse;
+    use trellis::defs::parse;
 
     /// The reviewer-flagged follow-up to issue #67 (real operator
     /// precedence): a nested, mixed-operator `Expr` — `Add(Column("a"),

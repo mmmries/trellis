@@ -32,8 +32,8 @@
 //! unconditionally" philosophy) — and every definition sourced from that
 //! table gets a matching identity-passthrough field for each (`SELECT <col>
 //! AS <col>`, the same bare-`Expr::Column` shape
-//! `engine/tests/defs_backfill_direct.rs` already exercises by hand, and the
-//! same narrowing `engine::defs::ddl::passthrough_source_column` already
+//! `trellis/tests/defs_backfill_direct.rs` already exercises by hand, and the
+//! same narrowing `trellis::defs::ddl::passthrough_source_column` already
 //! special-cases). See [`TableSpec`]'s `text_values`/`bool_values`/
 //! `uuid_values` fields and the `text_value`/`bool_value`/`uuid_value`
 //! strategies below.
@@ -62,22 +62,22 @@
 //! **The domain is *not* "0, 1, 2, plus `NULL`"**, despite the improvement
 //! plan's own text asking for exactly that. A `NULL` grouping value was
 //! implemented and drawn during this task's development, and immediately
-//! found a real engine bug: `engine::defs::ddl::create_aggregate_target_table`
+//! found a real engine bug: `trellis::defs::ddl::create_aggregate_target_table`
 //! declares the `GROUP BY` columns as the target's Postgres `PRIMARY KEY`,
 //! which is unconditionally `NOT NULL` — so a source row with a `NULL`
 //! grouping value makes every attempted write to that group fail with a
 //! genuine `null value in column ... violates not-null constraint` error.
 //! **Corrected during review, against an independent from-scratch repro
-//! directly against `engine::staging::apply::drain_once`:** this is *not*
+//! directly against `trellis::staging::apply::drain_once`:** this is *not*
 //! an infinite retry of the same segment, and it does *not* stall the source
-//! table's watermark. `engine::client`'s `app_worker_loop` releases a failed
+//! table's watermark. `trellis::client`'s `app_worker_loop` releases a failed
 //! claim and re-fetches the same segment, but `staging::quarantine`'s
 //! existing isolate-before-blaming machinery (`quarantine::classify` routes
 //! a plain Postgres constraint-violation error to `FailureClass::Isolate`)
 //! probes the offending row alone, charges it a death, and — once its death
 //! count crosses `quarantine::DEFAULT_DEATH_THRESHOLD` (5, reached within a
 //! single `drain_once` call in the repro) — evicts and parks it, letting the
-//! rest of the batch drain normally; `engine/tests/quarantine.rs`'s
+//! rest of the batch drain normally; `trellis/tests/quarantine.rs`'s
 //! `repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still_drains`
 //! already covers exactly this recovery path for a different deterministic
 //! per-row failure. The real, still-unfixed defect is narrower and
@@ -120,7 +120,7 @@
 //! never touched by `Update`/`Delete`/`DuplicateInsert` (same B1 precedent —
 //! a group changing membership via delete/insert of whole rows is already
 //! the sharpest edge; *migrating* a live row from one group to another via
-//! `Update` is real, separate coverage `engine/tests/apply_aggregate.rs`
+//! `Update` is real, separate coverage `trellis/tests/apply_aggregate.rs`
 //! already exercises by hand, not drawn here). `KeySpace::Aggregate.group_by`
 //! is always exactly one column (never a composite/multi-column group-by,
 //! which the engine grammar supports but this generator does not draw).
@@ -154,7 +154,7 @@
 //!   (this doc comment is written after both have merged): a derived field
 //!   is attached only to `OneToOne` defs, never `Aggregate` ones — see that
 //!   function's own doc comment for why (in short,
-//!   `engine::defs::validate::validate`'s `UngroupedColumnReference` check
+//!   `trellis::defs::validate::validate`'s `UngroupedColumnReference` check
 //!   would reject a derived field's bare, unaggregated column reference on
 //!   an `Aggregate` def; every `DerivedShape` references `c1`/`c2`/the text
 //!   column bare, none of them wrapped in `SUM`/`COUNT`/`AVG`/`MIN`/`MAX`).
@@ -165,7 +165,7 @@
 //! - Awkward text values (empty string, the literal text `"NULL"`, a
 //!   U+001F-containing string, a comma/quote/backslash string) are drawn
 //!   here, but this does **not** close the improvement plan's "attacks the
-//!   key encoding" framing for B1: `engine::intake::extract_key`'s
+//!   key encoding" framing for B1: `trellis::intake::extract_key`'s
 //!   composite-key delimiter and `defs::oracle::group_key`'s `Aggregate`
 //!   grouping-key encoding only matter for a *multi-column* primary key
 //!   (never drawn — the pk stays single-column `Numeric`) or a *`Text`-typed*
@@ -208,7 +208,7 @@
 //!   nullable at the schema level (`ManualBackend::create_source_table` never
 //!   emits `NOT NULL` for a non-primary-key column), and the engine's `+`
 //!   evaluator already treats a `NULL` operand as short-circuiting to `NULL`
-//!   (`engine::defs::eval`'s `Operator::Add` arm), matching Postgres's own
+//!   (`trellis::defs::eval`'s `Operator::Add` arm), matching Postgres's own
 //!   `numeric + NULL = NULL`. So drawing `None` for `c1`/`c2` needed no
 //!   engine or model change — see [`Mutate`] and the `value` strategy below.
 //! - **Empty string, the literal text `"NULL"`, delimiter-containing
@@ -222,7 +222,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 
 use crate::model::{
     Cardinality, Column, NamePool, NoiseAction, NoiseEvent, NoiseEventKind, NoisePlan, Op,
@@ -233,7 +233,7 @@ use crate::model::{
 ///
 /// **Numeric-path pairing (design doc §3, a load-bearing invariant).** The
 /// generator only ever emits small non-negative *integers* here, and the sole
-/// derivation is `c1 + c2`. Both the engine (`engine::numeric::Numeric`) and
+/// derivation is `c1 + c2`. Both the engine (`trellis::numeric::Numeric`) and
 /// the SQL oracle (Postgres `numeric`) are arbitrary-precision base-10: an
 /// integer sum has one exact representation on both sides, with no rounding
 /// and no float path to fall off of, so the two can never disagree by
@@ -309,21 +309,21 @@ pub const REL_FK_COLUMN: usize = 8;
 /// (case), and the date/time types (session-dependent rendering).
 ///
 /// **Deliberately duplicated here rather than imported.** The engine's own
-/// copy (`engine::defs::catalog`'s `TEXT_STABLE_JOIN_KEY_TYPES`) is private
+/// copy (`trellis::defs::catalog`'s `TEXT_STABLE_JOIN_KEY_TYPES`) is private
 /// to that module, and the design doc's seam (§1/§2) says this crate should
 /// not reach into engine internals to decide what a valid program is — the
 /// generator's job is to *independently* know the rules and only emit
 /// programs that satisfy them, exactly as [`crate::oracle`] independently
 /// renders SQL rather than calling the engine's renderer. Exposing the
-/// engine's constant would also be an `engine/` change, which issue #34 is
+/// engine's constant would also be an `trellis/` change, which issue #34 is
 /// explicitly scoped out of. The cost of the duplication is bounded: if the
 /// two ever drift, the generator emits a relationship the engine rejects,
 /// and an install rejection is a **hard failure, never a skip** (design
 /// doc §3) — so the drift surfaces as a loud test failure on the very next
 /// run, not as silently-lost coverage.
 ///
-/// Only [`engine::defs::ast::ValueType::Text`] and
-/// [`engine::defs::ast::ValueType::Uuid`] of this crate's four value types
+/// Only [`trellis::defs::ast::ValueType::Text`] and
+/// [`trellis::defs::ast::ValueType::Uuid`] of this crate's four value types
 /// map into this set (`Numeric` renders as `numeric` and `Boolean` as
 /// `boolean`, neither of which is listed), which is why the relationship
 /// key/FK columns are `Text`.
@@ -435,7 +435,7 @@ pub enum AggregateColumn {
 
 /// One calculated field of a generated [`KeySpace::Aggregate`] definition
 /// (task B4): one of the five functions
-/// `engine::defs::registry::AGGREGATE_FUNCTIONS` accepts, carrying which
+/// `trellis::defs::registry::AGGREGATE_FUNCTIONS` accepts, carrying which
 /// column it aggregates (all but `Count`, which is `COUNT(*)` row-counting
 /// and takes no argument at all). Kept as a small enum — rather than a bare
 /// `(name, column)` pair — so [`build_program_multi_with_shapes`]'s match
@@ -443,9 +443,9 @@ pub enum AggregateColumn {
 /// sixth aggregate function to the engine would need a new variant here
 /// before it could compile, not just a new string someone forgot to draw.
 ///
-/// Two of `SUM`/`COUNT`/`AVG` are [`engine::defs::invertibility::Invertibility::Invertible`]
+/// Two of `SUM`/`COUNT`/`AVG` are [`trellis::defs::invertibility::Invertibility::Invertible`]
 /// (delta-maintained); `MIN`/`MAX` are always
-/// [`engine::defs::invertibility::Invertibility::RecomputeOnly`] — see that
+/// [`trellis::defs::invertibility::Invertibility::RecomputeOnly`] — see that
 /// module's doc comment. Drawing a real mix of both classes in the same
 /// aggregate def (not just across different defs) is exactly what
 /// `tests/coverage.rs`'s B4 floor tests assert actually happens.
@@ -460,7 +460,7 @@ pub enum AggregateFn {
 
 impl AggregateFn {
     /// This function's canonical uppercased name, exactly as
-    /// `engine::defs::registry::AGGREGATE_FUNCTIONS` spells it.
+    /// `trellis::defs::registry::AGGREGATE_FUNCTIONS` spells it.
     fn name(self) -> &'static str {
         match self {
             AggregateFn::Sum(_) => "SUM",
@@ -993,7 +993,7 @@ pub fn build_program_multi_with_shapes(
                         // Task B1: one identity-passthrough field per new
                         // column, reusing the column's own name as the field
                         // name (`SELECT <col> AS <col>`) — the exact shape
-                        // `engine/tests/defs_backfill_direct.rs` already
+                        // `trellis/tests/defs_backfill_direct.rs` already
                         // exercises by hand, and every def sourced from this
                         // table gets the same three, determined by the
                         // table's shape rather than drawn independently per
@@ -1018,7 +1018,7 @@ pub fn build_program_multi_with_shapes(
                 DefShape::Aggregate { functions } => {
                     // The grouping-column passthrough field
                     // (`SELECT <grain> AS <grain>`) is required —
-                    // `engine::defs::validate::validate` rejects any other
+                    // `trellis::defs::validate::validate` rejects any other
                     // expression under a grouping column's own name — and
                     // every other field is one of `functions`, drawn from
                     // `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over `c1`/`c2` (see
@@ -1078,7 +1078,7 @@ pub fn build_program_multi_with_shapes(
 /// B4): the field name encodes both the function and its aggregated column
 /// (`sum_c1`, `avg_c2`, ...) so distinct `(function, column)` draws — even two
 /// functions sharing the same column, e.g. `SUM(c1)` and `AVG(c1)`, which
-/// deliberately exercises `engine::defs::ddl::count_column_names`'s shared
+/// deliberately exercises `trellis::defs::ddl::count_column_names`'s shared
 /// hidden-count-column path — never collide; `COUNT` has no column and always
 /// takes the fixed name `cnt`. `c1`/`c2` are the source table's own rendered
 /// column names (as everywhere else in this module).
@@ -1116,15 +1116,15 @@ fn aggregate_field_def(func: AggregateFn, c1: &str, c2: &str) -> FieldDef {
 /// infallible for the *values* this generator actually produces, the same
 /// way AVG's hidden count-partial already keeps `+`/`AVG` divide-by-zero-free
 /// (see this module's numeric-path pairing note above). Walked one shape at a
-/// time (`engine/src/defs/eval.rs`'s `apply_operator`/`apply_function`):
+/// time (`trellis/src/defs/eval.rs`'s `apply_operator`/`apply_function`):
 ///
-/// - **`Operator::GreaterThan`**: both operands are `engine::numeric::Numeric`
+/// - **`Operator::GreaterThan`**: both operands are `trellis::numeric::Numeric`
 ///   (arbitrary-precision decimal, like `+`), and `Numeric::compare` never
 ///   errors — there is no overflow, division, or precision loss to trigger
 ///   one. `Postgres::numeric >` cannot error either.
 /// - **`STRPOS`**: `haystack.find(needle)` is a total function over any two
 ///   `&str`s (`""`, no match, unicode — all handled, see
-///   `engine/tests/defs_text_functions.rs`'s `STRPOS_CASES`); it always
+///   `trellis/tests/defs_text_functions.rs`'s `STRPOS_CASES`); it always
 ///   returns a `usize`, never fails. Postgres's `strpos` is equally total.
 /// - **`OCTET_LENGTH`/`CHAR_LENGTH`**: `str::len`/`str::chars().count()` never
 ///   fail for any valid Rust `String` (which every `Text` value already is,
@@ -1144,7 +1144,7 @@ fn aggregate_field_def(func: AggregateFn, c1: &str, c2: &str) -> FieldDef {
 ///   one. This generator sidesteps that risk entirely by only ever drawing
 ///   `REGEXP_COUNT` patterns from `strategy::REGEXP_COUNT_PATTERN_POOL`, the
 ///   same dialect-common subset (literal text, `.`, `*`, `+`, `?`, `[...]`,
-///   `|`, `^`, `$`) `engine/tests/defs_text_functions.rs` already vets against
+///   `|`, `^`, `$`) `trellis/tests/defs_text_functions.rs` already vets against
 ///   real Postgres — never an arbitrary pattern that might expose that gap.
 ///   A future widening that draws *arbitrary* regex syntax would need to
 ///   cross exactly this boundary (and would be the first place a genuine
@@ -1171,7 +1171,7 @@ fn aggregate_field_def(func: AggregateFn, c1: &str, c2: &str) -> FieldDef {
 /// (`Expr::Column`), never wrapped in an aggregate function — that's exactly
 /// what makes a `OneToOne` field a legal `SELECT` projection. On an
 /// `Aggregate` def, a bare reference to a non-grouping-key source column is
-/// rejected by `engine::defs::validate::validate`'s
+/// rejected by `trellis::defs::validate::validate`'s
 /// `UngroupedColumnReference` check (every row in a group must be folded to
 /// one value before it can appear in the target). So a `DerivedShape` field
 /// could never be attached to an `Aggregate` def and still validate — see
@@ -1283,7 +1283,7 @@ impl DerivedShape {
 /// only ever attached when `derived[j]` is `Some` *and* `defs[j]`'s shape is
 /// `DefShape::OneToOne` — see [`DerivedShape`]'s own doc comment for why an
 /// `Aggregate` def can never legally carry one (every `DerivedShape` variant
-/// references a source column bare, and `engine::defs::validate::validate`
+/// references a source column bare, and `trellis::defs::validate::validate`
 /// rejects a bare, ungrouped column reference on an `Aggregate` def). This
 /// function enforces that pairing with an assertion rather than silently
 /// ignoring a `Some` paired with `DefShape::Aggregate`: a caller that drew
@@ -1380,7 +1380,7 @@ pub fn build_program_multi_with_shapes_and_derived(
 /// `COUNT(*)` has no relationship form at all (`COUNT(<rel>.<column>)` — the
 /// per-related-row count — is a separate shape carried by
 /// [`RelAggregateFn::Count`], and is the *only* `COUNT` shape
-/// `engine::defs::parser` accepts over a path).
+/// `trellis::defs::parser` accepts over a path).
 ///
 /// `Count` is legal only over a **to-many** path in a row-grain (`OneToOne`)
 /// definition. Inside a `GROUP BY` definition the parser routes `COUNT(...)`
@@ -1398,7 +1398,7 @@ pub enum RelAggregateFn {
 
 impl RelAggregateFn {
     /// This function's canonical uppercased name, as
-    /// `engine::defs::registry::AGGREGATE_FUNCTIONS` spells it.
+    /// `trellis::defs::registry::AGGREGATE_FUNCTIONS` spells it.
     pub fn name(self) -> &'static str {
         match self {
             RelAggregateFn::Sum => "SUM",
@@ -1413,7 +1413,7 @@ impl RelAggregateFn {
 /// Which of the three **engine-supported** relationship-reference shapes a
 /// generated definition takes (issue #34). Every other combination of
 /// cardinality × wrapping × key-space is rejected by
-/// `engine::defs::validate`, and an install rejection is a hard failure,
+/// `trellis::defs::validate`, and an install rejection is a hard failure,
 /// never a skip (design doc §3), so those are structurally unrepresentable
 /// here rather than merely undrawn:
 ///
@@ -1701,7 +1701,7 @@ pub fn build_program_multi_with_derived(
 /// By the time `defs[def_index]` installs, `program.ops[0..after_op]` have
 /// already run — including, if `after_op` is chosen past that definition's
 /// own source table's first seed insert, real pre-existing source rows for
-/// [`engine::defs::catalog::install_definition`]'s direct-backfill path to
+/// [`trellis::defs::catalog::install_definition`]'s direct-backfill path to
 /// build from (exactly the scenario `generative/tests/backfill.rs` exercises
 /// by hand against a bare [`crate::backend::ManualBackend`], now reachable
 /// from inside [`crate::run::run_convergence`]'s own op-stream loop). This
@@ -2248,7 +2248,7 @@ mod strategy {
     /// task B1): the empty string; the literal four-character text `"NULL"`
     /// (distinct from SQL `NULL`, i.e. `None` — that's [`value`]'s job, this
     /// is the string that spells the word); a string containing the U+001F
-    /// unit-separator (`engine::intake::extract_key`'s composite-key
+    /// unit-separator (`trellis::intake::extract_key`'s composite-key
     /// delimiter — see the module doc comment's scope-cut note on why this
     /// doesn't yet reach that risk); and a string containing a
     /// comma/quote/backslash (SQL-binding/escaping awkwardness, independent
@@ -2374,7 +2374,7 @@ mod strategy {
     /// Regex patterns [`DerivedShape::RegexpCount`] draws from — restricted
     /// to syntax common to Rust's `regex` crate and Postgres's default ARE
     /// dialect (literal text, `.`, `*`, `+`, `?`, `[...]`, `|`, `^`, `$`),
-    /// the exact same restriction `engine/tests/defs_text_functions.rs`'s
+    /// the exact same restriction `trellis/tests/defs_text_functions.rs`'s
     /// `REGEXP_COUNT_METACHARACTER_CASES` already vets against real
     /// Postgres. See [`DerivedShape`]'s doc comment (the D0 finding) for why
     /// this specific restriction is what keeps `REGEXP_COUNT` eval-time-
@@ -2421,18 +2421,18 @@ mod strategy {
     /// oversight: a `NULL` grouping value is real, standard SQL (Postgres's
     /// `GROUP BY` puts every `NULL` into one group, like any other value),
     /// but this engine's `KeySpace::Aggregate` target-table DDL
-    /// (`engine::defs::ddl::create_aggregate_target_table`) declares the
+    /// (`trellis::defs::ddl::create_aggregate_target_table`) declares the
     /// `group_by` columns as the target's `PRIMARY KEY` — and Postgres
     /// primary-key columns are `NOT NULL` unconditionally, by definition, with
     /// no opt-out. A source row whose grouping column is `NULL` therefore
     /// makes every write to that group's target row fail with a real
     /// Postgres `null value in column ... violates not-null constraint`
     /// error — confirmed directly against a from-scratch, ManualBackend-free
-    /// `engine::staging::apply` repro during this task's own testing, one
+    /// `trellis::staging::apply` repro during this task's own testing, one
     /// `COUNT(*)`-only field, one seeded row with `NULL` grain, nothing else.
     ///
     /// **Corrected during review** (an independent repro against
-    /// `engine::staging::apply::drain_once` directly): the failure is *not*
+    /// `trellis::staging::apply::drain_once` directly): the failure is *not*
     /// an infinite retry of the same segment and does *not* stall the
     /// source table's watermark. `staging::quarantine::classify` routes a
     /// plain constraint-violation error to `FailureClass::Isolate`, whose
@@ -2441,7 +2441,7 @@ mod strategy {
     /// and — once it crosses `quarantine::DEFAULT_DEATH_THRESHOLD` (5,
     /// reached within a *single* `drain_once` call in the repro) — evicts
     /// and parks it, letting the rest of the batch (and every other key)
-    /// drain and apply normally; `engine/tests/quarantine.rs`'s
+    /// drain and apply normally; `trellis/tests/quarantine.rs`'s
     /// `repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still_drains`
     /// already covers this exact recovery path for an unrelated
     /// deterministically-malformed value. The real defect is narrower and
@@ -2510,7 +2510,7 @@ mod strategy {
     ];
 
     /// A drawn `Aggregate` def's non-grouping fields (task B4): 2 to 5 of the
-    /// five aggregate functions (`engine::defs::registry::AGGREGATE_FUNCTIONS`),
+    /// five aggregate functions (`trellis::defs::registry::AGGREGATE_FUNCTIONS`),
     /// each drawn at most once (`subsequence` over [`ALL_FN_KINDS`] never
     /// repeats an element), so multiple functions genuinely co-occur on the
     /// same def without ever needing two fields of the same name. Every
@@ -2518,10 +2518,10 @@ mod strategy {
     /// (not per occurrence, since each function occurs at most once anyway),
     /// so two different functions landing on the *same* column — e.g.
     /// `SUM(c1)` and `AVG(c1)` — is a real, reachable draw: that's precisely
-    /// the shape that exercises `engine::defs::ddl::count_column_names`'s
+    /// the shape that exercises `trellis::defs::ddl::count_column_names`'s
     /// shared hidden-count-column path (two fields aggregating the exact same
     /// argument share one partial column) from the generative side, not just
-    /// `engine/tests/apply_aggregate.rs`'s hand-built fixture.
+    /// `trellis/tests/apply_aggregate.rs`'s hand-built fixture.
     ///
     /// The lower bound of 2 (not 1) guarantees at least two functions always
     /// co-occur, per the improvement-plan task's explicit ask ("draw at least
@@ -2610,7 +2610,7 @@ mod strategy {
     /// Which aggregate function wraps a generated relationship path.
     ///
     /// `in_aggregate_def` excludes [`RelAggregateFn::Count`]: inside a
-    /// `GROUP BY` definition `engine::defs::parser` routes every `COUNT(...)`
+    /// `GROUP BY` definition `trellis::defs::parser` routes every `COUNT(...)`
     /// through its `COUNT(*)`-only branch and rejects `COUNT(<rel>.<col>)`
     /// outright (`UnsupportedAggregateFunction`), so drawing it there would
     /// be a parse-time install rejection — a hard failure, never a skip
@@ -3024,7 +3024,7 @@ mod strategy {
     /// cut, discovered *while building this task*, mirroring
     /// [`grain_value`]'s own precedent for a found-but-out-of-scope engine
     /// bug.** Restarting the primary client mid-stream originally reproduced
-    /// a real engine bug: `engine::intake::Intake::connect` built its
+    /// a real engine bug: `trellis::intake::Intake::connect` built its
     /// `pgwire_replication::ReplicationConfig` with no explicit `start_lsn`,
     /// so a fresh connection resumed from the replication *slot's own*
     /// server-tracked `confirmed_flush_lsn` — which only advances once a
@@ -3039,7 +3039,7 @@ mod strategy {
     /// segment seals — once draining has already applied it, a redelivered
     /// duplicate is a second, independent delta, silently double-counting an
     /// `Aggregate` target's `SUM`/`COUNT`. **Fixed** (see
-    /// `engine::intake::Intake::connect`'s own updated doc comment/code):
+    /// `trellis::intake::Intake::connect`'s own updated doc comment/code):
     /// `Intake::connect` now passes its own durably-read `last_confirmed` as
     /// `start_lsn` explicitly, which can never be behind the slot's own
     /// position, closing the large majority of this race.
@@ -3056,7 +3056,7 @@ mod strategy {
     /// `convergence_holds_across_a_mid_stream_client_restart`/
     /// `a_restart_and_a_scale_out_interleaved_mid_stream_still_converge` doc
     /// comments for the confirmed root cause: a seal/append race in
-    /// `engine::staging::seal::seal_if_active_nonempty`, latent regardless
+    /// `trellis::staging::seal::seal_if_active_nonempty`, latent regardless
     /// of restart or `OneToOne` vs. `Aggregate`, that a restart's extra
     /// timing perturbation (and a tiny test program's near-instant drain)
     /// simply made likely to hit. The `OneToOne` restriction here predates

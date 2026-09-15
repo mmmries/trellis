@@ -3,12 +3,12 @@
 //! source DML, quiesce, and read back via `snapshot()` — the property
 //! declarations, hand-built pins, and meta-tests design doc §1 calls
 //! `tests/` live in this crate's `tests/` directory, matching every other
-//! workspace crate's convention (`engine/tests/*`).
+//! workspace crate's convention (`trellis/tests/*`).
 
-use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use generative::backend::{Backend, ManualBackend};
 use generative::model::{NamePool, Op, OpOutcome, Program, Table};
 use testkit::TestCluster;
+use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 
 #[tokio::test]
 async fn installs_a_trivial_def_and_converges_dml_to_the_expected_snapshot() {

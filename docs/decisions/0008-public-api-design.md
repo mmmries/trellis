@@ -29,7 +29,7 @@ until the shape of what's being embedded is settled.
 
 ## What already exists
 
-`engine/src/app.rs`'s `Trellis` facade (from commit `5e55ee0`) already
+`trellis/src/app.rs`'s `Trellis` facade (from commit `5e55ee0`) already
 implements most of the "planned interactions" #82 lists:
 
 * `Trellis::connect(config, options)` — one entrypoint, `TrellisOptions`
@@ -72,7 +72,7 @@ target is actually built.
 
 **Correction from this doc's first draft:** that draft justified the sync
 decision by pointing out `install_definition`
-(`engine/src/defs/catalog.rs:207`) already blocks synchronously through a full
+(`trellis/src/defs/catalog.rs:207`) already blocks synchronously through a full
 backfill on the fast direct-build path today, and treated "sync call, separate
 poll for completion" as merely formalizing the existing ring-fallback path's
 behavior. That reasoning doesn't survive contact with scale: even the fast,
@@ -100,10 +100,10 @@ worker running *somewhere* in the fleet; a connection that only ever calls
 its definition sit in `waiting_to_backfill` indefinitely — worth calling out
 in whatever documentation eventually covers this for embedders.
 
-**Settled:** the synchronous wrapper (`BlockingTrellis`, `engine/src/blocking.rs`)
-lives directly in the `engine` crate alongside `Trellis`, not in a separate
+**Settled:** the synchronous wrapper (`BlockingTrellis`, `trellis/src/blocking.rs`)
+lives directly in the `trellis` crate alongside `Trellis`, not in a separate
 shim crate — despite this doc's earlier leaning toward a separate crate.
-`engine` remains async-native (`Trellis`'s own methods are untouched);
+`trellis` remains async-native (`Trellis`'s own methods are untouched);
 `BlockingTrellis` is an additive wrapper that owns a dedicated thread running
 its own Tokio runtime (the same pattern `Client::start` already uses
 internally) and guards against being called from a thread that already has a
@@ -153,7 +153,7 @@ Rust-idiomatic nested enums in place and translating only at the FFI shim
 later. Settling this now avoids the FFI shim work in #87 turning into a giant
 `match` over every internal error variant that ever gets added.
 
-**Settled:** `ErrorCode` (`engine/src/error_code.rs`) is a small,
+**Settled:** `ErrorCode` (`trellis/src/error_code.rs`) is a small,
 `#[non_exhaustive]` enum of coarse categories (`Parse`, `Validation`,
 `Connectivity`, `Conflict`, `NotFound`, `Internal`) — one code per broad kind
 of failure an FFI caller would actually branch on, not one per internal Rust

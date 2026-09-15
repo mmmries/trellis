@@ -8,7 +8,7 @@
 //! since Postgres doesn't support binding identifiers — that's fine here
 //! because callers are test code, not untrusted input.
 
-use engine::Pool;
+use trellis::Pool;
 
 /// Creates a minimal source table: `id bigint primary key`, `payload text`,
 /// `updated_at timestamptz`.

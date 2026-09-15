@@ -31,10 +31,10 @@
 
 use std::time::Duration;
 
-use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use generative::backend::{Backend, ManualBackend};
 use generative::model::{NamePool, Op, OpOutcome, Program, Table};
 use testkit::TestCluster;
+use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 
 #[tokio::test]
 async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {

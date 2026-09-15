@@ -24,9 +24,9 @@ is the design it references.
 ## 1. Architecture
 
 The suite is the `generative` crate. It is a workspace member (not out-of-tree),
-so ordinary `cargo build`/`cargo test` compile it and an engine signature change
+so ordinary `cargo build`/`cargo test` compile it and a trellis signature change
 can never rot it silently. It dev-depends on `testkit` (the disposable cluster)
-and `engine`.
+and `trellis`.
 
 `testkit` already provides:
 
@@ -63,7 +63,7 @@ and what prints on failure:
 ```
 Program {
   tables:      [ { name, pk_col, columns: [{name, type}] } ]
-  defs:        [ TransformDef ]         // reuses engine::defs::ast, see §2
+  defs:        [ TransformDef ]         // reuses trellis::defs::ast, see §2
   ops:         [ Insert{table,row} | Update{table,pk,changes} | Delete{table,pk} ]
 }
 ```
@@ -73,7 +73,7 @@ shrunk counterexample you can read at a glance beats one that is technically
 smaller. Give every table its primary-key column **unconditionally**, so no
 shrink step can strand a definition that references it.
 
-`defs` reuses `engine::defs::ast::TransformDef` directly. It started 1-1 /
+`defs` reuses `trellis::defs::ast::TransformDef` directly. It started 1-1 /
 numeric-`+` only; it now also covers `GROUP BY` aggregate definitions and —
 per issue #34 — named relationship declarations (a `relationships` list
 installed ahead of every definition) with the three relationship-reading
@@ -118,7 +118,7 @@ Postgres equivalent is out of scope by definition.
 
 ### The evaluator recompute becomes a secondary cross-check
 
-The existing `engine::defs::oracle::recompute` (evaluator-driven) is retained
+The existing `trellis::defs::oracle::recompute` (evaluator-driven) is retained
 as a **parity check on the mirror-Postgres claim**. Per op we compare three things:
 
 - persisted target **vs. Postgres-SQL oracle** — correctness (a mismatch is a
@@ -309,7 +309,7 @@ reproducibility contract — not by whether it injects faults:
 | 3. Generative + fault actions | random program incl. faults, seeded | same oracle at quiescence | at program level (shrinking) | minutes–hours |
 | 4. Black-box chaos | wall-clock random | invariants over recorded history | no | nightly / pre-release |
 
-- **Layer 1 already exists in Trellis** — `engine/tests/*` and the `testkit`
+- **Layer 1 already exists in Trellis** — `trellis/tests/*` and the `testkit`
   crash/straddler pins. Every race bug found by layers 2–4 terminates as a
   layer-1 pin here.
 - **Layer 2 is what this epic stands up first.**

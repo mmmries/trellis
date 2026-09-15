@@ -1,4 +1,4 @@
-//! Generative correctness test suite for the `engine` crate (issue #3,
+//! Generative correctness test suite for the `trellis` crate (issue #3,
 //! epic #2). See `docs/generative-test-suite.md` for the architecture.
 //!
 //! Five strictly-separated modules (design doc §1):

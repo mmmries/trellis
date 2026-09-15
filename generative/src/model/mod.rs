@@ -7,7 +7,7 @@
 //! this crate generates is byte-for-byte the same shape the parser produces
 //! from concrete syntax.
 
-use engine::defs::ast::{TransformDef, ValueType};
+use trellis::defs::ast::{TransformDef, ValueType};
 
 /// One column on a [`Table`].
 #[derive(Debug, Clone, PartialEq)]
@@ -30,7 +30,7 @@ pub struct Table {
     ///
     /// This exists for relationships: ADR-0006 derives a relationship's
     /// cardinality from whether its **to-side** column is provably unique
-    /// (primary key or `UNIQUE`), and `engine::defs::catalog` introspects
+    /// (primary key or `UNIQUE`), and `trellis::defs::catalog` introspects
     /// that live against `pg_catalog` at `create_relationship` time. A
     /// generated to-one relationship therefore needs a real `UNIQUE`
     /// constraint on the to-side column, which the backend can only emit if
@@ -47,7 +47,7 @@ impl Table {
     /// The PK column is always [`ValueType::Numeric`]: today's generator
     /// scope is 1-1/numeric-`+` definitions only, and a numeric PK is what
     /// every existing engine test builds against (see
-    /// `engine/tests/apply.rs`'s `orders` table).
+    /// `trellis/tests/apply.rs`'s `orders` table).
     pub fn new(pool: &mut NamePool, column_types: &[ValueType]) -> Table {
         let name = pool.next_table_name();
         let pk_col = pool.next_column_name();
@@ -86,7 +86,7 @@ impl Table {
 /// — not declared — from whether the **to-side** column is provably unique:
 /// the concrete-syntax declaration
 /// (`RELATIONSHIP <name> FROM <t>.<c> TO <t>.<c>`) carries no cardinality
-/// keyword at all, and `engine::defs::catalog` introspects `pg_catalog` for a
+/// keyword at all, and `trellis::defs::catalog` introspects `pg_catalog` for a
 /// primary-key/`UNIQUE` index on the to-side column to decide.
 ///
 /// This enum records the cardinality the *generator* built the relationship
@@ -110,7 +110,7 @@ pub enum Cardinality {
 /// `RELATIONSHIP <name> FROM <from_table>.<from_col> TO <to_table>.<to_col>`.
 ///
 /// Plain data, like every other part of a [`Program`] — the concrete syntax
-/// the backend hands `engine::defs::create_relationship` is rendered from
+/// the backend hands `trellis::defs::create_relationship` is rendered from
 /// these fields (see `crate::backend::ManualBackend`), and the oracle renders
 /// its own independent `SELECT` from them too.
 ///
@@ -262,7 +262,7 @@ pub struct Program {
     /// any op runs" (today's only behavior, and [`crate::run::run_convergence`]'s
     /// default). A nonzero value `N` means "install this definition only once
     /// `ops[0..N]` have already been applied" — real rows can already exist
-    /// in `defs[i].source` by then, exercising `engine::defs::catalog::install_definition`'s
+    /// in `defs[i].source` by then, exercising `trellis::defs::catalog::install_definition`'s
     /// direct-backfill-over-preexisting-rows path (the same path
     /// `generative/tests/backfill.rs` exercises by hand, now reachable from
     /// inside the harness's own op-stream loop). Must be index-aligned with
@@ -377,7 +377,7 @@ impl NoisePlan {
     }
 }
 
-/// The composite row-key convention for an [`engine::defs::ast::KeySpace::Aggregate`]
+/// The composite row-key convention for an [`trellis::defs::ast::KeySpace::Aggregate`]
 /// target (improvement-plan task B4): every row in a `GROUP BY` target is
 /// keyed by its grouping column(s)' rendered text values, but unlike a 1-1
 /// target's primary key (never `NULL`, enforced by the source table's own
@@ -389,10 +389,10 @@ impl NoisePlan {
 /// scoped out of the generator for now); this function still handles a
 /// `NULL` component correctly regardless, since a hand-built pin can
 /// construct one directly (see [`crate::generate::TableSpec::grain_values`]'s
-/// doc comment), and [`engine::defs::oracle::recompute_aggregate`]'s own
+/// doc comment), and [`trellis::defs::oracle::recompute_aggregate`]'s own
 /// private `group_key` this mirrors has no such restriction either.
 /// [`crate::oracle`]'s SQL
-/// oracle, its evaluator oracle (via [`engine::defs::oracle::recompute_aggregate`],
+/// oracle, its evaluator oracle (via [`trellis::defs::oracle::recompute_aggregate`],
 /// whose own private `group_key` uses this exact same length-prefixing
 /// scheme independently), and [`crate::backend::ManualBackend`]'s persisted-
 /// target reader all key their rows through this one function, so a group's

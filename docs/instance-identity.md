@@ -29,8 +29,8 @@ distinct schema.
 The schema is created if it does not already exist when migrations run, and the
 connection pool pins `search_path` to it on every connection so Trellis's own
 SQL never needs to qualify names by hand. Resolution and defaulting live in
-`engine/src/config.rs` (`DEFAULT_SCHEMA`); the `search_path` seam lives in
-`engine/src/pool.rs`. `Config::schema()` exposes the resolved schema, and
+`trellis/src/config.rs` (`DEFAULT_SCHEMA`); the `search_path` seam lives in
+`trellis/src/pool.rs`. `Config::schema()` exposes the resolved schema, and
 `Config`'s `Display` impl gives a one-line summary suitable for logging.
 
 A configured name that isn't usable as a schema is rejected before it ever
@@ -52,10 +52,10 @@ the schema could have been recreated, restored under the wrong name, or
 never have been Trellis's to begin with. Each instance therefore writes a
 single-row identity marker, `trellis_instance` (added in migration V9),
 recording the schema name it was created under and an
-`instance_format_version` (see `engine::identity::INSTANCE_FORMAT_VERSION`).
+`instance_format_version` (see `trellis::identity::INSTANCE_FORMAT_VERSION`).
 
-Before the migration runner ever touches the schema, `engine::identity::prepare_attach`
-(called from `engine::migrate`) checks it:
+Before the migration runner ever touches the schema, `trellis::identity::prepare_attach`
+(called from `trellis::migrate`) checks it:
 
 * **Fresh, or ours mid-migration** (schema doesn't exist yet, exists but is
   empty, or exists with Trellis's own migration ledger —
@@ -76,7 +76,7 @@ Before the migration runner ever touches the schema, `engine::identity::prepare_
   surfaces as a typed `Error::IncompatibleInstance` rather than silently
   proceeding.
 
-After the runner has ensured `trellis_instance` exists, `engine::identity::seed_marker`
+After the runner has ensured `trellis_instance` exists, `trellis::identity::seed_marker`
 always runs — an `insert ... on conflict (singleton) do nothing`, not a
 plain insert gated on "is this fresh." That makes seeding idempotent across
 three cases that would otherwise need separate handling: a clean re-attach
@@ -85,5 +85,5 @@ three cases that would otherwise need separate handling: a clean re-attach
 racing to migrate the same brand-new schema for the first time (the loser's
 insert becomes a no-op instead of a unique-violation error).
 
-`engine::identity::Identity::resolved` reports the identity (schema +
+`trellis::identity::Identity::resolved` reports the identity (schema +
 format version) this build would attach as, without touching the database.

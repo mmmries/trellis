@@ -5,7 +5,7 @@
 //! `cli/src/commands/prometheus.rs`'s module doc comment) — it just needs the
 //! flag validated as well-formed, not silently ignored if malformed. The
 //! subcommands that do connect (`define`, `run`, `status`) need the same
-//! DSN — resolved the same way [`engine::Config::resolve`] already resolves
+//! DSN — resolved the same way [`trellis::Config::resolve`] already resolves
 //! it for any embedder: an explicit connection string if the operator gave
 //! one, else `TRELLIS_DATABASE_URL`, else the standard `PGHOST`/`PGPORT`/
 //! `PGUSER`/`PGPASSWORD`/`PGDATABASE` environment variables. This module's
@@ -30,7 +30,7 @@ const SHORT_FLAG: &str = "-d";
 /// this once, on the full argv, before splitting off the subcommand name.
 ///
 /// Returns `Ok(None)` if the flag isn't present at all (callers then fall
-/// back to `engine::Config::resolve`'s own env-var chain). Errors if the flag
+/// back to `trellis::Config::resolve`'s own env-var chain). Errors if the flag
 /// is given with no following value, or given more than once.
 pub fn extract_database_url(args: &mut Vec<String>) -> Result<Option<String>, String> {
     let Some(idx) = args.iter().position(|a| a == LONG_FLAG || a == SHORT_FLAG) else {

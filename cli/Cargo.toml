@@ -1,8 +1,12 @@
 [package]
-name = "trellis"
+name = "trellis-cli"
 version = "0.1.0"
 edition.workspace = true
 
+[[bin]]
+name = "trellis"
+path = "src/main.rs"
+
 [dependencies]
-engine = { path = "../engine" }
+trellis = { path = "../trellis" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "time"] }

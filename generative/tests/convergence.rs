@@ -22,9 +22,6 @@
 //! -p generative --test convergence`). Failing seeds are persisted to the
 //! checked-in `tests/proptest-regressions/convergence.txt` and replayed first.
 
-use engine::defs::ast::Expr;
-use engine::defs::qualified_target_table;
-use engine::{Config, Pool};
 use generative::backend::{Backend, ManualBackend};
 use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, DerivedShape, Mutate, RelAggregateFn, RelFieldKind,
@@ -36,6 +33,9 @@ use generative::run::{RunError, check_program, run_convergence};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
+use trellis::defs::ast::Expr;
+use trellis::defs::qualified_target_table;
+use trellis::{Config, Pool};
 
 /// One tokio runtime and one shared, initdb-once cluster for a test thread's
 /// proptest cases. See the module doc comment for why this is thread-local.
@@ -351,7 +351,7 @@ async fn a_duplicate_pk_insert_error_still_converges() {
 
 /// A seeded row with `NULL` in a nullable column (design doc §3's awkward
 /// values) converges: `NULL + n = NULL` on both sides (Postgres's `numeric`
-/// arithmetic and `engine::defs::eval`'s `Operator::Add` arm agree), so the
+/// arithmetic and `trellis::defs::eval`'s `Operator::Add` arm agree), so the
 /// SQL oracle and the maintained target must agree too.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_null_value_in_a_nullable_column_converges() {
@@ -449,7 +449,7 @@ async fn a_two_table_two_def_program_converges_end_to_end() {
 /// Row 1 carries plain, unremarkable values for all three new columns. Row 2
 /// carries the U+001F ("unit separator") awkward text literal specifically
 /// (design doc §3 / the module doc comment's B1 scope-cut note): it's the
-/// same byte `engine::intake::extract_key`'s composite-key encoding treats
+/// same byte `trellis::intake::extract_key`'s composite-key encoding treats
 /// specially, so proving *this* value round-trips correctly through a plain
 /// `Text` column — SQL binding, the `::text` cast on both insert and every
 /// read-back, this harness's own snapshot diffing — is the most direct way
@@ -551,7 +551,7 @@ async fn a_nested_mixed_operator_and_function_expression_converges_end_to_end() 
         matches!(
             derived,
             Expr::BinaryOp {
-                op: engine::defs::ast::Operator::GreaterThan,
+                op: trellis::defs::ast::Operator::GreaterThan,
                 lhs,
                 ..
             } if matches!(lhs.as_ref(), Expr::FunctionCall { name, .. } if name == "STRPOS")
@@ -656,10 +656,10 @@ async fn an_aggregate_group_emptied_by_deletes_converges_and_the_row_disappears(
 }
 
 /// Improvement-plan task B4: `MIN`/`MAX` are always
-/// `engine::defs::invertibility::Invertibility::RecomputeOnly` (never
+/// `trellis::defs::invertibility::Invertibility::RecomputeOnly` (never
 /// delta-maintained) — deleting a group's *current* extreme member must
 /// recompute the new extreme from the group's remaining rows, not fall back
-/// to a stale cached value. `engine/tests/apply_aggregate.rs` already covers
+/// to a stale cached value. `trellis/tests/apply_aggregate.rs` already covers
 /// this shape by hand at the engine layer; this pin drives the identical
 /// edge through the generative harness's own convergence property, so a
 /// regression here is caught by the same three-way (target/evaluator/SQL)
@@ -719,10 +719,10 @@ async fn deleting_a_groups_current_min_and_max_forces_a_real_recompute() {
 }
 
 /// Improvement-plan task B4: `AVG`'s hidden sum/count partials
-/// (`engine::defs::invertibility::PartialField`), and — since this def's
+/// (`trellis::defs::invertibility::PartialField`), and — since this def's
 /// `SUM` and `AVG` both aggregate the exact same column — the shared hidden
-/// running-count column `engine::defs::ddl::count_column_names` gives them
-/// (`engine/tests/apply_aggregate.rs` covers the shared-count-column shape by
+/// running-count column `trellis::defs::ddl::count_column_names` gives them
+/// (`trellis/tests/apply_aggregate.rs` covers the shared-count-column shape by
 /// hand; this drives the same shape through the generative harness). An
 /// insert, an update that changes the aggregated value, and a delete all
 /// land in the same group, so every fold path (insert delta, update delta,
@@ -780,7 +780,7 @@ async fn avg_and_sum_over_the_same_column_share_a_partial_and_stay_correct_throu
     // Postgres's numeric division picks its own display scale (e.g.
     // `50.0000000000000000`), which this grammar's `AVG` inherits rather
     // than reformats — compare by parsed value, not exact text, matching
-    // `engine/tests/apply_aggregate.rs`'s own `assert_count_and_avg` helper.
+    // `trellis/tests/apply_aggregate.rs`'s own `assert_count_and_avg` helper.
     let avg: f64 = row["avg_c1"]
         .as_deref()
         .expect("avg_c1 must not be NULL")
@@ -1152,7 +1152,7 @@ async fn truncating_a_relationship_to_side_table_leaves_a_stale_aggregate_enrich
 /// *through a relationship* used to leave that definition's enrichment
 /// permanently stale.
 ///
-/// Mechanism (`engine::staging::apply`): the truncate-clear path resolves
+/// Mechanism (`trellis::staging::apply`): the truncate-clear path resolves
 /// affected targets with `catalog::transforms_for_source` — definitions whose
 /// **source** is the truncated table — while reverse propagation into
 /// definitions that merely *read* the table lived in the separate keyed
@@ -1167,7 +1167,7 @@ async fn truncating_a_relationship_to_side_table_leaves_a_stale_aggregate_enrich
 /// `LEFT JOIN` finds nothing and says `NULL`; the maintained target used to
 /// still say `22`.
 ///
-/// Fixed by having the truncate-clear path (`engine/src/staging/apply.rs`)
+/// Fixed by having the truncate-clear path (`trellis/src/staging/apply.rs`)
 /// also resolve `catalog::relationships_to_table` for the truncated table and
 /// stage every from-side row with a non-`NULL` join column as a reverse
 /// recompute, through the same `reverse_recomputes` accumulator the

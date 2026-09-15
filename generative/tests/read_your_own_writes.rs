@@ -20,10 +20,10 @@
 //! statement's own transaction commits — nothing about that commit touches
 //! the engine. Reflecting it in the target requires, at minimum: the
 //! logical-replication stream delivering and decoding the WAL record
-//! (`engine::intake`), appending it to the staging ring, *sealing* the
+//! (`trellis::intake`), appending it to the staging ring, *sealing* the
 //! active segment — which only happens on the staging worker's fixed
 //! `maintenance_interval` tick (**300ms** by default,
-//! `engine::client::ClientOptions::maintenance_interval`, and this backend
+//! `trellis::client::ClientOptions::maintenance_interval`, and this backend
 //! never overrides it — see `ManualBackend::install`) — then claiming,
 //! folding, and applying that batch. Every one of those is a separate
 //! asynchronous hop, several of them gated behind a fixed poll that only
@@ -44,7 +44,6 @@
 //! probability of every single attempt racing the ~300ms tick and losing is
 //! astronomically lower than any one attempt doing so.
 
-use engine::{Config, Pool};
 use generative::backend::{Backend, ManualBackend};
 use generative::generate::{
     DefShape, RelFieldKind, RelFieldSpec, TableSpec, build_program,
@@ -53,6 +52,7 @@ use generative::generate::{
 use generative::model::{Op, OpOutcome};
 use generative::run::check_program;
 use testkit::TestCluster;
+use trellis::{Config, Pool};
 
 /// How many distinct updates to race against `quiesce()` before concluding
 /// the negative control couldn't demonstrate staleness at all (see the

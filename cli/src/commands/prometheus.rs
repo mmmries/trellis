@@ -1,7 +1,7 @@
 //! `trellis prometheus [--bind <ADDR>]` — a Prometheus-scrapeable HTTP
 //! listener for the engine's metrics.
 //!
-//! There is no metrics registry in `engine` yet (tracked as issue #51, "in-
+//! There is no metrics registry in `trellis` yet (tracked as issue #51, "in-
 //! process registry"), and no Prometheus text-exposition support either
 //! (issue #53, "Prometheus exposition via mountable render_prometheus()").
 //! So this command can't actually serve metrics today. What it *can* do is

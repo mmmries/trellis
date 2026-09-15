@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["engine", "benchmark", "cli", "generative", "testkit"]
+members = ["trellis", "benchmark", "cli", "generative", "testkit"]
 
 [workspace.package]
 edition = "2024"

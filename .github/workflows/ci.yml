@@ -38,7 +38,7 @@ jobs:
       - name: Install PostgreSQL server binaries
         # the shared test harness (see testkit/src/cluster.rs) shells out to
         # initdb/postgres/pg_isready/createdb/dropdb to spin up throwaway
-        # instances for engine's (and other crates') integration tests.
+        # instances for trellis's (and other crates') integration tests.
         # Prefer PostgreSQL server binaries already present on the runner (not
         # necessarily on PATH); fall back to installing the distro package.
         run: |

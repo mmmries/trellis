@@ -1,9 +1,9 @@
 //! The independent recompute oracle (design doc §2): renders a
-//! [`engine::defs::ast::TransformDef`]'s formulas back to a `SELECT` against
+//! [`trellis::defs::ast::TransformDef`]'s formulas back to a `SELECT` against
 //! the source and treats Postgres itself as the correctness authority. Uses
 //! only the shared components design doc §2 names — the parser AST, a small
 //! AST→`SELECT` printer written here (sharing no code with the engine's
-//! evaluator), and [`engine::defs::oracle::recompute`] (evaluation, a
+//! evaluator), and [`trellis::defs::oracle::recompute`] (evaluation, a
 //! *secondary* parity check, not the pipeline-driving maintenance code that
 //! is [`crate::backend`]'s job alone).
 //!
@@ -13,7 +13,7 @@
 //!
 //! - **persisted target** — what [`crate::backend::Backend::snapshot`] read
 //!   back from the maintained target table;
-//! - **evaluator** — [`engine::defs::oracle::recompute`], the engine's own
+//! - **evaluator** — [`trellis::defs::oracle::recompute`], the engine's own
 //!   evaluator run from scratch;
 //! - **SQL oracle** — the definition rendered back to a `SELECT` and run by
 //!   Postgres itself.
@@ -27,9 +27,9 @@
 //!
 //! # DB access
 //!
-//! Both oracles take an [`engine::Pool`] — a connection handle — exactly as
-//! [`engine::defs::oracle::recompute`] already does. The oracle *reads*; it
-//! never imports `engine::client`/`engine::staging` or otherwise drives the
+//! Both oracles take an [`trellis::Pool`] — a connection handle — exactly as
+//! [`trellis::defs::oracle::recompute`] already does. The oracle *reads*; it
+//! never imports `trellis::client`/`trellis::staging` or otherwise drives the
 //! maintenance pipeline (that seam is [`crate::backend`]'s alone). A
 //! pool connection has its `search_path` pinned, so an unqualified source
 //! table name resolves the same way `recompute` relies on.
@@ -38,11 +38,11 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
-use engine::Pool;
-use engine::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use engine::defs::oracle::{OracleError, recompute, recompute_aggregate};
-use engine::defs::registry;
-use engine::numeric::Numeric;
+use trellis::Pool;
+use trellis::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use trellis::defs::oracle::{OracleError, recompute, recompute_aggregate};
+use trellis::defs::registry;
+use trellis::numeric::Numeric;
 
 use crate::model::{Cardinality, Program, Relationship, Table, group_key};
 
@@ -60,7 +60,7 @@ enum Comparison {
     /// Byte-exact text equality — int, text, date, timestamp, uuid, boolean.
     Exact,
     /// Decimal by value, ignoring scale (`2.50 ≡ 2.5`), via
-    /// [`engine::numeric::Numeric`] rather than hand-rolled parsing.
+    /// [`trellis::numeric::Numeric`] rather than hand-rolled parsing.
     DecimalByValue,
     /// Combined absolute+relative tolerance for floats. **Unreachable
     /// today**: [`ValueType`] has no float variant, so no column or
@@ -254,7 +254,7 @@ impl fmt::Display for ThreeWayReport {
 }
 
 /// Quotes a Postgres identifier for safe interpolation into rendered SQL,
-/// mirroring `engine::pool`'s own (crate-private) helper of the same name.
+/// mirroring `trellis::pool`'s own (crate-private) helper of the same name.
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
@@ -262,7 +262,7 @@ fn quote_ident(ident: &str) -> String {
 /// Renders a calculated-field expression back to Postgres SQL text.
 ///
 /// Deliberately independent of the engine's evaluator *and* of
-/// `engine::defs::oracle::render_expr_sql` — the oracle's whole value is that
+/// `trellis::defs::oracle::render_expr_sql` — the oracle's whole value is that
 /// its `SELECT` shares no code with the thing it checks (both happen to
 /// choose the same idiomatic rendering — quoted identifiers, an explicit cast
 /// on every literal, `name(args)` for a function call — independently, not by
@@ -283,7 +283,7 @@ fn quote_ident(ident: &str) -> String {
 /// a false differential.
 ///
 /// **Collation.** `>` here is `Numeric, Numeric -> Boolean`
-/// (`engine::defs::registry::OPERATORS` never gives it a `Text` operand), and
+/// (`trellis::defs::registry::OPERATORS` never gives it a `Text` operand), and
 /// none of the five scalar functions performs a collation-sensitive
 /// comparison: `STRPOS` is a plain substring search (byte/character match,
 /// not locale ordering), `OCTET_LENGTH`/`CHAR_LENGTH` just count,
@@ -310,7 +310,7 @@ fn render_expr(expr: &Expr) -> String {
             };
             format!("({} {symbol} {})", render_expr(lhs), render_expr(rhs))
         }
-        // `COUNT(*)` (task B4, mirroring `engine::defs::oracle::render_expr_sql`'s
+        // `COUNT(*)` (task B4, mirroring `trellis::defs::oracle::render_expr_sql`'s
         // own special case): the parser's only accepted `COUNT` shape has no
         // argument at all in the AST (`args` is empty), so `*` is rendered
         // back explicitly rather than falling through to the generic
@@ -460,7 +460,7 @@ fn collect_join_rels<'a>(expr: &'a Expr, rels: &RelIndex<'_>, out: &mut BTreeSet
 /// # Panics
 ///
 /// On a bare to-many path or an aggregate wrapping something other than a
-/// single path — shapes `engine::defs::validate` rejects, which the generator
+/// single path — shapes `trellis::defs::validate` rejects, which the generator
 /// therefore never emits. Refusing to guess (design doc §2) keeps a future
 /// widening a loud failure rather than a silent false differential.
 fn render_rel_expr(expr: &Expr, source: &str, rels: &RelIndex<'_>) -> String {
@@ -692,7 +692,7 @@ fn render_select(def: &TransformDef, pk_column: &str, rels: &RelIndex<'_>) -> St
 /// pk expression in the rendered `SELECT` (see [`render_select`]'s doc
 /// comment), so this instead locates each `group_by` column by name among
 /// `def.fields` (every grouping column has a passthrough field of the same
-/// name — enforced by `engine::defs::validate::validate`'s
+/// name — enforced by `trellis::defs::validate::validate`'s
 /// `GroupingColumnFieldMustBePassthrough` check) and excludes it from the
 /// row's own `by_column` map, exactly as [`target_fields`] excludes the 1-1
 /// pk column.
@@ -760,8 +760,8 @@ pub async fn sql_oracle(
 }
 
 /// Recomputes `def`'s target with the engine's own evaluator
-/// ([`engine::defs::oracle::recompute`] for 1-1,
-/// [`engine::defs::oracle::recompute_aggregate`] for `Aggregate` — task B4)
+/// ([`trellis::defs::oracle::recompute`] for 1-1,
+/// [`trellis::defs::oracle::recompute_aggregate`] for `Aggregate` — task B4)
 /// and renders each [`Value`] to text, into field-only [`Rows`] keyed by the
 /// primary key (1-1) or the grouping columns' composite [`group_key`]
 /// (`Aggregate`, already computed by `recompute_aggregate` itself, since it's
@@ -775,7 +775,7 @@ pub async fn sql_oracle(
 /// column(s) are excluded from `by_column`, matching [`sql_oracle`]'s
 /// `Aggregate` arm.
 ///
-/// [`Value`]: engine::defs::eval::Value
+/// [`Value`]: trellis::defs::eval::Value
 pub async fn evaluator_oracle(
     pool: &Pool,
     def: &TransformDef,
@@ -950,7 +950,7 @@ pub fn three_way(
 ///
 /// Task B2 widens it again: `BinaryOp`/`FunctionCall`'s return type is no
 /// longer hardcoded `Numeric` either — it's read off
-/// `engine::defs::registry::operator_spec`/`lookup_function`, the same
+/// `trellis::defs::registry::operator_spec`/`lookup_function`, the same
 /// source of truth the parser/validator/evaluator all already share
 /// (ADR-0004), rather than this oracle keeping its own separate copy of
 /// "which operator/function returns which type" that could silently drift
@@ -991,7 +991,7 @@ fn field_value_type(
             .unwrap_or_else(|| {
                 panic!(
                     "oracle: unknown function {name:?} — the generator only ever builds calls \
-                     registered in engine::defs::registry::FUNCTIONS or \
+                     registered in trellis::defs::registry::FUNCTIONS or \
                      AGGREGATE_FUNCTION_SPECS; extend field_value_type (and render_expr) if \
                      that set ever widens"
                 )
@@ -1023,7 +1023,7 @@ pub async fn check(
     let target = target_fields(target, pk_column);
 
     // Issue #34: the evaluator leg does not exist for a relationship-reading
-    // definition. `engine::defs::oracle::recompute`/`recompute_aggregate`
+    // definition. `trellis::defs::oracle::recompute`/`recompute_aggregate`
     // select only *source* columns and run each row through `evaluate`,
     // whose empty `RelationshipContext` makes any path an
     // `EvalError::UnsupportedRelationshipPath` — the engine documents this
@@ -1038,7 +1038,7 @@ pub async fn check(
     // when printed. The *authority* leg — the one that catches a pipeline /
     // fold / apply / ordering bug — is unaffected; what's lost is the
     // secondary ADR-0004 parity cross-check, which would need a
-    // `recompute_with_relationships` entry point in `engine/` to restore
+    // `recompute_with_relationships` entry point in `trellis/` to restore
     // (out of scope for this issue, which is generative-crate-only).
     if uses_relationships(def) {
         let mut report = three_way(program, def, source_columns, &target, &sql, &sql);
@@ -1200,7 +1200,7 @@ mod tests {
             target: "d0".into(),
             source: "t0".into(),
             key_space: KeySpace::OneToOne,
-            fields: vec![engine::defs::ast::FieldDef {
+            fields: vec![trellis::defs::ast::FieldDef {
                 name: "total".into(),
                 expr: Expr::BinaryOp {
                     op: Operator::Add,
@@ -1220,7 +1220,7 @@ mod tests {
     /// panicking (the old pin here, `render_select_panics_on_an_aggregate_key_space`,
     /// asserted the pre-B4 refuse-to-guess behavior; this is its
     /// replacement now that the real thing works). Mirrors the
-    /// `order_summary` shape `engine/tests/apply_aggregate.rs` uses as its
+    /// `order_summary` shape `trellis/tests/apply_aggregate.rs` uses as its
     /// own model aggregate definition.
     #[test]
     fn render_select_renders_a_group_by_aggregate() {
@@ -1231,18 +1231,18 @@ mod tests {
                 group_by: vec!["grain".into()],
             },
             fields: vec![
-                engine::defs::ast::FieldDef {
+                trellis::defs::ast::FieldDef {
                     name: "grain".into(),
                     expr: Expr::Column("grain".into()),
                 },
-                engine::defs::ast::FieldDef {
+                trellis::defs::ast::FieldDef {
                     name: "total".into(),
                     expr: Expr::FunctionCall {
                         name: "SUM".into(),
                         args: vec![Expr::Column("c1".into())],
                     },
                 },
-                engine::defs::ast::FieldDef {
+                trellis::defs::ast::FieldDef {
                     name: "cnt".into(),
                     expr: Expr::FunctionCall {
                         name: "COUNT".into(),
@@ -1307,7 +1307,7 @@ mod tests {
     /// `field_value_type` (which drives per-cell comparison choice) actually
     /// agrees that every one of the five aggregate functions — both the
     /// `Invertible` ones (`SUM`/`COUNT`/`AVG`) and the `RecomputeOnly` ones
-    /// (`MIN`/`MAX`, see `engine::defs::invertibility`) — produces a Numeric
+    /// (`MIN`/`MAX`, see `trellis::defs::invertibility`) — produces a Numeric
     /// result, since that's what selects `Comparison::DecimalByValue` over
     /// `Comparison::Exact` for the field.
     #[test]
@@ -1412,7 +1412,7 @@ mod tests {
             target: "d0".into(),
             source: "t0".into(),
             key_space: KeySpace::OneToOne,
-            fields: vec![engine::defs::ast::FieldDef {
+            fields: vec![trellis::defs::ast::FieldDef {
                 name: "rel_enrich".into(),
                 expr: path(),
             }],
@@ -1436,7 +1436,7 @@ mod tests {
             target: "d0".into(),
             source: "t0".into(),
             key_space: KeySpace::OneToOne,
-            fields: vec![engine::defs::ast::FieldDef {
+            fields: vec![trellis::defs::ast::FieldDef {
                 name: "rel_agg".into(),
                 expr: Expr::FunctionCall {
                     name: "SUM".into(),
@@ -1473,11 +1473,11 @@ mod tests {
                 group_by: vec!["k".into()],
             },
             fields: vec![
-                engine::defs::ast::FieldDef {
+                trellis::defs::ast::FieldDef {
                     name: "k".into(),
                     expr: Expr::Column("k".into()),
                 },
-                engine::defs::ast::FieldDef {
+                trellis::defs::ast::FieldDef {
                     name: "rel_agg".into(),
                     expr: Expr::FunctionCall {
                         name: "SUM".into(),
@@ -1506,7 +1506,7 @@ mod tests {
             target: "d0".into(),
             source: "t0".into(),
             key_space: KeySpace::OneToOne,
-            fields: vec![engine::defs::ast::FieldDef {
+            fields: vec![trellis::defs::ast::FieldDef {
                 name: "rel_enrich".into(),
                 expr: path(),
             }],
@@ -1526,7 +1526,7 @@ mod tests {
             target: "d0".into(),
             source: "t0".into(),
             key_space: KeySpace::OneToOne,
-            fields: vec![engine::defs::ast::FieldDef {
+            fields: vec![trellis::defs::ast::FieldDef {
                 name: "rel_enrich".into(),
                 expr: Expr::RelationshipPath {
                     rel: "nope".into(),
@@ -1591,7 +1591,7 @@ mod tests {
 
     /// A string literal renders as a single-quote-escaped, explicitly
     /// `::text`-cast Postgres literal — the same explicit-cast convention
-    /// `engine::defs::oracle::render_expr_sql` independently uses for the
+    /// `trellis::defs::oracle::render_expr_sql` independently uses for the
     /// same reason (an unadorned string constant leaves Postgres to infer a
     /// type, and an explicit cast removes that ambiguity).
     #[test]
@@ -1637,7 +1637,7 @@ mod tests {
     }
 
     /// [`field_value_type`] reads `>`'s return type off the shared registry
-    /// (`engine::defs::registry::operator_spec`) rather than hardcoding it —
+    /// (`trellis::defs::registry::operator_spec`) rather than hardcoding it —
     /// this pins that it actually gets `Boolean`, not the `Numeric` every
     /// prior operator (`+`) happened to return.
     #[test]

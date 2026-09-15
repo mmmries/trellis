@@ -10,7 +10,7 @@
 //! oracle, and per-op checking are all identical between the two files; only
 //! the worker count (and, here, the burst-batching knob below) differ.
 //!
-//! [`EngineClient`]: engine::Client
+//! [`EngineClient`]: trellis::Client
 //!
 //! # What this is *not*: harness-issued concurrent/out-of-order ops
 //!
@@ -40,7 +40,7 @@
 //! one row's change is ever in flight — a naive N-worker backend driven that
 //! way mostly proves "N idle-ish workers don't duplicate/corrupt a single
 //! claim," not that a real batch gets split and drained by several workers at
-//! once (`engine::staging::claim`'s bucket-splitting only kicks in above a
+//! once (`trellis::staging::claim`'s bucket-splitting only kicks in above a
 //! sealed batch's own row-count threshold). [`run_convergence_bursty`]
 //! (`generative::run`) applies several already-generated ops back-to-back,
 //! with no `quiesce()` in between, before checking convergence once per
@@ -107,7 +107,6 @@
 //! why); this file's `HARNESS` is its own, independent `thread_local`, so the
 //! two test binaries never share a cluster or a slot/publication.
 
-use engine::{Config, Pool};
 use generative::backend::ManualBackend;
 use generative::generate::{
     Mutate, build_program, schedule_restart, schedule_scale_out, trivial_program,
@@ -116,6 +115,7 @@ use generative::run::{RunError, run_convergence, run_convergence_bursty};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
+use trellis::{Config, Pool};
 
 /// How many application-worker tasks the property's `ManualBackend` runs.
 /// Fixed (not drawn) and small: this property's job is proving the
@@ -266,9 +266,9 @@ async fn a_hand_built_program_converges_under_the_concurrent_backend() {
 }
 
 /// The non-negotiable D4 pin: a batch that **genuinely exceeds** the engine's
-/// real split threshold (`engine::staging::claim::MIN_ROWS_TO_SPLIT`, 256 as
+/// real split threshold (`trellis::staging::claim::MIN_ROWS_TO_SPLIT`, 256 as
 /// of this writing — not imported here, per the backend seam's "nothing
-/// outside `generative::backend` may import `engine::staging`" rule; see
+/// outside `generative::backend` may import `trellis::staging`" rule; see
 /// `ManualBackend::max_bucket_count`'s doc comment for the one sanctioned
 /// door back out) gets seen, sealed, split into more than one bucket, and
 /// drained correctly by more than one worker.
@@ -340,13 +340,13 @@ async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
 }
 
 /// Cross-cutting holistic-review pin: the phase-gap-straggler fix
-/// (`engine::staging::seal::seal_if_active_nonempty`'s straggler-catching
-/// case, `engine::staging::converge::converged_through`'s condition 3 — see
+/// (`trellis::staging::seal::seal_if_active_nonempty`'s straggler-catching
+/// case, `trellis::staging::converge::converged_through`'s condition 3 — see
 /// `generative/tests/client_lifecycle.rs`'s module doc comment for the full
 /// writeup) was found and fixed entirely under the *single*-worker,
 /// burst-batching runtime (`ManualBackend::connect`/`connect_with_options`
 /// with `application_threads: 1`). That fix's own regression coverage
-/// (`client_lifecycle.rs`, `engine/tests/sealing.rs`, `engine/tests/converge.rs`)
+/// (`client_lifecycle.rs`, `trellis/tests/sealing.rs`, `trellis/tests/converge.rs`)
 /// never drives it through this file's genuinely-concurrent, more-than-one-
 /// application-worker runtime at the same time as a restart/scale-out —
 /// i.e. nothing on this branch previously confirmed the fix holds when the

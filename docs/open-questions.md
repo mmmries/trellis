@@ -16,7 +16,7 @@ storage and the read APIs but left the policy knobs open:
 * Retry-with-backoff vs. immediate quarantine, and whether a dead-letter area
   is needed.
 
-Issue #16 (per-key isolate/evict/park/release, `engine/src/staging/quarantine.rs`)
+Issue #16 (per-key isolate/evict/park/release, `trellis/src/staging/quarantine.rs`)
 resolved two of these knobs for its own poison/poison_held/key_deaths track —
 a distinct mechanism from ADR-0003's transform-wide fuse, but facing the same
 open questions:

@@ -16,9 +16,9 @@
 //!   incremental delta path.
 //!
 //! As of M3 (issue #63) both phases build their target with
-//! [`engine::defs::backfill_definition`] — a direct, key-range-chunked
+//! [`trellis::defs::backfill_definition`] — a direct, key-range-chunked
 //! source→target build that bypasses the staging ring — paired with
-//! [`engine::defs::create_definition_without_backfill`] so the ring
+//! [`trellis::defs::create_definition_without_backfill`] so the ring
 //! enumeration doesn't also run. The build is synchronous and complete on
 //! return, so each phase is timed by simply wrapping the `backfill_definition`
 //! call; the pre-M3 `Client` + `has_pending` convergence poll is gone.
@@ -26,18 +26,18 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use engine::config::DEFAULT_SCHEMA;
-use engine::defs::{
+use testkit::TestCluster;
+use tokio_postgres::{Client as RawClient, NoTls};
+use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::{
     ValueType, backfill_definition, create_aggregate_target_table,
     create_definition_without_backfill, create_target_table, parse, source_primary_key,
 };
-use testkit::TestCluster;
-use tokio_postgres::{Client as RawClient, NoTls};
 
 use crate::generate;
 
-/// Connects directly to `dsn` (bypassing `engine::Pool`), matching the
-/// convention `engine`'s own integration tests use — the reference-floor and
+/// Connects directly to `dsn` (bypassing `trellis::Pool`), matching the
+/// convention `trellis`'s own integration tests use — the reference-floor and
 /// correctness queries below want a plain `tokio_postgres::Client`, which the
 /// pool's wrapped client doesn't expose, so they go through a raw connection.
 pub(crate) async fn connect_raw(dsn: &str) -> RawClient {
@@ -267,8 +267,8 @@ async fn measure_write_floor(raw: &RawClient) -> u128 {
 /// definition rather than hand-duplicated) — an exact-value check, not just
 /// a row count. Returns whether it matched, plus the group count for
 /// reporting.
-async fn check_correctness(raw: &RawClient, def: &engine::defs::ast::TransformDef) -> (bool, i64) {
-    let oracle_sql = engine::defs::render_aggregate_select_sql(def);
+async fn check_correctness(raw: &RawClient, def: &trellis::defs::ast::TransformDef) -> (bool, i64) {
+    let oracle_sql = trellis::defs::render_aggregate_select_sql(def);
     let oracle_sql =
         format!("select author::text, total_size::text, post_count::text from ({oracle_sql}) o");
     let oracle: HashMap<String, (Option<String>, Option<String>)> = raw

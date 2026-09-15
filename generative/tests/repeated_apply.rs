@@ -64,12 +64,12 @@
 //!   row without dropping or double-applying either one," which is the
 //!   actual, honest scope of this task.
 
-use engine::{Config, Pool};
 use generative::backend::{Backend, ManualBackend};
 use generative::generate::{Mutate, build_program};
 use generative::model::OpOutcome;
 use generative::run::check_program;
 use testkit::TestCluster;
+use trellis::{Config, Pool};
 
 /// The genuinely non-trivial D1 case: two `Update`s against the same row,
 /// back to back (no quiesce in between, so both deltas can land close

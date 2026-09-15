@@ -12,13 +12,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use engine::defs::ast::{Expr, KeySpace, Operator, TransformDef, ValueType};
+use trellis::defs::ast::{Expr, KeySpace, Operator, TransformDef, ValueType};
 
 use crate::model::{Cardinality, Op, OpOutcome, Program, Relationship};
 
 /// Per-run coverage tallies over any number of [`Program`]s. Every field is
 /// keyed on the `&'static str` name of the variant it tallies, not the
-/// engine/model enum itself — [`ValueType`] in particular has no `Hash` impl
+/// trellis/model enum itself — [`ValueType`] in particular has no `Hash` impl
 /// (it's an engine type, not owned by this crate), so this follows the same
 /// name-mapping convention `tests/coverage.rs`'s `sorted_value_types` helper
 /// already uses.
@@ -38,7 +38,7 @@ pub struct Coverage {
     /// while walking `expr_shapes`.
     pub operators: HashSet<&'static str>,
     /// Which function names (the [`Expr::FunctionCall`] `name` field, one of
-    /// `engine::defs::registry::FUNCTIONS`/`AGGREGATE_FUNCTION_SPECS`'s
+    /// `trellis::defs::registry::FUNCTIONS`/`AGGREGATE_FUNCTION_SPECS`'s
     /// canonical uppercased names) appear across every `FieldDef.expr` on
     /// every def, walked recursively alongside `expr_shapes` (improvement-plan
     /// task B2). An unrecognized function name is tallied as `"Other"` rather
@@ -322,7 +322,7 @@ fn operator_name(op: Operator) -> &'static str {
 
 /// Maps a [`Expr::FunctionCall`] name to a stable `&'static str` for
 /// [`Coverage::functions`], matching the canonical uppercased names
-/// `engine::defs::registry::FUNCTIONS`/`AGGREGATE_FUNCTION_SPECS` already use
+/// `trellis::defs::registry::FUNCTIONS`/`AGGREGATE_FUNCTION_SPECS` already use
 /// (and the generator only ever builds). A name outside that fixed set
 /// collapses to `"Other"` rather than leaking an arbitrary caller-owned
 /// `String` into a `HashSet<&'static str>`.
