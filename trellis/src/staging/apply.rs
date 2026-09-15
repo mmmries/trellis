@@ -981,23 +981,25 @@ pub struct ApplyPlan {
     /// out of scope for this issue (see `staging::apply_aggregate`'s module
     /// doc comment for the rest of what this issue does cover).
     ///
-    /// Investigated (issue #11 review): could a definition actually be
-    /// *created* reading from an aggregate target today, making this skip a
-    /// live correctness gap rather than a moot one? Yes — `defs::validate`/
-    /// `create_definition` impose no primary-key-shape check at
-    /// definition-creation time, so nothing stops such a definition from
-    /// being saved. But `compute()`'s Phase 2 unconditionally calls
-    /// `ddl::source_primary_key` for every distinct source table a batch's
-    /// folded changes touch, *before* any per-definition dispatch — so the
-    /// very first drain attempt against that source fails loudly with
-    /// `DdlError::CompositePrimaryKeyUnsupported` (surfaced as
-    /// [`ApplyError::Ddl`]), before the encoded composite group-key text
-    /// could ever be misread as a single-column key. The ordinary
-    /// aggregate-write path below (the "3b" step) stages downstream
-    /// Recompute rows keyed the same encoded way for exactly the same
-    /// reason: both paths are consistent in outcome (fail loud, never
-    /// silently misuse the key) regardless of which one a batch takes, so
-    /// this skip is not a live gap today.
+    /// Investigated (issue #11 review, corrected during #51/#52 review):
+    /// could a definition actually be *created* reading from an aggregate
+    /// target today, making this skip a live correctness gap rather than a
+    /// moot one? Yes, and the originally-assumed safety net does **not**
+    /// reliably prevent it: `defs::validate`/`create_definition` impose no
+    /// primary-key-shape check at definition-creation time, and
+    /// `ddl::source_primary_key` only rejects a source with *more than one*
+    /// PK column — a single-column `GROUP BY` (the common case) produces a
+    /// genuinely single-column aggregate-target PK, so
+    /// `DdlError::CompositePrimaryKeyUnsupported` never fires for it. The
+    /// encoded composite group-key text (`derive_group_key`'s
+    /// `"{len}:{value}"` shape, `apply_aggregate.rs`) reaches a real
+    /// evaluator and gets misread as a raw PK value — confirmed to crash
+    /// for a numeric-typed group column, and plausibly silently corrupts
+    /// downstream rows for a text-typed one. **Tracked as
+    /// [#103](https://github.com/salesforce-misc/trellis/issues/103)**, a
+    /// pre-existing bug independent of #51/#52's observability work. Fixing
+    /// it is out of scope here; this doc comment previously (incorrectly)
+    /// described the gap as moot for every group-by shape — it is not.
     aggregate_clears: HashMap<String, AggregateClearPlan>,
     /// Issue #16: the (non-truncate) folded records whose `(src_table,
     /// key)` is already in the `poison` marker table — excluded from every
@@ -2188,17 +2190,20 @@ pub async fn apply_and_mark_drained_many(
     // groups fold into the same `changed` accounting as the 1-1 case, so
     // downstream propagation below needs no branching of its own. This
     // stages Recompute rows keyed by the encoded composite group key, same
-    // as any 1-1 target — see [`ApplyPlan::aggregate_clears`]'s doc comment
-    // for why that is not a live misuse risk today: no definition reading
-    // from an aggregate target can actually survive its first drain attempt.
-    // `src_changed` is always `None` here (rather than threaded from
-    // `apply_aggregate::AggregateTargetPlan`, out of scope for issues
-    // #51/#52's fix — see this module's `apply_aggregate` submodule, whose
-    // group written/deleted shape carries no origin today): a moot gap, not
-    // a live one, for the exact same reason `aggregate_clears` already
-    // documents — no definition can actually survive its first drain attempt
-    // reading from an aggregate target's composite key, so the `Recompute`
-    // rows staged from this branch never reach a real evaluator anyway.
+    // as any 1-1 target — see [`ApplyPlan::aggregate_clears`]'s doc comment,
+    // corrected during #51/#52's review: chaining a definition onto a
+    // single-group-by-column aggregate target *is* live and reachable, and
+    // is a real (pre-existing, unrelated) bug tracked as
+    // [#103](https://github.com/salesforce-misc/trellis/issues/103).
+    // `src_changed` is always `None` here (`apply_aggregate::AggregateTargetPlan`'s
+    // written/deleted shape carries no origin today) — deliberately left
+    // unthreaded rather than plumbed in this commit, since #103's fix may
+    // change this path's shape entirely; threading it now risked doing
+    // throwaway work. Tracked as
+    // [#104](https://github.com/salesforce-misc/trellis/issues/104), to be
+    // revisited once #103 lands — do not read this as "moot," it is a known,
+    // live gap in the latency histograms for any transform chained off an
+    // aggregate target.
     for (target, agg_plan) in &plan.aggregate_targets {
         // `&agg_plan.target` (issue #73's persisted identity), not the bare
         // `target` map key — see `AggregateTargetPlan::target`'s doc
