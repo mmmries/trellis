@@ -93,11 +93,26 @@ pub enum StagedChange {
     /// definition re-derive, backfill) use: a bare, image-less recompute
     /// trigger. It asserts nothing about the row's state — only "recompute
     /// this key."
+    ///
+    /// `src_changed` (added for issues #51/#52's multi-hop gap) is the
+    /// timestamp of the real source commit this recompute traces back to,
+    /// when one is known — `Some` for forward/reverse propagation and
+    /// quarantine replay (all of which inherit it from the triggering
+    /// change), `None` for backfill's cursor-enumerated pre-existing rows
+    /// (there is no meaningful origin for a row nothing ever "changed" —
+    /// see `intake::publication`'s backfill enumeration). Without this, an
+    /// automatically-propagated hop-to-hop chain (transform A's output
+    /// feeding transform B as B's input, entirely through `Recompute` rows)
+    /// would carry no origin at all past the first hop, leaving both the
+    /// per-transform latency histogram (#51) and the end-to-end latency
+    /// histogram (#52) unable to observe anything for it — exactly the gap
+    /// this field closes.
     Recompute {
         src_table: String,
         key: String,
         hop_gen: i32,
         group_key: Option<String>,
+        src_changed: Option<SystemTime>,
     },
     /// A source `TRUNCATE` of `src_table` (issue #60): one row per truncated
     /// relation, key-less (see [`TRUNCATE_SENTINEL_KEY`]) and image-less —
@@ -175,6 +190,7 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 key,
                 hop_gen,
                 group_key,
+                src_changed,
             } => ChangeRow {
                 src_table,
                 key,
@@ -183,7 +199,7 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 old_image: None,
                 new_image: None,
                 origin_lsn: None,
-                src_changed: None,
+                src_changed: *src_changed,
                 hop_gen: *hop_gen,
                 group_key: group_key.as_deref(),
             },

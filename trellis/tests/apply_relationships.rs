@@ -107,6 +107,45 @@ async fn stage_cdc(
         .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
 }
 
+/// Stages one image-bearing (CDC-shaped) change into the active ring
+/// segment with an explicit `src_changed`, for tests exercising the
+/// reverse-recompute fan-in tie-break (issues #51/#52's multi-hop gap):
+/// `min(src_changed)` wins across every to-side change that resolves to the
+/// same from-side key in one batch. [`stage_cdc`] above leaves `src_changed`
+/// `NULL`, which is fine for tests that only care about *which* keys get
+/// staged, not their origin timestamps.
+async fn stage_cdc_with_src_changed(
+    client: &Client,
+    src_table: &str,
+    key: &str,
+    op: &str,
+    old_image: Option<&str>,
+    new_image: Option<&str>,
+    src_changed: std::time::SystemTime,
+) {
+    let table = active_seg_table(client).await;
+    let lsn = PgLsn::from(1u64);
+    client
+        .execute(
+            &format!(
+                "insert into {table} (src_table, key, op, lsn, old_image, new_image, hop_gen, \
+                 src_changed) \
+                 values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0, $7)"
+            ),
+            &[
+                &src_table,
+                &key,
+                &op,
+                &lsn,
+                &old_image,
+                &new_image,
+                &src_changed,
+            ],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
+}
+
 /// Seals and drains repeatedly until nothing is pending anywhere in the ring.
 /// Reverse recompute appends fresh `Recompute` rows into the (new) active
 /// segment as it drains, so convergence takes more than one seal.
@@ -675,6 +714,130 @@ async fn reverse_recompute_dedupes_across_relationships_sharing_from_table() {
         1,
         "article 1 must be staged exactly once even though two relationships \
          (comments, likes) both touched it in this batch"
+    );
+
+    drain_to_quiescence(&db.pool, &mut client).await;
+}
+
+// ---------------------------------------------------------------------
+// Issues #51/#52's multi-hop gap: the fan-in tie-break on `src_changed`
+// ---------------------------------------------------------------------
+
+/// The `src_changed` column of the (sole, deduped) `Recompute` row staged
+/// for `(from_table, key)` in the active segment.
+async fn staged_recompute_src_changed(
+    client: &Client,
+    from_table: &str,
+    key: &str,
+) -> Option<std::time::SystemTime> {
+    let seg = active_seg_table(client).await;
+    let sql = format!(
+        "select src_changed from {seg} where src_table = $1 and key = $2 and op = 'recompute'"
+    );
+    client
+        .query_one(sql.as_str(), &[&from_table, &key])
+        .await
+        .expect("read staged recompute's src_changed")
+        .get(0)
+}
+
+/// Two to-many to-side changes (comments on the same article) land in one
+/// batch with two different `src_changed` origins. Reverse recompute
+/// resolves both to the same from-side key (article 1) and must dedupe them
+/// into one `Recompute` row (issue #79) carrying the **earlier** of the two
+/// origins (issues #51/#52's multi-hop gap: `min(src_changed)` wins on
+/// fan-in — deliberately the opposite merge direction from `hop_gen`'s own
+/// fan-in tie-break, which takes the max; see `staging::apply`'s
+/// `earliest_src_changed` doc comment).
+#[tokio::test]
+async fn reverse_recompute_fan_in_keeps_the_earliest_src_changed() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table articles (id integer primary key, title text); \
+             create table comments (id integer primary key, article_id integer, word_count integer); \
+             alter table comments replica identity full; \
+             insert into articles (id, title) values (1, 'a1')",
+        )
+        .await
+        .expect("create tables and seed from-side rows");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP comments FROM articles.id TO comments.article_id",
+    )
+    .await
+    .expect("create to-many relationship");
+
+    client
+        .execute(
+            "insert into comments (id, article_id, word_count) values (100, 1, 5), (101, 1, 9)",
+            &[],
+        )
+        .await
+        .expect("insert two comments on the same article");
+
+    let now = std::time::SystemTime::now();
+    let earlier = now - std::time::Duration::from_secs(120);
+    let later = now - std::time::Duration::from_secs(5);
+
+    // Staged deliberately out of chronological order — the tie-break must
+    // pick the earlier origin regardless of which row this batch happens to
+    // process first.
+    stage_cdc_with_src_changed(
+        &client,
+        "comments",
+        "101",
+        "insert",
+        None,
+        Some("{\"id\":101,\"article_id\":1,\"word_count\":9}"),
+        later,
+    )
+    .await;
+    stage_cdc_with_src_changed(
+        &client,
+        "comments",
+        "100",
+        "insert",
+        None,
+        Some("{\"id\":100,\"article_id\":1,\"word_count\":5}"),
+        earlier,
+    )
+    .await;
+
+    let seg = seal_active_segment(&mut client).await;
+    while apply::drain_once(&db.pool, seg, "reverse_test", 1, "trellis_apply_test")
+        .await
+        .expect("drain_once")
+        .is_some()
+    {}
+
+    assert_eq!(
+        staged_recompute_count(&client, "articles", "1").await,
+        1,
+        "both comments resolve to the same from-side key and must dedupe to one recompute"
+    );
+
+    let observed = staged_recompute_src_changed(&client, "articles", "1").await;
+    // Postgres's `timestamptz` column only has microsecond precision, so
+    // compare via `duration_since(UNIX_EPOCH)` truncated the same way rather
+    // than requiring exact `SystemTime` equality.
+    let expected_micros = earlier
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("earlier is after the epoch")
+        .as_micros();
+    let observed_micros = observed
+        .expect("the staged recompute must carry a src_changed")
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("observed is after the epoch")
+        .as_micros();
+    assert_eq!(
+        observed_micros, expected_micros,
+        "the fan-in tie-break must keep the earlier (min) of the two contributing origins, \
+         not the later one and not the order they happened to be staged/processed in"
     );
 
     drain_to_quiescence(&db.pool, &mut client).await;

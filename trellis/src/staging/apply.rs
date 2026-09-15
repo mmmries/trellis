@@ -782,19 +782,28 @@ fn record_transform_apply_metrics(
 /// cast round-trips exactly (numeric's decimal text, `Display for bool`'s
 /// `true`/`false`, text values verbatim) — matching this module's existing
 /// "text in, typed cast in SQL" convention for every other value it writes.
+///
+/// `src_changed` (issues #51/#52's multi-hop gap) is the triggering
+/// [`FoldedChange::src_changed`], carried forward the same way `hop_gen` is
+/// — so a downstream `Recompute` row this write's own propagation stages
+/// (see [`apply_and_mark_drained_many`]'s step 4) keeps a real origin
+/// instead of losing it at this hop.
 #[derive(Debug, Clone)]
 struct TargetWrite {
     pk_text: String,
     values: Vec<Option<String>>,
     hop_gen: i32,
+    src_changed: Option<std::time::SystemTime>,
 }
 
 /// One key's deletion from a target table (the folded change had no
-/// `new_image`).
+/// `new_image`). `src_changed` plays the same forward-carrying role as
+/// [`TargetWrite::src_changed`].
 #[derive(Debug, Clone)]
 struct TargetDelete {
     pk_text: String,
     hop_gen: i32,
+    src_changed: Option<std::time::SystemTime>,
 }
 
 /// Everything Phase 3 needs to write one target table: its primary key
@@ -834,6 +843,12 @@ struct TargetPlan {
 /// own `hop_gen`, carried forward so keys the clear physically removes
 /// propagate downstream at `hop_gen + 1`, exactly like any other
 /// physically-changed key.
+///
+/// `src_changed` is the triggering truncate sentinel's own `src_changed`
+/// (issues #51/#52's multi-hop gap), fan-in tie-broken by `min` across
+/// however many truncated sources resolve to this same target — see
+/// [`earliest_src_changed`]'s doc comment for why `min`, not `max`, is the
+/// right merge here.
 #[derive(Debug, Clone)]
 struct ClearPlan {
     pk: PrimaryKeyColumn,
@@ -842,6 +857,7 @@ struct ClearPlan {
     /// fully-qualified target identity this clear's `DELETE FROM` must bind,
     /// rather than the bare map key it's stored under.
     qualified_target: String,
+    src_changed: Option<std::time::SystemTime>,
 }
 
 /// The aggregate-target counterpart to [`ClearPlan`] — see
@@ -855,6 +871,72 @@ struct ClearPlan {
 struct AggregateClearPlan {
     hop_gen: i32,
     qualified_target: String,
+}
+
+/// The fan-in tie-break for [`StagedChange::Recompute::src_changed`]
+/// (issues #51/#52's multi-hop gap): when more than one to-side change in a
+/// batch feeds the same propagated key (forward propagation's `changed` map,
+/// or reverse recompute's `(from_table, from_key)` accumulator), the
+/// **earliest** (`min`) of their origins wins — the oldest/earliest
+/// source-commit timestamp captures the slowest straggler in the group,
+/// matching the p99/stall-visibility intent these latency histograms exist
+/// for. This is deliberately the opposite of `hop_gen`'s own fan-in
+/// tie-break (`max`, propagation depth: the deepest contributor sets the
+/// bound) — same shape of merge, different direction, because the two
+/// numbers answer different questions ("how stale is the staler input" vs.
+/// "how deep is the deepest input").
+///
+/// `None` never wins over a real `Some`: an origin-less contributor (a
+/// backfill-enumerated recompute, or any other change with no traceable
+/// source commit) doesn't get to blank out a known origin its fan-in sibling
+/// carried — it simply contributes nothing to the merge. Only when *every*
+/// contributor is origin-less does the result stay `None`.
+fn earliest_src_changed(
+    a: Option<std::time::SystemTime>,
+    b: Option<std::time::SystemTime>,
+) -> Option<std::time::SystemTime> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(t), None) | (None, Some(t)) => Some(t),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::earliest_src_changed;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn earliest_src_changed_picks_the_lesser_of_two_known_origins() {
+        let earlier = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let later = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        assert_eq!(
+            earliest_src_changed(Some(later), Some(earlier)),
+            Some(earlier),
+            "the earlier of two known origins must win, regardless of argument order"
+        );
+        assert_eq!(
+            earliest_src_changed(Some(earlier), Some(later)),
+            Some(earlier)
+        );
+    }
+
+    #[test]
+    fn earliest_src_changed_never_lets_a_none_beat_a_known_origin() {
+        let known = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        assert_eq!(
+            earliest_src_changed(Some(known), None),
+            Some(known),
+            "an origin-less fan-in sibling must not blank out a known origin"
+        );
+        assert_eq!(earliest_src_changed(None, Some(known)), Some(known));
+    }
+
+    #[test]
+    fn earliest_src_changed_of_two_unknowns_stays_unknown() {
+        assert_eq!(earliest_src_changed(None, None), None);
+    }
 }
 
 /// Phase 2's output: an in-memory plan Phase 3 applies inside one
@@ -940,7 +1022,11 @@ pub struct ApplyPlan {
     /// reusing the same async staging/apply/fence pipeline forward propagation
     /// uses rather than any bespoke persisted reverse index. `hop_gen` is the
     /// triggering related-row change's own `hop_gen + 1`, hop-bounded at emit.
-    reverse_recomputes: Vec<(String, String, i32)>,
+    /// The trailing `Option<SystemTime>` is the triggering change's
+    /// `src_changed`, fan-in tie-broken by [`earliest_src_changed`] when more
+    /// than one to-side change resolves to the same `(from_table,
+    /// from_key)` (issues #51/#52's multi-hop gap).
+    reverse_recomputes: Vec<(String, String, i32, Option<std::time::SystemTime>)>,
 }
 
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
@@ -1007,7 +1093,12 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // ever needed, at the highest hop_gen any contributing relationship
     // required. Keyed by `(from_table, from_key)`; drained into the
     // `Vec` shape `ApplyPlan` expects right before it's constructed below.
-    let mut reverse_recomputes: HashMap<(String, String), i32> = HashMap::new();
+    // The `Option<SystemTime>` half is `src_changed` (issues #51/#52's
+    // multi-hop gap), fan-in tie-broken by `earliest_src_changed` (min) —
+    // deliberately the opposite merge direction from `hop_gen`'s `max`, see
+    // that function's doc comment.
+    let mut reverse_recomputes: HashMap<(String, String), (i32, Option<std::time::SystemTime>)> =
+        HashMap::new();
 
     for (source_key, changes) in by_source {
         let version = catalog::source_table_version(pool, source_key).await?;
@@ -1163,8 +1254,13 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         for rel in &inbound_rels {
             // Join-key text -> the max `hop_gen` of the to-side changes that
             // touched it (a re-parent update touches both its old and new
-            // key; a delete carries only its pre-image).
+            // key; a delete carries only its pre-image), and (issues
+            // #51/#52's multi-hop gap) the *earliest* (`min`) `src_changed`
+            // among those same changes — see `earliest_src_changed`'s doc
+            // comment for why the two use opposite merge directions.
             let mut key_hops: HashMap<String, i32> = HashMap::new();
+            let mut key_src_changed: HashMap<String, Option<std::time::SystemTime>> =
+                HashMap::new();
             for (i, change) in changes.iter().enumerate() {
                 let mut note = |value: &Option<String>, hop: i32| {
                     if let Some(text) = value {
@@ -1172,6 +1268,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             .entry(text.clone())
                             .and_modify(|h| *h = (*h).max(hop))
                             .or_insert(hop);
+                        key_src_changed
+                            .entry(text.clone())
+                            .and_modify(|sc| *sc = earliest_src_changed(*sc, change.src_changed))
+                            .or_insert(change.src_changed);
                     }
                 };
                 if let Some(row) = &rows[i] {
@@ -1196,10 +1296,14 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             .await?;
             for (from_key, join_text) in matches {
                 let hop = key_hops.get(&join_text).copied().unwrap_or(0) + 1;
+                let src_changed = key_src_changed.get(&join_text).copied().flatten();
                 reverse_recomputes
                     .entry((rel.def.from_table.clone(), from_key))
-                    .and_modify(|h| *h = (*h).max(hop))
-                    .or_insert(hop);
+                    .and_modify(|(h, sc)| {
+                        *h = (*h).max(hop);
+                        *sc = earliest_src_changed(*sc, src_changed);
+                    })
+                    .or_insert((hop, src_changed));
             }
         }
 
@@ -1373,12 +1477,14 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                                 pk_text: change.key.clone(),
                                 values,
                                 hop_gen: change.hop_gen,
+                                src_changed: change.src_changed,
                             });
                         }
                         None => {
                             plan.deletes.push(TargetDelete {
                                 pk_text: change.key.clone(),
                                 hop_gen: change.hop_gen,
+                                src_changed: change.src_changed,
                             });
                         }
                     }
@@ -1549,12 +1655,15 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     clears
                         .entry(def.def.target.clone())
                         .and_modify(|existing| {
-                            existing.hop_gen = existing.hop_gen.max(change.hop_gen)
+                            existing.hop_gen = existing.hop_gen.max(change.hop_gen);
+                            existing.src_changed =
+                                earliest_src_changed(existing.src_changed, change.src_changed);
                         })
                         .or_insert(ClearPlan {
                             pk: pk.clone(),
                             hop_gen: change.hop_gen,
                             qualified_target: def.target_table.clone(),
+                            src_changed: change.src_changed,
                         });
                 }
             }
@@ -1598,8 +1707,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             for from_key in from_keys {
                 reverse_recomputes
                     .entry((rel.def.from_table.clone(), from_key))
-                    .and_modify(|h| *h = (*h).max(hop))
-                    .or_insert(hop);
+                    .and_modify(|(h, sc)| {
+                        *h = (*h).max(hop);
+                        *sc = earliest_src_changed(*sc, change.src_changed);
+                    })
+                    .or_insert((hop, change.src_changed));
             }
         }
     }
@@ -1641,10 +1753,13 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         }
     }
 
-    let reverse_recomputes: Vec<(String, String, i32)> = reverse_recomputes
-        .into_iter()
-        .map(|((from_table, from_key), hop)| (from_table, from_key, hop))
-        .collect();
+    let reverse_recomputes: Vec<(String, String, i32, Option<std::time::SystemTime>)> =
+        reverse_recomputes
+            .into_iter()
+            .map(|((from_table, from_key), (hop, src_changed))| {
+                (from_table, from_key, hop, src_changed)
+            })
+            .collect();
 
     Ok(ApplyPlan {
         versions,
@@ -1671,6 +1786,14 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
 /// `cols_per_row` to get the actual chunk size. 60000 leaves headroom below
 /// 65535 regardless of column count.
 const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
+
+/// One physically-touched target key, as [`apply_and_mark_drained_many`]'s
+/// `changed` accumulator and downstream-propagation step track it: the key
+/// text, the `hop_gen` it carries forward, and (issues #51/#52's multi-hop
+/// gap) the `src_changed` origin it carries forward — `None` for an
+/// aggregate target's group key (see the 3b step's doc comment) or any
+/// other touched key with no traceable origin.
+type ChangedKey = (String, i32, Option<std::time::SystemTime>);
 
 /// Runs one target table's ordered pre-lock, then its no-op-suppressed
 /// upsert and delete, returning the keys Postgres actually wrote to vs.
@@ -1981,8 +2104,12 @@ pub async fn apply_and_mark_drained_many(
     // not `insert`): a target can appear in both `plan.clears` and
     // `plan.targets` in the same batch — a truncate clear followed by a
     // same-batch post-truncate write to the same target — and both halves'
-    // physically-touched keys must propagate downstream.
-    let mut changed: HashMap<&str, Vec<(String, i32)>> = HashMap::new();
+    // physically-touched keys must propagate downstream. The third tuple
+    // element (see [`ChangedKey`]) is `src_changed` (issues #51/#52's
+    // multi-hop gap), carried into the `Recompute` row step 4 stages for
+    // this key, so a downstream hop reached purely through automatic
+    // propagation still traces back to a real origin.
+    let mut changed: HashMap<&str, Vec<ChangedKey>> = HashMap::new();
 
     // 2. Truncate clears, before this target's own upsert/delete below —
     // see this function's doc comment on why "clear, then write" is safe
@@ -2003,7 +2130,10 @@ pub async fn apply_and_mark_drained_many(
         if cleared.is_empty() {
             continue;
         }
-        let touched: Vec<(String, i32)> = cleared.into_iter().map(|k| (k, clear.hop_gen)).collect();
+        let touched: Vec<ChangedKey> = cleared
+            .into_iter()
+            .map(|k| (k, clear.hop_gen, clear.src_changed))
+            .collect();
         changed.entry(target.as_str()).or_default().extend(touched);
     }
 
@@ -2030,19 +2160,23 @@ pub async fn apply_and_mark_drained_many(
         }
 
         let mut hop_gen_of: HashMap<&str, i32> = HashMap::new();
+        let mut src_changed_of: HashMap<&str, Option<std::time::SystemTime>> = HashMap::new();
         for w in &target_plan.writes {
             hop_gen_of.insert(w.pk_text.as_str(), w.hop_gen);
+            src_changed_of.insert(w.pk_text.as_str(), w.src_changed);
         }
         for d in &target_plan.deletes {
             hop_gen_of.insert(d.pk_text.as_str(), d.hop_gen);
+            src_changed_of.insert(d.pk_text.as_str(), d.src_changed);
         }
 
-        let touched: Vec<(String, i32)> = written
+        let touched: Vec<ChangedKey> = written
             .into_iter()
             .chain(deleted)
             .map(|key| {
                 let hop_gen = hop_gen_of.get(key.as_str()).copied().unwrap_or(0);
-                (key, hop_gen)
+                let src_changed = src_changed_of.get(key.as_str()).copied().flatten();
+                (key, hop_gen, src_changed)
             })
             .collect();
         changed.entry(target.as_str()).or_default().extend(touched);
@@ -2057,6 +2191,14 @@ pub async fn apply_and_mark_drained_many(
     // as any 1-1 target — see [`ApplyPlan::aggregate_clears`]'s doc comment
     // for why that is not a live misuse risk today: no definition reading
     // from an aggregate target can actually survive its first drain attempt.
+    // `src_changed` is always `None` here (rather than threaded from
+    // `apply_aggregate::AggregateTargetPlan`, out of scope for issues
+    // #51/#52's fix — see this module's `apply_aggregate` submodule, whose
+    // group written/deleted shape carries no origin today): a moot gap, not
+    // a live one, for the exact same reason `aggregate_clears` already
+    // documents — no definition can actually survive its first drain attempt
+    // reading from an aggregate target's composite key, so the `Recompute`
+    // rows staged from this branch never reach a real evaluator anyway.
     for (target, agg_plan) in &plan.aggregate_targets {
         // `&agg_plan.target` (issue #73's persisted identity), not the bare
         // `target` map key — see `AggregateTargetPlan::target`'s doc
@@ -2070,10 +2212,13 @@ pub async fn apply_and_mark_drained_many(
         if result.written.is_empty() && result.deleted.is_empty() {
             continue;
         }
-        changed
-            .entry(target.as_str())
-            .or_default()
-            .extend(result.written.into_iter().chain(result.deleted));
+        changed.entry(target.as_str()).or_default().extend(
+            result
+                .written
+                .into_iter()
+                .chain(result.deleted)
+                .map(|(key, hop_gen)| (key, hop_gen, None)),
+        );
     }
 
     // 4. Downstream propagation, with the hop bound checked before staging
@@ -2090,7 +2235,7 @@ pub async fn apply_and_mark_drained_many(
         {
             continue;
         }
-        for (key, hop_gen) in touched {
+        for (key, hop_gen, src_changed) in touched {
             let next_hop = hop_gen + 1;
             if next_hop > MAX_HOP_GEN {
                 hop_bound_tables.push(target.to_string());
@@ -2102,6 +2247,7 @@ pub async fn apply_and_mark_drained_many(
                 key: key.clone(),
                 hop_gen: next_hop,
                 group_key: None,
+                src_changed: *src_changed,
             });
         }
     }
@@ -2110,7 +2256,7 @@ pub async fn apply_and_mark_drained_many(
     // re-derive, resolved in Phase 2 and staged here as ordinary image-less
     // recomputes — the same shape and same hop bound forward propagation uses,
     // just keyed by the from-side table/PK rather than a touched target key.
-    for (from_table, key, hop_gen) in &plan.reverse_recomputes {
+    for (from_table, key, hop_gen, src_changed) in &plan.reverse_recomputes {
         if *hop_gen > MAX_HOP_GEN {
             hop_bound_tables.push(from_table.clone());
             worst_hop_gen = worst_hop_gen.max(*hop_gen);
@@ -2121,6 +2267,7 @@ pub async fn apply_and_mark_drained_many(
             key: key.clone(),
             hop_gen: *hop_gen,
             group_key: None,
+            src_changed: *src_changed,
         });
     }
 
