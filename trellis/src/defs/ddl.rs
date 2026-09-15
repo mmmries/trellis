@@ -318,16 +318,33 @@ async fn source_column_pg_types(
 }
 
 /// The neighbor target table's name for `def` — see module docs for why this
-/// is simply `def.target` unchanged. Unqualified: the catalog stores and
-/// looks up target tables by this bare name, independent of which schema
-/// [`qualified_target_table`] actually creates it under.
+/// is simply `def.target` unchanged. Bare — `def.target` is always the
+/// unqualified name the grammar parsed (issue #76 hasn't taught it a
+/// `schema.table` spelling), independent of which schema
+/// [`qualified_target_table`] actually creates it under. Note this is *not*
+/// the same string `transform_definitions.target_table` persists as of issue
+/// #73: the catalog's own identity column holds the fully-qualified
+/// `schema.table` form (built via `intake::publication::qualify`, at
+/// definition-acceptance time — see `catalog::create_definition_inner`), not
+/// this bare name. Callers that need a live connection (whose `search_path`
+/// already resolves this bare name to the right physical table —
+/// `pool::session_bootstrap` pins `target_schema` onto it) can keep using
+/// this unqualified; callers that need the persisted identity string must
+/// read `transform_definitions.target_table` instead, not reconstruct it
+/// from this function.
 pub fn neighbor_table_name(def: &TransformDef) -> &str {
     &def.target
 }
 
 /// The fully schema-qualified name of `def`'s neighbor target table under
 /// `target_schema` (see the module doc comment) — `"{target_schema}"."{def.target}"`,
-/// each component quoted independently via [`quote_ident`].
+/// each component quoted independently via [`quote_ident`]. Built for direct
+/// interpolation into DDL text, not as a persisted-identity string: this
+/// quotes each component separately, whereas `transform_definitions.target_table`
+/// (issue #73) is the plain, unquoted `"schema.table"` form
+/// `intake::publication::qualify` builds — the two are never byte-for-byte
+/// equal, so don't compare or persist this function's output as if it were
+/// that identity.
 pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String {
     format!(
         "{}.{}",

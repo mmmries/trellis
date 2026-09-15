@@ -337,10 +337,16 @@ impl From<crate::error::Error> for ApplyError {
 /// `ApplyPlan::versions`, etc.), can stay unchanged rather than needing this
 /// hot path to thread real schema identity through. See
 /// [`crate::defs::source_table_version`]'s doc comment for the full
-/// bare-vs-qualified rationale and its TODO(#73). A target table's own
-/// downstream `src_table` (the `Recompute` rows this module stages) is
-/// already unqualified — [`crate::defs::ddl::neighbor_table_name`] never
-/// adds a schema — so stripping is a no-op there, same as before #72.
+/// bare-vs-qualified rationale — including why issue #73 (which also
+/// persists `transform_definitions.target_table` qualified) does *not*
+/// retire this stripping: a target table's own downstream `src_table` (the
+/// `Recompute` rows this module stages) is still unqualified —
+/// [`crate::defs::ddl::neighbor_table_name`] deliberately never adds a
+/// schema, issue #73 or not — so stripping remains a no-op for that case,
+/// exactly as before #72, rather than becoming a stable identity function
+/// this call site could now skip outright. Retiring the split entirely (by
+/// qualifying every emitted `src_table`, `Recompute` rows included) is issue
+/// #75's emission-audit territory.
 fn catalog_source_key(src_table: &str) -> &str {
     match src_table.rsplit_once('.') {
         Some((_, table)) => table,
@@ -1683,8 +1689,11 @@ pub async fn apply_and_mark_drained_many(
     // 1. Version fence. `source_key` is bare (see `catalog_source_key`'s doc
     // comment); `source_table_versions.source_table` is qualified as of
     // issue #72, so this matches against its bare table-name suffix, same
-    // as `defs::source_table_version`'s own read (TODO(#73) there applies
-    // here too).
+    // as `defs::source_table_version`'s own read — see that function's doc
+    // comment for why issue #73 doesn't retire this (short version:
+    // `source_key` still traces back to `ddl::neighbor_table_name`, which
+    // stays bare regardless; only issue #75's emission audit would let this
+    // go back to an exact match).
     for (source_key, loaded_version) in &plan.versions {
         let row = txn
             .query_opt(

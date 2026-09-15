@@ -44,6 +44,9 @@ pub type Client = deadpool_postgres::Client;
 #[derive(Debug, Clone)]
 pub struct Pool {
     inner: DeadpoolPool,
+    /// A copy of the [`Config::target_schema`] this pool was built from —
+    /// see [`Pool::target_schema`].
+    target_schema: String,
 }
 
 impl Pool {
@@ -74,13 +77,35 @@ impl Pool {
             }))
             .build()?;
 
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            target_schema: config.target_schema().to_string(),
+        })
     }
 
     /// Acquires a connection, waiting for one to become available if the
     /// pool is at capacity.
     pub async fn get(&self) -> Result<Client, Error> {
         Ok(self.inner.get().await?)
+    }
+
+    /// The [`Config::target_schema`] this pool was built with (issue #73,
+    /// ADR-0007) — the same value baked into every connection's own
+    /// `search_path` by [`session_bootstrap`] above, and the same value
+    /// every real caller of [`crate::defs::install_definition`] already
+    /// passes as its own `target_schema` argument (that argument and this
+    /// one are never meant to diverge; `install_definition` still takes its
+    /// own explicit parameter rather than reading this one, so its
+    /// target-table DDL and [`crate::defs::catalog::create_definition_inner`]'s
+    /// persisted qualification are threaded from one guaranteed-identical
+    /// value instead of two that merely happen to agree). Exposed so
+    /// [`crate::defs::catalog::create_definition`]/
+    /// [`crate::defs::catalog::create_definition_without_backfill`] — the
+    /// ring-path entry points, which take no `target_schema` parameter of
+    /// their own — can qualify a definition's target table the same way,
+    /// without widening their public signature.
+    pub(crate) fn target_schema(&self) -> &str {
+        &self.target_schema
     }
 }
 

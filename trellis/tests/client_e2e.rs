@@ -21,7 +21,7 @@ use std::time::Duration;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::Pool;
-use trellis::config::DEFAULT_SCHEMA;
+use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     TransformStatus, chunk_queue, create_definition, create_target_table, install_definition,
@@ -561,7 +561,11 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
         async || {
             let status: Option<String> = raw
                 .query_opt(
-                    "select status from transform_definitions where target_table = 'widgets_calc'",
+                    // Issue #73: `target_table` is persisted fully-qualified now.
+                    &format!(
+                        "select status from transform_definitions \
+                         where target_table = '{DEFAULT_TARGET_SCHEMA}.widgets_calc'"
+                    ),
                     &[],
                 )
                 .await
@@ -660,7 +664,11 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
         async || {
             let status: Option<String> = raw
                 .query_opt(
-                    "select status from transform_definitions where target_table = 'gadgets_calc'",
+                    // Issue #73: `target_table` is persisted fully-qualified now.
+                    &format!(
+                        "select status from transform_definitions \
+                         where target_table = '{DEFAULT_TARGET_SCHEMA}.gadgets_calc'"
+                    ),
                     &[],
                 )
                 .await

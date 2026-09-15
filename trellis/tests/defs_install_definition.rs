@@ -23,7 +23,7 @@ use std::time::Duration;
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Predicate, RelationshipDef, TransformDef};
 use trellis::defs::{
     TransformStatus, ValueType, chunk_queue, create_relationship, install_definition,
@@ -275,7 +275,9 @@ async fn install_definition_fast_path_ends_up_live() {
     );
     let rows = client
         .query(
-            "select status from transform_definitions where target_table = 't'",
+            &format!(
+                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.t'"
+            ),
             &[],
         )
         .await
@@ -296,7 +298,9 @@ async fn install_definition_fast_path_ends_up_live() {
     drain_backfill_chunks(&db.pool, "public").await;
     let rows = client
         .query(
-            "select status from transform_definitions where target_table = 't'",
+            &format!(
+                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.t'"
+            ),
             &[],
         )
         .await
@@ -358,7 +362,9 @@ async fn install_definition_ring_fallback_ends_up_live() {
 
     let rows = client
         .query(
-            "select status from transform_definitions where target_table = 'article_cat'",
+            &format!(
+                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.article_cat'"
+            ),
             &[],
         )
         .await

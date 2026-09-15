@@ -19,19 +19,57 @@
 //! v1 definitions are immutable: this module only exposes creation and
 //! read, no update/delete.
 //!
-//! **Source identity is fully-qualified (issue #72, ADR-0007).**
-//! `transform_definitions.source_table` and `source_table_versions.source_table`
-//! hold `def.source` resolved to its `schema.table` identity exactly once, at
+//! **Source and target identity are both fully-qualified (issues #72/#73,
+//! ADR-0007).** `transform_definitions.source_table`/`target_table` and
+//! `source_table_versions.source_table` hold `def.source`/`def.target`
+//! resolved to their `schema.table` identity exactly once, at
 //! definition-acceptance time (`create_definition_inner`'s
-//! [`resolve_source_schema_in_txn`] call), never the bare spelling the
-//! grammar parsed. Every read of either column downstream must treat the
-//! value as already-qualified and must not re-resolve it — see
-//! [`resolve_source_schema_in_txn`]'s own doc comment for exactly why
-//! re-resolving a qualified value fails outright rather than merely being
-//! redundant. `schema_nodes`/`schema_edges` and `relationship_definitions`'
-//! endpoints are the one place this module still keys on the bare name —
-//! that migration is issue #74's, not this one's (see the `TODO(#74)`s at
-//! `create_definition_inner`'s node/edge resolution).
+//! [`resolve_source_schema_in_txn`] call for the source side,
+//! `Config::target_schema`/`intake::publication::qualify` for the target
+//! side), never the bare spelling the grammar parsed. Every read of any of
+//! these columns downstream must treat the value as already-qualified and
+//! must not re-resolve it — see [`resolve_source_schema_in_txn`]'s own doc
+//! comment for exactly why re-resolving a qualified value fails outright
+//! rather than merely being redundant. A handful of read sites deliberately
+//! stay bare regardless — `column_dependents`, `definition_by_target`, and
+//! every `app.rs` read reachable through `docs/decisions/0003`'s
+//! `transform.column` addressing scheme — because their callers only ever
+//! have the bare name the grammar accepts back (issue #76 hasn't landed
+//! qualified-target syntax) or because re-exposing the qualified spelling
+//! through that addressing scheme would misparse a real transform address as
+//! a column one (see each function's own doc comment); these match
+//! `target_table`'s bare table-name suffix via `split_part` rather than the
+//! qualified column directly. `schema_nodes`/`schema_edges` and
+//! `relationship_definitions`' endpoints are the one place this module still
+//! keys on the bare name across the board — that migration is issue #74's,
+//! not this one's (see the `TODO(#74)`s at `create_definition_inner`'s
+//! node/edge resolution, which now also explains why qualifying only
+//! *this* function's two `resolve_node_in_txn` calls wouldn't actually be
+//! safe ahead of #74).
+//!
+//! **Bare target-table suffixes are still enforced globally unique, just no
+//! longer by `target_table`'s own `unique` constraint.** Qualifying
+//! `target_table` (#73) narrowed that constraint to the qualified spelling
+//! only, which would otherwise let e.g. `public.foo` and `custom.foo`
+//! coexist as two live definitions — exactly the ambiguity every
+//! `split_part`-based bare-suffix read site above assumes can't happen.
+//! `create_definition_inner` re-closes that gap itself, at write time,
+//! rejecting a new definition with [`CatalogError::TargetTableSuffixCollision`]
+//! if its qualified target would collide with another live definition's
+//! bare suffix under a different schema — see that check's own comment for
+//! why this is provisional pending issue #76. This is now double-enforced,
+//! not merely application-level: `transform_definitions_target_suffix_idx`
+//! (`V23__transform_definitions_target_suffix_idx.sql`) is a real Postgres
+//! expression unique index on `split_part(target_table, '.', 2)`, the same
+//! DB-level backstop `target_table`'s own `unique` constraint already is for
+//! exact-qualified-name collisions — it closes the race two concurrent
+//! `create_definition` calls could otherwise win against each other's
+//! same-transaction-invisible, still-uncommitted inserts. The app-level
+//! check stays the primary path (a typed, name-carrying error beats a raw
+//! constraint violation for the common, non-racing case); the rare
+//! insert-time failure that check can't see is caught and translated back
+//! into the same [`CatalogError::TargetTableSuffixCollision`] rather than
+//! surfacing as an opaque [`CatalogError::Db`].
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -79,6 +117,70 @@ pub enum CatalogError {
     /// search path (see [`resolve_source_schema_in_txn`]) — the table was
     /// dropped, renamed, or never existed under that bare name.
     SourceTableNotFound(String),
+    /// This definition's resolved, qualified target (`{target_schema}.{def.target}`)
+    /// shares a bare table-name suffix with a *different* qualified target
+    /// some other still-persisted definition already uses — e.g.
+    /// `public.foo` alongside `custom.foo`, most plausibly from
+    /// `Config::target_schema` changing between deploys and a `TRANSFORM
+    /// ... TARGET foo` being redeclared under it. Issue #73 made
+    /// `transform_definitions.target_table` store the qualified spelling, so
+    /// `target_table text not null unique` (`V2__transform_catalog.sql`)
+    /// only enforces uniqueness of *that* spelling now, not the bare suffix
+    /// it used to store outright — checked and rejected here, in
+    /// `create_definition_inner`, rather than at any individual read site,
+    /// because every `split_part(target_table, '.', 2)`-keyed reader
+    /// (`definition_by_target`, `dependents_of`, `app.rs`'s status/
+    /// quarantine polls, `generative`'s `unsettled_definitions`) assumes
+    /// that suffix is globally unique and has no way to safely cope with two
+    /// definitions colliding under it — see this variant's `Display` message
+    /// for the operator-facing explanation.
+    ///
+    /// Double-enforced as of the reviewer follow-up to issue #73: this
+    /// application-level pre-check is still the primary path (it reports a
+    /// clean, typed error naming both spellings — see
+    /// `docs/decisions/0008-public-api-design.md` on why that beats a raw
+    /// Postgres unique-violation for callers), but it only ever sees its own
+    /// transaction's snapshot, so two concurrent `create_definition` calls
+    /// resolving different-schema targets for the same bare suffix could
+    /// each pass it and both commit. `transform_definitions_target_suffix_idx`
+    /// (`V23__transform_definitions_target_suffix_idx.sql`) is the real
+    /// DB-level guard that closes that race; `create_definition_inner`
+    /// catches the rare insert-time unique-violation against it and
+    /// translates it into this same variant (with `existing: None` — see the
+    /// field's own doc comment) rather than letting it surface as a raw
+    /// [`CatalogError::Db`].
+    ///
+    /// Provisional: issue #76 will teach the grammar an explicit
+    /// `schema.table` spelling for `FROM`/`TARGET`, at which point an
+    /// operator will be able to unambiguously address `custom.foo` as
+    /// distinct from `public.foo` and this restriction may need to relax (or
+    /// a different addressing scheme adopted) — until then, every bare-
+    /// suffix reader above still only ever has the bare name to key off of,
+    /// so disallowing the collision outright is the only choice that
+    /// doesn't quietly corrupt one of them.
+    ///
+    /// Raised from two different places, both folding into this one variant
+    /// since callers only need one type to match on: `create_definition_inner`'s
+    /// pre-check (`existing: Some(_)`, the common case — the colliding row is
+    /// still visible in this transaction's own snapshot, so its qualified
+    /// spelling can be reported) and a genuine insert-time race against
+    /// `transform_definitions_target_suffix_idx`
+    /// (`V23__transform_definitions_target_suffix_idx.sql`, `existing: None`
+    /// — a concurrent transaction's insert that the pre-check's snapshot
+    /// couldn't see committed first, so by the time this transaction's own
+    /// insert fails on the index, it has no further query available inside
+    /// its now-aborted transaction to learn what it lost to).
+    TargetTableSuffixCollision {
+        /// The bare table-name suffix both spellings share.
+        target: String,
+        /// The qualified spelling this rejected definition resolved to.
+        requested: String,
+        /// The qualified spelling already persisted by another live
+        /// definition under the same bare suffix, when known. `None` only
+        /// for the insert-time race path above, where the aborted
+        /// transaction has no way left to look it up.
+        existing: Option<String>,
+    },
     /// An aggregate (`GROUP BY`) definition (issue #47) was rejected because
     /// its source table's replica identity doesn't guarantee the old row
     /// image the delta-maintenance path (`apply_aggregate.rs`) needs on
@@ -121,6 +223,11 @@ impl CatalogError {
             CatalogError::UnknownValueType { .. } => ErrorCode::Internal,
             CatalogError::Backfill(err) => err.code(),
             CatalogError::SourceTableNotFound(_) => ErrorCode::NotFound,
+            // Collides with existing state (another live definition's
+            // persisted target), not a structural/semantic rejection of this
+            // definition's own text — the same category
+            // `ValidationError::DuplicateRelationshipName` reports.
+            CatalogError::TargetTableSuffixCollision { .. } => ErrorCode::Conflict,
             CatalogError::ReplicaIdentityRequired(err) => err.code(),
             CatalogError::Ddl(err) => err.code(),
             CatalogError::DirectBackfill(err) => err.code(),
@@ -150,6 +257,28 @@ impl fmt::Display for CatalogError {
             CatalogError::SourceTableNotFound(table) => {
                 write!(f, "source table \"{table}\" not found on the search path")
             }
+            CatalogError::TargetTableSuffixCollision {
+                target,
+                requested,
+                existing: Some(existing),
+            } => write!(
+                f,
+                "target table \"{target}\" is ambiguous: this definition would persist \
+                 \"{requested}\", but \"{existing}\" already exists under the same bare \
+                 table name — two definitions cannot share a bare target-table name under \
+                 different schemas"
+            ),
+            CatalogError::TargetTableSuffixCollision {
+                target,
+                requested,
+                existing: None,
+            } => write!(
+                f,
+                "target table \"{target}\" is ambiguous: this definition would persist \
+                 \"{requested}\", but another definition was concurrently created under the \
+                 same bare table name — two definitions cannot share a bare target-table \
+                 name under different schemas"
+            ),
             CatalogError::ReplicaIdentityRequired(err) => write!(f, "{err}"),
             CatalogError::Ddl(err) => write!(f, "failed to create target table: {err}"),
             CatalogError::DirectBackfill(err) => write!(f, "direct backfill failed: {err}"),
@@ -167,6 +296,7 @@ impl std::error::Error for CatalogError {
             CatalogError::UnknownValueType { .. } => None,
             CatalogError::Backfill(err) => Some(err),
             CatalogError::SourceTableNotFound(_) => None,
+            CatalogError::TargetTableSuffixCollision { .. } => None,
             CatalogError::ReplicaIdentityRequired(err) => Some(err),
             CatalogError::Ddl(err) => Some(err),
             CatalogError::DirectBackfill(err) => Some(err),
@@ -220,12 +350,22 @@ pub async fn create_definition(
     // so there's no separate, awaited step for a caller to observe this row
     // sitting through first. Only `install_definition`'s direct-build path
     // has such a step — see its own `TransformStatus::Backfilling` use.
+    //
+    // `pool.target_schema()`, not a parameter of this function's own (issue
+    // #73): this ring-path entry point never runs target-table DDL itself
+    // (its caller is assumed to have already created the physical table —
+    // see this module's doc comment), so there is no sibling DDL call for a
+    // separately-threaded `target_schema` argument to ever drift from. See
+    // [`crate::pool::Pool::target_schema`]'s own doc comment for why reading
+    // it off `pool` here is exactly as safe as `install_definition` passing
+    // its own explicit argument.
     create_definition_inner(
         pool,
         source_text,
         source_columns,
         true,
         TransformStatus::Live,
+        pool.target_schema(),
     )
     .await
 }
@@ -244,12 +384,16 @@ pub async fn create_definition_without_backfill(
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<Definition, CatalogError> {
+    // `pool.target_schema()` — see [`create_definition`]'s own call site for
+    // why this ring-path entry point reads it off `pool` rather than taking
+    // its own `target_schema` parameter.
     create_definition_inner(
         pool,
         source_text,
         source_columns,
         false,
         TransformStatus::Live,
+        pool.target_schema(),
     )
     .await
 }
@@ -356,7 +500,8 @@ pub async fn install_definition(
     if let KeySpace::OneToOne = &def.key_space
         && !backfill::uses_relationships(&def)
     {
-        return install_plain_one_to_one(pool, source_text, source_columns, &def).await;
+        return install_plain_one_to_one(pool, source_text, source_columns, &def, target_schema)
+            .await;
     }
 
     // Issue #79 (bug B): capture each table's coverage fence *before* the
@@ -370,12 +515,21 @@ pub async fn install_definition(
     // cleanup story for each of the three outcomes below. No ring
     // enumeration (`backfill: false`): the direct build below is what's about
     // to fold the source's pre-existing rows in.
+    // `target_schema` — this function's own parameter, the exact value the
+    // DDL step above just created the physical target table under — is
+    // threaded straight through rather than re-derived from `pool` (contrast
+    // [`create_definition`]'s call site): issue #73's persisted qualification
+    // must never be able to drift from what the DDL actually built, and a
+    // parameter passed through unchanged can't drift from itself the way two
+    // independently-sourced values merely expected to agree theoretically
+    // could.
     let mut definition = create_definition_inner(
         pool,
         source_text,
         source_columns,
         false,
         TransformStatus::Backfilling,
+        target_schema,
     )
     .await?;
 
@@ -422,13 +576,19 @@ async fn install_plain_one_to_one(
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
     def: &TransformDef,
+    target_schema: &str,
 ) -> Result<Definition, CatalogError> {
+    // `target_schema` — threaded straight from `install_definition`'s own
+    // parameter, the same value its DDL step already created the physical
+    // target table under — same no-drift-by-construction reasoning as
+    // `install_definition`'s own `create_definition_inner` call (issue #73).
     let mut definition = create_definition_inner(
         pool,
         source_text,
         source_columns,
         false,
         TransformStatus::Backfilling,
+        target_schema,
     )
     .await?;
 
@@ -672,6 +832,7 @@ async fn create_definition_inner(
     source_columns: &HashMap<String, ValueType>,
     backfill: bool,
     status: TransformStatus,
+    target_schema: &str,
 ) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse(source_text)?;
     // Issue #40: enrichment fields (`<rel>.<col>`) are validated against
@@ -705,20 +866,29 @@ async fn create_definition_inner(
     // per the issue's "prefer the smaller change" guidance.
     //
     // Keyed on the *bare* `def.source`/`def.target`, not
-    // `qualified_source`/a qualified target: `def.target` has no qualified
-    // form yet (target-table qualification is issue #73, not this one), and
-    // `schema_nodes` itself still keys on bare names pending issue #74's
-    // migration of the whole graph to qualified identity. Qualifying only
-    // the source side here would split one physical table's node in two
-    // whenever it's later chained (a downstream definition's bare
-    // `def.source` naming today's `def.target`) — the target-side insert
-    // would keep using the bare name while a source-side resolution of the
-    // same table would insert under its qualified spelling, so the two
-    // never share a `schema_nodes` row and `reject_if_table_cycle` stops
-    // seeing the real graph. Bare-for-now, consistent on both sides, is the
-    // safer half-step; issue #74 migrates both sides to qualified identity
-    // together. TODO(#74): pass `qualified_source`/a qualified target here
-    // once that lands.
+    // `qualified_source`/`qualified_target` (both resolved below): as of
+    // issue #73, both sides of *this* call now have a qualified form
+    // available, but `schema_nodes` itself still keys on bare names pending
+    // issue #74's migration of the whole graph to qualified identity, and
+    // switching just this function's two `resolve_node_in_txn` calls to
+    // qualified would not actually close that gap — it would reopen the
+    // exact node-splitting bug the pre-#73 version of this comment warned
+    // about, one level up: [`create_relationship`] resolves a relationship's
+    // `from_table`/`to_table` endpoints (its own `resolve_node_in_txn`
+    // calls, a few functions below) bare too, and relationship endpoints
+    // aren't in this issue's scope — ADR-0007's own "Scope" section defers
+    // them explicitly. A table that is both a transform source/target *and*
+    // a relationship endpoint (the common case ADR-0006's examples all
+    // chain off) would then resolve to two different `schema_nodes` rows for
+    // the same physical table depending on which grammar last referenced
+    // it — `TRANSFORM` (qualified, if this were switched) vs. `RELATIONSHIP`
+    // (still bare) — which is strictly worse than today's "always bare, so
+    // at least self-consistent" graph. Bare-for-now, consistent across
+    // *every* caller of `resolve_node_in_txn` (not just this one), is the
+    // safer half-step; issue #74 migrates every one of them — this
+    // function's two calls and [`create_relationship`]'s two — to qualified
+    // identity together, in one pass, rather than piecemeal. TODO(#74): pass
+    // `qualified_source`/`qualified_target` here once that lands.
     let source_node = resolve_node_in_txn(&txn, &def.source, NodeKind::Source).await?;
     let target_node = resolve_node_in_txn(&txn, &def.target, NodeKind::Target).await?;
 
@@ -739,7 +909,7 @@ async fn create_definition_inner(
     // Bare `def.source`/`def.target`, matching the node resolution above —
     // `schema_edges` is keyed by `schema_nodes.id`, so this walks the exact
     // same bare-keyed graph those nodes were just resolved into (TODO(#74)
-    // applies here identically).
+    // applies here identically, for the same relationship-endpoint reason).
     reject_if_table_cycle(&txn, &def.source, &def.target).await?;
 
     // Issue #21: a transform's `FROM` is a `Source` dependency edge from its
@@ -780,6 +950,78 @@ async fn create_definition_inner(
     let source_schema = resolve_source_schema_in_txn(&txn, &def.source).await?;
     let qualified_source = crate::intake::publication::qualify(&source_schema, &def.source)?;
 
+    // Issue #73 / ADR-0007: resolve `def.target` — likewise bare, the
+    // grammar's `TARGET`/transform-name clause has no qualification syntax
+    // either (issue #76) — to its fully-qualified identity exactly once,
+    // here, mirroring `qualified_source` immediately above. Unlike the
+    // source side, `def.target`'s schema is never search-path-resolved: a
+    // source table's schema is *discovered* (it already exists somewhere on
+    // the path), but a target table's schema is a config-time *decision*,
+    // `target_schema` — the exact value this function's own caller
+    // (`install_definition`, or `pool.target_schema()` for the ring-path
+    // entry points — see their own call sites) already used, or is about to
+    // use, for the physical `CREATE TABLE` (`ddl::qualified_target_table`).
+    // Built via the same `intake::publication::qualify` helper as
+    // `qualified_source`, not `ddl::qualified_target_table` directly: the two
+    // produce different shapes for different jobs — `qualify` returns the
+    // plain, unquoted `"schema.table"` this whole module's qualified-identity
+    // convention already uses (what a downstream chained definition's own
+    // `resolve_source_schema_in_txn` + `qualify` on its bare `def.source`
+    // will independently reproduce once it names this target), while
+    // `qualified_target_table` returns a separately-quoted
+    // `"schema"."table"` string built for direct interpolation into DDL
+    // text — never meant to be compared as a persisted identity string, and
+    // never equal to `qualify`'s output byte-for-byte.
+    let qualified_target = crate::intake::publication::qualify(target_schema, &def.target)?;
+
+    // Reviewer follow-up to issue #73 / ADR-0007: reject this definition if
+    // `qualified_target` shares a bare table-name suffix with a *different*
+    // qualified spelling some other still-persisted definition already
+    // uses. Before #73, `target_table` stored the bare name and its own
+    // `unique` constraint (`V2__transform_catalog.sql`) enforced this for
+    // free; now that the column stores the qualified spelling, that
+    // constraint only guarantees the qualified string is unique, and
+    // nothing else stopped `public.foo` and `custom.foo` from coexisting
+    // (most plausibly: `Config::target_schema` changed between deploys and
+    // an operator redeclared a same-named `TRANSFORM ... TARGET foo`).
+    // Every `split_part(target_table, '.', 2)`-keyed read site downstream
+    // ([`definition_by_target`], [`dependents_of`], `app.rs`'s
+    // `status`/`quarantine_status`, `generative`'s `unsettled_definitions`)
+    // was written assuming that suffix is globally unique — some
+    // (`definition_by_target`) would silently splice two colliding
+    // definitions' rows into one corrupted [`super::ast::TransformDef`]
+    // rather than error — so this closes the gap once, here, at
+    // definition-acceptance time, rather than teaching every one of those
+    // call sites to defend against an ambiguity that shouldn't be able to
+    // exist. Checked within this same transaction, against the same
+    // `transaction`'s view of `transform_definitions` every other check in
+    // this function already reads.
+    //
+    // Provisional, not a permanent rule: issue #76 will teach the grammar an
+    // explicit `schema.table` spelling for `FROM`/`TARGET`, and once an
+    // operator can write e.g. `TRANSFORM ... FROM custom.foo` to disambiguate
+    // from `public.foo`, this restriction may need to relax (or a different
+    // addressing scheme adopted) — but until #76 lands, every read site
+    // above still only ever has the bare name to key off of, so allowing the
+    // collision to be created at all would just move the silent-corruption
+    // risk somewhere else.
+    if let Some(row) = txn
+        .query_opt(
+            "select target_table from transform_definitions \
+             where split_part(target_table, '.', 2) = $1 and target_table <> $2 \
+             limit 1",
+            &[&def.target, &qualified_target],
+        )
+        .await?
+    {
+        let existing: String = row.get(0);
+        return Err(CatalogError::TargetTableSuffixCollision {
+            target: def.target.clone(),
+            requested: qualified_target,
+            existing: Some(existing),
+        });
+    }
+
     // Issue #23: a definition's initial backfill is one enumeration of its
     // source table, staged as `Recompute` triggers into the active ring
     // segment via the same append path CDC/reverse-propagation use — one
@@ -815,14 +1057,33 @@ async fn create_definition_inner(
 
     let status_text = status.as_str();
 
-    let id: i64 = txn
+    // Reviewer follow-up to issue #73: `transform_definitions_target_suffix_idx`
+    // (`V23__transform_definitions_target_suffix_idx.sql`) is the DB-level
+    // backstop for the exact same invariant the pre-check above enforces
+    // optimistically — it's what actually closes the race between two
+    // concurrent `create_definition` calls each resolving a different-schema
+    // target for the same bare suffix, since the pre-check's `select` only
+    // ever sees its own transaction's snapshot and can't see the other
+    // transaction's still-uncommitted insert. This insert is normally
+    // expected to succeed (the pre-check already ruled out every collision
+    // its own snapshot could see); a unique-violation against that specific
+    // index here means the check passed but a concurrent transaction won the
+    // race and committed first — translated into the same
+    // [`CatalogError::TargetTableSuffixCollision`] the pre-check raises,
+    // rather than left as an opaque [`CatalogError::Db`], so a caller sees
+    // one typed error for this invariant regardless of which of the two
+    // paths caught it. `existing` is `None` here (contrast the pre-check's
+    // `Some`): the insert failure has already aborted this transaction, so
+    // there's no further query available in it to look up what was won
+    // against.
+    let id: i64 = match txn
         .query_one(
             "insert into transform_definitions
                 (target_table, source_table, source_version, definition_text, source_columns, status)
              values ($1, $2, $3, $4, jsonb_object($5::text[], $6::text[]), $7)
              returning id",
             &[
-                &def.target,
+                &qualified_target,
                 &qualified_source,
                 &version,
                 &source_text,
@@ -831,8 +1092,18 @@ async fn create_definition_inner(
                 &status_text,
             ],
         )
-        .await?
-        .get(0);
+        .await
+    {
+        Ok(row) => row.get(0),
+        Err(err) if is_target_suffix_index_violation(&err) => {
+            return Err(CatalogError::TargetTableSuffixCollision {
+                target: def.target.clone(),
+                requested: qualified_target,
+                existing: None,
+            });
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     txn.commit().await?;
 
@@ -843,6 +1114,28 @@ async fn create_definition_inner(
         source_columns: source_columns.clone(),
         status,
     })
+}
+
+/// Whether `err` is a unique-violation against
+/// `transform_definitions_target_suffix_idx`
+/// (`V23__transform_definitions_target_suffix_idx.sql`) specifically — the
+/// signal [`create_definition_inner`]'s final insert uses to tell "a
+/// concurrent transaction won the bare-target-suffix race the pre-check
+/// above couldn't see" apart from any other constraint violation the same
+/// insert could raise (most notably `transform_definitions_target_table_key`,
+/// an exact-qualified-name duplicate, which stays a raw [`CatalogError::Db`]
+/// — see `a_duplicate_target_table_surfaces_the_underlying_postgres_detail`).
+/// Matched by constraint/index name, not just [`tokio_postgres::error::SqlState::UNIQUE_VIOLATION`]
+/// alone, since that SQLSTATE alone can't distinguish the two — mirrors
+/// `staging::quarantine::is_undefined_table`'s style of a small, named
+/// `&tokio_postgres::Error -> bool` predicate rather than inlining the check
+/// at its one call site.
+fn is_target_suffix_index_violation(err: &tokio_postgres::Error) -> bool {
+    let Some(db_err) = err.as_db_error() else {
+        return false;
+    };
+    *db_err.code() == tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+        && db_err.constraint() == Some("transform_definitions_target_suffix_idx")
 }
 
 /// Parses, validates, and stores a new relationship declaration (issue #26
@@ -1843,6 +2136,19 @@ struct PendingDefinition {
 /// [`TransformStatus::Live`] — see `chunk_queue::complete_direct_backfill`)
 /// re-derives the definition's target from current source state once it goes
 /// live, folding in anything skipped while it wasn't.
+///
+/// `node_table` ($1) is matched bare against `schema_nodes.table_name`,
+/// unaffected by issue #73 — `schema_nodes` stays bare pending issue #74 (see
+/// [`create_definition_inner`]'s doc comment), and every caller here
+/// ([`transforms_for_source`], `staging::apply`'s `catalog_source_key`
+/// results) already hands this a bare table name. The join from `to_node`
+/// onto `transform_definitions`, though, *is* affected: `to_node.table_name`
+/// is that same still-bare `schema_nodes` identity, but
+/// `transform_definitions.target_table` has been fully-qualified since issue
+/// #73, so a plain `t.target_table = to_node.table_name` would never match
+/// again — matched instead against `target_table`'s bare table-name suffix
+/// (`split_part`), the same convention [`table_has_other_reader`] already
+/// established for its own bare/qualified `source_table` join.
 pub async fn dependents_of(
     pool: &Pool,
     node_table: &str,
@@ -1855,7 +2161,7 @@ pub async fn dependents_of(
              from schema_nodes from_node
              join schema_edges se on se.from_node_id = from_node.id and se.kind = $2
              join schema_nodes to_node on to_node.id = se.to_node_id
-             join transform_definitions t on t.target_table = to_node.table_name
+             join transform_definitions t on split_part(t.target_table, '.', 2) = to_node.table_name
              left join lateral jsonb_each_text(t.source_columns) e on true
              where from_node.table_name = $1 and t.status = 'live'
              order by t.id",
@@ -2003,13 +2309,27 @@ pub async fn all_source_tables(pool: &Pool) -> Result<Vec<String>, CatalogError>
 /// by `apply::catalog_source_key`) still hands it a bare name — see that
 /// function's own doc comment for why: a CDC-staged `FoldedChange::src_table`
 /// is qualified and gets stripped to bare before reaching here, and a
-/// downstream (target-table-as-source, issue #73, not qualified yet) one was
-/// already bare. Since `source_table_versions.source_table` is qualified as
-/// of issue #72, matching it exactly against that already-bare key would
-/// never succeed; the `split_part` match restores the pre-#72 bare-vs-bare
-/// comparison this call site depends on. TODO(#73): once target tables gain
-/// qualified identity too, `apply.rs` can pass a qualified key straight
-/// through and this can go back to an exact match.
+/// downstream (target-table-as-source) one was already bare. Since
+/// `source_table_versions.source_table` is qualified as of issue #72,
+/// matching it exactly against that already-bare key would never succeed;
+/// the `split_part` match restores the pre-#72 bare-vs-bare comparison this
+/// call site depends on.
+///
+/// **Not resolved by issue #73.** An earlier draft of this comment predicted
+/// #73 (persisting `transform_definitions.target_table` qualified) would let
+/// `apply.rs` pass a qualified key straight through here once it landed. It
+/// doesn't: a chained definition's downstream `Recompute` trigger — what
+/// actually stages a "target-table-as-source" change into this apply path —
+/// gets its `src_table` from [`super::ddl::neighbor_table_name`], which
+/// issue #73 deliberately leaves bare (see that function's own doc comment:
+/// it's read live, over a connection whose `search_path` already resolves
+/// it, not compared as a persisted identity string). Catalog persistence and
+/// emitted-statement qualification are two different jobs — ADR-0007 splits
+/// them into separate decision points (1) and (3) — and only the first is
+/// this issue's. Making every emitted `src_table`/trigger row qualified, so
+/// this and `staging::apply::catalog_source_key` could drop their
+/// `split_part`/bare-suffix matching entirely, is issue #75's emission
+/// audit, not #72's or #73's.
 pub async fn source_table_version(
     pool: &Pool,
     source_table: &str,
@@ -2099,6 +2419,17 @@ pub(crate) async fn definition_by_id(
 /// where `transform` is this crate's `target_table`). Used by
 /// `staging::quarantine`'s column-resume path to reconstruct the
 /// [`super::ast::TransformDef`] whose column it's re-deriving.
+///
+/// `target_table` is — and, per this doc comment, must stay — the *bare*
+/// name every caller here actually has: a `Trellis` API consumer only ever
+/// knows the bare name their `TRANSFORM <name> FROM ...` text declared (the
+/// grammar has no qualified-target syntax yet — issue #76), and
+/// `docs/decisions/0003`'s `transform.column` addressing scheme parses on the
+/// first `.` (`app::QuarantineTarget::parse`) — a qualified address here
+/// would misparse as a column reference the moment a target table lived
+/// outside the default schema. Matched against `target_table`'s bare
+/// table-name suffix (`split_part`), not the qualified column directly,
+/// since it's been fully-qualified since issue #73.
 pub async fn definition_by_target(
     pool: &Pool,
     target_table: &str,
@@ -2109,7 +2440,7 @@ pub async fn definition_by_target(
             "select t.id, t.source_version, t.definition_text, t.status, e.key, e.value \
              from transform_definitions t \
              left join lateral jsonb_each_text(t.source_columns) e on true \
-             where t.target_table = $1",
+             where split_part(t.target_table, '.', 2) = $1",
             &[&target_table],
         )
         .await?;
@@ -2195,7 +2526,18 @@ pub(crate) async fn column_dependents(
     let client = pool.get().await?;
     let def_rows = client
         .query(
-            "select target_table, definition_text from transform_definitions",
+            // `split_part(target_table, '.', 2)`, not the qualified column
+            // directly (issue #73): the `String` this returns for each row
+            // is pushed straight into `deps` below as a *downstream
+            // transform* identifier, which flows into
+            // `staging::quarantine`'s `column_status`/`column_pause_cascades`
+            // bookkeeping — an entirely bare-keyed subsystem seeded from the
+            // bare `transform` a `Trellis` caller passes to `pause_column`/
+            // `resume_column`. Returning the newly-qualified spelling here
+            // instead would split that bookkeeping across two spellings of
+            // the same transform depending on whether a row was reached
+            // directly or via cascade.
+            "select split_part(target_table, '.', 2), definition_text from transform_definitions",
             &[],
         )
         .await?;
@@ -2230,9 +2572,12 @@ pub(crate) async fn column_dependents(
         // `def.source` (freshly re-parsed from `definition_text`), not the
         // persisted `transform_definitions.source_table` column — issue #72
         // made that column fully-qualified, but `upstream_table` here is
-        // always a bare *target* table name (target-table qualification is
-        // issue #73, not landed), so comparing against it needs the same
-        // bare spelling `def.source` already gives for free.
+        // always a bare *target* table name (a downstream transform's
+        // `def.source` naming an upstream one's `def.target`, or a paused
+        // column's own bare transform — see `staging::quarantine`'s
+        // callers), so comparing against it needs the same bare spelling
+        // `def.source` already gives for free, matching the `split_part`
+        // read of `target_table` above.
         for field in &def.fields {
             if expr_references_column(
                 &field.expr,

@@ -15,7 +15,7 @@ use std::time::Duration;
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::{TransformStatus, ValueType, chunk_queue, install_definition};
 use trellis::intake::publication;
 use trellis::staging::apply;
@@ -199,7 +199,9 @@ async fn a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another
 
     let status: String = client
         .query_one(
-            "select status from transform_definitions where target_table = 't'",
+            &format!(
+                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.t'"
+            ),
             &[],
         )
         .await
@@ -334,7 +336,9 @@ async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
 
     let status: String = client
         .query_one(
-            "select status from transform_definitions where target_table = 't'",
+            &format!(
+                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.t'"
+            ),
             &[],
         )
         .await
@@ -408,7 +412,9 @@ async fn a_stale_claimants_late_finish_after_reclaim_is_a_no_op() {
 
     let status: String = client
         .query_one(
-            "select status from transform_definitions where target_table = 't'",
+            &format!(
+                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.t'"
+            ),
             &[],
         )
         .await
@@ -471,7 +477,9 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
         .expect("finish A's chunk");
     let status_a: String = client
         .query_one(
-            "select status from transform_definitions where target_table = 'a_calc'",
+            &format!(
+                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.a_calc'"
+            ),
             &[],
         )
         .await
@@ -561,7 +569,9 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
         .expect("finish B's chunk");
     let status_b: String = client
         .query_one(
-            "select status from transform_definitions where target_table = 'b_calc'",
+            &format!(
+                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.b_calc'"
+            ),
             &[],
         )
         .await

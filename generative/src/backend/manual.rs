@@ -697,10 +697,15 @@ impl ManualBackend {
     async fn unsettled_definitions(&self) -> Result<Vec<String>, ManualBackendError> {
         let mut unsettled = Vec::new();
         for def in &self.defs {
+            // Issue #73: `target_table` is persisted fully-qualified now,
+            // but `def.target` (freshly parsed definition text) is bare —
+            // match against `target_table`'s bare table-name suffix, same
+            // convention `trellis::app::Trellis::status` itself uses.
             let Some(row) = self
                 .raw
                 .query_opt(
-                    "select status from transform_definitions where target_table = $1",
+                    "select status from transform_definitions \
+                     where split_part(target_table, '.', 2) = $1",
                     &[&def.target],
                 )
                 .await?

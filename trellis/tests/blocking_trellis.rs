@@ -16,6 +16,7 @@
 //! any test below.
 
 use testkit::TestCluster;
+use trellis::config::DEFAULT_TARGET_SCHEMA;
 use trellis::{BlockingTrellis, Config, TransformStatus, TrellisError, TrellisOptions};
 
 /// (a) + (c): a full lifecycle — connect, migrate, define, definitions(), a
@@ -56,7 +57,13 @@ fn full_lifecycle_is_synchronous_start_to_finish() {
 
     let defs = trellis.definitions().expect("definitions (sync)");
     assert_eq!(defs.len(), 1);
-    assert_eq!(defs[0].target_table, "widget_totals");
+    // Issue #73: `DefinitionSummary.target_table` reports the persisted,
+    // fully-qualified identity now, matching `source_table`'s own
+    // already-qualified precedent from issue #72.
+    assert_eq!(
+        defs[0].target_table,
+        format!("{DEFAULT_TARGET_SCHEMA}.widget_totals")
+    );
 
     let status = trellis.status("widget_totals").expect("status (sync)");
     assert!(

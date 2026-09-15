@@ -249,9 +249,16 @@ impl Trellis {
         target_table: &str,
     ) -> Result<Option<TransformStatus>, TrellisError> {
         let client = self.pool.get().await?;
+        // Issue #73: `transform_definitions.target_table` is persisted
+        // fully-qualified, but every caller here only ever has the bare name
+        // their `TRANSFORM <name> FROM ...` text declared (the grammar has no
+        // qualified-target syntax yet — issue #76), so match against
+        // `target_table`'s bare table-name suffix rather than the qualified
+        // column directly.
         let row = client
             .query_opt(
-                "select status from transform_definitions where target_table = $1",
+                "select status from transform_definitions \
+                 where split_part(target_table, '.', 2) = $1",
                 &[&target_table],
             )
             .await?;
@@ -374,10 +381,19 @@ impl Trellis {
         let client = self.pool.get().await?;
         let mut entries = Vec::new();
 
+        // Issue #73: read back the bare table-name suffix, not the persisted
+        // fully-qualified `target_table` — `QuarantineTarget::Transform`
+        // round-trips through `docs/decisions/0003`'s `transform.column`
+        // addressing scheme elsewhere in this API (`quarantine_status`,
+        // `resume_column`, `sample_quarantined`, all keyed on the bare name
+        // the grammar accepts back), which parses an address on its first
+        // `.` — handing it a qualified `"schema.table"` spelling here would
+        // make every entry in this list misparse as a column address the
+        // moment a target table lived outside the default schema.
         let quarantined_transforms = client
             .query(
-                "select target_table from transform_definitions where status = 'quarantined' \
-                 order by target_table",
+                "select split_part(target_table, '.', 2) from transform_definitions \
+                 where status = 'quarantined' order by target_table",
                 &[],
             )
             .await?;
@@ -424,9 +440,15 @@ impl Trellis {
         let client = self.pool.get().await?;
         match &target {
             QuarantineTarget::Transform(t) => {
+                // Issue #73: `t` is the bare name `QuarantineTarget::parse`
+                // extracted from the caller's address — match against
+                // `target_table`'s bare table-name suffix, not the persisted
+                // qualified column (see `status`'s own call site for the
+                // same reasoning).
                 let row = client
                     .query_opt(
-                        "select status from transform_definitions where target_table = $1",
+                        "select status from transform_definitions \
+                         where split_part(target_table, '.', 2) = $1",
                         &[t],
                     )
                     .await?
@@ -443,9 +465,12 @@ impl Trellis {
                 })
             }
             QuarantineTarget::Column(t, c) => {
+                // Issue #73: same bare-suffix match as the `Transform` arm
+                // above — `t` is bare, `target_table` is qualified.
                 let transform_exists: bool = client
                     .query_one(
-                        "select exists(select 1 from transform_definitions where target_table = $1)",
+                        "select exists(select 1 from transform_definitions \
+                         where split_part(target_table, '.', 2) = $1)",
                         &[t],
                     )
                     .await?
@@ -525,9 +550,12 @@ impl Trellis {
                 }
             },
             QuarantineTarget::Transform(t) => {
+                // Issue #73: `t` is bare — same `split_part` match as
+                // `status`/`quarantine_status`.
                 let source_row = client
                     .query_opt(
-                        "select source_table from transform_definitions where target_table = $1",
+                        "select source_table from transform_definitions \
+                         where split_part(target_table, '.', 2) = $1",
                         &[t],
                     )
                     .await?
@@ -537,12 +565,17 @@ impl Trellis {
                 // actually stages) isn't uniformly so — a raw/CDC-sourced
                 // definition's poisoned rows are staged qualified (matching
                 // `qualified` directly), while a definition chained off
-                // another's target table are staged bare (target-table
-                // qualification is issue #73, not landed yet — see
-                // `defs::source_table_version`'s doc comment for the same
-                // split elsewhere). Matching against both forms keeps this
-                // query correct either way rather than picking one and
-                // silently going empty for the other.
+                // another's target table are staged bare. Landing issue #73
+                // (which persists `transform_definitions.target_table`
+                // qualified too) doesn't close this gap: a chained
+                // definition's poisoned rows get their `src_table` from
+                // `ddl::neighbor_table_name`, which #73 deliberately leaves
+                // bare (see `defs::source_table_version`'s doc comment for
+                // the full rationale, and why closing this for good is
+                // issue #75's emission-audit territory instead). Matching
+                // against both forms keeps this query correct either way
+                // rather than picking one and silently going empty for the
+                // other.
                 let qualified: String = source_row.get(0);
                 let bare = qualified
                     .split_once('.')

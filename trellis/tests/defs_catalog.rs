@@ -136,6 +136,124 @@ async fn source_table_is_persisted_fully_qualified() {
     assert_eq!(version, 1);
 }
 
+/// Issue #73 / ADR-0007's mirror of `source_table_is_persisted_fully_qualified`
+/// above, for the target side: `transform_definitions.target_table` must
+/// persist `def.target` resolved to `{Config::target_schema}.{def.target}`,
+/// not the bare spelling the definition text names. Unlike the source side,
+/// the target schema is never search-path-resolved — it's `Config::target_schema`,
+/// `"public"` by default (`DEFAULT_TARGET_SCHEMA`, what `testkit`'s pools use
+/// unless overridden) — so this doesn't need a non-default-schema table to
+/// prove real resolution happened; it just needs to prove the schema prefix
+/// is there at all.
+#[tokio::test]
+async fn target_table_is_persisted_fully_qualified() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "posts").await;
+
+    let source_columns: HashMap<String, ValueType> =
+        HashMap::from([("title".to_string(), ValueType::Text)]);
+    let def = create_definition(
+        &db.pool,
+        "TRANSFORM post_titles FROM posts SELECT title AS out",
+        &source_columns,
+    )
+    .await
+    .expect("valid definition should be stored");
+    // The returned `Definition` re-parses `definition_text`, which the
+    // grammar never qualifies — this stays bare regardless of what's
+    // persisted, exactly like `def.source` above.
+    assert_eq!(def.def.target, "post_titles");
+
+    let client = db.pool.get().await.expect("get connection");
+    let target_table: String = client
+        .query_one(
+            "select target_table from transform_definitions where id = $1",
+            &[&def.id],
+        )
+        .await
+        .expect("read back the persisted definition")
+        .get(0);
+    assert_eq!(target_table, "public.post_titles");
+}
+
+/// Issue #73's chained/multi-hop coverage: once both the source and target
+/// sides are qualified (issues #72 and #73 together), a second definition
+/// chained off a first definition's *target* must still resolve correctly —
+/// the second definition's `resolve_source_schema_in_txn` walk over its bare
+/// `FROM` clause finds the first definition's physical target table via
+/// `search_path` (`pool::session_bootstrap` pins the configured target
+/// schema onto it) exactly as it would any other source, and the two
+/// definitions' persisted `target_table`/`source_table` columns land on the
+/// identical qualified string — proving the chain's identity actually
+/// matches end to end, not just that each definition independently
+/// qualified its own name the same way.
+#[tokio::test]
+async fn a_definitions_target_table_matches_a_chained_definitions_source_table() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "a").await;
+
+    let a_def = create_definition(
+        &db.pool,
+        "TRANSFORM b FROM a SELECT id AS total",
+        &HashMap::from([("id".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect("a -> b definition should be stored");
+
+    // `create_definition` never issues target-table DDL itself (`install_definition`'s
+    // job) — materialize `b` for real before chaining `c` off of it, mirroring
+    // `defs_edges.rs`'s `materialize_chained_target` helper.
+    let pk = trellis::defs::source_primary_key(&db.pool, "a")
+        .await
+        .expect("introspect a's primary key");
+    let b_def = trellis::defs::parse("TRANSFORM b FROM a SELECT id AS total")
+        .expect("parse b's definition");
+    trellis::defs::create_target_table(
+        &db.pool,
+        &b_def,
+        "public",
+        &pk,
+        &HashMap::from([("id".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect("materialize b's target table");
+
+    let c_def = create_definition(
+        &db.pool,
+        "TRANSFORM c FROM b SELECT total AS total_again",
+        &HashMap::from([("total".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect("b -> c definition should be stored");
+
+    let client = db.pool.get().await.expect("get connection");
+    let a_target_table: String = client
+        .query_one(
+            "select target_table from transform_definitions where id = $1",
+            &[&a_def.id],
+        )
+        .await
+        .expect("read back a's persisted definition")
+        .get(0);
+    let c_source_table: String = client
+        .query_one(
+            "select source_table from transform_definitions where id = $1",
+            &[&c_def.id],
+        )
+        .await
+        .expect("read back c's persisted definition")
+        .get(0);
+
+    assert_eq!(a_target_table, "public.b");
+    assert_eq!(
+        c_source_table, a_target_table,
+        "c's source and a's target must resolve to the identical qualified \
+         identity for the chain to actually connect"
+    );
+}
+
 /// Issue #63's write-path gap: the source-column type map a definition was
 /// validated against must be persisted, not just returned transiently from
 /// `create_definition` — `transforms_for_source` (what the physical apply
@@ -551,6 +669,279 @@ async fn a_duplicate_target_table_surfaces_the_underlying_postgres_detail() {
     assert!(
         message.contains("transform_definitions_target_table_key"),
         "expected the violated constraint's name in the error message, got: {message}"
+    );
+}
+
+/// Reviewer follow-up to issue #73 (see
+/// `CatalogError::TargetTableSuffixCollision`'s own doc comment):
+/// qualifying `target_table` narrowed its `unique` constraint to the
+/// *qualified* spelling only, so two live definitions could otherwise
+/// coexist as `public.foo` and `custom.foo` — most plausibly from
+/// `Config::target_schema` changing between deploys and an operator
+/// redeclaring a same-named `TRANSFORM ... TARGET foo` under it. Every
+/// `split_part(target_table, '.', 2)`-keyed read site downstream
+/// (`definition_by_target`, `dependents_of`, `app.rs`'s status/quarantine
+/// polls, `generative`'s `unsettled_definitions`) assumes that suffix is
+/// globally unique, so `create_definition_inner` must reject the second
+/// definition outright rather than let the collision persist. Reproduces
+/// the "target schema changed between deploys" scenario directly, via a
+/// second pool built with a different `target_schema` against the same
+/// database, rather than mutating search_path mid-test.
+#[tokio::test]
+async fn a_target_table_colliding_on_bare_suffix_under_a_different_schema_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM foo FROM orders SELECT price AS total",
+        &columns(&["price"]),
+    )
+    .await
+    .expect("first definition (public.foo) should be stored");
+
+    {
+        let client = db.pool.get().await.expect("get connection");
+        client
+            .batch_execute("create schema custom")
+            .await
+            .expect("create the second target schema");
+    }
+
+    let custom_config = trellis::Config::from_dsn(db.dsn().to_string())
+        .expect("valid dsn")
+        .with_target_schema("custom")
+        .expect("valid target schema");
+    let custom_pool =
+        trellis::Pool::new(&custom_config).expect("build pool with target_schema=custom");
+
+    let err = create_definition(
+        &custom_pool,
+        "TRANSFORM foo FROM orders SELECT price AS total",
+        &columns(&["price"]),
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        CatalogError::TargetTableSuffixCollision {
+            target,
+            requested,
+            existing,
+        } => {
+            assert_eq!(target, "foo");
+            assert_eq!(requested, "custom.foo");
+            assert_eq!(existing, Some("public.foo".to_string()));
+        }
+        other => panic!("expected TargetTableSuffixCollision, got: {other:?}"),
+    }
+
+    // The rejected second definition must not have been persisted at all —
+    // this is a write-path rejection, not a read-side workaround.
+    let client = db.pool.get().await.expect("get connection");
+    let count: i64 = client
+        .query_one(
+            "select count(*) from transform_definitions where split_part(target_table, '.', 2) = 'foo'",
+            &[],
+        )
+        .await
+        .expect("count definitions")
+        .get(0);
+    assert_eq!(count, 1, "the rejected second definition must not persist");
+}
+
+/// Reviewer follow-up to issue #73's own follow-up
+/// (`transform_definitions_target_suffix_idx`,
+/// `V23__transform_definitions_target_suffix_idx.sql`): the TOCTOU race the
+/// index exists to close, reproduced for real rather than merely asserted by
+/// inspection. `create_definition_inner`'s pre-check
+/// (`a_target_table_colliding_on_bare_suffix_under_a_different_schema_is_rejected`
+/// above) only ever sees its own transaction's snapshot, so it cannot see a
+/// concurrent transaction's still-uncommitted insert of a colliding
+/// definition — this test holds exactly such an uncommitted insert open on a
+/// raw connection while a real `create_definition` call runs concurrently,
+/// so its pre-check provably passes (the colliding row isn't visible yet)
+/// and only the final `insert` — which must then block on Postgres's own
+/// unique-index conflict resolution until the raw connection's transaction
+/// resolves — discovers the collision. Committing the raw connection's
+/// transaction (rather than rolling it back) makes that final insert lose
+/// the race deterministically, exercising exactly the "the check passed but
+/// the insert now races the index" path
+/// `is_target_suffix_index_violation`/`CatalogError::TargetTableSuffixCollision`
+/// (`existing: None`) exist for.
+///
+/// Bypasses `create_definition_inner`'s own pre-check entirely for the raw
+/// insert (a direct `insert into transform_definitions`, not a second
+/// `create_definition` call) specifically so nothing about *this* test
+/// relies on the pre-check's behavior — only the DB-level index is under
+/// test here.
+#[tokio::test]
+async fn a_concurrent_insert_racing_the_target_suffix_index_is_translated_to_a_collision_error() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_bare_source_table(&db.pool, "orders").await;
+
+    // Establishes the `source_table_versions` row the raw insert below needs
+    // to satisfy `transform_definitions.source_table`'s FK — a real
+    // definition already exists for `orders`'s qualified identity, whatever
+    // its own target happens to be. Read back the qualified spelling rather
+    // than assuming `public.orders`: `create_bare_source_table` deliberately
+    // leaves the table unqualified so it lands via the pool's ambient
+    // search_path (`trellis` schema first — see that helper's own doc
+    // comment), not necessarily `public`.
+    let seed_def = create_definition(
+        &db.pool,
+        "TRANSFORM bar FROM orders SELECT price AS total",
+        &columns(&["price"]),
+    )
+    .await
+    .expect("seed definition should be stored");
+    let qualified_orders: String = db
+        .pool
+        .get()
+        .await
+        .expect("get connection")
+        .query_one(
+            "select source_table from transform_definitions where id = $1",
+            &[&seed_def.id],
+        )
+        .await
+        .expect("read back the seed definition's qualified source")
+        .get(0);
+
+    {
+        let client = db.pool.get().await.expect("get connection");
+        client
+            .batch_execute("create schema custom")
+            .await
+            .expect("create the second target schema");
+    }
+
+    // A raw connection, outside the pool, holding open a transaction that
+    // has inserted `public.foo` but not yet committed — standing in for
+    // "another session's concurrent `create_definition` call", except here
+    // the timing is under this test's own control rather than left to
+    // chance.
+    let (raw_client, raw_connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+        .await
+        .expect("raw connect");
+    tokio::spawn(async move {
+        let _ = raw_connection.await;
+    });
+    raw_client
+        .batch_execute(&format!(
+            "set search_path to {}, public",
+            trellis::config::DEFAULT_SCHEMA
+        ))
+        .await
+        .expect("set search_path on raw connection");
+    raw_client
+        .batch_execute("begin")
+        .await
+        .expect("begin raw transaction");
+    raw_client
+        .execute(
+            "insert into transform_definitions
+                (target_table, source_table, source_version, definition_text)
+             values ('public.foo', $1, 1, 'TRANSFORM foo FROM orders SELECT price AS total')",
+            &[&qualified_orders],
+        )
+        .await
+        .expect("raw, uncommitted insert of the colliding row");
+
+    let custom_config = trellis::Config::from_dsn(db.dsn().to_string())
+        .expect("valid dsn")
+        .with_target_schema("custom")
+        .expect("valid target schema");
+    let custom_pool =
+        trellis::Pool::new(&custom_config).expect("build pool with target_schema=custom");
+
+    let racing_call = tokio::spawn(async move {
+        create_definition(
+            &custom_pool,
+            "TRANSFORM foo FROM orders SELECT price AS total",
+            &columns(&["price"]),
+        )
+        .await
+    });
+
+    // Wait until the spawned `create_definition` call's own insert is
+    // actually blocked on the raw connection's uncommitted conflicting index
+    // entry (`pg_locks.granted = false`) before committing — committing too
+    // early (before the racing call even reaches its insert) would let the
+    // pre-check see the row instead and take the ordinary, non-racing path
+    // this test isn't exercising; there's nothing to wait on if the race
+    // never actually engages.
+    let observer = db.pool.get().await.expect("get connection");
+    let mut waited = std::time::Duration::ZERO;
+    let poll_interval = std::time::Duration::from_millis(20);
+    let timeout = std::time::Duration::from_secs(10);
+    loop {
+        let blocked: i64 = observer
+            .query_one(
+                "select count(*) from pg_locks l
+                 join pg_stat_activity a on l.pid = a.pid
+                 where not l.granted and a.datname = current_database()",
+                &[],
+            )
+            .await
+            .expect("poll pg_locks")
+            .get(0);
+        if blocked > 0 {
+            break;
+        }
+        if waited >= timeout {
+            panic!(
+                "timed out waiting for the racing create_definition call's insert \
+                 to block on the raw connection's uncommitted row"
+            );
+        }
+        tokio::time::sleep(poll_interval).await;
+        waited += poll_interval;
+    }
+    drop(observer);
+
+    raw_client
+        .batch_execute("commit")
+        .await
+        .expect("commit the raw connection's transaction, unblocking the racing insert");
+
+    let err = racing_call
+        .await
+        .expect("racing create_definition task should not panic")
+        .unwrap_err();
+
+    match err {
+        CatalogError::TargetTableSuffixCollision {
+            target,
+            requested,
+            existing,
+        } => {
+            assert_eq!(target, "foo");
+            assert_eq!(requested, "custom.foo");
+            assert_eq!(
+                existing, None,
+                "the insert-time race path has no live transaction left to \
+                 look the colliding row's identity up in"
+            );
+        }
+        other => panic!("expected TargetTableSuffixCollision, got: {other:?}"),
+    }
+
+    // The racing call must not have persisted anything either.
+    let client = db.pool.get().await.expect("get connection");
+    let count: i64 = client
+        .query_one(
+            "select count(*) from transform_definitions where split_part(target_table, '.', 2) = 'foo'",
+            &[],
+        )
+        .await
+        .expect("count definitions")
+        .get(0);
+    assert_eq!(
+        count, 1,
+        "only the raw connection's committed row should persist under this suffix"
     );
 }
 

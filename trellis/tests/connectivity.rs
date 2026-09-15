@@ -29,9 +29,14 @@ async fn migrate_up_is_idempotent() {
     assert_eq!(
         first_run,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
         ],
-        "expected exactly V1 through V21 to be applied"
+        // Issue #73 added V22 (drops `column_status`'s now-unenforceable
+        // `target_table` foreign key). Its reviewer follow-up added V23
+        // (the `transform_definitions_target_suffix_idx` expression unique
+        // index — the DB-level backstop for `create_definition_inner`'s
+        // bare-target-suffix pre-check).
+        "expected exactly V1 through V23 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.

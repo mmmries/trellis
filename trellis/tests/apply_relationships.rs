@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::ast::{
     Expr, FieldDef, KeySpace, Predicate, RelationshipDef, TransformDef, ValueType,
 };
@@ -248,9 +248,14 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
     .expect("create target table");
     client
         .execute(
-            "update transform_definitions \
-             set definition_text = 'TRANSFORM article_cat FROM articles SELECT category.name AS category_name' \
-             where target_table = 'article_cat'",
+            // Issue #73: `target_table` is persisted fully-qualified now —
+            // `article_cat` was created via `create_target_table(..., "public", ...)`
+            // above, so it landed under `DEFAULT_TARGET_SCHEMA`.
+            &format!(
+                "update transform_definitions \
+                 set definition_text = 'TRANSFORM article_cat FROM articles SELECT category.name AS category_name' \
+                 where target_table = '{DEFAULT_TARGET_SCHEMA}.article_cat'"
+            ),
             &[],
         )
         .await
