@@ -8,7 +8,8 @@ The intent and goal of open sourcing this project is to increase the contributor
 
 # Getting started
 
-Please join the community on {Here list Slack channels, Email lists, Glitter, Discord, etc... links}. Also please make sure to take a look at the project [roadmap](ROADMAP.md) to see where we are headed.
+Feel free to clone the project, run some [examples](https://github.com/mmmries/trellis-examples) or go build your own.
+The `docs` directory is a great place to get to grips with the current state of the project and the general direction we're headed.
 
 # Issues, requests & ideas
 
