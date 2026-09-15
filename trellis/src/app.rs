@@ -186,7 +186,9 @@ impl Trellis {
     /// those two shapes.
     pub async fn define(&self, definition_text: &str) -> Result<Definition, TrellisError> {
         let parsed = defs::parse(definition_text)?;
-        let source_columns = self.source_columns(&parsed.source).await?;
+        let source_columns = self
+            .source_columns(&parsed.source, parsed.explicit_source_schema.as_deref())
+            .await?;
         defs::install_definition(
             &self.pool,
             definition_text,
@@ -684,16 +686,51 @@ impl Trellis {
     /// Introspects `source_table`'s column names and types for the definition
     /// validator, the same `information_schema` read
     /// [`defs::install_definition`] expects its caller to supply.
+    ///
+    /// Broader sweep, reviewer follow-up to issue #74 (epic #78's own
+    /// whole-branch review): this used to query `information_schema.columns`
+    /// with a bare `table_name = $1 and table_schema = any(current_schemas(false))`
+    /// `search_path` walk — the same no-fallback shape every other fixed gap
+    /// in this round had — fed straight from [`defs::ast::TransformDef::source`],
+    /// which also completely ignored
+    /// [`defs::ast::TransformDef::explicit_source_schema`] (issue #76).
+    /// So *this*, the very first thing [`Trellis::define`] does with a
+    /// parsed definition, rejected both an explicitly-qualified `FROM
+    /// <schema>.<table>` naming a table outside this connection's
+    /// `search_path`, and a bare `FROM <table>` chaining off another
+    /// definition's target explicitly qualified into a non-default schema
+    /// (issue #76) — before `install_definition`'s own, already-fixed
+    /// resolution (`resolve_source_for_install`) was ever reached: this call
+    /// happens first, in [`Trellis::define`], and returns
+    /// [`TrellisError::SourceTableNotFound`] eagerly on an empty result, so
+    /// `install_definition` was never even called. Now resolves the source
+    /// the same way `resolve_source_for_install` does — an explicit schema
+    /// names that exact relation directly, a bare name goes through
+    /// [`defs::catalog::resolve_graph_identity`]'s two-step (physical
+    /// `search_path` lookup, falling back to a live definition's own bare
+    /// target-suffix) — then queries `information_schema.columns` by the
+    /// resolved `table_schema`/`table_name` pair directly, rather than
+    /// walking `search_path` a second time.
     async fn source_columns(
         &self,
         source_table: &str,
+        explicit_source_schema: Option<&str>,
     ) -> Result<HashMap<String, ValueType>, TrellisError> {
+        let qualified = match explicit_source_schema {
+            Some(schema) => crate::intake::publication::qualify(schema, source_table)
+                .map_err(CatalogError::from)?,
+            None => defs::catalog::resolve_graph_identity(&self.pool, source_table).await?,
+        };
+        let (schema, table) = qualified
+            .split_once('.')
+            .expect("resolve_graph_identity/qualify always return a schema.table-shaped string");
+
         let client = self.pool.get().await?;
         let rows = client
             .query(
                 "select column_name, data_type from information_schema.columns \
-                 where table_name = $1 and table_schema = any(current_schemas(false))",
-                &[&source_table],
+                 where table_schema = $1 and table_name = $2",
+                &[&schema, &table],
             )
             .await?;
 

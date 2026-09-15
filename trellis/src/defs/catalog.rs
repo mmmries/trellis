@@ -833,21 +833,36 @@ async fn plan_direct_backfill_coverage(
         // here exactly as it is there, never re-walked through `search_path`,
         // so the coverage fence below is captured (and later looked up) under
         // the *actual* persisted qualified name rather than a different one
-        // `resolve_source_schema_in_txn` might independently pick. Every
-        // other table in this set is a relationship to-side
-        // ([`ResolvedRelationship::to_table`]), which ADR-0007's "Scope"
-        // section explicitly leaves bare-resolved for now (relationship
-        // endpoints aren't qualified syntax yet — a later issue's job), so
-        // only this one entry needs the branch.
-        let schema = if bare_table == def.source {
+        // a bare walk might independently pick. Every other table in this set
+        // is a relationship to-side ([`ResolvedRelationship::to_table`]),
+        // which ADR-0007's "Scope" section explicitly leaves bare-resolved
+        // for now (relationship endpoints aren't qualified syntax yet — a
+        // later issue's job), so only this one entry needs the branch.
+        //
+        // Reviewer follow-up to issue #74 (epic #78's own whole-branch
+        // review): both branches used to call [`resolve_source_schema_in_txn`]
+        // directly — a plain `search_path` walk with no fallback — even
+        // though `create_definition_inner`'s own resolution of a bare
+        // `def.source`/relationship to-side has carried issue #74's
+        // bare-target-suffix fallback ([`resolve_graph_identity_in_txn`])
+        // since that issue landed. Since this function only ever runs from
+        // `install_definition`'s fast path (never from the ring path that
+        // already had the fallback), a bare name chained off another
+        // definition's target explicitly qualified into a non-default schema
+        // (issue #76) failed here first, before the build ever ran, as a
+        // plain "not found on the search path". Switched to
+        // [`resolve_graph_identity_in_txn`] itself (which already returns the
+        // fully-qualified identity directly, so the separate `qualify` call
+        // below moves into this same match), rather than re-implementing the
+        // fallback a third time.
+        let qualified = if bare_table == def.source {
             match &def.explicit_source_schema {
-                Some(schema) => schema.clone(),
-                None => resolve_source_schema_in_txn(&txn, &bare_table).await?,
+                Some(schema) => crate::intake::publication::qualify(schema, &bare_table)?,
+                None => resolve_graph_identity_in_txn(&txn, &bare_table).await?,
             }
         } else {
-            resolve_source_schema_in_txn(&txn, &bare_table).await?
+            resolve_graph_identity_in_txn(&txn, &bare_table).await?
         };
-        let qualified = crate::intake::publication::qualify(&schema, &bare_table)?;
         if table_has_other_reader(&txn, &bare_table, &qualified).await? {
             plans.push(CoveragePlan::Clear { qualified });
         } else {
@@ -1335,8 +1350,45 @@ pub async fn create_relationship(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
-    let from_type = column_type_in_txn(&txn, &def.from_table, &def.from_col).await?;
-    let to_type = column_type_in_txn(&txn, &def.to_table, &def.to_col).await?;
+    // Issue #74, ADR-0007: resolve both endpoints to their fully-qualified
+    // identity via the same [`resolve_graph_identity_in_txn`]
+    // [`create_definition_inner`] uses for a transform's source/target,
+    // *before* touching `schema_nodes`/`schema_edges` — or, per the reviewer
+    // follow-up below, this function's own pg_catalog introspection either —
+    // at all. Required now that graph keys on qualified identity, so a table
+    // that's both a relationship endpoint and a transform source/target (the
+    // common case ADR-0006's own examples all chain off) resolves to one
+    // node either way, not two. `relationship_definitions.from_table`/
+    // `to_table` themselves stay bare (`def.from_table`/`def.to_table`,
+    // inserted below) — a relationship endpoint gaining its *own* persisted
+    // qualified identity is explicitly out of this issue's scope (ADR-0007's
+    // "Scope" section: "relationship endpoints... as they gain persisted
+    // identity" is future work) — only the shared `schema_nodes`/
+    // `schema_edges` graph these calls feed needs to agree with the
+    // transform side today.
+    //
+    // Reviewer follow-up to issue #74 (epic #78's own whole-branch review):
+    // this resolution used to run *after* this function's own pg_catalog
+    // introspection (`column_type_in_txn`/`to_col_cardinality_in_txn`/
+    // `has_usable_fk_index_in_txn`/`assert_replica_identity_supports_to_many`,
+    // below), which resolve `def.from_table`/`def.to_table` bare via
+    // `pg_catalog.to_regclass` — a plain `search_path` walk with no
+    // fallback, unlike this call. So a relationship endpoint that bare-names
+    // another definition's target explicitly qualified into a non-default
+    // schema (issue #76) never reached this resolution at all: it failed
+    // first, in one of those four checks, as a false "does not exist" (e.g.
+    // `to_col_cardinality_in_txn`'s `to_regclass($1)` resolving to `NULL`
+    // reads as "no such index", not "wrong schema"). Moved up here, before
+    // any of them, and threaded through via [`resolve_relationship_endpoint_in_txn`]
+    // — a thin wrapper around this exact function, not a second fallback
+    // implementation — so every pg_catalog lookup below gets the same
+    // two-step resolution `create_definition_inner` already relies on.
+    let qualified_from = resolve_relationship_endpoint_in_txn(&txn, &def.from_table).await?;
+    let qualified_to = resolve_relationship_endpoint_in_txn(&txn, &def.to_table).await?;
+
+    let from_type =
+        column_type_in_txn(&txn, &qualified_from, &def.from_table, &def.from_col).await?;
+    let to_type = column_type_in_txn(&txn, &qualified_to, &def.to_table, &def.to_col).await?;
     assert_comparable_types(&def, &from_type, &to_type)?;
     assert_join_key_type_supported(&def, &from_type, &to_type)?;
 
@@ -1356,23 +1408,6 @@ pub async fn create_relationship(
         }
         .into());
     }
-
-    // Issue #74, ADR-0007: resolve both endpoints to their fully-qualified
-    // identity via the same [`resolve_graph_identity_in_txn`]
-    // [`create_definition_inner`] uses for a transform's source/target,
-    // *before* touching `schema_nodes`/`schema_edges` at all — required now
-    // that graph keys on qualified identity, so a table that's both a
-    // relationship endpoint and a transform source/target (the common case
-    // ADR-0006's own examples all chain off) resolves to one node either
-    // way, not two. `relationship_definitions.from_table`/`to_table`
-    // themselves stay bare (`def.from_table`/`def.to_table`, inserted
-    // below) — a relationship endpoint gaining its *own* persisted qualified
-    // identity is explicitly out of this issue's scope (ADR-0007's "Scope"
-    // section: "relationship endpoints... as they gain persisted identity"
-    // is future work) — only the shared `schema_nodes`/`schema_edges` graph
-    // these two calls feed needs to agree with the transform side today.
-    let qualified_from = resolve_graph_identity_in_txn(&txn, &def.from_table).await?;
-    let qualified_to = resolve_graph_identity_in_txn(&txn, &def.to_table).await?;
 
     let from_node = resolve_node_in_txn(&txn, &qualified_from, NodeKind::Source).await?;
     // `to_table` is marked `is_source` here too, even though a relationship's
@@ -1406,17 +1441,17 @@ pub async fn create_relationship(
 
     persist_edge_in_txn(&txn, to_node.id, from_node.id, EdgeKind::Relationship).await?;
 
-    let cardinality = to_col_cardinality_in_txn(&txn, &def.to_table, &def.to_col).await?;
+    let cardinality = to_col_cardinality_in_txn(&txn, &qualified_to, &def.to_col).await?;
 
     // To-many's join key is a non-PK column on the to-side; reverse recompute
     // reads it from delete/re-parent pre-images, which the default (PK)
     // replica identity omits — reject unless the to-side carries it (#41).
     if cardinality == RelationshipCardinality::ToMany {
-        assert_replica_identity_supports_to_many(&txn, &def).await?;
+        assert_replica_identity_supports_to_many(&txn, &def, &qualified_to).await?;
     }
 
     let mut warnings = Vec::new();
-    if !has_usable_fk_index_in_txn(&txn, &def.from_table, &def.from_col).await? {
+    if !has_usable_fk_index_in_txn(&txn, &qualified_from, &def.from_col).await? {
         warnings.push(RelationshipWarning::MissingFkIndex {
             from_table: def.from_table.clone(),
             from_col: def.from_col.clone(),
@@ -1575,9 +1610,26 @@ pub(crate) async fn resolve_relationships(
             continue;
         };
         let to_table = reldef.def.to_table.clone();
+        // Reviewer follow-up to issue #74 (epic #78's own whole-branch
+        // review, 4th gap): `column_type` below queries `pg_attribute`
+        // straight off this bare `to_table` — a `to_regclass` `search_path`
+        // walk with no fallback, same as `create_relationship`'s own
+        // pg_catalog checks had before [`resolve_relationship_endpoint_in_txn`]
+        // — so a relationship whose bare `TO <table>.id` chains off another
+        // definition's target explicitly qualified into a non-default schema
+        // (issue #76) resolved fine at `create_relationship` time but still
+        // failed here, at calculated-field relationship-path enrichment
+        // resolution (issue #40), as a false
+        // [`ValidationError::UnknownRelationshipColumn`]. Resolved via
+        // [`resolve_relationship_endpoint`] — the pooled counterpart to
+        // [`resolve_relationship_endpoint_in_txn`], same best-effort
+        // fallback-to-bare-on-total-miss behavior — so a genuinely
+        // nonexistent to-table still reports its own precise error out of
+        // `column_type` below, not this resolution's.
+        let query_to_table = resolve_relationship_endpoint(pool, &to_table).await?;
         let mut column_types = HashMap::with_capacity(columns.len());
         for column in columns {
-            let pg_type = column_type(pool, &to_table, &column).await?;
+            let pg_type = column_type(pool, &query_to_table, &to_table, &column).await?;
             column_types.insert(column, value_type_from_pg(&pg_type));
         }
         resolved.insert(
@@ -1704,6 +1756,76 @@ async fn resolve_graph_identity_in_txn(
     }
 }
 
+/// Best-effort counterpart to [`resolve_graph_identity_in_txn`], for
+/// [`create_relationship`]'s own pg_catalog introspection
+/// (`column_type_in_txn`/`to_col_cardinality_in_txn`/
+/// `has_usable_fk_index_in_txn`/`assert_replica_identity_supports_to_many`) —
+/// reviewer follow-up to issue #74 (epic #78's own whole-branch review). Those
+/// four resolve `def.from_table`/`def.to_table` via `pg_catalog.to_regclass`,
+/// which — like [`resolve_source_schema_in_txn`]'s own walk — only ever
+/// considers *this connection's* `search_path`, so a relationship endpoint
+/// that bare-names another definition's target explicitly qualified into a
+/// non-default schema (issue #76) needs the exact same bare-target-suffix
+/// fallback `create_definition_inner`'s `qualified_source` already gets.
+///
+/// Unlike [`resolve_graph_identity_in_txn`] itself, a *total* miss (neither a
+/// physical table nor a live definition's target) is not an error here — it
+/// falls back to returning `table` unchanged. That matters for a genuinely
+/// nonexistent endpoint: `column_type_in_txn` et al. below still run their
+/// own `to_regclass`-based lookup against the same bare name Postgres itself
+/// would have tried, so they still report their own precise
+/// [`ValidationError::UnknownRelationshipColumn`]/[`ValidationError::RelationshipToManyRequiresReplicaIdentity`]
+/// — naming the actual missing column/table exactly as before this fix —
+/// rather than this function's own less specific
+/// [`CatalogError::SourceTableNotFound`], which existing callers (e.g.
+/// `an_unknown_from_column_is_rejected`) don't expect and which wouldn't say
+/// anything about *which* endpoint or column is the problem. The two-step
+/// fallback only ever swaps in a qualified identity when doing so can
+/// actually resolve something; it never turns one "not found" into a worse
+/// one.
+///
+/// Also doubles as this function's *only* graph-identity resolution for
+/// [`create_relationship`] (see that function's own call site): once
+/// `column_type_in_txn` has confirmed the qualified/bare identity this
+/// returns is real, the same value is reused for
+/// [`resolve_node_in_txn`]/[`reject_if_table_cycle`] rather than re-resolving
+/// a second time — safe because the bare-fallback case above can only be
+/// reached when `table` doesn't resolve at all, which always fails one of
+/// those pg_catalog checks first and returns before either graph call is
+/// ever reached.
+async fn resolve_relationship_endpoint_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    table: &str,
+) -> Result<String, CatalogError> {
+    match resolve_graph_identity_in_txn(txn, table).await {
+        Ok(qualified) => Ok(qualified),
+        Err(CatalogError::SourceTableNotFound(_)) => Ok(table.to_string()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Pooled (non-transaction) counterpart to
+/// [`resolve_relationship_endpoint_in_txn`] — same best-effort resolution
+/// (falls back to `table` unchanged on a total miss, rather than erroring),
+/// via [`resolve_graph_identity`] instead of the txn-scoped
+/// [`resolve_graph_identity_in_txn`]. [`resolve_relationships`] (issue #40's
+/// calculated-field relationship-path enrichment) is the one caller today:
+/// it resolves a relationship's `to_table` before handing it to
+/// [`column_type`], mirroring exactly how [`create_relationship`] resolves
+/// `def.from_table`/`def.to_table` before its own pg_catalog checks
+/// (reviewer follow-up to issue #74, epic #78's own whole-branch review, 4th
+/// gap — see the call site's own comment). `resolve_relationships` runs
+/// entirely on a pooled connection (never inside a catalog-owned
+/// transaction; every caller passes a `&Pool`, not a `Transaction`), so the
+/// pooled resolution is correct here, not the txn one.
+async fn resolve_relationship_endpoint(pool: &Pool, table: &str) -> Result<String, CatalogError> {
+    match resolve_graph_identity(pool, table).await {
+        Ok(qualified) => Ok(qualified),
+        Err(CatalogError::SourceTableNotFound(_)) => Ok(table.to_string()),
+        Err(err) => Err(err),
+    }
+}
+
 /// Pooled (non-transaction) counterpart to [`resolve_graph_identity_in_txn`]
 /// — same two-step resolution (physical `search_path` lookup, falling back
 /// to a live definition's own bare target-suffix), for callers outside a
@@ -1805,16 +1927,32 @@ async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String
 /// between the two calls) — matching this same function's caller's own
 /// fail-fast explicit-schema check just above it, also redundant-but-harmless
 /// against `create_definition_inner`'s copy.
+///
+/// Reviewer follow-up to issue #74 (epic #78's own whole-branch review): the
+/// bare (`None`) branch used to call [`resolve_source_schema`] directly — a
+/// plain `search_path` walk with no fallback — even though
+/// `create_definition_inner`'s own resolution of the exact same bare
+/// `def.source` (its `qualified_source`, above) has carried issue #74's
+/// bare-target-suffix fallback ([`resolve_graph_identity`]) since that issue
+/// landed. That gap meant *this*, `install_definition`'s own "far more
+/// common" entry point (see its own doc comment), never actually got the
+/// fallback in practice: this function's DDL/direct-build steps run and can
+/// fail *before* `create_definition_inner` is ever reached (only the plain
+/// 1-1 path reaches it at all, and only after this qualification already
+/// succeeded), so a bare `FROM <name>` chained off another definition's
+/// target explicitly qualified into a non-default schema (issue #76) failed
+/// here first, as a plain "not found on the search path" — never getting the
+/// chance to resolve the way the ring path always could. Switched to
+/// [`resolve_graph_identity`] itself, the same pooled two-step resolution
+/// `staging::apply::compute`'s `qualified_schema_node_key` already reuses,
+/// rather than re-implementing the fallback a third time.
 async fn resolve_source_for_install(
     pool: &Pool,
     def: &TransformDef,
 ) -> Result<String, CatalogError> {
     match &def.explicit_source_schema {
         Some(schema) => Ok(crate::intake::publication::qualify(schema, &def.source)?),
-        None => {
-            let schema = resolve_source_schema(pool, &def.source).await?;
-            Ok(crate::intake::publication::qualify(&schema, &def.source)?)
-        }
+        None => resolve_graph_identity(pool, &def.source).await,
     }
 }
 
@@ -1868,7 +2006,24 @@ async fn confirm_qualified_table_exists(
 /// resolvers that run before `create_definition` opens its transaction (issue
 /// #40's [`resolve_relationships`]). Same query, same
 /// [`ValidationError::UnknownRelationshipColumn`] on a missing column.
-async fn column_type(pool: &Pool, table: &str, column: &str) -> Result<String, CatalogError> {
+///
+/// `query_table`/`display_table` split (4th-gap fix, reviewer follow-up to
+/// issue #74, epic #78's own whole-branch review): mirrors
+/// [`column_type_in_txn`]'s own split, added for [`create_relationship`]'s
+/// pg_catalog checks — same reasoning applies here verbatim.
+/// [`resolve_relationships`] passes [`resolve_relationship_endpoint`]'s
+/// result as `query_table` (schema-qualified whenever that resolution needed
+/// to be, so `to_regclass` can find a to-side explicitly qualified into a
+/// non-default schema) but always passes the original, bare
+/// `reldef.def.to_table` as `display_table`, so a reported
+/// [`ValidationError::UnknownRelationshipColumn`] still names the table
+/// exactly as the relationship's own source text did.
+async fn column_type(
+    pool: &Pool,
+    query_table: &str,
+    display_table: &str,
+    column: &str,
+) -> Result<String, CatalogError> {
     let client = pool.get().await?;
     let row = client
         .query_opt(
@@ -1878,13 +2033,13 @@ async fn column_type(pool: &Pool, table: &str, column: &str) -> Result<String, C
                and a.attname = $2
                and a.attnum > 0
                and not a.attisdropped",
-            &[&table, &column],
+            &[&query_table, &column],
         )
         .await?;
     match row {
         Some(row) => Ok(row.get(0)),
         None => Err(ValidationError::UnknownRelationshipColumn {
-            table: table.to_string(),
+            table: display_table.to_string(),
             column: column.to_string(),
         }
         .into()),
@@ -1916,9 +2071,23 @@ fn value_type_from_pg(pg_type: &str) -> ValueType {
 /// but has no such column" only in that both are reported the same way
 /// (issue #27 doesn't need the distinction: either one means the endpoint
 /// isn't real) — see [`ValidationError::UnknownRelationshipColumn`].
+///
+/// `query_table` and `display_table` deliberately differ (reviewer follow-up
+/// to issue #74, epic #78's own whole-branch review): [`create_relationship`]
+/// passes [`resolve_relationship_endpoint_in_txn`]'s result as `query_table`
+/// — schema-qualified whenever that resolution needed to be, so
+/// `to_regclass` can find a target explicitly qualified into a non-default
+/// schema — but always passes the original, bare `def.from_table`/
+/// `def.to_table` as `display_table`, so a reported
+/// [`ValidationError::UnknownRelationshipColumn`] names the table exactly as
+/// the relationship's own source text did, unchanged from before this fix,
+/// rather than leaking this function's internal schema-qualified resolution
+/// into user-facing error text for the ordinary (already-on-`search_path`)
+/// case.
 async fn column_type_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
-    table: &str,
+    query_table: &str,
+    display_table: &str,
     column: &str,
 ) -> Result<String, CatalogError> {
     let row = txn
@@ -1929,13 +2098,13 @@ async fn column_type_in_txn(
                and a.attname = $2
                and a.attnum > 0
                and not a.attisdropped",
-            &[&table, &column],
+            &[&query_table, &column],
         )
         .await?;
     match row {
         Some(row) => Ok(row.get(0)),
         None => Err(ValidationError::UnknownRelationshipColumn {
-            table: table.to_string(),
+            table: display_table.to_string(),
             column: column.to_string(),
         }
         .into()),
@@ -2060,7 +2229,10 @@ fn assert_comparable_types(
 /// left behind by a failed `CREATE UNIQUE INDEX CONCURRENTLY`) or a partial
 /// unique index (`... where active`), which only constrains the rows it
 /// covers. Assumes `to_table`/`to_col` already resolved (callers run this
-/// after [`column_type_in_txn`] has confirmed both exist).
+/// after [`column_type_in_txn`] has confirmed both exist) — [`create_relationship`]
+/// passes its own [`resolve_relationship_endpoint_in_txn`] result, not
+/// `def.to_table` directly (reviewer follow-up to issue #74), so a to-side
+/// explicitly qualified into a non-default schema resolves here too.
 async fn to_col_cardinality_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
     to_table: &str,
@@ -2109,9 +2281,21 @@ async fn to_col_cardinality_in_txn(
 /// Callers invoke this only for [`RelationshipCardinality::ToMany`]; to-one
 /// carries the FK in the from-side's own row image and needs no extra replica
 /// identity (see ADR-0006). Assumes `to_table`/`to_col` already resolved.
+///
+/// `to_table` — [`create_relationship`]'s own [`resolve_relationship_endpoint_in_txn`]
+/// result, not `def.to_table` directly (reviewer follow-up to issue #74,
+/// epic #78's own whole-branch review) — is what `to_regclass` below
+/// actually queries, so a to-side explicitly qualified into a non-default
+/// schema resolves here exactly as it does in every other pg_catalog check
+/// this function's caller runs. The reported
+/// [`ValidationError::RelationshipToManyRequiresReplicaIdentity`] still names
+/// `def.to_table` (bare), matching this file's convention elsewhere
+/// (`assert_comparable_types`/`assert_join_key_type_supported`) of reporting
+/// the relationship's own source text, not an internally-resolved identity.
 async fn assert_replica_identity_supports_to_many(
     txn: &tokio_postgres::Transaction<'_>,
     def: &RelationshipDef,
+    to_table: &str,
 ) -> Result<(), CatalogError> {
     let adequate: bool = txn
         .query_one(
@@ -2131,7 +2315,7 @@ async fn assert_replica_identity_supports_to_many(
                 )
              from pg_class c
              where c.oid = pg_catalog.to_regclass($1)",
-            &[&def.to_table, &def.to_col],
+            &[&to_table, &def.to_col],
         )
         .await?
         .get(0);
@@ -2196,15 +2380,35 @@ async fn assert_replica_identity_supports_aggregate(
     // has it), reintroducing issue #47's aggregate-corruption bug through
     // this issue's own new grammar. `to_regclass` accepts a qualified
     // `"schema.table"` string directly, so no other logic changes.
-    let regclass_source = match &def.explicit_source_schema {
+    //
+    // Reviewer follow-up to issue #74 (epic #78's own whole-branch review):
+    // the bare (`None`) branch used to pass `def.source` straight through
+    // unresolved — a plain `to_regclass` `search_path` walk with no
+    // fallback — even though `create_definition_inner`'s own resolution of
+    // the identical bare `def.source` (`qualified_source`, below) has
+    // carried issue #74's bare-target-suffix fallback
+    // ([`resolve_graph_identity_in_txn`]) since that issue landed. Since
+    // this check runs first, ahead of that resolution, a bare aggregate
+    // source chained off another definition's target explicitly qualified
+    // into a non-default schema (issue #76) never reached
+    // `qualified_source` at all: `to_regclass` returned `NULL` for the
+    // unqualified name, and the `query_one` below then found zero matching
+    // `pg_class` rows — an opaque `Db(Error{kind: RowCount})`, not a clean
+    // rejection. Switched to [`resolve_graph_identity_in_txn`] itself here
+    // too, rather than re-implementing the fallback a third time; a
+    // genuinely nonexistent source now surfaces as that function's own
+    // [`CatalogError::SourceTableNotFound`] instead of the same `RowCount`
+    // confusion, which is strictly clearer even though it's not this
+    // gap's main target.
+    let qualified_source = match &def.explicit_source_schema {
         Some(schema) => crate::intake::publication::qualify(schema, &def.source)?,
-        None => def.source.clone(),
+        None => resolve_graph_identity_in_txn(txn, &def.source).await?,
     };
 
     let is_full: bool = txn
         .query_one(
             "select relreplident = 'f' from pg_class where oid = pg_catalog.to_regclass($1)",
-            &[&regclass_source],
+            &[&qualified_source],
         )
         .await?
         .get(0);
@@ -2241,6 +2445,12 @@ async fn assert_replica_identity_supports_aggregate(
 /// Never issues DDL — this only informs the caller's decision to emit
 /// [`RelationshipWarning::MissingFkIndex`] (ADR-0005: Trellis never modifies
 /// the source schema).
+///
+/// `from_table` — [`create_relationship`]'s own [`resolve_relationship_endpoint_in_txn`]
+/// result, not `def.from_table` directly (reviewer follow-up to issue #74) —
+/// so a from-side explicitly qualified into a non-default schema resolves
+/// here too; the warning itself, built by the caller from `def.from_table`,
+/// is unaffected either way.
 async fn has_usable_fk_index_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
     from_table: &str,

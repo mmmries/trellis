@@ -1038,6 +1038,138 @@ async fn explicitly_qualified_aggregate_source_probes_the_right_table_not_a_same
     );
 }
 
+/// The target-side counterpart to
+/// [`explicitly_qualified_aggregate_source_probes_the_right_table_not_a_same_named_decoy`]
+/// above, and `apply.rs`'s own
+/// `explicitly_qualified_target_receives_a_live_cdc_write` — the aggregate
+/// half of the same bug (reviewer follow-up to issue #74, epic #78's own
+/// whole-branch review): an aggregate definition installed with an explicit
+/// non-default *target* schema (issue #76's `TRANSFORM custom.<target> FROM
+/// ...` grammar) backfills fine, but a live CDC write used to fail outright
+/// — `upsert_group`/`delete_group_row` (`staging::apply_aggregate`'s own
+/// per-group Phase 3 DML-emission functions) bound their `target: &str`
+/// parameter straight into `quote_ident` instead of
+/// [`AggregateTargetPlan::target`]'s qualified identity, so their SQL tried
+/// to write bare, unqualified `order_summary`, not on this connection's
+/// pinned `search_path`, even though `custom.order_summary` (the real,
+/// already-backfilled target) exists.
+///
+/// Drains a single-group insert (`upsert_group`'s lone-delta-group path)
+/// then that same group's extinction (`delete_group_row`'s path) — between
+/// them, and via [`apply_aggregate_target`]'s own shared pre-lock, every
+/// per-group DML-emission site this reviewer follow-up fixes runs at least
+/// once.
+#[tokio::test]
+async fn explicitly_qualified_aggregate_target_receives_a_live_cdc_write() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create schema custom; \
+             create table order_items (id integer primary key, order_id integer, amount numeric); \
+             alter table order_items replica identity full",
+        )
+        .await
+        .expect("seed source table and the custom schema");
+
+    const SOURCE: &str = "TRANSFORM custom.order_summary FROM order_items GROUP BY order_id \
+         SELECT order_id AS order_id, SUM(amount) AS total";
+    let def = parse(SOURCE).expect("parse the explicitly-qualified aggregate target");
+    let source_columns = numeric_columns(&["id", "order_id", "amount"]);
+    create_aggregate_target_table(&db.pool, &def, "custom", &source_columns)
+        .await
+        .expect("materialize custom.order_summary ahead of create_definition");
+    create_definition(&db.pool, SOURCE, &source_columns)
+        .await
+        .expect("create aggregate definition against the explicitly-qualified target");
+
+    // Seed group 10's physical row and its matching CDC insert — mirroring
+    // real replication, where the physical write and its CDC event both
+    // reflect the same post-image.
+    client
+        .execute(
+            "insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
+            &[],
+        )
+        .await
+        .expect("seed physical order_items row");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "order_items",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"order_id":"10","amount":"5.00"}"#),
+    )
+    .await;
+    let seg0 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg0, "worker").await;
+
+    let total: Option<String> = client
+        .query_one(
+            "select total::text from custom.order_summary where order_id = 10",
+            &[],
+        )
+        .await
+        .expect(
+            "custom.order_summary must exist and hold group 10 — a bare, unqualified \
+             upsert_group write would have raised relation \"order_summary\" does not \
+             exist instead",
+        )
+        .get(0);
+    assert_eq!(total.as_deref(), Some("5.00"), "seed total for group 10");
+
+    // Delete the only row in group 10, both physically and via CDC — the
+    // group goes extinct, routing through `delete_group_row`.
+    client
+        .execute("delete from order_items where id = 1", &[])
+        .await
+        .expect("physically delete the only row in group 10");
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "order_items",
+        "1",
+        "delete",
+        Some(r#"{"order_id":"10","amount":"5.00"}"#),
+        None,
+    )
+    .await;
+    let seg1 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg1, "worker").await;
+
+    let remaining: i64 = client
+        .query_one(
+            "select count(*) from custom.order_summary where order_id = 10",
+            &[],
+        )
+        .await
+        .expect("count custom.order_summary")
+        .get(0);
+    assert_eq!(
+        remaining, 0,
+        "the extinct group's row must be gone from custom.order_summary"
+    );
+
+    let bare_decoy_exists: bool = client
+        .query_one(
+            "select exists (select 1 from information_schema.tables \
+             where table_name = 'order_summary' and table_schema <> 'custom')",
+            &[],
+        )
+        .await
+        .expect("check for a same-named decoy outside the custom schema")
+        .get(0);
+    assert!(
+        !bare_decoy_exists,
+        "the live writes must land in custom.order_summary, never create/touch a \
+         same-named table in some other schema on the connection's search_path"
+    );
+}
+
 /// Issue #11 review, finding #2 (MEDIUM): when a group keeps rows after a
 /// delete, but every remaining row's aggregated value is NULL, the SUM
 /// column must itself go `NULL` — matching Postgres's own "sum of zero

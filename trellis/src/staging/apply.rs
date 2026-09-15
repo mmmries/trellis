@@ -764,6 +764,18 @@ struct TargetPlan {
     field_types: Vec<ValueType>,
     writes: Vec<TargetWrite>,
     deletes: Vec<TargetDelete>,
+    /// The persisted, fully-qualified `"schema.table"` identity of this
+    /// target (issue #73's `Definition::target_table`, ADR-0007) —
+    /// carried alongside the bare `def.def.target` this plan is keyed by
+    /// (see [`ApplyPlan::targets`]'s doc comment on why the map key itself
+    /// stays bare) so [`apply_target`] can bind the *right* physical table
+    /// into its `INSERT`/`UPDATE`/`DELETE` SQL, rather than leaving a
+    /// target explicitly qualified into a non-default schema (issue #76) to
+    /// resolve against whatever `search_path` the executing session
+    /// happens to carry. Mirrors [`AggregateTargetPlan::source`]/this same
+    /// struct's own eventual reuse of `qualified_source`'s established
+    /// pattern from #76.
+    qualified_target: String,
 }
 
 /// One target table this batch must clear in full before its own keyed
@@ -780,6 +792,23 @@ struct TargetPlan {
 struct ClearPlan {
     pk: PrimaryKeyColumn,
     hop_gen: i32,
+    /// Same role as [`TargetPlan::qualified_target`]: the persisted,
+    /// fully-qualified target identity this clear's `DELETE FROM` must bind,
+    /// rather than the bare map key it's stored under.
+    qualified_target: String,
+}
+
+/// The aggregate-target counterpart to [`ClearPlan`] — see
+/// [`ApplyPlan::aggregate_clears`]'s doc comment for why this carries no
+/// [`PrimaryKeyColumn`] of its own (a plain full-table `DELETE`, no
+/// `RETURNING`-projected key shape needed). `qualified_target` plays the
+/// same role [`ClearPlan::qualified_target`]/[`TargetPlan::qualified_target`]
+/// do: the persisted, fully-qualified identity the `DELETE FROM` must bind,
+/// not the bare map key this is stored under.
+#[derive(Debug, Clone)]
+struct AggregateClearPlan {
+    hop_gen: i32,
+    qualified_target: String,
 }
 
 /// Phase 2's output: an in-memory plan Phase 3 applies inside one
@@ -841,7 +870,7 @@ pub struct ApplyPlan {
     /// reason: both paths are consistent in outcome (fail loud, never
     /// silently misuse the key) regardless of which one a batch takes, so
     /// this skip is not a live gap today.
-    aggregate_clears: HashMap<String, i32>,
+    aggregate_clears: HashMap<String, AggregateClearPlan>,
     /// Issue #16: the (non-truncate) folded records whose `(src_table,
     /// key)` is already in the `poison` marker table — excluded from every
     /// map above (the fold excludes a poisoned key *globally*, not just
@@ -1133,38 +1162,53 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 // declared type, though (see `infer_field_types`' doc), and
                 // that column already exists — introspect it. Non-relationship
                 // definitions keep the pure inference, behavior-identical.
-                let field_types: Vec<ValueType> = if eval::relationship_references(&def.def)
-                    .is_empty()
-                {
-                    // This branch runs only for relationship-free definitions
-                    // (guarded above), so type inference needs no relationship
-                    // metadata: an empty map (issue #40).
-                    let inferred_types = validate::infer_field_types(
-                        &def.def,
-                        &def.source_columns,
-                        &std::collections::HashMap::new(),
-                    )?;
-                    field_names
-                        .iter()
-                        .map(|name| {
-                            inferred_types
-                                .get(name)
-                                .copied()
-                                .unwrap_or(ValueType::Numeric)
-                        })
-                        .collect()
-                } else {
-                    let target_types = to_column_types(pool, &def.def.target, &field_names).await?;
-                    field_names
-                        .iter()
-                        .map(|name| {
-                            target_types
-                                .get(name)
-                                .copied()
-                                .unwrap_or(ValueType::Numeric)
-                        })
-                        .collect()
-                };
+                let field_types: Vec<ValueType> =
+                    if eval::relationship_references(&def.def).is_empty() {
+                        // This branch runs only for relationship-free definitions
+                        // (guarded above), so type inference needs no relationship
+                        // metadata: an empty map (issue #40).
+                        let inferred_types = validate::infer_field_types(
+                            &def.def,
+                            &def.source_columns,
+                            &std::collections::HashMap::new(),
+                        )?;
+                        field_names
+                            .iter()
+                            .map(|name| {
+                                inferred_types
+                                    .get(name)
+                                    .copied()
+                                    .unwrap_or(ValueType::Numeric)
+                            })
+                            .collect()
+                    } else {
+                        // Broader sweep, reviewer follow-up to issue #74 (epic
+                        // #78's own whole-branch review): `def.def.target` is
+                        // always bare, even for a definition whose `TRANSFORM`
+                        // clause explicitly spelled `schema.target` (issue #76;
+                        // see `TransformDef`'s own doc comment), so binding it
+                        // straight into `to_column_types`'s `to_regclass` lookup
+                        // relied on the connection's pinned `search_path`
+                        // (`Config::schema`/`Config::target_schema`/`"public"`)
+                        // finding it — silently wrong (or simply absent) for a
+                        // target explicitly qualified into a schema outside that
+                        // pin. `def.target_table` is right here on the same
+                        // struct, already the fully-qualified identity issue #73
+                        // persisted at acceptance time — use it instead of
+                        // re-deriving (or mis-deriving) the physical location
+                        // from the bare AST field.
+                        let target_types =
+                            to_column_types(pool, &def.target_table, &field_names).await?;
+                        field_names
+                            .iter()
+                            .map(|name| {
+                                target_types
+                                    .get(name)
+                                    .copied()
+                                    .unwrap_or(ValueType::Numeric)
+                            })
+                            .collect()
+                    };
 
                 // ADR-0003's amendment (column-level quarantine): a column
                 // the fuse has paused is excluded from both this plan's
@@ -1198,6 +1242,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         field_types: field_types.clone(),
                         writes: Vec::new(),
                         deletes: Vec::new(),
+                        // The persisted, fully-qualified identity (issue #73)
+                        // — not re-derived, since `def` (this source's own
+                        // catalog `Definition`) already carries it. See
+                        // `TargetPlan::qualified_target`'s doc comment.
+                        qualified_target: def.target_table.clone(),
                     });
 
                 // Reused across every change below (issue #68): `regexp_count`'s
@@ -1359,6 +1408,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         group_by_types,
                         field_plans,
                         qualified_source.to_string(),
+                        def.target_table.clone(),
                         field_exprs,
                         rel_joins,
                     )
@@ -1382,7 +1432,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // "resolve targets from the catalog" step the by-source loop above runs
     // per key, just once per truncated source instead of once per key.
     let mut clears: HashMap<String, ClearPlan> = HashMap::new();
-    let mut aggregate_clears: HashMap<String, i32> = HashMap::new();
+    let mut aggregate_clears: HashMap<String, AggregateClearPlan> = HashMap::new();
     for change in &truncated {
         let source_key = catalog_source_key(&change.src_table);
         // Fence this source too, even though nothing evaluated against it —
@@ -1423,8 +1473,13 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 KeySpace::Aggregate { .. } => {
                     aggregate_clears
                         .entry(def.def.target.clone())
-                        .and_modify(|hop_gen| *hop_gen = (*hop_gen).max(change.hop_gen))
-                        .or_insert(change.hop_gen);
+                        .and_modify(|existing| {
+                            existing.hop_gen = existing.hop_gen.max(change.hop_gen)
+                        })
+                        .or_insert(AggregateClearPlan {
+                            hop_gen: change.hop_gen,
+                            qualified_target: def.target_table.clone(),
+                        });
                 }
                 KeySpace::OneToOne => {
                     clears
@@ -1435,6 +1490,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         .or_insert(ClearPlan {
                             pk: pk.clone(),
                             hop_gen: change.hop_gen,
+                            qualified_target: def.target_table.clone(),
                         });
                 }
             }
@@ -1546,7 +1602,6 @@ const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
 /// writes anything.
 async fn apply_target(
     txn: &Transaction<'_>,
-    target: &str,
     plan: &TargetPlan,
 ) -> Result<(Vec<String>, Vec<String>), ApplyError> {
     if plan.writes.is_empty() && plan.deletes.is_empty() {
@@ -1555,7 +1610,12 @@ async fn apply_target(
 
     let pk_ident = quote_ident(&plan.pk.name);
     let pk_cast = plan.pk.data_type.as_str();
-    let target_ident = quote_ident(target);
+    // `plan.qualified_target` (issue #73's persisted identity), not a bare
+    // `quote_ident(target)` — a target explicitly qualified into a
+    // non-default schema (issue #76) isn't necessarily on this connection's
+    // pinned `search_path`. See `TargetPlan::qualified_target`'s doc comment
+    // and `ddl::qualified_target_table_ident`'s.
+    let target_ident = ddl::qualified_target_table_ident(&plan.qualified_target);
     let field_idents: Vec<String> = plan.field_names.iter().map(|n| quote_ident(n)).collect();
 
     let mut lock_keys: Vec<&str> = plan
@@ -1840,7 +1900,7 @@ pub async fn apply_and_mark_drained_many(
     // here specifically (single-bucket batch, barrier-drained).
     for (target, clear) in &plan.clears {
         let pk_ident = quote_ident(&clear.pk.name);
-        let target_ident = quote_ident(target);
+        let target_ident = ddl::qualified_target_table_ident(&clear.qualified_target);
         let cleared: Vec<String> = txn
             .query(
                 &format!("delete from {target_ident} returning {pk_ident}::text as pk"),
@@ -1862,8 +1922,8 @@ pub async fn apply_and_mark_drained_many(
     // doc comment on why these are a plain full-table delete with no
     // downstream propagation, unlike every other clear/write/delete this
     // function tracks via `changed`.
-    for target in plan.aggregate_clears.keys() {
-        let target_ident = quote_ident(target);
+    for clear in plan.aggregate_clears.values() {
+        let target_ident = ddl::qualified_target_table_ident(&clear.qualified_target);
         let cleared = txn
             .execute(&format!("delete from {target_ident}"), &[])
             .await?;
@@ -1872,7 +1932,7 @@ pub async fn apply_and_mark_drained_many(
 
     // 3. Ordered pre-lock + upsert/delete, per target table.
     for (target, target_plan) in &plan.targets {
-        let (written, deleted) = apply_target(txn, target, target_plan).await?;
+        let (written, deleted) = apply_target(txn, target_plan).await?;
         keys_written += written.len();
         keys_deleted += deleted.len();
 
@@ -1909,7 +1969,12 @@ pub async fn apply_and_mark_drained_many(
     // for why that is not a live misuse risk today: no definition reading
     // from an aggregate target can actually survive its first drain attempt.
     for (target, agg_plan) in &plan.aggregate_targets {
-        let result = apply_aggregate::apply_aggregate_target(txn, target, agg_plan).await?;
+        // `&agg_plan.target` (issue #73's persisted identity), not the bare
+        // `target` map key — see `AggregateTargetPlan::target`'s doc
+        // comment. `target` itself stays bare here purely as the
+        // `changed`/`downstream_readers` bookkeeping key below.
+        let result =
+            apply_aggregate::apply_aggregate_target(txn, &agg_plan.target, agg_plan).await?;
         keys_written += result.written.len();
         keys_deleted += result.deleted.len();
 

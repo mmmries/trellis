@@ -386,6 +386,39 @@ pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String
 /// hand-build a plan against a bare table name in the connection's own
 /// default schema.
 pub(crate) fn qualified_source_table(qualified: &str) -> String {
+    quote_qualified_ident(qualified)
+}
+
+/// The target-side counterpart to [`qualified_source_table`] — same
+/// component-independent quoting of an already-qualified `"schema.table"`
+/// string, for a definition's *target* identity
+/// ([`super::model::Definition::target_table`]) rather than its source.
+///
+/// Broader sweep, reviewer follow-up to issue #74 (epic #78's own
+/// whole-branch review): the live CDC-apply write path (`staging::apply`'s
+/// `apply_target`/truncate-clears loop, `staging::apply_aggregate`'s
+/// target-write sites, `staging::quarantine`'s `recompute_column`) never got
+/// this fix on the target side, even though issue #76 already let a
+/// `TRANSFORM` clause spell an explicit non-default target schema — every
+/// one of those sites was still binding `def.def.target` (bare) straight
+/// into `quote_ident`, which silently mis-resolved (or simply couldn't find)
+/// a target explicitly qualified outside the connection's pinned
+/// `search_path`. Every such site now reads
+/// [`super::model::Definition::target_table`] (or a plan field carrying it
+/// forward, mirroring how `source`/`qualified_source` already got threaded
+/// through in #76) through this function instead.
+pub(crate) fn qualified_target_table_ident(qualified: &str) -> String {
+    quote_qualified_ident(qualified)
+}
+
+/// Shared quoting logic for [`qualified_source_table`]/
+/// [`qualified_target_table_ident`]: splits an already-qualified
+/// `"schema.table"` string on its first `.` and quotes each component
+/// independently, for direct interpolation into DDL/DML text. See
+/// [`qualified_source_table`]'s own doc comment for the fallback/splitting
+/// rationale — identical for both callers, since neither cares whether the
+/// qualified string came from a source or target identity.
+fn quote_qualified_ident(qualified: &str) -> String {
     match qualified.split_once('.') {
         Some((schema, table)) => format!("{}.{}", quote_ident(schema), quote_ident(table)),
         None => quote_ident(qualified),

@@ -369,6 +369,155 @@ async fn explicitly_qualified_source_reads_the_right_table_on_a_live_refetch() {
     }
 }
 
+/// The target-side twin of
+/// [`explicitly_qualified_source_reads_the_right_table_on_a_live_refetch`]
+/// above, and the one this round of issue #78's own fix-sweep exists for: a
+/// definition installed with an explicit non-default *target* schema (issue
+/// #76's `TRANSFORM custom.<target> FROM ...` grammar) backfills fine (its
+/// ring-enumeration and direct-build paths already read
+/// `Definition::target_table`/`resolve_source_for_install` correctly), but a
+/// subsequent *live* CDC write against its source used to fail outright:
+/// `apply_target` (`staging::apply`'s Phase 3 DML-emission function) bound
+/// `def.def.target` — always bare, even here — straight into
+/// `quote_ident`, so its `INSERT`/`UPDATE`/`DELETE` tried to write
+/// `"order_totals"` unqualified, which isn't on this connection's pinned
+/// `search_path` (`{DEFAULT_SCHEMA}, "public"}` — see `qualify_fixture_table`'s
+/// own doc comment) and so does not exist from its point of view, even
+/// though `custom.order_totals` (the real, already-backfilled target) does.
+/// Confirmed empirically before this fix: this exact repro raised a bare
+/// `relation "order_totals" does not exist`.
+///
+/// Drains an insert, an update, and a delete against `orders` — the same
+/// three-op shape [`drain_matches_the_oracle_across_an_insert_update_and_delete`]
+/// covers for the unqualified-target case — and checks `custom.order_totals`
+/// (not a same-named `public.order_totals`/`{DEFAULT_SCHEMA}.order_totals`
+/// decoy) reflects every one of them.
+#[tokio::test]
+async fn explicitly_qualified_target_receives_a_live_cdc_write() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create schema custom; \
+             create table orders (id integer primary key, price numeric, tax numeric)",
+        )
+        .await
+        .expect("seed source table and the custom schema");
+
+    let source_columns = numeric_columns(&["id", "price", "tax"]);
+    let def_text = "TRANSFORM custom.order_totals FROM orders SELECT price + tax AS total";
+    let def = trellis::defs::parse(def_text).expect("parse the explicitly-qualified target");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &def, "custom", &pk, &source_columns, &def.source)
+        .await
+        .expect("materialize custom.order_totals ahead of create_definition");
+
+    // `orders` starts empty (mirroring this file's other tests' convention)
+    // so `create_definition`'s own ring-enumeration backfill enumerates
+    // nothing, and every row below arrives purely as this batch's staged CDC
+    // events instead.
+    create_definition(&db.pool, def_text, &source_columns)
+        .await
+        .expect("create definition against the explicitly-qualified target");
+
+    client
+        .execute(
+            "insert into orders (id, price, tax) values (1, 10.00, 1.50), (2, 20.00, 2.00)",
+            &[],
+        )
+        .await
+        .expect("seed source rows after the definition exists");
+
+    // Pre-populate a target row for order 3, standing in for data an earlier
+    // drain wrote before this batch's delete arrives.
+    client
+        .execute(
+            "insert into custom.order_totals (id, total) values (3, 999)",
+            &[],
+        )
+        .await
+        .expect("pre-populate target row for the key this batch deletes");
+
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"price":"10.00","tax":"1.50"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "2",
+        "update",
+        Some(r#"{"price":"15.00","tax":"1.00"}"#),
+        Some(r#"{"price":"20.00","tax":"2.00"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "3",
+        "delete",
+        Some(r#"{"price":"5.00","tax":"0.50"}"#),
+        None,
+    )
+    .await;
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let outcome = drain(&db.pool, seg_seq, "worker").await;
+    assert_eq!(outcome.keys_written, 2, "orders 1 and 2 must be written");
+    assert_eq!(outcome.keys_deleted, 1, "order 3 must be deleted");
+
+    let target_rows: Vec<(i32, Option<String>)> = client
+        .query("select id, total::text from custom.order_totals", &[])
+        .await
+        .expect(
+            "custom.order_totals must exist and be readable — a bare, unqualified \
+             write would have raised relation \"order_totals\" does not exist instead",
+        )
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let expected: HashMap<i32, &str> = HashMap::from([(1, "11.50"), (2, "22.00")]);
+    assert_eq!(
+        target_rows.len(),
+        2,
+        "order 3 must be gone and only orders 1 and 2 remain"
+    );
+    for (id, total) in target_rows {
+        assert_eq!(
+            total.as_deref(),
+            expected.get(&id).copied(),
+            "custom.order_totals.total mismatch for id {id}"
+        );
+    }
+
+    let bare_decoy_exists: bool = client
+        .query_one(
+            "select exists (select 1 from information_schema.tables \
+             where table_name = 'order_totals' and table_schema <> 'custom')",
+            &[],
+        )
+        .await
+        .expect("check for a same-named decoy outside the custom schema")
+        .get(0);
+    assert!(
+        !bare_decoy_exists,
+        "the live write must land in custom.order_totals, never create/touch a \
+         same-named table in some other schema on the connection's search_path"
+    );
+}
+
 #[tokio::test]
 async fn a_fully_drained_single_bucket_batch_flips_the_segment_to_drained() {
     let cluster = TestCluster::start();

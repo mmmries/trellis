@@ -325,6 +325,22 @@ pub(super) struct AggregateTargetPlan {
     /// can't make a forced-recompute probe silently read the wrong physical
     /// relation.
     pub source: String,
+    /// The target table's fully-qualified `"schema.table"` identity (issue
+    /// #73's `Definition::target_table`, threaded through the identical way
+    /// [`AggregateTargetPlan::source`] already threads issue #76's
+    /// `qualified_source`) — reviewer follow-up to issue #74 (epic #78's own
+    /// whole-branch review): every DML-emission site below
+    /// (`delete_group_row`, `upsert_group`, `apply_delta_groups_bulk`,
+    /// `apply_forced_groups_bulk`, `apply_aggregate_target`'s own pre-lock)
+    /// reads its `target: &str` parameter through
+    /// [`ddl::qualified_target_table_ident`] rather than a bare
+    /// `quote_ident`, so a target explicitly qualified into a non-default
+    /// schema (issue #76) resolves to the right physical relation instead
+    /// of silently leaning on the connection's pinned `search_path`. The
+    /// `target: &str` parameters those functions still take are always this
+    /// same qualified string by the time they're called — see
+    /// `super::apply::apply_and_mark_drained_many`'s call site.
+    pub target: String,
     pub field_exprs: HashMap<String, Expr>,
     /// Every [`AggFieldKind::Sum`]/[`AggFieldKind::Avg`] field's hidden
     /// running-count partial column name (issue #48) — derived once here via
@@ -364,6 +380,7 @@ impl AggregateTargetPlan {
         group_by_types: Vec<ValueType>,
         fields: Vec<AggFieldPlan>,
         source: String,
+        target: String,
         field_exprs: HashMap<String, Expr>,
         rel_joins: Vec<RelJoin>,
     ) -> Self {
@@ -384,6 +401,7 @@ impl AggregateTargetPlan {
             fields,
             groups: HashMap::new(),
             source,
+            target,
             field_exprs,
             count_column_names,
             rel_joins,
@@ -788,9 +806,13 @@ async fn delete_group_row(
     values: &[Option<String>],
 ) -> Result<bool, ApplyError> {
     let where_sql = group_where_clause(group_by, group_by_types, 1);
+    // `target` is always [`AggregateTargetPlan::target`]'s qualified
+    // identity by the time this is called (reviewer follow-up to issue #74)
+    // — quoted component-independently via
+    // [`ddl::qualified_target_table_ident`], not a bare `quote_ident`.
     let sql = format!(
         "delete from {} where {where_sql} returning 1",
-        quote_ident(target)
+        ddl::qualified_target_table_ident(target)
     );
     let rows = txn.query(&sql, &group_where_params(values)).await?;
     Ok(!rows.is_empty())
@@ -930,7 +952,9 @@ async fn upsert_group(
     group: &GroupPlan,
 ) -> Result<bool, ApplyError> {
     let pk_idents: Vec<String> = plan.group_by.iter().map(|c| quote_ident(c)).collect();
-    let target_ident = quote_ident(target);
+    // `target` is always [`AggregateTargetPlan::target`]'s qualified
+    // identity by the time this is called (reviewer follow-up to issue #74).
+    let target_ident = ddl::qualified_target_table_ident(target);
 
     // Pass 1: decide each field's strategy, running every probe this group's
     // write needs and collecting their results — no SQL text or `params`
@@ -1424,7 +1448,9 @@ async fn apply_forced_groups_bulk(
         .map(|a| a.iter().any(|v| v.is_none()))
         .collect();
     let source_ident = ddl::qualified_source_table(&plan.source);
-    let target_ident = quote_ident(target);
+    // `target` is always [`AggregateTargetPlan::target`]'s qualified
+    // identity by the time this is called (reviewer follow-up to issue #74).
+    let target_ident = ddl::qualified_target_table_ident(target);
     let group_idents: Vec<String> = plan.group_by.iter().map(|c| quote_ident(c)).collect();
     // Issue #94: to-one relationship joins onto the recompute's source scan,
     // so a `SUM(post.word_count)` field reads the joined to-side column. The
@@ -2096,7 +2122,9 @@ async fn apply_delta_groups_bulk(
     groups: &[(&String, &GroupPlan)],
 ) -> Result<(), ApplyError> {
     let arity = plan.group_by.len();
-    let target_ident = quote_ident(target);
+    // `target` is always [`AggregateTargetPlan::target`]'s qualified
+    // identity by the time this is called (reviewer follow-up to issue #74).
+    let target_ident = ddl::qualified_target_table_ident(target);
     let pk_idents: Vec<String> = plan.group_by.iter().map(|c| quote_ident(c)).collect();
 
     let group_plans: Vec<&GroupPlan> = groups.iter().map(|(_, g)| *g).collect();
@@ -2237,7 +2265,11 @@ pub(super) async fn apply_aggregate_target(
         });
     }
 
-    let target_ident = quote_ident(target);
+    // `target` — the caller's [`AggregateTargetPlan::target`] (reviewer
+    // follow-up to issue #74, epic #78's own whole-branch review) — is the
+    // persisted, fully-qualified identity, not a bare `def.def.target`; see
+    // `super::apply::apply_and_mark_drained_many`'s call site.
+    let target_ident = ddl::qualified_target_table_ident(target);
     let all_groups: Vec<&GroupPlan> = group_keys.iter().map(|k| &plan.groups[*k]).collect();
     let arity = plan.group_by.len();
 
@@ -2387,6 +2419,7 @@ mod tests {
                 kind: AggFieldKind::Sum,
             }],
             "order_items".to_string(),
+            "order_summary".to_string(),
             HashMap::from([(
                 "total".to_string(),
                 Expr::FunctionCall {
@@ -2468,6 +2501,7 @@ mod tests {
                 kind: AggFieldKind::Sum,
             }],
             "order_items".to_string(),
+            "order_summary".to_string(),
             HashMap::from([(
                 "total".to_string(),
                 Expr::FunctionCall {
@@ -2571,6 +2605,7 @@ mod tests {
             vec![ValueType::Numeric],
             fields,
             "order_items".to_string(),
+            "order_summary".to_string(),
             exprs,
             Vec::new(),
         )

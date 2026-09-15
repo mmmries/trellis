@@ -608,6 +608,122 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
     }
 }
 
+/// Reviewer follow-up to issue #74 (epic #78's own whole-branch review): the
+/// quarantine-recompute counterpart to `apply.rs`'s
+/// `explicitly_qualified_target_receives_a_live_cdc_write` and
+/// `apply_aggregate.rs`'s
+/// `explicitly_qualified_aggregate_target_receives_a_live_cdc_write` — a
+/// definition installed with an explicit non-default *target* schema (issue
+/// #76's grammar) used to fail `resume_column`'s recompute outright:
+/// `recompute_column`'s own `UPDATE` (`staging::quarantine`) bound
+/// `def.def.target` — always bare — straight into `quote_ident`, instead of
+/// `Definition::target_table`'s qualified identity, so the write tried
+/// bare, unqualified `order_totals`, not on this connection's pinned
+/// `search_path`, even though `custom.order_totals` (the real target) does
+/// exist and already carries the bare (non-`total`) columns a prior,
+/// successful drain wrote for it.
+#[tokio::test]
+async fn resume_column_recomputes_an_explicitly_qualified_target() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create schema custom; \
+             create table orders (id integer primary key, price numeric, tax numeric)",
+        )
+        .await
+        .expect("seed source table and the custom schema");
+
+    const DEF_TEXT: &str = "TRANSFORM custom.order_totals FROM orders SELECT price + tax AS total";
+    let def = trellis::defs::parse(DEF_TEXT).expect("parse the explicitly-qualified target");
+    let source_columns = numeric_columns(&["id", "price", "tax"]);
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &def, "custom", &pk, &source_columns, &def.source)
+        .await
+        .expect("materialize custom.order_totals ahead of create_definition");
+    create_definition(&db.pool, DEF_TEXT, &source_columns)
+        .await
+        .expect("create definition against the explicitly-qualified target");
+
+    // Trip the column fuse exactly like this file's other tests — the
+    // malformed images below are purely staged/synthetic and never touch
+    // the physical `orders` table.
+    let bad_ids: Vec<i64> = (1..=DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    stage_bad_orders(&mut client, &db.pool, &bad_ids).await;
+    assert!(
+        column_status_row(&client, "order_totals", "total")
+            .await
+            .is_some(),
+        "the fuse must have tripped"
+    );
+
+    // A real, valid row in the physical source table, plus a bare (`total`
+    // excluded) target row for it — standing in for what a drain retried
+    // after the column paused would have already written, the state
+    // `resume_column`'s recompute is meant to fill in.
+    client
+        .execute(
+            "insert into orders (id, price, tax) values (200, 10.00, 5.00)",
+            &[],
+        )
+        .await
+        .expect("seed a valid source row");
+    client
+        .execute("insert into custom.order_totals (id) values (200)", &[])
+        .await
+        .expect("pre-populate a bare target row for the row resume must fill in");
+
+    let resumed = quarantine::resume_column(&db.pool, "order_totals", "total")
+        .await
+        .expect(
+            "resume_column must recompute against custom.order_totals — a bare, \
+             unqualified UPDATE would have raised relation \"order_totals\" does \
+             not exist instead",
+        );
+    assert_eq!(
+        resumed,
+        vec![("order_totals".to_string(), "total".to_string())]
+    );
+
+    assert_eq!(
+        column_status_row(&client, "order_totals", "total").await,
+        None,
+        "the column must no longer be paused after a successful resume"
+    );
+
+    let total: String = client
+        .query_one(
+            "select total::text from custom.order_totals where id = 200",
+            &[],
+        )
+        .await
+        .expect("read custom.order_totals")
+        .get(0);
+    assert_eq!(
+        total, "15.00",
+        "resume must have recomputed custom.order_totals against the real source row"
+    );
+
+    let bare_decoy_exists: bool = client
+        .query_one(
+            "select exists (select 1 from information_schema.tables \
+             where table_name = 'order_totals' and table_schema <> 'custom')",
+            &[],
+        )
+        .await
+        .expect("check for a same-named decoy outside the custom schema")
+        .get(0);
+    assert!(
+        !bare_decoy_exists,
+        "the recompute must land in custom.order_totals, never create/touch a \
+         same-named table in some other schema on the connection's search_path"
+    );
+}
+
 // ---------------------------------------------------------------------
 // (e) The three read methods and the resume method, on both `Trellis` and
 //     `BlockingTrellis`.

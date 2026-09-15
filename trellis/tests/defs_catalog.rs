@@ -8,7 +8,7 @@ use testkit::TestCluster;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{
     CatalogError, ValidationError, ValueType, all_source_tables, create_definition,
-    create_relationship, transforms_for_source,
+    create_relationship, install_definition, transforms_for_source,
 };
 
 fn columns(names: &[&str]) -> HashMap<String, ValueType> {
@@ -1605,5 +1605,129 @@ async fn an_aggregate_against_an_explicitly_qualified_source_is_accepted_despite
     .expect(
         "aggregate against the explicitly-qualified custom.orders (REPLICA IDENTITY FULL) \
          must be accepted even though a same-named decoy lacks it",
+    );
+}
+
+/// Reviewer follow-up to issue #74 (epic #78's own whole-branch review):
+/// unlike the two tests above (an aggregate whose *own* `FROM` is explicitly
+/// schema-qualified), this covers a bare aggregate `FROM t` chained off a
+/// *different* definition's target that was explicitly qualified into a
+/// non-default schema. `assert_replica_identity_supports_aggregate` runs
+/// before `create_definition_inner` resolves `qualified_source`, so it used
+/// to pass the bare `def.source` straight to `to_regclass` in the `None`
+/// (bare) branch — no `search_path` fallback at all, unlike the explicit
+/// branch just above. `custom` is nowhere on this pool's pinned
+/// `search_path` (`Config::schema`/`Config::target_schema`/`public`), so
+/// `to_regclass("t")` returned `NULL` and the identity query then matched
+/// zero `pg_class` rows — an opaque `Db(Error{kind: RowCount})`, not the
+/// `custom.t` lookup this test expects.
+#[tokio::test]
+async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_target_is_accepted_when_full()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create schema custom; \
+             create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) values (1, 10), (2, 20)",
+        )
+        .await
+        .expect("seed source and create the custom schema");
+
+    // Def A: installs with an explicit non-default target schema, exactly
+    // like the two tests above's own decoy setup — `custom` is nowhere on
+    // this pool's pinned `search_path`.
+    install_definition(
+        &db.pool,
+        "TRANSFORM custom.t FROM s SELECT a AS x",
+        &columns(&["a"]),
+        "public",
+    )
+    .await
+    .expect("def A installs with an explicit non-default target schema");
+
+    client
+        .batch_execute("alter table custom.t replica identity full")
+        .await
+        .expect("grant custom.t full replica identity");
+
+    // Def B: a bare aggregate `FROM t` must still resolve to def A's
+    // `custom.t` — a plain `search_path` walk alone (what `to_regclass` did
+    // here before this fix) would find nothing and fail with an opaque
+    // RowCount error, never reaching the identity check at all.
+    create_definition(
+        &db.pool,
+        "TRANSFORM totals FROM t GROUP BY x SELECT x AS x, COUNT(*) AS n",
+        &columns(&["x"]),
+    )
+    .await
+    .expect(
+        "aggregate's bare FROM must resolve to def A's explicitly-qualified custom.t \
+         target (REPLICA IDENTITY FULL), not fail with a RowCount resolution miss",
+    );
+}
+
+/// The mirror of the test above: `custom.t` genuinely lacks `REPLICA
+/// IDENTITY FULL`, so the bare-chained aggregate must still be rejected —
+/// but with the real [`CatalogError::ReplicaIdentityRequired`], not the
+/// opaque `RowCount` resolution-miss error the gap produced before this fix
+/// (a totally unresolvable bare source hit the same `RowCount` failure,
+/// masking what should have been a clean identity rejection).
+#[tokio::test]
+async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_target_is_rejected_cleanly_when_not_full()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create schema custom; \
+             create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) values (1, 10), (2, 20)",
+        )
+        .await
+        .expect("seed source and create the custom schema");
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM custom.t FROM s SELECT a AS x",
+        &columns(&["a"]),
+        "public",
+    )
+    .await
+    .expect("def A installs with an explicit non-default target schema");
+    // `custom.t` is left at the default replica identity deliberately.
+
+    let err = create_definition(
+        &db.pool,
+        "TRANSFORM totals FROM t GROUP BY x SELECT x AS x, COUNT(*) AS n",
+        &columns(&["x"]),
+    )
+    .await
+    .unwrap_err();
+
+    match &err {
+        CatalogError::ReplicaIdentityRequired(_) => {}
+        other => panic!(
+            "expected a clean ReplicaIdentityRequired rejection, got {other:?} \
+             (a RowCount error here would mean resolution never even reached \
+             custom.t)"
+        ),
+    }
+
+    let count: i64 = client
+        .query_one(
+            "select count(*) from transform_definitions \
+             where split_part(target_table, '.', 2) = 'totals'",
+            &[],
+        )
+        .await
+        .expect("count definitions")
+        .get(0);
+    assert_eq!(
+        count, 0,
+        "the wrongly-would-be-accepted aggregate definition must not persist"
     );
 }
