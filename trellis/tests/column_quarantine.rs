@@ -19,6 +19,7 @@ use std::time::Duration;
 use testkit::{TestCluster, TestDatabase};
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
+use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     TransformStatus, chunk_queue, create_aggregate_target_table, create_definition,
@@ -82,6 +83,24 @@ fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
         .collect()
 }
 
+/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`] — where every bare
+/// `create table` in this file's own fixtures actually lands, since
+/// `connect_raw` pins `search_path` to `trellis, public` and never qualifies
+/// its own DDL. Matches `tests/quarantine.rs`'s (and `tests/apply.rs`'s) own
+/// `qualify_fixture_table` (issue #74, ADR-0007): a CDC-staged `src_table`
+/// must be fully qualified to match what a real CDC producer stages (issue
+/// #76) and what the dependency graph now keys on (issue #74), or
+/// `catalog::transforms_for_source` silently finds nothing and this whole
+/// file's column-fuse machinery never even gets exercised. Already-qualified
+/// input (containing a `.`) passes through unchanged.
+fn qualify_fixture_table(name: &str) -> String {
+    if name.contains('.') {
+        name.to_string()
+    } else {
+        format!("{DEFAULT_SCHEMA}.{name}")
+    }
+}
+
 async fn insert_cdc_row(
     client: &Client,
     table: &str,
@@ -91,6 +110,7 @@ async fn insert_cdc_row(
     old_image: Option<&str>,
     new_image: Option<&str>,
 ) {
+    let src_table = qualify_fixture_table(src_table);
     let lsn = PgLsn::from(1u64);
     client
         .execute(
@@ -118,6 +138,8 @@ fn order_totals_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -141,7 +163,7 @@ async fn seed_order_totals(db: &TestDatabase, client: &Client) -> TransformDef {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
     def
@@ -168,6 +190,7 @@ async fn seed_order_summaries(db: &TestDatabase, orders_def: &TransformDef) {
         "public",
         &pk,
         &order_totals_columns,
+        &summary_def.def.source,
     )
     .await
     .expect("create order_summaries table");
@@ -585,6 +608,122 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
     }
 }
 
+/// Reviewer follow-up to issue #74 (epic #78's own whole-branch review): the
+/// quarantine-recompute counterpart to `apply.rs`'s
+/// `explicitly_qualified_target_receives_a_live_cdc_write` and
+/// `apply_aggregate.rs`'s
+/// `explicitly_qualified_aggregate_target_receives_a_live_cdc_write` — a
+/// definition installed with an explicit non-default *target* schema (issue
+/// #76's grammar) used to fail `resume_column`'s recompute outright:
+/// `recompute_column`'s own `UPDATE` (`staging::quarantine`) bound
+/// `def.def.target` — always bare — straight into `quote_ident`, instead of
+/// `Definition::target_table`'s qualified identity, so the write tried
+/// bare, unqualified `order_totals`, not on this connection's pinned
+/// `search_path`, even though `custom.order_totals` (the real target) does
+/// exist and already carries the bare (non-`total`) columns a prior,
+/// successful drain wrote for it.
+#[tokio::test]
+async fn resume_column_recomputes_an_explicitly_qualified_target() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create schema custom; \
+             create table orders (id integer primary key, price numeric, tax numeric)",
+        )
+        .await
+        .expect("seed source table and the custom schema");
+
+    const DEF_TEXT: &str = "TRANSFORM custom.order_totals FROM orders SELECT price + tax AS total";
+    let def = trellis::defs::parse(DEF_TEXT).expect("parse the explicitly-qualified target");
+    let source_columns = numeric_columns(&["id", "price", "tax"]);
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &def, "custom", &pk, &source_columns, &def.source)
+        .await
+        .expect("materialize custom.order_totals ahead of create_definition");
+    create_definition(&db.pool, DEF_TEXT, &source_columns)
+        .await
+        .expect("create definition against the explicitly-qualified target");
+
+    // Trip the column fuse exactly like this file's other tests — the
+    // malformed images below are purely staged/synthetic and never touch
+    // the physical `orders` table.
+    let bad_ids: Vec<i64> = (1..=DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    stage_bad_orders(&mut client, &db.pool, &bad_ids).await;
+    assert!(
+        column_status_row(&client, "order_totals", "total")
+            .await
+            .is_some(),
+        "the fuse must have tripped"
+    );
+
+    // A real, valid row in the physical source table, plus a bare (`total`
+    // excluded) target row for it — standing in for what a drain retried
+    // after the column paused would have already written, the state
+    // `resume_column`'s recompute is meant to fill in.
+    client
+        .execute(
+            "insert into orders (id, price, tax) values (200, 10.00, 5.00)",
+            &[],
+        )
+        .await
+        .expect("seed a valid source row");
+    client
+        .execute("insert into custom.order_totals (id) values (200)", &[])
+        .await
+        .expect("pre-populate a bare target row for the row resume must fill in");
+
+    let resumed = quarantine::resume_column(&db.pool, "order_totals", "total")
+        .await
+        .expect(
+            "resume_column must recompute against custom.order_totals — a bare, \
+             unqualified UPDATE would have raised relation \"order_totals\" does \
+             not exist instead",
+        );
+    assert_eq!(
+        resumed,
+        vec![("order_totals".to_string(), "total".to_string())]
+    );
+
+    assert_eq!(
+        column_status_row(&client, "order_totals", "total").await,
+        None,
+        "the column must no longer be paused after a successful resume"
+    );
+
+    let total: String = client
+        .query_one(
+            "select total::text from custom.order_totals where id = 200",
+            &[],
+        )
+        .await
+        .expect("read custom.order_totals")
+        .get(0);
+    assert_eq!(
+        total, "15.00",
+        "resume must have recomputed custom.order_totals against the real source row"
+    );
+
+    let bare_decoy_exists: bool = client
+        .query_one(
+            "select exists (select 1 from information_schema.tables \
+             where table_name = 'order_totals' and table_schema <> 'custom')",
+            &[],
+        )
+        .await
+        .expect("check for a same-named decoy outside the custom schema")
+        .get(0);
+    assert!(
+        !bare_decoy_exists,
+        "the recompute must land in custom.order_totals, never create/touch a \
+         same-named table in some other schema on the connection's search_path"
+    );
+}
+
 // ---------------------------------------------------------------------
 // (e) The three read methods and the resume method, on both `Trellis` and
 //     `BlockingTrellis`.
@@ -791,10 +930,11 @@ async fn an_existing_row_level_fuse_scenario_is_unaffected() {
     };
     assert_eq!(outcome.keys_written, 1, "only the survivor, key 2, writes");
 
+    let orders = qualify_fixture_table("orders");
     let poisoned: bool = client
         .query_one(
-            "select exists(select 1 from poison where src_table = 'orders' and key = '1')",
-            &[],
+            "select exists(select 1 from poison where src_table = $1 and key = '1')",
+            &[&orders],
         )
         .await
         .expect("read poison")
@@ -1125,13 +1265,22 @@ async fn resume_recomputes_correctly_even_when_a_sibling_column_still_throws() {
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let pk = source_primary_key(&db.pool, "calc_src")
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &calc_def, "public", &pk, &source_columns)
-        .await
-        .expect("create calc table");
+    create_target_table(
+        &db.pool,
+        &calc_def,
+        "public",
+        &pk,
+        &source_columns,
+        &calc_def.source,
+    )
+    .await
+    .expect("create calc table");
 
     // Seed the target with sentinel values distinct from any real
     // recomputed result, so a successful recompute is unambiguous.
@@ -1258,10 +1407,19 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
-    create_target_table(&db.pool, &def_a, "public", &pk, &source_columns)
-        .await
-        .expect("create sib_a table");
+    create_target_table(
+        &db.pool,
+        &def_a,
+        "public",
+        &pk,
+        &source_columns,
+        &def_a.source,
+    )
+    .await
+    .expect("create sib_a table");
     let def_b = TransformDef {
         target: "sib_b".to_string(),
         source: "shared_src".to_string(),
@@ -1275,10 +1433,19 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
-    create_target_table(&db.pool, &def_b, "public", &pk, &source_columns)
-        .await
-        .expect("create sib_b table");
+    create_target_table(
+        &db.pool,
+        &def_b,
+        "public",
+        &pk,
+        &source_columns,
+        &def_b.source,
+    )
+    .await
+    .expect("create sib_b table");
 
     // `DEFAULT_COLUMN_DEATH_THRESHOLD` distinct bad rows, all in one batch —
     // the same "breadth of distinct rows, not one row retried" shape
@@ -1334,11 +1501,12 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
     // unaffected by the ambiguity fallback: every distinct bad row is still
     // charged toward its own key-level counter exactly as it would be
     // without this feature (`tests/quarantine.rs`'s own fuse, untouched).
+    let shared_src = qualify_fixture_table("shared_src");
     for id in &bad_ids {
         let deaths: Option<i32> = client
             .query_opt(
-                "select deaths from key_deaths where src_table = 'shared_src' and key = $1",
-                &[&id.to_string()],
+                "select deaths from key_deaths where src_table = $1 and key = $2",
+                &[&shared_src, &id.to_string()],
             )
             .await
             .expect("read key_deaths")

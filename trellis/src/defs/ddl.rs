@@ -250,10 +250,16 @@ fn map_resolve_error(err: super::catalog::CatalogError) -> DdlError {
     }
 }
 
-/// Introspects `source_table`'s primary key from `pg_catalog`. Resolves
-/// `source_table` through the connection's `search_path` (already pinned by
-/// `crate::pool`'s session bootstrap), via a bound `::regclass` cast rather
-/// than string-interpolating the table name into the query.
+/// Introspects `source_table`'s primary key from `pg_catalog`, via a bound
+/// `::regclass` cast (`to_regclass($1)`) rather than string-interpolating the
+/// table name into the query. `to_regclass` resolves a schema-qualified
+/// `"schema.table"` string exactly (issue #76, ADR-0007) — every real caller
+/// now passes one (`Definition::source_table`, or
+/// `catalog::resolve_source_for_install`'s equivalent at definition-acceptance
+/// time), so this no longer depends on the connection's `search_path`
+/// (`crate::pool`'s session bootstrap) the way it did before issue #72/#76. A
+/// bare table name still resolves via `search_path` exactly as before, for
+/// any caller that genuinely has nothing more specific.
 pub async fn source_primary_key(
     pool: &Pool,
     source_table: &str,
@@ -318,22 +324,105 @@ async fn source_column_pg_types(
 }
 
 /// The neighbor target table's name for `def` — see module docs for why this
-/// is simply `def.target` unchanged. Unqualified: the catalog stores and
-/// looks up target tables by this bare name, independent of which schema
-/// [`qualified_target_table`] actually creates it under.
+/// is simply `def.target` unchanged. Bare — `def.target` is always the
+/// unqualified table name, even for a definition whose `TRANSFORM` clause
+/// explicitly wrote a `schema.table` spelling (issue #76; see
+/// [`super::ast::TransformDef`]'s own doc comment for why that dotted
+/// spelling never lands in this field), independent of which schema
+/// [`qualified_target_table`] actually creates it under. Note this is *not*
+/// the same string `transform_definitions.target_table` persists as of issue
+/// #73: the catalog's own identity column holds the fully-qualified
+/// `schema.table` form (built via `intake::publication::qualify`, at
+/// definition-acceptance time — see `catalog::create_definition_inner`), not
+/// this bare name. Callers that need a live connection (whose `search_path`
+/// already resolves this bare name to the right physical table —
+/// `pool::session_bootstrap` pins `target_schema` onto it) can keep using
+/// this unqualified; callers that need the persisted identity string must
+/// read `transform_definitions.target_table` instead, not reconstruct it
+/// from this function.
 pub fn neighbor_table_name(def: &TransformDef) -> &str {
     &def.target
 }
 
 /// The fully schema-qualified name of `def`'s neighbor target table under
 /// `target_schema` (see the module doc comment) — `"{target_schema}"."{def.target}"`,
-/// each component quoted independently via [`quote_ident`].
+/// each component quoted independently via [`quote_ident`]. Built for direct
+/// interpolation into DDL text, not as a persisted-identity string: this
+/// quotes each component separately, whereas `transform_definitions.target_table`
+/// (issue #73) is the plain, unquoted `"schema.table"` form
+/// `intake::publication::qualify` builds — the two are never byte-for-byte
+/// equal, so don't compare or persist this function's output as if it were
+/// that identity.
 pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String {
     format!(
         "{}.{}",
         quote_ident(target_schema),
         quote_ident(neighbor_table_name(def))
     )
+}
+
+/// The read-side counterpart to [`qualified_target_table`] (issue #76,
+/// ADR-0007): quotes an already-qualified `"schema.table"` name — as read
+/// back from [`super::model::Definition::source_table`]
+/// (`transform_definitions.source_table`), or freshly resolved by
+/// `catalog::resolve_source_for_install`/`create_definition_inner`'s own
+/// `qualified_source` at definition-acceptance time — for direct
+/// interpolation into DDL/DML text, each component quoted independently via
+/// [`quote_ident`]. This is what every physical SQL-builder that reads a
+/// definition's live source table (backfill, CDC apply, quarantine
+/// recompute) must use in place of a bare `quote_ident(&def.source)`/
+/// `quote_ident(source_key)`, which would otherwise leave the schema to
+/// resolve against whatever `search_path` the executing session happens to
+/// carry (`pool::session_bootstrap`'s pinned `Config::schema`/
+/// `Config::target_schema`/`"public"`) — exactly the bug class ADR-0007
+/// exists to close.
+///
+/// Splits on the first `.`, matching `intake::publication::qualify`'s sole
+/// construction site for this shape (which rejects a `.` inside either
+/// component, so the first `.` here is always the real separator). Falls
+/// back to quoting `qualified` whole when it carries no `.` at all — not a
+/// shape any production caller produces (every real source is qualified by
+/// the time it reaches here), but keeps this usable by tests/oracles that
+/// hand-build a plan against a bare table name in the connection's own
+/// default schema.
+pub(crate) fn qualified_source_table(qualified: &str) -> String {
+    quote_qualified_ident(qualified)
+}
+
+/// The target-side counterpart to [`qualified_source_table`] — same
+/// component-independent quoting of an already-qualified `"schema.table"`
+/// string, for a definition's *target* identity
+/// ([`super::model::Definition::target_table`]) rather than its source.
+///
+/// Broader sweep, reviewer follow-up to issue #74 (epic #78's own
+/// whole-branch review): the live CDC-apply write path (`staging::apply`'s
+/// `apply_target`/truncate-clears loop, `staging::apply_aggregate`'s
+/// target-write sites, `staging::quarantine`'s `recompute_column`) never got
+/// this fix on the target side, even though issue #76 already let a
+/// `TRANSFORM` clause spell an explicit non-default target schema — every
+/// one of those sites was still binding `def.def.target` (bare) straight
+/// into `quote_ident`, which silently mis-resolved (or simply couldn't find)
+/// a target explicitly qualified outside the connection's pinned
+/// `search_path`. Every such site now reads
+/// [`super::model::Definition::target_table`] (or a plan field carrying it
+/// forward, mirroring how `source`/`qualified_source` already got threaded
+/// through in #76) through this function instead.
+pub(crate) fn qualified_target_table_ident(qualified: &str) -> String {
+    quote_qualified_ident(qualified)
+}
+
+/// Shared quoting logic for [`qualified_source_table`]/
+/// [`qualified_target_table_ident`]: splits an already-qualified
+/// `"schema.table"` string on its first `.` and quotes each component
+/// independently, for direct interpolation into DDL/DML text. See
+/// [`qualified_source_table`]'s own doc comment for the fallback/splitting
+/// rationale — identical for both callers, since neither cares whether the
+/// qualified string came from a source or target identity.
+fn quote_qualified_ident(qualified: &str) -> String {
+    match qualified.split_once('.') {
+        Some((schema, table)) => format!("{}.{}", quote_ident(schema), quote_ident(table)),
+        None => quote_ident(qualified),
+    }
 }
 
 /// Creates `def`'s neighbor target table (idempotent: `create table if not
@@ -348,12 +437,20 @@ pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String
 /// [`qualified_target_table`]) — distinct from the connection's own
 /// Trellis-managed schema, so this is always schema-qualified explicitly
 /// rather than relying on `search_path`.
+///
+/// `source_table` is `def.source`'s fully-qualified `"schema.table"` identity
+/// (issue #76, ADR-0007) — the caller's own already-resolved
+/// `catalog::resolve_source_for_install` result — used below (via
+/// [`qualified_source_table`]) to introspect a passthrough field's concrete
+/// source column type, rather than the bare `def.source` left to
+/// `search_path`.
 pub async fn create_target_table(
     pool: &Pool,
     def: &TransformDef,
     target_schema: &str,
     pk: &PrimaryKeyColumn,
     source_columns: &HashMap<String, ValueType>,
+    source_table: &str,
 ) -> Result<(), DdlError> {
     // Issue #40: a relationship-enriched field's type is the referenced
     // to-side column's type, which `infer_field_types` reads from resolved
@@ -392,7 +489,7 @@ pub async fn create_target_table(
     let source_pg_types = if passthroughs.is_empty() {
         HashMap::new()
     } else {
-        source_column_pg_types(pool, &def.source).await?
+        source_column_pg_types(pool, source_table).await?
     };
 
     let mut sql = format!(
@@ -712,6 +809,8 @@ mod tests {
                 },
             }],
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         }
     }
 

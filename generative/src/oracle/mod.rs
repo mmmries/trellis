@@ -1209,6 +1209,8 @@ mod tests {
                 },
             }],
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         };
         assert_eq!(
             render_select(&def, "c0", &RelIndex::new(&empty_program())),
@@ -1251,6 +1253,8 @@ mod tests {
                 },
             ],
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         };
         assert_eq!(
             render_select(&def, "c0", &RelIndex::new(&empty_program())),
@@ -1417,6 +1421,8 @@ mod tests {
                 expr: path(),
             }],
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         };
         assert_eq!(
             render_select(&def, "pk", &RelIndex::new(&program)),
@@ -1444,6 +1450,8 @@ mod tests {
                 },
             }],
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         };
         let sql = render_select(&def, "pk", &RelIndex::new(&program));
         assert_eq!(
@@ -1486,6 +1494,8 @@ mod tests {
                 },
             ],
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         };
         assert_eq!(
             render_select(&def, "pk", &RelIndex::new(&program)),
@@ -1511,6 +1521,8 @@ mod tests {
                 expr: path(),
             }],
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         };
         let _ = render_select(&def, "pk", &RelIndex::new(&program));
     }
@@ -1534,6 +1546,8 @@ mod tests {
                 },
             }],
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         };
         let _ = render_select(&def, "pk", &RelIndex::new(&program));
     }

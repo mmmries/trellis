@@ -24,6 +24,35 @@ pub struct Definition {
     /// Where this transform is in its lifecycle (issue #55) — see
     /// [`TransformStatus`].
     pub status: TransformStatus,
+    /// The persisted, fully-qualified `"schema.table"` form of `def.source`
+    /// — `transform_definitions.source_table` read back verbatim (issue #72
+    /// resolved it once, at acceptance time, via `search_path` for a bare
+    /// `FROM`, or trusted an explicit `FROM <schema>.<source>` outright as of
+    /// issue #76; see `catalog::create_definition_inner`'s `qualified_source`).
+    ///
+    /// **This is the identity every physical SQL-builder that reads the live
+    /// source table at backfill/CDC-apply/quarantine-recompute time must use**
+    /// (ADR-0007) — never `def.source` alone, which is always bare (see
+    /// [`super::ast::TransformDef`]'s own doc comment) and, left unqualified
+    /// in emitted SQL, would silently resolve against whichever schema the
+    /// executing session's pinned `search_path` (`Config::schema`,
+    /// `Config::target_schema`, `"public"` — see `pool::session_bootstrap`)
+    /// happens to carry, not necessarily the schema this definition actually
+    /// resolved against at creation time. `defs::ddl::qualified_source_table`
+    /// turns this into a directly-interpolatable, independently-quoted DDL/DML
+    /// fragment; a `to_regclass($1)`-style introspection query can bind this
+    /// string as-is.
+    pub source_table: String,
+    /// The persisted, fully-qualified `"schema.table"` form of `def.target`
+    /// — `transform_definitions.target_table` read back verbatim (issue #73
+    /// resolved it once, at acceptance time, mirroring `source_table` above;
+    /// issue #74 additionally made this the exact identity `schema_nodes`'
+    /// target-side node is keyed on, so it now doubles as the qualified key
+    /// a caller with only `def.target` (bare) can use to re-enter the
+    /// `schema_nodes`/`schema_edges` graph — see
+    /// `staging::apply::compute`'s `downstream_readers` check for the one
+    /// call site that needs exactly this).
+    pub target_table: String,
 }
 
 /// A transform's lifecycle status (issue #55), persisted as
@@ -165,10 +194,10 @@ pub enum NodeKind {
 }
 
 /// A first-class identity for a table Trellis knows about — as a source, a
-/// target, or (via chained transforms) both — that transforms (and, later,
-/// relationships) resolve their endpoints against instead of a bare
-/// table-name string. One row per physical table: `is_source`/`is_target`
-/// each start `false` and are only ever set to `true` by
+/// target, or (via chained transforms) both — that transforms (and, as of
+/// issue #74, relationships too) resolve their endpoints against instead of
+/// a bare table-name string. One row per physical table: `is_source`/
+/// `is_target` each start `false` and are only ever set to `true` by
 /// [`super::catalog::resolve_node`], never back to `false`. Only identity is
 /// persisted ([`super::catalog`]'s `schema_nodes` table); a node's columns
 /// and types are introspected live from `pg_catalog`/`information_schema`
@@ -176,6 +205,14 @@ pub enum NodeKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaNode {
     pub id: i64,
+    /// The fully-qualified `"schema.table"` identity this node is keyed on
+    /// (issue #74, ADR-0007). `public.posts` and `archive.posts` are
+    /// distinct rows with independent `is_source`/`is_target` flags and
+    /// independent `schema_edges` — before issue #74 this held the bare
+    /// table name, so same-named tables in different schemas collided into
+    /// one node; every caller must now pass (and compare against) the
+    /// qualified form, never re-deriving it here (same resolve-once
+    /// discipline as `transform_definitions.source_table`/`target_table`).
     pub table_name: String,
     pub is_source: bool,
     pub is_target: bool,

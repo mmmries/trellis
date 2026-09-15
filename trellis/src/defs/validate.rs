@@ -232,6 +232,30 @@ pub enum ValidationError {
         to_table: String,
         to_col: String,
     },
+    /// An explicitly-qualified `FROM <schema>.<table>` source reference
+    /// (issue #76, ADR-0007 grammar clause 4) named a schema that does not
+    /// actually contain a table by that name, as introspected live against
+    /// `information_schema.tables`
+    /// ([`super::catalog::confirm_qualified_table_exists_in_txn`]). Distinct
+    /// from [`super::catalog::CatalogError::SourceTableNotFound`]: that
+    /// variant means "no schema on `search_path` has this bare name",
+    /// whereas this one means "the exact schema the definition named is
+    /// real, or isn't, but either way doesn't have this table" — an explicit
+    /// spelling resolves to that one relation, never a `search_path` walk.
+    QualifiedSourceTableNotFound { schema: String, table: String },
+    /// The `TRANSFORM <target>` twin of
+    /// [`ValidationError::QualifiedSourceTableNotFound`]: an explicitly-qualified
+    /// `TRANSFORM <schema>.<target>` reference (issue #76) named a schema
+    /// that doesn't actually contain a table by that name. For the common
+    /// [`super::catalog::install_definition`] path this schema is checked
+    /// *after* the physical `CREATE TABLE` DDL already ran under the same
+    /// explicit schema, so a miss here would mean that DDL itself failed
+    /// silently rather than a genuine spelling error; for the ring-path entry
+    /// points ([`super::catalog::create_definition`]/
+    /// [`super::catalog::create_definition_without_backfill`]), which assume
+    /// their caller already created the physical target table, this is the
+    /// only check that a bogus explicit schema ever gets.
+    QualifiedTargetTableNotFound { schema: String, table: String },
 }
 
 /// Payload of [`ValidationError::RelationshipTypeMismatch`], boxed out of the
@@ -423,6 +447,19 @@ impl fmt::Display for ValidationError {
                  from-side rows to re-derive and silently diverges from the Postgres oracle; \
                  run `ALTER TABLE {to_table} REPLICA IDENTITY FULL;` (or use a replica-identity \
                  index that covers {to_col})"
+            ),
+            ValidationError::QualifiedSourceTableNotFound { schema, table } => write!(
+                f,
+                "FROM names '{schema}.{table}' explicitly, but schema '{schema}' has no table \
+                 named '{table}'; an explicit schema.table spelling resolves to that exact \
+                 relation, not a search_path walk (ADR-0007), so this is checked as written"
+            ),
+            ValidationError::QualifiedTargetTableNotFound { schema, table } => write!(
+                f,
+                "TRANSFORM names '{schema}.{table}' explicitly, but schema '{schema}' has no \
+                 table named '{table}'; an explicit schema.table spelling resolves to that exact \
+                 relation, not the configured target schema (ADR-0007), so this is checked as \
+                 written"
             ),
         }
     }
@@ -1134,6 +1171,8 @@ mod tests {
             key_space: KeySpace::OneToOne,
             fields,
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         }
     }
 
@@ -1660,6 +1699,8 @@ mod tests {
             },
             fields,
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         }
     }
 

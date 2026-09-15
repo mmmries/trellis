@@ -160,9 +160,16 @@ async fn setup(db: &testkit::TestDatabase) -> TransformDef {
 
     let def = parse(BUILD_SRC).expect("parse build def");
     let pk = source_primary_key(&db.pool, "authors").await.expect("pk");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns())
-        .await
-        .expect("create relationship-enriched target");
+    create_target_table(
+        &db.pool,
+        &def,
+        "public",
+        &pk,
+        &source_columns(),
+        &def.source,
+    )
+    .await
+    .expect("create relationship-enriched target");
     def
 }
 
@@ -172,7 +179,7 @@ async fn relationship_build_matches_oracle_including_no_match_and_multi_child() 
     let db = cluster.create_isolated_database().await;
 
     let def = setup(&db).await;
-    backfill_definition(&db.pool, &def, "public", &source_columns())
+    backfill_definition(&db.pool, &def, "public", &def.source, &source_columns())
         .await
         .expect("backfill");
 
@@ -224,7 +231,7 @@ async fn relationship_build_rerun_reflects_source_mutations() {
     let db = cluster.create_isolated_database().await;
 
     let def = setup(&db).await;
-    backfill_definition(&db.pool, &def, "public", &source_columns())
+    backfill_definition(&db.pool, &def, "public", &def.source, &source_columns())
         .await
         .expect("first backfill");
 
@@ -246,7 +253,7 @@ async fn relationship_build_rerun_reflects_source_mutations() {
         .expect("mutate child tables between runs");
     drop(client);
 
-    backfill_definition(&db.pool, &def, "public", &source_columns())
+    backfill_definition(&db.pool, &def, "public", &def.source, &source_columns())
         .await
         .expect("second backfill after mutation");
 

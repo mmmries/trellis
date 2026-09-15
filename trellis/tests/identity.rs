@@ -260,10 +260,12 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
         .iter()
         .map(|row| row.get(0))
         .collect();
+    // Issue #73 added V22; its reviewer follow-up added V23. Issue #74
+    // added V24.
     assert_eq!(
         applied,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
         ]
     );
 }

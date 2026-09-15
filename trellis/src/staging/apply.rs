@@ -318,24 +318,93 @@ impl From<crate::error::Error> for ApplyError {
 /// The catalog's lookup key for a folded record's `src_table`: everything
 /// after the last `.`, if any.
 ///
-/// Definitions are stored — and their versions keyed — by the *unqualified*
-/// table name a `TRANSFORM ... FROM <table>` clause names (see
-/// `defs::parser`'s grammar; `defs/mod.rs`'s own doctest parses `FROM
-/// orders` to `def.source == "orders"`) — never schema-qualified. CDC
-/// intake's own producer, though, always stages changes under the
-/// qualified `"schema.table"` shape `intake::publication::qualify` builds,
-/// which [`FoldedChange::src_table`] inherits directly from the ring. This
-/// is the one seam that reconciles the two conventions: strip a schema
-/// prefix before ever asking the catalog about a folded record's source. A
-/// target table's own downstream `src_table` (the `Recompute` rows this
-/// module stages) is already unqualified —
-/// [`crate::defs::ddl::neighbor_table_name`] never adds a schema — so this
-/// is a no-op there.
+/// A definition's `def.source` is always a *bare* table name — even once
+/// issue #76 taught the grammar's `TRANSFORM ... FROM <table>` clause an
+/// explicit `schema.table` spelling, `def.source` itself still only ever
+/// holds the bare table part (see `defs::ast::TransformDef`'s own doc
+/// comment for why; `defs::parser`'s grammar and `defs/mod.rs`'s own tests
+/// cover both the bare and explicitly-qualified parses). CDC intake's
+/// own producer, though, always stages changes under the qualified
+/// `"schema.table"` shape `intake::publication::qualify` builds, which
+/// [`FoldedChange::src_table`] inherits directly from the ring. This is the
+/// one seam that reconciles the two conventions: strip a schema prefix
+/// before ever asking the catalog about a folded record's source.
+///
+/// Note this produces a *bare* key even though, as of issue #72,
+/// `transform_definitions.source_table`/`source_table_versions.source_table`
+/// themselves now persist the fully-qualified form — those columns' own
+/// read sites (e.g. [`crate::defs::source_table_version`]) match against
+/// their bare table-name suffix precisely so this function's output, and
+/// every internal key this whole apply path builds from it (`by_source`,
+/// `ApplyPlan::versions`, etc.), can stay unchanged rather than needing this
+/// hot path to thread real schema identity through. See
+/// [`crate::defs::source_table_version`]'s doc comment for the full
+/// bare-vs-qualified rationale — including why issue #73 (which also
+/// persists `transform_definitions.target_table` qualified) does *not*
+/// retire this stripping: a target table's own downstream `src_table` (the
+/// `Recompute` rows this module stages) is still unqualified —
+/// [`crate::defs::ddl::neighbor_table_name`] deliberately never adds a
+/// schema, issue #73 or not — so stripping remains a no-op for that case,
+/// exactly as before #72, rather than becoming a stable identity function
+/// this call site could now skip outright. Retiring the split entirely (by
+/// qualifying every emitted `src_table`, `Recompute` rows included) is issue
+/// #75's emission-audit territory.
+///
+/// This function's output stays purely a *lookup key* (issue #76's own
+/// reviewer follow-up): every catalog read below it (`source_table_version`,
+/// `transforms_for_source`, `relationships_to_table`) keeps using this bare
+/// form, matching the bare-suffix indexes those tables are keyed on. The
+/// *physical* SQL builders that actually read a live source row
+/// (`ddl::source_primary_key`, [`read_live_rows_batch`], the source string
+/// embedded in an [`AggregateTargetPlan`]) use the qualified
+/// `change.src_table` each bucket's own changes already carry instead — see
+/// `compute`'s `by_source` loop — never this bare key, so a same-named table
+/// in a different schema can't make one of those builders read the wrong
+/// physical relation.
 fn catalog_source_key(src_table: &str) -> &str {
     match src_table.rsplit_once('.') {
         Some((_, table)) => table,
         None => src_table,
     }
+}
+
+/// Resolves `src_table` to the fully-qualified identity
+/// [`catalog::transforms_for_source`]/[`catalog::dependents_of`] now require
+/// (issue #74, ADR-0007: `schema_nodes` keys on qualified identity, so a
+/// bare lookup there silently finds nothing rather than erroring).
+///
+/// A no-op for the common case — `src_table` already contains a `.` — which
+/// covers every real CDC-staged or backfill-enumerated change (issue #76
+/// qualifies `change.src_table` unconditionally at the point it's staged).
+/// Two different shapes of bare `src_table` reach this function, needing
+/// two different resolutions — both handled by delegating to
+/// [`catalog::resolve_graph_identity`] rather than this function choosing
+/// between them itself:
+///
+/// 1. A downstream `Recompute` trigger *this apply path itself* staged for
+///    a chained definition's target (`compute`'s "Downstream propagation"
+///    step, `apply_and_mark_drained`), carrying the plain, bare
+///    `def.def.target` as its `src_table` (qualifying every such row at the
+///    point it's staged is issue #75's emission-audit territory, not this
+///    one's — see `catalog_source_key`'s own doc comment on the same
+///    deliberate-bare convention). This is `resolve_graph_identity`'s
+///    bare-target-suffix fallback: the name can only be some other live
+///    definition's own target.
+/// 2. A reverse-recompute trigger for a relationship's from-side
+///    (`from_side_keys_for_join`/`from_side_keys_with_non_null_join`'s
+///    callers below, staging `rel.def.from_table` as `src_table`) —
+///    `relationship_definitions.from_table` is always bare (ADR-0007's
+///    "Scope" section leaves relationship endpoints unqualified) and is a
+///    genuine *source* table, never anyone's target, so the bare-target-
+///    suffix fallback above would never find it. This is
+///    `resolve_graph_identity`'s *first* step instead: a plain physical
+///    `search_path` lookup, exactly like resolving a fresh definition's own
+///    bare `FROM`.
+async fn qualified_schema_node_key(pool: &Pool, src_table: &str) -> Result<String, ApplyError> {
+    if src_table.contains('.') {
+        return Ok(src_table.to_string());
+    }
+    Ok(catalog::resolve_graph_identity(pool, src_table).await?)
 }
 
 /// Decodes a staged jsonb image (bound as text — this crate has no
@@ -395,7 +464,7 @@ async fn read_live_rows_batch(
          from (select {pk_ident}::text as k, to_jsonb(t.*) as doc from {} t \
                where {pk_ident} = any($1::text[]::{}[])) m \
          cross join lateral jsonb_each_text(m.doc) e",
-        quote_ident(source_table),
+        ddl::qualified_source_table(source_table),
         pk.data_type,
     );
     let db_rows = client.query(&sql, &[&keys]).await?;
@@ -695,6 +764,18 @@ struct TargetPlan {
     field_types: Vec<ValueType>,
     writes: Vec<TargetWrite>,
     deletes: Vec<TargetDelete>,
+    /// The persisted, fully-qualified `"schema.table"` identity of this
+    /// target (issue #73's `Definition::target_table`, ADR-0007) —
+    /// carried alongside the bare `def.def.target` this plan is keyed by
+    /// (see [`ApplyPlan::targets`]'s doc comment on why the map key itself
+    /// stays bare) so [`apply_target`] can bind the *right* physical table
+    /// into its `INSERT`/`UPDATE`/`DELETE` SQL, rather than leaving a
+    /// target explicitly qualified into a non-default schema (issue #76) to
+    /// resolve against whatever `search_path` the executing session
+    /// happens to carry. Mirrors [`AggregateTargetPlan::source`]/this same
+    /// struct's own eventual reuse of `qualified_source`'s established
+    /// pattern from #76.
+    qualified_target: String,
 }
 
 /// One target table this batch must clear in full before its own keyed
@@ -711,6 +792,23 @@ struct TargetPlan {
 struct ClearPlan {
     pk: PrimaryKeyColumn,
     hop_gen: i32,
+    /// Same role as [`TargetPlan::qualified_target`]: the persisted,
+    /// fully-qualified target identity this clear's `DELETE FROM` must bind,
+    /// rather than the bare map key it's stored under.
+    qualified_target: String,
+}
+
+/// The aggregate-target counterpart to [`ClearPlan`] — see
+/// [`ApplyPlan::aggregate_clears`]'s doc comment for why this carries no
+/// [`PrimaryKeyColumn`] of its own (a plain full-table `DELETE`, no
+/// `RETURNING`-projected key shape needed). `qualified_target` plays the
+/// same role [`ClearPlan::qualified_target`]/[`TargetPlan::qualified_target`]
+/// do: the persisted, fully-qualified identity the `DELETE FROM` must bind,
+/// not the bare map key this is stored under.
+#[derive(Debug, Clone)]
+struct AggregateClearPlan {
+    hop_gen: i32,
+    qualified_target: String,
 }
 
 /// Phase 2's output: an in-memory plan Phase 3 applies inside one
@@ -772,7 +870,7 @@ pub struct ApplyPlan {
     /// reason: both paths are consistent in outcome (fail loud, never
     /// silently misuse the key) regardless of which one a batch takes, so
     /// this skip is not a live gap today.
-    aggregate_clears: HashMap<String, i32>,
+    aggregate_clears: HashMap<String, AggregateClearPlan>,
     /// Issue #16: the (non-truncate) folded records whose `(src_table,
     /// key)` is already in the `poison` marker table — excluded from every
     /// map above (the fold excludes a poisoned key *globally*, not just
@@ -863,6 +961,19 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         let version = catalog::source_table_version(pool, source_key).await?;
         versions.insert(source_key.to_string(), version);
 
+        // The fully-qualified source identity this batch's own CDC producer
+        // staged (issue #76, ADR-0007) — `change.src_table`, not `source_key`
+        // (that stays bare purely as the catalog lookup key, per
+        // `catalog_source_key`'s own doc comment). Every change in this
+        // bucket shares the same bare suffix by construction (`by_source`
+        // grouped on it); they're expected to also share this qualified form
+        // (the same physical table), so any one of them gives the right
+        // answer for the physical reads below — used in place of a bare
+        // `source_key` so `source_primary_key`/`read_live_rows_batch` don't
+        // leave the schema to resolve against whatever `search_path` the
+        // executing session happens to carry.
+        let qualified_source = changes[0].src_table.as_str();
+
         // `source_key` alone determines the source table's primary key, not
         // the individual definition (issue #69) — introspected once per
         // source here and reused both below (every definition subscribed to
@@ -870,7 +981,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // definition it's evaluated against). A live `42P01` here means
         // `source_key` no longer exists (issue #16's dropped-table purge,
         // not an ordinary DDL error) — see [`ApplyError::SourceTableDropped`].
-        let pk = match ddl::source_primary_key(pool, source_key).await {
+        let pk = match ddl::source_primary_key(pool, qualified_source).await {
             Ok(pk) => pk,
             Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
                 return Err(ApplyError::SourceTableDropped {
@@ -913,13 +1024,30 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 .iter()
                 .map(|&i| changes[i].key.as_str())
                 .collect();
-            let mut live_rows = read_live_rows_batch(pool, source_key, &pk, &live_keys).await?;
+            let mut live_rows =
+                read_live_rows_batch(pool, qualified_source, &pk, &live_keys).await?;
             for &i in &live_refetch_indices {
                 rows[i] = live_rows.remove(changes[i].key.as_str());
             }
         }
 
-        let defs = catalog::transforms_for_source(pool, source_key).await?;
+        // `qualified_source` (via `qualified_schema_node_key`), not
+        // `source_key`: `schema_nodes`/`schema_edges` now key on qualified
+        // identity (issue #74, ADR-0007), so `transforms_for_source` (a
+        // thin `dependents_of` wrapper) needs an exact qualified match
+        // here, not the bare catalog-lookup key `catalog_source_key`'s own
+        // doc comment already explains stays bare for
+        // `source_table_version`/`relationships_to_table` below (both still
+        // bare-suffix-keyed, unaffected by #74). `qualified_source` is
+        // usually already fully-qualified (real CDC/backfill), but a
+        // downstream-propagation hop's `src_table` is a bare target name
+        // this same apply path staged — `qualified_schema_node_key` resolves
+        // that case too; see its own doc comment.
+        let defs = catalog::transforms_for_source(
+            pool,
+            &qualified_schema_node_key(pool, qualified_source).await?,
+        )
+        .await?;
 
         // Aggregate definitions need each change's *old*-side row too (to
         // derive a grain-migrating change's old group key and its old
@@ -1034,38 +1162,53 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 // declared type, though (see `infer_field_types`' doc), and
                 // that column already exists — introspect it. Non-relationship
                 // definitions keep the pure inference, behavior-identical.
-                let field_types: Vec<ValueType> = if eval::relationship_references(&def.def)
-                    .is_empty()
-                {
-                    // This branch runs only for relationship-free definitions
-                    // (guarded above), so type inference needs no relationship
-                    // metadata: an empty map (issue #40).
-                    let inferred_types = validate::infer_field_types(
-                        &def.def,
-                        &def.source_columns,
-                        &std::collections::HashMap::new(),
-                    )?;
-                    field_names
-                        .iter()
-                        .map(|name| {
-                            inferred_types
-                                .get(name)
-                                .copied()
-                                .unwrap_or(ValueType::Numeric)
-                        })
-                        .collect()
-                } else {
-                    let target_types = to_column_types(pool, &def.def.target, &field_names).await?;
-                    field_names
-                        .iter()
-                        .map(|name| {
-                            target_types
-                                .get(name)
-                                .copied()
-                                .unwrap_or(ValueType::Numeric)
-                        })
-                        .collect()
-                };
+                let field_types: Vec<ValueType> =
+                    if eval::relationship_references(&def.def).is_empty() {
+                        // This branch runs only for relationship-free definitions
+                        // (guarded above), so type inference needs no relationship
+                        // metadata: an empty map (issue #40).
+                        let inferred_types = validate::infer_field_types(
+                            &def.def,
+                            &def.source_columns,
+                            &std::collections::HashMap::new(),
+                        )?;
+                        field_names
+                            .iter()
+                            .map(|name| {
+                                inferred_types
+                                    .get(name)
+                                    .copied()
+                                    .unwrap_or(ValueType::Numeric)
+                            })
+                            .collect()
+                    } else {
+                        // Broader sweep, reviewer follow-up to issue #74 (epic
+                        // #78's own whole-branch review): `def.def.target` is
+                        // always bare, even for a definition whose `TRANSFORM`
+                        // clause explicitly spelled `schema.target` (issue #76;
+                        // see `TransformDef`'s own doc comment), so binding it
+                        // straight into `to_column_types`'s `to_regclass` lookup
+                        // relied on the connection's pinned `search_path`
+                        // (`Config::schema`/`Config::target_schema`/`"public"`)
+                        // finding it — silently wrong (or simply absent) for a
+                        // target explicitly qualified into a schema outside that
+                        // pin. `def.target_table` is right here on the same
+                        // struct, already the fully-qualified identity issue #73
+                        // persisted at acceptance time — use it instead of
+                        // re-deriving (or mis-deriving) the physical location
+                        // from the bare AST field.
+                        let target_types =
+                            to_column_types(pool, &def.target_table, &field_names).await?;
+                        field_names
+                            .iter()
+                            .map(|name| {
+                                target_types
+                                    .get(name)
+                                    .copied()
+                                    .unwrap_or(ValueType::Numeric)
+                            })
+                            .collect()
+                    };
 
                 // ADR-0003's amendment (column-level quarantine): a column
                 // the fuse has paused is excluded from both this plan's
@@ -1099,6 +1242,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         field_types: field_types.clone(),
                         writes: Vec::new(),
                         deletes: Vec::new(),
+                        // The persisted, fully-qualified identity (issue #73)
+                        // — not re-derived, since `def` (this source's own
+                        // catalog `Definition`) already carries it. See
+                        // `TargetPlan::qualified_target`'s doc comment.
+                        qualified_target: def.target_table.clone(),
                     });
 
                 // Reused across every change below (issue #68): `regexp_count`'s
@@ -1259,7 +1407,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         group_by.clone(),
                         group_by_types,
                         field_plans,
-                        source_key.to_string(),
+                        qualified_source.to_string(),
+                        def.target_table.clone(),
                         field_exprs,
                         rel_joins,
                     )
@@ -1283,7 +1432,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // "resolve targets from the catalog" step the by-source loop above runs
     // per key, just once per truncated source instead of once per key.
     let mut clears: HashMap<String, ClearPlan> = HashMap::new();
-    let mut aggregate_clears: HashMap<String, i32> = HashMap::new();
+    let mut aggregate_clears: HashMap<String, AggregateClearPlan> = HashMap::new();
     for change in &truncated {
         let source_key = catalog_source_key(&change.src_table);
         // Fence this source too, even though nothing evaluated against it —
@@ -1293,7 +1442,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         let version = catalog::source_table_version(pool, source_key).await?;
         versions.entry(source_key.to_string()).or_insert(version);
 
-        let pk = match ddl::source_primary_key(pool, source_key).await {
+        let pk = match ddl::source_primary_key(pool, &change.src_table).await {
             Ok(pk) => pk,
             Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
                 return Err(ApplyError::SourceTableDropped {
@@ -1307,14 +1456,30 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             }
             Err(err) => return Err(err.into()),
         };
-        let defs = catalog::transforms_for_source(pool, source_key).await?;
+        // `&change.src_table` (qualified), not `source_key` (bare) — see
+        // the by-source loop above's identical comment on its own
+        // `transforms_for_source` call. A `TRUNCATE` is always a real
+        // physical CDC event (never a bare, internally-synthesized
+        // `Recompute` row), so `qualified_schema_node_key` is a no-op here
+        // in practice — routed through it anyway for the same safety the
+        // by-source loop gets, at effectively no cost.
+        let defs = catalog::transforms_for_source(
+            pool,
+            &qualified_schema_node_key(pool, &change.src_table).await?,
+        )
+        .await?;
         for def in &defs {
             match &def.def.key_space {
                 KeySpace::Aggregate { .. } => {
                     aggregate_clears
                         .entry(def.def.target.clone())
-                        .and_modify(|hop_gen| *hop_gen = (*hop_gen).max(change.hop_gen))
-                        .or_insert(change.hop_gen);
+                        .and_modify(|existing| {
+                            existing.hop_gen = existing.hop_gen.max(change.hop_gen)
+                        })
+                        .or_insert(AggregateClearPlan {
+                            hop_gen: change.hop_gen,
+                            qualified_target: def.target_table.clone(),
+                        });
                 }
                 KeySpace::OneToOne => {
                     clears
@@ -1325,6 +1490,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         .or_insert(ClearPlan {
                             pk: pk.clone(),
                             hop_gen: change.hop_gen,
+                            qualified_target: def.target_table.clone(),
                         });
                 }
             }
@@ -1371,9 +1537,18 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     all_targets.extend(aggregate_targets.keys());
     all_targets.extend(aggregate_clears.keys());
     for target in all_targets {
-        let has_downstream = !catalog::transforms_for_source(pool, target)
-            .await?
-            .is_empty();
+        // `target` is bare (`def.def.target`) — `schema_nodes` now keys on
+        // qualified identity (issue #74, ADR-0007), so a bare lookup here
+        // would silently find nothing and permanently disable downstream
+        // propagation for every chained transform.
+        // `qualified_schema_node_key` resolves it the same way it resolves
+        // a bare `Recompute`-staged `src_table` above (this *is* exactly
+        // that case, one step earlier: `target` is about to become such a
+        // row's `src_table` the moment this loop's caller stages it).
+        let has_downstream =
+            !catalog::transforms_for_source(pool, &qualified_schema_node_key(pool, target).await?)
+                .await?
+                .is_empty();
         downstream_readers.insert(target.clone(), has_downstream);
     }
 
@@ -1427,7 +1602,6 @@ const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
 /// writes anything.
 async fn apply_target(
     txn: &Transaction<'_>,
-    target: &str,
     plan: &TargetPlan,
 ) -> Result<(Vec<String>, Vec<String>), ApplyError> {
     if plan.writes.is_empty() && plan.deletes.is_empty() {
@@ -1436,7 +1610,12 @@ async fn apply_target(
 
     let pk_ident = quote_ident(&plan.pk.name);
     let pk_cast = plan.pk.data_type.as_str();
-    let target_ident = quote_ident(target);
+    // `plan.qualified_target` (issue #73's persisted identity), not a bare
+    // `quote_ident(target)` — a target explicitly qualified into a
+    // non-default schema (issue #76) isn't necessarily on this connection's
+    // pinned `search_path`. See `TargetPlan::qualified_target`'s doc comment
+    // and `ddl::qualified_target_table_ident`'s.
+    let target_ident = ddl::qualified_target_table_ident(&plan.qualified_target);
     let field_idents: Vec<String> = plan.field_names.iter().map(|n| quote_ident(n)).collect();
 
     let mut lock_keys: Vec<&str> = plan
@@ -1670,11 +1849,19 @@ pub async fn apply_and_mark_drained_many(
     plan: &ApplyPlan,
     wake_channel: &str,
 ) -> Result<ManyApplyOutcome, ApplyError> {
-    // 1. Version fence.
+    // 1. Version fence. `source_key` is bare (see `catalog_source_key`'s doc
+    // comment); `source_table_versions.source_table` is qualified as of
+    // issue #72, so this matches against its bare table-name suffix, same
+    // as `defs::source_table_version`'s own read — see that function's doc
+    // comment for why issue #73 doesn't retire this (short version:
+    // `source_key` still traces back to `ddl::neighbor_table_name`, which
+    // stays bare regardless; only issue #75's emission audit would let this
+    // go back to an exact match).
     for (source_key, loaded_version) in &plan.versions {
         let row = txn
             .query_opt(
-                "select version from source_table_versions where source_table = $1 for share",
+                "select version from source_table_versions \
+                 where split_part(source_table, '.', 2) = $1 for share",
                 &[source_key],
             )
             .await?;
@@ -1713,7 +1900,7 @@ pub async fn apply_and_mark_drained_many(
     // here specifically (single-bucket batch, barrier-drained).
     for (target, clear) in &plan.clears {
         let pk_ident = quote_ident(&clear.pk.name);
-        let target_ident = quote_ident(target);
+        let target_ident = ddl::qualified_target_table_ident(&clear.qualified_target);
         let cleared: Vec<String> = txn
             .query(
                 &format!("delete from {target_ident} returning {pk_ident}::text as pk"),
@@ -1735,8 +1922,8 @@ pub async fn apply_and_mark_drained_many(
     // doc comment on why these are a plain full-table delete with no
     // downstream propagation, unlike every other clear/write/delete this
     // function tracks via `changed`.
-    for target in plan.aggregate_clears.keys() {
-        let target_ident = quote_ident(target);
+    for clear in plan.aggregate_clears.values() {
+        let target_ident = ddl::qualified_target_table_ident(&clear.qualified_target);
         let cleared = txn
             .execute(&format!("delete from {target_ident}"), &[])
             .await?;
@@ -1745,7 +1932,7 @@ pub async fn apply_and_mark_drained_many(
 
     // 3. Ordered pre-lock + upsert/delete, per target table.
     for (target, target_plan) in &plan.targets {
-        let (written, deleted) = apply_target(txn, target, target_plan).await?;
+        let (written, deleted) = apply_target(txn, target_plan).await?;
         keys_written += written.len();
         keys_deleted += deleted.len();
 
@@ -1782,7 +1969,12 @@ pub async fn apply_and_mark_drained_many(
     // for why that is not a live misuse risk today: no definition reading
     // from an aggregate target can actually survive its first drain attempt.
     for (target, agg_plan) in &plan.aggregate_targets {
-        let result = apply_aggregate::apply_aggregate_target(txn, target, agg_plan).await?;
+        // `&agg_plan.target` (issue #73's persisted identity), not the bare
+        // `target` map key — see `AggregateTargetPlan::target`'s doc
+        // comment. `target` itself stays bare here purely as the
+        // `changed`/`downstream_readers` bookkeeping key below.
+        let result =
+            apply_aggregate::apply_aggregate_target(txn, &agg_plan.target, agg_plan).await?;
         keys_written += result.written.len();
         keys_deleted += result.deleted.len();
 

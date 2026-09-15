@@ -65,6 +65,24 @@ fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
         .collect()
 }
 
+/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`] — where every bare
+/// `create table` in this file's own fixtures actually lands, since
+/// `connect_raw` pins `search_path` to `{DEFAULT_SCHEMA}, public` and never
+/// qualifies its own DDL. Matches `apply.rs`'s own `qualify_fixture_table`
+/// (issue #74, ADR-0007): a CDC-staged `src_table`, and everything keyed off
+/// it downstream (`poison`/`poison_held`/`key_deaths`, and `schema_nodes`'s
+/// own lookups via `transforms_for_source`), must be fully qualified to
+/// match what a real CDC producer stages (issue #76) and what the
+/// dependency graph now keys on (issue #74). Already-qualified input
+/// (containing a `.`) passes through unchanged.
+fn qualify_fixture_table(name: &str) -> String {
+    if name.contains('.') {
+        name.to_string()
+    } else {
+        format!("{DEFAULT_SCHEMA}.{name}")
+    }
+}
+
 /// Stages one image-bearing (CDC-shaped) change directly into `table`, with
 /// an explicit `hop_gen` — `apply.rs`'s own `insert_cdc_row` always hardcodes
 /// `hop_gen = 0`, but the halting-schema-error test here needs to seed a
@@ -121,6 +139,8 @@ fn order_totals_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -143,7 +163,7 @@ async fn seed_order_totals(db: &TestDatabase, client: &Client) -> TransformDef {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
     def
@@ -313,10 +333,11 @@ async fn an_innocent_batch_mate_is_not_charged_and_the_error_surfaces_unattribut
     // Key "1" carries a malformed numeric field — fails `eval::evaluate`
     // (`EvalError::InvalidNumber`), an isolate-eligible failure. Key "2" is
     // healthy.
+    let orders = qualify_fixture_table("orders");
     insert_cdc_row(
         &client,
         "seg_0",
-        "orders",
+        &orders,
         "1",
         "insert",
         None,
@@ -326,7 +347,7 @@ async fn an_innocent_batch_mate_is_not_charged_and_the_error_surfaces_unattribut
     insert_cdc_row(
         &client,
         "seg_0",
-        "orders",
+        &orders,
         "2",
         "insert",
         None,
@@ -342,20 +363,20 @@ async fn an_innocent_batch_mate_is_not_charged_and_the_error_surfaces_unattribut
     }
 
     assert_eq!(
-        key_deaths_count(&client, "orders", "1").await,
+        key_deaths_count(&client, &orders, "1").await,
         Some(1),
         "the key that actually fails alone must be charged exactly once"
     );
     assert_eq!(
-        key_deaths_count(&client, "orders", "2").await,
+        key_deaths_count(&client, &orders, "2").await,
         None,
         "the innocent batch-mate must not be charged at all"
     );
     assert!(
-        !poison_marker_exists(&client, "orders", "1").await,
+        !poison_marker_exists(&client, &orders, "1").await,
         "one death is below the default threshold; nothing is evicted yet"
     );
-    assert!(!poison_marker_exists(&client, "orders", "2").await);
+    assert!(!poison_marker_exists(&client, &orders, "2").await);
 }
 
 /// Scenario: a clean drain clears a key's death counter, so a stale death
@@ -426,13 +447,14 @@ async fn a_healthy_later_change_to_a_poisoned_key_survives_via_its_own_parked_co
         .await
         .expect("seed orders rows");
 
+    let orders = qualify_fixture_table("orders");
     // Key "2" is already poisoned from some earlier, unrelated failure.
-    insert_poison_marker(&client, "orders", "2").await;
+    insert_poison_marker(&client, &orders, "2").await;
 
     insert_cdc_row(
         &client,
         "seg_0",
-        "orders",
+        &orders,
         "1",
         "insert",
         None,
@@ -443,7 +465,7 @@ async fn a_healthy_later_change_to_a_poisoned_key_survives_via_its_own_parked_co
     insert_cdc_row(
         &client,
         "seg_0",
-        "orders",
+        &orders,
         "2",
         "insert",
         None,
@@ -467,8 +489,8 @@ async fn a_healthy_later_change_to_a_poisoned_key_survives_via_its_own_parked_co
 
     let held: i64 = client
         .query_one(
-            "select count(*) from poison_held where src_table = 'orders' and key = '2' and seg_seq = $1",
-            &[&seg_seq],
+            "select count(*) from poison_held where src_table = $1 and key = '2' and seg_seq = $2",
+            &[&orders, &seg_seq],
         )
         .await
         .expect("count poison_held rows")
@@ -478,7 +500,7 @@ async fn a_healthy_later_change_to_a_poisoned_key_survives_via_its_own_parked_co
         "the excluding batch must have parked its own contribution for key 2"
     );
 
-    let replayed = trellis::staging::release_key(&db.pool, "orders", "2")
+    let replayed = trellis::staging::release_key(&db.pool, &orders, "2")
         .await
         .expect("release_key");
     assert_eq!(replayed, 1);
@@ -534,16 +556,18 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
         "public",
         &pk,
         &order_totals_columns,
+        &summary_def.def.source,
     )
     .await
     .expect("create order_summary table");
 
     // Already at the hop bound: applying and propagating once more must trip
     // it.
+    let orders = qualify_fixture_table("orders");
     insert_cdc_row_with_hop_gen(
         &client,
         "seg_0",
-        "orders",
+        &orders,
         "1",
         "insert",
         None,
@@ -564,7 +588,7 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
     }
 
     assert!(
-        !poison_marker_exists(&client, "orders", "1").await,
+        !poison_marker_exists(&client, &orders, "1").await,
         "a halting schema error must never quarantine the key that triggered it"
     );
 
@@ -804,13 +828,14 @@ async fn release_replays_in_batch_then_position_order_and_telescopes_to_the_orac
         .await
         .expect("seed orders row");
 
-    insert_poison_marker(&client, "orders", "1").await;
+    let orders = qualify_fixture_table("orders");
+    insert_poison_marker(&client, &orders, "1").await;
     // Two excluding batches' own parked contributions for the same key,
     // inserted out of seg_seq order here to prove release doesn't just
     // replay insertion order.
     insert_poison_held(
         &client,
-        "orders",
+        &orders,
         "1",
         2,
         "update",
@@ -821,7 +846,7 @@ async fn release_replays_in_batch_then_position_order_and_telescopes_to_the_orac
     .await;
     insert_poison_held(
         &client,
-        "orders",
+        &orders,
         "1",
         1,
         "update",
@@ -831,7 +856,7 @@ async fn release_replays_in_batch_then_position_order_and_telescopes_to_the_orac
     )
     .await;
 
-    let replayed = trellis::staging::release_key(&db.pool, "orders", "1")
+    let replayed = trellis::staging::release_key(&db.pool, &orders, "1")
         .await
         .expect("release_key");
     assert_eq!(replayed, 2);
@@ -918,10 +943,11 @@ async fn a_batch_failure_that_only_reproduces_combined_surfaces_unblamed() {
         .await
         .expect("seed live order_items rows");
 
+    let order_items = qualify_fixture_table("order_items");
     insert_cdc_row(
         &client,
         "seg_0",
-        "order_items",
+        &order_items,
         "1",
         "insert",
         None,
@@ -931,7 +957,7 @@ async fn a_batch_failure_that_only_reproduces_combined_surfaces_unblamed() {
     insert_cdc_row(
         &client,
         "seg_0",
-        "order_items",
+        &order_items,
         "2",
         "insert",
         None,
@@ -953,13 +979,13 @@ async fn a_batch_failure_that_only_reproduces_combined_surfaces_unblamed() {
     }
 
     assert_eq!(
-        key_deaths_count(&client, "order_items", "1").await,
+        key_deaths_count(&client, &order_items, "1").await,
         None,
         "neither key reproduces the failure alone, so neither is charged"
     );
-    assert_eq!(key_deaths_count(&client, "order_items", "2").await, None);
-    assert!(!poison_marker_exists(&client, "order_items", "1").await);
-    assert!(!poison_marker_exists(&client, "order_items", "2").await);
+    assert_eq!(key_deaths_count(&client, &order_items, "2").await, None);
+    assert!(!poison_marker_exists(&client, &order_items, "1").await);
+    assert!(!poison_marker_exists(&client, &order_items, "2").await);
 
     let target_row_exists: bool = client
         .query_one(
@@ -997,10 +1023,11 @@ async fn repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still
 
     // Key "1" is malformed and fails every real attempt to apply it; key
     // "2" is healthy throughout.
+    let orders = qualify_fixture_table("orders");
     insert_cdc_row(
         &client,
         "seg_0",
-        "orders",
+        &orders,
         "1",
         "insert",
         None,
@@ -1010,7 +1037,7 @@ async fn repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still
     insert_cdc_row(
         &client,
         "seg_0",
-        "orders",
+        &orders,
         "2",
         "insert",
         None,
@@ -1041,10 +1068,10 @@ async fn repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still
     assert_eq!(outcome.keys_written, 1, "only the survivor, key 2, writes");
 
     assert!(
-        poison_marker_exists(&client, "orders", "1").await,
+        poison_marker_exists(&client, &orders, "1").await,
         "the key must have actually crossed the threshold and been evicted"
     );
-    let deaths = key_deaths_count(&client, "orders", "1")
+    let deaths = key_deaths_count(&client, &orders, "1")
         .await
         .expect("an evicted key's death counter is never cleared by eviction itself");
     assert!(
@@ -1055,8 +1082,8 @@ async fn repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still
     let held: i64 = client
         .query_one(
             "select count(*) from poison_held \
-             where src_table = 'orders' and key = '1' and seg_seq = $1",
-            &[&seg_seq],
+             where src_table = $1 and key = '1' and seg_seq = $2",
+            &[&orders, &seg_seq],
         )
         .await
         .expect("count poison_held rows")

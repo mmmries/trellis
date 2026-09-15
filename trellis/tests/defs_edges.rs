@@ -7,21 +7,33 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use trellis::defs::{
     CatalogError, EdgeKind, NodeKind, ValidationError, ValueType, create_definition,
-    create_target_table, dependents_of, parse, persist_edge, resolve_node, source_primary_key,
-    transforms_for_source,
+    create_target_table, dependents_of, node_for_table, parse, persist_edge, resolve_node,
+    source_primary_key, transforms_for_source,
 };
 
 /// Creates a minimal backing relation for a definition's source table
 /// (issue #23's backfill enumerates it for real, via a live `regclass`/
 /// catalog lookup) — a bare PK column is enough, since `validate()` checks
 /// column references against the passed-in `source_columns` map, not the
-/// live schema. Left unqualified so it lands via the pool's ambient
-/// `search_path` (Trellis schema first), matching the schema
-/// `create_definition` assumes for `def.source` today.
+/// live schema.
+///
+/// Explicitly under `public` (issue #74, ADR-0007) — not left to land
+/// wherever the pool's ambient `search_path` happens to put a bare `CREATE
+/// TABLE` (`trellis`, per `pool::session_bootstrap`), as before #74. Several
+/// tests below reuse the same bare name both as a real source table here and
+/// later as a chained definition's bare `TRANSFORM <name> ...` target; a
+/// target always resolves against `Config::target_schema` (`public` by
+/// default — a config-time decision, never a `search_path` walk, per
+/// ADR-0007 decision (1)), so this table needs to actually live there too or
+/// the two roles now resolve to two different qualified nodes instead of one
+/// — before #74's qualified `schema_nodes` keying, the bare graph couldn't
+/// tell the difference either way.
 async fn create_bare_source_table(pool: &trellis::pool::Pool, name: &str) {
     let client = pool.get().await.expect("get connection");
     client
-        .batch_execute(&format!("create table {name} (id serial primary key)"))
+        .batch_execute(&format!(
+            "create table public.{name} (id serial primary key)"
+        ))
         .await
         .expect("create bare source table");
 }
@@ -45,7 +57,7 @@ async fn materialize_chained_target(
     let pk = source_primary_key(pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(pool, &def, "public", &pk, source_columns)
+    create_target_table(pool, &def, "public", &pk, source_columns, &def.source)
         .await
         .expect("materialize chained target table");
 }
@@ -64,7 +76,7 @@ async fn creating_a_definition_persists_a_source_edge() {
     .await
     .expect("valid definition should be stored");
 
-    let dependents = dependents_of(&db.pool, "orders", EdgeKind::Source)
+    let dependents = dependents_of(&db.pool, "public.orders", EdgeKind::Source)
         .await
         .expect("query dependents");
     assert_eq!(dependents.len(), 1);
@@ -88,17 +100,17 @@ async fn a_node_with_no_dependents_of_a_kind_returns_empty() {
     // No relationship or join edges are ever persisted today (issue #21's
     // explicit out-of-scope) — querying for them must come back empty, not
     // error or fall back to source edges.
-    let joins = dependents_of(&db.pool, "orders", EdgeKind::Join)
+    let joins = dependents_of(&db.pool, "public.orders", EdgeKind::Join)
         .await
         .expect("query join dependents");
     assert!(joins.is_empty());
 
-    let relationships = dependents_of(&db.pool, "orders", EdgeKind::Relationship)
+    let relationships = dependents_of(&db.pool, "public.orders", EdgeKind::Relationship)
         .await
         .expect("query relationship dependents");
     assert!(relationships.is_empty());
 
-    let unrelated = dependents_of(&db.pool, "nonexistent_table", EdgeKind::Source)
+    let unrelated = dependents_of(&db.pool, "public.nonexistent_table", EdgeKind::Source)
         .await
         .expect("query dependents of an unknown node");
     assert!(unrelated.is_empty());
@@ -138,13 +150,13 @@ async fn the_dependency_graph_is_walkable_across_multiple_hops() {
     .await
     .expect("b -> c definition should be stored");
 
-    let a_dependents = dependents_of(&db.pool, "a", EdgeKind::Source)
+    let a_dependents = dependents_of(&db.pool, "public.a", EdgeKind::Source)
         .await
         .expect("query a's dependents");
     assert_eq!(a_dependents.len(), 1);
     assert_eq!(a_dependents[0].def.target, "b");
 
-    let b_dependents = dependents_of(&db.pool, "b", EdgeKind::Source)
+    let b_dependents = dependents_of(&db.pool, "public.b", EdgeKind::Source)
         .await
         .expect("query b's dependents");
     assert_eq!(b_dependents.len(), 1);
@@ -152,7 +164,7 @@ async fn the_dependency_graph_is_walkable_across_multiple_hops() {
 
     // "a" has no direct edge to "c" — a two-hop chain is two edges, not one
     // that skips the intermediate node.
-    let a_to_c = dependents_of(&db.pool, "a", EdgeKind::Source)
+    let a_to_c = dependents_of(&db.pool, "public.a", EdgeKind::Source)
         .await
         .expect("query a's dependents again");
     assert!(a_to_c.iter().all(|def| def.def.target != "c"));
@@ -174,10 +186,10 @@ async fn transforms_for_source_agrees_with_dependents_of_source_edges() {
     .await
     .expect("valid definition should be stored");
 
-    let via_wrapper = transforms_for_source(&db.pool, "orders")
+    let via_wrapper = transforms_for_source(&db.pool, "public.orders")
         .await
         .expect("transforms_for_source");
-    let via_resolver = dependents_of(&db.pool, "orders", EdgeKind::Source)
+    let via_resolver = dependents_of(&db.pool, "public.orders", EdgeKind::Source)
         .await
         .expect("dependents_of");
 
@@ -213,7 +225,7 @@ async fn dependents_of_returns_all_distinct_source_edges_for_fan_out() {
     .await
     .expect("second definition establishes a distinct orders -> order_flags edge");
 
-    let dependents = dependents_of(&db.pool, "orders", EdgeKind::Source)
+    let dependents = dependents_of(&db.pool, "public.orders", EdgeKind::Source)
         .await
         .expect("query dependents");
     assert_eq!(dependents.len(), 2);
@@ -231,10 +243,10 @@ async fn persisting_the_same_edge_twice_does_not_duplicate_the_row() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
-    let from_node = resolve_node(&db.pool, "orders", NodeKind::Source)
+    let from_node = resolve_node(&db.pool, "public.orders", NodeKind::Source)
         .await
         .expect("resolve source node");
-    let to_node = resolve_node(&db.pool, "order_totals", NodeKind::Target)
+    let to_node = resolve_node(&db.pool, "public.order_totals", NodeKind::Target)
         .await
         .expect("resolve target node");
 
@@ -286,7 +298,11 @@ async fn a_direct_table_cycle_is_rejected() {
         CatalogError::Validate(ValidationError::TableCycle { cycle }) => {
             assert_eq!(
                 cycle,
-                vec!["a".to_string(), "b".to_string(), "a".to_string()]
+                vec![
+                    "public.a".to_string(),
+                    "public.b".to_string(),
+                    "public.a".to_string()
+                ]
             );
         }
         other => panic!("expected Validate(TableCycle), got {other:?}"),
@@ -294,7 +310,7 @@ async fn a_direct_table_cycle_is_rejected() {
 
     // The rejected definition must not have persisted anything: "a" still
     // has exactly one dependent.
-    let a_dependents = dependents_of(&db.pool, "a", EdgeKind::Source)
+    let a_dependents = dependents_of(&db.pool, "public.a", EdgeKind::Source)
         .await
         .expect("query a's dependents");
     assert_eq!(a_dependents.len(), 1);
@@ -345,10 +361,10 @@ async fn a_transitive_table_cycle_is_rejected() {
             assert_eq!(
                 cycle,
                 vec![
-                    "a".to_string(),
-                    "b".to_string(),
-                    "c".to_string(),
-                    "a".to_string(),
+                    "public.a".to_string(),
+                    "public.b".to_string(),
+                    "public.c".to_string(),
+                    "public.a".to_string(),
                 ]
             );
         }
@@ -404,16 +420,16 @@ async fn a_shortcut_edge_across_an_existing_path_is_not_a_cycle() {
     let db = cluster.create_isolated_database().await;
     create_bare_source_table(&db.pool, "a").await;
 
-    let a_node = resolve_node(&db.pool, "a", NodeKind::Source)
+    let a_node = resolve_node(&db.pool, "public.a", NodeKind::Source)
         .await
         .expect("resolve a as source");
-    let b_source_node = resolve_node(&db.pool, "b", NodeKind::Source)
+    let b_source_node = resolve_node(&db.pool, "public.b", NodeKind::Source)
         .await
         .expect("resolve b as source");
-    let b_target_node = resolve_node(&db.pool, "b", NodeKind::Target)
+    let b_target_node = resolve_node(&db.pool, "public.b", NodeKind::Target)
         .await
         .expect("resolve b as target");
-    let c_node = resolve_node(&db.pool, "c", NodeKind::Target)
+    let c_node = resolve_node(&db.pool, "public.c", NodeKind::Target)
         .await
         .expect("resolve c as target");
 
@@ -431,4 +447,75 @@ async fn a_shortcut_edge_across_an_existing_path_is_not_a_cycle() {
     )
     .await
     .expect("a -> c is a shortcut across an existing path, not a cycle");
+}
+
+/// The actual point of issue #74 (ADR-0007): `public.posts` and
+/// `archive.posts` — the same bare table name, in two different schemas —
+/// must resolve to two independent `schema_nodes` rows with two
+/// independent sets of dependent edges, not collide into one node the way
+/// the bare-keyed graph did before this issue. Both sources are named via
+/// the explicit `schema.table` grammar (issue #76) so this test doesn't
+/// depend on `search_path` ordering to pick one or the other.
+#[tokio::test]
+async fn same_named_tables_in_different_schemas_are_distinct_nodes_with_independent_edges() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table public.posts (id serial primary key, views integer); \
+             create schema archive; \
+             create table archive.posts (id serial primary key, views integer)",
+        )
+        .await
+        .expect("create public.posts and archive.posts");
+    drop(client);
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM public_post_totals FROM public.posts SELECT views AS total_views",
+        &HashMap::from([("views".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect("public.posts definition should be stored");
+
+    create_definition(
+        &db.pool,
+        "TRANSFORM archive_post_totals FROM archive.posts SELECT views AS total_views",
+        &HashMap::from([("views".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect("archive.posts definition should be stored");
+
+    // Distinct nodes, each correctly reporting its own qualified identity —
+    // before issue #74 both `FROM` clauses would have resolved to the same
+    // bare "posts" node.
+    let public_node = node_for_table(&db.pool, "public.posts")
+        .await
+        .expect("query public.posts node")
+        .expect("public.posts node must exist");
+    let archive_node = node_for_table(&db.pool, "archive.posts")
+        .await
+        .expect("query archive.posts node")
+        .expect("archive.posts node must exist");
+    assert_ne!(
+        public_node.id, archive_node.id,
+        "public.posts and archive.posts must resolve to distinct schema_nodes rows"
+    );
+    assert_eq!(public_node.table_name, "public.posts");
+    assert_eq!(archive_node.table_name, "archive.posts");
+
+    // Independent edges: each node's own `Source` dependent is its own
+    // definition, not the other schema's.
+    let public_dependents = dependents_of(&db.pool, "public.posts", EdgeKind::Source)
+        .await
+        .expect("query public.posts dependents");
+    assert_eq!(public_dependents.len(), 1);
+    assert_eq!(public_dependents[0].def.target, "public_post_totals");
+
+    let archive_dependents = dependents_of(&db.pool, "archive.posts", EdgeKind::Source)
+        .await
+        .expect("query archive.posts dependents");
+    assert_eq!(archive_dependents.len(), 1);
+    assert_eq!(archive_dependents[0].def.target, "archive_post_totals");
 }

@@ -49,6 +49,8 @@ fn order_totals_def() -> TransformDef {
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -154,6 +156,8 @@ async fn function_call_composed_with_greater_than_matches_postgres() {
                 expr: expr.clone(),
             }],
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         };
         let source_columns = HashMap::from([("name".to_string(), ValueType::Text)]);
         let evaluated =
@@ -196,6 +200,7 @@ async fn hand_staged_apply_of_a_source_change_converges_to_the_oracle() {
         "public",
         &pk,
         &numeric_columns(&["price", "tax"]),
+        &def.source,
     )
     .await
     .expect("create target table");
@@ -363,6 +368,8 @@ fn order_totals_aggregate_def() -> TransformDef {
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -580,6 +587,8 @@ async fn aggregate_recompute_matches_postgres_group_by_for_a_cross_field_alias()
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = HashMap::from([
         ("order_id".to_string(), ValueType::Numeric),
@@ -668,6 +677,8 @@ async fn to_one_left_join_render_matches_evaluator() {
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let relationships = HashMap::from([(
         "category".to_string(),
@@ -803,6 +814,8 @@ async fn to_many_correlated_aggregate_render_matches_evaluator() {
         }))
         .collect(),
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let relationships = HashMap::from([(
         "comments".to_string(),

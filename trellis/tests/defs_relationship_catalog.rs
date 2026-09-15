@@ -8,8 +8,8 @@ use testkit::TestCluster;
 use trellis::defs::{
     CatalogError, EdgeKind, RelationshipCardinality, RelationshipDefinition,
     RelationshipTypeMismatch, RelationshipWarning, ValidationError, ValueType, create_definition,
-    create_relationship, create_target_table, edges_from, parse, relationship_by_name,
-    source_primary_key,
+    create_relationship, create_target_table, edges_from, install_definition, parse,
+    relationship_by_name, source_primary_key,
 };
 
 /// A bare table with an integer primary key named `pk_col` — good enough to
@@ -158,17 +158,23 @@ async fn a_relationship_appears_as_a_typed_edge_in_the_resolver() {
     .await
     .expect("valid relationship should be stored");
 
-    let relationship_edges = edges_from(&db.pool, "users", EdgeKind::Relationship)
+    // "trellis" (`Config::schema`, the default `TRELLIS_SCHEMA`), not
+    // "public" — issue #74, ADR-0007: `edges_from`/`node_for_table` now
+    // require a fully-qualified name, and `posts`/`users` above land under
+    // whatever schema is first in the pool's ambient `search_path` for a
+    // bare `CREATE TABLE`, which `pool::session_bootstrap` pins to the
+    // Trellis schema first.
+    let relationship_edges = edges_from(&db.pool, "trellis.users", EdgeKind::Relationship)
         .await
         .expect("query edges");
     assert_eq!(relationship_edges.len(), 1);
     assert_eq!(relationship_edges[0].kind, EdgeKind::Relationship);
 
-    let from_node = trellis::defs::node_for_table(&db.pool, "posts")
+    let from_node = trellis::defs::node_for_table(&db.pool, "trellis.posts")
         .await
         .expect("query node")
         .expect("posts node should exist");
-    let to_node = trellis::defs::node_for_table(&db.pool, "users")
+    let to_node = trellis::defs::node_for_table(&db.pool, "trellis.users")
         .await
         .expect("query node")
         .expect("users node should exist");
@@ -177,7 +183,7 @@ async fn a_relationship_appears_as_a_typed_edge_in_the_resolver() {
 
     // No `Source` edge was created by declaring a relationship — the two
     // edge kinds stay distinct in the graph.
-    let source_edges = edges_from(&db.pool, "users", EdgeKind::Source)
+    let source_edges = edges_from(&db.pool, "trellis.users", EdgeKind::Source)
         .await
         .expect("query edges");
     assert!(source_edges.is_empty());
@@ -1131,8 +1137,13 @@ async fn a_relationship_edge_that_would_close_a_cycle_is_rejected() {
 
     match err {
         CatalogError::Validate(ValidationError::TableCycle { cycle }) => {
-            assert!(cycle.contains(&"a".to_string()));
-            assert!(cycle.contains(&"b".to_string()));
+            // "trellis.a"/"trellis.b" (issue #74, ADR-0007): `a`/`b` above
+            // land under the Trellis schema, the first entry in a bare
+            // `CREATE TABLE`'s ambient `search_path` — see
+            // `a_relationship_appears_as_a_typed_edge_in_the_resolver`'s
+            // identical note.
+            assert!(cycle.contains(&"trellis.a".to_string()));
+            assert!(cycle.contains(&"trellis.b".to_string()));
         }
         other => panic!("expected TableCycle, got {other:?}"),
     }
@@ -1170,7 +1181,7 @@ async fn a_relationship_from_a_transform_target_back_to_its_own_source_is_accept
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("materialize chained target table");
 
@@ -1230,7 +1241,7 @@ async fn an_integer_passthrough_on_a_calculated_table_is_a_valid_join_key() {
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("materialize calculated target table");
 
@@ -1289,7 +1300,7 @@ async fn a_numeric_passthrough_on_a_calculated_table_is_still_rejected_as_a_join
     let pk = source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("materialize calculated target table");
 
@@ -1320,4 +1331,166 @@ async fn a_numeric_passthrough_on_a_calculated_table_is_still_rejected_as_a_join
         .await
         .expect("read query");
     assert!(missing.is_none());
+}
+
+/// Reviewer follow-up to issue #74 (epic #78's own whole-branch review):
+/// `create_relationship`'s own pg_catalog introspection
+/// (`column_type_in_txn`/`to_col_cardinality_in_txn`/`has_usable_fk_index_in_txn`/
+/// `assert_replica_identity_supports_to_many`) resolved `def.from_table`/
+/// `def.to_table` bare via `pg_catalog.to_regclass`'s own `search_path` walk,
+/// with no fallback — unlike this same function's later
+/// `resolve_graph_identity_in_txn` calls, which already had issue #74's
+/// bare-target-suffix fallback. So a relationship whose `to_table` bare-names
+/// a definition's target explicitly qualified into a non-default schema
+/// (issue #76) failed here first, in `column_type_in_txn`, as a false
+/// "does not exist" — never reaching the later, fallback-equipped
+/// resolution at all.
+#[tokio::test]
+async fn a_relationship_to_table_resolves_a_bare_name_chained_off_a_non_default_schema_target() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create schema custom; \
+             create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) values (1, 10), (2, 20); \
+             create table order_line_items (id integer primary key, t2_id integer)",
+        )
+        .await
+        .expect("seed tables and the custom schema");
+    drop(client);
+
+    // Def A: installs with an explicit non-default target schema — `custom`
+    // is nowhere on this pool's pinned `search_path`
+    // (`Config::schema`/`Config::target_schema`/`public`).
+    let cols = HashMap::from([("a".to_string(), ValueType::Numeric)]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM custom.t2 FROM s SELECT a AS total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("def A installs with an explicit non-default target schema");
+
+    // The relationship's bare `TO t2.id` must still resolve to def A's
+    // `custom.t2` — a plain `search_path` walk alone (what `to_regclass`
+    // does inside `column_type_in_txn`/`to_col_cardinality_in_txn`) would
+    // report "does not exist", even though `custom.t2` is live.
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP t2 FROM order_line_items.t2_id TO t2.id",
+    )
+    .await
+    .expect(
+        "the relationship's bare TO must resolve to def A's explicitly-qualified \
+         custom.t2 target, not be rejected as 'does not exist'",
+    );
+    assert_eq!(created.def.to_table, "t2");
+    assert_eq!(created.cardinality, RelationshipCardinality::ToOne);
+
+    let read_back = relationship_by_name(&db.pool, "order_line_items", "t2")
+        .await
+        .expect("read query")
+        .expect("relationship should be found");
+    assert_eq!(read_back.def.to_table, "t2");
+}
+
+/// The 4th gap in this same reviewer follow-up round (epic #78's own
+/// whole-branch review, issue #74/#40): unlike the test above (which covers
+/// `create_relationship`'s own pg_catalog checks), this covers a *separate*
+/// definition's calculated-field relationship-path enrichment
+/// (`catalog::resolve_relationships`, issue #40) reading a to-side column
+/// through a relationship whose `to_table` bare-names a chained,
+/// non-default-schema-qualified target. `resolve_relationships`' own
+/// `column_type` (pooled, not txn-scoped — this resolver runs entirely
+/// outside a transaction) queried `pg_attribute`/`to_regclass` directly
+/// against the relationship's bare `to_table`, with no fallback — even
+/// though `create_relationship` itself (the test above) had already been
+/// fixed to resolve the identical bare `to_table` before its own pg_catalog
+/// checks. So a relationship that resolves fine at `create_relationship`
+/// time could still make a *later* definition's calculated field referencing
+/// it fail here, at enrichment resolution, as a false
+/// `ValidationError::UnknownRelationshipColumn` — even though the relevant
+/// column plainly exists on `custom.t2`.
+#[tokio::test]
+async fn a_calculated_field_relationship_path_resolves_a_to_table_chained_off_a_non_default_schema_target()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create schema custom; \
+             create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) values (1, 10), (2, 20); \
+             create table order_line_items (id integer primary key, t2_id integer); \
+             insert into order_line_items (id, t2_id) values (1, 1), (2, 2)",
+        )
+        .await
+        .expect("seed tables and the custom schema");
+    drop(client);
+
+    // Def A: installs with an explicit non-default target schema — `custom`
+    // is nowhere on this pool's pinned `search_path`
+    // (`Config::schema`/`Config::target_schema`/`public`).
+    let cols = HashMap::from([("a".to_string(), ValueType::Numeric)]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM custom.t2 FROM s SELECT a AS total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("def A installs with an explicit non-default target schema");
+
+    // The relationship's bare `TO t2.id` must resolve to def A's `custom.t2`
+    // (already covered by the test above; needed here as this test's own
+    // setup).
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP t2 FROM order_line_items.t2_id TO t2.id",
+    )
+    .await
+    .expect("the relationship's bare TO must resolve to def A's custom.t2 target");
+
+    // Def B: a bare, relationship-free source with a calculated field
+    // enriched via `t2.total` — this is what exercises
+    // `resolve_relationships`/`column_type`'s own resolution of the
+    // relationship's `to_table`. Before this fix, `column_type`'s bare
+    // `to_regclass("t2")` lookup would miss `custom.t2` entirely and report
+    // `UnknownRelationshipColumn { table: "t2", column: "total" }`, even
+    // though `create_relationship` above already proved `t2` resolves to a
+    // live, real relationship.
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM enriched FROM order_line_items SELECT t2.total AS total_copy",
+        &HashMap::new(),
+        "public",
+    )
+    .await
+    .expect(
+        "the calculated field's t2.total enrichment must resolve t2's to_table to \
+         def A's explicitly-qualified custom.t2 target, not be rejected as an \
+         unknown relationship column",
+    );
+
+    let client = db.pool.get().await.expect("get connection");
+    let mismatches: i64 = client
+        .query_one(
+            "select count(*) from enriched e \
+             join order_line_items o on o.id = e.id \
+             join custom.t2 on custom.t2.id = o.t2_id \
+             where e.total_copy is distinct from custom.t2.total",
+            &[],
+        )
+        .await
+        .expect("compare enriched against custom.t2")
+        .get(0);
+    assert_eq!(
+        mismatches, 0,
+        "enriched.total_copy must reflect custom.t2.total via the resolved relationship"
+    );
+    assert_eq!(def.def.target, "enriched");
 }

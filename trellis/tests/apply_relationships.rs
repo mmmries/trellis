@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::ast::{
     Expr, FieldDef, KeySpace, Predicate, RelationshipDef, TransformDef, ValueType,
 };
@@ -64,6 +64,25 @@ async fn active_seg_table(client: &Client) -> String {
     format!("seg_{ring_slot}")
 }
 
+/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`] — where every bare
+/// `create table` in this file's own fixtures actually lands, since
+/// `connect_raw` pins `search_path` to `{DEFAULT_SCHEMA}, public` and never
+/// qualifies its own DDL. Mirrors `apply.rs`'s `qualify_fixture_table`: a
+/// real CDC producer always stages a fully-qualified `src_table` (issue
+/// #76), and `compute`'s forward-propagation lookup
+/// (`catalog::transforms_for_source`) now requires that exact qualified
+/// identity to match `schema_nodes`/`schema_edges` (issue #74, ADR-0007) —
+/// an unqualified `src_table` here silently finds no subscribed definitions
+/// rather than erroring. Already-qualified input (containing a `.`) passes
+/// through unchanged.
+fn qualify_fixture_table(name: &str) -> String {
+    if name.contains('.') {
+        name.to_string()
+    } else {
+        format!("{DEFAULT_SCHEMA}.{name}")
+    }
+}
+
 /// Stages one image-bearing (CDC-shaped) change into the active ring segment.
 async fn stage_cdc(
     client: &Client,
@@ -73,6 +92,7 @@ async fn stage_cdc(
     old_image: Option<&str>,
     new_image: Option<&str>,
 ) {
+    let src_table = qualify_fixture_table(src_table);
     let table = active_seg_table(client).await;
     let lsn = PgLsn::from(1u64);
     client
@@ -139,6 +159,8 @@ fn to_one_oracle_def() -> TransformDef {
             },
         ],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -156,6 +178,8 @@ fn to_one_placeholder_def() -> TransformDef {
             expr: Expr::Column("title".to_string()),
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     }
 }
 
@@ -243,14 +267,20 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
         "public",
         &pk,
         &source_columns,
+        &to_one_placeholder_def().source,
     )
     .await
     .expect("create target table");
     client
         .execute(
-            "update transform_definitions \
-             set definition_text = 'TRANSFORM article_cat FROM articles SELECT category.name AS category_name' \
-             where target_table = 'article_cat'",
+            // Issue #73: `target_table` is persisted fully-qualified now —
+            // `article_cat` was created via `create_target_table(..., "public", ...)`
+            // above, so it landed under `DEFAULT_TARGET_SCHEMA`.
+            &format!(
+                "update transform_definitions \
+                 set definition_text = 'TRANSFORM article_cat FROM articles SELECT category.name AS category_name' \
+                 where target_table = '{DEFAULT_TARGET_SCHEMA}.article_cat'"
+            ),
             &[],
         )
         .await

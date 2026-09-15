@@ -63,11 +63,11 @@ async fn one_to_one_build_is_exhaustive_across_chunk_boundaries() {
         .await
         .expect("create def");
     let pk = source_primary_key(&db.pool, "s").await.expect("pk");
-    create_target_table(&db.pool, &def, "public", &pk, &cols)
+    create_target_table(&db.pool, &def, "public", &pk, &cols, &def.source)
         .await
         .expect("create target");
 
-    backfill_definition(&db.pool, &def, "public", &cols)
+    backfill_definition(&db.pool, &def, "public", &def.source, &cols)
         .await
         .expect("backfill");
 
@@ -119,11 +119,11 @@ async fn one_to_one_build_handles_pk_gaps() {
         .await
         .expect("create def");
     let pk = source_primary_key(&db.pool, "s").await.expect("pk");
-    create_target_table(&db.pool, &def, "public", &pk, &cols)
+    create_target_table(&db.pool, &def, "public", &pk, &cols, &def.source)
         .await
         .expect("create target");
 
-    backfill_definition(&db.pool, &def, "public", &cols)
+    backfill_definition(&db.pool, &def, "public", &def.source, &cols)
         .await
         .expect("backfill");
 
@@ -174,7 +174,7 @@ async fn aggregate_build_matches_oracle_across_group_key_chunks() {
         .await
         .expect("create target");
 
-    backfill_definition(&db.pool, &def, "public", &cols)
+    backfill_definition(&db.pool, &def, "public", &def.source, &cols)
         .await
         .expect("backfill");
 
@@ -209,7 +209,7 @@ async fn aggregate_build_handles_null_group_keys() {
         .await
         .expect("create target");
 
-    backfill_definition(&db.pool, &def, "public", &cols)
+    backfill_definition(&db.pool, &def, "public", &def.source, &cols)
         .await
         .expect("backfill");
 
@@ -272,7 +272,7 @@ async fn aggregate_build_computes_min_max_avg() {
         .await
         .expect("create target");
 
-    backfill_definition(&db.pool, &def, "public", &cols)
+    backfill_definition(&db.pool, &def, "public", &def.source, &cols)
         .await
         .expect("backfill");
 
@@ -339,10 +339,10 @@ async fn aggregate_build_is_idempotent_on_rerun() {
     // Overwrite ON CONFLICT means a re-run (the recovery story for a crash
     // partway through) recomputes to the same values rather than doubling the
     // SUM (M3 concern #4).
-    backfill_definition(&db.pool, &def, "public", &cols)
+    backfill_definition(&db.pool, &def, "public", &def.source, &cols)
         .await
         .expect("first backfill");
-    backfill_definition(&db.pool, &def, "public", &cols)
+    backfill_definition(&db.pool, &def, "public", &def.source, &cols)
         .await
         .expect("second backfill");
 
@@ -413,7 +413,7 @@ async fn aggregate_build_scans_source_once_not_per_chunk() {
     }
 
     let before = seq_scans(&db).await;
-    backfill_definition(&db.pool, &def, "public", &cols)
+    backfill_definition(&db.pool, &def, "public", &def.source, &cols)
         .await
         .expect("backfill");
     let after = seq_scans(&db).await;

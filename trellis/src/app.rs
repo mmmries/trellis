@@ -186,7 +186,9 @@ impl Trellis {
     /// those two shapes.
     pub async fn define(&self, definition_text: &str) -> Result<Definition, TrellisError> {
         let parsed = defs::parse(definition_text)?;
-        let source_columns = self.source_columns(&parsed.source).await?;
+        let source_columns = self
+            .source_columns(&parsed.source, parsed.explicit_source_schema.as_deref())
+            .await?;
         defs::install_definition(
             &self.pool,
             definition_text,
@@ -249,9 +251,19 @@ impl Trellis {
         target_table: &str,
     ) -> Result<Option<TransformStatus>, TrellisError> {
         let client = self.pool.get().await?;
+        // Issue #73: `transform_definitions.target_table` is persisted
+        // fully-qualified, but every caller here only ever has the bare name
+        // their `TRANSFORM <name> FROM ...` text declared — even once issue
+        // #76 taught the grammar an explicit `schema.table` spelling,
+        // `def.target` itself still always holds just the bare table name
+        // (see `defs::ast::TransformDef`'s own doc comment for why), so this
+        // API's callers never have anything but the bare name to poll with —
+        // match against `target_table`'s bare table-name suffix rather than
+        // the qualified column directly.
         let row = client
             .query_opt(
-                "select status from transform_definitions where target_table = $1",
+                "select status from transform_definitions \
+                 where split_part(target_table, '.', 2) = $1",
                 &[&target_table],
             )
             .await?;
@@ -374,10 +386,19 @@ impl Trellis {
         let client = self.pool.get().await?;
         let mut entries = Vec::new();
 
+        // Issue #73: read back the bare table-name suffix, not the persisted
+        // fully-qualified `target_table` — `QuarantineTarget::Transform`
+        // round-trips through `docs/decisions/0003`'s `transform.column`
+        // addressing scheme elsewhere in this API (`quarantine_status`,
+        // `resume_column`, `sample_quarantined`, all keyed on the bare name
+        // the grammar accepts back), which parses an address on its first
+        // `.` — handing it a qualified `"schema.table"` spelling here would
+        // make every entry in this list misparse as a column address the
+        // moment a target table lived outside the default schema.
         let quarantined_transforms = client
             .query(
-                "select target_table from transform_definitions where status = 'quarantined' \
-                 order by target_table",
+                "select split_part(target_table, '.', 2) from transform_definitions \
+                 where status = 'quarantined' order by target_table",
                 &[],
             )
             .await?;
@@ -424,9 +445,15 @@ impl Trellis {
         let client = self.pool.get().await?;
         match &target {
             QuarantineTarget::Transform(t) => {
+                // Issue #73: `t` is the bare name `QuarantineTarget::parse`
+                // extracted from the caller's address — match against
+                // `target_table`'s bare table-name suffix, not the persisted
+                // qualified column (see `status`'s own call site for the
+                // same reasoning).
                 let row = client
                     .query_opt(
-                        "select status from transform_definitions where target_table = $1",
+                        "select status from transform_definitions \
+                         where split_part(target_table, '.', 2) = $1",
                         &[t],
                     )
                     .await?
@@ -443,9 +470,12 @@ impl Trellis {
                 })
             }
             QuarantineTarget::Column(t, c) => {
+                // Issue #73: same bare-suffix match as the `Transform` arm
+                // above — `t` is bare, `target_table` is qualified.
                 let transform_exists: bool = client
                     .query_one(
-                        "select exists(select 1 from transform_definitions where target_table = $1)",
+                        "select exists(select 1 from transform_definitions \
+                         where split_part(target_table, '.', 2) = $1)",
                         &[t],
                     )
                     .await?
@@ -525,22 +555,45 @@ impl Trellis {
                 }
             },
             QuarantineTarget::Transform(t) => {
+                // Issue #73: `t` is bare — same `split_part` match as
+                // `status`/`quarantine_status`.
                 let source_row = client
                     .query_opt(
-                        "select source_table from transform_definitions where target_table = $1",
+                        "select source_table from transform_definitions \
+                         where split_part(target_table, '.', 2) = $1",
                         &[t],
                     )
                     .await?
                     .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?;
-                let source_table: String = source_row.get(0);
+                // Issue #72: `transform_definitions.source_table` is now
+                // fully qualified, but `poison.src_table` (what CDC intake
+                // actually stages) isn't uniformly so — a raw/CDC-sourced
+                // definition's poisoned rows are staged qualified (matching
+                // `qualified` directly), while a definition chained off
+                // another's target table are staged bare. Landing issue #73
+                // (which persists `transform_definitions.target_table`
+                // qualified too) doesn't close this gap: a chained
+                // definition's poisoned rows get their `src_table` from
+                // `ddl::neighbor_table_name`, which #73 deliberately leaves
+                // bare (see `defs::source_table_version`'s doc comment for
+                // the full rationale, and why closing this for good is
+                // issue #75's emission-audit territory instead). Matching
+                // against both forms keeps this query correct either way
+                // rather than picking one and silently going empty for the
+                // other.
+                let qualified: String = source_row.get(0);
+                let bare = qualified
+                    .split_once('.')
+                    .map(|(_, table)| table.to_string())
+                    .unwrap_or_else(|| qualified.clone());
                 match &after {
                     Some((after_src, after_key)) => {
                         client
                             .query(
                                 "select src_table, key, last_error from poison \
-                                 where src_table = $1 and (src_table, key) > ($2, $3) \
-                                 order by src_table, key limit $4",
-                                &[&source_table, after_src, after_key, &limit],
+                                 where src_table in ($1, $2) and (src_table, key) > ($3, $4) \
+                                 order by src_table, key limit $5",
+                                &[&qualified, &bare, after_src, after_key, &limit],
                             )
                             .await?
                     }
@@ -548,9 +601,9 @@ impl Trellis {
                         client
                             .query(
                                 "select src_table, key, last_error from poison \
-                                 where src_table = $1 \
-                                 order by src_table, key limit $2",
-                                &[&source_table, &limit],
+                                 where src_table in ($1, $2) \
+                                 order by src_table, key limit $3",
+                                &[&qualified, &bare, &limit],
                             )
                             .await?
                     }
@@ -633,16 +686,51 @@ impl Trellis {
     /// Introspects `source_table`'s column names and types for the definition
     /// validator, the same `information_schema` read
     /// [`defs::install_definition`] expects its caller to supply.
+    ///
+    /// Broader sweep, reviewer follow-up to issue #74 (epic #78's own
+    /// whole-branch review): this used to query `information_schema.columns`
+    /// with a bare `table_name = $1 and table_schema = any(current_schemas(false))`
+    /// `search_path` walk — the same no-fallback shape every other fixed gap
+    /// in this round had — fed straight from [`defs::ast::TransformDef::source`],
+    /// which also completely ignored
+    /// [`defs::ast::TransformDef::explicit_source_schema`] (issue #76).
+    /// So *this*, the very first thing [`Trellis::define`] does with a
+    /// parsed definition, rejected both an explicitly-qualified `FROM
+    /// <schema>.<table>` naming a table outside this connection's
+    /// `search_path`, and a bare `FROM <table>` chaining off another
+    /// definition's target explicitly qualified into a non-default schema
+    /// (issue #76) — before `install_definition`'s own, already-fixed
+    /// resolution (`resolve_source_for_install`) was ever reached: this call
+    /// happens first, in [`Trellis::define`], and returns
+    /// [`TrellisError::SourceTableNotFound`] eagerly on an empty result, so
+    /// `install_definition` was never even called. Now resolves the source
+    /// the same way `resolve_source_for_install` does — an explicit schema
+    /// names that exact relation directly, a bare name goes through
+    /// [`defs::catalog::resolve_graph_identity`]'s two-step (physical
+    /// `search_path` lookup, falling back to a live definition's own bare
+    /// target-suffix) — then queries `information_schema.columns` by the
+    /// resolved `table_schema`/`table_name` pair directly, rather than
+    /// walking `search_path` a second time.
     async fn source_columns(
         &self,
         source_table: &str,
+        explicit_source_schema: Option<&str>,
     ) -> Result<HashMap<String, ValueType>, TrellisError> {
+        let qualified = match explicit_source_schema {
+            Some(schema) => crate::intake::publication::qualify(schema, source_table)
+                .map_err(CatalogError::from)?,
+            None => defs::catalog::resolve_graph_identity(&self.pool, source_table).await?,
+        };
+        let (schema, table) = qualified
+            .split_once('.')
+            .expect("resolve_graph_identity/qualify always return a schema.table-shaped string");
+
         let client = self.pool.get().await?;
         let rows = client
             .query(
                 "select column_name, data_type from information_schema.columns \
-                 where table_name = $1 and table_schema = any(current_schemas(false))",
-                &[&source_table],
+                 where table_schema = $1 and table_name = $2",
+                &[&schema, &table],
             )
             .await?;
 
@@ -663,34 +751,22 @@ impl Trellis {
 
 /// The full transitive closure of source tables reachable from every
 /// registered definition — each definition's direct anchor table plus every
-/// relationship `to_table` reachable from one (see
-/// [`defs::all_source_tables`]) — each qualified as `"schema.table"` for
-/// [`ClientOptions::source_tables`]. `all_source_tables` returns bare table
-/// names, so this resolves each one's schema off `information_schema`.
+/// relationship `to_table` reachable from one — each already schema-qualified
+/// for [`ClientOptions::source_tables`].
+///
+/// Issue #75, ADR-0007: [`defs::all_source_tables`] itself now returns each
+/// table's actual, already-persisted qualified identity, so this is a thin
+/// pass-through — it used to re-resolve every bare result against
+/// `information_schema`/`current_schemas(false)` (a `search_path` walk of
+/// exactly the kind ADR-0007 forbids downstream of definition-acceptance
+/// time), which broke for a source living outside this connection's
+/// `search_path` (e.g. an issue #76 explicit-schema source).
 ///
 /// `pub` (rather than `pub(crate)`) only so `trellis/tests/app.rs` can exercise
 /// it directly as `trellis::app::qualified_source_tables`; not re-exported
 /// from the crate root, so it isn't part of [`Trellis`]'s public surface.
 pub async fn qualified_source_tables(pool: &Pool) -> Result<Vec<String>, TrellisError> {
-    let client = pool.get().await?;
-    let tables = defs::all_source_tables(pool).await?;
-
-    let mut qualified = Vec::with_capacity(tables.len());
-    for source_table in tables {
-        let schema_rows = client
-            .query(
-                "select table_schema from information_schema.tables \
-                 where table_name = $1 and table_schema = any(current_schemas(false))",
-                &[&source_table],
-            )
-            .await?;
-        let schema: String = schema_rows
-            .first()
-            .ok_or_else(|| TrellisError::SourceTableNotFound(source_table.clone()))?
-            .get(0);
-        qualified.push(format!("{schema}.{source_table}"));
-    }
-    Ok(qualified)
+    Ok(defs::all_source_tables(pool).await?)
 }
 
 /// Maps a Postgres `information_schema.columns.data_type` string to the

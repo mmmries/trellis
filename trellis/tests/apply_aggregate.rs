@@ -48,6 +48,23 @@ async fn seal_active_segment(client: &mut Client) -> i64 {
     outcome.sealed_seg_seq
 }
 
+/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`] — where every
+/// bare `create table` in this file's own fixtures actually lands, since
+/// `connect_raw` pins `search_path` to `{DEFAULT_SCHEMA}, public` and never
+/// qualifies its own DDL. Used by [`insert_cdc_row`] so a hand-staged ring
+/// row's `src_table` matches what a real CDC producer would actually stage
+/// (issue #76: always fully-qualified) and, as of issue #74, what
+/// `schema_nodes`/`schema_edges` now key on. Already-qualified input
+/// (containing a `.`) passes through unchanged. Mirrors `apply.rs`'s own
+/// `qualify_fixture_table` helper (test files can't share private helpers).
+fn qualify_fixture_table(name: &str) -> String {
+    if name.contains('.') {
+        name.to_string()
+    } else {
+        format!("{DEFAULT_SCHEMA}.{name}")
+    }
+}
+
 async fn insert_cdc_row(
     client: &Client,
     table: &str,
@@ -57,6 +74,7 @@ async fn insert_cdc_row(
     old_image: Option<&str>,
     new_image: Option<&str>,
 ) {
+    let src_table = qualify_fixture_table(src_table);
     let lsn = PgLsn::from(1u64);
     client
         .execute(
@@ -565,8 +583,11 @@ async fn a_definition_change_on_an_aggregate_only_source_trips_the_version_fence
 
     client
         .execute(
-            "update source_table_versions set version = version + 1 \
-             where source_table = 'order_items'",
+            // Issue #72: `source_table` is persisted fully-qualified now.
+            &format!(
+                "update source_table_versions set version = version + 1 \
+                 where source_table = '{DEFAULT_SCHEMA}.order_items'"
+            ),
             &[],
         )
         .await
@@ -649,7 +670,11 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_aggregate_
 
     client
         .execute(
-            "update source_table_versions set version = version + 1 where source_table = 'widgets'",
+            // Issue #72: `source_table` is persisted fully-qualified now.
+            &format!(
+                "update source_table_versions set version = version + 1 \
+                 where source_table = '{DEFAULT_SCHEMA}.widgets'"
+            ),
             &[],
         )
         .await
@@ -898,6 +923,250 @@ async fn image_less_recompute_trigger_still_probes_a_stale_sum_field() {
         Some("8.00"),
         "the SUM field must be probed (5.00 + 3.00), not left stale at 5.00, \
          even though this batch's field_accum has no delta for it"
+    );
+}
+
+/// Issue #77 / ADR-0007's same-named-decoy regression for the *aggregate*
+/// CDC-apply path — a distinct code path from the plain 1-1 case
+/// `apply.rs`'s `explicitly_qualified_source_reads_the_right_table_on_a_live_refetch`
+/// covers. `compute`'s own qualified-source threading (that 1-1 test, and
+/// this file's `image_less_recompute_trigger_still_probes_a_stale_sum_field`
+/// above, both already exercise it) only gets an aggregate definition as far
+/// as forcing a group onto the full-recompute path; the *live re-read* for
+/// that forced group runs through `apply_aggregate`'s own probes
+/// (`probe_sum_and_count`/`probe_recompute_fields_bulk` et al., see
+/// `AggregateTargetPlan::source`'s own doc comment) via
+/// `ddl::qualified_source_table` — separate code from `compute`'s
+/// `read_live_rows_batch`, so it needs its own coverage. Mirrors
+/// `image_less_recompute_trigger_still_probes_a_stale_sum_field`'s
+/// out-of-band-insert-then-image-less-recompute shape exactly, except
+/// `order_items` now has a same-named decoy sitting in `public` (this pool's
+/// own pinned `search_path`) while the definition explicitly names
+/// `custom.order_items` as its real source — the two hold different amounts,
+/// so a wrong-table probe is unmistakable in the resulting SUM.
+#[tokio::test]
+async fn explicitly_qualified_aggregate_source_probes_the_right_table_not_a_same_named_decoy() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table public.order_items (id integer primary key, order_id integer, amount numeric); \
+             insert into public.order_items (id, order_id, amount) values (1, 10, 999.00), (2, 10, 888.00); \
+             create schema custom; \
+             create table custom.order_items (id integer primary key, order_id integer, amount numeric); \
+             alter table custom.order_items replica identity full; \
+             insert into custom.order_items (id, order_id, amount) values (1, 10, 5.00);",
+        )
+        .await
+        .expect("seed the public.order_items decoy and the real custom.order_items");
+
+    const SOURCE: &str = "TRANSFORM order_summary FROM custom.order_items GROUP BY order_id \
+         SELECT order_id AS order_id, SUM(amount) AS total";
+    let def = parse(SOURCE).expect("parse the explicitly-qualified aggregate definition");
+    let source_columns = numeric_columns(&["id", "order_id", "amount"]);
+    create_definition(&db.pool, SOURCE, &source_columns)
+        .await
+        .expect("create aggregate definition against the explicitly-qualified source");
+    create_aggregate_target_table(&db.pool, &def, "public", &source_columns)
+        .await
+        .expect("create aggregate target table");
+
+    // Seed group 10's target row via an ordinary insert batch: total = 5.00.
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "custom.order_items",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"order_id":"10","amount":"5.00"}"#),
+    )
+    .await;
+    let seg0 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg0, "worker").await;
+
+    let total: Option<String> = client
+        .query_one(
+            "select total::text from order_summary where order_id = 10",
+            &[],
+        )
+        .await
+        .expect("read seeded group")
+        .get(0);
+    assert_eq!(total.as_deref(), Some("5.00"), "seed total");
+
+    // A second row lands in custom.order_items's group 10 entirely
+    // out-of-band (no CDC image staged for it), forcing the image-less
+    // recompute trigger below onto the full-recompute (probe) path.
+    client
+        .execute(
+            "insert into custom.order_items (id, order_id, amount) values (2, 10, 3.00)",
+            &[],
+        )
+        .await
+        .expect("out-of-band insert into custom.order_items's group 10");
+
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "custom.order_items",
+        "1",
+        "recompute",
+        None,
+        None,
+    )
+    .await;
+    let seg1 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg1, "worker").await;
+
+    let total: Option<String> = client
+        .query_one(
+            "select total::text from order_summary where order_id = 10",
+            &[],
+        )
+        .await
+        .expect("read probed group")
+        .get(0);
+    assert_eq!(
+        total.as_deref(),
+        Some("8.00"),
+        "the probe must read custom.order_items (5.00 + 3.00 = 8.00), not the \
+         same-named public.order_items decoy sitting on this pool's own \
+         pinned search_path"
+    );
+}
+
+/// The target-side counterpart to
+/// [`explicitly_qualified_aggregate_source_probes_the_right_table_not_a_same_named_decoy`]
+/// above, and `apply.rs`'s own
+/// `explicitly_qualified_target_receives_a_live_cdc_write` — the aggregate
+/// half of the same bug (reviewer follow-up to issue #74, epic #78's own
+/// whole-branch review): an aggregate definition installed with an explicit
+/// non-default *target* schema (issue #76's `TRANSFORM custom.<target> FROM
+/// ...` grammar) backfills fine, but a live CDC write used to fail outright
+/// — `upsert_group`/`delete_group_row` (`staging::apply_aggregate`'s own
+/// per-group Phase 3 DML-emission functions) bound their `target: &str`
+/// parameter straight into `quote_ident` instead of
+/// [`AggregateTargetPlan::target`]'s qualified identity, so their SQL tried
+/// to write bare, unqualified `order_summary`, not on this connection's
+/// pinned `search_path`, even though `custom.order_summary` (the real,
+/// already-backfilled target) exists.
+///
+/// Drains a single-group insert (`upsert_group`'s lone-delta-group path)
+/// then that same group's extinction (`delete_group_row`'s path) — between
+/// them, and via [`apply_aggregate_target`]'s own shared pre-lock, every
+/// per-group DML-emission site this reviewer follow-up fixes runs at least
+/// once.
+#[tokio::test]
+async fn explicitly_qualified_aggregate_target_receives_a_live_cdc_write() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create schema custom; \
+             create table order_items (id integer primary key, order_id integer, amount numeric); \
+             alter table order_items replica identity full",
+        )
+        .await
+        .expect("seed source table and the custom schema");
+
+    const SOURCE: &str = "TRANSFORM custom.order_summary FROM order_items GROUP BY order_id \
+         SELECT order_id AS order_id, SUM(amount) AS total";
+    let def = parse(SOURCE).expect("parse the explicitly-qualified aggregate target");
+    let source_columns = numeric_columns(&["id", "order_id", "amount"]);
+    create_aggregate_target_table(&db.pool, &def, "custom", &source_columns)
+        .await
+        .expect("materialize custom.order_summary ahead of create_definition");
+    create_definition(&db.pool, SOURCE, &source_columns)
+        .await
+        .expect("create aggregate definition against the explicitly-qualified target");
+
+    // Seed group 10's physical row and its matching CDC insert — mirroring
+    // real replication, where the physical write and its CDC event both
+    // reflect the same post-image.
+    client
+        .execute(
+            "insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
+            &[],
+        )
+        .await
+        .expect("seed physical order_items row");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "order_items",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"order_id":"10","amount":"5.00"}"#),
+    )
+    .await;
+    let seg0 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg0, "worker").await;
+
+    let total: Option<String> = client
+        .query_one(
+            "select total::text from custom.order_summary where order_id = 10",
+            &[],
+        )
+        .await
+        .expect(
+            "custom.order_summary must exist and hold group 10 — a bare, unqualified \
+             upsert_group write would have raised relation \"order_summary\" does not \
+             exist instead",
+        )
+        .get(0);
+    assert_eq!(total.as_deref(), Some("5.00"), "seed total for group 10");
+
+    // Delete the only row in group 10, both physically and via CDC — the
+    // group goes extinct, routing through `delete_group_row`.
+    client
+        .execute("delete from order_items where id = 1", &[])
+        .await
+        .expect("physically delete the only row in group 10");
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "order_items",
+        "1",
+        "delete",
+        Some(r#"{"order_id":"10","amount":"5.00"}"#),
+        None,
+    )
+    .await;
+    let seg1 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg1, "worker").await;
+
+    let remaining: i64 = client
+        .query_one(
+            "select count(*) from custom.order_summary where order_id = 10",
+            &[],
+        )
+        .await
+        .expect("count custom.order_summary")
+        .get(0);
+    assert_eq!(
+        remaining, 0,
+        "the extinct group's row must be gone from custom.order_summary"
+    );
+
+    let bare_decoy_exists: bool = client
+        .query_one(
+            "select exists (select 1 from information_schema.tables \
+             where table_name = 'order_summary' and table_schema <> 'custom')",
+            &[],
+        )
+        .await
+        .expect("check for a same-named decoy outside the custom schema")
+        .get(0);
+    assert!(
+        !bare_decoy_exists,
+        "the live writes must land in custom.order_summary, never create/touch a \
+         same-named table in some other schema on the connection's search_path"
     );
 }
 

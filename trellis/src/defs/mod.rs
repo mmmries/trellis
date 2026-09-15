@@ -743,4 +743,116 @@ mod tests {
             other => panic!("expected UnsupportedPredicate, got {other:?}"),
         }
     }
+
+    // Issue #76 / ADR-0007 grammar clause 4: `TRANSFORM`/`FROM` accept an
+    // explicit `schema.table` spelling, in addition to the bare `<table>`
+    // form these tests exercised above.
+
+    #[test]
+    fn bare_source_and_target_still_parse_with_no_explicit_schema() {
+        let def = parse("TRANSFORM order_totals FROM orders SELECT a + b AS total").unwrap();
+
+        assert_eq!(def.target, "order_totals");
+        assert_eq!(def.explicit_target_schema, None);
+        assert_eq!(def.source, "orders");
+        assert_eq!(def.explicit_source_schema, None);
+    }
+
+    #[test]
+    fn parses_an_explicitly_qualified_source() {
+        let def = parse("TRANSFORM order_totals FROM custom.orders SELECT a + b AS total").unwrap();
+
+        assert_eq!(def.target, "order_totals");
+        assert_eq!(def.explicit_target_schema, None);
+        assert_eq!(def.source, "orders");
+        assert_eq!(def.explicit_source_schema, Some("custom".to_string()));
+    }
+
+    #[test]
+    fn parses_an_explicitly_qualified_target() {
+        let def = parse("TRANSFORM custom.order_totals FROM orders SELECT a + b AS total").unwrap();
+
+        assert_eq!(def.target, "order_totals");
+        assert_eq!(def.explicit_target_schema, Some("custom".to_string()));
+        assert_eq!(def.source, "orders");
+        assert_eq!(def.explicit_source_schema, None);
+    }
+
+    #[test]
+    fn parses_explicitly_qualified_source_and_target_together() {
+        let def = parse("TRANSFORM reporting.order_totals FROM sales.orders SELECT a + b AS total")
+            .unwrap();
+
+        assert_eq!(def.target, "order_totals");
+        assert_eq!(def.explicit_target_schema, Some("reporting".to_string()));
+        assert_eq!(def.source, "orders");
+        assert_eq!(def.explicit_source_schema, Some("sales".to_string()));
+    }
+
+    #[test]
+    fn rejects_a_table_reference_with_a_trailing_dot() {
+        let err = parse("TRANSFORM t FROM s.").unwrap_err();
+        match err {
+            ParseError::UnexpectedEof { expected } => assert_eq!(expected, "an identifier"),
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_a_table_reference_with_an_empty_schema_component() {
+        let err = parse("TRANSFORM t FROM .orders SELECT a AS x").unwrap_err();
+        match err {
+            ParseError::UnexpectedToken { expected, found } => {
+                assert_eq!(expected, "an identifier");
+                assert_eq!(found, "'.'");
+            }
+            other => panic!("expected UnexpectedToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_a_table_reference_with_more_than_two_qualified_parts() {
+        let err = parse("TRANSFORM t FROM a.b.c SELECT x AS y").unwrap_err();
+        match err {
+            ParseError::TooManyQualifiedNameParts { reference } => {
+                assert_eq!(reference, "a.b.c");
+            }
+            other => panic!("expected TooManyQualifiedNameParts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_a_target_reference_with_more_than_two_qualified_parts() {
+        let err = parse("TRANSFORM a.b.c FROM s SELECT x AS y").unwrap_err();
+        match err {
+            ParseError::TooManyQualifiedNameParts { reference } => {
+                assert_eq!(reference, "a.b.c");
+            }
+            other => panic!("expected TooManyQualifiedNameParts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qualified_table_reference_does_not_collide_with_relationship_path_syntax() {
+        // The `<rel>.<column>` relationship-path grammar (issue #25) reuses
+        // the same `ident '.' ident` token shape inside a field expression —
+        // confirms the two never compete for the same tokens, since the
+        // table-reference form is only ever parsed in `TRANSFORM`/`FROM`
+        // position, well before `SELECT`'s field list is reached.
+        let def = parse("TRANSFORM t FROM custom.orders SELECT product.category_name AS category")
+            .unwrap();
+
+        assert_eq!(def.source, "orders");
+        assert_eq!(def.explicit_source_schema, Some("custom".to_string()));
+        assert_eq!(
+            def.fields,
+            vec![FieldDef {
+                name: "category".to_string(),
+                expr: Expr::RelationshipPath {
+                    rel: "product".to_string(),
+                    column: "category_name".to_string(),
+                },
+            }]
+        );
+    }
 }

@@ -58,6 +58,8 @@ mod tests {
             key_space: KeySpace::OneToOne,
             fields: vec![],
             predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
         }
     }
 

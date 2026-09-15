@@ -966,8 +966,8 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
         });
     }
 
-    let pk = ddl::source_primary_key(pool, &def.def.source).await?;
-    let source_ident = quote_ident(&def.def.source);
+    let pk = ddl::source_primary_key(pool, &def.source_table).await?;
+    let source_ident = ddl::qualified_source_table(&def.source_table);
     let pk_ident = quote_ident(&pk.name);
 
     let client = pool.get().await?;
@@ -1012,8 +1012,15 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
         let inferred = validate::infer_field_types(&def.def, &def.source_columns, &HashMap::new())?;
         inferred.get(column).copied().unwrap_or(ValueType::Numeric)
     } else {
+        // Broader sweep, reviewer follow-up to issue #74 (epic #78's own
+        // whole-branch review): `def.def.target` is always bare, even for an
+        // explicitly `schema.target`-qualified `TRANSFORM` (issue #76) — see
+        // `staging::apply::compute`'s identical fix, right above this
+        // function's own `apply::to_column_types` call, for the full
+        // reasoning. `def.target_table` (already the persisted, qualified
+        // identity) is available here the same way.
         let col_names = vec![column.to_string()];
-        let types = apply::to_column_types(pool, &def.def.target, &col_names).await?;
+        let types = apply::to_column_types(pool, &def.target_table, &col_names).await?;
         types.get(column).copied().unwrap_or(ValueType::Numeric)
     };
     let pg_type = match field_type {
@@ -1023,7 +1030,14 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
         ValueType::Uuid => "uuid",
     };
 
-    let target_ident = quote_ident(&def.def.target);
+    // `def.target_table` (issue #73's persisted, qualified identity), not a
+    // bare `quote_ident(&def.def.target)` — reviewer follow-up to issue #74
+    // (epic #78's own whole-branch review): a target explicitly qualified
+    // into a non-default schema (issue #76) isn't necessarily on this
+    // connection's pinned `search_path`. See
+    // `staging::apply::apply_target`'s identical fix for the live CDC-apply
+    // write path this recompute UPDATE shares the same bug class with.
+    let target_ident = ddl::qualified_target_table_ident(&def.target_table);
     let col_ident = quote_ident(column);
     let mut regex_cache = eval::RegexCache::new();
 

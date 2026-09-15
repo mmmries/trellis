@@ -45,6 +45,10 @@ pub enum ParseError {
     UnsupportedPredicate { detail: String },
     /// `COALESCE` called with zero arguments.
     AtLeastOneArgumentRequired { name: String },
+    /// A `TRANSFORM`/`FROM` table reference (issue #76, ADR-0007 grammar
+    /// clause 4) had more than the two `<schema>.<table>` components this
+    /// grammar accepts — e.g. `a.b.c`.
+    TooManyQualifiedNameParts { reference: String },
 }
 
 impl ParseError {
@@ -104,6 +108,12 @@ impl fmt::Display for ParseError {
             ParseError::AtLeastOneArgumentRequired { name } => {
                 write!(f, "function '{name}' requires at least 1 argument")
             }
+            ParseError::TooManyQualifiedNameParts { reference } => write!(
+                f,
+                "'{reference}' is not a valid table reference: only a bare <table> or a \
+                 qualified <schema>.<table> is supported (issue #76), not a third '.'-separated \
+                 part"
+            ),
         }
     }
 }
