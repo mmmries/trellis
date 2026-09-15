@@ -673,12 +673,31 @@ fn value_type_from_pg(pg_type: &str) -> ValueType {
 /// change, so this reuses grouping/iteration `compute` performs regardless
 /// of whether metrics are recorded, per the ADR's "effectively free"
 /// framing.
-fn record_transform_apply_metrics(transform: &str, src_changed: Option<std::time::SystemTime>) {
+///
+/// Issue #52: every `Some(src_changed)` this function sees is also buffered
+/// into `end_to_end_origins`, keyed by `transform` — one origin timestamp
+/// per applied change, same as the per-transform histogram observes. This
+/// is *not* itself gated on terminal-ness: at the point every call site
+/// below runs, `compute` hasn't yet determined which targets in this batch
+/// are terminal (that's [`ApplyPlan::downstream_readers`], computed once,
+/// after every source's changes have been evaluated — see the end of
+/// [`compute`]). Buffering here and flushing only the terminal targets'
+/// entries there reuses that one dedup'd downstream-reader lookup instead of
+/// adding a second one per change.
+fn record_transform_apply_metrics(
+    transform: &str,
+    src_changed: Option<std::time::SystemTime>,
+    end_to_end_origins: &mut HashMap<String, Vec<std::time::SystemTime>>,
+) {
     if let Some(src_changed) = src_changed {
         let latency = std::time::SystemTime::now()
             .duration_since(src_changed)
             .unwrap_or(std::time::Duration::ZERO);
         crate::metrics::record_transform_latency(transform, latency);
+        end_to_end_origins
+            .entry(transform.to_string())
+            .or_default()
+            .push(src_changed);
     }
     crate::metrics::increment_changes_applied(transform);
 }
@@ -874,6 +893,12 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     let mut versions: HashMap<String, Option<i64>> = HashMap::new();
     let mut targets: HashMap<String, TargetPlan> = HashMap::new();
     let mut aggregate_targets: HashMap<String, AggregateTargetPlan> = HashMap::new();
+    // Issue #52: every `Some(src_changed)` origin timestamp
+    // `record_transform_apply_metrics` sees below, buffered per consuming
+    // target — flushed into `metrics::record_end_to_end_latency` only for
+    // targets the `downstream_readers` computation at the end of this
+    // function finds terminal (see that call site's comment).
+    let mut end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>> = HashMap::new();
     // Issue #79: deduped across *every* relationship (and every source_key)
     // this whole `compute` call processes, not just within one relationship's
     // `key_hops` — two distinct inbound relationships sharing the same
@@ -1209,7 +1234,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             });
                         }
                     }
-                    record_transform_apply_metrics(&def.def.target, change.src_changed);
+                    record_transform_apply_metrics(
+                        &def.def.target,
+                        change.src_changed,
+                        &mut end_to_end_origins,
+                    );
                 }
                 continue;
             };
@@ -1304,7 +1333,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 &mut regex_cache,
             )?;
             for change in &changes {
-                record_transform_apply_metrics(&def.def.target, change.src_changed);
+                record_transform_apply_metrics(
+                    &def.def.target,
+                    change.src_changed,
+                    &mut end_to_end_origins,
+                );
             }
         }
     }
@@ -1363,7 +1396,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // downstream target, same as a row-driven change — recorded
             // once per def per truncated source, mirroring the row-driven
             // by_source loop above (issue #51/ADR-0009 decision 5).
-            record_transform_apply_metrics(&def.def.target, change.src_changed);
+            record_transform_apply_metrics(
+                &def.def.target,
+                change.src_changed,
+                &mut end_to_end_origins,
+            );
         }
 
         // Issue #98: a TRUNCATE clears definitions reading this table
@@ -1411,6 +1448,22 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             .await?
             .is_empty();
         downstream_readers.insert(target.clone(), has_downstream);
+        // Issue #52/ADR-0009 decision 2: end-to-end latency is only ever
+        // recorded for a *terminal* transform — one with no downstream
+        // reader of its own — reusing this exact "does anything read
+        // `target`" lookup rather than a second one. An intermediate hop
+        // (`has_downstream` true) still gets its per-transform latency from
+        // `record_transform_apply_metrics` above; it simply never flushes
+        // here, so its origins in `end_to_end_origins` are dropped once
+        // this function returns.
+        if !has_downstream && let Some(origins) = end_to_end_origins.get(target) {
+            for origin in origins {
+                let latency = std::time::SystemTime::now()
+                    .duration_since(*origin)
+                    .unwrap_or(std::time::Duration::ZERO);
+                crate::metrics::record_end_to_end_latency(target, latency);
+            }
+        }
     }
 
     let reverse_recomputes: Vec<(String, String, i32)> = reverse_recomputes
