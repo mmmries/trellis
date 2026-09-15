@@ -140,9 +140,10 @@ A change flowing source → hop → hop → apply *is* a trace. Settled in
 we adopt **spans** as a first-class signal, modeling propagation as a
 `tracing` span tree. This makes the pipeline's shape observable and carries
 the per-hop latency data for free — the per-transform latency histogram is
-*derived from* span durations captured during fold, rather than instrumented
-independently. This gates issue #56's design (span-based instrumentation of
-the propagation path).
+*derived from* span durations captured during apply (downstream of fold,
+where changes are already grouped by the transform(s) that consume them),
+rather than instrumented independently. This gates issue #56's design
+(span-based instrumentation of the propagation path).
 
 ## Transform status lifecycle
 
