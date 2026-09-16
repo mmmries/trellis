@@ -288,7 +288,12 @@ pub(super) struct GroupPlan {
 }
 
 impl GroupPlan {
-    fn new(group_values: Vec<Option<String>>) -> Self {
+    /// Widened to `pub(super)` for issue #131, epic #127: the reverse-delta
+    /// apply path (`super::apply`'s `RelationshipReverseRecord` handling)
+    /// builds `GroupPlan`s directly from live-enumerated from-side rows,
+    /// outside `accumulate_changes`' own batch loop, and needs this same
+    /// constructor rather than a duplicate.
+    pub(super) fn new(group_values: Vec<Option<String>>) -> Self {
         GroupPlan {
             group_values,
             field_accum: HashMap::new(),
@@ -418,7 +423,9 @@ impl AggregateTargetPlan {
 /// value), duplicated locally since that one is private to the oracle
 /// module and this is the one other place a group needs to be named as a
 /// single string.
-fn derive_group_key(row: &Row, group_by: &[String]) -> (Vec<Option<String>>, String) {
+/// `pub(super)`: issue #131's reverse-delta apply path derives a live
+/// from-side row's group key the same way this batch-driven caller does.
+pub(super) fn derive_group_key(row: &Row, group_by: &[String]) -> (Vec<Option<String>>, String) {
     let values: Vec<Option<String>> = group_by
         .iter()
         .map(|c| row.get(c).cloned().flatten())
@@ -482,7 +489,13 @@ fn derive_group_key(row: &Row, group_by: &[String]) -> (Vec<Option<String>>, Str
 /// function trusts that rather than re-deriving it per row/change, since
 /// every call within one [`accumulate_changes`] batch would otherwise
 /// repeat the exact same rewrite of the exact same `def`.
-fn row_contribution(
+///
+/// `pub(super)`: issue #131's reverse-delta apply path also calls this
+/// directly, against a *relationship-substituted* rewritten def (a
+/// `RelationshipPath` swapped for a synthetic `Column` carrying the
+/// parent's old/new image value) rather than `accumulate_changes`' plain
+/// per-batch rewrite — see `super::apply`'s `ReverseAggregateShape`.
+pub(super) fn row_contribution(
     def: &TransformDef,
     row: &Row,
     source_columns: &HashMap<String, ValueType>,
@@ -511,7 +524,10 @@ fn row_contribution(
 /// fields, and any calculated field composing one of those) is left
 /// byte-for-byte identical to `def`'s own field, so this changes nothing
 /// about their evaluation.
-fn contribution_def(def: &TransformDef) -> TransformDef {
+/// `pub(super)`: issue #131's reverse-delta apply path applies this same
+/// `AVG`-as-`SUM` rewrite to its own relationship-substituted definition
+/// before calling [`row_contribution`].
+pub(super) fn contribution_def(def: &TransformDef) -> TransformDef {
     let mut def = def.clone();
     for field in &mut def.fields {
         if let Expr::FunctionCall { name, .. } = &mut field.expr
@@ -629,31 +645,7 @@ pub(super) fn accumulate_changes(
                         .entry(new_key)
                         .or_insert_with(|| GroupPlan::new(new_values));
                     group.hop_gen = group.hop_gen.max(change.hop_gen);
-                    for field in &plan.fields {
-                        if !matches!(
-                            field.kind,
-                            AggFieldKind::Sum | AggFieldKind::Avg | AggFieldKind::Count
-                        ) {
-                            continue;
-                        }
-                        let old_v = old_contrib.get(&field.name).cloned().flatten();
-                        let new_v = new_contrib.get(&field.name).cloned().flatten();
-                        // Per-change cancellation: an unchanged contribution
-                        // is not a delta at all, and skipping it is what
-                        // lets `apply_aggregate_target` tell "this field had
-                        // no activity this batch" (no `field_accum` entry)
-                        // from "activity that happened to net to zero".
-                        if old_v == new_v {
-                            continue;
-                        }
-                        let accum = group.field_accum.entry(field.name.clone()).or_default();
-                        if let Some(v) = new_v {
-                            accum.adds.push(v);
-                        }
-                        if let Some(v) = old_v {
-                            accum.subs.push(v);
-                        }
-                    }
+                    diff_contributions(&plan.fields, group, &old_contrib, &new_contrib);
                 } else {
                     // Grain migration: subtract from the old group, add to
                     // the new one, independently.
@@ -732,6 +724,55 @@ fn sub_contributions(
         }
         let accum = group.field_accum.entry(field.name.clone()).or_default();
         if let Some(v) = contrib.get(&field.name).cloned().flatten() {
+            accum.subs.push(v);
+        }
+    }
+}
+
+/// Diffs one row's contribution before (`old_contrib`) and after
+/// (`new_contrib`) some change **that does not move the row into or out of
+/// `group`** — factored out of `accumulate_changes`'s own in-place-update
+/// branch (an ordinary same-group CDC `UPDATE`) so issue #131's
+/// reverse-delta apply can reuse the exact same per-field cancellation
+/// rule, which it needs for a different reason than `accumulate_changes`
+/// does: a parent-only change never adds or removes a from-side row from
+/// its group at all (the row's own `GROUP BY` columns never change), so
+/// every field must be diffed individually rather than blindly
+/// subtracted-then-added via [`sub_contributions`]/[`add_contributions`] —
+/// otherwise a field the relationship doesn't even touch (e.g. a plain
+/// `COUNT(*)`, whose contribution is `1` regardless of any relationship
+/// value) would wrongly gain a net +1/-1 delta on every reverse apply that
+/// touches its group, double-counting it against the value backfill/an
+/// earlier apply already established.
+///
+/// An unchanged contribution (`old_v == new_v`, always true for a field the
+/// change doesn't touch) pushes no accumulator entry at all — not a
+/// zero-effect add/sub pair — which is what lets [`apply_aggregate_target`]
+/// tell "this field had no activity this batch" from "activity that
+/// happened to net to zero" (`group_has_activity`'s own distinction).
+pub(super) fn diff_contributions(
+    fields: &[AggFieldPlan],
+    group: &mut GroupPlan,
+    old_contrib: &HashMap<String, Option<String>>,
+    new_contrib: &HashMap<String, Option<String>>,
+) {
+    for field in fields {
+        if !matches!(
+            field.kind,
+            AggFieldKind::Sum | AggFieldKind::Avg | AggFieldKind::Count
+        ) {
+            continue;
+        }
+        let old_v = old_contrib.get(&field.name).cloned().flatten();
+        let new_v = new_contrib.get(&field.name).cloned().flatten();
+        if old_v == new_v {
+            continue;
+        }
+        let accum = group.field_accum.entry(field.name.clone()).or_default();
+        if let Some(v) = new_v {
+            accum.adds.push(v);
+        }
+        if let Some(v) = old_v {
             accum.subs.push(v);
         }
     }
