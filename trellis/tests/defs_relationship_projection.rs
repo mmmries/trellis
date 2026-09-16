@@ -228,6 +228,108 @@ async fn projection_column_set_widens_to_cover_each_consumers_reads() {
     );
 }
 
+/// Regression test for a review follow-up to #129: a to-side row inserted
+/// *directly* (an ordinary replicated write, landing after the relationship
+/// was declared and its projection backfilled, but before any consumer
+/// exists to trigger a widen) must still show up in the projection once a
+/// widen finally does run. Nothing keeps the projection continuously synced
+/// yet — that's #130/#131 — so a widen that only `ALTER TABLE`s and
+/// `UPDATE`s rows *already in the projection* would silently and
+/// permanently strand this row, with no later mechanism to ever catch it up.
+#[tokio::test]
+async fn projection_widen_catches_up_a_to_side_row_inserted_before_the_widen() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table categories (id integer primary key, name text); \
+             alter table categories replica identity full; \
+             insert into categories (id, name) values (10, 'Tech'); \
+             create table articles (id integer primary key, category_id integer, title text); \
+             insert into articles (id, category_id, title) values (1, 10, 'a1')",
+        )
+        .await
+        .expect("create + seed tables");
+    drop(client);
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP category FROM articles.category_id TO categories.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    let projection_table = relationship_projection(&db.pool, created.id)
+        .await
+        .expect("read projection catalog row")
+        .expect("a to-one relationship must have a projection")
+        .projection_table;
+
+    assert_eq!(
+        projection_row_count(&db.pool, &projection_table).await,
+        1,
+        "the projection's initial backfill should cover the one pre-existing category"
+    );
+
+    // A second category row lands as an ordinary write, with no consumer
+    // and therefore no widen anywhere near it yet — exactly the window
+    // #130/#131 don't cover.
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("insert into categories (id, name) values (20, 'News')")
+        .await
+        .expect("insert a second category row directly");
+    drop(client);
+
+    // The first consumer's widen is the only thing that runs against this
+    // relationship's projection from here on.
+    create_definition(
+        &db.pool,
+        "TRANSFORM article_cat FROM articles SELECT category.name AS category_name",
+        &numeric_columns(&["id", "category_id"]),
+    )
+    .await
+    .expect("first consumer definition");
+
+    let client = db.pool.get().await.expect("get connection");
+    let mut rows: Vec<(i32, String)> = client
+        .query(
+            &format!("select id, name from {projection_table} order by id"),
+            &[],
+        )
+        .await
+        .expect("read projection data")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    rows.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        rows,
+        vec![(10, "Tech".to_string()), (20, "News".to_string())],
+        "the directly-inserted row must be caught up by the widen, not stranded"
+    );
+
+    // Bookkeeping is seeded for the caught-up row too, not left however
+    // `insert ... default` would have left it (there is no `default` on
+    // these columns, so a bug here would surface as a NOT NULL violation
+    // rather than a silently-wrong value — this asserts the intended values
+    // directly).
+    let bookkeeping: Vec<(i32, i64, bool)> = client
+        .query(
+            &format!(
+                "select id, __trellis_gen, __trellis_lsn is not null from {projection_table} \
+                 order by id"
+            ),
+            &[],
+        )
+        .await
+        .expect("read projection bookkeeping")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    assert_eq!(bookkeeping, vec![(10, 0, true), (20, 0, true)]);
+}
+
 /// A to-side row whose (non-primary-key, plain-`UNIQUE`) key is `NULL` is
 /// excluded from the projection's backfill outright: the projection's key
 /// column is `NOT NULL` (it's the physical primary key of the projection

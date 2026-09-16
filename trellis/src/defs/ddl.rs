@@ -508,11 +508,18 @@ pub(crate) fn qualified_relationship_projection_table(
 ///
 /// `__trellis_`-prefixed rather than a bare `gen`, matching this module's
 /// existing `__{field}_sum`/`__{field}_count` hidden-partial-column
-/// convention (see [`avg_sum_column`]/[`count_needing_arg`]): a to-side
-/// column a consumer legitimately reads through the relationship — however
-/// unlikely a column literally named `gen` is — can never collide with this
-/// bookkeeping column, since a real to-side column can't start with
-/// `__trellis_` without colliding with Trellis's own naming first.
+/// convention (see [`avg_sum_column`]/[`count_needing_arg`]): this makes a
+/// collision with a to-side column a consumer legitimately reads through the
+/// relationship *unlikely*, not impossible — a to-side column literally
+/// named `__trellis_gen` (equally: [`PROJECTION_LSN_COLUMN`] and a to-side
+/// `__trellis_lsn`) would still silently collide with this bookkeeping
+/// column, the same residual risk every `__`-prefixed hidden column in this
+/// module already accepts. Review follow-up to issue #129: flagged
+/// explicitly here, for #130/#131 to keep in mind, rather than solved now —
+/// detecting/rejecting it would need its own validation pass over the
+/// to-side schema, out of this issue's foundation-only scope, and no
+/// generated or hand-written schema in this codebase's own test/fixture
+/// corpus exercises it today.
 pub(crate) const PROJECTION_GEN_COLUMN: &str = "__trellis_gen";
 
 /// The settled parent projection's per-row LSN chain (issue #129, epic #127;

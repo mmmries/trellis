@@ -2653,18 +2653,39 @@ pub async fn relationship_projection(
 }
 
 /// Ensures the to-one relationship `relationship_id` names has a settled
-/// parent projection (issue #129, epic #127) that carries at least every
-/// column in `needed_columns`: creates the projection from scratch (and
-/// backfills its bookkeeping columns for every existing to-side row) the
-/// first time this is called for `relationship_id`, or widens an existing
-/// one (`alter table ... add column` + backfilling *just* the new column,
-/// for every existing to-side row) for any of `needed_columns` it doesn't
-/// carry yet. A column already present is left completely untouched, never
-/// re-backfilled — widening only ever adds, never overwrites.
+/// parent projection (issue #129, epic #127) that (a) carries at least every
+/// column in `needed_columns` and (b) has a row for every to-side key —
+/// creating the projection from scratch the first time this is called for
+/// `relationship_id`, widening an existing one (`alter table ... add
+/// column`) for any of `needed_columns` it doesn't carry yet, and — on
+/// *every* call, regardless of whether (b) needed anything new — inserting a
+/// projection row for any to-side key that doesn't have one yet. A column or
+/// row already present is left completely untouched; this only ever adds.
+///
+/// **Why (b) is not just "the first-creation backfill plus widening the
+/// columns of rows that are already there"** (review follow-up to issue
+/// #129): nothing keeps the projection continuously in sync with its to-side
+/// table yet — that's the forward/reverse paths, #130/#131, neither of which
+/// exists. Between this relationship's declaration and whenever a consumer
+/// first triggers a widen, the to-side table keeps taking ordinary
+/// replicated writes, including plain `INSERT`s of new rows the projection
+/// has never seen. A widen that only `ALTER TABLE`s and then `UPDATE ...
+/// FROM`s the columns of rows *already in the projection* silently skips
+/// every such row forever — there is no later resync to catch it, since
+/// #130/#131 aren't built yet. So every call here re-derives "every
+/// currently-known column" (bookkeeping plus whatever data columns already
+/// exist, plus whatever `needed_columns` just added) and anti-join-inserts
+/// any missing to-side key with all of them populated from the live to-side
+/// table — the same shape the original from-scratch backfill used, just
+/// scoped to `not exists` rather than the unconditional first insert. This
+/// makes "create" and "catch up" the same code path instead of two
+/// independently-maintained ones that quietly drifted apart (the from-scratch
+/// backfill this replaces used to run once, in the `None` branch below, and
+/// nothing else ever re-ran it — exactly the gap this fixes).
 ///
 /// Two call sites, both already inside their own open transaction so a
-/// projection creation/widen commits or rolls back atomically with whatever
-/// catalog change occasioned it:
+/// projection creation/widen/catch-up commits or rolls back atomically with
+/// whatever catalog change occasioned it:
 /// * [`create_relationship`] calls this with `needed_columns: &[]` right
 ///   after inserting the relationship's own row — so every to-one
 ///   relationship gets a (bookkeeping-columns-only) projection
@@ -2678,9 +2699,13 @@ pub async fn relationship_projection(
 ///   a new consumer's reads, and a projection several transforms share
 ///   (issue #129's own scope line: "one projection can serve several
 ///   transforms") ends up carrying the union of every consumer's reads
-///   without any consumer needing to know about the others.
+///   without any consumer needing to know about the others. This is also
+///   the call site that exercises the row catch-up above in practice: any
+///   `create_definition`/`install_definition` call is a natural point where
+///   directly-written to-side rows accumulated since the relationship (or
+///   the last widen) get folded back in.
 ///
-/// `to_col_pg_type` is only consulted the first time (an existing
+/// `to_col_pg_type` is only consulted on first creation (an existing
 /// projection's key column type can't change short of dropping the
 /// projection outright, which nothing does in v1).
 #[allow(clippy::too_many_arguments)]
@@ -2704,6 +2729,7 @@ async fn ensure_relationship_projection_in_txn(
     // doc comment). Every DML statement built below uses this quoted form,
     // never `qualified_to_table` itself.
     let quoted_to_table = ddl::qualified_source_table(qualified_to_table);
+    let to_col_ident = quote_ident(to_col);
 
     let existing = txn
         .query_opt(
@@ -2726,17 +2752,15 @@ async fn ensure_relationship_projection_in_txn(
             // [`super::ddl::PROJECTION_GEN_COLUMN`]/
             // [`super::ddl::PROJECTION_LSN_COLUMN`]'s doc comments for what
             // each means and how it's meant to be advanced. No data columns
-            // yet: this branch only runs once, at first creation, before
-            // `needed_columns` (below) has anything to add for a call from
-            // [`create_relationship`] (always empty) or is applied for a
-            // call from a definition's own widen (handled uniformly below,
-            // whether the table was just created here or already existed).
+            // yet, and no rows either — the row catch-up below (which runs
+            // unconditionally, not just when `needed_columns` is non-empty)
+            // is what actually populates it, using this branch's freshly
+            // created, still-empty table as its starting point.
             txn.batch_execute(&format!(
                 "create table if not exists {qualified_projection} (\
                      {to_col_ident} {to_col_pg_type} primary key, \
                      {gen_col} bigint not null default 0, \
                      {lsn_col} pg_lsn not null)",
-                to_col_ident = quote_ident(to_col),
                 gen_col = quote_ident(ddl::PROJECTION_GEN_COLUMN),
                 lsn_col = quote_ident(ddl::PROJECTION_LSN_COLUMN),
             ))
@@ -2749,60 +2773,39 @@ async fn ensure_relationship_projection_in_txn(
             )
             .await?;
 
-            // Full initial backfill: one row per to-side key, bookkeeping
-            // columns only. NULL-keyed to-side rows are excluded outright —
-            // `to_col` is this table's own primary key (so it can't hold a
-            // NULL), and a NULL join key can never match a from-side row
-            // anyway (SQL `NULL <> NULL`; `eval::eval_expr`'s
-            // `RelationshipPath` arm already treats a NULL from-side join
-            // key as "no match" for the identical reason), so there is no
-            // row a NULL `to_col` value could ever need to seed — unlike
-            // #128's nullable-*grouping-key* fix, which had to make room for
-            // a NULL group because a NULL group is itself a real,
-            // needs-storage aggregation bucket. A NULL to-side key isn't a
-            // bucket at all; it's simply never a projection row.
-            //
-            // `pg_current_wal_lsn()` is captured once, via the `seed` CTE,
-            // and shared by every row this one statement writes — see
-            // [`super::ddl::PROJECTION_LSN_COLUMN`]'s doc comment for
-            // exactly what that value does and doesn't guarantee, and what
-            // #131/#132 should confirm before relying on it.
-            let seed_lsn_sql = format!(
-                "with seed as (select pg_current_wal_lsn() as lsn) \
-                 insert into {qualified_projection} ({to_col_ident}, {gen_col}, {lsn_col}) \
-                 select t.{to_col_ident}, 0, seed.lsn \
-                 from {quoted_to_table} t, seed \
-                 where t.{to_col_ident} is not null",
-                to_col_ident = quote_ident(to_col),
-                gen_col = quote_ident(ddl::PROJECTION_GEN_COLUMN),
-                lsn_col = quote_ident(ddl::PROJECTION_LSN_COLUMN),
-            );
-            txn.batch_execute(&seed_lsn_sql).await?;
-
             projection_table
         }
     };
 
-    if needed_columns.is_empty() {
-        return Ok(());
-    }
-
     let qualified_projection =
         ddl::qualified_relationship_projection_table(target_schema, &projection_table);
 
-    let existing_cols: HashSet<String> = txn
+    // Every data column (i.e. excluding the key and the two bookkeeping
+    // columns) the projection currently carries, in ordinal order — the
+    // union this function has to keep in step with is exactly this set,
+    // widened below by `needed_columns` and then used, in full, by the row
+    // catch-up that follows. A `Vec` (not a `HashSet`): a handful of columns
+    // at most, and iteration order should match `information_schema`'s own
+    // ordinal order for a readable generated `insert`/`update` column list.
+    let bookkeeping = [
+        to_col,
+        ddl::PROJECTION_GEN_COLUMN,
+        ddl::PROJECTION_LSN_COLUMN,
+    ];
+    let mut data_columns: Vec<String> = txn
         .query(
             "select column_name from information_schema.columns \
-             where table_schema = $1 and table_name = $2",
+             where table_schema = $1 and table_name = $2 order by ordinal_position",
             &[&target_schema, &projection_table],
         )
         .await?
         .into_iter()
-        .map(|row| row.get(0))
+        .map(|row| row.get::<_, String>(0))
+        .filter(|c| !bookkeeping.contains(&c.as_str()))
         .collect();
 
     for column in needed_columns {
-        if existing_cols.contains(column) {
+        if data_columns.contains(column) {
             continue;
         }
         let pg_type = column_type_in_txn(txn, qualified_to_table, to_table_bare, column).await?;
@@ -2811,19 +2814,71 @@ async fn ensure_relationship_projection_in_txn(
             "alter table {qualified_projection} add column if not exists {col_ident} {pg_type}"
         ))
         .await?;
-        // Backfill the new column for every existing projection row —
-        // existing rows are already exactly "one per to-side key" (the
-        // initial backfill above never omits a key that a later widen would
-        // need to catch up on), so a plain `update ... from` covers all of
-        // them in one statement; there is no "new row" case here, only a
-        // wider existing one.
+        // Backfill the new column for every projection row that already
+        // exists — the row catch-up below handles any to-side key that
+        // isn't a projection row yet at all, using this same widened column
+        // list, so this `update` only has to cover the "existing row, new
+        // column" half.
         txn.batch_execute(&format!(
             "update {qualified_projection} p set {col_ident} = t.{col_ident} \
-             from {quoted_to_table} t where t.{to_col_ident} = p.{to_col_ident}",
-            to_col_ident = quote_ident(to_col),
+             from {quoted_to_table} t where t.{to_col_ident} = p.{to_col_ident}"
         ))
         .await?;
+        data_columns.push(column.clone());
     }
+
+    // Row catch-up (review follow-up to issue #129 — see this function's own
+    // doc comment for the scenario this closes): insert a projection row,
+    // with every currently-known column populated, for any to-side key that
+    // doesn't have one yet. Runs on every call, not just when `needed_columns`
+    // added something — a call with an already-fully-covered column set can
+    // still be the first opportunity to notice to-side rows that arrived
+    // since the last call. `not exists` makes this a no-op for keys the
+    // projection already has, so it's safe to run unconditionally rather
+    // than trying to track "did anything actually change" first. Excludes
+    // NULL-keyed to-side rows for the same reason the original from-scratch
+    // backfill did (`to_col` is `not null` here, and a NULL join key can
+    // never match a from-side row anyway) — a different situation from
+    // #128's nullable *grouping*-key fix, since a NULL to-side key isn't a
+    // bucket needing storage.
+    //
+    // `pg_current_wal_lsn()` is captured fresh here (via the `seed` CTE, not
+    // reused from any earlier call) and shared by every row *this*
+    // statement writes — see [`super::ddl::PROJECTION_LSN_COLUMN`]'s doc
+    // comment for exactly what that value does and doesn't guarantee, and
+    // what #131/#132 should confirm before relying on it.
+    let mut insert_col_idents = vec![
+        to_col_ident.clone(),
+        quote_ident(ddl::PROJECTION_GEN_COLUMN),
+        quote_ident(ddl::PROJECTION_LSN_COLUMN),
+    ];
+    let mut select_col_exprs = vec![
+        format!("t.{to_col_ident}"),
+        "0".to_string(),
+        "seed.lsn".to_string(),
+    ];
+    for column in &data_columns {
+        let col_ident = quote_ident(column);
+        select_col_exprs.push(format!("t.{col_ident}"));
+        insert_col_idents.push(col_ident);
+    }
+    // Named (not captured) on purpose: `{insert_col_idents}`/`{select_col_exprs}`
+    // must render the *joined* `String` below, not `Debug`-format the `Vec`
+    // locals of the same name that captured-identifier interpolation would
+    // otherwise reach for.
+    let insert_cols = insert_col_idents.join(", ");
+    let select_cols = select_col_exprs.join(", ");
+    let catch_up_sql = format!(
+        "with seed as (select pg_current_wal_lsn() as lsn) \
+         insert into {qualified_projection} ({insert_cols}) \
+         select {select_cols} \
+         from {quoted_to_table} t, seed \
+         where t.{to_col_ident} is not null \
+           and not exists (\
+             select 1 from {qualified_projection} p where p.{to_col_ident} = t.{to_col_ident}\
+           )"
+    );
+    txn.batch_execute(&catch_up_sql).await?;
 
     Ok(())
 }
