@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
-use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
+use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{
     Expr, FieldDef, KeySpace, Predicate, RelationshipDef, TransformDef, ValueType,
 };
@@ -203,18 +203,22 @@ fn to_one_oracle_def() -> TransformDef {
     }
 }
 
-/// A valid (relationship-free) stand-in with the same target and column shape
-/// (id pk + `category_name` text) as the real definition, so `create_target_table`
-/// — which type-infers and would reject a relationship path — can build the
-/// target. The real `definition_text` is written in afterward.
-fn to_one_placeholder_def() -> TransformDef {
+/// The real definition, created directly through the front door (issue #40's
+/// validator accepts a bare to-one `<rel>.<column>` path, so no
+/// placeholder-def-then-rewrite hack is needed here any more). `id` is left
+/// out — `create_target_table` adds the source's own PK column itself, same
+/// as `defs_relationship_frontdoor.rs`'s identically-shaped `to_one_def`.
+fn to_one_def() -> TransformDef {
     TransformDef {
         target: "article_cat".to_string(),
         source: "articles".to_string(),
         key_space: KeySpace::OneToOne,
         fields: vec![FieldDef {
             name: "category_name".to_string(),
-            expr: Expr::Column("title".to_string()),
+            expr: Expr::RelationshipPath {
+                rel: "category".to_string(),
+                column: "name".to_string(),
+            },
         }],
         predicate: Predicate::True,
         explicit_source_schema: None,
@@ -259,6 +263,24 @@ async fn target_to_one(client: &Client) -> HashMap<String, Option<String>> {
         .collect()
 }
 
+/// The bare (schema-resolved-via-`search_path`) table name of `relationship_id`'s
+/// settled parent projection (issue #129). Issue #130 (epic #127) moved the
+/// forward to-one read off a live to-side lookup onto this projection, but
+/// nothing yet advances a projection row's *data* columns when its
+/// underlying parent changes — that's #131's job, not built yet. This test
+/// exercises the reverse-recompute *staging* mechanism (issue #30, entirely
+/// unchanged by #130) across a sequence of parent mutations, so it stands in
+/// for #131 itself below, directly mirroring each mutation it makes to
+/// `categories` onto the projection — delete every such call once #131 lands
+/// and keeps the projection itself in sync.
+async fn projection_table_name(pool: &trellis::Pool, relationship_id: i64) -> String {
+    trellis::defs::relationship_projection(pool, relationship_id)
+        .await
+        .expect("read projection catalog row")
+        .expect("to-one relationship has a projection")
+        .projection_table
+}
+
 #[tokio::test]
 async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
     let cluster = TestCluster::start();
@@ -286,15 +308,19 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
         .await
         .expect("create tables");
 
-    create_relationship(
+    let relationship = create_relationship(
         &db.pool,
         "RELATIONSHIP category FROM articles.category_id TO categories.id",
     )
     .await
     .expect("create to-one relationship");
 
-    // Placeholder definition: valid (no relationship path) so `create_definition`
-    // sets up nodes/edges/target, then rewritten to the relationship form.
+    // Front door (issue #40): declare the definition directly against the
+    // real relationship path — no placeholder-def-then-rewrite hack needed
+    // now that the validator accepts it. `create_definition`'s own widen
+    // call (issue #129) adds `name` to the projection right here, while
+    // `categories` is still empty, matching this test's own step 1 (both
+    // articles' categories don't exist yet).
     let source_columns = columns(&[
         ("id", ValueType::Numeric),
         ("category_id", ValueType::Numeric),
@@ -302,38 +328,26 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
     ]);
     create_definition(
         &db.pool,
-        "TRANSFORM article_cat FROM articles SELECT title AS category_name",
+        "TRANSFORM article_cat FROM articles SELECT category.name AS category_name",
         &source_columns,
     )
     .await
-    .expect("create placeholder definition");
+    .expect("create to-one enrichment definition through the front door");
     let pk = source_primary_key(&db.pool, "articles")
         .await
         .expect("introspect articles pk");
     create_target_table(
         &db.pool,
-        &to_one_placeholder_def(),
+        &to_one_def(),
         "public",
         &pk,
         &source_columns,
-        &to_one_placeholder_def().source,
+        &to_one_def().source,
     )
     .await
     .expect("create target table");
-    client
-        .execute(
-            // Issue #73: `target_table` is persisted fully-qualified now —
-            // `article_cat` was created via `create_target_table(..., "public", ...)`
-            // above, so it landed under `DEFAULT_TARGET_SCHEMA`.
-            &format!(
-                "update transform_definitions \
-                 set definition_text = 'TRANSFORM article_cat FROM articles SELECT category.name AS category_name' \
-                 where target_table = '{DEFAULT_TARGET_SCHEMA}.article_cat'"
-            ),
-            &[],
-        )
-        .await
-        .expect("rewrite definition to relationship form");
+
+    let projection_table = projection_table_name(&db.pool, relationship.id).await;
 
     // Step 1 — insert two articles pointing at not-yet-existent categories
     // (forward eval: enrichment resolves to NULL, LEFT JOIN no-match).
@@ -374,6 +388,16 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
         .execute("insert into categories (id, name) values (10, 'Tech')", &[])
         .await
         .expect("insert category 10");
+    client
+        .execute(
+            &format!(
+                "insert into {projection_table} (id, __trellis_gen, __trellis_lsn, name) \
+                 values (10, 0, pg_current_wal_lsn(), 'Tech')"
+            ),
+            &[],
+        )
+        .await
+        .expect("stand in for #131: add the projection row category insert created");
     stage_cdc(
         &client,
         "categories",
@@ -398,6 +422,13 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
         )
         .await
         .expect("update category name");
+    client
+        .execute(
+            &format!("update {projection_table} set name = 'Technology' where id = 10"),
+            &[],
+        )
+        .await
+        .expect("stand in for #131: advance the projection's own name column");
     stage_cdc(
         &client,
         "categories",
@@ -422,6 +453,13 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
         .execute("update categories set id = 20 where id = 10", &[])
         .await
         .expect("re-parent category id");
+    client
+        .execute(
+            &format!("update {projection_table} set id = 20 where id = 10"),
+            &[],
+        )
+        .await
+        .expect("stand in for #131: advance the projection's own key column");
     stage_cdc(
         &client,
         "categories",
@@ -443,6 +481,13 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
         .execute("delete from categories where id = 20", &[])
         .await
         .expect("delete category 20");
+    client
+        .execute(
+            &format!("delete from {projection_table} where id = 20"),
+            &[],
+        )
+        .await
+        .expect("stand in for #131: remove the projection row category delete removed");
     stage_cdc(
         &client,
         "categories",
