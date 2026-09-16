@@ -692,16 +692,38 @@ fn value_type_from_pg(pg_type: &str) -> ValueType {
 // Phase 2: compute
 // ---------------------------------------------------------------------
 
-/// Issue #51/ADR-0009 decision 5: records one applied change's per-transform
-/// hop latency and throughput, from data [`compute`]'s by-source grouping
-/// already has in hand — no new I/O, no new join. `transform` is the
-/// consuming definition's target table (this crate's one "transform name,"
-/// per `ApplyError::ColumnNotPaused`/`DefinitionNotLive`'s own `transform`
-/// fields). `src_changed` is [`FoldedChange::src_changed`]: `Some` for a
-/// change that traces back to a real source commit (the histogram's
-/// `.observe()` value is `now - src_changed`), `None` for a bare recompute
-/// trigger with no origin timestamp to measure against — such a change
-/// still counts toward throughput, just not latency.
+/// Issue #51/ADR-0009 decision 5: buffers one applied change's per-transform
+/// hop latency/throughput observation, from data [`compute`]'s by-source
+/// grouping already has in hand — no new I/O, no new join. `transform` is
+/// the consuming definition's target table (this crate's one "transform
+/// name," per `ApplyError::ColumnNotPaused`/`DefinitionNotLive`'s own
+/// `transform` fields). `src_changed` is [`FoldedChange::src_changed`]:
+/// `Some` for a change that traces back to a real source commit (the
+/// histogram's eventual `.observe()` value is `now - src_changed`, `now`
+/// sampled fresh at flush time — see [`flush_apply_metrics`]), `None` for a
+/// bare recompute trigger with no origin timestamp to measure against —
+/// such a change still counts toward throughput, just not latency.
+///
+/// **Buffers, does not record** (the epic #49 cross-cutting review's fix,
+/// closing a gap in issues #51/#52): `compute` (Phase 2) has no transaction
+/// and no locks, and [`drain_once`]/[`drain_many`]'s "reload, recompute,
+/// retry" loop calls it again, from scratch, on the very same `folded`
+/// input, for a version-fence miss or a rolled-back Phase 3 failure —
+/// [`classify_and_retry`]'s `VersionFenceMiss`/`Transient` classes both
+/// return "retry unchanged." Recording straight into the global registry
+/// here, as this function used to, meant a change that took N attempts to
+/// actually land got counted into `trellis_changes_applied_total` and both
+/// latency histograms N times instead of once, worst exactly under the
+/// lock-contention/version-fence-race conditions where accurate throughput
+/// numbers matter most. Buffering into `transform_observations` (one entry
+/// per call, mirroring what used to be recorded immediately) and flushing
+/// only once, after the winning attempt's transaction actually commits
+/// (`flush_apply_metrics`, called from `drain_once`/`drain_many` right after
+/// their own `txn.commit().await?`), fixes both the double-counting and the
+/// secondary issue of latency being measured against a pre-commit
+/// timestamp: `flush_apply_metrics` samples `SystemTime::now()` itself, at
+/// commit time, rather than reusing whatever this function would have
+/// sampled during planning.
 ///
 /// Called once per applied change per consuming definition — both the 1-1
 /// write/delete dispatch and the aggregate accumulate path below call this
@@ -717,25 +739,24 @@ fn value_type_from_pg(pg_type: &str) -> ValueType {
 /// below runs, `compute` hasn't yet determined which targets in this batch
 /// are terminal (that's [`ApplyPlan::downstream_readers`], computed once,
 /// after every source's changes have been evaluated — see the end of
-/// [`compute`]). Buffering here and flushing only the terminal targets'
+/// [`compute`]). Buffering here and filtering to only the terminal targets'
 /// entries there reuses that one dedup'd downstream-reader lookup instead of
-/// adding a second one per change.
-fn record_transform_apply_metrics(
+/// adding a second one per change; the filtered result is itself stored on
+/// [`ApplyPlan`] (not flushed) for the same retry-safety reason as
+/// `transform_observations`.
+fn buffer_transform_apply_metrics(
     transform: &str,
     src_changed: Option<std::time::SystemTime>,
     end_to_end_origins: &mut HashMap<String, Vec<std::time::SystemTime>>,
+    transform_observations: &mut Vec<(String, Option<std::time::SystemTime>)>,
 ) {
     if let Some(src_changed) = src_changed {
-        let latency = std::time::SystemTime::now()
-            .duration_since(src_changed)
-            .unwrap_or(std::time::Duration::ZERO);
-        crate::metrics::record_transform_latency(transform, latency);
         end_to_end_origins
             .entry(transform.to_string())
             .or_default()
             .push(src_changed);
     }
-    crate::metrics::increment_changes_applied(transform);
+    transform_observations.push((transform.to_string(), src_changed));
 }
 
 /// One key's write into a target table: the evaluated calculated-field
@@ -842,8 +863,10 @@ fn earliest_src_changed(
 
 #[cfg(test)]
 mod tests {
-    use super::earliest_src_changed;
+    use super::*;
     use std::time::{Duration, SystemTime};
+    use tokio_postgres::NoTls;
+    use tokio_postgres::types::PgLsn;
 
     #[test]
     fn earliest_src_changed_picks_the_lesser_of_two_known_origins() {
@@ -874,6 +897,251 @@ mod tests {
     #[test]
     fn earliest_src_changed_of_two_unknowns_stays_unknown() {
         assert_eq!(earliest_src_changed(None, None), None);
+    }
+
+    /// The exact numeric value of a Prometheus exposition line whose metric
+    /// name is `metric` (matched with a trailing `{` so `_count`/`_sum`/
+    /// `_bucket`/plain-counter variants never collide with one another) and
+    /// which carries a `transform="..."` label matching `transform` —
+    /// `None` if no such line exists yet. Used below to assert an *exact*
+    /// count (not just presence, which `metrics.rs`'s own tests already
+    /// cover), since proving this module's fix means proving a count that
+    /// could have been inflated by a retry is not.
+    fn metric_value(rendered: &str, metric: &str, transform: &str) -> Option<u64> {
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!("{metric}{{"))
+                    && line.contains(&format!("transform=\"{transform}\""))
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v as u64)
+    }
+
+    /// Epic #49's final cross-cutting review found that [`compute`] (Phase
+    /// 2: no transaction, no locks) used to record straight into the global
+    /// metrics registry — but [`drain_once`]/[`drain_many`]'s "reload,
+    /// recompute, retry" loop calls `compute` again, unchanged, on a
+    /// version-fence miss or a rolled-back Phase 3 failure, so a change that
+    /// took more than one attempt to actually land got double-(or worse-)
+    /// counted into `trellis_changes_applied_total` and both latency
+    /// histograms. The fix: `compute` only *buffers* observations onto the
+    /// [`ApplyPlan`] it returns (`transform_observations`/`end_to_end_origins`),
+    /// and only [`flush_apply_metrics`] — called by `drain_once`/`drain_many`
+    /// right after their own `txn.commit().await?` succeeds — actually
+    /// records them.
+    ///
+    /// This proves both halves directly: `compute` run twice against the
+    /// exact same folded input (standing in for `drain_once`'s retry loop
+    /// without needing to force a real, racy version-fence/serialization
+    /// failure) never touches the registry either time, and a single
+    /// `flush_apply_metrics` call on the winning attempt's plan records
+    /// exactly one observation per metric — not two, even though `compute`
+    /// itself ran twice.
+    #[tokio::test]
+    async fn compute_only_buffers_metrics_and_a_single_flush_records_them_exactly_once() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "set search_path to {}, public",
+                crate::config::DEFAULT_SCHEMA
+            ))
+            .await
+            .expect("set search_path");
+
+        // `testkit::TestDatabase::pool` is `trellis::pool::Pool` from
+        // testkit's point of view — a *different* (if structurally
+        // identical) type from this crate's own `crate::pool::Pool` when
+        // this module is compiled as `trellis`'s own `--lib` test binary
+        // (testkit depends on the published `trellis` crate, not on "this"
+        // compilation of it). Every function this test calls below
+        // (`compute`, `crate::defs::create_definition`, ...) takes this
+        // crate's own `Pool`, so a fresh one is built here, straight from
+        // the same DSN `testkit` already migrated — Postgres itself doesn't
+        // care which Rust type did the connecting.
+        let pool_config =
+            crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = crate::pool::Pool::new(&pool_config).expect("build a same-crate pool");
+
+        let source = "apply_rs_metrics_buffer_test_orders";
+        let target = "apply_rs_metrics_buffer_test_totals";
+
+        // `source` starts empty — its one row arrives below, after the
+        // definition exists, purely as this test's own staged CDC event.
+        // That keeps the definition's own initial backfill (which
+        // enumerates whatever `source` holds at definition time) from
+        // separately re-discovering and writing the same row, which would
+        // otherwise land a second, backfill-driven observation alongside
+        // this test's hand-staged one — mirroring `apply.rs`'s own
+        // `drain_matches_the_oracle_across_an_insert_update_and_delete`
+        // convention.
+        client
+            .batch_execute(&format!(
+                "create table {source} (id integer primary key, price numeric, tax numeric)"
+            ))
+            .await
+            .expect("seed source table");
+
+        let source_columns: HashMap<String, ValueType> = [
+            ("id".to_string(), ValueType::Numeric),
+            ("price".to_string(), ValueType::Numeric),
+            ("tax".to_string(), ValueType::Numeric),
+        ]
+        .into_iter()
+        .collect();
+        let definition = crate::defs::create_definition(
+            &pool,
+            &format!("TRANSFORM {target} FROM {source} SELECT price + tax AS total"),
+            &source_columns,
+        )
+        .await
+        .expect("create definition");
+        let pk = crate::defs::source_primary_key(&pool, source)
+            .await
+            .expect("introspect source primary key");
+        crate::defs::create_target_table(&pool, &definition.def, "public", &pk, &source_columns)
+            .await
+            .expect("create target table");
+
+        client
+            .execute(
+                &format!("insert into {source} (id, price, tax) values (1, 10.00, 1.50)"),
+                &[],
+            )
+            .await
+            .expect("seed source rows after the definition exists");
+
+        // Stage one CDC row with a real `src_changed`, so both the
+        // per-transform and end-to-end histograms have something to
+        // observe, not just the throughput counter.
+        client
+            .execute(
+                "insert into seg_0 (src_table, key, op, lsn, old_image, new_image, hop_gen, \
+                 src_changed) \
+                 values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0, now())",
+                &[
+                    &source,
+                    &"1",
+                    &"insert",
+                    &PgLsn::from(1u64),
+                    &None::<String>,
+                    &Some(r#"{"price":"10.00","tax":"1.50"}"#.to_string()),
+                ],
+            )
+            .await
+            .expect("stage cdc row");
+
+        let mut seal_client = client;
+        let seal_outcome = crate::staging::seal::seal_phase1(&mut seal_client)
+            .await
+            .expect("seal phase 1");
+        crate::staging::seal::seal_phase2(&seal_client, seal_outcome.sealed_seg_seq)
+            .await
+            .expect("seal phase 2");
+        let seg_seq = seal_outcome.sealed_seg_seq;
+
+        let mut phase1_client = pool.get().await.expect("connection");
+        let txn = phase1_client.transaction().await.expect("begin phase 1");
+        claim::claim(&*txn, seg_seq, "worker", 1)
+            .await
+            .expect("claim");
+        let filter = claim::owned_bucket_filter(&*txn, seg_seq, "worker")
+            .await
+            .expect("owned_bucket_filter");
+        let folded = fold::fold(&txn, seg_seq, filter).await.expect("fold");
+        txn.commit().await.expect("commit phase 1");
+
+        // Before any `compute` call: the registry must not already mention
+        // this test's distinctively-named transform (guards against a
+        // false pass if some later assertion's "still absent" check were
+        // vacuously true for an unrelated reason).
+        let before = crate::metrics::Metrics::new().render_prometheus();
+        assert!(
+            metric_value(&before, "trellis_changes_applied_total", target).is_none(),
+            "transform must not already appear in the registry: {before}"
+        );
+
+        // First "attempt": builds a plan and buffers its observations —
+        // must not touch the registry at all.
+        let plan1 = compute(&pool, &folded).await.expect("compute (attempt 1)");
+        assert_eq!(
+            plan1.transform_observations.len(),
+            1,
+            "compute must buffer exactly one (transform, src_changed) observation: {:?}",
+            plan1.transform_observations
+        );
+        let (observed_transform, observed_src_changed) = &plan1.transform_observations[0];
+        assert_eq!(observed_transform, target);
+        assert!(
+            observed_src_changed.is_some(),
+            "the staged change carried a real src_changed, so it must be buffered as Some"
+        );
+        assert_eq!(
+            plan1.end_to_end_origins.get(target).map(Vec::len),
+            Some(1),
+            "target has no downstream reader, so it is terminal and must buffer one end-to-end \
+             origin"
+        );
+        let after_compute_1 = crate::metrics::Metrics::new().render_prometheus();
+        assert!(
+            metric_value(&after_compute_1, "trellis_changes_applied_total", target).is_none(),
+            "compute (Phase 2, no transaction) must never record into the registry itself: \
+             {after_compute_1}"
+        );
+
+        // Second "attempt": `drain_once`/`drain_many`'s retry loop calls
+        // `compute` again, from scratch, against the exact same `folded`
+        // input, on a version-fence miss or a rolled-back Phase 3 failure.
+        // Simulated here directly (rather than forcing a real, racy
+        // version-fence/serialization failure) — what matters is that
+        // `compute` running twice must not, by itself, double anything.
+        let plan2 = compute(&pool, &folded).await.expect("compute (attempt 2)");
+        let after_compute_2 = crate::metrics::Metrics::new().render_prometheus();
+        assert!(
+            metric_value(&after_compute_2, "trellis_changes_applied_total", target).is_none(),
+            "a second compute() call over the same input must still not record anything: \
+             {after_compute_2}"
+        );
+
+        // Only the winning attempt's plan is ever flushed, exactly once —
+        // mirroring `drain_once`/`drain_many` calling `flush_apply_metrics`
+        // right after their own successful `txn.commit().await?`.
+        flush_apply_metrics(&plan2);
+
+        let after_flush = crate::metrics::Metrics::new().render_prometheus();
+        assert_eq!(
+            metric_value(&after_flush, "trellis_changes_applied_total", target),
+            Some(1),
+            "exactly one throughput increment must land, even though compute() ran twice: \
+             {after_flush}"
+        );
+        assert_eq!(
+            metric_value(
+                &after_flush,
+                "trellis_transform_latency_seconds_count",
+                target
+            ),
+            Some(1),
+            "exactly one per-transform latency observation must land: {after_flush}"
+        );
+        assert_eq!(
+            metric_value(
+                &after_flush,
+                "trellis_end_to_end_latency_seconds_count",
+                target
+            ),
+            Some(1),
+            "exactly one end-to-end latency observation must land (target is terminal): \
+             {after_flush}"
+        );
     }
 }
 
@@ -967,6 +1235,25 @@ pub struct ApplyPlan {
     /// than one to-side change resolves to the same `(from_table,
     /// from_key)` (issues #51/#52's multi-hop gap).
     reverse_recomputes: Vec<(String, String, i32, Option<std::time::SystemTime>)>,
+    /// Epic #49 cross-cutting review fix (issues #51/#52): every
+    /// `(transform, src_changed)` observation [`buffer_transform_apply_metrics`]
+    /// buffered during this `compute` call, in place of recording each one
+    /// immediately — drained by [`flush_apply_metrics`] into
+    /// [`crate::metrics::record_transform_latency`]/
+    /// [`crate::metrics::increment_changes_applied`] only once the batch
+    /// this plan belongs to actually commits, so a plan a retry discards
+    /// (version-fence miss, rolled-back Phase 3 failure) never reaches the
+    /// registry at all. See [`buffer_transform_apply_metrics`]'s doc comment
+    /// for why eager recording here was the bug.
+    transform_observations: Vec<(String, Option<std::time::SystemTime>)>,
+    /// The terminal-transform-only counterpart to `transform_observations`,
+    /// above: `end_to_end_origins` (the accumulator `compute` builds while
+    /// evaluating every source) filtered down, once `downstream_readers` is
+    /// known, to only the targets with no downstream reader of their own —
+    /// mirroring exactly what `compute` used to flush directly into
+    /// [`crate::metrics::record_end_to_end_latency`] at the end of its
+    /// per-target loop. Buffered for the same retry-safety reason.
+    end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>>,
 }
 
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
@@ -1046,11 +1333,19 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     let mut targets: HashMap<String, TargetPlan> = HashMap::new();
     let mut aggregate_targets: HashMap<String, AggregateTargetPlan> = HashMap::new();
     // Issue #52: every `Some(src_changed)` origin timestamp
-    // `record_transform_apply_metrics` sees below, buffered per consuming
-    // target — flushed into `metrics::record_end_to_end_latency` only for
+    // `buffer_transform_apply_metrics` sees below, buffered per consuming
+    // target — filtered into `ApplyPlan::end_to_end_origins` only for
     // targets the `downstream_readers` computation at the end of this
-    // function finds terminal (see that call site's comment).
+    // function finds terminal (see that call site's comment). Not itself
+    // part of `ApplyPlan` — only the terminal-filtered subset is.
     let mut end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>> = HashMap::new();
+    // Epic #49 cross-cutting review fix (issues #51/#52): every
+    // `(transform, src_changed)` pair `buffer_transform_apply_metrics` below
+    // would previously have recorded immediately — now buffered here and
+    // carried out on `ApplyPlan`, flushed post-commit by
+    // [`flush_apply_metrics`]. See `buffer_transform_apply_metrics`'s doc
+    // comment for why eager recording here was the bug.
+    let mut transform_observations: Vec<(String, Option<std::time::SystemTime>)> = Vec::new();
     // Issue #79: deduped across *every* relationship (and every source_key)
     // this whole `compute` call processes, not just within one relationship's
     // `key_hops` — two distinct inbound relationships sharing the same
@@ -1411,10 +1706,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             });
                         }
                     }
-                    record_transform_apply_metrics(
+                    buffer_transform_apply_metrics(
                         &def.def.target,
                         change.src_changed,
                         &mut end_to_end_origins,
+                        &mut transform_observations,
                     );
                 }
                 continue;
@@ -1510,10 +1806,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 &mut regex_cache,
             )?;
             for change in &changes {
-                record_transform_apply_metrics(
+                buffer_transform_apply_metrics(
                     &def.def.target,
                     change.src_changed,
                     &mut end_to_end_origins,
+                    &mut transform_observations,
                 );
             }
         }
@@ -1576,10 +1873,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // downstream target, same as a row-driven change — recorded
             // once per def per truncated source, mirroring the row-driven
             // by_source loop above (issue #51/ADR-0009 decision 5).
-            record_transform_apply_metrics(
+            buffer_transform_apply_metrics(
                 &def.def.target,
                 change.src_changed,
                 &mut end_to_end_origins,
+                &mut transform_observations,
             );
         }
 
@@ -1626,6 +1924,12 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     all_targets.extend(clears.keys());
     all_targets.extend(aggregate_targets.keys());
     all_targets.extend(aggregate_clears.keys());
+    // Epic #49 cross-cutting review fix (issues #51/#52): only the
+    // terminal-filtered subset of `end_to_end_origins` survives into
+    // `ApplyPlan` — flushed post-commit by `flush_apply_metrics`, not
+    // recorded here.
+    let mut terminal_end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>> =
+        HashMap::new();
     for target in all_targets {
         let has_downstream = !catalog::transforms_for_source(pool, target)
             .await?
@@ -1636,16 +1940,12 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // reader of its own — reusing this exact "does anything read
         // `target`" lookup rather than a second one. An intermediate hop
         // (`has_downstream` true) still gets its per-transform latency from
-        // `record_transform_apply_metrics` above; it simply never flushes
-        // here, so its origins in `end_to_end_origins` are dropped once
-        // this function returns.
+        // `buffer_transform_apply_metrics` above; it simply never carries
+        // through to `ApplyPlan::end_to_end_origins`, so its origins in the
+        // local `end_to_end_origins` accumulator are dropped once this
+        // function returns.
         if !has_downstream && let Some(origins) = end_to_end_origins.get(target) {
-            for origin in origins {
-                let latency = std::time::SystemTime::now()
-                    .duration_since(*origin)
-                    .unwrap_or(std::time::Duration::ZERO);
-                crate::metrics::record_end_to_end_latency(target, latency);
-            }
+            terminal_end_to_end_origins.insert(target.clone(), origins.clone());
         }
     }
 
@@ -1667,7 +1967,49 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         poisoned_park,
         applied_keys,
         reverse_recomputes,
+        transform_observations,
+        end_to_end_origins: terminal_end_to_end_origins,
     })
+}
+
+/// Epic #49 cross-cutting review fix (issues #51/#52): flushes `plan`'s
+/// buffered metrics observations — [`ApplyPlan::transform_observations`]
+/// into [`crate::metrics::record_transform_latency`]/
+/// [`crate::metrics::increment_changes_applied`], [`ApplyPlan::end_to_end_origins`]
+/// into [`crate::metrics::record_end_to_end_latency`] — sampling
+/// `SystemTime::now()` fresh, right here, rather than reusing whatever
+/// [`compute`] would have sampled during planning.
+///
+/// Must only be called once a batch's `apply_and_mark_drained`/
+/// `apply_and_mark_drained_many` call has actually committed. `compute`
+/// (Phase 2: no transaction, no locks) can run more than once for the same
+/// folded input — [`drain_once`]/[`drain_many`]'s retry loop calls it again
+/// on a version-fence miss or a rolled-back Phase 3 failure
+/// (`classify_and_retry`'s `VersionFenceMiss`/`Transient` classes) — so a
+/// `plan` built by a losing attempt must never reach this function; only
+/// the plan behind the attempt whose transaction actually commits should.
+/// Both `drain_once` and `drain_many` share this one helper (called right
+/// after their own `txn.commit().await?`) rather than each recording
+/// inline, since both hand it the exact same `&ApplyPlan` shape regardless
+/// of how many segments that attempt coalesced.
+fn flush_apply_metrics(plan: &ApplyPlan) {
+    for (transform, src_changed) in &plan.transform_observations {
+        if let Some(src_changed) = src_changed {
+            let latency = std::time::SystemTime::now()
+                .duration_since(*src_changed)
+                .unwrap_or(std::time::Duration::ZERO);
+            crate::metrics::record_transform_latency(transform, latency);
+        }
+        crate::metrics::increment_changes_applied(transform);
+    }
+    for (transform, origins) in &plan.end_to_end_origins {
+        for origin in origins {
+            let latency = std::time::SystemTime::now()
+                .duration_since(*origin)
+                .unwrap_or(std::time::Duration::ZERO);
+            crate::metrics::record_end_to_end_latency(transform, latency);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1712,7 +2054,7 @@ type ChangedKey = (String, i32, Option<std::time::SystemTime>);
 /// Issue #56/ADR-0009 decision 3: the finest-grained span in the
 /// propagation tree — one per consuming transform per batch, downstream of
 /// fold (`docs/observability.md`'s "Logs and traces" section), the exact
-/// same grouping #51's `record_transform_apply_metrics` observes its
+/// same grouping #51's `buffer_transform_apply_metrics` observes its
 /// per-transform latency histogram from. `transform` (this target's own
 /// name — this crate's one "transform name," per
 /// `ApplyError::ColumnNotPaused`/`DefinitionNotLive`'s own `transform`
@@ -2434,6 +2776,12 @@ pub async fn drain_once(
         match apply_and_mark_drained(&txn, seg_seq, claimed_by, &plan, wake_channel).await {
             Ok(outcome) => {
                 txn.commit().await?;
+                // Epic #49 cross-cutting review fix (issues #51/#52): only
+                // flush `plan`'s buffered metrics now, once this attempt's
+                // transaction has actually committed — never from inside
+                // `compute` itself, which the loop above may have called
+                // more than once for this same `folded` input.
+                flush_apply_metrics(&plan);
                 backoff.reset();
                 return Ok(Some(outcome));
             }
@@ -2595,6 +2943,11 @@ pub async fn drain_many(
         {
             Ok(outcome) => {
                 txn.commit().await?;
+                // Epic #49 cross-cutting review fix (issues #51/#52): see
+                // `drain_once`'s matching call — flush only now that this
+                // attempt's (possibly multi-segment) transaction has
+                // actually committed.
+                flush_apply_metrics(&plan);
                 backoff.reset();
                 return Ok(Some(outcome));
             }
