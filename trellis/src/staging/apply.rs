@@ -152,6 +152,21 @@ pub enum ApplyError {
     /// resume until the definition reaches `Live` closes the window instead
     /// of racing it.
     DefinitionNotLive { transform: String },
+    /// A failure from [`crate::intake::publication`]'s backfill-marker
+    /// machinery (issue #55: [`super::quarantine::resume_transform`]
+    /// re-parking a catch-up marker, or clearing/qualifying its source
+    /// table).
+    Intake(crate::intake::IntakeError),
+    /// [`super::quarantine::resume_transform`] was asked to resume a target
+    /// with no corresponding `transform_definitions` row at all.
+    TransformNotFound { transform: String },
+    /// [`super::quarantine::resume_transform`] was asked to resume a
+    /// target whose current status isn't
+    /// [`crate::defs::model::TransformStatus::Quarantined`] — resuming a
+    /// transform that isn't quarantined is caller error, not a silent
+    /// no-op, mirroring [`ApplyError::ColumnNotPaused`]'s same discipline
+    /// for the column-level tier.
+    TransformNotQuarantined { transform: String },
 }
 
 impl ApplyError {
@@ -187,6 +202,9 @@ impl ApplyError {
             // malformed" (-> Validation) or "nothing by that name exists"
             // (-> NotFound).
             ApplyError::DefinitionNotLive { .. } => ErrorCode::Conflict,
+            ApplyError::Intake(err) => err.code(),
+            ApplyError::TransformNotFound { .. } => ErrorCode::NotFound,
+            ApplyError::TransformNotQuarantined { .. } => ErrorCode::Conflict,
         }
     }
 }
@@ -238,6 +256,15 @@ impl fmt::Display for ApplyError {
                 "'{transform}' is not currently live (it may still be backfilling); resuming a \
                  paused column requires its definition to be live first"
             ),
+            ApplyError::Intake(err) => write!(f, "backfill marker error: {err}"),
+            ApplyError::TransformNotFound { transform } => {
+                write!(f, "no transform named '{transform}' is registered")
+            }
+            ApplyError::TransformNotQuarantined { transform } => write!(
+                f,
+                "'{transform}' is not currently quarantined; resuming it re-runs its full \
+                 backfill, which is only valid from `quarantined`"
+            ),
         }
     }
 }
@@ -253,12 +280,15 @@ impl std::error::Error for ApplyError {
             ApplyError::Backfill(err) => Some(err),
             ApplyError::Db(err) => Some(err),
             ApplyError::Pool(err) => Some(err),
+            ApplyError::Intake(err) => Some(err),
             ApplyError::ClaimLost
             | ApplyError::VersionFenceMiss { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::SourceTableDropped { .. }
             | ApplyError::ColumnNotPaused { .. }
-            | ApplyError::DefinitionNotLive { .. } => None,
+            | ApplyError::DefinitionNotLive { .. }
+            | ApplyError::TransformNotFound { .. }
+            | ApplyError::TransformNotQuarantined { .. } => None,
         }
     }
 }
@@ -296,6 +326,12 @@ impl From<ValidationError> for ApplyError {
 impl From<crate::defs::backfill::BackfillError> for ApplyError {
     fn from(err: crate::defs::backfill::BackfillError) -> Self {
         ApplyError::Backfill(err)
+    }
+}
+
+impl From<crate::intake::IntakeError> for ApplyError {
+    fn from(err: crate::intake::IntakeError) -> Self {
+        ApplyError::Intake(err)
     }
 }
 
@@ -725,6 +761,73 @@ fn value_type_from_pg(pg_type: &str) -> ValueType {
 // Phase 2: compute
 // ---------------------------------------------------------------------
 
+/// Issue #51/ADR-0009 decision 5: buffers one applied change's per-transform
+/// hop latency/throughput observation, from data [`compute`]'s by-source
+/// grouping already has in hand — no new I/O, no new join. `transform` is
+/// the consuming definition's target table (this crate's one "transform
+/// name," per `ApplyError::ColumnNotPaused`/`DefinitionNotLive`'s own
+/// `transform` fields). `src_changed` is [`FoldedChange::src_changed`]:
+/// `Some` for a change that traces back to a real source commit (the
+/// histogram's eventual `.observe()` value is `now - src_changed`, `now`
+/// sampled fresh at flush time — see [`flush_apply_metrics`]), `None` for a
+/// bare recompute trigger with no origin timestamp to measure against —
+/// such a change still counts toward throughput, just not latency.
+///
+/// **Buffers, does not record** (the epic #49 cross-cutting review's fix,
+/// closing a gap in issues #51/#52): `compute` (Phase 2) has no transaction
+/// and no locks, and [`drain_once`]/[`drain_many`]'s "reload, recompute,
+/// retry" loop calls it again, from scratch, on the very same `folded`
+/// input, for a version-fence miss or a rolled-back Phase 3 failure —
+/// [`classify_and_retry`]'s `VersionFenceMiss`/`Transient` classes both
+/// return "retry unchanged." Recording straight into the global registry
+/// here, as this function used to, meant a change that took N attempts to
+/// actually land got counted into `trellis_changes_applied_total` and both
+/// latency histograms N times instead of once, worst exactly under the
+/// lock-contention/version-fence-race conditions where accurate throughput
+/// numbers matter most. Buffering into `transform_observations` (one entry
+/// per call, mirroring what used to be recorded immediately) and flushing
+/// only once, after the winning attempt's transaction actually commits
+/// (`flush_apply_metrics`, called from `drain_once`/`drain_many` right after
+/// their own `txn.commit().await?`), fixes both the double-counting and the
+/// secondary issue of latency being measured against a pre-commit
+/// timestamp: `flush_apply_metrics` samples `SystemTime::now()` itself, at
+/// commit time, rather than reusing whatever this function would have
+/// sampled during planning.
+///
+/// Called once per applied change per consuming definition — both the 1-1
+/// write/delete dispatch and the aggregate accumulate path below call this
+/// at the point each of their per-change loops already visits every folded
+/// change, so this reuses grouping/iteration `compute` performs regardless
+/// of whether metrics are recorded, per the ADR's "effectively free"
+/// framing.
+///
+/// Issue #52: every `Some(src_changed)` this function sees is also buffered
+/// into `end_to_end_origins`, keyed by `transform` — one origin timestamp
+/// per applied change, same as the per-transform histogram observes. This
+/// is *not* itself gated on terminal-ness: at the point every call site
+/// below runs, `compute` hasn't yet determined which targets in this batch
+/// are terminal (that's [`ApplyPlan::downstream_readers`], computed once,
+/// after every source's changes have been evaluated — see the end of
+/// [`compute`]). Buffering here and filtering to only the terminal targets'
+/// entries there reuses that one dedup'd downstream-reader lookup instead of
+/// adding a second one per change; the filtered result is itself stored on
+/// [`ApplyPlan`] (not flushed) for the same retry-safety reason as
+/// `transform_observations`.
+fn buffer_transform_apply_metrics(
+    transform: &str,
+    src_changed: Option<std::time::SystemTime>,
+    end_to_end_origins: &mut HashMap<String, Vec<std::time::SystemTime>>,
+    transform_observations: &mut Vec<(String, Option<std::time::SystemTime>)>,
+) {
+    if let Some(src_changed) = src_changed {
+        end_to_end_origins
+            .entry(transform.to_string())
+            .or_default()
+            .push(src_changed);
+    }
+    transform_observations.push((transform.to_string(), src_changed));
+}
+
 /// One key's write into a target table: the evaluated calculated-field
 /// values, rendered to their canonical text form (aligned with the owning
 /// [`TargetPlan::field_names`]/[`TargetPlan::field_types`]) plus the
@@ -736,19 +839,28 @@ fn value_type_from_pg(pg_type: &str) -> ValueType {
 /// cast round-trips exactly (numeric's decimal text, `Display for bool`'s
 /// `true`/`false`, text values verbatim) — matching this module's existing
 /// "text in, typed cast in SQL" convention for every other value it writes.
+///
+/// `src_changed` (issues #51/#52's multi-hop gap) is the triggering
+/// [`FoldedChange::src_changed`], carried forward the same way `hop_gen` is
+/// — so a downstream `Recompute` row this write's own propagation stages
+/// (see [`apply_and_mark_drained_many`]'s step 4) keeps a real origin
+/// instead of losing it at this hop.
 #[derive(Debug, Clone)]
 struct TargetWrite {
     pk_text: String,
     values: Vec<Option<String>>,
     hop_gen: i32,
+    src_changed: Option<std::time::SystemTime>,
 }
 
 /// One key's deletion from a target table (the folded change had no
-/// `new_image`).
+/// `new_image`). `src_changed` plays the same forward-carrying role as
+/// [`TargetWrite::src_changed`].
 #[derive(Debug, Clone)]
 struct TargetDelete {
     pk_text: String,
     hop_gen: i32,
+    src_changed: Option<std::time::SystemTime>,
 }
 
 /// Everything Phase 3 needs to write one target table: its primary key
@@ -788,6 +900,12 @@ struct TargetPlan {
 /// own `hop_gen`, carried forward so keys the clear physically removes
 /// propagate downstream at `hop_gen + 1`, exactly like any other
 /// physically-changed key.
+///
+/// `src_changed` is the triggering truncate sentinel's own `src_changed`
+/// (issues #51/#52's multi-hop gap), fan-in tie-broken by `min` across
+/// however many truncated sources resolve to this same target — see
+/// [`earliest_src_changed`]'s doc comment for why `min`, not `max`, is the
+/// right merge here.
 #[derive(Debug, Clone)]
 struct ClearPlan {
     pk: PrimaryKeyColumn,
@@ -796,6 +914,7 @@ struct ClearPlan {
     /// fully-qualified target identity this clear's `DELETE FROM` must bind,
     /// rather than the bare map key it's stored under.
     qualified_target: String,
+    src_changed: Option<std::time::SystemTime>,
 }
 
 /// The aggregate-target counterpart to [`ClearPlan`] — see
@@ -809,6 +928,326 @@ struct ClearPlan {
 struct AggregateClearPlan {
     hop_gen: i32,
     qualified_target: String,
+}
+
+/// The fan-in tie-break for [`StagedChange::Recompute::src_changed`]
+/// (issues #51/#52's multi-hop gap): when more than one to-side change in a
+/// batch feeds the same propagated key (forward propagation's `changed` map,
+/// or reverse recompute's `(from_table, from_key)` accumulator), the
+/// **earliest** (`min`) of their origins wins — the oldest/earliest
+/// source-commit timestamp captures the slowest straggler in the group,
+/// matching the p99/stall-visibility intent these latency histograms exist
+/// for. This is deliberately the opposite of `hop_gen`'s own fan-in
+/// tie-break (`max`, propagation depth: the deepest contributor sets the
+/// bound) — same shape of merge, different direction, because the two
+/// numbers answer different questions ("how stale is the staler input" vs.
+/// "how deep is the deepest input").
+///
+/// `None` never wins over a real `Some`: an origin-less contributor (a
+/// backfill-enumerated recompute, or any other change with no traceable
+/// source commit) doesn't get to blank out a known origin its fan-in sibling
+/// carried — it simply contributes nothing to the merge. Only when *every*
+/// contributor is origin-less does the result stay `None`.
+fn earliest_src_changed(
+    a: Option<std::time::SystemTime>,
+    b: Option<std::time::SystemTime>,
+) -> Option<std::time::SystemTime> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(t), None) | (None, Some(t)) => Some(t),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+    use tokio_postgres::NoTls;
+    use tokio_postgres::types::PgLsn;
+
+    #[test]
+    fn earliest_src_changed_picks_the_lesser_of_two_known_origins() {
+        let earlier = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let later = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        assert_eq!(
+            earliest_src_changed(Some(later), Some(earlier)),
+            Some(earlier),
+            "the earlier of two known origins must win, regardless of argument order"
+        );
+        assert_eq!(
+            earliest_src_changed(Some(earlier), Some(later)),
+            Some(earlier)
+        );
+    }
+
+    #[test]
+    fn earliest_src_changed_never_lets_a_none_beat_a_known_origin() {
+        let known = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        assert_eq!(
+            earliest_src_changed(Some(known), None),
+            Some(known),
+            "an origin-less fan-in sibling must not blank out a known origin"
+        );
+        assert_eq!(earliest_src_changed(None, Some(known)), Some(known));
+    }
+
+    #[test]
+    fn earliest_src_changed_of_two_unknowns_stays_unknown() {
+        assert_eq!(earliest_src_changed(None, None), None);
+    }
+
+    /// The exact numeric value of a Prometheus exposition line whose metric
+    /// name is `metric` (matched with a trailing `{` so `_count`/`_sum`/
+    /// `_bucket`/plain-counter variants never collide with one another) and
+    /// which carries a `transform="..."` label matching `transform` —
+    /// `None` if no such line exists yet. Used below to assert an *exact*
+    /// count (not just presence, which `metrics.rs`'s own tests already
+    /// cover), since proving this module's fix means proving a count that
+    /// could have been inflated by a retry is not.
+    fn metric_value(rendered: &str, metric: &str, transform: &str) -> Option<u64> {
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!("{metric}{{"))
+                    && line.contains(&format!("transform=\"{transform}\""))
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v as u64)
+    }
+
+    /// Epic #49's final cross-cutting review found that [`compute`] (Phase
+    /// 2: no transaction, no locks) used to record straight into the global
+    /// metrics registry — but [`drain_once`]/[`drain_many`]'s "reload,
+    /// recompute, retry" loop calls `compute` again, unchanged, on a
+    /// version-fence miss or a rolled-back Phase 3 failure, so a change that
+    /// took more than one attempt to actually land got double-(or worse-)
+    /// counted into `trellis_changes_applied_total` and both latency
+    /// histograms. The fix: `compute` only *buffers* observations onto the
+    /// [`ApplyPlan`] it returns (`transform_observations`/`end_to_end_origins`),
+    /// and only [`flush_apply_metrics`] — called by `drain_once`/`drain_many`
+    /// right after their own `txn.commit().await?` succeeds — actually
+    /// records them.
+    ///
+    /// This proves both halves directly: `compute` run twice against the
+    /// exact same folded input (standing in for `drain_once`'s retry loop
+    /// without needing to force a real, racy version-fence/serialization
+    /// failure) never touches the registry either time, and a single
+    /// `flush_apply_metrics` call on the winning attempt's plan records
+    /// exactly one observation per metric — not two, even though `compute`
+    /// itself ran twice.
+    #[tokio::test]
+    async fn compute_only_buffers_metrics_and_a_single_flush_records_them_exactly_once() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "set search_path to {}, public",
+                crate::config::DEFAULT_SCHEMA
+            ))
+            .await
+            .expect("set search_path");
+
+        // `testkit::TestDatabase::pool` is `trellis::pool::Pool` from
+        // testkit's point of view — a *different* (if structurally
+        // identical) type from this crate's own `crate::pool::Pool` when
+        // this module is compiled as `trellis`'s own `--lib` test binary
+        // (testkit depends on the published `trellis` crate, not on "this"
+        // compilation of it). Every function this test calls below
+        // (`compute`, `crate::defs::create_definition`, ...) takes this
+        // crate's own `Pool`, so a fresh one is built here, straight from
+        // the same DSN `testkit` already migrated — Postgres itself doesn't
+        // care which Rust type did the connecting.
+        let pool_config =
+            crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = crate::pool::Pool::new(&pool_config).expect("build a same-crate pool");
+
+        let source = "apply_rs_metrics_buffer_test_orders";
+        let target = "apply_rs_metrics_buffer_test_totals";
+
+        // `source` starts empty — its one row arrives below, after the
+        // definition exists, purely as this test's own staged CDC event.
+        // That keeps the definition's own initial backfill (which
+        // enumerates whatever `source` holds at definition time) from
+        // separately re-discovering and writing the same row, which would
+        // otherwise land a second, backfill-driven observation alongside
+        // this test's hand-staged one — mirroring `apply.rs`'s own
+        // `drain_matches_the_oracle_across_an_insert_update_and_delete`
+        // convention.
+        client
+            .batch_execute(&format!(
+                "create table {source} (id integer primary key, price numeric, tax numeric)"
+            ))
+            .await
+            .expect("seed source table");
+
+        let source_columns: HashMap<String, ValueType> = [
+            ("id".to_string(), ValueType::Numeric),
+            ("price".to_string(), ValueType::Numeric),
+            ("tax".to_string(), ValueType::Numeric),
+        ]
+        .into_iter()
+        .collect();
+        let definition = crate::defs::create_definition(
+            &pool,
+            &format!("TRANSFORM {target} FROM {source} SELECT price + tax AS total"),
+            &source_columns,
+        )
+        .await
+        .expect("create definition");
+        let pk = crate::defs::source_primary_key(&pool, source)
+            .await
+            .expect("introspect source primary key");
+        crate::defs::create_target_table(
+            &pool,
+            &definition.def,
+            "public",
+            &pk,
+            &source_columns,
+            source,
+        )
+        .await
+        .expect("create target table");
+
+        client
+            .execute(
+                &format!("insert into {source} (id, price, tax) values (1, 10.00, 1.50)"),
+                &[],
+            )
+            .await
+            .expect("seed source rows after the definition exists");
+
+        // Stage one CDC row with a real `src_changed`, so both the
+        // per-transform and end-to-end histograms have something to
+        // observe, not just the throughput counter.
+        client
+            .execute(
+                "insert into seg_0 (src_table, key, op, lsn, old_image, new_image, hop_gen, \
+                 src_changed) \
+                 values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0, now())",
+                &[
+                    &source,
+                    &"1",
+                    &"insert",
+                    &PgLsn::from(1u64),
+                    &None::<String>,
+                    &Some(r#"{"price":"10.00","tax":"1.50"}"#.to_string()),
+                ],
+            )
+            .await
+            .expect("stage cdc row");
+
+        let mut seal_client = client;
+        let seal_outcome = crate::staging::seal::seal_phase1(&mut seal_client)
+            .await
+            .expect("seal phase 1");
+        crate::staging::seal::seal_phase2(&seal_client, seal_outcome.sealed_seg_seq)
+            .await
+            .expect("seal phase 2");
+        let seg_seq = seal_outcome.sealed_seg_seq;
+
+        let mut phase1_client = pool.get().await.expect("connection");
+        let txn = phase1_client.transaction().await.expect("begin phase 1");
+        claim::claim(&*txn, seg_seq, "worker", 1)
+            .await
+            .expect("claim");
+        let filter = claim::owned_bucket_filter(&*txn, seg_seq, "worker")
+            .await
+            .expect("owned_bucket_filter");
+        let folded = fold::fold(&txn, seg_seq, filter).await.expect("fold");
+        txn.commit().await.expect("commit phase 1");
+
+        // Before any `compute` call: the registry must not already mention
+        // this test's distinctively-named transform (guards against a
+        // false pass if some later assertion's "still absent" check were
+        // vacuously true for an unrelated reason).
+        let before = crate::metrics::Metrics::new().render_prometheus();
+        assert!(
+            metric_value(&before, "trellis_changes_applied_total", target).is_none(),
+            "transform must not already appear in the registry: {before}"
+        );
+
+        // First "attempt": builds a plan and buffers its observations —
+        // must not touch the registry at all.
+        let plan1 = compute(&pool, &folded).await.expect("compute (attempt 1)");
+        assert_eq!(
+            plan1.transform_observations.len(),
+            1,
+            "compute must buffer exactly one (transform, src_changed) observation: {:?}",
+            plan1.transform_observations
+        );
+        let (observed_transform, observed_src_changed) = &plan1.transform_observations[0];
+        assert_eq!(observed_transform, target);
+        assert!(
+            observed_src_changed.is_some(),
+            "the staged change carried a real src_changed, so it must be buffered as Some"
+        );
+        assert_eq!(
+            plan1.end_to_end_origins.get(target).map(Vec::len),
+            Some(1),
+            "target has no downstream reader, so it is terminal and must buffer one end-to-end \
+             origin"
+        );
+        let after_compute_1 = crate::metrics::Metrics::new().render_prometheus();
+        assert!(
+            metric_value(&after_compute_1, "trellis_changes_applied_total", target).is_none(),
+            "compute (Phase 2, no transaction) must never record into the registry itself: \
+             {after_compute_1}"
+        );
+
+        // Second "attempt": `drain_once`/`drain_many`'s retry loop calls
+        // `compute` again, from scratch, against the exact same `folded`
+        // input, on a version-fence miss or a rolled-back Phase 3 failure.
+        // Simulated here directly (rather than forcing a real, racy
+        // version-fence/serialization failure) — what matters is that
+        // `compute` running twice must not, by itself, double anything.
+        let plan2 = compute(&pool, &folded).await.expect("compute (attempt 2)");
+        let after_compute_2 = crate::metrics::Metrics::new().render_prometheus();
+        assert!(
+            metric_value(&after_compute_2, "trellis_changes_applied_total", target).is_none(),
+            "a second compute() call over the same input must still not record anything: \
+             {after_compute_2}"
+        );
+
+        // Only the winning attempt's plan is ever flushed, exactly once —
+        // mirroring `drain_once`/`drain_many` calling `flush_apply_metrics`
+        // right after their own successful `txn.commit().await?`.
+        flush_apply_metrics(&plan2);
+
+        let after_flush = crate::metrics::Metrics::new().render_prometheus();
+        assert_eq!(
+            metric_value(&after_flush, "trellis_changes_applied_total", target),
+            Some(1),
+            "exactly one throughput increment must land, even though compute() ran twice: \
+             {after_flush}"
+        );
+        assert_eq!(
+            metric_value(
+                &after_flush,
+                "trellis_transform_latency_seconds_count",
+                target
+            ),
+            Some(1),
+            "exactly one per-transform latency observation must land: {after_flush}"
+        );
+        assert_eq!(
+            metric_value(
+                &after_flush,
+                "trellis_end_to_end_latency_seconds_count",
+                target
+            ),
+            Some(1),
+            "exactly one end-to-end latency observation must land (target is terminal): \
+             {after_flush}"
+        );
+    }
 }
 
 /// Phase 2's output: an in-memory plan Phase 3 applies inside one
@@ -853,23 +1292,25 @@ pub struct ApplyPlan {
     /// out of scope for this issue (see `staging::apply_aggregate`'s module
     /// doc comment for the rest of what this issue does cover).
     ///
-    /// Investigated (issue #11 review): could a definition actually be
-    /// *created* reading from an aggregate target today, making this skip a
-    /// live correctness gap rather than a moot one? Yes — `defs::validate`/
-    /// `create_definition` impose no primary-key-shape check at
-    /// definition-creation time, so nothing stops such a definition from
-    /// being saved. But `compute()`'s Phase 2 unconditionally calls
-    /// `ddl::source_primary_key` for every distinct source table a batch's
-    /// folded changes touch, *before* any per-definition dispatch — so the
-    /// very first drain attempt against that source fails loudly with
-    /// `DdlError::CompositePrimaryKeyUnsupported` (surfaced as
-    /// [`ApplyError::Ddl`]), before the encoded composite group-key text
-    /// could ever be misread as a single-column key. The ordinary
-    /// aggregate-write path below (the "3b" step) stages downstream
-    /// Recompute rows keyed the same encoded way for exactly the same
-    /// reason: both paths are consistent in outcome (fail loud, never
-    /// silently misuse the key) regardless of which one a batch takes, so
-    /// this skip is not a live gap today.
+    /// Investigated (issue #11 review, corrected during #51/#52 review):
+    /// could a definition actually be *created* reading from an aggregate
+    /// target today, making this skip a live correctness gap rather than a
+    /// moot one? Yes, and the originally-assumed safety net does **not**
+    /// reliably prevent it: `defs::validate`/`create_definition` impose no
+    /// primary-key-shape check at definition-creation time, and
+    /// `ddl::source_primary_key` only rejects a source with *more than one*
+    /// PK column — a single-column `GROUP BY` (the common case) produces a
+    /// genuinely single-column aggregate-target PK, so
+    /// `DdlError::CompositePrimaryKeyUnsupported` never fires for it. The
+    /// encoded composite group-key text (`derive_group_key`'s
+    /// `"{len}:{value}"` shape, `apply_aggregate.rs`) reaches a real
+    /// evaluator and gets misread as a raw PK value — confirmed to crash
+    /// for a numeric-typed group column, and plausibly silently corrupts
+    /// downstream rows for a text-typed one. **Tracked as
+    /// [#103](https://github.com/salesforce-misc/trellis/issues/103)**, a
+    /// pre-existing bug independent of #51/#52's observability work. Fixing
+    /// it is out of scope here; this doc comment previously (incorrectly)
+    /// described the gap as moot for every group-by shape — it is not.
     aggregate_clears: HashMap<String, AggregateClearPlan>,
     /// Issue #16: the (non-truncate) folded records whose `(src_table,
     /// key)` is already in the `poison` marker table — excluded from every
@@ -894,7 +1335,30 @@ pub struct ApplyPlan {
     /// reusing the same async staging/apply/fence pipeline forward propagation
     /// uses rather than any bespoke persisted reverse index. `hop_gen` is the
     /// triggering related-row change's own `hop_gen + 1`, hop-bounded at emit.
-    reverse_recomputes: Vec<(String, String, i32)>,
+    /// The trailing `Option<SystemTime>` is the triggering change's
+    /// `src_changed`, fan-in tie-broken by [`earliest_src_changed`] when more
+    /// than one to-side change resolves to the same `(from_table,
+    /// from_key)` (issues #51/#52's multi-hop gap).
+    reverse_recomputes: Vec<(String, String, i32, Option<std::time::SystemTime>)>,
+    /// Epic #49 cross-cutting review fix (issues #51/#52): every
+    /// `(transform, src_changed)` observation [`buffer_transform_apply_metrics`]
+    /// buffered during this `compute` call, in place of recording each one
+    /// immediately — drained by [`flush_apply_metrics`] into
+    /// [`crate::metrics::record_transform_latency`]/
+    /// [`crate::metrics::increment_changes_applied`] only once the batch
+    /// this plan belongs to actually commits, so a plan a retry discards
+    /// (version-fence miss, rolled-back Phase 3 failure) never reaches the
+    /// registry at all. See [`buffer_transform_apply_metrics`]'s doc comment
+    /// for why eager recording here was the bug.
+    transform_observations: Vec<(String, Option<std::time::SystemTime>)>,
+    /// The terminal-transform-only counterpart to `transform_observations`,
+    /// above: `end_to_end_origins` (the accumulator `compute` builds while
+    /// evaluating every source) filtered down, once `downstream_readers` is
+    /// known, to only the targets with no downstream reader of their own —
+    /// mirroring exactly what `compute` used to flush directly into
+    /// [`crate::metrics::record_end_to_end_latency`] at the end of its
+    /// per-target loop. Buffered for the same retry-safety reason.
+    end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>>,
 }
 
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
@@ -905,6 +1369,26 @@ pub struct ApplyPlan {
 /// Reloads the catalog fresh on every call, including retries: this is
 /// what makes [`drain_once`]'s retry-on-fence-miss loop "reload, recompute"
 /// rather than needing any separate invalidation path.
+///
+/// Issue #56/ADR-0009 decision 3: this span is the "hop" half of the
+/// source-commit → hop → hop → apply tree — one span per compute pass over
+/// a folded batch, with a per-source-table [`tracing::debug!`] event inside
+/// the loop below (not a nested span: the loop body's accumulators
+/// (`targets`, `versions`, `end_to_end_origins`, ...) are threaded through
+/// by mutable reference across many `.await` points, and a held span guard
+/// across those would make this function's future non-`Send` for no benefit
+/// — an event carries the same `src_table`/`changes` information without
+/// that cost). [`apply_target`] (Phase 3) is this tree's next, more
+/// fine-grained span, one per consuming transform.
+#[tracing::instrument(
+    name = "staging.compute",
+    skip(pool, folded),
+    fields(
+        folded = folded.len(),
+        poisoned = tracing::field::Empty,
+        sources = tracing::field::Empty,
+    )
+)]
 pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, ApplyError> {
     // Issue #16: exclude already-poisoned keys before anything else touches
     // them — the fold excludes a poisoned key globally, not just from this
@@ -917,6 +1401,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         .map(|c| (c.src_table.as_str(), c.key.as_str()))
         .collect();
     let poisoned = quarantine::poisoned_keys_among(pool, &candidates).await?;
+    tracing::Span::current().record("poisoned", poisoned.len());
 
     let mut by_source: HashMap<&str, Vec<&FoldedChange>> = HashMap::new();
     // Truncate sentinels (issue #60) never enter the keyed by-source
@@ -941,10 +1426,31 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             .or_default()
             .push(change);
     }
+    if !poisoned_park.is_empty() {
+        tracing::warn!(
+            excluded = poisoned_park.len(),
+            "batch excludes already-poisoned keys, parking this batch's own contribution"
+        );
+    }
+    tracing::Span::current().record("sources", by_source.len());
 
     let mut versions: HashMap<String, Option<i64>> = HashMap::new();
     let mut targets: HashMap<String, TargetPlan> = HashMap::new();
     let mut aggregate_targets: HashMap<String, AggregateTargetPlan> = HashMap::new();
+    // Issue #52: every `Some(src_changed)` origin timestamp
+    // `buffer_transform_apply_metrics` sees below, buffered per consuming
+    // target — filtered into `ApplyPlan::end_to_end_origins` only for
+    // targets the `downstream_readers` computation at the end of this
+    // function finds terminal (see that call site's comment). Not itself
+    // part of `ApplyPlan` — only the terminal-filtered subset is.
+    let mut end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>> = HashMap::new();
+    // Epic #49 cross-cutting review fix (issues #51/#52): every
+    // `(transform, src_changed)` pair `buffer_transform_apply_metrics` below
+    // would previously have recorded immediately — now buffered here and
+    // carried out on `ApplyPlan`, flushed post-commit by
+    // [`flush_apply_metrics`]. See `buffer_transform_apply_metrics`'s doc
+    // comment for why eager recording here was the bug.
+    let mut transform_observations: Vec<(String, Option<std::time::SystemTime>)> = Vec::new();
     // Issue #79: deduped across *every* relationship (and every source_key)
     // this whole `compute` call processes, not just within one relationship's
     // `key_hops` — two distinct inbound relationships sharing the same
@@ -955,9 +1461,19 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // ever needed, at the highest hop_gen any contributing relationship
     // required. Keyed by `(from_table, from_key)`; drained into the
     // `Vec` shape `ApplyPlan` expects right before it's constructed below.
-    let mut reverse_recomputes: HashMap<(String, String), i32> = HashMap::new();
+    // The `Option<SystemTime>` half is `src_changed` (issues #51/#52's
+    // multi-hop gap), fan-in tie-broken by `earliest_src_changed` (min) —
+    // deliberately the opposite merge direction from `hop_gen`'s `max`, see
+    // that function's doc comment.
+    let mut reverse_recomputes: HashMap<(String, String), (i32, Option<std::time::SystemTime>)> =
+        HashMap::new();
 
     for (source_key, changes) in by_source {
+        tracing::debug!(
+            src_table = %source_key,
+            changes = changes.len(),
+            "evaluating a source table's folded changes"
+        );
         let version = catalog::source_table_version(pool, source_key).await?;
         versions.insert(source_key.to_string(), version);
 
@@ -1111,8 +1627,13 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         for rel in &inbound_rels {
             // Join-key text -> the max `hop_gen` of the to-side changes that
             // touched it (a re-parent update touches both its old and new
-            // key; a delete carries only its pre-image).
+            // key; a delete carries only its pre-image), and (issues
+            // #51/#52's multi-hop gap) the *earliest* (`min`) `src_changed`
+            // among those same changes — see `earliest_src_changed`'s doc
+            // comment for why the two use opposite merge directions.
             let mut key_hops: HashMap<String, i32> = HashMap::new();
+            let mut key_src_changed: HashMap<String, Option<std::time::SystemTime>> =
+                HashMap::new();
             for (i, change) in changes.iter().enumerate() {
                 let mut note = |value: &Option<String>, hop: i32| {
                     if let Some(text) = value {
@@ -1120,6 +1641,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             .entry(text.clone())
                             .and_modify(|h| *h = (*h).max(hop))
                             .or_insert(hop);
+                        key_src_changed
+                            .entry(text.clone())
+                            .and_modify(|sc| *sc = earliest_src_changed(*sc, change.src_changed))
+                            .or_insert(change.src_changed);
                     }
                 };
                 if let Some(row) = &rows[i] {
@@ -1144,10 +1669,14 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             .await?;
             for (from_key, join_text) in matches {
                 let hop = key_hops.get(&join_text).copied().unwrap_or(0) + 1;
+                let src_changed = key_src_changed.get(&join_text).copied().flatten();
                 reverse_recomputes
                     .entry((rel.def.from_table.clone(), from_key))
-                    .and_modify(|h| *h = (*h).max(hop))
-                    .or_insert(hop);
+                    .and_modify(|(h, sc)| {
+                        *h = (*h).max(hop);
+                        *sc = earliest_src_changed(*sc, src_changed);
+                    })
+                    .or_insert((hop, src_changed));
             }
         }
 
@@ -1321,15 +1850,23 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                                 pk_text: change.key.clone(),
                                 values,
                                 hop_gen: change.hop_gen,
+                                src_changed: change.src_changed,
                             });
                         }
                         None => {
                             plan.deletes.push(TargetDelete {
                                 pk_text: change.key.clone(),
                                 hop_gen: change.hop_gen,
+                                src_changed: change.src_changed,
                             });
                         }
                     }
+                    buffer_transform_apply_metrics(
+                        &def.def.target,
+                        change.src_changed,
+                        &mut end_to_end_origins,
+                        &mut transform_observations,
+                    );
                 }
                 continue;
             };
@@ -1424,6 +1961,14 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 &def.source_columns,
                 &mut regex_cache,
             )?;
+            for change in &changes {
+                buffer_transform_apply_metrics(
+                    &def.def.target,
+                    change.src_changed,
+                    &mut end_to_end_origins,
+                    &mut transform_observations,
+                );
+            }
         }
     }
 
@@ -1485,15 +2030,28 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     clears
                         .entry(def.def.target.clone())
                         .and_modify(|existing| {
-                            existing.hop_gen = existing.hop_gen.max(change.hop_gen)
+                            existing.hop_gen = existing.hop_gen.max(change.hop_gen);
+                            existing.src_changed =
+                                earliest_src_changed(existing.src_changed, change.src_changed);
                         })
                         .or_insert(ClearPlan {
                             pk: pk.clone(),
                             hop_gen: change.hop_gen,
                             qualified_target: def.target_table.clone(),
+                            src_changed: change.src_changed,
                         });
                 }
             }
+            // A TRUNCATE is a genuine applied change to every direct
+            // downstream target, same as a row-driven change — recorded
+            // once per def per truncated source, mirroring the row-driven
+            // by_source loop above (issue #51/ADR-0009 decision 5).
+            buffer_transform_apply_metrics(
+                &def.def.target,
+                change.src_changed,
+                &mut end_to_end_origins,
+                &mut transform_observations,
+            );
         }
 
         // Issue #98: a TRUNCATE clears definitions reading this table
@@ -1525,8 +2083,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             for from_key in from_keys {
                 reverse_recomputes
                     .entry((rel.def.from_table.clone(), from_key))
-                    .and_modify(|h| *h = (*h).max(hop))
-                    .or_insert(hop);
+                    .and_modify(|(h, sc)| {
+                        *h = (*h).max(hop);
+                        *sc = earliest_src_changed(*sc, change.src_changed);
+                    })
+                    .or_insert((hop, change.src_changed));
             }
         }
     }
@@ -1536,6 +2097,12 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     all_targets.extend(clears.keys());
     all_targets.extend(aggregate_targets.keys());
     all_targets.extend(aggregate_clears.keys());
+    // Epic #49 cross-cutting review fix (issues #51/#52): only the
+    // terminal-filtered subset of `end_to_end_origins` survives into
+    // `ApplyPlan` — flushed post-commit by `flush_apply_metrics`, not
+    // recorded here.
+    let mut terminal_end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>> =
+        HashMap::new();
     for target in all_targets {
         // `target` is bare (`def.def.target`) — `schema_nodes` now keys on
         // qualified identity (issue #74, ADR-0007), so a bare lookup here
@@ -1550,12 +2117,27 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 .await?
                 .is_empty();
         downstream_readers.insert(target.clone(), has_downstream);
+        // Issue #52/ADR-0009 decision 2: end-to-end latency is only ever
+        // recorded for a *terminal* transform — one with no downstream
+        // reader of its own — reusing this exact "does anything read
+        // `target`" lookup rather than a second one. An intermediate hop
+        // (`has_downstream` true) still gets its per-transform latency from
+        // `buffer_transform_apply_metrics` above; it simply never carries
+        // through to `ApplyPlan::end_to_end_origins`, so its origins in the
+        // local `end_to_end_origins` accumulator are dropped once this
+        // function returns.
+        if !has_downstream && let Some(origins) = end_to_end_origins.get(target) {
+            terminal_end_to_end_origins.insert(target.clone(), origins.clone());
+        }
     }
 
-    let reverse_recomputes: Vec<(String, String, i32)> = reverse_recomputes
-        .into_iter()
-        .map(|((from_table, from_key), hop)| (from_table, from_key, hop))
-        .collect();
+    let reverse_recomputes: Vec<(String, String, i32, Option<std::time::SystemTime>)> =
+        reverse_recomputes
+            .into_iter()
+            .map(|((from_table, from_key), (hop, src_changed))| {
+                (from_table, from_key, hop, src_changed)
+            })
+            .collect();
 
     Ok(ApplyPlan {
         versions,
@@ -1567,7 +2149,49 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         poisoned_park,
         applied_keys,
         reverse_recomputes,
+        transform_observations,
+        end_to_end_origins: terminal_end_to_end_origins,
     })
+}
+
+/// Epic #49 cross-cutting review fix (issues #51/#52): flushes `plan`'s
+/// buffered metrics observations — [`ApplyPlan::transform_observations`]
+/// into [`crate::metrics::record_transform_latency`]/
+/// [`crate::metrics::increment_changes_applied`], [`ApplyPlan::end_to_end_origins`]
+/// into [`crate::metrics::record_end_to_end_latency`] — sampling
+/// `SystemTime::now()` fresh, right here, rather than reusing whatever
+/// [`compute`] would have sampled during planning.
+///
+/// Must only be called once a batch's `apply_and_mark_drained`/
+/// `apply_and_mark_drained_many` call has actually committed. `compute`
+/// (Phase 2: no transaction, no locks) can run more than once for the same
+/// folded input — [`drain_once`]/[`drain_many`]'s retry loop calls it again
+/// on a version-fence miss or a rolled-back Phase 3 failure
+/// (`classify_and_retry`'s `VersionFenceMiss`/`Transient` classes) — so a
+/// `plan` built by a losing attempt must never reach this function; only
+/// the plan behind the attempt whose transaction actually commits should.
+/// Both `drain_once` and `drain_many` share this one helper (called right
+/// after their own `txn.commit().await?`) rather than each recording
+/// inline, since both hand it the exact same `&ApplyPlan` shape regardless
+/// of how many segments that attempt coalesced.
+fn flush_apply_metrics(plan: &ApplyPlan) {
+    for (transform, src_changed) in &plan.transform_observations {
+        if let Some(src_changed) = src_changed {
+            let latency = std::time::SystemTime::now()
+                .duration_since(*src_changed)
+                .unwrap_or(std::time::Duration::ZERO);
+            crate::metrics::record_transform_latency(transform, latency);
+        }
+        crate::metrics::increment_changes_applied(transform);
+    }
+    for (transform, origins) in &plan.end_to_end_origins {
+        for origin in origins {
+            let latency = std::time::SystemTime::now()
+                .duration_since(*origin)
+                .unwrap_or(std::time::Duration::ZERO);
+            crate::metrics::record_end_to_end_latency(transform, latency);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1582,6 +2206,14 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
 /// `cols_per_row` to get the actual chunk size. 60000 leaves headroom below
 /// 65535 regardless of column count.
 const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
+
+/// One physically-touched target key, as [`apply_and_mark_drained_many`]'s
+/// `changed` accumulator and downstream-propagation step track it: the key
+/// text, the `hop_gen` it carries forward, and (issues #51/#52's multi-hop
+/// gap) the `src_changed` origin it carries forward — `None` for an
+/// aggregate target's group key (see the 3b step's doc comment) or any
+/// other touched key with no traceable origin.
+type ChangedKey = (String, i32, Option<std::time::SystemTime>);
 
 /// Runs one target table's ordered pre-lock, then its no-op-suppressed
 /// upsert and delete, returning the keys Postgres actually wrote to vs.
@@ -1600,8 +2232,31 @@ const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
 /// pre-lock exists to close: two transactions racing on overlapping keys
 /// still each take every lock, in the same ascending order, before either
 /// writes anything.
+///
+/// Issue #56/ADR-0009 decision 3: the finest-grained span in the
+/// propagation tree — one per consuming transform per batch, downstream of
+/// fold (`docs/observability.md`'s "Logs and traces" section), the exact
+/// same grouping #51's `buffer_transform_apply_metrics` observes its
+/// per-transform latency histogram from. `transform` (this target's own
+/// name — this crate's one "transform name," per
+/// `ApplyError::ColumnNotPaused`/`DefinitionNotLive`'s own `transform`
+/// fields) matches the metrics facade's `transform` label exactly, so a
+/// trace and a Prometheus series for the same transform are easy to
+/// cross-reference by eye.
+#[tracing::instrument(
+    name = "staging.apply_target",
+    skip(txn, target, plan),
+    fields(
+        transform = %target,
+        proposed_writes = plan.writes.len(),
+        proposed_deletes = plan.deletes.len(),
+        written = tracing::field::Empty,
+        deleted = tracing::field::Empty,
+    )
+)]
 async fn apply_target(
     txn: &Transaction<'_>,
+    target: &str,
     plan: &TargetPlan,
 ) -> Result<(Vec<String>, Vec<String>), ApplyError> {
     if plan.writes.is_empty() && plan.deletes.is_empty() {
@@ -1756,6 +2411,9 @@ async fn apply_target(
         deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
     }
 
+    let span = tracing::Span::current();
+    span.record("written", written.len());
+    span.record("deleted", deleted.len());
     Ok((written, deleted))
 }
 
@@ -1842,6 +2500,23 @@ pub async fn apply_and_mark_drained(
 /// see [`drain_many`]'s `owned` filtering), and, since [`ApplyPlan::versions`]
 /// etc. are shared across all of them, must never mix a truncate-bearing
 /// segment with any other (see [`next_claimable_segments`]'s barrier).
+///
+/// Issue #56/ADR-0009 decision 3: the batch-level span in the propagation
+/// tree's apply phase — parent of every [`apply_target`]/
+/// [`apply_aggregate::apply_aggregate_target`] span this call makes (one per
+/// consuming transform), since each of those runs inside this async fn's own
+/// `#[tracing::instrument]`-created span.
+#[tracing::instrument(
+    name = "staging.apply_and_mark_drained",
+    skip(txn, plan, wake_channel),
+    fields(
+        segments = seg_seqs.len(),
+        targets = plan.targets.len(),
+        aggregate_targets = plan.aggregate_targets.len(),
+        keys_written = tracing::field::Empty,
+        keys_deleted = tracing::field::Empty,
+    )
+)]
 pub async fn apply_and_mark_drained_many(
     txn: &Transaction<'_>,
     seg_seqs: &[i64],
@@ -1867,6 +2542,10 @@ pub async fn apply_and_mark_drained_many(
             .await?;
         let current: Option<i64> = row.map(|r| r.get(0));
         if current != *loaded_version {
+            tracing::debug!(
+                src_table = %source_key,
+                "version fence miss: source table's definitions changed mid-drain"
+            );
             return Err(ApplyError::VersionFenceMiss {
                 src_table: source_key.clone(),
             });
@@ -1892,8 +2571,12 @@ pub async fn apply_and_mark_drained_many(
     // not `insert`): a target can appear in both `plan.clears` and
     // `plan.targets` in the same batch — a truncate clear followed by a
     // same-batch post-truncate write to the same target — and both halves'
-    // physically-touched keys must propagate downstream.
-    let mut changed: HashMap<&str, Vec<(String, i32)>> = HashMap::new();
+    // physically-touched keys must propagate downstream. The third tuple
+    // element (see [`ChangedKey`]) is `src_changed` (issues #51/#52's
+    // multi-hop gap), carried into the `Recompute` row step 4 stages for
+    // this key, so a downstream hop reached purely through automatic
+    // propagation still traces back to a real origin.
+    let mut changed: HashMap<&str, Vec<ChangedKey>> = HashMap::new();
 
     // 2. Truncate clears, before this target's own upsert/delete below —
     // see this function's doc comment on why "clear, then write" is safe
@@ -1914,7 +2597,10 @@ pub async fn apply_and_mark_drained_many(
         if cleared.is_empty() {
             continue;
         }
-        let touched: Vec<(String, i32)> = cleared.into_iter().map(|k| (k, clear.hop_gen)).collect();
+        let touched: Vec<ChangedKey> = cleared
+            .into_iter()
+            .map(|k| (k, clear.hop_gen, clear.src_changed))
+            .collect();
         changed.entry(target.as_str()).or_default().extend(touched);
     }
 
@@ -1932,7 +2618,7 @@ pub async fn apply_and_mark_drained_many(
 
     // 3. Ordered pre-lock + upsert/delete, per target table.
     for (target, target_plan) in &plan.targets {
-        let (written, deleted) = apply_target(txn, target_plan).await?;
+        let (written, deleted) = apply_target(txn, target, target_plan).await?;
         keys_written += written.len();
         keys_deleted += deleted.len();
 
@@ -1941,19 +2627,23 @@ pub async fn apply_and_mark_drained_many(
         }
 
         let mut hop_gen_of: HashMap<&str, i32> = HashMap::new();
+        let mut src_changed_of: HashMap<&str, Option<std::time::SystemTime>> = HashMap::new();
         for w in &target_plan.writes {
             hop_gen_of.insert(w.pk_text.as_str(), w.hop_gen);
+            src_changed_of.insert(w.pk_text.as_str(), w.src_changed);
         }
         for d in &target_plan.deletes {
             hop_gen_of.insert(d.pk_text.as_str(), d.hop_gen);
+            src_changed_of.insert(d.pk_text.as_str(), d.src_changed);
         }
 
-        let touched: Vec<(String, i32)> = written
+        let touched: Vec<ChangedKey> = written
             .into_iter()
             .chain(deleted)
             .map(|key| {
                 let hop_gen = hop_gen_of.get(key.as_str()).copied().unwrap_or(0);
-                (key, hop_gen)
+                let src_changed = src_changed_of.get(key.as_str()).copied().flatten();
+                (key, hop_gen, src_changed)
             })
             .collect();
         changed.entry(target.as_str()).or_default().extend(touched);
@@ -1965,9 +2655,20 @@ pub async fn apply_and_mark_drained_many(
     // groups fold into the same `changed` accounting as the 1-1 case, so
     // downstream propagation below needs no branching of its own. This
     // stages Recompute rows keyed by the encoded composite group key, same
-    // as any 1-1 target — see [`ApplyPlan::aggregate_clears`]'s doc comment
-    // for why that is not a live misuse risk today: no definition reading
-    // from an aggregate target can actually survive its first drain attempt.
+    // as any 1-1 target — see [`ApplyPlan::aggregate_clears`]'s doc comment,
+    // corrected during #51/#52's review: chaining a definition onto a
+    // single-group-by-column aggregate target *is* live and reachable, and
+    // is a real (pre-existing, unrelated) bug tracked as
+    // [#103](https://github.com/salesforce-misc/trellis/issues/103).
+    // `src_changed` is always `None` here (`apply_aggregate::AggregateTargetPlan`'s
+    // written/deleted shape carries no origin today) — deliberately left
+    // unthreaded rather than plumbed in this commit, since #103's fix may
+    // change this path's shape entirely; threading it now risked doing
+    // throwaway work. Tracked as
+    // [#104](https://github.com/salesforce-misc/trellis/issues/104), to be
+    // revisited once #103 lands — do not read this as "moot," it is a known,
+    // live gap in the latency histograms for any transform chained off an
+    // aggregate target.
     for (target, agg_plan) in &plan.aggregate_targets {
         // `&agg_plan.target` (issue #73's persisted identity), not the bare
         // `target` map key — see `AggregateTargetPlan::target`'s doc
@@ -1981,10 +2682,13 @@ pub async fn apply_and_mark_drained_many(
         if result.written.is_empty() && result.deleted.is_empty() {
             continue;
         }
-        changed
-            .entry(target.as_str())
-            .or_default()
-            .extend(result.written.into_iter().chain(result.deleted));
+        changed.entry(target.as_str()).or_default().extend(
+            result
+                .written
+                .into_iter()
+                .chain(result.deleted)
+                .map(|(key, hop_gen)| (key, hop_gen, None)),
+        );
     }
 
     // 4. Downstream propagation, with the hop bound checked before staging
@@ -2001,7 +2705,7 @@ pub async fn apply_and_mark_drained_many(
         {
             continue;
         }
-        for (key, hop_gen) in touched {
+        for (key, hop_gen, src_changed) in touched {
             let next_hop = hop_gen + 1;
             if next_hop > MAX_HOP_GEN {
                 hop_bound_tables.push(target.to_string());
@@ -2013,6 +2717,7 @@ pub async fn apply_and_mark_drained_many(
                 key: key.clone(),
                 hop_gen: next_hop,
                 group_key: None,
+                src_changed: *src_changed,
             });
         }
     }
@@ -2021,7 +2726,7 @@ pub async fn apply_and_mark_drained_many(
     // re-derive, resolved in Phase 2 and staged here as ordinary image-less
     // recomputes — the same shape and same hop bound forward propagation uses,
     // just keyed by the from-side table/PK rather than a touched target key.
-    for (from_table, key, hop_gen) in &plan.reverse_recomputes {
+    for (from_table, key, hop_gen, src_changed) in &plan.reverse_recomputes {
         if *hop_gen > MAX_HOP_GEN {
             hop_bound_tables.push(from_table.clone());
             worst_hop_gen = worst_hop_gen.max(*hop_gen);
@@ -2032,18 +2737,30 @@ pub async fn apply_and_mark_drained_many(
             key: key.clone(),
             hop_gen: *hop_gen,
             group_key: None,
+            src_changed: *src_changed,
         });
     }
 
     if !hop_bound_tables.is_empty() {
         hop_bound_tables.sort();
         hop_bound_tables.dedup();
+        tracing::error!(
+            hop_gen = worst_hop_gen,
+            tables = ?hop_bound_tables,
+            "downstream propagation exceeded the hop bound; a wave may have run away"
+        );
         return Err(ApplyError::HopBoundExceeded {
             hop_gen: worst_hop_gen,
             tables: hop_bound_tables,
         });
     }
 
+    if !recompute_changes.is_empty() {
+        tracing::debug!(
+            count = recompute_changes.len(),
+            "staged downstream recomputes from this batch's physically-changed keys"
+        );
+    }
     append::append(txn, &recompute_changes).await?;
 
     // 4b. Issue #16: a clean drain clears the death counters for every key
@@ -2076,6 +2793,12 @@ pub async fn apply_and_mark_drained_many(
             .collect();
 
         if claimed_buckets.is_empty() {
+            tracing::warn!(
+                seg_seq,
+                claimed_by = %claimed_by,
+                "claim was gone by completion time; nothing applied twice, but its buckets \
+                 must be reclaimed by whoever holds them now"
+            );
             return Err(ApplyError::ClaimLost);
         }
 
@@ -2107,6 +2830,9 @@ pub async fn apply_and_mark_drained_many(
     txn.execute("select pg_notify($1, '')", &[&wake_channel])
         .await?;
 
+    let span = tracing::Span::current();
+    span.record("keys_written", keys_written);
+    span.record("keys_deleted", keys_deleted);
     Ok(ManyApplyOutcome {
         keys_written,
         keys_deleted,
@@ -2159,6 +2885,19 @@ const MAX_APPLY_ATTEMPTS: u32 = 5;
 /// — the buckets were all already claimed by someone else — without
 /// folding or computing anything. Otherwise returns the winning attempt's
 /// [`ApplyOutcome`].
+///
+/// Issue #56/ADR-0009 decision 3: the outermost span in the propagation
+/// tree's apply phase — parent, across however many retries this call
+/// takes, of every [`compute`]/[`apply_and_mark_drained`] span (and, through
+/// those, every per-transform [`apply_target`] span) a winning attempt
+/// makes. `attempt` is recorded once per loop iteration, so its final
+/// exported value is however many attempts this call actually took, not
+/// just the first.
+#[tracing::instrument(
+    name = "staging.drain_once",
+    skip(pool, wake_channel),
+    fields(claimed_by = %claimed_by, attempt = tracing::field::Empty)
+)]
 pub async fn drain_once(
     pool: &Pool,
     seg_seq: i64,
@@ -2184,6 +2923,7 @@ pub async fn drain_once(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
+        tracing::Span::current().record("attempt", attempt);
         let plan = match compute(pool, &folded).await {
             Ok(plan) => plan,
             Err(ApplyError::SourceTableDropped { source_table }) => {
@@ -2194,6 +2934,12 @@ pub async fn drain_once(
                 // with it excluded. Not counted against
                 // `MAX_APPLY_ATTEMPTS` — this corrects `folded` itself
                 // rather than retrying the same input.
+                tracing::warn!(
+                    seg_seq,
+                    source_table = %source_table,
+                    "source table no longer exists; purging its staged rows and retrying \
+                     without it"
+                );
                 quarantine::purge_dropped_table(pool, &source_table).await?;
                 folded.retain(|c| c.src_table != source_table);
                 attempt -= 1;
@@ -2230,6 +2976,12 @@ pub async fn drain_once(
         match apply_and_mark_drained(&txn, seg_seq, claimed_by, &plan, wake_channel).await {
             Ok(outcome) => {
                 txn.commit().await?;
+                // Epic #49 cross-cutting review fix (issues #51/#52): only
+                // flush `plan`'s buffered metrics now, once this attempt's
+                // transaction has actually committed — never from inside
+                // `compute` itself, which the loop above may have called
+                // more than once for this same `folded` input.
+                flush_apply_metrics(&plan);
                 backoff.reset();
                 return Ok(Some(outcome));
             }
@@ -2291,6 +3043,19 @@ pub const MAX_COALESCE_SEGMENTS: usize = 32;
 /// claimed at least one bucket from — never a segment it claimed nothing
 /// on, which [`apply_and_mark_drained_many`]'s completion step would
 /// otherwise misreport as [`ApplyError::ClaimLost`].
+///
+/// Issue #56/ADR-0009 decision 3: [`drain_once`]'s doc comment describes the
+/// span this creates — same role, just parenting a coalesced batch's spans
+/// instead of a single segment's.
+#[tracing::instrument(
+    name = "staging.drain_many",
+    skip(pool, wake_channel),
+    fields(
+        claimed_by = %claimed_by,
+        segments = seg_seqs.len(),
+        attempt = tracing::field::Empty,
+    )
+)]
 pub async fn drain_many(
     pool: &Pool,
     seg_seqs: &[i64],
@@ -2338,9 +3103,15 @@ pub async fn drain_many(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
+        tracing::Span::current().record("attempt", attempt);
         let plan = match compute(pool, &folded).await {
             Ok(plan) => plan,
             Err(ApplyError::SourceTableDropped { source_table }) => {
+                tracing::warn!(
+                    source_table = %source_table,
+                    "source table no longer exists; purging its staged rows and retrying \
+                     without it"
+                );
                 quarantine::purge_dropped_table(pool, &source_table).await?;
                 folded.retain(|c| c.src_table != source_table);
                 attempt -= 1;
@@ -2372,6 +3143,11 @@ pub async fn drain_many(
         {
             Ok(outcome) => {
                 txn.commit().await?;
+                // Epic #49 cross-cutting review fix (issues #51/#52): see
+                // `drain_once`'s matching call — flush only now that this
+                // attempt's (possibly multi-segment) transaction has
+                // actually committed.
+                flush_apply_metrics(&plan);
                 backoff.reset();
                 return Ok(Some(outcome));
             }
@@ -2425,8 +3201,15 @@ async fn classify_and_retry(
         // machine, reused as-is.
         quarantine::FailureClass::VersionFenceMiss => {
             if attempt >= MAX_APPLY_ATTEMPTS {
+                tracing::warn!(
+                    seg_seq,
+                    attempt,
+                    error = %err,
+                    "version fence miss retries exhausted; surfacing the failure"
+                );
                 return Err(err);
             }
+            tracing::debug!(seg_seq, attempt, error = %err, "version fence miss; retrying");
             let delay = backoff.next_delay();
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
@@ -2439,13 +3222,25 @@ async fn classify_and_retry(
         // consecutive fence misses specifically (doc 06).
         quarantine::FailureClass::Transient => {
             if attempt >= MAX_APPLY_ATTEMPTS {
+                tracing::warn!(
+                    seg_seq,
+                    attempt,
+                    error = %err,
+                    "transient failure retries exhausted; surfacing the failure"
+                );
                 return Err(err);
             }
+            tracing::debug!(seg_seq, attempt, error = %err, "transient apply failure; retrying");
             Ok(None)
         }
         // Halting schema diagnosis: never quarantine, propagate loudly
         // after recording the stop metric.
         quarantine::FailureClass::Halting => {
+            tracing::error!(
+                seg_seq,
+                error = %err,
+                "halting failure classification; never quarantined, propagating loudly"
+            );
             quarantine::record_halting_stop(pool, &err.to_string()).await?;
             Err(err)
         }
@@ -2455,6 +3250,12 @@ async fn classify_and_retry(
         // the error is surfaced, not blamed.
         quarantine::FailureClass::Isolate => {
             if attempt >= MAX_APPLY_ATTEMPTS {
+                tracing::warn!(
+                    seg_seq,
+                    attempt,
+                    error = %err,
+                    "isolate-eligible failure retries exhausted; surfacing the failure"
+                );
                 return Err(err);
             }
             match quarantine::isolate_and_evict(
@@ -2467,8 +3268,22 @@ async fn classify_and_retry(
             )
             .await?
             {
-                Some(retry_folded) => Ok(Some(retry_folded)),
-                None => Err(err),
+                Some(retry_folded) => {
+                    tracing::warn!(
+                        seg_seq,
+                        remaining = retry_folded.len(),
+                        "isolated and evicted at least one poisoned key; retrying without it"
+                    );
+                    Ok(Some(retry_folded))
+                }
+                None => {
+                    tracing::debug!(
+                        seg_seq,
+                        error = %err,
+                        "isolation reproduced nothing; surfacing the original failure"
+                    );
+                    Err(err)
+                }
             }
         }
     }

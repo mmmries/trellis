@@ -121,6 +121,17 @@ pub struct ClientOptions {
     /// delivery, and the only wake source if the listener connection itself
     /// couldn't be opened).
     pub poll_interval: Duration,
+    /// How often the maintenance loop snapshots `crate::metrics`'s registry
+    /// into `metric_rollup` (issue #54, ADR-0009 decision 7) and prunes rows
+    /// older than [`ClientOptions::rollup_retention`]. Only consulted when
+    /// `staging_worker` is set, same as `reconcile_interval` — see
+    /// [`MaintenanceConfig`]'s own doc comment for why this rides on the
+    /// same loop rather than a dedicated task.
+    pub rollup_interval: Duration,
+    /// How far back [`crate::rollup::prune`] keeps `metric_rollup` rows
+    /// before trimming them, each time the rollup tick above fires (issue
+    /// #54, ADR-0009 decision 7).
+    pub rollup_retention: Duration,
 }
 
 impl Default for ClientOptions {
@@ -140,6 +151,8 @@ impl Default for ClientOptions {
             hard_cap: intake::spill::DEFAULT_HARD_CAP,
             heartbeat: HeartbeatDaemonConfig::default(),
             poll_interval: Duration::from_millis(200),
+            rollup_interval: crate::rollup::DEFAULT_ROLLUP_INTERVAL,
+            rollup_retention: crate::rollup::DEFAULT_RETENTION,
         }
     }
 }
@@ -450,6 +463,8 @@ async fn run(
             interval: options.maintenance_interval,
             reclaim_ttl: options.reclaim_ttl,
             reconcile_interval: options.reconcile_interval,
+            rollup_interval: options.rollup_interval,
+            rollup_retention: options.rollup_retention,
         };
         maintenance_task = Some(tokio::spawn(maintenance_loop(
             maintenance_config,
@@ -661,15 +676,35 @@ struct MaintenanceConfig {
     interval: Duration,
     reclaim_ttl: Duration,
     reconcile_interval: Duration,
+    /// Issue #54, ADR-0009 decision 7: how often the loop snapshots
+    /// `crate::metrics`'s registry into `metric_rollup` and prunes rows
+    /// outside `rollup_retention`. Rides on this same loop rather than a
+    /// dedicated task for the same reason the `staging_segments` gauge
+    /// refresh does (see that code's own comment below): the loop already
+    /// ticks on a live connection regardless, and a rollup snapshot/prune
+    /// is no more disruptive to share a tick with than a reconcile pass is
+    /// — both are coarser-than-`interval` operations gated behind their own
+    /// `next_*` due-time, exactly like `reconcile_interval`/`next_reconcile`
+    /// below.
+    rollup_interval: Duration,
+    /// Issue #54, ADR-0009 decision 7: how far back the prune half of the
+    /// rollup tick above keeps `metric_rollup` rows.
+    rollup_retention: Duration,
 }
 
 /// Runs seal-on-demand, stuck-seal recovery, stale-claim reclaim,
-/// drained-segment retirement (stage 06, issue #13/#58), and — on its own,
-/// coarser cadence — publication/backfill re-reconciliation (issue #14) on a
-/// fixed tick until shutdown. Rides only with the staging worker (see the
-/// module doc comment) — application-only clients never run this, since
-/// sealing/recovery/reclaim/retirement/reconciliation are ring-wide
-/// operations that must not be duplicated across every client in a fleet.
+/// drained-segment retirement (stage 06, issue #13/#58), metric
+/// rollup/prune (issue #54), and — on its own, coarser cadence —
+/// publication/backfill re-reconciliation (issue #14) on a fixed tick until
+/// shutdown. Rides only with the staging worker (see the module doc
+/// comment) — application-only clients never run this, since
+/// sealing/recovery/reclaim/retirement/reconciliation/rollup are ring-wide
+/// or process-wide operations that must not be duplicated across every
+/// client in a fleet (a rollup snapshot in particular: every client in a
+/// fleet shares one Postgres-backed `metric_rollup` table, but each
+/// process's `crate::metrics` registry is its own process-local instance —
+/// running this on every client would multiply-write the same wall-clock
+/// window once per process rather than once per fleet).
 ///
 /// Holds one dedicated connection across ticks (reconnecting lazily on
 /// error) rather than opening a fresh one every tick.
@@ -684,6 +719,8 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         interval,
         reclaim_ttl,
         reconcile_interval,
+        rollup_interval,
+        rollup_retention,
     } = config;
 
     let seal_config = SealConfig::default();
@@ -693,6 +730,12 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     // reconciliation pass at that point, but this makes the loop's own
     // cadence not depend on when it happens to first observe `Instant::now()`.
     let mut next_reconcile = Instant::now();
+    // Same reasoning as `next_reconcile` above, but there is no equivalent
+    // "already ran one pass at startup" for the rollup — the registry may
+    // be empty on the very first tick anyway (nothing recorded yet), so an
+    // immediately-due first snapshot costs nothing and keeps this cadence's
+    // behavior uniform with `next_reconcile`'s.
+    let mut next_rollup = Instant::now();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -723,6 +766,17 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
             if !failed {
                 failed = staging::retire_drained_segments(c).await.is_err();
             }
+            if !failed {
+                // ADR-0009 decision 5's staging_segments{state} gauge: cheap
+                // to read here since maintenance_loop already ticks on this
+                // connection regardless, and a failed read just skips a
+                // gauge refresh rather than derailing the tick's other work.
+                if let Ok(counts) = staging::segment_state_counts(c).await {
+                    for (state, count) in counts {
+                        crate::metrics::set_staging_segments(state.as_sql(), count as u64);
+                    }
+                }
+            }
             if !failed && Instant::now() >= next_reconcile {
                 failed = reconcile_source_tables(
                     c,
@@ -734,6 +788,28 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 .await
                 .is_err();
                 next_reconcile = Instant::now() + reconcile_interval;
+            }
+            if !failed && Instant::now() >= next_rollup {
+                // Issue #54, ADR-0009 decision 7: snapshot the in-process
+                // registry (`crate::metrics::snapshot`, issue #54's read
+                // path — see that function's doc comment) into
+                // `metric_rollup`, then prune rows outside
+                // `rollup_retention`. Both on the same tick, same as the
+                // `staging_segments` gauge refresh above: this loop already
+                // holds a live connection regardless, and neither operation
+                // needs a cadence of its own finer or coarser than the
+                // other.
+                let samples = crate::metrics::snapshot();
+                let now = std::time::SystemTime::now();
+                failed = crate::rollup::write_snapshot(c, &samples, now)
+                    .await
+                    .is_err();
+                if !failed {
+                    failed = crate::rollup::prune(c, now, rollup_retention)
+                        .await
+                        .is_err();
+                }
+                next_rollup = Instant::now() + rollup_interval;
             }
             if failed {
                 // Drop and reconnect next tick rather than spin on a wedged

@@ -69,6 +69,7 @@ enum Job {
         String,
         oneshot::Sender<Result<Vec<(String, String)>, TrellisError>>,
     ),
+    ResumeTransform(String, oneshot::Sender<Result<(), TrellisError>>),
     Shutdown(oneshot::Sender<Result<(), TrellisError>>),
 }
 
@@ -142,6 +143,17 @@ impl BlockingTrellis {
     /// Applies Trellis's schema migrations. See [`Trellis::migrate`].
     pub fn migrate(&self) -> Result<(), TrellisError> {
         self.submit(Job::Migrate)
+    }
+
+    /// A handle onto this process's in-process metrics registry. See
+    /// [`Trellis::metrics`]. Unlike every other method here, this doesn't
+    /// round-trip through the background thread's job channel: the registry
+    /// is a process-wide global (see `trellis::metrics`'s module doc
+    /// comment), not state owned by the background thread's [`Trellis`], and
+    /// reading it is synchronous and side-effect-free, so there's nothing to
+    /// block on.
+    pub fn metrics(&self) -> crate::metrics::Metrics {
+        crate::metrics::Metrics::new()
     }
 
     /// Registers a transform definition and creates its target table. See
@@ -223,6 +235,13 @@ impl BlockingTrellis {
     pub fn resume_column(&self, target: &str) -> Result<Vec<(String, String)>, TrellisError> {
         let target = target.to_string();
         self.submit(|reply| Job::ResumeColumn(target, reply))
+    }
+
+    /// Resumes a whole-transform-quarantined transform. See
+    /// [`Trellis::resume_transform`].
+    pub fn resume_transform(&self, target: &str) -> Result<(), TrellisError> {
+        let target = target.to_string();
+        self.submit(|reply| Job::ResumeTransform(target, reply))
     }
 
     /// Stops any background work this connection started and waits for the
@@ -327,6 +346,9 @@ async fn run(
             }
             Job::ResumeColumn(target, reply) => {
                 let _ = reply.send(trellis.resume_column(&target).await);
+            }
+            Job::ResumeTransform(target, reply) => {
+                let _ = reply.send(trellis.resume_transform(&target).await);
             }
             Job::Shutdown(reply) => {
                 let _ = reply.send(trellis.shutdown().await);

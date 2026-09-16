@@ -574,6 +574,45 @@ pub async fn install_definition(
         }
     }
 
+    // Issue #55: if this definition's own source table already has a
+    // durable, unsettled `pending_backfill` marker (some unrelated
+    // transaction elsewhere in the cluster is pinning the `xmin` fence a
+    // publication-join or catch-up marker was captured against — see
+    // docs/observability.md's "Backfill status and the `xmin` caveat"),
+    // defer *both* backfill mechanisms below (chunked and direct/set-based
+    // alike) to that marker's own discharge rather than racing it: persist
+    // the row `waiting_to_backfill` and return immediately, with no chunk
+    // enqueued and no direct build attempted.
+    // `intake::publication::run_pending_backfills` promotes it through
+    // `backfilling` -> `live` once the fence settles, via the exact same
+    // ring-style enumeration path a plain `create_definition` always uses —
+    // universally correct for any key-space (it's `install_definition`'s
+    // own `Unsupported` fallback), just not the fast path this definition
+    // would otherwise have taken.
+    //
+    // Only `def.source` is checked, not every relationship to-side table
+    // [`plan_direct_backfill_coverage`] would also read below — a
+    // deliberate scope cut: the doc's `xmin` caveat is framed around a
+    // *source* table joining the publication, and a relationship's to-side
+    // table has its own, already-correct coverage-fence handling
+    // independent of this check. Reuses `qualified_source` (resolved once,
+    // above, via [`resolve_source_for_install`]) rather than re-deriving its
+    // own copy through the plain, fallback-free [`resolve_source_schema`] —
+    // that naive resolution can't follow a bare `def.source` chained off
+    // another definition's explicitly-qualified target (issue #76), which
+    // `resolve_source_for_install`'s two-step fallback already handles.
+    if defer_if_fence_unsettled(pool, &qualified_source).await? {
+        return create_definition_inner(
+            pool,
+            source_text,
+            source_columns,
+            false,
+            TransformStatus::WaitingToBackfill,
+            target_schema,
+        )
+        .await;
+    }
+
     if let KeySpace::OneToOne = &def.key_space
         && !backfill::uses_relationships(&def)
     {
@@ -953,7 +992,7 @@ async fn create_definition_inner(
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
     backfill: bool,
-    status: TransformStatus,
+    mut status: TransformStatus,
     target_schema: &str,
 ) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse(source_text)?;
@@ -1205,7 +1244,27 @@ async fn create_definition_inner(
     // schema, then the target schema, then `public`, in that order)
     // identically either way.
     if backfill {
-        crate::intake::publication::enumerate_and_append(&txn, &qualified_source).await?;
+        // Issue #55: if this table already has a durable `pending_backfill`
+        // marker whose `xmin` fence hasn't settled yet (some unrelated
+        // transaction elsewhere in the cluster is pinning it — see
+        // docs/observability.md's "Backfill status and the `xmin` caveat"),
+        // enumerating it right now would race that marker's own later
+        // discharge. Defer instead: persist `waiting_to_backfill` and skip
+        // the enumeration here — `intake::publication::run_pending_backfills`
+        // promotes this row through `backfilling` -> `live` once the same
+        // marker's fence settles (see its `advance_deferred_definitions`).
+        // A stale `backfill_coverage` record for this table (left by some
+        // *other* definition's earlier direct build) must not let that
+        // later discharge skip the enumeration this brand-new definition
+        // has never itself had — clearing it forces the safe full
+        // enumeration, exactly [`clear_backfill_coverage`]'s existing
+        // multi-reader contract.
+        if crate::intake::publication::backfill_marker_unsettled(&*txn, &qualified_source).await? {
+            status = TransformStatus::WaitingToBackfill;
+            crate::intake::publication::clear_backfill_coverage(&*txn, &qualified_source).await?;
+        } else {
+            crate::intake::publication::enumerate_and_append(&txn, &qualified_source).await?;
+        }
     }
 
     let version: i64 = txn
@@ -1885,7 +1944,8 @@ fn effective_target_schema<'a>(def: &'a TransformDef, target_schema: &'a str) ->
 /// transaction and computes its own, independent, authoritative copy —
 /// mirrors [`column_type`]/[`column_type_in_txn`]'s same pool-vs-txn split.
 /// Same `search_path` walk, same [`CatalogError::SourceTableNotFound`] on no
-/// match.
+/// match. Also covers [`install_definition`]'s issue #55 fence check, which
+/// likewise runs before any transaction of its own is open.
 async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String, CatalogError> {
     let client = pool.get().await?;
     let row = client
@@ -2000,6 +2060,28 @@ async fn confirm_qualified_table_exists(
         .await?
         .get(0);
     Ok(exists)
+}
+
+/// Checks whether `qualified_source`'s own `pending_backfill` marker (if
+/// any) is unsettled (issue #55: [`crate::intake::publication::backfill_marker_unsettled`]),
+/// and if so, clears any stale [`crate::intake::publication::clear_backfill_coverage`]
+/// record for it before reporting `true` — a definition about to be
+/// persisted `waiting_to_backfill` because of this check has never itself
+/// backfilled the table, so it cannot trust a coverage record some earlier,
+/// unrelated direct build left behind (see [`coverage_covers`]'s "safe
+/// default" contract, mirrored by [`clear_backfill_coverage`]'s own
+/// multi-reader handling).
+async fn defer_if_fence_unsettled(
+    pool: &Pool,
+    qualified_source: &str,
+) -> Result<bool, CatalogError> {
+    let client = pool.get().await?;
+    let unsettled =
+        crate::intake::publication::backfill_marker_unsettled(&**client, qualified_source).await?;
+    if unsettled {
+        crate::intake::publication::clear_backfill_coverage(&**client, qualified_source).await?;
+    }
+    Ok(unsettled)
 }
 
 /// Pooled (non-transaction) counterpart to [`column_type_in_txn`], for

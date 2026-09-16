@@ -1,22 +1,39 @@
 //! `trellis prometheus [--bind <ADDR>]` — a Prometheus-scrapeable HTTP
 //! listener for the engine's metrics.
 //!
-//! There is no metrics registry in `trellis` yet (tracked as issue #51, "in-
-//! process registry"), and no Prometheus text-exposition support either
-//! (issue #53, "Prometheus exposition via mountable render_prometheus()").
-//! So this command can't actually serve metrics today. What it *can* do is
-//! exist: bind a socket, accept connections, and answer every request with a
-//! plain, honest "not implemented yet" instead of leaving operators/scrape
-//! configs pointed at a connection refusal or (worse) a missing binary
-//! subcommand. When #51/#53 land, wiring this up for real should be a small
-//! diff against this module — swap the fixed response body for a rendered
-//! registry snapshot — not a server built from scratch.
+//! Issue #51 added the in-process metrics registry and issue #53 added its
+//! public, embedder-facing exposition —
+//! [`trellis::metrics::Metrics::render_prometheus`] — so this command now
+//! renders and serves the real thing: every request gets a `200 OK` with the
+//! registry's current contents in Prometheus text exposition format, read
+//! fresh at request time.
+//!
+//! **This process's own registry, nothing more.** `render_prometheus()` (see
+//! its doc comment, and ADR-0009 decision 1) reads whichever in-process
+//! registry this `trellis` binary's own recorder calls have populated — it
+//! is not a network read against some other, already-running engine
+//! process. Run standalone (this command's only mode today), that registry
+//! stays empty forever: nothing else in this process calls
+//! `trellis::staging`/`trellis::client` to actually record observations, so
+//! a scrape here returns a valid but metric-less body. That's an accurate
+//! answer for this command's current shape, not a placeholder — Prometheus's
+//! text format is well-defined for an empty registry (an empty body). The
+//! design point of [`trellis::metrics::Metrics::render_prometheus`] (`docs/observability.md`'s
+//! "mountable handler, not a bound port") is that a *real* deployment mounts
+//! this same render call from inside the process that's actually running the
+//! engine (a [`trellis::Trellis`]/[`trellis::Client`] with `staging`/
+//! `drain_threads` set) — e.g. behind an axum/actix/hyper `/metrics` route in
+//! that same binary — rather than scraping a separate `trellis prometheus`
+//! process. This standalone listener remains useful as a drop-in scrape
+//! target when that's the topology wanted (or for smoke-testing the
+//! exposition format itself), and demonstrates the few lines that wiring
+//! takes.
 //!
 //! Accordingly, `-d`/`--database-url` is accepted (for symmetry with the
-//! other subcommands, and because real metrics will eventually need to read
-//! from the database) but otherwise unused: this command never calls
-//! `Config::resolve`/`Trellis::connect`. It's still validated as a
-//! well-formed flag by `connection::extract_database_url` before this
+//! other subcommands) but otherwise unused: this command never calls
+//! `Config::resolve`/`Trellis::connect` — the metrics registry it reads is
+//! purely in-process and needs no database connection. It's still validated
+//! as a well-formed flag by `connection::extract_database_url` before this
 //! module's `parse` ever sees argv, same as every other subcommand — a
 //! malformed `-d` with no value is rejected there, not silently swallowed
 //! here.
@@ -26,25 +43,32 @@
 //! nothing else worth reading; this drains bytes off the socket only far
 //! enough to know the client is done sending its request headers (or to give
 //! up under a size/time cap, so a slow or silent client can't wedge a
-//! connection open indefinitely) and then writes back a fixed, valid
-//! HTTP/1.1 response. Pulling in an HTTP-server crate for that would violate
-//! this workspace's dependency-minimalism convention for a job this small.
+//! connection open indefinitely) and then writes back a fixed-status,
+//! rendered-body HTTP/1.1 response. Pulling in an HTTP-server crate for that
+//! would violate this workspace's dependency-minimalism convention for a job
+//! this small — and per ADR-0009 decision 1, `trellis` itself deliberately
+//! never links an HTTP server (`metrics-exporter-prometheus`'s Hyper-listener
+//! feature is off); this hand-rolled listener lives here in the CLI, not in
+//! the library.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use trellis::metrics::Metrics;
 
 /// Help text for `trellis prometheus -h`/`--help`, and prefixed to any
 /// argument-parsing error so a mistake also shows correct usage.
 pub const USAGE: &str = "\
 Usage: trellis prometheus [--bind <ADDR>] [--database-url <URL>]
 
-Binds an HTTP listener and answers every request with a fixed 501 response,
-since the engine has no metrics registry or Prometheus exposition yet (see
-issues #51 and #53). This command exists so operators/scrape configs pointed
-at it get a clear answer instead of a connection refusal, and so wiring in
-real metrics later doesn't require building the listener from scratch.
+Binds an HTTP listener and answers every request with this process's own
+in-process metrics registry, rendered in Prometheus text exposition format
+(issues #51/#53). Since this command runs standalone rather than alongside a
+running engine, the registry it renders is normally empty — see this
+module's doc comment for the intended topology (mounting render_prometheus()
+inside the process actually running the engine, rather than scraping this
+command).
 
 Options:
   --bind <ADDR>              host:port to listen on. Default:
@@ -133,15 +157,9 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 /// runs in its own task).
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The fixed response body, explaining what isn't implemented yet and
-/// pointing at the tracking issues.
-const RESPONSE_BODY: &str = "\
-Prometheus metrics exposition is not implemented yet.
-
-The engine has no in-process metrics registry (issue #51) or Prometheus text
-exposition (issue #53) yet. This endpoint exists as a placeholder so scrape
-configs and operators get a clear answer instead of a connection refusal.
-";
+/// The `Content-Type` Prometheus's own text exposition format expects
+/// (https://github.com/prometheus/docs/blob/main/content/docs/instrumenting/exposition_formats.md).
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// Binds `args.bind`, prints a startup message, then accepts connections
 /// (each handled in its own spawned task) until interrupted with Ctrl-C.
@@ -156,7 +174,7 @@ pub async fn run(args: Args, _database_url: Option<String>) -> Result<String, St
         .local_addr()
         .map_err(|err| format!("failed to read bound address: {err}"))?;
 
-    println!("trellis prometheus listening on http://{bound_addr} (not implemented yet: #51/#53)");
+    println!("trellis prometheus listening on http://{bound_addr}");
     println!("press Ctrl-C to stop");
 
     loop {
@@ -190,24 +208,29 @@ pub async fn run(args: Args, _database_url: Option<String>) -> Result<String, St
 }
 
 /// Drains (a bounded amount of) the request off `stream`, then writes back
-/// the fixed 501 response and closes the connection. Any I/O error here is
-/// this single connection's problem, not the server's — the caller logs and
-/// moves on rather than propagating anything that would affect other
-/// connections.
+/// the registry's current contents — rendered fresh for this request via
+/// [`Metrics::render_prometheus`] — as a `200 OK` and closes the connection.
+/// Any I/O error here is this single connection's problem, not the server's
+/// — the caller logs and moves on rather than propagating anything that
+/// would affect other connections.
 async fn handle_connection(mut stream: TcpStream) -> Result<(), String> {
     read_request(&mut stream).await?;
+    let body = Metrics::new().render_prometheus();
     let response = format!(
-        "HTTP/1.1 501 Not Implemented\r\n\
-         Content-Type: text/plain\r\n\
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: {PROMETHEUS_CONTENT_TYPE}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n\
-         {RESPONSE_BODY}",
-        RESPONSE_BODY.len(),
+         {body}",
+        body.len(),
     );
-    stream
-        .write_all(response.as_bytes())
+    // Bounded the same way `read_request` is: a client that stops reading
+    // mid-response (TCP backpressure) shouldn't be able to pin this
+    // connection's spawned task open indefinitely.
+    tokio::time::timeout(READ_TIMEOUT, stream.write_all(response.as_bytes()))
         .await
+        .map_err(|_| "timed out writing response".to_string())?
         .map_err(|err| format!("failed to write response: {err}"))?;
     stream
         .shutdown()
@@ -246,7 +269,7 @@ async fn read_request(stream: &mut TcpStream) -> Result<(), String> {
     match tokio::time::timeout(READ_TIMEOUT, drain).await {
         Ok(result) => result,
         // A client that never finishes sending headers within the timeout
-        // still gets the fixed response — we just stop waiting on it.
+        // still gets a response — we just stop waiting on it.
         Err(_) => Ok(()),
     }
 }
@@ -325,5 +348,59 @@ mod tests {
         let args = vec!["bogus".to_string()];
         let err = parse(&args).unwrap_err();
         assert!(err.contains("unrecognized argument"));
+    }
+
+    /// End-to-end (within this process) check that this command really does
+    /// serve the registry now, rather than the old fixed 501 body: records
+    /// one observation directly against `trellis::metrics` (the same global
+    /// registry `Metrics::render_prometheus` reads — no `Trellis`/Postgres
+    /// connection needed for this), drives `handle_connection` over a real
+    /// loopback socket, and checks the response is a `200 OK` with the
+    /// Prometheus content type whose body contains that observation.
+    #[tokio::test]
+    async fn serves_the_rendered_registry_as_a_200_with_the_prometheus_content_type() {
+        trellis::metrics::increment_changes_applied("prometheus_cli_test_target");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        tokio::spawn(async move {
+            let (stream, _peer_addr) = listener.accept().await.expect("accept one connection");
+            handle_connection(stream)
+                .await
+                .expect("handle_connection succeeds");
+        });
+
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .expect("connect to the listener");
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write the request");
+        let mut buf = Vec::new();
+        stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("read the whole response before the server closes the connection");
+        let response = String::from_utf8(buf).expect("response is valid utf-8");
+
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "expected a 200, got: {response}"
+        );
+        assert!(
+            response.contains(&format!("Content-Type: {PROMETHEUS_CONTENT_TYPE}")),
+            "missing the Prometheus content type header: {response}"
+        );
+        assert!(
+            response.contains("trellis_changes_applied_total"),
+            "response body missing the recorded metric: {response}"
+        );
+        assert!(
+            response.contains("prometheus_cli_test_target"),
+            "response body missing the recorded label: {response}"
+        );
     }
 }

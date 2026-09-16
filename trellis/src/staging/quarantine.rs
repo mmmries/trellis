@@ -333,6 +333,12 @@ async fn evict_key(
     last_error: &str,
     contribution: Option<&FoldedChange>,
 ) -> Result<(), ApplyError> {
+    tracing::warn!(
+        src_table = %src_table,
+        key = %key,
+        last_error = %last_error,
+        "evicting a key to the poison table; it crossed the row-level death threshold"
+    );
     txn.execute(
         "insert into poison (src_table, key, last_error) \
          values ($1, $2, $3) \
@@ -402,6 +408,13 @@ pub async fn isolate_and_evict(
             Err(err) => {
                 let class = classify(&err);
                 if class == FailureClass::Halting {
+                    tracing::error!(
+                        src_table = %change.src_table,
+                        key = %change.key,
+                        error = %err,
+                        "halting failure diagnosing a probed key's compute; propagating, \
+                         never quarantined"
+                    );
                     record_halting_stop(pool, &err.to_string()).await?;
                     return Err(err);
                 }
@@ -442,6 +455,13 @@ pub async fn isolate_and_evict(
         if let Err(err) = outcome {
             let class = classify(&err);
             if class == FailureClass::Halting {
+                tracing::error!(
+                    src_table = %change.src_table,
+                    key = %change.key,
+                    error = %err,
+                    "halting failure diagnosing a probed key's apply; propagating, never \
+                     quarantined"
+                );
                 record_halting_stop(pool, &err.to_string()).await?;
                 return Err(err);
             }
@@ -691,6 +711,12 @@ async fn trip_column_fuse(
     column: &str,
     last_error: &str,
 ) -> Result<(), ApplyError> {
+    tracing::warn!(
+        transform = %transform,
+        column = %column,
+        last_error = %last_error,
+        "column fuse tripped; pausing it and cascading the pause to its dependents"
+    );
     let client = pool.get().await?;
     client
         .execute(
@@ -767,6 +793,13 @@ async fn cascade_pause(pool: &Pool, transform: &str, column: &str) -> Result<(),
                 )
                 .await?;
             if newly_paused > 0 {
+                tracing::warn!(
+                    transform = %downstream_transform,
+                    column = %downstream_column,
+                    upstream_transform = %upstream_transform,
+                    upstream_column = %upstream_column,
+                    "column paused via cascade from an upstream pause"
+                );
                 queue.push_back((downstream_transform, downstream_column));
             }
         }
@@ -802,6 +835,11 @@ async fn cascade_pause(pool: &Pool, transform: &str, column: &str) -> Result<(),
 /// same bug one hop down — by the time a downstream pair is reached, any
 /// upstream pairs earlier in the queue have already been fully resumed and
 /// committed, so there is nothing left to roll back.
+#[tracing::instrument(
+    name = "quarantine.resume_column",
+    skip(pool),
+    fields(transform = %transform, column = %column, resumed = tracing::field::Empty)
+)]
 pub async fn resume_column(
     pool: &Pool,
     transform: &str,
@@ -925,7 +963,107 @@ pub async fn resume_column(
         }
     }
 
+    tracing::Span::current().record("resumed", resumed.len());
+    tracing::info!(resumed = ?resumed, "resumed paused column(s)");
     Ok(resumed)
+}
+
+/// Resumes a whole-transform-quarantined definition — ADR-0003's coarser,
+/// transform-wide fuse tier, distinct from [`resume_column`]'s per-column
+/// tier (which additionally requires the owning definition to already be
+/// `live`; a `quarantined` definition is, by construction, never that).
+///
+/// Requires `target`'s current status to be
+/// [`TransformStatus::Quarantined`] ([`ApplyError::TransformNotQuarantined`]
+/// otherwise, checked before any mutation — resuming a transform that isn't
+/// quarantined is caller error, not a silent no-op, matching
+/// [`resume_column`]'s [`ApplyError::ColumnNotPaused`] discipline). Drops
+/// the definition to [`TransformStatus::WaitingToBackfill`] and re-parks a
+/// fresh `pending_backfill` marker for its source table (reusing
+/// [`crate::intake::publication::park_backfill_catchup`] — the exact
+/// mechanism a chunked build's own post-completion catch-up already uses,
+/// see `defs::catalog::complete_direct_backfill`), so the actual re-backfill
+/// runs through [`crate::intake::publication::run_pending_backfills`]'s own
+/// `xmin`-fence-respecting discharge — never a shortcut that re-derives the
+/// target without waiting out a concurrent transaction that might still be
+/// pinning the fence (issue #55; docs/observability.md's "Backfill status
+/// and the `xmin` caveat" applies here exactly as it does to a fresh
+/// transform's own initial backfill: resuming can sit in
+/// `waiting_to_backfill` for as long as some unrelated transaction pins the
+/// cluster's `xmin`, and that is correct, not a fault).
+///
+/// Clears any stale `backfill_coverage` record for the source table first
+/// (issue #79, bug B's multi-reader contract): a quarantined definition's
+/// target may be broken or only partially written, so a coverage record
+/// that would otherwise let the discharge skip enumeration cannot be
+/// trusted here — full re-enumeration is the safe default.
+///
+/// **What this does not (yet) do.** As of this writing, nothing in this
+/// codebase actually *trips* a definition to `Quarantined` in the first
+/// place — the whole-transform fuse ADR-0003 describes ("if a failure isn't
+/// attributable to one column ... it trips the whole transform to
+/// `quarantined` exactly as before") has no writer; only the per-key
+/// ([`isolate_and_evict`]/`poison`) and per-column ([`trip_column_fuse`])
+/// tiers are wired today. `resume_transform` implements ADR-0003's *resume*
+/// half of the contract, correctly fence-gated, so whichever trip mechanism
+/// lands later has somewhere correct to call — it does not itself add the
+/// trip, and nothing here should be read as evidence one already exists.
+#[tracing::instrument(name = "quarantine.resume_transform", skip(pool), fields(transform = %target))]
+pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+
+    // `target` is the bare transform name (matching `resume_column`'s own
+    // `transform` parameter convention), but `transform_definitions.target_table`
+    // is persisted fully-qualified (issue #73) — match on its bare suffix,
+    // the same `split_part(target_table, '.', 2)` pattern
+    // `TargetTableSuffixCollision`'s own check already uses, rather than
+    // requiring every caller to know and pass the qualified identity.
+    let row = txn
+        .query_opt(
+            "select id, source_table, status from transform_definitions \
+             where split_part(target_table, '.', 2) = $1 for update",
+            &[&target],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Err(ApplyError::TransformNotFound {
+            transform: target.to_string(),
+        });
+    };
+    let id: i64 = row.get(0);
+    let source_table: String = row.get(1);
+    let status_text: String = row.get(2);
+    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+        panic!("transform_definitions.status held unrecognized value '{status_text}'")
+    });
+    if status != TransformStatus::Quarantined {
+        return Err(ApplyError::TransformNotQuarantined {
+            transform: target.to_string(),
+        });
+    }
+
+    txn.execute(
+        "update transform_definitions set status = $1 where id = $2",
+        &[&TransformStatus::WaitingToBackfill.as_str(), &id],
+    )
+    .await?;
+
+    // `transform_definitions.source_table` is already the fully-qualified
+    // `"schema.table"` form (issue #72) — re-resolving it via
+    // `resolve_source_schema_in_txn` (bare names only) or re-`qualify`-ing it
+    // would reject it outright (`DottedIdentifierComponent`).
+    crate::intake::publication::clear_backfill_coverage(&*txn, &source_table).await?;
+    crate::intake::publication::park_backfill_catchup(&*txn, &source_table).await?;
+
+    txn.commit().await?;
+    tracing::info!(
+        transform = %target,
+        from = %TransformStatus::Quarantined.as_str(),
+        to = %TransformStatus::WaitingToBackfill.as_str(),
+        "transform resumed from quarantine; re-parked for a fresh backfill"
+    );
+    Ok(())
 }
 
 /// Re-derives `column`'s value across every current row of `def.def.source`
@@ -1131,6 +1269,7 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
                     key: key.to_string(),
                     hop_gen,
                     group_key,
+                    src_changed,
                 }
             } else {
                 let cdc_op = match op.as_str() {

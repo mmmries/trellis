@@ -29,7 +29,8 @@ async fn migrate_up_is_idempotent() {
     assert_eq!(
         first_run,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25
         ],
         // Issue #73 added V22 (drops `column_status`'s now-unenforceable
         // `target_table` foreign key). Its reviewer follow-up added V23
@@ -39,8 +40,10 @@ async fn migrate_up_is_idempotent() {
         // bare-keyed `schema_nodes`/`schema_edges` rows now stale under the
         // qualified-identity keying — see that migration's own doc comment
         // for why this is a destructive, assume-empty migration rather than
-        // ADR-0007's literal canonicalize-in-place proposal).
-        "expected exactly V1 through V24 to be applied"
+        // ADR-0007's literal canonicalize-in-place proposal). Issue #54
+        // (epic #49) added V25 (`metric_rollup`, renumbered from its
+        // original V22 to land after the above).
+        "expected exactly V1 through V25 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.

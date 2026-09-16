@@ -24,7 +24,8 @@ Commands:
   define <GRAMMAR>   Register a TRANSFORM or RELATIONSHIP definition.
   run                 Run the live CDC/apply pipeline until interrupted.
   status              Print registered definitions/relationships and exit.
-  prometheus          Serve a placeholder metrics endpoint until interrupted.
+  prometheus          Serve this process's metrics registry as Prometheus
+                       text exposition until interrupted.
 
 Options:
   -d, --database-url <URL>  Postgres connection string. May be given before
@@ -212,8 +213,8 @@ fn run_status(args: Vec<String>, database_url: Option<String>) -> ExitCode {
 /// Dispatches `trellis prometheus`: handles `-h`/`--help` itself (so it
 /// works without a database connection — this command never needs one, see
 /// the module doc comment), otherwise parses the flags and serves the
-/// placeholder metrics endpoint until interrupted, on a single-use tokio
-/// runtime.
+/// Prometheus text-exposition metrics endpoint until interrupted, on a
+/// single-use tokio runtime.
 fn run_prometheus(args: Vec<String>, database_url: Option<String>) -> ExitCode {
     if wants_help(&args) {
         print!("{}", commands::prometheus::USAGE);

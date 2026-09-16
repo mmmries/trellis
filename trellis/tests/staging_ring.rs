@@ -18,6 +18,7 @@ fn recompute(src_table: &str, key: &str) -> StagedChange {
         key: key.to_string(),
         hop_gen: 0,
         group_key: None,
+        src_changed: None,
     }
 }
 

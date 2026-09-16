@@ -2251,6 +2251,23 @@ async fn apply_delta_groups_bulk(
 /// planner-chosen order (and the per-group loop's own encoded-key order need
 /// not match the SQL column order) — the pre-lock, not the write order, is
 /// what fixes the acquisition order once every lock is held up front.
+///
+/// Issue #56/ADR-0009 decision 3: the aggregate-target counterpart to
+/// [`super::apply::apply_target`]'s per-transform span — same `transform`
+/// field convention, same place in the propagation tree (Phase 3, one span
+/// per consuming transform per batch), just for a
+/// [`crate::defs::ast::KeySpace::Aggregate`] target instead of a
+/// [`crate::defs::ast::KeySpace::OneToOne`] one.
+#[tracing::instrument(
+    name = "staging.apply_aggregate_target",
+    skip(txn, plan),
+    fields(
+        transform = %target,
+        groups = plan.groups.len(),
+        written = tracing::field::Empty,
+        deleted = tracing::field::Empty,
+    )
+)]
 pub(super) async fn apply_aggregate_target(
     txn: &Transaction<'_>,
     target: &str,
@@ -2367,6 +2384,9 @@ pub(super) async fn apply_aggregate_target(
         }
     }
 
+    let span = tracing::Span::current();
+    span.record("written", written.len());
+    span.record("deleted", deleted.len());
     Ok(AggregateApplyResult { written, deleted })
 }
 

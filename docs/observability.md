@@ -5,8 +5,10 @@ changes are propagating, where they're stuck, and what work is pending or
 blocked. This is the counterpart to [data-flow](data-flow.md) — that document
 describes the flow; this one describes how we *measure* it.
 
-This is a first design pass; settled decisions are stated as such, and open
-ones are collected under [Open questions](#open-questions).
+This is a first design pass; settled decisions are stated as such. The
+questions originally collected under [Open questions](#open-questions) are
+now all settled — see [ADR-0009](decisions/0009-observability-decisions.md)
+for the decisions and their rationale.
 
 ## Goals and non-goals
 
@@ -63,13 +65,18 @@ stage relative to that origin. Two families of measurement follow:
   transform's input to its output being applied. One histogram per transform.
 * **End-to-end latency** — time from the *source* commit to the *final*
   transform's apply. For a DAG this is the whole-chain rollup, keyed by the
-  terminal transform (or by source→sink pair — see open questions).
+  **terminal transform** — settled in
+  [ADR-0009](decisions/0009-observability-decisions.md#2-end-to-end-latency-keying-terminal-transform-only),
+  not by source→sink pair, to keep cardinality low.
 
 Recommended supporting counters/gauges so the histograms are interpretable:
 
 * `changes_applied_total{transform}` — throughput denominator.
-* `staging_ring_depth{transform}` — backlog depth (ties to
-  [the staging ring](staging-and-claiming/02-the-staging-ring.md)).
+* `staging_segments{state}` — a cheap, system-level gauge counting segments
+  by state (ties to [the staging ring](staging-and-claiming/02-the-staging-ring.md)).
+  This replaces the per-transform `staging_ring_depth{transform}` gauge
+  originally proposed here, which [ADR-0009](decisions/0009-observability-decisions.md#5-staging-ring-metrics-drop-the-per-transform-depth-gauge-add-a-cheap-segment-state-gauge)
+  drops in favor of this lower-cost alternative.
 
 Backfill progress is deliberately *not* a metric — it's the transform's
 [lifecycle status](#backfill-status-and-the-xmin-caveat), a small enumerable
@@ -82,8 +89,11 @@ exported bucket counts (`histogram_quantile` in PromQL), rather than
 client-computed summary quantiles. Histograms **aggregate across instances**;
 summaries do not. Since a Trellis deployment may run more than one engine
 process against the same cluster, aggregatability matters. The cost is choosing
-bucket boundaries up front — we'll seed them from the expected sub-second to
-tens-of-seconds propagation range and revisit.
+bucket boundaries up front — settled in
+[ADR-0009](decisions/0009-observability-decisions.md#6-histogram-bucket-boundaries)
+as a single global exponential set spanning ~10ms-60s (the expected
+sub-second to tens-of-seconds propagation range), not configurable per
+transform in this pass.
 
 ### Exposition: a mountable handler, not a bound port
 
@@ -97,6 +107,39 @@ let body = trellis.metrics().render_prometheus(); // Prometheus text format
 
 No port binding, no HTTP framework, no bind-address config; wiring costs the
 operator a few lines.
+
+**Implemented (issue #53).** [`Trellis::metrics`](../trellis/src/app.rs) (and
+[`BlockingTrellis::metrics`](../trellis/src/blocking.rs), for callers without
+a `tokio` runtime of their own) returns a
+[`trellis::metrics::Metrics`](../trellis/src/metrics.rs) handle whose
+[`render_prometheus`](../trellis/src/metrics.rs) method is exactly the
+`String`-returning call sketched above — no HTTP framework or bound socket
+inside the `trellis` crate itself, per ADR-0009 decision 1. A minimal
+end-to-end example, an axum-style `/metrics` handler mounted alongside a
+running engine:
+
+```rust,no_run
+# async fn example(trellis: std::sync::Arc<trellis::Trellis>) -> String {
+// A route handler in the operator's own HTTP stack, closing over the
+// running `Trellis` (or just calling `trellis::metrics::Metrics::new()`
+// directly — the registry is process-wide, not scoped to one `Trellis`
+// connection, so any in-process handle reaches the same data).
+trellis.metrics().render_prometheus()
+# }
+```
+
+`cli/src/commands/prometheus.rs` is a second, complete (if deliberately
+minimal — no HTTP-parsing crate, see its module doc comment) example: a
+`trellis prometheus [--bind <ADDR>]` subcommand that hand-rolls a small
+TCP listener and answers every request with `Metrics::new().render_prometheus()`
+as a `200 OK`, `Content-Type: text/plain; version=0.0.4; charset=utf-8`
+response — worth reading as a template for wiring this into a real HTTP
+stack, though note its own doc comment's caveat: run standalone (its only
+mode), it renders *its own* process's registry, which stays empty unless
+that same process is also running the engine. A real deployment mounts
+`render_prometheus()` from inside the process actually running
+[`Trellis`]/[`Client`] (`staging`/`drain_threads` set), not from a separate
+scrape-only binary.
 
 ### Retention: Postgres rollup tables
 
@@ -114,7 +157,10 @@ already owns**, survives restarts, is directly SQL-queryable for the future
 "suggest optimizations" use case, and is naturally shared across engine
 instances. The costs we accept: added write load, one more schema object, and a
 prune job on the DB. Rollup interval and retention window are configurable;
-defaults TBD (see open questions).
+defaults are settled in
+[ADR-0009](decisions/0009-observability-decisions.md#7-rollup-interval-and-retention-issue-54):
+5-minute rollup interval, 7-day retention, storing raw histogram buckets
+(not pre-computed quantiles) so history stays re-aggregatable.
 
 ## Logs and traces
 
@@ -122,12 +168,15 @@ Logs go through the **`tracing`** facade with an optional **OTLP export layer**,
 so operators who run an OpenTelemetry collector get compliant output and those
 who don't still get structured local logs.
 
-Open framing question worth resolving early: a change flowing source → hop → hop
-→ apply *is* a trace. Modeling propagation as **spans** would make the pipeline's
-shape observable and could carry the per-hop latency data for free — potentially
-letting the metrics histograms be *derived from* span durations rather than
-instrumented separately. Whether we commit to spans/traces as a first-class
-signal, or keep logs flat and instrument metrics independently, is open below.
+A change flowing source → hop → hop → apply *is* a trace. Settled in
+[ADR-0009](decisions/0009-observability-decisions.md#3-traces-vs-flat-logs-spans-are-first-class):
+we adopt **spans** as a first-class signal, modeling propagation as a
+`tracing` span tree. This makes the pipeline's shape observable and carries
+the per-hop latency data for free — the per-transform latency histogram is
+*derived from* span durations captured during apply (downstream of fold,
+where changes are already grouped by the transform(s) that consume them),
+rather than instrumented independently. This gates issue #56's design
+(span-based instrumentation of the propagation path).
 
 ## Transform status lifecycle
 
@@ -177,34 +226,51 @@ The remedy is documentation, not a signal: a transform stays in
 idle-in-transaction connections, long analytics queries, `pg_dump`, or workload
 on another database sharing the cluster.
 
-## Proposed dependencies
+## Dependencies
 
-None added yet — listed here as **proposals to approve**, per the no-auto-install
-rule:
+Approved and pinned in `trellis/Cargo.toml` (issues #51/#56) — see
+[ADR-0009](decisions/0009-observability-decisions.md#1-dependencies-metrics-facade-not-prometheus-directly)
+for the full rationale, including why the `metrics` facade was chosen over
+depending on the `prometheus` crate directly:
 
-* Metrics registry + Prometheus text rendering (e.g. the `metrics` facade +
-  `metrics-exporter-prometheus`, or the `prometheus` crate directly).
-* `tracing` + an OTLP export layer (e.g. `tracing-opentelemetry` +
-  `opentelemetry-otlp`) for logs/traces.
-
-We'll pin exact crates and versions when we start implementation.
+* `metrics` + `metrics-exporter-prometheus` for the in-process metrics
+  registry and Prometheus text rendering. `metrics-exporter-prometheus`'s
+  optional Hyper-listener feature is **not** enabled — this stays a pure
+  registry + text-encoder, matching "Exposition: a mountable handler, not a
+  bound port" above.
+* `tracing` (unconditional) for spans/events; `tracing-opentelemetry` +
+  `opentelemetry-otlp` for OTLP export, both behind the `otlp` Cargo feature
+  (off by default, and genuinely absent from the dependency tree when
+  unused — not merely unused at runtime).
 
 ## Open questions
 
+All settled by [ADR-0009](decisions/0009-observability-decisions.md):
+
 * **End-to-end keying for DAGs** — is end-to-end latency keyed by terminal
-  transform, by source→sink pair, or both? Affects cardinality.
+  transform, by source→sink pair, or both? Affects cardinality. **Settled:**
+  [terminal transform only](decisions/0009-observability-decisions.md#2-end-to-end-latency-keying-terminal-transform-only).
 * **Histogram buckets** — the initial boundary set, and whether they're
-  configurable per transform.
+  configurable per transform. **Settled:**
+  [a single global exponential set, ~10ms-60s, not configurable per transform](decisions/0009-observability-decisions.md#6-histogram-bucket-boundaries).
 * **Traces vs. flat logs** — do we adopt spans/traces as a first-class signal
   (and derive latency from them), or keep logs flat and instrument metrics
-  separately?
+  separately? **Settled:**
+  [spans are first-class; per-transform latency derives from span durations](decisions/0009-observability-decisions.md#3-traces-vs-flat-logs-spans-are-first-class).
 * **Rollup interval and retention window defaults**, and whether the rollup is
   raw histogram buckets or pre-computed quantiles (pre-computed quantiles are
-  not re-aggregatable later).
+  not re-aggregatable later). **Settled:**
+  [5-minute interval, 7-day retention, raw buckets — both configurable](decisions/0009-observability-decisions.md#7-rollup-interval-and-retention-issue-54).
 * **Where transform status is stored and read** — does the lifecycle status live
   alongside the [ADR-0003](decisions/0003-quarantine-storage-and-api.md)
   quarantine model or in its own transform-registry row, and is it exposed via
-  the same client read that lists quarantined transforms?
+  the same client read that lists quarantined transforms? **Settled:**
+  [the existing `transform_definitions.status` field — no new schema](decisions/0009-observability-decisions.md#4-transform-status-storage-no-new-field).
+
+Additionally, the staging-ring supporting-gauge design (originally
+`staging_ring_depth{transform}`, above) is
+[settled](decisions/0009-observability-decisions.md#5-staging-ring-metrics-drop-the-per-transform-depth-gauge-add-a-cheap-segment-state-gauge)
+in favor of a cheap `staging_segments{state}` gauge.
 
 ## Related
 

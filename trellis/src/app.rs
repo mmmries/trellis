@@ -161,6 +161,25 @@ impl Trellis {
         &self.config
     }
 
+    /// A handle onto this process's in-process metrics registry (issue #53),
+    /// for Prometheus exposition — see [`crate::metrics::Metrics::render_prometheus`]:
+    ///
+    /// ```no_run
+    /// # async fn example(trellis: &trellis::Trellis) {
+    /// let body = trellis.metrics().render_prometheus();
+    /// # }
+    /// ```
+    ///
+    /// The registry itself is process-wide, not scoped to this particular
+    /// connection (see `trellis::metrics`'s module doc comment) — this
+    /// method exists so callers reach it through the same facade as
+    /// everything else, matching `docs/observability.md`'s
+    /// `trellis.metrics().render_prometheus()` sketch, rather than because
+    /// `self` is actually consulted.
+    pub fn metrics(&self) -> crate::metrics::Metrics {
+        crate::metrics::Metrics::new()
+    }
+
     /// Applies Trellis's schema migrations. Idempotent — safe to call on
     /// every startup.
     pub async fn migrate(&self) -> Result<(), TrellisError> {
@@ -627,10 +646,10 @@ impl Trellis {
     /// including why a dependent with its own independent reason to stay
     /// paused is left alone). `target` must address a column
     /// (`transform.column`) — [`TrellisError::ColumnAddressRequired`] if
-    /// given a bare transform name, since there is no whole-transform
-    /// "resume" action in this API (a `quarantined` transform resumes by
-    /// re-running its full backfill, a different operation entirely — see
-    /// `docs/transforms.md#status`).
+    /// given a bare transform name — a `quarantined` transform's
+    /// whole-transform remedy is [`Trellis::resume_transform`], a different
+    /// operation entirely (drops back to `waiting_to_backfill` and re-runs
+    /// the full backfill — see `docs/transforms.md#status`), not this call.
     ///
     /// Returns every `(transform, column)` pair actually resumed —
     /// `target` itself first, then any dependents whose pause was purely
@@ -644,6 +663,21 @@ impl Trellis {
             }
             QuarantineTarget::Transform(_) => Err(TrellisError::ColumnAddressRequired),
         }
+    }
+
+    /// Resumes a whole-transform-quarantined transform (issue #55; ADR-0003's
+    /// coarser, transform-wide fuse tier — the counterpart to
+    /// [`Trellis::resume_column`]'s per-column tier). `target` must be a bare
+    /// transform's target table, not a `transform.column` address — see
+    /// [`crate::staging::quarantine::resume_transform`] for the full
+    /// contract, including why this drops the transform to
+    /// [`TransformStatus::WaitingToBackfill`] and re-runs its backfill
+    /// through the same `xmin`-fence-respecting path a fresh transform's own
+    /// initial backfill uses, rather than a shortcut.
+    pub async fn resume_transform(&self, target: &str) -> Result<(), TrellisError> {
+        quarantine::resume_transform(&self.pool, target)
+            .await
+            .map_err(TrellisError::Apply)
     }
 
     /// Stops any background work this connection started (staging worker and
@@ -985,9 +1019,8 @@ pub enum TrellisError {
     /// doesn't exist in `transform_definitions` at all.
     TransformNotFound(String),
     /// [`Trellis::resume_column`] was given a bare transform address
-    /// (no `.column`) — there is no whole-transform "resume" action in this
-    /// API; a `quarantined` transform's remedy is a full backfill, not this
-    /// call.
+    /// (no `.column`) — a `quarantined` transform's whole-transform remedy
+    /// is [`Trellis::resume_transform`], not this call.
     ColumnAddressRequired,
 }
 
@@ -1076,8 +1109,8 @@ impl std::fmt::Display for TrellisError {
             }
             TrellisError::ColumnAddressRequired => write!(
                 f,
-                "resume_column needs a \"transform.column\" address; a bare transform name has \
-                 no whole-transform resume action (re-run its backfill instead)"
+                "resume_column needs a \"transform.column\" address; to resume a whole \
+                 quarantined transform, call resume_transform instead"
             ),
         }
     }
