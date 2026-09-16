@@ -1038,3 +1038,46 @@ async fn a_source_table_with_a_numeric_primary_key_is_rejected() {
         other => panic!("expected UnsupportedPrimaryKeyType, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_nulls_distinct_unique_index_is_not_accepted_as_a_primary_key_stand_in() {
+    // Issue #128 follow-up: a plain `UNIQUE` index on a nullable column
+    // allows multiple NULLs, so it doesn't actually guarantee row identity
+    // the way a `PRIMARY KEY` or a `UNIQUE NULLS NOT DISTINCT` constraint
+    // does. Falling back to it here would silently reintroduce the "NULL
+    // rows collide/vanish" failure mode #128 fixed, through a side door.
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+
+    client
+        .batch_execute("create table widgets (id integer, label text unique)")
+        .await
+        .expect("seed source table with a nulls-distinct unique column");
+
+    let err = source_primary_key(&db.pool, "widgets").await.unwrap_err();
+    match err {
+        DdlError::NoPrimaryKey { source_table } => assert_eq!(source_table, "widgets"),
+        other => panic!("expected NoPrimaryKey, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_not_null_unique_index_is_accepted_as_a_primary_key_stand_in() {
+    // The other half of the guard above: a `UNIQUE` index is a safe
+    // identity when every indexed column is `NOT NULL`, since no NULL can
+    // ever occur to collide under nulls-distinct semantics.
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+
+    client
+        .batch_execute("create table widgets (id integer, label text not null unique)")
+        .await
+        .expect("seed source table with a not-null unique column");
+
+    let pk = source_primary_key(&db.pool, "widgets")
+        .await
+        .expect("a not-null unique index should stand in for a primary key");
+    assert_eq!(pk.name, "label");
+}

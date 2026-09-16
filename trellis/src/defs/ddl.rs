@@ -333,7 +333,24 @@ pub async fn source_primary_key(
                  where i.indrelid = pg_catalog.to_regclass($1)
                    and (
                      i.indisprimary
-                     or (i.indisunique and i.indimmediate and i.indpred is null)
+                     or (
+                       i.indisunique and i.indimmediate and i.indpred is null
+                       -- A plain (nulls-distinct) UNIQUE index doesn't reject
+                       -- duplicate NULLs, so it isn't a true identity unless
+                       -- either NULLS NOT DISTINCT (like create_aggregate_target_table's
+                       -- grouping-column constraint) or every indexed column is
+                       -- NOT NULL, in which case no NULL can ever occur.
+                       and (
+                         i.indnullsnotdistinct
+                         or not exists (
+                           select 1
+                           from pg_attribute a
+                           where a.attrelid = i.indrelid
+                             and a.attnum = any(i.indkey)
+                             and not a.attnotnull
+                         )
+                       )
+                     )
                    )
                  order by i.indisprimary desc, i.indexrelid asc
                  limit 1
