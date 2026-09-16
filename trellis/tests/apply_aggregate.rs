@@ -18,7 +18,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{create_aggregate_target_table, create_definition, parse};
 use trellis::staging::apply::{self, ApplyError};
-use trellis::staging::{claim, fold};
+use trellis::staging::{claim, converge, fold};
 
 fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
     names
@@ -374,6 +374,203 @@ async fn drain_matches_the_oracle_for_aggregate_insert_update_delete_and_grain_m
         g10.3.as_deref(),
         Some("5.00"),
         "group 10 min must recompute too"
+    );
+}
+
+/// Issue #128: a source row whose grouping column is `NULL` is legal SQL
+/// (`GROUP BY` folds every `NULL` in a column into one group, like any other
+/// value) and must flow through the live delta path exactly like any other
+/// group — written to the target, never quarantined, never left behind as a
+/// stale row once its group empties out. Before the fix,
+/// `create_aggregate_target_table` keyed the grouping column with a bare
+/// `PRIMARY KEY`, so the live delta's upsert into a NULL group raised a real
+/// `null value in column ... violates not-null constraint` error;
+/// `quarantine::classify` isolated the offending row, and — because replaying
+/// it reproduced the identical violation — it could never be recovered, and
+/// `converge::converged_through` would treat the parked `poison_held` row as
+/// permanently unconverged. This test drives the exact same live-delta path
+/// (`insert_cdc_row` + `drain`, not the unit-level `apply_forced_groups_bulk`
+/// harness `apply_aggregate.rs`'s own dedicated NULL-key unit test uses) and
+/// asserts neither `poison_held` nor `key_deaths` ever gets a row.
+#[tokio::test]
+async fn a_null_grouping_key_flows_through_the_live_delta_path_without_quarantine() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table order_items (id integer primary key, order_id integer, amount numeric); \
+             alter table order_items replica identity full",
+        )
+        .await
+        .expect("create source table");
+    // `converged_through`'s condition 1 fails closed on a missing
+    // `replication_progress` row (see that function's own doc comment) —
+    // unrelated to this test's actual NULL-key scenario, but needed so the
+    // final convergence check below reflects condition 4 (the poison band)
+    // rather than this unrelated always-false floor.
+    client
+        .execute(
+            "insert into replication_progress (slot_name, confirmed_lsn) values ('slot1', $1)",
+            &[&PgLsn::from(1000u64)],
+        )
+        .await
+        .expect("seed replication_progress");
+
+    // `setup` installs the definition and creates the target table; its
+    // return value (needed by `read_oracle`'s NULL-unsafe `order_id::text`
+    // key) isn't usable here since this test's whole point is a NULL
+    // `order_id` — see the direct `order_id is null` queries below instead.
+    setup(&db).await;
+
+    // Step 1: two brand-new rows land in the NULL group via an ordinary
+    // insert batch — the same shape a real un-attributed order (no
+    // `order_id` yet) would take.
+    client
+        .execute(
+            "insert into order_items (id, order_id, amount) values (1, null, 5.00), (2, null, 7.00)",
+            &[],
+        )
+        .await
+        .expect("seed live NULL-keyed order_items rows");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "order_items",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"order_id":null,"amount":"5.00"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "order_items",
+        "2",
+        "insert",
+        None,
+        Some(r#"{"order_id":null,"amount":"7.00"}"#),
+    )
+    .await;
+
+    let seg0 = seal_active_segment(&mut client).await;
+    let outcome0 = drain(&db.pool, seg0, "worker").await;
+    assert_eq!(outcome0.keys_written, 1, "one NULL group is created");
+
+    let null_group_row = client
+        .query_one(
+            "select total::text, min_amount::text from order_summary where order_id is null",
+            &[],
+        )
+        .await
+        .expect("the NULL group must have a target row");
+    let null_group: (String, String) = (null_group_row.get(0), null_group_row.get(1));
+    assert_eq!(
+        null_group,
+        ("12.00".to_string(), "5.00".to_string()),
+        "the NULL group's SUM/MIN must reflect both contributing rows"
+    );
+
+    let poisoned: i64 = client
+        .query_one("select count(*) from poison_held", &[])
+        .await
+        .expect("count poison_held rows")
+        .get(0);
+    assert_eq!(
+        poisoned, 0,
+        "a NULL grouping key must never be isolated into quarantine"
+    );
+    let deaths: i64 = client
+        .query_one("select count(*) from key_deaths", &[])
+        .await
+        .expect("count key_deaths rows")
+        .get(0);
+    assert_eq!(
+        deaths, 0,
+        "a NULL grouping key must never charge a quarantine death"
+    );
+
+    // Step 2: one NULL-group row migrates *out* (order_id assigned, id 1 ->
+    // group 40) and the other is deleted, so the NULL group must go fully
+    // extinct — its target row removed, not left behind stale.
+    client
+        .batch_execute(
+            "update order_items set order_id = 40 where id = 1; \
+             delete from order_items where id = 2",
+        )
+        .await
+        .expect("apply live end-state for step 2");
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "order_items",
+        "1",
+        "update",
+        Some(r#"{"order_id":null,"amount":"5.00"}"#),
+        Some(r#"{"order_id":"40","amount":"5.00"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "order_items",
+        "2",
+        "delete",
+        Some(r#"{"order_id":null,"amount":"7.00"}"#),
+        None,
+    )
+    .await;
+
+    let seg1 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg1, "worker").await;
+
+    let null_rows: i64 = client
+        .query_one(
+            "select count(*) from order_summary where order_id is null",
+            &[],
+        )
+        .await
+        .expect("count NULL-keyed target rows")
+        .get(0);
+    assert_eq!(
+        null_rows, 0,
+        "the NULL group's target row must be removed once it empties out"
+    );
+    let g40_total: String = client
+        .query_one(
+            "select total::text from order_summary where order_id = 40",
+            &[],
+        )
+        .await
+        .expect("group 40 must have received the migrated row")
+        .get(0);
+    assert_eq!(g40_total, "5.00", "group 40 total after the migration");
+
+    let poisoned: i64 = client
+        .query_one("select count(*) from poison_held", &[])
+        .await
+        .expect("count poison_held rows")
+        .get(0);
+    assert_eq!(
+        poisoned, 0,
+        "still no quarantine after the migration/delete"
+    );
+
+    // Issue #128's liveness half: `converge::converged_through`'s condition 4
+    // deliberately blocks on any live `poison_held` row (by design, for a
+    // *genuine* poison case — see that function's own doc comment). With no
+    // NULL-key row ever quarantined in the first place, a token at every
+    // staged change's LSN (this harness's `insert_cdc_row` always stages at
+    // `PgLsn::from(1)`) must converge — the same scenario that used to hang
+    // the generative suite's `quiesce` past its 30s timeout.
+    let converged = converge::converged_through(&client, PgLsn::from(1u64))
+        .await
+        .expect("converged_through");
+    assert!(
+        converged,
+        "a NULL grouping key must never stall convergence"
     );
 }
 

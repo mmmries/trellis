@@ -306,6 +306,20 @@ fn map_resolve_error(err: super::catalog::CatalogError) -> DdlError {
 /// returned key via `::text` casts, so an unsafe type here would risk the
 /// same silent divergence a relationship join key is already guarded
 /// against.
+/// Falls back to `source_table`'s own unique constraint when it has no
+/// `PRIMARY KEY` (issue #128). [`create_aggregate_target_table`] keys its
+/// grouping columns with a `UNIQUE NULLS NOT DISTINCT` constraint rather than
+/// a `PRIMARY KEY`, precisely so a NULL grouping value is representable
+/// (`PRIMARY KEY` forbids `NULL` outright) — so an aggregate target chained
+/// into as another definition's source (`TRANSFORM x FROM some_aggregate`,
+/// #102's own worked example) has no `indisprimary` row at all. Without this
+/// fallback every such chain would regress from working to
+/// [`DdlError::NoPrimaryKey`]. Ties among multiple qualifying unique indexes
+/// break on `indexrelid` ascending (oldest first) for a deterministic choice;
+/// partial (`indpred`) and deferred (`not indimmediate`) unique indexes are
+/// excluded because either would make the index an unreliable stand-in for a
+/// row identity (a partial index doesn't cover every row; a deferred one
+/// doesn't guarantee uniqueness at statement end).
 pub async fn source_primary_key(
     pool: &Pool,
     source_table: &str,
@@ -313,11 +327,23 @@ pub async fn source_primary_key(
     let client = pool.get().await?;
     let rows = client
         .query(
-            "select a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod)
+            "with chosen_index as (
+                 select i.indexrelid
+                 from pg_index i
+                 where i.indrelid = pg_catalog.to_regclass($1)
+                   and (
+                     i.indisprimary
+                     or (i.indisunique and i.indimmediate and i.indpred is null)
+                   )
+                 order by i.indisprimary desc, i.indexrelid asc
+                 limit 1
+             )
+             select a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod)
              from pg_index i
+             join chosen_index c on c.indexrelid = i.indexrelid
              join pg_attribute a
                on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
-             where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary",
+             where i.indrelid = pg_catalog.to_regclass($1)",
             &[&source_table],
         )
         .await?;
@@ -725,9 +751,28 @@ pub(crate) fn count_column_names_from<'a>(
 
 /// Creates an [`super::ast::KeySpace::Aggregate`] definition's neighbor
 /// target table (idempotent, same convention as [`create_target_table`]),
-/// whose primary key is the composite tuple of grouping columns rather than
-/// a single column inherited from the source — a `GROUP BY` target has no
-/// single source row to inherit a key from; the group itself is the key.
+/// whose key is the composite tuple of grouping columns rather than a single
+/// column inherited from the source — a `GROUP BY` target has no single
+/// source row to inherit a key from; the group itself is the key.
+///
+/// The grouping columns are keyed with a `UNIQUE NULLS NOT DISTINCT`
+/// constraint rather than a bare `PRIMARY KEY` (issue #128): a source
+/// grouping column can itself be `NULL` (Postgres's own `GROUP BY` folds all
+/// `NULL`s in a column into one group, same as any other value), and a
+/// `PRIMARY KEY` forbids `NULL` in any of its columns outright, which made a
+/// NULL-keyed group unrepresentable on the target — backfill silently
+/// dropped it and the live delta path raised a `not-null constraint`
+/// violation that quarantined the row with no way to recover it. `NULLS NOT
+/// DISTINCT` (Postgres 15+, pinned to 17.10 in `.tool-versions`) keeps the
+/// same dedup guarantee `PRIMARY KEY` gave — two grouping tuples that agree
+/// on every column, NULLs included, still collide — while allowing the NULL
+/// tuple to exist at all. `ON CONFLICT (group columns)` (both here and in
+/// the live delta path) still resolves against this constraint exactly as it
+/// did against the old `PRIMARY KEY`: conflict-target inference matches on
+/// the indexed columns, not on the index's nulls-distinctness. Chaining a
+/// further definition off this target still works because
+/// [`source_primary_key`] falls back to a table's unique constraint when it
+/// has no `indisprimary` index.
 ///
 /// Each grouping column's type comes from `source_columns` (the same
 /// [`ValueType`]-only map every other column type in this grammar is
@@ -737,7 +782,7 @@ pub(crate) fn count_column_names_from<'a>(
 /// A calculated field whose name matches a grouping column (the
 /// `SELECT order_id AS order_id, SUM(amount) AS total` passthrough idiom)
 /// contributes no separate column — it's assumed to be that same grouping
-/// value passed through, already covered by the primary key column above.
+/// value passed through, already covered by the unique-keyed column above.
 ///
 /// `target_schema` is the schema the table is created under — see
 /// [`create_target_table`]'s doc comment on why this is always
@@ -836,7 +881,10 @@ pub async fn create_aggregate_target_table(
         }
     }
     let pk_columns: Vec<String> = group_by.iter().map(|c| quote_ident(c)).collect();
-    sql.push_str(&format!(", primary key ({})", pk_columns.join(", ")));
+    sql.push_str(&format!(
+        ", unique nulls not distinct ({})",
+        pk_columns.join(", ")
+    ));
     sql.push(')');
 
     let client = pool.get().await?;
