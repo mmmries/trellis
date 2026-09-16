@@ -265,13 +265,23 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
-    // To-side keeps Postgres's DEFAULT replica identity (its primary key) — the
-    // point of this test is that the reverse path needs no `REPLICA IDENTITY
-    // FULL` on the to-side, because a to-one's `to_col` *is* that primary key.
+    // The image-less reverse-recompute path this test exercises (staging a
+    // `Recompute` marker per affected from-side row, re-reading the *current*
+    // parent row rather than comparing against an old image) itself needs no
+    // `REPLICA IDENTITY FULL` on the to-side — a to-one's `to_col` already
+    // *is* the primary key, which the DEFAULT identity always carries. But
+    // issue #129 (epic #127's settled parent projection) added an
+    // unconditional `REPLICA IDENTITY FULL` requirement at
+    // `create_relationship` time for every to-one relationship regardless of
+    // which apply mechanism ends up consuming it — the projection's own
+    // future reverse-applied advance (#131) needs the to-side row's *entire*
+    // old image, not just its key — so this table needs it set too, even
+    // though nothing in this specific test's own code path reads it yet.
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
-             create table articles (id integer primary key, category_id integer, title text)",
+             create table articles (id integer primary key, category_id integer, title text); \
+             alter table categories replica identity full",
         )
         .await
         .expect("create tables");

@@ -514,6 +514,7 @@ async fn install_definition_ring_fallback_ends_up_live() {
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
+             alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'); \
              insert into articles (id, category_id, title) values (1, 10, 'a1')",
         )
@@ -941,6 +942,7 @@ async fn install_definition_falls_back_to_ring_for_relationship_enriched_definit
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
+             alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'), (20, 'News'); \
              insert into articles (id, category_id, title) values \
              (1, 10, 'a1'), (2, 20, 'a2'), (3, 99, 'a3')",
@@ -1428,6 +1430,7 @@ async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chai
              create table s (id bigint primary key, a numeric); \
              insert into s (id, a) select g, g from generate_series(1, 50) g; \
              create table tags (id serial primary key, label text); \
+             alter table tags replica identity full; \
              insert into tags (id, label) select g, 'tagged' from generate_series(1, 50) g",
         )
         .await

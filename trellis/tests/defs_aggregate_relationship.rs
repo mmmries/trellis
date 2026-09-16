@@ -147,12 +147,17 @@ const TAG_TOTALS: &str = "TRANSFORM tag_totals FROM post_tags GROUP BY tag \
 /// Issue #94's exact schema. `post_tags` needs `REPLICA IDENTITY FULL` because
 /// it is an *aggregate* source (the delta/recompute path needs the old image to
 /// locate the group a changed row is leaving) — unrelated to the relationship.
+/// `posts` needs it too, as of issue #129: it's the to-side of a to-one
+/// relationship, whose settled parent projection now requires `REPLICA
+/// IDENTITY FULL` unconditionally (`assert_replica_identity_supports_projection`),
+/// independent of and in addition to the aggregate-source reason above.
 async fn create_schema(client: &Client) {
     client
         .batch_execute(
             "create table posts (id integer primary key, word_count integer); \
              create table post_tags (id integer primary key, post integer, tag text); \
              alter table post_tags replica identity full; \
+             alter table posts replica identity full; \
              create index on post_tags (post); \
              insert into posts (id, word_count) values (1, 100), (2, 250), (3, null); \
              insert into post_tags (id, post, tag) values \
