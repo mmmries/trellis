@@ -1554,6 +1554,40 @@ async fn check_reverse_guards(
     // passed — the from-side child rows a from-side change touching either
     // `old_key` or `new_key`, deduped so an ordinary same-key attribute
     // update (`old_key == new_key`) doesn't scan the same key twice.
+    //
+    // **Note for #133's implementer, on the plan doc's §3.1 fold-erasure
+    // finding** ("post 3 appears in neither folded image" when a from-side
+    // row is inserted then re-pointed within the same batch): that finding
+    // is about guard (b) specifically — `RelationshipGenBump` is resolved
+    // from the *folded* view (`compute`'s per-def evaluation), so a parent
+    // key an intermediate, erased image touched never gets its projection
+    // row's `gen` bumped at all, and guard (b)'s re-check can't detect a
+    // conflict that never bumped anything.
+    //
+    // `from_side_change_in_flight` below, by contrast, scans the **raw**
+    // ring rows directly (`seg_N`'s physical rows, one per raw CDC change,
+    // never mutated by the fold — only `claim`/`fold`'s *read-time*
+    // collapsing ever loses the intermediate image), so it *does* see the
+    // erased touch — as long as the batch that erased it is still
+    // undrained when this check runs: an in-flight insert
+    // (`old_image=NULL`, `new_image` naming the erased parent key) is a
+    // distinct physical row from the later re-point, and both independently
+    // match `old_image ->> from_col`/`new_image ->> from_col` here. That
+    // gives this guard a real, if incomplete, safety net for the scenario:
+    // it closes the window while the erasing batch is still draining, but
+    // once that batch fully drains (its own forward apply having already
+    // resolved directly against the *final* parent, never having produced
+    // a settled contribution to the erased intermediate one — which is
+    // arguably correct on its own terms, since that row's settled state
+    // never touched the erased parent at all), there is nothing left in the
+    // ring for this scan to find. Whether that residual window is fully
+    // closed, or needs the plan doc's own prescribed fix (§7 Phase 1 step
+    // 5b: give the ring's reserved `group_key` column a real "union of
+    // touched join keys" merge rule and drive guard (b) off it, explicitly
+    // sequenced *after* this issue) is the open question #133 should
+    // resolve with a dedicated test once that merge rule exists — this
+    // comment is the trail left instead of a hastily-built one now, per
+    // that issue's own review.
     let mut keys: Vec<&str> = Vec::with_capacity(2);
     if let Some(k) = old_key.as_deref() {
         keys.push(k);
@@ -3952,12 +3986,31 @@ pub async fn apply_and_mark_drained_many(
     // `key_col::text = any($1::text[])`, not the native-typed cast
     // `from_side_keys_for_join`'s own doc comment flags as unindexed
     // (P0.1/plan doc §6) — out of scope here, matches this module's other
-    // untyped relationship lookups.
+    // untyped relationship lookups. The touched-key array is sorted before
+    // binding (review follow-up to #132) — see the inline comment at that
+    // sort for why.
     for bump in plan.relationship_gen_bumps.values() {
         if bump.touched_keys.is_empty() {
             continue;
         }
-        let keys: Vec<&str> = bump.touched_keys.iter().map(String::as_str).collect();
+        // Ascending-key lock order (review follow-up to #132): `touched_keys`
+        // is a `HashSet`, whose iteration order is unspecified and can vary
+        // run to run. Without a deterministic sort here, two concurrent
+        // `apply_and_mark_drained_many` calls whose batches both touch an
+        // overlapping set of relationship-projection parent keys (plausible
+        // whenever two segments both contain from-side rows re-pointing
+        // among the same hot parents) could have their `UPDATE ... WHERE key
+        // = ANY($1)` lock those rows in different orders and deadlock —
+        // Postgres detects and aborts one side rather than corrupting
+        // anything, but it's a needless liveness hazard, and this codebase
+        // already has the fix for exactly this class of bug: the
+        // target-write lock just above sorts (and dedups) its keys before
+        // taking `FOR UPDATE` locks, with `two_overlapping_group_writers_serialize_via_ascending_lock_order_not_deadlock`
+        // as its regression pin. Sorting the bound array doesn't change
+        // *what* this bare `UPDATE` locks, only lines up every concurrent
+        // caller's lock-acquisition order onto the same ascending sequence.
+        let mut keys: Vec<&str> = bump.touched_keys.iter().map(String::as_str).collect();
+        keys.sort_unstable();
         let key_ident = quote_ident(&bump.key_col);
         let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
         txn.execute(
