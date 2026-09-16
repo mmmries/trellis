@@ -1,7 +1,11 @@
 //! An internal facade over the `metrics`/`metrics-exporter-prometheus`
 //! in-process registry (issue #51, `docs/decisions/0009-observability-decisions.md`).
 //!
-//! Call sites elsewhere in this crate (`staging::apply::compute`, today)
+//! Call sites elsewhere in this crate (`staging::apply::flush_apply_metrics`,
+//! today — called from `staging::apply::drain_once`/`drain_many` once a
+//! batch's apply transaction has actually committed; see that function's doc
+//! comment for why recording happens there and not from `staging::apply::compute`
+//! itself, which merely buffers the data these functions end up recording)
 //! record through the plain functions below rather than reaching for the
 //! `metrics` crate's own macros/types directly — so a future change to the
 //! recording backend (a different facade, a second exporter, richer label
@@ -144,11 +148,13 @@ pub fn ensure_installed() {
 }
 
 /// Records one observation of [`TRANSFORM_LATENCY_METRIC`] for `transform`.
-/// Called from [`crate::staging::apply::compute`] once per applied change
-/// that carries an origin timestamp (`FoldedChange::src_changed` is `None`
-/// for a bare recompute trigger with no source change behind it — nothing
-/// to measure latency against, so callers skip this and call only
-/// [`increment_changes_applied`] for such a change).
+/// Called from `staging::apply::flush_apply_metrics` once per
+/// applied change that carries an origin timestamp (`FoldedChange::src_changed`
+/// is `None` for a bare recompute trigger with no source change behind it —
+/// nothing to measure latency against, so callers skip this and call only
+/// [`increment_changes_applied`] for such a change) — only once the batch
+/// that produced the observation has actually committed, per that
+/// function's own doc comment.
 pub fn record_transform_latency(transform: &str, latency: Duration) {
     ensure_installed();
     metrics::histogram!(TRANSFORM_LATENCY_METRIC, "transform" => transform.to_string())
@@ -156,10 +162,12 @@ pub fn record_transform_latency(transform: &str, latency: Duration) {
 }
 
 /// Records one observation of [`END_TO_END_LATENCY_METRIC`] for `transform`
-/// — issue #52. Called from [`crate::staging::apply::compute`] once per
-/// applied change whose *consuming* transform is terminal (no downstream
-/// reader — see [`crate::defs::catalog::transforms_for_source`]) and that
-/// carries an origin timestamp, mirroring
+/// — issue #52. Called from `staging::apply::flush_apply_metrics`
+/// (same post-commit timing as [`record_transform_latency`] — see that
+/// function's doc comment) once per applied change whose *consuming*
+/// transform is terminal (no downstream reader — see
+/// [`crate::defs::catalog::transforms_for_source`]) and that carries an
+/// origin timestamp, mirroring
 /// [`record_transform_latency`]'s `src_changed` gate exactly: the value
 /// observed is the same `now - src_changed` duration, just gated to
 /// terminal transforms and recorded under a different metric name. Reuses
