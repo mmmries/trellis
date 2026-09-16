@@ -186,6 +186,26 @@ async fn projection_lsn(client: &Client, projection_table: &str, id: i32) -> Opt
         .get(0)
 }
 
+/// Drives `claim`/`fold`/`compute` by hand for one segment, stopping short
+/// of applying it — the building block both the guard-(d) stopgap tests in
+/// this file share, so two (or more) segments' Phase 2 can be forced to run
+/// before either's Phase 3 commits (the out-of-order-drain race guard (d)
+/// exists for; `drain_once` always applies a segment immediately after
+/// computing it, so it can't construct this scenario on its own).
+async fn claim_fold_compute(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> ApplyPlan {
+    let mut phase1 = pool.get().await.expect("connection");
+    let txn = phase1.transaction().await.expect("begin phase 1");
+    claim::claim(&*txn, seg_seq, claimed_by, 1)
+        .await
+        .expect("claim");
+    let filter = claim::owned_bucket_filter(&*txn, seg_seq, claimed_by)
+        .await
+        .expect("owned_bucket_filter");
+    let folded = fold::fold(&txn, seg_seq, filter).await.expect("fold");
+    txn.commit().await.expect("commit phase 1");
+    apply::compute(pool, &folded).await.expect("compute")
+}
+
 async fn projection_row_exists(client: &Client, projection_table: &str, id: i32) -> bool {
     client
         .query_one(
@@ -507,29 +527,9 @@ async fn a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges() {
     .await;
     let seg_a = seal_active_segment(&mut client).await;
 
-    async fn claim_fold_compute(
-        pool: &trellis::Pool,
-        client: &mut Client,
-        seg_seq: i64,
-        claimed_by: &str,
-    ) -> ApplyPlan {
-        let mut phase1 = pool.get().await.expect("connection");
-        let txn = phase1.transaction().await.expect("begin phase 1");
-        claim::claim(&*txn, seg_seq, claimed_by, 1)
-            .await
-            .expect("claim");
-        let filter = claim::owned_bucket_filter(&*txn, seg_seq, claimed_by)
-            .await
-            .expect("owned_bucket_filter");
-        let folded = fold::fold(&txn, seg_seq, filter).await.expect("fold");
-        txn.commit().await.expect("commit phase 1");
-        let _ = client;
-        apply::compute(pool, &folded).await.expect("compute")
-    }
-
     // Phase 2 for segment A — captures `prev_lsn` against the pre-update
     // projection state.
-    let plan_a = claim_fold_compute(&db.pool, &mut client, seg_a, "worker_a").await;
+    let plan_a = claim_fold_compute(&db.pool, seg_a, "worker_a").await;
 
     // Second parent change: 400 -> 500 (live value, matching what A's own
     // apply hasn't landed yet), its own later segment — captured *before*
@@ -549,7 +549,7 @@ async fn a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges() {
     )
     .await;
     let seg_b = seal_active_segment(&mut client).await;
-    let plan_b = claim_fold_compute(&db.pool, &mut client, seg_b, "worker_b").await;
+    let plan_b = claim_fold_compute(&db.pool, seg_b, "worker_b").await;
 
     // Apply A: matches, advances the projection to lsn 100.
     let mut phase3 = db.pool.get().await.expect("connection");
@@ -595,6 +595,124 @@ async fn a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges() {
         Some(&(Some("3".to_string()), Some("750".to_string()))),
         "250 (post 2) + 500 (post 1's true final value, recovered via the stopgap \
          fallback) + null (post 999)"
+    );
+}
+
+/// Review follow-up to issue #131: the guard-(d) stopgap's fallback loop
+/// used to enumerate `old_key`/`new_key` with no dedup, so an *ordinary*
+/// same-key parent attribute update (`old_key == new_key`, the common case
+/// — a parent PK change or insert/delete is what actually needs both sides)
+/// iterated the identical join key twice and staged every matching
+/// from-side row's image-less `Recompute` *twice*. Not a correctness bug (a
+/// `Recompute` re-derives live state idempotently), but it doubled the ring
+/// writes and live-DB reads every time the stopgap fired on an ordinary
+/// update.
+///
+/// Same two-segment setup as `a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges`,
+/// but both parent changes touch the same `id = 1` (an ordinary attribute
+/// update on both sides, not a repoint) — the exact shape the bug affected
+/// — and instead of draining to quiescence, this inspects the ring
+/// directly right after B's rejected apply commits: exactly one `recompute`
+/// row per from-side row matching post 1 (ids 10 and 12), not two apiece.
+#[tokio::test]
+async fn a_same_key_stopgap_stages_exactly_one_recompute_per_from_side_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    // First parent change: 100 -> 400, its own segment.
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("first update");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        100,
+    )
+    .await;
+    let seg_a = seal_active_segment(&mut client).await;
+    let plan_a = claim_fold_compute(&db.pool, seg_a, "worker_a").await;
+
+    // Second parent change: same key (id = 1), 400 -> 500 — old_key ==
+    // new_key, the common case the bug affected. Captured before A applies,
+    // so it reads the same stale prev_lsn A is about to consume.
+    client
+        .execute("update posts set word_count = 500 where id = 1", &[])
+        .await
+        .expect("second update");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":400}"),
+        Some("{\"id\":1,\"word_count\":500}"),
+        200,
+    )
+    .await;
+    let seg_b = seal_active_segment(&mut client).await;
+    let plan_b = claim_fold_compute(&db.pool, seg_b, "worker_b").await;
+
+    // Apply A: matches, advances the projection to lsn 100.
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3 (a)");
+    apply::apply_and_mark_drained(&txn, seg_a, "worker_a", &plan_a, "trellis_reverse_test")
+        .await
+        .expect("apply A");
+    txn.commit().await.expect("commit A");
+
+    // Apply B: prev_lsn is stale — the guard-(d) stopgap fires and falls
+    // back to Recompute for post_tags rows 10 and 12 (both point at
+    // post 1). Neither A's fast-path delta (no downstream readers of
+    // tag_totals) nor B's own stopgap branch (it `continue`s past the
+    // `needs_recompute_fallback`/projection-advance code) stages anything
+    // else, so whatever lands in the now-active ring segment is exactly
+    // this test's signal.
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3 (b)");
+    apply::apply_and_mark_drained(&txn, seg_b, "worker_b", &plan_b, "trellis_reverse_test")
+        .await
+        .expect("apply B");
+    txn.commit().await.expect("commit B");
+
+    let table = active_seg_table(&client).await;
+    let post_tags_table = qualify_fixture_table("post_tags");
+    let recompute_keys: Vec<String> = client
+        .query(
+            &format!(
+                "select key from {table} where src_table = $1 and op = 'recompute' order by key"
+            ),
+            &[&post_tags_table],
+        )
+        .await
+        .expect("read staged recompute rows")
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+
+    assert_eq!(
+        recompute_keys,
+        vec!["10".to_string(), "12".to_string()],
+        "exactly one fallback Recompute per from-side row matching post 1 \
+         (ids 10 and 12) — not two apiece from redundantly enumerating \
+         old_key and new_key when they're equal"
     );
 }
 

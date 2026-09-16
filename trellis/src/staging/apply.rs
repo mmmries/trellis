@@ -3711,6 +3711,17 @@ pub async fn apply_and_mark_drained_many(
                  recompute of its from-side rows (stopgap for #134's \
                  deferral plumbing)"
             );
+            // Dedup by from-side key, the same `seen_keys` pattern the
+            // sibling `needs_recompute_fallback` branch below uses — for
+            // the common case (an ordinary parent attribute update,
+            // `old_key == new_key`) this loop would otherwise enumerate the
+            // identical join key twice and stage every matching from-side
+            // row's `Recompute` twice: not a correctness bug (a `Recompute`
+            // re-derives live state idempotently either way), but it
+            // doubles the ring writes and live-DB reads every time this
+            // stopgap fires on an ordinary update. Review follow-up to
+            // issue #131.
+            let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
             for key in [old_key.as_deref(), new_key.as_deref()]
                 .into_iter()
                 .flatten()
@@ -3724,12 +3735,14 @@ pub async fn apply_and_mark_drained_many(
                 )
                 .await?;
                 for (from_key, _) in from_rows {
-                    relationship_reverse_fallback.push((
-                        shape.from_table.clone(),
-                        from_key,
-                        record.hop_gen + 1,
-                        record.src_changed,
-                    ));
+                    if seen_keys.insert(from_key.clone()) {
+                        relationship_reverse_fallback.push((
+                            shape.from_table.clone(),
+                            from_key,
+                            record.hop_gen + 1,
+                            record.src_changed,
+                        ));
+                    }
                 }
             }
             continue;
