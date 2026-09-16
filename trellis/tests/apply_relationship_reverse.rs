@@ -2091,43 +2091,76 @@ async fn a_deferred_reverse_lands_in_the_active_segment_never_the_draining_one()
 }
 
 /// The plan doc's `d5_block_*` counters (issue #134's own §7 step 6/step 7
-/// naming), one dedicated scenario per guard — each must increment its own
-/// label by exactly one on that guard's rejection, and not perturb the
-/// other three. Reuses the same four scenarios `guard_a_.../guard_b_.../
-/// guard_c_...`/`a_stale_prev_lsn_...` build above, trimmed to just the
-/// metric assertion (this file's own convergence/staged-row assertions for
-/// each guard already live on those tests).
+/// naming), one dedicated scenario per guard. Two layers, deliberately:
+///
+/// 1. **`ApplyOutcome::deferral_counts` itself** — a plain struct field,
+///    populated by Phase 3 and returned from `apply_and_mark_drained`
+///    regardless of what its caller does next. Asserting on this directly
+///    is deterministic and has zero shared/concurrent state to race
+///    against — this is the primary, always-reliable check that Phase 3
+///    attributed the rejection to the right guard.
+/// 2. **The metrics registry itself** — `apply_and_mark_drained`'s own
+///    callers are responsible for flushing `deferral_counts` into
+///    `trellis::metrics::increment_relationship_reverse_deferred` only
+///    *after* their own commit succeeds (`drain_once`/`drain_many` do this
+///    internally via `flush_relationship_reverse_deferral_metrics`, a
+///    private helper — this test, calling `apply_and_mark_drained`
+///    directly the same way every other scenario in this file does,
+///    reproduces that exact same post-commit flush call by hand). This is
+///    what actually proves the wiring reaches Prometheus, not just that
+///    Phase 3's own bookkeeping is correct.
 ///
 /// The registry is process-wide (`metrics.rs`'s own module doc comment) —
 /// shared with every other test in this binary, run in parallel by
-/// default — so every assertion here is a **delta** across its own
-/// `apply_and_mark_drained` call, snapshotting immediately before and
-/// after, never an absolute value.
+/// default, including several *other* tests in this same file that also
+/// trigger a guard rejection (and so also bump one of these same four
+/// labels). Review follow-up to this issue confirmed an earlier version of
+/// layer 2 here — asserting the *other three* labels stayed at an exact
+/// prior value across the one label under test — flaky under that
+/// concurrency: a sibling test's own rejection landing inside this test's
+/// narrow before/after window is indistinguishable, on a shared global
+/// counter, from a real bug. Narrowed to what a shared, concurrently-written
+/// counter can actually support without a redesign of the (deliberately
+/// process-wide, ADR-0009) metrics registry or serializing this file's
+/// tests against each other: layer 2 asserts only that *its own* label's
+/// delta is **at least** one (never exactly one, and never that the other
+/// three stayed put) — robust to any amount of concurrent noise from
+/// sibling tests, and, since a delta can only ever move *up*, never a
+/// false negative. `metric_label`'s own per-variant mapping is separately
+/// unit-tested, with zero concurrency exposure at all, in `staging::apply`'s
+/// own test module
+/// (`reverse_guard_failure_metric_labels_match_the_plan_docs_own_d5_block_names`).
 #[tokio::test]
-async fn each_guard_increments_its_own_deferral_metric_and_only_its_own() {
+async fn each_guard_increments_its_own_deferral_metric() {
     const METRIC: &str = "trellis_relationship_reverse_deferred_total";
-    const LABELS: [&str; 4] = [
-        "d5_block_barrier",
-        "d5_block_gen",
-        "d5_block_inflight",
-        "d5_block_order",
-    ];
 
-    async fn snapshot() -> [u64; 4] {
+    async fn value_for(label: &str) -> u64 {
         let rendered = trellis::metrics::Metrics::new().render_prometheus();
-        std::array::from_fn(|i| counter_value(&rendered, METRIC, "guard", LABELS[i]))
+        counter_value(&rendered, METRIC, "guard", label)
     }
 
-    async fn assert_only_this_label_moved(before: [u64; 4], moved_index: usize) {
-        let after = snapshot().await;
-        for (i, label) in LABELS.iter().enumerate() {
-            let expected = before[i] + u64::from(i == moved_index);
-            assert_eq!(
-                after[i], expected,
-                "label {label:?} moved unexpectedly (before={:?}, after={:?})",
-                before, after
-            );
+    /// Mirrors `staging::apply::flush_relationship_reverse_deferral_metrics`
+    /// (private to that crate) by hand — any direct caller of
+    /// `apply_and_mark_drained`/`_many` (this test included) owns this same
+    /// post-commit-only responsibility `drain_once`/`drain_many` discharge
+    /// internally.
+    fn flush(deferral_counts: &std::collections::HashMap<&'static str, u64>) {
+        for (guard, count) in deferral_counts {
+            for _ in 0..*count {
+                trellis::metrics::increment_relationship_reverse_deferred(guard);
+            }
         }
+    }
+
+    async fn assert_label_advanced_by_at_least_one(before: u64, label: &str) {
+        let after = value_for(label).await;
+        assert!(
+            after >= before + 1,
+            "label {label:?} must have advanced by at least one \
+             (before={before}, after={after}) — it may be more than one if \
+             a concurrently-running sibling test also rejected on this \
+             same guard, which is expected and not itself a failure"
+        );
     }
 
     // Guard (a): watermark barrier.
@@ -2163,10 +2196,10 @@ async fn each_guard_increments_its_own_deferral_metric_and_only_its_own() {
         let seg = seal_active_segment(&mut client).await;
         let plan = claim_fold_compute(&db.pool, seg, "worker_metric_a").await;
 
-        let before = snapshot().await;
+        let before = value_for("d5_block_barrier").await;
         let mut phase3 = db.pool.get().await.expect("connection");
         let txn = phase3.transaction().await.expect("begin phase 3");
-        apply::apply_and_mark_drained(
+        let outcome = apply::apply_and_mark_drained(
             &txn,
             seg,
             "worker_metric_a",
@@ -2177,7 +2210,13 @@ async fn each_guard_increments_its_own_deferral_metric_and_only_its_own() {
         .await
         .expect("apply (rejected by guard a)");
         txn.commit().await.expect("commit");
-        assert_only_this_label_moved(before, 0).await;
+        assert_eq!(
+            outcome.deferral_counts.get("d5_block_barrier"),
+            Some(&1),
+            "Phase 3 must attribute this rejection to guard (a)'s own label"
+        );
+        flush(&outcome.deferral_counts);
+        assert_label_advanced_by_at_least_one(before, "d5_block_barrier").await;
     }
 
     // Guard (b): generation check.
@@ -2223,10 +2262,10 @@ async fn each_guard_increments_its_own_deferral_metric_and_only_its_own() {
             .await
             .expect("simulate a concurrent forward apply");
 
-        let before = snapshot().await;
+        let before = value_for("d5_block_gen").await;
         let mut phase3 = db.pool.get().await.expect("connection");
         let txn = phase3.transaction().await.expect("begin phase 3");
-        apply::apply_and_mark_drained(
+        let outcome = apply::apply_and_mark_drained(
             &txn,
             seg,
             "worker_metric_b",
@@ -2237,7 +2276,13 @@ async fn each_guard_increments_its_own_deferral_metric_and_only_its_own() {
         .await
         .expect("apply (rejected by guard b)");
         txn.commit().await.expect("commit");
-        assert_only_this_label_moved(before, 1).await;
+        assert_eq!(
+            outcome.deferral_counts.get("d5_block_gen"),
+            Some(&1),
+            "Phase 3 must attribute this rejection to guard (b)'s own label"
+        );
+        flush(&outcome.deferral_counts);
+        assert_label_advanced_by_at_least_one(before, "d5_block_gen").await;
     }
 
     // Guard (c): in-flight check.
@@ -2290,10 +2335,10 @@ async fn each_guard_increments_its_own_deferral_metric_and_only_its_own() {
         .await;
         let plan = claim_fold_compute(&db.pool, seg, "worker_metric_c").await;
 
-        let before = snapshot().await;
+        let before = value_for("d5_block_inflight").await;
         let mut phase3 = db.pool.get().await.expect("connection");
         let txn = phase3.transaction().await.expect("begin phase 3");
-        apply::apply_and_mark_drained(
+        let outcome = apply::apply_and_mark_drained(
             &txn,
             seg,
             "worker_metric_c",
@@ -2304,7 +2349,13 @@ async fn each_guard_increments_its_own_deferral_metric_and_only_its_own() {
         .await
         .expect("apply (rejected by guard c)");
         txn.commit().await.expect("commit");
-        assert_only_this_label_moved(before, 2).await;
+        assert_eq!(
+            outcome.deferral_counts.get("d5_block_inflight"),
+            Some(&1),
+            "Phase 3 must attribute this rejection to guard (c)'s own label"
+        );
+        flush(&outcome.deferral_counts);
+        assert_label_advanced_by_at_least_one(before, "d5_block_inflight").await;
     }
 
     // Guard (d): per-parent ordering (the stale-prev_lsn scenario).
@@ -2372,10 +2423,10 @@ async fn each_guard_increments_its_own_deferral_metric_and_only_its_own() {
         .expect("apply A");
         txn.commit().await.expect("commit A");
 
-        let before = snapshot().await;
+        let before = value_for("d5_block_order").await;
         let mut phase3 = db.pool.get().await.expect("connection");
         let txn = phase3.transaction().await.expect("begin phase 3 (b)");
-        apply::apply_and_mark_drained(
+        let outcome = apply::apply_and_mark_drained(
             &txn,
             seg_b,
             "worker_metric_d_b",
@@ -2386,6 +2437,233 @@ async fn each_guard_increments_its_own_deferral_metric_and_only_its_own() {
         .await
         .expect("apply B (rejected by guard d)");
         txn.commit().await.expect("commit B");
-        assert_only_this_label_moved(before, 3).await;
+        assert_eq!(
+            outcome.deferral_counts.get("d5_block_order"),
+            Some(&1),
+            "Phase 3 must attribute this rejection to guard (d)'s own label"
+        );
+        flush(&outcome.deferral_counts);
+        assert_label_advanced_by_at_least_one(before, "d5_block_order").await;
     }
+}
+
+/// Review follow-up to issue #134: the `retry_count > 0` restriction alone
+/// (this module's first attempt at closing the `force_every_group`-vs-
+/// `diff_pass` staleness hazard) is too narrow — it only ever protects a
+/// record that was *itself* previously guard-rejected. This is the
+/// independent first-attempt reproduction the review built against the
+/// unmodified `retry_count`-only fix and confirmed corrupts data: the
+/// parent's live row is updated for real, a sibling from-side row is
+/// inserted and *fully drained* — triggering `force_every_group`'s live
+/// recompute, which reads the *already-updated* live parent value and
+/// settles the whole group to the true total — and only *then* does the
+/// parent's own CDC get staged. Guard (c) finds nothing in flight (the
+/// sibling already fully drained) and passes on the very first attempt
+/// (`retry_count == 0`), so the old restriction alone would let the fast
+/// `diff_pass` path run anyway and re-add a delta the sibling's own live
+/// recompute had already folded in.
+///
+/// `relationship_fast_path_precondition_holds` is what's supposed to catch
+/// this now: it scans every physical ring row — not just still-undrained
+/// ones — for a sibling touching this key, so the *already-drained-but-
+/// not-yet-retired* sibling here still leaves a trace it can find (this
+/// test deliberately never calls `retire_drained_segments`, so that trace
+/// survives — see that function's own doc comment for the residual gap
+/// once retirement *does* run).
+#[tokio::test]
+async fn a_sibling_that_already_drained_via_force_every_group_before_the_parents_own_cdc_is_staged_does_not_corrupt_a_first_attempt()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    // This test's own lsns must be real, monotonically-increasing WAL
+    // positions, not this file's usual small hand-picked placeholders
+    // (`100`, `200`, ...): `record.prev_lsn` (the lower bound
+    // `relationship_fast_path_precondition_holds` checks the sibling's own
+    // lsn against) comes from the settled parent projection's
+    // `__trellis_lsn`, which backfill stamps from a *real*
+    // `pg_current_wal_lsn()` at relationship-creation time — a large value
+    // already, by the time this test's own staging starts, from all the
+    // real WAL activity `create_schema`/`create_relationship`/
+    // `drain_to_quiescence` above generate. A hand-picked small lsn for the
+    // sibling below would (harmlessly, but misleadingly) sit *below* that
+    // baseline and never satisfy the "committed after the projection's own
+    // last-known-good position" test this function's own doc comment
+    // describes — masking the very hazard this test exists to prove closed.
+    let base: u64 = u64::from(
+        client
+            .query_one("select pg_current_wal_lsn()", &[])
+            .await
+            .expect("read the current wal lsn")
+            .get::<_, PgLsn>(0),
+    );
+
+    // The parent's *live* row is updated for real, but its CDC is not
+    // staged yet — mirroring "the reverse hasn't even been enumerated" at
+    // this point.
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("live update the related post");
+
+    // A sibling from-side row, inserted and *fully drained* before the
+    // parent's own CDC ever lands: its own forward evaluation goes through
+    // `force_every_group` (this aggregate reads a relationship), which
+    // live-joins against the *already-updated* parent row and settles the
+    // whole 'rust' group (row 10 and the new row) to the true total — using
+    // the new value, never having known an "old" 100/still-word_count era
+    // at all.
+    client
+        .execute(
+            "insert into post_tags (id, post, tag) values (40, 1, 'rust')",
+            &[],
+        )
+        .await
+        .expect("insert a new post_tags row pointing at post 1");
+    stage_cdc_at_lsn(
+        &client,
+        "post_tags",
+        "40",
+        "insert",
+        None,
+        Some("{\"id\":40,\"post\":1,\"tag\":\"rust\"}"),
+        base + 50,
+    )
+    .await;
+    let sibling_seg = seal_active_segment(&mut client).await;
+    let watermark = StagedWatermark::saturated();
+    while apply::drain_once(
+        &db.pool,
+        sibling_seg,
+        "worker_sibling",
+        1,
+        "trellis_reverse_test",
+        &watermark,
+    )
+    .await
+    .expect("drain_once sibling_seg")
+    .is_some()
+    {}
+    // Deliberately *not* calling `retire_drained_segments` here: this test
+    // is the case `relationship_fast_path_precondition_holds` is meant to
+    // catch (the sibling's ring row is still physically present, just
+    // marked drained) — see that function's own doc comment for why an
+    // already-*retired* sibling is a different, still-open story.
+
+    let totals_before_parent_cdc = target_totals(&client).await;
+    assert_eq!(
+        totals_before_parent_cdc.get("rust"),
+        Some(&(Some("4".to_string()), Some("1050".to_string()))),
+        "sanity: the sibling's own force_every_group recompute must have \
+         already settled 'rust' to the true total (400 via row 10 + 250 via \
+         post 2's row 11 + null via post 999's row 13 + 400 via the new \
+         row 40) *before* the parent's own CDC is ever staged"
+    );
+
+    // *Now* stage the parent's own CDC — first attempt, never rejected.
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        base + 100,
+    )
+    .await;
+    let seg = seal_active_segment(&mut client).await;
+    let plan = claim_fold_compute(&db.pool, seg, "worker_parent").await;
+
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg,
+        "worker_parent",
+        &plan,
+        "trellis_reverse_test",
+        &watermark,
+    )
+    .await
+    .expect("apply the parent's reverse");
+    txn.commit().await.expect("commit");
+
+    // Guards (a)/(b)/(c)/(d) all genuinely pass here (nothing rejects the
+    // record outright — the sibling is *not* in flight by guard (c)'s own,
+    // unchanged "still undrained" definition), so this never becomes a
+    // `rel_reverse_deferred` row at all. It's the fast-path-vs-fallback
+    // decision, one level deeper, that must route to the fallback: the
+    // whole `aggregate_shapes` loop is skipped for this record (not just
+    // the touched 'rust' group), so *every* from-side row matching post 1
+    // — rows 10 and 12 ('rust' and 'db' respectively) and the new row 40 —
+    // gets an image-less `Recompute`, the same shape
+    // `needs_recompute_fallback` already uses.
+    let mut recompute_keys = staged_recompute_keys(&client, "post_tags").await;
+    recompute_keys.sort();
+    assert_eq!(
+        recompute_keys,
+        vec!["10".to_string(), "12".to_string(), "40".to_string()],
+        "the fast path's own extra precondition must have found the \
+         already-drained sibling and routed this first attempt to the \
+         fallback instead of trusting a stale diff"
+    );
+    assert!(
+        staged_deferred_reverses(&client, relationship.id)
+            .await
+            .is_empty(),
+        "no guard actually rejected this record — only the fast-path's own \
+         extra precondition did — so nothing should be staged as \
+         rel_reverse_deferred here"
+    );
+
+    let totals_after = target_totals(&client).await;
+    assert_eq!(
+        totals_after.get("rust"),
+        Some(&(Some("4".to_string()), Some("1050".to_string()))),
+        "the total must stay exactly correct — not double-corrected by a \
+         diff_pass that assumed row 10 (and the new row 40) still reflected \
+         the pre-update 100 value"
+    );
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        Some(PgLsn::from(base + 100)),
+        "guards all genuinely passed, so the projection must still advance \
+         to this record's own lsn — only the *fast-path write* was routed \
+         to the fallback, not the whole record"
+    );
+
+    // The re-staged `Recompute`s for rows 10/12/40 must still drain
+    // cleanly — idempotent for 'rust' (already correct) and the actual
+    // correction for 'db' (row 12, untouched by anything until now).
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    drain_to_quiescence(&db.pool, &mut client).await;
+    let totals_final = target_totals(&client).await;
+    assert_eq!(
+        totals_final.get("rust"),
+        Some(&(Some("4".to_string()), Some("1050".to_string()))),
+        "still correct after the fallback's own idempotent recomputes drain"
+    );
+    assert_eq!(
+        totals_final.get("db"),
+        Some(&(Some("2".to_string()), Some("400".to_string()))),
+        "'db' (row 12's group, never touched by the sibling's own \
+         force_every_group pass) must converge too: 400 (post 1, its true \
+         final value) + null (post 3)"
+    );
 }

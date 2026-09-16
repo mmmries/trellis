@@ -413,7 +413,29 @@ pub async fn isolate_and_evict(
 
     let mut poisoned: Vec<(String, String, String)> = Vec::new();
     for change in folded {
-        if change.is_truncate {
+        // Issue #134/#135 review follow-up: a `rel_reverse_deferred` row
+        // must never be probed/poisoned/parked here, for the same reason
+        // `park_batch_contribution`/`poisoned_park` already exclude it at
+        // the `compute()` level (that module's own comment) — `poison_held`
+        // has no columns for `relationship_id`/`retry_count` and no
+        // `rel_reverse_deferred` `op` value in its own CHECK constraint
+        // (`V13__quarantine.sql`, deliberately not widened when V28 added
+        // the new ring op — see that migration's own doc comment), so
+        // parking one would silently derive a *wrong* `op` from image shape
+        // alone (`folded_change_op`), drop `relationship_id`/`retry_count`
+        // entirely, and — worse — `release_key` would later re-append it as
+        // a bogus `StagedChange::Cdc` against this op's synthetic sentinel
+        // `src_table` (`apply::relationship_reverse_deferred_src_table`),
+        // which is not a real table at all. Skipping it here is the loud,
+        // safe failure mode doc 06 asks for: if nothing else in this batch
+        // reproduces the error in isolation, `poisoned` stays empty and the
+        // caller (`classify_and_retry`'s `Isolate` arm) surfaces the
+        // original failure rather than silently corrupting quarantine
+        // state. A complete fix — genuinely quarantine-safe deferred
+        // reverses, with their own `poison_held` columns/op mirroring this
+        // issue's V28 migration — is real and larger than this follow-up;
+        // tracked separately rather than attempted here.
+        if change.is_truncate || change.relationship_reverse_deferred.is_some() {
             continue;
         }
         let singleton = std::slice::from_ref(change);

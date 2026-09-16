@@ -1560,6 +1560,107 @@ async fn from_side_change_in_flight(
     Ok(row.get(0))
 }
 
+/// Issue #134 review follow-up: the fast (`diff_pass`) aggregate delta
+/// path's own, *additional* precondition — stricter than, and checked
+/// independently of, guard (c) above (which still governs the plain
+/// apply-or-defer decision, unchanged, per #132's own ablation proof that
+/// its current "still undrained" shape is load-bearing for *that*
+/// question).
+///
+/// **The hazard this closes** (confirmed by an independent review
+/// reproduction against the shipped, unmodified #134 commit — real, not
+/// retry-specific): `apply_aggregate::accumulate_changes`'s
+/// `force_every_group` path (`rel_joins` non-empty — still live; deleting
+/// it is plan doc §7 Phase 1 step 8, unscheduled) does a **live**, full
+/// group recompute, via a direct SQL join back to the relationship's
+/// to-side table, whenever *any* sibling from-side row's own forward CDC is
+/// evaluated — completely independent of, and invisible to, this
+/// relationship's settled-parent-projection/guard machinery (it doesn't
+/// read the projection, and critically it never bumps
+/// [`ddl::PROJECTION_GEN_COLUMN`] the way the projection-based forward path
+/// does — see [`RelationshipGenBump`]'s own doc comment). If a sibling's
+/// own drain runs `force_every_group` for this same group *after*
+/// `old_row` was true but *before* this reverse's `diff_pass` gets to
+/// apply, the group's stored value can already equal what `diff_pass` is
+/// about to *add on top of* — a real double-correction, confirmed to
+/// reproduce **on a genuinely first attempt** (`retry_count == 0`), not
+/// just a retried one: `retry_count > 0` alone (this module's other
+/// guard-rejection-specific restriction) is too narrow, since guard (c)
+/// itself can genuinely find nothing in flight — the racing sibling may
+/// have already fully drained — and let a first attempt straight into the
+/// same trap.
+///
+/// **What this checks, and its own limits.** Unlike guard (c) (scoped to
+/// rows still `state <> 'drained'`), this scans every physical ring row —
+/// staged, in-flight, *or already drained* — matching `keys` via
+/// `from_col`, with `lsn` in `(since_lsn, watermark_x]` (an *exclusive*
+/// lower bound: `since_lsn` is `record.prev_lsn`, the projection's
+/// already-known-good position as of Phase 2's capture — anything at or
+/// before it is already accounted for; `None` means "no prior projection
+/// row" — a parent INSERT — so *every* matching row counts, since there is
+/// no "before" era to bound against). This catches the same-batch and
+/// recently-drained-but-not-yet-retired cases — the realistic shape of
+/// this hazard, and the only shape this module's own tests (this issue's
+/// retry scenarios, and every existing #131/#132/#133 positive-path test)
+/// can exercise without deliberately engineering ring retirement into the
+/// gap.
+///
+/// **What it does *not* close**: a sibling whose ring evidence has already
+/// been *retired* (`retire::retire_drained_segments` truncates the whole
+/// physical slot once every older batch has drained) before this check
+/// runs leaves no trace here to find — this function can only see what the
+/// ring still holds. Closing that residual case fully needs a persistent
+/// signal that survives retirement, e.g. `force_every_group`'s own bulk
+/// recompute (`apply_aggregate::apply_forced_groups_bulk`) additionally
+/// bumping the touched relationship(s)' projection `__trellis_gen`, the
+/// same way the projection-based forward path's step 3c already does —
+/// explicitly **not** implemented here: it requires locating the joined
+/// parent keys inside that bulk `INSERT ... SELECT` and threading them back
+/// through `apply_aggregate`'s own result type, a change to the
+/// `force_every_group`/`rel_joins` machinery this issue's own scope
+/// excludes. Flagged as a named follow-up (see this issue's own report/PR
+/// description) rather than attempted here, given the size and risk of that
+/// change relative to what could be validated in this pass. Until either
+/// that lands or plan doc §7 Phase 1 step 8 deletes `force_every_group`
+/// outright, this function's ring-based check is deliberately the more
+/// conservative of the two achievable options (narrower — and *only*
+/// exposed in the residual gap above — beats the alternative of disabling
+/// the fast path unconditionally, which would regress #131's whole
+/// performance case for the overwhelming majority of drains that never
+/// come near this race).
+async fn relationship_fast_path_precondition_holds(
+    txn: &Transaction<'_>,
+    from_table: &str,
+    from_col: &str,
+    keys: &[&str],
+    since_lsn: Option<PgLsn>,
+    watermark_x: PgLsn,
+) -> Result<bool, ApplyError> {
+    if keys.is_empty() {
+        return Ok(true);
+    }
+    let arms = converge::per_ring_table(" union all ", |_slot, table| {
+        format!(
+            "select 1 from {table} r \
+             where r.src_table = $1 \
+               and r.op in ('insert', 'update', 'delete') \
+               and r.lsn <= $2 \
+               and ($5::pg_lsn is null or r.lsn > $5) \
+               and (r.old_image ->> $3 = any($4::text[]) \
+                    or r.new_image ->> $3 = any($4::text[]))"
+        )
+    });
+    let sql = format!("select exists ({arms})");
+    let row = txn
+        .query_one(
+            &sql,
+            &[&from_table, &watermark_x, &from_col, &keys, &since_lsn],
+        )
+        .await?;
+    let anything_found: bool = row.get(0);
+    Ok(!anything_found)
+}
+
 /// Checks all four of #132's guards for one [`RelationshipReverseRecord`],
 /// inside the already-open Phase 3 `txn` — [`apply_and_mark_drained_many`]'s
 /// "3d" step's single "may this record's delta apply?" decision, replacing
@@ -2249,6 +2350,38 @@ mod tests {
     #[test]
     fn earliest_src_changed_of_two_unknowns_stays_unknown() {
         assert_eq!(earliest_src_changed(None, None), None);
+    }
+
+    /// Issue #134/#135 review follow-up: `ReverseGuardFailure::metric_label`'s
+    /// per-variant mapping, as a pure in-memory unit test — no DB, no
+    /// shared process-wide metrics registry, so (unlike an integration test
+    /// that reads `trellis::metrics::Metrics::render_prometheus`, itself
+    /// shared with every other test in the same binary and run in
+    /// parallel by default) this can never be flaky. Deliberately narrow:
+    /// this is the "each guard maps to its own, correct label" proof;
+    /// `tests/apply_relationship_reverse.rs`'s own metrics test is what
+    /// proves the *end-to-end wiring* (Phase 3 discovery -> buffered
+    /// `ApplyOutcome::deferral_counts` -> post-commit flush -> registry)
+    /// actually works, which a pure unit test of this function alone
+    /// cannot.
+    #[test]
+    fn reverse_guard_failure_metric_labels_match_the_plan_docs_own_d5_block_names() {
+        assert_eq!(
+            ReverseGuardFailure::Watermark.metric_label(),
+            "d5_block_barrier"
+        );
+        assert_eq!(
+            ReverseGuardFailure::Generation.metric_label(),
+            "d5_block_gen"
+        );
+        assert_eq!(
+            ReverseGuardFailure::InFlight.metric_label(),
+            "d5_block_inflight"
+        );
+        assert_eq!(
+            ReverseGuardFailure::Ordering.metric_label(),
+            "d5_block_order"
+        );
     }
 
     /// The exact numeric value of a Prometheus exposition line whose metric
@@ -3672,6 +3805,30 @@ fn flush_apply_metrics(plan: &ApplyPlan) {
     }
 }
 
+/// Issue #134/#135 review follow-up: flushes [`ApplyOutcome::deferral_counts`]/
+/// [`ManyApplyOutcome::deferral_counts`] into
+/// [`crate::metrics::increment_relationship_reverse_deferred`] — the
+/// deferral-metrics counterpart to [`flush_apply_metrics`], with the exact
+/// same "only after this attempt's transaction has actually committed"
+/// contract and for the same reason: `drain_once`/`drain_many`'s retry loop
+/// can call `apply_and_mark_drained`/`apply_and_mark_drained_many` more than
+/// once for the same folded input on a `VersionFenceMiss` or a transient
+/// Phase-3 failure (doc 06's `FenceMissBackoff`, an *ordinary*, routine
+/// occurrence, not a rare edge case) — recording eagerly, from inside that
+/// function itself, would inflate a guard's count once per losing attempt,
+/// exactly the kind of skew #135's fairness/starvation decisions can least
+/// afford under the high-contention conditions where they matter most.
+/// Not folded into `flush_apply_metrics` itself (which takes `&ApplyPlan`,
+/// a Phase-2-only artifact): these counts are discovered live during Phase
+/// 3, so they ride on the apply outcome instead.
+fn flush_relationship_reverse_deferral_metrics(deferral_counts: &HashMap<&'static str, u64>) {
+    for (guard, count) in deferral_counts {
+        for _ in 0..*count {
+            crate::metrics::increment_relationship_reverse_deferred(guard);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Phase 3: apply ∪ mark-drained
 // ---------------------------------------------------------------------
@@ -3963,6 +4120,7 @@ pub async fn apply_and_mark_drained(
         keys_written: outcome.keys_written,
         keys_deleted: outcome.keys_deleted,
         batch_drained: outcome.segments_drained[0].1,
+        deferral_counts: outcome.deferral_counts,
     })
 }
 
@@ -4054,6 +4212,14 @@ pub async fn apply_and_mark_drained_many(
 
     let mut keys_written = 0usize;
     let mut keys_deleted = 0usize;
+    // Issue #134/#135 review follow-up: per-guard deferral counts this
+    // Phase 3 pass discovers, buffered here rather than recorded eagerly —
+    // see [`ManyApplyOutcome::deferral_counts`]'s own doc comment for why
+    // (this function's own `VersionFenceMiss`/transient-failure retry loop,
+    // one layer up in `drain_once`/`drain_many`, can call it more than once
+    // for the same folded input; only the attempt whose transaction
+    // actually commits may ever reach the metrics registry).
+    let mut deferral_counts: HashMap<&'static str, u64> = HashMap::new();
     // `changed` accumulates rather than overwrites per target (`extend`,
     // not `insert`): a target can appear in both `plan.clears` and
     // `plan.targets` in the same batch — a truncate clear followed by a
@@ -4292,7 +4458,10 @@ pub async fn apply_and_mark_drained_many(
             // mechanism (see this module's own doc section), and burning a
             // hop generation per retry would trip `MAX_HOP_GEN` after 32
             // routine deferrals.
-            crate::metrics::increment_relationship_reverse_deferred(failure.metric_label());
+            //
+            // Buffered into `deferral_counts`, not recorded straight into
+            // the metrics registry here — see that variable's own comment.
+            *deferral_counts.entry(failure.metric_label()).or_insert(0) += 1;
             tracing::warn!(
                 relationship_projection = %shape.qualified_projection,
                 guard = %failure,
@@ -4345,48 +4514,48 @@ pub async fn apply_and_mark_drained_many(
         // doesn't carry.
         //
         // Issue #134 correctness fork, found while building this issue's
-        // own test coverage: `record.retry_count == 0` gates this whole
-        // fast path. A *retried* record (`retry_count > 0`) skips straight
-        // to the fallback below instead, even for an otherwise-qualifying
-        // aggregate target. Reason: `diff_pass` assumes every from-side row
-        // currently matching this key contributed under `old_parent`'s
+        // own test coverage, and sharpened by review follow-up (an
+        // independent reproduction proved a first-attempt, `retry_count ==
+        // 0` record vulnerable too — see
+        // `relationship_fast_path_precondition_holds`'s own doc comment for
+        // the full hazard and the residual gap this still leaves open):
+        // `diff_pass` assumes every from-side row currently matching this
+        // key had its prior contribution computed under `old_parent`'s
         // value and needs correcting to `new_parent`'s — true only if
-        // nothing else touched the group in between. That assumption can
-        // break specifically *because* a record was deferred: guard (c)
-        // (by far the most common guard rejection per the plan doc's own
-        // measured ablation) defers exactly when a sibling from-side
-        // change is in flight, and once that sibling drains, its own
-        // forward evaluation may go through `apply_aggregate`'s
-        // `force_every_group` path (`rel_joins` non-empty — still live,
-        // explicitly out of scope for this issue; deleting it is plan doc
-        // §7 Phase 1 step 8, unscheduled) — a full **live** group recompute
-        // that does not know or care about this deferred record's pending
-        // delta, and can leave the group already holding the *new* value
-        // by the time the retry runs. Reapplying `diff_pass` against that
-        // already-correct state double-corrects it (confirmed by a
-        // generative-style reproduction during this issue's own test
-        // development: a from-side insert racing a deferred guard-(c)
-        // rejection on the same relationship-reading aggregate corrupted
-        // the total by exactly the deferred delta's own magnitude, once
-        // per row the intervening `force_every_group` pass had already
-        // touched). The fallback path below is immune to this — it stages
-        // an image-less `Recompute`, which (for this same definition) goes
-        // through the identical `force_every_group` live recompute, so it
-        // is idempotent no matter how many times the group has already
-        // been touched. This is a real, load-bearing correctness fix for
-        // #134, not a style choice: without it, the *majority* guard
-        // (guard (c)) would be the one most likely to corrupt data on
-        // retry. It is also a documented, flagged gap for whoever picks up
-        // plan doc §7 Phase 1 step 8 (deleting `force_every_group`): once
-        // every relationship-reading aggregate's forward path goes through
-        // the projection/delta mechanism instead, this interaction — and
-        // this `retry_count == 0` gate working around it — goes away, and
-        // the fast path can safely run on every retry again.
-        for agg_shape in shape
-            .aggregate_shapes
-            .iter()
-            .filter(|_| record.retry_count == 0)
+        // nothing else touched the group in between. `retry_count == 0` is
+        // kept as a cheap, always-correct pre-filter (a record that has
+        // already been deferred once is inherently more exposed and this
+        // avoids the extra query for the common non-retried case with no
+        // loss of safety), `&&`ed with a real, general check —
+        // [`relationship_fast_path_precondition_holds`] — for whether any
+        // sibling from-side change (staged, in-flight, *or already
+        // drained*) could have raced this record's own old/new window via
+        // `force_every_group`. Either one failing routes to the fallback
+        // below (identical treatment to `needs_recompute_fallback`), which
+        // is immune to this hazard: it stages an image-less `Recompute`,
+        // which (for this same definition) goes through the identical
+        // `force_every_group` live recompute, so it is idempotent no
+        // matter how many times the group has already been touched.
+        let mut fast_path_keys: Vec<&str> = Vec::with_capacity(2);
+        if let Some(k) = old_key.as_deref() {
+            fast_path_keys.push(k);
+        }
+        if let Some(k) = new_key.as_deref()
+            && Some(k) != old_key.as_deref()
         {
+            fast_path_keys.push(k);
+        }
+        let fast_path_safe = record.retry_count == 0
+            && relationship_fast_path_precondition_holds(
+                txn,
+                &shape.from_table,
+                &shape.from_col,
+                &fast_path_keys,
+                record.prev_lsn,
+                record.watermark,
+            )
+            .await?;
+        for agg_shape in shape.aggregate_shapes.iter().filter(|_| fast_path_safe) {
             let mut target_plan = agg_shape.template.clone();
             let mut regex_cache = eval::RegexCache::new();
 
@@ -4509,12 +4678,13 @@ pub async fn apply_and_mark_drained_many(
         // multi-relationship aggregate — see
         // `ReverseRelationshipShape::needs_recompute_fallback`'s doc
         // comment) still needs the pre-#131 treatment for every touched
-        // from-side row. Issue #134: also runs whenever this record is a
-        // retry (`retry_count > 0`), covering `aggregate_shapes`' own
-        // targets too — see the fast-path loop's own comment just above for
-        // why a retried record skips that loop entirely rather than only
-        // skipping it for definitions this flag already names.
-        if shape.needs_recompute_fallback || record.retry_count > 0 {
+        // from-side row. Issue #134: also runs whenever `!fast_path_safe`
+        // (a retry, or `relationship_fast_path_precondition_holds` found a
+        // racing sibling), covering `aggregate_shapes`' own targets too —
+        // see the fast-path loop's own comment just above for why an
+        // unsafe record skips that loop entirely rather than only skipping
+        // it for definitions this flag already names.
+        if shape.needs_recompute_fallback || !fast_path_safe {
             let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
             for key in [old_key.as_deref(), new_key.as_deref()]
                 .into_iter()
@@ -4737,6 +4907,7 @@ pub async fn apply_and_mark_drained_many(
         keys_written,
         keys_deleted,
         segments_drained,
+        deferral_counts,
     })
 }
 
@@ -4744,11 +4915,28 @@ pub async fn apply_and_mark_drained_many(
 /// rows it physically wrote/deleted (no-op-suppressed writes excluded), and
 /// whether this call's completion flipped the segment to `'drained'`
 /// (`false` if other buckets are still outstanding).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy` as of issue #134/#135's review follow-up
+/// (`deferral_counts` is a `HashMap`) — every existing call site only ever
+/// read this by field or by a single `let` binding, never relied on
+/// implicit copies, so this is additive in practice.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyOutcome {
     pub keys_written: usize,
     pub keys_deleted: usize,
     pub batch_drained: bool,
+    /// Issue #134/#135: per-guard deferral counts this call's Phase 3 pass
+    /// discovered, keyed by [`ReverseGuardFailure::metric_label`] — the
+    /// caller's own responsibility to flush into
+    /// [`crate::metrics::increment_relationship_reverse_deferred`] *after*
+    /// this call's transaction has actually committed (see
+    /// [`flush_apply_metrics`]'s doc comment for why: this whole call can
+    /// be retried in full — a losing attempt's counts must never reach the
+    /// registry). Empty whenever no reverse guard rejected anything this
+    /// pass, which — reused from [`ManyApplyOutcome::deferral_counts`] via
+    /// [`apply_and_mark_drained`]'s wrapper — is the overwhelming common
+    /// case.
+    pub deferral_counts: HashMap<&'static str, u64>,
 }
 
 /// What one successful [`apply_and_mark_drained_many`] call did — the
@@ -4763,6 +4951,10 @@ pub struct ManyApplyOutcome {
     pub keys_written: usize,
     pub keys_deleted: usize,
     pub segments_drained: Vec<(i64, bool)>,
+    /// Issue #134/#135 review follow-up: buffered, not recorded eagerly —
+    /// see [`ApplyOutcome::deferral_counts`]'s doc comment (this field is
+    /// that one's source, for the coalesced-segment path).
+    pub deferral_counts: HashMap<&'static str, u64>,
 }
 
 // ---------------------------------------------------------------------
@@ -4885,6 +5077,10 @@ pub async fn drain_once(
                 // `compute` itself, which the loop above may have called
                 // more than once for this same `folded` input.
                 flush_apply_metrics(&plan);
+                // Issue #134/#135 review follow-up: same post-commit-only
+                // contract, for the deferral counters this attempt's own
+                // Phase 3 pass discovered.
+                flush_relationship_reverse_deferral_metrics(&outcome.deferral_counts);
                 backoff.reset();
                 return Ok(Some(outcome));
             }
@@ -5059,6 +5255,9 @@ pub async fn drain_many(
                 // attempt's (possibly multi-segment) transaction has
                 // actually committed.
                 flush_apply_metrics(&plan);
+                // Issue #134/#135 review follow-up: see `drain_once`'s
+                // matching call.
+                flush_relationship_reverse_deferral_metrics(&outcome.deferral_counts);
                 backoff.reset();
                 return Ok(Some(outcome));
             }

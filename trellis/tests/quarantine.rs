@@ -1301,3 +1301,86 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
         "threshold 0 short-circuits before touching key_deaths at all"
     );
 }
+
+/// Review follow-up to issue #134/#135: a `rel_reverse_deferred`
+/// `FoldedChange` must never be probed, poisoned, or parked by
+/// `isolate_and_evict` — its synthetic `src_table` (a per-relationship
+/// sentinel, `staging::apply::relationship_reverse_deferred_src_table`) is
+/// not a real table, `poison_held` has no columns for its
+/// `relationship_id`/`retry_count` and no matching `op` value in its own
+/// CHECK constraint, and a later `release_key` would re-append it as a
+/// bogus `StagedChange::Cdc` against a table name that doesn't exist. This
+/// pins the fix directly against `isolate_and_evict` (no ring/DB staging
+/// needed at all: the skip happens before this function ever calls
+/// `apply::compute`, so a synthetic key that doesn't correspond to
+/// anything real is sufficient to prove it) — even given an *otherwise
+/// maximally poison-prone* input (a `threshold` of 1, guaranteeing
+/// eviction on the very first death for anything that *is* probed), the
+/// deferred row must come out completely untouched: no probe, no death
+/// charge, no poison marker, no parked contribution — and `isolate_and_evict`
+/// itself must report nothing evicted, so its caller (`classify_and_retry`'s
+/// `Isolate` arm) surfaces the original failure loudly instead of retrying
+/// forever against an unresolvable "poisoned" synthetic key.
+#[tokio::test]
+async fn isolate_and_evict_never_probes_or_poisons_a_deferred_relationship_reverse() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    // A synthetic sentinel `src_table` shaped exactly like
+    // `relationship_reverse_deferred_src_table` produces — deliberately
+    // not backed by any real table, relationship, or definition: if this
+    // function ever tried to `compute()`/apply it, that alone would fail
+    // loudly (a `SourceTableDropped`-shaped or catalog-lookup error), which
+    // is precisely the point — this input has no legitimate way to
+    // succeed except by being skipped outright.
+    let sentinel_src_table = "\u{1f}trellis-rel-reverse-deferred:999";
+
+    let folded = vec![FoldedChange {
+        src_table: sentinel_src_table.to_string(),
+        key: "1".to_string(),
+        new_image: Some(r#"{"id":1,"v":2}"#.to_string()),
+        old_image: Some(r#"{"id":1,"v":1}"#.to_string()),
+        src_changed: None,
+        origin_lsn: None,
+        lsn: Some(PgLsn::from(1u64)),
+        hop_gen: 0,
+        first_seen: SystemTime::now(),
+        group_key: None,
+        is_truncate: false,
+        relationship_reverse_deferred: Some(999),
+        retry_count: 1,
+    }];
+
+    let result = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 1)
+        .await
+        .expect(
+            "isolate_and_evict must not error on a deferred reverse — it must be skipped \
+             outright, never probed",
+        );
+    assert!(
+        result.is_none(),
+        "a batch containing only a deferred reverse must report nothing evicted, so the \
+         caller surfaces the original failure instead of silently 'resolving' it"
+    );
+
+    assert!(
+        !poison_marker_exists(&client, sentinel_src_table, "1").await,
+        "a deferred reverse must never be poisoned under its synthetic src_table"
+    );
+    assert_eq!(
+        key_deaths_count(&client, sentinel_src_table, "1").await,
+        None,
+        "a deferred reverse must never be charged a death"
+    );
+    let poison_held_rows: i64 = client
+        .query_one("select count(*) from poison_held", &[])
+        .await
+        .expect("count poison_held")
+        .get(0);
+    assert_eq!(
+        poison_held_rows, 0,
+        "a deferred reverse must never be parked into poison_held under its synthetic \
+         src_table — release_key has no way to safely re-append it later"
+    );
+}

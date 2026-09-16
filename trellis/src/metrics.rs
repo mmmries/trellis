@@ -212,20 +212,22 @@ pub fn set_staging_segments(state: &str, count: u64) {
 }
 
 /// Increments [`RELATIONSHIP_REVERSE_DEFERRED_METRIC`] by one for `guard`
-/// (issue #134/#135) — called from `staging::apply::apply_and_mark_drained_many`'s
-/// "3d" step at the same point it re-stages the rejected record as a
-/// `StagedChange::RelationshipReverseDeferred`, inside the open Phase-3
-/// transaction. Unlike `record_transform_latency`/`increment_changes_applied`
-/// (buffered on `ApplyPlan` and flushed only post-commit — see
-/// `staging::apply::flush_apply_metrics`'s doc comment for why), this is
-/// recorded eagerly, before that transaction commits: a documented, accepted
-/// gap (the same posture this exact call site's own `tracing::warn!` already
-/// takes) rather than plumbing a fourth buffered-metrics accumulator through
-/// `ApplyPlan`/Phase 3 for a purely observational counter — a rolled-back
-/// Phase 3 (rare; only a later, unrelated failure in the same transaction
-/// after this step runs) could over-count by one per guard rejection in that
-/// transaction, never under-count, and never affects anything the deferral
-/// mechanism's own correctness depends on.
+/// (issue #134/#135). Called from
+/// `staging::apply::flush_relationship_reverse_deferral_metrics`, itself
+/// called from `drain_once`/`drain_many` immediately after (and only after)
+/// their own `txn.commit().await?` succeeds — buffered, not recorded
+/// eagerly from inside Phase 3 (`apply_and_mark_drained_many`'s "3d" step,
+/// where the rejection is discovered) — matching
+/// `record_transform_latency`/`increment_changes_applied`'s own established
+/// pattern (`ApplyPlan`'s buffered fields, flushed by `flush_apply_metrics`
+/// post-commit): review follow-up to this issue found the eager version
+/// double- (or triple-, ...) counted whenever `drain_once`/`drain_many`'s
+/// retry loop re-ran the same folded input's Phase 3 pass in full on a
+/// `VersionFenceMiss`/transient failure (doc 06's `FenceMissBackoff` — a
+/// routine occurrence, not a rare edge case), inflating exactly the counter
+/// #135's fairness/starvation decisions need to read accurately, and doing
+/// so most under the high-contention conditions where those decisions
+/// matter most.
 pub fn increment_relationship_reverse_deferred(guard: &str) {
     ensure_installed();
     metrics::counter!(RELATIONSHIP_REVERSE_DEFERRED_METRIC, "guard" => guard.to_string())
