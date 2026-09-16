@@ -110,19 +110,21 @@ pub fn classify(err: &ApplyError) -> FailureClass {
     match err {
         ApplyError::VersionFenceMiss { .. } => FailureClass::VersionFenceMiss,
         ApplyError::HopBoundExceeded { .. } => FailureClass::Halting,
-        // Both of these mean "this definition can never work against this
-        // source's real schema" — a structural, schema-shape diagnosis
+        // All three of these mean "this definition can never work against
+        // this source's real schema" — a structural, schema-shape diagnosis
         // exactly like the hop bound, not a per-row data problem. By the
-        // time either reaches here, `compute()` has already ruled out "the
-        // table is simply gone" (`drain_once` special-cases
+        // time any of them reaches here, `compute()` has already ruled out
+        // "the table is simply gone" (`drain_once` special-cases
         // `ApplyError::SourceTableDropped` before classification ever runs)
-        // — what's left is a real primary key shape `ddl::source_primary_key`
-        // cannot use, which every key touching that source reproduces
-        // identically alone. Isolating it would charge, and eventually
-        // evict, every such key one at a time for a failure none of them
-        // individually caused.
+        // — what's left is a real primary key shape or type
+        // `ddl::source_primary_key` cannot use (issue #107 added the type
+        // check alongside the pre-existing arity checks), which every key
+        // touching that source reproduces identically alone. Isolating it
+        // would charge, and eventually evict, every such key one at a time
+        // for a failure none of them individually caused.
         ApplyError::Ddl(DdlError::NoPrimaryKey { .. })
-        | ApplyError::Ddl(DdlError::CompositePrimaryKeyUnsupported { .. }) => FailureClass::Halting,
+        | ApplyError::Ddl(DdlError::CompositePrimaryKeyUnsupported { .. })
+        | ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType { .. }) => FailureClass::Halting,
         _ if is_transient(err) => FailureClass::Transient,
         _ => FailureClass::Isolate,
     }
@@ -1422,6 +1424,20 @@ mod unit_tests {
             src_table: "orders".to_string(),
         };
         assert_eq!(classify(&err), FailureClass::VersionFenceMiss);
+    }
+
+    #[test]
+    fn classify_maps_unsupported_primary_key_type_to_halting() {
+        // Issue #107: a non-text-stable single-column primary key is exactly
+        // as structural as the composite-key and no-key cases above, so it
+        // must halt too rather than isolate-and-evict every key touching
+        // that source one at a time.
+        let err = ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType {
+            source_table: "events".to_string(),
+            column: "occurred_at".to_string(),
+            pg_type: "timestamp with time zone".to_string(),
+        });
+        assert_eq!(classify(&err), FailureClass::Halting);
     }
 
     #[test]
