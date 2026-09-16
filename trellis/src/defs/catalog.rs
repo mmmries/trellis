@@ -595,9 +595,12 @@ pub async fn install_definition(
     // deliberate scope cut: the doc's `xmin` caveat is framed around a
     // *source* table joining the publication, and a relationship's to-side
     // table has its own, already-correct coverage-fence handling
-    // independent of this check.
-    let source_schema = resolve_source_schema(pool, &def.source).await?;
-    let qualified_source = crate::intake::publication::qualify(&source_schema, &def.source)?;
+    // independent of this check. Reuses `qualified_source` (resolved once,
+    // above, via [`resolve_source_for_install`]) rather than re-deriving its
+    // own copy through the plain, fallback-free [`resolve_source_schema`] —
+    // that naive resolution can't follow a bare `def.source` chained off
+    // another definition's explicitly-qualified target (issue #76), which
+    // `resolve_source_for_install`'s two-step fallback already handles.
     if defer_if_fence_unsettled(pool, &qualified_source).await? {
         return create_definition_inner(
             pool,

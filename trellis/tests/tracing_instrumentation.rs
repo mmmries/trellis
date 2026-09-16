@@ -341,6 +341,8 @@ async fn compute_and_apply_spans_fire_with_batch_and_transform_fields() {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     let source_columns = numeric_columns(&["id", "price", "tax"]);
     create_definition(
@@ -353,7 +355,7 @@ async fn compute_and_apply_spans_fire_with_batch_and_transform_fields() {
     let pk = trellis::defs::source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
 
@@ -471,6 +473,8 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
             },
         }],
         predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
     };
     client
         .batch_execute("create table orders (id integer primary key, price numeric, tax numeric)")
@@ -487,7 +491,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
     let pk = trellis::defs::source_primary_key(&db.pool, &def.source)
         .await
         .expect("introspect source primary key");
-    create_target_table(&db.pool, &def, "public", &pk, &source_columns)
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
     client

@@ -35,7 +35,7 @@ use std::time::Duration;
 use testkit::TestCluster;
 use testkit::crash::OpenTransaction;
 use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::{
     TransformStatus, ValueType, chunk_queue, create_definition, install_definition,
 };
@@ -124,10 +124,15 @@ async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
 }
 
 async fn status_of(client: &Client, target_table: &str) -> TransformStatus {
+    // `transform_definitions.target_table` is persisted fully-qualified
+    // (issue #73) — every definition this test file installs lands in
+    // `DEFAULT_TARGET_SCHEMA` ("public"), so qualify the bare name callers
+    // pass rather than matching against the unqualified column value.
+    let qualified = format!("{DEFAULT_TARGET_SCHEMA}.{target_table}");
     let text: String = client
         .query_one(
             "select status from transform_definitions where target_table = $1",
-            &[&target_table],
+            &[&qualified],
         )
         .await
         .expect("query status")
@@ -311,7 +316,10 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
         .await
         .expect("mutate a source row so the divergence is checkable");
     raw.execute(
-        "update transform_definitions set status = 'quarantined' where target_table = 't2'",
+        &format!(
+            "update transform_definitions set status = 'quarantined' \
+             where target_table = '{DEFAULT_TARGET_SCHEMA}.t2'"
+        ),
         &[],
     )
     .await

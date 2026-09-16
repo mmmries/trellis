@@ -1013,10 +1013,16 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
+    // `target` is the bare transform name (matching `resume_column`'s own
+    // `transform` parameter convention), but `transform_definitions.target_table`
+    // is persisted fully-qualified (issue #73) — match on its bare suffix,
+    // the same `split_part(target_table, '.', 2)` pattern
+    // `TargetTableSuffixCollision`'s own check already uses, rather than
+    // requiring every caller to know and pass the qualified identity.
     let row = txn
         .query_opt(
             "select id, source_table, status from transform_definitions \
-             where target_table = $1 for update",
+             where split_part(target_table, '.', 2) = $1 for update",
             &[&target],
         )
         .await?;

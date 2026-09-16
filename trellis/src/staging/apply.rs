@@ -1105,9 +1105,16 @@ mod tests {
         let pk = crate::defs::source_primary_key(&pool, source)
             .await
             .expect("introspect source primary key");
-        crate::defs::create_target_table(&pool, &definition.def, "public", &pk, &source_columns)
-            .await
-            .expect("create target table");
+        crate::defs::create_target_table(
+            &pool,
+            &definition.def,
+            "public",
+            &pk,
+            &source_columns,
+            source,
+        )
+        .await
+        .expect("create target table");
 
         client
             .execute(
@@ -2238,7 +2245,7 @@ type ChangedKey = (String, i32, Option<std::time::SystemTime>);
 /// cross-reference by eye.
 #[tracing::instrument(
     name = "staging.apply_target",
-    skip(txn, plan),
+    skip(txn, target, plan),
     fields(
         transform = %target,
         proposed_writes = plan.writes.len(),
@@ -2249,6 +2256,7 @@ type ChangedKey = (String, i32, Option<std::time::SystemTime>);
 )]
 async fn apply_target(
     txn: &Transaction<'_>,
+    target: &str,
     plan: &TargetPlan,
 ) -> Result<(Vec<String>, Vec<String>), ApplyError> {
     if plan.writes.is_empty() && plan.deletes.is_empty() {
@@ -2610,7 +2618,7 @@ pub async fn apply_and_mark_drained_many(
 
     // 3. Ordered pre-lock + upsert/delete, per target table.
     for (target, target_plan) in &plan.targets {
-        let (written, deleted) = apply_target(txn, target_plan).await?;
+        let (written, deleted) = apply_target(txn, target, target_plan).await?;
         keys_written += written.len();
         keys_deleted += deleted.len();
 

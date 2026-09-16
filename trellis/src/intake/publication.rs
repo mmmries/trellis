@@ -688,9 +688,10 @@ pub async fn run_pending_backfills(
 }
 
 /// Promotes every `transform_definitions` row sourced from `table` (matched
-/// against `source_table`'s own bare, unqualified shape — see
-/// [`split_qualified`]) currently in `from` to `to`, returning the ids
-/// actually moved (issue #55).
+/// against `source_table`'s own persisted, fully-qualified shape — issue
+/// #72; `table` itself is always already qualified here, since every caller
+/// derives it from `pending_backfill.table_name`) currently in `from` to
+/// `to`, returning the ids actually moved (issue #55).
 ///
 /// Scoped by both `source_table` and current `status`, so a second,
 /// unrelated definition on the same table sitting in some other status for
@@ -707,13 +708,12 @@ async fn advance_deferred_definitions(
     from: TransformStatus,
     to: TransformStatus,
 ) -> Result<Vec<i64>, IntakeError> {
-    let (_, bare_table) = split_qualified(table)?;
     let rows = client
         .query(
             "update transform_definitions set status = $1 \
              where source_table = $2 and status = $3 \
              returning id",
-            &[&to.as_str(), &bare_table, &from.as_str()],
+            &[&to.as_str(), &table, &from.as_str()],
         )
         .await?;
     let ids: Vec<i64> = rows.into_iter().map(|r| r.get(0)).collect();
@@ -726,7 +726,7 @@ async fn advance_deferred_definitions(
         // cluster-wide" (see that diagram's caveat), and this event is the
         // moment that ambiguity resolves.
         tracing::info!(
-            table = %bare_table,
+            table = %table,
             ids = ?ids,
             from = %from.as_str(),
             to = %to.as_str(),
