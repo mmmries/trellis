@@ -26,7 +26,7 @@ use trellis::defs::{
     relationship_projection, source_primary_key,
 };
 use trellis::staging::apply::{self, ApplyPlan};
-use trellis::staging::{claim, fold, has_pending, retire_drained_segments};
+use trellis::staging::{StagedWatermark, claim, fold, has_pending, retire_drained_segments};
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -96,12 +96,24 @@ async fn stage_cdc_at_lsn(
 }
 
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+    // Issue #132: a throwaway, always-caught-up watermark for the tests
+    // that just want the pipeline to converge — the guard (a)-specific
+    // tests below build their own `StagedWatermark` by hand instead of
+    // using this helper.
+    let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
-        while apply::drain_once(pool, seg, "reverse_test", 1, "trellis_reverse_test")
-            .await
-            .expect("drain_once")
-            .is_some()
+        while apply::drain_once(
+            pool,
+            seg,
+            "reverse_test",
+            1,
+            "trellis_reverse_test",
+            &watermark,
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
         {}
         retire_drained_segments(client)
             .await
@@ -215,6 +227,40 @@ async fn projection_row_exists(client: &Client, projection_table: &str, id: i32)
         .await
         .unwrap_or_else(|e| panic!("probe {projection_table} for id {id}: {e}"))
         .get(0)
+}
+
+/// Issue #132 guard (b)'s own column — read the same way [`projection_lsn`]
+/// reads guard (d)'s.
+async fn projection_gen(client: &Client, projection_table: &str, id: i32) -> i64 {
+    client
+        .query_one(
+            &format!("select __trellis_gen from {projection_table} where id = $1"),
+            &[&id],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("read {projection_table}'s gen for id {id}: {e}"))
+        .get(0)
+}
+
+/// The `key`s of every image-less `recompute` row currently staged for
+/// `src_table` in the *active* ring segment — the guard-rejection stopgap's
+/// own signal (see the guard-(d) tests above for the same pattern), reused
+/// by issue #132's guard (a)/(b)/(c) tests below.
+async fn staged_recompute_keys(client: &Client, src_table: &str) -> Vec<String> {
+    let table = active_seg_table(client).await;
+    let src_table = qualify_fixture_table(src_table);
+    client
+        .query(
+            &format!(
+                "select key from {table} where src_table = $1 and op = 'recompute' order by key"
+            ),
+            &[&src_table],
+        )
+        .await
+        .expect("read staged recompute rows")
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect()
 }
 
 // ---------------------------------------------------------------------
@@ -554,9 +600,16 @@ async fn a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges() {
     // Apply A: matches, advances the projection to lsn 100.
     let mut phase3 = db.pool.get().await.expect("connection");
     let txn = phase3.transaction().await.expect("begin phase 3 (a)");
-    apply::apply_and_mark_drained(&txn, seg_a, "worker_a", &plan_a, "trellis_reverse_test")
-        .await
-        .expect("apply A");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg_a,
+        "worker_a",
+        &plan_a,
+        "trellis_reverse_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("apply A");
     txn.commit().await.expect("commit A");
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
@@ -568,9 +621,16 @@ async fn a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges() {
     // ordering stopgap must reject B's own delta.
     let mut phase3 = db.pool.get().await.expect("connection");
     let txn = phase3.transaction().await.expect("begin phase 3 (b)");
-    apply::apply_and_mark_drained(&txn, seg_b, "worker_b", &plan_b, "trellis_reverse_test")
-        .await
-        .expect("apply B (rejected internally, but the drain call itself still succeeds)");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg_b,
+        "worker_b",
+        &plan_b,
+        "trellis_reverse_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("apply B (rejected internally, but the drain call itself still succeeds)");
     txn.commit().await.expect("commit B");
 
     assert_eq!(
@@ -673,9 +733,16 @@ async fn a_same_key_stopgap_stages_exactly_one_recompute_per_from_side_row() {
     // Apply A: matches, advances the projection to lsn 100.
     let mut phase3 = db.pool.get().await.expect("connection");
     let txn = phase3.transaction().await.expect("begin phase 3 (a)");
-    apply::apply_and_mark_drained(&txn, seg_a, "worker_a", &plan_a, "trellis_reverse_test")
-        .await
-        .expect("apply A");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg_a,
+        "worker_a",
+        &plan_a,
+        "trellis_reverse_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("apply A");
     txn.commit().await.expect("commit A");
 
     // Apply B: prev_lsn is stale — the guard-(d) stopgap fires and falls
@@ -687,9 +754,16 @@ async fn a_same_key_stopgap_stages_exactly_one_recompute_per_from_side_row() {
     // this test's signal.
     let mut phase3 = db.pool.get().await.expect("connection");
     let txn = phase3.transaction().await.expect("begin phase 3 (b)");
-    apply::apply_and_mark_drained(&txn, seg_b, "worker_b", &plan_b, "trellis_reverse_test")
-        .await
-        .expect("apply B");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg_b,
+        "worker_b",
+        &plan_b,
+        "trellis_reverse_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("apply B");
     txn.commit().await.expect("commit B");
 
     let table = active_seg_table(&client).await;
@@ -713,6 +787,578 @@ async fn a_same_key_stopgap_stages_exactly_one_recompute_per_from_side_row() {
         "exactly one fallback Recompute per from-side row matching post 1 \
          (ids 10 and 12) — not two apiece from redundantly enumerating \
          old_key and new_key when they're equal"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 6. Issue #132's guards (a), (b), (c) — guard (d) is #4 above (issue
+//    #131's original stopgap, formalized as one of these four guards in
+//    `apply.rs`'s `check_reverse_guards`).
+//
+// Each test drives `compute`/`apply_and_mark_drained` by hand (the same
+// `claim_fold_compute` building block guard (d)'s tests use above) so the
+// specific precondition each guard checks can be violated deliberately,
+// independent of the other three, mirroring
+// `a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges`'s own
+// pattern: assert the guard rejected (the projection did not advance, and
+// an image-less fallback recompute was staged for the parent's from-side
+// rows), then drive the pipeline to quiescence and assert it still
+// converges on the true final value.
+// ---------------------------------------------------------------------
+
+/// Guard (a) (plan doc §2; ablation 125/3000, and the precondition that
+/// makes guard (c) trustworthy at all): a reverse record whose captured
+/// watermark `X` (the source's write frontier as of Phase 2) is still ahead
+/// of what intake has *staged* must not apply — even though nothing else
+/// about the record looks wrong (no concurrent forward apply, no sibling
+/// reverse, no in-flight child). Driven with a [`StagedWatermark`]
+/// constructed fresh (starts at LSN 0 — see its own doc comment) and never
+/// advanced: no live `intake::Intake` runs in this test at all, so a
+/// watermark that never moves is exactly "intake hasn't caught up yet."
+#[tokio::test]
+async fn guard_a_watermark_barrier_rejects_and_the_pipeline_still_converges() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+    let baseline_lsn = projection_lsn(&client, &projection_table, 1).await;
+
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("update the related post");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        100,
+    )
+    .await;
+    let seg = seal_active_segment(&mut client).await;
+    let plan = claim_fold_compute(&db.pool, seg, "worker_a").await;
+
+    // Guard (a): this database has already generated plenty of real WAL
+    // (schema DDL, seed inserts, the drain-to-quiescence above) by the time
+    // `claim_fold_compute` captured its own `X` a moment ago, so a
+    // watermark that starts at (and stays at) LSN 0 is certain to be
+    // behind it.
+    let unstaged_watermark = StagedWatermark::new();
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg,
+        "worker_a",
+        &plan,
+        "trellis_reverse_test",
+        &unstaged_watermark,
+    )
+    .await
+    .expect("apply (rejected internally by guard (a), but the drain call itself still succeeds)");
+    txn.commit().await.expect("commit");
+
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        baseline_lsn,
+        "guard (a) must reject before ever touching the projection"
+    );
+    assert_eq!(
+        staged_recompute_keys(&client, "post_tags").await,
+        vec!["10".to_string(), "12".to_string()],
+        "guard (a) must fall back to an image-less recompute of post 1's \
+         from-side rows"
+    );
+
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("650".to_string()))),
+        "the pipeline must still converge on post 1's true value (400) via \
+         the fallback, even though guard (a) rejected the direct delta — \
+         an aborting reverse defers and retries, it does not stall the batch"
+    );
+}
+
+/// Guard (b) (plan doc §2; ablation 82/3000): a reverse record whose
+/// captured `prev_gen` no longer matches the projection row's current
+/// `__trellis_gen`, re-read under `FOR UPDATE` in Phase 3, must not apply —
+/// a forward apply resolved this same parent through the projection
+/// between Phase 2's capture and Phase 3's lock. Simulated by bumping
+/// `__trellis_gen` directly (reaching past the mechanism, matching this
+/// suite's own convention for standing in for a piece another issue builds
+/// — see e.g. `insert_poison_held` in `quarantine.rs`): building a *real*
+/// concurrent forward apply here would need a second, independent
+/// from-side change unrelated to this scenario, which is exactly what
+/// `apply_and_mark_drained_many`'s "3c" step's gen-bump already is regardless
+/// of what triggered it.
+#[tokio::test]
+async fn guard_b_generation_check_rejects_and_the_pipeline_still_converges() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+    let baseline_lsn = projection_lsn(&client, &projection_table, 1).await;
+    let baseline_gen = projection_gen(&client, &projection_table, 1).await;
+
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("update the related post");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        100,
+    )
+    .await;
+    let seg = seal_active_segment(&mut client).await;
+    let plan = claim_fold_compute(&db.pool, seg, "worker_a").await;
+
+    // Simulate "a forward apply landed between Phase 2's capture and Phase
+    // 3's lock" by bumping the projection row's gen directly — exactly the
+    // effect `apply_and_mark_drained_many`'s "3c" step has, regardless of
+    // what change actually triggered it.
+    client
+        .execute(
+            &format!(
+                "update {projection_table} set __trellis_gen = __trellis_gen + 1 where id = 1"
+            ),
+            &[],
+        )
+        .await
+        .expect("bump the projection's gen, simulating a concurrent forward apply");
+
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg,
+        "worker_a",
+        &plan,
+        "trellis_reverse_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("apply (rejected internally by guard (b), but the drain call itself still succeeds)");
+    txn.commit().await.expect("commit");
+
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        baseline_lsn,
+        "guard (b) must reject before ever touching the projection's lsn"
+    );
+    assert_eq!(
+        projection_gen(&client, &projection_table, 1).await,
+        baseline_gen + 1,
+        "the projection's gen must stay exactly at the simulated forward \
+         apply's bump — guard (b) must not advance it further"
+    );
+    assert_eq!(
+        staged_recompute_keys(&client, "post_tags").await,
+        vec!["10".to_string(), "12".to_string()],
+        "guard (b) must fall back to an image-less recompute of post 1's \
+         from-side rows"
+    );
+
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("650".to_string()))),
+        "the pipeline must still converge on post 1's true value (400) via \
+         the fallback, even though guard (b) rejected the direct delta"
+    );
+}
+
+/// Guard (c) (plan doc §2; ablation 1174/3000 — the guard doing most of the
+/// correctness work): a reverse record must not apply while any staged
+/// from-side change for its parent's join key, committed at or before `X`,
+/// is still undrained — otherwise the paired subtract-old/add-new delta
+/// would be computed against a from-side row set that doesn't yet equal
+/// what the target actually reflects. Built by staging a brand-new
+/// `post_tags` row pointing at post 1 into the *new* active segment (left
+/// deliberately unsealed, hence undrained) before computing/applying the
+/// *earlier*, already-sealed segment holding post 1's own parent change —
+/// guard (a) and guard (d) both pass here (a saturated watermark and an
+/// unmoved `prev_lsn`), isolating guard (c) as the one guard that catches
+/// this.
+#[tokio::test]
+async fn guard_c_in_flight_check_rejects_and_the_pipeline_still_converges() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+    let baseline_lsn = projection_lsn(&client, &projection_table, 1).await;
+    let baseline_gen = projection_gen(&client, &projection_table, 1).await;
+
+    // The parent change, sealed alone into its own segment.
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("update the related post");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        100,
+    )
+    .await;
+    let seg = seal_active_segment(&mut client).await;
+
+    // A brand-new from-side row pointing at the same parent, staged into
+    // the (new) active segment right after — never sealed, so it stays
+    // undrained for the rest of this test.
+    client
+        .execute(
+            "insert into post_tags (id, post, tag) values (20, 1, 'rust')",
+            &[],
+        )
+        .await
+        .expect("insert a new post_tags row pointing at post 1");
+    stage_cdc_at_lsn(
+        &client,
+        "post_tags",
+        "20",
+        "insert",
+        None,
+        Some("{\"id\":20,\"post\":1,\"tag\":\"rust\"}"),
+        50,
+    )
+    .await;
+
+    // Phase 2 for the parent's segment — captured *after* the from-side
+    // insert above already committed, so `X` (guard (a)'s watermark) is
+    // certain to cover it.
+    let plan = claim_fold_compute(&db.pool, seg, "worker_a").await;
+
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg,
+        "worker_a",
+        &plan,
+        "trellis_reverse_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("apply (rejected internally by guard (c), but the drain call itself still succeeds)");
+    txn.commit().await.expect("commit");
+
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        baseline_lsn,
+        "guard (c) must reject before ever touching the projection"
+    );
+    assert_eq!(
+        projection_gen(&client, &projection_table, 1).await,
+        baseline_gen,
+        "guard (c) must reject before ever touching the projection"
+    );
+    // The fallback's own live enumeration picks up every from-side row
+    // currently matching post 1 — including the brand-new row 20, since
+    // that enumeration is a plain live read, not itself guarded (see
+    // `from_side_rows_for_join_txn`'s doc comment).
+    assert_eq!(
+        staged_recompute_keys(&client, "post_tags").await,
+        vec!["10".to_string(), "12".to_string(), "20".to_string()],
+        "guard (c) must fall back to an image-less recompute of every \
+         from-side row currently matching post 1"
+    );
+
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("4".to_string()), Some("1050".to_string()))),
+        "the pipeline must still converge on post 1's true value (400), \
+         counting the new row 20 exactly once: 400 (post 1, via row 10) + \
+         250 (post 2) + null (post 999) + 400 (post 1, via the new row 20)"
+    );
+}
+
+/// Positive case: an ordinary parent update where all four guards
+/// genuinely pass — including guard (a), proven with a real
+/// [`StagedWatermark`] advanced to (not merely defaulted past) the current
+/// `pg_current_wal_lsn()`, not [`StagedWatermark::saturated`]. A direct
+/// positive signal that the true-delta path ran (the projection's lsn
+/// advances to this record's own lsn) rather than an indirect "the final
+/// total happens to be right" check, and that *no* fallback recompute was
+/// staged — the fast path fully covered this record.
+#[tokio::test]
+async fn all_four_guards_pass_and_the_delta_applies_in_the_ordinary_case() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("update the related post");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        100,
+    )
+    .await;
+    let seg = seal_active_segment(&mut client).await;
+    let plan = claim_fold_compute(&db.pool, seg, "worker_a").await;
+
+    // Guard (a) genuinely passes here: seeded at LSN 0, then advanced to
+    // the real current `pg_current_wal_lsn()` — strictly past whatever `X`
+    // Phase 2 captured a moment ago, since nothing else has committed on
+    // this connection since.
+    let watermark = StagedWatermark::new();
+    let now: PgLsn = client
+        .query_one("select pg_current_wal_lsn()", &[])
+        .await
+        .expect("read the current wal lsn")
+        .get(0);
+    watermark.advance(now);
+
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg,
+        "worker_a",
+        &plan,
+        "trellis_reverse_test",
+        &watermark,
+    )
+    .await
+    .expect("apply");
+    txn.commit().await.expect("commit");
+
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        Some(PgLsn::from(100)),
+        "all four guards passed, so the true-delta path must have advanced \
+         the projection to this record's own lsn"
+    );
+    assert_eq!(
+        staged_recompute_keys(&client, "post_tags").await,
+        Vec::<String>::new(),
+        "all four guards passed, so no fallback recompute should have been \
+         staged for post 1's children"
+    );
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("650".to_string())))
+    );
+}
+
+/// A combined, hand-interleaved scenario loosely modeling the plan doc's
+/// own generative ablation campaign (§4): two segments draining
+/// out-of-order (guard (d)'s own scenario) *and* a from-side child staged
+/// in between, still undrained when the pipeline finally gets back around
+/// to it. Not a substitute for that 3,000-run campaign (explicitly out of
+/// this issue's scope — see #138), just a hand-built check that the four
+/// guards still compose correctly (each one's rejection doesn't corrupt or
+/// skip what the others are responsible for) under more than one hazard at
+/// once.
+#[tokio::test]
+async fn out_of_order_segments_plus_an_in_flight_child_still_converges() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    // Segment A: 100 -> 400.
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("first update");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        100,
+    )
+    .await;
+    let seg_a = seal_active_segment(&mut client).await;
+    let plan_a = claim_fold_compute(&db.pool, seg_a, "worker_a").await;
+
+    // Segment B: 400 -> 500 (the live value), captured before A applies —
+    // the same stale-`prev_lsn` setup as guard (d)'s own test.
+    client
+        .execute("update posts set word_count = 500 where id = 1", &[])
+        .await
+        .expect("second update");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":400}"),
+        Some("{\"id\":1,\"word_count\":500}"),
+        200,
+    )
+    .await;
+    let seg_b = seal_active_segment(&mut client).await;
+    let plan_b = claim_fold_compute(&db.pool, seg_b, "worker_b").await;
+
+    // A applies cleanly.
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3 (a)");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg_a,
+        "worker_a",
+        &plan_a,
+        "trellis_reverse_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("apply A");
+    txn.commit().await.expect("commit A");
+
+    // A brand-new from-side row, staged into the current active segment
+    // (never sealed here) — still undrained by the time B's rejected apply
+    // runs below.
+    client
+        .execute(
+            "insert into post_tags (id, post, tag) values (21, 1, 'rust')",
+            &[],
+        )
+        .await
+        .expect("insert a new post_tags row pointing at post 1");
+    stage_cdc_at_lsn(
+        &client,
+        "post_tags",
+        "21",
+        "insert",
+        None,
+        Some("{\"id\":21,\"post\":1,\"tag\":\"rust\"}"),
+        150,
+    )
+    .await;
+
+    // B's `prev_lsn` (captured before A applied) is already stale, so
+    // guard (d) rejects it regardless of the in-flight child above — this
+    // exercises both hazards landing on the same key in the same window,
+    // not just one at a time.
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3 (b)");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg_b,
+        "worker_b",
+        &plan_b,
+        "trellis_reverse_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("apply B (rejected internally, but the drain call itself still succeeds)");
+    txn.commit().await.expect("commit B");
+
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("4".to_string()), Some("1250".to_string()))),
+        "500 (post 1's true final value, via row 10) + 250 (post 2) + null \
+         (post 999) + 500 (post 1's true final value, via the new row 21) \
+         — recovered correctly despite the out-of-order segments and the \
+         in-flight child both landing on the same key"
     );
 }
 

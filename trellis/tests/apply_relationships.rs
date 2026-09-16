@@ -30,7 +30,7 @@ use trellis::defs::{
     source_primary_key,
 };
 use trellis::staging::apply;
-use trellis::staging::{has_pending, retire_drained_segments};
+use trellis::staging::{StagedWatermark, has_pending, retire_drained_segments};
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -150,12 +150,22 @@ async fn stage_cdc_with_src_changed(
 /// Reverse recompute appends fresh `Recompute` rows into the (new) active
 /// segment as it drains, so convergence takes more than one seal.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+    // Issue #132: a throwaway, always-caught-up watermark — no live
+    // `Intake` runs in this test, and this file isn't exercising guard (a).
+    let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
-        while apply::drain_once(pool, seg, "reverse_test", 1, "trellis_apply_test")
-            .await
-            .expect("drain_once")
-            .is_some()
+        while apply::drain_once(
+            pool,
+            seg,
+            "reverse_test",
+            1,
+            "trellis_apply_test",
+            &watermark,
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
         {}
         // Free the drained ring slots so repeated seals don't exhaust the ring.
         retire_drained_segments(client)
@@ -541,10 +551,18 @@ async fn reverse_keys_for_to_side_change(
     from_table: &str,
 ) -> Vec<String> {
     let seg = seal_active_segment(client).await;
-    while apply::drain_once(pool, seg, "reverse_test", 1, "trellis_apply_test")
-        .await
-        .expect("drain_once")
-        .is_some()
+    let watermark = StagedWatermark::saturated();
+    while apply::drain_once(
+        pool,
+        seg,
+        "reverse_test",
+        1,
+        "trellis_apply_test",
+        &watermark,
+    )
+    .await
+    .expect("drain_once")
+    .is_some()
     {}
     let keys = staged_from_side_recomputes(client, from_table).await;
     drain_to_quiescence(pool, client).await;
@@ -758,10 +776,18 @@ async fn reverse_recompute_dedupes_across_relationships_sharing_from_table() {
     .await;
 
     let seg = seal_active_segment(&mut client).await;
-    while apply::drain_once(&db.pool, seg, "reverse_test", 1, "trellis_apply_test")
-        .await
-        .expect("drain_once")
-        .is_some()
+    let watermark = StagedWatermark::saturated();
+    while apply::drain_once(
+        &db.pool,
+        seg,
+        "reverse_test",
+        1,
+        "trellis_apply_test",
+        &watermark,
+    )
+    .await
+    .expect("drain_once")
+    .is_some()
     {}
 
     assert_eq!(
@@ -864,10 +890,18 @@ async fn reverse_recompute_fan_in_keeps_the_earliest_src_changed() {
     .await;
 
     let seg = seal_active_segment(&mut client).await;
-    while apply::drain_once(&db.pool, seg, "reverse_test", 1, "trellis_apply_test")
-        .await
-        .expect("drain_once")
-        .is_some()
+    let watermark = StagedWatermark::saturated();
+    while apply::drain_once(
+        &db.pool,
+        seg,
+        "reverse_test",
+        1,
+        "trellis_apply_test",
+        &watermark,
+    )
+    .await
+    .expect("drain_once")
+    .is_some()
     {}
 
     assert_eq!(

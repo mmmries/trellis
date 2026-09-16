@@ -38,7 +38,7 @@ use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, Transfor
 use trellis::defs::{TransformStatus, create_definition, create_target_table, install_definition};
 use trellis::intake::{self, publication, spill};
 use trellis::staging::apply;
-use trellis::staging::{FoldedChange, isolate_and_evict};
+use trellis::staging::{FoldedChange, StagedWatermark, isolate_and_evict};
 
 // ---------------------------------------------------------------------
 // A minimal capturing `tracing_subscriber::Layer`
@@ -275,7 +275,7 @@ async fn intake_commit_transaction_span_records_slot_and_change_count() {
         spill_threshold: spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: spill::DEFAULT_HARD_CAP,
     };
-    let mut consumer = intake::Intake::connect(&config)
+    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new())
         .await
         .expect("connect intake");
 
@@ -383,6 +383,7 @@ async fn compute_and_apply_spans_fire_with_batch_and_transform_fields() {
         "span_test_worker",
         1,
         "trellis_span_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")

@@ -18,7 +18,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{create_definition, create_target_table, recompute, source_primary_key};
 use trellis::staging::apply::{self, ApplyError};
-use trellis::staging::{SegmentState, TRUNCATE_SENTINEL_KEY, claim, fold};
+use trellis::staging::{SegmentState, StagedWatermark, TRUNCATE_SENTINEL_KEY, claim, fold};
 
 fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
     names
@@ -163,10 +163,19 @@ fn order_totals_def() -> TransformDef {
 /// does, and panics with the underlying error on failure — this test file's
 /// standard "drain and expect it to succeed" step.
 async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
-    apply::drain_once(pool, seg_seq, claimed_by, 1, "trellis_apply_test")
-        .await
-        .expect("drain_once")
-        .expect("drain_once must claim and drain something")
+    // Issue #132: a throwaway, always-caught-up watermark — no live
+    // `Intake` runs in this test file, and it isn't exercising guard (a).
+    apply::drain_once(
+        pool,
+        seg_seq,
+        claimed_by,
+        1,
+        "trellis_apply_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("drain_once")
+    .expect("drain_once must claim and drain something")
 }
 
 #[tokio::test]
@@ -656,9 +665,16 @@ async fn a_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
     let plan = apply::compute(&db.pool, &folded).await.expect("compute");
     let mut phase3_client = db.pool.get().await.expect("connection");
     let txn = phase3_client.transaction().await.expect("begin phase 3");
-    let err = apply::apply_and_mark_drained(&txn, seg_seq, "worker", &plan, "trellis_apply_test")
-        .await
-        .expect_err("the claim is gone; completion must fail");
+    let err = apply::apply_and_mark_drained(
+        &txn,
+        seg_seq,
+        "worker",
+        &plan,
+        "trellis_apply_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect_err("the claim is gone; completion must fail");
     assert!(matches!(err, ApplyError::ClaimLost), "got {err:?}");
     txn.rollback().await.expect("rollback phase 3");
 
@@ -756,9 +772,16 @@ async fn a_definition_change_on_a_touched_source_trips_the_version_fence() {
 
     let mut phase3_client = db.pool.get().await.expect("connection");
     let txn = phase3_client.transaction().await.expect("begin phase 3");
-    let err = apply::apply_and_mark_drained(&txn, seg_seq, "worker", &plan, "trellis_apply_test")
-        .await
-        .expect_err("orders' version moved since compute; the fence must trip");
+    let err = apply::apply_and_mark_drained(
+        &txn,
+        seg_seq,
+        "worker",
+        &plan,
+        "trellis_apply_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect_err("orders' version moved since compute; the fence must trip");
     match &err {
         ApplyError::VersionFenceMiss { src_table } => assert_eq!(src_table, "orders"),
         other => panic!("expected VersionFenceMiss, got {other:?}"),
@@ -864,10 +887,16 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_fence() {
 
     let mut phase3_client = db.pool.get().await.expect("connection");
     let txn = phase3_client.transaction().await.expect("begin phase 3");
-    let outcome =
-        apply::apply_and_mark_drained(&txn, seg_seq, "worker", &plan, "trellis_apply_test")
-            .await
-            .expect("an unrelated source's version change must not trip this batch's fence");
+    let outcome = apply::apply_and_mark_drained(
+        &txn,
+        seg_seq,
+        "worker",
+        &plan,
+        "trellis_apply_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("an unrelated source's version change must not trip this batch's fence");
     txn.commit().await.expect("commit phase 3");
     assert_eq!(outcome.keys_written, 1);
 }
@@ -2116,10 +2145,17 @@ async fn drain_many_coalesces_two_sealed_segments_into_one_apply_pass() {
     .await;
     let seg2 = seal_active_segment(&mut client).await;
 
-    let outcome = apply::drain_many(&db.pool, &[seg1, seg2], "worker", 1, "trellis_apply_test")
-        .await
-        .expect("drain_many")
-        .expect("drain_many must claim and drain something");
+    let outcome = apply::drain_many(
+        &db.pool,
+        &[seg1, seg2],
+        "worker",
+        1,
+        "trellis_apply_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("drain_many")
+    .expect("drain_many must claim and drain something");
 
     assert_eq!(
         outcome.keys_written, 3,

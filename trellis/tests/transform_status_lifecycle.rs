@@ -132,12 +132,25 @@ async fn insert_cdc_row(
 /// Seals and drains repeatedly until nothing is pending anywhere in the
 /// ring — the same harness `defs_install_definition.rs` uses.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+    // Issue #132: a throwaway, always-caught-up watermark — this helper
+    // has no live `Intake` running (these tests stage CDC rows by hand),
+    // and none of this file's tests exercise guard (a) specifically, so a
+    // real watermark would only ever make guard (a) reject spuriously.
+    let watermark = trellis::staging::StagedWatermark::saturated();
+    let watermark = &watermark;
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
-        while apply::drain_once(pool, seg, "status_lifecycle_test", 1, "trellis_status_test")
-            .await
-            .expect("drain_once")
-            .is_some()
+        while apply::drain_once(
+            pool,
+            seg,
+            "status_lifecycle_test",
+            1,
+            "trellis_status_test",
+            watermark,
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
         {}
         retire_drained_segments(client)
             .await

@@ -26,6 +26,7 @@ use trellis::defs::{
     create_relationship, create_target_table, install_definition, relationship_projection,
     source_primary_key,
 };
+use trellis::staging::StagedWatermark;
 use trellis::staging::apply::{self, ApplyError};
 use trellis::staging::quarantine::{self, DEFAULT_COLUMN_DEATH_THRESHOLD};
 use trellis::{BlockingTrellis, Config, Trellis, TrellisOptions};
@@ -226,8 +227,15 @@ async fn stage_bad_orders(client: &mut Client, pool: &trellis::Pool, ids: &[i64]
         .await;
     }
     let seg_seq = seal_active_segment(client).await;
-    let result =
-        apply::drain_once(pool, seg_seq, "worker", 1, "trellis_column_quarantine_test").await;
+    let result = apply::drain_once(
+        pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
     assert!(
         matches!(result, Err(ApplyError::Eval(_))),
         "a malformed numeric field must still surface as an evaluator failure, got {result:?}"
@@ -367,6 +375,7 @@ async fn paused_column_freezes_instead_of_going_null_or_being_overwritten() {
         "worker",
         1,
         "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -409,6 +418,7 @@ async fn paused_column_freezes_instead_of_going_null_or_being_overwritten() {
         "worker",
         1,
         "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -551,6 +561,7 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
         "worker",
         1,
         "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -921,6 +932,7 @@ async fn an_existing_row_level_fuse_scenario_is_unaffected() {
             "worker",
             1,
             "trellis_column_quarantine_test",
+            &StagedWatermark::saturated(),
         )
         .await
         {
@@ -1162,6 +1174,7 @@ async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate()
         "worker",
         1,
         "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -1178,6 +1191,7 @@ async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate()
         "worker",
         1,
         "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -1478,6 +1492,7 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
         "worker",
         1,
         "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
     )
     .await;
     assert!(
@@ -1693,6 +1708,7 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
         "worker",
         1,
         "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")

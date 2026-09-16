@@ -24,7 +24,7 @@ use trellis::defs::{
 };
 use trellis::staging::apply::{self, ApplyError, MAX_HOP_GEN};
 use trellis::staging::converge;
-use trellis::staging::{FoldedChange, isolate_and_evict};
+use trellis::staging::{FoldedChange, StagedWatermark, isolate_and_evict};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
 /// `apply.rs`/`converge.rs`'s convention.
@@ -233,10 +233,19 @@ async fn poison_marker_exists(client: &Client, src_table: &str, key: &str) -> bo
 }
 
 async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
-    apply::drain_once(pool, seg_seq, claimed_by, 1, "trellis_quarantine_test")
-        .await
-        .expect("drain_once")
-        .expect("drain_once must claim and drain something")
+    // Issue #132: a throwaway, always-caught-up watermark — no live
+    // `Intake` runs in this test file, and it isn't exercising guard (a).
+    apply::drain_once(
+        pool,
+        seg_seq,
+        claimed_by,
+        1,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("drain_once")
+    .expect("drain_once must claim and drain something")
 }
 
 /// Scenario: a poisoned key's parked contribution keeps its original
@@ -356,7 +365,15 @@ async fn an_innocent_batch_mate_is_not_charged_and_the_error_surfaces_unattribut
     .await;
 
     let seg_seq = seal_active_segment(&mut client).await;
-    let result = apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await;
+    let result = apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
     match result {
         Err(ApplyError::Eval(_)) => {}
         other => panic!("expected an Eval error to surface, got {other:?}"),
@@ -581,7 +598,15 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
         .expect("halting_stop_stats before");
 
     let seg_seq = seal_active_segment(&mut client).await;
-    let result = apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await;
+    let result = apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
     match result {
         Err(ApplyError::HopBoundExceeded { .. }) => {}
         other => panic!("expected HopBoundExceeded to propagate, got {other:?}"),
@@ -666,7 +691,15 @@ async fn a_composite_primary_key_source_is_never_quarantined_and_stops_the_insta
         .expect("halting_stop_stats before");
 
     let seg_seq = seal_active_segment(&mut client).await;
-    let result = apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await;
+    let result = apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
     match result {
         Err(ApplyError::Ddl(DdlError::CompositePrimaryKeyUnsupported { .. })) => {}
         other => panic!("expected CompositePrimaryKeyUnsupported to propagate, got {other:?}"),
@@ -1042,7 +1075,15 @@ async fn a_batch_failure_that_only_reproduces_combined_surfaces_unblamed() {
     .await;
     let seg1 = seal_active_segment(&mut client).await;
 
-    let result = apply::drain_once(&db.pool, seg1, "worker", 1, "trellis_quarantine_test").await;
+    let result = apply::drain_once(
+        &db.pool,
+        seg1,
+        "worker",
+        1,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
     match &result {
         Err(ApplyError::Db(db_err)) => {
             assert_eq!(
@@ -1124,7 +1165,16 @@ async fn repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still
 
     let mut real_failures = 0;
     let outcome = loop {
-        match apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await {
+        match apply::drain_once(
+            &db.pool,
+            seg_seq,
+            "worker",
+            1,
+            "trellis_quarantine_test",
+            &StagedWatermark::saturated(),
+        )
+        .await
+        {
             Ok(Some(outcome)) => break outcome,
             Ok(None) => panic!("drain_once claimed nothing on a still-undrained segment"),
             Err(_) => {

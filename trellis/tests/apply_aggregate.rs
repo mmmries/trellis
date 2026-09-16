@@ -18,7 +18,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{create_aggregate_target_table, create_definition, parse};
 use trellis::staging::apply::{self, ApplyError};
-use trellis::staging::{claim, converge, fold};
+use trellis::staging::{StagedWatermark, claim, converge, fold};
 
 fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
     names
@@ -89,10 +89,19 @@ async fn insert_cdc_row(
 }
 
 async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
-    apply::drain_once(pool, seg_seq, claimed_by, 1, "trellis_apply_aggregate_test")
-        .await
-        .expect("drain_once")
-        .expect("drain_once must claim and drain something")
+    // Issue #132: a throwaway, always-caught-up watermark — no live
+    // `Intake` runs in this test file, and it isn't exercising guard (a).
+    apply::drain_once(
+        pool,
+        seg_seq,
+        claimed_by,
+        1,
+        "trellis_apply_aggregate_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("drain_once")
+    .expect("drain_once must claim and drain something")
 }
 
 const ORDER_SUMMARY_SOURCE: &str = "TRANSFORM order_summary FROM order_items GROUP BY order_id \
@@ -694,6 +703,7 @@ async fn an_aggregate_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
         "worker",
         &plan,
         "trellis_apply_aggregate_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect_err("the claim is gone; completion must fail");
@@ -723,6 +733,7 @@ async fn an_aggregate_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
         "worker",
         &plan,
         "trellis_apply_aggregate_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("a fresh claim's apply must commit");
@@ -798,6 +809,7 @@ async fn a_definition_change_on_an_aggregate_only_source_trips_the_version_fence
         "worker",
         &plan,
         "trellis_apply_aggregate_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect_err("order_items' version moved since compute; the fence must trip");
@@ -885,6 +897,7 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_aggregate_
         "worker",
         &plan,
         "trellis_apply_aggregate_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("an unrelated source's version change must not trip this batch's fence");
@@ -2634,6 +2647,7 @@ async fn drain_many_coalesces_two_sealed_segments_into_one_aggregate_apply_pass(
         "worker",
         1,
         "trellis_apply_aggregate_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_many")

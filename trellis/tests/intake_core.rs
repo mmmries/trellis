@@ -24,7 +24,7 @@ use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::intake::{self, IntakeError, replica_identity};
-use trellis::staging::{CdcOp, StagedChange, TRUNCATE_SENTINEL_KEY};
+use trellis::staging::{CdcOp, StagedChange, StagedWatermark, TRUNCATE_SENTINEL_KEY};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`) and pins
 /// `search_path`, matching `trellis/tests/staging_ring.rs`'s helper of the
@@ -370,7 +370,7 @@ async fn end_to_end_happy_path_stages_a_change_and_advances_the_watermark() {
         spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: intake::spill::DEFAULT_HARD_CAP,
     };
-    let mut consumer = intake::Intake::connect(&config)
+    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new())
         .await
         .expect("connect intake");
 
@@ -473,7 +473,7 @@ async fn a_full_replica_identity_change_extracts_the_primary_key_not_the_whole_r
         spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: intake::spill::DEFAULT_HARD_CAP,
     };
-    let mut consumer = intake::Intake::connect(&config)
+    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new())
         .await
         .expect("connect intake");
 
@@ -562,7 +562,7 @@ async fn a_truncate_message_becomes_a_staged_sentinel_not_dropped() {
         spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: intake::spill::DEFAULT_HARD_CAP,
     };
-    let mut consumer = intake::Intake::connect(&config)
+    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new())
         .await
         .expect("connect intake");
 
