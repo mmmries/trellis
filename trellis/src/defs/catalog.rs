@@ -92,7 +92,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::error_code::{self, ErrorCode};
-use crate::pool::Pool;
+use crate::pool::{Pool, quote_ident};
 
 use super::ast::{Expr, KeySpace, RelationshipDef, TransformDef, ValueType};
 use super::backfill::{self, BackfillError};
@@ -1116,6 +1116,20 @@ async fn create_definition_inner(
     let qualified_target =
         crate::intake::publication::qualify(resolved_target_schema, &def.target)?;
 
+    // Issue #129, epic #127: before this definition is persisted, widen the
+    // settled parent projection of every to-one relationship its fields read
+    // through to cover those reads — see
+    // [`widen_relationship_projections_for_definition_in_txn`]'s own doc
+    // comment. Deliberately ahead of the node/cycle/backfill work below, in
+    // this same transaction: a definition that fails later in this function
+    // rolls the widen back with it, and one that succeeds can never go live
+    // observing a projection that hasn't caught up to its own declared
+    // reads. A relationship-free definition (by far the common case) costs
+    // nothing extra here — [`super::eval::relationship_references`] returns
+    // empty and the loop inside never runs a query.
+    widen_relationship_projections_for_definition_in_txn(&txn, &def, resolved_target_schema)
+        .await?;
+
     // Issue #20: every definition's source and target resolve to a
     // first-class `SchemaNode`, created on first reference (a source node
     // the moment something first transforms it; a target node the moment
@@ -1505,8 +1519,16 @@ pub async fn create_relationship(
     // To-many's join key is a non-PK column on the to-side; reverse recompute
     // reads it from delete/re-parent pre-images, which the default (PK)
     // replica identity omits — reject unless the to-side carries it (#41).
+    //
+    // A to-one relationship instead gets a settled parent projection (issue
+    // #129, epic #127) unconditionally — see
+    // [`assert_replica_identity_supports_projection`]'s own doc comment for
+    // why this is gated on cardinality alone, exactly like the to-many arm,
+    // rather than on whether a consumer exists yet.
     if cardinality == RelationshipCardinality::ToMany {
         assert_replica_identity_supports_to_many(&txn, &def, &qualified_to).await?;
+    } else {
+        assert_replica_identity_supports_projection(&txn, &def, &qualified_to).await?;
     }
 
     let mut warnings = Vec::new();
@@ -1535,6 +1557,31 @@ pub async fn create_relationship(
         )
         .await?
         .get(0);
+
+    // Issue #129, epic #127: every to-one relationship gets a settled parent
+    // projection from the moment it's declared, not just once a consumer
+    // shows up — see [`ensure_relationship_projection_in_txn`]'s own doc
+    // comment for why (a relationship must exist before anything can
+    // reference it, so there is never a consumer yet at this point) and for
+    // why `needed_columns` is empty here (this call only creates the
+    // projection and seeds its bookkeeping columns for every existing
+    // to-side row; [`create_definition_inner`]'s own call is what widens it
+    // once a consumer's read columns are known). Runs inside this same
+    // transaction so a relationship declaration and its projection's
+    // creation commit or roll back together.
+    if cardinality == RelationshipCardinality::ToOne {
+        ensure_relationship_projection_in_txn(
+            &txn,
+            id,
+            &qualified_to,
+            &def.to_table,
+            &def.to_col,
+            &to_type,
+            pool.target_schema(),
+            &[],
+        )
+        .await?;
+    }
 
     txn.commit().await?;
 
@@ -2509,6 +2556,339 @@ async fn assert_replica_identity_supports_aggregate(
 
     crate::intake::require_replica_identity_full(&def.source, !is_full)
         .map_err(CatalogError::ReplicaIdentityRequired)
+}
+
+/// Rejects a to-one relationship (issue #129, epic #127) whose to-side
+/// table's replica identity can't guarantee an old row image. Every to-one
+/// relationship gets a settled parent projection unconditionally — see
+/// [`create_relationship`]'s own call site — and the projection's
+/// reverse-applied advance (#131) needs the to-side row's *entire* old image
+/// to detect and apply a parent update/delete/re-key, the same requirement
+/// [`assert_replica_identity_supports_aggregate`] already enforces for an
+/// aggregate's source; see that function's doc comment for why only
+/// `REPLICA IDENTITY FULL` — not the narrower `USING INDEX` a single-column
+/// `to_col` check ([`assert_replica_identity_supports_to_many`]) would
+/// accept — is enough for an old image of unpredictably-many columns, and
+/// for why this delegates to [`crate::intake::require_replica_identity_full`]
+/// rather than duplicating its rejection text: that function's own
+/// `needs_old_image` parameter is unconditional, so this queries
+/// `pg_class.relreplident` itself first and only passes `true` through when
+/// the to-side table is actually inadequate today, exactly mirroring
+/// [`assert_replica_identity_supports_aggregate`]'s own two-step shape.
+///
+/// **Gated on cardinality alone, not on whether the relationship has a
+/// consumer yet.** A relationship must be declared before anything can
+/// reference it (a [`super::ast::Expr::RelationshipPath`]'s `rel` head
+/// resolves via [`relationship_by_name`], which only ever finds an
+/// already-persisted row), so at the point this runs — inside
+/// [`create_relationship`], before that row is even committed — no consumer
+/// can exist yet. Gating on "has a consumer today" would therefore never
+/// fire: it would silently accept a to-one relationship whose to-side can
+/// never actually satisfy a projection some *later* definition needs,
+/// discovered only when that later definition's widen
+/// ([`ensure_relationship_projection_in_txn`]) fails partway through
+/// *its* transaction — a confusing place to first learn the real problem is
+/// this relationship's declaration. Rejecting here instead matches
+/// [`assert_replica_identity_supports_to_many`]'s own unconditional,
+/// cardinality-only gate, and is consistent with this epic's Phase 1 design
+/// (`issue-102-PLAN-DRAFT.md` §7): the projection is built alongside the
+/// relationship itself, not deferred until first use.
+async fn assert_replica_identity_supports_projection(
+    txn: &tokio_postgres::Transaction<'_>,
+    def: &RelationshipDef,
+    to_table: &str,
+) -> Result<(), CatalogError> {
+    let is_full: bool = txn
+        .query_one(
+            "select relreplident = 'f' from pg_class where oid = pg_catalog.to_regclass($1)",
+            &[&to_table],
+        )
+        .await?
+        .get(0);
+
+    crate::intake::require_replica_identity_full(&def.to_table, !is_full)
+        .map_err(CatalogError::ReplicaIdentityRequired)
+}
+
+/// A to-one relationship's settled parent projection (issue #129, epic
+/// #127), as stored in `relationship_projections` — the catalog record of
+/// which physical table backs a given relationship's projection, not the
+/// projection's live data. The projection's own bookkeeping columns
+/// (`__trellis_gen`/`__trellis_lsn`) and projected data columns live on the
+/// physical `projection_table` itself — see
+/// [`super::ddl::PROJECTION_GEN_COLUMN`]/[`super::ddl::PROJECTION_LSN_COLUMN`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationshipProjection {
+    pub id: i64,
+    pub relationship_id: i64,
+    /// The physical table's bare name — schema-qualify it with
+    /// [`super::ddl::qualified_relationship_projection_table`] and this
+    /// [`Pool`]'s own `target_schema()` before querying it directly, the
+    /// same convention [`Definition::target_table`] documents for a
+    /// transform's own target.
+    pub projection_table: String,
+}
+
+/// Reads back the settled parent projection for the relationship
+/// `relationship_id` names, or `None` if it's a to-many relationship (which
+/// never gets one in Phase 1 of this epic — to-many relationship aggregates
+/// keep going through the existing `rel_joins`/ring path) or an unknown id.
+pub async fn relationship_projection(
+    pool: &Pool,
+    relationship_id: i64,
+) -> Result<Option<RelationshipProjection>, CatalogError> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "select id, relationship_id, projection_table from relationship_projections \
+             where relationship_id = $1",
+            &[&relationship_id],
+        )
+        .await?;
+    Ok(row.map(|row| RelationshipProjection {
+        id: row.get(0),
+        relationship_id: row.get(1),
+        projection_table: row.get(2),
+    }))
+}
+
+/// Ensures the to-one relationship `relationship_id` names has a settled
+/// parent projection (issue #129, epic #127) that carries at least every
+/// column in `needed_columns`: creates the projection from scratch (and
+/// backfills its bookkeeping columns for every existing to-side row) the
+/// first time this is called for `relationship_id`, or widens an existing
+/// one (`alter table ... add column` + backfilling *just* the new column,
+/// for every existing to-side row) for any of `needed_columns` it doesn't
+/// carry yet. A column already present is left completely untouched, never
+/// re-backfilled — widening only ever adds, never overwrites.
+///
+/// Two call sites, both already inside their own open transaction so a
+/// projection creation/widen commits or rolls back atomically with whatever
+/// catalog change occasioned it:
+/// * [`create_relationship`] calls this with `needed_columns: &[]` right
+///   after inserting the relationship's own row — so every to-one
+///   relationship gets a (bookkeeping-columns-only) projection
+///   unconditionally, before any consumer exists to read it (see
+///   [`assert_replica_identity_supports_projection`]'s doc comment for why
+///   that ordering is unavoidable).
+/// * [`create_definition_inner`] calls this once per to-one relationship a
+///   newly-created definition's fields read through
+///   ([`widen_relationship_projections_for_definition_in_txn`]), with that
+///   definition's own referenced columns — so the projection grows to cover
+///   a new consumer's reads, and a projection several transforms share
+///   (issue #129's own scope line: "one projection can serve several
+///   transforms") ends up carrying the union of every consumer's reads
+///   without any consumer needing to know about the others.
+///
+/// `to_col_pg_type` is only consulted the first time (an existing
+/// projection's key column type can't change short of dropping the
+/// projection outright, which nothing does in v1).
+#[allow(clippy::too_many_arguments)]
+async fn ensure_relationship_projection_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    relationship_id: i64,
+    qualified_to_table: &str,
+    to_table_bare: &str,
+    to_col: &str,
+    to_col_pg_type: &str,
+    target_schema: &str,
+    needed_columns: &[String],
+) -> Result<(), CatalogError> {
+    // `qualified_to_table` is the plain, unquoted `"schema.table"` identity
+    // (`resolve_relationship_endpoint_in_txn`'s own return shape) — safe to
+    // bind as a `to_regclass($1)` parameter (as [`column_type_in_txn`]
+    // already does with it below), but *not* safe to splice directly into
+    // raw SQL text: unlike a bind parameter, interpolated SQL needs each
+    // component quoted independently, exactly the gap
+    // [`super::ddl::qualified_source_table`] exists to close (see its own
+    // doc comment). Every DML statement built below uses this quoted form,
+    // never `qualified_to_table` itself.
+    let quoted_to_table = ddl::qualified_source_table(qualified_to_table);
+
+    let existing = txn
+        .query_opt(
+            "select projection_table from relationship_projections where relationship_id = $1",
+            &[&relationship_id],
+        )
+        .await?;
+
+    let projection_table = match existing {
+        Some(row) => row.get::<_, String>(0),
+        None => {
+            let projection_table = ddl::relationship_projection_table_name(relationship_id);
+            let qualified_projection =
+                ddl::qualified_relationship_projection_table(target_schema, &projection_table);
+
+            // The projection's own shape: its key (the to-side column
+            // itself, same name and type as the to-side's), plus the two
+            // bookkeeping columns every projection carries regardless of
+            // which consumers it serves — see
+            // [`super::ddl::PROJECTION_GEN_COLUMN`]/
+            // [`super::ddl::PROJECTION_LSN_COLUMN`]'s doc comments for what
+            // each means and how it's meant to be advanced. No data columns
+            // yet: this branch only runs once, at first creation, before
+            // `needed_columns` (below) has anything to add for a call from
+            // [`create_relationship`] (always empty) or is applied for a
+            // call from a definition's own widen (handled uniformly below,
+            // whether the table was just created here or already existed).
+            txn.batch_execute(&format!(
+                "create table if not exists {qualified_projection} (\
+                     {to_col_ident} {to_col_pg_type} primary key, \
+                     {gen_col} bigint not null default 0, \
+                     {lsn_col} pg_lsn not null)",
+                to_col_ident = quote_ident(to_col),
+                gen_col = quote_ident(ddl::PROJECTION_GEN_COLUMN),
+                lsn_col = quote_ident(ddl::PROJECTION_LSN_COLUMN),
+            ))
+            .await?;
+
+            txn.execute(
+                "insert into relationship_projections (relationship_id, projection_table) \
+                 values ($1, $2)",
+                &[&relationship_id, &projection_table],
+            )
+            .await?;
+
+            // Full initial backfill: one row per to-side key, bookkeeping
+            // columns only. NULL-keyed to-side rows are excluded outright —
+            // `to_col` is this table's own primary key (so it can't hold a
+            // NULL), and a NULL join key can never match a from-side row
+            // anyway (SQL `NULL <> NULL`; `eval::eval_expr`'s
+            // `RelationshipPath` arm already treats a NULL from-side join
+            // key as "no match" for the identical reason), so there is no
+            // row a NULL `to_col` value could ever need to seed — unlike
+            // #128's nullable-*grouping-key* fix, which had to make room for
+            // a NULL group because a NULL group is itself a real,
+            // needs-storage aggregation bucket. A NULL to-side key isn't a
+            // bucket at all; it's simply never a projection row.
+            //
+            // `pg_current_wal_lsn()` is captured once, via the `seed` CTE,
+            // and shared by every row this one statement writes — see
+            // [`super::ddl::PROJECTION_LSN_COLUMN`]'s doc comment for
+            // exactly what that value does and doesn't guarantee, and what
+            // #131/#132 should confirm before relying on it.
+            let seed_lsn_sql = format!(
+                "with seed as (select pg_current_wal_lsn() as lsn) \
+                 insert into {qualified_projection} ({to_col_ident}, {gen_col}, {lsn_col}) \
+                 select t.{to_col_ident}, 0, seed.lsn \
+                 from {quoted_to_table} t, seed \
+                 where t.{to_col_ident} is not null",
+                to_col_ident = quote_ident(to_col),
+                gen_col = quote_ident(ddl::PROJECTION_GEN_COLUMN),
+                lsn_col = quote_ident(ddl::PROJECTION_LSN_COLUMN),
+            );
+            txn.batch_execute(&seed_lsn_sql).await?;
+
+            projection_table
+        }
+    };
+
+    if needed_columns.is_empty() {
+        return Ok(());
+    }
+
+    let qualified_projection =
+        ddl::qualified_relationship_projection_table(target_schema, &projection_table);
+
+    let existing_cols: HashSet<String> = txn
+        .query(
+            "select column_name from information_schema.columns \
+             where table_schema = $1 and table_name = $2",
+            &[&target_schema, &projection_table],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+
+    for column in needed_columns {
+        if existing_cols.contains(column) {
+            continue;
+        }
+        let pg_type = column_type_in_txn(txn, qualified_to_table, to_table_bare, column).await?;
+        let col_ident = quote_ident(column);
+        txn.batch_execute(&format!(
+            "alter table {qualified_projection} add column if not exists {col_ident} {pg_type}"
+        ))
+        .await?;
+        // Backfill the new column for every existing projection row —
+        // existing rows are already exactly "one per to-side key" (the
+        // initial backfill above never omits a key that a later widen would
+        // need to catch up on), so a plain `update ... from` covers all of
+        // them in one statement; there is no "new row" case here, only a
+        // wider existing one.
+        txn.batch_execute(&format!(
+            "update {qualified_projection} p set {col_ident} = t.{col_ident} \
+             from {quoted_to_table} t where t.{to_col_ident} = p.{to_col_ident}",
+            to_col_ident = quote_ident(to_col),
+        ))
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// The [`create_definition_inner`] half of issue #129's projection-widening:
+/// for every to-one relationship `def`'s fields read through
+/// ([`super::eval::relationship_references`], grouped by relationship name),
+/// ensures its settled parent projection carries every referenced column —
+/// via [`ensure_relationship_projection_in_txn`] — before `def` itself is
+/// persisted, so a definition can never be live while reading a projection
+/// that hasn't caught up to it yet.
+///
+/// A to-many relationship reference is silently skipped (no projection in
+/// Phase 1); an unknown relationship name is silently skipped too — not this
+/// function's job to reject it, [`validate`] (already run, by every caller,
+/// against this same `def`) is what raises
+/// [`ValidationError::UnknownRelationship`] for that, and this function only
+/// ever runs as part of persisting a definition that's already passed that
+/// check.
+async fn widen_relationship_projections_for_definition_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    def: &TransformDef,
+    target_schema: &str,
+) -> Result<(), CatalogError> {
+    let mut columns_by_rel: HashMap<String, Vec<String>> = HashMap::new();
+    for (rel, column) in super::eval::relationship_references(def) {
+        columns_by_rel.entry(rel).or_default().push(column);
+    }
+
+    for (rel, columns) in columns_by_rel {
+        let Some(row) = txn
+            .query_opt(
+                "select id, to_table, to_col, cardinality from relationship_definitions \
+                 where from_table = $1 and name = $2",
+                &[&def.source, &rel],
+            )
+            .await?
+        else {
+            continue;
+        };
+        let relationship_id: i64 = row.get(0);
+        let to_table: String = row.get(1);
+        let to_col: String = row.get(2);
+        let cardinality_text: String = row.get(3);
+        if cardinality_text != RelationshipCardinality::ToOne.as_str() {
+            continue;
+        }
+
+        let qualified_to = resolve_relationship_endpoint_in_txn(txn, &to_table).await?;
+        let to_col_pg_type = column_type_in_txn(txn, &qualified_to, &to_table, &to_col).await?;
+
+        ensure_relationship_projection_in_txn(
+            txn,
+            relationship_id,
+            &qualified_to,
+            &to_table,
+            &to_col,
+            &to_col_pg_type,
+            target_schema,
+            &columns,
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 /// Whether `from_table` has a usable index for looking up rows by

@@ -44,9 +44,10 @@ pub use ast::{
 };
 pub use backfill::{BackfillError, backfill_definition};
 pub use catalog::{
-    CatalogError, all_source_tables, create_definition, create_definition_without_backfill,
-    create_relationship, dependents_of, edges_from, install_definition, node_for_table,
-    persist_edge, relationship_by_name, resolve_node, source_table_version, transforms_for_source,
+    CatalogError, RelationshipProjection, all_source_tables, create_definition,
+    create_definition_without_backfill, create_relationship, dependents_of, edges_from,
+    install_definition, node_for_table, persist_edge, relationship_by_name,
+    relationship_projection, resolve_node, source_table_version, transforms_for_source,
 };
 pub use ddl::{
     DdlError, PrimaryKeyColumn, create_aggregate_target_table, create_target_table,

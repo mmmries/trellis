@@ -458,6 +458,97 @@ pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String
     )
 }
 
+/// The physical, Trellis-owned table a to-one relationship's settled parent
+/// projection lives in (issue #129, epic #127's "settled parent projection"
+/// — see `trellis/tests/spikes/issue-102-PLAN-DRAFT.md` §2) —
+/// `_trellis_rel_projection_<id>`, named after the relationship's own
+/// catalog id rather than its declared name. A relationship name is unique
+/// only *per from-table* (`V16__relationship_definitions.sql`'s `unique
+/// (from_table, name)`), so two different from-tables can declare a
+/// same-named relationship; the id is the one thing already guaranteed
+/// globally unique by the time this is called
+/// (`catalog::create_relationship` names the projection right after
+/// inserting the relationship's own row, in the same transaction — see
+/// `catalog::ensure_relationship_projection_in_txn`), so it's the natural
+/// disambiguator. Matches this crate's existing `_trellis_backfill_*` naming
+/// for its own other generated tables ([`super::backfill::STAGE_TABLE`],
+/// [`super::backfill::REL_STAGE_TABLE_PREFIX`]).
+pub(crate) fn relationship_projection_table_name(relationship_id: i64) -> String {
+    format!("_trellis_rel_projection_{relationship_id}")
+}
+
+/// The schema-qualified, DDL-ready form of
+/// [`relationship_projection_table_name`]'s output — same component-independent
+/// quoting as [`qualified_target_table`], for direct interpolation into DDL/DML
+/// text.
+pub(crate) fn qualified_relationship_projection_table(
+    target_schema: &str,
+    projection_table: &str,
+) -> String {
+    format!(
+        "{}.{}",
+        quote_ident(target_schema),
+        quote_ident(projection_table)
+    )
+}
+
+/// The settled parent projection's per-row generation counter (issue #129,
+/// epic #127; the plan doc's §2 guard (b), "optimistic generation check"):
+/// bumped by any forward apply that touches this parent row, so a reverse
+/// (#131/#132) can detect — by re-reading this column under `FOR UPDATE` in
+/// its own apply transaction and comparing against the value it captured
+/// when it enumerated — that a forward apply landed in between, and
+/// abort/defer rather than overwrite a fresher forward-applied value. Every
+/// row starts at `0` at backfill time (see
+/// [`super::catalog::ensure_relationship_projection_in_txn`]); #131 is the
+/// intended first writer of any advance past that seed, and the plan doc's
+/// §3.1 finding (the generation must be bumped from the *raw* change images,
+/// not the folded ones) is guidance for that implementation, not something
+/// this column's shape enforces on its own.
+///
+/// `__trellis_`-prefixed rather than a bare `gen`, matching this module's
+/// existing `__{field}_sum`/`__{field}_count` hidden-partial-column
+/// convention (see [`avg_sum_column`]/[`count_needing_arg`]): a to-side
+/// column a consumer legitimately reads through the relationship — however
+/// unlikely a column literally named `gen` is — can never collide with this
+/// bookkeeping column, since a real to-side column can't start with
+/// `__trellis_` without colliding with Trellis's own naming first.
+pub(crate) const PROJECTION_GEN_COLUMN: &str = "__trellis_gen";
+
+/// The settled parent projection's per-row LSN chain (issue #129, epic #127;
+/// the plan doc's §2 guard (d), "per-parent ordering"): advanced only when a
+/// *justified* reverse — one whose own `prev_lsn` matched this column's
+/// current value, read under lock — applies, to the LSN of the parent-row
+/// change that reverse represents. Two parent changes staged from different
+/// ring segments can drain out of order (plan doc §3: "a later segment's
+/// bucket can commit before an earlier segment's"), which is what makes this
+/// chain necessary rather than a plain "last write wins" advance.
+///
+/// **Seeding, and what #131/#132 should confirm about it.** At backfill time
+/// every row is seeded with the same single value: the current WAL position
+/// as of backfill completion (`pg_current_wal_lsn()`, captured once in
+/// [`super::catalog::ensure_relationship_projection_in_txn`] and shared by
+/// every row that one backfill statement writes) — not any individual
+/// row's own "true" last-modified LSN, which a plain `SELECT` against the
+/// to-side table has no way to recover (Postgres doesn't expose a per-row
+/// last-commit LSN). This is sound *as long as* guard (d) is implemented as
+/// a self-referential, optimistic version stamp — a reverse's own `prev_lsn`
+/// is populated by reading this same column at enumeration time, and guard
+/// (d) simply re-checks it hasn't moved since, the same shape guard (b)'s
+/// `gen` check already uses — because then the seed only has to be
+/// internally consistent with itself, never externally correct against real
+/// WAL history. **Flagged for #131/#132 to double check**: if guard (d)
+/// instead needs this to equal some independently-verifiable "last change to
+/// this exact row" LSN, this seeding strategy does not provide that, and
+/// needs revisiting before guard (d) is implemented against it.
+///
+/// `not null`, not nullable: every row is written by a backfill that always
+/// has a real captured LSN in hand (there is no code path yet — forward
+/// apply of a brand-new to-side row is #130/#131 — that inserts a projection
+/// row any other way), so there is no seedless state this column needs to
+/// represent.
+pub(crate) const PROJECTION_LSN_COLUMN: &str = "__trellis_lsn";
+
 /// The read-side counterpart to [`qualified_target_table`] (issue #76,
 /// ADR-0007): quotes an already-qualified `"schema.table"` name — as read
 /// back from [`super::model::Definition::source_table`]
