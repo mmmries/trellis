@@ -5,6 +5,5 @@
 //! module here plus one arm there, not touching anything else.
 
 pub mod define;
-pub mod prometheus;
 pub mod run;
 pub mod status;

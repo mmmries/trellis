@@ -54,21 +54,18 @@ server to the core `trellis` crate.  `metrics-exporter-prometheus` has an
 optional Cargo feature that bundles a Hyper listener; that feature is **not**
 enabled here, preserving `docs/observability.md`'s "mountable handler, not a
 bound port" design (`render_prometheus()` stays a plain function the operator
-serves from their own HTTP stack — see `cli/src/commands/prometheus.rs`,
-already a placeholder for exactly this).
+serves from their own HTTP stack — see `cli/src/commands/run.rs`'s
+`--prometheus-bind` flag for a worked example).
 
 The facade was chosen over depending on the `prometheus` crate directly
-because issue #54's rollup job needs to read the *same* registry that
-`render_prometheus()` (issue #53) renders from, to compute periodic
-aggregates without a second, parallel recording path. `metrics` separates
-"recording an observation" (via its `Recorder` trait, implemented once by
-`metrics-exporter-prometheus`) from "reading the registry back out." Both
-`render_prometheus()` and the rollup job can consume the registry through
-`metrics`/`metrics-exporter-prometheus`'s own inspection surface, rather than
-the rollup job reaching into the `prometheus` crate's concrete `Registry`/
-`HistogramVec` types directly. That keeps the two readers decoupled from each
-other's implementation and avoids hardwiring Prometheus's own type shapes
-into code (the rollup table) that outlives any one exposition format.
+because issue #54's rollup job (later removed — see decision 7's superseding
+note) needed to read the *same* registry that `render_prometheus()` (issue
+#53) renders from, to compute periodic aggregates without a second, parallel
+recording path. `metrics` separates "recording an observation" (via its
+`Recorder` trait, implemented once by `metrics-exporter-prometheus`) from
+"reading the registry back out" — a decoupling that outlived the rollup job
+itself and still avoids hardwiring Prometheus's own concrete `Registry`/
+`HistogramVec` types into this crate's recording call sites.
 
 ### 2. End-to-end latency keying: terminal transform only
 
@@ -232,6 +229,16 @@ This decision doesn't itself create the migration — the rollup table lands
 in the next available migration number when #54 is implemented (latest as of
 this writing is `V21__column_quarantine.sql`, so the rollup table would be
 `V22__...`).
+
+**Superseded (2026-09-16).** Issue #54 was implemented (`V25__metric_rollup.sql`,
+`trellis::rollup`) and then removed. On reflection, retention and
+cross-instance aggregation are exactly what an operator's existing Prometheus/
+VictoriaMetrics/Thanos stack already does well; duplicating a pruned history
+table inside Trellis added write load, a schema object, and a prune job for a
+capability that mature external tooling already covers, rather than a gap
+Trellis itself needed to fill. `docs/observability.md`'s goals no longer list
+self-retained history — see its ["Retention"](../observability.md#retention-left-to-prometheus-not-trellis)
+section.
 
 ## Options considered
 

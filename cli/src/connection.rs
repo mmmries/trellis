@@ -1,17 +1,12 @@
 //! Shared database-connection resolution for CLI subcommands.
 //!
-//! Every subcommand accepts `-d`/`--database-url` for consistency, even
-//! `prometheus`, which doesn't connect to Postgres at all yet (see
-//! `cli/src/commands/prometheus.rs`'s module doc comment) — it just needs the
-//! flag validated as well-formed, not silently ignored if malformed. The
-//! subcommands that do connect (`define`, `run`, `status`) need the same
-//! DSN — resolved the same way [`trellis::Config::resolve`] already resolves
-//! it for any embedder: an explicit connection string if the operator gave
-//! one, else `TRELLIS_DATABASE_URL`, else the standard `PGHOST`/`PGPORT`/
-//! `PGUSER`/`PGPASSWORD`/`PGDATABASE` environment variables. This module's
-//! only job is pulling that explicit connection string out of argv, if
-//! present, before handing it to `Config::resolve` (or, for `prometheus`,
-//! discarding it).
+//! Every subcommand accepts `-d`/`--database-url`, resolved the same way
+//! [`trellis::Config::resolve`] already resolves it for any embedder: an
+//! explicit connection string if the operator gave one, else
+//! `TRELLIS_DATABASE_URL`, else the standard `PGHOST`/`PGPORT`/`PGUSER`/
+//! `PGPASSWORD`/`PGDATABASE` environment variables. This module's only job is
+//! pulling that explicit connection string out of argv, if present, before
+//! handing it to `Config::resolve`.
 
 /// The long spelling of the connection-string flag.
 const LONG_FLAG: &str = "--database-url";
