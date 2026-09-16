@@ -1,0 +1,729 @@
+//! Integration tests for issue #131 (epic #127): the to-one relationship
+//! reverse **delta** — a parent-keyed record carrying the parent's old/new
+//! image and a `(prev_lsn, lsn)` chain, applied as paired subtract-old/
+//! add-new over the parent's from-side rows, replacing the pre-#131
+//! image-less from-side `Recompute` for to-one relationships specifically.
+//! See `trellis/tests/spikes/issue-102-PLAN-DRAFT.md` §2 and §7 Phase 1
+//! steps 4-5, and `staging::apply`'s own module doc comment (the "Issue
+//! #131, epic #127" section) for the mechanism.
+//!
+//! Reuses issue #94's `defs_aggregate_relationship.rs` schema/fixture
+//! (`post_tags` from-side, `posts` to-side, `SUM`/`COUNT` grouped by `tag`)
+//! since it's already exactly the fully-invertible, single-relationship
+//! shape this issue's fast path targets, and its dangling reference (a
+//! `post_tags` row pointing at `post = 999`, which doesn't exist in the seed
+//! data) doubles as a ready-made parent-insert fixture.
+
+use std::collections::HashMap;
+
+use testkit::TestCluster;
+use tokio_postgres::types::PgLsn;
+use tokio_postgres::{Client, NoTls};
+use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::ast::{Expr, FieldDef, KeySpace, Predicate, TransformDef, ValueType};
+use trellis::defs::{
+    create_definition, create_relationship, create_target_table, install_definition,
+    relationship_projection, source_primary_key,
+};
+use trellis::staging::apply::{self, ApplyPlan};
+use trellis::staging::{claim, fold, has_pending, retire_drained_segments};
+
+async fn connect_raw(dsn: &str) -> Client {
+    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
+        .await
+        .expect("set search_path");
+    client
+}
+
+async fn seal_active_segment(client: &mut Client) -> i64 {
+    use trellis::staging::seal;
+    let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+    seal::seal_phase2(client, outcome.sealed_seg_seq)
+        .await
+        .expect("seal phase 2");
+    outcome.sealed_seg_seq
+}
+
+async fn active_seg_table(client: &Client) -> String {
+    let ring_slot: i16 = client
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment pointer")
+        .get(0);
+    format!("seg_{ring_slot}")
+}
+
+fn qualify_fixture_table(name: &str) -> String {
+    if name.contains('.') {
+        name.to_string()
+    } else {
+        format!("{DEFAULT_SCHEMA}.{name}")
+    }
+}
+
+/// Stages one image-bearing (CDC-shaped) change into the active ring
+/// segment, at an explicit `lsn` — unlike most of this crate's other test
+/// files' `stage_cdc` helpers, which pin every row to `lsn = 1`, several
+/// tests here need distinct, ordered LSNs (the fold's "latest wins" rule,
+/// and the reverse record's own `lsn`/`prev_lsn` chain, both key off it).
+async fn stage_cdc_at_lsn(
+    client: &Client,
+    src_table: &str,
+    key: &str,
+    op: &str,
+    old_image: Option<&str>,
+    new_image: Option<&str>,
+    lsn: u64,
+) {
+    let src_table = qualify_fixture_table(src_table);
+    let table = active_seg_table(client).await;
+    let lsn = PgLsn::from(lsn);
+    client
+        .execute(
+            &format!(
+                "insert into {table} (src_table, key, op, lsn, old_image, new_image, hop_gen) \
+                 values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0)"
+            ),
+            &[&src_table, &key, &op, &lsn, &old_image, &new_image],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
+}
+
+async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+    for _ in 0..16 {
+        let seg = seal_active_segment(client).await;
+        while apply::drain_once(pool, seg, "reverse_test", 1, "trellis_reverse_test")
+            .await
+            .expect("drain_once")
+            .is_some()
+        {}
+        retire_drained_segments(client)
+            .await
+            .expect("retire drained segments");
+        if !has_pending(client).await.expect("has_pending") {
+            return;
+        }
+    }
+    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
+}
+
+fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
+    pairs
+        .iter()
+        .map(|(name, ty)| (name.to_string(), *ty))
+        .collect()
+}
+
+fn post_tags_columns() -> HashMap<String, ValueType> {
+    columns(&[
+        ("id", ValueType::Numeric),
+        ("post", ValueType::Numeric),
+        ("tag", ValueType::Text),
+    ])
+}
+
+const TAG_TOTALS: &str = "TRANSFORM tag_totals FROM post_tags GROUP BY tag \
+     SELECT COUNT(*) AS post_count, SUM(post.word_count) AS total_words";
+
+/// Issue #94's exact schema (see `defs_aggregate_relationship.rs`), reused
+/// verbatim: `post_tags` row 13 (`post = 999`, tag `rust`) is a dangling
+/// reference to a post that doesn't exist yet — this file's parent-insert
+/// test inserts it.
+async fn create_schema(client: &Client) {
+    client
+        .batch_execute(
+            "create table posts (id integer primary key, word_count integer); \
+             create table post_tags (id integer primary key, post integer, tag text); \
+             alter table post_tags replica identity full; \
+             alter table posts replica identity full; \
+             create index on post_tags (post); \
+             insert into posts (id, word_count) values (1, 100), (2, 250), (3, null); \
+             insert into post_tags (id, post, tag) values \
+               (10, 1, 'rust'), (11, 2, 'rust'), (12, 1, 'db'), \
+               (13, 999, 'rust'), (14, 3, 'db')",
+        )
+        .await
+        .expect("create + seed issue #94's schema");
+}
+
+type Totals = HashMap<String, (Option<String>, Option<String>)>;
+
+async fn target_totals(client: &Client) -> Totals {
+    client
+        .query(
+            "select tag, post_count::text, total_words::text from tag_totals",
+            &[],
+        )
+        .await
+        .expect("read tag_totals")
+        .into_iter()
+        .map(|r| (r.get(0), (r.get(1), r.get(2))))
+        .collect()
+}
+
+async fn projection_table_for(pool: &trellis::Pool, relationship_id: i64) -> String {
+    relationship_projection(pool, relationship_id)
+        .await
+        .expect("read projection catalog row")
+        .expect("to-one relationship has a projection")
+        .projection_table
+}
+
+async fn projection_lsn(client: &Client, projection_table: &str, id: i32) -> Option<PgLsn> {
+    client
+        .query_one(
+            &format!("select __trellis_lsn from {projection_table} where id = $1"),
+            &[&id],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("read {projection_table}'s lsn for id {id}: {e}"))
+        .get(0)
+}
+
+async fn projection_row_exists(client: &Client, projection_table: &str, id: i32) -> bool {
+    client
+        .query_one(
+            &format!("select exists (select 1 from {projection_table} where id = $1)"),
+            &[&id],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("probe {projection_table} for id {id}: {e}"))
+        .get(0)
+}
+
+// ---------------------------------------------------------------------
+// 1. A to-side update is a real delta, not a live recompute.
+// ---------------------------------------------------------------------
+
+/// A to-side (parent) update that changes a `SUM`-read column advances the
+/// settled parent projection's `__trellis_lsn` to the change's own `lsn` —
+/// a signature only issue #131's reverse-delta apply produces. The pre-#131
+/// mechanism (an image-less from-side `Recompute`) never wrote to the
+/// projection at all, so this is a direct, positive proof the new path ran,
+/// not just an end-state convergence check (which an eventually-correct
+/// live recompute would also pass).
+#[tokio::test]
+async fn to_side_update_advances_the_projection_lsn_via_the_delta_path() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("update the related post");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        100,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        Some(PgLsn::from(100)),
+        "the reverse-delta apply must advance the projection's own lsn chain \
+         to the applied record's lsn"
+    );
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("650".to_string())))
+    );
+    assert_eq!(
+        totals.get("db"),
+        Some(&(Some("2".to_string()), Some("400".to_string())))
+    );
+}
+
+// ---------------------------------------------------------------------
+// 2. N parent changes to the same key in one batch fold to one record.
+// ---------------------------------------------------------------------
+
+/// Two updates to the same to-side row, staged into the *same* segment
+/// before it seals, fold (via the ordinary, pre-existing CDC fold — see
+/// `RelationshipReverseRecord`'s doc comment on why no new ring plumbing was
+/// needed) to one reverse record: `old_image` from the earliest raw change,
+/// `new_image`/`lsn` from the latest. The target must reflect only the
+/// *net* effect (100 -> 500, never a transient 100 -> 400 -> 500 that a
+/// naive per-raw-row apply would double-count), and the projection's lsn
+/// must land on the *latest* staged lsn, not the first.
+#[tokio::test]
+async fn two_parent_changes_in_one_batch_fold_to_one_record() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+
+    client
+        .execute("update posts set word_count = 500 where id = 1", &[])
+        .await
+        .expect("update the related post to its final value");
+    // Two raw CDC rows for the same key, same batch: 100->400, then
+    // 400->500. The pre-existing fold collapses them to old=100, new=500.
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        100,
+    )
+    .await;
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":400}"),
+        Some("{\"id\":1,\"word_count\":500}"),
+        200,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        Some(PgLsn::from(200)),
+        "the folded record's lsn must be the latest of the two raw changes"
+    );
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("750".to_string()))),
+        "net effect only: 250 (post 2) + 500 (post 1, its *final* value) + null"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 3. Parent insert and parent delete.
+// ---------------------------------------------------------------------
+
+/// A parent INSERT (`old_image` absent): `post_tags` row 13's dangling
+/// reference to `post = 999` starts contributing once that post exists,
+/// and the projection gets a brand-new row (not an update to one that
+/// never existed).
+#[tokio::test]
+async fn parent_insert_is_picked_up_by_the_reverse_path() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+    assert!(
+        !projection_row_exists(&client, &projection_table, 999).await,
+        "post 999 doesn't exist yet, so the projection must not have a row for it"
+    );
+
+    client
+        .execute("insert into posts (id, word_count) values (999, 999)", &[])
+        .await
+        .expect("insert the previously-dangling post");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "999",
+        "insert",
+        None,
+        Some("{\"id\":999,\"word_count\":999}"),
+        50,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert!(
+        projection_row_exists(&client, &projection_table, 999).await,
+        "the reverse path must insert a projection row for a brand-new parent"
+    );
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 999).await,
+        Some(PgLsn::from(50))
+    );
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("1349".to_string()))),
+        "100 (post 1) + 250 (post 2) + 999 (the newly-inserted post 999)"
+    );
+}
+
+/// A parent DELETE (`new_image` absent): deleting post 2 removes its
+/// contribution to `rust`'s total and removes its projection row outright.
+#[tokio::test]
+async fn parent_delete_is_picked_up_by_the_reverse_path() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+    assert!(projection_row_exists(&client, &projection_table, 2).await);
+
+    client
+        .execute("delete from posts where id = 2", &[])
+        .await
+        .expect("delete the related post");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "2",
+        "delete",
+        Some("{\"id\":2,\"word_count\":250}"),
+        None,
+        75,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert!(
+        !projection_row_exists(&client, &projection_table, 2).await,
+        "the reverse path must delete the projection row for a deleted parent"
+    );
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("100".to_string()))),
+        "only post 1's 100 remains; post 2 is gone and post 999 never existed"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 4. The ordering stopgap (guard (d), pre-#132) actually rejects a stale
+//    prev_lsn, and the pipeline still converges afterward.
+// ---------------------------------------------------------------------
+
+/// Simulates two reverse records for the *same* parent key both captured
+/// (Phase 2) before either applied (Phase 3) — the scenario the plan doc's
+/// guard (d) exists for (§2: "two parent changes in different segments can
+/// drain out of order"). Driven by hand at the `compute`/
+/// `apply_and_mark_drained` level (rather than `drain_once`, which always
+/// applies a segment immediately after computing it) so both computes can
+/// be forced to run before either apply commits.
+///
+/// The first apply succeeds and advances the projection's `lsn`. The
+/// second's `prev_lsn` (captured before the first applied) no longer
+/// matches, so it must **not** apply its own delta directly — asserted by
+/// checking the projection's `lsn` is still the first record's, not the
+/// second's, immediately after the second apply commits. The stopgap then
+/// re-stages the second record's from-side rows as an image-less
+/// `Recompute`, so a further drain to quiescence must still converge to the
+/// correct final total (500's contribution, not 400's or double-counted).
+#[tokio::test]
+async fn a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+
+    // First parent change: 100 -> 400, its own segment.
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("first update");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        100,
+    )
+    .await;
+    let seg_a = seal_active_segment(&mut client).await;
+
+    async fn claim_fold_compute(
+        pool: &trellis::Pool,
+        client: &mut Client,
+        seg_seq: i64,
+        claimed_by: &str,
+    ) -> ApplyPlan {
+        let mut phase1 = pool.get().await.expect("connection");
+        let txn = phase1.transaction().await.expect("begin phase 1");
+        claim::claim(&*txn, seg_seq, claimed_by, 1)
+            .await
+            .expect("claim");
+        let filter = claim::owned_bucket_filter(&*txn, seg_seq, claimed_by)
+            .await
+            .expect("owned_bucket_filter");
+        let folded = fold::fold(&txn, seg_seq, filter).await.expect("fold");
+        txn.commit().await.expect("commit phase 1");
+        let _ = client;
+        apply::compute(pool, &folded).await.expect("compute")
+    }
+
+    // Phase 2 for segment A — captures `prev_lsn` against the pre-update
+    // projection state.
+    let plan_a = claim_fold_compute(&db.pool, &mut client, seg_a, "worker_a").await;
+
+    // Second parent change: 400 -> 500 (live value, matching what A's own
+    // apply hasn't landed yet), its own later segment — captured *before*
+    // A's Phase 3 runs, so it reads the exact same stale `prev_lsn`.
+    client
+        .execute("update posts set word_count = 500 where id = 1", &[])
+        .await
+        .expect("second update");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":400}"),
+        Some("{\"id\":1,\"word_count\":500}"),
+        200,
+    )
+    .await;
+    let seg_b = seal_active_segment(&mut client).await;
+    let plan_b = claim_fold_compute(&db.pool, &mut client, seg_b, "worker_b").await;
+
+    // Apply A: matches, advances the projection to lsn 100.
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3 (a)");
+    apply::apply_and_mark_drained(&txn, seg_a, "worker_a", &plan_a, "trellis_reverse_test")
+        .await
+        .expect("apply A");
+    txn.commit().await.expect("commit A");
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        Some(PgLsn::from(100))
+    );
+
+    // Apply B: its `prev_lsn` (captured before A applied) no longer matches
+    // the projection's current lsn (100, not the pre-update seed) — the
+    // ordering stopgap must reject B's own delta.
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3 (b)");
+    apply::apply_and_mark_drained(&txn, seg_b, "worker_b", &plan_b, "trellis_reverse_test")
+        .await
+        .expect("apply B (rejected internally, but the drain call itself still succeeds)");
+    txn.commit().await.expect("commit B");
+
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        Some(PgLsn::from(100)),
+        "B's stale prev_lsn must be rejected — the projection stays at A's lsn, \
+         not advanced to B's"
+    );
+
+    // The stopgap re-staged B's from-side rows as an image-less recompute;
+    // draining that to quiescence must still converge on the *true* final
+    // value (500, the live value by now), not 400 (A's value, stale) and
+    // not double-counted.
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("750".to_string()))),
+        "250 (post 2) + 500 (post 1's true final value, recovered via the stopgap \
+         fallback) + null (post 999)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 5. To-many relationships are unaffected.
+// ---------------------------------------------------------------------
+
+fn articles_columns() -> HashMap<String, ValueType> {
+    columns(&[
+        ("id", ValueType::Numeric),
+        ("category_id", ValueType::Numeric),
+    ])
+}
+
+fn article_cat_def() -> TransformDef {
+    TransformDef {
+        target: "article_cat".to_string(),
+        source: "articles".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "category_name".to_string(),
+            expr: Expr::RelationshipPath {
+                rel: "category".to_string(),
+                column: "name".to_string(),
+            },
+        }],
+        predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
+    }
+}
+
+async fn target_category_name(client: &Client, id: i32) -> Option<String> {
+    client
+        .query_one(
+            "select category_name from article_cat where id = $1",
+            &[&id],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("read article_cat id {id}: {e}"))
+        .get(0)
+}
+
+/// A `KeySpace::OneToOne` target reading a to-one relationship is design
+/// fork 1 in `build_reverse_relationship_shape`'s doc comment — it has no
+/// additive semantics to delta, so it stays on the pre-#131 image-less
+/// `Recompute` mechanism (`ReverseRelationshipShape::needs_recompute_fallback`)
+/// rather than being folded into the new fast path. This just proves that
+/// fallback still converges correctly post-#131 — a regression check for
+/// the exact scenario `apply_relationship_forward.rs`'s fixture uses.
+#[tokio::test]
+async fn a_one_to_one_target_still_converges_via_the_fallback_mechanism() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table categories (id integer primary key, name text); \
+             alter table categories replica identity full; \
+             insert into categories (id, name) values (10, 'Tech'); \
+             create table articles (id integer primary key, category_id integer); \
+             insert into articles (id, category_id) values (1, 10)",
+        )
+        .await
+        .expect("create + seed tables");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP category FROM articles.category_id TO categories.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    create_definition(
+        &db.pool,
+        "TRANSFORM article_cat FROM articles SELECT category.name AS category_name",
+        &articles_columns(),
+    )
+    .await
+    .expect("create to-one enrichment definition");
+    let pk = source_primary_key(&db.pool, "articles")
+        .await
+        .expect("introspect articles pk");
+    create_target_table(
+        &db.pool,
+        &article_cat_def(),
+        "public",
+        &pk,
+        &articles_columns(),
+        &article_cat_def().source,
+    )
+    .await
+    .expect("create target table");
+    stage_cdc_at_lsn(
+        &client,
+        "articles",
+        "1",
+        "insert",
+        None,
+        Some("{\"id\":1,\"category_id\":10}"),
+        1,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        target_category_name(&client, 1).await,
+        Some("Tech".to_string())
+    );
+
+    client
+        .execute("update categories set name = 'Renamed' where id = 10", &[])
+        .await
+        .expect("rename the category");
+    stage_cdc_at_lsn(
+        &client,
+        "categories",
+        "10",
+        "update",
+        Some("{\"id\":10,\"name\":\"Tech\"}"),
+        Some("{\"id\":10,\"name\":\"Renamed\"}"),
+        1,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        target_category_name(&client, 1).await,
+        Some("Renamed".to_string()),
+        "a 1-1 target reading the relationship must still re-derive via the \
+         pre-#131 fallback, unchanged"
+    );
+}
