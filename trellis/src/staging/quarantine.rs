@@ -1232,7 +1232,17 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
             .iter()
             .map(|pk_text| Some(rows_by_pk[pk_text].clone()))
             .collect();
-        apply::build_relationship_context(pool, &def.def.source, &def.def, &rows).await?
+        // This resume path is an ad hoc, non-transactional, per-row pass
+        // over every current source row — not part of the staging ring's
+        // claim/fold/compute/apply pipeline `build_relationship_context`'s
+        // gen-bump signal exists to guard (issue #130, epic #127), so
+        // `old_rows: None` here: there is no folded change with an old
+        // image to widen the touched-key set from, and the returned
+        // gen-bump map is discarded rather than applied in any transaction
+        // (there isn't one spanning this whole function to apply it in).
+        let (ctx, _gen_bumps) =
+            apply::build_relationship_context(pool, &def.def.source, &def.def, &rows, None).await?;
+        ctx
     };
 
     let field_type = if rel_refs.is_empty() {

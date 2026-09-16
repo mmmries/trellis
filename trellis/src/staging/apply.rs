@@ -576,6 +576,39 @@ async fn from_side_keys_with_non_null_join(
     Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
+/// One to-one relationship's settled-parent projection keys a batch's
+/// relationship resolution touched (issue #130, epic #127; plan doc §2's
+/// guard (b) precondition — "the generation must be bumped... so a reverse
+/// can detect that a forward apply landed in between"). [`build_relationship_context`]
+/// resolves this in Phase 2 (the same catalog read that finds the projection
+/// table to query), so Phase 3 ([`apply_and_mark_drained_many`]'s gen-bump
+/// step) needs no catalog/pool access of its own to apply it — the same
+/// "decide in Phase 2, apply in Phase 3" split [`ApplyPlan::downstream_readers`]
+/// already uses.
+///
+/// **Known gap, tracked as issue #133** (plan doc §3.1): `touched_keys` is
+/// derived from the *folded* change's own old- and new-image join-key values
+/// — both folded endpoints (a re-point bumps both the old and new parent),
+/// not the pre-fold history. A parent erased by the fold within one batch
+/// (`ins(post 3)` + `repoint(3 -> 2)` folding to `new={post: 2}`, with post 3
+/// appearing in neither folded endpoint) is invisible here too, so it won't
+/// be bumped even though a child briefly pointed at it mid-batch — a reverse
+/// holding an enumeration captured before the re-point would then wrongly
+/// pass guard (b)'s check against post 3's `gen`. The fix is #133: widen the
+/// staging ring's `group_key` column to carry the union of touched join keys
+/// from the *raw* (pre-fold) change history, and drive this off that instead
+/// of the folded endpoints. Not solved here — #130's job is only to bump
+/// `gen` from the best signal the folded change already carries.
+#[derive(Debug, Clone)]
+pub(crate) struct RelationshipGenBump {
+    /// [`ddl::qualified_relationship_projection_table`]'s output — ready for
+    /// direct interpolation into the Phase 3 `UPDATE`.
+    qualified_projection: String,
+    /// The projection's own primary key column (the relationship's `to_col`).
+    key_col: String,
+    touched_keys: std::collections::HashSet<String>,
+}
+
 /// Builds the [`RelationshipContext`] a relationship-enriched from-side target
 /// needs to re-evaluate (issue #30 wiring of the #28/#29 evaluator): for each
 /// relationship the definition references, the related to-side rows keyed by
@@ -584,12 +617,32 @@ async fn from_side_keys_with_non_null_join(
 /// evaluate — so only the related rows those rows actually need are fetched.
 /// `from_table` is the definition's own source table (a relationship's
 /// `from_table`).
+///
+/// **Issue #130, epic #127**: a to-one relationship (`RelationshipCardinality::ToOne`)
+/// resolves against the settled parent projection (#129's
+/// `catalog::relationship_projection`), never a live read of the to-side —
+/// see this module's doc comment / plan doc §2 for why a live read
+/// double-counts the `δA⋈δB` cross term on the forward path. A to-many
+/// relationship is untouched: Phase 1 of this epic is to-one relationship
+/// *values* only (#94's shape), so `ToManyRelationship` still resolves via
+/// [`fetch_to_side_rows`]'s live read, exactly as before.
+///
+/// `old_rows`, when supplied, is the same-length, same-index decoded
+/// pre-image of each of `rows`' underlying changes — used only to widen the
+/// gen-bump touched-key set (see [`RelationshipGenBump`]'s doc comment) with
+/// each change's *old* join-key value, not to resolve anything the evaluator
+/// reads. `None` is the shape `quarantine::recompute_column`'s ad hoc,
+/// non-transactional resume path passes, since it isn't part of the staging
+/// ring's claim/fold/compute/apply pipeline this gen bump guards — that
+/// caller discards the returned gen-bump map entirely, so `None` simply
+/// costs it nothing beyond not bothering to compute the old-side half.
 pub(crate) async fn build_relationship_context(
     pool: &Pool,
     from_table: &str,
     def: &TransformDef,
     rows: &[Option<Row>],
-) -> Result<RelationshipContext, ApplyError> {
+    old_rows: Option<&[Option<Row>]>,
+) -> Result<(RelationshipContext, HashMap<i64, RelationshipGenBump>), ApplyError> {
     // Group the referenced columns by relationship name (a relationship may be
     // read for more than one column across the definition's fields).
     let mut cols_by_rel: HashMap<String, Vec<String>> = HashMap::new();
@@ -602,6 +655,7 @@ pub(crate) async fn build_relationship_context(
 
     let mut by_name: HashMap<String, ToOneRelationship> = HashMap::new();
     let mut to_many_by_name: HashMap<String, ToManyRelationship> = HashMap::new();
+    let mut gen_bumps: HashMap<i64, RelationshipGenBump> = HashMap::new();
 
     for (rel_name, columns) in cols_by_rel {
         let Some(reldef) = catalog::relationship_by_name(pool, from_table, &rel_name).await? else {
@@ -626,26 +680,87 @@ pub(crate) async fn build_relationship_context(
         }
 
         let to_columns = to_column_types(pool, &to_table, &columns).await?;
-        let grouped = fetch_to_side_rows(pool, &to_table, &to_col, &join_keys).await?;
 
         match reldef.cardinality {
             RelationshipCardinality::ToOne => {
-                // `to_col` is UNIQUE, so each key has exactly one related row.
-                let to_rows_by_key = grouped
-                    .into_iter()
-                    .filter_map(|(k, mut v)| v.pop().map(|row| (k, row)))
-                    .collect();
+                let projection = catalog::relationship_projection(pool, reldef.id).await?;
+                let qualified_projection = projection.as_ref().map(|p| {
+                    ddl::qualified_relationship_projection_table(
+                        pool.target_schema(),
+                        &p.projection_table,
+                    )
+                });
+
+                let to_rows_by_key = match &qualified_projection {
+                    Some(qualified_projection) => {
+                        fetch_relationship_projection_rows(
+                            pool,
+                            qualified_projection,
+                            &to_col,
+                            &join_keys,
+                        )
+                        .await?
+                    }
+                    None => {
+                        // Every to-one relationship gets a projection
+                        // unconditionally at `create_relationship` time
+                        // (#129's `ensure_relationship_projection_in_txn`) —
+                        // this should be unreachable. Phase 2 holds no locks
+                        // and can't assume the catalog is self-consistent on
+                        // that promise alone, so this degrades to "nothing
+                        // resolves" (an empty to-side, same as a genuinely
+                        // dangling join key) rather than panicking.
+                        tracing::error!(
+                            relationship = %rel_name,
+                            from_table = %from_table,
+                            "to-one relationship has no settled parent projection; \
+                             resolving as empty (should be unreachable — #129 creates \
+                             one unconditionally)"
+                        );
+                        HashMap::new()
+                    }
+                };
                 by_name.insert(
                     rel_name,
                     ToOneRelationship {
-                        from_col,
+                        from_col: from_col.clone(),
                         cardinality: RelationshipCardinality::ToOne,
                         to_columns,
                         to_rows_by_key,
                     },
                 );
+
+                // #130's gen-bump signal — see [`RelationshipGenBump`]'s doc
+                // comment for the #133 gap this is a documented,
+                // best-available approximation of. Both folded endpoints:
+                // the new-side join keys just resolved above, plus every
+                // change's own old-image `from_col` value (a re-point's
+                // *previous* parent, which the new-side scan never sees).
+                if let Some(qualified_projection) = qualified_projection {
+                    let mut touched: std::collections::HashSet<String> =
+                        join_keys.iter().cloned().collect();
+                    if let Some(old_rows) = old_rows {
+                        for old_row in old_rows.iter().flatten() {
+                            if let Some(Some(text)) = old_row.get(&from_col) {
+                                touched.insert(text.clone());
+                            }
+                        }
+                    }
+                    if !touched.is_empty() {
+                        gen_bumps
+                            .entry(reldef.id)
+                            .or_insert_with(|| RelationshipGenBump {
+                                qualified_projection,
+                                key_col: to_col.clone(),
+                                touched_keys: std::collections::HashSet::new(),
+                            })
+                            .touched_keys
+                            .extend(touched);
+                    }
+                }
             }
             RelationshipCardinality::ToMany => {
+                let grouped = fetch_to_side_rows(pool, &to_table, &to_col, &join_keys).await?;
                 to_many_by_name.insert(
                     rel_name,
                     ToManyRelationship {
@@ -658,7 +773,10 @@ pub(crate) async fn build_relationship_context(
         }
     }
 
-    Ok(RelationshipContext::new(by_name).with_to_many(to_many_by_name))
+    Ok((
+        RelationshipContext::new(by_name).with_to_many(to_many_by_name),
+        gen_bumps,
+    ))
 }
 
 /// The to-side rows whose `to_col` matches any of `join_keys`, grouped by that
@@ -705,6 +823,49 @@ async fn fetch_to_side_rows(
         grouped.entry(jk).or_default().push(row);
     }
     Ok(grouped)
+}
+
+/// The settled parent projection's rows whose key column matches any of
+/// `join_keys` (issue #130, epic #127) — [`build_relationship_context`]'s
+/// to-one counterpart to [`fetch_to_side_rows`], reading `qualified_projection`
+/// (already schema-qualified via [`ddl::qualified_relationship_projection_table`])
+/// instead of the live to-side table. The projection's key column is a real
+/// `primary key` (`catalog::ensure_relationship_projection_in_txn`'s DDL), so
+/// unlike `fetch_to_side_rows` there is at most one row per key — no
+/// `row_number()`/grouping dance needed, just a per-key `Row` assembled the
+/// same `jsonb_each_text` way every other decode in this module uses. This
+/// also happens to return every column the projection carries (bookkeeping
+/// columns `__trellis_gen`/`__trellis_lsn` included, plus any data column a
+/// *different* consumer widened in) — harmless, since the evaluator only ever
+/// reads the specific columns a definition's own fields reference
+/// ([`eval::eval_expr`]'s `Row::get`), and a `Row` carrying extra unread keys
+/// is exactly what every other decode in this module already produces.
+async fn fetch_relationship_projection_rows(
+    pool: &Pool,
+    qualified_projection: &str,
+    key_col: &str,
+    join_keys: &[String],
+) -> Result<HashMap<String, Row>, ApplyError> {
+    if join_keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let client = pool.get().await?;
+    let key_ident = quote_ident(key_col);
+    let sql = format!(
+        "select p.{key_ident}::text as jk, e.key, e.value \
+         from {qualified_projection} p \
+         cross join lateral jsonb_each_text(to_jsonb(p.*)) e \
+         where p.{key_ident}::text = any($1::text[])"
+    );
+    let db_rows = client.query(&sql, &[&join_keys]).await?;
+    let mut rows: HashMap<String, Row> = HashMap::new();
+    for db_row in db_rows {
+        let jk: String = db_row.get(0);
+        let field: String = db_row.get(1);
+        let value: Option<String> = db_row.get(2);
+        rows.entry(jk).or_default().insert(field, value);
+    }
+    Ok(rows)
 }
 
 /// The [`ValueType`] of each named column on `table`, introspected live from
@@ -1359,6 +1520,15 @@ pub struct ApplyPlan {
     /// [`crate::metrics::record_end_to_end_latency`] at the end of its
     /// per-target loop. Buffered for the same retry-safety reason.
     end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>>,
+    /// Issue #130, epic #127: every to-one relationship this batch's
+    /// relationship resolution touched, keyed by `relationship_definitions.id`
+    /// — accumulated across every [`build_relationship_context`] call this
+    /// `compute` pass makes (several definitions, or several sources, can
+    /// share one relationship) and bumped, once per touched key, in Phase 3
+    /// by [`apply_and_mark_drained_many`]. See [`RelationshipGenBump`]'s doc
+    /// comment for exactly what "touched" means and the #133 gap it's a
+    /// documented approximation of.
+    relationship_gen_bumps: HashMap<i64, RelationshipGenBump>,
 }
 
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
@@ -1467,6 +1637,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // that function's doc comment.
     let mut reverse_recomputes: HashMap<(String, String), (i32, Option<std::time::SystemTime>)> =
         HashMap::new();
+    // Issue #130, epic #127: accumulated across every source/definition this
+    // `compute` pass evaluates a to-one relationship for — see
+    // [`ApplyPlan::relationship_gen_bumps`]'s doc comment.
+    let mut relationship_gen_bumps: HashMap<i64, RelationshipGenBump> = HashMap::new();
 
     for (source_key, changes) in by_source {
         tracing::debug!(
@@ -1571,10 +1745,16 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // here and shared across every aggregate definition on this source,
         // same as `rows` above. Only decoded when this source actually has
         // an aggregate reader, to avoid the extra round trips for the
-        // (overwhelmingly common) 1-1-only source.
-        let needs_old_rows = defs
-            .iter()
-            .any(|def| matches!(def.def.key_space, KeySpace::Aggregate { .. }));
+        // (overwhelmingly common) 1-1-only source. Issue #130 widens this
+        // same gate: a 1-1 definition reading a to-one relationship also
+        // needs each change's old-image join-key value, to bump `gen` for
+        // the parent a re-point/delete moved *away* from (see
+        // `RelationshipGenBump`'s doc comment) — sharing one decode here
+        // rather than a second pass over the same images.
+        let needs_old_rows = defs.iter().any(|def| {
+            matches!(def.def.key_space, KeySpace::Aggregate { .. })
+                || !eval::relationship_references(&def.def).is_empty()
+        });
         let mut old_rows: Vec<Option<Row>> = Vec::with_capacity(changes.len());
         if needs_old_rows {
             for change in &changes {
@@ -1796,7 +1976,30 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 let rel_ctx = if eval::relationship_references(&def.def).is_empty() {
                     None
                 } else {
-                    Some(build_relationship_context(pool, source_key, &def.def, &rows).await?)
+                    let (ctx, gen_bumps) = build_relationship_context(
+                        pool,
+                        source_key,
+                        &def.def,
+                        &rows,
+                        Some(&old_rows),
+                    )
+                    .await?;
+                    // Issue #130: merge this definition's touched-parent keys
+                    // into the whole-batch accumulator — several definitions
+                    // (or several sources, across loop iterations) can share
+                    // one relationship, and every one of them needs to land
+                    // in the same Phase 3 bump.
+                    for (rel_id, bump) in gen_bumps {
+                        relationship_gen_bumps
+                            .entry(rel_id)
+                            .and_modify(|existing| {
+                                existing
+                                    .touched_keys
+                                    .extend(bump.touched_keys.iter().cloned());
+                            })
+                            .or_insert(bump);
+                    }
+                    Some(ctx)
                 };
 
                 // Three shapes, per fold.rs's rules: `Some(new_image)` is an
@@ -2151,6 +2354,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         reverse_recomputes,
         transform_observations,
         end_to_end_origins: terminal_end_to_end_origins,
+        relationship_gen_bumps,
     })
 }
 
@@ -2437,7 +2641,13 @@ async fn apply_target(
 ///    [`compute`]) survive, while anything the truncate is meant to erase
 ///    does not.
 /// 3. **The ordered pre-lock + upsert/delete**, per target table, via
-///    [`apply_target`].
+///    [`apply_target`], immediately followed by the **relationship
+///    settled-parent projection gen bump** (issue #130, epic #127): every
+///    to-one relationship parent this batch's relationship resolution
+///    touched (`plan.relationship_gen_bumps`) gets its projection's
+///    `__trellis_gen` bumped by 1, in this same transaction — see that
+///    step's own inline comment for the exact semantics and the #133 gap it
+///    documents.
 /// 4. **Downstream propagation**: for every physically-changed key (write
 ///    or delete — no-op-suppressed writes don't count) in a target table at
 ///    least one definition currently reads, stages a `Recompute` row at
@@ -2689,6 +2899,46 @@ pub async fn apply_and_mark_drained_many(
                 .chain(result.deleted)
                 .map(|(key, hop_gen)| (key, hop_gen, None)),
         );
+    }
+
+    // 3c. Relationship settled-parent projection gen bump (issue #130, epic
+    // #127; plan doc §2 guard (b)'s precondition): every to-one relationship
+    // parent this batch's relationship resolution touched
+    // (`ApplyPlan::relationship_gen_bumps`, resolved in Phase 2) gets its
+    // projection row's `__trellis_gen` bumped by exactly 1, in this same
+    // transaction — so guard (b) (#132) can detect, by re-reading under `FOR
+    // UPDATE` and comparing against a value it captured earlier, that a
+    // forward apply landed in between. One `UPDATE ... SET gen = gen + 1
+    // WHERE key = ANY(...)` per relationship, over the *deduped* set of
+    // touched keys (`RelationshipGenBump::touched_keys` is a `HashSet`) — so
+    // a parent touched by two different from-side rows in this same batch
+    // (e.g. two children re-pointing onto the same parent) still only
+    // advances its generation by 1 for the whole transaction, not once per
+    // touching row: guard (b) only needs "did anything land since I captured
+    // this," not a count of how many things did. A key with no projection
+    // row yet (see `ensure_relationship_projection_in_txn`'s own doc comment
+    // on the widen-only catch-up gap #131 closes) simply bumps nothing — no
+    // error, same as any `UPDATE ... WHERE` matching zero rows. Plain
+    // `key_col::text = any($1::text[])`, not the native-typed cast
+    // `from_side_keys_for_join`'s own doc comment flags as unindexed
+    // (P0.1/plan doc §6) — out of scope here, matches this module's other
+    // untyped relationship lookups.
+    for bump in plan.relationship_gen_bumps.values() {
+        if bump.touched_keys.is_empty() {
+            continue;
+        }
+        let keys: Vec<&str> = bump.touched_keys.iter().map(String::as_str).collect();
+        let key_ident = quote_ident(&bump.key_col);
+        let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
+        txn.execute(
+            &format!(
+                "update {} set {gen_ident} = {gen_ident} + 1 \
+                 where {key_ident}::text = any($1::text[])",
+                bump.qualified_projection,
+            ),
+            &[&keys],
+        )
+        .await?;
     }
 
     // 4. Downstream propagation, with the hop bound checked before staging
