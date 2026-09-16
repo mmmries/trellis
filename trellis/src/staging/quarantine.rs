@@ -72,6 +72,17 @@ pub const DEFAULT_DEATH_THRESHOLD: i32 = 5;
 /// per transform/column.
 pub const DEFAULT_COLUMN_DEATH_THRESHOLD: i32 = DEFAULT_DEATH_THRESHOLD;
 
+/// The whole-transform fuse's threshold (`docs/decisions/0003-quarantine-storage-and-api.md`'s
+/// "The original transform-wide fuse still exists as a coarser, separate
+/// tier"): another sibling of [`DEFAULT_DEATH_THRESHOLD`] and
+/// [`DEFAULT_COLUMN_DEATH_THRESHOLD`], same value, named separately for the
+/// same independent-tunability reason those two document. This one counts
+/// *distinct evicted keys for one `src_table`* — see
+/// [`trip_transform_fuse_if_crossed`] — rather than repeated attempts
+/// against one key or distinct poisoned rows for one `(transform, column)`
+/// pair.
+pub const DEFAULT_TRANSFORM_DEATH_THRESHOLD: i32 = DEFAULT_DEATH_THRESHOLD;
+
 // ---------------------------------------------------------------------
 // Failure classification
 // ---------------------------------------------------------------------
@@ -505,6 +516,12 @@ pub async fn isolate_and_evict(
             .find(|c| !c.is_truncate && &c.src_table == src_table && &c.key == key);
         evict_key(&txn, seg_seq, src_table, key, last_error, contribution).await?;
     }
+    let mut evicted_src_tables: Vec<&str> = evict_now.iter().map(|(t, _, _)| t.as_str()).collect();
+    evicted_src_tables.sort_unstable();
+    evicted_src_tables.dedup();
+    for src_table in evicted_src_tables {
+        trip_transform_fuse_if_crossed(&txn, pool, src_table).await?;
+    }
     txn.commit().await?;
 
     let evicted: HashSet<(&str, &str)> = evict_now
@@ -517,6 +534,78 @@ pub async fn isolate_and_evict(
         .cloned()
         .collect();
     Ok(Some(retry_folded))
+}
+
+// ---------------------------------------------------------------------
+// Whole-transform fuse (ADR-0003's original, coarser tier — issue #105)
+// ---------------------------------------------------------------------
+//
+// ADR-0003: "if a failure isn't attributable to one column (e.g. a
+// key-shape/DDL failure that dooms every column's write for that row
+// alike), it trips the whole transform to quarantined exactly as before."
+// Every key [`isolate_and_evict`] evicts is exactly that: a failure that
+// survived a probe run *alone* and still wasn't attributable to a single
+// calculated field (whether or not [`attribute_column_failure`] separately
+// also charged a column fuse alongside it — the two tiers are independent,
+// see that function's own doc comment). So the `poison` marker table this
+// module already maintains *is* the distinct-evicted-key count this fuse
+// needs — no new counter table, unlike [`key_deaths`]/`column_deaths`'s
+// incrementally-maintained counters: `poison` is already keyed one row per
+// `(src_table, key)`, so `count(*) where src_table = $1` is already exactly
+// "how many distinct keys for this source are currently evicted," with no
+// write-amplification tradeoff to make.
+
+/// Checks whether `src_table`'s whole-transform fuse has crossed
+/// [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`] and, if so, quarantines every
+/// transform definition [`crate::defs::catalog::transforms_for_source`]
+/// resolves for it (a source table can back more than one transform — each
+/// one independently pays for its own source's poisoned-key breadth, so
+/// every one of them trips together rather than picking just one).
+///
+/// Must run **inside the same transaction** [`isolate_and_evict`] just used
+/// to insert this call's own triggering eviction(s) into `poison` — the
+/// `count(*)` below is read against `txn` itself (not a fresh pool
+/// connection) specifically so it observes those just-inserted, not-yet-committed
+/// rows; a separate connection would undercount until commit and could miss
+/// the exact eviction that crosses the threshold.
+///
+/// Idempotent: a definition already [`TransformStatus::Quarantined`] is left
+/// alone (no redundant write, no repeated log line) on every later eviction
+/// that keeps `src_table` above threshold.
+async fn trip_transform_fuse_if_crossed(
+    txn: &Transaction<'_>,
+    pool: &Pool,
+    src_table: &str,
+) -> Result<(), ApplyError> {
+    let poisoned_count: i64 = txn
+        .query_one(
+            "select count(*) from poison where src_table = $1",
+            &[&src_table],
+        )
+        .await?
+        .get(0);
+    if poisoned_count < DEFAULT_TRANSFORM_DEATH_THRESHOLD as i64 {
+        return Ok(());
+    }
+
+    let definitions = catalog::transforms_for_source(pool, src_table).await?;
+    for def in definitions {
+        if def.status == TransformStatus::Quarantined {
+            continue;
+        }
+        tracing::warn!(
+            transform = %def.def.target,
+            src_table = %src_table,
+            poisoned_count,
+            "whole-transform fuse tripped; quarantining"
+        );
+        txn.execute(
+            "update transform_definitions set status = $1 where id = $2",
+            &[&TransformStatus::Quarantined.as_str(), &def.id],
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -1000,16 +1089,14 @@ pub async fn resume_column(
 /// that would otherwise let the discharge skip enumeration cannot be
 /// trusted here — full re-enumeration is the safe default.
 ///
-/// **What this does not (yet) do.** As of this writing, nothing in this
-/// codebase actually *trips* a definition to `Quarantined` in the first
-/// place — the whole-transform fuse ADR-0003 describes ("if a failure isn't
-/// attributable to one column ... it trips the whole transform to
-/// `quarantined` exactly as before") has no writer; only the per-key
-/// ([`isolate_and_evict`]/`poison`) and per-column ([`trip_column_fuse`])
-/// tiers are wired today. `resume_transform` implements ADR-0003's *resume*
-/// half of the contract, correctly fence-gated, so whichever trip mechanism
-/// lands later has somewhere correct to call — it does not itself add the
-/// trip, and nothing here should be read as evidence one already exists.
+/// **The trip half of this contract** lives in
+/// [`trip_transform_fuse_if_crossed`], called from [`isolate_and_evict`]
+/// once a batch of evictions lands: when `src_table`'s distinct-evicted-key
+/// count (the `poison` marker table) crosses
+/// [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`], every transform definition
+/// subscribed to that source is quarantined (issue #105 — this used to have
+/// no writer at all; `resume_transform` predates it and was written first so
+/// the trip mechanism would have somewhere correct to land).
 #[tracing::instrument(name = "quarantine.resume_transform", skip(pool), fields(transform = %target))]
 pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyError> {
     let mut client = pool.get().await?;
