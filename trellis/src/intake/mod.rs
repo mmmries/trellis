@@ -41,7 +41,7 @@ use pgoutput::{ColumnValue, Message, Relation, RelationCache};
 
 use crate::staging::append;
 use crate::staging::session::ProducerSession;
-use crate::staging::{CdcOp, StagedChange};
+use crate::staging::{CdcOp, StagedChange, StagedWatermark};
 
 /// The Postgres epoch (2000-01-01T00:00:00Z) as microseconds since the Unix
 /// epoch — `pgoutput` timestamps count from 2000, not 1970. A bare constant
@@ -404,6 +404,19 @@ pub struct Intake {
     /// Rate-limits the keepalive persist (it is itself a WAL-generating
     /// write) — see [`KEEPALIVE_PERSIST_INTERVAL`].
     last_keepalive_persist: Instant,
+    /// Issue #132, epic #127, guard (a)'s own in-process "staged-through"
+    /// watermark — distinct from `last_confirmed` above (this struct's
+    /// mirror of the *durable*, throttled watermark). Advanced right after
+    /// every successful [`stage_and_advance`] commit
+    /// ([`Self::commit_transaction`]) and on every keepalive with **no**
+    /// throttle at all ([`Self::advance_watermark_on_keepalive`]) — see
+    /// [`StagedWatermark`]'s own doc comment for why this tracks the
+    /// source's write frontier far more tightly than `last_confirmed`/
+    /// `replication_progress.confirmed_lsn` do. Constructed by the caller
+    /// (see [`Self::connect`]'s parameter) and shared, via `Clone`, with
+    /// whatever runs guard (a)'s check on the apply/drain side — see
+    /// `client.rs`'s own wiring.
+    watermark: StagedWatermark,
 }
 
 /// How often a quiet stream's keepalive-driven watermark advance may persist
@@ -425,7 +438,27 @@ impl Intake {
     /// with no durable watermark lets WAL reclaim ahead of work that never
     /// persists, silently) and that the slot itself is still healthy — see
     /// [`publication::require_slot_healthy`].
-    pub async fn connect(config: &IntakeConfig) -> Result<Self, IntakeError> {
+    ///
+    /// `watermark` (issue #132, epic #127, guard (a)) is constructed by the
+    /// caller — before this call, per that issue's own wiring note — and
+    /// shared (via `Clone`) with whatever runs guard (a)'s check on the
+    /// apply/drain side; see `client.rs`. Seeded here to `last_confirmed`
+    /// (the durably-persisted position this connection is about to resume
+    /// replication from) rather than left at whatever the caller
+    /// constructed it with: a fresh [`StagedWatermark::new`] starts at LSN
+    /// 0, and without this seed a restart would make guard (a) reject every
+    /// relationship reverse record until intake re-streamed all the way
+    /// back past `last_confirmed` — safe (guard (a) fails closed) but
+    /// needlessly conservative, since `last_confirmed` is already a
+    /// durably-proven "staged at least this far" position. [`StagedWatermark::advance`]'s
+    /// own monotonic guard makes this seed a no-op if the caller already
+    /// passed in something at least this fresh (e.g. a shared watermark
+    /// surviving an in-process `Intake` restart that never dropped the
+    /// `Arc`).
+    pub async fn connect(
+        config: &IntakeConfig,
+        watermark: StagedWatermark,
+    ) -> Result<Self, IntakeError> {
         let session = ProducerSession::connect(&config.dsn, &config.schema).await?;
         let last_confirmed = fetch_confirmed_lsn(session.client(), &config.slot)
             .await?
@@ -469,6 +502,7 @@ impl Intake {
             .with_start_lsn(pgwire_replication::Lsn::from(u64::from(last_confirmed)));
         let replication =
             pgwire_replication::ReplicationClient::connect(replication_config).await?;
+        watermark.advance(last_confirmed);
         Ok(Self {
             replication,
             session,
@@ -486,6 +520,7 @@ impl Intake {
             // first keepalive after connecting is never held back by the
             // rate limit.
             last_keepalive_persist: Instant::now() - KEEPALIVE_PERSIST_INTERVAL,
+            watermark,
         })
     }
 
@@ -704,13 +739,23 @@ impl Intake {
         // inside it.
         self.replication.update_applied_lsn(end_lsn);
         self.last_confirmed = lsn;
+        // Issue #132, epic #127: the in-process staged-through watermark
+        // advances here too, right after the same commit that durably
+        // staged `buffer`'s rows — this is the primary advance point
+        // `StagedWatermark`'s own doc comment describes ("advanced right
+        // after each stage_and_advance commit").
+        self.watermark.advance(lsn);
         Ok(())
     }
 
     /// The quiet-stream watermark advance (issue #8): a stream carrying no
     /// watched changes still needs the watermark to advance on keepalive
     /// frames, with four load-bearing guards — see "The quiet-stream
-    /// problem" in the design doc.
+    /// problem" in the design doc. Also where issue #132's in-process
+    /// [`StagedWatermark`] gets its own keepalive-driven advance, ahead of
+    /// (and unthrottled by) those same four guards — see the inline
+    /// comment at its call below for why the two watermarks intentionally
+    /// diverge.
     async fn advance_watermark_on_keepalive(
         &mut self,
         wal_end: pgwire_replication::Lsn,
@@ -723,6 +768,17 @@ impl Intake {
             return Ok(());
         }
         let candidate = PgLsn::from(wal_end.as_u64());
+
+        // Issue #132, epic #127: the in-process staged-through watermark
+        // advances on *every* non-mid-transaction keepalive, with no
+        // throttle — deliberately ahead of (and independent from) the
+        // persisted-watermark guards below, which exist to rate-limit a
+        // real WAL-generating write. `StagedWatermark::advance` is its own
+        // monotonic no-op below `candidate`'s already-published value, so
+        // this is safe to call unconditionally here regardless of where
+        // `last_confirmed`/the persisted `confirmed_lsn` currently sit.
+        self.watermark.advance(candidate);
+
         // Guard (b), the in-memory half: never regress. (The SQL
         // `confirmed_lsn < $1` guard below covers the persisted half.)
         if candidate <= self.last_confirmed {

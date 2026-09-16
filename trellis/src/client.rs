@@ -414,6 +414,31 @@ async fn run(
         return;
     }
 
+    // Issue #132, epic #127, guard (a): one shared in-process
+    // "staged-through" watermark, constructed here — before
+    // `intake::Intake::connect` below, per that issue's own wiring note —
+    // and cloned into both the intake task (which advances it) and every
+    // app-worker task's `AppWorkerConfig` below (which reads it, via the
+    // drain path's `check_reverse_guards`).
+    //
+    // **Known limitation, worth flagging explicitly**: this only advances
+    // for real when `options.staging_worker` is set on *this* client — an
+    // `Arc<AtomicU64>` is inherently process-local. A fleet topology where
+    // `application_threads > 0` clients run in a *different* process from
+    // the one `staging_worker: true` client (a legal, documented topology —
+    // see this module's own doc comment), a drain-only client's watermark
+    // here never advances past its `StagedWatermark::new()` starting point
+    // (LSN 0), so guard (a) fails closed for every relationship reverse
+    // record such a worker ever processes, falling back to the
+    // image-less-recompute stopgap every time rather than ever taking the
+    // true-delta fast path. That's always *safe* (guard (a) failing closed
+    // never corrupts anything — see `StagedWatermark::new`'s own doc
+    // comment), just needlessly conservative for that specific multi-process
+    // topology; propagating a cross-process watermark (e.g. by polling
+    // `replication_progress` somehow without reintroducing the 10-second
+    // sawtooth this issue's own §5 measured as wrong) is out of scope here.
+    let watermark = staging::StagedWatermark::new();
+
     let mut intake_task = None;
     let mut maintenance_task = None;
     if options.staging_worker {
@@ -424,7 +449,7 @@ async fn run(
                 return;
             }
         };
-        let mut intake = match intake::Intake::connect(&intake_config).await {
+        let mut intake = match intake::Intake::connect(&intake_config, watermark.clone()).await {
             Ok(intake) => intake,
             Err(err) => {
                 let _ = ready_tx.send(Err(err.into()));
@@ -473,6 +498,7 @@ async fn run(
             poll_interval: options.poll_interval,
             reclaim_ttl: options.reclaim_ttl,
             chunk_reclaim_interval: options.maintenance_interval,
+            watermark: watermark.clone(),
         };
         app_worker_tasks.push(tokio::spawn(app_worker_loop(
             worker_config,
@@ -899,6 +925,14 @@ struct AppWorkerConfig {
     /// `ClientOptions::maintenance_interval`'s cadence rather than inventing
     /// a third interval knob.
     chunk_reclaim_interval: Duration,
+    /// Issue #132, epic #127, guard (a): this fleet's shared in-process
+    /// "staged-through" watermark — the same `Arc` `run()` constructs and
+    /// clones into `intake::Intake::connect` (when this client also runs
+    /// `staging_worker: true`), threaded here so [`staging::drain_many`]'s
+    /// own Phase 3 apply can check guard (a) for any relationship reverse
+    /// record it drains. See `run()`'s own doc comment on this field for
+    /// the multi-process-fleet caveat.
+    watermark: staging::StagedWatermark,
 }
 
 /// How many pending backfill chunks one [`app_worker_loop`] iteration claims
@@ -937,6 +971,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         poll_interval,
         reclaim_ttl,
         chunk_reclaim_interval,
+        watermark,
     } = config;
 
     // Captured before `heartbeat_config` is moved into `HeartbeatDaemon::spawn`
@@ -1036,8 +1071,15 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
             Err(_) => 1,
         };
 
-        let outcome =
-            staging::drain_many(&pool, &seg_seqs, &claimed_by, live_workers, &wake_channel).await;
+        let outcome = staging::drain_many(
+            &pool,
+            &seg_seqs,
+            &claimed_by,
+            live_workers,
+            &wake_channel,
+            &watermark,
+        )
+        .await;
         let drain_failed = outcome.is_err();
         if drain_failed {
             // Release immediately rather than waiting on the reclaim TTL:

@@ -45,10 +45,12 @@ use crate::pool::{Pool, quote_ident};
 use super::append::{self, StagedChange};
 use super::apply_aggregate::{self, AggregateTargetPlan};
 use super::claim;
+use super::converge;
 use super::error::StagingError;
 use super::fold::{self, FoldedChange};
 use super::liveness::FenceMissBackoff;
 use super::quarantine;
+use super::watermark::StagedWatermark;
 
 /// The absolute ceiling on [`FoldedChange::hop_gen`] propagation, a backstop
 /// over and above the schema-derived hop bound doc 05 describes ("one past
@@ -793,19 +795,23 @@ pub(crate) async fn build_relationship_context(
 // `compute` below). Instead it builds one [`RelationshipReverseRecord`] per
 // touched parent key, carrying the parent's own old/new image (already
 // folded — see this struct's doc comment for why no new ring plumbing is
-// needed to get that) and a `prev_lsn` read live off the settled parent
-// projection at Phase 2 capture time. Phase 3
-// ([`apply_and_mark_drained_many`]'s "3d" step) re-validates `prev_lsn`
-// under `FOR UPDATE` (the guard-(d) stopgap this issue ships in place of
-// #132's full guard suite), then, for every aggregate target whose fields
-// are fully invertible and read only this one relationship
+// needed to get that), a `prev_lsn`/`prev_gen` pair read live off the
+// settled parent projection at Phase 2 capture time, and (issue #132) `X`,
+// the source's write frontier captured in that same round trip. Phase 3
+// ([`apply_and_mark_drained_many`]'s "3d" step, [`check_reverse_guards`])
+// re-validates all four of #132's guards — (a) the watermark barrier, (b)
+// the generation check, (c) the in-flight check, and (d) #131's own
+// `prev_lsn` ordering check, re-read under the same `FOR UPDATE` lock as
+// (b) — then, for every aggregate target whose fields are fully invertible
+// and read only this one relationship
 // ([`ReverseRelationshipShape::aggregate_shapes`]), applies a true
 // subtract-old/add-new delta over the parent's from-side rows — reusing
 // `apply_aggregate`'s existing per-row contribution/delta-apply machinery
 // rather than reinventing it. Anything that mechanism can't cover (a 1-1
 // target, a `MIN`/`MAX` field, a definition reading more than one
 // relationship — see [`build_reverse_relationship_shape`]'s doc comment)
-// falls back to the pre-#131 image-less `Recompute`, unchanged.
+// falls back to the pre-#131 image-less `Recompute`, unchanged — the same
+// fallback any of #132's four guards also uses when it rejects a record.
 
 /// One to-one relationship's reverse-delta shape (issue #131): everything
 /// Phase 3 needs to apply a [`RelationshipReverseRecord`] for this
@@ -910,6 +916,15 @@ struct ReverseAggregateShape {
 /// retried without burning `hop_gen` — the plan doc's Phase 1 step 6) is
 /// explicitly future work (#134), which the plan doc itself sequences
 /// *after* this issue and #132.
+///
+/// **Issue #132's additions** (guards (a)/(b), alongside #131's own
+/// `prev_lsn` for guard (d)): `prev_gen` and `watermark` are captured in the
+/// exact same Phase 2 round trip as `prev_lsn` (see
+/// [`capture_reverse_guard_state`]) rather than as separate reads — the
+/// issue's own "capture X in the same statement as the enumeration"
+/// requirement for guard (a), and the natural place to also capture guard
+/// (b)'s `gen` alongside guard (d)'s `lsn`, since both come off the exact
+/// same projection row.
 #[derive(Debug, Clone)]
 pub(crate) struct RelationshipReverseRecord {
     shape: Arc<ReverseRelationshipShape>,
@@ -934,7 +949,32 @@ pub(crate) struct RelationshipReverseRecord {
     /// forms. `None` when no projection row existed yet to read (a parent
     /// INSERT, or the should-be-unreachable missing-projection case) —
     /// Phase 3 treats that as "nothing to conflict with," not a miss.
+    ///
+    /// Guard (d) (#131's original stopgap, formalized as one of #132's four
+    /// guards): Phase 3 re-reads this same column under `FOR UPDATE` and
+    /// requires it still equal `prev_lsn` before applying.
     prev_lsn: Option<PgLsn>,
+    /// Issue #132 guard (b): the projection row's [`ddl::PROJECTION_GEN_COLUMN`]
+    /// as read live, in Phase 2, alongside `prev_lsn` above (same query, same
+    /// row, same "taken once in Phase 2" shape) — `None` under the identical
+    /// conditions `prev_lsn` is `None` (no projection row yet). Phase 3
+    /// re-reads it under the same `FOR UPDATE` lock `prev_lsn`'s re-check
+    /// uses and requires it unchanged: a forward apply that resolved this
+    /// parent through the projection between Phase 2's capture and Phase 3's
+    /// apply bumps this column (`apply_and_mark_drained_many`'s "3c" step),
+    /// so a mismatch here means this reverse's enumeration may no longer
+    /// equal the parent's *applied* value.
+    prev_gen: Option<i64>,
+    /// Issue #132 guard (a): `X`, "the source's write frontier," captured in
+    /// the same Phase 2 statement as `prev_lsn`/`prev_gen` above (via
+    /// `pg_current_wal_lsn()` against the same connection). Phase 3 must not
+    /// apply this record until [`StagedWatermark::get`] reports intake has
+    /// staged everything committed at or before this value — see
+    /// `check_reverse_guards`'s guard (a) arm and this module's "Issue #131,
+    /// #132" doc section for why a lower/earlier capture is always safe (it
+    /// only makes the barrier easier, never wrongly permissive) while a
+    /// later one would not be.
+    watermark: PgLsn,
     hop_gen: i32,
     src_changed: Option<std::time::SystemTime>,
 }
@@ -1172,33 +1212,75 @@ fn relationship_key_text(row: &Option<Row>, to_col: &str) -> Option<String> {
     row.as_ref().and_then(|r| r.get(to_col)).cloned().flatten()
 }
 
+/// The Phase 2 capture behind three of #132's four guards — [`prev_lsn`],
+/// [`prev_gen`], and [`watermark`] (guard (d)'s ordering check, guard (b)'s
+/// generation check, and guard (a)'s watermark barrier, respectively; see
+/// [`RelationshipReverseRecord`]'s doc comment for each field's role in
+/// Phase 3).
+///
+/// [`prev_lsn`]: ReverseCapture::prev_lsn
+/// [`prev_gen`]: ReverseCapture::prev_gen
+/// [`watermark`]: ReverseCapture::watermark
+struct ReverseCapture {
+    prev_lsn: Option<PgLsn>,
+    prev_gen: Option<i64>,
+    watermark: PgLsn,
+}
+
 /// Live-reads the settled parent projection's current
-/// [`ddl::PROJECTION_LSN_COLUMN`] for `key` — [`RelationshipReverseRecord::prev_lsn`]'s
-/// source, per this issue's own derivation (confirmed against
-/// [`ddl::PROJECTION_LSN_COLUMN`]'s doc comment): a plain, unlocked read
-/// taken in Phase 2, re-validated under `FOR UPDATE` in Phase 3
-/// (`apply_and_mark_drained_many`'s "3d" step). `None` if `qualified_projection`
-/// is empty (the should-be-unreachable no-projection case) or no row exists
-/// yet for `key` (a parent that's about to be INSERTed).
-async fn live_read_projection_lsn(
+/// [`ddl::PROJECTION_LSN_COLUMN`]/[`ddl::PROJECTION_GEN_COLUMN`] for `key`,
+/// **and** captures guard (a)'s `X` — `pg_current_wal_lsn()`, "the source's
+/// write frontier" — in the very same statement, per the issue's own
+/// requirement (`select ..., pg_current_wal_lsn() from <projection> where
+/// ...`), not as a separate round trip. A plain, unlocked read taken once in
+/// Phase 2; Phase 3 (`apply_and_mark_drained_many`'s "3d" step,
+/// `check_reverse_guards`) re-validates `prev_lsn`/`prev_gen` under `FOR
+/// UPDATE` and re-checks the watermark against the live
+/// [`StagedWatermark`].
+///
+/// `prev_lsn`/`prev_gen` are both `None` when `qualified_projection` is
+/// empty (the should-be-unreachable no-projection case), `key` is `None`
+/// (defensive — every record reaching this point has at least one of
+/// old/new key, per `compute`'s own "both images absent" skip, but this
+/// function does not assume that), or no projection row exists yet for
+/// `key` (a parent that's about to be INSERTed) — in every such case this
+/// still issues a bare `select pg_current_wal_lsn()` so `watermark` is
+/// always populated: guard (a) applies to every reverse record, including a
+/// parent insert, not only ones with an existing projection row.
+async fn capture_reverse_guard_state(
     pool: &Pool,
     qualified_projection: &str,
     to_col: &str,
-    key: &str,
-) -> Result<Option<PgLsn>, ApplyError> {
-    if qualified_projection.is_empty() {
-        return Ok(None);
-    }
+    key: Option<&str>,
+) -> Result<ReverseCapture, ApplyError> {
     let client = pool.get().await?;
-    let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
-    let key_ident = quote_ident(to_col);
-    let row = client
-        .query_opt(
-            &format!("select {lsn_ident} from {qualified_projection} where {key_ident}::text = $1"),
-            &[&key],
-        )
-        .await?;
-    Ok(row.map(|r| r.get(0)))
+    if let (Some(key), false) = (key, qualified_projection.is_empty()) {
+        let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
+        let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
+        let key_ident = quote_ident(to_col);
+        let row = client
+            .query_opt(
+                &format!(
+                    "select {lsn_ident}, {gen_ident}, pg_current_wal_lsn() \
+                     from {qualified_projection} where {key_ident}::text = $1"
+                ),
+                &[&key],
+            )
+            .await?;
+        if let Some(row) = row {
+            return Ok(ReverseCapture {
+                prev_lsn: row.get(0),
+                prev_gen: row.get(1),
+                watermark: row.get(2),
+            });
+        }
+    }
+    let row = client.query_one("select pg_current_wal_lsn()", &[]).await?;
+    Ok(ReverseCapture {
+        prev_lsn: None,
+        prev_gen: None,
+        watermark: row.get(0),
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -1209,15 +1291,19 @@ async fn live_read_projection_lsn(
 /// full row images, inside the already-locked Phase 3 transaction —
 /// [`apply_and_mark_drained_many`]'s "3d" step's from-side enumeration.
 ///
-/// **Known gap, tracked for #132** (matches the note already on
-/// [`ReverseRelationshipShape`]'s construction site and the pre-#131
-/// `from_side_keys_for_join`'s own doc comment): this reads *live* state,
-/// not the *applied* set the plan doc's guards (a) (watermark barrier) and
-/// (c) (in-flight check) are what make equal to it — see the plan doc §2's
-/// guard table. This issue's own text calls a live re-enumeration inside
-/// the locked Phase 3 transaction "an acceptable stand-in" for now; #132
-/// must tighten this before the mechanism is safe under concurrent/
-/// out-of-order drain.
+/// **This reads live state** — safe only because [`check_reverse_guards`]
+/// (issue #132) has already run, immediately before every call site below,
+/// and proven the live state *equals* the applied one for the specific
+/// join key(s) this call is about to read: guard (a) (the watermark
+/// barrier) plus guard (c) (the in-flight check) together prove nothing
+/// committed at or before this record's captured `X` is still mid-flight
+/// for these keys, and guards (b)/(d) prove no forward apply or
+/// out-of-order sibling reverse landed between Phase 2's enumeration and
+/// this transaction's lock. Before #132, this doc comment flagged that gap
+/// as open; it is now closed by every caller's own guard check, not by
+/// anything in this function itself — this function still does nothing on
+/// its own to enforce it, so a *new* caller added later must run the guard
+/// check first too.
 async fn from_side_rows_for_join_txn(
     txn: &Transaction<'_>,
     from_table: &str,
@@ -1243,6 +1329,253 @@ async fn from_side_rows_for_join_txn(
         rows.entry(key).or_default().insert(field, value);
     }
     Ok(rows.into_iter().collect())
+}
+
+// ---------------------------------------------------------------------
+// Issue #132, epic #127: the four guards
+// ---------------------------------------------------------------------
+//
+// See the plan doc's §2 guard table and this module's own "Issue #131,
+// epic #127" section above for the mechanism these formalize. All four are
+// checked together, in [`check_reverse_guards`], as one Phase 3 step per
+// [`RelationshipReverseRecord`] — a failure on any one of them gets the
+// exact same treatment: no target/projection write for this record, fall
+// back to re-staging its from-side rows as an image-less `Recompute` at
+// `hop_gen + 1` (the same stopgap #131 shipped for guard (d) alone, now
+// shared by all four — explicitly still a stand-in for #134's real
+// deferral/retry plumbing, not a fix for the underlying "an aborted reverse
+// must not stall the batch, but must retry, not merely recompute-and-forget"
+// concern #134 exists to solve).
+
+/// Which of #132's four guards rejected a [`RelationshipReverseRecord`] —
+/// carried only as far as the `tracing::warn!` in
+/// [`apply_and_mark_drained_many`]'s "3d" step; every rejection gets
+/// identical treatment downstream (the Recompute-fallback stopgap), so nothing
+/// else branches on which variant fired. A typed enum rather than a bare
+/// `&'static str` purely so a future metrics/observability pass (the plan
+/// doc's Phase 1 step 7 flags exactly this need — "the deferral counters
+/// should become engine metrics") has something to match on without
+/// re-parsing a log message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReverseGuardFailure {
+    /// Guard (a): intake has not yet staged everything committed at or
+    /// before this record's captured watermark `X`.
+    Watermark,
+    /// Guard (b): the projection row's `__trellis_gen` moved since Phase 2's
+    /// capture — a forward apply landed in between.
+    Generation,
+    /// Guard (c): a staged from-side change for this parent's old/new join
+    /// key, committed at or before `X`, is still undrained.
+    InFlight,
+    /// Guard (d): the projection row's `__trellis_lsn` no longer matches
+    /// this record's `prev_lsn` — an out-of-order sibling reverse (or this
+    /// same one, replayed) already advanced it, or moved it out from under
+    /// this one.
+    Ordering,
+}
+
+impl fmt::Display for ReverseGuardFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ReverseGuardFailure::Watermark => "watermark barrier (guard a)",
+            ReverseGuardFailure::Generation => "generation check (guard b)",
+            ReverseGuardFailure::InFlight => "in-flight check (guard c)",
+            ReverseGuardFailure::Ordering => "per-parent ordering (guard d)",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Guard (c) (plan doc §2; the guard measured to do most of the correctness
+/// work, 1174/3000 ablation runs corrupted without it): "is there a staged
+/// change on `from_table`, matching any of `keys` via `from_col` against
+/// either its `old_image` or `new_image`, committed (`lsn`) at or before
+/// `watermark_x`, that hasn't drained yet?"
+///
+/// "Hasn't drained yet" mirrors [`converge::converged_through`]'s own
+/// condition 3 (a row is pending if its owning segment's `state <>
+/// 'drained'`, or — the straggler case — the segment *is* `'drained'` but
+/// this particular row landed after that segment's own fence snapshot was
+/// captured, so the segment's completion never actually scanned it): scoped
+/// here to one `src_table`/join-key/`lsn` predicate instead of
+/// `converged_through`'s whole-token one, and, unlike that predicate, this
+/// one has no need to special-case the *active* slot for query-plan reasons
+/// — every physical ring row this predicate can even match already carries
+/// a concrete `lsn <= watermark_x`, so a plain per-table `exists` (rather
+/// than `converged_through`'s `min(origin_lsn)` optimization for the
+/// continuously-growing active slot) is cheap regardless of which slot is
+/// active. The active slot's own `segments` row always has `state =
+/// 'active'`, which is `<> 'drained'`, so it falls out of the same `exists`
+/// clause with no separate arm needed.
+///
+/// Only `op in ('insert', 'update', 'delete')` rows can match at all — a
+/// `Recompute` row carries no images (`old_image`/`new_image` both `NULL`,
+/// so `->> from_col` is `NULL` either way) and a `Truncate` row is
+/// key-less — so the explicit `op` filter is redundant with that but kept
+/// for readability. Deliberately does not special-case a `Truncate` on
+/// `from_table` itself (out of scope for this issue — see the module's own
+/// "what to actually do" list's to-many/`rel_joins` exclusion, and no
+/// existing test exercises a to-one relationship's from-side table being
+/// truncated mid-flight).
+async fn from_side_change_in_flight(
+    txn: &Transaction<'_>,
+    from_table: &str,
+    from_col: &str,
+    keys: &[&str],
+    watermark_x: PgLsn,
+) -> Result<bool, ApplyError> {
+    if keys.is_empty() {
+        return Ok(false);
+    }
+    let arms = converge::per_ring_table(" union all ", |slot, table| {
+        format!(
+            "select 1 from {table} r \
+             where r.src_table = $1 \
+               and r.op in ('insert', 'update', 'delete') \
+               and r.lsn <= $2 \
+               and (r.old_image ->> $3 = any($4::text[]) \
+                    or r.new_image ->> $3 = any($4::text[])) \
+               and exists ( \
+                   select 1 from segments s \
+                   where s.ring_slot = {slot} \
+                     and (s.state <> 'drained' \
+                          or (s.fence_snapshot is not null \
+                              and not pg_visible_in_snapshot(r.row_txid, s.fence_snapshot))) \
+               )"
+        )
+    });
+    let sql = format!("select exists ({arms})");
+    let row = txn
+        .query_one(&sql, &[&from_table, &watermark_x, &from_col, &keys])
+        .await?;
+    Ok(row.get(0))
+}
+
+/// Checks all four of #132's guards for one [`RelationshipReverseRecord`],
+/// inside the already-open Phase 3 `txn` — [`apply_and_mark_drained_many`]'s
+/// "3d" step's single "may this record's delta apply?" decision, replacing
+/// #131's own inline guard-(d)-only check. Cheapest/most-locking-averse
+/// first: guard (a) is a bare in-memory comparison (no SQL at all), so it
+/// short-circuits before this function ever touches the projection row;
+/// guards (b)/(d) share the one `FOR UPDATE` read #131 already took (adding
+/// `__trellis_gen` to its `SELECT` list, not a second query); guard (c) —
+/// the most expensive, a ring scan — runs last, only once the cheaper three
+/// have already passed.
+///
+/// **Locking discipline** (the issue's own "Locking" section): this
+/// function's `FOR UPDATE` on the projection row is the *reverse* side of
+/// "a forward apply touching a parent takes `FOR SHARE`... a reverse takes
+/// `FOR UPDATE`." The forward side is `apply_and_mark_drained_many`'s "3c"
+/// step's `UPDATE ... SET gen = gen + 1 WHERE key = ANY(...)` — an `UPDATE`
+/// already takes the same exclusive row lock `FOR UPDATE` would (Postgres's
+/// row-level locking has no weaker mode an `UPDATE` could take instead), so
+/// no separate explicit `SELECT ... FOR SHARE` is needed there: the
+/// `UPDATE` itself *is* the serializing lock. That is what makes this
+/// function's guard (b) re-check meaningful rather than racy — a
+/// concurrent forward apply's gen-bump `UPDATE` and this reverse's `FOR
+/// UPDATE` read can never interleave mid-row; whichever transaction gets
+/// there first blocks the other until it commits or rolls back, so by the
+/// time this `SELECT ... FOR UPDATE` returns, it has either (a) landed
+/// before any concurrent forward apply touched this row (nothing to
+/// detect — `prev_gen` still matches) or (b) waited for that forward
+/// apply's `UPDATE` to commit and then observed its bumped `gen` (guard (b)
+/// correctly fails). There is no third interleaving.
+///
+/// Returns `Ok(None)` when every guard passes. Returns `Ok(Some(failure))`
+/// naming the *first* guard that didn't — never more than one, since guard
+/// evaluation stops at the first failure (there is nothing further to learn
+/// from checking the rest once this record is already going to the
+/// fallback path).
+async fn check_reverse_guards(
+    txn: &Transaction<'_>,
+    shape: &ReverseRelationshipShape,
+    record: &RelationshipReverseRecord,
+    old_key: &Option<String>,
+    new_key: &Option<String>,
+    watermark: &StagedWatermark,
+) -> Result<Option<ReverseGuardFailure>, ApplyError> {
+    // Guard (a): watermark barrier. A bare in-memory read — no SQL, no
+    // lock — so this always runs first.
+    if watermark.get() < record.watermark {
+        return Ok(Some(ReverseGuardFailure::Watermark));
+    }
+
+    // Guards (b)/(d): one row-locked read of the projection, shared between
+    // both — see this function's own doc comment on why the lock this takes
+    // is what makes guard (b) sound rather than racy.
+    let lock_key = old_key.as_deref().or(new_key.as_deref());
+    let (current_lsn, current_gen): (Option<Option<PgLsn>>, Option<Option<i64>>) = match lock_key {
+        Some(key) if !shape.qualified_projection.is_empty() => {
+            let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
+            let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
+            let key_ident = quote_ident(&shape.to_col);
+            let row = txn
+                .query_opt(
+                    &format!(
+                        "select {lsn_ident}, {gen_ident} from {} \
+                         where {key_ident}::text = $1 for update",
+                        shape.qualified_projection,
+                    ),
+                    &[&key],
+                )
+                .await?;
+            match row {
+                Some(row) => (Some(row.get(0)), Some(row.get(1))),
+                None => (None, None),
+            }
+        }
+        _ => (None, None),
+    };
+
+    // Guard (b): a missing projection row (a parent about to be INSERTed,
+    // or the should-be-unreachable no-projection case) has no `gen` to have
+    // moved — nothing to conflict with, always passes, same posture guard
+    // (d) already took for this case pre-#132.
+    let gen_ok = match current_gen {
+        None => true,
+        Some(current) => current == record.prev_gen,
+    };
+    if !gen_ok {
+        return Ok(Some(ReverseGuardFailure::Generation));
+    }
+
+    // Guard (d): #131's original stopgap, unchanged in substance, now one
+    // arm of this unified check.
+    let ordering_ok = match current_lsn {
+        None => true,
+        Some(current) => current == record.prev_lsn,
+    };
+    if !ordering_ok {
+        return Ok(Some(ReverseGuardFailure::Ordering));
+    }
+
+    // Guard (c): the in-flight check, last (most expensive) and only once
+    // (a) captured X, (b) the gen, and (d) the ordering have all already
+    // passed — the from-side child rows a from-side change touching either
+    // `old_key` or `new_key`, deduped so an ordinary same-key attribute
+    // update (`old_key == new_key`) doesn't scan the same key twice.
+    let mut keys: Vec<&str> = Vec::with_capacity(2);
+    if let Some(k) = old_key.as_deref() {
+        keys.push(k);
+    }
+    if let Some(k) = new_key.as_deref()
+        && Some(k) != old_key.as_deref()
+    {
+        keys.push(k);
+    }
+    if from_side_change_in_flight(
+        txn,
+        &shape.from_table,
+        &shape.from_col,
+        &keys,
+        record.watermark,
+    )
+    .await?
+    {
+        return Ok(Some(ReverseGuardFailure::InFlight));
+    }
+
+    Ok(None)
 }
 
 /// Splices `parent_row`'s referenced to-side columns into a clone of
@@ -2531,25 +2864,22 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 }
                 let read_key = relationship_key_text(&old_row, &rel.def.to_col)
                     .or_else(|| relationship_key_text(&new_row, &rel.def.to_col));
-                let prev_lsn = match &read_key {
-                    Some(key) => {
-                        live_read_projection_lsn(
-                            pool,
-                            &shape.qualified_projection,
-                            &shape.to_col,
-                            key,
-                        )
-                        .await?
-                    }
-                    None => None,
-                };
+                let capture = capture_reverse_guard_state(
+                    pool,
+                    &shape.qualified_projection,
+                    &shape.to_col,
+                    read_key.as_deref(),
+                )
+                .await?;
                 relationship_reverses.push(RelationshipReverseRecord {
                     shape: Arc::clone(&shape),
                     old_row,
                     new_row,
                     new_image: change.new_image.clone(),
                     lsn: change.lsn,
-                    prev_lsn,
+                    prev_lsn: capture.prev_lsn,
+                    prev_gen: capture.prev_gen,
+                    watermark: capture.watermark,
                     hop_gen: change.hop_gen,
                     src_changed: change.src_changed,
                 });
@@ -3377,9 +3707,11 @@ pub async fn apply_and_mark_drained(
     claimed_by: &str,
     plan: &ApplyPlan,
     wake_channel: &str,
+    watermark: &StagedWatermark,
 ) -> Result<ApplyOutcome, ApplyError> {
     let outcome =
-        apply_and_mark_drained_many(txn, &[seg_seq], claimed_by, plan, wake_channel).await?;
+        apply_and_mark_drained_many(txn, &[seg_seq], claimed_by, plan, wake_channel, watermark)
+            .await?;
     Ok(ApplyOutcome {
         keys_written: outcome.keys_written,
         keys_deleted: outcome.keys_deleted,
@@ -3415,7 +3747,7 @@ pub async fn apply_and_mark_drained(
 /// `#[tracing::instrument]`-created span.
 #[tracing::instrument(
     name = "staging.apply_and_mark_drained",
-    skip(txn, plan, wake_channel),
+    skip(txn, plan, wake_channel, watermark),
     fields(
         segments = seg_seqs.len(),
         targets = plan.targets.len(),
@@ -3430,6 +3762,7 @@ pub async fn apply_and_mark_drained_many(
     claimed_by: &str,
     plan: &ApplyPlan,
     wake_channel: &str,
+    watermark: &StagedWatermark,
 ) -> Result<ManyApplyOutcome, ApplyError> {
     // 1. Version fence. `source_key` is bare (see `catalog_source_key`'s doc
     // comment); `source_table_versions.source_table` is qualified as of
@@ -3667,49 +4000,29 @@ pub async fn apply_and_mark_drained_many(
         let old_key = relationship_key_text(&record.old_row, &shape.to_col);
         let new_key = relationship_key_text(&record.new_row, &shape.to_col);
 
-        // Guard (d) stopgap (plan doc §2; #132 builds the real guard
-        // suite): re-read the projection row's own `__trellis_lsn`,
-        // row-locked, and compare against this record's `prev_lsn`,
-        // captured live in Phase 2. A missing projection row (a parent
-        // about to be INSERTed, or the should-be-unreachable
-        // no-projection case) has nothing to conflict with and always
-        // passes.
-        let lock_key = old_key.as_deref().or(new_key.as_deref());
-        let current_lsn: Option<Option<PgLsn>> = match lock_key {
-            Some(key) if !shape.qualified_projection.is_empty() => {
-                let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
-                let key_ident = quote_ident(&shape.to_col);
-                txn.query_opt(
-                    &format!(
-                        "select {lsn_ident} from {} where {key_ident}::text = $1 for update",
-                        shape.qualified_projection,
-                    ),
-                    &[&key],
-                )
-                .await?
-                .map(|row| row.get(0))
-            }
-            _ => None,
-        };
-        let ordering_ok = match current_lsn {
-            None => true,
-            Some(current) => current == record.prev_lsn,
-        };
-
-        if !ordering_ok {
+        // Issue #132: all four guards, checked together — see
+        // `check_reverse_guards`'s own doc comment for the mechanism, the
+        // locking discipline, and why they're combined into one Phase 3
+        // step instead of four independent ones.
+        if let Some(failure) =
+            check_reverse_guards(txn, shape, record, &old_key, &new_key, watermark).await?
+        {
             // Stopgap (explicitly not #134's deferral/retry plumbing,
             // which doesn't exist yet): fall back to exactly the pre-#131
             // mechanism for every touched from-side row — an image-less
             // `Recompute` at `hop_gen + 1`. Do NOT touch any target table
-            // or the projection for this record: the sibling record that
-            // *did* match `prev_lsn` already advanced them (or will, once
-            // it's processed/re-captured).
+            // or the projection for this record: whatever justified this
+            // guard's rejection (a fresher forward apply, an in-flight
+            // from-side change, an out-of-order sibling reverse, or intake
+            // simply not caught up yet) will let a later drain of the
+            // resulting recompute converge on the true state, the same way
+            // #131's original guard-(d)-only stopgap already did.
             tracing::warn!(
                 relationship_projection = %shape.qualified_projection,
-                "issue #131 reverse record's prev_lsn did not match the \
-                 projection's current lsn; falling back to an image-less \
-                 recompute of its from-side rows (stopgap for #134's \
-                 deferral plumbing)"
+                guard = %failure,
+                "issue #132 reverse guard rejected this record's delta; \
+                 falling back to an image-less recompute of its from-side \
+                 rows (stopgap for #134's deferral plumbing)"
             );
             // Dedup by from-side key, the same `seen_keys` pattern the
             // sibling `needs_recompute_fallback` branch below uses — for
@@ -4157,7 +4470,7 @@ const MAX_APPLY_ATTEMPTS: u32 = 5;
 /// just the first.
 #[tracing::instrument(
     name = "staging.drain_once",
-    skip(pool, wake_channel),
+    skip(pool, wake_channel, watermark),
     fields(claimed_by = %claimed_by, attempt = tracing::field::Empty)
 )]
 pub async fn drain_once(
@@ -4166,6 +4479,7 @@ pub async fn drain_once(
     claimed_by: &str,
     live_workers: i64,
     wake_channel: &str,
+    watermark: &StagedWatermark,
 ) -> Result<Option<ApplyOutcome>, ApplyError> {
     let mut folded = {
         let mut client = pool.get().await?;
@@ -4235,7 +4549,9 @@ pub async fn drain_once(
 
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
-        match apply_and_mark_drained(&txn, seg_seq, claimed_by, &plan, wake_channel).await {
+        match apply_and_mark_drained(&txn, seg_seq, claimed_by, &plan, wake_channel, watermark)
+            .await
+        {
             Ok(outcome) => {
                 txn.commit().await?;
                 // Epic #49 cross-cutting review fix (issues #51/#52): only
@@ -4311,7 +4627,7 @@ pub const MAX_COALESCE_SEGMENTS: usize = 32;
 /// instead of a single segment's.
 #[tracing::instrument(
     name = "staging.drain_many",
-    skip(pool, wake_channel),
+    skip(pool, wake_channel, watermark),
     fields(
         claimed_by = %claimed_by,
         segments = seg_seqs.len(),
@@ -4324,6 +4640,7 @@ pub async fn drain_many(
     claimed_by: &str,
     live_workers: i64,
     wake_channel: &str,
+    watermark: &StagedWatermark,
 ) -> Result<Option<ManyApplyOutcome>, ApplyError> {
     if seg_seqs.is_empty() {
         return Ok(None);
@@ -4400,8 +4717,15 @@ pub async fn drain_many(
 
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
-        match apply_and_mark_drained_many(&txn, &owned_segments, claimed_by, &plan, wake_channel)
-            .await
+        match apply_and_mark_drained_many(
+            &txn,
+            &owned_segments,
+            claimed_by,
+            &plan,
+            wake_channel,
+            watermark,
+        )
+        .await
         {
             Ok(outcome) => {
                 txn.commit().await?;

@@ -47,7 +47,12 @@ use super::error::StagingError;
 /// table_name)`, then joins them with `sep`. Every predicate below that must
 /// reason about "every ring table" shares this rather than each hand-rolling
 /// its own unroll of `RING_SIZE`.
-fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> String {
+///
+/// `pub(crate)` (issue #132, epic #127): `apply`'s guard (c) in-flight check
+/// needs the exact same "reason about every ring table" pattern, scoped to a
+/// specific `src_table`/join-key/`lsn` predicate instead of this module's
+/// own origin-lsn-threshold one — see `apply::from_side_change_in_flight`.
+pub(crate) fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> String {
     (0..RING_SIZE)
         .map(|slot| {
             let table = ring_table_name(slot).expect("0..RING_SIZE is always a valid ring slot");

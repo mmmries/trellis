@@ -47,6 +47,7 @@ use crate::pool::{Pool, quote_ident};
 use super::append::{self, CdcOp, RING_SIZE, StagedChange, ring_table_name};
 use super::apply::{self, ApplyError};
 use super::fold::FoldedChange;
+use super::watermark::StagedWatermark;
 
 /// The fuse threshold ADR-0003 left open, decided here: a key evicts once
 /// [`record_key_death`] returns a count at or past this many. `0` disables
@@ -462,8 +463,23 @@ pub async fn isolate_and_evict(
 
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
-        let outcome =
-            apply::apply_and_mark_drained(&txn, seg_seq, claimed_by, &plan, wake_channel).await;
+        // This probe applies-then-rolls-back purely to classify a poisoned
+        // key's failure in isolation — it never commits, so a guard (a)
+        // rejection here would only ever muddy the diagnosis of an
+        // unrelated failure, never protect real state. `saturated()`
+        // (issue #132) makes guard (a) a no-op for this probe, matching how
+        // every other guard here is unaffected too: a guard rejection is an
+        // `Ok` outcome (the fallback-Recompute path), never the
+        // `ApplyError` this probe is specifically trying to reproduce.
+        let outcome = apply::apply_and_mark_drained(
+            &txn,
+            seg_seq,
+            claimed_by,
+            &plan,
+            wake_channel,
+            &StagedWatermark::saturated(),
+        )
+        .await;
         let _ = txn.rollback().await;
         if let Err(err) = outcome {
             let class = classify(&err);
