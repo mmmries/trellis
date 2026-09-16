@@ -20,9 +20,6 @@ for the decisions and their rationale.
 * **Pull-based export** — those metrics exposed in Prometheus text format so
   operators can scrape them into whatever they already run for dashboards and
   alerting.
-* **Self-retained history** — Trellis keeps a time-bounded rollup of its own
-  metrics independent of any external scraper, so it can later analyze usage
-  patterns and suggest optimizations.
 * **Structured logs** — emitted through a facade that can export in
   OpenTelemetry form.
 * **Transform status** — every transform carries an observable lifecycle status
@@ -33,8 +30,10 @@ for the decisions and their rationale.
 
 **Non-goals (for this pass)**
 
-* Being a metrics *backend*. Trellis exposes and briefly retains; it does not
-  replace Prometheus/Grafana/etc.
+* Being a metrics *backend*. Trellis only exposes an in-process registry for
+  scraping; it does not retain history of its own or replace Prometheus/
+  Grafana/etc. (Metric rollup/retention was tried and reversed — see
+  [ADR-0009 decision 7](decisions/0009-observability-decisions.md#7-rollup-interval-and-retention-issue-54).)
 * Distributed tracing across the *application's* code. We instrument Trellis's
   own pipeline, not the caller's write path.
 
@@ -45,9 +44,7 @@ unified telemetry pipeline. Each is idiomatic on its own and they evolve
 independently:
 
 ```
-metrics ──► in-process registry ──┬─► render_prometheus()  (operator scrapes)
-                                   └─► periodic rollup ──► trellis.metric_rollup
-                                                            (pruned to retention window)
+metrics ──► in-process registry ──► render_prometheus()  (operator scrapes)
 
 logs/spans ──► `tracing` facade ──► optional OTLP export layer
 ```
@@ -128,39 +125,31 @@ trellis.metrics().render_prometheus()
 # }
 ```
 
-`cli/src/commands/prometheus.rs` is a second, complete (if deliberately
-minimal — no HTTP-parsing crate, see its module doc comment) example: a
-`trellis prometheus [--bind <ADDR>]` subcommand that hand-rolls a small
-TCP listener and answers every request with `Metrics::new().render_prometheus()`
-as a `200 OK`, `Content-Type: text/plain; version=0.0.4; charset=utf-8`
-response — worth reading as a template for wiring this into a real HTTP
-stack, though note its own doc comment's caveat: run standalone (its only
-mode), it renders *its own* process's registry, which stays empty unless
-that same process is also running the engine. A real deployment mounts
-`render_prometheus()` from inside the process actually running
-[`Trellis`]/[`Client`] (`staging`/`drain_threads` set), not from a separate
-scrape-only binary.
+`cli/src/commands/run.rs`'s `--prometheus-bind <ADDR>` flag is a complete
+(if deliberately minimal — no HTTP-parsing crate) example: when given,
+`trellis run` hand-rolls a small TCP listener alongside the live pipeline and
+answers every request with `Metrics::new().render_prometheus()` as a
+`200 OK`, `Content-Type: text/plain; version=0.0.4; charset=utf-8` response —
+worth reading as a template for wiring this into a real HTTP stack, since it
+renders the same process's registry that's actually running the engine
+(unlike a separate scrape-only process, whose registry would always be
+empty). An embedder building their own binary mounts `render_prometheus()`
+from inside whatever process is actually running
+[`Trellis`]/[`Client`] (`staging`/`drain_threads` set), the same way.
 
-### Retention: Postgres rollup tables
+### Retention: left to Prometheus, not Trellis
 
-Trellis keeps its own history in a **pruned Postgres table** it owns (working
-name `trellis.metric_rollup`), written by a periodic rollup job and trimmed to a
-configurable retention window:
-
-```
-metrics ──► rollup every N minutes ──► trellis.metric_rollup ──► prune > retention_window
-```
-
-Chosen over an in-memory ring (which a restart wipes) and an embedded on-disk
-store (a new storage dependency) because it **reuses the Postgres schema Trellis
-already owns**, survives restarts, is directly SQL-queryable for the future
-"suggest optimizations" use case, and is naturally shared across engine
-instances. The costs we accept: added write load, one more schema object, and a
-prune job on the DB. Rollup interval and retention window are configurable;
-defaults are settled in
-[ADR-0009](decisions/0009-observability-decisions.md#7-rollup-interval-and-retention-issue-54):
-5-minute rollup interval, 7-day retention, storing raw histogram buckets
-(not pre-computed quantiles) so history stays re-aggregatable.
+Trellis does **not** retain metric history of its own. An earlier design
+([ADR-0009 decision 7](decisions/0009-observability-decisions.md#7-rollup-interval-and-retention-issue-54))
+called for a pruned Postgres rollup table (`metric_rollup`) written by a
+periodic job — that was implemented (issue #54) and then reversed: retention,
+rollup, and cross-instance aggregation are exactly what a real Prometheus/
+VictoriaMetrics/Thanos deployment already does well, and duplicating that
+inside Trellis added write load and a schema object for no capability an
+operator's existing scrape/TSDB stack doesn't already provide. Operators who
+want history configure their scraper's own retention against the
+`render_prometheus()` endpoint (or `trellis run --prometheus-bind`) like any
+other Prometheus target.
 
 ## Logs and traces
 
@@ -258,9 +247,11 @@ All settled by [ADR-0009](decisions/0009-observability-decisions.md):
   separately? **Settled:**
   [spans are first-class; per-transform latency derives from span durations](decisions/0009-observability-decisions.md#3-traces-vs-flat-logs-spans-are-first-class).
 * **Rollup interval and retention window defaults**, and whether the rollup is
-  raw histogram buckets or pre-computed quantiles (pre-computed quantiles are
-  not re-aggregatable later). **Settled:**
-  [5-minute interval, 7-day retention, raw buckets — both configurable](decisions/0009-observability-decisions.md#7-rollup-interval-and-retention-issue-54).
+  raw histogram buckets or pre-computed quantiles. **Settled, then reversed:**
+  [originally 5-minute interval/7-day retention/raw buckets](decisions/0009-observability-decisions.md#7-rollup-interval-and-retention-issue-54);
+  the rollup table was later removed in favor of leaving retention/aggregation
+  to an external Prometheus/TSDB stack (see [Retention](#retention-left-to-prometheus-not-trellis)
+  above).
 * **Where transform status is stored and read** — does the lifecycle status live
   alongside the [ADR-0003](decisions/0003-quarantine-storage-and-api.md)
   quarantine model or in its own transform-registry row, and is it exposed via

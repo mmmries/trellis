@@ -261,13 +261,13 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
         .map(|row| row.get(0))
         .collect();
     // Issue #73 added V22; its reviewer follow-up added V23. Issue #74
-    // added V24. Issue #54 (epic #49) added V25 (`metric_rollup`,
-    // renumbered from its original V22 to land after the above).
+    // added V24. Issue #54 (epic #49) added V25 (`metric_rollup`); later
+    // removed (metric history/aggregation is left to an operator's own
+    // Prometheus stack — see docs/observability.md's "Retention" section).
     assert_eq!(
         applied,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
         ]
     );
 }

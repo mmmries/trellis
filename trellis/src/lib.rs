@@ -71,7 +71,6 @@ pub mod numeric;
 #[cfg(feature = "otlp")]
 pub mod otel;
 pub mod pool;
-pub mod rollup;
 pub mod staging;
 
 pub use app::{
