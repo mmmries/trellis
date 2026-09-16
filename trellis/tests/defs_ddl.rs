@@ -928,3 +928,65 @@ async fn a_source_table_with_a_composite_primary_key_is_rejected() {
         other => panic!("expected CompositePrimaryKeyUnsupported, got {other:?}"),
     }
 }
+
+/// Issue #107: a single-column primary key of an unsafe (non-text-stable)
+/// type must be rejected exactly like a relationship join key of the same
+/// type already is (`assert_join_key_type_supported`) — 1-1 apply/backfill
+/// compare the primary key via `::text` casts throughout, so e.g. a
+/// `timestamptz` PK's `::text` rendering is session-`TimeZone`-dependent and
+/// could silently fail to match a logically identical key rendered under a
+/// different `TimeZone`, missing or duplicating target rows with no error.
+#[tokio::test]
+async fn a_source_table_with_a_timestamptz_primary_key_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+
+    client
+        .batch_execute("create table events (occurred_at timestamptz primary key, payload text)")
+        .await
+        .expect("seed source table with a timestamptz primary key");
+
+    let err = source_primary_key(&db.pool, "events").await.unwrap_err();
+    match err {
+        DdlError::UnsupportedPrimaryKeyType {
+            source_table,
+            column,
+            pg_type,
+        } => {
+            assert_eq!(source_table, "events");
+            assert_eq!(column, "occurred_at");
+            assert_eq!(pg_type, "timestamp with time zone");
+        }
+        other => panic!("expected UnsupportedPrimaryKeyType, got {other:?}"),
+    }
+}
+
+/// Issue #107, `numeric` variant: `1.0::text` != `1.00::text` even though the
+/// two values are numerically equal, so a `numeric` primary key is exactly as
+/// unsafe under `::text` comparison as a `timestamptz` one.
+#[tokio::test]
+async fn a_source_table_with_a_numeric_primary_key_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+
+    client
+        .batch_execute("create table balances (account_id numeric primary key, cents numeric)")
+        .await
+        .expect("seed source table with a numeric primary key");
+
+    let err = source_primary_key(&db.pool, "balances").await.unwrap_err();
+    match err {
+        DdlError::UnsupportedPrimaryKeyType {
+            source_table,
+            column,
+            pg_type,
+        } => {
+            assert_eq!(source_table, "balances");
+            assert_eq!(column, "account_id");
+            assert_eq!(pg_type, "numeric");
+        }
+        other => panic!("expected UnsupportedPrimaryKeyType, got {other:?}"),
+    }
+}

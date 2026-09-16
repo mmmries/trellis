@@ -27,9 +27,15 @@
 //! of schema introspection this issue needs, distinct from the general
 //! "introspect the whole source schema" question the catalog module (#23)
 //! left to intake). Only a single-column primary key is supported, matching
-//! the 1-1 grammar's single-source-row assumption; every calculated field is
-//! typed per its inferred [`super::ast::ValueType`] (issue #63 widened this
-//! from a blanket `numeric` to `numeric`/`text`/`boolean`, reusing
+//! the 1-1 grammar's single-source-row assumption, and its Postgres type must
+//! be [text-stable](super::catalog::is_text_stable_join_key_type) — the same
+//! allowlist a relationship join key is held to (issue #28) — since every 1-1
+//! apply/backfill path compares this primary key via `::text` casts just
+//! like a join key; an unsafe type (e.g. `numeric`, `timestamptz`, `bytea`)
+//! is rejected at definition time rather than risking a silent
+//! missed/duplicated target row later (issue #107). Every calculated field
+//! is typed per its inferred [`super::ast::ValueType`] (issue #63 widened
+//! this from a blanket `numeric` to `numeric`/`text`/`boolean`, reusing
 //! [`super::validate::infer_field_types`] rather than a second type-inference
 //! implementation).
 
@@ -106,6 +112,25 @@ pub enum DdlError {
     /// The source table's primary key spans more than one column; only a
     /// single-column primary key is supported by this 1-1 slice.
     CompositePrimaryKeyUnsupported { source_table: String },
+    /// The source table's (single-column) primary key resolved to a Postgres
+    /// type outside [`super::catalog::is_text_stable_join_key_type`]'s
+    /// allowlist (issue #107). Every 1-1 apply/backfill path
+    /// (`staging::apply`, `staging::backfill`) compares this primary key via
+    /// `::text` casts, exactly like a relationship join key — so a
+    /// non-text-stable type (`numeric`/`real`/`double precision`: `1.0` vs
+    /// `1.00`; `timestamp`/`timestamptz`/`date`/`time`: session-TimeZone- or
+    /// style-dependent rendering; `bytea`: `bytea_output`-dependent
+    /// rendering; `boolean`, `json`/`jsonb`; or any unknown type) would let
+    /// logically-identical keys rendered two different ways silently fail to
+    /// match, missing or duplicating target rows with no error. Rejected at
+    /// definition time instead, mirroring
+    /// [`ValidationError::RelationshipUnsupportedJoinKeyType`]'s treatment of
+    /// the same class of type for relationship join keys.
+    UnsupportedPrimaryKeyType {
+        source_table: String,
+        column: String,
+        pg_type: String,
+    },
     /// `def`'s calculated fields failed type inference — meaning `def`
     /// reached DDL generation without having passed [`super::validate::validate`]
     /// against this same `source_columns`, since a validated definition's
@@ -146,9 +171,9 @@ impl DdlError {
             // The source table's shape doesn't support the 1-1 DDL slice —
             // a rejected definition, same category as any other validation
             // failure.
-            DdlError::NoPrimaryKey { .. } | DdlError::CompositePrimaryKeyUnsupported { .. } => {
-                ErrorCode::Validation
-            }
+            DdlError::NoPrimaryKey { .. }
+            | DdlError::CompositePrimaryKeyUnsupported { .. }
+            | DdlError::UnsupportedPrimaryKeyType { .. } => ErrorCode::Validation,
             DdlError::InvalidDefinition(err) => err.code(),
             // Stored-data corruption or cross-version parser drift, not a
             // rejection of the current call's input.
@@ -170,6 +195,18 @@ impl fmt::Display for DdlError {
                 f,
                 "source table '{source_table}' has a composite primary key, which the 1-1 \
                  target-DDL slice does not support"
+            ),
+            DdlError::UnsupportedPrimaryKeyType {
+                source_table,
+                column,
+                pg_type,
+            } => write!(
+                f,
+                "source table '{source_table}' has primary key {column} ({pg_type}), a type \
+                 whose equality isn't text-stable, so the 1-1 apply/backfill paths (which \
+                 compare primary keys as text) would silently diverge from the Postgres \
+                 oracle's typed equality; supported primary key types are integer, bigint, \
+                 smallint, uuid, text, and character varying"
             ),
             DdlError::InvalidDefinition(err) => {
                 write!(f, "cannot generate target-table DDL: {err}")
@@ -196,7 +233,9 @@ impl fmt::Display for DdlError {
 impl std::error::Error for DdlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            DdlError::NoPrimaryKey { .. } | DdlError::CompositePrimaryKeyUnsupported { .. } => None,
+            DdlError::NoPrimaryKey { .. }
+            | DdlError::CompositePrimaryKeyUnsupported { .. }
+            | DdlError::UnsupportedPrimaryKeyType { .. } => None,
             DdlError::InvalidDefinition(err) => Some(err),
             DdlError::RelationshipReparse(err) => Some(err),
             DdlError::AliasSubstitution(err) => Some(err),
@@ -259,7 +298,14 @@ fn map_resolve_error(err: super::catalog::CatalogError) -> DdlError {
 /// time), so this no longer depends on the connection's `search_path`
 /// (`crate::pool`'s session bootstrap) the way it did before issue #72/#76. A
 /// bare table name still resolves via `search_path` exactly as before, for
-/// any caller that genuinely has nothing more specific.
+/// any caller that genuinely has nothing more specific. Beyond arity
+/// (rejecting zero or multiple PK columns), also gates the resolved column's
+/// *type*: only [`super::catalog::is_text_stable_join_key_type`]'s allowlist
+/// is accepted, returning [`DdlError::UnsupportedPrimaryKeyType`] otherwise
+/// (issue #107) — every caller of this function ultimately compares the
+/// returned key via `::text` casts, so an unsafe type here would risk the
+/// same silent divergence a relationship join key is already guarded
+/// against.
 pub async fn source_primary_key(
     pool: &Pool,
     source_table: &str,
@@ -280,10 +326,18 @@ pub async fn source_primary_key(
         0 => Err(DdlError::NoPrimaryKey {
             source_table: source_table.to_string(),
         }),
-        1 => Ok(PrimaryKeyColumn {
-            name: rows[0].get(0),
-            data_type: rows[0].get(1),
-        }),
+        1 => {
+            let name: String = rows[0].get(0);
+            let data_type: String = rows[0].get(1);
+            if !super::catalog::is_text_stable_join_key_type(&data_type) {
+                return Err(DdlError::UnsupportedPrimaryKeyType {
+                    source_table: source_table.to_string(),
+                    column: name,
+                    pg_type: data_type,
+                });
+            }
+            Ok(PrimaryKeyColumn { name, data_type })
+        }
         _ => Err(DdlError::CompositePrimaryKeyUnsupported {
             source_table: source_table.to_string(),
         }),
