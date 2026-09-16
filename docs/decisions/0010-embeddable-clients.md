@@ -11,9 +11,9 @@ informed:
 A common way to run Trellis is inside an application written in another
 language — a Rails or Phoenix app that already serializes schema change
 through ordered, repeatable migration files, and wants the `TRANSFORM` that
-derives from a table to live in the same file as the `CREATE TABLE` (issue
-#87). That means the host process loads Trellis **in-process**, over an FFI
-boundary, rather than deploying and sequencing a separate service.
+derives from a table to live in the same file as the `CREATE TABLE`. That means
+the host process loads Trellis **in-process**, over an FFI boundary, rather
+than deploying and sequencing a separate service.
 
 This ADR records four decisions about that boundary: what binds to what, what
 each binding is allowed to reimplement, who owns which threads, and what
@@ -36,12 +36,21 @@ this boundary and the decisions below build directly on them:
 
 ## Decision 1: each binding wraps the `trellis` crate directly
 
-The published libraries are two thin Rust crates, each depending on `trellis`
-and wrapping `BlockingTrellis`:
+Each binding is a thin Rust crate depending on `trellis` and wrapping
+`BlockingTrellis`:
 
 * **Elixir** — a [Rustler](https://github.com/rusterlium/rustler) NIF.
 * **Ruby** — [Magnus](https://github.com/matsadler/magnus) on the
   [`rb-sys`](https://github.com/oxidize-rb/rb-sys) toolchain.
+
+Those crates are a build input, not the deliverable. **Each binding is
+published through its own language's registry** — a Hex package on `hex.pm`
+for Elixir, a gem on `rubygems.org` for Ruby — because that is where the
+people who need it already look, and it is what lets a host app declare Trellis
+in `mix.exs` or its `Gemfile` alongside every other dependency. Neither binding
+crate goes to `crates.io`: a Rust program has no use for one, and would depend
+on `trellis` directly. Each published package carries a compiled native
+extension, so an installing application needs no Rust toolchain.
 
 **There is no shared FFI library between them.** Specifically, no
 `trellis-ffi` cdylib exporting a C ABI for `ruby-ffi` and Erlang's raw NIF API
@@ -194,7 +203,7 @@ implementation to get right — which is decision 2 applied to types.
 
 ## Related issues
 
-#87 (embeddable clients), #82 / [ADR-0008](0008-public-api-design.md) (the
-public API these bindings wrap), #55 (the status lifecycle behind the
-poll-to-`live` contract), #49 / [ADR-0009](0009-observability-decisions.md)
-(the metrics and logs an embedder surfaces).
+#82 / [ADR-0008](0008-public-api-design.md) (the public API these bindings
+wrap), #55 (the status lifecycle behind the poll-to-`live` contract), #49 /
+[ADR-0009](0009-observability-decisions.md) (the metrics and logs an embedder
+surfaces).
