@@ -39,6 +39,8 @@ use tokio_postgres::types::PgLsn;
 
 use pgoutput::{ColumnValue, Message, Relation, RelationCache};
 
+use crate::defs::catalog;
+use crate::pool::Pool;
 use crate::staging::append;
 use crate::staging::session::ProducerSession;
 use crate::staging::{CdcOp, StagedChange, StagedWatermark};
@@ -254,18 +256,26 @@ fn json_string(s: &str) -> String {
 /// `lsn`/`src_changed` are left unset here — they are the transaction's
 /// commit position/time, not known until the `Commit` message arrives — and
 /// are stamped onto every buffered change by [`Intake::commit_transaction`].
+///
+/// `group_key_cols` (issue #133) is `relation`'s outbound-relationship
+/// `from_col` names — [`Intake::handle_xlog_data`]'s
+/// [`GroupKeyColumns`]-cached lookup, passed in rather than looked up here
+/// because this function stays pure/synchronous (no `pool`, no `.await`):
+/// see [`touched_group_key`] for what it does with them.
 fn cdc_change(
     relation: &Relation,
     op: CdcOp,
     old: Option<&[ColumnValue]>,
     new: Option<&[ColumnValue]>,
     primary_key: Option<&[String]>,
+    group_key_cols: &[String],
 ) -> Result<StagedChange, IntakeError> {
     let key_tuple = new.or(old).ok_or_else(|| IntakeError::MissingKeyValue {
         table: relation.name.clone(),
     })?;
     let key = extract_key(relation, key_tuple, primary_key)?;
     let src_table = publication::qualify(&relation.namespace, &relation.name)?;
+    let group_key = touched_group_key(relation, old, new, group_key_cols);
     Ok(StagedChange::Cdc {
         src_table,
         key,
@@ -276,8 +286,45 @@ fn cdc_change(
         origin_lsn: None,
         src_changed: None,
         hop_gen: 0,
-        group_key: None,
+        group_key,
     })
+}
+
+/// Issue #133: the union of `group_key_cols`' values across `old` and `new`
+/// — the real, pre-fold "which join-key values did this row's own change
+/// touch" signal [`StagedChange::Cdc::group_key`] carries into the ring (see
+/// that field's doc comment for the merge rule it feeds and why it has to
+/// come from here, not from the folded image). Reads straight off the
+/// still-typed `ColumnValue` tuples, exactly where they're already in scope
+/// — no JSON re-parse of the encoded images needed. `None` when
+/// `group_key_cols` is empty (this table isn't any relationship's
+/// from-side, the overwhelmingly common case) or neither tuple carries a
+/// non-null, non-unchanged value for any of them.
+fn touched_group_key(
+    relation: &Relation,
+    old: Option<&[ColumnValue]>,
+    new: Option<&[ColumnValue]>,
+    group_key_cols: &[String],
+) -> Option<Vec<String>> {
+    if group_key_cols.is_empty() {
+        return None;
+    }
+    let mut values: Vec<String> = Vec::new();
+    for tuple in [old, new].into_iter().flatten() {
+        for (name, value) in pgoutput::named_columns(relation, tuple) {
+            if let ColumnValue::Text(text) = value
+                && group_key_cols.iter().any(|col| col == name)
+                && !values.iter().any(|v| v == text)
+            {
+                values.push(text.clone());
+            }
+        }
+    }
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
 }
 
 /// Stamps every buffered change with its transaction's commit position/time
@@ -370,6 +417,76 @@ impl IntakeConfig {
     }
 }
 
+/// Issue #133's `src_table -> from_col` cache: the outbound-relationship
+/// column names [`touched_group_key`] needs, so [`Intake::handle_xlog_data`]
+/// never does a live catalog lookup per row. Keyed by the **bare** table
+/// name (`relation.name`, no schema) — `relationship_definitions.from_table`
+/// is itself persisted bare (`catalog::create_relationship`'s own doc
+/// comment: "a relationship endpoint gaining its own persisted qualified
+/// identity is... future work"), the same pre-ADR-0007 convention
+/// `staging::apply::catalog_source_key` already works around for this exact
+/// table. A schema-qualified lookup key here would silently never match and
+/// leave `group_key` permanently unpopulated for every real relationship.
+///
+/// Refreshed lazily, per `src_table`, whenever an entry is missing or older
+/// than [`GROUP_KEY_CACHE_TTL`] — a plain refresh-on-miss/refresh-on-stale
+/// map, not a push-invalidation channel. That's a deliberate "keep it
+/// simple" choice (matching this crate's existing periodic-refresh
+/// conventions, e.g. `client::maintenance_loop`'s own due-time throttle,
+/// rather than inventing a general cache-invalidation mechanism for one
+/// column): a relationship created after intake starts becomes visible
+/// within one TTL window, not a restart, which is the liveness bar this
+/// needs to clear — sub-second pickup was never a requirement. Correctness
+/// never depends on this cache being fresh, either: a stale or empty entry
+/// only ever *under*-populates `group_key` (a from-side row whose real
+/// outbound relationship this cache hasn't observed yet just gets `None`,
+/// exactly like every producer wrote before #133), which costs guard (b) a
+/// spurious pass in precisely the fold-erasure window #133 exists to close
+/// — it can never cause guard (b), or any of the other three guards, to
+/// reject something that should have applied.
+struct GroupKeyColumns {
+    pool: Pool,
+    entries: std::collections::HashMap<String, (Vec<String>, Instant)>,
+}
+
+/// How long a [`GroupKeyColumns`] entry stays fresh before the next lookup
+/// for that `src_table` re-queries the catalog — see that struct's own doc
+/// comment for why a coarse, refresh-on-miss cache is the right amount of
+/// machinery here.
+const GROUP_KEY_CACHE_TTL: Duration = Duration::from_secs(30);
+
+impl GroupKeyColumns {
+    fn new(pool: Pool) -> Self {
+        Self {
+            pool,
+            entries: std::collections::HashMap::new(),
+        }
+    }
+
+    /// `src_table`'s outbound-relationship `from_col` names, sorted and
+    /// deduped — empty (not an error) for a table with no outbound
+    /// relationship at all, the overwhelmingly common case.
+    async fn columns_for(&mut self, src_table: &str) -> Result<&[String], IntakeError> {
+        let stale = match self.entries.get(src_table) {
+            Some((_, refreshed_at)) => refreshed_at.elapsed() > GROUP_KEY_CACHE_TTL,
+            None => true,
+        };
+        if stale {
+            let rels = catalog::relationships_from_table(&self.pool, src_table).await?;
+            let mut cols: Vec<String> = rels.into_iter().map(|r| r.def.from_col).collect();
+            cols.sort();
+            cols.dedup();
+            self.entries
+                .insert(src_table.to_string(), (cols, Instant::now()));
+        }
+        Ok(&self
+            .entries
+            .get(src_table)
+            .expect("just inserted or already fresh above")
+            .0)
+    }
+}
+
 /// The consumer (issue #7's "single stager"): owns the replication
 /// connection and the dedicated staging connection ([`ProducerSession`],
 /// which enforces the producer singleton), decodes `pgoutput` bytes, buffers
@@ -386,6 +503,9 @@ pub struct Intake {
     /// on each `Relation` message and never consulted for any other
     /// replica identity (see `handle_xlog_data`).
     primary_keys: std::collections::HashMap<i32, Vec<String>>,
+    /// Issue #133: `src_table -> from_col` column names, refreshed
+    /// lazily/on-miss — see [`GroupKeyColumns`]'s own doc comment.
+    group_key_columns: GroupKeyColumns,
     buffer: spill::TxnBuffer,
     spill_threshold: usize,
     hard_cap: usize,
@@ -455,9 +575,15 @@ impl Intake {
     /// passed in something at least this fresh (e.g. a shared watermark
     /// surviving an in-process `Intake` restart that never dropped the
     /// `Arc`).
+    /// `pool` (issue #133) backs [`GroupKeyColumns`]'s catalog cache only —
+    /// a `Pool` is cheap to `Clone` (`Arc`-backed) and distinct from
+    /// `session`'s dedicated producer connection, so this never competes
+    /// with (or is required for) the producer singleton lock
+    /// [`ProducerSession`] enforces.
     pub async fn connect(
         config: &IntakeConfig,
         watermark: StagedWatermark,
+        pool: Pool,
     ) -> Result<Self, IntakeError> {
         let session = ProducerSession::connect(&config.dsn, &config.schema).await?;
         let last_confirmed = fetch_confirmed_lsn(session.client(), &config.slot)
@@ -510,6 +636,7 @@ impl Intake {
             wake_channel: config.wake_channel.clone(),
             relations: RelationCache::new(),
             primary_keys: std::collections::HashMap::new(),
+            group_key_columns: GroupKeyColumns::new(pool),
             buffer: spill::TxnBuffer::new(config.spill_threshold, config.hard_cap),
             spill_threshold: config.spill_threshold,
             hard_cap: config.hard_cap,
@@ -598,9 +725,24 @@ impl Intake {
             }
             Message::Insert { relation_id, new } => {
                 let relation = self.relations.get(relation_id)?;
+                // Issue #133: `group_key_cols` before `pk`, so the
+                // `.await` below (the cache's only possible catalog round
+                // trip — a plain map read on a fresh entry) happens before
+                // any other field borrow is live. `relation.name` (bare),
+                // not a schema-qualified identity — see
+                // `GroupKeyColumns::columns_for`'s own doc comment for why
+                // `relationship_definitions.from_table` is keyed bare.
+                let group_key_cols = self.group_key_columns.columns_for(&relation.name).await?;
                 let pk = self.primary_keys.get(&relation_id).map(Vec::as_slice);
                 self.buffer.push(
-                    cdc_change(relation, CdcOp::Insert, None, Some(&new), pk)?,
+                    cdc_change(
+                        relation,
+                        CdcOp::Insert,
+                        None,
+                        Some(&new),
+                        pk,
+                        group_key_cols,
+                    )?,
                     xid,
                 )?;
             }
@@ -611,9 +753,17 @@ impl Intake {
             } => {
                 let relation = self.relations.get(relation_id)?;
                 let old_tuple = old.as_ref().map(|(_, tuple)| tuple.as_slice());
+                let group_key_cols = self.group_key_columns.columns_for(&relation.name).await?;
                 let pk = self.primary_keys.get(&relation_id).map(Vec::as_slice);
                 self.buffer.push(
-                    cdc_change(relation, CdcOp::Update, old_tuple, Some(&new), pk)?,
+                    cdc_change(
+                        relation,
+                        CdcOp::Update,
+                        old_tuple,
+                        Some(&new),
+                        pk,
+                        group_key_cols,
+                    )?,
                     xid,
                 )?;
             }
@@ -621,9 +771,17 @@ impl Intake {
                 relation_id, old, ..
             } => {
                 let relation = self.relations.get(relation_id)?;
+                let group_key_cols = self.group_key_columns.columns_for(&relation.name).await?;
                 let pk = self.primary_keys.get(&relation_id).map(Vec::as_slice);
                 self.buffer.push(
-                    cdc_change(relation, CdcOp::Delete, Some(&old), None, pk)?,
+                    cdc_change(
+                        relation,
+                        CdcOp::Delete,
+                        Some(&old),
+                        None,
+                        pk,
+                        group_key_cols,
+                    )?,
                     xid,
                 )?;
             }
@@ -896,7 +1054,7 @@ mod tests {
     fn cdc_change_builds_insert_with_no_old_image() {
         let r = relation(vec![("id", true), ("payload", false)]);
         let new = vec![ColumnValue::Text("1".into()), ColumnValue::Text("a".into())];
-        let change = cdc_change(&r, CdcOp::Insert, None, Some(&new), None).unwrap();
+        let change = cdc_change(&r, CdcOp::Insert, None, Some(&new), None, &[]).unwrap();
         match change {
             StagedChange::Cdc {
                 src_table,
@@ -904,6 +1062,7 @@ mod tests {
                 op,
                 old_image,
                 new_image,
+                group_key,
                 ..
             } => {
                 assert_eq!(src_table, "public.widgets");
@@ -911,6 +1070,10 @@ mod tests {
                 assert_eq!(op, CdcOp::Insert);
                 assert!(old_image.is_none());
                 assert_eq!(new_image.unwrap(), r#"{"id":"1","payload":"a"}"#);
+                assert!(
+                    group_key.is_none(),
+                    "empty group_key_cols must never populate group_key"
+                );
             }
             other => panic!("expected Cdc, got {other:?}"),
         }
@@ -920,7 +1083,7 @@ mod tests {
     fn cdc_change_builds_delete_with_no_new_image() {
         let r = relation(vec![("id", true)]);
         let old = vec![ColumnValue::Text("9".into())];
-        let change = cdc_change(&r, CdcOp::Delete, Some(&old), None, None).unwrap();
+        let change = cdc_change(&r, CdcOp::Delete, Some(&old), None, None, &[]).unwrap();
         match change {
             StagedChange::Cdc {
                 key,
@@ -931,6 +1094,76 @@ mod tests {
                 assert_eq!(key, "9");
                 assert!(new_image.is_none());
                 assert_eq!(old_image.unwrap(), r#"{"id":"9"}"#);
+            }
+            other => panic!("expected Cdc, got {other:?}"),
+        }
+    }
+
+    /// Issue #133: a from-side row's `group_key` unions its outbound
+    /// relationship column's value from *both* images when they differ (a
+    /// re-point in this one change) — the exact signal guard (b) needs even
+    /// before any fold ever runs.
+    #[test]
+    fn cdc_change_populates_group_key_from_old_and_new_images() {
+        let r = relation(vec![("id", true), ("post", false), ("tag", false)]);
+        let old = vec![
+            ColumnValue::Text("30".into()),
+            ColumnValue::Text("3".into()),
+            ColumnValue::Text("rust".into()),
+        ];
+        let new = vec![
+            ColumnValue::Text("30".into()),
+            ColumnValue::Text("2".into()),
+            ColumnValue::Text("rust".into()),
+        ];
+        let group_key_cols = vec!["post".to_string()];
+        let change = cdc_change(
+            &r,
+            CdcOp::Update,
+            Some(&old),
+            Some(&new),
+            None,
+            &group_key_cols,
+        )
+        .unwrap();
+        match change {
+            StagedChange::Cdc { group_key, .. } => {
+                assert_eq!(
+                    group_key.unwrap(),
+                    vec!["3".to_string(), "2".to_string()],
+                    "must union the old-image and new-image touched values, in that order"
+                );
+            }
+            other => panic!("expected Cdc, got {other:?}"),
+        }
+    }
+
+    /// An unchanged `group_key_cols` value (present, identical, in both
+    /// images) must not be duplicated in the union.
+    #[test]
+    fn cdc_change_dedups_an_unchanged_group_key_value_across_old_and_new() {
+        let r = relation(vec![("id", true), ("post", false)]);
+        let old = vec![
+            ColumnValue::Text("30".into()),
+            ColumnValue::Text("3".into()),
+        ];
+        let new = vec![
+            ColumnValue::Text("30".into()),
+            ColumnValue::Text("3".into()),
+        ];
+        let group_key_cols = vec!["post".to_string()];
+        let change = cdc_change(
+            &r,
+            CdcOp::Update,
+            Some(&old),
+            Some(&new),
+            None,
+            &group_key_cols,
+        )
+        .unwrap();
+        match change {
+            StagedChange::Cdc { group_key, .. } => {
+                assert_eq!(group_key.unwrap(), vec!["3".to_string()]);
             }
             other => panic!("expected Cdc, got {other:?}"),
         }

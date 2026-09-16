@@ -201,7 +201,7 @@ async fn keepalive_watermark_advance_is_guarded_on_every_axis() {
         spill_threshold: spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: spill::DEFAULT_HARD_CAP,
     };
-    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new())
+    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await
         .expect("connect intake");
 
@@ -438,7 +438,7 @@ async fn a_missing_slot_with_prior_confirmed_progress_is_a_loud_startup_error() 
         hard_cap: spill::DEFAULT_HARD_CAP,
     };
 
-    match intake::Intake::connect(&config, StagedWatermark::new()).await {
+    match intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone()).await {
         Err(IntakeError::SlotLost {
             slot,
             last_confirmed_lsn,
@@ -498,7 +498,7 @@ async fn connecting_with_no_progress_row_is_a_loud_startup_error() {
         hard_cap: spill::DEFAULT_HARD_CAP,
     };
 
-    match intake::Intake::connect(&config, StagedWatermark::new()).await {
+    match intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone()).await {
         Err(IntakeError::MissingProgressRow { slot }) => {
             assert_eq!(slot, "orphan_slot");
         }
@@ -558,7 +558,7 @@ async fn initial_snapshot_handshake_seeds_the_progress_row_connect_requires() {
         spill_threshold: spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: spill::DEFAULT_HARD_CAP,
     };
-    intake::Intake::connect(&config, StagedWatermark::new())
+    intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await
         .expect("connect must succeed once the handshake has seeded the row");
 }

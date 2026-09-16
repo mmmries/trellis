@@ -87,7 +87,20 @@ pub enum StagedChange {
         origin_lsn: Option<PgLsn>,
         src_changed: Option<SystemTime>,
         hop_gen: i32,
-        group_key: Option<String>,
+        /// Issue #133: the union of every join-key value this row's own
+        /// change touched — every column that is some relationship's
+        /// `from_col`, read from `old_image` (if present) and `new_image`
+        /// (if present). Populated by intake (`intake::mod::Intake`'s
+        /// `handle_xlog_data`, using a cached outbound-relationship column
+        /// map) or backfill's replay of a spilled/parked change; `None`
+        /// when this row's `src_table` has no outbound relationship at all,
+        /// or (rare, transient) the catalog cache hasn't observed one yet.
+        /// See `staging::fold`'s doc comment for the union merge rule this
+        /// feeds, and `staging::apply::RelationshipGenBump` for why this
+        /// (not the folded old/new image endpoints alone) is what guard
+        /// (b) needs to catch a parent the fold erases entirely within one
+        /// batch.
+        group_key: Option<Vec<String>>,
     },
     /// The shape all three non-CDC producers (reverse propagation,
     /// definition re-derive, backfill) use: a bare, image-less recompute
@@ -111,7 +124,12 @@ pub enum StagedChange {
         src_table: String,
         key: String,
         hop_gen: i32,
-        group_key: Option<String>,
+        /// Always `None` in practice: a `Recompute` carries no image at all
+        /// (see this variant's own doc comment), so there is no `old_image`/
+        /// `new_image` to read a touched join-key value from — see
+        /// [`StagedChange::Cdc::group_key`] for the field this mirrors and
+        /// why it's meaningless here rather than merely unpopulated.
+        group_key: Option<Vec<String>>,
         src_changed: Option<SystemTime>,
     },
     /// A source `TRUNCATE` of `src_table` (issue #60): one row per truncated
@@ -156,7 +174,7 @@ struct ChangeRow<'a> {
     origin_lsn: Option<PgLsn>,
     src_changed: Option<SystemTime>,
     hop_gen: i32,
-    group_key: Option<&'a str>,
+    group_key: Option<&'a [String]>,
 }
 
 impl<'a> From<&'a StagedChange> for ChangeRow<'a> {

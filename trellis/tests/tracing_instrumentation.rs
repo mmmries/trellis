@@ -275,7 +275,7 @@ async fn intake_commit_transaction_span_records_slot_and_change_count() {
         spill_threshold: spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: spill::DEFAULT_HARD_CAP,
     };
-    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new())
+    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await
         .expect("connect intake");
 

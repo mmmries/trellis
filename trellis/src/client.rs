@@ -449,13 +449,14 @@ async fn run(
                 return;
             }
         };
-        let mut intake = match intake::Intake::connect(&intake_config, watermark.clone()).await {
-            Ok(intake) => intake,
-            Err(err) => {
-                let _ = ready_tx.send(Err(err.into()));
-                return;
-            }
-        };
+        let mut intake =
+            match intake::Intake::connect(&intake_config, watermark.clone(), pool.clone()).await {
+                Ok(intake) => intake,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err.into()));
+                    return;
+                }
+            };
         // Intake's replication consumer has no built-in cancellation, but
         // it's crash-safe and resumable (acked LSNs are durable, and a
         // fresh `Intake::connect` resumes from the last confirmed

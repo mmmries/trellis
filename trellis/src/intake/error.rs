@@ -97,6 +97,14 @@ pub enum IntakeError {
     /// action this crate never takes on its own — so this names the exact
     /// operator recovery instead.
     OrphanedSlot { slot: String },
+    /// Issue #133: a `defs::catalog` lookup failed — the only catalog
+    /// dependency this module has is the outbound-relationship cache
+    /// (`relationships_from_table`) that populates the ring's `group_key`
+    /// column. Composed via `From` rather than flattened, matching
+    /// [`IntakeError::Staging`]'s convention. `Box`ed: `CatalogError`
+    /// itself carries a `Backfill(IntakeError)` variant, so an unboxed
+    /// cycle between the two enums would make both infinite-sized.
+    Catalog(Box<crate::defs::catalog::CatalogError>),
 }
 
 impl IntakeError {
@@ -118,6 +126,7 @@ impl IntakeError {
             IntakeError::Transport(_) => ErrorCode::Connectivity,
             IntakeError::Staging(err) => err.code(),
             IntakeError::Db(err) => error_code::classify_pg_error(err),
+            IntakeError::Catalog(err) => err.code(),
             IntakeError::ReplicaIdentityRequired { .. } => ErrorCode::Validation,
             IntakeError::MissingProgressRow { .. }
             | IntakeError::OrphanedSlot { .. }
@@ -138,6 +147,7 @@ impl fmt::Display for IntakeError {
         match self {
             IntakeError::Transport(msg) => write!(f, "replication transport error: {msg}"),
             IntakeError::Staging(err) => write!(f, "{err}"),
+            IntakeError::Catalog(err) => write!(f, "{err}"),
             IntakeError::Db(err) => {
                 write!(f, "intake database error: ")?;
                 crate::error::write_pg_error(f, err)
@@ -206,6 +216,7 @@ impl std::error::Error for IntakeError {
             IntakeError::Db(err) => Some(err),
             IntakeError::Decode(err) => Some(err),
             IntakeError::Io(err) => Some(err),
+            IntakeError::Catalog(err) => Some(err),
             IntakeError::Transport(_)
             | IntakeError::ReplicaIdentityRequired { .. }
             | IntakeError::MissingKeyValue { .. }
@@ -229,6 +240,12 @@ impl From<std::io::Error> for IntakeError {
 impl From<StagingError> for IntakeError {
     fn from(err: StagingError) -> Self {
         IntakeError::Staging(err)
+    }
+}
+
+impl From<crate::defs::catalog::CatalogError> for IntakeError {
+    fn from(err: crate::defs::catalog::CatalogError) -> Self {
+        IntakeError::Catalog(Box::new(err))
     }
 }
 

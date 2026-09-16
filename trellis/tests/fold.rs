@@ -46,7 +46,7 @@ struct RawRow<'a> {
     origin_lsn: Option<u64>,
     src_changed: bool,
     hop_gen: i32,
-    group_key: Option<&'a str>,
+    group_key: Option<Vec<&'a str>>,
 }
 
 impl<'a> RawRow<'a> {
@@ -129,7 +129,7 @@ async fn fold_matches_a_from_scratch_oracle_across_mixed_ops() {
             origin_lsn: Some(100),
             src_changed: true,
             hop_gen: 0,
-            group_key: Some("g1"),
+            group_key: Some(vec!["g1"]),
         },
     )
     .await;
@@ -203,7 +203,7 @@ async fn fold_matches_a_from_scratch_oracle_across_mixed_ops() {
     assert_eq!(inserted.origin_lsn, Some(PgLsn::from(100)));
     assert!(inserted.src_changed.is_some());
     assert_eq!(inserted.hop_gen, 0);
-    assert_eq!(inserted.group_key, Some("g1".to_string()));
+    assert_eq!(inserted.group_key, Some(vec!["g1".to_string()]));
 
     let updated = find(&folded, "updated-twice");
     assert_eq!(updated.new_image, Some(r#"{"v": "c"}"#.to_string()));
@@ -225,6 +225,115 @@ async fn fold_matches_a_from_scratch_oracle_across_mixed_ops() {
     assert_eq!(recomputed.hop_gen, 1);
 
     assert_eq!(folded.len(), 4, "exactly one record per key: {folded:?}");
+}
+
+/// Issue #133: `group_key`'s real merge rule is a per-key **union** of every
+/// raw row's own touched-join-key array — not "pick one row's value" the
+/// way `new_image`/`old_image`'s arg-extremes work. Three raw rows touching
+/// three distinct join values (with some overlap between consecutive rows,
+/// and a fourth, group_key-less row thrown in) must fold to the full
+/// deduplicated union of all of them, not just one arbitrary row's array —
+/// and, in particular, the union must still carry "3", even though it's
+/// long gone from the folded `new_image` by the time this key's history
+/// ends at lsn 40 (the exact "fold erases the join key" shape this issue
+/// fixes: `staging::apply::RelationshipGenBump` reads this field, not
+/// `new_image`, for precisely this reason).
+#[tokio::test]
+async fn group_key_folds_to_the_real_union_of_every_raw_rows_touched_values() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    insert_row(
+        &client,
+        "seg_0",
+        &RawRow {
+            key: "repointed",
+            op: "insert",
+            lsn: Some(10),
+            old_image: None,
+            new_image: Some(r#"{"post":"3"}"#),
+            origin_lsn: Some(10),
+            src_changed: true,
+            hop_gen: 0,
+            group_key: Some(vec!["3"]),
+        },
+    )
+    .await;
+    insert_row(
+        &client,
+        "seg_0",
+        &RawRow {
+            key: "repointed",
+            op: "update",
+            lsn: Some(20),
+            old_image: Some(r#"{"post":"3"}"#),
+            new_image: Some(r#"{"post":"2"}"#),
+            origin_lsn: Some(20),
+            src_changed: true,
+            hop_gen: 0,
+            group_key: Some(vec!["3", "2"]),
+        },
+    )
+    .await;
+    insert_row(
+        &client,
+        "seg_0",
+        &RawRow {
+            key: "repointed",
+            op: "update",
+            lsn: Some(30),
+            old_image: Some(r#"{"post":"2"}"#),
+            new_image: Some(r#"{"post":"5"}"#),
+            origin_lsn: Some(30),
+            src_changed: true,
+            hop_gen: 0,
+            group_key: Some(vec!["2", "5"]),
+        },
+    )
+    .await;
+    // A fourth row for the same key with no group_key at all (e.g. a
+    // no-op-shaped change on some other column) — must not poison the
+    // union with a NULL element or otherwise disturb it.
+    insert_row(
+        &client,
+        "seg_0",
+        &RawRow {
+            key: "repointed",
+            op: "update",
+            lsn: Some(40),
+            old_image: Some(r#"{"post":"5"}"#),
+            new_image: Some(r#"{"post":"5"}"#),
+            origin_lsn: Some(40),
+            src_changed: true,
+            hop_gen: 0,
+            group_key: None,
+        },
+    )
+    .await;
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let txn = client.transaction().await.expect("begin fold txn");
+    let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
+        .await
+        .expect("fold");
+
+    let record = find(&folded, "repointed");
+    let mut group_key = record
+        .group_key
+        .clone()
+        .expect("group_key must be populated when any raw row carried one");
+    group_key.sort();
+    assert_eq!(
+        group_key,
+        vec!["2".to_string(), "3".to_string(), "5".to_string()],
+        "must be the full deduplicated union of every raw row's touched values, \
+         not just one row's (arbitrary) value: {folded:?}"
+    );
+    // The folded image only ever names the last endpoint (5) — exactly the
+    // erasure this issue fixes: "3" (and, transiently, "2") are invisible
+    // in new_image/old_image but must still survive via group_key.
+    assert_eq!(record.new_image, Some(r#"{"post": "5"}"#.to_string()));
 }
 
 /// A key born inside the batch: an insert immediately followed by an update

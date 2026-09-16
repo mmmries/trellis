@@ -1252,12 +1252,14 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
         // over every current source row — not part of the staging ring's
         // claim/fold/compute/apply pipeline `build_relationship_context`'s
         // gen-bump signal exists to guard (issue #130, epic #127), so
-        // `old_rows: None` here: there is no folded change with an old
-        // image to widen the touched-key set from, and the returned
-        // gen-bump map is discarded rather than applied in any transaction
-        // (there isn't one spanning this whole function to apply it in).
+        // `old_rows: None`/`changes: None` here: there is no folded change
+        // (with an old image, or a #133 `group_key`) to widen the
+        // touched-key set from, and the returned gen-bump map is discarded
+        // rather than applied in any transaction (there isn't one spanning
+        // this whole function to apply it in).
         let (ctx, _gen_bumps) =
-            apply::build_relationship_context(pool, &def.def.source, &def.def, &rows, None).await?;
+            apply::build_relationship_context(pool, &def.def.source, &def.def, &rows, None, None)
+                .await?;
         ctx
     };
 
@@ -1377,7 +1379,7 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
             let origin_lsn: Option<PgLsn> = row.get(5);
             let src_changed: Option<SystemTime> = row.get(6);
             let hop_gen: i32 = row.get(7);
-            let group_key: Option<String> = row.get(8);
+            let group_key: Option<Vec<String>> = row.get(8);
             if op == "recompute" {
                 StagedChange::Recompute {
                     src_table: src_table.to_string(),

@@ -589,19 +589,29 @@ async fn from_side_keys_with_non_null_join(
 /// "decide in Phase 2, apply in Phase 3" split [`ApplyPlan::downstream_readers`]
 /// already uses.
 ///
-/// **Known gap, tracked as issue #133** (plan doc §3.1): `touched_keys` is
-/// derived from the *folded* change's own old- and new-image join-key values
-/// — both folded endpoints (a re-point bumps both the old and new parent),
-/// not the pre-fold history. A parent erased by the fold within one batch
-/// (`ins(post 3)` + `repoint(3 -> 2)` folding to `new={post: 2}`, with post 3
-/// appearing in neither folded endpoint) is invisible here too, so it won't
-/// be bumped even though a child briefly pointed at it mid-batch — a reverse
-/// holding an enumeration captured before the re-point would then wrongly
-/// pass guard (b)'s check against post 3's `gen`. The fix is #133: widen the
-/// staging ring's `group_key` column to carry the union of touched join keys
-/// from the *raw* (pre-fold) change history, and drive this off that instead
-/// of the folded endpoints. Not solved here — #130's job is only to bump
-/// `gen` from the best signal the folded change already carries.
+/// **Issue #133 (closed the gap this comment used to describe):**
+/// `touched_keys` used to be derived only from the *folded* change's own
+/// old- and new-image join-key values — both folded endpoints (a re-point
+/// bumps both the old and new parent), never the pre-fold history. A parent
+/// erased by the fold within one batch (`ins(post 3)` + `repoint(3 -> 2)`
+/// folding to `new={post: 2}`, with post 3 appearing in neither folded
+/// endpoint) was invisible there too, so it never got bumped even though a
+/// child briefly pointed at it mid-batch — a reverse holding an enumeration
+/// captured before the re-point would then wrongly pass guard (b)'s check
+/// against post 3's `gen`.
+///
+/// [`build_relationship_context`] now unions in each touched change's own
+/// [`FoldedChange::group_key`] — the ring's real, pre-fold "every join-key
+/// value this row's raw change history touched" signal (see that field's
+/// and `staging::fold`'s doc comments for the union merge rule) — on top of
+/// the folded-endpoint values it already collected. That union is a strict
+/// superset of the old signal (an extra touched key only ever costs an
+/// UPDATE that matches zero rows — see the Phase 3 gen-bump step's own doc
+/// comment), so keeping both sources rather than replacing one with the
+/// other can only add coverage, never regress it, if `group_key` is ever
+/// unpopulated for some row (e.g. a table with no cached outbound
+/// relationship yet — see `intake::Intake`'s own doc comment on that
+/// cache's refresh-on-miss strategy).
 #[derive(Debug, Clone)]
 pub(crate) struct RelationshipGenBump {
     /// [`ddl::qualified_relationship_projection_table`]'s output — ready for
@@ -639,12 +649,22 @@ pub(crate) struct RelationshipGenBump {
 /// ring's claim/fold/compute/apply pipeline this gen bump guards — that
 /// caller discards the returned gen-bump map entirely, so `None` simply
 /// costs it nothing beyond not bothering to compute the old-side half.
+///
+/// `changes`, when supplied, is the same-length, same-index slice of
+/// [`FoldedChange`]s `rows`/`old_rows` were decoded from — issue #133's
+/// signal, read for its `group_key` (the real, pre-fold union of touched
+/// join keys; see that field's doc comment) and unioned into the same
+/// gen-bump touched-key set `old_rows` widens. `None` for the same
+/// `quarantine::recompute_column` caller as `old_rows`: that path has no
+/// `FoldedChange`s at all (a live full-table scan, not the staging ring's
+/// pipeline) and, as above, discards the gen-bump map regardless.
 pub(crate) async fn build_relationship_context(
     pool: &Pool,
     from_table: &str,
     def: &TransformDef,
     rows: &[Option<Row>],
     old_rows: Option<&[Option<Row>]>,
+    changes: Option<&[&FoldedChange]>,
 ) -> Result<(RelationshipContext, HashMap<i64, RelationshipGenBump>), ApplyError> {
     // Group the referenced columns by relationship name (a relationship may be
     // read for more than one column across the definition's fields).
@@ -733,12 +753,19 @@ pub(crate) async fn build_relationship_context(
                     },
                 );
 
-                // #130's gen-bump signal — see [`RelationshipGenBump`]'s doc
-                // comment for the #133 gap this is a documented,
-                // best-available approximation of. Both folded endpoints:
-                // the new-side join keys just resolved above, plus every
-                // change's own old-image `from_col` value (a re-point's
-                // *previous* parent, which the new-side scan never sees).
+                // #130's gen-bump signal, widened by #133 — see
+                // [`RelationshipGenBump`]'s doc comment. Three sources, all
+                // unioned (a spurious extra touched key only ever costs a
+                // zero-row `UPDATE`, never a correctness problem — see the
+                // Phase 3 gen-bump step's own doc comment): the folded
+                // endpoints (both folded new-side join keys just resolved
+                // above, and every change's own folded old-image `from_col`
+                // value — a re-point's *previous* parent, which the
+                // new-side scan never sees), plus #133's real pre-fold
+                // signal: every touched change's own `group_key` union,
+                // which is what still names a parent (like the plan doc's
+                // "post 3") the fold erased from *both* folded endpoints
+                // within this same batch.
                 if let Some(qualified_projection) = qualified_projection {
                     let mut touched: std::collections::HashSet<String> =
                         join_keys.iter().cloned().collect();
@@ -746,6 +773,13 @@ pub(crate) async fn build_relationship_context(
                         for old_row in old_rows.iter().flatten() {
                             if let Some(Some(text)) = old_row.get(&from_col) {
                                 touched.insert(text.clone());
+                            }
+                        }
+                    }
+                    if let Some(changes) = changes {
+                        for change in changes {
+                            if let Some(group_key) = &change.group_key {
+                                touched.extend(group_key.iter().cloned());
                             }
                         }
                     }
@@ -1555,39 +1589,34 @@ async fn check_reverse_guards(
     // `old_key` or `new_key`, deduped so an ordinary same-key attribute
     // update (`old_key == new_key`) doesn't scan the same key twice.
     //
-    // **Note for #133's implementer, on the plan doc's §3.1 fold-erasure
-    // finding** ("post 3 appears in neither folded image" when a from-side
-    // row is inserted then re-pointed within the same batch): that finding
-    // is about guard (b) specifically — `RelationshipGenBump` is resolved
-    // from the *folded* view (`compute`'s per-def evaluation), so a parent
-    // key an intermediate, erased image touched never gets its projection
-    // row's `gen` bumped at all, and guard (b)'s re-check can't detect a
-    // conflict that never bumped anything.
+    // **Resolved by #133, on the plan doc's §3.1 fold-erasure finding**
+    // ("post 3 appears in neither folded image" when a from-side row is
+    // inserted then re-pointed within the same batch): that finding was
+    // about guard (b) specifically — `RelationshipGenBump` used to be
+    // resolved purely from the *folded* view (`compute`'s per-def
+    // evaluation), so a parent key an intermediate, erased image touched
+    // never got its projection row's `gen` bumped at all, and guard (b)'s
+    // re-check couldn't detect a conflict that never bumped anything.
+    // `build_relationship_context` now also unions in each touched change's
+    // `FoldedChange::group_key` — the real, pre-fold union of touched
+    // join keys the ring carries precisely for this (see that field's and
+    // `staging::fold`'s doc comments for the merge rule) — so the erased
+    // parent's `gen` does bump, and guard (b) alone now catches the
+    // scenario. See `tests/apply_relationship_reverse.rs`'s
+    // `issue_133_a_within_batch_repoint_still_bumps_the_erased_intermediate_parents_gen`
+    // for the dedicated regression pin this comment used to ask for.
     //
-    // `from_side_change_in_flight` below, by contrast, scans the **raw**
-    // ring rows directly (`seg_N`'s physical rows, one per raw CDC change,
-    // never mutated by the fold — only `claim`/`fold`'s *read-time*
-    // collapsing ever loses the intermediate image), so it *does* see the
-    // erased touch — as long as the batch that erased it is still
-    // undrained when this check runs: an in-flight insert
-    // (`old_image=NULL`, `new_image` naming the erased parent key) is a
-    // distinct physical row from the later re-point, and both independently
-    // match `old_image ->> from_col`/`new_image ->> from_col` here. That
-    // gives this guard a real, if incomplete, safety net for the scenario:
-    // it closes the window while the erasing batch is still draining, but
-    // once that batch fully drains (its own forward apply having already
-    // resolved directly against the *final* parent, never having produced
-    // a settled contribution to the erased intermediate one — which is
-    // arguably correct on its own terms, since that row's settled state
-    // never touched the erased parent at all), there is nothing left in the
-    // ring for this scan to find. Whether that residual window is fully
-    // closed, or needs the plan doc's own prescribed fix (§7 Phase 1 step
-    // 5b: give the ring's reserved `group_key` column a real "union of
-    // touched join keys" merge rule and drive guard (b) off it, explicitly
-    // sequenced *after* this issue) is the open question #133 should
-    // resolve with a dedicated test once that merge rule exists — this
-    // comment is the trail left instead of a hastily-built one now, per
-    // that issue's own review.
+    // `from_side_change_in_flight` below still independently scans the
+    // **raw** ring rows directly (`seg_N`'s physical rows, one per raw CDC
+    // change, never mutated by the fold — only `claim`/`fold`'s *read-time*
+    // collapsing ever loses the intermediate image) for the same erased
+    // touch, so it also catches it — but only as long as the erasing batch
+    // is still undrained when this check runs (see the doc comment history
+    // in git blame for the exact "once that batch fully drains, there is
+    // nothing left in the ring for this scan to find" reasoning this guard
+    // used to have to lean on alone). With #133 landed, guard (c) catching
+    // it too is redundant-but-harmless defense in depth, not the only
+    // safety net for this scenario anymore.
     let mut keys: Vec<&str> = Vec::with_capacity(2);
     if let Some(k) = old_key.as_deref() {
         keys.push(k);
@@ -3042,6 +3071,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         &def.def,
                         &rows,
                         Some(&old_rows),
+                        Some(changes.as_slice()),
                     )
                     .await?;
                     // Issue #130: merge this definition's touched-parent keys

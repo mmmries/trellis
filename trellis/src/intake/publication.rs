@@ -396,6 +396,17 @@ pub(crate) async fn enumerate_and_append(
                 src_table: src_table.to_string(),
                 key,
                 hop_gen: 0,
+                // Issue #133: intentionally `None`, not merely unpopulated
+                // — a `Recompute` carries no `old_image`/`new_image` (see
+                // `StagedChange::Recompute`'s own doc comment), and
+                // `group_key`'s value is specifically "which join-key
+                // values this row's own image-bearing history touched," so
+                // there is no image here to read one from. This is the
+                // "backfill-enumeration producer" the issue's own text
+                // flags as needing "the equivalent treatment" — the
+                // equivalent treatment for an image-less producer is
+                // leaving this `None`, matching every other `Recompute`
+                // producer (reverse propagation, definition re-derive).
                 group_key: None,
                 // No meaningful origin for a backfill's cursor-enumerated
                 // pre-existing row — nothing "changed" it; see

@@ -95,6 +95,41 @@ async fn stage_cdc_at_lsn(
         .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
 }
 
+/// Issue #133's own staging helper: [`stage_cdc_at_lsn`] plus an explicit
+/// `group_key` — standing in for what real intake's `cdc_change`/
+/// `touched_group_key` would have populated from the row's own old/new
+/// images for its outbound relationship's `from_col`, since these tests
+/// stage directly into the ring rather than running a real replication
+/// stream.
+async fn stage_cdc_with_group_key_at_lsn(
+    client: &Client,
+    src_table: &str,
+    key: &str,
+    op: &str,
+    old_image: Option<&str>,
+    new_image: Option<&str>,
+    lsn: u64,
+    group_key: &[&str],
+) {
+    let src_table = qualify_fixture_table(src_table);
+    let table = active_seg_table(client).await;
+    let lsn = PgLsn::from(lsn);
+    let group_key: Vec<&str> = group_key.to_vec();
+    client
+        .execute(
+            &format!(
+                "insert into {table} \
+                 (src_table, key, op, lsn, old_image, new_image, hop_gen, group_key) \
+                 values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0, $7)"
+            ),
+            &[
+                &src_table, &key, &op, &lsn, &old_image, &new_image, &group_key,
+            ],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
+}
+
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // Issue #132: a throwaway, always-caught-up watermark for the tests
     // that just want the pipeline to converge — the guard (a)-specific
@@ -1008,6 +1043,269 @@ async fn guard_b_generation_check_rejects_and_the_pipeline_still_converges() {
         Some(&(Some("3".to_string()), Some("650".to_string()))),
         "the pipeline must still converge on post 1's true value (400) via \
          the fallback, even though guard (b) rejected the direct delta"
+    );
+}
+
+/// Issue #133's own regression pin — the exact trace from the issue body
+/// (plan doc §3.1): a from-side row (`articles`) is inserted pointing at
+/// category 3, then re-pointed to category 2, **within the same batch**.
+/// The fold collapses this to `old_image = NULL` (born in the batch),
+/// `new_image` naming category 2 — category 3 appears in *neither* folded
+/// endpoint. Before #133, nothing signalled that category 3 was touched at
+/// all, so its projection row's `gen` never bumped, and a reverse for
+/// category 3 holding an enumeration captured before the re-point would
+/// wrongly pass guard (b) and move a row (`articles` id 100) that never
+/// left. This test proves both halves directly: (1) the erasing batch's own
+/// Phase 3 still bumps category 3's `gen` (a positive, direct signal —
+/// before #133 this assertion alone fails, since nothing in the folded
+/// old/new image ever named category 3), and (2) a stale reverse captured
+/// before that bump is then correctly rejected by guard (b) rather than
+/// silently applying against a from-side set that already moved on.
+///
+/// Deliberately uses the `articles`/`categories` `KeySpace::OneToOne`
+/// fixture (`article_cat_def`, below), **not** this file's usual
+/// `post_tags`/`posts` aggregate fixture: an aggregate definition's forward
+/// path goes through `apply_aggregate`'s `rel_joins`/`force_every_group`
+/// mechanism (out of scope for this issue — see the plan doc §7 step 8 and
+/// this crate's own review notes), which never calls
+/// `build_relationship_context` and so never reaches the #133 gen-bump code
+/// at all. A `KeySpace::OneToOne` definition reading a relationship is the
+/// shape that actually exercises it on the forward path.
+#[tokio::test]
+async fn issue_133_a_within_batch_repoint_still_bumps_the_erased_intermediate_parents_gen() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table categories (id integer primary key, name text); \
+             alter table categories replica identity full; \
+             create table articles (id integer primary key, category_id integer); \
+             alter table articles replica identity full; \
+             insert into categories (id, name) values (1, 'A'), (2, 'B'), (3, 'C')",
+        )
+        .await
+        .expect("create + seed tables");
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP category FROM articles.category_id TO categories.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    create_definition(
+        &db.pool,
+        "TRANSFORM article_cat FROM articles SELECT category.name AS category_name",
+        &articles_columns(),
+    )
+    .await
+    .expect("create to-one enrichment definition");
+    let pk = source_primary_key(&db.pool, "articles")
+        .await
+        .expect("introspect articles pk");
+    create_target_table(
+        &db.pool,
+        &article_cat_def(),
+        "public",
+        &pk,
+        &articles_columns(),
+        &article_cat_def().source,
+    )
+    .await
+    .expect("create target table");
+
+    // The pre-existing child: article 100, already pointing at category 3
+    // before either of this test's two batches runs — the row guard (b)'s
+    // fallback must (correctly) still move, and must be the *only* one it
+    // moves. Both the live row (guard (b)'s fallback live-enumerates the
+    // *current* table, not the ring) and its staged CDC record (so the
+    // forward path picks it up too) are needed.
+    client
+        .execute(
+            "insert into articles (id, category_id) values (100, 3)",
+            &[],
+        )
+        .await
+        .expect("insert article 100 pointing at category 3");
+    stage_cdc_at_lsn(
+        &client,
+        "articles",
+        "100",
+        "insert",
+        None,
+        Some("{\"id\":100,\"category_id\":3}"),
+        1,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+    let baseline_lsn_3 = projection_lsn(&client, &projection_table, 3).await;
+    let baseline_gen_3 = projection_gen(&client, &projection_table, 3).await;
+
+    // The reverse candidate: a genuine parent change to category 3 (rename
+    // it), Phase 2-captured *before* the erasing batch below ever runs — so
+    // its `prev_gen` is `baseline_gen_3`, about to go stale.
+    client
+        .execute("update categories set name = 'C-renamed' where id = 3", &[])
+        .await
+        .expect("rename category 3");
+    stage_cdc_at_lsn(
+        &client,
+        "categories",
+        "3",
+        "update",
+        Some("{\"id\":3,\"name\":\"C\"}"),
+        Some("{\"id\":3,\"name\":\"C-renamed\"}"),
+        100,
+    )
+    .await;
+    let seg_r = seal_active_segment(&mut client).await;
+    let plan_r = claim_fold_compute(&db.pool, seg_r, "worker_r").await;
+
+    // The erasing batch: `articles` row 200 inserted pointing at category
+    // 3, then re-pointed to category 2 — both within the *same*,
+    // still-active segment. `group_key` is set explicitly on each raw row
+    // (standing in for what real intake's `touched_group_key` would have
+    // read off these same old/new images), exactly as issue #133 populates
+    // it: the insert's own touched value (3), then the update's own
+    // touched values (3 and 2).
+    client
+        .execute(
+            "insert into articles (id, category_id) values (200, 3)",
+            &[],
+        )
+        .await
+        .expect("insert an article pointing at category 3");
+    stage_cdc_with_group_key_at_lsn(
+        &client,
+        "articles",
+        "200",
+        "insert",
+        None,
+        Some("{\"id\":200,\"category_id\":3}"),
+        200,
+        &["3"],
+    )
+    .await;
+    client
+        .execute("update articles set category_id = 2 where id = 200", &[])
+        .await
+        .expect("re-point article 200 to category 2");
+    stage_cdc_with_group_key_at_lsn(
+        &client,
+        "articles",
+        "200",
+        "update",
+        Some("{\"id\":200,\"category_id\":3}"),
+        Some("{\"id\":200,\"category_id\":2}"),
+        300,
+        &["3", "2"],
+    )
+    .await;
+
+    // Fully drain the erasing batch on its own — its Phase 3 is what must
+    // bump category 3's gen via the #133 `group_key` signal.
+    let seg_e = seal_active_segment(&mut client).await;
+    let watermark = StagedWatermark::saturated();
+    while apply::drain_once(
+        &db.pool,
+        seg_e,
+        "worker_e",
+        1,
+        "trellis_reverse_test",
+        &watermark,
+    )
+    .await
+    .expect("drain_once seg_e")
+    .is_some()
+    {}
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+
+    // (1) The positive, direct signal: category 3's projection row's gen
+    // must have bumped, even though category 3 is invisible in the erasing
+    // batch's own folded old/new images — this is exactly the assertion
+    // that fails without #133 (the folded-endpoint-only signal never names
+    // category 3 at all: old_image is NULL, born in the batch; new_image
+    // names category 2).
+    assert_eq!(
+        projection_gen(&client, &projection_table, 3).await,
+        baseline_gen_3 + 1,
+        "the erased intermediate parent (category 3) must still get its gen \
+         bumped — the folded old/new images alone never name it"
+    );
+
+    // (2) Guard (b): the reverse captured *before* that bump must now be
+    // rejected, not silently applied against a from-side set that already
+    // moved on (article 200 no longer points at category 3).
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg_r,
+        "worker_r",
+        &plan_r,
+        "trellis_reverse_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("apply (rejected internally by guard (b), but the drain call itself still succeeds)");
+    txn.commit().await.expect("commit");
+
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 3).await,
+        baseline_lsn_3,
+        "guard (b) must reject before ever touching the projection's lsn"
+    );
+    assert_eq!(
+        projection_gen(&client, &projection_table, 3).await,
+        baseline_gen_3 + 1,
+        "guard (b) must not advance gen any further than the erasing batch's own bump"
+    );
+    assert_eq!(
+        staged_recompute_keys(&client, "articles").await,
+        vec!["100".to_string()],
+        "guard (b) must fall back to an image-less recompute of category 3's \
+         *current* from-side rows — article 100 (the original, undisturbed \
+         pointer), not article 200 (which re-pointed away and must not be \
+         wrongly moved)"
+    );
+
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    // Not "C-renamed": the mechanism-level assertions above are this test's
+    // actual #133 proof (the erased parent's gen bumped; guard (b) then
+    // correctly rejected the stale reverse and fell back to recomputing
+    // exactly article 100, not article 200). The rejected reverse's own
+    // projection-advance step is a documented no-op on rejection — see
+    // `apply_and_mark_drained_many`'s "3d" step's own comment ("Do NOT
+    // touch any target table or the projection for this record") — so the
+    // settled parent projection for category 3 stays at its pre-rename
+    // value until something re-attempts that reverse. Retrying it is #134's
+    // still-unbuilt deferral/retry plumbing, explicitly out of scope here;
+    // a `KeySpace::OneToOne` target has no live-join fallback the way an
+    // aggregate's `rel_joins` path does (that's why this fixture — not
+    // TAG_TOTALS — is what exercises guard (b) at all, per this test's own
+    // opening comment), so its recompute re-reads the same (still-stale)
+    // projection rather than the live `categories` table.
+    assert_eq!(
+        target_category_name(&client, 100).await,
+        Some("C".to_string()),
+        "article 100's target stays on category 3's pre-rename value — the \
+         rejected reverse's projection-advance is a no-op by design (#134), \
+         not a regression in #133's own fix"
+    );
+    assert_eq!(
+        target_category_name(&client, 200).await,
+        Some("B".to_string()),
+        "article 200 must reflect category 2 (where it actually re-pointed to), \
+         not category 3 (where guard (b) correctly refused to move it)"
     );
 }
 

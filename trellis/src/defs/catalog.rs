@@ -1683,6 +1683,51 @@ pub async fn relationships_to_table(
     Ok(result)
 }
 
+/// Every relationship whose `from_table` is `from_table` — the outbound
+/// mirror of [`relationships_to_table`], structured identically (same query
+/// shape, same read-back-and-reparse). Issue #133 (epic #127) uses this to
+/// build intake's `src_table -> from_col` cache: the columns a from-side
+/// row's own CDC images must be read to populate the ring's `group_key`
+/// column (the union of join-key values that row's change touched).
+pub async fn relationships_from_table(
+    pool: &Pool,
+    from_table: &str,
+) -> Result<Vec<RelationshipDefinition>, CatalogError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "select id, definition_text, cardinality
+             from relationship_definitions
+             where from_table = $1
+             order by id",
+            &[&from_table],
+        )
+        .await?;
+
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: i64 = row.get(0);
+        let text: String = row.get(1);
+        let cardinality_text: String = row.get(2);
+        let def = parse_relationship(&text)?;
+        let cardinality = RelationshipCardinality::from_persisted(&cardinality_text)
+            .unwrap_or_else(|| {
+                panic!(
+                    "relationship_definitions.cardinality held unrecognized value '{cardinality_text}'"
+                )
+            });
+        result.push(RelationshipDefinition {
+            id,
+            def,
+            cardinality,
+            // Creation-time guidance, not a fact about the persisted row — see
+            // the field's doc comment on [`RelationshipDefinition`].
+            warnings: Vec::new(),
+        });
+    }
+    Ok(result)
+}
+
 /// Resolves every relationship a definition's calculated fields reference
 /// (issue #40) into the [`ResolvedRelationship`] map [`super::validate`] needs
 /// to enforce ADR-0006's reference-time cardinality and type rules. The
