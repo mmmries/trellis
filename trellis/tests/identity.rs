@@ -266,12 +266,13 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // Prometheus stack — see docs/observability.md's "Retention" section),
     // so V25 is not reissued to anything else. Issue #129 (epic #127)
     // added V26 (`relationship_projections`). Issue #133 (epic #127) added
-    // V27 (`group_key_array`).
+    // V27 (`group_key_array`). Issue #134 (epic #127) added V28
+    // (`relationship_reverse_deferred`).
     assert_eq!(
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            26, 27
+            26, 27, 28
         ]
     );
 }

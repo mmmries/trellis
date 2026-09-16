@@ -145,6 +145,27 @@ pub struct FoldedChange {
     /// this to find, per drain, which `src_table`s were truncated, without
     /// filtering `op` anywhere upstream of this one flag.
     pub is_truncate: bool,
+    /// Issue #134: this key's `relationship_definitions.id`, present iff at
+    /// least one row in this group carries `op = 'rel_reverse_deferred'` — a
+    /// previously guard-rejected to-one relationship reverse, ready to
+    /// retry. Every row that can contribute to one group necessarily shares
+    /// the same relationship id (the synthetic `src_table` this op uses,
+    /// `staging::apply::relationship_reverse_deferred_src_table`, embeds it,
+    /// so two different relationships' rows never land in the same fold
+    /// group at all) — mirrors `is_truncate`'s discriminator role: `compute`
+    /// (`staging::apply`) filters a group with this set out of the ordinary
+    /// per-source forward-evaluation loop entirely (same as a truncate
+    /// sentinel) and reconstructs a fresh `RelationshipReverseRecord` from
+    /// it instead, re-deriving guard state live rather than from anything
+    /// this struct carries.
+    pub relationship_reverse_deferred: Option<i64>,
+    /// Issue #134: `MAX(retry_count)` across the group's
+    /// `rel_reverse_deferred` rows — mirrors `hop_gen`'s own MAX-across-
+    /// the-group fold rule (the same rationale applies: folding to the
+    /// larger count can't itself cause an under-report of how many times
+    /// this reverse has been deferred). `0` when
+    /// `relationship_reverse_deferred` is `None`.
+    pub retry_count: i32,
 }
 
 /// The fenced window's full column projection the fold needs, with jsonb
@@ -156,7 +177,7 @@ pub struct FoldedChange {
 /// on `op` (see the discriminator comment below).
 const FOLD_COLUMNS: &str = "src_table, key, old_image::text as old_image, \
      new_image::text as new_image, lsn, origin_lsn, src_changed, hop_gen, \
-     group_key, appended_at, change_id, route, op";
+     group_key, appended_at, change_id, route, op, relationship_id, retry_count";
 
 /// Runs the claim-time fold over `seg_seq`'s fenced window, restricted to
 /// `bucket`. One [`FoldedChange`] per `(src_table, key)` present in that
@@ -267,7 +288,11 @@ pub async fn fold(
              case when bool_or(src_changed is not null) then 0 else max(hop_gen) end as hop_gen, \
              min(appended_at) as first_seen, \
              group_keys.group_key, \
-             bool_or(op = 'truncate') as is_truncate \
+             bool_or(op = 'truncate') as is_truncate, \
+             max(relationship_id) filter (where op = 'rel_reverse_deferred') \
+                 as relationship_reverse_deferred, \
+             coalesce(max(retry_count) filter (where op = 'rel_reverse_deferred'), 0) \
+                 as retry_count \
          from filtered \
          left join group_keys \
              on group_keys.src_table = filtered.src_table and group_keys.key = filtered.key \
@@ -296,6 +321,8 @@ pub async fn fold(
             first_seen: row.get(8),
             group_key: row.get(9),
             is_truncate: row.get(10),
+            relationship_reverse_deferred: row.get(11),
+            retry_count: row.get(12),
         })
         .collect())
 }
@@ -377,6 +404,15 @@ pub fn merge_folded_changes(per_segment: Vec<Vec<FoldedChange>>) -> Vec<FoldedCh
 ///   assumed away, so a future caller that breaks that invariant fails
 ///   toward "still marked as a truncate" rather than toward silently
 ///   dropping one.
+/// - `relationship_reverse_deferred`: issue #134 — whichever side carries
+///   one (`Option::or`); both sides carrying different values would mean two
+///   different relationships' rows landed in the same `(src_table, key)`
+///   group, which the synthetic per-relationship `src_table` this op uses
+///   (`apply::relationship_reverse_deferred_src_table`) makes impossible by
+///   construction, so this is "propagate the one real value forward,"
+///   exactly like `group_key`'s missing-side convention.
+/// - `retry_count`: `MAX` across the two sides, mirroring `hop_gen`'s own
+///   cross-segment `MAX` rule and [`fold`]'s SQL `MAX(retry_count)`.
 fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
     let earlier_has_image = earlier.old_image.is_some() || earlier.new_image.is_some();
     let later_has_image = later.old_image.is_some() || later.new_image.is_some();
@@ -413,6 +449,10 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
         first_seen: earlier.first_seen.min(later.first_seen),
         group_key: merge_group_keys(earlier.group_key, later.group_key),
         is_truncate: earlier.is_truncate || later.is_truncate,
+        relationship_reverse_deferred: earlier
+            .relationship_reverse_deferred
+            .or(later.relationship_reverse_deferred),
+        retry_count: earlier.retry_count.max(later.retry_count),
     }
 }
 
@@ -461,6 +501,8 @@ mod merge_tests {
             first_seen: SystemTime::UNIX_EPOCH,
             group_key: None,
             is_truncate: false,
+            relationship_reverse_deferred: None,
+            retry_count: 0,
         }
     }
 

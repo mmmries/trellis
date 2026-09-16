@@ -83,6 +83,19 @@ const END_TO_END_LATENCY_METRIC: &str = "trellis_end_to_end_latency_seconds";
 /// rows by [`crate::staging::SegmentState`], labeled `state`.
 const STAGING_SEGMENTS_METRIC: &str = "trellis_staging_segments";
 
+/// Issue #134/#135 (epic #127): count of to-one relationship reverse deltas
+/// deferred by one of issue #132's four guards, labeled `guard` — the plan
+/// doc's own `d5_block_barrier`/`d5_block_gen`/`d5_block_inflight`/
+/// `d5_block_order` names, used verbatim as this one metric's label
+/// *values* (`ReverseGuardFailure::metric_label`) rather than as four
+/// separate metric names, matching this module's existing
+/// one-metric-plus-label convention. Issue #135 (starvation freedom, not
+/// yet built) is the reason this exists now: a fairness mechanism needs
+/// exactly this per-guard deferral rate to model against, and it needs to be
+/// observable in production before that mechanism ships, not just modeled
+/// offline.
+const RELATIONSHIP_REVERSE_DEFERRED_METRIC: &str = "trellis_relationship_reverse_deferred_total";
+
 /// The process-wide recorder handle, built and installed on first use. See
 /// the module doc comment's "Recorder installation" section.
 fn handle() -> &'static PrometheusHandle {
@@ -131,6 +144,11 @@ fn describe_metrics() {
     metrics::describe_gauge!(
         STAGING_SEGMENTS_METRIC,
         "Count of staging ring segments, labeled by state (active/sealed/draining/drained)."
+    );
+    metrics::describe_counter!(
+        RELATIONSHIP_REVERSE_DEFERRED_METRIC,
+        "Count of to-one relationship reverse deltas deferred by a guard rejection, labeled by \
+         guard (d5_block_barrier/d5_block_gen/d5_block_inflight/d5_block_order)."
     );
 }
 
@@ -191,6 +209,27 @@ pub fn increment_changes_applied(transform: &str) {
 pub fn set_staging_segments(state: &str, count: u64) {
     ensure_installed();
     metrics::gauge!(STAGING_SEGMENTS_METRIC, "state" => state.to_string()).set(count as f64);
+}
+
+/// Increments [`RELATIONSHIP_REVERSE_DEFERRED_METRIC`] by one for `guard`
+/// (issue #134/#135) — called from `staging::apply::apply_and_mark_drained_many`'s
+/// "3d" step at the same point it re-stages the rejected record as a
+/// `StagedChange::RelationshipReverseDeferred`, inside the open Phase-3
+/// transaction. Unlike `record_transform_latency`/`increment_changes_applied`
+/// (buffered on `ApplyPlan` and flushed only post-commit — see
+/// `staging::apply::flush_apply_metrics`'s doc comment for why), this is
+/// recorded eagerly, before that transaction commits: a documented, accepted
+/// gap (the same posture this exact call site's own `tracing::warn!` already
+/// takes) rather than plumbing a fourth buffered-metrics accumulator through
+/// `ApplyPlan`/Phase 3 for a purely observational counter — a rolled-back
+/// Phase 3 (rare; only a later, unrelated failure in the same transaction
+/// after this step runs) could over-count by one per guard rejection in that
+/// transaction, never under-count, and never affects anything the deferral
+/// mechanism's own correctness depends on.
+pub fn increment_relationship_reverse_deferred(guard: &str) {
+    ensure_installed();
+    metrics::counter!(RELATIONSHIP_REVERSE_DEFERRED_METRIC, "guard" => guard.to_string())
+        .increment(1);
 }
 
 /// A handle onto this process's in-process metrics registry — the public,

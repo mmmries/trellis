@@ -1279,6 +1279,8 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
         first_seen: SystemTime::now(),
         group_key: None,
         is_truncate: false,
+        relationship_reverse_deferred: None,
+        retry_count: 0,
     }];
 
     let result = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 0)

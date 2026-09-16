@@ -353,6 +353,12 @@ pub(crate) fn stamp_commit_metadata(
                 *src_changed = Some(changed_at);
             }
             StagedChange::Recompute { .. } => {}
+            // Issue #134: never produced by intake — only Phase 3
+            // (`staging::apply::apply_and_mark_drained_many`) stages this
+            // variant, directly through an open `Transaction`, never
+            // through this buffered/spilled intake path. `lsn`/`src_changed`
+            // are set explicitly by that call site instead of here.
+            StagedChange::RelationshipReverseDeferred { .. } => {}
         }
     }
 }

@@ -298,6 +298,86 @@ async fn staged_recompute_keys(client: &Client, src_table: &str) -> Vec<String> 
         .collect()
 }
 
+/// Issue #134: every `rel_reverse_deferred` row currently staged for
+/// `relationship_id` in the *active* ring segment — `(key, retry_count,
+/// hop_gen)`, ordered by key. `hop_gen` rides along so tests can assert the
+/// hop-bound-exemption property directly off the persisted row, not just
+/// off `MAX_HOP_GEN` never tripping.
+async fn staged_deferred_reverses(
+    client: &Client,
+    relationship_id: i64,
+) -> Vec<(String, i32, i32)> {
+    let table = active_seg_table(client).await;
+    client
+        .query(
+            &format!(
+                "select key, retry_count, hop_gen from {table} \
+                 where op = 'rel_reverse_deferred' and relationship_id = $1 order by key"
+            ),
+            &[&relationship_id],
+        )
+        .await
+        .expect("read staged rel_reverse_deferred rows")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect()
+}
+
+/// Issue #134: same shape as [`staged_deferred_reverses`], but scoped to
+/// one *specific* already-sealed `seg_seq`'s own physical ring table,
+/// rather than whatever is currently active — how the
+/// "re-stage into the active batch, never the one being drained" tests
+/// below prove a deferred row is *absent* from the segment its own
+/// rejection ran against.
+async fn deferred_reverses_in_segment(
+    client: &Client,
+    seg_seq: i64,
+    relationship_id: i64,
+) -> Vec<(String, i32, i32)> {
+    let ring_slot: i16 = client
+        .query_one(
+            "select ring_slot from segments where seg_seq = $1",
+            &[&seg_seq],
+        )
+        .await
+        .expect("read segment's ring_slot")
+        .get(0);
+    let table = format!("seg_{ring_slot}");
+    client
+        .query(
+            &format!(
+                "select key, retry_count, hop_gen from {table} \
+                 where op = 'rel_reverse_deferred' and relationship_id = $1 order by key"
+            ),
+            &[&relationship_id],
+        )
+        .await
+        .expect("read staged rel_reverse_deferred rows")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect()
+}
+
+/// The current value of one label-series of a counter, scraped out of
+/// [`trellis::metrics::Metrics::render_prometheus`]'s text exposition —
+/// mirrors `end_to_end_latency.rs`'s own `bucket_count`/
+/// `metric_mentions_transform` helpers for that file's histograms. `0` when
+/// the series doesn't appear in the render at all (a label combination
+/// that's never been incremented yet doesn't emit a line), matching a
+/// counter's own natural starting value — never a panic, since a "before"
+/// snapshot legitimately hits this case for a guard this test hasn't
+/// triggered yet.
+fn counter_value(rendered: &str, metric: &str, label_name: &str, label_value: &str) -> u64 {
+    rendered
+        .lines()
+        .find(|line| {
+            line.starts_with(metric) && line.contains(&format!("{label_name}=\"{label_value}\""))
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------
 // 1. A to-side update is a real delta, not a live recompute.
 // ---------------------------------------------------------------------
@@ -693,30 +773,31 @@ async fn a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges() {
     );
 }
 
-/// Review follow-up to issue #131: the guard-(d) stopgap's fallback loop
-/// used to enumerate `old_key`/`new_key` with no dedup, so an *ordinary*
-/// same-key parent attribute update (`old_key == new_key`, the common case
-/// — a parent PK change or insert/delete is what actually needs both sides)
-/// iterated the identical join key twice and staged every matching
-/// from-side row's image-less `Recompute` *twice*. Not a correctness bug (a
-/// `Recompute` re-derives live state idempotently), but it doubled the ring
-/// writes and live-DB reads every time the stopgap fired on an ordinary
-/// update.
+/// Issue #134 (originally a review follow-up to issue #131, about the
+/// guard-(d) stopgap's *from-side Recompute* fallback loop double-staging
+/// when `old_key == new_key`): that fallback no longer exists — a guard
+/// rejection now re-stages the record itself as one `rel_reverse_deferred`
+/// row, not a per-from-side-row `Recompute` fan-out, so the double-staging
+/// this test originally pinned is structurally impossible today (there is
+/// nothing left to enumerate twice). Repurposed to pin the replacement
+/// invariant that matters now: an ordinary same-key parent update
+/// (`old_key == new_key`, ids equal) whose guard (d) rejects stages
+/// *exactly one* `rel_reverse_deferred` row — not two, one per key side —
+/// carrying `retry_count = 1` and `hop_gen = 0` (issue #134's exemption).
 ///
 /// Same two-segment setup as `a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges`,
 /// but both parent changes touch the same `id = 1` (an ordinary attribute
-/// update on both sides, not a repoint) — the exact shape the bug affected
-/// — and instead of draining to quiescence, this inspects the ring
-/// directly right after B's rejected apply commits: exactly one `recompute`
-/// row per from-side row matching post 1 (ids 10 and 12), not two apiece.
+/// update on both sides, not a repoint) — and instead of draining to
+/// quiescence, this inspects the ring directly right after B's rejected
+/// apply commits.
 #[tokio::test]
-async fn a_same_key_stopgap_stages_exactly_one_recompute_per_from_side_row() {
+async fn a_same_key_guard_rejection_stages_exactly_one_deferred_reverse_row() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     create_schema(&client).await;
 
-    create_relationship(
+    let relationship = create_relationship(
         &db.pool,
         "RELATIONSHIP post FROM post_tags.post TO posts.id",
     )
@@ -780,10 +861,10 @@ async fn a_same_key_stopgap_stages_exactly_one_recompute_per_from_side_row() {
     .expect("apply A");
     txn.commit().await.expect("commit A");
 
-    // Apply B: prev_lsn is stale — the guard-(d) stopgap fires and falls
-    // back to Recompute for post_tags rows 10 and 12 (both point at
-    // post 1). Neither A's fast-path delta (no downstream readers of
-    // tag_totals) nor B's own stopgap branch (it `continue`s past the
+    // Apply B: prev_lsn is stale — guard (d) rejects and B is re-staged as
+    // one `rel_reverse_deferred` row (issue #134), not a from-side
+    // Recompute fan-out. Neither A's fast-path delta (no downstream readers
+    // of tag_totals) nor B's own deferral branch (it `continue`s past the
     // `needs_recompute_fallback`/projection-advance code) stages anything
     // else, so whatever lands in the now-active ring segment is exactly
     // this test's signal.
@@ -801,27 +882,13 @@ async fn a_same_key_stopgap_stages_exactly_one_recompute_per_from_side_row() {
     .expect("apply B");
     txn.commit().await.expect("commit B");
 
-    let table = active_seg_table(&client).await;
-    let post_tags_table = qualify_fixture_table("post_tags");
-    let recompute_keys: Vec<String> = client
-        .query(
-            &format!(
-                "select key from {table} where src_table = $1 and op = 'recompute' order by key"
-            ),
-            &[&post_tags_table],
-        )
-        .await
-        .expect("read staged recompute rows")
-        .into_iter()
-        .map(|r| r.get(0))
-        .collect();
-
+    let deferred = staged_deferred_reverses(&client, relationship.id).await;
     assert_eq!(
-        recompute_keys,
-        vec!["10".to_string(), "12".to_string()],
-        "exactly one fallback Recompute per from-side row matching post 1 \
-         (ids 10 and 12) — not two apiece from redundantly enumerating \
-         old_key and new_key when they're equal"
+        deferred,
+        vec![("1".to_string(), 1, 0)],
+        "exactly one rel_reverse_deferred row for post 1 (old_key == new_key, \
+         not one per side), retry_count 1 on its first rejection, hop_gen \
+         untouched at 0"
     );
 }
 
@@ -914,10 +981,16 @@ async fn guard_a_watermark_barrier_rejects_and_the_pipeline_still_converges() {
         "guard (a) must reject before ever touching the projection"
     );
     assert_eq!(
-        staged_recompute_keys(&client, "post_tags").await,
-        vec!["10".to_string(), "12".to_string()],
-        "guard (a) must fall back to an image-less recompute of post 1's \
-         from-side rows"
+        staged_deferred_reverses(&client, relationship.id).await,
+        vec![("1".to_string(), 1, 0)],
+        "guard (a) must defer and re-stage the record itself (issue #134) — \
+         one rel_reverse_deferred row for post 1, retry_count 1, hop_gen \
+         untouched at 0 — not an image-less recompute of its from-side rows"
+    );
+    assert!(
+        staged_recompute_keys(&client, "post_tags").await.is_empty(),
+        "issue #134 replaces the from-side Recompute fallback entirely; \
+         nothing should be staged for post_tags directly"
     );
 
     retire_drained_segments(&mut client)
@@ -930,8 +1003,15 @@ async fn guard_a_watermark_barrier_rejects_and_the_pipeline_still_converges() {
         totals.get("rust"),
         Some(&(Some("3".to_string()), Some("650".to_string()))),
         "the pipeline must still converge on post 1's true value (400) via \
-         the fallback, even though guard (a) rejected the direct delta — \
+         a retried delta, even though guard (a) rejected the first attempt — \
          an aborting reverse defers and retries, it does not stall the batch"
+    );
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        Some(PgLsn::from(100)),
+        "the retried delta must eventually advance the projection to the \
+         deferred record's own lsn, proving it applied as a real delta on \
+         retry rather than merely converging via some other path"
     );
 }
 
@@ -1026,10 +1106,11 @@ async fn guard_b_generation_check_rejects_and_the_pipeline_still_converges() {
          apply's bump — guard (b) must not advance it further"
     );
     assert_eq!(
-        staged_recompute_keys(&client, "post_tags").await,
-        vec!["10".to_string(), "12".to_string()],
-        "guard (b) must fall back to an image-less recompute of post 1's \
-         from-side rows"
+        staged_deferred_reverses(&client, relationship.id).await,
+        vec![("1".to_string(), 1, 0)],
+        "guard (b) must defer and re-stage the record itself (issue #134) — \
+         one rel_reverse_deferred row for post 1, retry_count 1, hop_gen \
+         untouched at 0 — not an image-less recompute of its from-side rows"
     );
 
     retire_drained_segments(&mut client)
@@ -1042,7 +1123,15 @@ async fn guard_b_generation_check_rejects_and_the_pipeline_still_converges() {
         totals.get("rust"),
         Some(&(Some("3".to_string()), Some("650".to_string()))),
         "the pipeline must still converge on post 1's true value (400) via \
-         the fallback, even though guard (b) rejected the direct delta"
+         a retried delta, even though guard (b) rejected the first attempt — \
+         the retry re-derives prev_gen fresh (now the simulated forward \
+         apply's bumped value), so it correctly passes once retried"
+    );
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        Some(PgLsn::from(100)),
+        "the retried delta must eventually advance the projection to the \
+         deferred record's own lsn"
     );
 }
 
@@ -1266,12 +1355,16 @@ async fn issue_133_a_within_batch_repoint_still_bumps_the_erased_intermediate_pa
         "guard (b) must not advance gen any further than the erasing batch's own bump"
     );
     assert_eq!(
-        staged_recompute_keys(&client, "articles").await,
-        vec!["100".to_string()],
-        "guard (b) must fall back to an image-less recompute of category 3's \
-         *current* from-side rows — article 100 (the original, undisturbed \
-         pointer), not article 200 (which re-pointed away and must not be \
-         wrongly moved)"
+        staged_deferred_reverses(&client, relationship.id).await,
+        vec![("3".to_string(), 1, 0)],
+        "guard (b) must defer and re-stage the record itself (issue #134) — \
+         one rel_reverse_deferred row for category 3, retry_count 1, hop_gen \
+         untouched at 0 — not an image-less recompute of its from-side rows"
+    );
+    assert!(
+        staged_recompute_keys(&client, "articles").await.is_empty(),
+        "issue #134 replaces the from-side Recompute fallback entirely; \
+         nothing should be staged for articles directly by the rejection"
     );
 
     retire_drained_segments(&mut client)
@@ -1279,27 +1372,26 @@ async fn issue_133_a_within_batch_repoint_still_bumps_the_erased_intermediate_pa
         .expect("retire drained segments");
     drain_to_quiescence(&db.pool, &mut client).await;
 
-    // Not "C-renamed": the mechanism-level assertions above are this test's
-    // actual #133 proof (the erased parent's gen bumped; guard (b) then
-    // correctly rejected the stale reverse and fell back to recomputing
-    // exactly article 100, not article 200). The rejected reverse's own
-    // projection-advance step is a documented no-op on rejection — see
-    // `apply_and_mark_drained_many`'s "3d" step's own comment ("Do NOT
-    // touch any target table or the projection for this record") — so the
-    // settled parent projection for category 3 stays at its pre-rename
-    // value until something re-attempts that reverse. Retrying it is #134's
-    // still-unbuilt deferral/retry plumbing, explicitly out of scope here;
-    // a `KeySpace::OneToOne` target has no live-join fallback the way an
-    // aggregate's `rel_joins` path does (that's why this fixture — not
-    // TAG_TOTALS — is what exercises guard (b) at all, per this test's own
-    // opening comment), so its recompute re-reads the same (still-stale)
-    // projection rather than the live `categories` table.
+    // The mechanism-level assertions above are this test's actual #133
+    // proof (the erased parent's gen bumped; guard (b) then correctly
+    // rejected the stale reverse rather than silently applying it). With
+    // issue #134's deferral plumbing now built, that rejected reverse is
+    // re-derived and retried on the next drain: `prev_gen` is re-captured
+    // fresh (now the erasing batch's own bump, `baseline_gen_3 + 1`) rather
+    // than replayed stale, so the retry's guard (b) check correctly passes
+    // this time (nothing bumped the gen again in between), the delta
+    // applies, and the projection advances to "C-renamed" — which the
+    // `needs_recompute_fallback` path's own re-staged `Recompute` for
+    // article 100 (still, correctly, the only from-side row this reverse
+    // touches — article 200 re-pointed away and is untouched by it) then
+    // picks up. Article 100 ends up on the *new* value, not stuck on the
+    // stale one — the entire point of #134 is that a deferred reverse
+    // converges, not that it never applies.
     assert_eq!(
         target_category_name(&client, 100).await,
-        Some("C".to_string()),
-        "article 100's target stays on category 3's pre-rename value — the \
-         rejected reverse's projection-advance is a no-op by design (#134), \
-         not a regression in #133's own fix"
+        Some("C-renamed".to_string()),
+        "article 100 must eventually reflect category 3's renamed value \
+         once the deferred reverse is retried and succeeds (issue #134)"
     );
     assert_eq!(
         target_category_name(&client, 200).await,
@@ -1410,15 +1502,22 @@ async fn guard_c_in_flight_check_rejects_and_the_pipeline_still_converges() {
         baseline_gen,
         "guard (c) must reject before ever touching the projection"
     );
-    // The fallback's own live enumeration picks up every from-side row
-    // currently matching post 1 — including the brand-new row 20, since
-    // that enumeration is a plain live read, not itself guarded (see
-    // `from_side_rows_for_join_txn`'s doc comment).
+    // Issue #134: guard (c) defers and re-stages the record itself, rather
+    // than falling back to a live from-side enumeration — the retry's own
+    // fast-path delta (once row 20's segment has drained and the in-flight
+    // condition clears) is what ends up picking up row 20 live, via the
+    // same `from_side_rows_for_join_txn` read the pre-#134 fallback used.
     assert_eq!(
-        staged_recompute_keys(&client, "post_tags").await,
-        vec!["10".to_string(), "12".to_string(), "20".to_string()],
-        "guard (c) must fall back to an image-less recompute of every \
-         from-side row currently matching post 1"
+        staged_deferred_reverses(&client, relationship.id).await,
+        vec![("1".to_string(), 1, 0)],
+        "guard (c) must defer and re-stage the record itself (issue #134) — \
+         one rel_reverse_deferred row for post 1, retry_count 1, hop_gen \
+         untouched at 0 — not an image-less recompute of its from-side rows"
+    );
+    assert!(
+        staged_recompute_keys(&client, "post_tags").await.is_empty(),
+        "issue #134 replaces the from-side Recompute fallback entirely; \
+         nothing should be staged for post_tags directly by the rejection"
     );
 
     retire_drained_segments(&mut client)
@@ -1432,7 +1531,15 @@ async fn guard_c_in_flight_check_rejects_and_the_pipeline_still_converges() {
         Some(&(Some("4".to_string()), Some("1050".to_string()))),
         "the pipeline must still converge on post 1's true value (400), \
          counting the new row 20 exactly once: 400 (post 1, via row 10) + \
-         250 (post 2) + null (post 999) + 400 (post 1, via the new row 20)"
+         250 (post 2) + null (post 999) + 400 (post 1, via the new row 20) \
+         — via a retried delta, once row 20's segment drains and guard (c) \
+         no longer sees anything in flight"
+    );
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        Some(PgLsn::from(100)),
+        "the retried delta must eventually advance the projection to the \
+         deferred record's own lsn"
     );
 }
 
@@ -1542,7 +1649,7 @@ async fn out_of_order_segments_plus_an_in_flight_child_still_converges() {
     let mut client = connect_raw(db.dsn()).await;
     create_schema(&client).await;
 
-    create_relationship(
+    let relationship = create_relationship(
         &db.pool,
         "RELATIONSHIP post FROM post_tags.post TO posts.id",
     )
@@ -1552,6 +1659,7 @@ async fn out_of_order_segments_plus_an_in_flight_child_still_converges() {
         .await
         .expect("install the aggregate-over-to-one definition");
     drain_to_quiescence(&db.pool, &mut client).await;
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
 
     // Segment A: 100 -> 400.
     client
@@ -1656,7 +1764,21 @@ async fn out_of_order_segments_plus_an_in_flight_child_still_converges() {
         "500 (post 1's true final value, via row 10) + 250 (post 2) + null \
          (post 999) + 500 (post 1's true final value, via the new row 21) \
          — recovered correctly despite the out-of-order segments and the \
-         in-flight child both landing on the same key"
+         in-flight child both landing on the same key. Takes more than one \
+         retry round: guard (c) defers again on the very first retry\
+         attempt, since row 21's own CDC shares the deferred record's \
+         segment and so still reads as undrained mid-transaction; the \
+         second retry (once that segment has actually committed) passes. \
+         See issue #134's `retry_count == 0` fast-path gate (this module's \
+         own comment on it) for why this doesn't corrupt the total despite \
+         `force_every_group` having already live-recomputed row 21's group \
+         by the time the delta finally applies."
+    );
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        Some(PgLsn::from(200)),
+        "the retried delta must eventually advance the projection to B's \
+         own lsn"
     );
 }
 
@@ -1788,4 +1910,482 @@ async fn a_one_to_one_target_still_converges_via_the_fallback_mechanism() {
         "a 1-1 target reading the relationship must still re-derive via the \
          pre-#131 fallback, unchanged"
     );
+}
+
+// ---------------------------------------------------------------------
+// 6. Issue #134: the deferral plumbing itself — its own staged kind, the
+//    retry counter's hop_gen exemption, re-staging into the active batch,
+//    and the four per-guard metrics.
+// ---------------------------------------------------------------------
+
+/// The core exemption this issue exists to build: a reverse that keeps
+/// getting deferred must never touch `hop_gen`, so it can never trip
+/// [`apply::MAX_HOP_GEN`] (32) — unlike the pre-#134 stopgap, which staged
+/// its from-side fallback at `hop_gen + 1` on every rejection and so
+/// *would* have tripped the bound after 32 rejections of the same reverse.
+/// Driven by hand, well past 32 rounds, with a watermark that never
+/// advances (guard (a) rejects deterministically, every single time,
+/// independent of any other guard's state) — the simplest guard to hold
+/// open indefinitely on purpose.
+#[tokio::test]
+async fn deferring_the_same_reverse_past_max_hop_gen_never_trips_the_hop_bound() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("update the related post");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        100,
+    )
+    .await;
+
+    // Never advanced — guard (a) rejects on every single round, forever,
+    // regardless of retry_count. `apply::MAX_HOP_GEN` is 32; this drives 40
+    // rounds, well past it, and asserts `retry_count` climbs monotonically
+    // to 40 while `hop_gen` stays pinned at 0 the entire time.
+    let unstaged_watermark = StagedWatermark::new();
+    const ROUNDS: i32 = 40;
+    for round in 1..=ROUNDS {
+        let seg = seal_active_segment(&mut client).await;
+        let plan = claim_fold_compute(&db.pool, seg, "worker_hopgen").await;
+        let mut phase3 = db.pool.get().await.expect("connection");
+        let txn = phase3.transaction().await.expect("begin phase 3");
+        apply::apply_and_mark_drained(
+            &txn,
+            seg,
+            "worker_hopgen",
+            &plan,
+            "trellis_reverse_test",
+            &unstaged_watermark,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("round {round}: apply must never fail with HopBoundExceeded (or any other error): {e}")
+        });
+        txn.commit().await.expect("commit");
+        retire_drained_segments(&mut client)
+            .await
+            .expect("retire drained segments");
+
+        let deferred = staged_deferred_reverses(&client, relationship.id).await;
+        assert_eq!(
+            deferred,
+            vec![("1".to_string(), round, 0)],
+            "round {round}: retry_count must climb to exactly {round}, and \
+             hop_gen must stay at 0 — issue #134's whole point is that this \
+             counter is independent of, and never burns, hop_gen"
+        );
+    }
+}
+
+/// Doc 05's property 1 ("the claimed batch is immutable... every producer
+/// writes to the *active* batch, including a worker doing downstream
+/// propagation") applied to issue #134's new producer: a guard rejection's
+/// re-staged `rel_reverse_deferred` row must land in whichever segment is
+/// *currently accepting new appends* — never retroactively inserted into
+/// the segment that's mid-drain (the one whose guard just rejected it).
+/// Proven directly against the ring's physical tables, not inferred from
+/// convergence: the deferred row is present in the segment that was
+/// *active* at the moment of rejection, and absent from the segment that
+/// was actually being drained.
+#[tokio::test]
+async fn a_deferred_reverse_lands_in_the_active_segment_never_the_draining_one() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("update the related post");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        100,
+    )
+    .await;
+    let seg = seal_active_segment(&mut client).await;
+    let plan = claim_fold_compute(&db.pool, seg, "worker_active_batch").await;
+
+    // `seg` is now sealed (about to be claimed/drained below); whatever
+    // ring slot is active *now* is a different, later segment — captured
+    // before the apply so this test can independently verify against both
+    // physical tables afterward, not just infer it from one lookup.
+    let active_table_before = active_seg_table(&client).await;
+    let seg_ring_slot: i16 = client
+        .query_one("select ring_slot from segments where seg_seq = $1", &[&seg])
+        .await
+        .expect("read seg's own ring_slot")
+        .get(0);
+    let seg_table = format!("seg_{seg_ring_slot}");
+    assert_ne!(
+        active_table_before, seg_table,
+        "sanity: the sealed segment being drained and the currently-active \
+         one must be different physical tables"
+    );
+
+    let unstaged_watermark = StagedWatermark::new();
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg,
+        "worker_active_batch",
+        &plan,
+        "trellis_reverse_test",
+        &unstaged_watermark,
+    )
+    .await
+    .expect("apply (rejected internally by guard (a))");
+    txn.commit().await.expect("commit");
+
+    assert_eq!(
+        staged_deferred_reverses(&client, relationship.id).await,
+        vec![("1".to_string(), 1, 0)],
+        "the deferred row must be present in the currently-active segment"
+    );
+    assert_eq!(
+        deferred_reverses_in_segment(&client, seg, relationship.id).await,
+        Vec::<(String, i32, i32)>::new(),
+        "the deferred row must be absent from the segment whose guard \
+         rejection produced it — re-staging into the batch being drained \
+         (rather than the active one) would violate doc 05's property 1"
+    );
+}
+
+/// The plan doc's `d5_block_*` counters (issue #134's own §7 step 6/step 7
+/// naming), one dedicated scenario per guard — each must increment its own
+/// label by exactly one on that guard's rejection, and not perturb the
+/// other three. Reuses the same four scenarios `guard_a_.../guard_b_.../
+/// guard_c_...`/`a_stale_prev_lsn_...` build above, trimmed to just the
+/// metric assertion (this file's own convergence/staged-row assertions for
+/// each guard already live on those tests).
+///
+/// The registry is process-wide (`metrics.rs`'s own module doc comment) —
+/// shared with every other test in this binary, run in parallel by
+/// default — so every assertion here is a **delta** across its own
+/// `apply_and_mark_drained` call, snapshotting immediately before and
+/// after, never an absolute value.
+#[tokio::test]
+async fn each_guard_increments_its_own_deferral_metric_and_only_its_own() {
+    const METRIC: &str = "trellis_relationship_reverse_deferred_total";
+    const LABELS: [&str; 4] = [
+        "d5_block_barrier",
+        "d5_block_gen",
+        "d5_block_inflight",
+        "d5_block_order",
+    ];
+
+    async fn snapshot() -> [u64; 4] {
+        let rendered = trellis::metrics::Metrics::new().render_prometheus();
+        std::array::from_fn(|i| counter_value(&rendered, METRIC, "guard", LABELS[i]))
+    }
+
+    async fn assert_only_this_label_moved(before: [u64; 4], moved_index: usize) {
+        let after = snapshot().await;
+        for (i, label) in LABELS.iter().enumerate() {
+            let expected = before[i] + u64::from(i == moved_index);
+            assert_eq!(
+                after[i], expected,
+                "label {label:?} moved unexpectedly (before={:?}, after={:?})",
+                before, after
+            );
+        }
+    }
+
+    // Guard (a): watermark barrier.
+    {
+        let cluster = TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect_raw(db.dsn()).await;
+        create_schema(&client).await;
+        create_relationship(
+            &db.pool,
+            "RELATIONSHIP post FROM post_tags.post TO posts.id",
+        )
+        .await
+        .expect("create to-one relationship");
+        install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+            .await
+            .expect("install the aggregate-over-to-one definition");
+        drain_to_quiescence(&db.pool, &mut client).await;
+        client
+            .execute("update posts set word_count = 400 where id = 1", &[])
+            .await
+            .expect("update");
+        stage_cdc_at_lsn(
+            &client,
+            "posts",
+            "1",
+            "update",
+            Some("{\"id\":1,\"word_count\":100}"),
+            Some("{\"id\":1,\"word_count\":400}"),
+            100,
+        )
+        .await;
+        let seg = seal_active_segment(&mut client).await;
+        let plan = claim_fold_compute(&db.pool, seg, "worker_metric_a").await;
+
+        let before = snapshot().await;
+        let mut phase3 = db.pool.get().await.expect("connection");
+        let txn = phase3.transaction().await.expect("begin phase 3");
+        apply::apply_and_mark_drained(
+            &txn,
+            seg,
+            "worker_metric_a",
+            &plan,
+            "trellis_reverse_test",
+            &StagedWatermark::new(),
+        )
+        .await
+        .expect("apply (rejected by guard a)");
+        txn.commit().await.expect("commit");
+        assert_only_this_label_moved(before, 0).await;
+    }
+
+    // Guard (b): generation check.
+    {
+        let cluster = TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect_raw(db.dsn()).await;
+        create_schema(&client).await;
+        let relationship = create_relationship(
+            &db.pool,
+            "RELATIONSHIP post FROM post_tags.post TO posts.id",
+        )
+        .await
+        .expect("create to-one relationship");
+        install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+            .await
+            .expect("install the aggregate-over-to-one definition");
+        drain_to_quiescence(&db.pool, &mut client).await;
+        let projection_table = projection_table_for(&db.pool, relationship.id).await;
+        client
+            .execute("update posts set word_count = 400 where id = 1", &[])
+            .await
+            .expect("update");
+        stage_cdc_at_lsn(
+            &client,
+            "posts",
+            "1",
+            "update",
+            Some("{\"id\":1,\"word_count\":100}"),
+            Some("{\"id\":1,\"word_count\":400}"),
+            100,
+        )
+        .await;
+        let seg = seal_active_segment(&mut client).await;
+        let plan = claim_fold_compute(&db.pool, seg, "worker_metric_b").await;
+        client
+            .execute(
+                &format!(
+                    "update {projection_table} set __trellis_gen = __trellis_gen + 1 where id = 1"
+                ),
+                &[],
+            )
+            .await
+            .expect("simulate a concurrent forward apply");
+
+        let before = snapshot().await;
+        let mut phase3 = db.pool.get().await.expect("connection");
+        let txn = phase3.transaction().await.expect("begin phase 3");
+        apply::apply_and_mark_drained(
+            &txn,
+            seg,
+            "worker_metric_b",
+            &plan,
+            "trellis_reverse_test",
+            &StagedWatermark::saturated(),
+        )
+        .await
+        .expect("apply (rejected by guard b)");
+        txn.commit().await.expect("commit");
+        assert_only_this_label_moved(before, 1).await;
+    }
+
+    // Guard (c): in-flight check.
+    {
+        let cluster = TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect_raw(db.dsn()).await;
+        create_schema(&client).await;
+        create_relationship(
+            &db.pool,
+            "RELATIONSHIP post FROM post_tags.post TO posts.id",
+        )
+        .await
+        .expect("create to-one relationship");
+        install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+            .await
+            .expect("install the aggregate-over-to-one definition");
+        drain_to_quiescence(&db.pool, &mut client).await;
+        client
+            .execute("update posts set word_count = 400 where id = 1", &[])
+            .await
+            .expect("update");
+        stage_cdc_at_lsn(
+            &client,
+            "posts",
+            "1",
+            "update",
+            Some("{\"id\":1,\"word_count\":100}"),
+            Some("{\"id\":1,\"word_count\":400}"),
+            100,
+        )
+        .await;
+        let seg = seal_active_segment(&mut client).await;
+        client
+            .execute(
+                "insert into post_tags (id, post, tag) values (30, 1, 'rust')",
+                &[],
+            )
+            .await
+            .expect("insert a new post_tags row pointing at post 1");
+        stage_cdc_at_lsn(
+            &client,
+            "post_tags",
+            "30",
+            "insert",
+            None,
+            Some("{\"id\":30,\"post\":1,\"tag\":\"rust\"}"),
+            50,
+        )
+        .await;
+        let plan = claim_fold_compute(&db.pool, seg, "worker_metric_c").await;
+
+        let before = snapshot().await;
+        let mut phase3 = db.pool.get().await.expect("connection");
+        let txn = phase3.transaction().await.expect("begin phase 3");
+        apply::apply_and_mark_drained(
+            &txn,
+            seg,
+            "worker_metric_c",
+            &plan,
+            "trellis_reverse_test",
+            &StagedWatermark::saturated(),
+        )
+        .await
+        .expect("apply (rejected by guard c)");
+        txn.commit().await.expect("commit");
+        assert_only_this_label_moved(before, 2).await;
+    }
+
+    // Guard (d): per-parent ordering (the stale-prev_lsn scenario).
+    {
+        let cluster = TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect_raw(db.dsn()).await;
+        create_schema(&client).await;
+        create_relationship(
+            &db.pool,
+            "RELATIONSHIP post FROM post_tags.post TO posts.id",
+        )
+        .await
+        .expect("create to-one relationship");
+        install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+            .await
+            .expect("install the aggregate-over-to-one definition");
+        drain_to_quiescence(&db.pool, &mut client).await;
+
+        client
+            .execute("update posts set word_count = 400 where id = 1", &[])
+            .await
+            .expect("first update");
+        stage_cdc_at_lsn(
+            &client,
+            "posts",
+            "1",
+            "update",
+            Some("{\"id\":1,\"word_count\":100}"),
+            Some("{\"id\":1,\"word_count\":400}"),
+            100,
+        )
+        .await;
+        let seg_a = seal_active_segment(&mut client).await;
+        let plan_a = claim_fold_compute(&db.pool, seg_a, "worker_metric_d_a").await;
+
+        client
+            .execute("update posts set word_count = 500 where id = 1", &[])
+            .await
+            .expect("second update");
+        stage_cdc_at_lsn(
+            &client,
+            "posts",
+            "1",
+            "update",
+            Some("{\"id\":1,\"word_count\":400}"),
+            Some("{\"id\":1,\"word_count\":500}"),
+            200,
+        )
+        .await;
+        let seg_b = seal_active_segment(&mut client).await;
+        let plan_b = claim_fold_compute(&db.pool, seg_b, "worker_metric_d_b").await;
+
+        let mut phase3 = db.pool.get().await.expect("connection");
+        let txn = phase3.transaction().await.expect("begin phase 3 (a)");
+        apply::apply_and_mark_drained(
+            &txn,
+            seg_a,
+            "worker_metric_d_a",
+            &plan_a,
+            "trellis_reverse_test",
+            &StagedWatermark::saturated(),
+        )
+        .await
+        .expect("apply A");
+        txn.commit().await.expect("commit A");
+
+        let before = snapshot().await;
+        let mut phase3 = db.pool.get().await.expect("connection");
+        let txn = phase3.transaction().await.expect("begin phase 3 (b)");
+        apply::apply_and_mark_drained(
+            &txn,
+            seg_b,
+            "worker_metric_d_b",
+            &plan_b,
+            "trellis_reverse_test",
+            &StagedWatermark::saturated(),
+        )
+        .await
+        .expect("apply B (rejected by guard d)");
+        txn.commit().await.expect("commit B");
+        assert_only_this_label_moved(before, 3).await;
+    }
 }

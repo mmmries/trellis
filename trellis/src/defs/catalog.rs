@@ -1638,6 +1638,50 @@ pub async fn relationship_by_name(
     }))
 }
 
+/// Reads back the relationship whose `relationship_definitions.id` is `id` —
+/// issue #134's deferred-reverse reconstruction path uses this: a
+/// `rel_reverse_deferred` ring row persists only the relationship's id (see
+/// `staging::append::StagedChange::RelationshipReverseDeferred`), so a later
+/// drain that finds one needs to look the relationship back up by id alone,
+/// not by `(from_table, name)` ([`relationship_by_name`]) or `to_table`
+/// ([`relationships_to_table`]) — neither of which a bare id lets it derive
+/// without an extra round trip. `Ok(None)` when the relationship no longer
+/// exists (dropped between the deferral and this retry) — the caller's job to
+/// decide what "nothing to retry against anymore" means, not this function's.
+pub async fn relationship_by_id(
+    pool: &Pool,
+    id: i64,
+) -> Result<Option<RelationshipDefinition>, CatalogError> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "select definition_text, cardinality
+             from relationship_definitions
+             where id = $1",
+            &[&id],
+        )
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+
+    let text: String = row.get(0);
+    let cardinality_text: String = row.get(1);
+    let def = parse_relationship(&text)?;
+    let cardinality =
+        RelationshipCardinality::from_persisted(&cardinality_text).unwrap_or_else(|| {
+            panic!(
+                "relationship_definitions.cardinality held unrecognized value '{cardinality_text}'"
+            )
+        });
+    Ok(Some(RelationshipDefinition {
+        id,
+        def,
+        cardinality,
+        // Creation-time guidance, not a fact about the persisted row — see
+        // the field's doc comment on [`RelationshipDefinition`].
+        warnings: Vec::new(),
+    }))
+}
+
 /// Every relationship whose `to_table` is `to_table` — the reverse of
 /// [`relationship_by_name`]'s `from_table` lookup. The staging reverse
 /// recompute (issue #30) uses this to answer "a row in this table just
