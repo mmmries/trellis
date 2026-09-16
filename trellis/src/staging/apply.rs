@@ -26,17 +26,18 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{PgLsn, ToSql};
 use tokio_postgres::{GenericClient, Transaction};
 
-use crate::defs::ast::{KeySpace, TransformDef, ValueType};
+use crate::defs::ast::{Expr, KeySpace, TransformDef, ValueType};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::eval::{
     self, EvalError, RelationshipContext, Row, ToManyRelationship, ToOneRelationship,
 };
-use crate::defs::model::RelationshipCardinality;
+use crate::defs::model::{RelationshipCardinality, RelationshipDefinition};
 use crate::defs::validate::{self, ValidationError};
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
@@ -777,6 +778,627 @@ pub(crate) async fn build_relationship_context(
         RelationshipContext::new(by_name).with_to_many(to_many_by_name),
         gen_bumps,
     ))
+}
+
+// ---------------------------------------------------------------------
+// Issue #131, epic #127: the to-one reverse delta
+// ---------------------------------------------------------------------
+//
+// Design summary (see the plan doc's §2 "Reverse" and §7 Phase 1 steps 4-5,
+// and this function's own call site in `compute`'s `inbound_rels` loop):
+//
+// A parent (to-side) change to a to-one relationship no longer stages an
+// image-less from-side `Recompute` per touched from-side row (the pre-#131,
+// still-current behavior for to-*many* relationships — see the branch in
+// `compute` below). Instead it builds one [`RelationshipReverseRecord`] per
+// touched parent key, carrying the parent's own old/new image (already
+// folded — see this struct's doc comment for why no new ring plumbing is
+// needed to get that) and a `prev_lsn` read live off the settled parent
+// projection at Phase 2 capture time. Phase 3
+// ([`apply_and_mark_drained_many`]'s "3d" step) re-validates `prev_lsn`
+// under `FOR UPDATE` (the guard-(d) stopgap this issue ships in place of
+// #132's full guard suite), then, for every aggregate target whose fields
+// are fully invertible and read only this one relationship
+// ([`ReverseRelationshipShape::aggregate_shapes`]), applies a true
+// subtract-old/add-new delta over the parent's from-side rows — reusing
+// `apply_aggregate`'s existing per-row contribution/delta-apply machinery
+// rather than reinventing it. Anything that mechanism can't cover (a 1-1
+// target, a `MIN`/`MAX` field, a definition reading more than one
+// relationship — see [`build_reverse_relationship_shape`]'s doc comment)
+// falls back to the pre-#131 image-less `Recompute`, unchanged.
+
+/// One to-one relationship's reverse-delta shape (issue #131): everything
+/// Phase 3 needs to apply a [`RelationshipReverseRecord`] for this
+/// relationship, resolved once per relationship per `compute()` call (Phase
+/// 2, which has a `pool`) and shared, via `Arc`, by every parent key this
+/// batch's fold touched for it — Phase 3 holds no `pool`, only `txn` (see
+/// [`apply_and_mark_drained_many`]'s own doc comment), so nothing here can
+/// be re-derived once Phase 3 starts.
+#[derive(Debug)]
+pub(crate) struct ReverseRelationshipShape {
+    /// Empty (`String::new()`) in the should-be-unreachable case where this
+    /// relationship has no projection row at all (#129 creates one
+    /// unconditionally at `create_relationship` time) — Phase 3 treats that
+    /// the same as an ordering-check miss for every record carrying this
+    /// shape, the same defensive posture [`build_relationship_context`]
+    /// takes for the identical gap on the forward path.
+    qualified_projection: String,
+    /// The projection's bare (unquoted) table name — `qualified_projection`
+    /// is already quoted/schema-qualified for direct SQL interpolation, so
+    /// the projection-advance step needs this separately to introspect
+    /// `information_schema.columns` (issue #131's own write path: which
+    /// data columns to copy off the parent's new image).
+    projection_table_bare: String,
+    /// The target schema `projection_table_bare` lives in — bare, for the
+    /// same `information_schema.columns` introspection.
+    target_schema: String,
+    to_col: String,
+    from_table: String,
+    from_col: String,
+    from_pk: PrimaryKeyColumn,
+    /// Fully-invertible, single-relationship aggregate targets reading this
+    /// relationship — the issue #131 fast (true-delta) path. See
+    /// [`build_reverse_relationship_shape`]'s doc comment for exactly which
+    /// definitions qualify.
+    aggregate_shapes: Vec<ReverseAggregateShape>,
+    /// Whether at least one definition on `from_table` referencing this
+    /// relationship is *not* covered by `aggregate_shapes` — a
+    /// `KeySpace::OneToOne` definition, an aggregate with a
+    /// `RecomputeOnly` field (`MIN`/`MAX`, or a composed expression), or an
+    /// aggregate reading more than one relationship. Every touched
+    /// from-side row still needs the pre-#131 image-less `Recompute`
+    /// treatment when this is `true`.
+    needs_recompute_fallback: bool,
+}
+
+/// One aggregate target's issue #131 fast-path shape: everything needed to
+/// turn a live-enumerated from-side row into a [`apply_aggregate::GroupPlan`]
+/// delta, without a live `JOIN` back to the to-side table (the parent's
+/// old/new *image* already has the value; see the module doc comment above).
+#[derive(Debug)]
+struct ReverseAggregateShape {
+    /// The target's fully-qualified identity
+    /// ([`crate::defs::model::Definition::target_table`]).
+    target: String,
+    /// An empty-`.groups` template — cloned fresh per [`RelationshipReverseRecord`]
+    /// this shape applies to (Phase 3 does not batch sibling records
+    /// touching the same target together; see that step's own doc comment
+    /// for why that's a documented, non-correctness-affecting
+    /// simplification). Built from the *original*, unrewritten definition
+    /// (`AggregateTargetPlan::new`'s usual construction) — its
+    /// `field_exprs`/`count_column_names` must match what
+    /// `create_aggregate_target_table` actually created, not this shape's
+    /// relationship-substituted evaluation form below.
+    template: AggregateTargetPlan,
+    /// `def`, relationship-substituted (every `RelationshipPath { rel:
+    /// <this relationship's name>, column }` rewritten to `Column(<synthetic
+    /// column name>)`, per `synthetic_columns`) and then
+    /// [`apply_aggregate::contribution_def`]'s `AVG`-as-`SUM` rewrite
+    /// applied on top — ready to hand [`apply_aggregate::row_contribution`]
+    /// directly, the same way `accumulate_changes` hands it its own
+    /// per-batch rewrite.
+    contribution_def: TransformDef,
+    /// `def`'s source-column type map, widened with one entry per synthetic
+    /// column (typed from the to-side column it stands in for).
+    source_columns: HashMap<String, ValueType>,
+    /// `(to_side_column, synthetic_column_name)` — how Phase 3 splices the
+    /// parent's old/new image into a live from-side row before evaluating
+    /// it (see [`augment_row_with_relationship_value`]).
+    synthetic_columns: Vec<(String, String)>,
+}
+
+/// One to-one relationship's parent-keyed reverse record (issue #131),
+/// built in `compute()` (Phase 2) from one already-folded [`FoldedChange`]
+/// on the relationship's own `to_table`, applied in Phase 3.
+///
+/// **No new ring/staging-kind plumbing was needed to get here** — a
+/// deliberate, documented deviation from this issue's own "what to actually
+/// do" checklist, which speculated a new [`StagedChange`] variant might be
+/// needed. It isn't, for this issue: the parent's own CDC rows are *already*
+/// folded, generically, by the existing [`fold::fold`]/
+/// [`fold::merge_folded_changes`] (any table's raw CDC rows for one key
+/// collapse to one [`FoldedChange`] — first old image, last new image,
+/// `lsn` the group's `GREATEST` — before `compute()` ever sees them), so "N
+/// parent changes for the same key in one batch fold to one record" falls
+/// out of machinery that already exists, for free, the same way it already
+/// does for every other table. The only genuinely new datum is `prev_lsn`,
+/// which this issue's own derivation (confirmed against
+/// `ddl::PROJECTION_LSN_COLUMN`'s doc comment, written for #129/#130 ahead
+/// of this issue landing) is a **live read of the projection, taken once in
+/// Phase 2**, not something that needs to ride along a raw ring row. A real
+/// persisted staging kind for this record (so a deferred one can be
+/// retried without burning `hop_gen` — the plan doc's Phase 1 step 6) is
+/// explicitly future work (#134), which the plan doc itself sequences
+/// *after* this issue and #132.
+#[derive(Debug, Clone)]
+pub(crate) struct RelationshipReverseRecord {
+    shape: Arc<ReverseRelationshipShape>,
+    /// The parent's decoded pre-image row, or `None` for a parent INSERT.
+    old_row: Option<Row>,
+    /// The parent's decoded post-image row, or `None` for a parent DELETE.
+    new_row: Option<Row>,
+    /// The parent's raw post-image JSON text (unparsed) — used only by the
+    /// projection's own UPSERT, which leans on Postgres's
+    /// `jsonb_populate_record` to coerce JSON into the projection's real
+    /// column types rather than this crate re-deriving a per-column cast.
+    /// The pre-image needs no equivalent: the projection's delete half only
+    /// needs `old_row`'s *key*, never any of its other column values.
+    new_image: Option<String>,
+    /// The folded change's own `GREATEST` `lsn` — this record's own
+    /// identity in the projection's LSN chain once it applies.
+    lsn: Option<PgLsn>,
+    /// The projection's `__trellis_lsn` as read live, in Phase 2, for
+    /// whichever of `old_row`/`new_row`'s key was available (preferring the
+    /// old key, the pre-this-batch identity) — see this struct's own doc
+    /// comment and [`ddl::PROJECTION_LSN_COLUMN`]'s for the chain this
+    /// forms. `None` when no projection row existed yet to read (a parent
+    /// INSERT, or the should-be-unreachable missing-projection case) —
+    /// Phase 3 treats that as "nothing to conflict with," not a miss.
+    prev_lsn: Option<PgLsn>,
+    hop_gen: i32,
+    src_changed: Option<std::time::SystemTime>,
+}
+
+/// The synthetic source-column name [`build_reverse_relationship_shape`]
+/// substitutes for a `RelationshipPath { column, .. }` reference — the
+/// `__trellis_`-prefixed hidden-column convention
+/// [`ddl::PROJECTION_GEN_COLUMN`]'s doc comment already flags as carrying a
+/// (small, accepted) collision risk with a real source column, reused here
+/// for the same reason.
+fn synthetic_relationship_column(column: &str) -> String {
+    format!("__trellis_rev_{column}")
+}
+
+/// Rewrites every `RelationshipPath { rel: <rel_name>, column }` in `expr`
+/// (recursing through `BinaryOp`/`FunctionCall`) to `Column(<synthetic
+/// column name>)` per `synthetic_columns`, in place. A `RelationshipPath`
+/// for a *different* relationship name is left untouched — reaching one
+/// here at all means the caller already excluded this definition from the
+/// fast path (see [`build_reverse_relationship_shape`]'s multi-relationship
+/// fallback), so this function is never actually asked to resolve one.
+fn substitute_relationship_path(
+    expr: &mut Expr,
+    rel_name: &str,
+    synthetic_columns: &HashMap<String, String>,
+) {
+    match expr {
+        Expr::RelationshipPath { rel, column } if rel == rel_name => {
+            let synthetic = synthetic_columns
+                .get(column)
+                .cloned()
+                .unwrap_or_else(|| synthetic_relationship_column(column));
+            *expr = Expr::Column(synthetic);
+        }
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            substitute_relationship_path(lhs, rel_name, synthetic_columns);
+            substitute_relationship_path(rhs, rel_name, synthetic_columns);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                substitute_relationship_path(arg, rel_name, synthetic_columns);
+            }
+        }
+        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        Expr::RelationshipPath { .. } => {}
+    }
+}
+
+/// Builds `rel`'s [`ReverseRelationshipShape`] (issue #131) — the one-time,
+/// per-relationship, per-`compute()`-call catalog resolution every parent
+/// key this batch's fold touches for `rel` shares (see
+/// [`RelationshipReverseRecord`]'s doc comment).
+///
+/// **The design fork this issue's own report needs to flag prominently**:
+/// which definitions get the new true-delta fast path
+/// (`ReverseRelationshipShape::aggregate_shapes`) versus the pre-#131
+/// fallback (`needs_recompute_fallback`, i.e. an ordinary image-less
+/// `Recompute` staged for every touched from-side row, exactly as before
+/// this issue). A definition qualifies for the fast path **iff** all of:
+/// 1. It's a [`KeySpace::Aggregate`] definition (a `KeySpace::OneToOne`
+///    target has no additive semantics to delta at all — a from-side row's
+///    own target row is just re-derived outright, which is already O(one
+///    row), not the O(group) cost this epic targets — so 1-1 targets simply
+///    keep going through the old mechanism, unchanged).
+/// 2. Every field [`apply_aggregate::classify_fields`] classifies is
+///    invertible (`Sum`/`Avg`/`Count`) — a `RecomputeOnly` field
+///    (`MIN`/`MAX`, or a composed expression) has no per-row delta at all by
+///    construction, so a definition with even one such field falls back
+///    whole (not just that one field) to keep this issue's scope tractable;
+///    a future pass could split a target's fields between the two
+///    mechanisms.
+/// 3. It references **exactly this one relationship** — a definition
+///    reading two different to-one relationships needs the *other* one's
+///    current value resolved too (a second projection read) to evaluate a
+///    contribution at all, which this issue does not implement; it falls
+///    back rather than silently mis-evaluating.
+async fn build_reverse_relationship_shape(
+    pool: &Pool,
+    rel: &RelationshipDefinition,
+) -> Result<ReverseRelationshipShape, ApplyError> {
+    let projection = catalog::relationship_projection(pool, rel.id).await?;
+    let (qualified_projection, projection_table_bare) = match projection {
+        Some(p) => (
+            ddl::qualified_relationship_projection_table(pool.target_schema(), &p.projection_table),
+            p.projection_table,
+        ),
+        None => {
+            tracing::error!(
+                relationship = %rel.def.name,
+                to_table = %rel.def.to_table,
+                "to-one relationship has no settled parent projection; every \
+                 reverse record for it will be treated as an ordering-check \
+                 miss (should be unreachable — #129 creates one unconditionally)"
+            );
+            (String::new(), String::new())
+        }
+    };
+    let target_schema = pool.target_schema().to_string();
+    let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
+    // `transforms_for_source` matches `schema_nodes.table_name` exactly
+    // (ADR-0007's fully-qualified keying) and every SQL-emitting site below
+    // (`AggregateTargetPlan::source`, `from_side_rows_for_join_txn`'s
+    // `ddl::qualified_source_table`) documents the same requirement — unlike
+    // `source_primary_key` above (a `to_regclass` resolution that already
+    // tolerates a bare name via `search_path`), so this shape stores the
+    // qualified form of `from_table` throughout, not `rel.def.from_table`
+    // verbatim (which the to-many arm elsewhere in this module can get away
+    // with, since it only ever feeds `source_primary_key`/
+    // `from_side_keys_for_join`).
+    let qualified_from_table = qualified_schema_node_key(pool, &rel.def.from_table).await?;
+    let defs = catalog::transforms_for_source(pool, &qualified_from_table).await?;
+
+    let mut aggregate_shapes = Vec::new();
+    let mut needs_recompute_fallback = false;
+
+    for def in &defs {
+        let refs = eval::relationship_references(&def.def);
+        let rel_refs: Vec<&(String, String)> = refs
+            .iter()
+            .filter(|(name, _)| name == &rel.def.name)
+            .collect();
+        if rel_refs.is_empty() {
+            continue;
+        }
+        let distinct_rels: std::collections::HashSet<&str> =
+            refs.iter().map(|(name, _)| name.as_str()).collect();
+
+        let KeySpace::Aggregate { group_by } = &def.def.key_space else {
+            // KeySpace::OneToOne — design fork 1, see this function's doc
+            // comment.
+            needs_recompute_fallback = true;
+            continue;
+        };
+        if distinct_rels.len() > 1 {
+            // Design fork 3.
+            needs_recompute_fallback = true;
+            continue;
+        }
+
+        let relationships = catalog::resolve_relationships(pool, &def.def).await?;
+        let substituted_exprs = crate::defs::backfill::substituted_field_exprs(&def.def)?;
+        let field_plans = apply_aggregate::classify_fields(
+            &def.def,
+            group_by,
+            &def.source_columns,
+            &substituted_exprs,
+            &relationships,
+        )?;
+        if field_plans
+            .iter()
+            .any(|f| f.kind == apply_aggregate::AggFieldKind::RecomputeOnly)
+        {
+            // Design fork 2.
+            needs_recompute_fallback = true;
+            continue;
+        }
+
+        let group_by_types: Vec<ValueType> = group_by
+            .iter()
+            .map(|c| {
+                def.source_columns
+                    .get(c)
+                    .copied()
+                    .unwrap_or(ValueType::Numeric)
+            })
+            .collect();
+        let field_exprs: HashMap<String, Expr> = substituted_exprs
+            .into_iter()
+            .filter(|(name, _)| !group_by.contains(name))
+            .collect();
+        let template = AggregateTargetPlan::new(
+            group_by.clone(),
+            group_by_types,
+            field_plans,
+            qualified_from_table.clone(),
+            def.target_table.clone(),
+            field_exprs,
+            // No live JOIN needed: the triggering relationship's value comes
+            // from the parent's old/new image via a synthetic column below,
+            // not a SQL join back to the to-side table — and design fork 3
+            // already ruled out any *other* relationship reference reaching
+            // here.
+            Vec::new(),
+        );
+
+        let mut synthetic_columns = Vec::new();
+        let mut synthetic_map = HashMap::new();
+        let mut source_columns = def.source_columns.clone();
+        for (_, column) in &rel_refs {
+            if synthetic_map.contains_key(column.as_str()) {
+                continue;
+            }
+            let synthetic = synthetic_relationship_column(column);
+            let value_type = relationships
+                .get(&rel.def.name)
+                .and_then(|r| r.column_types.get(column))
+                .copied()
+                .unwrap_or(ValueType::Text);
+            source_columns.insert(synthetic.clone(), value_type);
+            synthetic_columns.push((column.clone(), synthetic.clone()));
+            synthetic_map.insert(column.clone(), synthetic);
+        }
+        let mut rewritten = def.def.clone();
+        for field in &mut rewritten.fields {
+            substitute_relationship_path(&mut field.expr, &rel.def.name, &synthetic_map);
+        }
+        let contribution_def = apply_aggregate::contribution_def(&rewritten);
+
+        aggregate_shapes.push(ReverseAggregateShape {
+            target: def.target_table.clone(),
+            template,
+            contribution_def,
+            source_columns,
+            synthetic_columns,
+        });
+    }
+
+    Ok(ReverseRelationshipShape {
+        qualified_projection,
+        projection_table_bare,
+        target_schema,
+        to_col: rel.def.to_col.clone(),
+        from_table: qualified_from_table,
+        from_col: rel.def.from_col.clone(),
+        from_pk,
+        aggregate_shapes,
+        needs_recompute_fallback,
+    })
+}
+
+/// The `to_col` text value off `row`, or `None` if `row` is absent or the
+/// column is (an absent column and a genuine SQL `NULL` are both "no key
+/// here" for join purposes).
+fn relationship_key_text(row: &Option<Row>, to_col: &str) -> Option<String> {
+    row.as_ref().and_then(|r| r.get(to_col)).cloned().flatten()
+}
+
+/// Live-reads the settled parent projection's current
+/// [`ddl::PROJECTION_LSN_COLUMN`] for `key` — [`RelationshipReverseRecord::prev_lsn`]'s
+/// source, per this issue's own derivation (confirmed against
+/// [`ddl::PROJECTION_LSN_COLUMN`]'s doc comment): a plain, unlocked read
+/// taken in Phase 2, re-validated under `FOR UPDATE` in Phase 3
+/// (`apply_and_mark_drained_many`'s "3d" step). `None` if `qualified_projection`
+/// is empty (the should-be-unreachable no-projection case) or no row exists
+/// yet for `key` (a parent that's about to be INSERTed).
+async fn live_read_projection_lsn(
+    pool: &Pool,
+    qualified_projection: &str,
+    to_col: &str,
+    key: &str,
+) -> Result<Option<PgLsn>, ApplyError> {
+    if qualified_projection.is_empty() {
+        return Ok(None);
+    }
+    let client = pool.get().await?;
+    let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
+    let key_ident = quote_ident(to_col);
+    let row = client
+        .query_opt(
+            &format!("select {lsn_ident} from {qualified_projection} where {key_ident}::text = $1"),
+            &[&key],
+        )
+        .await?;
+    Ok(row.map(|r| r.get(0)))
+}
+
+// ---------------------------------------------------------------------
+// Issue #131, epic #127: Phase 3 helpers for the reverse-delta apply
+// ---------------------------------------------------------------------
+
+/// Live-enumerates `from_table`'s rows whose `from_col` matches `join_key`,
+/// full row images, inside the already-locked Phase 3 transaction —
+/// [`apply_and_mark_drained_many`]'s "3d" step's from-side enumeration.
+///
+/// **Known gap, tracked for #132** (matches the note already on
+/// [`ReverseRelationshipShape`]'s construction site and the pre-#131
+/// `from_side_keys_for_join`'s own doc comment): this reads *live* state,
+/// not the *applied* set the plan doc's guards (a) (watermark barrier) and
+/// (c) (in-flight check) are what make equal to it — see the plan doc §2's
+/// guard table. This issue's own text calls a live re-enumeration inside
+/// the locked Phase 3 transaction "an acceptable stand-in" for now; #132
+/// must tighten this before the mechanism is safe under concurrent/
+/// out-of-order drain.
+async fn from_side_rows_for_join_txn(
+    txn: &Transaction<'_>,
+    from_table: &str,
+    from_col: &str,
+    from_pk: &PrimaryKeyColumn,
+    join_key: &str,
+) -> Result<Vec<(String, Row)>, ApplyError> {
+    let sql = format!(
+        "select m.k, e.key, e.value \
+         from (select {pk}::text as k, to_jsonb(t.*) as doc from {tbl} t \
+               where {col}::text = $1) m \
+         cross join lateral jsonb_each_text(m.doc) e",
+        pk = quote_ident(&from_pk.name),
+        col = quote_ident(from_col),
+        tbl = ddl::qualified_source_table(from_table),
+    );
+    let db_rows = txn.query(&sql, &[&join_key]).await?;
+    let mut rows: HashMap<String, Row> = HashMap::new();
+    for db_row in db_rows {
+        let key: String = db_row.get(0);
+        let field: String = db_row.get(1);
+        let value: Option<String> = db_row.get(2);
+        rows.entry(key).or_default().insert(field, value);
+    }
+    Ok(rows.into_iter().collect())
+}
+
+/// Splices `parent_row`'s referenced to-side columns into a clone of
+/// `from_row`, under each synthetic column name
+/// [`ReverseAggregateShape::synthetic_columns`] maps it to — how a live
+/// from-side row is made ready for
+/// [`apply_aggregate::row_contribution`] against a
+/// [`ReverseAggregateShape::contribution_def`], which reads the
+/// relationship's value as an ordinary `Column` reference rather than
+/// resolving a live `RelationshipPath` join. `parent_row` is `None` only
+/// for the pass this apply never takes (a parent INSERT has no old-key
+/// pass; a parent DELETE has no new-key pass — see this function's one call
+/// site), so the synthetic column is always populated when it's actually
+/// read.
+fn augment_row_with_relationship_value(
+    from_row: &Row,
+    synthetic_columns: &[(String, String)],
+    parent_row: &Option<Row>,
+) -> Row {
+    let mut augmented = from_row.clone();
+    for (to_col, synthetic) in synthetic_columns {
+        // Always insert the synthetic key, even when `parent_row` is
+        // absent (this row's `from_col` doesn't match this pass' parent
+        // key at all — a parent insert/delete/PK-change's "no match" side)
+        // — as `None` (present, SQL `NULL`), never leaving the key out of
+        // the map entirely. The evaluator's `Row` convention distinguishes
+        // the two (`eval::EvalError::MissingColumn` fires only for a truly
+        // *absent* key): the relationship column always exists on the
+        // to-side schema, it just has no matching row for this pass, which
+        // is exactly the same "resolves to `NULL`" shape a genuine SQL
+        // `LEFT JOIN` no-match already produces (see `eval.rs`'s
+        // `evaluate_with_relationships`/`ToOneRelationship` handling).
+        let value = parent_row
+            .as_ref()
+            .and_then(|row| row.get(to_col))
+            .cloned()
+            .flatten();
+        augmented.insert(synthetic.clone(), value);
+    }
+    augmented
+}
+
+/// The settled parent projection's current data columns (excluding the key
+/// and the two bookkeeping columns) — the same `information_schema.columns`
+/// introspection [`catalog::ensure_relationship_projection_in_txn`] already
+/// uses, duplicated here since Phase 3 holds no `pool` (only `txn`) and that
+/// function is private to `defs::catalog`.
+async fn projection_data_columns(
+    txn: &Transaction<'_>,
+    target_schema: &str,
+    projection_table_bare: &str,
+    to_col: &str,
+) -> Result<Vec<String>, ApplyError> {
+    let bookkeeping = [
+        to_col,
+        ddl::PROJECTION_GEN_COLUMN,
+        ddl::PROJECTION_LSN_COLUMN,
+    ];
+    let rows = txn
+        .query(
+            "select column_name from information_schema.columns \
+             where table_schema = $1 and table_name = $2 order by ordinal_position",
+            &[&target_schema, &projection_table_bare],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .filter(|c| !bookkeeping.contains(&c.as_str()))
+        .collect())
+}
+
+/// Advances the settled parent projection for one applied
+/// [`RelationshipReverseRecord`] (issue #131) — a symmetric delete-then-upsert
+/// keyed independently by `old_key`/`new_key`, so a parent PK-changing
+/// update (a genuinely different projection row identity — rare, but
+/// Postgres imposes no immutability on `to_col` itself) is handled the same
+/// way as an ordinary same-key update, a parent insert (`old_key` absent),
+/// or a parent delete (`new_key` absent). Sets [`ddl::PROJECTION_LSN_COLUMN`]
+/// to `lsn`; **never touches [`ddl::PROJECTION_GEN_COLUMN`]** — that column
+/// is step 3c's forward bookkeeping (a *different* signal: "has a forward
+/// apply landed since some Phase-2 capture"), and this reverse advance is
+/// not one — see both columns' own doc comments for the distinction.
+///
+/// The upsert leans on Postgres's own `jsonb_populate_record` against the
+/// projection table's real composite row type, rather than this crate
+/// re-deriving a per-column cast from `information_schema`: every projected
+/// data column's name already appears as a key in the parent's raw new
+/// image (a full row dump), so Postgres's own JSON-to-record coercion does
+/// exactly the right thing for whichever subset of columns the projection
+/// actually carries.
+async fn apply_projection_advance(
+    txn: &Transaction<'_>,
+    shape: &ReverseRelationshipShape,
+    old_key: &Option<String>,
+    new_key: &Option<String>,
+    new_image: Option<&str>,
+    lsn: Option<PgLsn>,
+) -> Result<(), ApplyError> {
+    if shape.qualified_projection.is_empty() {
+        return Ok(());
+    }
+    let key_ident = quote_ident(&shape.to_col);
+
+    if let Some(old_key) = old_key
+        && new_key.as_deref() != Some(old_key.as_str())
+    {
+        txn.execute(
+            &format!(
+                "delete from {} where {key_ident}::text = $1",
+                shape.qualified_projection
+            ),
+            &[old_key],
+        )
+        .await?;
+    }
+
+    let Some(new_image) = new_image else {
+        return Ok(());
+    };
+    let data_columns = projection_data_columns(
+        txn,
+        &shape.target_schema,
+        &shape.projection_table_bare,
+        &shape.to_col,
+    )
+    .await?;
+    let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
+    let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
+
+    let mut insert_cols = vec![key_ident.clone()];
+    let mut select_exprs = vec![format!("r.{key_ident}")];
+    let mut update_sets = Vec::new();
+    for col in &data_columns {
+        let ident = quote_ident(col);
+        insert_cols.push(ident.clone());
+        select_exprs.push(format!("r.{ident}"));
+        update_sets.push(format!("{ident} = excluded.{ident}"));
+    }
+    insert_cols.push(gen_ident.clone());
+    select_exprs.push("0".to_string());
+    insert_cols.push(lsn_ident.clone());
+    select_exprs.push("$2::pg_lsn".to_string());
+    update_sets.push(format!("{lsn_ident} = excluded.{lsn_ident}"));
+
+    let sql = format!(
+        "insert into {proj} ({insert_cols}) \
+         select {select_exprs} from jsonb_populate_record(null::{proj}, $1::text::jsonb) r \
+         on conflict ({key_ident}) do update set {update_sets}",
+        proj = shape.qualified_projection,
+        insert_cols = insert_cols.join(", "),
+        select_exprs = select_exprs.join(", "),
+        update_sets = update_sets.join(", "),
+    );
+    txn.execute(&sql, &[&new_image, &lsn]).await?;
+    Ok(())
 }
 
 /// The to-side rows whose `to_col` matches any of `join_keys`, grouped by that
@@ -1529,6 +2151,12 @@ pub struct ApplyPlan {
     /// comment for exactly what "touched" means and the #133 gap it's a
     /// documented approximation of.
     relationship_gen_bumps: HashMap<i64, RelationshipGenBump>,
+    /// Issue #131, epic #127: every to-one relationship's parent-keyed
+    /// reverse record this batch's fold produced — see
+    /// [`RelationshipReverseRecord`]'s doc comment. Applied by
+    /// [`apply_and_mark_drained_many`]'s "3d" step, after the ordinary
+    /// aggregate-target writes (step 3b) and the forward gen-bump (step 3c).
+    relationship_reverses: Vec<RelationshipReverseRecord>,
 }
 
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
@@ -1641,6 +2269,16 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // `compute` pass evaluates a to-one relationship for — see
     // [`ApplyPlan::relationship_gen_bumps`]'s doc comment.
     let mut relationship_gen_bumps: HashMap<i64, RelationshipGenBump> = HashMap::new();
+    // Issue #131, epic #127: one `ReverseRelationshipShape` per to-one
+    // relationship this `compute()` call builds a reverse record for,
+    // resolved once (a handful of catalog reads) and shared by every
+    // touched parent key — see `RelationshipReverseRecord`'s doc comment.
+    let mut relationship_reverse_shapes: HashMap<i64, Arc<ReverseRelationshipShape>> =
+        HashMap::new();
+    // Issue #131: every to-one relationship's parent-keyed reverse record
+    // this batch's fold produced, applied by `apply_and_mark_drained_many`'s
+    // "3d" step.
+    let mut relationship_reverses: Vec<RelationshipReverseRecord> = Vec::new();
 
     for (source_key, changes) in by_source {
         tracing::debug!(
@@ -1805,58 +2443,116 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             decoded
         };
         for rel in &inbound_rels {
-            // Join-key text -> the max `hop_gen` of the to-side changes that
-            // touched it (a re-parent update touches both its old and new
-            // key; a delete carries only its pre-image), and (issues
-            // #51/#52's multi-hop gap) the *earliest* (`min`) `src_changed`
-            // among those same changes — see `earliest_src_changed`'s doc
-            // comment for why the two use opposite merge directions.
-            let mut key_hops: HashMap<String, i32> = HashMap::new();
-            let mut key_src_changed: HashMap<String, Option<std::time::SystemTime>> =
-                HashMap::new();
-            for (i, change) in changes.iter().enumerate() {
-                let mut note = |value: &Option<String>, hop: i32| {
-                    if let Some(text) = value {
-                        key_hops
-                            .entry(text.clone())
-                            .and_modify(|h| *h = (*h).max(hop))
-                            .or_insert(hop);
-                        key_src_changed
-                            .entry(text.clone())
-                            .and_modify(|sc| *sc = earliest_src_changed(*sc, change.src_changed))
-                            .or_insert(change.src_changed);
+            // Issue #131, epic #127: to-one relationships get the new
+            // parent-keyed reverse record + delta mechanism below;
+            // to-many relationships keep exactly this pre-#131 image-less
+            // recompute path, unchanged — Phase 1 of this epic is to-one
+            // relationship *values* only (see the plan doc §7).
+            if rel.cardinality == RelationshipCardinality::ToMany {
+                // Join-key text -> the max `hop_gen` of the to-side changes
+                // that touched it (a re-parent update touches both its old
+                // and new key; a delete carries only its pre-image), and
+                // (issues #51/#52's multi-hop gap) the *earliest* (`min`)
+                // `src_changed` among those same changes — see
+                // `earliest_src_changed`'s doc comment for why the two use
+                // opposite merge directions.
+                let mut key_hops: HashMap<String, i32> = HashMap::new();
+                let mut key_src_changed: HashMap<String, Option<std::time::SystemTime>> =
+                    HashMap::new();
+                for (i, change) in changes.iter().enumerate() {
+                    let mut note = |value: &Option<String>, hop: i32| {
+                        if let Some(text) = value {
+                            key_hops
+                                .entry(text.clone())
+                                .and_modify(|h| *h = (*h).max(hop))
+                                .or_insert(hop);
+                            key_src_changed
+                                .entry(text.clone())
+                                .and_modify(|sc| {
+                                    *sc = earliest_src_changed(*sc, change.src_changed)
+                                })
+                                .or_insert(change.src_changed);
+                        }
+                    };
+                    if let Some(row) = &rows[i] {
+                        note(row.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
                     }
-                };
-                if let Some(row) = &rows[i] {
-                    note(row.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
+                    if let Some(old) = &reverse_old_rows[i] {
+                        note(old.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
+                    }
                 }
-                if let Some(old) = &reverse_old_rows[i] {
-                    note(old.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
+                if key_hops.is_empty() {
+                    continue;
                 }
-            }
-            if key_hops.is_empty() {
+                let join_keys: Vec<String> = key_hops.keys().cloned().collect();
+                let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
+                let matches = from_side_keys_for_join(
+                    pool,
+                    &rel.def.from_table,
+                    &from_pk,
+                    &rel.def.from_col,
+                    &join_keys,
+                )
+                .await?;
+                for (from_key, join_text) in matches {
+                    let hop = key_hops.get(&join_text).copied().unwrap_or(0) + 1;
+                    let src_changed = key_src_changed.get(&join_text).copied().flatten();
+                    reverse_recomputes
+                        .entry((rel.def.from_table.clone(), from_key))
+                        .and_modify(|(h, sc)| {
+                            *h = (*h).max(hop);
+                            *sc = earliest_src_changed(*sc, src_changed);
+                        })
+                        .or_insert((hop, src_changed));
+                }
                 continue;
             }
-            let join_keys: Vec<String> = key_hops.keys().cloned().collect();
-            let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
-            let matches = from_side_keys_for_join(
-                pool,
-                &rel.def.from_table,
-                &from_pk,
-                &rel.def.from_col,
-                &join_keys,
-            )
-            .await?;
-            for (from_key, join_text) in matches {
-                let hop = key_hops.get(&join_text).copied().unwrap_or(0) + 1;
-                let src_changed = key_src_changed.get(&join_text).copied().flatten();
-                reverse_recomputes
-                    .entry((rel.def.from_table.clone(), from_key))
-                    .and_modify(|(h, sc)| {
-                        *h = (*h).max(hop);
-                        *sc = earliest_src_changed(*sc, src_changed);
-                    })
-                    .or_insert((hop, src_changed));
+
+            // Issue #131: to-one. One `ReverseRelationshipShape` per
+            // relationship per `compute()` call, shared (via `Arc`) by every
+            // parent key this batch's fold touches for it.
+            let shape = match relationship_reverse_shapes.get(&rel.id) {
+                Some(shape) => Arc::clone(shape),
+                None => {
+                    let shape = Arc::new(build_reverse_relationship_shape(pool, rel).await?);
+                    relationship_reverse_shapes.insert(rel.id, Arc::clone(&shape));
+                    shape
+                }
+            };
+            for (i, change) in changes.iter().enumerate() {
+                let old_row = reverse_old_rows[i].clone();
+                let new_row = rows[i].clone();
+                if old_row.is_none() && new_row.is_none() {
+                    // Both decoded images absent — an image-less change to
+                    // the parent's own table (a bare recompute trigger),
+                    // never a real parent state transition. Nothing to
+                    // reverse-apply.
+                    continue;
+                }
+                let read_key = relationship_key_text(&old_row, &rel.def.to_col)
+                    .or_else(|| relationship_key_text(&new_row, &rel.def.to_col));
+                let prev_lsn = match &read_key {
+                    Some(key) => {
+                        live_read_projection_lsn(
+                            pool,
+                            &shape.qualified_projection,
+                            &shape.to_col,
+                            key,
+                        )
+                        .await?
+                    }
+                    None => None,
+                };
+                relationship_reverses.push(RelationshipReverseRecord {
+                    shape: Arc::clone(&shape),
+                    old_row,
+                    new_row,
+                    new_image: change.new_image.clone(),
+                    lsn: change.lsn,
+                    prev_lsn,
+                    hop_gen: change.hop_gen,
+                    src_changed: change.src_changed,
+                });
             }
         }
 
@@ -2355,6 +3051,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         transform_observations,
         end_to_end_origins: terminal_end_to_end_origins,
         relationship_gen_bumps,
+        relationship_reverses,
     })
 }
 
@@ -2941,6 +3638,289 @@ pub async fn apply_and_mark_drained_many(
         .await?;
     }
 
+    // 3d. Issue #131, epic #127: to-one relationship reverse-delta apply —
+    // see `RelationshipReverseRecord`'s doc comment for the mechanism and
+    // `ReverseRelationshipShape`'s for the fast-path/fallback split this
+    // step dispatches on.
+    //
+    // Not batched across sibling records touching the same aggregate
+    // target within this one drain (each record calls
+    // `apply_aggregate::apply_aggregate_target` on its own, immediately) —
+    // a documented, non-correctness-affecting simplification flagged for
+    // whoever picks up the next perf pass: the writes are genuinely
+    // additive, so N sequential per-record applies to the same group
+    // produce the same final value as one batched apply with the merged
+    // deltas, just as N SQL round trips instead of one. Every record in
+    // `plan.relationship_reverses` is already the whole batch's fold
+    // collapsed to one record per parent key (see that field's own doc
+    // comment), so this only matters when *two different* parent keys in
+    // one drain happen to feed the same target (e.g. an aggregate grouped
+    // by a column unrelated to the relationship).
+    let mut relationship_reverse_fallback: Vec<(
+        String,
+        String,
+        i32,
+        Option<std::time::SystemTime>,
+    )> = Vec::new();
+    for record in &plan.relationship_reverses {
+        let shape = &record.shape;
+        let old_key = relationship_key_text(&record.old_row, &shape.to_col);
+        let new_key = relationship_key_text(&record.new_row, &shape.to_col);
+
+        // Guard (d) stopgap (plan doc §2; #132 builds the real guard
+        // suite): re-read the projection row's own `__trellis_lsn`,
+        // row-locked, and compare against this record's `prev_lsn`,
+        // captured live in Phase 2. A missing projection row (a parent
+        // about to be INSERTed, or the should-be-unreachable
+        // no-projection case) has nothing to conflict with and always
+        // passes.
+        let lock_key = old_key.as_deref().or(new_key.as_deref());
+        let current_lsn: Option<Option<PgLsn>> = match lock_key {
+            Some(key) if !shape.qualified_projection.is_empty() => {
+                let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
+                let key_ident = quote_ident(&shape.to_col);
+                txn.query_opt(
+                    &format!(
+                        "select {lsn_ident} from {} where {key_ident}::text = $1 for update",
+                        shape.qualified_projection,
+                    ),
+                    &[&key],
+                )
+                .await?
+                .map(|row| row.get(0))
+            }
+            _ => None,
+        };
+        let ordering_ok = match current_lsn {
+            None => true,
+            Some(current) => current == record.prev_lsn,
+        };
+
+        if !ordering_ok {
+            // Stopgap (explicitly not #134's deferral/retry plumbing,
+            // which doesn't exist yet): fall back to exactly the pre-#131
+            // mechanism for every touched from-side row — an image-less
+            // `Recompute` at `hop_gen + 1`. Do NOT touch any target table
+            // or the projection for this record: the sibling record that
+            // *did* match `prev_lsn` already advanced them (or will, once
+            // it's processed/re-captured).
+            tracing::warn!(
+                relationship_projection = %shape.qualified_projection,
+                "issue #131 reverse record's prev_lsn did not match the \
+                 projection's current lsn; falling back to an image-less \
+                 recompute of its from-side rows (stopgap for #134's \
+                 deferral plumbing)"
+            );
+            for key in [old_key.as_deref(), new_key.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                let from_rows = from_side_rows_for_join_txn(
+                    txn,
+                    &shape.from_table,
+                    &shape.from_col,
+                    &shape.from_pk,
+                    key,
+                )
+                .await?;
+                for (from_key, _) in from_rows {
+                    relationship_reverse_fallback.push((
+                        shape.from_table.clone(),
+                        from_key,
+                        record.hop_gen + 1,
+                        record.src_changed,
+                    ));
+                }
+            }
+            continue;
+        }
+
+        // Fast path: a true delta for every fully-invertible,
+        // single-relationship aggregate target.
+        //
+        // **Not** an unconditional subtract-old/add-new over two
+        // *independent* row sets — a parent-only change never moves a
+        // from-side row into or out of its aggregate group (the row's own
+        // `GROUP BY` columns never change), so every affected row is
+        // diffed in place: its contribution *under the old parent state*
+        // vs. *under the new one*, per field, via
+        // `apply_aggregate::diff_contributions` (the same per-field
+        // cancellation `accumulate_changes`'s own in-place-update branch
+        // uses) — otherwise a field the relationship doesn't even read
+        // (e.g. a plain `COUNT(*)`) would wrongly gain a net delta every
+        // time its group is touched here. The common case (an ordinary
+        // parent attribute update; `old_key == new_key`) enumerates the
+        // row set once. `old_key != new_key` (a parent insert, delete, or
+        // the rare case of the parent's own key value itself changing)
+        // enumerates each side separately, diffing against "no relationship
+        // match" (`parent = None`) for whichever side a row's own set
+        // doesn't carry.
+        for agg_shape in &shape.aggregate_shapes {
+            let mut target_plan = agg_shape.template.clone();
+            let mut regex_cache = eval::RegexCache::new();
+
+            let diff_pass = async |txn: &Transaction<'_>,
+                                   target_plan: &mut AggregateTargetPlan,
+                                   regex_cache: &mut eval::RegexCache,
+                                   pass_key: &str,
+                                   old_parent: &Option<Row>,
+                                   new_parent: &Option<Row>|
+                   -> Result<(), ApplyError> {
+                let from_rows = from_side_rows_for_join_txn(
+                    txn,
+                    &shape.from_table,
+                    &shape.from_col,
+                    &shape.from_pk,
+                    pass_key,
+                )
+                .await?;
+                for (_, from_row) in from_rows {
+                    let old_augmented = augment_row_with_relationship_value(
+                        &from_row,
+                        &agg_shape.synthetic_columns,
+                        old_parent,
+                    );
+                    let new_augmented = augment_row_with_relationship_value(
+                        &from_row,
+                        &agg_shape.synthetic_columns,
+                        new_parent,
+                    );
+                    let (values, group_key) =
+                        apply_aggregate::derive_group_key(&new_augmented, &target_plan.group_by);
+                    let old_contrib = apply_aggregate::row_contribution(
+                        &agg_shape.contribution_def,
+                        &old_augmented,
+                        &agg_shape.source_columns,
+                        regex_cache,
+                    )?;
+                    let new_contrib = apply_aggregate::row_contribution(
+                        &agg_shape.contribution_def,
+                        &new_augmented,
+                        &agg_shape.source_columns,
+                        regex_cache,
+                    )?;
+                    let group = target_plan
+                        .groups
+                        .entry(group_key)
+                        .or_insert_with(|| apply_aggregate::GroupPlan::new(values));
+                    group.hop_gen = group.hop_gen.max(record.hop_gen);
+                    apply_aggregate::diff_contributions(
+                        &target_plan.fields,
+                        group,
+                        &old_contrib,
+                        &new_contrib,
+                    );
+                }
+                Ok(())
+            };
+
+            if old_key == new_key {
+                if let Some(key) = &old_key {
+                    diff_pass(
+                        txn,
+                        &mut target_plan,
+                        &mut regex_cache,
+                        key,
+                        &record.old_row,
+                        &record.new_row,
+                    )
+                    .await?;
+                }
+            } else {
+                if let Some(key) = &old_key {
+                    diff_pass(
+                        txn,
+                        &mut target_plan,
+                        &mut regex_cache,
+                        key,
+                        &record.old_row,
+                        &None,
+                    )
+                    .await?;
+                }
+                if let Some(key) = &new_key {
+                    diff_pass(
+                        txn,
+                        &mut target_plan,
+                        &mut regex_cache,
+                        key,
+                        &None,
+                        &record.new_row,
+                    )
+                    .await?;
+                }
+            }
+
+            if target_plan.groups.is_empty() {
+                continue;
+            }
+            let result =
+                apply_aggregate::apply_aggregate_target(txn, &agg_shape.target, &target_plan)
+                    .await?;
+            keys_written += result.written.len();
+            keys_deleted += result.deleted.len();
+            if !result.written.is_empty() || !result.deleted.is_empty() {
+                changed
+                    .entry(agg_shape.target.as_str())
+                    .or_default()
+                    .extend(
+                        result
+                            .written
+                            .into_iter()
+                            .chain(result.deleted)
+                            .map(|(key, hop_gen)| (key, hop_gen, record.src_changed)),
+                    );
+            }
+        }
+
+        // Fallback: anything the fast path doesn't cover for this
+        // relationship (a 1-1 target, a `RecomputeOnly` field, a
+        // multi-relationship aggregate — see
+        // `ReverseRelationshipShape::needs_recompute_fallback`'s doc
+        // comment) still needs the pre-#131 treatment for every touched
+        // from-side row.
+        if shape.needs_recompute_fallback {
+            let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for key in [old_key.as_deref(), new_key.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                let from_rows = from_side_rows_for_join_txn(
+                    txn,
+                    &shape.from_table,
+                    &shape.from_col,
+                    &shape.from_pk,
+                    key,
+                )
+                .await?;
+                for (from_key, _) in from_rows {
+                    if seen_keys.insert(from_key.clone()) {
+                        relationship_reverse_fallback.push((
+                            shape.from_table.clone(),
+                            from_key,
+                            record.hop_gen + 1,
+                            record.src_changed,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Advance the projection — issue #131's own write, distinct from
+        // step 3c's forward `__trellis_gen` bump above (never touched
+        // here; see `apply_projection_advance`'s doc comment for the
+        // distinction).
+        apply_projection_advance(
+            txn,
+            shape,
+            &old_key,
+            &new_key,
+            record.new_image.as_deref(),
+            record.lsn,
+        )
+        .await?;
+    }
+
     // 4. Downstream propagation, with the hop bound checked before staging
     // anything.
     let mut recompute_changes = Vec::new();
@@ -2977,6 +3957,25 @@ pub async fn apply_and_mark_drained_many(
     // recomputes — the same shape and same hop bound forward propagation uses,
     // just keyed by the from-side table/PK rather than a touched target key.
     for (from_table, key, hop_gen, src_changed) in &plan.reverse_recomputes {
+        if *hop_gen > MAX_HOP_GEN {
+            hop_bound_tables.push(from_table.clone());
+            worst_hop_gen = worst_hop_gen.max(*hop_gen);
+            continue;
+        }
+        recompute_changes.push(StagedChange::Recompute {
+            src_table: from_table.clone(),
+            key: key.clone(),
+            hop_gen: *hop_gen,
+            group_key: None,
+            src_changed: *src_changed,
+        });
+    }
+
+    // Issue #131: the same image-less recompute staging, for step 3d's own
+    // two fallback cases — the ordering-check-miss stopgap, and definitions
+    // `ReverseRelationshipShape::needs_recompute_fallback` excludes from the
+    // fast path.
+    for (from_table, key, hop_gen, src_changed) in &relationship_reverse_fallback {
         if *hop_gen > MAX_HOP_GEN {
             hop_bound_tables.push(from_table.clone());
             worst_hop_gen = worst_hop_gen.max(*hop_gen);
