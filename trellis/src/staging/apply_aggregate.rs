@@ -377,8 +377,15 @@ pub(super) struct AggregateTargetPlan {
     /// relationship-free aggregate, in which case every SQL statement this
     /// module emits is byte-identical to what it emitted before #94.
     ///
-    /// Non-empty also *means* "this target is on the forced-recompute path"
-    /// — see the module doc comment and [`accumulate_changes`].
+    /// Before issue #136, non-empty also *meant* "every group of this target
+    /// is on the forced-recompute path" (`force_every_group`). #136 deleted
+    /// that routing — an invertible field (`SUM`/`AVG`/`COUNT`) reading a
+    /// relationship path is still folded incrementally through the ordinary
+    /// delta path, exactly like a plain-column field — so this no longer
+    /// implies anything about *routing*; it only tells every SQL builder
+    /// that reads a `RecomputeOnly` field's expression ([`render_agg_expr`]
+    /// and its callers) whether that expression's relationship paths need a
+    /// join, regardless of which path (forced or delta) it's rendered from.
     pub rel_joins: Vec<RelJoin>,
 }
 
@@ -1008,14 +1015,32 @@ pub(super) struct AggregateApplyResult {
 /// own [`derive_group_key`] doesn't attempt `GROUP BY`'s "NULLs group
 /// together" semantics beyond this) never silently fails to match itself.
 fn group_where_clause(group_by: &[String], group_by_types: &[ValueType], start: usize) -> String {
+    group_where_clause_aliased(group_by, group_by_types, start, None)
+}
+
+/// [`group_where_clause`], with each column optionally qualified by `alias`
+/// — needed once the `FROM` clause it's paired with joins in a second table
+/// (a to-one relationship's to-side, per issue #94), so an unqualified
+/// `GROUP BY` column name can't become ambiguous against a same-named
+/// to-side column. `None` renders byte-identical to the unaliased form, so
+/// every relationship-free call site is unaffected.
+fn group_where_clause_aliased(
+    group_by: &[String],
+    group_by_types: &[ValueType],
+    start: usize,
+    alias: Option<&str>,
+) -> String {
     group_by
         .iter()
         .zip(group_by_types)
         .enumerate()
         .map(|(i, (col, ty))| {
+            let col_sql = match alias {
+                Some(a) => format!("{a}.{}", quote_ident(col)),
+                None => quote_ident(col),
+            };
             format!(
-                "{} is not distinct from ${}::text::{}",
-                quote_ident(col),
+                "{col_sql} is not distinct from ${}::text::{}",
                 start + i,
                 ddl::pg_type_name(*ty)
             )
@@ -1073,24 +1098,48 @@ async fn delete_group_row(
 /// path, any) field's current value for one group directly from the source
 /// — `select (<rendered expr>)::text from source where <group columns> =
 /// ...`, scoped to just this group, never a full-table scan. Rendering via
-/// [`oracle::render_expr_sql`] means this is not a second implementation of
-/// the field's semantics: it is the exact SQL the correctness oracle itself
-/// would run for this field, evaluated with no `GROUP BY` because the
-/// `WHERE` clause has already restricted the input to exactly one group.
+/// [`render_agg_expr`] — the same relationship-aware branch
+/// [`apply_forced_groups_bulk`]/[`probe_recompute_fields_bulk`] use — means
+/// this is not a second implementation of the field's semantics: it is the
+/// exact SQL the correctness oracle itself would run for this field,
+/// evaluated with no `GROUP BY` because the `WHERE` clause has already
+/// restricted the input to exactly one group. A plan with to-one
+/// relationship joins (issue #94) needs its to-side table joined in here
+/// too — reachable whenever an ordinary (non-forced) delta touches exactly
+/// one group with a `RecomputeOnly` field reading a relationship path (this
+/// module's whole-branch-review regression, epic #127: issue #131's design
+/// scoped `MIN`/`MAX`-over-relationship out of the reverse fast path, and
+/// issue #136 then routed such a group through the *forward* ordinary delta
+/// path instead of the old always-joins-correctly `force_every_group`) — so
+/// this mirrors those bulk builders' `rel_joins_sql`/aliasing rather than
+/// assuming an unaliased, join-free source scan.
 async fn probe_field_value(
     txn: &Transaction<'_>,
-    source: &str,
+    plan: &AggregateTargetPlan,
     expr: &Expr,
-    group_by: &[String],
-    group_by_types: &[ValueType],
     values: &[Option<String>],
 ) -> Result<Option<String>, ApplyError> {
-    let expr_sql = oracle::render_expr_sql(expr);
-    let where_sql = group_where_clause(group_by, group_by_types, 1);
-    let sql = format!(
-        "select ({expr_sql})::text from {} where {where_sql}",
-        ddl::qualified_source_table(source)
-    );
+    let expr_sql = render_agg_expr(plan, expr);
+    let source_ident = ddl::qualified_source_table(&plan.source);
+    let sql = if plan.rel_joins.is_empty() {
+        let where_sql = group_where_clause(&plan.group_by, &plan.group_by_types, 1);
+        format!("select ({expr_sql})::text from {source_ident} where {where_sql}")
+    } else {
+        let rel_joins_sql = oracle::to_one_join_clauses(
+            plan.rel_joins.iter().map(|j| {
+                (
+                    j.name.as_str(),
+                    j.to_table.as_str(),
+                    j.to_col.as_str(),
+                    j.from_col.as_str(),
+                )
+            }),
+            "s",
+        );
+        let where_sql =
+            group_where_clause_aliased(&plan.group_by, &plan.group_by_types, 1, Some("s"));
+        format!("select ({expr_sql})::text from {source_ident} s{rel_joins_sql} where {where_sql}")
+    };
     let row = txn.query_one(&sql, &group_where_params(values)).await?;
     Ok(row.get(0))
 }
@@ -1318,15 +1367,7 @@ async fn upsert_group(
             }
             AggFieldKind::RecomputeOnly => {
                 let expr = &plan.field_exprs[field.name.as_str()];
-                let value = probe_field_value(
-                    txn,
-                    &plan.source,
-                    expr,
-                    &plan.group_by,
-                    &plan.group_by_types,
-                    &group.group_values,
-                )
-                .await?;
+                let value = probe_field_value(txn, plan, expr, &group.group_values).await?;
                 probed.push(value);
                 columns.push(ColumnPlan::Recompute(
                     field.name.clone(),
@@ -1869,18 +1910,30 @@ fn agg_arg_sql(plan: &AggregateTargetPlan, field_name: &str) -> String {
 }
 
 /// One aggregate field's (or field argument's) expression as SQL over this
-/// plan's recompute scan, where the source is aliased `s`.
+/// plan's recompute scan, where the source is aliased `s` (every caller with
+/// a non-empty `rel_joins` joins the source under that alias — see
+/// [`oracle::to_one_join_clauses`]'s own call sites in this file).
 ///
 /// A relationship-free plan renders through [`oracle::render_expr_sql`]
 /// unchanged — unqualified column names, exactly as before #94, which matters
-/// because the per-group probes ([`probe_field_value`],
-/// [`probe_sum_and_count`]) render the same expressions against an *unaliased*
-/// source. A plan with to-one relationship joins renders through
-/// [`oracle::render_to_one_rel_expr_sql`] instead, qualifying source columns
-/// with `s` (they'd otherwise be ambiguous against the joined to-side table)
-/// and resolving each `<rel>.<column>` path off its join alias. Those per-group
-/// probes are unreachable for such a plan: every one of its groups is forced
-/// onto this bulk recompute path (see [`accumulate_changes`]).
+/// because callers with no relationship join ([`probe_field_value`],
+/// [`probe_sum_and_count`], [`probe_recompute_fields_bulk`]) render the same
+/// expressions against an *unaliased* source. A plan with to-one relationship
+/// joins renders through [`oracle::render_to_one_rel_expr_sql`] instead,
+/// qualifying source columns with `s` (they'd otherwise be ambiguous against
+/// the joined to-side table) and resolving each `<rel>.<column>` path off its
+/// join alias.
+///
+/// Every caller that can be reached for a plan with relationship joins must
+/// pair this with [`oracle::to_one_join_clauses`] over `plan.rel_joins`
+/// (aliased `s`, matching this function's own aliasing), or the rendered
+/// `<rel>.<column>` reference resolves to nothing. Before issue #136,
+/// `force_every_group` guaranteed every group of such a plan reached only
+/// [`apply_forced_groups_bulk`] (which already did this), making the ordinary
+/// delta-path probes ([`probe_field_value`], [`probe_recompute_fields_bulk`])
+/// unreachable for a relationship-reading `RecomputeOnly` field; #136 routes
+/// such groups through the ordinary delta path instead, so both of those now
+/// need — and carry — the same join.
 fn render_agg_expr(plan: &AggregateTargetPlan, expr: &Expr) -> String {
     if plan.rel_joins.is_empty() {
         oracle::render_expr_sql(expr)
@@ -2028,12 +2081,29 @@ async fn probe_recompute_fields_bulk(
         .map(|f| {
             format!(
                 "({})::text",
-                oracle::render_expr_sql(&plan.field_exprs[f.name.as_str()])
+                render_agg_expr(plan, &plan.field_exprs[f.name.as_str()])
             )
         })
         .collect();
+    // Issue #94 (same as `apply_forced_groups_bulk`): a `RecomputeOnly` field
+    // reading a to-one relationship path (e.g. `MIN(rel.col)`/`MAX(rel.col)`)
+    // needs its relationship's to-side table joined onto this scan, or
+    // `render_agg_expr` above renders an unresolved `rel.col` path that panics
+    // in the relationship-free renderer it would otherwise fall through to.
+    // Empty for a relationship-free plan, leaving this SQL byte-identical.
+    let rel_joins_sql = oracle::to_one_join_clauses(
+        plan.rel_joins.iter().map(|j| {
+            (
+                j.name.as_str(),
+                j.to_table.as_str(),
+                j.to_col.as_str(),
+                j.from_col.as_str(),
+            )
+        }),
+        "s",
+    );
     let sql = format!(
-        "select k.ord::bigint, {} from {} join {source_ident} s on {} group by k.ord",
+        "select k.ord::bigint, {} from {} join {source_ident} s on {}{rel_joins_sql} group by k.ord",
         select_exprs.join(", "),
         keyset_unnest(&plan.group_by_types, 1, true),
         keyset_match(&plan.group_by, "s", null_safe),

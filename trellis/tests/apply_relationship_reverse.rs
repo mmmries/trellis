@@ -101,6 +101,11 @@ async fn stage_cdc_at_lsn(
 /// images for its outbound relationship's `from_col`, since these tests
 /// stage directly into the ring rather than running a real replication
 /// stream.
+// 8 args, all independently meaningful test-staging inputs (mirrors
+// `stage_cdc_at_lsn`'s own shape plus `group_key`) — a struct wrapper would
+// just move the same fields into another type call sites still have to fill
+// in field-by-field, for no real clarity gain in a test helper.
+#[allow(clippy::too_many_arguments)]
 async fn stage_cdc_with_group_key_at_lsn(
     client: &Client,
     src_table: &str,
@@ -2388,7 +2393,7 @@ async fn fairness_escalation_increments_its_own_metric() {
 
     let after = metric_value(&trellis::metrics::Metrics::new().render_prometheus());
     assert!(
-        after >= before + 1,
+        after > before,
         "the fairness-escalation metric must have advanced by at least one \
          (before={before}, after={after}) — it may be more than one if a \
          concurrently-running sibling test also escalated, which is expected \
@@ -2552,7 +2557,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
     async fn assert_label_advanced_by_at_least_one(before: u64, label: &str) {
         let after = value_for(label).await;
         assert!(
-            after >= before + 1,
+            after > before,
             "label {label:?} must have advanced by at least one \
              (before={before}, after={after}) — it may be more than one if \
              a concurrently-running sibling test also rejected on this \

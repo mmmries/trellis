@@ -862,6 +862,255 @@ async fn two_relationships_sharing_a_to_side_column_name_resolve_independently()
 }
 
 // ---------------------------------------------------------------------
+// Whole-branch review regression (epic #127): an invertible field mixed with
+// a relationship-reading `RecomputeOnly` field on the same target, driven
+// through an *ordinary* forward delta (never image-less, so never
+// `force_full_recompute`).
+//
+// Before issue #136, every group of a relationship-reading aggregate target
+// was forced onto `apply_forced_groups_bulk` (`force_every_group`), which
+// already joined the to-side table correctly — so `upsert_group`'s
+// `probe_field_value` and `apply_delta_groups_bulk`'s
+// `probe_recompute_fields_bulk` could never actually be reached for such a
+// target, regardless of how many groups one batch touched. #136 deleted that
+// routing: `SUM`/`AVG`/`COUNT` fields (even ones reading a relationship path)
+// now fold incrementally through the ordinary ("delta") path, but a `MIN`/
+// `MAX` field on that same target is still `RecomputeOnly` and gets probed
+// live — through whichever of those two functions `apply_aggregate_target`
+// picks based on how many groups the batch touched (`upsert_group` for
+// exactly one, `apply_delta_groups_bulk` for more than one). Both functions
+// rendered the `RecomputeOnly` expression through the relationship-unaware
+// `oracle::render_expr_sql` and built no `JOIN` for it at all, so either path
+// panicked (`render_expr_sql called on an unresolved relationship path`) the
+// moment a real batch reached it — `apply_delta_groups_bulk`'s corner is what
+// the generative fuzz suite caught; `upsert_group`'s single-group corner is
+// the same defect, uncovered by close reading during this fix.
+//
+// `MIXED_TOTALS` gives every group both kinds at once: `SUM(id)` (`id` is a
+// plain, non-relationship column — invertible, folds via the delta path
+// unconditionally) and `MIN(post.word_count)` (a to-one relationship read —
+// `RecomputeOnly`, so it's the one that must probe live and correctly).
+
+const MIXED_TOTALS: &str = "TRANSFORM tag_mixed FROM post_tags GROUP BY tag \
+     SELECT SUM(id) AS id_sum, MIN(post.word_count) AS min_word_count";
+
+fn mixed_oracle_def() -> TransformDef {
+    TransformDef {
+        target: "tag_mixed".to_string(),
+        source: "post_tags".to_string(),
+        key_space: KeySpace::Aggregate {
+            group_by: vec!["tag".to_string()],
+        },
+        fields: vec![
+            FieldDef {
+                name: "tag".to_string(),
+                expr: Expr::Column("tag".to_string()),
+            },
+            FieldDef {
+                name: "id_sum".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![Expr::Column("id".to_string())],
+                },
+            },
+            FieldDef {
+                name: "min_word_count".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "MIN".to_string(),
+                    args: vec![Expr::RelationshipPath {
+                        rel: "post".to_string(),
+                        column: "word_count".to_string(),
+                    }],
+                },
+            },
+        ],
+        predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
+    }
+}
+
+async fn mixed_oracle_totals(client: &Client) -> Totals {
+    let base = render_aggregate_relationship_select_sql(&mixed_oracle_def(), &post_rel());
+    let sql = format!("select tag, id_sum::text, min_word_count::text from ({base}) t");
+    client
+        .query(sql.as_str(), &[])
+        .await
+        .expect("query mixed sum/relationship-min oracle")
+        .into_iter()
+        .map(|r| (r.get(0), (r.get(1), r.get(2))))
+        .collect()
+}
+
+async fn mixed_target_totals(client: &Client) -> Totals {
+    client
+        .query(
+            "select tag, id_sum::text, min_word_count::text from tag_mixed",
+            &[],
+        )
+        .await
+        .expect("read tag_mixed")
+        .into_iter()
+        .map(|r| (r.get(0), (r.get(1), r.get(2))))
+        .collect()
+}
+
+/// Adds post 4 (`word_count = 5`, lower than every seeded post) unreferenced
+/// by any existing `post_tags` row — so backfill's totals are unaffected, and
+/// each test below only picks it up via the specific forward insert(s) it
+/// stages, making a `min_word_count` change a direct signal that the new
+/// row's relationship read was actually folded in (not just "didn't panic").
+async fn add_low_word_count_post(client: &Client) {
+    client
+        .execute("insert into posts (id, word_count) values (4, 5)", &[])
+        .await
+        .expect("insert post 4");
+}
+
+/// The single-touched-group corner: one forward insert, one group touched,
+/// so `apply_aggregate_target` routes it through `upsert_group` —
+/// `probe_field_value`'s corner of this regression.
+#[tokio::test]
+async fn sum_and_relationship_min_mixed_single_group_forward_insert() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+    add_low_word_count_post(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, MIXED_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the mixed sum/relationship-min definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        mixed_target_totals(&client).await,
+        mixed_oracle_totals(&client).await,
+        "after backfill"
+    );
+    assert_eq!(
+        mixed_target_totals(&client).await.get("rust"),
+        Some(&(Some("34".to_string()), Some("100".to_string()))),
+        "sanity: rust = 10 + 11 + 13 = 34, min(100, 250, missing-post) = 100"
+    );
+
+    client
+        .execute(
+            "insert into post_tags (id, post, tag) values (20, 4, 'rust')",
+            &[],
+        )
+        .await
+        .expect("insert a new post_tag");
+    stage_cdc(
+        &client,
+        "post_tags",
+        "20",
+        "insert",
+        None,
+        Some("{\"id\":20,\"post\":4,\"tag\":\"rust\"}"),
+    )
+    .await;
+    // Only 'rust' is touched by this batch — must not panic (pre-fix:
+    // `render_expr_sql called on an unresolved relationship path 'post.word_count'`).
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = mixed_target_totals(&client).await;
+    assert_eq!(
+        totals,
+        mixed_oracle_totals(&client).await,
+        "after a single-group forward delta mixing an invertible field with \
+         a relationship-reading RecomputeOnly field"
+    );
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("54".to_string()), Some("5".to_string()))),
+        "id_sum = 34 + 20 = 54; min_word_count drops to post 4's 5, proving \
+         the new row's relationship read was actually folded into the live \
+         MIN probe, not just non-panicking"
+    );
+}
+
+/// The multi-touched-group corner: two forward inserts landing in different
+/// groups within the same drain batch, so `apply_aggregate_target` routes it
+/// through `apply_delta_groups_bulk` — `probe_recompute_fields_bulk`'s corner
+/// of this regression, and the one the generative fuzz suite's
+/// `convergence_holds_across_a_mid_stream_scale_out` caught.
+#[tokio::test]
+async fn sum_and_relationship_min_mixed_two_groups_in_one_batch() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+    add_low_word_count_post(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, MIXED_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the mixed sum/relationship-min definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    client
+        .execute(
+            "insert into post_tags (id, post, tag) values (21, 4, 'rust'), (22, 4, 'db')",
+            &[],
+        )
+        .await
+        .expect("insert two new post_tags rows in different groups");
+    stage_cdc(
+        &client,
+        "post_tags",
+        "21",
+        "insert",
+        None,
+        Some("{\"id\":21,\"post\":4,\"tag\":\"rust\"}"),
+    )
+    .await;
+    stage_cdc(
+        &client,
+        "post_tags",
+        "22",
+        "insert",
+        None,
+        Some("{\"id\":22,\"post\":4,\"tag\":\"db\"}"),
+    )
+    .await;
+    // Both 'rust' and 'db' are touched in the same batch (two groups, so the
+    // bulk path) — must not panic (pre-fix: same `render_expr_sql` panic as
+    // the single-group corner above, from `probe_recompute_fields_bulk`
+    // instead of `probe_field_value`).
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = mixed_target_totals(&client).await;
+    assert_eq!(
+        totals,
+        mixed_oracle_totals(&client).await,
+        "after a two-group forward delta mixing an invertible field with a \
+         relationship-reading RecomputeOnly field"
+    );
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("55".to_string()), Some("5".to_string()))),
+        "id_sum = 34 + 21 = 55; min_word_count drops to post 4's 5"
+    );
+    assert_eq!(
+        totals.get("db"),
+        Some(&(Some("48".to_string()), Some("5".to_string()))),
+        "id_sum = 26 + 22 = 48; min_word_count drops from 100 to post 4's 5"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Rejections that must still fire.
 // ---------------------------------------------------------------------
 
