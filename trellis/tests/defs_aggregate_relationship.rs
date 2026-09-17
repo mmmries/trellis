@@ -594,6 +594,273 @@ async fn a_from_side_re_point_within_one_update_diffs_old_and_new_parent_contrib
     );
 }
 
+/// Issue #136 review follow-up: `AVG` over a relationship-read column
+/// (`AVG(post.word_count)`) — code-reading confirmed `contribution_def`'s
+/// `AVG`-as-`SUM` rewrite only touches a field's own top-level
+/// `FunctionCall` and runs *after* `build_forward_relationship_shape`'s
+/// `RelationshipPath`-to-synthetic-`Column` substitution, so the two
+/// rewrites should compose regardless of order — but nothing exercised
+/// `AVG` combined with a relationship read before this test (every existing
+/// `AVG` test is relationship-free, and #94's own aggregate-relationship
+/// tests only cover `SUM`/`COUNT`). Proves both backfill and the ordinary
+/// forward delta path maintain `AVG`'s hidden sum/count partials correctly
+/// when the averaged value itself comes from a relationship, including the
+/// `NULL`-skipping rule (`post = 999` resolves to no post at all; post 3's
+/// `word_count` is a genuine SQL `NULL` — both must be excluded from the
+/// average, not treated as zero), by comparing against Postgres's own
+/// `LEFT JOIN … GROUP BY … AVG(...)` oracle rather than a hardcoded
+/// (scale-sensitive) literal.
+#[tokio::test]
+async fn avg_over_a_relationship_read_column_maintains_through_backfill_and_forward_insert() {
+    fn oracle_avg_def() -> TransformDef {
+        TransformDef {
+            target: "tag_avg".to_string(),
+            source: "post_tags".to_string(),
+            key_space: KeySpace::Aggregate {
+                group_by: vec!["tag".to_string()],
+            },
+            fields: vec![
+                FieldDef {
+                    name: "tag".to_string(),
+                    expr: Expr::Column("tag".to_string()),
+                },
+                FieldDef {
+                    name: "avg_words".to_string(),
+                    expr: Expr::FunctionCall {
+                        name: "AVG".to_string(),
+                        args: vec![Expr::RelationshipPath {
+                            rel: "post".to_string(),
+                            column: "word_count".to_string(),
+                        }],
+                    },
+                },
+            ],
+            predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
+        }
+    }
+
+    async fn oracle_avg_totals(client: &Client) -> HashMap<String, Option<String>> {
+        let base = render_aggregate_relationship_select_sql(&oracle_avg_def(), &post_rel());
+        let sql = format!("select tag, avg_words::text from ({base}) t");
+        client
+            .query(sql.as_str(), &[])
+            .await
+            .expect("query avg-over-relationship oracle")
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect()
+    }
+
+    async fn target_avg_totals(client: &Client) -> HashMap<String, Option<String>> {
+        client
+            .query("select tag, avg_words::text from tag_avg", &[])
+            .await
+            .expect("read tag_avg")
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect()
+    }
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(
+        &db.pool,
+        "TRANSFORM tag_avg FROM post_tags GROUP BY tag SELECT AVG(post.word_count) AS avg_words",
+        &post_tags_columns(),
+        "public",
+    )
+    .await
+    .expect("install the AVG-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        target_avg_totals(&client).await,
+        oracle_avg_totals(&client).await,
+        "after backfill"
+    );
+
+    // Forward delta: a new post_tags row pointing at post 2 (250 words)
+    // joins 'db' (previously just post 1's 100, with post 3's NULL
+    // skipped) — post-#136 this resolves via the settled projection and
+    // must still fold into AVG's running sum/count partials correctly.
+    client
+        .execute(
+            "insert into post_tags (id, post, tag) values (15, 2, 'db')",
+            &[],
+        )
+        .await
+        .expect("insert a new post_tag");
+    stage_cdc(
+        &client,
+        "post_tags",
+        "15",
+        "insert",
+        None,
+        Some("{\"id\":15,\"post\":2,\"tag\":\"db\"}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_avg_totals(&client).await;
+    assert_eq!(
+        totals,
+        oracle_avg_totals(&client).await,
+        "after a forward delta touching an AVG field's relationship read"
+    );
+    assert_eq!(
+        totals.get("db").cloned().flatten(),
+        Some("175.0000000000000000".to_string()),
+        "'db' must now average post 1 (100) and post 2 (250) = 175 (at \
+         Postgres's own avg() scale), folded in via the forward delta, not \
+         left at the backfilled 100"
+    );
+}
+
+/// Issue #136 review follow-up: two distinct relationships referenced by the
+/// same aggregate definition, both happening to read a to-side column with
+/// the same *name* (`author.score`/`editor.score`, both relationships
+/// pointing at `users`) — code-reading confirmed
+/// `forward_relationship_synthetic_column(rel, column)`'s namespacing by
+/// *both* relationship name and column avoids the collision a naming scheme
+/// keyed on column alone would hit (two different relationships' resolved
+/// values overwriting the same synthetic column on the augmented row), but
+/// no test actually constructed two relationships sharing a to-side column
+/// name before this one. Proves both totals resolve correctly, independently
+/// of each other, through backfill and an ordinary forward delta — the SQL
+/// oracle comparison would itself corrupt silently (one field's value
+/// leaking into the other) if the collision this test targets were ever
+/// reintroduced.
+#[tokio::test]
+async fn two_relationships_sharing_a_to_side_column_name_resolve_independently() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table users (id integer primary key, score numeric); \
+             alter table users replica identity full; \
+             insert into users (id, score) values (1, 10), (2, 20), (3, 30); \
+             create table reviews \
+               (id integer primary key, article_id integer, author_id integer, \
+                editor_id integer); \
+             alter table reviews replica identity full; \
+             insert into reviews (id, article_id, author_id, editor_id) values \
+               (1, 100, 1, 2), (2, 100, 2, 3)",
+        )
+        .await
+        .expect("create + seed two-relationship schema");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP author FROM reviews.author_id TO users.id",
+    )
+    .await
+    .expect("create the author relationship");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP editor FROM reviews.editor_id TO users.id",
+    )
+    .await
+    .expect("create the editor relationship");
+
+    let source_columns = columns(&[
+        ("id", ValueType::Numeric),
+        ("article_id", ValueType::Numeric),
+        ("author_id", ValueType::Numeric),
+        ("editor_id", ValueType::Numeric),
+    ]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM review_totals FROM reviews GROUP BY article_id \
+         SELECT COUNT(*) AS review_count, SUM(author.score) AS author_total, \
+         SUM(editor.score) AS editor_total",
+        &source_columns,
+        "public",
+    )
+    .await
+    .expect("install the two-relationship aggregate definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    async fn review_totals(
+        client: &Client,
+    ) -> HashMap<String, (Option<String>, Option<String>, Option<String>)> {
+        client
+            .query(
+                "select article_id::text, review_count::text, author_total::text, \
+                 editor_total::text from review_totals",
+                &[],
+            )
+            .await
+            .expect("read review_totals")
+            .into_iter()
+            .map(|r| (r.get(0), (r.get(1), r.get(2), r.get(3))))
+            .collect()
+    }
+
+    // After backfill: author scores 10 (user 1, row 1) + 20 (user 2, row 2)
+    // = 30; editor scores 20 (user 2, row 1) + 30 (user 3, row 2) = 50 —
+    // each field must resolve from its *own* relationship, never the
+    // other's.
+    let totals = review_totals(&client).await;
+    assert_eq!(
+        totals.get("100"),
+        Some(&(
+            Some("2".to_string()),
+            Some("30".to_string()),
+            Some("50".to_string())
+        )),
+        "after backfill: author_total (30) and editor_total (50) must not \
+         collide or leak into each other despite both relationships reading \
+         a to-side column named 'score'"
+    );
+
+    // Forward delta: a new review row (author 3 -> score 30, editor 1 ->
+    // score 10) folds into the same group.
+    client
+        .execute(
+            "insert into reviews (id, article_id, author_id, editor_id) \
+             values (3, 100, 3, 1)",
+            &[],
+        )
+        .await
+        .expect("insert a new review");
+    stage_cdc(
+        &client,
+        "reviews",
+        "3",
+        "insert",
+        None,
+        Some("{\"id\":3,\"article_id\":100,\"author_id\":3,\"editor_id\":1}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        review_totals(&client).await.get("100"),
+        Some(&(
+            Some("3".to_string()),
+            Some("60".to_string()),
+            Some("60".to_string())
+        )),
+        "after the forward delta: author_total = 30 + 30 (user 3) = 60, \
+         editor_total = 50 + 10 (user 1) = 60 — each still resolved \
+         independently via its own synthetic column, not aliased onto the \
+         other's"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Rejections that must still fire.
 // ---------------------------------------------------------------------
