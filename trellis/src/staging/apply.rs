@@ -724,9 +724,23 @@ pub(crate) async fn build_relationship_context(
 
         // The join keys we need on the to-side: the distinct non-NULL
         // `from_col` values of the from-side rows this batch evaluates.
+        //
+        // Issue #136: also folds in `old_rows`' own `from_col` values, not
+        // just `rows`' (new-side) — a `KeySpace::OneToOne` caller never
+        // needed this (it only ever evaluates the *new* row, so the old
+        // parent's value is never read), but the forward aggregate delta
+        // path does: it must resolve a row's contribution under *both* its
+        // old and new relationship value when the row's own `from_col`
+        // itself changes within one folded update (a re-point), to subtract
+        // the old contribution and add the new one rather than silently
+        // treating the old side as "no match". Folding in an extra key here
+        // only ever costs fetching one more (unused) projection row for a
+        // `KeySpace::OneToOne` caller — never a correctness problem, per
+        // this function's own "spurious extra touched key" rule below.
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut join_keys: Vec<String> = Vec::new();
-        for row in rows.iter().flatten() {
+        let old_rows_iter = old_rows.unwrap_or(&[]).iter().flatten();
+        for row in rows.iter().flatten().chain(old_rows_iter) {
             if let Some(Some(text)) = row.get(&from_col)
                 && seen.insert(text.as_str())
             {
@@ -1112,11 +1126,23 @@ pub(crate) fn relationship_reverse_deferred_src_table(relationship_id: i64) -> S
 /// Rewrites every `RelationshipPath { rel: <rel_name>, column }` in `expr`
 /// (recursing through `BinaryOp`/`FunctionCall`) to `Column(<synthetic
 /// column name>)` per `synthetic_columns`, in place. A `RelationshipPath`
-/// for a *different* relationship name is left untouched — reaching one
-/// here at all means the caller already excluded this definition from the
-/// fast path (see [`build_reverse_relationship_shape`]'s multi-relationship
-/// fallback), so this function is never actually asked to resolve one.
-fn substitute_relationship_path(
+/// for a *different* relationship name is left untouched — for this
+/// module's own reverse-path caller, reaching one here at all means the
+/// caller already excluded this definition from the fast path (see
+/// [`build_reverse_relationship_shape`]'s multi-relationship fallback), so
+/// this function is never actually asked to resolve one there.
+///
+/// `pub(super)`: issue #136's forward aggregate delta path
+/// (`apply_aggregate::build_forward_relationship_shape`) reuses this
+/// directly rather than reimplementing it — this function has no
+/// reverse-specific assumption baked into its own signature (it takes a
+/// bare `rel_name`/`synthetic_columns` map, nothing about which direction
+/// the substitution serves), unlike [`synthetic_relationship_column`]'s
+/// naming convention, which the forward path deliberately does *not* reuse
+/// verbatim (see that path's own `forward_relationship_synthetic_column`
+/// for why: a forward plan can carry more than one relationship, unlike a
+/// reverse shape).
+pub(super) fn substitute_relationship_path(
     expr: &mut Expr,
     rel_name: &str,
     synthetic_columns: &HashMap<String, String>,
@@ -1599,28 +1625,43 @@ async fn from_side_change_in_flight(
 /// its current "still undrained" shape is load-bearing for *that*
 /// question).
 ///
-/// **The hazard this closes** (confirmed by an independent review
+/// **The hazard this closed** (confirmed by an independent review
 /// reproduction against the shipped, unmodified #134 commit — real, not
 /// retry-specific): `apply_aggregate::accumulate_changes`'s
-/// `force_every_group` path (`rel_joins` non-empty — still live; deleting
-/// it is plan doc §7 Phase 1 step 8, unscheduled) does a **live**, full
-/// group recompute, via a direct SQL join back to the relationship's
-/// to-side table, whenever *any* sibling from-side row's own forward CDC is
+/// `force_every_group` path (`rel_joins` non-empty) used to do a **live**,
+/// full group recompute, via a direct SQL join back to the relationship's
+/// to-side table, whenever *any* sibling from-side row's own forward CDC was
 /// evaluated — completely independent of, and invisible to, this
-/// relationship's settled-parent-projection/guard machinery (it doesn't
-/// read the projection, and critically it never bumps
+/// relationship's settled-parent-projection/guard machinery (it never read
+/// the projection, and critically it never bumped
 /// [`ddl::PROJECTION_GEN_COLUMN`] the way the projection-based forward path
-/// does — see [`RelationshipGenBump`]'s own doc comment). If a sibling's
-/// own drain runs `force_every_group` for this same group *after*
-/// `old_row` was true but *before* this reverse's `diff_pass` gets to
-/// apply, the group's stored value can already equal what `diff_pass` is
-/// about to *add on top of* — a real double-correction, confirmed to
-/// reproduce **on a genuinely first attempt** (`retry_count == 0`), not
-/// just a retried one: `retry_count > 0` alone (this module's other
-/// guard-rejection-specific restriction) is too narrow, since guard (c)
-/// itself can genuinely find nothing in flight — the racing sibling may
-/// have already fully drained — and let a first attempt straight into the
-/// same trap.
+/// does — see [`RelationshipGenBump`]'s own doc comment). If a sibling's own
+/// drain ran `force_every_group` for this same group *after* `old_row` was
+/// true but *before* this reverse's `diff_pass` got to apply, the group's
+/// stored value could already equal what `diff_pass` was about to *add on
+/// top of* — a real double-correction, confirmed to reproduce **on a
+/// genuinely first attempt** (`retry_count == 0`), not just a retried one:
+/// `retry_count > 0` alone (this module's other guard-rejection-specific
+/// restriction) was too narrow, since guard (c) itself can genuinely find
+/// nothing in flight — the racing sibling may have already fully drained —
+/// and let a first attempt straight into the same trap.
+///
+/// **Issue #136 (epic #127) deleted `force_every_group` outright** — an
+/// ordinary sibling forward touch to a relationship-reading aggregate now
+/// always resolves through the same settled-parent-projection/guard
+/// machinery this function protects (`apply_aggregate::build_forward_relationship_shape`,
+/// wired from this module's own `build_relationship_context` call in the
+/// aggregate branch of `compute`), so the specific live-read race this
+/// function was built for is no longer reachable through an ordinary CDC
+/// row at all. This function's own CDC-row scan below is left unchanged
+/// regardless: it has no way to know *why* a matching sibling row exists
+/// (a safe post-#136 delta application, or some other cause), so it still
+/// conservatively routes to the fallback on any match — safe (the fallback
+/// is always correct), just more conservative than strictly necessary for
+/// that one now-closed case. Tightening this to distinguish the two is a
+/// possible follow-up, not attempted here (out of #136's own scope, and
+/// this function still has genuine, narrower value below independent of
+/// that hazard — see "What this checks" and "What it does *not* close").
 ///
 /// **What this checks, and its own limits.** Unlike guard (c) (scoped to
 /// rows still `state <> 'drained'`), this scans every physical ring row —
@@ -1641,25 +1682,28 @@ async fn from_side_change_in_flight(
 /// been *retired* (`retire::retire_drained_segments` truncates the whole
 /// physical slot once every older batch has drained) before this check
 /// runs leaves no trace here to find — this function can only see what the
-/// ring still holds. Closing that residual case fully needs a persistent
-/// signal that survives retirement, e.g. `force_every_group`'s own bulk
-/// recompute (`apply_aggregate::apply_forced_groups_bulk`) additionally
-/// bumping the touched relationship(s)' projection `__trellis_gen`, the
-/// same way the projection-based forward path's step 3c already does —
-/// explicitly **not** implemented here: it requires locating the joined
-/// parent keys inside that bulk `INSERT ... SELECT` and threading them back
-/// through `apply_aggregate`'s own result type, a change to the
-/// `force_every_group`/`rel_joins` machinery this issue's own scope
-/// excludes. Flagged as a named follow-up (see this issue's own report/PR
-/// description) rather than attempted here, given the size and risk of that
-/// change relative to what could be validated in this pass. Until either
-/// that lands or plan doc §7 Phase 1 step 8 deletes `force_every_group`
-/// outright, this function's ring-based check is deliberately the more
-/// conservative of the two achievable options (narrower — and *only*
-/// exposed in the residual gap above — beats the alternative of disabling
-/// the fast path unconditionally, which would regress #131's whole
-/// performance case for the overwhelming majority of drains that never
-/// come near this race).
+/// ring still holds.
+///
+/// **Post-#136, that residual gap is closed for the ordinary delta-path
+/// case by guard (b), not by this function.** `check_reverse_guards` (guard
+/// (b) in particular) always runs *before* this function is ever reached —
+/// see this step's own call site — and now that the aggregate branch of
+/// `compute` bumps `__trellis_gen` via `build_relationship_context` the same
+/// way the `KeySpace::OneToOne` branch always did (see this issue's own
+/// comment on that call site), any sibling forward delta that touched this
+/// parent — retired ring evidence or not, since a generation counter, unlike
+/// a ring row, is never erased by retirement — already failed guard (b) and
+/// never reaches this function at all. What remains genuinely unclosed is
+/// narrower and pre-existing (not introduced or widened by #136): an
+/// image-less-recompute-triggered [`apply_aggregate::GroupPlan::force_full_recompute`]
+/// (backfill, definition re-derive, or reverse propagation's own fallback —
+/// see `apply_aggregate`'s module doc comment) still recomputes via a live
+/// `JOIN` and still never bumps `gen`, so a retired *and* image-less-forced
+/// sibling could still race undetected by either guard (b) or this
+/// function's own ring scan. Not fixed here — the image-less/forced path is
+/// explicitly out of #136's scope (see that issue), and closing this sliver
+/// would need the same "bump gen from inside the bulk recompute" follow-up
+/// this comment used to describe for the pre-#136 case generally.
 async fn relationship_fast_path_precondition_holds(
     txn: &Transaction<'_>,
     from_table: &str,
@@ -3716,6 +3760,56 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     )
                 });
 
+            // Issue #136: a relationship-reading aggregate's ordinary
+            // (non-image-less) per-row delta now resolves its `<rel>.<column>`
+            // reads the same way a `KeySpace::OneToOne` target already does —
+            // against the settled parent projection, via
+            // `build_relationship_context` — rather than the old
+            // `force_every_group` full live-join recompute. Gated on
+            // `eval::relationship_references`, exactly like the `OneToOne`
+            // branch above, so a relationship-free aggregate (the
+            // overwhelmingly common case) costs nothing extra.
+            //
+            // This also closes a latent gap: before this issue,
+            // `accumulate_changes` never called `build_relationship_context`
+            // for an aggregate definition at all (it had no need to — the
+            // forced-recompute path read the live to-side table directly,
+            // never the projection), so a to-one relationship consumed
+            // *only* by an invertible aggregate never got its projection's
+            // `__trellis_gen` bumped by any forward apply, even though issue
+            // #131's reverse fast path (`build_reverse_relationship_shape`)
+            // has been eligible for exactly that shape (a `KeySpace::Aggregate`
+            // definition with only invertible fields reading one
+            // relationship) since #131 shipped — guard (b) could not have
+            // detected a race for such a relationship. Wiring this the same
+            // way the `OneToOne` branch already does closes that gap for
+            // every relationship an aggregate reads, not just this issue's
+            // own new delta path.
+            let rel_ctx = if eval::relationship_references(&def.def).is_empty() {
+                None
+            } else {
+                let (ctx, gen_bumps) = build_relationship_context(
+                    pool,
+                    source_key,
+                    &def.def,
+                    &rows,
+                    Some(&old_rows),
+                    Some(changes.as_slice()),
+                )
+                .await?;
+                for (rel_id, bump) in gen_bumps {
+                    relationship_gen_bumps
+                        .entry(rel_id)
+                        .and_modify(|existing| {
+                            existing
+                                .touched_keys
+                                .extend(bump.touched_keys.iter().cloned());
+                        })
+                        .or_insert(bump);
+                }
+                Some(ctx)
+            };
+
             let mut regex_cache = eval::RegexCache::new();
             apply_aggregate::accumulate_changes(
                 target_plan,
@@ -3725,6 +3819,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 &old_rows,
                 &def.source_columns,
                 &mut regex_cache,
+                rel_ctx.as_ref(),
             )?;
             for change in &changes {
                 buffer_transform_apply_metrics(

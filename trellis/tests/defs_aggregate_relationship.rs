@@ -29,7 +29,7 @@ use trellis::defs::ast::{
 };
 use trellis::defs::{
     CatalogError, ValidationError, create_relationship, install_definition,
-    render_aggregate_relationship_select_sql,
+    relationship_projection, render_aggregate_relationship_select_sql,
 };
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -371,6 +371,97 @@ async fn inserting_a_from_side_row_updates_its_groups_total() {
     );
 }
 
+/// Issue #136 (epic #127): an ordinary from-side insert into a
+/// relationship-reading aggregate resolves the relationship's value from the
+/// *settled parent projection* (issue #130's mechanism), never a live read
+/// of the to-side table — mirroring
+/// `apply_relationship_forward.rs`'s `forward_to_one_resolves_from_the_projection_not_live_parent_state`
+/// for the analogous `KeySpace::OneToOne` case, but for a `KeySpace::Aggregate`
+/// field wrapped in `SUM`. Before #136, this went through `accumulate_changes`'s
+/// now-removed `force_every_group`, which forced a **live** `LEFT JOIN`
+/// recompute for the whole touched group — so this exact scenario (a live
+/// rename with no reverse recompute in between) would have picked up the
+/// *new* live value immediately. Proved by manufacturing the same
+/// projection/live desync `apply_relationship_forward.rs` uses: renaming
+/// post 1's `word_count` live, with no CDC staged and no reverse recompute
+/// run, then inserting a brand-new `post_tags` row pointing at it.
+#[tokio::test]
+async fn inserting_a_from_side_row_resolves_from_the_projection_not_live_parent_state() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    // `install_definition`'s widen (#129) catches post 1's word_count into
+    // the projection right here, while 100 is still its only-ever value.
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let projection_table = relationship_projection(&db.pool, relationship.id)
+        .await
+        .expect("read projection catalog row")
+        .expect("to-one relationship has a projection")
+        .projection_table;
+    let projection_word_count: Option<i32> = client
+        .query_one(
+            &format!("select word_count from {projection_table} where id = 1"),
+            &[],
+        )
+        .await
+        .expect("read projected word_count")
+        .get(0);
+    assert_eq!(
+        projection_word_count,
+        Some(100),
+        "sanity: the projection settled on post 1's original word_count"
+    );
+
+    // Live-only mutation: no CDC staged, no reverse recompute, nothing
+    // advances the projection.
+    client
+        .execute("update posts set word_count = 999 where id = 1", &[])
+        .await
+        .expect("rename the live post's word_count without touching the projection");
+
+    // A brand-new post_tags row, forward-applied for the first time,
+    // referencing the now-desynced post.
+    client
+        .execute(
+            "insert into post_tags (id, post, tag) values (15, 1, 'rust')",
+            &[],
+        )
+        .await
+        .expect("insert a new post_tag");
+    stage_cdc(
+        &client,
+        "post_tags",
+        "15",
+        "insert",
+        None,
+        Some("{\"id\":15,\"post\":1,\"tag\":\"rust\"}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("4".to_string()), Some("450".to_string()))),
+        "the new row's contribution must come from the settled projection \
+         (still 100: 100 via row 10 + 250 via row 11 + null via row 13 + 100 \
+         via the new row 15), not the live post row (renamed to 999 after \
+         the projection settled)"
+    );
+}
+
 /// Reverse propagation (ADR-0006's to-side direction, issue #30's mechanism):
 /// changing the *related* `posts` row's `word_count` must re-derive every group
 /// whose members read it — here post 1 is referenced by both the `rust` and
@@ -421,6 +512,85 @@ async fn updating_a_to_side_row_updates_every_dependent_group() {
     assert_eq!(
         totals.get("db"),
         Some(&(Some("2".to_string()), Some("400".to_string())))
+    );
+}
+
+/// Issue #136 (epic #127): a from-side row re-pointed from one parent to
+/// another *within a single already-folded change* (a genuine single
+/// `UPDATE`, not an insert-then-repoint the fold would erase) correctly
+/// subtracts its contribution under the *old* parent and adds it under the
+/// *new* one, in one change — mirroring issue #131's reverse-side test for
+/// the analogous case (`apply_relationship_forward.rs`'s
+/// `forward_apply_re_point_bumps_gen_for_both_old_and_new_parent`), but
+/// proving the forward *aggregate delta's own value*, not just the
+/// projection's `gen` bookkeeping.
+///
+/// Row 10 (`post = 1`, tag `rust`) is re-pointed to `post = 2` — the same
+/// `GROUP BY` group (`tag` is unchanged, so this is a same-group in-place
+/// update, not a grain migration), but `accumulate_changes` must still
+/// resolve the row's relationship read *twice*, once per side, off each
+/// side's own `post` value (`row_contribution` under `old_row`'s `post = 1`
+/// vs. `new_row`'s `post = 2`) — exactly the case a naive single-resolution
+/// implementation (resolving once off, say, the new row only) would get
+/// wrong.
+#[tokio::test]
+async fn a_from_side_re_point_within_one_update_diffs_old_and_new_parent_contributions() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals_before = target_totals(&client).await;
+    assert_eq!(
+        totals_before.get("rust"),
+        Some(&(Some("3".to_string()), Some("350".to_string()))),
+        "sanity: 'rust' starts at 100 (row 10, post 1) + 250 (row 11, post 2) \
+         + null (row 13, post 999)"
+    );
+
+    // Re-point row 10 from post 1 (word_count 100) to post 2 (word_count
+    // 250) — same group (`tag` stays 'rust'), one folded UPDATE carrying
+    // both a real old image and a real new image.
+    client
+        .execute("update post_tags set post = 2 where id = 10", &[])
+        .await
+        .expect("re-point row 10");
+    stage_cdc(
+        &client,
+        "post_tags",
+        "10",
+        "update",
+        Some("{\"id\":10,\"post\":1,\"tag\":\"rust\"}"),
+        Some("{\"id\":10,\"post\":2,\"tag\":\"rust\"}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals,
+        oracle_totals(&client).await,
+        "after a same-group from-side re-point"
+    );
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("500".to_string()))),
+        "row 10 must subtract its OLD contribution (100, via post 1) and add \
+         its NEW one (250, via post 2) in one delta — 250 (row 10, now post \
+         2) + 250 (row 11, post 2) + null (row 13, post 999) = 500, not 350 \
+         (no-op, as if the repoint were never resolved) or some other value \
+         a single-sided resolution would produce"
     );
 }
 

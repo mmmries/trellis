@@ -131,6 +131,18 @@ impl RelationshipContext {
         }
     }
 
+    /// The resolved to-one relationship data for `rel`, if any — the same
+    /// lookup [`eval_expr`]'s own `RelationshipPath` arm does internally
+    /// against `by_name`, exposed for issue #136's forward aggregate
+    /// substitution path (`staging::apply_aggregate`'s
+    /// `build_forward_relationship_shape`/`forward_row_contribution`), which
+    /// needs to resolve a relationship's current value from the same
+    /// settled-projection-backed context this module's own pure evaluator
+    /// already consumes, without duplicating `by_name`'s storage.
+    pub(crate) fn to_one(&self, rel: &str) -> Option<&ToOneRelationship> {
+        self.by_name.get(rel)
+    }
+
     /// Adds the to-many relationship data (issue #29), for a context that has
     /// aggregate-wrapped relationship paths to resolve. Chains onto [`new`].
     #[must_use]

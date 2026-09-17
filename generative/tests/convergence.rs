@@ -1085,12 +1085,16 @@ async fn a_to_one_relationship_aggregated_inside_a_group_by_converges_end_to_end
 /// Whether this passes tells us whether the `apply.rs` fix above already
 /// generalizes to the aggregate path: the reverse-recompute it stages is an
 /// ordinary image-less `Recompute` on the from-side (`t0`) row, and
-/// `apply_aggregate::accumulate_changes` already forces *any* image-less
+/// `apply_aggregate::accumulate_changes` always forces *any* image-less
 /// change's group onto the full-recompute path (a `force_full_recompute`
 /// group is re-derived by `apply_forced_groups_bulk`'s `LEFT JOIN`
-/// unconditionally, not only when `accumulate_changes`'s own
-/// `force_every_group` — driven by a non-empty `rel_joins` — set it) — so no
-/// aggregate-specific code needed to change for this to converge.
+/// unconditionally) regardless of whether the touching change carries a
+/// real image — so no aggregate-specific code needed to change for this to
+/// converge. (Before issue #136, epic #127, an *ordinary* image-bearing
+/// change to a relationship-reading aggregate was also forced onto this
+/// same path, via `accumulate_changes`'s own now-removed
+/// `force_every_group`; #136 replaced that half with a real per-row delta,
+/// but left the image-less half this test exercises untouched.)
 #[tokio::test(flavor = "multi_thread")]
 async fn truncating_a_relationship_to_side_table_leaves_a_stale_aggregate_enrichment() {
     let cluster = TestCluster::start();

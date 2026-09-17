@@ -1153,13 +1153,20 @@ async fn guard_b_generation_check_rejects_and_the_pipeline_still_converges() {
 ///
 /// Deliberately uses the `articles`/`categories` `KeySpace::OneToOne`
 /// fixture (`article_cat_def`, below), **not** this file's usual
-/// `post_tags`/`posts` aggregate fixture: an aggregate definition's forward
-/// path goes through `apply_aggregate`'s `rel_joins`/`force_every_group`
-/// mechanism (out of scope for this issue — see the plan doc §7 step 8 and
-/// this crate's own review notes), which never calls
-/// `build_relationship_context` and so never reaches the #133 gen-bump code
-/// at all. A `KeySpace::OneToOne` definition reading a relationship is the
-/// shape that actually exercises it on the forward path.
+/// `post_tags`/`posts` aggregate fixture: at the time this test was written,
+/// an aggregate definition's forward path went through `apply_aggregate`'s
+/// `rel_joins`/`force_every_group` mechanism (out of scope for this issue —
+/// see the plan doc §7 step 8 and this crate's own review notes), which
+/// never called `build_relationship_context` and so never reached the #133
+/// gen-bump code at all — a `KeySpace::OneToOne` definition reading a
+/// relationship was the only shape that exercised it on the forward path.
+/// Issue #136 (epic #127) later deleted `force_every_group` and wired the
+/// aggregate forward path through `build_relationship_context` too (see
+/// `apply_aggregate`'s module doc comment), so this distinction no longer
+/// holds — but this test's own fixture choice is left as-is rather than
+/// migrated, since it already covers the `KeySpace::OneToOne` shape
+/// correctly and `defs_aggregate_relationship.rs`/`apply_relationship_forward.rs`
+/// cover the aggregate shape.
 #[tokio::test]
 async fn issue_133_a_within_batch_repoint_still_bumps_the_erased_intermediate_parents_gen() {
     let cluster = TestCluster::start();
@@ -1771,8 +1778,8 @@ async fn out_of_order_segments_plus_an_in_flight_child_still_converges() {
          second retry (once that segment has actually committed) passes. \
          See issue #134's `retry_count == 0` fast-path gate (this module's \
          own comment on it) for why this doesn't corrupt the total despite \
-         `force_every_group` having already live-recomputed row 21's group \
-         by the time the delta finally applies."
+         row 21's own forward apply having already folded its contribution \
+         into the group by the time the delta finally applies."
     );
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
@@ -2838,30 +2845,50 @@ async fn each_guard_increments_its_own_deferral_metric() {
 }
 
 /// Review follow-up to issue #134: the `retry_count > 0` restriction alone
-/// (this module's first attempt at closing the `force_every_group`-vs-
-/// `diff_pass` staleness hazard) is too narrow — it only ever protects a
-/// record that was *itself* previously guard-rejected. This is the
-/// independent first-attempt reproduction the review built against the
-/// unmodified `retry_count`-only fix and confirmed corrupts data: the
-/// parent's live row is updated for real, a sibling from-side row is
-/// inserted and *fully drained* — triggering `force_every_group`'s live
-/// recompute, which reads the *already-updated* live parent value and
-/// settles the whole group to the true total — and only *then* does the
-/// parent's own CDC get staged. Guard (c) finds nothing in flight (the
-/// sibling already fully drained) and passes on the very first attempt
-/// (`retry_count == 0`), so the old restriction alone would let the fast
-/// `diff_pass` path run anyway and re-add a delta the sibling's own live
-/// recompute had already folded in.
+/// (this module's first attempt at closing the old `force_every_group`-vs-
+/// `diff_pass` staleness hazard) was too narrow — it only ever protected a
+/// record that was *itself* previously guard-rejected. This test originally
+/// reproduced that hazard directly: `force_every_group` (removed by issue
+/// #136, epic #127) used to make an *ordinary* sibling insert's own forward
+/// evaluation do a **live** SQL join straight back to the to-side table, so
+/// a sibling that drained between the parent's live write and the parent's
+/// own CDC being staged would settle the whole group to the *already
+/// updated* live total — an "old" era `diff_pass` could then wrongly
+/// re-add a delta on top of.
 ///
-/// `relationship_fast_path_precondition_holds` is what's supposed to catch
-/// this now: it scans every physical ring row — not just still-undrained
-/// ones — for a sibling touching this key, so the *already-drained-but-
-/// not-yet-retired* sibling here still leaves a trace it can find (this
-/// test deliberately never calls `retire_drained_segments`, so that trace
-/// survives — see that function's own doc comment for the residual gap
-/// once retirement *does* run).
+/// **Post-#136**, an ordinary from-side insert to a relationship-reading
+/// aggregate never live-reads the to-side table at all: it resolves the
+/// relationship the same way a `KeySpace::OneToOne` target already did
+/// (issue #130's settled parent projection), so the sibling below now
+/// settles 'rust' using the *old*, still-unbumped projection value (100),
+/// never the live-updated one (400) — the specific staleness hazard this
+/// test used to reproduce is no longer reachable through this path at all
+/// (see `apply_aggregate`'s module doc comment's "Relationship-reading
+/// aggregates" section). What survives, and what this test now proves
+/// instead: `relationship_fast_path_precondition_holds` (issue #134's own
+/// review follow-up) does not know *why* a sibling row touched this parent
+/// key — it conservatively treats any matching CDC row in the LSN window as
+/// disqualifying, whether or not that row could actually have raced this
+/// reverse — so it still routes this record to the pre-#131 image-less
+/// fallback exactly as before, and that fallback must still converge to the
+/// true total. This is deliberately left as-is (more conservative than
+/// strictly necessary post-#136), not tightened here: doing so would need
+/// `relationship_fast_path_precondition_holds` to distinguish "a sibling
+/// that resolved via the safe settled-projection path" from "one that could
+/// have live-read a mid-flight value," which no longer exists as a
+/// distinction to draw now that no forward path does the latter — a
+/// possible follow-up simplification, not a correctness gap (the fallback
+/// this routes to is always correct, just more conservative than it now
+/// strictly needs to be).
+///
+/// `relationship_fast_path_precondition_holds` scans every physical ring
+/// row — not just still-undrained ones — for a sibling touching this key,
+/// so the *already-drained-but-not-yet-retired* sibling here still leaves a
+/// trace it can find (this test deliberately never calls
+/// `retire_drained_segments`, so that trace survives — see that function's
+/// own doc comment for the residual gap once retirement *does* run).
 #[tokio::test]
-async fn a_sibling_that_already_drained_via_force_every_group_before_the_parents_own_cdc_is_staged_does_not_corrupt_a_first_attempt()
+async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_does_not_corrupt_a_first_attempt()
  {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -2910,12 +2937,10 @@ async fn a_sibling_that_already_drained_via_force_every_group_before_the_parents
         .expect("live update the related post");
 
     // A sibling from-side row, inserted and *fully drained* before the
-    // parent's own CDC ever lands: its own forward evaluation goes through
-    // `force_every_group` (this aggregate reads a relationship), which
-    // live-joins against the *already-updated* parent row and settles the
-    // whole 'rust' group (row 10 and the new row) to the true total — using
-    // the new value, never having known an "old" 100/still-word_count era
-    // at all.
+    // parent's own CDC ever lands: post-#136, its own forward evaluation
+    // resolves post 1's word_count from the settled parent projection (still
+    // 100 — nothing has bumped it yet), never a live read of the
+    // already-updated `posts` row (400).
     client
         .execute(
             "insert into post_tags (id, post, tag) values (40, 1, 'rust')",
@@ -2956,11 +2981,12 @@ async fn a_sibling_that_already_drained_via_force_every_group_before_the_parents
     let totals_before_parent_cdc = target_totals(&client).await;
     assert_eq!(
         totals_before_parent_cdc.get("rust"),
-        Some(&(Some("4".to_string()), Some("1050".to_string()))),
-        "sanity: the sibling's own force_every_group recompute must have \
-         already settled 'rust' to the true total (400 via row 10 + 250 via \
-         post 2's row 11 + null via post 999's row 13 + 400 via the new \
-         row 40) *before* the parent's own CDC is ever staged"
+        Some(&(Some("4".to_string()), Some("450".to_string()))),
+        "sanity: the sibling's own forward delta must have resolved post 1's \
+         relationship value from the settled projection (still 100, via row \
+         10 + the new row 40) + 250 via post 2's row 11 + null via post \
+         999's row 13 = 450 — *not* the live-updated 400 — before the \
+         parent's own CDC is ever staged"
     );
 
     // *Now* stage the parent's own CDC — first attempt, never rejected.
@@ -3019,13 +3045,21 @@ async fn a_sibling_that_already_drained_via_force_every_group_before_the_parents
          rel_reverse_deferred here"
     );
 
+    // The reverse's own delta write was routed to the fallback (not
+    // `diff_pass`), so nothing has corrected 'rust' yet at this point —
+    // it's still the pre-fallback, sibling-only total from above, not yet
+    // double-corrected *or* under-corrected. The re-staged `Recompute`s
+    // (rows 10/12/40, asserted above) are what bring it to the true final
+    // value once they drain, below.
     let totals_after = target_totals(&client).await;
     assert_eq!(
         totals_after.get("rust"),
-        Some(&(Some("4".to_string()), Some("1050".to_string()))),
-        "the total must stay exactly correct — not double-corrected by a \
-         diff_pass that assumed row 10 (and the new row 40) still reflected \
-         the pre-update 100 value"
+        Some(&(Some("4".to_string()), Some("450".to_string()))),
+        "the fallback's own image-less Recomputes haven't drained yet (that \
+         happens below), so the group must still read exactly the same as \
+         it did right after the sibling's own forward apply — no partial or \
+         double correction from this transaction's own reverse write, which \
+         was routed entirely to the fallback"
     );
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
     assert_eq!(
@@ -3052,8 +3086,8 @@ async fn a_sibling_that_already_drained_via_force_every_group_before_the_parents
     assert_eq!(
         totals_final.get("db"),
         Some(&(Some("2".to_string()), Some("400".to_string()))),
-        "'db' (row 12's group, never touched by the sibling's own \
-         force_every_group pass) must converge too: 400 (post 1, its true \
-         final value) + null (post 3)"
+        "'db' (row 12's group, never touched by the sibling's own forward \
+         apply) must converge too: 400 (post 1, its true final value) + \
+         null (post 3)"
     );
 }
