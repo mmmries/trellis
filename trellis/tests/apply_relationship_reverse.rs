@@ -1918,17 +1918,23 @@ async fn a_one_to_one_target_still_converges_via_the_fallback_mechanism() {
 //    and the four per-guard metrics.
 // ---------------------------------------------------------------------
 
-/// The core exemption this issue exists to build: a reverse that keeps
-/// getting deferred must never touch `hop_gen`, so it can never trip
-/// [`apply::MAX_HOP_GEN`] (32) — unlike the pre-#134 stopgap, which staged
-/// its from-side fallback at `hop_gen + 1` on every rejection and so
-/// *would* have tripped the bound after 32 rejections of the same reverse.
-/// Driven by hand, well past 32 rounds, with a watermark that never
-/// advances (guard (a) rejects deterministically, every single time,
-/// independent of any other guard's state) — the simplest guard to hold
-/// open indefinitely on purpose.
+/// Two things at once, both load-bearing: (1) issue #134's own exemption —
+/// a reverse that keeps getting deferred must never touch `hop_gen`, so it
+/// can never trip [`apply::MAX_HOP_GEN`] (32) — and (2) issue #135's
+/// fairness bound on top of it — deferral must not continue forever in the
+/// first place. Before #135, this test drove a watermark that never
+/// advances (guard (a) rejects deterministically, every single round,
+/// independent of any other guard's state) for 40 rounds and asserted
+/// `retry_count` climbed monotonically the whole way, precisely because
+/// nothing stopped it. That is no longer the correct expectation: guard (a)
+/// is not guard (d), so once `retry_count` reaches
+/// [`apply::RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD`], the next rejection
+/// must escalate instead of deferring a `THRESHOLD + 1`-th time — see
+/// `staging::apply`'s own "Issue #135, epic #127: fairness escalation"
+/// design section for why escalating past guard (a)/(b)/(c) specifically
+/// (never (d)) is sound.
 #[tokio::test]
-async fn deferring_the_same_reverse_past_max_hop_gen_never_trips_the_hop_bound() {
+async fn deferring_past_the_fairness_threshold_escalates_instead_of_spinning_forever() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -1945,6 +1951,8 @@ async fn deferring_the_same_reverse_past_max_hop_gen_never_trips_the_hop_bound()
         .expect("install the aggregate-over-to-one definition");
     drain_to_quiescence(&db.pool, &mut client).await;
 
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+
     client
         .execute("update posts set word_count = 400 where id = 1", &[])
         .await
@@ -1960,18 +1968,18 @@ async fn deferring_the_same_reverse_past_max_hop_gen_never_trips_the_hop_bound()
     )
     .await;
 
-    // Never advanced — guard (a) rejects on every single round, forever,
-    // regardless of retry_count. `apply::MAX_HOP_GEN` is 32; this drives 40
-    // rounds, well past it, and asserts `retry_count` climbs monotonically
-    // to 40 while `hop_gen` stays pinned at 0 the entire time.
+    // Never advanced — guard (a) rejects on every single round, so nothing
+    // about *this specific* rejection ever resolves on its own. Before the
+    // threshold, this must look exactly like the pre-#135 behavior:
+    // `retry_count` climbing by one per round, `hop_gen` pinned at 0.
     let unstaged_watermark = StagedWatermark::new();
-    const ROUNDS: i32 = 40;
-    for round in 1..=ROUNDS {
+    let threshold = apply::RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD;
+    for round in 1..threshold {
         let seg = seal_active_segment(&mut client).await;
         let plan = claim_fold_compute(&db.pool, seg, "worker_hopgen").await;
         let mut phase3 = db.pool.get().await.expect("connection");
         let txn = phase3.transaction().await.expect("begin phase 3");
-        apply::apply_and_mark_drained(
+        let outcome = apply::apply_and_mark_drained(
             &txn,
             seg,
             "worker_hopgen",
@@ -1988,6 +1996,11 @@ async fn deferring_the_same_reverse_past_max_hop_gen_never_trips_the_hop_bound()
             .await
             .expect("retire drained segments");
 
+        assert_eq!(
+            outcome.fairness_escalations, 0,
+            "round {round}: below the fairness threshold ({threshold}), so this must \
+             be an ordinary deferral, not an escalation"
+        );
         let deferred = staged_deferred_reverses(&client, relationship.id).await;
         assert_eq!(
             deferred,
@@ -1997,6 +2010,383 @@ async fn deferring_the_same_reverse_past_max_hop_gen_never_trips_the_hop_bound()
              counter is independent of, and never burns, hop_gen"
         );
     }
+
+    // The threshold-th rejection: `retry_count` going in is `threshold - 1`,
+    // so this attempt's `retry_count + 1 == threshold` — the escalation
+    // branch fires instead of yet another deferral.
+    let seg = seal_active_segment(&mut client).await;
+    let plan = claim_fold_compute(&db.pool, seg, "worker_hopgen").await;
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    let outcome = apply::apply_and_mark_drained(
+        &txn,
+        seg,
+        "worker_hopgen",
+        &plan,
+        "trellis_reverse_test",
+        &unstaged_watermark,
+    )
+    .await
+    .expect("apply must succeed — escalation, not an error, is how this resolves");
+    txn.commit().await.expect("commit");
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+
+    assert_eq!(
+        outcome.fairness_escalations, 1,
+        "round {threshold}: exactly one reverse transition must escalate — guard (a) \
+         is still failing (the watermark never advanced), so this can only be the \
+         fairness mechanism, not a natural pass"
+    );
+    assert!(
+        staged_deferred_reverses(&client, relationship.id)
+            .await
+            .is_empty(),
+        "escalation must consume the deferred row — nothing left to retry"
+    );
+    assert_eq!(
+        staged_recompute_keys(&client, "post_tags").await,
+        vec!["10".to_string(), "12".to_string()],
+        "escalation must stage the pre-#131 fallback recompute for every from-side \
+         row currently under post 1 (post_tags 10 and 12), the same always-correct \
+         mechanism a guard rejection used before #134 introduced deferral"
+    );
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        Some(PgLsn::from(100)),
+        "escalation must advance the settled parent projection to this transition's \
+         own lsn immediately, even though guard (a) — which does not gate the \
+         projection write, only the fast-path delta — is still failing"
+    );
+
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("650".to_string()))),
+        "the pipeline must still converge on post 1's true value (400) via the \
+         escalated recompute, even though guard (a) never once passed"
+    );
+}
+
+/// Issue #135's own crux: a **liveness** model, not just a correctness one.
+/// The existing generative/ablation campaign (`issue-102-PLAN-DRAFT.md` §7
+/// step 7, §10) only ever measures state *after* a workload stops, so it
+/// cannot observe starvation by construction. This test simulates a hot
+/// parent (`posts` row 1) whose own value changes exactly once, while its
+/// children (`post_tags`) churn continuously — a brand-new child lands in
+/// *every single drain round*, sustained for longer than the fairness
+/// threshold, with no quiet round ever engineered in on purpose.
+///
+/// Before issue #135, this is exactly the starvation shape: every round's
+/// own freshly-staged, freshly-forward-evaluated child bumps the parent's
+/// projection `gen` inside the *same* transaction as the reverse's guard
+/// (b) re-check (see `staging::apply`'s "Issue #135" design section for
+/// why that race is structural, not probabilistic, here — nothing about it
+/// depends on real concurrency or timing luck), so guard (b) fails
+/// deterministically, round after round, for as long as churn continues.
+/// A `retry_count`-only mechanism with no bound would defer forever under
+/// this exact load.
+///
+/// Asserts liveness with an explicit, checked upper bound — the reverse
+/// must escalate at or before round
+/// [`apply::RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD`], not merely
+/// "eventually" — while churn continues both during and after that round,
+/// and the parent's own transition still converges to the fully correct
+/// final state once every staged recompute drains.
+#[tokio::test]
+async fn a_hot_parent_under_sustained_child_churn_still_resolves_within_the_fairness_bound() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+
+    // The parent's own single, real edit — the transition the reverse must
+    // eventually apply, despite everything below.
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("update the related post");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        100,
+    )
+    .await;
+
+    // Guard (a) is saturated on purpose — this test isolates the churn-driven
+    // failure modes (guards (b)/(c)), not the watermark barrier, which the
+    // threshold test above already covers in isolation.
+    let watermark = StagedWatermark::saturated();
+    let threshold = apply::RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD;
+    let mut next_child_id = 40i32;
+    let mut resolved_at_round: Option<i32> = None;
+
+    async fn insert_churn_child(client: &Client, id: i32) {
+        client
+            .execute(
+                &format!("insert into post_tags (id, post, tag) values ({id}, 1, 'churn')"),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("insert churn child {id}: {e}"));
+        stage_cdc_at_lsn(
+            client,
+            "post_tags",
+            &id.to_string(),
+            "insert",
+            None,
+            Some(&format!("{{\"id\":{id},\"post\":1,\"tag\":\"churn\"}}")),
+            200 + u64::try_from(id).expect("id is non-negative"),
+        )
+        .await;
+    }
+
+    // Sustained churn: continue for a few rounds *past* the threshold too,
+    // so the test would visibly fail (never finding `fairness_escalations >
+    // 0`, then panicking below) if the mechanism only happened to work for
+    // a lucky handful of rounds rather than actually bounding the wait.
+    for round in 1..=(threshold + 3) {
+        insert_churn_child(&client, next_child_id).await;
+        next_child_id += 1;
+
+        let seg = seal_active_segment(&mut client).await;
+        let plan = claim_fold_compute(&db.pool, seg, "worker_churn").await;
+        let mut phase3 = db.pool.get().await.expect("connection");
+        let txn = phase3.transaction().await.expect("begin phase 3");
+        let outcome = apply::apply_and_mark_drained(
+            &txn,
+            seg,
+            "worker_churn",
+            &plan,
+            "trellis_reverse_test",
+            &watermark,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("round {round}: apply must not fail: {e}"));
+        txn.commit().await.expect("commit");
+        retire_drained_segments(&mut client)
+            .await
+            .expect("retire drained segments");
+
+        if outcome.fairness_escalations > 0 {
+            resolved_at_round = Some(round);
+            break;
+        }
+
+        // Still pending, still churning — the property that would be false
+        // without issue #135's fix: under #134 alone this could spin past
+        // `threshold` indefinitely, since every round supplies its own
+        // fresh guard (b) failure.
+        assert!(
+            !staged_deferred_reverses(&client, relationship.id)
+                .await
+                .is_empty(),
+            "round {round}: the reverse must still be pending (deferred), not \
+             silently dropped"
+        );
+        assert!(
+            round < threshold,
+            "round {round}: exceeded the fairness threshold ({threshold}) without \
+             escalating — this is exactly the starvation issue #135 exists to rule out"
+        );
+    }
+
+    let resolved_at_round = resolved_at_round.unwrap_or_else(|| {
+        panic!(
+            "the reverse never escalated within {} rounds under sustained churn — \
+             starvation freedom is broken",
+            threshold + 3
+        )
+    });
+    assert!(
+        resolved_at_round <= threshold,
+        "escalation must happen at or before round {threshold} (the fairness \
+         threshold), not round {resolved_at_round}"
+    );
+    assert!(
+        staged_deferred_reverses(&client, relationship.id)
+            .await
+            .is_empty(),
+        "escalation must consume the deferred row"
+    );
+    assert_eq!(
+        projection_lsn(&client, &projection_table, 1).await,
+        Some(PgLsn::from(100)),
+        "escalation must advance the projection to the parent's true final value, \
+         even though it took several rounds of sustained child churn to get there"
+    );
+
+    // A few more churn rounds *after* resolution — proving the system stays
+    // live afterward too, not merely that it eventually gives up once.
+    for _ in 0..2 {
+        insert_churn_child(&client, next_child_id).await;
+        next_child_id += 1;
+    }
+
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    // Final correctness: the original transition (post 1's rust/db tags)
+    // converged exactly as it would with no churn at all —
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("650".to_string()))),
+        "post 1's real transition must still converge correctly (400, not a stale \
+         100) despite continuous, unrelated child churn throughout"
+    );
+
+    // — and every churn child (whether it landed before or after escalation)
+    // is counted exactly once, against the parent's *true* final value: proof
+    // the fallback recompute this mechanism triggers is not merely
+    // non-corrupting but actually self-correcting for churn that arrived
+    // while the parent's own projection was still stale.
+    let churn_count = i64::from(next_child_id - 40);
+    let (churn_post_count, churn_total_words) =
+        totals.get("churn").expect("the churn tag group exists");
+    assert_eq!(
+        churn_post_count.as_deref(),
+        Some(churn_count.to_string().as_str()),
+        "every churn child must be counted exactly once, regardless of whether it \
+         raced the parent's own pending transition"
+    );
+    assert_eq!(
+        churn_total_words.as_deref(),
+        Some((400 * churn_count).to_string().as_str()),
+        "every churn child's contribution must reflect post 1's true final \
+         word_count (400), including the ones evaluated before escalation against \
+         the still-stale projection value — proof the fallback recompute this \
+         mechanism relies on is self-correcting, not merely non-corrupting"
+    );
+}
+
+/// Issue #135's own observability requirement (the plan doc's "the deferral
+/// counters should become engine metrics so it is observable in
+/// production" — already true for `d5_block_*` since #134; this is that
+/// same requirement for the fairness mechanism itself): a fairness
+/// escalation must be independently visible on
+/// `trellis_relationship_reverse_fairness_escalated_total`, a separate
+/// series from `trellis_relationship_reverse_deferred_total` (see
+/// `metrics.rs`'s own doc comment on why the two are not one metric with an
+/// extra label value). Drives the same stuck-guard-(a) scenario as
+/// `deferring_past_the_fairness_threshold_escalates_instead_of_spinning_forever`,
+/// but checks the metric directly rather than `ApplyOutcome`'s own field
+/// (already covered there) — this test's job is the registry plumbing, not
+/// the escalation decision itself.
+#[tokio::test]
+async fn fairness_escalation_increments_its_own_metric() {
+    const METRIC: &str = "trellis_relationship_reverse_fairness_escalated_total";
+
+    fn metric_value(rendered: &str) -> u64 {
+        rendered
+            .lines()
+            .find(|line| line.starts_with(METRIC))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    let before = metric_value(&trellis::metrics::Metrics::new().render_prometheus());
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("update");
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        100,
+    )
+    .await;
+
+    let unstaged_watermark = StagedWatermark::new();
+    let threshold = apply::RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD;
+    let mut escalated = false;
+    for _ in 1..=threshold {
+        let seg = seal_active_segment(&mut client).await;
+        let plan = claim_fold_compute(&db.pool, seg, "worker_metric_fair").await;
+        let mut phase3 = db.pool.get().await.expect("connection");
+        let txn = phase3.transaction().await.expect("begin phase 3");
+        let outcome = apply::apply_and_mark_drained(
+            &txn,
+            seg,
+            "worker_metric_fair",
+            &plan,
+            "trellis_reverse_test",
+            &unstaged_watermark,
+        )
+        .await
+        .expect("apply");
+        txn.commit().await.expect("commit");
+        retire_drained_segments(&mut client)
+            .await
+            .expect("retire drained segments");
+
+        // Mirrors `staging::apply::flush_relationship_reverse_fairness_escalation_metric`
+        // (private to that crate) by hand — the same caller responsibility
+        // `each_guard_increments_its_own_deferral_metric` discharges for
+        // `deferral_counts`.
+        for _ in 0..outcome.fairness_escalations {
+            trellis::metrics::increment_relationship_reverse_fairness_escalated();
+        }
+        if outcome.fairness_escalations > 0 {
+            escalated = true;
+            break;
+        }
+    }
+    assert!(
+        escalated,
+        "the stuck-guard-(a) scenario must escalate within {threshold} rounds"
+    );
+
+    let after = metric_value(&trellis::metrics::Metrics::new().render_prometheus());
+    assert!(
+        after >= before + 1,
+        "the fairness-escalation metric must have advanced by at least one \
+         (before={before}, after={after}) — it may be more than one if a \
+         concurrently-running sibling test also escalated, which is expected \
+         and not itself a failure"
+    );
 }
 
 /// Doc 05's property 1 ("the claimed batch is immutable... every producer

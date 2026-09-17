@@ -62,6 +62,38 @@ use super::watermark::StagedWatermark;
 /// primary guard.
 pub const MAX_HOP_GEN: i32 = 32;
 
+/// Issue #135 (epic #127): starvation-freedom threshold for a to-one
+/// relationship reverse's guard-gated retry loop (issue #134's
+/// `RelationshipReverseDeferred`/`retry_count`) — see the "Issue #135:
+/// fairness escalation" section below (right after [`check_reverse_guards`])
+/// for the full design and the alternatives it rejects. Once a single
+/// reverse *transition* (one parent's old-image/new-image pair — fixed
+/// across every retry, never re-derived; see [`RelationshipReverseRecord`]'s
+/// doc comment) has been rejected by guard (a), (b), or (c) this many times
+/// in a row, the *next* rejection escalates instead of deferring again: it
+/// advances the settled parent projection immediately (sound once an
+/// independent recheck of guard (d) — the projection's own LSN chain —
+/// holds; see [`reverse_ordering_still_holds`]) and resolves the aggregate
+/// correction via the pre-#131 image-less `Recompute` fallback, which needs
+/// none of #132's four guards for its own correctness.
+///
+/// **Why 5.** No production signal exists yet to tune this against — this
+/// issue's own stress model (see the module's test suite and its report) is
+/// what informs the choice, not a fleet metric. 5 is small enough to bound
+/// worst-case staleness to a handful of drain cycles (in practice usually
+/// far fewer — guard (d) is expected to hold on nearly every attempt once
+/// children are the only source of churn, since nothing else is racing to
+/// move *this* parent's own projection row; see the design section's
+/// reasoning) while large enough that an ordinary transient blip — the
+/// *common* case #134's own doc section measured — never pays the
+/// fallback's live-recompute cost in place of the fast path's true delta.
+/// A plain constant, not a runtime setting, following this module's own
+/// [`MAX_HOP_GEN`] precedent: promote it to something tunable only if a real
+/// deployment's `trellis_relationship_reverse_deferred_total` /
+/// `trellis_relationship_reverse_fairness_escalated_total` metrics ever show
+/// a need.
+pub const RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD: i32 = 5;
+
 // ---------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------
@@ -1815,6 +1847,219 @@ async fn check_reverse_guards(
     }
 
     Ok(None)
+}
+
+// ---------------------------------------------------------------------
+// Issue #135, epic #127: fairness escalation — starvation freedom for the
+// reverse retry loop
+// ---------------------------------------------------------------------
+//
+// **The problem.** Every guard-rejected [`RelationshipReverseRecord`] is
+// deferred and retried later (issue #134). Under sustained from-side churn
+// on one hot parent — children being inserted/updated/re-pointed onto it
+// continuously, faster than one drain cycle settles — that retry loop can
+// fail forever, for two independent, structural reasons, not merely bad
+// luck:
+//
+// * **Guard (c) (in-flight).** A batch's own from-side writes are staged
+//   into segments that are `state = 'draining'` (not yet `'drained'`) until
+//   *this same transaction*'s step 5, which runs *after* step 3d's guard
+//   check. So a reverse co-batched with any of its own parent's children
+//   sees them as "still undrained" on the very first attempt, by
+//   construction — not a race, a guarantee. Retrying buys nothing if the
+//   *next* batch also contains fresh children for the same hot parent, which
+//   sustained churn guarantees it will.
+// * **Guard (b) (generation).** Step 3c bumps a parent's projection `gen` on
+//   *every* batch whose forward evaluation resolves that parent for any
+//   child — regardless of whether the child's own value changed. Under
+//   sustained churn this fires on essentially every batch touching the
+//   parent's children, so the window between Phase 2's live capture and
+//   Phase 3's `FOR UPDATE` recheck is very likely to contain at least one
+//   bump whenever concurrent apply workers are active.
+//
+// Both are driven by the *children's* own ordinary traffic, not by the
+// parent itself changing repeatedly — the parent's own to-side row may have
+// changed exactly once. That rules out any fix that tries to catch a quiet
+// instant, since sustained churn need never produce one.
+//
+// **The issue's own sketch, and why it isn't the mechanism below.** The
+// issue proposed a persisted "hold" that blocks *new* forward applies for a
+// parent once its reverse has deferred N times, until the in-flight set
+// drains to empty. Worked through concretely, this does not hold up:
+//
+// 1. Guard (c)'s own query treats *any* non-`'drained'` segment — including
+//    the still-open *active* segment nothing has even claimed yet — as
+//    in-flight. "Blocking" a child's forward apply by simply not processing
+//    it leaves its row sitting in exactly such a segment, still in-flight,
+//    forever. That is the priority-inversion the issue itself named:
+//    holding children back to protect the parent's reverse would keep the
+//    in-flight set the reverse is waiting on non-empty *by the hold's own
+//    action* — a self-inflicted deadlock, not a fix.
+// 2. Even granting some other way to "pause" children, guard (b)'s
+//    projection `gen` bump cannot be safely suppressed for a held parent:
+//    that bump is what lets guard (b) catch a forward apply that resolved a
+//    stale relationship value *and already fully drained* before guard (c)
+//    could ever see it (the #133/#134-era race guard (b) exists for
+//    specifically). Suppressing it to protect the reverse would silently
+//    reopen that exact double-application hazard. A "hold" that is honest
+//    about this needs to stop children's forward evaluation from resolving
+//    the relationship at all, which is a much larger change (a new
+//    forward-defer capability, per the issue's own callout) with its own
+//    correctness surface this issue's scope does not budget for.
+//
+// **The mechanism actually shipped: escalate away from the fragile fast
+// path, not block the forward path.** Guards (a)/(b)/(c) exist to protect
+// exactly one thing: the *fast-path delta*'s assumption that the from-side
+// enumeration it reads is race-free against any other write touching the
+// same aggregate contributions. They are not needed for the *pre-#131*
+// image-less `Recompute` fallback (`ReverseRelationshipShape::needs_recompute_fallback`,
+// and the `!fast_path_safe` case below) — that path just re-evaluates each
+// row against current live state on its own next drain, with the same
+// per-row locking every other definition's ordinary forward evaluation
+// already relies on, and converges regardless of how much concurrent
+// activity raced it. It was every guard-rejected record's own treatment
+// before #134 introduced defer-and-retry as a cheaper common case.
+//
+// So: once a transition's `retry_count` reaches
+// [`RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD`], the *next* guard rejection
+// (for guard (a), (b), or (c) — never (d), see below) escalates instead of
+// deferring again — [`stage_reverse_recompute_fallback`] stages the
+// always-correct recompute for every touched from-side row, exactly as the
+// existing fallback branch does, and the settled parent projection is
+// advanced immediately via [`apply_projection_advance`], exactly as the
+// all-guards-passed path already does. This reuses two already-proven
+// mechanisms; nothing about how children are forward-applied changes, so
+// there is no new blocking, no new "hold" state, and no new deadlock
+// surface.
+//
+// **Why advancing the projection here is sound.** [`check_reverse_guards`]
+// short-circuits at the *first* failing guard, in order (a), (b), (d), (c) —
+// so a `Generation`/`Watermark`/`InFlight` failure it reports carries no
+// information about whether guard (d) (the projection's own LSN chain) also
+// holds; that check may never have run. Guard (d) is the one guard that
+// gates whether it is *safe to write* the projection at all (an
+// out-of-order or replayed transition must not stomp a fresher one); guards
+// (a)/(b)/(c) only ever gate the *fast-path delta's* correctness, never the
+// plain "does this transition's `prev_lsn` still match the projection"
+// question. [`reverse_ordering_still_holds`] answers that question
+// independently, under the same `FOR UPDATE` lock (re-acquiring a lock this
+// transaction already holds is a no-op, not a second wait), before
+// escalation is allowed to touch the projection. If guard (d) itself is
+// what's failing, escalation never happens — the record keeps deferring
+// (unchanged from #134) — see the residual limitation this leaves, below.
+//
+// **The liveness bound this gives, and what it does not cover.** Guard (d)
+// only fails when *another* reverse for the *same parent* raced this one —
+// i.e. the parent's own row being edited again, not its children churning —
+// and the ordinary SQL fold already collapses multiple same-batch edits to
+// one parent into a single transition, so this is expected to be rare under
+// the "hot parent, churning children" scenario this issue targets. Modulo
+// that, every reverse transition is guaranteed to fully resolve (both the
+// projection advance and the aggregate correction) within
+// [`RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD`] deferred-retry drain cycles,
+// unconditionally — the escalation branch performs its action outright, it
+// does not merely retry again. **What this does not guarantee**: a parent
+// whose own row is itself repeatedly, concurrently re-edited by more than
+// one racing writer fast enough to keep failing guard (d) on every
+// escalation attempt too is not covered by this mechanism and could still
+// defer indefinitely — a narrower and different failure mode than the one
+// this issue's own stress model exercises (sustained *child* churn against
+// a parent edited once). Flagged here, and in this issue's report, as a
+// known residual limitation rather than left implicit.
+
+/// Issue #135: an independent, guard-(d)-only recheck used *only* by the
+/// fairness-escalation path — never by [`check_reverse_guards`]'s own
+/// ordinary defer-or-apply decision, which already covers guard (d) as one
+/// arm of its short-circuiting evaluation (see that function's doc comment
+/// and this section's own "Why advancing the projection here is sound"
+/// above for why a `Generation`/`Watermark`/`InFlight` failure it reports
+/// carries no information about whether guard (d) also holds).
+///
+/// Takes the same `FOR UPDATE` lock [`check_reverse_guards`] already took
+/// (or would take) on this row, inside the same transaction — Postgres
+/// re-locking a row this transaction already holds is a no-op, not a second
+/// wait.
+async fn reverse_ordering_still_holds(
+    txn: &Transaction<'_>,
+    shape: &ReverseRelationshipShape,
+    old_key: &Option<String>,
+    new_key: &Option<String>,
+    record: &RelationshipReverseRecord,
+) -> Result<bool, ApplyError> {
+    let lock_key = old_key.as_deref().or(new_key.as_deref());
+    let Some(key) = lock_key else {
+        // No key at all: `check_reverse_guards` never rejects such a record
+        // in the first place (its own "both keys `None`" short-circuit
+        // always passes), so this function is never actually called in that
+        // shape — defensive `true` matches that function's own posture.
+        return Ok(true);
+    };
+    if shape.qualified_projection.is_empty() {
+        return Ok(true);
+    }
+    let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
+    let key_ident = quote_ident(&shape.to_col);
+    let row = txn
+        .query_opt(
+            &format!(
+                "select {lsn_ident} from {} where {key_ident}::text = $1 for update",
+                shape.qualified_projection,
+            ),
+            &[&key],
+        )
+        .await?;
+    match row {
+        None => Ok(true),
+        Some(row) => {
+            let current_lsn: Option<PgLsn> = row.get(0);
+            Ok(current_lsn == record.prev_lsn)
+        }
+    }
+}
+
+/// Stages the pre-#131 image-less `Recompute` fallback (issue #131's own
+/// stopgap, shared since by every guard rejection before #134 and by
+/// `ReverseRelationshipShape::needs_recompute_fallback`/`!fast_path_safe`
+/// since) for every from-side row currently matching `old_key`/`new_key` via
+/// `shape.from_col` — live-enumerated inside the already-locked Phase 3
+/// `txn`, deduped against `seen_keys` (shared across every call this same
+/// record makes, so a same-key `old_key == new_key` update is not staged
+/// twice). Needs none of #132's four guards for its own correctness: each
+/// staged `Recompute` is picked up on a later drain and re-evaluated against
+/// whatever is live *then*, the same way any other definition's ordinary
+/// forward evaluation already is — which is exactly why issue #135's
+/// fairness escalation (see this module's own design section above) can
+/// lean on it as the always-safe exit from the guard-gated retry loop.
+#[allow(clippy::too_many_arguments)]
+async fn stage_reverse_recompute_fallback(
+    txn: &Transaction<'_>,
+    shape: &ReverseRelationshipShape,
+    old_key: &Option<String>,
+    new_key: &Option<String>,
+    hop_gen: i32,
+    src_changed: Option<std::time::SystemTime>,
+    seen_keys: &mut std::collections::HashSet<String>,
+    fallback: &mut Vec<(String, String, i32, Option<std::time::SystemTime>)>,
+) -> Result<(), ApplyError> {
+    for key in [old_key.as_deref(), new_key.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let from_rows = from_side_rows_for_join_txn(
+            txn,
+            &shape.from_table,
+            &shape.from_col,
+            &shape.from_pk,
+            key,
+        )
+        .await?;
+        for (from_key, _) in from_rows {
+            if seen_keys.insert(from_key.clone()) {
+                fallback.push((shape.from_table.clone(), from_key, hop_gen, src_changed));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Splices `parent_row`'s referenced to-side columns into a clone of
@@ -3829,6 +4074,15 @@ fn flush_relationship_reverse_deferral_metrics(deferral_counts: &HashMap<&'stati
     }
 }
 
+/// Issue #135: the fairness-escalation counterpart to
+/// [`flush_relationship_reverse_deferral_metrics`] — same post-commit-only
+/// contract and the same reason (see that function's doc comment).
+fn flush_relationship_reverse_fairness_escalation_metric(count: u64) {
+    for _ in 0..count {
+        crate::metrics::increment_relationship_reverse_fairness_escalated();
+    }
+}
+
 // ---------------------------------------------------------------------
 // Phase 3: apply ∪ mark-drained
 // ---------------------------------------------------------------------
@@ -4121,6 +4375,7 @@ pub async fn apply_and_mark_drained(
         keys_deleted: outcome.keys_deleted,
         batch_drained: outcome.segments_drained[0].1,
         deferral_counts: outcome.deferral_counts,
+        fairness_escalations: outcome.fairness_escalations,
     })
 }
 
@@ -4220,6 +4475,11 @@ pub async fn apply_and_mark_drained_many(
     // for the same folded input; only the attempt whose transaction
     // actually commits may ever reach the metrics registry).
     let mut deferral_counts: HashMap<&'static str, u64> = HashMap::new();
+    // Issue #135: count of reverse transitions this pass resolved via
+    // fairness escalation (see [`ManyApplyOutcome::fairness_escalations`]'s
+    // doc comment) — buffered under the exact same post-commit-only
+    // contract as `deferral_counts` just above, for the same reason.
+    let mut fairness_escalations: u64 = 0;
     // `changed` accumulates rather than overwrites per target (`extend`,
     // not `insert`): a target can appear in both `plan.clears` and
     // `plan.targets` in the same batch — a truncate clear followed by a
@@ -4445,6 +4705,53 @@ pub async fn apply_and_mark_drained_many(
         if let Some(failure) =
             check_reverse_guards(txn, shape, record, &old_key, &new_key, watermark).await?
         {
+            // Issue #135: fairness escalation — see this module's own
+            // "Issue #135, epic #127: fairness escalation" design section
+            // (right after `check_reverse_guards`) for the full mechanism
+            // and why it is sound. Guard (d) failing itself is never
+            // eligible (see that section's "residual limitation"): the next
+            // check independently confirms guard (d) still holds before
+            // this branch is allowed to touch the projection at all.
+            if failure != ReverseGuardFailure::Ordering
+                && record.retry_count + 1 >= RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD
+                && reverse_ordering_still_holds(txn, shape, &old_key, &new_key, record).await?
+            {
+                *deferral_counts.entry(failure.metric_label()).or_insert(0) += 1;
+                fairness_escalations += 1;
+                tracing::warn!(
+                    relationship_projection = %shape.qualified_projection,
+                    guard = %failure,
+                    retry_count = record.retry_count + 1,
+                    threshold = RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD,
+                    "issue #135 fairness escalation: this reverse's guard-gated retry budget \
+                     is exhausted; advancing the projection and falling back to the \
+                     always-correct recompute instead of deferring again"
+                );
+                let mut seen_keys: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                stage_reverse_recompute_fallback(
+                    txn,
+                    shape,
+                    &old_key,
+                    &new_key,
+                    record.hop_gen + 1,
+                    record.src_changed,
+                    &mut seen_keys,
+                    &mut relationship_reverse_fallback,
+                )
+                .await?;
+                apply_projection_advance(
+                    txn,
+                    shape,
+                    &old_key,
+                    &new_key,
+                    record.new_image.as_deref(),
+                    record.lsn,
+                )
+                .await?;
+                continue;
+            }
+
             // Issue #134: defer and re-stage, rather than #131/#132/#133's
             // stopgap of falling back to an image-less `Recompute` of every
             // touched from-side row at `hop_gen + 1`. Do NOT touch any
@@ -4686,29 +4993,17 @@ pub async fn apply_and_mark_drained_many(
         // it for definitions this flag already names.
         if shape.needs_recompute_fallback || !fast_path_safe {
             let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for key in [old_key.as_deref(), new_key.as_deref()]
-                .into_iter()
-                .flatten()
-            {
-                let from_rows = from_side_rows_for_join_txn(
-                    txn,
-                    &shape.from_table,
-                    &shape.from_col,
-                    &shape.from_pk,
-                    key,
-                )
-                .await?;
-                for (from_key, _) in from_rows {
-                    if seen_keys.insert(from_key.clone()) {
-                        relationship_reverse_fallback.push((
-                            shape.from_table.clone(),
-                            from_key,
-                            record.hop_gen + 1,
-                            record.src_changed,
-                        ));
-                    }
-                }
-            }
+            stage_reverse_recompute_fallback(
+                txn,
+                shape,
+                &old_key,
+                &new_key,
+                record.hop_gen + 1,
+                record.src_changed,
+                &mut seen_keys,
+                &mut relationship_reverse_fallback,
+            )
+            .await?;
         }
 
         // Advance the projection — issue #131's own write, distinct from
@@ -4908,6 +5203,7 @@ pub async fn apply_and_mark_drained_many(
         keys_deleted,
         segments_drained,
         deferral_counts,
+        fairness_escalations,
     })
 }
 
@@ -4937,6 +5233,17 @@ pub struct ApplyOutcome {
     /// [`apply_and_mark_drained`]'s wrapper — is the overwhelming common
     /// case.
     pub deferral_counts: HashMap<&'static str, u64>,
+    /// Issue #135: count of to-one relationship reverse transitions this
+    /// call's Phase 3 pass resolved via fairness escalation (see
+    /// [`RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD`]'s doc comment and the
+    /// "Issue #135" design section right after [`check_reverse_guards`])
+    /// rather than deferring again — the caller's own responsibility to
+    /// flush into
+    /// [`crate::metrics::increment_relationship_reverse_fairness_escalated`]
+    /// under the same post-commit-only contract as `deferral_counts` above.
+    /// Reused from [`ManyApplyOutcome::fairness_escalations`] via
+    /// [`apply_and_mark_drained`]'s wrapper.
+    pub fairness_escalations: u64,
 }
 
 /// What one successful [`apply_and_mark_drained_many`] call did — the
@@ -4955,6 +5262,9 @@ pub struct ManyApplyOutcome {
     /// see [`ApplyOutcome::deferral_counts`]'s doc comment (this field is
     /// that one's source, for the coalesced-segment path).
     pub deferral_counts: HashMap<&'static str, u64>,
+    /// Issue #135: see [`ApplyOutcome::fairness_escalations`]'s doc comment
+    /// (this field is that one's source, for the coalesced-segment path).
+    pub fairness_escalations: u64,
 }
 
 // ---------------------------------------------------------------------
@@ -5081,6 +5391,10 @@ pub async fn drain_once(
                 // contract, for the deferral counters this attempt's own
                 // Phase 3 pass discovered.
                 flush_relationship_reverse_deferral_metrics(&outcome.deferral_counts);
+                // Issue #135: same post-commit-only contract, for the
+                // fairness-escalation count this attempt's own Phase 3 pass
+                // discovered.
+                flush_relationship_reverse_fairness_escalation_metric(outcome.fairness_escalations);
                 backoff.reset();
                 return Ok(Some(outcome));
             }
@@ -5258,6 +5572,10 @@ pub async fn drain_many(
                 // Issue #134/#135 review follow-up: see `drain_once`'s
                 // matching call.
                 flush_relationship_reverse_deferral_metrics(&outcome.deferral_counts);
+                // Issue #135: same post-commit-only contract, for the
+                // fairness-escalation count this attempt's own Phase 3 pass
+                // discovered.
+                flush_relationship_reverse_fairness_escalation_metric(outcome.fairness_escalations);
                 backoff.reset();
                 return Ok(Some(outcome));
             }
