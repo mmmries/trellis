@@ -40,14 +40,43 @@ pub struct Table {
     pub unique_cols: Vec<String>,
 }
 
+/// The Postgres type every generated table's primary-key column is declared
+/// with.
+///
+/// Not derived from a [`ValueType`] on purpose. The generator seeds primary
+/// keys as consecutive integers (`1..=seed_count`, see
+/// `crate::generate::build_program_multi_with_shapes`), but [`ValueType`]'s
+/// only numeric variant maps to Postgres `numeric` — and the engine rejects a
+/// `numeric` primary key outright with
+/// `trellis::defs::ddl::DdlError::UnsupportedPrimaryKeyType`, because
+/// `source_primary_key` gates the resolved PK type on
+/// `is_text_stable_join_key_type`'s allowlist (issue #107): every consumer
+/// compares that key via a `::text` cast, and `numeric` is not text-stable
+/// (`1.0::text != 1.00::text` though the two are numerically equal).
+///
+/// Declaring the PK `numeric` therefore made *every* generated program fail
+/// to install, which is what broke `backend_seam` and the `backfill.rs` /
+/// `bulk_operations.rs` suites. `bigint` is on that allowlist, is what the
+/// hand-written engine tests actually use (`trellis/tests/apply.rs`'s
+/// `orders` table declares `id integer primary key`), and comfortably holds
+/// the `i64` pks the generator mints.
+pub const PRIMARY_KEY_PG_TYPE: &str = "bigint";
+
 impl Table {
     /// Builds a table from `pool`, giving it a primary-key column
     /// unconditionally — before any of `column_types` — so no future shrink
     /// step can strand a definition that references it (design doc §1).
-    /// The PK column is always [`ValueType::Numeric`]: today's generator
-    /// scope is 1-1/numeric-`+` definitions only, and a numeric PK is what
-    /// every existing engine test builds against (see
-    /// `trellis/tests/apply.rs`'s `orders` table).
+    ///
+    /// The PK column's Postgres type is [`PRIMARY_KEY_PG_TYPE`], *not* the
+    /// [`ValueType`] stored on its [`Column`]. [`ValueType`] is
+    /// `trellis::defs::ast`'s expression-level type and has no integer
+    /// variant, so it simply cannot name the type a primary key needs; the
+    /// `ValueType::Numeric` recorded below is an unavoidable placeholder.
+    /// Nothing may render the PK column's type from it — see
+    /// [`PRIMARY_KEY_PG_TYPE`] for why a `numeric` PK is rejected outright by
+    /// the engine, and `crate::backend::manual`'s `column_pg_type`, which is
+    /// the one place every DDL and cast site resolves a column's declared
+    /// type through.
     pub fn new(pool: &mut NamePool, column_types: &[ValueType]) -> Table {
         let name = pool.next_table_name();
         let pk_col = pool.next_column_name();

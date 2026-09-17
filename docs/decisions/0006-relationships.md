@@ -167,15 +167,33 @@ directions:
 * **Reverse (a *related* row changes).** Trellis resolves, from the dependency
   graph, which relationships target the changed table, then re-derives the
   referencing rows whose join key matches the changed row's key. That key comes
-  from the changed row's replica image. For a **to-one** relationship the join
-  key is the to-side's own primary key, always present in the default replica
-  identity, so no extra replica identity is needed. For a **to-many**
-  relationship the join key is a *non-PK* column on the to-side, which the
-  default (PK) replica identity omits from delete/re-parent pre-images; such a
-  relationship therefore requires `REPLICA IDENTITY FULL` (or a replica-identity
-  index covering the join column) on the to-side, enforced at define time. This
-  reuses the existing "recompute" staging path rather than a bespoke persisted
-  reverse index.
+  from the changed row's replica image, so both cardinalities constrain the
+  replica identity of the tables involved — enforced at define time, when the
+  relationship is declared, rather than deferred to first use:
+
+  * A **to-many** relationship's join key is a *non-PK* column on the to-side,
+    which the default (PK) replica identity omits from delete/re-parent
+    pre-images. It requires `REPLICA IDENTITY FULL`, or a replica-identity index
+    covering the join column.
+  * A **to-one** relationship's join key is the to-side's own primary key, which
+    the default replica identity does carry — but the key alone is not enough.
+    Every to-one relationship gets a settled parent projection unconditionally,
+    and that projection's reverse-applied advance needs the to-side row's
+    *entire* old image to detect a parent update, delete, or re-key. A narrower
+    replica identity covering only the join column cannot supply an old image of
+    unpredictably-many columns, so a to-one relationship requires
+    `REPLICA IDENTITY FULL` on the to-side.
+  * A **to-one** relationship additionally requires `REPLICA IDENTITY FULL` on
+    its **from-side** (child) table. The from-side's join column is an ordinary
+    non-key column — the foreign key — so under that table's default (PK)
+    replica identity, an `UPDATE` that re-points the foreign key without
+    touching the primary key ships *no* pre-image at all, rather than one that
+    merely omits the changed column. Anything recovering a row's prior parent
+    from the replication message is then reading nothing. The to-side gate above
+    cannot catch this: a from-side re-point never touches the to-side row.
+
+  This reuses the existing "recompute" staging path rather than a bespoke
+  persisted reverse index.
 
   Finding the affected referencing rows is a lookup on the from-side join column.
   That lookup is **correct without an index**; an index only makes it fast. Per

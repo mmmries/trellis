@@ -161,6 +161,26 @@ impl TestCluster {
             .arg("max_replication_slots=10")
             .arg("-c")
             .arg("max_wal_senders=10")
+            // Tests that assert on what the server logged (`log_statement =
+            // 'all'`, see `trellis/tests/apply.rs`) read the `postgres.log`
+            // file the two `Stdio::from` handles below point at. That only
+            // works while the server writes to its inherited stderr: with the
+            // logging collector on, the postmaster hands logging to a
+            // collector subprocess that writes its own rotated files under
+            // `$PGDATA/log` instead, and everything those tests want to scrape
+            // lands there rather than in the file they read.
+            //
+            // `logging_collector` defaults to `off` in vanilla Postgres, but
+            // some distributions ship a `postgresql.conf.sample` that turns it
+            // on (Fedora's does), and `initdb` copies that sample verbatim into
+            // the cluster it creates — so whether those tests pass depended on
+            // the packaging of whichever Postgres happened to be on `PATH`.
+            // Pinning it here makes the cluster's logging behaviour a property
+            // of the harness rather than of the host. It is a postmaster-level
+            // setting, so passing it on the command line also outranks both
+            // `postgresql.conf` and any later `ALTER SYSTEM`.
+            .arg("-c")
+            .arg("logging_collector=off")
             .stdout(Stdio::from(log_file.try_clone().expect("clone log handle")))
             .stderr(Stdio::from(log_file))
             .spawn()

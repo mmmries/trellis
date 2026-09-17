@@ -40,7 +40,8 @@ use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
 
 use super::Snapshot;
 use crate::model::{
-    Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Relationship, Table, group_key,
+    Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, PRIMARY_KEY_PG_TYPE, Program,
+    Relationship, Table, group_key,
 };
 
 /// How long [`ManualBackend::quiesce`] waits for convergence before giving
@@ -476,17 +477,24 @@ impl ManualBackend {
             }
             sql.push_str(&quote_ident(&column.name));
             sql.push(' ');
-            sql.push_str(pg_type_name(column.value_type));
             if column.name == table.pk_col {
+                // The PK's declared type comes from `PRIMARY_KEY_PG_TYPE`,
+                // never from its `ValueType` — see that constant's doc
+                // comment for why a `numeric` PK is rejected at install time.
+                sql.push_str(PRIMARY_KEY_PG_TYPE);
                 sql.push_str(" primary key");
-            } else if table.unique_cols.iter().any(|c| c == &column.name) {
-                // Issue #34: a real single-column UNIQUE constraint, which
-                // is what makes `trellis::defs::catalog`'s live `pg_catalog`
-                // introspection resolve a relationship whose *to*-side is
-                // this column as to-one (ADR-0006's cardinality rule). A
-                // generated to-one relationship is otherwise rejected as a
-                // bare reference to a to-many relationship.
-                sql.push_str(" unique");
+            } else {
+                sql.push_str(pg_type_name(column.value_type));
+                if table.unique_cols.iter().any(|c| c == &column.name) {
+                    // Issue #34: a real single-column UNIQUE constraint,
+                    // which is what makes `trellis::defs::catalog`'s live
+                    // `pg_catalog` introspection resolve a relationship whose
+                    // *to*-side is this column as to-one (ADR-0006's
+                    // cardinality rule). A generated to-one relationship is
+                    // otherwise rejected as a bare reference to a to-many
+                    // relationship.
+                    sql.push_str(" unique");
+                }
             }
         }
         sql.push(')');
@@ -557,6 +565,31 @@ impl ManualBackend {
             .and_then(|t| t.columns.iter().find(|c| c.name == column))
     }
 
+    /// The Postgres type `column` was actually declared with in
+    /// [`Self::create_source_table`] — the single source of truth every
+    /// `$n::text::<type>` cast in this backend renders from.
+    ///
+    /// A primary-key column resolves to [`PRIMARY_KEY_PG_TYPE`] rather than
+    /// to [`pg_type_name`] of its [`ValueType`], because [`ValueType`] cannot
+    /// name an integer type and the placeholder it carries (`Numeric`) is not
+    /// what the column was declared as. Casting a pk through `numeric` still
+    /// *worked* — Postgres assignment-casts `numeric` to `bigint` — but it
+    /// round-trips an integer key through an arbitrary-precision type for no
+    /// reason, and it is exactly the kind of near-miss that hid the original
+    /// `numeric`-pk bug. Routing every site through here keeps the DDL and
+    /// the DML casts from drifting apart again.
+    fn column_pg_type(&self, table: &str, column: &str) -> &'static str {
+        let is_pk = self.tables.get(table).is_some_and(|t| t.pk_col == column);
+        if is_pk {
+            return PRIMARY_KEY_PG_TYPE;
+        }
+        pg_type_name(
+            self.column(table, column)
+                .map(|c| c.value_type)
+                .unwrap_or(ValueType::Numeric),
+        )
+    }
+
     fn assignment(
         &self,
         table: &str,
@@ -564,16 +597,12 @@ impl ManualBackend {
         index: usize,
         value: &Option<String>,
     ) -> Assignment {
-        let value_type = self
-            .column(table, column)
-            .map(|c| c.value_type)
-            .unwrap_or(ValueType::Numeric);
         Assignment {
             fragment: format!(
                 "{}=${}::text::{}",
                 quote_ident(column),
                 index,
-                pg_type_name(value_type)
+                self.column_pg_type(table, column)
             ),
             value: value.clone(),
         }
@@ -785,15 +814,7 @@ impl super::Backend for ManualBackend {
                     .iter()
                     .enumerate()
                     .map(|(i, (col, val))| Assignment {
-                        fragment: format!(
-                            "${}::text::{}",
-                            i + 1,
-                            pg_type_name(
-                                self.column(table, col)
-                                    .map(|c| c.value_type)
-                                    .unwrap_or(ValueType::Numeric)
-                            )
-                        ),
+                        fragment: format!("${}::text::{}", i + 1, self.column_pg_type(table, col)),
                         value: val.clone(),
                     })
                     .collect();
@@ -833,21 +854,20 @@ impl super::Backend for ManualBackend {
                 for (i, (col, val)) in changes.iter().enumerate() {
                     assignments.push(self.assignment(table, col, i + 1, val));
                 }
-                let pk_type = self
-                    .column(table, &pk_col)
-                    .map(|c| c.value_type)
-                    .unwrap_or(ValueType::Numeric);
                 let set_clause = assignments
                     .iter()
                     .map(|a| a.fragment.clone())
                     .collect::<Vec<_>>()
                     .join(", ");
+                // `PRIMARY_KEY_PG_TYPE`, not the pk column's `ValueType`:
+                // the cast has to name the type the column was actually
+                // declared with in `create_source_table`.
                 let sql = format!(
                     "update {} set {set_clause} where {}=${}::text::{}",
                     quote_ident(table),
                     quote_ident(&pk_col),
                     changes.len() + 1,
-                    pg_type_name(pk_type),
+                    PRIMARY_KEY_PG_TYPE,
                 );
                 let mut params: Vec<Option<String>> =
                     assignments.into_iter().map(|a| a.value).collect();
@@ -866,15 +886,13 @@ impl super::Backend for ManualBackend {
                     .ok_or_else(|| ManualBackendError::UnknownTable {
                         table: table.clone(),
                     })?;
-                let pk_type = self
-                    .column(table, &pk_col)
-                    .map(|c| c.value_type)
-                    .unwrap_or(ValueType::Numeric);
+                // Same as the `Update` arm above: the cast names
+                // `PRIMARY_KEY_PG_TYPE`, the declared type of the column.
                 let sql = format!(
                     "delete from {} where {}=$1::text::{}",
                     quote_ident(table),
                     quote_ident(&pk_col),
-                    pg_type_name(pk_type),
+                    PRIMARY_KEY_PG_TYPE,
                 );
                 self.raw.execute(&sql, &[pk]).await?
             }
@@ -940,11 +958,7 @@ impl super::Backend for ManualBackend {
                             format!(
                                 "${}::text::{}",
                                 params.len(),
-                                pg_type_name(
-                                    self.column(table, col)
-                                        .map(|c| c.value_type)
-                                        .unwrap_or(ValueType::Numeric)
-                                )
+                                self.column_pg_type(table, col)
                             )
                         })
                         .collect();
