@@ -3836,15 +3836,14 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 // Issue #126: `pk` is this source's full (possibly
                 // composite) primary key, shared with the `KeySpace::Aggregate`
                 // branch above (which needs no single-column narrowing at
-                // all). A `KeySpace::OneToOne` definition, though, could only
-                // ever have been installed against a single-column source
-                // primary key (`catalog::install_definition`'s own
-                // `ddl::require_single_column_pk` gate) — so this narrowing
-                // can never actually fail for a definition that reached this
-                // point live; it's still routed through the typed error
-                // (rather than an `expect`) to match this module's own
-                // "don't trust an invariant it can't itself enforce"
-                // convention.
+                // all). A `KeySpace::OneToOne` definition installed through
+                // `catalog::install_definition` can only have a single-column
+                // source primary key (its own `ddl::require_single_column_pk`
+                // gate), so this narrowing fails here only for a definition
+                // that reached the ring via a path that skips that gate (see
+                // `quarantine.rs`'s
+                // `a_composite_primary_key_source_is_never_quarantined_and_stops_the_instance`)
+                // — a real, typed halting error, not an invariant violation.
                 let target_pk = ddl::require_single_column_pk(pk.clone(), qualified_source)?;
                 let plan = targets
                     .entry(def.def.target.clone())
