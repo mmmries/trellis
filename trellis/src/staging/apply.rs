@@ -549,14 +549,73 @@ async fn read_live_rows_batch(
     Ok(rows)
 }
 
-/// The from-side keys whose `from_col` matches any of `join_keys` (compared as
-/// `::text`, the relationship join-key convention shared with the evaluator —
-/// exact for the integer/uuid/text keys relationships allow, numeric keys
-/// being rejected at definition time). Returns `(from_pk_text, from_col_text)`
-/// so the reverse-recompute caller can map each matched from-side row back to
-/// the join value — hence the triggering related-row change's `hop_gen` — that
-/// pulled it in. A `NULL` `from_col` never matches (SQL `NULL`), so such rows
-/// are absent, exactly like the evaluator's LEFT JOIN no-match.
+/// The exact Postgres type of `column` on `table`, as rendered by
+/// `format_type` (e.g. `integer`, `bigint`, `uuid`) — the same `pg_catalog`
+/// introspection [`ddl::source_primary_key`]/[`to_column_types`] do, kept
+/// here as its own single-column helper so a relationship key-lookup can
+/// bind its key-array parameter to the column's own native type instead of
+/// casting the column itself to `::text` (issue #125): `where col::text =
+/// any($1::text[])` puts the cast on the *indexed* side, which defeats any
+/// btree index on `col` and degrades what should be an O(touched keys)
+/// lookup into an O(table size) sequential scan (measured 275x/794x slower
+/// on realistic data volumes). `where col = any($1::text[]::{ty}[])` casts
+/// the *bound array* instead — `col` is compared at its own type, so
+/// Postgres can still use a btree index on it. `None` if the column doesn't
+/// exist, mirroring [`to_column_types`]'s "missing is simply absent"
+/// convention; such a caller falls back to the old untyped `::text`
+/// comparison, which fails the same way this lookup always did if the
+/// column is genuinely gone.
+async fn key_column_pg_type(
+    pool: &Pool,
+    table: &str,
+    column: &str,
+) -> Result<Option<String>, ApplyError> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "select pg_catalog.format_type(a.atttypid, a.atttypmod) \
+             from pg_attribute a \
+             where a.attrelid = pg_catalog.to_regclass($1) \
+               and a.attname = $2 \
+               and a.attnum > 0 \
+               and not a.attisdropped",
+            &[&table, &column],
+        )
+        .await?;
+    Ok(row.map(|r| r.get(0)))
+}
+
+/// Renders a key-array equality filter against `col_ident` (an already
+/// `quote_ident`-quoted column reference — this function does no quoting of
+/// its own). Issue #125's fix, factored out as its own pure, directly
+/// testable function shared by every relationship/join-key lookup below:
+/// when `pg_type` (from [`key_column_pg_type`]) is known, casts the *bound
+/// `$1` array* to it (`col = any($1::text[]::{ty}[])`), leaving `col_ident`
+/// itself uncast so a btree index on it stays usable; when `pg_type` is
+/// `None` (the column couldn't be introspected), falls back to the old,
+/// unindexable `col_ident::text = any($1::text[])` form, which casts
+/// `col_ident` itself. Regression-pinned by this module's own
+/// `key_array_filter_*` unit tests below — a future edit that swaps these
+/// two arms, or that re-adds a bare `::text` cast on `col_ident` in the
+/// `Some` arm, would fail them immediately.
+fn key_array_filter(col_ident: &str, pg_type: Option<&str>) -> String {
+    match pg_type {
+        Some(ty) => format!("{col_ident} = any($1::text[]::{ty}[])"),
+        None => format!("{col_ident}::text = any($1::text[])"),
+    }
+}
+
+/// The from-side keys whose `from_col` matches any of `join_keys` (compared
+/// at `from_col`'s own native type via [`key_column_pg_type`] — issue #125 —
+/// falling back to the old `::text` comparison if the column can't be
+/// introspected; the relationship join-key convention is otherwise shared
+/// with the evaluator: exact for the integer/uuid/text keys relationships
+/// allow, numeric keys being rejected at definition time). Returns
+/// `(from_pk_text, from_col_text)` so the reverse-recompute caller can map
+/// each matched from-side row back to the join value — hence the triggering
+/// related-row change's `hop_gen` — that pulled it in. A `NULL` `from_col`
+/// never matches (SQL `NULL`), so such rows are absent, exactly like the
+/// evaluator's LEFT JOIN no-match.
 async fn from_side_keys_for_join(
     pool: &Pool,
     from_table: &str,
@@ -568,12 +627,14 @@ async fn from_side_keys_for_join(
         return Ok(Vec::new());
     }
     let client = pool.get().await?;
+    let col_ident = quote_ident(from_col);
+    let pg_type = key_column_pg_type(pool, from_table, from_col).await?;
+    let filter = key_array_filter(&col_ident, pg_type.as_deref());
     let sql = format!(
-        "select {pk}::text, {col}::text \
+        "select {pk}::text, {col_ident}::text \
          from {tbl} \
-         where {col}::text = any($1::text[])",
+         where {filter}",
         pk = quote_ident(&from_pk.name),
-        col = quote_ident(from_col),
         tbl = quote_ident(from_table),
     );
     let rows = client.query(&sql, &[&join_keys]).await?;
@@ -765,6 +826,7 @@ pub(crate) async fn build_relationship_context(
                         fetch_relationship_projection_rows(
                             pool,
                             qualified_projection,
+                            &to_table,
                             &to_col,
                             &join_keys,
                         )
@@ -2262,13 +2324,16 @@ async fn apply_projection_advance(
     Ok(())
 }
 
-/// The to-side rows whose `to_col` matches any of `join_keys`, grouped by that
-/// key's `::text` (the evaluator's key convention, shared with
-/// [`from_side_keys_for_join`]). A `NULL` `to_col` is absent (SQL `NULL` never
-/// joins) — matching the evaluator's requirement that such a to-side row carry
-/// no key. To-one relationships get exactly one row per key (`to_col` is
-/// UNIQUE); to-many get the full related set. Decodes each row's columns via
-/// the same in-SQL `jsonb_each_text` unnest [`read_live_rows_batch`] uses.
+/// The to-side rows whose `to_col` matches any of `join_keys` (compared at
+/// `to_col`'s own native type via [`key_column_pg_type`] — issue #125,
+/// falling back to the old `::text` comparison if the column can't be
+/// introspected), grouped by that key's `::text` (the evaluator's key
+/// convention, shared with [`from_side_keys_for_join`]). A `NULL` `to_col` is
+/// absent (SQL `NULL` never joins) — matching the evaluator's requirement
+/// that such a to-side row carry no key. To-one relationships get exactly one
+/// row per key (`to_col` is UNIQUE); to-many get the full related set.
+/// Decodes each row's columns via the same in-SQL `jsonb_each_text` unnest
+/// [`read_live_rows_batch`] uses.
 async fn fetch_to_side_rows(
     pool: &Pool,
     to_table: &str,
@@ -2279,16 +2344,18 @@ async fn fetch_to_side_rows(
         return Ok(HashMap::new());
     }
     let client = pool.get().await?;
+    let col_ident = quote_ident(to_col);
+    let tbl_ident = quote_ident(to_table);
+    let pg_type = key_column_pg_type(pool, to_table, to_col).await?;
+    let filter = key_array_filter(&col_ident, pg_type.as_deref());
     let sql = format!(
         "select m.jk, m.rn, e.key, e.value \
-         from (select {col}::text as jk, \
+         from (select {col_ident}::text as jk, \
                       row_number() over () as rn, \
                       to_jsonb(t.*) as doc \
-               from {tbl} t \
-               where {col}::text = any($1::text[])) m \
+               from {tbl_ident} t \
+               where {filter}) m \
          cross join lateral jsonb_each_text(m.doc) e",
-        col = quote_ident(to_col),
-        tbl = quote_ident(to_table),
     );
     let db_rows = client.query(&sql, &[&join_keys]).await?;
     // Assemble each row by its stable `rn`, carrying its join key, then group.
@@ -2323,9 +2390,22 @@ async fn fetch_to_side_rows(
 /// reads the specific columns a definition's own fields reference
 /// ([`eval::eval_expr`]'s `Row::get`), and a `Row` carrying extra unread keys
 /// is exactly what every other decode in this module already produces.
+///
+/// Issue #125: the filter compares `key_col` at its own native type via
+/// [`key_column_pg_type`], not an untyped `::text` cast, so a btree index on
+/// the projection's key column (always present — it's the table's own
+/// `primary key`) stays usable. The type is looked up on `to_table` (the
+/// relationship's live to-side table) rather than the projection itself:
+/// `catalog::ensure_relationship_projection_in_txn` creates the projection's
+/// key column with exactly `to_table`'s `to_col` type, so the two always
+/// agree, and `to_table` is a plain bare/qualified table name `to_regclass`
+/// resolves directly — unlike `qualified_projection`, which arrives here
+/// already `quote_ident`-quoted for direct interpolation, not in the shape
+/// `to_regclass` expects as a bind parameter.
 async fn fetch_relationship_projection_rows(
     pool: &Pool,
     qualified_projection: &str,
+    to_table: &str,
     key_col: &str,
     join_keys: &[String],
 ) -> Result<HashMap<String, Row>, ApplyError> {
@@ -2334,11 +2414,13 @@ async fn fetch_relationship_projection_rows(
     }
     let client = pool.get().await?;
     let key_ident = quote_ident(key_col);
+    let pg_type = key_column_pg_type(pool, to_table, key_col).await?;
+    let filter = key_array_filter(&format!("p.{key_ident}"), pg_type.as_deref());
     let sql = format!(
         "select p.{key_ident}::text as jk, e.key, e.value \
          from {qualified_projection} p \
          cross join lateral jsonb_each_text(to_jsonb(p.*)) e \
-         where p.{key_ident}::text = any($1::text[])"
+         where {filter}"
     );
     let db_rows = client.query(&sql, &[&join_keys]).await?;
     let mut rows: HashMap<String, Row> = HashMap::new();
@@ -2923,6 +3005,150 @@ mod tests {
             "exactly one end-to-end latency observation must land (target is terminal): \
              {after_flush}"
         );
+    }
+
+    /// Issue #125 regression pin, part 1: [`key_array_filter`] renders the
+    /// fixed, indexable shape — the bound `$1` array cast to the column's
+    /// own type, the column reference itself left uncast — when the
+    /// column's native type is known. A future edit that puts the `::text`
+    /// cast back on `col_ident` (rather than on the array) fails this
+    /// immediately, without needing a live Postgres connection at all.
+    #[test]
+    fn key_array_filter_casts_the_bound_array_not_the_column_when_type_is_known() {
+        let filter = key_array_filter(r#""join_key""#, Some("integer"));
+        assert_eq!(filter, r#""join_key" = any($1::text[]::integer[])"#);
+        assert!(
+            !filter.starts_with(r#""join_key"::text"#),
+            "the column reference itself must never be cast to ::text — that's exactly the \
+             cast that defeats a btree index on it (issue #125): {filter}"
+        );
+    }
+
+    /// Issue #125 regression pin, part 2: without a known native type (the
+    /// column couldn't be introspected), [`key_array_filter`] must still
+    /// fall back to the old, unindexable `::text` form rather than emitting
+    /// invalid SQL (an untyped `any($1::text[])` with no cast at all would
+    /// leave `col_ident`'s type to ordinary operator resolution, which is
+    /// not guaranteed to match `col_ident`'s real type for every allowed
+    /// join-key type).
+    #[test]
+    fn key_array_filter_falls_back_to_the_old_text_cast_when_type_is_unknown() {
+        let filter = key_array_filter(r#""join_key""#, None);
+        assert_eq!(filter, r#""join_key"::text = any($1::text[])"#);
+    }
+
+    /// Issue #125's actual regression: three relationship key-lookup sites
+    /// in this module (`from_side_keys_for_join`, `fetch_to_side_rows`,
+    /// `fetch_relationship_projection_rows`) used to render their join-key
+    /// filter as `col::text = any($1::text[])` — a cast on the *column*,
+    /// which Postgres can never satisfy with a plain btree index on that
+    /// column, regardless of table size or statistics. This proves the
+    /// fixed shape's real-world effect end to end against a live Postgres:
+    /// [`key_column_pg_type`] correctly discovers a real column's native
+    /// type from `pg_catalog`, and the resulting [`key_array_filter`]
+    /// clause lets the planner pick an index scan for a lookup of a handful
+    /// of keys out of a much larger indexed table — while the old,
+    /// pre-#125 filter shape, run against the very same table and index,
+    /// can only ever plan a sequential scan (proving the bug was real, not
+    /// just that the fixed form happens to also allow one).
+    #[tokio::test]
+    async fn key_array_filter_lets_postgres_use_the_index_the_old_text_cast_form_could_not() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // Large enough that an index scan over a handful of keys is
+        // unambiguously cheaper than a full scan, so the planner's own cost
+        // model — not just "an index technically exists" — picks the index
+        // for the fixed filter shape.
+        client
+            .batch_execute(
+                "create table big_from_side (id bigint primary key, join_key integer); \
+                 create index big_from_side_join_key_idx on big_from_side (join_key); \
+                 insert into big_from_side \
+                 select g, g % 5000 from generate_series(1, 200000) g; \
+                 analyze big_from_side;",
+            )
+            .await
+            .expect("seed a large indexed table");
+
+        let pool_config =
+            crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = crate::pool::Pool::new(&pool_config).expect("build a same-crate pool");
+
+        let pg_type = key_column_pg_type(&pool, "big_from_side", "join_key")
+            .await
+            .expect("introspect join_key's type");
+        assert_eq!(
+            pg_type.as_deref(),
+            Some("integer"),
+            "the join column's native pg_catalog type must be discovered correctly"
+        );
+
+        let keys = vec!["42".to_string()];
+
+        let fixed_filter = key_array_filter(r#""join_key""#, pg_type.as_deref());
+        let fixed_plan = explain_plan_lines(
+            &client,
+            &format!("select 1 from \"big_from_side\" where {fixed_filter}"),
+            &keys,
+        )
+        .await;
+        assert!(
+            fixed_plan.iter().any(|line| line.contains("Index")),
+            "issue #125's fix should let Postgres use the btree index on join_key, got:\n{}",
+            fixed_plan.join("\n")
+        );
+        assert!(
+            !fixed_plan.iter().any(|line| line.contains("Seq Scan")),
+            "issue #125's fix should not fall back to a sequential scan, got:\n{}",
+            fixed_plan.join("\n")
+        );
+
+        // Sanity check / regression pin: the pre-#125 shape casts the
+        // *column* to `::text`, which no btree index on the untransformed
+        // column can ever satisfy — this must remain a sequential scan on
+        // this same table and index, proving the bug this test guards
+        // against was real.
+        let old_filter = r#""join_key"::text = any($1::text[])"#;
+        let old_plan = explain_plan_lines(
+            &client,
+            &format!("select 1 from \"big_from_side\" where {old_filter}"),
+            &keys,
+        )
+        .await;
+        assert!(
+            old_plan.iter().any(|line| line.contains("Seq Scan")),
+            "sanity check: the old col::text cast form must force a sequential scan \
+             (if this fails, Postgres itself changed how it plans this — re-check the \
+             fixture), got:\n{}",
+            old_plan.join("\n")
+        );
+    }
+
+    /// `EXPLAIN`'s plan text, one line per returned row — used by
+    /// [`key_array_filter_lets_postgres_use_the_index_the_old_text_cast_form_could_not`]
+    /// to assert on the *shape* of the plan Postgres actually chooses
+    /// (`Index` vs. `Seq Scan`) rather than merely on row-level output,
+    /// which can't distinguish "fast, indexed lookup" from "slow, full
+    /// table scan that happens to return the same rows."
+    async fn explain_plan_lines(
+        client: &tokio_postgres::Client,
+        sql: &str,
+        keys: &[String],
+    ) -> Vec<String> {
+        client
+            .query(&format!("explain {sql}"), &[&keys])
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect()
     }
 }
 
