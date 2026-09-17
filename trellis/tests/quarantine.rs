@@ -688,6 +688,82 @@ async fn a_composite_primary_key_source_is_never_quarantined_and_stops_the_insta
     assert!(after.last_reason.is_some());
 }
 
+/// Scenario: a single-column primary key of an unsafe, non-text-stable type
+/// (`DdlError::UnsupportedPrimaryKeyType`, issue #107) is exactly as
+/// structural as the composite-key case above — "this definition can never
+/// work against this source's real schema" — so it must halt too, not get
+/// isolated and eventually evicted key by key. Two keys touch the unsafe
+/// source; both would reproduce the failure alone (it's schema-shaped, not
+/// row-shaped), which is precisely why isolating it would be wrong: neither
+/// gets charged a death, and the original error surfaces unmodified.
+#[tokio::test]
+async fn an_unsupported_primary_key_type_source_is_never_quarantined_and_stops_the_instance() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute("create table events (occurred_at timestamptz primary key, payload text)")
+        .await
+        .expect("create source table with a timestamptz primary key");
+
+    let source_columns = numeric_columns(&["occurred_at", "payload"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM event_echo FROM events SELECT payload AS payload",
+        &source_columns,
+    )
+    .await
+    .expect("create definition over the unsafe-pk source");
+
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "events",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"occurred_at":"2024-01-01T00:00:00Z","payload":"a"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "events",
+        "2",
+        "insert",
+        None,
+        Some(r#"{"occurred_at":"2024-01-02T00:00:00Z","payload":"b"}"#),
+    )
+    .await;
+
+    let before = trellis::staging::halting_stop_stats(&db.pool)
+        .await
+        .expect("halting_stop_stats before");
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let result = apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await;
+    match result {
+        Err(ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType { .. })) => {}
+        other => panic!("expected UnsupportedPrimaryKeyType to propagate, got {other:?}"),
+    }
+
+    assert_eq!(
+        key_deaths_count(&client, "events", "1").await,
+        None,
+        "a structural schema failure must not charge any key that merely touched it"
+    );
+    assert_eq!(key_deaths_count(&client, "events", "2").await, None);
+    assert!(!poison_marker_exists(&client, "events", "1").await);
+    assert!(!poison_marker_exists(&client, "events", "2").await);
+
+    let after = trellis::staging::halting_stop_stats(&db.pool)
+        .await
+        .expect("halting_stop_stats after");
+    assert_eq!(after.stop_count, before.stop_count + 1);
+    assert!(after.last_reason.is_some());
+}
+
 /// Scenario: `poison_held` is idempotent on `(src_table, key, seg_seq)` — a
 /// retried park for the exact same batch and key must not duplicate or
 /// overwrite the row already parked for it.

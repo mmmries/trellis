@@ -2244,14 +2244,27 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "character varying",
 ];
 
-/// Rejects `def` if either endpoint's join key type isn't in
-/// [`TEXT_STABLE_JOIN_KEY_TYPES`] — issue #28 review, hardened per review of
-/// #27/#28 (a numeric-only blocklist missed `character(n)`, `citext`, and
-/// `timestamptz`, which also diverge under the engine's `::text`-equality
-/// join vs. the Postgres oracle's native typed `=`). Checks both sides
-/// rather than relying on [`assert_comparable_types`]'s family match to
-/// stand in for the other: `character` and `character varying` share a
-/// family but only one is on this allowlist, so a from/to pair could
+/// Whether `pg_type` (a `format_type` rendering, e.g. `integer`, `character
+/// varying(255)`) is in [`TEXT_STABLE_JOIN_KEY_TYPES`] — the single source of
+/// truth both [`assert_join_key_type_supported`] (relationship join keys,
+/// issue #28) and [`super::ddl::source_primary_key`] (1-1 transform primary
+/// keys, issue #107) gate on. Any modifier (`(255)`, `(10,2)`) is stripped
+/// before matching, same as [`type_family`], so `varchar(255)` and
+/// `varchar(100)` are both recognized as `character varying` rather than
+/// falling through to the catch-all rejection as two distinct strings.
+pub(crate) fn is_text_stable_join_key_type(pg_type: &str) -> bool {
+    let base = pg_type.split('(').next().unwrap_or(pg_type).trim();
+    TEXT_STABLE_JOIN_KEY_TYPES.contains(&base)
+}
+
+/// Rejects `def` if either endpoint's join key type isn't
+/// [`text-stable`](is_text_stable_join_key_type) — issue #28 review, hardened
+/// per review of #27/#28 (a numeric-only blocklist missed `character(n)`,
+/// `citext`, and `timestamptz`, which also diverge under the engine's
+/// `::text`-equality join vs. the Postgres oracle's native typed `=`). Checks
+/// both sides rather than relying on [`assert_comparable_types`]'s family
+/// match to stand in for the other: `character` and `character varying`
+/// share a family but only one is on this allowlist, so a from/to pair could
 /// straddle the line.
 fn assert_join_key_type_supported(
     def: &RelationshipDef,
@@ -2262,8 +2275,7 @@ fn assert_join_key_type_supported(
         (&def.from_table, &def.from_col, from_type),
         (&def.to_table, &def.to_col, to_type),
     ] {
-        let base = pg_type.split('(').next().unwrap_or(pg_type).trim();
-        if !TEXT_STABLE_JOIN_KEY_TYPES.contains(&base) {
+        if !is_text_stable_join_key_type(pg_type) {
             return Err(ValidationError::RelationshipUnsupportedJoinKeyType {
                 name: def.name.clone(),
                 table: table.clone(),
