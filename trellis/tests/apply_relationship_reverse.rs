@@ -1853,6 +1853,7 @@ async fn a_one_to_one_target_still_converges_via_the_fallback_mechanism() {
              alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'); \
              create table articles (id integer primary key, category_id integer); \
+             alter table articles replica identity full; \
              insert into articles (id, category_id) values (1, 10)",
         )
         .await

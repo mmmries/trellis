@@ -211,6 +211,7 @@ async fn frontdoor_to_one_enrichment_converges_to_oracle() {
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
              alter table categories replica identity full; \
+             alter table articles replica identity full; \
              insert into categories (id, name) values (10, 'Tech'), (20, 'News'); \
              insert into articles (id, category_id, title) values \
              (1, 10, 'a1'), (2, 20, 'a2'), (3, 99, 'a3')",
@@ -534,7 +535,8 @@ async fn frontdoor_rejects_aggregate_over_to_one_path() {
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
-             alter table categories replica identity full",
+             alter table categories replica identity full; \
+             alter table articles replica identity full",
         )
         .await
         .expect("create tables");
@@ -582,7 +584,8 @@ async fn frontdoor_rejects_unknown_to_side_column() {
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
-             alter table categories replica identity full",
+             alter table categories replica identity full; \
+             alter table articles replica identity full",
         )
         .await
         .expect("create tables");

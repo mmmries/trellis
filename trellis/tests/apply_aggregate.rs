@@ -16,7 +16,10 @@ use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
-use trellis::defs::{create_aggregate_target_table, create_definition, parse};
+use trellis::defs::{
+    create_aggregate_target_table, create_definition, create_definition_without_backfill,
+    create_target_table, parse, source_primary_key,
+};
 use trellis::staging::apply::{self, ApplyError};
 use trellis::staging::{StagedWatermark, claim, converge, fold};
 
@@ -2854,5 +2857,194 @@ async fn drain_computes_an_aggregate_cross_field_alias_through_insert_and_update
         target["10"],
         (Some("9.00".to_string()), Some("18.00".to_string())),
         "double_total must track 2 * total after the update"
+    );
+}
+
+/// Issue #103: chaining an ordinary 1-1 definition onto a
+/// single-`GROUP BY`-column aggregate target must not misread
+/// `derive_group_key`'s internal `HashMap`-key encoding as the target's
+/// real primary-key value.
+///
+/// `order_summary`'s real Postgres identity (its `UNIQUE NULLS NOT
+/// DISTINCT` grouping-column constraint, the same one
+/// `ddl::source_primary_key` falls back to when nothing is `indisprimary`)
+/// is genuinely a *single*, unencoded column (`order_id`) — so
+/// `ddl::source_primary_key` does not reject `order_summary_alert`
+/// chaining onto it (only a *composite* grouping key is rejected), and
+/// `defs::validate`/`create_definition` impose no primary-key-shape check
+/// of their own. Before the fix, `derive_group_key` always
+/// length-prefix-encoded the group key regardless of arity, and that
+/// encoded string flowed, unchanged, into the `Recompute` this chained
+/// definition automatically gets staged
+/// (`apply_and_mark_drained_many`'s downstream-propagation step) — whose
+/// live refetch (`apply::read_live_rows_batch`) then tried to bind the
+/// encoded string as a literal primary-key value, crashing exactly as the
+/// issue reports.
+///
+/// `order_id` is `uuid` here, not the issue's own `numeric` example:
+/// `defs::catalog::is_text_stable_join_key_type` (issue #107, landed after
+/// #103 was filed, unrelated to it) now makes `ddl::source_primary_key`
+/// reject a `numeric`-typed 1-1 source primary key outright — and
+/// `create_aggregate_target_table` only ever renders a `GROUP BY` column
+/// as one of `numeric`/`text`/`boolean`/`uuid` (`ValueType`'s own
+/// variants), never a narrower concrete integer type — so a `numeric`
+/// group-by column can no longer even reach `create_target_table` to
+/// reproduce the issue's exact wording. `uuid` is the other
+/// `create_aggregate_target_table`-reachable type still on that allowlist,
+/// so it's what still exercises `derive_group_key`'s live, reachable bug
+/// today: a `uuid` column's length-prefixed encoding of itself is never
+/// itself a valid `uuid` literal, so the chained definition's live refetch
+/// still crashes the same way, on `invalid input syntax for type uuid`
+/// instead of `numeric` — same root cause, same fix, still a real (not
+/// merely historical) regression risk this test guards.
+///
+/// After the fix, a single-column `GROUP BY`'s key is the plain, unencoded
+/// value, matching `order_summary`'s real PK shape exactly, so this drain
+/// succeeds and correctly propagates the row.
+#[tokio::test]
+async fn chaining_onto_a_single_group_by_column_aggregate_target_does_not_misread_the_group_key() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table order_items (\
+                 id integer primary key, order_id uuid, amount numeric\
+             ); \
+             alter table order_items replica identity full",
+        )
+        .await
+        .expect("create source table");
+
+    const AGG_SOURCE: &str = "TRANSFORM order_summary FROM order_items GROUP BY order_id \
+         SELECT order_id AS order_id, SUM(amount) AS total";
+    let agg_def = parse(AGG_SOURCE).expect("parse aggregate definition");
+    let order_items_columns = HashMap::from([
+        ("id".to_string(), ValueType::Numeric),
+        ("order_id".to_string(), ValueType::Uuid),
+        ("amount".to_string(), ValueType::Numeric),
+    ]);
+    // `order_items` is still empty at definition-creation time (same
+    // "definition created before its source has any rows" convention
+    // every other test in this file uses), so this definition's own
+    // initial ring backfill enumerates nothing.
+    create_definition(&db.pool, AGG_SOURCE, &order_items_columns)
+        .await
+        .expect("create aggregate definition");
+    create_aggregate_target_table(&db.pool, &agg_def, "public", &order_items_columns)
+        .await
+        .expect("create order_summary target table");
+
+    // Chain a second, ordinary 1-1 definition onto `order_summary` as its
+    // source — issue #103's exact scenario.
+    const CHAINED_SOURCE: &str =
+        "TRANSFORM order_summary_alert FROM order_summary SELECT total AS total";
+    let chained_def = parse(CHAINED_SOURCE).expect("parse chained definition");
+    let summary_columns = HashMap::from([
+        ("order_id".to_string(), ValueType::Uuid),
+        ("total".to_string(), ValueType::Numeric),
+    ]);
+    // `create_definition_without_backfill`, not `create_definition`:
+    // `order_summary`'s target table is keyed by a `UNIQUE NULLS NOT
+    // DISTINCT` constraint rather than a real Postgres `PRIMARY KEY` (see
+    // `create_aggregate_target_table`'s doc comment) — a deliberate,
+    // separate design choice so a NULL grouping value stays representable.
+    // `intake::publication::enumerate_and_append`'s own primary-key lookup
+    // (unlike `ddl::source_primary_key`'s unique-index fallback this
+    // test's `#103` fix cares about) requires a real `indisprimary` row and
+    // has no such fallback, so a definition-creation backfill enumeration
+    // of `order_summary` would fail with `MissingKeyValue` — an unrelated,
+    // pre-existing gap. Harmless to skip here regardless: `order_summary`
+    // is still empty at this point, so there's nothing to backfill.
+    create_definition_without_backfill(&db.pool, CHAINED_SOURCE, &summary_columns)
+        .await
+        .expect("create chained definition reading order_summary");
+    let summary_pk = source_primary_key(&db.pool, "order_summary")
+        .await
+        .expect("introspect order_summary's real (single-column) primary key");
+    assert_eq!(
+        summary_pk.name, "order_id",
+        "order_summary's real PK must be its single GROUP BY column"
+    );
+    assert_eq!(summary_pk.data_type, "uuid");
+    create_target_table(
+        &db.pool,
+        &chained_def,
+        "public",
+        &summary_pk,
+        &summary_columns,
+        "order_summary",
+    )
+    .await
+    .expect("create order_summary_alert target table");
+
+    // Step 1: a fresh group lands via an ordinary live insert into
+    // `order_items` — this drain writes `order_summary`'s group row and,
+    // since `order_summary_alert` reads it, automatically stages a
+    // downstream `Recompute` for that group's key at `hop_gen + 1`, into
+    // the *next* active segment (not this one).
+    const ORDER_ID: &str = "11111111-1111-1111-1111-111111111111";
+    client
+        .execute(
+            &format!(
+                "insert into order_items (id, order_id, amount) values (1, '{ORDER_ID}', 5.00)"
+            ),
+            &[],
+        )
+        .await
+        .expect("seed live order_items row");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "order_items",
+        "1",
+        "insert",
+        None,
+        Some(&format!(r#"{{"order_id":"{ORDER_ID}","amount":"5.00"}}"#)),
+    )
+    .await;
+
+    let seg0 = seal_active_segment(&mut client).await;
+    let outcome0 = drain(&db.pool, seg0, "worker").await;
+    assert_eq!(
+        outcome0.keys_written, 1,
+        "order_summary's group is newly created"
+    );
+
+    let total: String = client
+        .query_one(
+            &format!("select total::text from order_summary where order_id = '{ORDER_ID}'"),
+            &[],
+        )
+        .await
+        .expect("order_summary group row")
+        .get(0);
+    assert_eq!(total, "5.00");
+
+    // Step 2: drain the automatically-staged downstream `Recompute` for
+    // `order_summary_alert`. Before the fix, this call would panic —
+    // `read_live_rows_batch`'s live refetch tried to bind the
+    // length-prefixed-encoded group key (not a valid `uuid` literal) as a
+    // literal `uuid` primary-key value and the underlying query failed
+    // outright.
+    let seg1 = seal_active_segment(&mut client).await;
+    let outcome1 = drain(&db.pool, seg1, "worker").await;
+    assert_eq!(
+        outcome1.keys_written, 1,
+        "the chained order_summary_alert definition's recompute must succeed"
+    );
+
+    let alert_total: String = client
+        .query_one(
+            &format!("select total::text from order_summary_alert where order_id = '{ORDER_ID}'"),
+            &[],
+        )
+        .await
+        .expect("order_summary_alert must have the chained row")
+        .get(0);
+    assert_eq!(
+        alert_total, "5.00",
+        "the chained definition must read order_summary's real (unencoded) group key value"
     );
 }

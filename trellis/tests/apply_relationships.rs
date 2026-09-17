@@ -309,11 +309,16 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
     // future reverse-applied advance (#131) needs the to-side row's *entire*
     // old image, not just its key — so this table needs it set too, even
     // though nothing in this specific test's own code path reads it yet.
+    // Issue #158 extends that same unconditional requirement to the
+    // from-side (`articles`): its `category_id` is an ordinary non-PK
+    // column, so under the default (PK-only) replica identity a re-pointing
+    // `UPDATE` would ship no old image at all.
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
-             alter table categories replica identity full",
+             alter table categories replica identity full; \
+             alter table articles replica identity full",
         )
         .await
         .expect("create tables");
