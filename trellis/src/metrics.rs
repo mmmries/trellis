@@ -83,6 +83,38 @@ const END_TO_END_LATENCY_METRIC: &str = "trellis_end_to_end_latency_seconds";
 /// rows by [`crate::staging::SegmentState`], labeled `state`.
 const STAGING_SEGMENTS_METRIC: &str = "trellis_staging_segments";
 
+/// Issue #134/#135 (epic #127): count of to-one relationship reverse deltas
+/// deferred by one of issue #132's four guards, labeled `guard` — the plan
+/// doc's own `d5_block_barrier`/`d5_block_gen`/`d5_block_inflight`/
+/// `d5_block_order` names, used verbatim as this one metric's label
+/// *values* (`ReverseGuardFailure::metric_label`) rather than as four
+/// separate metric names, matching this module's existing
+/// one-metric-plus-label convention. Issue #135 (starvation freedom, not
+/// yet built) is the reason this exists now: a fairness mechanism needs
+/// exactly this per-guard deferral rate to model against, and it needs to be
+/// observable in production before that mechanism ships, not just modeled
+/// offline.
+const RELATIONSHIP_REVERSE_DEFERRED_METRIC: &str = "trellis_relationship_reverse_deferred_total";
+
+/// Issue #135 (epic #127): count of to-one relationship reverse *transitions*
+/// (one parent's old-image/new-image pair) that exhausted
+/// [`crate::staging::apply::RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD`]'s
+/// guard-gated retry budget and were resolved by the fairness-escalation
+/// path instead — advancing the settled parent projection immediately and
+/// falling back to the pre-#131 image-less recompute for the aggregate
+/// correction, rather than deferring again. Deliberately a *separate* metric
+/// from [`RELATIONSHIP_REVERSE_DEFERRED_METRIC`] rather than one more label
+/// value on it: a deferral is the expected, common-case outcome of a guard
+/// rejection (#134's own doc section), while an escalation means the normal
+/// retry loop never found a clean window in
+/// [`crate::staging::apply::RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD`] attempts
+/// — a signal worth its own series (a sustained non-zero rate names a
+/// specific hot parent worth investigating), not something an operator
+/// should have to pick out of a per-guard breakdown built for a different
+/// question.
+const RELATIONSHIP_REVERSE_FAIRNESS_ESCALATED_METRIC: &str =
+    "trellis_relationship_reverse_fairness_escalated_total";
+
 /// The process-wide recorder handle, built and installed on first use. See
 /// the module doc comment's "Recorder installation" section.
 fn handle() -> &'static PrometheusHandle {
@@ -131,6 +163,17 @@ fn describe_metrics() {
     metrics::describe_gauge!(
         STAGING_SEGMENTS_METRIC,
         "Count of staging ring segments, labeled by state (active/sealed/draining/drained)."
+    );
+    metrics::describe_counter!(
+        RELATIONSHIP_REVERSE_DEFERRED_METRIC,
+        "Count of to-one relationship reverse deltas deferred by a guard rejection, labeled by \
+         guard (d5_block_barrier/d5_block_gen/d5_block_inflight/d5_block_order)."
+    );
+    metrics::describe_counter!(
+        RELATIONSHIP_REVERSE_FAIRNESS_ESCALATED_METRIC,
+        "Count of to-one relationship reverse transitions that exhausted their guard-gated \
+         retry budget and were resolved via the fairness-escalation fallback instead of \
+         deferring again."
     );
 }
 
@@ -191,6 +234,41 @@ pub fn increment_changes_applied(transform: &str) {
 pub fn set_staging_segments(state: &str, count: u64) {
     ensure_installed();
     metrics::gauge!(STAGING_SEGMENTS_METRIC, "state" => state.to_string()).set(count as f64);
+}
+
+/// Increments [`RELATIONSHIP_REVERSE_DEFERRED_METRIC`] by one for `guard`
+/// (issue #134/#135). Called from
+/// `staging::apply::flush_relationship_reverse_deferral_metrics`, itself
+/// called from `drain_once`/`drain_many` immediately after (and only after)
+/// their own `txn.commit().await?` succeeds — buffered, not recorded
+/// eagerly from inside Phase 3 (`apply_and_mark_drained_many`'s "3d" step,
+/// where the rejection is discovered) — matching
+/// `record_transform_latency`/`increment_changes_applied`'s own established
+/// pattern (`ApplyPlan`'s buffered fields, flushed by `flush_apply_metrics`
+/// post-commit): review follow-up to this issue found the eager version
+/// double- (or triple-, ...) counted whenever `drain_once`/`drain_many`'s
+/// retry loop re-ran the same folded input's Phase 3 pass in full on a
+/// `VersionFenceMiss`/transient failure (doc 06's `FenceMissBackoff` — a
+/// routine occurrence, not a rare edge case), inflating exactly the counter
+/// #135's fairness/starvation decisions need to read accurately, and doing
+/// so most under the high-contention conditions where those decisions
+/// matter most.
+pub fn increment_relationship_reverse_deferred(guard: &str) {
+    ensure_installed();
+    metrics::counter!(RELATIONSHIP_REVERSE_DEFERRED_METRIC, "guard" => guard.to_string())
+        .increment(1);
+}
+
+/// Increments [`RELATIONSHIP_REVERSE_FAIRNESS_ESCALATED_METRIC`] by one
+/// (issue #135). Called from
+/// `staging::apply::flush_relationship_reverse_fairness_escalation_metric`,
+/// under the same post-commit-only contract as
+/// [`increment_relationship_reverse_deferred`] — see that function's own doc
+/// comment for why (the same `VersionFenceMiss`/transient-failure retry loop
+/// can attempt the same folded input's Phase 3 pass more than once).
+pub fn increment_relationship_reverse_fairness_escalated() {
+    ensure_installed();
+    metrics::counter!(RELATIONSHIP_REVERSE_FAIRNESS_ESCALATED_METRIC).increment(1);
 }
 
 /// A handle onto this process's in-process metrics registry — the public,

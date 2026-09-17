@@ -27,7 +27,7 @@ use trellis::defs::ast::{
 };
 use trellis::defs::{
     CatalogError, ValidationError, create_definition, create_relationship, create_target_table,
-    render_relationship_select_sql, source_primary_key,
+    relationship_projection, render_relationship_select_sql, source_primary_key,
 };
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -89,12 +89,25 @@ async fn stage_cdc(
 /// Reverse recompute appends fresh `Recompute` rows into the (new) active
 /// segment as it drains, so convergence takes more than one seal.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+    // Issue #132: a throwaway, always-caught-up watermark — this helper
+    // has no live `Intake` running (these tests stage CDC rows by hand),
+    // and none of this file's tests exercise guard (a) specifically, so a
+    // real watermark would only ever make guard (a) reject spuriously.
+    let watermark = trellis::staging::StagedWatermark::saturated();
+    let watermark = &watermark;
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
-        while apply::drain_once(pool, seg, "frontdoor_test", 1, "trellis_frontdoor_test")
-            .await
-            .expect("drain_once")
-            .is_some()
+        while apply::drain_once(
+            pool,
+            seg,
+            "frontdoor_test",
+            1,
+            "trellis_frontdoor_test",
+            watermark,
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
         {}
         retire_drained_segments(client)
             .await
@@ -197,6 +210,7 @@ async fn frontdoor_to_one_enrichment_converges_to_oracle() {
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
+             alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'), (20, 'News'); \
              insert into articles (id, category_id, title) values \
              (1, 10, 'a1'), (2, 20, 'a2'), (3, 99, 'a3')",
@@ -207,7 +221,7 @@ async fn frontdoor_to_one_enrichment_converges_to_oracle() {
     // Front door: declare the relationship, then create the enrichment
     // definition directly (no placeholder). Issue #40's validator accepts the
     // bare to-one `category.name` path.
-    create_relationship(
+    let relationship = create_relationship(
         &db.pool,
         "RELATIONSHIP category FROM articles.category_id TO categories.id",
     )
@@ -261,6 +275,33 @@ async fn frontdoor_to_one_enrichment_converges_to_oracle() {
         )
         .await
         .expect("update category name");
+
+    // Issue #130 (epic #127) moved the *forward* to-one read off a live
+    // to-side lookup onto the settled parent projection (#129) — but nothing
+    // yet advances a projection row's *data* columns when its underlying
+    // parent changes; that's #131's job, still unbuilt. Without it, the
+    // projection's `name` for category 10 would stay frozen at `'Tech'`
+    // forever after `create_definition`'s initial widen/catch-up, and the
+    // reverse-recompute convergence this test exercises (issue #30, entirely
+    // unchanged by #130) would have nothing meaningful left to assert against
+    // the live-truth oracle below. Stand in for #131 directly, mirroring
+    // exactly the mutation just made to `categories` — delete this once #131
+    // lands and keeps the projection itself in sync.
+    let projection = relationship_projection(&db.pool, relationship.id)
+        .await
+        .expect("read projection catalog row")
+        .expect("to-one relationship has a projection");
+    client
+        .execute(
+            &format!(
+                "update {} set name = 'Technology' where id = 10",
+                projection.projection_table
+            ),
+            &[],
+        )
+        .await
+        .expect("stand in for #131: advance the projection's own data column");
+
     stage_cdc(
         &client,
         "categories",
@@ -492,7 +533,8 @@ async fn frontdoor_rejects_aggregate_over_to_one_path() {
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
-             create table articles (id integer primary key, category_id integer, title text)",
+             create table articles (id integer primary key, category_id integer, title text); \
+             alter table categories replica identity full",
         )
         .await
         .expect("create tables");
@@ -539,7 +581,8 @@ async fn frontdoor_rejects_unknown_to_side_column() {
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
-             create table articles (id integer primary key, category_id integer, title text)",
+             create table articles (id integer primary key, category_id integer, title text); \
+             alter table categories replica identity full",
         )
         .await
         .expect("create tables");

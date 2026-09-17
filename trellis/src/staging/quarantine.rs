@@ -47,6 +47,7 @@ use crate::pool::{Pool, quote_ident};
 use super::append::{self, CdcOp, RING_SIZE, StagedChange, ring_table_name};
 use super::apply::{self, ApplyError};
 use super::fold::FoldedChange;
+use super::watermark::StagedWatermark;
 
 /// The fuse threshold ADR-0003 left open, decided here: a key evicts once
 /// [`record_key_death`] returns a count at or past this many. `0` disables
@@ -412,7 +413,29 @@ pub async fn isolate_and_evict(
 
     let mut poisoned: Vec<(String, String, String)> = Vec::new();
     for change in folded {
-        if change.is_truncate {
+        // Issue #134/#135 review follow-up: a `rel_reverse_deferred` row
+        // must never be probed/poisoned/parked here, for the same reason
+        // `park_batch_contribution`/`poisoned_park` already exclude it at
+        // the `compute()` level (that module's own comment) — `poison_held`
+        // has no columns for `relationship_id`/`retry_count` and no
+        // `rel_reverse_deferred` `op` value in its own CHECK constraint
+        // (`V13__quarantine.sql`, deliberately not widened when V28 added
+        // the new ring op — see that migration's own doc comment), so
+        // parking one would silently derive a *wrong* `op` from image shape
+        // alone (`folded_change_op`), drop `relationship_id`/`retry_count`
+        // entirely, and — worse — `release_key` would later re-append it as
+        // a bogus `StagedChange::Cdc` against this op's synthetic sentinel
+        // `src_table` (`apply::relationship_reverse_deferred_src_table`),
+        // which is not a real table at all. Skipping it here is the loud,
+        // safe failure mode doc 06 asks for: if nothing else in this batch
+        // reproduces the error in isolation, `poisoned` stays empty and the
+        // caller (`classify_and_retry`'s `Isolate` arm) surfaces the
+        // original failure rather than silently corrupting quarantine
+        // state. A complete fix — genuinely quarantine-safe deferred
+        // reverses, with their own `poison_held` columns/op mirroring this
+        // issue's V28 migration — is real and larger than this follow-up;
+        // tracked separately rather than attempted here.
+        if change.is_truncate || change.relationship_reverse_deferred.is_some() {
             continue;
         }
         let singleton = std::slice::from_ref(change);
@@ -462,8 +485,23 @@ pub async fn isolate_and_evict(
 
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
-        let outcome =
-            apply::apply_and_mark_drained(&txn, seg_seq, claimed_by, &plan, wake_channel).await;
+        // This probe applies-then-rolls-back purely to classify a poisoned
+        // key's failure in isolation — it never commits, so a guard (a)
+        // rejection here would only ever muddy the diagnosis of an
+        // unrelated failure, never protect real state. `saturated()`
+        // (issue #132) makes guard (a) a no-op for this probe, matching how
+        // every other guard here is unaffected too: a guard rejection is an
+        // `Ok` outcome (the fallback-Recompute path), never the
+        // `ApplyError` this probe is specifically trying to reproduce.
+        let outcome = apply::apply_and_mark_drained(
+            &txn,
+            seg_seq,
+            claimed_by,
+            &plan,
+            wake_channel,
+            &StagedWatermark::saturated(),
+        )
+        .await;
         let _ = txn.rollback().await;
         if let Err(err) = outcome {
             let class = classify(&err);
@@ -1232,7 +1270,19 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
             .iter()
             .map(|pk_text| Some(rows_by_pk[pk_text].clone()))
             .collect();
-        apply::build_relationship_context(pool, &def.def.source, &def.def, &rows).await?
+        // This resume path is an ad hoc, non-transactional, per-row pass
+        // over every current source row — not part of the staging ring's
+        // claim/fold/compute/apply pipeline `build_relationship_context`'s
+        // gen-bump signal exists to guard (issue #130, epic #127), so
+        // `old_rows: None`/`changes: None` here: there is no folded change
+        // (with an old image, or a #133 `group_key`) to widen the
+        // touched-key set from, and the returned gen-bump map is discarded
+        // rather than applied in any transaction (there isn't one spanning
+        // this whole function to apply it in).
+        let (ctx, _gen_bumps) =
+            apply::build_relationship_context(pool, &def.def.source, &def.def, &rows, None, None)
+                .await?;
+        ctx
     };
 
     let field_type = if rel_refs.is_empty() {
@@ -1351,7 +1401,7 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
             let origin_lsn: Option<PgLsn> = row.get(5);
             let src_changed: Option<SystemTime> = row.get(6);
             let hop_gen: i32 = row.get(7);
-            let group_key: Option<String> = row.get(8);
+            let group_key: Option<Vec<String>> = row.get(8);
             if op == "recompute" {
                 StagedChange::Recompute {
                     src_table: src_table.to_string(),

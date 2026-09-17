@@ -59,46 +59,42 @@
 //! maintenance in the engine), per `local_docs/generative-suite-improvement-plan.md`'s
 //! task B4.
 //!
-//! **The domain is *not* "0, 1, 2, plus `NULL`"**, despite the improvement
-//! plan's own text asking for exactly that. A `NULL` grouping value was
-//! implemented and drawn during this task's development, and immediately
-//! found a real engine bug: `trellis::defs::ddl::create_aggregate_target_table`
-//! declares the `GROUP BY` columns as the target's Postgres `PRIMARY KEY`,
-//! which is unconditionally `NOT NULL` — so a source row with a `NULL`
-//! grouping value makes every attempted write to that group fail with a
+//! **The domain *is* now "0, 1, 2, plus `NULL`"**, matching the improvement
+//! plan's original text (issue #128). It wasn't always: a `NULL` grouping
+//! value was implemented and drawn early in task B4's development, and
+//! immediately found a real engine bug — `trellis::defs::ddl::create_aggregate_target_table`
+//! declared the `GROUP BY` columns as the target's Postgres `PRIMARY KEY`,
+//! which is unconditionally `NOT NULL`, so a source row with a `NULL`
+//! grouping value made every attempted write to that group fail with a
 //! genuine `null value in column ... violates not-null constraint` error.
-//! **Corrected during review, against an independent from-scratch repro
-//! directly against `trellis::staging::apply::drain_once`:** this is *not*
-//! an infinite retry of the same segment, and it does *not* stall the source
-//! table's watermark. `trellis::client`'s `app_worker_loop` releases a failed
-//! claim and re-fetches the same segment, but `staging::quarantine`'s
-//! existing isolate-before-blaming machinery (`quarantine::classify` routes
-//! a plain Postgres constraint-violation error to `FailureClass::Isolate`)
-//! probes the offending row alone, charges it a death, and — once its death
-//! count crosses `quarantine::DEFAULT_DEATH_THRESHOLD` (5, reached within a
-//! single `drain_once` call in the repro) — evicts and parks it, letting the
-//! rest of the batch drain normally; `trellis/tests/quarantine.rs`'s
-//! `repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still_drains`
-//! already covers exactly this recovery path for a different deterministic
-//! per-row failure. The real, still-unfixed defect is narrower and
-//! *silent*: the `NULL`-keyed row's contribution is permanently excluded
-//! from its aggregate group, with no automatic recovery — and not even a
-//! manual `quarantine::release_key` recovers it, since replaying the same
-//! row just reproduces the identical constraint violation and re-quarantines
-//! it. What *does* genuinely hang is this suite's own `run_convergence`/
-//! `quiesce`: `staging::converge::converged_through`'s condition 4
-//! deliberately treats any live `poison_held` row as "not converged" until
-//! an operator releases it, and nothing here ever does — so a token at or
-//! past the poisoned row's LSN never converges, observed as `quiesce`
-//! hanging past its 30-second `QUIESCE_TIMEOUT`. See [`grain_value`]'s doc
-//! comment for the full writeup. That's a real, reproducible correctness bug
-//! (a legal SQL `NULL` grouping value is silently and permanently dropped
-//! from its aggregate, unrecoverably) worth fixing
-//! (`create_aggregate_target_table` needs a NULL-tolerant unique constraint
-//! instead of a bare composite `PRIMARY KEY`), but it's an engine schema
-//! change outside this generative-suite-widening task's scope — so this
-//! generator draws only the three non-`NULL` grain values, not the `NULL`
-//! group the plan asked for, until that engine fix lands.
+//! The failure itself was never a liveness wedge on its own — `trellis::client`'s
+//! `app_worker_loop` releases a failed claim and re-fetches the same segment,
+//! and `staging::quarantine`'s isolate-before-blaming machinery
+//! (`quarantine::classify` routes a plain Postgres constraint-violation error
+//! to `FailureClass::Isolate`) probes the offending row alone, charges it a
+//! death, and evicts/parks it once past `quarantine::DEFAULT_DEATH_THRESHOLD`,
+//! letting the rest of the batch drain normally — but the parked row's
+//! contribution was then permanently and silently excluded from its
+//! aggregate group, with no automatic recovery, and not even a manual
+//! `quarantine::release_key` could recover it, since replaying the same row
+//! just reproduced the identical constraint violation and re-quarantined it.
+//! And because `staging::converge::converged_through`'s condition 4
+//! deliberately treats any live `poison_held` row as "not converged" until an
+//! operator releases it, a token at or past the poisoned row's LSN never
+//! converged — observed directly as this suite's own `quiesce` hanging past
+//! its 30-second `QUIESCE_TIMEOUT`.
+//!
+//! Issue #128 fixed the root cause: `create_aggregate_target_table` now keys
+//! the `GROUP BY` columns with a `UNIQUE NULLS NOT DISTINCT` constraint
+//! instead of a bare `PRIMARY KEY`, so a NULL-keyed group is representable
+//! and still deduplicated correctly, `defs::backfill`'s direct aggregate
+//! build no longer silently drops a NULL-keyed group, and
+//! `ddl::source_primary_key` falls back to a unique constraint when a source
+//! table has no `PRIMARY KEY` so chaining off an aggregate target still
+//! works. A NULL grouping value no longer hits the not-null violation at
+//! all, so it's never quarantined and never blocks `converge`/`quiesce` in
+//! the first place — see [`grain_value`]'s doc comment for how the domain is
+//! drawn now.
 //!
 //! **Design choice: every table gets a grain column, not just tables an
 //! `Aggregate` def happens to source from.** The alternative (only tables
@@ -270,14 +266,13 @@ pub const MAX_TABLES: usize = 3;
 /// to `MAX_TABLES`: two definitions can and do land on the same table.
 pub const MAX_DEFS: usize = 3;
 
-/// The inclusive upper bound of the grain column's value domain
-/// (improvement-plan task B4): `0..=GRAIN_MAX` is the grain column's *entire*
-/// value space — kept at `2` (three possible values total; see
-/// [`grain_value`]'s doc comment for why this is three, not the plan's
-/// originally-requested four including `NULL`) so it stays "tiny,
-/// heavily-repeating" (the plan's own words): with `MAX_SEED_ROWS` (4) rows
-/// drawn from a 3-value domain, a real collision (two seed rows landing in
-/// the same group) is the common case, not a rare one, and a handful of
+/// The inclusive upper bound of the grain column's *non-`NULL`* value domain
+/// (improvement-plan task B4): `0..=GRAIN_MAX` is the grain column's non-NULL
+/// value space — kept at `2` (three possible non-`NULL` values; see
+/// [`grain_value`]'s doc comment for the fourth, `NULL`, value) so it stays
+/// "tiny, heavily-repeating" (the plan's own words): with `MAX_SEED_ROWS` (4)
+/// rows drawn from a 3-value domain, a real collision (two seed rows landing
+/// in the same group) is the common case, not a rare one, and a handful of
 /// `Delete` mutates has real odds of emptying a group entirely — see the
 /// module doc comment's B4 section.
 pub const GRAIN_MAX: i64 = 2;
@@ -400,12 +395,12 @@ pub enum Mutate {
     /// revival is still logically the same row coming back, and must keep
     /// its original non-numeric content. This matters well beyond
     /// legibility for the grain column specifically — see the
-    /// `grain_value` proptest strategy's doc comment for the real engine bug
-    /// a `NULL` grain value hits; a revival that carelessly defaulted the
-    /// grain column to `NULL` would reopen exactly that bug through a second
-    /// door the generator never meant to leave open (`grain_value` itself
-    /// never draws `NULL`, but that guarantee is worthless if a revival
-    /// could still manufacture one).
+    /// `grain_value` proptest strategy's doc comment for issue #128, the
+    /// engine bug a `NULL` grain value used to hit and which grain_value's
+    /// own occasional `NULL` draw now exercises deliberately; a revival that
+    /// carelessly *reset* the grain column to some other value (`NULL` or
+    /// otherwise) instead of preserving whatever it originally was would
+    /// silently change which group the revived row belongs to.
     DuplicateInsert {
         pk: i64,
         c1: Option<i64>,
@@ -532,15 +527,14 @@ pub struct TableSpec {
     /// `text_values`.
     pub uuid_values: Vec<Option<String>>,
     /// `grain_values[i]` is the rendered value (`"0"`/`"1"`/`"2"`, see
-    /// [`GRAIN_MAX`]) for seeded primary key `i + 1`'s grain column
-    /// (improvement-plan task B4). Stays `Option<String>` — the same shape
-    /// every other seeded column here uses — so a hand-built pin can still
-    /// construct a `None` (SQL `NULL`) grain value directly if one is ever
-    /// needed (e.g. a regression pin for the `NULL`-grouping-key engine bug
-    /// [`grain_value`]'s doc comment describes), even though the `grain_value`
-    /// proptest strategy itself never draws one. Same length contract as
-    /// `text_values`. Never touched by [`Mutate`] — see the module doc
-    /// comment's B4 scope cuts.
+    /// [`GRAIN_MAX`], or `None` for a `NULL` group — see [`grain_value`]'s
+    /// doc comment for issue #128) for seeded primary key `i + 1`'s grain
+    /// column (improvement-plan task B4). Stays `Option<String>` — the same
+    /// shape every other seeded column here uses — so a hand-built pin can
+    /// construct a `None` (SQL `NULL`) grain value directly for a targeted
+    /// regression pin, same as the `grain_value` proptest strategy itself now
+    /// draws one on its own. Same length contract as `text_values`. Never
+    /// touched by [`Mutate`] — see the module doc comment's B4 scope cuts.
     pub grain_values: Vec<Option<String>>,
     /// `rel_fk_values[i]` is the rendered value for seeded primary key
     /// `i + 1`'s relationship **foreign-key** column (issue #34) — the
@@ -2420,69 +2414,51 @@ mod strategy {
         ]
     }
 
-    /// A single grain column value (improvement-plan task B4): `0..=GRAIN_MAX`,
-    /// always `Some` — **never `NULL`**, despite the improvement-plan task's
-    /// original text asking for a "0, 1, 2, plus NULL" domain. This is a
-    /// deliberate scope cut discovered *while building this task*, not an
-    /// oversight: a `NULL` grouping value is real, standard SQL (Postgres's
+    /// A single grain column value (improvement-plan task B4): `0..=GRAIN_MAX`
+    /// most of the time, occasionally `None` (SQL `NULL`) — the "0, 1, 2, plus
+    /// NULL" domain the improvement plan originally asked for. This was
+    /// deliberately cut down to the three non-`NULL` values for a while
+    /// (issue #128): a `NULL` grouping value is real, standard SQL (Postgres's
     /// `GROUP BY` puts every `NULL` into one group, like any other value),
-    /// but this engine's `KeySpace::Aggregate` target-table DDL
-    /// (`trellis::defs::ddl::create_aggregate_target_table`) declares the
-    /// `group_by` columns as the target's `PRIMARY KEY` — and Postgres
-    /// primary-key columns are `NOT NULL` unconditionally, by definition, with
-    /// no opt-out. A source row whose grouping column is `NULL` therefore
-    /// makes every write to that group's target row fail with a real
-    /// Postgres `null value in column ... violates not-null constraint`
-    /// error — confirmed directly against a from-scratch, ManualBackend-free
-    /// `trellis::staging::apply` repro during this task's own testing, one
-    /// `COUNT(*)`-only field, one seeded row with `NULL` grain, nothing else.
+    /// but `trellis::defs::ddl::create_aggregate_target_table` used to declare
+    /// the `group_by` columns as the target's `PRIMARY KEY`, and Postgres
+    /// primary-key columns are `NOT NULL` unconditionally — so a source row
+    /// whose grouping column was `NULL` made every write to that group's
+    /// target row fail with a real Postgres `null value in column ...
+    /// violates not-null constraint` error. The failure itself was never a
+    /// liveness wedge on its own (`staging::quarantine`'s isolate-before-blaming
+    /// machinery parks the offending row alone after a few deaths and lets
+    /// the rest of the batch drain), but the parked row's contribution was
+    /// then permanently and silently excluded from its aggregate group with
+    /// no automatic recovery, and `staging::converge::converged_through`'s
+    /// condition 4 — which deliberately treats any live `poison_held` row as
+    /// "not converged" until an operator releases it — meant a token at or
+    /// past that row's LSN never converged, observed directly as this
+    /// suite's own `quiesce` hanging past its 30s `QUIESCE_TIMEOUT`.
     ///
-    /// **Corrected during review** (an independent repro against
-    /// `trellis::staging::apply::drain_once` directly): the failure is *not*
-    /// an infinite retry of the same segment and does *not* stall the
-    /// source table's watermark. `staging::quarantine::classify` routes a
-    /// plain constraint-violation error to `FailureClass::Isolate`, whose
-    /// isolate-before-blaming machinery (`quarantine::isolate_and_evict`)
-    /// probes the offending row alone, charges it a death each real attempt,
-    /// and — once it crosses `quarantine::DEFAULT_DEATH_THRESHOLD` (5,
-    /// reached within a *single* `drain_once` call in the repro) — evicts
-    /// and parks it, letting the rest of the batch (and every other key)
-    /// drain and apply normally; `trellis/tests/quarantine.rs`'s
-    /// `repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still_drains`
-    /// already covers this exact recovery path for an unrelated
-    /// deterministically-malformed value. The real defect is narrower and
-    /// silent, not a liveness wedge: the `NULL`-keyed row's contribution is
-    /// permanently excluded from its aggregate group with no automatic
-    /// recovery, and the repro further shows even a manual
-    /// `quarantine::release_key` cannot recover it — replaying the same row
-    /// just reproduces the identical constraint violation and re-quarantines
-    /// it. What genuinely never resolves on its own is this suite's own
-    /// `run_convergence`/`quiesce`: `staging::converge::converged_through`'s
-    /// condition 4 deliberately treats any live `poison_held` row as "not
-    /// converged" until an operator releases it, which nothing here ever
-    /// does — so a token at or past the poisoned row's LSN never converges,
-    /// observed directly as this suite's `run_convergence` timing out at its
-    /// 30s `QUIESCE_TIMEOUT` on a *fresh, uncontended* cluster, not just
-    /// under load. This is still a real, reproducible bug worth fixing — a
-    /// legal SQL `NULL` grouping value is silently and permanently dropped
-    /// from its aggregate, with no way to recover it even by hand — just a
-    /// narrower and different one than "retries forever" would suggest; a
-    /// real fix needs a schema change to `create_aggregate_target_table` (a
-    /// NULL-tolerant unique constraint instead of a bare `PRIMARY KEY`, plus
-    /// whatever upsert-conflict-target changes that implies throughout
-    /// `staging::apply_aggregate`), which is engine work well outside this
-    /// generative-suite-widening task's scope. Until that lands, this
-    /// generator must not draw a value that's *known* to silently and
-    /// permanently drop data from the very pipeline it's exercising — see
-    /// also `tests/coverage.rs`'s `awkward_values_off_never_draws_null`,
-    /// which this keeps satisfying unconditionally (there's no
-    /// `awkward_values`-gated branch to keep in sync here at all now) rather
-    /// than incidentally.
+    /// Issue #128 fixed the root cause: `create_aggregate_target_table` now
+    /// keys the grouping columns with a `UNIQUE NULLS NOT DISTINCT`
+    /// constraint instead of a bare `PRIMARY KEY`, `defs::backfill`'s direct
+    /// aggregate build no longer drops a NULL-keyed group, and
+    /// `ddl::source_primary_key` falls back to a unique constraint so
+    /// chaining off an aggregate target still works. A `NULL` grouping value
+    /// no longer hits the not-null violation, so it's never quarantined and
+    /// never blocks convergence — safe to draw again.
+    ///
+    /// Not gated by `awkward_values` (see [`trivial_program_with`]'s doc
+    /// comment) — `NULL` here is a structural grouping-domain dimension, the
+    /// same "always available regardless of the flag" treatment `def_shape`/
+    /// `DerivedShape`/`Mutate::DuplicateInsert` already get, not a per-column
+    /// awkward-value knob. `tests/coverage.rs`'s
+    /// `awkward_values_off_never_draws_null` accounts for this by excluding
+    /// each table's grain column (`columns[6]`) from its "never draws NULL"
+    /// check rather than expecting this function to respect the flag.
     fn grain_value() -> impl Strategy<Value = Option<String>> {
         prop_oneof![
-            Just(Some("0".to_string())),
-            Just(Some("1".to_string())),
-            Just(Some("2".to_string())),
+            VALUE_WEIGHT => Just(Some("0".to_string())),
+            VALUE_WEIGHT => Just(Some("1".to_string())),
+            VALUE_WEIGHT => Just(Some("2".to_string())),
+            NULL_WEIGHT => Just(None),
         ]
     }
 
@@ -2838,13 +2814,13 @@ mod strategy {
     /// `awkward_values` gates every other column's `NULL` draw (see
     /// [`value`], [`text_value`], [`bool_value`], [`uuid_value`],
     /// [`rel_fk_value`]); it does
-    /// not gate [`grain_value`] (which never draws `NULL` at all — see its
-    /// own doc comment for the engine bug that finding forced this scope cut
-    /// over), nor does it affect [`Mutate::DuplicateInsert`], [`def_shape`]
-    /// (which of a def's fields are `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over), or
-    /// [`DerivedShape`] (every `OneToOne` def always gets one `derived`
-    /// field) — all distinct, structural widenings, always available
-    /// regardless of the flag.
+    /// not gate [`grain_value`] (which draws its own occasional `NULL`
+    /// unconditionally — see its own doc comment for issue #128, the engine
+    /// bug that used to force a scope cut here), nor does it affect
+    /// [`Mutate::DuplicateInsert`], [`def_shape`] (which of a def's fields
+    /// are `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over), or [`DerivedShape`] (every
+    /// `OneToOne` def always gets one `derived` field) — all distinct,
+    /// structural widenings, always available regardless of the flag.
     pub fn trivial_program_with(awkward_values: bool) -> impl Strategy<Value = Program> {
         prop::collection::vec(table_spec(awkward_values), 1..=MAX_TABLES)
             .prop_flat_map(|tables| {
@@ -3028,8 +3004,8 @@ mod strategy {
     /// **Scoped to `KeySpace::OneToOne` definitions, not
     /// [`trivial_program_with`]'s full mix — a deliberate, documented scope
     /// cut, discovered *while building this task*, mirroring
-    /// [`grain_value`]'s own precedent for a found-but-out-of-scope engine
-    /// bug.** Restarting the primary client mid-stream originally reproduced
+    /// [`grain_value`]'s own history of a found-but-then-out-of-scope engine
+    /// bug (issue #128, since fixed).** Restarting the primary client mid-stream originally reproduced
     /// a real engine bug: `trellis::intake::Intake::connect` built its
     /// `pgwire_replication::ReplicationConfig` with no explicit `start_lsn`,
     /// so a fresh connection resumed from the replication *slot's own*

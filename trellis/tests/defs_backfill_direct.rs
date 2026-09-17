@@ -213,25 +213,26 @@ async fn aggregate_build_handles_null_group_keys() {
         .await
         .expect("backfill");
 
-    // The NULL-author group is deliberately never built: the target's group-by
-    // column is its primary key, so a NULL key has no representable row. The
-    // non-NULL groups (authors 1 and 2) must still be exact.
+    // Issue #128: the NULL-author group is now representable (the target's
+    // group-by column is keyed by a `UNIQUE NULLS NOT DISTINCT` constraint,
+    // not a bare `PRIMARY KEY`) and must be built exactly like any other
+    // group — not silently dropped.
     let client = db.pool.get().await.expect("get connection");
-    let null_rows: i64 = client
-        .query_one("select count(*) from public.t where author is null", &[])
+    let null_total: String = client
+        .query_one("select total::text from public.t where author is null", &[])
         .await
-        .unwrap()
+        .expect("the NULL-author group must have a built row")
         .get(0);
-    assert_eq!(
-        null_rows, 0,
-        "NULL-key group is not representable and must be skipped"
-    );
-    let non_null_rows: i64 = client
+    assert_eq!(null_total, "70", "NULL-author group sum = 30 + 40");
+    let total_rows: i64 = client
         .query_one("select count(*) from public.t", &[])
         .await
         .unwrap()
         .get(0);
-    assert_eq!(non_null_rows, 2, "both non-NULL-key groups built");
+    assert_eq!(
+        total_rows, 3,
+        "both non-NULL groups (authors 1 and 2) plus the NULL group"
+    );
     let author1_total: String = client
         .query_one("select total::text from public.t where author = 1", &[])
         .await
@@ -435,9 +436,10 @@ async fn aggregate_build_scans_source_once_not_per_chunk() {
 
 /// Asserts `public.t` (the aggregate target `def` built) is value-equal to a
 /// fresh `GROUP BY` over the source rendered straight from `def`, comparing
-/// every group's visible columns. NULL-key groups are excluded from the oracle:
-/// the target's group-by PK can't represent them, so the built target won't
-/// contain them.
+/// every group's visible columns — including a NULL-key group (issue #128):
+/// the target's grouping columns are keyed by a `UNIQUE NULLS NOT DISTINCT`
+/// constraint, not a bare `PRIMARY KEY`, so a NULL-key group is representable
+/// and must match the oracle exactly like any other group.
 async fn assert_aggregate_matches_oracle(
     db: &testkit::TestDatabase,
     def: &trellis::defs::ast::TransformDef,
@@ -459,16 +461,11 @@ async fn assert_aggregate_matches_oracle(
         .map(|f| format!("coalesce({}::text, 'NULL')", f.name))
         .collect::<Vec<_>>()
         .join(" || '|' || ");
-    let group_not_null = group_by
-        .iter()
-        .map(|c| format!("{c} is not null"))
-        .collect::<Vec<_>>()
-        .join(" and ");
 
     let oracle_sql = render_aggregate_select_sql(def);
     let oracle = text_pairs(
         &client,
-        &format!("select {key_expr}, {val_expr} from ({oracle_sql}) o where {group_not_null}"),
+        &format!("select {key_expr}, {val_expr} from ({oracle_sql}) o"),
     )
     .await;
     let target = text_pairs(

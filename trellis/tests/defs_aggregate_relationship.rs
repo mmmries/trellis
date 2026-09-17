@@ -29,7 +29,7 @@ use trellis::defs::ast::{
 };
 use trellis::defs::{
     CatalogError, ValidationError, create_relationship, install_definition,
-    render_aggregate_relationship_select_sql,
+    relationship_projection, render_aggregate_relationship_select_sql,
 };
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -109,12 +109,25 @@ async fn stage_cdc(
 /// Reverse recompute appends fresh `Recompute` rows into the (new) active
 /// segment as it drains, so convergence takes more than one seal.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+    // Issue #132: a throwaway, always-caught-up watermark — this helper
+    // has no live `Intake` running (these tests stage CDC rows by hand),
+    // and none of this file's tests exercise guard (a) specifically, so a
+    // real watermark would only ever make guard (a) reject spuriously.
+    let watermark = trellis::staging::StagedWatermark::saturated();
+    let watermark = &watermark;
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
-        while apply::drain_once(pool, seg, "agg_rel_test", 1, "trellis_agg_rel_test")
-            .await
-            .expect("drain_once")
-            .is_some()
+        while apply::drain_once(
+            pool,
+            seg,
+            "agg_rel_test",
+            1,
+            "trellis_agg_rel_test",
+            watermark,
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
         {}
         retire_drained_segments(client)
             .await
@@ -147,12 +160,17 @@ const TAG_TOTALS: &str = "TRANSFORM tag_totals FROM post_tags GROUP BY tag \
 /// Issue #94's exact schema. `post_tags` needs `REPLICA IDENTITY FULL` because
 /// it is an *aggregate* source (the delta/recompute path needs the old image to
 /// locate the group a changed row is leaving) — unrelated to the relationship.
+/// `posts` needs it too, as of issue #129: it's the to-side of a to-one
+/// relationship, whose settled parent projection now requires `REPLICA
+/// IDENTITY FULL` unconditionally (`assert_replica_identity_supports_projection`),
+/// independent of and in addition to the aggregate-source reason above.
 async fn create_schema(client: &Client) {
     client
         .batch_execute(
             "create table posts (id integer primary key, word_count integer); \
              create table post_tags (id integer primary key, post integer, tag text); \
              alter table post_tags replica identity full; \
+             alter table posts replica identity full; \
              create index on post_tags (post); \
              insert into posts (id, word_count) values (1, 100), (2, 250), (3, null); \
              insert into post_tags (id, post, tag) values \
@@ -353,6 +371,97 @@ async fn inserting_a_from_side_row_updates_its_groups_total() {
     );
 }
 
+/// Issue #136 (epic #127): an ordinary from-side insert into a
+/// relationship-reading aggregate resolves the relationship's value from the
+/// *settled parent projection* (issue #130's mechanism), never a live read
+/// of the to-side table — mirroring
+/// `apply_relationship_forward.rs`'s `forward_to_one_resolves_from_the_projection_not_live_parent_state`
+/// for the analogous `KeySpace::OneToOne` case, but for a `KeySpace::Aggregate`
+/// field wrapped in `SUM`. Before #136, this went through `accumulate_changes`'s
+/// now-removed `force_every_group`, which forced a **live** `LEFT JOIN`
+/// recompute for the whole touched group — so this exact scenario (a live
+/// rename with no reverse recompute in between) would have picked up the
+/// *new* live value immediately. Proved by manufacturing the same
+/// projection/live desync `apply_relationship_forward.rs` uses: renaming
+/// post 1's `word_count` live, with no CDC staged and no reverse recompute
+/// run, then inserting a brand-new `post_tags` row pointing at it.
+#[tokio::test]
+async fn inserting_a_from_side_row_resolves_from_the_projection_not_live_parent_state() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    // `install_definition`'s widen (#129) catches post 1's word_count into
+    // the projection right here, while 100 is still its only-ever value.
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let projection_table = relationship_projection(&db.pool, relationship.id)
+        .await
+        .expect("read projection catalog row")
+        .expect("to-one relationship has a projection")
+        .projection_table;
+    let projection_word_count: Option<i32> = client
+        .query_one(
+            &format!("select word_count from {projection_table} where id = 1"),
+            &[],
+        )
+        .await
+        .expect("read projected word_count")
+        .get(0);
+    assert_eq!(
+        projection_word_count,
+        Some(100),
+        "sanity: the projection settled on post 1's original word_count"
+    );
+
+    // Live-only mutation: no CDC staged, no reverse recompute, nothing
+    // advances the projection.
+    client
+        .execute("update posts set word_count = 999 where id = 1", &[])
+        .await
+        .expect("rename the live post's word_count without touching the projection");
+
+    // A brand-new post_tags row, forward-applied for the first time,
+    // referencing the now-desynced post.
+    client
+        .execute(
+            "insert into post_tags (id, post, tag) values (15, 1, 'rust')",
+            &[],
+        )
+        .await
+        .expect("insert a new post_tag");
+    stage_cdc(
+        &client,
+        "post_tags",
+        "15",
+        "insert",
+        None,
+        Some("{\"id\":15,\"post\":1,\"tag\":\"rust\"}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("4".to_string()), Some("450".to_string()))),
+        "the new row's contribution must come from the settled projection \
+         (still 100: 100 via row 10 + 250 via row 11 + null via row 13 + 100 \
+         via the new row 15), not the live post row (renamed to 999 after \
+         the projection settled)"
+    );
+}
+
 /// Reverse propagation (ADR-0006's to-side direction, issue #30's mechanism):
 /// changing the *related* `posts` row's `word_count` must re-derive every group
 /// whose members read it — here post 1 is referenced by both the `rust` and
@@ -403,6 +512,601 @@ async fn updating_a_to_side_row_updates_every_dependent_group() {
     assert_eq!(
         totals.get("db"),
         Some(&(Some("2".to_string()), Some("400".to_string())))
+    );
+}
+
+/// Issue #136 (epic #127): a from-side row re-pointed from one parent to
+/// another *within a single already-folded change* (a genuine single
+/// `UPDATE`, not an insert-then-repoint the fold would erase) correctly
+/// subtracts its contribution under the *old* parent and adds it under the
+/// *new* one, in one change — mirroring issue #131's reverse-side test for
+/// the analogous case (`apply_relationship_forward.rs`'s
+/// `forward_apply_re_point_bumps_gen_for_both_old_and_new_parent`), but
+/// proving the forward *aggregate delta's own value*, not just the
+/// projection's `gen` bookkeeping.
+///
+/// Row 10 (`post = 1`, tag `rust`) is re-pointed to `post = 2` — the same
+/// `GROUP BY` group (`tag` is unchanged, so this is a same-group in-place
+/// update, not a grain migration), but `accumulate_changes` must still
+/// resolve the row's relationship read *twice*, once per side, off each
+/// side's own `post` value (`row_contribution` under `old_row`'s `post = 1`
+/// vs. `new_row`'s `post = 2`) — exactly the case a naive single-resolution
+/// implementation (resolving once off, say, the new row only) would get
+/// wrong.
+#[tokio::test]
+async fn a_from_side_re_point_within_one_update_diffs_old_and_new_parent_contributions() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals_before = target_totals(&client).await;
+    assert_eq!(
+        totals_before.get("rust"),
+        Some(&(Some("3".to_string()), Some("350".to_string()))),
+        "sanity: 'rust' starts at 100 (row 10, post 1) + 250 (row 11, post 2) \
+         + null (row 13, post 999)"
+    );
+
+    // Re-point row 10 from post 1 (word_count 100) to post 2 (word_count
+    // 250) — same group (`tag` stays 'rust'), one folded UPDATE carrying
+    // both a real old image and a real new image.
+    client
+        .execute("update post_tags set post = 2 where id = 10", &[])
+        .await
+        .expect("re-point row 10");
+    stage_cdc(
+        &client,
+        "post_tags",
+        "10",
+        "update",
+        Some("{\"id\":10,\"post\":1,\"tag\":\"rust\"}"),
+        Some("{\"id\":10,\"post\":2,\"tag\":\"rust\"}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals,
+        oracle_totals(&client).await,
+        "after a same-group from-side re-point"
+    );
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("500".to_string()))),
+        "row 10 must subtract its OLD contribution (100, via post 1) and add \
+         its NEW one (250, via post 2) in one delta — 250 (row 10, now post \
+         2) + 250 (row 11, post 2) + null (row 13, post 999) = 500, not 350 \
+         (no-op, as if the repoint were never resolved) or some other value \
+         a single-sided resolution would produce"
+    );
+}
+
+/// Issue #136 review follow-up: `AVG` over a relationship-read column
+/// (`AVG(post.word_count)`) — code-reading confirmed `contribution_def`'s
+/// `AVG`-as-`SUM` rewrite only touches a field's own top-level
+/// `FunctionCall` and runs *after* `build_forward_relationship_shape`'s
+/// `RelationshipPath`-to-synthetic-`Column` substitution, so the two
+/// rewrites should compose regardless of order — but nothing exercised
+/// `AVG` combined with a relationship read before this test (every existing
+/// `AVG` test is relationship-free, and #94's own aggregate-relationship
+/// tests only cover `SUM`/`COUNT`). Proves both backfill and the ordinary
+/// forward delta path maintain `AVG`'s hidden sum/count partials correctly
+/// when the averaged value itself comes from a relationship, including the
+/// `NULL`-skipping rule (`post = 999` resolves to no post at all; post 3's
+/// `word_count` is a genuine SQL `NULL` — both must be excluded from the
+/// average, not treated as zero), by comparing against Postgres's own
+/// `LEFT JOIN … GROUP BY … AVG(...)` oracle rather than a hardcoded
+/// (scale-sensitive) literal.
+#[tokio::test]
+async fn avg_over_a_relationship_read_column_maintains_through_backfill_and_forward_insert() {
+    fn oracle_avg_def() -> TransformDef {
+        TransformDef {
+            target: "tag_avg".to_string(),
+            source: "post_tags".to_string(),
+            key_space: KeySpace::Aggregate {
+                group_by: vec!["tag".to_string()],
+            },
+            fields: vec![
+                FieldDef {
+                    name: "tag".to_string(),
+                    expr: Expr::Column("tag".to_string()),
+                },
+                FieldDef {
+                    name: "avg_words".to_string(),
+                    expr: Expr::FunctionCall {
+                        name: "AVG".to_string(),
+                        args: vec![Expr::RelationshipPath {
+                            rel: "post".to_string(),
+                            column: "word_count".to_string(),
+                        }],
+                    },
+                },
+            ],
+            predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
+        }
+    }
+
+    async fn oracle_avg_totals(client: &Client) -> HashMap<String, Option<String>> {
+        let base = render_aggregate_relationship_select_sql(&oracle_avg_def(), &post_rel());
+        let sql = format!("select tag, avg_words::text from ({base}) t");
+        client
+            .query(sql.as_str(), &[])
+            .await
+            .expect("query avg-over-relationship oracle")
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect()
+    }
+
+    async fn target_avg_totals(client: &Client) -> HashMap<String, Option<String>> {
+        client
+            .query("select tag, avg_words::text from tag_avg", &[])
+            .await
+            .expect("read tag_avg")
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect()
+    }
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(
+        &db.pool,
+        "TRANSFORM tag_avg FROM post_tags GROUP BY tag SELECT AVG(post.word_count) AS avg_words",
+        &post_tags_columns(),
+        "public",
+    )
+    .await
+    .expect("install the AVG-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        target_avg_totals(&client).await,
+        oracle_avg_totals(&client).await,
+        "after backfill"
+    );
+
+    // Forward delta: a new post_tags row pointing at post 2 (250 words)
+    // joins 'db' (previously just post 1's 100, with post 3's NULL
+    // skipped) — post-#136 this resolves via the settled projection and
+    // must still fold into AVG's running sum/count partials correctly.
+    client
+        .execute(
+            "insert into post_tags (id, post, tag) values (15, 2, 'db')",
+            &[],
+        )
+        .await
+        .expect("insert a new post_tag");
+    stage_cdc(
+        &client,
+        "post_tags",
+        "15",
+        "insert",
+        None,
+        Some("{\"id\":15,\"post\":2,\"tag\":\"db\"}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_avg_totals(&client).await;
+    assert_eq!(
+        totals,
+        oracle_avg_totals(&client).await,
+        "after a forward delta touching an AVG field's relationship read"
+    );
+    assert_eq!(
+        totals.get("db").cloned().flatten(),
+        Some("175.0000000000000000".to_string()),
+        "'db' must now average post 1 (100) and post 2 (250) = 175 (at \
+         Postgres's own avg() scale), folded in via the forward delta, not \
+         left at the backfilled 100"
+    );
+}
+
+/// Issue #136 review follow-up: two distinct relationships referenced by the
+/// same aggregate definition, both happening to read a to-side column with
+/// the same *name* (`author.score`/`editor.score`, both relationships
+/// pointing at `users`) — code-reading confirmed
+/// `forward_relationship_synthetic_column(rel, column)`'s namespacing by
+/// *both* relationship name and column avoids the collision a naming scheme
+/// keyed on column alone would hit (two different relationships' resolved
+/// values overwriting the same synthetic column on the augmented row), but
+/// no test actually constructed two relationships sharing a to-side column
+/// name before this one. Proves both totals resolve correctly, independently
+/// of each other, through backfill and an ordinary forward delta — the SQL
+/// oracle comparison would itself corrupt silently (one field's value
+/// leaking into the other) if the collision this test targets were ever
+/// reintroduced.
+#[tokio::test]
+async fn two_relationships_sharing_a_to_side_column_name_resolve_independently() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table users (id integer primary key, score numeric); \
+             alter table users replica identity full; \
+             insert into users (id, score) values (1, 10), (2, 20), (3, 30); \
+             create table reviews \
+               (id integer primary key, article_id integer, author_id integer, \
+                editor_id integer); \
+             alter table reviews replica identity full; \
+             insert into reviews (id, article_id, author_id, editor_id) values \
+               (1, 100, 1, 2), (2, 100, 2, 3)",
+        )
+        .await
+        .expect("create + seed two-relationship schema");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP author FROM reviews.author_id TO users.id",
+    )
+    .await
+    .expect("create the author relationship");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP editor FROM reviews.editor_id TO users.id",
+    )
+    .await
+    .expect("create the editor relationship");
+
+    let source_columns = columns(&[
+        ("id", ValueType::Numeric),
+        ("article_id", ValueType::Numeric),
+        ("author_id", ValueType::Numeric),
+        ("editor_id", ValueType::Numeric),
+    ]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM review_totals FROM reviews GROUP BY article_id \
+         SELECT COUNT(*) AS review_count, SUM(author.score) AS author_total, \
+         SUM(editor.score) AS editor_total",
+        &source_columns,
+        "public",
+    )
+    .await
+    .expect("install the two-relationship aggregate definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    async fn review_totals(
+        client: &Client,
+    ) -> HashMap<String, (Option<String>, Option<String>, Option<String>)> {
+        client
+            .query(
+                "select article_id::text, review_count::text, author_total::text, \
+                 editor_total::text from review_totals",
+                &[],
+            )
+            .await
+            .expect("read review_totals")
+            .into_iter()
+            .map(|r| (r.get(0), (r.get(1), r.get(2), r.get(3))))
+            .collect()
+    }
+
+    // After backfill: author scores 10 (user 1, row 1) + 20 (user 2, row 2)
+    // = 30; editor scores 20 (user 2, row 1) + 30 (user 3, row 2) = 50 —
+    // each field must resolve from its *own* relationship, never the
+    // other's.
+    let totals = review_totals(&client).await;
+    assert_eq!(
+        totals.get("100"),
+        Some(&(
+            Some("2".to_string()),
+            Some("30".to_string()),
+            Some("50".to_string())
+        )),
+        "after backfill: author_total (30) and editor_total (50) must not \
+         collide or leak into each other despite both relationships reading \
+         a to-side column named 'score'"
+    );
+
+    // Forward delta: a new review row (author 3 -> score 30, editor 1 ->
+    // score 10) folds into the same group.
+    client
+        .execute(
+            "insert into reviews (id, article_id, author_id, editor_id) \
+             values (3, 100, 3, 1)",
+            &[],
+        )
+        .await
+        .expect("insert a new review");
+    stage_cdc(
+        &client,
+        "reviews",
+        "3",
+        "insert",
+        None,
+        Some("{\"id\":3,\"article_id\":100,\"author_id\":3,\"editor_id\":1}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        review_totals(&client).await.get("100"),
+        Some(&(
+            Some("3".to_string()),
+            Some("60".to_string()),
+            Some("60".to_string())
+        )),
+        "after the forward delta: author_total = 30 + 30 (user 3) = 60, \
+         editor_total = 50 + 10 (user 1) = 60 — each still resolved \
+         independently via its own synthetic column, not aliased onto the \
+         other's"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Whole-branch review regression (epic #127): an invertible field mixed with
+// a relationship-reading `RecomputeOnly` field on the same target, driven
+// through an *ordinary* forward delta (never image-less, so never
+// `force_full_recompute`).
+//
+// Before issue #136, every group of a relationship-reading aggregate target
+// was forced onto `apply_forced_groups_bulk` (`force_every_group`), which
+// already joined the to-side table correctly — so `upsert_group`'s
+// `probe_field_value` and `apply_delta_groups_bulk`'s
+// `probe_recompute_fields_bulk` could never actually be reached for such a
+// target, regardless of how many groups one batch touched. #136 deleted that
+// routing: `SUM`/`AVG`/`COUNT` fields (even ones reading a relationship path)
+// now fold incrementally through the ordinary ("delta") path, but a `MIN`/
+// `MAX` field on that same target is still `RecomputeOnly` and gets probed
+// live — through whichever of those two functions `apply_aggregate_target`
+// picks based on how many groups the batch touched (`upsert_group` for
+// exactly one, `apply_delta_groups_bulk` for more than one). Both functions
+// rendered the `RecomputeOnly` expression through the relationship-unaware
+// `oracle::render_expr_sql` and built no `JOIN` for it at all, so either path
+// panicked (`render_expr_sql called on an unresolved relationship path`) the
+// moment a real batch reached it — `apply_delta_groups_bulk`'s corner is what
+// the generative fuzz suite caught; `upsert_group`'s single-group corner is
+// the same defect, uncovered by close reading during this fix.
+//
+// `MIXED_TOTALS` gives every group both kinds at once: `SUM(id)` (`id` is a
+// plain, non-relationship column — invertible, folds via the delta path
+// unconditionally) and `MIN(post.word_count)` (a to-one relationship read —
+// `RecomputeOnly`, so it's the one that must probe live and correctly).
+
+const MIXED_TOTALS: &str = "TRANSFORM tag_mixed FROM post_tags GROUP BY tag \
+     SELECT SUM(id) AS id_sum, MIN(post.word_count) AS min_word_count";
+
+fn mixed_oracle_def() -> TransformDef {
+    TransformDef {
+        target: "tag_mixed".to_string(),
+        source: "post_tags".to_string(),
+        key_space: KeySpace::Aggregate {
+            group_by: vec!["tag".to_string()],
+        },
+        fields: vec![
+            FieldDef {
+                name: "tag".to_string(),
+                expr: Expr::Column("tag".to_string()),
+            },
+            FieldDef {
+                name: "id_sum".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![Expr::Column("id".to_string())],
+                },
+            },
+            FieldDef {
+                name: "min_word_count".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "MIN".to_string(),
+                    args: vec![Expr::RelationshipPath {
+                        rel: "post".to_string(),
+                        column: "word_count".to_string(),
+                    }],
+                },
+            },
+        ],
+        predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
+    }
+}
+
+async fn mixed_oracle_totals(client: &Client) -> Totals {
+    let base = render_aggregate_relationship_select_sql(&mixed_oracle_def(), &post_rel());
+    let sql = format!("select tag, id_sum::text, min_word_count::text from ({base}) t");
+    client
+        .query(sql.as_str(), &[])
+        .await
+        .expect("query mixed sum/relationship-min oracle")
+        .into_iter()
+        .map(|r| (r.get(0), (r.get(1), r.get(2))))
+        .collect()
+}
+
+async fn mixed_target_totals(client: &Client) -> Totals {
+    client
+        .query(
+            "select tag, id_sum::text, min_word_count::text from tag_mixed",
+            &[],
+        )
+        .await
+        .expect("read tag_mixed")
+        .into_iter()
+        .map(|r| (r.get(0), (r.get(1), r.get(2))))
+        .collect()
+}
+
+/// Adds post 4 (`word_count = 5`, lower than every seeded post) unreferenced
+/// by any existing `post_tags` row — so backfill's totals are unaffected, and
+/// each test below only picks it up via the specific forward insert(s) it
+/// stages, making a `min_word_count` change a direct signal that the new
+/// row's relationship read was actually folded in (not just "didn't panic").
+async fn add_low_word_count_post(client: &Client) {
+    client
+        .execute("insert into posts (id, word_count) values (4, 5)", &[])
+        .await
+        .expect("insert post 4");
+}
+
+/// The single-touched-group corner: one forward insert, one group touched,
+/// so `apply_aggregate_target` routes it through `upsert_group` —
+/// `probe_field_value`'s corner of this regression.
+#[tokio::test]
+async fn sum_and_relationship_min_mixed_single_group_forward_insert() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+    add_low_word_count_post(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, MIXED_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the mixed sum/relationship-min definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        mixed_target_totals(&client).await,
+        mixed_oracle_totals(&client).await,
+        "after backfill"
+    );
+    assert_eq!(
+        mixed_target_totals(&client).await.get("rust"),
+        Some(&(Some("34".to_string()), Some("100".to_string()))),
+        "sanity: rust = 10 + 11 + 13 = 34, min(100, 250, missing-post) = 100"
+    );
+
+    client
+        .execute(
+            "insert into post_tags (id, post, tag) values (20, 4, 'rust')",
+            &[],
+        )
+        .await
+        .expect("insert a new post_tag");
+    stage_cdc(
+        &client,
+        "post_tags",
+        "20",
+        "insert",
+        None,
+        Some("{\"id\":20,\"post\":4,\"tag\":\"rust\"}"),
+    )
+    .await;
+    // Only 'rust' is touched by this batch — must not panic (pre-fix:
+    // `render_expr_sql called on an unresolved relationship path 'post.word_count'`).
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = mixed_target_totals(&client).await;
+    assert_eq!(
+        totals,
+        mixed_oracle_totals(&client).await,
+        "after a single-group forward delta mixing an invertible field with \
+         a relationship-reading RecomputeOnly field"
+    );
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("54".to_string()), Some("5".to_string()))),
+        "id_sum = 34 + 20 = 54; min_word_count drops to post 4's 5, proving \
+         the new row's relationship read was actually folded into the live \
+         MIN probe, not just non-panicking"
+    );
+}
+
+/// The multi-touched-group corner: two forward inserts landing in different
+/// groups within the same drain batch, so `apply_aggregate_target` routes it
+/// through `apply_delta_groups_bulk` — `probe_recompute_fields_bulk`'s corner
+/// of this regression, and the one the generative fuzz suite's
+/// `convergence_holds_across_a_mid_stream_scale_out` caught.
+#[tokio::test]
+async fn sum_and_relationship_min_mixed_two_groups_in_one_batch() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+    add_low_word_count_post(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, MIXED_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the mixed sum/relationship-min definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    client
+        .execute(
+            "insert into post_tags (id, post, tag) values (21, 4, 'rust'), (22, 4, 'db')",
+            &[],
+        )
+        .await
+        .expect("insert two new post_tags rows in different groups");
+    stage_cdc(
+        &client,
+        "post_tags",
+        "21",
+        "insert",
+        None,
+        Some("{\"id\":21,\"post\":4,\"tag\":\"rust\"}"),
+    )
+    .await;
+    stage_cdc(
+        &client,
+        "post_tags",
+        "22",
+        "insert",
+        None,
+        Some("{\"id\":22,\"post\":4,\"tag\":\"db\"}"),
+    )
+    .await;
+    // Both 'rust' and 'db' are touched in the same batch (two groups, so the
+    // bulk path) — must not panic (pre-fix: same `render_expr_sql` panic as
+    // the single-group corner above, from `probe_recompute_fields_bulk`
+    // instead of `probe_field_value`).
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = mixed_target_totals(&client).await;
+    assert_eq!(
+        totals,
+        mixed_oracle_totals(&client).await,
+        "after a two-group forward delta mixing an invertible field with a \
+         relationship-reading RecomputeOnly field"
+    );
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("55".to_string()), Some("5".to_string()))),
+        "id_sum = 34 + 21 = 55; min_word_count drops to post 4's 5"
+    );
+    assert_eq!(
+        totals.get("db"),
+        Some(&(Some("48".to_string()), Some("5".to_string()))),
+        "id_sum = 26 + 22 = 48; min_word_count drops from 100 to post 4's 5"
     );
 }
 

@@ -26,17 +26,18 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{PgLsn, ToSql};
 use tokio_postgres::{GenericClient, Transaction};
 
-use crate::defs::ast::{KeySpace, TransformDef, ValueType};
+use crate::defs::ast::{Expr, KeySpace, TransformDef, ValueType};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::eval::{
     self, EvalError, RelationshipContext, Row, ToManyRelationship, ToOneRelationship,
 };
-use crate::defs::model::RelationshipCardinality;
+use crate::defs::model::{RelationshipCardinality, RelationshipDefinition};
 use crate::defs::validate::{self, ValidationError};
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
@@ -44,10 +45,12 @@ use crate::pool::{Pool, quote_ident};
 use super::append::{self, StagedChange};
 use super::apply_aggregate::{self, AggregateTargetPlan};
 use super::claim;
+use super::converge;
 use super::error::StagingError;
 use super::fold::{self, FoldedChange};
 use super::liveness::FenceMissBackoff;
 use super::quarantine;
+use super::watermark::StagedWatermark;
 
 /// The absolute ceiling on [`FoldedChange::hop_gen`] propagation, a backstop
 /// over and above the schema-derived hop bound doc 05 describes ("one past
@@ -58,6 +61,38 @@ use super::quarantine;
 /// creation time (`detect_cycle`), so this is defense-in-depth, not the
 /// primary guard.
 pub const MAX_HOP_GEN: i32 = 32;
+
+/// Issue #135 (epic #127): starvation-freedom threshold for a to-one
+/// relationship reverse's guard-gated retry loop (issue #134's
+/// `RelationshipReverseDeferred`/`retry_count`) — see the "Issue #135:
+/// fairness escalation" section below (right after [`check_reverse_guards`])
+/// for the full design and the alternatives it rejects. Once a single
+/// reverse *transition* (one parent's old-image/new-image pair — fixed
+/// across every retry, never re-derived; see [`RelationshipReverseRecord`]'s
+/// doc comment) has been rejected by guard (a), (b), or (c) this many times
+/// in a row, the *next* rejection escalates instead of deferring again: it
+/// advances the settled parent projection immediately (sound once an
+/// independent recheck of guard (d) — the projection's own LSN chain —
+/// holds; see [`reverse_ordering_still_holds`]) and resolves the aggregate
+/// correction via the pre-#131 image-less `Recompute` fallback, which needs
+/// none of #132's four guards for its own correctness.
+///
+/// **Why 5.** No production signal exists yet to tune this against — this
+/// issue's own stress model (see the module's test suite and its report) is
+/// what informs the choice, not a fleet metric. 5 is small enough to bound
+/// worst-case staleness to a handful of drain cycles (in practice usually
+/// far fewer — guard (d) is expected to hold on nearly every attempt once
+/// children are the only source of churn, since nothing else is racing to
+/// move *this* parent's own projection row; see the design section's
+/// reasoning) while large enough that an ordinary transient blip — the
+/// *common* case #134's own doc section measured — never pays the
+/// fallback's live-recompute cost in place of the fast path's true delta.
+/// A plain constant, not a runtime setting, following this module's own
+/// [`MAX_HOP_GEN`] precedent: promote it to something tunable only if a real
+/// deployment's `trellis_relationship_reverse_deferred_total` /
+/// `trellis_relationship_reverse_fairness_escalated_total` metrics ever show
+/// a need.
+pub const RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD: i32 = 5;
 
 // ---------------------------------------------------------------------
 // Errors
@@ -576,6 +611,49 @@ async fn from_side_keys_with_non_null_join(
     Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
+/// One to-one relationship's settled-parent projection keys a batch's
+/// relationship resolution touched (issue #130, epic #127; plan doc §2's
+/// guard (b) precondition — "the generation must be bumped... so a reverse
+/// can detect that a forward apply landed in between"). [`build_relationship_context`]
+/// resolves this in Phase 2 (the same catalog read that finds the projection
+/// table to query), so Phase 3 ([`apply_and_mark_drained_many`]'s gen-bump
+/// step) needs no catalog/pool access of its own to apply it — the same
+/// "decide in Phase 2, apply in Phase 3" split [`ApplyPlan::downstream_readers`]
+/// already uses.
+///
+/// **Issue #133 (closed the gap this comment used to describe):**
+/// `touched_keys` used to be derived only from the *folded* change's own
+/// old- and new-image join-key values — both folded endpoints (a re-point
+/// bumps both the old and new parent), never the pre-fold history. A parent
+/// erased by the fold within one batch (`ins(post 3)` + `repoint(3 -> 2)`
+/// folding to `new={post: 2}`, with post 3 appearing in neither folded
+/// endpoint) was invisible there too, so it never got bumped even though a
+/// child briefly pointed at it mid-batch — a reverse holding an enumeration
+/// captured before the re-point would then wrongly pass guard (b)'s check
+/// against post 3's `gen`.
+///
+/// [`build_relationship_context`] now unions in each touched change's own
+/// [`FoldedChange::group_key`] — the ring's real, pre-fold "every join-key
+/// value this row's raw change history touched" signal (see that field's
+/// and `staging::fold`'s doc comments for the union merge rule) — on top of
+/// the folded-endpoint values it already collected. That union is a strict
+/// superset of the old signal (an extra touched key only ever costs an
+/// UPDATE that matches zero rows — see the Phase 3 gen-bump step's own doc
+/// comment), so keeping both sources rather than replacing one with the
+/// other can only add coverage, never regress it, if `group_key` is ever
+/// unpopulated for some row (e.g. a table with no cached outbound
+/// relationship yet — see `intake::Intake`'s own doc comment on that
+/// cache's refresh-on-miss strategy).
+#[derive(Debug, Clone)]
+pub(crate) struct RelationshipGenBump {
+    /// [`ddl::qualified_relationship_projection_table`]'s output — ready for
+    /// direct interpolation into the Phase 3 `UPDATE`.
+    qualified_projection: String,
+    /// The projection's own primary key column (the relationship's `to_col`).
+    key_col: String,
+    touched_keys: std::collections::HashSet<String>,
+}
+
 /// Builds the [`RelationshipContext`] a relationship-enriched from-side target
 /// needs to re-evaluate (issue #30 wiring of the #28/#29 evaluator): for each
 /// relationship the definition references, the related to-side rows keyed by
@@ -584,12 +662,42 @@ async fn from_side_keys_with_non_null_join(
 /// evaluate — so only the related rows those rows actually need are fetched.
 /// `from_table` is the definition's own source table (a relationship's
 /// `from_table`).
+///
+/// **Issue #130, epic #127**: a to-one relationship (`RelationshipCardinality::ToOne`)
+/// resolves against the settled parent projection (#129's
+/// `catalog::relationship_projection`), never a live read of the to-side —
+/// see this module's doc comment / plan doc §2 for why a live read
+/// double-counts the `δA⋈δB` cross term on the forward path. A to-many
+/// relationship is untouched: Phase 1 of this epic is to-one relationship
+/// *values* only (#94's shape), so `ToManyRelationship` still resolves via
+/// [`fetch_to_side_rows`]'s live read, exactly as before.
+///
+/// `old_rows`, when supplied, is the same-length, same-index decoded
+/// pre-image of each of `rows`' underlying changes — used only to widen the
+/// gen-bump touched-key set (see [`RelationshipGenBump`]'s doc comment) with
+/// each change's *old* join-key value, not to resolve anything the evaluator
+/// reads. `None` is the shape `quarantine::recompute_column`'s ad hoc,
+/// non-transactional resume path passes, since it isn't part of the staging
+/// ring's claim/fold/compute/apply pipeline this gen bump guards — that
+/// caller discards the returned gen-bump map entirely, so `None` simply
+/// costs it nothing beyond not bothering to compute the old-side half.
+///
+/// `changes`, when supplied, is the same-length, same-index slice of
+/// [`FoldedChange`]s `rows`/`old_rows` were decoded from — issue #133's
+/// signal, read for its `group_key` (the real, pre-fold union of touched
+/// join keys; see that field's doc comment) and unioned into the same
+/// gen-bump touched-key set `old_rows` widens. `None` for the same
+/// `quarantine::recompute_column` caller as `old_rows`: that path has no
+/// `FoldedChange`s at all (a live full-table scan, not the staging ring's
+/// pipeline) and, as above, discards the gen-bump map regardless.
 pub(crate) async fn build_relationship_context(
     pool: &Pool,
     from_table: &str,
     def: &TransformDef,
     rows: &[Option<Row>],
-) -> Result<RelationshipContext, ApplyError> {
+    old_rows: Option<&[Option<Row>]>,
+    changes: Option<&[&FoldedChange]>,
+) -> Result<(RelationshipContext, HashMap<i64, RelationshipGenBump>), ApplyError> {
     // Group the referenced columns by relationship name (a relationship may be
     // read for more than one column across the definition's fields).
     let mut cols_by_rel: HashMap<String, Vec<String>> = HashMap::new();
@@ -602,6 +710,7 @@ pub(crate) async fn build_relationship_context(
 
     let mut by_name: HashMap<String, ToOneRelationship> = HashMap::new();
     let mut to_many_by_name: HashMap<String, ToManyRelationship> = HashMap::new();
+    let mut gen_bumps: HashMap<i64, RelationshipGenBump> = HashMap::new();
 
     for (rel_name, columns) in cols_by_rel {
         let Some(reldef) = catalog::relationship_by_name(pool, from_table, &rel_name).await? else {
@@ -615,9 +724,23 @@ pub(crate) async fn build_relationship_context(
 
         // The join keys we need on the to-side: the distinct non-NULL
         // `from_col` values of the from-side rows this batch evaluates.
+        //
+        // Issue #136: also folds in `old_rows`' own `from_col` values, not
+        // just `rows`' (new-side) — a `KeySpace::OneToOne` caller never
+        // needed this (it only ever evaluates the *new* row, so the old
+        // parent's value is never read), but the forward aggregate delta
+        // path does: it must resolve a row's contribution under *both* its
+        // old and new relationship value when the row's own `from_col`
+        // itself changes within one folded update (a re-point), to subtract
+        // the old contribution and add the new one rather than silently
+        // treating the old side as "no match". Folding in an extra key here
+        // only ever costs fetching one more (unused) projection row for a
+        // `KeySpace::OneToOne` caller — never a correctness problem, per
+        // this function's own "spurious extra touched key" rule below.
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut join_keys: Vec<String> = Vec::new();
-        for row in rows.iter().flatten() {
+        let old_rows_iter = old_rows.unwrap_or(&[]).iter().flatten();
+        for row in rows.iter().flatten().chain(old_rows_iter) {
             if let Some(Some(text)) = row.get(&from_col)
                 && seen.insert(text.as_str())
             {
@@ -626,26 +749,101 @@ pub(crate) async fn build_relationship_context(
         }
 
         let to_columns = to_column_types(pool, &to_table, &columns).await?;
-        let grouped = fetch_to_side_rows(pool, &to_table, &to_col, &join_keys).await?;
 
         match reldef.cardinality {
             RelationshipCardinality::ToOne => {
-                // `to_col` is UNIQUE, so each key has exactly one related row.
-                let to_rows_by_key = grouped
-                    .into_iter()
-                    .filter_map(|(k, mut v)| v.pop().map(|row| (k, row)))
-                    .collect();
+                let projection = catalog::relationship_projection(pool, reldef.id).await?;
+                let qualified_projection = projection.as_ref().map(|p| {
+                    ddl::qualified_relationship_projection_table(
+                        pool.target_schema(),
+                        &p.projection_table,
+                    )
+                });
+
+                let to_rows_by_key = match &qualified_projection {
+                    Some(qualified_projection) => {
+                        fetch_relationship_projection_rows(
+                            pool,
+                            qualified_projection,
+                            &to_col,
+                            &join_keys,
+                        )
+                        .await?
+                    }
+                    None => {
+                        // Every to-one relationship gets a projection
+                        // unconditionally at `create_relationship` time
+                        // (#129's `ensure_relationship_projection_in_txn`) —
+                        // this should be unreachable. Phase 2 holds no locks
+                        // and can't assume the catalog is self-consistent on
+                        // that promise alone, so this degrades to "nothing
+                        // resolves" (an empty to-side, same as a genuinely
+                        // dangling join key) rather than panicking.
+                        tracing::error!(
+                            relationship = %rel_name,
+                            from_table = %from_table,
+                            "to-one relationship has no settled parent projection; \
+                             resolving as empty (should be unreachable — #129 creates \
+                             one unconditionally)"
+                        );
+                        HashMap::new()
+                    }
+                };
                 by_name.insert(
                     rel_name,
                     ToOneRelationship {
-                        from_col,
+                        from_col: from_col.clone(),
                         cardinality: RelationshipCardinality::ToOne,
                         to_columns,
                         to_rows_by_key,
                     },
                 );
+
+                // #130's gen-bump signal, widened by #133 — see
+                // [`RelationshipGenBump`]'s doc comment. Three sources, all
+                // unioned (a spurious extra touched key only ever costs a
+                // zero-row `UPDATE`, never a correctness problem — see the
+                // Phase 3 gen-bump step's own doc comment): the folded
+                // endpoints (both folded new-side join keys just resolved
+                // above, and every change's own folded old-image `from_col`
+                // value — a re-point's *previous* parent, which the
+                // new-side scan never sees), plus #133's real pre-fold
+                // signal: every touched change's own `group_key` union,
+                // which is what still names a parent (like the plan doc's
+                // "post 3") the fold erased from *both* folded endpoints
+                // within this same batch.
+                if let Some(qualified_projection) = qualified_projection {
+                    let mut touched: std::collections::HashSet<String> =
+                        join_keys.iter().cloned().collect();
+                    if let Some(old_rows) = old_rows {
+                        for old_row in old_rows.iter().flatten() {
+                            if let Some(Some(text)) = old_row.get(&from_col) {
+                                touched.insert(text.clone());
+                            }
+                        }
+                    }
+                    if let Some(changes) = changes {
+                        for change in changes {
+                            if let Some(group_key) = &change.group_key {
+                                touched.extend(group_key.iter().cloned());
+                            }
+                        }
+                    }
+                    if !touched.is_empty() {
+                        gen_bumps
+                            .entry(reldef.id)
+                            .or_insert_with(|| RelationshipGenBump {
+                                qualified_projection,
+                                key_col: to_col.clone(),
+                                touched_keys: std::collections::HashSet::new(),
+                            })
+                            .touched_keys
+                            .extend(touched);
+                    }
+                }
             }
             RelationshipCardinality::ToMany => {
+                let grouped = fetch_to_side_rows(pool, &to_table, &to_col, &join_keys).await?;
                 to_many_by_name.insert(
                     rel_name,
                     ToManyRelationship {
@@ -658,7 +856,1410 @@ pub(crate) async fn build_relationship_context(
         }
     }
 
-    Ok(RelationshipContext::new(by_name).with_to_many(to_many_by_name))
+    Ok((
+        RelationshipContext::new(by_name).with_to_many(to_many_by_name),
+        gen_bumps,
+    ))
+}
+
+// ---------------------------------------------------------------------
+// Issue #131, epic #127: the to-one reverse delta
+// ---------------------------------------------------------------------
+//
+// Design summary (see the plan doc's §2 "Reverse" and §7 Phase 1 steps 4-5,
+// and this function's own call site in `compute`'s `inbound_rels` loop):
+//
+// A parent (to-side) change to a to-one relationship no longer stages an
+// image-less from-side `Recompute` per touched from-side row (the pre-#131,
+// still-current behavior for to-*many* relationships — see the branch in
+// `compute` below). Instead it builds one [`RelationshipReverseRecord`] per
+// touched parent key, carrying the parent's own old/new image (already
+// folded — see this struct's doc comment for why no new ring plumbing is
+// needed to get that), a `prev_lsn`/`prev_gen` pair read live off the
+// settled parent projection at Phase 2 capture time, and (issue #132) `X`,
+// the source's write frontier captured in that same round trip. Phase 3
+// ([`apply_and_mark_drained_many`]'s "3d" step, [`check_reverse_guards`])
+// re-validates all four of #132's guards — (a) the watermark barrier, (b)
+// the generation check, (c) the in-flight check, and (d) #131's own
+// `prev_lsn` ordering check, re-read under the same `FOR UPDATE` lock as
+// (b) — then, for every aggregate target whose fields are fully invertible
+// and read only this one relationship
+// ([`ReverseRelationshipShape::aggregate_shapes`]), applies a true
+// subtract-old/add-new delta over the parent's from-side rows — reusing
+// `apply_aggregate`'s existing per-row contribution/delta-apply machinery
+// rather than reinventing it. Anything that mechanism can't cover (a 1-1
+// target, a `MIN`/`MAX` field, a definition reading more than one
+// relationship — see [`build_reverse_relationship_shape`]'s doc comment)
+// falls back to the pre-#131 image-less `Recompute`, unchanged — the same
+// fallback any of #132's four guards also uses when it rejects a record.
+
+/// One to-one relationship's reverse-delta shape (issue #131): everything
+/// Phase 3 needs to apply a [`RelationshipReverseRecord`] for this
+/// relationship, resolved once per relationship per `compute()` call (Phase
+/// 2, which has a `pool`) and shared, via `Arc`, by every parent key this
+/// batch's fold touched for it — Phase 3 holds no `pool`, only `txn` (see
+/// [`apply_and_mark_drained_many`]'s own doc comment), so nothing here can
+/// be re-derived once Phase 3 starts.
+#[derive(Debug)]
+pub(crate) struct ReverseRelationshipShape {
+    /// `relationship_definitions.id` — issue #134's deferred-reverse
+    /// persistence needs this to build
+    /// [`append::StagedChange::RelationshipReverseDeferred`]'s synthetic
+    /// fold identity (`relationship_reverse_deferred_src_table`) and its own
+    /// `relationship_id` column, and to look this shape back up
+    /// (`catalog::relationship_by_id`) on a later drain without re-deriving
+    /// it from anything else persisted.
+    id: i64,
+    /// Empty (`String::new()`) in the should-be-unreachable case where this
+    /// relationship has no projection row at all (#129 creates one
+    /// unconditionally at `create_relationship` time) — Phase 3 treats that
+    /// the same as an ordering-check miss for every record carrying this
+    /// shape, the same defensive posture [`build_relationship_context`]
+    /// takes for the identical gap on the forward path.
+    qualified_projection: String,
+    /// The projection's bare (unquoted) table name — `qualified_projection`
+    /// is already quoted/schema-qualified for direct SQL interpolation, so
+    /// the projection-advance step needs this separately to introspect
+    /// `information_schema.columns` (issue #131's own write path: which
+    /// data columns to copy off the parent's new image).
+    projection_table_bare: String,
+    /// The target schema `projection_table_bare` lives in — bare, for the
+    /// same `information_schema.columns` introspection.
+    target_schema: String,
+    to_col: String,
+    from_table: String,
+    from_col: String,
+    from_pk: PrimaryKeyColumn,
+    /// Fully-invertible, single-relationship aggregate targets reading this
+    /// relationship — the issue #131 fast (true-delta) path. See
+    /// [`build_reverse_relationship_shape`]'s doc comment for exactly which
+    /// definitions qualify.
+    aggregate_shapes: Vec<ReverseAggregateShape>,
+    /// Whether at least one definition on `from_table` referencing this
+    /// relationship is *not* covered by `aggregate_shapes` — a
+    /// `KeySpace::OneToOne` definition, an aggregate with a
+    /// `RecomputeOnly` field (`MIN`/`MAX`, or a composed expression), or an
+    /// aggregate reading more than one relationship. Every touched
+    /// from-side row still needs the pre-#131 image-less `Recompute`
+    /// treatment when this is `true`.
+    needs_recompute_fallback: bool,
+}
+
+/// One aggregate target's issue #131 fast-path shape: everything needed to
+/// turn a live-enumerated from-side row into a [`apply_aggregate::GroupPlan`]
+/// delta, without a live `JOIN` back to the to-side table (the parent's
+/// old/new *image* already has the value; see the module doc comment above).
+#[derive(Debug)]
+struct ReverseAggregateShape {
+    /// The target's fully-qualified identity
+    /// ([`crate::defs::model::Definition::target_table`]).
+    target: String,
+    /// An empty-`.groups` template — cloned fresh per [`RelationshipReverseRecord`]
+    /// this shape applies to (Phase 3 does not batch sibling records
+    /// touching the same target together; see that step's own doc comment
+    /// for why that's a documented, non-correctness-affecting
+    /// simplification). Built from the *original*, unrewritten definition
+    /// (`AggregateTargetPlan::new`'s usual construction) — its
+    /// `field_exprs`/`count_column_names` must match what
+    /// `create_aggregate_target_table` actually created, not this shape's
+    /// relationship-substituted evaluation form below.
+    template: AggregateTargetPlan,
+    /// `def`, relationship-substituted (every `RelationshipPath { rel:
+    /// <this relationship's name>, column }` rewritten to `Column(<synthetic
+    /// column name>)`, per `synthetic_columns`) and then
+    /// [`apply_aggregate::contribution_def`]'s `AVG`-as-`SUM` rewrite
+    /// applied on top — ready to hand [`apply_aggregate::row_contribution`]
+    /// directly, the same way `accumulate_changes` hands it its own
+    /// per-batch rewrite.
+    contribution_def: TransformDef,
+    /// `def`'s source-column type map, widened with one entry per synthetic
+    /// column (typed from the to-side column it stands in for).
+    source_columns: HashMap<String, ValueType>,
+    /// `(to_side_column, synthetic_column_name)` — how Phase 3 splices the
+    /// parent's old/new image into a live from-side row before evaluating
+    /// it (see [`augment_row_with_relationship_value`]).
+    synthetic_columns: Vec<(String, String)>,
+}
+
+/// One to-one relationship's parent-keyed reverse record (issue #131),
+/// built in `compute()` (Phase 2) from one already-folded [`FoldedChange`]
+/// on the relationship's own `to_table`, applied in Phase 3.
+///
+/// **No new ring/staging-kind plumbing was needed to get *this* far** — a
+/// deliberate, documented deviation from issue #131's own "what to actually
+/// do" checklist, which speculated a new [`StagedChange`] variant might be
+/// needed. It wasn't, for #131: the parent's own CDC rows are *already*
+/// folded, generically, by the existing [`fold::fold`]/
+/// [`fold::merge_folded_changes`] (any table's raw CDC rows for one key
+/// collapse to one [`FoldedChange`] — first old image, last new image,
+/// `lsn` the group's `GREATEST` — before `compute()` ever sees them), so "N
+/// parent changes for the same key in one batch fold to one record" falls
+/// out of machinery that already exists, for free, the same way it already
+/// does for every other table. The only genuinely new datum was `prev_lsn`,
+/// which #131's own derivation (confirmed against
+/// `ddl::PROJECTION_LSN_COLUMN`'s doc comment, written for #129/#130 ahead
+/// of #131 landing) is a **live read of the projection, taken once in
+/// Phase 2**, not something that needs to ride along a raw ring row.
+///
+/// Issue #134 *does* add a real persisted staging kind —
+/// [`StagedChange::RelationshipReverseDeferred`], its own `retry_count`
+/// field on this struct below, and `compute()`'s dedicated deferred-
+/// reconstruction loop (right after the by-source loop) — but only for the
+/// narrower case #131 deliberately deferred: a record that issue #132's
+/// guards *rejected* needs to be retried later without burning `hop_gen`,
+/// which does need to survive across a drain, unlike `prev_lsn`
+/// (re-derived live, same as #131 always did) or `prev_gen`/`watermark`
+/// (#132's additions, re-derived live the same way on a #134 retry —
+/// see [`StagedChange::RelationshipReverseDeferred`]'s own doc comment for
+/// why replaying either stale would be unsound). A record built fresh from
+/// raw CDC (this struct's other construction site) still needs no new ring
+/// plumbing at all, exactly as #131 established; only a *deferred* one
+/// does.
+///
+/// **Issue #132's additions** (guards (a)/(b), alongside #131's own
+/// `prev_lsn` for guard (d)): `prev_gen` and `watermark` are captured in the
+/// exact same Phase 2 round trip as `prev_lsn` (see
+/// [`capture_reverse_guard_state`]) rather than as separate reads — the
+/// issue's own "capture X in the same statement as the enumeration"
+/// requirement for guard (a), and the natural place to also capture guard
+/// (b)'s `gen` alongside guard (d)'s `lsn`, since both come off the exact
+/// same projection row.
+#[derive(Debug, Clone)]
+pub(crate) struct RelationshipReverseRecord {
+    shape: Arc<ReverseRelationshipShape>,
+    /// The parent's decoded pre-image row, or `None` for a parent INSERT.
+    old_row: Option<Row>,
+    /// The parent's decoded post-image row, or `None` for a parent DELETE.
+    new_row: Option<Row>,
+    /// The parent's raw pre-image JSON text (unparsed), mirroring
+    /// `new_image` below — `old_row`'s own decode source. Unlike
+    /// `new_image`, nothing in the pre-#134 apply path ever needed this
+    /// text form (the projection's delete half only needs `old_row`'s
+    /// *key*), so it went unstored until issue #134: a guard-rejected
+    /// record now needs to persist it verbatim into
+    /// [`append::StagedChange::RelationshipReverseDeferred::old_image`]
+    /// without re-serializing `old_row`.
+    old_image: Option<String>,
+    /// The parent's raw post-image JSON text (unparsed) — used by the
+    /// projection's own UPSERT, which leans on Postgres's
+    /// `jsonb_populate_record` to coerce JSON into the projection's real
+    /// column types rather than this crate re-deriving a per-column cast,
+    /// and (issue #134) by the guard-rejection deferral path for the same
+    /// reason `old_image` above is now stored.
+    new_image: Option<String>,
+    /// The folded change's own `GREATEST` `lsn` — this record's own
+    /// identity in the projection's LSN chain once it applies.
+    lsn: Option<PgLsn>,
+    /// The projection's `__trellis_lsn` as read live, in Phase 2, for
+    /// whichever of `old_row`/`new_row`'s key was available (preferring the
+    /// old key, the pre-this-batch identity) — see this struct's own doc
+    /// comment and [`ddl::PROJECTION_LSN_COLUMN`]'s for the chain this
+    /// forms. `None` when no projection row existed yet to read (a parent
+    /// INSERT, or the should-be-unreachable missing-projection case) —
+    /// Phase 3 treats that as "nothing to conflict with," not a miss.
+    ///
+    /// Guard (d) (#131's original stopgap, formalized as one of #132's four
+    /// guards): Phase 3 re-reads this same column under `FOR UPDATE` and
+    /// requires it still equal `prev_lsn` before applying.
+    prev_lsn: Option<PgLsn>,
+    /// Issue #132 guard (b): the projection row's [`ddl::PROJECTION_GEN_COLUMN`]
+    /// as read live, in Phase 2, alongside `prev_lsn` above (same query, same
+    /// row, same "taken once in Phase 2" shape) — `None` under the identical
+    /// conditions `prev_lsn` is `None` (no projection row yet). Phase 3
+    /// re-reads it under the same `FOR UPDATE` lock `prev_lsn`'s re-check
+    /// uses and requires it unchanged: a forward apply that resolved this
+    /// parent through the projection between Phase 2's capture and Phase 3's
+    /// apply bumps this column (`apply_and_mark_drained_many`'s "3c" step),
+    /// so a mismatch here means this reverse's enumeration may no longer
+    /// equal the parent's *applied* value.
+    prev_gen: Option<i64>,
+    /// Issue #132 guard (a): `X`, "the source's write frontier," captured in
+    /// the same Phase 2 statement as `prev_lsn`/`prev_gen` above (via
+    /// `pg_current_wal_lsn()` against the same connection). Phase 3 must not
+    /// apply this record until [`StagedWatermark::get`] reports intake has
+    /// staged everything committed at or before this value — see
+    /// `check_reverse_guards`'s guard (a) arm and this module's "Issue #131,
+    /// #132" doc section for why a lower/earlier capture is always safe (it
+    /// only makes the barrier easier, never wrongly permissive) while a
+    /// later one would not be.
+    watermark: PgLsn,
+    hop_gen: i32,
+    src_changed: Option<std::time::SystemTime>,
+    /// Issue #134: how many times this exact reverse (same relationship,
+    /// same parent key, same underlying transition) has already been
+    /// deferred by a guard rejection — `0` for a record built fresh from
+    /// raw parent CDC, or the persisted
+    /// [`append::StagedChange::RelationshipReverseDeferred::retry_count`]
+    /// for one reconstructed from a previously-deferred ring row. Never
+    /// derived from, or folded into, `hop_gen` above — see that field's own
+    /// migration/doc comment for why the two must stay independent.
+    retry_count: i32,
+}
+
+/// The synthetic source-column name [`build_reverse_relationship_shape`]
+/// substitutes for a `RelationshipPath { column, .. }` reference — the
+/// `__trellis_`-prefixed hidden-column convention
+/// [`ddl::PROJECTION_GEN_COLUMN`]'s doc comment already flags as carrying a
+/// (small, accepted) collision risk with a real source column, reused here
+/// for the same reason.
+fn synthetic_relationship_column(column: &str) -> String {
+    format!("__trellis_rev_{column}")
+}
+
+/// Issue #134: the synthetic `src_table` every
+/// [`append::StagedChange::RelationshipReverseDeferred`] for relationship
+/// `relationship_id` is staged under — see that variant's own doc comment
+/// for why it must be distinct from the relationship's real `to_table` (so
+/// this op's rows never fold, at the SQL fold's `(src_table, key)` grouping,
+/// with genuine CDC on the parent's real table, which would let them reach
+/// the ordinary per-source forward-evaluation loop and double-apply an
+/// already-forward-applied delta) and distinct *per relationship* (so two
+/// different relationships pointing at keys that happen to share text never
+/// fold together either). Prefixed with U+001F (INFORMATION SEPARATOR ONE),
+/// the same "no real qualified table name contains this" assumption
+/// [`append::TRUNCATE_SENTINEL_KEY`] already relies on — a real
+/// `information_schema`-qualified table name can't contain it.
+pub(crate) fn relationship_reverse_deferred_src_table(relationship_id: i64) -> String {
+    format!("\u{1f}trellis-rel-reverse-deferred:{relationship_id}")
+}
+
+/// Rewrites every `RelationshipPath { rel: <rel_name>, column }` in `expr`
+/// (recursing through `BinaryOp`/`FunctionCall`) to `Column(<synthetic
+/// column name>)` per `synthetic_columns`, in place. A `RelationshipPath`
+/// for a *different* relationship name is left untouched — for this
+/// module's own reverse-path caller, reaching one here at all means the
+/// caller already excluded this definition from the fast path (see
+/// [`build_reverse_relationship_shape`]'s multi-relationship fallback), so
+/// this function is never actually asked to resolve one there.
+///
+/// `pub(super)`: issue #136's forward aggregate delta path
+/// (`apply_aggregate::build_forward_relationship_shape`) reuses this
+/// directly rather than reimplementing it — this function has no
+/// reverse-specific assumption baked into its own signature (it takes a
+/// bare `rel_name`/`synthetic_columns` map, nothing about which direction
+/// the substitution serves), unlike [`synthetic_relationship_column`]'s
+/// naming convention, which the forward path deliberately does *not* reuse
+/// verbatim (see that path's own `forward_relationship_synthetic_column`
+/// for why: a forward plan can carry more than one relationship, unlike a
+/// reverse shape).
+pub(super) fn substitute_relationship_path(
+    expr: &mut Expr,
+    rel_name: &str,
+    synthetic_columns: &HashMap<String, String>,
+) {
+    match expr {
+        Expr::RelationshipPath { rel, column } if rel == rel_name => {
+            let synthetic = synthetic_columns
+                .get(column)
+                .cloned()
+                .unwrap_or_else(|| synthetic_relationship_column(column));
+            *expr = Expr::Column(synthetic);
+        }
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            substitute_relationship_path(lhs, rel_name, synthetic_columns);
+            substitute_relationship_path(rhs, rel_name, synthetic_columns);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                substitute_relationship_path(arg, rel_name, synthetic_columns);
+            }
+        }
+        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        Expr::RelationshipPath { .. } => {}
+    }
+}
+
+/// Builds `rel`'s [`ReverseRelationshipShape`] (issue #131) — the one-time,
+/// per-relationship, per-`compute()`-call catalog resolution every parent
+/// key this batch's fold touches for `rel` shares (see
+/// [`RelationshipReverseRecord`]'s doc comment).
+///
+/// **The design fork this issue's own report needs to flag prominently**:
+/// which definitions get the new true-delta fast path
+/// (`ReverseRelationshipShape::aggregate_shapes`) versus the pre-#131
+/// fallback (`needs_recompute_fallback`, i.e. an ordinary image-less
+/// `Recompute` staged for every touched from-side row, exactly as before
+/// this issue). A definition qualifies for the fast path **iff** all of:
+/// 1. It's a [`KeySpace::Aggregate`] definition (a `KeySpace::OneToOne`
+///    target has no additive semantics to delta at all — a from-side row's
+///    own target row is just re-derived outright, which is already O(one
+///    row), not the O(group) cost this epic targets — so 1-1 targets simply
+///    keep going through the old mechanism, unchanged).
+/// 2. Every field [`apply_aggregate::classify_fields`] classifies is
+///    invertible (`Sum`/`Avg`/`Count`) — a `RecomputeOnly` field
+///    (`MIN`/`MAX`, or a composed expression) has no per-row delta at all by
+///    construction, so a definition with even one such field falls back
+///    whole (not just that one field) to keep this issue's scope tractable;
+///    a future pass could split a target's fields between the two
+///    mechanisms.
+/// 3. It references **exactly this one relationship** — a definition
+///    reading two different to-one relationships needs the *other* one's
+///    current value resolved too (a second projection read) to evaluate a
+///    contribution at all, which this issue does not implement; it falls
+///    back rather than silently mis-evaluating.
+async fn build_reverse_relationship_shape(
+    pool: &Pool,
+    rel: &RelationshipDefinition,
+) -> Result<ReverseRelationshipShape, ApplyError> {
+    let projection = catalog::relationship_projection(pool, rel.id).await?;
+    let (qualified_projection, projection_table_bare) = match projection {
+        Some(p) => (
+            ddl::qualified_relationship_projection_table(pool.target_schema(), &p.projection_table),
+            p.projection_table,
+        ),
+        None => {
+            tracing::error!(
+                relationship = %rel.def.name,
+                to_table = %rel.def.to_table,
+                "to-one relationship has no settled parent projection; every \
+                 reverse record for it will be treated as an ordering-check \
+                 miss (should be unreachable — #129 creates one unconditionally)"
+            );
+            (String::new(), String::new())
+        }
+    };
+    let target_schema = pool.target_schema().to_string();
+    let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
+    // `transforms_for_source` matches `schema_nodes.table_name` exactly
+    // (ADR-0007's fully-qualified keying) and every SQL-emitting site below
+    // (`AggregateTargetPlan::source`, `from_side_rows_for_join_txn`'s
+    // `ddl::qualified_source_table`) documents the same requirement — unlike
+    // `source_primary_key` above (a `to_regclass` resolution that already
+    // tolerates a bare name via `search_path`), so this shape stores the
+    // qualified form of `from_table` throughout, not `rel.def.from_table`
+    // verbatim (which the to-many arm elsewhere in this module can get away
+    // with, since it only ever feeds `source_primary_key`/
+    // `from_side_keys_for_join`).
+    let qualified_from_table = qualified_schema_node_key(pool, &rel.def.from_table).await?;
+    let defs = catalog::transforms_for_source(pool, &qualified_from_table).await?;
+
+    let mut aggregate_shapes = Vec::new();
+    let mut needs_recompute_fallback = false;
+
+    for def in &defs {
+        let refs = eval::relationship_references(&def.def);
+        let rel_refs: Vec<&(String, String)> = refs
+            .iter()
+            .filter(|(name, _)| name == &rel.def.name)
+            .collect();
+        if rel_refs.is_empty() {
+            continue;
+        }
+        let distinct_rels: std::collections::HashSet<&str> =
+            refs.iter().map(|(name, _)| name.as_str()).collect();
+
+        let KeySpace::Aggregate { group_by } = &def.def.key_space else {
+            // KeySpace::OneToOne — design fork 1, see this function's doc
+            // comment.
+            needs_recompute_fallback = true;
+            continue;
+        };
+        if distinct_rels.len() > 1 {
+            // Design fork 3.
+            needs_recompute_fallback = true;
+            continue;
+        }
+
+        let relationships = catalog::resolve_relationships(pool, &def.def).await?;
+        let substituted_exprs = crate::defs::backfill::substituted_field_exprs(&def.def)?;
+        let field_plans = apply_aggregate::classify_fields(
+            &def.def,
+            group_by,
+            &def.source_columns,
+            &substituted_exprs,
+            &relationships,
+        )?;
+        if field_plans
+            .iter()
+            .any(|f| f.kind == apply_aggregate::AggFieldKind::RecomputeOnly)
+        {
+            // Design fork 2.
+            needs_recompute_fallback = true;
+            continue;
+        }
+
+        let group_by_types: Vec<ValueType> = group_by
+            .iter()
+            .map(|c| {
+                def.source_columns
+                    .get(c)
+                    .copied()
+                    .unwrap_or(ValueType::Numeric)
+            })
+            .collect();
+        let field_exprs: HashMap<String, Expr> = substituted_exprs
+            .into_iter()
+            .filter(|(name, _)| !group_by.contains(name))
+            .collect();
+        let template = AggregateTargetPlan::new(
+            group_by.clone(),
+            group_by_types,
+            field_plans,
+            qualified_from_table.clone(),
+            def.target_table.clone(),
+            field_exprs,
+            // No live JOIN needed: the triggering relationship's value comes
+            // from the parent's old/new image via a synthetic column below,
+            // not a SQL join back to the to-side table — and design fork 3
+            // already ruled out any *other* relationship reference reaching
+            // here.
+            Vec::new(),
+        );
+
+        let mut synthetic_columns = Vec::new();
+        let mut synthetic_map = HashMap::new();
+        let mut source_columns = def.source_columns.clone();
+        for (_, column) in &rel_refs {
+            if synthetic_map.contains_key(column.as_str()) {
+                continue;
+            }
+            let synthetic = synthetic_relationship_column(column);
+            let value_type = relationships
+                .get(&rel.def.name)
+                .and_then(|r| r.column_types.get(column))
+                .copied()
+                .unwrap_or(ValueType::Text);
+            source_columns.insert(synthetic.clone(), value_type);
+            synthetic_columns.push((column.clone(), synthetic.clone()));
+            synthetic_map.insert(column.clone(), synthetic);
+        }
+        let mut rewritten = def.def.clone();
+        for field in &mut rewritten.fields {
+            substitute_relationship_path(&mut field.expr, &rel.def.name, &synthetic_map);
+        }
+        let contribution_def = apply_aggregate::contribution_def(&rewritten);
+
+        aggregate_shapes.push(ReverseAggregateShape {
+            target: def.target_table.clone(),
+            template,
+            contribution_def,
+            source_columns,
+            synthetic_columns,
+        });
+    }
+
+    Ok(ReverseRelationshipShape {
+        id: rel.id,
+        qualified_projection,
+        projection_table_bare,
+        target_schema,
+        to_col: rel.def.to_col.clone(),
+        from_table: qualified_from_table,
+        from_col: rel.def.from_col.clone(),
+        from_pk,
+        aggregate_shapes,
+        needs_recompute_fallback,
+    })
+}
+
+/// The `to_col` text value off `row`, or `None` if `row` is absent or the
+/// column is (an absent column and a genuine SQL `NULL` are both "no key
+/// here" for join purposes).
+fn relationship_key_text(row: &Option<Row>, to_col: &str) -> Option<String> {
+    row.as_ref().and_then(|r| r.get(to_col)).cloned().flatten()
+}
+
+/// The Phase 2 capture behind three of #132's four guards — [`prev_lsn`],
+/// [`prev_gen`], and [`watermark`] (guard (d)'s ordering check, guard (b)'s
+/// generation check, and guard (a)'s watermark barrier, respectively; see
+/// [`RelationshipReverseRecord`]'s doc comment for each field's role in
+/// Phase 3).
+///
+/// [`prev_lsn`]: ReverseCapture::prev_lsn
+/// [`prev_gen`]: ReverseCapture::prev_gen
+/// [`watermark`]: ReverseCapture::watermark
+struct ReverseCapture {
+    prev_lsn: Option<PgLsn>,
+    prev_gen: Option<i64>,
+    watermark: PgLsn,
+}
+
+/// Live-reads the settled parent projection's current
+/// [`ddl::PROJECTION_LSN_COLUMN`]/[`ddl::PROJECTION_GEN_COLUMN`] for `key`,
+/// **and** captures guard (a)'s `X` — `pg_current_wal_lsn()`, "the source's
+/// write frontier" — in the very same statement, per the issue's own
+/// requirement (`select ..., pg_current_wal_lsn() from <projection> where
+/// ...`), not as a separate round trip. A plain, unlocked read taken once in
+/// Phase 2; Phase 3 (`apply_and_mark_drained_many`'s "3d" step,
+/// `check_reverse_guards`) re-validates `prev_lsn`/`prev_gen` under `FOR
+/// UPDATE` and re-checks the watermark against the live
+/// [`StagedWatermark`].
+///
+/// `prev_lsn`/`prev_gen` are both `None` when `qualified_projection` is
+/// empty (the should-be-unreachable no-projection case), `key` is `None`
+/// (defensive — every record reaching this point has at least one of
+/// old/new key, per `compute`'s own "both images absent" skip, but this
+/// function does not assume that), or no projection row exists yet for
+/// `key` (a parent that's about to be INSERTed) — in every such case this
+/// still issues a bare `select pg_current_wal_lsn()` so `watermark` is
+/// always populated: guard (a) applies to every reverse record, including a
+/// parent insert, not only ones with an existing projection row.
+async fn capture_reverse_guard_state(
+    pool: &Pool,
+    qualified_projection: &str,
+    to_col: &str,
+    key: Option<&str>,
+) -> Result<ReverseCapture, ApplyError> {
+    let client = pool.get().await?;
+    if let (Some(key), false) = (key, qualified_projection.is_empty()) {
+        let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
+        let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
+        let key_ident = quote_ident(to_col);
+        let row = client
+            .query_opt(
+                &format!(
+                    "select {lsn_ident}, {gen_ident}, pg_current_wal_lsn() \
+                     from {qualified_projection} where {key_ident}::text = $1"
+                ),
+                &[&key],
+            )
+            .await?;
+        if let Some(row) = row {
+            return Ok(ReverseCapture {
+                prev_lsn: row.get(0),
+                prev_gen: row.get(1),
+                watermark: row.get(2),
+            });
+        }
+    }
+    let row = client.query_one("select pg_current_wal_lsn()", &[]).await?;
+    Ok(ReverseCapture {
+        prev_lsn: None,
+        prev_gen: None,
+        watermark: row.get(0),
+    })
+}
+
+// ---------------------------------------------------------------------
+// Issue #131, epic #127: Phase 3 helpers for the reverse-delta apply
+// ---------------------------------------------------------------------
+
+/// Live-enumerates `from_table`'s rows whose `from_col` matches `join_key`,
+/// full row images, inside the already-locked Phase 3 transaction —
+/// [`apply_and_mark_drained_many`]'s "3d" step's from-side enumeration.
+///
+/// **This reads live state** — safe only because [`check_reverse_guards`]
+/// (issue #132) has already run, immediately before every call site below,
+/// and proven the live state *equals* the applied one for the specific
+/// join key(s) this call is about to read: guard (a) (the watermark
+/// barrier) plus guard (c) (the in-flight check) together prove nothing
+/// committed at or before this record's captured `X` is still mid-flight
+/// for these keys, and guards (b)/(d) prove no forward apply or
+/// out-of-order sibling reverse landed between Phase 2's enumeration and
+/// this transaction's lock. Before #132, this doc comment flagged that gap
+/// as open; it is now closed by every caller's own guard check, not by
+/// anything in this function itself — this function still does nothing on
+/// its own to enforce it, so a *new* caller added later must run the guard
+/// check first too.
+async fn from_side_rows_for_join_txn(
+    txn: &Transaction<'_>,
+    from_table: &str,
+    from_col: &str,
+    from_pk: &PrimaryKeyColumn,
+    join_key: &str,
+) -> Result<Vec<(String, Row)>, ApplyError> {
+    let sql = format!(
+        "select m.k, e.key, e.value \
+         from (select {pk}::text as k, to_jsonb(t.*) as doc from {tbl} t \
+               where {col}::text = $1) m \
+         cross join lateral jsonb_each_text(m.doc) e",
+        pk = quote_ident(&from_pk.name),
+        col = quote_ident(from_col),
+        tbl = ddl::qualified_source_table(from_table),
+    );
+    let db_rows = txn.query(&sql, &[&join_key]).await?;
+    let mut rows: HashMap<String, Row> = HashMap::new();
+    for db_row in db_rows {
+        let key: String = db_row.get(0);
+        let field: String = db_row.get(1);
+        let value: Option<String> = db_row.get(2);
+        rows.entry(key).or_default().insert(field, value);
+    }
+    Ok(rows.into_iter().collect())
+}
+
+// ---------------------------------------------------------------------
+// Issue #132, epic #127: the four guards
+// ---------------------------------------------------------------------
+//
+// See the plan doc's §2 guard table and this module's own "Issue #131,
+// epic #127" section above for the mechanism these formalize. All four are
+// checked together, in [`check_reverse_guards`], as one Phase 3 step per
+// [`RelationshipReverseRecord`] — a failure on any one of them gets the
+// exact same treatment: no target/projection write for this record, defer
+// and re-stage it as a [`StagedChange::RelationshipReverseDeferred`] for a
+// later drain to retry (issue #134) — see that variant's own doc comment,
+// and the guard-rejection branch of `apply_and_mark_drained_many`'s "3d"
+// step, for the mechanism. Before #134 landed, every rejection fell back to
+// re-staging its from-side rows as an image-less `Recompute` at
+// `hop_gen + 1` instead (the same stopgap #131 shipped for guard (d) alone,
+// then shared by all four for #132/#133) — replaced outright, not kept as
+// a fallback of its own.
+
+/// Which of #132's four guards rejected a [`RelationshipReverseRecord`] —
+/// carried only as far as the `tracing::warn!` in
+/// [`apply_and_mark_drained_many`]'s "3d" step; every rejection gets
+/// identical treatment downstream (the Recompute-fallback stopgap), so nothing
+/// else branches on which variant fired. A typed enum rather than a bare
+/// `&'static str` purely so a future metrics/observability pass (the plan
+/// doc's Phase 1 step 7 flags exactly this need — "the deferral counters
+/// should become engine metrics") has something to match on without
+/// re-parsing a log message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReverseGuardFailure {
+    /// Guard (a): intake has not yet staged everything committed at or
+    /// before this record's captured watermark `X`.
+    Watermark,
+    /// Guard (b): the projection row's `__trellis_gen` moved since Phase 2's
+    /// capture — a forward apply landed in between.
+    Generation,
+    /// Guard (c): a staged from-side change for this parent's old/new join
+    /// key, committed at or before `X`, is still undrained.
+    InFlight,
+    /// Guard (d): the projection row's `__trellis_lsn` no longer matches
+    /// this record's `prev_lsn` — an out-of-order sibling reverse (or this
+    /// same one, replayed) already advanced it, or moved it out from under
+    /// this one.
+    Ordering,
+}
+
+impl fmt::Display for ReverseGuardFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ReverseGuardFailure::Watermark => "watermark barrier (guard a)",
+            ReverseGuardFailure::Generation => "generation check (guard b)",
+            ReverseGuardFailure::InFlight => "in-flight check (guard c)",
+            ReverseGuardFailure::Ordering => "per-parent ordering (guard d)",
+        };
+        f.write_str(s)
+    }
+}
+
+impl ReverseGuardFailure {
+    /// The [`crate::metrics::increment_relationship_reverse_deferred`]
+    /// label this guard's rejection records under (issue #134/#135) — the
+    /// plan doc's own `d5_block_*` names (§7 step 7's "the deferral
+    /// counters (`d5_block_*`) should become engine metrics"), used
+    /// verbatim as label *values* on one counter rather than as four
+    /// separate metric names, matching this crate's existing
+    /// one-metric-plus-label convention (`transform`, `state`, ...).
+    pub(crate) fn metric_label(self) -> &'static str {
+        match self {
+            ReverseGuardFailure::Watermark => "d5_block_barrier",
+            ReverseGuardFailure::Generation => "d5_block_gen",
+            ReverseGuardFailure::InFlight => "d5_block_inflight",
+            ReverseGuardFailure::Ordering => "d5_block_order",
+        }
+    }
+}
+
+/// Guard (c) (plan doc §2; the guard measured to do most of the correctness
+/// work, 1174/3000 ablation runs corrupted without it): "is there a staged
+/// change on `from_table`, matching any of `keys` via `from_col` against
+/// either its `old_image` or `new_image`, committed (`lsn`) at or before
+/// `watermark_x`, that hasn't drained yet?"
+///
+/// "Hasn't drained yet" mirrors [`converge::converged_through`]'s own
+/// condition 3 (a row is pending if its owning segment's `state <>
+/// 'drained'`, or — the straggler case — the segment *is* `'drained'` but
+/// this particular row landed after that segment's own fence snapshot was
+/// captured, so the segment's completion never actually scanned it): scoped
+/// here to one `src_table`/join-key/`lsn` predicate instead of
+/// `converged_through`'s whole-token one, and, unlike that predicate, this
+/// one has no need to special-case the *active* slot for query-plan reasons
+/// — every physical ring row this predicate can even match already carries
+/// a concrete `lsn <= watermark_x`, so a plain per-table `exists` (rather
+/// than `converged_through`'s `min(origin_lsn)` optimization for the
+/// continuously-growing active slot) is cheap regardless of which slot is
+/// active. The active slot's own `segments` row always has `state =
+/// 'active'`, which is `<> 'drained'`, so it falls out of the same `exists`
+/// clause with no separate arm needed.
+///
+/// Only `op in ('insert', 'update', 'delete')` rows can match at all — a
+/// `Recompute` row carries no images (`old_image`/`new_image` both `NULL`,
+/// so `->> from_col` is `NULL` either way) and a `Truncate` row is
+/// key-less — so the explicit `op` filter is redundant with that but kept
+/// for readability. Deliberately does not special-case a `Truncate` on
+/// `from_table` itself (out of scope for this issue — see the module's own
+/// "what to actually do" list's to-many/`rel_joins` exclusion, and no
+/// existing test exercises a to-one relationship's from-side table being
+/// truncated mid-flight).
+async fn from_side_change_in_flight(
+    txn: &Transaction<'_>,
+    from_table: &str,
+    from_col: &str,
+    keys: &[&str],
+    watermark_x: PgLsn,
+) -> Result<bool, ApplyError> {
+    if keys.is_empty() {
+        return Ok(false);
+    }
+    let arms = converge::per_ring_table(" union all ", |slot, table| {
+        format!(
+            "select 1 from {table} r \
+             where r.src_table = $1 \
+               and r.op in ('insert', 'update', 'delete') \
+               and r.lsn <= $2 \
+               and (r.old_image ->> $3 = any($4::text[]) \
+                    or r.new_image ->> $3 = any($4::text[])) \
+               and exists ( \
+                   select 1 from segments s \
+                   where s.ring_slot = {slot} \
+                     and (s.state <> 'drained' \
+                          or (s.fence_snapshot is not null \
+                              and not pg_visible_in_snapshot(r.row_txid, s.fence_snapshot))) \
+               )"
+        )
+    });
+    let sql = format!("select exists ({arms})");
+    let row = txn
+        .query_one(&sql, &[&from_table, &watermark_x, &from_col, &keys])
+        .await?;
+    Ok(row.get(0))
+}
+
+/// Issue #134 review follow-up: the fast (`diff_pass`) aggregate delta
+/// path's own, *additional* precondition — stricter than, and checked
+/// independently of, guard (c) above (which still governs the plain
+/// apply-or-defer decision, unchanged, per #132's own ablation proof that
+/// its current "still undrained" shape is load-bearing for *that*
+/// question).
+///
+/// **The hazard this closed** (confirmed by an independent review
+/// reproduction against the shipped, unmodified #134 commit — real, not
+/// retry-specific): `apply_aggregate::accumulate_changes`'s
+/// `force_every_group` path (`rel_joins` non-empty) used to do a **live**,
+/// full group recompute, via a direct SQL join back to the relationship's
+/// to-side table, whenever *any* sibling from-side row's own forward CDC was
+/// evaluated — completely independent of, and invisible to, this
+/// relationship's settled-parent-projection/guard machinery (it never read
+/// the projection, and critically it never bumped
+/// [`ddl::PROJECTION_GEN_COLUMN`] the way the projection-based forward path
+/// does — see [`RelationshipGenBump`]'s own doc comment). If a sibling's own
+/// drain ran `force_every_group` for this same group *after* `old_row` was
+/// true but *before* this reverse's `diff_pass` got to apply, the group's
+/// stored value could already equal what `diff_pass` was about to *add on
+/// top of* — a real double-correction, confirmed to reproduce **on a
+/// genuinely first attempt** (`retry_count == 0`), not just a retried one:
+/// `retry_count > 0` alone (this module's other guard-rejection-specific
+/// restriction) was too narrow, since guard (c) itself can genuinely find
+/// nothing in flight — the racing sibling may have already fully drained —
+/// and let a first attempt straight into the same trap.
+///
+/// **Issue #136 (epic #127) deleted `force_every_group` outright** — an
+/// ordinary sibling forward touch to a relationship-reading aggregate now
+/// always resolves through the same settled-parent-projection/guard
+/// machinery this function protects (`apply_aggregate::build_forward_relationship_shape`,
+/// wired from this module's own `build_relationship_context` call in the
+/// aggregate branch of `compute`), so the specific live-read race this
+/// function was built for is no longer reachable through an ordinary CDC
+/// row at all. This function's own CDC-row scan below is left unchanged
+/// regardless: it has no way to know *why* a matching sibling row exists
+/// (a safe post-#136 delta application, or some other cause), so it still
+/// conservatively routes to the fallback on any match — safe (the fallback
+/// is always correct), just more conservative than strictly necessary for
+/// that one now-closed case. Tightening this to distinguish the two is a
+/// possible follow-up, not attempted here (out of #136's own scope, and
+/// this function still has genuine, narrower value below independent of
+/// that hazard — see "What this checks" and "What it does *not* close").
+///
+/// **What this checks, and its own limits.** Unlike guard (c) (scoped to
+/// rows still `state <> 'drained'`), this scans every physical ring row —
+/// staged, in-flight, *or already drained* — matching `keys` via
+/// `from_col`, with `lsn` in `(since_lsn, watermark_x]` (an *exclusive*
+/// lower bound: `since_lsn` is `record.prev_lsn`, the projection's
+/// already-known-good position as of Phase 2's capture — anything at or
+/// before it is already accounted for; `None` means "no prior projection
+/// row" — a parent INSERT — so *every* matching row counts, since there is
+/// no "before" era to bound against). This catches the same-batch and
+/// recently-drained-but-not-yet-retired cases — the realistic shape of
+/// this hazard, and the only shape this module's own tests (this issue's
+/// retry scenarios, and every existing #131/#132/#133 positive-path test)
+/// can exercise without deliberately engineering ring retirement into the
+/// gap.
+///
+/// **What it does *not* close**: a sibling whose ring evidence has already
+/// been *retired* (`retire::retire_drained_segments` truncates the whole
+/// physical slot once every older batch has drained) before this check
+/// runs leaves no trace here to find — this function can only see what the
+/// ring still holds.
+///
+/// **Post-#136, that residual gap is closed for the ordinary delta-path
+/// case by guard (b), not by this function.** `check_reverse_guards` (guard
+/// (b) in particular) always runs *before* this function is ever reached —
+/// see this step's own call site — and now that the aggregate branch of
+/// `compute` bumps `__trellis_gen` via `build_relationship_context` the same
+/// way the `KeySpace::OneToOne` branch always did (see this issue's own
+/// comment on that call site), any sibling forward delta that touched this
+/// parent — retired ring evidence or not, since a generation counter, unlike
+/// a ring row, is never erased by retirement — already failed guard (b) and
+/// never reaches this function at all. What remains genuinely unclosed is
+/// narrower and pre-existing (not introduced or widened by #136): an
+/// image-less-recompute-triggered [`apply_aggregate::GroupPlan::force_full_recompute`]
+/// (backfill, definition re-derive, or reverse propagation's own fallback —
+/// see `apply_aggregate`'s module doc comment) still recomputes via a live
+/// `JOIN` and still never bumps `gen`, so a retired *and* image-less-forced
+/// sibling could still race undetected by either guard (b) or this
+/// function's own ring scan. Not fixed here — the image-less/forced path is
+/// explicitly out of #136's scope (see that issue), and closing this sliver
+/// would need the same "bump gen from inside the bulk recompute" follow-up
+/// this comment used to describe for the pre-#136 case generally.
+async fn relationship_fast_path_precondition_holds(
+    txn: &Transaction<'_>,
+    from_table: &str,
+    from_col: &str,
+    keys: &[&str],
+    since_lsn: Option<PgLsn>,
+    watermark_x: PgLsn,
+) -> Result<bool, ApplyError> {
+    if keys.is_empty() {
+        return Ok(true);
+    }
+    let arms = converge::per_ring_table(" union all ", |_slot, table| {
+        format!(
+            "select 1 from {table} r \
+             where r.src_table = $1 \
+               and r.op in ('insert', 'update', 'delete') \
+               and r.lsn <= $2 \
+               and ($5::pg_lsn is null or r.lsn > $5) \
+               and (r.old_image ->> $3 = any($4::text[]) \
+                    or r.new_image ->> $3 = any($4::text[]))"
+        )
+    });
+    let sql = format!("select exists ({arms})");
+    let row = txn
+        .query_one(
+            &sql,
+            &[&from_table, &watermark_x, &from_col, &keys, &since_lsn],
+        )
+        .await?;
+    let anything_found: bool = row.get(0);
+    Ok(!anything_found)
+}
+
+/// Checks all four of #132's guards for one [`RelationshipReverseRecord`],
+/// inside the already-open Phase 3 `txn` — [`apply_and_mark_drained_many`]'s
+/// "3d" step's single "may this record's delta apply?" decision, replacing
+/// #131's own inline guard-(d)-only check. Cheapest/most-locking-averse
+/// first: guard (a) is a bare in-memory comparison (no SQL at all), so it
+/// short-circuits before this function ever touches the projection row;
+/// guards (b)/(d) share the one `FOR UPDATE` read #131 already took (adding
+/// `__trellis_gen` to its `SELECT` list, not a second query); guard (c) —
+/// the most expensive, a ring scan — runs last, only once the cheaper three
+/// have already passed.
+///
+/// **Locking discipline** (the issue's own "Locking" section): this
+/// function's `FOR UPDATE` on the projection row is the *reverse* side of
+/// "a forward apply touching a parent takes `FOR SHARE`... a reverse takes
+/// `FOR UPDATE`." The forward side is `apply_and_mark_drained_many`'s "3c"
+/// step's `UPDATE ... SET gen = gen + 1 WHERE key = ANY(...)` — an `UPDATE`
+/// already takes the same exclusive row lock `FOR UPDATE` would (Postgres's
+/// row-level locking has no weaker mode an `UPDATE` could take instead), so
+/// no separate explicit `SELECT ... FOR SHARE` is needed there: the
+/// `UPDATE` itself *is* the serializing lock. That is what makes this
+/// function's guard (b) re-check meaningful rather than racy — a
+/// concurrent forward apply's gen-bump `UPDATE` and this reverse's `FOR
+/// UPDATE` read can never interleave mid-row; whichever transaction gets
+/// there first blocks the other until it commits or rolls back, so by the
+/// time this `SELECT ... FOR UPDATE` returns, it has either (a) landed
+/// before any concurrent forward apply touched this row (nothing to
+/// detect — `prev_gen` still matches) or (b) waited for that forward
+/// apply's `UPDATE` to commit and then observed its bumped `gen` (guard (b)
+/// correctly fails). There is no third interleaving.
+///
+/// Returns `Ok(None)` when every guard passes. Returns `Ok(Some(failure))`
+/// naming the *first* guard that didn't — never more than one, since guard
+/// evaluation stops at the first failure (there is nothing further to learn
+/// from checking the rest once this record is already going to the
+/// fallback path).
+async fn check_reverse_guards(
+    txn: &Transaction<'_>,
+    shape: &ReverseRelationshipShape,
+    record: &RelationshipReverseRecord,
+    old_key: &Option<String>,
+    new_key: &Option<String>,
+    watermark: &StagedWatermark,
+) -> Result<Option<ReverseGuardFailure>, ApplyError> {
+    // Guard (a): watermark barrier. A bare in-memory read — no SQL, no
+    // lock — so this always runs first.
+    if watermark.get() < record.watermark {
+        return Ok(Some(ReverseGuardFailure::Watermark));
+    }
+
+    // Guards (b)/(d): one row-locked read of the projection, shared between
+    // both — see this function's own doc comment on why the lock this takes
+    // is what makes guard (b) sound rather than racy.
+    let lock_key = old_key.as_deref().or(new_key.as_deref());
+    let (current_lsn, current_gen): (Option<Option<PgLsn>>, Option<Option<i64>>) = match lock_key {
+        Some(key) if !shape.qualified_projection.is_empty() => {
+            let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
+            let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
+            let key_ident = quote_ident(&shape.to_col);
+            let row = txn
+                .query_opt(
+                    &format!(
+                        "select {lsn_ident}, {gen_ident} from {} \
+                         where {key_ident}::text = $1 for update",
+                        shape.qualified_projection,
+                    ),
+                    &[&key],
+                )
+                .await?;
+            match row {
+                Some(row) => (Some(row.get(0)), Some(row.get(1))),
+                None => (None, None),
+            }
+        }
+        _ => (None, None),
+    };
+
+    // Guard (b): a missing projection row (a parent about to be INSERTed,
+    // or the should-be-unreachable no-projection case) has no `gen` to have
+    // moved — nothing to conflict with, always passes, same posture guard
+    // (d) already took for this case pre-#132.
+    let gen_ok = match current_gen {
+        None => true,
+        Some(current) => current == record.prev_gen,
+    };
+    if !gen_ok {
+        return Ok(Some(ReverseGuardFailure::Generation));
+    }
+
+    // Guard (d): #131's original stopgap, unchanged in substance, now one
+    // arm of this unified check.
+    let ordering_ok = match current_lsn {
+        None => true,
+        Some(current) => current == record.prev_lsn,
+    };
+    if !ordering_ok {
+        return Ok(Some(ReverseGuardFailure::Ordering));
+    }
+
+    // Guard (c): the in-flight check, last (most expensive) and only once
+    // (a) captured X, (b) the gen, and (d) the ordering have all already
+    // passed — the from-side child rows a from-side change touching either
+    // `old_key` or `new_key`, deduped so an ordinary same-key attribute
+    // update (`old_key == new_key`) doesn't scan the same key twice.
+    //
+    // **Resolved by #133, on the plan doc's §3.1 fold-erasure finding**
+    // ("post 3 appears in neither folded image" when a from-side row is
+    // inserted then re-pointed within the same batch): that finding was
+    // about guard (b) specifically — `RelationshipGenBump` used to be
+    // resolved purely from the *folded* view (`compute`'s per-def
+    // evaluation), so a parent key an intermediate, erased image touched
+    // never got its projection row's `gen` bumped at all, and guard (b)'s
+    // re-check couldn't detect a conflict that never bumped anything.
+    // `build_relationship_context` now also unions in each touched change's
+    // `FoldedChange::group_key` — the real, pre-fold union of touched
+    // join keys the ring carries precisely for this (see that field's and
+    // `staging::fold`'s doc comments for the merge rule) — so the erased
+    // parent's `gen` does bump, and guard (b) alone now catches the
+    // scenario. See `tests/apply_relationship_reverse.rs`'s
+    // `issue_133_a_within_batch_repoint_still_bumps_the_erased_intermediate_parents_gen`
+    // for the dedicated regression pin this comment used to ask for.
+    //
+    // `from_side_change_in_flight` below still independently scans the
+    // **raw** ring rows directly (`seg_N`'s physical rows, one per raw CDC
+    // change, never mutated by the fold — only `claim`/`fold`'s *read-time*
+    // collapsing ever loses the intermediate image) for the same erased
+    // touch, so it also catches it — but only as long as the erasing batch
+    // is still undrained when this check runs (see the doc comment history
+    // in git blame for the exact "once that batch fully drains, there is
+    // nothing left in the ring for this scan to find" reasoning this guard
+    // used to have to lean on alone). With #133 landed, guard (c) catching
+    // it too is redundant-but-harmless defense in depth, not the only
+    // safety net for this scenario anymore.
+    let mut keys: Vec<&str> = Vec::with_capacity(2);
+    if let Some(k) = old_key.as_deref() {
+        keys.push(k);
+    }
+    if let Some(k) = new_key.as_deref()
+        && Some(k) != old_key.as_deref()
+    {
+        keys.push(k);
+    }
+    if from_side_change_in_flight(
+        txn,
+        &shape.from_table,
+        &shape.from_col,
+        &keys,
+        record.watermark,
+    )
+    .await?
+    {
+        return Ok(Some(ReverseGuardFailure::InFlight));
+    }
+
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------
+// Issue #135, epic #127: fairness escalation — starvation freedom for the
+// reverse retry loop
+// ---------------------------------------------------------------------
+//
+// **The problem.** Every guard-rejected [`RelationshipReverseRecord`] is
+// deferred and retried later (issue #134). Under sustained from-side churn
+// on one hot parent — children being inserted/updated/re-pointed onto it
+// continuously, faster than one drain cycle settles — that retry loop can
+// fail forever, for two independent, structural reasons, not merely bad
+// luck:
+//
+// * **Guard (c) (in-flight).** A batch's own from-side writes are staged
+//   into segments that are `state = 'draining'` (not yet `'drained'`) until
+//   *this same transaction*'s step 5, which runs *after* step 3d's guard
+//   check. So a reverse co-batched with any of its own parent's children
+//   sees them as "still undrained" on the very first attempt, by
+//   construction — not a race, a guarantee. Retrying buys nothing if the
+//   *next* batch also contains fresh children for the same hot parent, which
+//   sustained churn guarantees it will.
+// * **Guard (b) (generation).** Step 3c bumps a parent's projection `gen` on
+//   *every* batch whose forward evaluation resolves that parent for any
+//   child — regardless of whether the child's own value changed. Under
+//   sustained churn this fires on essentially every batch touching the
+//   parent's children, so the window between Phase 2's live capture and
+//   Phase 3's `FOR UPDATE` recheck is very likely to contain at least one
+//   bump whenever concurrent apply workers are active.
+//
+// Both are driven by the *children's* own ordinary traffic, not by the
+// parent itself changing repeatedly — the parent's own to-side row may have
+// changed exactly once. That rules out any fix that tries to catch a quiet
+// instant, since sustained churn need never produce one.
+//
+// **The issue's own sketch, and why it isn't the mechanism below.** The
+// issue proposed a persisted "hold" that blocks *new* forward applies for a
+// parent once its reverse has deferred N times, until the in-flight set
+// drains to empty. Worked through concretely, this does not hold up:
+//
+// 1. Guard (c)'s own query treats *any* non-`'drained'` segment — including
+//    the still-open *active* segment nothing has even claimed yet — as
+//    in-flight. "Blocking" a child's forward apply by simply not processing
+//    it leaves its row sitting in exactly such a segment, still in-flight,
+//    forever. That is the priority-inversion the issue itself named:
+//    holding children back to protect the parent's reverse would keep the
+//    in-flight set the reverse is waiting on non-empty *by the hold's own
+//    action* — a self-inflicted deadlock, not a fix.
+// 2. Even granting some other way to "pause" children, guard (b)'s
+//    projection `gen` bump cannot be safely suppressed for a held parent:
+//    that bump is what lets guard (b) catch a forward apply that resolved a
+//    stale relationship value *and already fully drained* before guard (c)
+//    could ever see it (the #133/#134-era race guard (b) exists for
+//    specifically). Suppressing it to protect the reverse would silently
+//    reopen that exact double-application hazard. A "hold" that is honest
+//    about this needs to stop children's forward evaluation from resolving
+//    the relationship at all, which is a much larger change (a new
+//    forward-defer capability, per the issue's own callout) with its own
+//    correctness surface this issue's scope does not budget for.
+//
+// **The mechanism actually shipped: escalate away from the fragile fast
+// path, not block the forward path.** Guards (a)/(b)/(c) exist to protect
+// exactly one thing: the *fast-path delta*'s assumption that the from-side
+// enumeration it reads is race-free against any other write touching the
+// same aggregate contributions. They are not needed for the *pre-#131*
+// image-less `Recompute` fallback (`ReverseRelationshipShape::needs_recompute_fallback`,
+// and the `!fast_path_safe` case below) — that path just re-evaluates each
+// row against current live state on its own next drain, with the same
+// per-row locking every other definition's ordinary forward evaluation
+// already relies on, and converges regardless of how much concurrent
+// activity raced it. It was every guard-rejected record's own treatment
+// before #134 introduced defer-and-retry as a cheaper common case.
+//
+// So: once a transition's `retry_count` reaches
+// [`RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD`], the *next* guard rejection
+// (for guard (a), (b), or (c) — never (d), see below) escalates instead of
+// deferring again — [`stage_reverse_recompute_fallback`] stages the
+// always-correct recompute for every touched from-side row, exactly as the
+// existing fallback branch does, and the settled parent projection is
+// advanced immediately via [`apply_projection_advance`], exactly as the
+// all-guards-passed path already does. This reuses two already-proven
+// mechanisms; nothing about how children are forward-applied changes, so
+// there is no new blocking, no new "hold" state, and no new deadlock
+// surface.
+//
+// **Why advancing the projection here is sound.** [`check_reverse_guards`]
+// short-circuits at the *first* failing guard, in order (a), (b), (d), (c) —
+// so a `Generation`/`Watermark`/`InFlight` failure it reports carries no
+// information about whether guard (d) (the projection's own LSN chain) also
+// holds; that check may never have run. Guard (d) is the one guard that
+// gates whether it is *safe to write* the projection at all (an
+// out-of-order or replayed transition must not stomp a fresher one); guards
+// (a)/(b)/(c) only ever gate the *fast-path delta's* correctness, never the
+// plain "does this transition's `prev_lsn` still match the projection"
+// question. [`reverse_ordering_still_holds`] answers that question
+// independently, under the same `FOR UPDATE` lock (re-acquiring a lock this
+// transaction already holds is a no-op, not a second wait), before
+// escalation is allowed to touch the projection. If guard (d) itself is
+// what's failing, escalation never happens — the record keeps deferring
+// (unchanged from #134) — see the residual limitation this leaves, below.
+//
+// **The liveness bound this gives, and what it does not cover.** Guard (d)
+// only fails when *another* reverse for the *same parent* raced this one —
+// i.e. the parent's own row being edited again, not its children churning —
+// and the ordinary SQL fold already collapses multiple same-batch edits to
+// one parent into a single transition, so this is expected to be rare under
+// the "hot parent, churning children" scenario this issue targets. Modulo
+// that, every reverse transition is guaranteed to fully resolve (both the
+// projection advance and the aggregate correction) within
+// [`RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD`] deferred-retry drain cycles,
+// unconditionally — the escalation branch performs its action outright, it
+// does not merely retry again. **What this does not guarantee**: a parent
+// whose own row is itself repeatedly, concurrently re-edited by more than
+// one racing writer fast enough to keep failing guard (d) on every
+// escalation attempt too is not covered by this mechanism and could still
+// defer indefinitely — a narrower and different failure mode than the one
+// this issue's own stress model exercises (sustained *child* churn against
+// a parent edited once). Flagged here, and in this issue's report, as a
+// known residual limitation rather than left implicit.
+
+/// Issue #135: an independent, guard-(d)-only recheck used *only* by the
+/// fairness-escalation path — never by [`check_reverse_guards`]'s own
+/// ordinary defer-or-apply decision, which already covers guard (d) as one
+/// arm of its short-circuiting evaluation (see that function's doc comment
+/// and this section's own "Why advancing the projection here is sound"
+/// above for why a `Generation`/`Watermark`/`InFlight` failure it reports
+/// carries no information about whether guard (d) also holds).
+///
+/// Takes the same `FOR UPDATE` lock [`check_reverse_guards`] already took
+/// (or would take) on this row, inside the same transaction — Postgres
+/// re-locking a row this transaction already holds is a no-op, not a second
+/// wait.
+async fn reverse_ordering_still_holds(
+    txn: &Transaction<'_>,
+    shape: &ReverseRelationshipShape,
+    old_key: &Option<String>,
+    new_key: &Option<String>,
+    record: &RelationshipReverseRecord,
+) -> Result<bool, ApplyError> {
+    let lock_key = old_key.as_deref().or(new_key.as_deref());
+    let Some(key) = lock_key else {
+        // No key at all: `check_reverse_guards` never rejects such a record
+        // in the first place (its own "both keys `None`" short-circuit
+        // always passes), so this function is never actually called in that
+        // shape — defensive `true` matches that function's own posture.
+        return Ok(true);
+    };
+    if shape.qualified_projection.is_empty() {
+        return Ok(true);
+    }
+    let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
+    let key_ident = quote_ident(&shape.to_col);
+    let row = txn
+        .query_opt(
+            &format!(
+                "select {lsn_ident} from {} where {key_ident}::text = $1 for update",
+                shape.qualified_projection,
+            ),
+            &[&key],
+        )
+        .await?;
+    match row {
+        None => Ok(true),
+        Some(row) => {
+            let current_lsn: Option<PgLsn> = row.get(0);
+            Ok(current_lsn == record.prev_lsn)
+        }
+    }
+}
+
+/// Stages the pre-#131 image-less `Recompute` fallback (issue #131's own
+/// stopgap, shared since by every guard rejection before #134 and by
+/// `ReverseRelationshipShape::needs_recompute_fallback`/`!fast_path_safe`
+/// since) for every from-side row currently matching `old_key`/`new_key` via
+/// `shape.from_col` — live-enumerated inside the already-locked Phase 3
+/// `txn`, deduped against `seen_keys` (shared across every call this same
+/// record makes, so a same-key `old_key == new_key` update is not staged
+/// twice). Needs none of #132's four guards for its own correctness: each
+/// staged `Recompute` is picked up on a later drain and re-evaluated against
+/// whatever is live *then*, the same way any other definition's ordinary
+/// forward evaluation already is — which is exactly why issue #135's
+/// fairness escalation (see this module's own design section above) can
+/// lean on it as the always-safe exit from the guard-gated retry loop.
+#[allow(clippy::too_many_arguments)]
+async fn stage_reverse_recompute_fallback(
+    txn: &Transaction<'_>,
+    shape: &ReverseRelationshipShape,
+    old_key: &Option<String>,
+    new_key: &Option<String>,
+    hop_gen: i32,
+    src_changed: Option<std::time::SystemTime>,
+    seen_keys: &mut std::collections::HashSet<String>,
+    fallback: &mut Vec<(String, String, i32, Option<std::time::SystemTime>)>,
+) -> Result<(), ApplyError> {
+    for key in [old_key.as_deref(), new_key.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let from_rows = from_side_rows_for_join_txn(
+            txn,
+            &shape.from_table,
+            &shape.from_col,
+            &shape.from_pk,
+            key,
+        )
+        .await?;
+        for (from_key, _) in from_rows {
+            if seen_keys.insert(from_key.clone()) {
+                fallback.push((shape.from_table.clone(), from_key, hop_gen, src_changed));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Splices `parent_row`'s referenced to-side columns into a clone of
+/// `from_row`, under each synthetic column name
+/// [`ReverseAggregateShape::synthetic_columns`] maps it to — how a live
+/// from-side row is made ready for
+/// [`apply_aggregate::row_contribution`] against a
+/// [`ReverseAggregateShape::contribution_def`], which reads the
+/// relationship's value as an ordinary `Column` reference rather than
+/// resolving a live `RelationshipPath` join. `parent_row` is `None` only
+/// for the pass this apply never takes (a parent INSERT has no old-key
+/// pass; a parent DELETE has no new-key pass — see this function's one call
+/// site), so the synthetic column is always populated when it's actually
+/// read.
+fn augment_row_with_relationship_value(
+    from_row: &Row,
+    synthetic_columns: &[(String, String)],
+    parent_row: &Option<Row>,
+) -> Row {
+    let mut augmented = from_row.clone();
+    for (to_col, synthetic) in synthetic_columns {
+        // Always insert the synthetic key, even when `parent_row` is
+        // absent (this row's `from_col` doesn't match this pass' parent
+        // key at all — a parent insert/delete/PK-change's "no match" side)
+        // — as `None` (present, SQL `NULL`), never leaving the key out of
+        // the map entirely. The evaluator's `Row` convention distinguishes
+        // the two (`eval::EvalError::MissingColumn` fires only for a truly
+        // *absent* key): the relationship column always exists on the
+        // to-side schema, it just has no matching row for this pass, which
+        // is exactly the same "resolves to `NULL`" shape a genuine SQL
+        // `LEFT JOIN` no-match already produces (see `eval.rs`'s
+        // `evaluate_with_relationships`/`ToOneRelationship` handling).
+        let value = parent_row
+            .as_ref()
+            .and_then(|row| row.get(to_col))
+            .cloned()
+            .flatten();
+        augmented.insert(synthetic.clone(), value);
+    }
+    augmented
+}
+
+/// The settled parent projection's current data columns (excluding the key
+/// and the two bookkeeping columns) — the same `information_schema.columns`
+/// introspection [`catalog::ensure_relationship_projection_in_txn`] already
+/// uses, duplicated here since Phase 3 holds no `pool` (only `txn`) and that
+/// function is private to `defs::catalog`.
+async fn projection_data_columns(
+    txn: &Transaction<'_>,
+    target_schema: &str,
+    projection_table_bare: &str,
+    to_col: &str,
+) -> Result<Vec<String>, ApplyError> {
+    let bookkeeping = [
+        to_col,
+        ddl::PROJECTION_GEN_COLUMN,
+        ddl::PROJECTION_LSN_COLUMN,
+    ];
+    let rows = txn
+        .query(
+            "select column_name from information_schema.columns \
+             where table_schema = $1 and table_name = $2 order by ordinal_position",
+            &[&target_schema, &projection_table_bare],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .filter(|c| !bookkeeping.contains(&c.as_str()))
+        .collect())
+}
+
+/// Advances the settled parent projection for one applied
+/// [`RelationshipReverseRecord`] (issue #131) — a symmetric delete-then-upsert
+/// keyed independently by `old_key`/`new_key`, so a parent PK-changing
+/// update (a genuinely different projection row identity — rare, but
+/// Postgres imposes no immutability on `to_col` itself) is handled the same
+/// way as an ordinary same-key update, a parent insert (`old_key` absent),
+/// or a parent delete (`new_key` absent). Sets [`ddl::PROJECTION_LSN_COLUMN`]
+/// to `lsn`; **never touches [`ddl::PROJECTION_GEN_COLUMN`]** — that column
+/// is step 3c's forward bookkeeping (a *different* signal: "has a forward
+/// apply landed since some Phase-2 capture"), and this reverse advance is
+/// not one — see both columns' own doc comments for the distinction.
+///
+/// The upsert leans on Postgres's own `jsonb_populate_record` against the
+/// projection table's real composite row type, rather than this crate
+/// re-deriving a per-column cast from `information_schema`: every projected
+/// data column's name already appears as a key in the parent's raw new
+/// image (a full row dump), so Postgres's own JSON-to-record coercion does
+/// exactly the right thing for whichever subset of columns the projection
+/// actually carries.
+async fn apply_projection_advance(
+    txn: &Transaction<'_>,
+    shape: &ReverseRelationshipShape,
+    old_key: &Option<String>,
+    new_key: &Option<String>,
+    new_image: Option<&str>,
+    lsn: Option<PgLsn>,
+) -> Result<(), ApplyError> {
+    if shape.qualified_projection.is_empty() {
+        return Ok(());
+    }
+    let key_ident = quote_ident(&shape.to_col);
+
+    if let Some(old_key) = old_key
+        && new_key.as_deref() != Some(old_key.as_str())
+    {
+        txn.execute(
+            &format!(
+                "delete from {} where {key_ident}::text = $1",
+                shape.qualified_projection
+            ),
+            &[old_key],
+        )
+        .await?;
+    }
+
+    let Some(new_image) = new_image else {
+        return Ok(());
+    };
+    let data_columns = projection_data_columns(
+        txn,
+        &shape.target_schema,
+        &shape.projection_table_bare,
+        &shape.to_col,
+    )
+    .await?;
+    let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
+    let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
+
+    let mut insert_cols = vec![key_ident.clone()];
+    let mut select_exprs = vec![format!("r.{key_ident}")];
+    let mut update_sets = Vec::new();
+    for col in &data_columns {
+        let ident = quote_ident(col);
+        insert_cols.push(ident.clone());
+        select_exprs.push(format!("r.{ident}"));
+        update_sets.push(format!("{ident} = excluded.{ident}"));
+    }
+    insert_cols.push(gen_ident.clone());
+    select_exprs.push("0".to_string());
+    insert_cols.push(lsn_ident.clone());
+    select_exprs.push("$2::pg_lsn".to_string());
+    update_sets.push(format!("{lsn_ident} = excluded.{lsn_ident}"));
+
+    let sql = format!(
+        "insert into {proj} ({insert_cols}) \
+         select {select_exprs} from jsonb_populate_record(null::{proj}, $1::text::jsonb) r \
+         on conflict ({key_ident}) do update set {update_sets}",
+        proj = shape.qualified_projection,
+        insert_cols = insert_cols.join(", "),
+        select_exprs = select_exprs.join(", "),
+        update_sets = update_sets.join(", "),
+    );
+    txn.execute(&sql, &[&new_image, &lsn]).await?;
+    Ok(())
 }
 
 /// The to-side rows whose `to_col` matches any of `join_keys`, grouped by that
@@ -705,6 +2306,49 @@ async fn fetch_to_side_rows(
         grouped.entry(jk).or_default().push(row);
     }
     Ok(grouped)
+}
+
+/// The settled parent projection's rows whose key column matches any of
+/// `join_keys` (issue #130, epic #127) — [`build_relationship_context`]'s
+/// to-one counterpart to [`fetch_to_side_rows`], reading `qualified_projection`
+/// (already schema-qualified via [`ddl::qualified_relationship_projection_table`])
+/// instead of the live to-side table. The projection's key column is a real
+/// `primary key` (`catalog::ensure_relationship_projection_in_txn`'s DDL), so
+/// unlike `fetch_to_side_rows` there is at most one row per key — no
+/// `row_number()`/grouping dance needed, just a per-key `Row` assembled the
+/// same `jsonb_each_text` way every other decode in this module uses. This
+/// also happens to return every column the projection carries (bookkeeping
+/// columns `__trellis_gen`/`__trellis_lsn` included, plus any data column a
+/// *different* consumer widened in) — harmless, since the evaluator only ever
+/// reads the specific columns a definition's own fields reference
+/// ([`eval::eval_expr`]'s `Row::get`), and a `Row` carrying extra unread keys
+/// is exactly what every other decode in this module already produces.
+async fn fetch_relationship_projection_rows(
+    pool: &Pool,
+    qualified_projection: &str,
+    key_col: &str,
+    join_keys: &[String],
+) -> Result<HashMap<String, Row>, ApplyError> {
+    if join_keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let client = pool.get().await?;
+    let key_ident = quote_ident(key_col);
+    let sql = format!(
+        "select p.{key_ident}::text as jk, e.key, e.value \
+         from {qualified_projection} p \
+         cross join lateral jsonb_each_text(to_jsonb(p.*)) e \
+         where p.{key_ident}::text = any($1::text[])"
+    );
+    let db_rows = client.query(&sql, &[&join_keys]).await?;
+    let mut rows: HashMap<String, Row> = HashMap::new();
+    for db_row in db_rows {
+        let jk: String = db_row.get(0);
+        let field: String = db_row.get(1);
+        let value: Option<String> = db_row.get(2);
+        rows.entry(jk).or_default().insert(field, value);
+    }
+    Ok(rows)
 }
 
 /// The [`ValueType`] of each named column on `table`, introspected live from
@@ -995,6 +2639,38 @@ mod tests {
     #[test]
     fn earliest_src_changed_of_two_unknowns_stays_unknown() {
         assert_eq!(earliest_src_changed(None, None), None);
+    }
+
+    /// Issue #134/#135 review follow-up: `ReverseGuardFailure::metric_label`'s
+    /// per-variant mapping, as a pure in-memory unit test — no DB, no
+    /// shared process-wide metrics registry, so (unlike an integration test
+    /// that reads `trellis::metrics::Metrics::render_prometheus`, itself
+    /// shared with every other test in the same binary and run in
+    /// parallel by default) this can never be flaky. Deliberately narrow:
+    /// this is the "each guard maps to its own, correct label" proof;
+    /// `tests/apply_relationship_reverse.rs`'s own metrics test is what
+    /// proves the *end-to-end wiring* (Phase 3 discovery -> buffered
+    /// `ApplyOutcome::deferral_counts` -> post-commit flush -> registry)
+    /// actually works, which a pure unit test of this function alone
+    /// cannot.
+    #[test]
+    fn reverse_guard_failure_metric_labels_match_the_plan_docs_own_d5_block_names() {
+        assert_eq!(
+            ReverseGuardFailure::Watermark.metric_label(),
+            "d5_block_barrier"
+        );
+        assert_eq!(
+            ReverseGuardFailure::Generation.metric_label(),
+            "d5_block_gen"
+        );
+        assert_eq!(
+            ReverseGuardFailure::InFlight.metric_label(),
+            "d5_block_inflight"
+        );
+        assert_eq!(
+            ReverseGuardFailure::Ordering.metric_label(),
+            "d5_block_order"
+        );
     }
 
     /// The exact numeric value of a Prometheus exposition line whose metric
@@ -1359,6 +3035,21 @@ pub struct ApplyPlan {
     /// [`crate::metrics::record_end_to_end_latency`] at the end of its
     /// per-target loop. Buffered for the same retry-safety reason.
     end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>>,
+    /// Issue #130, epic #127: every to-one relationship this batch's
+    /// relationship resolution touched, keyed by `relationship_definitions.id`
+    /// — accumulated across every [`build_relationship_context`] call this
+    /// `compute` pass makes (several definitions, or several sources, can
+    /// share one relationship) and bumped, once per touched key, in Phase 3
+    /// by [`apply_and_mark_drained_many`]. See [`RelationshipGenBump`]'s doc
+    /// comment for exactly what "touched" means and the #133 gap it's a
+    /// documented approximation of.
+    relationship_gen_bumps: HashMap<i64, RelationshipGenBump>,
+    /// Issue #131, epic #127: every to-one relationship's parent-keyed
+    /// reverse record this batch's fold produced — see
+    /// [`RelationshipReverseRecord`]'s doc comment. Applied by
+    /// [`apply_and_mark_drained_many`]'s "3d" step, after the ordinary
+    /// aggregate-target writes (step 3b) and the forward gen-bump (step 3c).
+    relationship_reverses: Vec<RelationshipReverseRecord>,
 }
 
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
@@ -1397,7 +3088,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // anything to.
     let candidates: Vec<(&str, &str)> = folded
         .iter()
-        .filter(|c| !c.is_truncate)
+        .filter(|c| !c.is_truncate && c.relationship_reverse_deferred.is_none())
         .map(|c| (c.src_table.as_str(), c.key.as_str()))
         .collect();
     let poisoned = quarantine::poisoned_keys_among(pool, &candidates).await?;
@@ -1409,11 +3100,28 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // `append::TRUNCATE_SENTINEL_KEY`) and produce no write/delete;
     // they're handled separately, right after that loop.
     let mut truncated: Vec<&FoldedChange> = Vec::new();
+    // Issue #134: deferred relationship reverses (`op = 'rel_reverse_deferred'`)
+    // never enter the keyed by-source evaluation loop below either, and for a
+    // sharper reason than truncate's "carries no key" — they carry the
+    // parent's *real* key, on a *synthetic* `src_table`
+    // (`relationship_reverse_deferred_src_table`), specifically so they
+    // can't. Letting one reach `by_source` would run it through the
+    // ordinary per-source forward-evaluation loop and double-apply the
+    // delta its original CDC row already forward-applied when it first
+    // landed — only the reverse-relationship delta was ever deferred, never
+    // the parent's own forward apply. Reconstructed into a fresh
+    // `RelationshipReverseRecord` in its own loop, right after `by_source`'s
+    // — see that loop's comment.
+    let mut relationship_reverse_deferrals: Vec<&FoldedChange> = Vec::new();
     let mut poisoned_park: Vec<FoldedChange> = Vec::new();
     let mut applied_keys: Vec<(String, String)> = Vec::new();
     for change in folded {
         if change.is_truncate {
             truncated.push(change);
+            continue;
+        }
+        if change.relationship_reverse_deferred.is_some() {
+            relationship_reverse_deferrals.push(change);
             continue;
         }
         if poisoned.contains(&(change.src_table.clone(), change.key.clone())) {
@@ -1467,6 +3175,20 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // that function's doc comment.
     let mut reverse_recomputes: HashMap<(String, String), (i32, Option<std::time::SystemTime>)> =
         HashMap::new();
+    // Issue #130, epic #127: accumulated across every source/definition this
+    // `compute` pass evaluates a to-one relationship for — see
+    // [`ApplyPlan::relationship_gen_bumps`]'s doc comment.
+    let mut relationship_gen_bumps: HashMap<i64, RelationshipGenBump> = HashMap::new();
+    // Issue #131, epic #127: one `ReverseRelationshipShape` per to-one
+    // relationship this `compute()` call builds a reverse record for,
+    // resolved once (a handful of catalog reads) and shared by every
+    // touched parent key — see `RelationshipReverseRecord`'s doc comment.
+    let mut relationship_reverse_shapes: HashMap<i64, Arc<ReverseRelationshipShape>> =
+        HashMap::new();
+    // Issue #131: every to-one relationship's parent-keyed reverse record
+    // this batch's fold produced, applied by `apply_and_mark_drained_many`'s
+    // "3d" step.
+    let mut relationship_reverses: Vec<RelationshipReverseRecord> = Vec::new();
 
     for (source_key, changes) in by_source {
         tracing::debug!(
@@ -1571,10 +3293,16 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // here and shared across every aggregate definition on this source,
         // same as `rows` above. Only decoded when this source actually has
         // an aggregate reader, to avoid the extra round trips for the
-        // (overwhelmingly common) 1-1-only source.
-        let needs_old_rows = defs
-            .iter()
-            .any(|def| matches!(def.def.key_space, KeySpace::Aggregate { .. }));
+        // (overwhelmingly common) 1-1-only source. Issue #130 widens this
+        // same gate: a 1-1 definition reading a to-one relationship also
+        // needs each change's old-image join-key value, to bump `gen` for
+        // the parent a re-point/delete moved *away* from (see
+        // `RelationshipGenBump`'s doc comment) — sharing one decode here
+        // rather than a second pass over the same images.
+        let needs_old_rows = defs.iter().any(|def| {
+            matches!(def.def.key_space, KeySpace::Aggregate { .. })
+                || !eval::relationship_references(&def.def).is_empty()
+        });
         let mut old_rows: Vec<Option<Row>> = Vec::with_capacity(changes.len());
         if needs_old_rows {
             for change in &changes {
@@ -1625,58 +3353,115 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             decoded
         };
         for rel in &inbound_rels {
-            // Join-key text -> the max `hop_gen` of the to-side changes that
-            // touched it (a re-parent update touches both its old and new
-            // key; a delete carries only its pre-image), and (issues
-            // #51/#52's multi-hop gap) the *earliest* (`min`) `src_changed`
-            // among those same changes — see `earliest_src_changed`'s doc
-            // comment for why the two use opposite merge directions.
-            let mut key_hops: HashMap<String, i32> = HashMap::new();
-            let mut key_src_changed: HashMap<String, Option<std::time::SystemTime>> =
-                HashMap::new();
-            for (i, change) in changes.iter().enumerate() {
-                let mut note = |value: &Option<String>, hop: i32| {
-                    if let Some(text) = value {
-                        key_hops
-                            .entry(text.clone())
-                            .and_modify(|h| *h = (*h).max(hop))
-                            .or_insert(hop);
-                        key_src_changed
-                            .entry(text.clone())
-                            .and_modify(|sc| *sc = earliest_src_changed(*sc, change.src_changed))
-                            .or_insert(change.src_changed);
+            // Issue #131, epic #127: to-one relationships get the new
+            // parent-keyed reverse record + delta mechanism below;
+            // to-many relationships keep exactly this pre-#131 image-less
+            // recompute path, unchanged — Phase 1 of this epic is to-one
+            // relationship *values* only (see the plan doc §7).
+            if rel.cardinality == RelationshipCardinality::ToMany {
+                // Join-key text -> the max `hop_gen` of the to-side changes
+                // that touched it (a re-parent update touches both its old
+                // and new key; a delete carries only its pre-image), and
+                // (issues #51/#52's multi-hop gap) the *earliest* (`min`)
+                // `src_changed` among those same changes — see
+                // `earliest_src_changed`'s doc comment for why the two use
+                // opposite merge directions.
+                let mut key_hops: HashMap<String, i32> = HashMap::new();
+                let mut key_src_changed: HashMap<String, Option<std::time::SystemTime>> =
+                    HashMap::new();
+                for (i, change) in changes.iter().enumerate() {
+                    let mut note = |value: &Option<String>, hop: i32| {
+                        if let Some(text) = value {
+                            key_hops
+                                .entry(text.clone())
+                                .and_modify(|h| *h = (*h).max(hop))
+                                .or_insert(hop);
+                            key_src_changed
+                                .entry(text.clone())
+                                .and_modify(|sc| {
+                                    *sc = earliest_src_changed(*sc, change.src_changed)
+                                })
+                                .or_insert(change.src_changed);
+                        }
+                    };
+                    if let Some(row) = &rows[i] {
+                        note(row.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
                     }
-                };
-                if let Some(row) = &rows[i] {
-                    note(row.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
+                    if let Some(old) = &reverse_old_rows[i] {
+                        note(old.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
+                    }
                 }
-                if let Some(old) = &reverse_old_rows[i] {
-                    note(old.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
+                if key_hops.is_empty() {
+                    continue;
                 }
-            }
-            if key_hops.is_empty() {
+                let join_keys: Vec<String> = key_hops.keys().cloned().collect();
+                let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
+                let matches = from_side_keys_for_join(
+                    pool,
+                    &rel.def.from_table,
+                    &from_pk,
+                    &rel.def.from_col,
+                    &join_keys,
+                )
+                .await?;
+                for (from_key, join_text) in matches {
+                    let hop = key_hops.get(&join_text).copied().unwrap_or(0) + 1;
+                    let src_changed = key_src_changed.get(&join_text).copied().flatten();
+                    reverse_recomputes
+                        .entry((rel.def.from_table.clone(), from_key))
+                        .and_modify(|(h, sc)| {
+                            *h = (*h).max(hop);
+                            *sc = earliest_src_changed(*sc, src_changed);
+                        })
+                        .or_insert((hop, src_changed));
+                }
                 continue;
             }
-            let join_keys: Vec<String> = key_hops.keys().cloned().collect();
-            let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
-            let matches = from_side_keys_for_join(
-                pool,
-                &rel.def.from_table,
-                &from_pk,
-                &rel.def.from_col,
-                &join_keys,
-            )
-            .await?;
-            for (from_key, join_text) in matches {
-                let hop = key_hops.get(&join_text).copied().unwrap_or(0) + 1;
-                let src_changed = key_src_changed.get(&join_text).copied().flatten();
-                reverse_recomputes
-                    .entry((rel.def.from_table.clone(), from_key))
-                    .and_modify(|(h, sc)| {
-                        *h = (*h).max(hop);
-                        *sc = earliest_src_changed(*sc, src_changed);
-                    })
-                    .or_insert((hop, src_changed));
+
+            // Issue #131: to-one. One `ReverseRelationshipShape` per
+            // relationship per `compute()` call, shared (via `Arc`) by every
+            // parent key this batch's fold touches for it.
+            let shape = match relationship_reverse_shapes.get(&rel.id) {
+                Some(shape) => Arc::clone(shape),
+                None => {
+                    let shape = Arc::new(build_reverse_relationship_shape(pool, rel).await?);
+                    relationship_reverse_shapes.insert(rel.id, Arc::clone(&shape));
+                    shape
+                }
+            };
+            for (i, change) in changes.iter().enumerate() {
+                let old_row = reverse_old_rows[i].clone();
+                let new_row = rows[i].clone();
+                if old_row.is_none() && new_row.is_none() {
+                    // Both decoded images absent — an image-less change to
+                    // the parent's own table (a bare recompute trigger),
+                    // never a real parent state transition. Nothing to
+                    // reverse-apply.
+                    continue;
+                }
+                let read_key = relationship_key_text(&old_row, &rel.def.to_col)
+                    .or_else(|| relationship_key_text(&new_row, &rel.def.to_col));
+                let capture = capture_reverse_guard_state(
+                    pool,
+                    &shape.qualified_projection,
+                    &shape.to_col,
+                    read_key.as_deref(),
+                )
+                .await?;
+                relationship_reverses.push(RelationshipReverseRecord {
+                    shape: Arc::clone(&shape),
+                    old_row,
+                    new_row,
+                    old_image: change.old_image.clone(),
+                    new_image: change.new_image.clone(),
+                    lsn: change.lsn,
+                    prev_lsn: capture.prev_lsn,
+                    prev_gen: capture.prev_gen,
+                    watermark: capture.watermark,
+                    hop_gen: change.hop_gen,
+                    src_changed: change.src_changed,
+                    retry_count: 0,
+                });
             }
         }
 
@@ -1796,7 +3581,31 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 let rel_ctx = if eval::relationship_references(&def.def).is_empty() {
                     None
                 } else {
-                    Some(build_relationship_context(pool, source_key, &def.def, &rows).await?)
+                    let (ctx, gen_bumps) = build_relationship_context(
+                        pool,
+                        source_key,
+                        &def.def,
+                        &rows,
+                        Some(&old_rows),
+                        Some(changes.as_slice()),
+                    )
+                    .await?;
+                    // Issue #130: merge this definition's touched-parent keys
+                    // into the whole-batch accumulator — several definitions
+                    // (or several sources, across loop iterations) can share
+                    // one relationship, and every one of them needs to land
+                    // in the same Phase 3 bump.
+                    for (rel_id, bump) in gen_bumps {
+                        relationship_gen_bumps
+                            .entry(rel_id)
+                            .and_modify(|existing| {
+                                existing
+                                    .touched_keys
+                                    .extend(bump.touched_keys.iter().cloned());
+                            })
+                            .or_insert(bump);
+                    }
+                    Some(ctx)
                 };
 
                 // Three shapes, per fold.rs's rules: `Some(new_image)` is an
@@ -1951,6 +3760,56 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     )
                 });
 
+            // Issue #136: a relationship-reading aggregate's ordinary
+            // (non-image-less) per-row delta now resolves its `<rel>.<column>`
+            // reads the same way a `KeySpace::OneToOne` target already does —
+            // against the settled parent projection, via
+            // `build_relationship_context` — rather than the old
+            // `force_every_group` full live-join recompute. Gated on
+            // `eval::relationship_references`, exactly like the `OneToOne`
+            // branch above, so a relationship-free aggregate (the
+            // overwhelmingly common case) costs nothing extra.
+            //
+            // This also closes a latent gap: before this issue,
+            // `accumulate_changes` never called `build_relationship_context`
+            // for an aggregate definition at all (it had no need to — the
+            // forced-recompute path read the live to-side table directly,
+            // never the projection), so a to-one relationship consumed
+            // *only* by an invertible aggregate never got its projection's
+            // `__trellis_gen` bumped by any forward apply, even though issue
+            // #131's reverse fast path (`build_reverse_relationship_shape`)
+            // has been eligible for exactly that shape (a `KeySpace::Aggregate`
+            // definition with only invertible fields reading one
+            // relationship) since #131 shipped — guard (b) could not have
+            // detected a race for such a relationship. Wiring this the same
+            // way the `OneToOne` branch already does closes that gap for
+            // every relationship an aggregate reads, not just this issue's
+            // own new delta path.
+            let rel_ctx = if eval::relationship_references(&def.def).is_empty() {
+                None
+            } else {
+                let (ctx, gen_bumps) = build_relationship_context(
+                    pool,
+                    source_key,
+                    &def.def,
+                    &rows,
+                    Some(&old_rows),
+                    Some(changes.as_slice()),
+                )
+                .await?;
+                for (rel_id, bump) in gen_bumps {
+                    relationship_gen_bumps
+                        .entry(rel_id)
+                        .and_modify(|existing| {
+                            existing
+                                .touched_keys
+                                .extend(bump.touched_keys.iter().cloned());
+                        })
+                        .or_insert(bump);
+                }
+                Some(ctx)
+            };
+
             let mut regex_cache = eval::RegexCache::new();
             apply_aggregate::accumulate_changes(
                 target_plan,
@@ -1960,6 +3819,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 &old_rows,
                 &def.source_columns,
                 &mut regex_cache,
+                rel_ctx.as_ref(),
             )?;
             for change in &changes {
                 buffer_transform_apply_metrics(
@@ -1970,6 +3830,95 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 );
             }
         }
+    }
+
+    // Issue #134: reconstruct a fresh `RelationshipReverseRecord` for every
+    // deferred reverse this batch's fold produced (see
+    // `relationship_reverse_deferrals`'s own comment above for why these
+    // never entered the by-source loop above). Guard state
+    // (`prev_lsn`/`prev_gen`/`watermark`) is re-derived live here, via the
+    // exact same `capture_reverse_guard_state` call the fresh-from-CDC path
+    // above uses — never replayed from anything persisted on the ring row
+    // (this op's own migration deliberately carries none of the three) —
+    // see that migration's doc comment for why: a stale replay could
+    // wrongly pass a guard that should now fail, or wrongly fail one that
+    // would now legitimately pass, silently reintroducing exactly the class
+    // of bug issues #132/#133 closed. `relationship_reverse_shapes` is the
+    // same cache the by-source loop above populates, so a relationship
+    // touched by both a genuine parent CDC row and a deferred retry in the
+    // same batch only ever builds its shape once.
+    for change in &relationship_reverse_deferrals {
+        let Some(rel_id) = change.relationship_reverse_deferred else {
+            unreachable!("filtered on relationship_reverse_deferred.is_some() above")
+        };
+        let shape = match relationship_reverse_shapes.get(&rel_id) {
+            Some(shape) => Arc::clone(shape),
+            None => {
+                let Some(rel) = catalog::relationship_by_id(pool, rel_id).await? else {
+                    // The relationship was dropped between the original
+                    // deferral and this retry — nothing left to retry
+                    // against. Drop the deferred row rather than erroring
+                    // the whole batch: a dropped relationship's own
+                    // catalog-side cleanup is responsible for anything else
+                    // that implies, not this drain.
+                    tracing::warn!(
+                        relationship_id = rel_id,
+                        "a deferred relationship reverse's relationship no longer exists; \
+                         dropping the retry"
+                    );
+                    continue;
+                };
+                let shape = Arc::new(build_reverse_relationship_shape(pool, &rel).await?);
+                relationship_reverse_shapes.insert(rel_id, Arc::clone(&shape));
+                shape
+            }
+        };
+        let old_row = match &change.old_image {
+            Some(text) => Some(decode_image(pool, text).await?),
+            None => None,
+        };
+        let new_row = match &change.new_image {
+            Some(text) => Some(decode_image(pool, text).await?),
+            None => None,
+        };
+        if old_row.is_none() && new_row.is_none() {
+            // Should be unreachable: a deferred row is only ever staged
+            // from a `RelationshipReverseRecord` that already had at least
+            // one image (Phase 3's own staging site can only reach the
+            // guard-rejection branch for a record that had one — see
+            // `check_reverse_guards`'s "both keys `None`" short-circuit,
+            // which always passes and never reaches that branch at all).
+            // Defensively skip rather than build a meaningless record.
+            continue;
+        }
+        let read_key = relationship_key_text(&old_row, &shape.to_col)
+            .or_else(|| relationship_key_text(&new_row, &shape.to_col));
+        let capture = capture_reverse_guard_state(
+            pool,
+            &shape.qualified_projection,
+            &shape.to_col,
+            read_key.as_deref(),
+        )
+        .await?;
+        relationship_reverses.push(RelationshipReverseRecord {
+            shape: Arc::clone(&shape),
+            old_row,
+            new_row,
+            old_image: change.old_image.clone(),
+            new_image: change.new_image.clone(),
+            lsn: change.lsn,
+            prev_lsn: capture.prev_lsn,
+            prev_gen: capture.prev_gen,
+            watermark: capture.watermark,
+            // Deliberately 0, not `change.hop_gen` (this op's ring row
+            // never meaningfully carries one — always staged as 0, see
+            // `append::ChangeRow`'s `RelationshipReverseDeferred` arm):
+            // retrying is not propagation, and must never contribute
+            // toward the hop bound.
+            hop_gen: 0,
+            src_changed: change.src_changed,
+            retry_count: change.retry_count,
+        });
     }
 
     // Truncate clears (issue #60): for each truncated src_table, resolve its
@@ -2151,6 +4100,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         reverse_recomputes,
         transform_observations,
         end_to_end_origins: terminal_end_to_end_origins,
+        relationship_gen_bumps,
+        relationship_reverses,
     })
 }
 
@@ -2191,6 +4142,39 @@ fn flush_apply_metrics(plan: &ApplyPlan) {
                 .unwrap_or(std::time::Duration::ZERO);
             crate::metrics::record_end_to_end_latency(transform, latency);
         }
+    }
+}
+
+/// Issue #134/#135 review follow-up: flushes [`ApplyOutcome::deferral_counts`]/
+/// [`ManyApplyOutcome::deferral_counts`] into
+/// [`crate::metrics::increment_relationship_reverse_deferred`] — the
+/// deferral-metrics counterpart to [`flush_apply_metrics`], with the exact
+/// same "only after this attempt's transaction has actually committed"
+/// contract and for the same reason: `drain_once`/`drain_many`'s retry loop
+/// can call `apply_and_mark_drained`/`apply_and_mark_drained_many` more than
+/// once for the same folded input on a `VersionFenceMiss` or a transient
+/// Phase-3 failure (doc 06's `FenceMissBackoff`, an *ordinary*, routine
+/// occurrence, not a rare edge case) — recording eagerly, from inside that
+/// function itself, would inflate a guard's count once per losing attempt,
+/// exactly the kind of skew #135's fairness/starvation decisions can least
+/// afford under the high-contention conditions where they matter most.
+/// Not folded into `flush_apply_metrics` itself (which takes `&ApplyPlan`,
+/// a Phase-2-only artifact): these counts are discovered live during Phase
+/// 3, so they ride on the apply outcome instead.
+fn flush_relationship_reverse_deferral_metrics(deferral_counts: &HashMap<&'static str, u64>) {
+    for (guard, count) in deferral_counts {
+        for _ in 0..*count {
+            crate::metrics::increment_relationship_reverse_deferred(guard);
+        }
+    }
+}
+
+/// Issue #135: the fairness-escalation counterpart to
+/// [`flush_relationship_reverse_deferral_metrics`] — same post-commit-only
+/// contract and the same reason (see that function's doc comment).
+fn flush_relationship_reverse_fairness_escalation_metric(count: u64) {
+    for _ in 0..count {
+        crate::metrics::increment_relationship_reverse_fairness_escalated();
     }
 }
 
@@ -2437,7 +4421,13 @@ async fn apply_target(
 ///    [`compute`]) survive, while anything the truncate is meant to erase
 ///    does not.
 /// 3. **The ordered pre-lock + upsert/delete**, per target table, via
-///    [`apply_target`].
+///    [`apply_target`], immediately followed by the **relationship
+///    settled-parent projection gen bump** (issue #130, epic #127): every
+///    to-one relationship parent this batch's relationship resolution
+///    touched (`plan.relationship_gen_bumps`) gets its projection's
+///    `__trellis_gen` bumped by 1, in this same transaction — see that
+///    step's own inline comment for the exact semantics and the #133 gap it
+///    documents.
 /// 4. **Downstream propagation**: for every physically-changed key (write
 ///    or delete — no-op-suppressed writes don't count) in a target table at
 ///    least one definition currently reads, stages a `Recompute` row at
@@ -2470,13 +4460,17 @@ pub async fn apply_and_mark_drained(
     claimed_by: &str,
     plan: &ApplyPlan,
     wake_channel: &str,
+    watermark: &StagedWatermark,
 ) -> Result<ApplyOutcome, ApplyError> {
     let outcome =
-        apply_and_mark_drained_many(txn, &[seg_seq], claimed_by, plan, wake_channel).await?;
+        apply_and_mark_drained_many(txn, &[seg_seq], claimed_by, plan, wake_channel, watermark)
+            .await?;
     Ok(ApplyOutcome {
         keys_written: outcome.keys_written,
         keys_deleted: outcome.keys_deleted,
         batch_drained: outcome.segments_drained[0].1,
+        deferral_counts: outcome.deferral_counts,
+        fairness_escalations: outcome.fairness_escalations,
     })
 }
 
@@ -2508,7 +4502,7 @@ pub async fn apply_and_mark_drained(
 /// `#[tracing::instrument]`-created span.
 #[tracing::instrument(
     name = "staging.apply_and_mark_drained",
-    skip(txn, plan, wake_channel),
+    skip(txn, plan, wake_channel, watermark),
     fields(
         segments = seg_seqs.len(),
         targets = plan.targets.len(),
@@ -2523,6 +4517,7 @@ pub async fn apply_and_mark_drained_many(
     claimed_by: &str,
     plan: &ApplyPlan,
     wake_channel: &str,
+    watermark: &StagedWatermark,
 ) -> Result<ManyApplyOutcome, ApplyError> {
     // 1. Version fence. `source_key` is bare (see `catalog_source_key`'s doc
     // comment); `source_table_versions.source_table` is qualified as of
@@ -2567,6 +4562,19 @@ pub async fn apply_and_mark_drained_many(
 
     let mut keys_written = 0usize;
     let mut keys_deleted = 0usize;
+    // Issue #134/#135 review follow-up: per-guard deferral counts this
+    // Phase 3 pass discovers, buffered here rather than recorded eagerly —
+    // see [`ManyApplyOutcome::deferral_counts`]'s own doc comment for why
+    // (this function's own `VersionFenceMiss`/transient-failure retry loop,
+    // one layer up in `drain_once`/`drain_many`, can call it more than once
+    // for the same folded input; only the attempt whose transaction
+    // actually commits may ever reach the metrics registry).
+    let mut deferral_counts: HashMap<&'static str, u64> = HashMap::new();
+    // Issue #135: count of reverse transitions this pass resolved via
+    // fairness escalation (see [`ManyApplyOutcome::fairness_escalations`]'s
+    // doc comment) — buffered under the exact same post-commit-only
+    // contract as `deferral_counts` just above, for the same reason.
+    let mut fairness_escalations: u64 = 0;
     // `changed` accumulates rather than overwrites per target (`extend`,
     // not `insert`): a target can appear in both `plan.clears` and
     // `plan.targets` in the same batch — a truncate clear followed by a
@@ -2691,6 +4699,423 @@ pub async fn apply_and_mark_drained_many(
         );
     }
 
+    // 3c. Relationship settled-parent projection gen bump (issue #130, epic
+    // #127; plan doc §2 guard (b)'s precondition): every to-one relationship
+    // parent this batch's relationship resolution touched
+    // (`ApplyPlan::relationship_gen_bumps`, resolved in Phase 2) gets its
+    // projection row's `__trellis_gen` bumped by exactly 1, in this same
+    // transaction — so guard (b) (#132) can detect, by re-reading under `FOR
+    // UPDATE` and comparing against a value it captured earlier, that a
+    // forward apply landed in between. One `UPDATE ... SET gen = gen + 1
+    // WHERE key = ANY(...)` per relationship, over the *deduped* set of
+    // touched keys (`RelationshipGenBump::touched_keys` is a `HashSet`) — so
+    // a parent touched by two different from-side rows in this same batch
+    // (e.g. two children re-pointing onto the same parent) still only
+    // advances its generation by 1 for the whole transaction, not once per
+    // touching row: guard (b) only needs "did anything land since I captured
+    // this," not a count of how many things did. A key with no projection
+    // row yet (see `ensure_relationship_projection_in_txn`'s own doc comment
+    // on the widen-only catch-up gap #131 closes) simply bumps nothing — no
+    // error, same as any `UPDATE ... WHERE` matching zero rows. Plain
+    // `key_col::text = any($1::text[])`, not the native-typed cast
+    // `from_side_keys_for_join`'s own doc comment flags as unindexed
+    // (P0.1/plan doc §6) — out of scope here, matches this module's other
+    // untyped relationship lookups. The touched-key array is sorted before
+    // binding (review follow-up to #132) — see the inline comment at that
+    // sort for why.
+    for bump in plan.relationship_gen_bumps.values() {
+        if bump.touched_keys.is_empty() {
+            continue;
+        }
+        // Ascending-key lock order (review follow-up to #132): `touched_keys`
+        // is a `HashSet`, whose iteration order is unspecified and can vary
+        // run to run. Without a deterministic sort here, two concurrent
+        // `apply_and_mark_drained_many` calls whose batches both touch an
+        // overlapping set of relationship-projection parent keys (plausible
+        // whenever two segments both contain from-side rows re-pointing
+        // among the same hot parents) could have their `UPDATE ... WHERE key
+        // = ANY($1)` lock those rows in different orders and deadlock —
+        // Postgres detects and aborts one side rather than corrupting
+        // anything, but it's a needless liveness hazard, and this codebase
+        // already has the fix for exactly this class of bug: the
+        // target-write lock just above sorts (and dedups) its keys before
+        // taking `FOR UPDATE` locks, with `two_overlapping_group_writers_serialize_via_ascending_lock_order_not_deadlock`
+        // as its regression pin. Sorting the bound array doesn't change
+        // *what* this bare `UPDATE` locks, only lines up every concurrent
+        // caller's lock-acquisition order onto the same ascending sequence.
+        let mut keys: Vec<&str> = bump.touched_keys.iter().map(String::as_str).collect();
+        keys.sort_unstable();
+        let key_ident = quote_ident(&bump.key_col);
+        let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
+        txn.execute(
+            &format!(
+                "update {} set {gen_ident} = {gen_ident} + 1 \
+                 where {key_ident}::text = any($1::text[])",
+                bump.qualified_projection,
+            ),
+            &[&keys],
+        )
+        .await?;
+    }
+
+    // 3d. Issue #131, epic #127: to-one relationship reverse-delta apply —
+    // see `RelationshipReverseRecord`'s doc comment for the mechanism and
+    // `ReverseRelationshipShape`'s for the fast-path/fallback split this
+    // step dispatches on.
+    //
+    // Not batched across sibling records touching the same aggregate
+    // target within this one drain (each record calls
+    // `apply_aggregate::apply_aggregate_target` on its own, immediately) —
+    // a documented, non-correctness-affecting simplification flagged for
+    // whoever picks up the next perf pass: the writes are genuinely
+    // additive, so N sequential per-record applies to the same group
+    // produce the same final value as one batched apply with the merged
+    // deltas, just as N SQL round trips instead of one. Every record in
+    // `plan.relationship_reverses` is already the whole batch's fold
+    // collapsed to one record per parent key (see that field's own doc
+    // comment), so this only matters when *two different* parent keys in
+    // one drain happen to feed the same target (e.g. an aggregate grouped
+    // by a column unrelated to the relationship).
+    let mut relationship_reverse_fallback: Vec<(
+        String,
+        String,
+        i32,
+        Option<std::time::SystemTime>,
+    )> = Vec::new();
+    // Issue #134: guard-rejected records are re-staged as
+    // `StagedChange::RelationshipReverseDeferred` (never touching `hop_gen`)
+    // rather than folded into `recompute_changes` (which enforces
+    // `MAX_HOP_GEN` below) — appended separately, after this loop, via its
+    // own `append::append` call.
+    let mut relationship_reverse_deferrals: Vec<StagedChange> = Vec::new();
+    for record in &plan.relationship_reverses {
+        let shape = &record.shape;
+        let old_key = relationship_key_text(&record.old_row, &shape.to_col);
+        let new_key = relationship_key_text(&record.new_row, &shape.to_col);
+
+        // Issue #132: all four guards, checked together — see
+        // `check_reverse_guards`'s own doc comment for the mechanism, the
+        // locking discipline, and why they're combined into one Phase 3
+        // step instead of four independent ones.
+        if let Some(failure) =
+            check_reverse_guards(txn, shape, record, &old_key, &new_key, watermark).await?
+        {
+            // Issue #135: fairness escalation — see this module's own
+            // "Issue #135, epic #127: fairness escalation" design section
+            // (right after `check_reverse_guards`) for the full mechanism
+            // and why it is sound. Guard (d) failing itself is never
+            // eligible (see that section's "residual limitation"): the next
+            // check independently confirms guard (d) still holds before
+            // this branch is allowed to touch the projection at all.
+            if failure != ReverseGuardFailure::Ordering
+                && record.retry_count + 1 >= RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD
+                && reverse_ordering_still_holds(txn, shape, &old_key, &new_key, record).await?
+            {
+                *deferral_counts.entry(failure.metric_label()).or_insert(0) += 1;
+                fairness_escalations += 1;
+                tracing::warn!(
+                    relationship_projection = %shape.qualified_projection,
+                    guard = %failure,
+                    retry_count = record.retry_count + 1,
+                    threshold = RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD,
+                    "issue #135 fairness escalation: this reverse's guard-gated retry budget \
+                     is exhausted; advancing the projection and falling back to the \
+                     always-correct recompute instead of deferring again"
+                );
+                let mut seen_keys: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                stage_reverse_recompute_fallback(
+                    txn,
+                    shape,
+                    &old_key,
+                    &new_key,
+                    record.hop_gen + 1,
+                    record.src_changed,
+                    &mut seen_keys,
+                    &mut relationship_reverse_fallback,
+                )
+                .await?;
+                apply_projection_advance(
+                    txn,
+                    shape,
+                    &old_key,
+                    &new_key,
+                    record.new_image.as_deref(),
+                    record.lsn,
+                )
+                .await?;
+                continue;
+            }
+
+            // Issue #134: defer and re-stage, rather than #131/#132/#133's
+            // stopgap of falling back to an image-less `Recompute` of every
+            // touched from-side row at `hop_gen + 1`. Do NOT touch any
+            // target table or the projection for this record — exactly the
+            // same "nothing applied, nothing lost" posture the stopgap took
+            // — but re-stage the record itself (not its from-side rows) as
+            // a `RelationshipReverseDeferred`, so the next drain that picks
+            // it up re-derives fresh guard state and re-attempts the exact
+            // same delta this one just failed to apply, at no `hop_gen`
+            // cost: deferral is measured to be the *common* case for this
+            // mechanism (see this module's own doc section), and burning a
+            // hop generation per retry would trip `MAX_HOP_GEN` after 32
+            // routine deferrals.
+            //
+            // Buffered into `deferral_counts`, not recorded straight into
+            // the metrics registry here — see that variable's own comment.
+            *deferral_counts.entry(failure.metric_label()).or_insert(0) += 1;
+            tracing::warn!(
+                relationship_projection = %shape.qualified_projection,
+                guard = %failure,
+                retry_count = record.retry_count + 1,
+                "issue #132 reverse guard rejected this record's delta; \
+                 deferring and re-staging it for retry (issue #134)"
+            );
+            // Guaranteed `Some` here: `check_reverse_guards` can only reach
+            // this branch (rather than passing every guard) when at least
+            // one of `old_key`/`new_key` is `Some` — see
+            // `check_reverse_guards`'s own `lock_key` match, whose `_ =>
+            // (None, None)` arm (both keys absent) always passes every
+            // guard and never returns `Some(failure)` at all.
+            let key = old_key
+                .clone()
+                .or_else(|| new_key.clone())
+                .expect("check_reverse_guards only rejects a record with a known key");
+            relationship_reverse_deferrals.push(StagedChange::RelationshipReverseDeferred {
+                src_table: relationship_reverse_deferred_src_table(shape.id),
+                key,
+                old_image: record.old_image.clone(),
+                new_image: record.new_image.clone(),
+                lsn: record.lsn,
+                src_changed: record.src_changed,
+                relationship_id: shape.id,
+                retry_count: record.retry_count + 1,
+            });
+            continue;
+        }
+
+        // Fast path: a true delta for every fully-invertible,
+        // single-relationship aggregate target.
+        //
+        // **Not** an unconditional subtract-old/add-new over two
+        // *independent* row sets — a parent-only change never moves a
+        // from-side row into or out of its aggregate group (the row's own
+        // `GROUP BY` columns never change), so every affected row is
+        // diffed in place: its contribution *under the old parent state*
+        // vs. *under the new one*, per field, via
+        // `apply_aggregate::diff_contributions` (the same per-field
+        // cancellation `accumulate_changes`'s own in-place-update branch
+        // uses) — otherwise a field the relationship doesn't even read
+        // (e.g. a plain `COUNT(*)`) would wrongly gain a net delta every
+        // time its group is touched here. The common case (an ordinary
+        // parent attribute update; `old_key == new_key`) enumerates the
+        // row set once. `old_key != new_key` (a parent insert, delete, or
+        // the rare case of the parent's own key value itself changing)
+        // enumerates each side separately, diffing against "no relationship
+        // match" (`parent = None`) for whichever side a row's own set
+        // doesn't carry.
+        //
+        // Issue #134 correctness fork, found while building this issue's
+        // own test coverage, and sharpened by review follow-up (an
+        // independent reproduction proved a first-attempt, `retry_count ==
+        // 0` record vulnerable too — see
+        // `relationship_fast_path_precondition_holds`'s own doc comment for
+        // the full hazard and the residual gap this still leaves open):
+        // `diff_pass` assumes every from-side row currently matching this
+        // key had its prior contribution computed under `old_parent`'s
+        // value and needs correcting to `new_parent`'s — true only if
+        // nothing else touched the group in between. `retry_count == 0` is
+        // kept as a cheap, always-correct pre-filter (a record that has
+        // already been deferred once is inherently more exposed and this
+        // avoids the extra query for the common non-retried case with no
+        // loss of safety), `&&`ed with a real, general check —
+        // [`relationship_fast_path_precondition_holds`] — for whether any
+        // sibling from-side change (staged, in-flight, *or already
+        // drained*) could have raced this record's own old/new window via
+        // `force_every_group`. Either one failing routes to the fallback
+        // below (identical treatment to `needs_recompute_fallback`), which
+        // is immune to this hazard: it stages an image-less `Recompute`,
+        // which (for this same definition) goes through the identical
+        // `force_every_group` live recompute, so it is idempotent no
+        // matter how many times the group has already been touched.
+        let mut fast_path_keys: Vec<&str> = Vec::with_capacity(2);
+        if let Some(k) = old_key.as_deref() {
+            fast_path_keys.push(k);
+        }
+        if let Some(k) = new_key.as_deref()
+            && Some(k) != old_key.as_deref()
+        {
+            fast_path_keys.push(k);
+        }
+        let fast_path_safe = record.retry_count == 0
+            && relationship_fast_path_precondition_holds(
+                txn,
+                &shape.from_table,
+                &shape.from_col,
+                &fast_path_keys,
+                record.prev_lsn,
+                record.watermark,
+            )
+            .await?;
+        for agg_shape in shape.aggregate_shapes.iter().filter(|_| fast_path_safe) {
+            let mut target_plan = agg_shape.template.clone();
+            let mut regex_cache = eval::RegexCache::new();
+
+            let diff_pass = async |txn: &Transaction<'_>,
+                                   target_plan: &mut AggregateTargetPlan,
+                                   regex_cache: &mut eval::RegexCache,
+                                   pass_key: &str,
+                                   old_parent: &Option<Row>,
+                                   new_parent: &Option<Row>|
+                   -> Result<(), ApplyError> {
+                let from_rows = from_side_rows_for_join_txn(
+                    txn,
+                    &shape.from_table,
+                    &shape.from_col,
+                    &shape.from_pk,
+                    pass_key,
+                )
+                .await?;
+                for (_, from_row) in from_rows {
+                    let old_augmented = augment_row_with_relationship_value(
+                        &from_row,
+                        &agg_shape.synthetic_columns,
+                        old_parent,
+                    );
+                    let new_augmented = augment_row_with_relationship_value(
+                        &from_row,
+                        &agg_shape.synthetic_columns,
+                        new_parent,
+                    );
+                    let (values, group_key) =
+                        apply_aggregate::derive_group_key(&new_augmented, &target_plan.group_by);
+                    let old_contrib = apply_aggregate::row_contribution(
+                        &agg_shape.contribution_def,
+                        &old_augmented,
+                        &agg_shape.source_columns,
+                        regex_cache,
+                    )?;
+                    let new_contrib = apply_aggregate::row_contribution(
+                        &agg_shape.contribution_def,
+                        &new_augmented,
+                        &agg_shape.source_columns,
+                        regex_cache,
+                    )?;
+                    let group = target_plan
+                        .groups
+                        .entry(group_key)
+                        .or_insert_with(|| apply_aggregate::GroupPlan::new(values));
+                    group.hop_gen = group.hop_gen.max(record.hop_gen);
+                    apply_aggregate::diff_contributions(
+                        &target_plan.fields,
+                        group,
+                        &old_contrib,
+                        &new_contrib,
+                    );
+                }
+                Ok(())
+            };
+
+            if old_key == new_key {
+                if let Some(key) = &old_key {
+                    diff_pass(
+                        txn,
+                        &mut target_plan,
+                        &mut regex_cache,
+                        key,
+                        &record.old_row,
+                        &record.new_row,
+                    )
+                    .await?;
+                }
+            } else {
+                if let Some(key) = &old_key {
+                    diff_pass(
+                        txn,
+                        &mut target_plan,
+                        &mut regex_cache,
+                        key,
+                        &record.old_row,
+                        &None,
+                    )
+                    .await?;
+                }
+                if let Some(key) = &new_key {
+                    diff_pass(
+                        txn,
+                        &mut target_plan,
+                        &mut regex_cache,
+                        key,
+                        &None,
+                        &record.new_row,
+                    )
+                    .await?;
+                }
+            }
+
+            if target_plan.groups.is_empty() {
+                continue;
+            }
+            let result =
+                apply_aggregate::apply_aggregate_target(txn, &agg_shape.target, &target_plan)
+                    .await?;
+            keys_written += result.written.len();
+            keys_deleted += result.deleted.len();
+            if !result.written.is_empty() || !result.deleted.is_empty() {
+                changed
+                    .entry(agg_shape.target.as_str())
+                    .or_default()
+                    .extend(
+                        result
+                            .written
+                            .into_iter()
+                            .chain(result.deleted)
+                            .map(|(key, hop_gen)| (key, hop_gen, record.src_changed)),
+                    );
+            }
+        }
+
+        // Fallback: anything the fast path doesn't cover for this
+        // relationship (a 1-1 target, a `RecomputeOnly` field, a
+        // multi-relationship aggregate — see
+        // `ReverseRelationshipShape::needs_recompute_fallback`'s doc
+        // comment) still needs the pre-#131 treatment for every touched
+        // from-side row. Issue #134: also runs whenever `!fast_path_safe`
+        // (a retry, or `relationship_fast_path_precondition_holds` found a
+        // racing sibling), covering `aggregate_shapes`' own targets too —
+        // see the fast-path loop's own comment just above for why an
+        // unsafe record skips that loop entirely rather than only skipping
+        // it for definitions this flag already names.
+        if shape.needs_recompute_fallback || !fast_path_safe {
+            let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+            stage_reverse_recompute_fallback(
+                txn,
+                shape,
+                &old_key,
+                &new_key,
+                record.hop_gen + 1,
+                record.src_changed,
+                &mut seen_keys,
+                &mut relationship_reverse_fallback,
+            )
+            .await?;
+        }
+
+        // Advance the projection — issue #131's own write, distinct from
+        // step 3c's forward `__trellis_gen` bump above (never touched
+        // here; see `apply_projection_advance`'s doc comment for the
+        // distinction).
+        apply_projection_advance(
+            txn,
+            shape,
+            &old_key,
+            &new_key,
+            record.new_image.as_deref(),
+            record.lsn,
+        )
+        .await?;
+    }
+
     // 4. Downstream propagation, with the hop bound checked before staging
     // anything.
     let mut recompute_changes = Vec::new();
@@ -2741,6 +5166,25 @@ pub async fn apply_and_mark_drained_many(
         });
     }
 
+    // Issue #131: the same image-less recompute staging, for step 3d's own
+    // two fallback cases — the ordering-check-miss stopgap, and definitions
+    // `ReverseRelationshipShape::needs_recompute_fallback` excludes from the
+    // fast path.
+    for (from_table, key, hop_gen, src_changed) in &relationship_reverse_fallback {
+        if *hop_gen > MAX_HOP_GEN {
+            hop_bound_tables.push(from_table.clone());
+            worst_hop_gen = worst_hop_gen.max(*hop_gen);
+            continue;
+        }
+        recompute_changes.push(StagedChange::Recompute {
+            src_table: from_table.clone(),
+            key: key.clone(),
+            hop_gen: *hop_gen,
+            group_key: None,
+            src_changed: *src_changed,
+        });
+    }
+
     if !hop_bound_tables.is_empty() {
         hop_bound_tables.sort();
         hop_bound_tables.dedup();
@@ -2762,6 +5206,22 @@ pub async fn apply_and_mark_drained_many(
         );
     }
     append::append(txn, &recompute_changes).await?;
+
+    // Issue #134: guard-rejected reverses, re-staged as their own kind —
+    // deliberately a separate `append::append` call from `recompute_changes`
+    // above, never subject to the hop-bound check that ran just above it
+    // (this op has no `hop_gen` to bound in the first place). Landing in the
+    // *active* segment (`append::append` always resolves the pointer fresh,
+    // inside this same `txn`) rather than the one being drained is the same
+    // property every other Phase-3 producer already relies on (doc 05
+    // property 1) — this reuses that exact mechanism, not a new one.
+    if !relationship_reverse_deferrals.is_empty() {
+        tracing::debug!(
+            count = relationship_reverse_deferrals.len(),
+            "staged deferred relationship reverse retries (issue #134)"
+        );
+    }
+    append::append(txn, &relationship_reverse_deferrals).await?;
 
     // 4b. Issue #16: a clean drain clears the death counters for every key
     // it just applied (not the poisoned ones it parked above) — doc 06's
@@ -2837,6 +5297,8 @@ pub async fn apply_and_mark_drained_many(
         keys_written,
         keys_deleted,
         segments_drained,
+        deferral_counts,
+        fairness_escalations,
     })
 }
 
@@ -2844,11 +5306,39 @@ pub async fn apply_and_mark_drained_many(
 /// rows it physically wrote/deleted (no-op-suppressed writes excluded), and
 /// whether this call's completion flipped the segment to `'drained'`
 /// (`false` if other buckets are still outstanding).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy` as of issue #134/#135's review follow-up
+/// (`deferral_counts` is a `HashMap`) — every existing call site only ever
+/// read this by field or by a single `let` binding, never relied on
+/// implicit copies, so this is additive in practice.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyOutcome {
     pub keys_written: usize,
     pub keys_deleted: usize,
     pub batch_drained: bool,
+    /// Issue #134/#135: per-guard deferral counts this call's Phase 3 pass
+    /// discovered, keyed by [`ReverseGuardFailure::metric_label`] — the
+    /// caller's own responsibility to flush into
+    /// [`crate::metrics::increment_relationship_reverse_deferred`] *after*
+    /// this call's transaction has actually committed (see
+    /// [`flush_apply_metrics`]'s doc comment for why: this whole call can
+    /// be retried in full — a losing attempt's counts must never reach the
+    /// registry). Empty whenever no reverse guard rejected anything this
+    /// pass, which — reused from [`ManyApplyOutcome::deferral_counts`] via
+    /// [`apply_and_mark_drained`]'s wrapper — is the overwhelming common
+    /// case.
+    pub deferral_counts: HashMap<&'static str, u64>,
+    /// Issue #135: count of to-one relationship reverse transitions this
+    /// call's Phase 3 pass resolved via fairness escalation (see
+    /// [`RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD`]'s doc comment and the
+    /// "Issue #135" design section right after [`check_reverse_guards`])
+    /// rather than deferring again — the caller's own responsibility to
+    /// flush into
+    /// [`crate::metrics::increment_relationship_reverse_fairness_escalated`]
+    /// under the same post-commit-only contract as `deferral_counts` above.
+    /// Reused from [`ManyApplyOutcome::fairness_escalations`] via
+    /// [`apply_and_mark_drained`]'s wrapper.
+    pub fairness_escalations: u64,
 }
 
 /// What one successful [`apply_and_mark_drained_many`] call did — the
@@ -2863,6 +5353,13 @@ pub struct ManyApplyOutcome {
     pub keys_written: usize,
     pub keys_deleted: usize,
     pub segments_drained: Vec<(i64, bool)>,
+    /// Issue #134/#135 review follow-up: buffered, not recorded eagerly —
+    /// see [`ApplyOutcome::deferral_counts`]'s doc comment (this field is
+    /// that one's source, for the coalesced-segment path).
+    pub deferral_counts: HashMap<&'static str, u64>,
+    /// Issue #135: see [`ApplyOutcome::fairness_escalations`]'s doc comment
+    /// (this field is that one's source, for the coalesced-segment path).
+    pub fairness_escalations: u64,
 }
 
 // ---------------------------------------------------------------------
@@ -2895,7 +5392,7 @@ const MAX_APPLY_ATTEMPTS: u32 = 5;
 /// just the first.
 #[tracing::instrument(
     name = "staging.drain_once",
-    skip(pool, wake_channel),
+    skip(pool, wake_channel, watermark),
     fields(claimed_by = %claimed_by, attempt = tracing::field::Empty)
 )]
 pub async fn drain_once(
@@ -2904,6 +5401,7 @@ pub async fn drain_once(
     claimed_by: &str,
     live_workers: i64,
     wake_channel: &str,
+    watermark: &StagedWatermark,
 ) -> Result<Option<ApplyOutcome>, ApplyError> {
     let mut folded = {
         let mut client = pool.get().await?;
@@ -2973,7 +5471,9 @@ pub async fn drain_once(
 
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
-        match apply_and_mark_drained(&txn, seg_seq, claimed_by, &plan, wake_channel).await {
+        match apply_and_mark_drained(&txn, seg_seq, claimed_by, &plan, wake_channel, watermark)
+            .await
+        {
             Ok(outcome) => {
                 txn.commit().await?;
                 // Epic #49 cross-cutting review fix (issues #51/#52): only
@@ -2982,6 +5482,14 @@ pub async fn drain_once(
                 // `compute` itself, which the loop above may have called
                 // more than once for this same `folded` input.
                 flush_apply_metrics(&plan);
+                // Issue #134/#135 review follow-up: same post-commit-only
+                // contract, for the deferral counters this attempt's own
+                // Phase 3 pass discovered.
+                flush_relationship_reverse_deferral_metrics(&outcome.deferral_counts);
+                // Issue #135: same post-commit-only contract, for the
+                // fairness-escalation count this attempt's own Phase 3 pass
+                // discovered.
+                flush_relationship_reverse_fairness_escalation_metric(outcome.fairness_escalations);
                 backoff.reset();
                 return Ok(Some(outcome));
             }
@@ -3049,7 +5557,7 @@ pub const MAX_COALESCE_SEGMENTS: usize = 32;
 /// instead of a single segment's.
 #[tracing::instrument(
     name = "staging.drain_many",
-    skip(pool, wake_channel),
+    skip(pool, wake_channel, watermark),
     fields(
         claimed_by = %claimed_by,
         segments = seg_seqs.len(),
@@ -3062,6 +5570,7 @@ pub async fn drain_many(
     claimed_by: &str,
     live_workers: i64,
     wake_channel: &str,
+    watermark: &StagedWatermark,
 ) -> Result<Option<ManyApplyOutcome>, ApplyError> {
     if seg_seqs.is_empty() {
         return Ok(None);
@@ -3138,8 +5647,15 @@ pub async fn drain_many(
 
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
-        match apply_and_mark_drained_many(&txn, &owned_segments, claimed_by, &plan, wake_channel)
-            .await
+        match apply_and_mark_drained_many(
+            &txn,
+            &owned_segments,
+            claimed_by,
+            &plan,
+            wake_channel,
+            watermark,
+        )
+        .await
         {
             Ok(outcome) => {
                 txn.commit().await?;
@@ -3148,6 +5664,13 @@ pub async fn drain_many(
                 // attempt's (possibly multi-segment) transaction has
                 // actually committed.
                 flush_apply_metrics(&plan);
+                // Issue #134/#135 review follow-up: see `drain_once`'s
+                // matching call.
+                flush_relationship_reverse_deferral_metrics(&outcome.deferral_counts);
+                // Issue #135: same post-commit-only contract, for the
+                // fairness-escalation count this attempt's own Phase 3 pass
+                // discovered.
+                flush_relationship_reverse_fairness_escalation_metric(outcome.fairness_escalations);
                 backoff.reset();
                 return Ok(Some(outcome));
             }

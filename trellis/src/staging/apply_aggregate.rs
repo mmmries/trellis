@@ -59,23 +59,38 @@
 //!   so the probe is *literally* the same SQL the correctness oracle would
 //!   run — never an approximated inverse.
 //!
-//! # Relationship-reading aggregates (issue #94)
+//! # Relationship-reading aggregates (issue #94, delta path since #136)
 //!
 //! A definition whose fields aggregate a **to-one** relationship path
-//! (`SUM(post.word_count)`) opts out of the delta model entirely: every group
-//! any change touches is marked [`GroupPlan::force_full_recompute`], so Phase
-//! 3 re-derives it from the source `LEFT JOIN`ed to the to-side table (see
-//! [`apply_forced_groups_bulk`]) rather than folding per-row contributions.
+//! (`SUM(post.word_count)`) *used to* opt out of the delta model entirely —
+//! every group any change touched was marked [`GroupPlan::force_full_recompute`]
+//! regardless of which side of a grain migration it was on, so Phase 3
+//! re-derived it from the source `LEFT JOIN`ed to the *live* to-side table
+//! (see [`apply_forced_groups_bulk`]) rather than folding per-row
+//! contributions. Issue #136 (epic #127) replaces that for an ordinary
+//! (non-image-less) change: [`accumulate_changes`] now resolves a row's
+//! relationship read(s) from the settled parent projection (issue #130's
+//! mechanism, the same one a `KeySpace::OneToOne` target's forward path
+//! already uses) via [`build_forward_relationship_shape`]/
+//! [`forward_row_contribution`], substituting each `RelationshipPath` for a
+//! synthetic `Column` carrying the resolved value (mirroring
+//! [`super::apply`]'s issue #131 reverse-path shape,
+//! `ReverseAggregateShape`) and folding the result through the ordinary
+//! per-row delta machinery below — no live `JOIN`, no forced full-group
+//! recompute, for this case.
 //!
-//! The delta model can't be used as-is here: a source row's contribution
-//! depends on a *related* row that is not in the change stream at all, so
-//! [`row_contribution`]'s purely-local per-row evaluation can't produce it.
-//! And a change to that related row arrives — via reverse propagation
-//! ([`super::apply::compute`]'s inbound-relationship pass, issue #30) — as an
-//! image-less recompute trigger on the from-side row, which is on the forced
-//! path regardless. Forcing both directions keeps one code path correct for
-//! both, instead of two that would have to agree. The cost is a group-scoped
-//! regrouping scan per touched group per batch in place of an O(1) increment.
+//! [`GroupPlan::force_full_recompute`]/[`apply_forced_groups_bulk`]'s
+//! live-`JOIN` machinery is **not** dead code, though: an **image-less**
+//! change (a bare recompute trigger — reverse propagation's own fallback
+//! path for anything the issue #131 fast path doesn't cover, definition
+//! re-derive, backfill) still forces its group onto it below, for the exact
+//! reason the "A known gap: image-less changes" section explains — no prior
+//! state to diff against, so a full-recompute re-derivation (a live `JOIN`
+//! is simply the correct way to compute a *fresh* group value, not an
+//! incremental adjustment, so it carries none of the double-counting risk a
+//! live-read *delta* would) sidesteps the ambiguity. Truncate propagation
+//! (a synthetic image-less recompute over every affected key) reaches the
+//! same path the same way.
 //!
 //! # Grain migration
 //!
@@ -119,7 +134,7 @@ use crate::defs::oracle;
 use crate::defs::validate::{self, ResolvedRelationship};
 use crate::pool::quote_ident;
 
-use super::apply::ApplyError;
+use super::apply::{ApplyError, substitute_relationship_path};
 use super::fold::FoldedChange;
 
 // ---------------------------------------------------------------------
@@ -288,7 +303,12 @@ pub(super) struct GroupPlan {
 }
 
 impl GroupPlan {
-    fn new(group_values: Vec<Option<String>>) -> Self {
+    /// Widened to `pub(super)` for issue #131, epic #127: the reverse-delta
+    /// apply path (`super::apply`'s `RelationshipReverseRecord` handling)
+    /// builds `GroupPlan`s directly from live-enumerated from-side rows,
+    /// outside `accumulate_changes`' own batch loop, and needs this same
+    /// constructor rather than a duplicate.
+    pub(super) fn new(group_values: Vec<Option<String>>) -> Self {
         GroupPlan {
             group_values,
             field_accum: HashMap::new(),
@@ -357,8 +377,15 @@ pub(super) struct AggregateTargetPlan {
     /// relationship-free aggregate, in which case every SQL statement this
     /// module emits is byte-identical to what it emitted before #94.
     ///
-    /// Non-empty also *means* "this target is on the forced-recompute path"
-    /// — see the module doc comment and [`accumulate_changes`].
+    /// Before issue #136, non-empty also *meant* "every group of this target
+    /// is on the forced-recompute path" (`force_every_group`). #136 deleted
+    /// that routing — an invertible field (`SUM`/`AVG`/`COUNT`) reading a
+    /// relationship path is still folded incrementally through the ordinary
+    /// delta path, exactly like a plain-column field — so this no longer
+    /// implies anything about *routing*; it only tells every SQL builder
+    /// that reads a `RecomputeOnly` field's expression ([`render_agg_expr`]
+    /// and its callers) whether that expression's relationship paths need a
+    /// join, regardless of which path (forced or delta) it's rendered from.
     pub rel_joins: Vec<RelJoin>,
 }
 
@@ -418,7 +445,9 @@ impl AggregateTargetPlan {
 /// value), duplicated locally since that one is private to the oracle
 /// module and this is the one other place a group needs to be named as a
 /// single string.
-fn derive_group_key(row: &Row, group_by: &[String]) -> (Vec<Option<String>>, String) {
+/// `pub(super)`: issue #131's reverse-delta apply path derives a live
+/// from-side row's group key the same way this batch-driven caller does.
+pub(super) fn derive_group_key(row: &Row, group_by: &[String]) -> (Vec<Option<String>>, String) {
     let values: Vec<Option<String>> = group_by
         .iter()
         .map(|c| row.get(c).cloned().flatten())
@@ -482,7 +511,13 @@ fn derive_group_key(row: &Row, group_by: &[String]) -> (Vec<Option<String>>, Str
 /// function trusts that rather than re-deriving it per row/change, since
 /// every call within one [`accumulate_changes`] batch would otherwise
 /// repeat the exact same rewrite of the exact same `def`.
-fn row_contribution(
+///
+/// `pub(super)`: issue #131's reverse-delta apply path also calls this
+/// directly, against a *relationship-substituted* rewritten def (a
+/// `RelationshipPath` swapped for a synthetic `Column` carrying the
+/// parent's old/new image value) rather than `accumulate_changes`' plain
+/// per-batch rewrite — see `super::apply`'s `ReverseAggregateShape`.
+pub(super) fn row_contribution(
     def: &TransformDef,
     row: &Row,
     source_columns: &HashMap<String, ValueType>,
@@ -511,7 +546,10 @@ fn row_contribution(
 /// fields, and any calculated field composing one of those) is left
 /// byte-for-byte identical to `def`'s own field, so this changes nothing
 /// about their evaluation.
-fn contribution_def(def: &TransformDef) -> TransformDef {
+/// `pub(super)`: issue #131's reverse-delta apply path applies this same
+/// `AVG`-as-`SUM` rewrite to its own relationship-substituted definition
+/// before calling [`row_contribution`].
+pub(super) fn contribution_def(def: &TransformDef) -> TransformDef {
     let mut def = def.clone();
     for field in &mut def.fields {
         if let Expr::FunctionCall { name, .. } = &mut field.expr
@@ -521,6 +559,207 @@ fn contribution_def(def: &TransformDef) -> TransformDef {
         }
     }
     def
+}
+
+/// The synthetic source-column name issue #136's forward relationship
+/// substitution splices a resolved to-one value under — the forward-path
+/// counterpart to [`super::apply::synthetic_relationship_column`]'s reverse
+/// convention, but scoped by *both* relationship name and to-side column,
+/// not the column alone.
+///
+/// That extra scoping is necessary here and isn't for the reverse path:
+/// [`super::apply::build_reverse_relationship_shape`]'s design fork 3
+/// restricts a reverse shape to exactly one relationship, so its bare
+/// `column`-only naming can never collide. A forward [`AggregateTargetPlan`]
+/// carries no such restriction — [`apply_forced_groups_bulk`]'s own
+/// `rel_joins_sql` already joins more than one to-side table in a single
+/// recompute statement — so two different relationships that happen to
+/// share a to-side column name (e.g. both `author` and `editor` relate to a
+/// `users` table and both read `.name`) must not collide on the same
+/// synthetic column.
+fn forward_relationship_synthetic_column(rel: &str, column: &str) -> String {
+    format!("__trellis_fwd_{rel}_{column}")
+}
+
+/// One resolved `<rel>.<column>` reference [`build_forward_relationship_shape`]
+/// rewrote into a synthetic `Column` — `from_col` is the from-row's own join
+/// key column (read fresh per row, per side, in
+/// [`forward_row_contribution`], since a row's own `from_col` can itself
+/// change between its old and new image within one folded update).
+#[derive(Debug, Clone)]
+struct ForwardRelationshipSynthetic {
+    rel_name: String,
+    from_col: String,
+    to_col: String,
+    synthetic: String,
+}
+
+/// Issue #136's forward-path counterpart to [`super::apply`]'s
+/// `ReverseAggregateShape` (issue #131): everything [`forward_row_contribution`]
+/// needs to evaluate one row's contribution against a relationship-reading
+/// aggregate definition without a live `JOIN` — built once per
+/// [`accumulate_changes`] batch (like [`contribution_def`]'s own per-batch
+/// rewrite), not once per row.
+///
+/// `synthetic` is empty for a relationship-free plan (`plan.rel_joins`
+/// empty, the overwhelmingly common case), in which case `contribution_def`/
+/// `source_columns` are exactly [`contribution_def`]'s plain rewrite and the
+/// caller's own `source_columns`, unchanged from before this issue —
+/// [`forward_row_contribution`] special-cases that shape into a plain
+/// passthrough.
+struct ForwardRelationshipShape {
+    contribution_def: TransformDef,
+    source_columns: HashMap<String, ValueType>,
+    synthetic: Vec<ForwardRelationshipSynthetic>,
+}
+
+/// Builds one batch's [`ForwardRelationshipShape`] for `def` against
+/// `rel_joins` (issue #136): every `RelationshipPath { rel, column }`
+/// reference this definition's fields make into one of `rel_joins`'
+/// relationships is rewritten to an ordinary `Column` reference at a
+/// synthetic name, via [`super::apply::substitute_relationship_path`] —
+/// reused directly rather than reimplemented, since that function is
+/// already generic over which relationship name it rewrites (nothing in its
+/// own signature is reverse-specific). Called once per relationship in
+/// `rel_joins`, since [`substitute_relationship_path`] only ever rewrites
+/// paths for the one `rel_name` it's given, leaving every other
+/// relationship's paths untouched until their own turn.
+///
+/// The resolved to-side value's [`ValueType`] comes from `rel_ctx`'s own
+/// [`eval::ToOneRelationship::to_columns`] — the same settled-projection-typed
+/// map [`super::apply::build_relationship_context`] already resolved for
+/// this batch (via `to_column_types`), not a second catalog round trip.
+///
+/// # Panics
+///
+/// If `rel_joins` is non-empty but `rel_ctx` is `None` — every caller with a
+/// relationship-reading plan must have already built a context (see
+/// `super::apply::compute`'s aggregate branch, which builds one via
+/// [`super::apply::build_relationship_context`] whenever
+/// [`eval::relationship_references`] is non-empty, the same gate this
+/// function's caller checks by way of `plan.rel_joins`).
+fn build_forward_relationship_shape(
+    def: &TransformDef,
+    rel_joins: &[RelJoin],
+    rel_ctx: Option<&eval::RelationshipContext>,
+    source_columns: &HashMap<String, ValueType>,
+) -> ForwardRelationshipShape {
+    if rel_joins.is_empty() {
+        return ForwardRelationshipShape {
+            contribution_def: contribution_def(def),
+            source_columns: source_columns.clone(),
+            synthetic: Vec::new(),
+        };
+    }
+    let ctx = rel_ctx.expect(
+        "AggregateTargetPlan carries rel_joins but accumulate_changes was called with no \
+         relationship context — see super::apply::compute's aggregate branch, which must \
+         build one via build_relationship_context whenever eval::relationship_references \
+         is non-empty",
+    );
+
+    let refs = eval::relationship_references(def);
+    let mut rewritten = def.clone();
+    let mut widened_source_columns = source_columns.clone();
+    let mut synthetic = Vec::new();
+
+    for join in rel_joins {
+        let mut synthetic_map: HashMap<String, String> = HashMap::new();
+        for (rel, column) in &refs {
+            if rel != &join.name || synthetic_map.contains_key(column) {
+                continue;
+            }
+            let synthetic_name = forward_relationship_synthetic_column(&join.name, column);
+            let value_type = ctx
+                .to_one(&join.name)
+                .and_then(|r| r.to_columns.get(column))
+                .copied()
+                .unwrap_or(ValueType::Text);
+            widened_source_columns.insert(synthetic_name.clone(), value_type);
+            synthetic.push(ForwardRelationshipSynthetic {
+                rel_name: join.name.clone(),
+                from_col: join.from_col.clone(),
+                to_col: column.clone(),
+                synthetic: synthetic_name.clone(),
+            });
+            synthetic_map.insert(column.clone(), synthetic_name);
+        }
+        for field in &mut rewritten.fields {
+            substitute_relationship_path(&mut field.expr, &join.name, &synthetic_map);
+        }
+    }
+
+    ForwardRelationshipShape {
+        contribution_def: contribution_def(&rewritten),
+        source_columns: widened_source_columns,
+        synthetic,
+    }
+}
+
+/// One row's contribution against `shape` (issue #136) — [`row_contribution`]
+/// itself for a relationship-free shape (`shape.synthetic` empty, a plain
+/// passthrough), or, for a relationship-reading one, [`row_contribution`]
+/// against a clone of `row` first spliced with each resolved to-one value
+/// under its synthetic column name (mirroring
+/// [`super::apply::augment_row_with_relationship_value`], issue #131's
+/// reverse-path equivalent) and `shape.contribution_def` (the
+/// relationship-substituted rewrite [`build_forward_relationship_shape`]
+/// built).
+///
+/// Resolution is **per row, per call** — deliberately not hoisted or cached
+/// across `old_row`/`new_row` for the same change — because a row's own
+/// join-key column (`from_col`) can itself differ between its old and new
+/// image within one folded update (a re-point): each side must resolve
+/// against *its own* `from_col` value, so the old contribution is computed
+/// under the old parent and the new one under the new parent, exactly the
+/// "subtract under old membership, add under new membership" rule the
+/// module doc comment's grain-migration section already establishes for the
+/// row's `GROUP BY` columns — this extends the same discipline to a
+/// relationship-resolved field value.
+///
+/// A from-row whose `from_col` is absent/NULL, or whose join key has no
+/// match in `rel_ctx`'s settled projection, resolves the synthetic column to
+/// `None` (SQL `NULL`) — the same "no match" LEFT JOIN semantics
+/// [`eval::eval_expr`]'s own `RelationshipPath` arm and
+/// `augment_row_with_relationship_value` both already establish, not a hard
+/// error: a synthetic column always exists on the augmented row, it just
+/// has no resolved value for this particular row/side.
+fn forward_row_contribution(
+    shape: &ForwardRelationshipShape,
+    rel_ctx: Option<&eval::RelationshipContext>,
+    row: &Row,
+    regex_cache: &mut RegexCache,
+) -> Result<HashMap<String, Option<String>>, ApplyError> {
+    if shape.synthetic.is_empty() {
+        return row_contribution(
+            &shape.contribution_def,
+            row,
+            &shape.source_columns,
+            regex_cache,
+        );
+    }
+    let ctx = rel_ctx.expect(
+        "ForwardRelationshipShape has synthetic columns but no relationship context was \
+         supplied (should be unreachable — build_forward_relationship_shape already \
+         requires one to build a non-empty shape)",
+    );
+    let mut augmented = row.clone();
+    for s in &shape.synthetic {
+        let value = row.get(&s.from_col).cloned().flatten().and_then(|key| {
+            ctx.to_one(&s.rel_name)
+                .and_then(|r| r.to_rows_by_key.get(&key))
+                .and_then(|to_row| to_row.get(&s.to_col))
+                .cloned()
+                .flatten()
+        });
+        augmented.insert(s.synthetic.clone(), value);
+    }
+    row_contribution(
+        &shape.contribution_def,
+        &augmented,
+        &shape.source_columns,
+        regex_cache,
+    )
 }
 
 /// Folds `changes` (one aggregate definition's slice of one drain's folded
@@ -536,6 +775,15 @@ fn contribution_def(def: &TransformDef) -> TransformDef {
 /// decoded `old_image`, or `None` when the change carried none (including
 /// the image-less case, where the prior state is genuinely unknown — see
 /// the module doc comment).
+///
+/// `rel_ctx` (issue #136) is the settled-parent-projection-backed
+/// [`eval::RelationshipContext`] `super::apply::compute`'s aggregate branch
+/// built via [`super::apply::build_relationship_context`] — `Some` whenever
+/// `def` reads any relationship ([`eval::relationship_references`]
+/// non-empty, the same gate a `KeySpace::OneToOne` definition uses),
+/// regardless of whether `plan.rel_joins` ends up needing it for any given
+/// change; `None` for the overwhelmingly common relationship-free
+/// definition. [`build_forward_relationship_shape`] is the only reader.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn accumulate_changes(
     plan: &mut AggregateTargetPlan,
@@ -545,6 +793,7 @@ pub(super) fn accumulate_changes(
     old_rows: &[Option<Row>],
     source_columns: &HashMap<String, ValueType>,
     regex_cache: &mut RegexCache,
+    rel_ctx: Option<&eval::RelationshipContext>,
 ) -> Result<(), ApplyError> {
     let KeySpace::Aggregate { group_by } = &def.key_space else {
         panic!("accumulate_changes called on a non-aggregate definition");
@@ -552,32 +801,20 @@ pub(super) fn accumulate_changes(
     // Built once per batch, not once per [`row_contribution`] call (every
     // change needs it, and it's the same rewrite of the same `def` every
     // time) — see [`contribution_def`]'s doc comment for why every `AVG`
-    // field is evaluated as the equivalent `SUM` here.
-    let contribution_def = contribution_def(def);
-
-    // Issue #94: a definition reading a to-one relationship path can't be
-    // maintained by per-row deltas at all (see the module doc comment), so
-    // every group any change touches — on either side of a grain migration —
-    // goes on the full-recompute path, exactly as an image-less change would.
-    let force_every_group = !plan.rel_joins.is_empty();
+    // field is evaluated as the equivalent `SUM` here. Issue #136: for a
+    // relationship-reading plan, this is also where every `RelationshipPath`
+    // this batch might need gets rewritten to a synthetic `Column` up front
+    // — see [`build_forward_relationship_shape`]'s own doc comment. A
+    // relationship-free plan gets back a shape whose `contribution_def`/
+    // `source_columns` are byte-identical to the pre-#136 rewrite, so
+    // [`forward_row_contribution`] below is a plain passthrough to
+    // [`row_contribution`] for the overwhelmingly common case.
+    let shape = build_forward_relationship_shape(def, &plan.rel_joins, rel_ctx, source_columns);
 
     for (i, change) in changes.iter().enumerate() {
         let is_image_less = change.old_image.is_none() && change.new_image.is_none();
         let old_row = &old_rows[i];
         let new_row = &rows[i];
-
-        if force_every_group {
-            for row in [old_row, new_row].into_iter().flatten() {
-                let (values, key) = derive_group_key(row, group_by);
-                let group = plan
-                    .groups
-                    .entry(key)
-                    .or_insert_with(|| GroupPlan::new(values));
-                group.force_full_recompute = true;
-                group.hop_gen = group.hop_gen.max(change.hop_gen);
-            }
-            continue;
-        }
 
         if is_image_less {
             if let Some(row) = new_row {
@@ -595,8 +832,7 @@ pub(super) fn accumulate_changes(
         match (old_row, new_row) {
             (None, Some(new_row)) => {
                 let (values, key) = derive_group_key(new_row, group_by);
-                let contrib =
-                    row_contribution(&contribution_def, new_row, source_columns, regex_cache)?;
+                let contrib = forward_row_contribution(&shape, rel_ctx, new_row, regex_cache)?;
                 let group = plan
                     .groups
                     .entry(key)
@@ -606,8 +842,7 @@ pub(super) fn accumulate_changes(
             }
             (Some(old_row), None) => {
                 let (values, key) = derive_group_key(old_row, group_by);
-                let contrib =
-                    row_contribution(&contribution_def, old_row, source_columns, regex_cache)?;
+                let contrib = forward_row_contribution(&shape, rel_ctx, old_row, regex_cache)?;
                 let group = plan
                     .groups
                     .entry(key)
@@ -618,10 +853,8 @@ pub(super) fn accumulate_changes(
             (Some(old_row), Some(new_row)) => {
                 let (old_values, old_key) = derive_group_key(old_row, group_by);
                 let (new_values, new_key) = derive_group_key(new_row, group_by);
-                let old_contrib =
-                    row_contribution(&contribution_def, old_row, source_columns, regex_cache)?;
-                let new_contrib =
-                    row_contribution(&contribution_def, new_row, source_columns, regex_cache)?;
+                let old_contrib = forward_row_contribution(&shape, rel_ctx, old_row, regex_cache)?;
+                let new_contrib = forward_row_contribution(&shape, rel_ctx, new_row, regex_cache)?;
 
                 if old_key == new_key {
                     let group = plan
@@ -629,31 +862,7 @@ pub(super) fn accumulate_changes(
                         .entry(new_key)
                         .or_insert_with(|| GroupPlan::new(new_values));
                     group.hop_gen = group.hop_gen.max(change.hop_gen);
-                    for field in &plan.fields {
-                        if !matches!(
-                            field.kind,
-                            AggFieldKind::Sum | AggFieldKind::Avg | AggFieldKind::Count
-                        ) {
-                            continue;
-                        }
-                        let old_v = old_contrib.get(&field.name).cloned().flatten();
-                        let new_v = new_contrib.get(&field.name).cloned().flatten();
-                        // Per-change cancellation: an unchanged contribution
-                        // is not a delta at all, and skipping it is what
-                        // lets `apply_aggregate_target` tell "this field had
-                        // no activity this batch" (no `field_accum` entry)
-                        // from "activity that happened to net to zero".
-                        if old_v == new_v {
-                            continue;
-                        }
-                        let accum = group.field_accum.entry(field.name.clone()).or_default();
-                        if let Some(v) = new_v {
-                            accum.adds.push(v);
-                        }
-                        if let Some(v) = old_v {
-                            accum.subs.push(v);
-                        }
-                    }
+                    diff_contributions(&plan.fields, group, &old_contrib, &new_contrib);
                 } else {
                     // Grain migration: subtract from the old group, add to
                     // the new one, independently.
@@ -737,6 +946,55 @@ fn sub_contributions(
     }
 }
 
+/// Diffs one row's contribution before (`old_contrib`) and after
+/// (`new_contrib`) some change **that does not move the row into or out of
+/// `group`** — factored out of `accumulate_changes`'s own in-place-update
+/// branch (an ordinary same-group CDC `UPDATE`) so issue #131's
+/// reverse-delta apply can reuse the exact same per-field cancellation
+/// rule, which it needs for a different reason than `accumulate_changes`
+/// does: a parent-only change never adds or removes a from-side row from
+/// its group at all (the row's own `GROUP BY` columns never change), so
+/// every field must be diffed individually rather than blindly
+/// subtracted-then-added via [`sub_contributions`]/[`add_contributions`] —
+/// otherwise a field the relationship doesn't even touch (e.g. a plain
+/// `COUNT(*)`, whose contribution is `1` regardless of any relationship
+/// value) would wrongly gain a net +1/-1 delta on every reverse apply that
+/// touches its group, double-counting it against the value backfill/an
+/// earlier apply already established.
+///
+/// An unchanged contribution (`old_v == new_v`, always true for a field the
+/// change doesn't touch) pushes no accumulator entry at all — not a
+/// zero-effect add/sub pair — which is what lets [`apply_aggregate_target`]
+/// tell "this field had no activity this batch" from "activity that
+/// happened to net to zero" (`group_has_activity`'s own distinction).
+pub(super) fn diff_contributions(
+    fields: &[AggFieldPlan],
+    group: &mut GroupPlan,
+    old_contrib: &HashMap<String, Option<String>>,
+    new_contrib: &HashMap<String, Option<String>>,
+) {
+    for field in fields {
+        if !matches!(
+            field.kind,
+            AggFieldKind::Sum | AggFieldKind::Avg | AggFieldKind::Count
+        ) {
+            continue;
+        }
+        let old_v = old_contrib.get(&field.name).cloned().flatten();
+        let new_v = new_contrib.get(&field.name).cloned().flatten();
+        if old_v == new_v {
+            continue;
+        }
+        let accum = group.field_accum.entry(field.name.clone()).or_default();
+        if let Some(v) = new_v {
+            accum.adds.push(v);
+        }
+        if let Some(v) = old_v {
+            accum.subs.push(v);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Phase 3: per-group apply
 // ---------------------------------------------------------------------
@@ -757,14 +1015,32 @@ pub(super) struct AggregateApplyResult {
 /// own [`derive_group_key`] doesn't attempt `GROUP BY`'s "NULLs group
 /// together" semantics beyond this) never silently fails to match itself.
 fn group_where_clause(group_by: &[String], group_by_types: &[ValueType], start: usize) -> String {
+    group_where_clause_aliased(group_by, group_by_types, start, None)
+}
+
+/// [`group_where_clause`], with each column optionally qualified by `alias`
+/// — needed once the `FROM` clause it's paired with joins in a second table
+/// (a to-one relationship's to-side, per issue #94), so an unqualified
+/// `GROUP BY` column name can't become ambiguous against a same-named
+/// to-side column. `None` renders byte-identical to the unaliased form, so
+/// every relationship-free call site is unaffected.
+fn group_where_clause_aliased(
+    group_by: &[String],
+    group_by_types: &[ValueType],
+    start: usize,
+    alias: Option<&str>,
+) -> String {
     group_by
         .iter()
         .zip(group_by_types)
         .enumerate()
         .map(|(i, (col, ty))| {
+            let col_sql = match alias {
+                Some(a) => format!("{a}.{}", quote_ident(col)),
+                None => quote_ident(col),
+            };
             format!(
-                "{} is not distinct from ${}::text::{}",
-                quote_ident(col),
+                "{col_sql} is not distinct from ${}::text::{}",
                 start + i,
                 ddl::pg_type_name(*ty)
             )
@@ -822,24 +1098,48 @@ async fn delete_group_row(
 /// path, any) field's current value for one group directly from the source
 /// — `select (<rendered expr>)::text from source where <group columns> =
 /// ...`, scoped to just this group, never a full-table scan. Rendering via
-/// [`oracle::render_expr_sql`] means this is not a second implementation of
-/// the field's semantics: it is the exact SQL the correctness oracle itself
-/// would run for this field, evaluated with no `GROUP BY` because the
-/// `WHERE` clause has already restricted the input to exactly one group.
+/// [`render_agg_expr`] — the same relationship-aware branch
+/// [`apply_forced_groups_bulk`]/[`probe_recompute_fields_bulk`] use — means
+/// this is not a second implementation of the field's semantics: it is the
+/// exact SQL the correctness oracle itself would run for this field,
+/// evaluated with no `GROUP BY` because the `WHERE` clause has already
+/// restricted the input to exactly one group. A plan with to-one
+/// relationship joins (issue #94) needs its to-side table joined in here
+/// too — reachable whenever an ordinary (non-forced) delta touches exactly
+/// one group with a `RecomputeOnly` field reading a relationship path (this
+/// module's whole-branch-review regression, epic #127: issue #131's design
+/// scoped `MIN`/`MAX`-over-relationship out of the reverse fast path, and
+/// issue #136 then routed such a group through the *forward* ordinary delta
+/// path instead of the old always-joins-correctly `force_every_group`) — so
+/// this mirrors those bulk builders' `rel_joins_sql`/aliasing rather than
+/// assuming an unaliased, join-free source scan.
 async fn probe_field_value(
     txn: &Transaction<'_>,
-    source: &str,
+    plan: &AggregateTargetPlan,
     expr: &Expr,
-    group_by: &[String],
-    group_by_types: &[ValueType],
     values: &[Option<String>],
 ) -> Result<Option<String>, ApplyError> {
-    let expr_sql = oracle::render_expr_sql(expr);
-    let where_sql = group_where_clause(group_by, group_by_types, 1);
-    let sql = format!(
-        "select ({expr_sql})::text from {} where {where_sql}",
-        ddl::qualified_source_table(source)
-    );
+    let expr_sql = render_agg_expr(plan, expr);
+    let source_ident = ddl::qualified_source_table(&plan.source);
+    let sql = if plan.rel_joins.is_empty() {
+        let where_sql = group_where_clause(&plan.group_by, &plan.group_by_types, 1);
+        format!("select ({expr_sql})::text from {source_ident} where {where_sql}")
+    } else {
+        let rel_joins_sql = oracle::to_one_join_clauses(
+            plan.rel_joins.iter().map(|j| {
+                (
+                    j.name.as_str(),
+                    j.to_table.as_str(),
+                    j.to_col.as_str(),
+                    j.from_col.as_str(),
+                )
+            }),
+            "s",
+        );
+        let where_sql =
+            group_where_clause_aliased(&plan.group_by, &plan.group_by_types, 1, Some("s"));
+        format!("select ({expr_sql})::text from {source_ident} s{rel_joins_sql} where {where_sql}")
+    };
     let row = txn.query_one(&sql, &group_where_params(values)).await?;
     Ok(row.get(0))
 }
@@ -1067,15 +1367,7 @@ async fn upsert_group(
             }
             AggFieldKind::RecomputeOnly => {
                 let expr = &plan.field_exprs[field.name.as_str()];
-                let value = probe_field_value(
-                    txn,
-                    &plan.source,
-                    expr,
-                    &plan.group_by,
-                    &plan.group_by_types,
-                    &group.group_values,
-                )
-                .await?;
+                let value = probe_field_value(txn, plan, expr, &group.group_values).await?;
                 probed.push(value);
                 columns.push(ColumnPlan::Recompute(
                     field.name.clone(),
@@ -1618,18 +1910,30 @@ fn agg_arg_sql(plan: &AggregateTargetPlan, field_name: &str) -> String {
 }
 
 /// One aggregate field's (or field argument's) expression as SQL over this
-/// plan's recompute scan, where the source is aliased `s`.
+/// plan's recompute scan, where the source is aliased `s` (every caller with
+/// a non-empty `rel_joins` joins the source under that alias — see
+/// [`oracle::to_one_join_clauses`]'s own call sites in this file).
 ///
 /// A relationship-free plan renders through [`oracle::render_expr_sql`]
 /// unchanged — unqualified column names, exactly as before #94, which matters
-/// because the per-group probes ([`probe_field_value`],
-/// [`probe_sum_and_count`]) render the same expressions against an *unaliased*
-/// source. A plan with to-one relationship joins renders through
-/// [`oracle::render_to_one_rel_expr_sql`] instead, qualifying source columns
-/// with `s` (they'd otherwise be ambiguous against the joined to-side table)
-/// and resolving each `<rel>.<column>` path off its join alias. Those per-group
-/// probes are unreachable for such a plan: every one of its groups is forced
-/// onto this bulk recompute path (see [`accumulate_changes`]).
+/// because callers with no relationship join ([`probe_field_value`],
+/// [`probe_sum_and_count`], [`probe_recompute_fields_bulk`]) render the same
+/// expressions against an *unaliased* source. A plan with to-one relationship
+/// joins renders through [`oracle::render_to_one_rel_expr_sql`] instead,
+/// qualifying source columns with `s` (they'd otherwise be ambiguous against
+/// the joined to-side table) and resolving each `<rel>.<column>` path off its
+/// join alias.
+///
+/// Every caller that can be reached for a plan with relationship joins must
+/// pair this with [`oracle::to_one_join_clauses`] over `plan.rel_joins`
+/// (aliased `s`, matching this function's own aliasing), or the rendered
+/// `<rel>.<column>` reference resolves to nothing. Before issue #136,
+/// `force_every_group` guaranteed every group of such a plan reached only
+/// [`apply_forced_groups_bulk`] (which already did this), making the ordinary
+/// delta-path probes ([`probe_field_value`], [`probe_recompute_fields_bulk`])
+/// unreachable for a relationship-reading `RecomputeOnly` field; #136 routes
+/// such groups through the ordinary delta path instead, so both of those now
+/// need — and carry — the same join.
 fn render_agg_expr(plan: &AggregateTargetPlan, expr: &Expr) -> String {
     if plan.rel_joins.is_empty() {
         oracle::render_expr_sql(expr)
@@ -1777,12 +2081,29 @@ async fn probe_recompute_fields_bulk(
         .map(|f| {
             format!(
                 "({})::text",
-                oracle::render_expr_sql(&plan.field_exprs[f.name.as_str()])
+                render_agg_expr(plan, &plan.field_exprs[f.name.as_str()])
             )
         })
         .collect();
+    // Issue #94 (same as `apply_forced_groups_bulk`): a `RecomputeOnly` field
+    // reading a to-one relationship path (e.g. `MIN(rel.col)`/`MAX(rel.col)`)
+    // needs its relationship's to-side table joined onto this scan, or
+    // `render_agg_expr` above renders an unresolved `rel.col` path that panics
+    // in the relationship-free renderer it would otherwise fall through to.
+    // Empty for a relationship-free plan, leaving this SQL byte-identical.
+    let rel_joins_sql = oracle::to_one_join_clauses(
+        plan.rel_joins.iter().map(|j| {
+            (
+                j.name.as_str(),
+                j.to_table.as_str(),
+                j.to_col.as_str(),
+                j.from_col.as_str(),
+            )
+        }),
+        "s",
+    );
     let sql = format!(
-        "select k.ord::bigint, {} from {} join {source_ident} s on {} group by k.ord",
+        "select k.ord::bigint, {} from {} join {source_ident} s on {}{rel_joins_sql} group by k.ord",
         select_exprs.join(", "),
         keyset_unnest(&plan.group_by_types, 1, true),
         keyset_match(&plan.group_by, "s", null_safe),
@@ -2563,6 +2884,176 @@ mod tests {
         assert_eq!(
             total, "12.00",
             "the NULL group's SUM must include both NULL-keyed source rows"
+        );
+    }
+
+    /// A minimal, hand-built [`FoldedChange`] for a real (non-image-less)
+    /// insert — no database, no ring, just enough for [`accumulate_changes`]
+    /// to take its ordinary per-row delta branch. Every field this module's
+    /// own logic doesn't read is a cheap, meaningless placeholder.
+    fn insert_change(key: &str) -> FoldedChange {
+        FoldedChange {
+            src_table: "post_tags".to_string(),
+            key: key.to_string(),
+            new_image: Some("{}".to_string()),
+            old_image: None,
+            src_changed: None,
+            origin_lsn: None,
+            lsn: None,
+            hop_gen: 0,
+            first_seen: std::time::SystemTime::UNIX_EPOCH,
+            group_key: None,
+            is_truncate: false,
+            relationship_reverse_deferred: None,
+            retry_count: 0,
+        }
+    }
+
+    /// Issue #136: an ordinary (non-image-less) from-side insert into a
+    /// relationship-reading aggregate must take the real per-row delta path,
+    /// never [`GroupPlan::force_full_recompute`] — the direct, unit-level
+    /// counterpart to this crate's integration coverage (`defs_aggregate_relationship.rs`'s
+    /// `inserting_a_from_side_row_resolves_from_the_projection_not_live_parent_state`),
+    /// asserted here against `accumulate_changes`'s own internal state
+    /// (`force_full_recompute` and the accumulated `field_accum`, both
+    /// `pub(super)`/private but visible to this child module) rather than a
+    /// live target table.
+    #[test]
+    fn accumulate_changes_takes_the_delta_path_not_force_full_recompute_for_a_relationship_read() {
+        use crate::defs::ast::{FieldDef, Predicate};
+        use crate::defs::model::RelationshipCardinality;
+
+        let def = TransformDef {
+            target: "tag_totals".to_string(),
+            source: "post_tags".to_string(),
+            key_space: KeySpace::Aggregate {
+                group_by: vec!["tag".to_string()],
+            },
+            fields: vec![
+                FieldDef {
+                    name: "tag".to_string(),
+                    expr: Expr::Column("tag".to_string()),
+                },
+                FieldDef {
+                    name: "total_words".to_string(),
+                    expr: Expr::FunctionCall {
+                        name: "SUM".to_string(),
+                        args: vec![Expr::RelationshipPath {
+                            rel: "post".to_string(),
+                            column: "word_count".to_string(),
+                        }],
+                    },
+                },
+            ],
+            predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
+        };
+        let source_columns = HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("post".to_string(), ValueType::Numeric),
+            ("tag".to_string(), ValueType::Text),
+        ]);
+        let relationships = HashMap::from([(
+            "post".to_string(),
+            ResolvedRelationship {
+                cardinality: RelationshipCardinality::ToOne,
+                to_table: "posts".to_string(),
+                to_col: "id".to_string(),
+                column_types: HashMap::from([("word_count".to_string(), ValueType::Numeric)]),
+            },
+        )]);
+        let field_plans = classify_fields(
+            &def,
+            &["tag".to_string()],
+            &source_columns,
+            &HashMap::from([("total_words".to_string(), def.fields[1].expr.clone())]),
+            &relationships,
+        )
+        .expect("classify fields");
+        let mut plan = AggregateTargetPlan::new(
+            vec!["tag".to_string()],
+            vec![ValueType::Text],
+            field_plans,
+            "post_tags".to_string(),
+            "tag_totals".to_string(),
+            HashMap::from([("total_words".to_string(), def.fields[1].expr.clone())]),
+            vec![RelJoin {
+                name: "post".to_string(),
+                to_table: "posts".to_string(),
+                to_col: "id".to_string(),
+                from_col: "post".to_string(),
+            }],
+        );
+
+        let rel_ctx = eval::RelationshipContext::new(HashMap::from([(
+            "post".to_string(),
+            eval::ToOneRelationship {
+                from_col: "post".to_string(),
+                cardinality: RelationshipCardinality::ToOne,
+                to_columns: HashMap::from([("word_count".to_string(), ValueType::Numeric)]),
+                to_rows_by_key: HashMap::from([(
+                    "1".to_string(),
+                    Row::from([
+                        ("id".to_string(), Some("1".to_string())),
+                        ("word_count".to_string(), Some("100".to_string())),
+                    ]),
+                )]),
+            },
+        )]));
+
+        let change = insert_change("15");
+        let changes: Vec<&FoldedChange> = vec![&change];
+        let rows: Vec<Option<Row>> = vec![Some(Row::from([
+            ("id".to_string(), Some("15".to_string())),
+            ("post".to_string(), Some("1".to_string())),
+            ("tag".to_string(), Some("rust".to_string())),
+        ]))];
+        let old_rows: Vec<Option<Row>> = vec![None];
+        let mut regex_cache = RegexCache::new();
+
+        accumulate_changes(
+            &mut plan,
+            &def,
+            &changes,
+            &rows,
+            &old_rows,
+            &source_columns,
+            &mut regex_cache,
+            Some(&rel_ctx),
+        )
+        .expect("accumulate_changes");
+
+        assert_eq!(plan.groups.len(), 1, "exactly one group touched");
+        let group = plan
+            .groups
+            .values()
+            .next()
+            .expect("the 'rust' group must be present");
+        assert!(
+            !group.force_full_recompute,
+            "an ordinary insert must take the real per-row delta path, not \
+             force_full_recompute — the whole point of issue #136"
+        );
+        assert_eq!(
+            group.group_values,
+            vec![Some("rust".to_string())],
+            "the group's own key must still be 'rust'"
+        );
+        let accum = group
+            .field_accum
+            .get("total_words")
+            .expect("total_words must have an accumulated entry");
+        assert_eq!(
+            accum.adds,
+            vec!["100".to_string()],
+            "the row's contribution must be post 1's word_count (100), \
+             resolved from the relationship context's settled projection \
+             data, not left unresolved or defaulted to NULL"
+        );
+        assert!(
+            accum.subs.is_empty(),
+            "a plain insert has nothing to subtract"
         );
     }
 

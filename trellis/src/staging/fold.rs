@@ -118,12 +118,26 @@ pub struct FoldedChange {
     /// rather than the batch's creation timestamp (see doc: an idle active
     /// batch's age is unbounded).
     pub first_seen: SystemTime,
-    /// A representative `group_key`: the first non-null value by append
-    /// order (`lsn`, then `change_id` to break ties, matching the same
-    /// order the arg-extremes use). For today's `KeySpace::OneToOne` slice
-    /// every row of a key should carry the same `group_key` anyway; this is
-    /// the "keep it simple" choice the doc allows rather than a real merge.
-    pub group_key: Option<String>,
+    /// Issue #133: the real union of every raw row's `group_key` array in
+    /// this `(src_table, key)` group — every join-key value any of the
+    /// group's rows' own `old_image`/`new_image` touched for some
+    /// relationship's `from_col`, deduplicated, with nulls filtered. Unlike
+    /// `new_image`/`old_image` (arg-extremes over the group, picking one
+    /// row's value), this is a genuine set union across *every* row, which
+    /// is exactly what makes it survive the fold's own "first old image,
+    /// last new image" collapse: a from-side row inserted and then
+    /// re-pointed within one batch (`ins(post 3)` + `repoint(3 -> 2)`)
+    /// folds `new_image`/`old_image` to endpoints that name only post 2 —
+    /// post 3 never appears in either — but this field still carries `{3,
+    /// 2}`, because it unions the insert's own touched value (3) with the
+    /// update's (3 and 2), not just the two folded endpoints. See
+    /// `staging::apply::RelationshipGenBump`'s doc comment for why guard
+    /// (b) reads this rather than the folded images. (An earlier version of
+    /// this field picked one arbitrary non-null value by append order —
+    /// "the doc's keep-it-simple choice" — which is exactly the placeholder
+    /// #133 replaces: it silently dropped every touched value but one,
+    /// which is precisely the erased-parent bug above.)
+    pub group_key: Option<Vec<String>>,
     /// Whether any row in this group is a truncate sentinel (`bool_or(op =
     /// 'truncate')`) — issue #60. In practice only the sentinel-key group
     /// (see `append::TRUNCATE_SENTINEL_KEY`) is ever `true`: no real key's
@@ -131,6 +145,27 @@ pub struct FoldedChange {
     /// this to find, per drain, which `src_table`s were truncated, without
     /// filtering `op` anywhere upstream of this one flag.
     pub is_truncate: bool,
+    /// Issue #134: this key's `relationship_definitions.id`, present iff at
+    /// least one row in this group carries `op = 'rel_reverse_deferred'` — a
+    /// previously guard-rejected to-one relationship reverse, ready to
+    /// retry. Every row that can contribute to one group necessarily shares
+    /// the same relationship id (the synthetic `src_table` this op uses,
+    /// `staging::apply::relationship_reverse_deferred_src_table`, embeds it,
+    /// so two different relationships' rows never land in the same fold
+    /// group at all) — mirrors `is_truncate`'s discriminator role: `compute`
+    /// (`staging::apply`) filters a group with this set out of the ordinary
+    /// per-source forward-evaluation loop entirely (same as a truncate
+    /// sentinel) and reconstructs a fresh `RelationshipReverseRecord` from
+    /// it instead, re-deriving guard state live rather than from anything
+    /// this struct carries.
+    pub relationship_reverse_deferred: Option<i64>,
+    /// Issue #134: `MAX(retry_count)` across the group's
+    /// `rel_reverse_deferred` rows — mirrors `hop_gen`'s own MAX-across-
+    /// the-group fold rule (the same rationale applies: folding to the
+    /// larger count can't itself cause an under-report of how many times
+    /// this reverse has been deferred). `0` when
+    /// `relationship_reverse_deferred` is `None`.
+    pub retry_count: i32,
 }
 
 /// The fenced window's full column projection the fold needs, with jsonb
@@ -142,7 +177,7 @@ pub struct FoldedChange {
 /// on `op` (see the discriminator comment below).
 const FOLD_COLUMNS: &str = "src_table, key, old_image::text as old_image, \
      new_image::text as new_image, lsn, origin_lsn, src_changed, hop_gen, \
-     group_key, appended_at, change_id, route, op";
+     group_key, appended_at, change_id, route, op, relationship_id, retry_count";
 
 /// Runs the claim-time fold over `seg_seq`'s fenced window, restricted to
 /// `bucket`. One [`FoldedChange`] per `(src_table, key)` present in that
@@ -205,6 +240,24 @@ pub async fn fold(
     // than the keys it voids, though in practice every truncate-bearing
     // batch seals with `bucket_count = 1` (see `seal::seal_phase1`), making
     // that moot today.
+    // Issue #133: `group_key` is a real per-key set union, computed
+    // separately from every other column here so it can't perturb them.
+    // `group_keys` unnests each raw row's own `group_key` array (a row with
+    // no array at all coalesces to `array[]`, so it contributes nothing and
+    // drops out of the join) and re-aggregates with `array_agg(distinct
+    // ...)`, which is what actually merges/dedups the union rather than
+    // picking one row's value — the placeholder this replaces used the same
+    // `array_agg(... order by ...) filter (...))[1]` arg-extreme idiom the
+    // image columns use, which is correct for "the value from one specific
+    // row" but wrong for "everything any row touched." Aggregating this in
+    // its own CTE (rather than joining the unnested rows straight into the
+    // outer `group by`) matters: cross-joining `filtered` against
+    // `unnest(group_key)` multiplies a row with an N-element array into N
+    // output rows, which would corrupt every *other* aggregate below
+    // (`min`/`max`/the image arg-extremes) by feeding them duplicated rows.
+    // `group_keys` collapses back to one row per key before it's ever
+    // joined against `filtered`, so the outer query's own row multiplicity
+    // — and therefore every other column's aggregate — is untouched.
     let sql = format!(
         "with fenced as ({window_sql}), \
          filtered as ( \
@@ -215,10 +268,16 @@ pub async fn fold(
                    where t.op = 'truncate' and t.src_table = f.src_table \
                      and (t.lsn, t.change_id) > (f.lsn, f.change_id) \
                ) \
+         ), \
+         group_keys as ( \
+             select src_table, key, \
+                    array_agg(distinct gk) filter (where gk is not null) as group_key \
+             from filtered, unnest(coalesce(group_key, array[]::text[])) as gk \
+             group by src_table, key \
          ) \
          select \
-             src_table, \
-             key, \
+             filtered.src_table, \
+             filtered.key, \
              (array_agg(new_image order by lsn desc, change_id desc) \
                  filter (where old_image is not null or new_image is not null))[1] as new_image, \
              (array_agg(old_image order by lsn asc, change_id asc) \
@@ -228,11 +287,16 @@ pub async fn fold(
              max(lsn) as lsn, \
              case when bool_or(src_changed is not null) then 0 else max(hop_gen) end as hop_gen, \
              min(appended_at) as first_seen, \
-             (array_agg(group_key order by lsn asc, change_id asc) \
-                 filter (where group_key is not null))[1] as group_key, \
-             bool_or(op = 'truncate') as is_truncate \
+             group_keys.group_key, \
+             bool_or(op = 'truncate') as is_truncate, \
+             max(relationship_id) filter (where op = 'rel_reverse_deferred') \
+                 as relationship_reverse_deferred, \
+             coalesce(max(retry_count) filter (where op = 'rel_reverse_deferred'), 0) \
+                 as retry_count \
          from filtered \
-         group by src_table, key"
+         left join group_keys \
+             on group_keys.src_table = filtered.src_table and group_keys.key = filtered.key \
+         group by filtered.src_table, filtered.key, group_keys.group_key"
     );
 
     let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
@@ -257,6 +321,8 @@ pub async fn fold(
             first_seen: row.get(8),
             group_key: row.get(9),
             is_truncate: row.get(10),
+            relationship_reverse_deferred: row.get(11),
+            retry_count: row.get(12),
         })
         .collect())
 }
@@ -314,7 +380,13 @@ pub fn merge_folded_changes(per_segment: Vec<Vec<FoldedChange>>) -> Vec<FoldedCh
 ///   pre-image. A side with neither image set contributed no image
 ///   information at all (a bare recompute trigger folded alone), so it
 ///   defers entirely to the other side rather than overwriting real
-///   evidence with `None`.
+///   evidence with `None`. **Exception, issue #134 review follow-up**: for
+///   a `relationship_reverse_deferred` record, `earlier`/`later` segment
+///   order does *not* approximate chronological order (a retry's segment
+///   reflects when it was *re-staged*, not the underlying parent
+///   transition's own `lsn`) — see this function's own inline comment at
+///   the branch that handles it, which orders by each side's own `lsn`
+///   instead.
 /// - `src_changed`/`lsn`: `Option::max` — `None` sorts below every `Some`,
 ///   and among two `Some`s the greater watermark/timestamp wins, matching
 ///   "OR across the group" and "GREATEST over every row" respectively.
@@ -324,8 +396,12 @@ pub fn merge_folded_changes(per_segment: Vec<Vec<FoldedChange>>) -> Vec<FoldedCh
 ///   resets propagation depth), else the greater of the two hop generations.
 /// - `first_seen`: the earlier of the two — first append into either
 ///   segment.
-/// - `group_key`: `earlier`'s, if it has one — "first non-null value by
-///   append order".
+/// - `group_key`: issue #133's real set union — every distinct value
+///   present in either side's array, deduplicated (see
+///   [`merge_group_keys`]) — mirroring [`fold`]'s own `array_agg(distinct
+///   ...)` union rule rather than the earlier "first non-null side wins"
+///   placeholder this replaces (which would have silently dropped
+///   `later`'s touched values whenever `earlier` had any at all).
 /// - `is_truncate`: OR. In practice always `false` here: the batching layer
 ///   that builds `per_segment` never coalesces a truncate-bearing segment
 ///   with any other (a truncate is its own drain barrier — see
@@ -334,9 +410,16 @@ pub fn merge_folded_changes(per_segment: Vec<Vec<FoldedChange>>) -> Vec<FoldedCh
 ///   assumed away, so a future caller that breaks that invariant fails
 ///   toward "still marked as a truncate" rather than toward silently
 ///   dropping one.
+/// - `relationship_reverse_deferred`: issue #134 — whichever side carries
+///   one (`Option::or`); both sides carrying different values would mean two
+///   different relationships' rows landed in the same `(src_table, key)`
+///   group, which the synthetic per-relationship `src_table` this op uses
+///   (`apply::relationship_reverse_deferred_src_table`) makes impossible by
+///   construction, so this is "propagate the one real value forward,"
+///   exactly like `group_key`'s missing-side convention.
+/// - `retry_count`: `MAX` across the two sides, mirroring `hop_gen`'s own
+///   cross-segment `MAX` rule and [`fold`]'s SQL `MAX(retry_count)`.
 fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
-    let earlier_has_image = earlier.old_image.is_some() || earlier.new_image.is_some();
-    let later_has_image = later.old_image.is_some() || later.new_image.is_some();
     let src_changed = earlier.src_changed.max(later.src_changed);
     let hop_gen = if src_changed.is_some() {
         0
@@ -349,28 +432,139 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
         (None, Some(b)) => Some(b),
         (None, None) => None,
     };
+    let relationship_reverse_deferred = earlier
+        .relationship_reverse_deferred
+        .or(later.relationship_reverse_deferred);
+
+    // Issue #134 review follow-up — CRITICAL: `relationship_reverse_deferred`
+    // rows are the one op where "earlier-sealed segment" does *not*
+    // approximate "chronologically earlier transition" the way it does for
+    // every other op this function merges. Ordinary CDC's own `lsn` is
+    // stamped at intake time and a row's *segment* is essentially "whichever
+    // one happened to be active when its source committed" — the two are
+    // naturally correlated, which is what makes the `earlier`/`later`
+    // segment-order convention below a sound proxy for chronological order
+    // in the general case. A deferred reverse's *segment* instead reflects
+    // *when it was last re-staged after a rejection* — entirely decoupled
+    // from the underlying parent transition's own `lsn` (issue #134's own
+    // resolved "re-derive fresh" design: a retry is staged into whatever
+    // segment is active *at retry time*, which can be arbitrarily later
+    // than another, unrelated reverse's own retry for an *older* parent
+    // transition). Two deferred reverses for the same relationship+parent
+    // key can therefore reach this function with `earlier.lsn >
+    // later.lsn` — an inversion the segment-order convention below would
+    // silently get backwards: it would pick `earlier`'s (chronologically
+    // *newer*) `old_image` and `later`'s (chronologically *older*)
+    // `new_image`, producing an internally-inconsistent image pair.
+    //
+    // **This is why this branch exists as its own case, not just a
+    // documentation note**: an inconsistent pair would corrupt not only a
+    // hypothetical direct `diff_pass` application (already blocked, today,
+    // by the *unrelated* fact that `retry_count` — see below — is always
+    // `>= 1` for a merged deferred record, which forces
+    // `apply::apply_and_mark_drained_many`'s own `retry_count == 0`
+    // fast-path gate to route every deferred reverse to the recompute
+    // fallback regardless) but *also*
+    // `apply::apply_projection_advance`'s write of the settled parent
+    // projection's own data columns from `new_image` — which runs
+    // unconditionally once guards pass, on *both* the fast and fallback
+    // paths, and is not protected by the `retry_count` coincidence at all.
+    // Fixed at the source instead of relying on that coincidence: order by
+    // each side's own `lsn` (`None` sorts first, matching this crate's
+    // "unknown sorts as earliest" convention elsewhere), and pick images by
+    // *that* order, not by which segment sealed first.
+    //
+    // `#135`/`#136`: if a future change ever lets a deferred reverse regain
+    // eligibility for the fast path (lifting the `retry_count == 0` gate –
+    // see that gate's own doc comment on `force_every_group` for when that
+    // could happen), this branch is what keeps folding sound regardless —
+    // it does not depend on that gate staying in place, unlike the
+    // `retry_count` coincidence above.
+    let (old_image, new_image) = if relationship_reverse_deferred.is_some() {
+        let (chronologically_earlier, chronologically_later) = if earlier.lsn <= later.lsn {
+            (&earlier, &later)
+        } else {
+            (&later, &earlier)
+        };
+        (
+            chronologically_earlier
+                .old_image
+                .clone()
+                .or_else(|| chronologically_later.old_image.clone()),
+            chronologically_later
+                .new_image
+                .clone()
+                .or_else(|| chronologically_earlier.new_image.clone()),
+        )
+    } else {
+        // Every other op: segment-sealed order is the sound proxy — see
+        // this function's own doc comment. Whichever side actually carries
+        // image evidence (either image field set) wins its half; a side
+        // with neither set contributed no image information at all (a bare
+        // recompute trigger folded alone), so it defers entirely to the
+        // other side rather than overwriting real evidence with `None`.
+        let earlier_has_image = earlier.old_image.is_some() || earlier.new_image.is_some();
+        let later_has_image = later.old_image.is_some() || later.new_image.is_some();
+        (
+            if earlier_has_image {
+                earlier.old_image.clone()
+            } else {
+                later.old_image.clone()
+            },
+            if later_has_image {
+                later.new_image.clone()
+            } else {
+                earlier.new_image.clone()
+            },
+        )
+    };
 
     FoldedChange {
         src_table: earlier.src_table,
         key: earlier.key,
-        new_image: if later_has_image {
-            later.new_image
-        } else {
-            earlier.new_image
-        },
-        old_image: if earlier_has_image {
-            earlier.old_image
-        } else {
-            later.old_image
-        },
+        new_image,
+        old_image,
         src_changed,
         origin_lsn,
         lsn: earlier.lsn.max(later.lsn),
         hop_gen,
         first_seen: earlier.first_seen.min(later.first_seen),
-        group_key: earlier.group_key.or(later.group_key),
+        group_key: merge_group_keys(earlier.group_key, later.group_key),
         is_truncate: earlier.is_truncate || later.is_truncate,
+        relationship_reverse_deferred,
+        // `MAX` across the two sides, mirroring `hop_gen`'s own
+        // cross-segment `MAX` rule and `fold`'s own SQL `MAX(retry_count)`
+        // — see this field's doc comment on `FoldedChange` for why `MAX`
+        // (not, say, sum) is the right merge here, and why every merged
+        // deferred record is therefore guaranteed `retry_count >= 1`.
+        retry_count: earlier.retry_count.max(later.retry_count),
     }
+}
+
+/// Issue #133's cross-segment counterpart to [`fold`]'s own SQL
+/// `array_agg(distinct ...)` union: a real set union of two segments'
+/// already-per-key `group_key` arrays, deduplicated and sorted (matching
+/// `array_agg(distinct ...)`'s own stable output — Postgres sorts a
+/// `DISTINCT` aggregate's input — so a segment-coalesced merge can't be
+/// told apart from a single-pass SQL fold by element order alone), `None`
+/// only when neither side has one. `None` sorts as "contributed nothing"
+/// (not as its own distinct value), matching every other field's
+/// `None`-means-missing convention in this module.
+fn merge_group_keys(a: Option<Vec<String>>, b: Option<Vec<String>>) -> Option<Vec<String>> {
+    let mut merged = match (a, b) {
+        (None, None) => return None,
+        (Some(only), None) | (None, Some(only)) => only,
+        (Some(mut a), Some(b)) => {
+            for value in b {
+                if !a.contains(&value) {
+                    a.push(value);
+                }
+            }
+            a
+        }
+    };
+    merged.sort_unstable();
+    Some(merged)
 }
 
 #[cfg(test)]
@@ -392,6 +586,8 @@ mod merge_tests {
             first_seen: SystemTime::UNIX_EPOCH,
             group_key: None,
             is_truncate: false,
+            relationship_reverse_deferred: None,
+            retry_count: 0,
         }
     }
 
@@ -531,5 +727,151 @@ mod merge_tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].new_image, Some("\"c\"".to_string()));
         assert_eq!(merged[0].lsn, Some(PgLsn::from(3)));
+    }
+
+    /// Issue #133: the cross-segment merge's `group_key` rule is a real set
+    /// union, matching [`fold`]'s own SQL `array_agg(distinct ...)` — not
+    /// the old `earlier.group_key.or(later.group_key)` placeholder, which
+    /// would have silently dropped every value `later` touched whenever
+    /// `earlier` had any `group_key` at all. Overlapping values must be
+    /// deduped, not just concatenated.
+    #[test]
+    fn group_key_cross_segment_merge_is_a_real_deduplicated_union() {
+        let mut first = base("1");
+        first.group_key = Some(vec!["a".to_string(), "b".to_string()]);
+        let mut second = base("1");
+        second.group_key = Some(vec!["b".to_string(), "c".to_string()]);
+
+        let merged = merge_folded_changes(vec![vec![first], vec![second]]);
+        assert_eq!(merged.len(), 1);
+        let mut group_key = merged[0].group_key.clone().expect("group_key present");
+        group_key.sort();
+        assert_eq!(
+            group_key,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "must be the real union of both segments' touched values, deduplicated \
+             (the old `.or()` placeholder would have kept only [\"a\", \"b\"])"
+        );
+    }
+
+    /// A segment with no `group_key` at all defers entirely to the other
+    /// side, same "missing side contributes nothing" convention every other
+    /// `Option` field in this merge follows.
+    #[test]
+    fn group_key_cross_segment_merge_treats_a_missing_side_as_contributing_nothing() {
+        let first = base("1"); // no group_key
+        let mut second = base("1");
+        second.group_key = Some(vec!["only".to_string()]);
+
+        let merged = merge_folded_changes(vec![vec![first], vec![second]]);
+        assert_eq!(merged[0].group_key, Some(vec!["only".to_string()]));
+
+        let mut third = base("1");
+        third.group_key = Some(vec!["only".to_string()]);
+        let fourth = base("1");
+        let merged = merge_folded_changes(vec![vec![third], vec![fourth]]);
+        assert_eq!(merged[0].group_key, Some(vec!["only".to_string()]));
+    }
+
+    /// Issue #134 review follow-up: two `relationship_reverse_deferred`
+    /// records for the same relationship+parent key, hand-staged so the
+    /// segment that sealed *first* (`per_segment`'s own `earlier` argument)
+    /// actually carries the chronologically *later* transition (higher
+    /// `lsn`) — the exact inversion a retry's own re-staging timing can
+    /// produce (see `merge_pair`'s own inline comment on this branch for
+    /// why segment order and `lsn` order decouple specifically for this
+    /// op). Before this fix, `merge_pair`'s segment-order convention would
+    /// have silently picked the *later*-sealed (but chronologically
+    /// *earlier*) segment's `new_image` and the *earlier*-sealed (but
+    /// chronologically *later*) segment's `old_image` — an internally
+    /// inconsistent pair that (a) would corrupt a direct fast-path
+    /// application if one ever ran against it, and, more immediately
+    /// relevant since `retry_count` alone already routes every deferred
+    /// record away from the fast path, (b) would corrupt
+    /// `apply::apply_projection_advance`'s unconditional write of the
+    /// settled parent projection's own columns, which is *not* gated by
+    /// `retry_count` at all. This pins the fix: `lsn` order wins over
+    /// segment order for this op.
+    #[test]
+    fn relationship_reverse_deferred_cross_segment_merge_orders_images_by_lsn_not_segment_order() {
+        // Sealed *first* (the `earlier` argument to `merge_pair`), but
+        // chronologically the *later* transition: 400 -> 500 at lsn 200.
+        let mut sealed_first_but_chronologically_later = base("1");
+        sealed_first_but_chronologically_later.relationship_reverse_deferred = Some(7);
+        sealed_first_but_chronologically_later.retry_count = 3;
+        sealed_first_but_chronologically_later.old_image = Some(r#"{"id":1,"v":400}"#.to_string());
+        sealed_first_but_chronologically_later.new_image = Some(r#"{"id":1,"v":500}"#.to_string());
+        sealed_first_but_chronologically_later.lsn = Some(PgLsn::from(200));
+
+        // Sealed *second* (the `later` argument to `merge_pair`), but
+        // chronologically the *earlier* transition: 100 -> 400 at lsn 100.
+        let mut sealed_second_but_chronologically_earlier = base("1");
+        sealed_second_but_chronologically_earlier.relationship_reverse_deferred = Some(7);
+        sealed_second_but_chronologically_earlier.retry_count = 1;
+        sealed_second_but_chronologically_earlier.old_image =
+            Some(r#"{"id":1,"v":100}"#.to_string());
+        sealed_second_but_chronologically_earlier.new_image =
+            Some(r#"{"id":1,"v":400}"#.to_string());
+        sealed_second_but_chronologically_earlier.lsn = Some(PgLsn::from(100));
+
+        let merged = merge_folded_changes(vec![
+            vec![sealed_first_but_chronologically_later],
+            vec![sealed_second_but_chronologically_earlier],
+        ]);
+        assert_eq!(merged.len(), 1);
+        let merged = &merged[0];
+        assert_eq!(
+            merged.old_image,
+            Some(r#"{"id":1,"v":100}"#.to_string()),
+            "old_image must come from the chronologically earliest transition \
+             (lsn 100), not whichever segment happened to seal first"
+        );
+        assert_eq!(
+            merged.new_image,
+            Some(r#"{"id":1,"v":500}"#.to_string()),
+            "new_image must come from the chronologically latest transition \
+             (lsn 200), not whichever segment happened to seal second"
+        );
+        assert_eq!(
+            merged.lsn,
+            Some(PgLsn::from(200)),
+            "the merged record's own lsn is still the greatest of the two, \
+             unaffected by this fix"
+        );
+        assert_eq!(
+            merged.relationship_reverse_deferred,
+            Some(7),
+            "the relationship id must survive the merge"
+        );
+        assert_eq!(
+            merged.retry_count, 3,
+            "retry_count still folds via MAX regardless of this fix — every \
+             merged deferred record is guaranteed retry_count >= 1"
+        );
+    }
+
+    /// The ordinary-CDC merge path is untouched by the `lsn`-ordering
+    /// branch above: with `relationship_reverse_deferred` absent on both
+    /// sides, segment order still governs, exactly as before this issue's
+    /// review follow-up.
+    #[test]
+    fn non_deferred_records_still_merge_by_segment_order_not_lsn() {
+        let mut first = base("1");
+        first.old_image = Some(r#"{"v":1}"#.to_string());
+        first.new_image = Some(r#"{"v":2}"#.to_string());
+        first.lsn = Some(PgLsn::from(50));
+
+        let mut second = base("1");
+        second.old_image = Some(r#"{"v":2}"#.to_string());
+        second.new_image = Some(r#"{"v":3}"#.to_string());
+        // Deliberately a *smaller* lsn than `first`'s, to prove this path
+        // ignores lsn ordering entirely (unlike the deferred-reverse
+        // branch) and defers purely to segment (append) order.
+        second.lsn = Some(PgLsn::from(10));
+
+        let merged = merge_folded_changes(vec![vec![first], vec![second]]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].old_image, Some(r#"{"v":1}"#.to_string()));
+        assert_eq!(merged[0].new_image, Some(r#"{"v":3}"#.to_string()));
     }
 }

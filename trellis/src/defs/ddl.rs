@@ -306,6 +306,20 @@ fn map_resolve_error(err: super::catalog::CatalogError) -> DdlError {
 /// returned key via `::text` casts, so an unsafe type here would risk the
 /// same silent divergence a relationship join key is already guarded
 /// against.
+/// Falls back to `source_table`'s own unique constraint when it has no
+/// `PRIMARY KEY` (issue #128). [`create_aggregate_target_table`] keys its
+/// grouping columns with a `UNIQUE NULLS NOT DISTINCT` constraint rather than
+/// a `PRIMARY KEY`, precisely so a NULL grouping value is representable
+/// (`PRIMARY KEY` forbids `NULL` outright) — so an aggregate target chained
+/// into as another definition's source (`TRANSFORM x FROM some_aggregate`,
+/// #102's own worked example) has no `indisprimary` row at all. Without this
+/// fallback every such chain would regress from working to
+/// [`DdlError::NoPrimaryKey`]. Ties among multiple qualifying unique indexes
+/// break on `indexrelid` ascending (oldest first) for a deterministic choice;
+/// partial (`indpred`) and deferred (`not indimmediate`) unique indexes are
+/// excluded because either would make the index an unreliable stand-in for a
+/// row identity (a partial index doesn't cover every row; a deferred one
+/// doesn't guarantee uniqueness at statement end).
 pub async fn source_primary_key(
     pool: &Pool,
     source_table: &str,
@@ -313,11 +327,40 @@ pub async fn source_primary_key(
     let client = pool.get().await?;
     let rows = client
         .query(
-            "select a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod)
+            "with chosen_index as (
+                 select i.indexrelid
+                 from pg_index i
+                 where i.indrelid = pg_catalog.to_regclass($1)
+                   and (
+                     i.indisprimary
+                     or (
+                       i.indisunique and i.indimmediate and i.indpred is null
+                       -- A plain (nulls-distinct) UNIQUE index doesn't reject
+                       -- duplicate NULLs, so it isn't a true identity unless
+                       -- either NULLS NOT DISTINCT (like create_aggregate_target_table's
+                       -- grouping-column constraint) or every indexed column is
+                       -- NOT NULL, in which case no NULL can ever occur.
+                       and (
+                         i.indnullsnotdistinct
+                         or not exists (
+                           select 1
+                           from pg_attribute a
+                           where a.attrelid = i.indrelid
+                             and a.attnum = any(i.indkey)
+                             and not a.attnotnull
+                         )
+                       )
+                     )
+                   )
+                 order by i.indisprimary desc, i.indexrelid asc
+                 limit 1
+             )
+             select a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod)
              from pg_index i
+             join chosen_index c on c.indexrelid = i.indexrelid
              join pg_attribute a
                on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
-             where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary",
+             where i.indrelid = pg_catalog.to_regclass($1)",
             &[&source_table],
         )
         .await?;
@@ -414,6 +457,104 @@ pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String
         quote_ident(neighbor_table_name(def))
     )
 }
+
+/// The physical, Trellis-owned table a to-one relationship's settled parent
+/// projection lives in (issue #129, epic #127's "settled parent projection"
+/// — see `trellis/tests/spikes/issue-102-PLAN-DRAFT.md` §2) —
+/// `_trellis_rel_projection_<id>`, named after the relationship's own
+/// catalog id rather than its declared name. A relationship name is unique
+/// only *per from-table* (`V16__relationship_definitions.sql`'s `unique
+/// (from_table, name)`), so two different from-tables can declare a
+/// same-named relationship; the id is the one thing already guaranteed
+/// globally unique by the time this is called
+/// (`catalog::create_relationship` names the projection right after
+/// inserting the relationship's own row, in the same transaction — see
+/// `catalog::ensure_relationship_projection_in_txn`), so it's the natural
+/// disambiguator. Matches this crate's existing `_trellis_backfill_*` naming
+/// for its own other generated tables ([`super::backfill::STAGE_TABLE`],
+/// [`super::backfill::REL_STAGE_TABLE_PREFIX`]).
+pub(crate) fn relationship_projection_table_name(relationship_id: i64) -> String {
+    format!("_trellis_rel_projection_{relationship_id}")
+}
+
+/// The schema-qualified, DDL-ready form of
+/// [`relationship_projection_table_name`]'s output — same component-independent
+/// quoting as [`qualified_target_table`], for direct interpolation into DDL/DML
+/// text.
+pub(crate) fn qualified_relationship_projection_table(
+    target_schema: &str,
+    projection_table: &str,
+) -> String {
+    format!(
+        "{}.{}",
+        quote_ident(target_schema),
+        quote_ident(projection_table)
+    )
+}
+
+/// The settled parent projection's per-row generation counter (issue #129,
+/// epic #127; the plan doc's §2 guard (b), "optimistic generation check"):
+/// bumped by any forward apply that touches this parent row, so a reverse
+/// (#131/#132) can detect — by re-reading this column under `FOR UPDATE` in
+/// its own apply transaction and comparing against the value it captured
+/// when it enumerated — that a forward apply landed in between, and
+/// abort/defer rather than overwrite a fresher forward-applied value. Every
+/// row starts at `0` at backfill time (see
+/// [`super::catalog::ensure_relationship_projection_in_txn`]); #131 is the
+/// intended first writer of any advance past that seed, and the plan doc's
+/// §3.1 finding (the generation must be bumped from the *raw* change images,
+/// not the folded ones) is guidance for that implementation, not something
+/// this column's shape enforces on its own.
+///
+/// `__trellis_`-prefixed rather than a bare `gen`, matching this module's
+/// existing `__{field}_sum`/`__{field}_count` hidden-partial-column
+/// convention (see [`avg_sum_column`]/[`count_needing_arg`]): this makes a
+/// collision with a to-side column a consumer legitimately reads through the
+/// relationship *unlikely*, not impossible — a to-side column literally
+/// named `__trellis_gen` (equally: [`PROJECTION_LSN_COLUMN`] and a to-side
+/// `__trellis_lsn`) would still silently collide with this bookkeeping
+/// column, the same residual risk every `__`-prefixed hidden column in this
+/// module already accepts. Review follow-up to issue #129: flagged
+/// explicitly here, for #130/#131 to keep in mind, rather than solved now —
+/// detecting/rejecting it would need its own validation pass over the
+/// to-side schema, out of this issue's foundation-only scope, and no
+/// generated or hand-written schema in this codebase's own test/fixture
+/// corpus exercises it today.
+pub(crate) const PROJECTION_GEN_COLUMN: &str = "__trellis_gen";
+
+/// The settled parent projection's per-row LSN chain (issue #129, epic #127;
+/// the plan doc's §2 guard (d), "per-parent ordering"): advanced only when a
+/// *justified* reverse — one whose own `prev_lsn` matched this column's
+/// current value, read under lock — applies, to the LSN of the parent-row
+/// change that reverse represents. Two parent changes staged from different
+/// ring segments can drain out of order (plan doc §3: "a later segment's
+/// bucket can commit before an earlier segment's"), which is what makes this
+/// chain necessary rather than a plain "last write wins" advance.
+///
+/// **Seeding, and what #131/#132 should confirm about it.** At backfill time
+/// every row is seeded with the same single value: the current WAL position
+/// as of backfill completion (`pg_current_wal_lsn()`, captured once in
+/// [`super::catalog::ensure_relationship_projection_in_txn`] and shared by
+/// every row that one backfill statement writes) — not any individual
+/// row's own "true" last-modified LSN, which a plain `SELECT` against the
+/// to-side table has no way to recover (Postgres doesn't expose a per-row
+/// last-commit LSN). This is sound *as long as* guard (d) is implemented as
+/// a self-referential, optimistic version stamp — a reverse's own `prev_lsn`
+/// is populated by reading this same column at enumeration time, and guard
+/// (d) simply re-checks it hasn't moved since, the same shape guard (b)'s
+/// `gen` check already uses — because then the seed only has to be
+/// internally consistent with itself, never externally correct against real
+/// WAL history. **Flagged for #131/#132 to double check**: if guard (d)
+/// instead needs this to equal some independently-verifiable "last change to
+/// this exact row" LSN, this seeding strategy does not provide that, and
+/// needs revisiting before guard (d) is implemented against it.
+///
+/// `not null`, not nullable: every row is written by a backfill that always
+/// has a real captured LSN in hand (there is no code path yet — forward
+/// apply of a brand-new to-side row is #130/#131 — that inserts a projection
+/// row any other way), so there is no seedless state this column needs to
+/// represent.
+pub(crate) const PROJECTION_LSN_COLUMN: &str = "__trellis_lsn";
 
 /// The read-side counterpart to [`qualified_target_table`] (issue #76,
 /// ADR-0007): quotes an already-qualified `"schema.table"` name — as read
@@ -725,9 +866,28 @@ pub(crate) fn count_column_names_from<'a>(
 
 /// Creates an [`super::ast::KeySpace::Aggregate`] definition's neighbor
 /// target table (idempotent, same convention as [`create_target_table`]),
-/// whose primary key is the composite tuple of grouping columns rather than
-/// a single column inherited from the source — a `GROUP BY` target has no
-/// single source row to inherit a key from; the group itself is the key.
+/// whose key is the composite tuple of grouping columns rather than a single
+/// column inherited from the source — a `GROUP BY` target has no single
+/// source row to inherit a key from; the group itself is the key.
+///
+/// The grouping columns are keyed with a `UNIQUE NULLS NOT DISTINCT`
+/// constraint rather than a bare `PRIMARY KEY` (issue #128): a source
+/// grouping column can itself be `NULL` (Postgres's own `GROUP BY` folds all
+/// `NULL`s in a column into one group, same as any other value), and a
+/// `PRIMARY KEY` forbids `NULL` in any of its columns outright, which made a
+/// NULL-keyed group unrepresentable on the target — backfill silently
+/// dropped it and the live delta path raised a `not-null constraint`
+/// violation that quarantined the row with no way to recover it. `NULLS NOT
+/// DISTINCT` (Postgres 15+, pinned to 17.10 in `.tool-versions`) keeps the
+/// same dedup guarantee `PRIMARY KEY` gave — two grouping tuples that agree
+/// on every column, NULLs included, still collide — while allowing the NULL
+/// tuple to exist at all. `ON CONFLICT (group columns)` (both here and in
+/// the live delta path) still resolves against this constraint exactly as it
+/// did against the old `PRIMARY KEY`: conflict-target inference matches on
+/// the indexed columns, not on the index's nulls-distinctness. Chaining a
+/// further definition off this target still works because
+/// [`source_primary_key`] falls back to a table's unique constraint when it
+/// has no `indisprimary` index.
 ///
 /// Each grouping column's type comes from `source_columns` (the same
 /// [`ValueType`]-only map every other column type in this grammar is
@@ -737,7 +897,7 @@ pub(crate) fn count_column_names_from<'a>(
 /// A calculated field whose name matches a grouping column (the
 /// `SELECT order_id AS order_id, SUM(amount) AS total` passthrough idiom)
 /// contributes no separate column — it's assumed to be that same grouping
-/// value passed through, already covered by the primary key column above.
+/// value passed through, already covered by the unique-keyed column above.
 ///
 /// `target_schema` is the schema the table is created under — see
 /// [`create_target_table`]'s doc comment on why this is always
@@ -836,7 +996,10 @@ pub async fn create_aggregate_target_table(
         }
     }
     let pk_columns: Vec<String> = group_by.iter().map(|c| quote_ident(c)).collect();
-    sql.push_str(&format!(", primary key ({})", pk_columns.join(", ")));
+    sql.push_str(&format!(
+        ", unique nulls not distinct ({})",
+        pk_columns.join(", ")
+    ));
     sql.push(')');
 
     let client = pool.get().await?;

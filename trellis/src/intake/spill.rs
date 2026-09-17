@@ -241,6 +241,13 @@ fn read_chunk(r: &mut impl Read, max: usize) -> io::Result<Vec<StagedChange>> {
 const TAG_CDC: u8 = 0;
 const TAG_RECOMPUTE: u8 = 1;
 const TAG_TRUNCATE: u8 = 2;
+// Issue #134: in practice this producer (intake) never emits a
+// `RelationshipReverseDeferred` — only Phase 3 (`staging::apply`) does, and
+// it always appends directly through an open `Transaction`, never through
+// this spill buffer. The tag/codec arm exists anyway so this match stays
+// exhaustive rather than needing a catch-all that would silently swallow a
+// future producer's use of this variant.
+const TAG_RELATIONSHIP_REVERSE_DEFERRED: u8 = 3;
 
 fn write_str(w: &mut impl Write, s: &str) -> io::Result<()> {
     w.write_all(&(s.len() as u32).to_le_bytes())?;
@@ -273,6 +280,36 @@ fn read_opt_str(r: &mut impl Read) -> io::Result<Option<String>> {
         return Ok(None);
     }
     Ok(Some(read_str(r)?))
+}
+
+fn write_opt_str_vec(w: &mut impl Write, v: &Option<Vec<String>>) -> io::Result<()> {
+    match v {
+        None => w.write_all(&[0]),
+        Some(items) => {
+            w.write_all(&[1])?;
+            w.write_all(&(items.len() as u32).to_le_bytes())?;
+            for item in items {
+                write_str(w, item)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn read_opt_str_vec(r: &mut impl Read) -> io::Result<Option<Vec<String>>> {
+    let mut tag = [0u8; 1];
+    r.read_exact(&mut tag)?;
+    if tag[0] == 0 {
+        return Ok(None);
+    }
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut items = Vec::with_capacity(len);
+    for _ in 0..len {
+        items.push(read_str(r)?);
+    }
+    Ok(Some(items))
 }
 
 fn write_opt_u64(w: &mut impl Write, v: Option<u64>) -> io::Result<()> {
@@ -332,7 +369,7 @@ fn write_change(w: &mut impl Write, change: &StagedChange) -> io::Result<()> {
                 }),
             )?;
             w.write_all(&hop_gen.to_le_bytes())?;
-            write_opt_str(w, group_key.as_deref())
+            write_opt_str_vec(w, group_key)
         }
         StagedChange::Recompute {
             src_table,
@@ -345,7 +382,7 @@ fn write_change(w: &mut impl Write, change: &StagedChange) -> io::Result<()> {
             write_str(w, src_table)?;
             write_str(w, key)?;
             w.write_all(&hop_gen.to_le_bytes())?;
-            write_opt_str(w, group_key.as_deref())?;
+            write_opt_str_vec(w, group_key)?;
             write_opt_u64(
                 w,
                 src_changed.map(|t| {
@@ -373,6 +410,33 @@ fn write_change(w: &mut impl Write, change: &StagedChange) -> io::Result<()> {
                         .as_micros() as u64
                 }),
             )
+        }
+        StagedChange::RelationshipReverseDeferred {
+            src_table,
+            key,
+            old_image,
+            new_image,
+            lsn,
+            src_changed,
+            relationship_id,
+            retry_count,
+        } => {
+            w.write_all(&[TAG_RELATIONSHIP_REVERSE_DEFERRED])?;
+            write_str(w, src_table)?;
+            write_str(w, key)?;
+            write_opt_str(w, old_image.as_deref())?;
+            write_opt_str(w, new_image.as_deref())?;
+            write_opt_u64(w, lsn.map(u64::from))?;
+            write_opt_u64(
+                w,
+                src_changed.map(|t| {
+                    t.duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_micros() as u64
+                }),
+            )?;
+            w.write_all(&relationship_id.to_le_bytes())?;
+            w.write_all(&retry_count.to_le_bytes())
         }
     }
 }
@@ -421,7 +485,7 @@ fn read_change(r: &mut impl Read) -> io::Result<Option<StagedChange>> {
             let mut hop_gen_buf = [0u8; 4];
             r.read_exact(&mut hop_gen_buf)?;
             let hop_gen = i32::from_le_bytes(hop_gen_buf);
-            let group_key = read_opt_str(r)?;
+            let group_key = read_opt_str_vec(r)?;
             StagedChange::Cdc {
                 src_table,
                 key,
@@ -441,7 +505,7 @@ fn read_change(r: &mut impl Read) -> io::Result<Option<StagedChange>> {
             let mut hop_gen_buf = [0u8; 4];
             r.read_exact(&mut hop_gen_buf)?;
             let hop_gen = i32::from_le_bytes(hop_gen_buf);
-            let group_key = read_opt_str(r)?;
+            let group_key = read_opt_str_vec(r)?;
             let src_changed = read_opt_u64(r)?
                 .map(|micros| SystemTime::UNIX_EPOCH + Duration::from_micros(micros));
             StagedChange::Recompute {
@@ -463,6 +527,31 @@ fn read_change(r: &mut impl Read) -> io::Result<Option<StagedChange>> {
                 lsn,
                 origin_lsn,
                 src_changed,
+            }
+        }
+        TAG_RELATIONSHIP_REVERSE_DEFERRED => {
+            let src_table = read_str(r)?;
+            let key = read_str(r)?;
+            let old_image = read_opt_str(r)?;
+            let new_image = read_opt_str(r)?;
+            let lsn = read_opt_u64(r)?.map(PgLsn::from);
+            let src_changed = read_opt_u64(r)?
+                .map(|micros| SystemTime::UNIX_EPOCH + Duration::from_micros(micros));
+            let mut relationship_id_buf = [0u8; 8];
+            r.read_exact(&mut relationship_id_buf)?;
+            let relationship_id = i64::from_le_bytes(relationship_id_buf);
+            let mut retry_count_buf = [0u8; 4];
+            r.read_exact(&mut retry_count_buf)?;
+            let retry_count = i32::from_le_bytes(retry_count_buf);
+            StagedChange::RelationshipReverseDeferred {
+                src_table,
+                key,
+                old_image,
+                new_image,
+                lsn,
+                src_changed,
+                relationship_id,
+                retry_count,
             }
         }
         other => {
@@ -490,7 +579,7 @@ mod tests {
             origin_lsn: Some(PgLsn::from(42)),
             src_changed: None,
             hop_gen: 3,
-            group_key: Some("g1".into()),
+            group_key: Some(vec!["g1".into(), "g2".into()]),
         }
     }
 
@@ -514,7 +603,7 @@ mod tests {
                 assert_eq!(new_image.unwrap(), r#"{"id":"1","note":"hi"}"#);
                 assert_eq!(origin_lsn, Some(PgLsn::from(42)));
                 assert_eq!(hop_gen, 3);
-                assert_eq!(group_key.unwrap(), "g1");
+                assert_eq!(group_key.unwrap(), vec!["g1".to_string(), "g2".to_string()]);
             }
             other => panic!("expected Cdc, got {other:?}"),
         }
@@ -572,6 +661,54 @@ mod tests {
                 );
             }
             other => panic!("expected Recompute, got {other:?}"),
+        }
+    }
+
+    /// Issue #134: `RelationshipReverseDeferred` round-trips through the
+    /// spill codec even though, in practice, only Phase 3
+    /// (`staging::apply`) ever produces this variant, always via an open
+    /// `Transaction` rather than through this intake-side buffer — the
+    /// codec still needs to be correct for it, not just exhaustively
+    /// matched, since nothing prevents a future producer from spilling one.
+    #[test]
+    fn round_trips_a_relationship_reverse_deferred_change() {
+        let change = StagedChange::RelationshipReverseDeferred {
+            src_table: "\u{1f}trellis-rel-reverse-deferred:7".into(),
+            key: "42".into(),
+            old_image: Some(r#"{"id":42,"name":"old"}"#.into()),
+            new_image: Some(r#"{"id":42,"name":"new"}"#.into()),
+            lsn: Some(PgLsn::from(500)),
+            src_changed: Some(SystemTime::UNIX_EPOCH + Duration::from_micros(9_000)),
+            relationship_id: 7,
+            retry_count: 3,
+        };
+        let mut buf = Vec::new();
+        write_change(&mut buf, &change).unwrap();
+        let decoded = read_change(&mut &buf[..]).unwrap().expect("one record");
+        match decoded {
+            StagedChange::RelationshipReverseDeferred {
+                src_table,
+                key,
+                old_image,
+                new_image,
+                lsn,
+                src_changed,
+                relationship_id,
+                retry_count,
+            } => {
+                assert_eq!(src_table, "\u{1f}trellis-rel-reverse-deferred:7");
+                assert_eq!(key, "42");
+                assert_eq!(old_image.unwrap(), r#"{"id":42,"name":"old"}"#);
+                assert_eq!(new_image.unwrap(), r#"{"id":42,"name":"new"}"#);
+                assert_eq!(lsn, Some(PgLsn::from(500)));
+                assert_eq!(
+                    src_changed,
+                    Some(SystemTime::UNIX_EPOCH + Duration::from_micros(9_000))
+                );
+                assert_eq!(relationship_id, 7);
+                assert_eq!(retry_count, 3);
+            }
+            other => panic!("expected RelationshipReverseDeferred, got {other:?}"),
         }
     }
 

@@ -94,12 +94,25 @@ async fn stage_cdc(
 /// Reverse recompute appends fresh `Recompute` rows into the (new) active
 /// segment as it drains, so convergence takes more than one seal.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+    // Issue #132: a throwaway, always-caught-up watermark — this helper
+    // has no live `Intake` running (these tests stage CDC rows by hand),
+    // and none of this file's tests exercise guard (a) specifically, so a
+    // real watermark would only ever make guard (a) reject spuriously.
+    let watermark = trellis::staging::StagedWatermark::saturated();
+    let watermark = &watermark;
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
-        while apply::drain_once(pool, seg, "nullability_test", 1, "trellis_nullability_test")
-            .await
-            .expect("drain_once")
-            .is_some()
+        while apply::drain_once(
+            pool,
+            seg,
+            "nullability_test",
+            1,
+            "trellis_nullability_test",
+            watermark,
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
         {}
         retire_drained_segments(client)
             .await
@@ -204,12 +217,16 @@ async fn to_one_enrichment_nulls_out_when_the_related_row_appears_then_disappear
 
     // Article 1 points at category 10, which does not exist yet — the FK is
     // unresolved from the very first build, not merely orphaned later. The
-    // to-side keeps Postgres's DEFAULT replica identity: a to-one's join key
-    // *is* the to-side primary key, so no `REPLICA IDENTITY FULL` is needed.
+    // to-side's own join-key-only needs would be satisfied by Postgres's
+    // DEFAULT replica identity (a to-one's join key *is* the to-side primary
+    // key), but issue #129's settled parent projection needs `REPLICA
+    // IDENTITY FULL` unconditionally regardless — see
+    // `assert_replica_identity_supports_projection`.
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
+             alter table categories replica identity full; \
              insert into articles (id, category_id, title) values (1, 10, 'a1')",
         )
         .await

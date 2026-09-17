@@ -153,33 +153,69 @@ fn every_supported_operator_appears_over_every_supported_argument_type() {
     }
 }
 
+/// `table`'s grain column name in `program`, if `table` is one of
+/// `program`'s tables. Every table gets a grain column unconditionally
+/// (improvement-plan task B4) at a fixed position (`Table::new`'s
+/// `columns[6]` — see `generate::build_program_multi_with_shapes`'s doc
+/// comment on that index), and `generate::strategy::grain_value` draws an
+/// occasional `NULL` for it *unconditionally*, independent of the
+/// `awkward_values` flag (issue #128) — so a "never draws NULL" check scoped
+/// to the flag must exclude this one structurally-always-on column.
+fn grain_column(program: &Program, table: &str) -> Option<String> {
+    program
+        .tables
+        .iter()
+        .find(|t| t.name == table)
+        .map(|t| t.columns[6].name.clone())
+}
+
 /// Every value drawn from an `Op::Insert`/`Op::Update`/`Op::BulkInsert` in
-/// `program`, in draw order. Ignores `Op::Delete`/`Op::Truncate` (neither
-/// carries a field value — improvement-plan task E6's `Truncate` is exactly
-/// as value-free as `Delete` here).
+/// `program`, in draw order, excluding each row's grain-column value (see
+/// [`grain_column`] — it draws `NULL` unconditionally, independent of
+/// `awkward_values`, so it isn't part of what this helper's callers are
+/// checking). Ignores `Op::Delete`/`Op::Truncate` (neither carries a field
+/// value — improvement-plan task E6's `Truncate` is exactly as value-free as
+/// `Delete` here).
 fn all_op_values(program: &generative::model::Program) -> Vec<Option<String>> {
+    let not_grain = |table: &str, name: &str| grain_column(program, table).as_deref() != Some(name);
     program
         .ops
         .iter()
         .flat_map(|op| match op {
-            Op::Insert { row, .. } => row.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
-            Op::Update { changes, .. } => changes.iter().map(|(_, v)| v.clone()).collect(),
-            Op::Delete { .. } | Op::Truncate { .. } => Vec::new(),
-            Op::BulkInsert { rows, .. } => rows
+            Op::Insert { table, row, .. } => row
                 .iter()
-                .flat_map(|row| row.iter().map(|(_, v)| v.clone()))
+                .filter(|(name, _)| not_grain(table, name))
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>(),
+            Op::Update { table, changes, .. } => changes
+                .iter()
+                .filter(|(name, _)| not_grain(table, name))
+                .map(|(_, v)| v.clone())
+                .collect(),
+            Op::Delete { .. } | Op::Truncate { .. } => Vec::new(),
+            Op::BulkInsert { table, rows, .. } => rows
+                .iter()
+                .flat_map(|row| {
+                    row.iter()
+                        .filter(|(name, _)| not_grain(table, name))
+                        .map(|(_, v)| v.clone())
+                })
                 .collect(),
         })
         .collect()
 }
 
-/// With the awkward-value feature flag off, the generator's value draws are
-/// structurally identical to before issue #7 widened the generator: a bare
-/// `0..=VALUE_MAX` integer, never `None`/SQL `NULL`. Sampling many programs
-/// (rather than instrumenting the exact strategy call sequence) is the
-/// practical way to prove the *behavior* — what actually gets drawn — hasn't
-/// silently changed; see `trivial_program_with`'s doc comment for why the
-/// off-path strategy shape is deliberately kept byte-for-byte the same.
+/// With the awkward-value feature flag off, the generator's *flag-gated*
+/// value draws are structurally identical to before issue #7 widened the
+/// generator: a bare `0..=VALUE_MAX` integer, never `None`/SQL `NULL`. Every
+/// table's grain column is excluded from this check ([`all_op_values`]/
+/// [`grain_column`]) because it draws an occasional `NULL` unconditionally,
+/// regardless of this flag (issue #128) — see `generate::strategy::grain_value`'s
+/// doc comment. Sampling many programs (rather than instrumenting the exact
+/// strategy call sequence) is the practical way to prove the *behavior* —
+/// what actually gets drawn — hasn't silently changed; see
+/// `trivial_program_with`'s doc comment for why the off-path strategy shape
+/// is deliberately kept byte-for-byte the same for every flag-gated column.
 #[test]
 fn awkward_values_off_never_draws_null() {
     let mut runner = TestRunner::default();
@@ -213,6 +249,46 @@ fn awkward_values_on_sometimes_draws_null() {
         saw_null,
         "awkward_values=true must draw NULL at least once across 500 samples"
     );
+}
+
+/// A grouping (grain) value's `NULL` draw (improvement-plan task B4, issue
+/// #128) actually appears, and does so **regardless of `awkward_values`** —
+/// unlike every other awkward-value column, `generate::strategy::grain_value`
+/// is not gated by the flag (see `trivial_program_with`'s doc comment), so
+/// this samples both `false` and `true` and expects to see it either way.
+/// Complements [`awkward_values_off_never_draws_null`]/
+/// `awkward_values_on_sometimes_draws_null` above, which deliberately
+/// exclude the grain column from their own check via [`all_op_values`]/
+/// [`grain_column`] — this is the other half, asserting what those two
+/// leave out actually happens.
+#[test]
+fn grain_value_sometimes_draws_null_regardless_of_awkward_values() {
+    for awkward_values in [false, true] {
+        let mut runner = TestRunner::default();
+        let strategy = trivial_program_with(awkward_values);
+        let saw_null_grain = (0..500).any(|_| {
+            let program = strategy
+                .new_tree(&mut runner)
+                .expect("strategy must produce a value")
+                .current();
+            program.ops.iter().any(|op| match op {
+                Op::Insert { table, row, .. } => row.iter().any(|(name, v)| {
+                    v.is_none() && grain_column(&program, table).as_deref() == Some(name)
+                }),
+                Op::BulkInsert { table, rows, .. } => rows.iter().any(|row| {
+                    row.iter().any(|(name, v)| {
+                        v.is_none() && grain_column(&program, table).as_deref() == Some(name)
+                    })
+                }),
+                _ => false,
+            })
+        });
+        assert!(
+            saw_null_grain,
+            "grain_value must draw NULL at least once across 500 samples \
+             (awkward_values={awkward_values})"
+        );
+    }
 }
 
 /// The default [`trivial_program`] strategy (awkward values on) also

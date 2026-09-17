@@ -49,11 +49,16 @@ async fn create_bare_source_table(pool: &trellis::pool::Pool, name: &str) {
 /// (cardinality `ToOne`, avoiding the to-many replica-identity requirement
 /// these tests don't care about); `fk_col` is a plain, non-unique integer
 /// column of the same type family, suitable as a relationship's `from_col`.
+/// `REPLICA IDENTITY FULL` unconditionally (issue #129, epic #127): several
+/// of this file's tests chain this table as the to-side of a to-one
+/// relationship, which now requires it regardless of whether the table is
+/// used as a from-side or to-side in any given test — harmless either way.
 async fn create_bare_relationship_table(pool: &trellis::pool::Pool, name: &str) {
     let client = pool.get().await.expect("get connection");
     client
         .batch_execute(&format!(
-            "create table {name} (id serial primary key, fk_col integer)"
+            "create table {name} (id serial primary key, fk_col integer); \
+             alter table {name} replica identity full"
         ))
         .await
         .expect("create bare relationship table");

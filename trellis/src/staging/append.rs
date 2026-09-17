@@ -87,7 +87,20 @@ pub enum StagedChange {
         origin_lsn: Option<PgLsn>,
         src_changed: Option<SystemTime>,
         hop_gen: i32,
-        group_key: Option<String>,
+        /// Issue #133: the union of every join-key value this row's own
+        /// change touched — every column that is some relationship's
+        /// `from_col`, read from `old_image` (if present) and `new_image`
+        /// (if present). Populated by intake (`intake::mod::Intake`'s
+        /// `handle_xlog_data`, using a cached outbound-relationship column
+        /// map) or backfill's replay of a spilled/parked change; `None`
+        /// when this row's `src_table` has no outbound relationship at all,
+        /// or (rare, transient) the catalog cache hasn't observed one yet.
+        /// See `staging::fold`'s doc comment for the union merge rule this
+        /// feeds, and `staging::apply::RelationshipGenBump` for why this
+        /// (not the folded old/new image endpoints alone) is what guard
+        /// (b) needs to catch a parent the fold erases entirely within one
+        /// batch.
+        group_key: Option<Vec<String>>,
     },
     /// The shape all three non-CDC producers (reverse propagation,
     /// definition re-derive, backfill) use: a bare, image-less recompute
@@ -111,7 +124,12 @@ pub enum StagedChange {
         src_table: String,
         key: String,
         hop_gen: i32,
-        group_key: Option<String>,
+        /// Always `None` in practice: a `Recompute` carries no image at all
+        /// (see this variant's own doc comment), so there is no `old_image`/
+        /// `new_image` to read a touched join-key value from — see
+        /// [`StagedChange::Cdc::group_key`] for the field this mirrors and
+        /// why it's meaningless here rather than merely unpopulated.
+        group_key: Option<Vec<String>>,
         src_changed: Option<SystemTime>,
     },
     /// A source `TRUNCATE` of `src_table` (issue #60): one row per truncated
@@ -128,6 +146,75 @@ pub enum StagedChange {
         origin_lsn: Option<PgLsn>,
         src_changed: Option<SystemTime>,
     },
+    /// Issue #134, epic #127: a to-one relationship's parent-keyed reverse
+    /// record (`staging::apply::RelationshipReverseRecord`) whose Phase 3
+    /// apply one of issue #132's four guards rejected — persisted so a
+    /// later drain can re-derive fresh guard state and retry it, without
+    /// ever touching `hop_gen`/[`crate::staging::apply::MAX_HOP_GEN`] (see
+    /// `retry_count`'s own doc comment: retrying is not propagation, and
+    /// deferral is measured to be the *common* case for this mechanism, not
+    /// the exception, so it must never risk tripping the hop bound).
+    ///
+    /// Carries the parent's own old/new image (`old_image`/`new_image`) and
+    /// its own identity in the settled parent projection's LSN chain
+    /// (`lsn`) — everything a retry needs to rebuild the exact same
+    /// [`crate::staging::apply::RelationshipReverseRecord`] shape the
+    /// original attempt used. Deliberately does **not** carry `prev_lsn`,
+    /// `prev_gen`, or the watermark `X`: issue #134's resolved design
+    /// fork is that those three guard inputs are re-derived fresh, live,
+    /// at retry time (`staging::apply::capture_reverse_guard_state`) rather
+    /// than replayed from their stale original capture — replaying them
+    /// could wrongly pass a guard that should now fail, or wrongly fail one
+    /// that would now legitimately pass, silently reintroducing exactly the
+    /// class of bug issues #132/#133 closed.
+    RelationshipReverseDeferred {
+        /// A synthetic per-relationship identity (see
+        /// `staging::apply::relationship_reverse_deferred_src_table`),
+        /// never a real source table name — chosen so this op's rows never
+        /// fold together, at the SQL fold's `(src_table, key)` grouping,
+        /// with genuine CDC on the parent's *real* table. If they did, a
+        /// deferred retry sitting alone in a later batch would reach the
+        /// ordinary per-source forward-evaluation loop and double-apply
+        /// the delta its original CDC row already forward-applied when it
+        /// first landed (that forward apply is never itself deferred —
+        /// only the reverse-relationship delta this variant stands in for
+        /// is). Multiple deferred reverses for the *same* relationship and
+        /// parent key, staged across more than one rejection, *do* fold
+        /// together via this same synthetic identity — reusing the ring's
+        /// existing first-old/last-new-image fold rule verbatim, the same
+        /// "N changes to one key fold to one record" property issue #131
+        /// already established for raw parent CDC.
+        src_table: String,
+        /// The parent's to-side key text (old key, preferring the
+        /// pre-this-transition identity; the new key when there is no old
+        /// one, i.e. a parent INSERT) — this op's own fold identity within
+        /// its relationship's synthetic namespace above.
+        key: String,
+        old_image: Option<String>,
+        new_image: Option<String>,
+        /// This reverse's own identity in the settled parent projection's
+        /// LSN chain (mirrors
+        /// [`crate::staging::apply::RelationshipReverseRecord::lsn`]) — the
+        /// folded parent change's own `GREATEST` `lsn`, unrelated to this
+        /// ring row's own append position.
+        lsn: Option<PgLsn>,
+        src_changed: Option<SystemTime>,
+        /// Which `relationship_definitions.id` this reverse belongs to —
+        /// how a later drain knows which
+        /// [`crate::staging::apply::ReverseRelationshipShape`] to rebuild,
+        /// without trying to parse one back out of `src_table` above.
+        relationship_id: i64,
+        /// This reverse's retry counter: 1 the first time a guard rejects
+        /// it, incremented on every subsequent rejection — read back,
+        /// folded (`MAX` across a batch's rows for the same key, mirroring
+        /// `hop_gen`'s own fold rule), and threaded onto the reconstructed
+        /// [`crate::staging::apply::RelationshipReverseRecord`] so metrics
+        /// and (eventually, issue #135) a fairness mechanism can observe
+        /// how many times a given reverse has been deferred. There is no
+        /// `hop_gen` field on this variant at all — see this op's own
+        /// migration/doc comment for why retrying must never touch it.
+        retry_count: i32,
+    },
 }
 
 impl StagedChange {
@@ -139,6 +226,7 @@ impl StagedChange {
             StagedChange::Cdc { src_table, .. } => src_table,
             StagedChange::Recompute { src_table, .. } => src_table,
             StagedChange::Truncate { src_table, .. } => src_table,
+            StagedChange::RelationshipReverseDeferred { src_table, .. } => src_table,
         }
     }
 }
@@ -156,7 +244,13 @@ struct ChangeRow<'a> {
     origin_lsn: Option<PgLsn>,
     src_changed: Option<SystemTime>,
     hop_gen: i32,
-    group_key: Option<&'a str>,
+    group_key: Option<&'a [String]>,
+    /// Issue #134: meaningful only for `op = 'rel_reverse_deferred'` — `0`
+    /// for every other variant, matching the ring's own column default.
+    retry_count: i32,
+    /// Issue #134: meaningful only for `op = 'rel_reverse_deferred'` —
+    /// `None` for every other variant.
+    relationship_id: Option<i64>,
 }
 
 impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
@@ -184,6 +278,8 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 src_changed: *src_changed,
                 hop_gen: *hop_gen,
                 group_key: group_key.as_deref(),
+                retry_count: 0,
+                relationship_id: None,
             },
             StagedChange::Recompute {
                 src_table,
@@ -202,6 +298,8 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 src_changed: *src_changed,
                 hop_gen: *hop_gen,
                 group_key: group_key.as_deref(),
+                retry_count: 0,
+                relationship_id: None,
             },
             StagedChange::Truncate {
                 src_table,
@@ -219,6 +317,31 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 src_changed: *src_changed,
                 hop_gen: 0,
                 group_key: None,
+                retry_count: 0,
+                relationship_id: None,
+            },
+            StagedChange::RelationshipReverseDeferred {
+                src_table,
+                key,
+                old_image,
+                new_image,
+                lsn,
+                src_changed,
+                relationship_id,
+                retry_count,
+            } => ChangeRow {
+                src_table,
+                key,
+                op: "rel_reverse_deferred",
+                lsn: *lsn,
+                old_image: old_image.as_deref(),
+                new_image: new_image.as_deref(),
+                origin_lsn: None,
+                src_changed: *src_changed,
+                hop_gen: 0,
+                group_key: None,
+                retry_count: *retry_count,
+                relationship_id: Some(*relationship_id),
             },
         }
     }
@@ -263,12 +386,13 @@ pub async fn append(txn: &Transaction<'_>, changes: &[StagedChange]) -> Result<(
         .get(0);
     let table = ring_table_name(ring_slot)?;
 
-    const COLUMNS: &str = "src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, hop_gen, group_key";
-    const COLS_PER_ROW: usize = 10;
+    const COLUMNS: &str = "src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, \
+         hop_gen, group_key, retry_count, relationship_id";
+    const COLS_PER_ROW: usize = 12;
     // Postgres's wire protocol caps a Bind message's parameter count at
-    // i16::MAX (65535); 6000 rows keeps every chunk's param count
+    // i16::MAX (65535); 5000 rows keeps every chunk's param count
     // (60000) safely under that regardless of column count.
-    const MAX_ROWS_PER_STATEMENT: usize = 6000;
+    const MAX_ROWS_PER_STATEMENT: usize = 5000;
 
     let rows: Vec<ChangeRow<'_>> = changes.iter().map(ChangeRow::from).collect();
 
@@ -281,7 +405,7 @@ pub async fn append(txn: &Transaction<'_>, changes: &[StagedChange]) -> Result<(
             }
             let base = i * COLS_PER_ROW;
             sql.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}::text::jsonb, ${}::text::jsonb, ${}, ${}, ${}, ${})",
+                "(${}, ${}, ${}, ${}, ${}::text::jsonb, ${}::text::jsonb, ${}, ${}, ${}, ${}, ${}, ${})",
                 base + 1,
                 base + 2,
                 base + 3,
@@ -292,6 +416,8 @@ pub async fn append(txn: &Transaction<'_>, changes: &[StagedChange]) -> Result<(
                 base + 8,
                 base + 9,
                 base + 10,
+                base + 11,
+                base + 12,
             ));
             params.push(&row.src_table);
             params.push(&row.key);
@@ -303,6 +429,8 @@ pub async fn append(txn: &Transaction<'_>, changes: &[StagedChange]) -> Result<(
             params.push(&row.src_changed);
             params.push(&row.hop_gen);
             params.push(&row.group_key);
+            params.push(&row.retry_count);
+            params.push(&row.relationship_id);
         }
 
         txn.execute(sql.as_str(), &params).await?;

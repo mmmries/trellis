@@ -605,22 +605,24 @@ async fn uuid_column_works_as_an_aggregate_group_by_key() {
         ]
     );
 
-    let pk_columns = client
+    // Issue #128: keyed by a `UNIQUE` constraint (not a `PRIMARY KEY`) —
+    // see the dedicated test below for the `NULLS NOT DISTINCT` assertion.
+    let key_columns = client
         .query(
             "select a.attname::text
              from pg_index i
              join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
-             where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary",
+             where i.indrelid = pg_catalog.to_regclass($1) and i.indisunique",
             &[&def.target],
         )
         .await
-        .expect("introspect target primary key");
-    let pk_columns: Vec<String> = pk_columns.into_iter().map(|row| row.get(0)).collect();
-    assert_eq!(pk_columns, vec!["author".to_string()]);
+        .expect("introspect target unique key");
+    let key_columns: Vec<String> = key_columns.into_iter().map(|row| row.get(0)).collect();
+    assert_eq!(key_columns, vec!["author".to_string()]);
 }
 
 #[tokio::test]
-async fn aggregate_target_table_gets_a_composite_primary_key_from_the_grouping_columns() {
+async fn aggregate_target_table_gets_a_nulls_not_distinct_unique_key_from_the_grouping_columns() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("connection");
@@ -692,18 +694,64 @@ async fn aggregate_target_table_gets_a_composite_primary_key_from_the_grouping_c
          that nets to zero\", the same way AVG already does)"
     );
 
-    let pk_columns = client
-        .query(
-            "select a.attname::text
-             from pg_index i
-             join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
+    // Issue #128: the grouping columns are keyed by a `UNIQUE NULLS NOT
+    // DISTINCT` constraint, not a bare `PRIMARY KEY` — a `PRIMARY KEY` would
+    // forbid a NULL grouping value outright, but `GROUP BY` folds NULLs into
+    // their own group like any other value, so the target must be able to
+    // store one.
+    let no_primary_key: i64 = client
+        .query_one(
+            "select count(*) from pg_index i
              where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary",
             &[&def.target],
         )
         .await
-        .expect("introspect target primary key");
-    let pk_columns: Vec<String> = pk_columns.into_iter().map(|row| row.get(0)).collect();
-    assert_eq!(pk_columns, vec!["order_id".to_string()]);
+        .expect("introspect target primary key")
+        .get(0);
+    assert_eq!(no_primary_key, 0, "the target must have no PRIMARY KEY");
+
+    let key_row = client
+        .query_one(
+            "select i.indnullsnotdistinct, i.indexrelid
+             from pg_index i
+             where i.indrelid = pg_catalog.to_regclass($1) and i.indisunique",
+            &[&def.target],
+        )
+        .await
+        .expect("introspect target unique key");
+    assert!(
+        key_row.get::<_, bool>(0),
+        "the unique constraint must be NULLS NOT DISTINCT so a NULL-keyed group still dedups"
+    );
+    let unique_index: tokio_postgres::types::Oid = key_row.get(1);
+
+    let key_columns: Vec<String> = client
+        .query(
+            "select a.attname::text
+             from pg_index i
+             join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
+             where i.indexrelid = $1",
+            &[&unique_index],
+        )
+        .await
+        .expect("introspect unique key columns")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(key_columns, vec!["order_id".to_string()]);
+
+    // The grouping column itself must remain nullable (a `PRIMARY KEY` would
+    // have implicitly forced it `NOT NULL`).
+    let is_nullable: String = client
+        .query_one(
+            "select is_nullable from information_schema.columns
+             where table_name = $1 and column_name = 'order_id'",
+            &[&def.target],
+        )
+        .await
+        .expect("introspect order_id nullability")
+        .get(0);
+    assert_eq!(is_nullable, "YES", "the grouping column must stay nullable");
 }
 
 /// Issue #48: `SUM(amount)` and `AVG(amount)` aggregate the exact same
@@ -989,4 +1037,47 @@ async fn a_source_table_with_a_numeric_primary_key_is_rejected() {
         }
         other => panic!("expected UnsupportedPrimaryKeyType, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_nulls_distinct_unique_index_is_not_accepted_as_a_primary_key_stand_in() {
+    // Issue #128 follow-up: a plain `UNIQUE` index on a nullable column
+    // allows multiple NULLs, so it doesn't actually guarantee row identity
+    // the way a `PRIMARY KEY` or a `UNIQUE NULLS NOT DISTINCT` constraint
+    // does. Falling back to it here would silently reintroduce the "NULL
+    // rows collide/vanish" failure mode #128 fixed, through a side door.
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+
+    client
+        .batch_execute("create table widgets (id integer, label text unique)")
+        .await
+        .expect("seed source table with a nulls-distinct unique column");
+
+    let err = source_primary_key(&db.pool, "widgets").await.unwrap_err();
+    match err {
+        DdlError::NoPrimaryKey { source_table } => assert_eq!(source_table, "widgets"),
+        other => panic!("expected NoPrimaryKey, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_not_null_unique_index_is_accepted_as_a_primary_key_stand_in() {
+    // The other half of the guard above: a `UNIQUE` index is a safe
+    // identity when every indexed column is `NOT NULL`, since no NULL can
+    // ever occur to collide under nulls-distinct semantics.
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+
+    client
+        .batch_execute("create table widgets (id integer, label text not null unique)")
+        .await
+        .expect("seed source table with a not-null unique column");
+
+    let pk = source_primary_key(&db.pool, "widgets")
+        .await
+        .expect("a not-null unique index should stand in for a primary key");
+    assert_eq!(pk.name, "label");
 }

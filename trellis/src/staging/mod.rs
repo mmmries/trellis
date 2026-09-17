@@ -27,6 +27,9 @@
 //!   eviction, parked work as the source of truth for an excluded key's
 //!   later healthy changes, operator-driven release, and the one sanctioned
 //!   exception to immutability (a dropped source table's purge).
+//! - [`watermark`] is issue #132's in-process "staged-through" LSN (guard
+//!   (a), "the watermark barrier") — a small, injectable handle intake
+//!   advances and the reverse-delta apply path (`apply`) reads.
 //! - [`error`] is this module's error type.
 //!
 //! What this module does *not* do: delta arithmetic for aggregate
@@ -51,6 +54,7 @@ pub mod retire;
 pub mod seal;
 pub mod session;
 pub mod state;
+pub mod watermark;
 
 pub use append::{
     CdcOp, RING_SIZE, StagedChange, TRUNCATE_SENTINEL_KEY, append, ring_slot_is_free,
@@ -84,3 +88,4 @@ pub use seal::{
 };
 pub use session::{PRODUCER_SINGLETON_LOCK_KEY, ProducerSession};
 pub use state::{SegmentState, segment_state_counts};
+pub use watermark::StagedWatermark;

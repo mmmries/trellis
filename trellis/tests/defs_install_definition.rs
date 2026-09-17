@@ -156,12 +156,25 @@ async fn stage_cdc(
 
 /// Seals and drains repeatedly until nothing is pending anywhere in the ring.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+    // Issue #132: a throwaway, always-caught-up watermark — this helper
+    // has no live `Intake` running (these tests stage CDC rows by hand),
+    // and none of this file's tests exercise guard (a) specifically, so a
+    // real watermark would only ever make guard (a) reject spuriously.
+    let watermark = trellis::staging::StagedWatermark::saturated();
+    let watermark = &watermark;
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
-        while apply::drain_once(pool, seg, "install_def_test", 1, "trellis_install_def_test")
-            .await
-            .expect("drain_once")
-            .is_some()
+        while apply::drain_once(
+            pool,
+            seg,
+            "install_def_test",
+            1,
+            "trellis_install_def_test",
+            watermark,
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
         {}
         retire_drained_segments(client)
             .await
@@ -514,6 +527,7 @@ async fn install_definition_ring_fallback_ends_up_live() {
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
+             alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'); \
              insert into articles (id, category_id, title) values (1, 10, 'a1')",
         )
@@ -941,6 +955,7 @@ async fn install_definition_falls_back_to_ring_for_relationship_enriched_definit
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
+             alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'), (20, 'News'); \
              insert into articles (id, category_id, title) values \
              (1, 10, 'a1'), (2, 20, 'a2'), (3, 99, 'a3')",
@@ -1428,6 +1443,7 @@ async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chai
              create table s (id bigint primary key, a numeric); \
              insert into s (id, a) select g, g from generate_series(1, 50) g; \
              create table tags (id serial primary key, label text); \
+             alter table tags replica identity full; \
              insert into tags (id, label) select g, 'tagged' from generate_series(1, 50) g",
         )
         .await

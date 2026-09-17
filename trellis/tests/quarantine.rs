@@ -24,7 +24,7 @@ use trellis::defs::{
 };
 use trellis::staging::apply::{self, ApplyError, MAX_HOP_GEN};
 use trellis::staging::converge;
-use trellis::staging::{FoldedChange, isolate_and_evict};
+use trellis::staging::{FoldedChange, StagedWatermark, isolate_and_evict};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
 /// `apply.rs`/`converge.rs`'s convention.
@@ -233,10 +233,19 @@ async fn poison_marker_exists(client: &Client, src_table: &str, key: &str) -> bo
 }
 
 async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
-    apply::drain_once(pool, seg_seq, claimed_by, 1, "trellis_quarantine_test")
-        .await
-        .expect("drain_once")
-        .expect("drain_once must claim and drain something")
+    // Issue #132: a throwaway, always-caught-up watermark — no live
+    // `Intake` runs in this test file, and it isn't exercising guard (a).
+    apply::drain_once(
+        pool,
+        seg_seq,
+        claimed_by,
+        1,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("drain_once")
+    .expect("drain_once must claim and drain something")
 }
 
 /// Scenario: a poisoned key's parked contribution keeps its original
@@ -356,7 +365,15 @@ async fn an_innocent_batch_mate_is_not_charged_and_the_error_surfaces_unattribut
     .await;
 
     let seg_seq = seal_active_segment(&mut client).await;
-    let result = apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await;
+    let result = apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
     match result {
         Err(ApplyError::Eval(_)) => {}
         other => panic!("expected an Eval error to surface, got {other:?}"),
@@ -581,7 +598,15 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
         .expect("halting_stop_stats before");
 
     let seg_seq = seal_active_segment(&mut client).await;
-    let result = apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await;
+    let result = apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
     match result {
         Err(ApplyError::HopBoundExceeded { .. }) => {}
         other => panic!("expected HopBoundExceeded to propagate, got {other:?}"),
@@ -666,7 +691,15 @@ async fn a_composite_primary_key_source_is_never_quarantined_and_stops_the_insta
         .expect("halting_stop_stats before");
 
     let seg_seq = seal_active_segment(&mut client).await;
-    let result = apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await;
+    let result = apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
     match result {
         Err(ApplyError::Ddl(DdlError::CompositePrimaryKeyUnsupported { .. })) => {}
         other => panic!("expected CompositePrimaryKeyUnsupported to propagate, got {other:?}"),
@@ -742,7 +775,15 @@ async fn an_unsupported_primary_key_type_source_is_never_quarantined_and_stops_t
         .expect("halting_stop_stats before");
 
     let seg_seq = seal_active_segment(&mut client).await;
-    let result = apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await;
+    let result = apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
     match result {
         Err(ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType { .. })) => {}
         other => panic!("expected UnsupportedPrimaryKeyType to propagate, got {other:?}"),
@@ -1042,7 +1083,15 @@ async fn a_batch_failure_that_only_reproduces_combined_surfaces_unblamed() {
     .await;
     let seg1 = seal_active_segment(&mut client).await;
 
-    let result = apply::drain_once(&db.pool, seg1, "worker", 1, "trellis_quarantine_test").await;
+    let result = apply::drain_once(
+        &db.pool,
+        seg1,
+        "worker",
+        1,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
     match &result {
         Err(ApplyError::Db(db_err)) => {
             assert_eq!(
@@ -1124,7 +1173,16 @@ async fn repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still
 
     let mut real_failures = 0;
     let outcome = loop {
-        match apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await {
+        match apply::drain_once(
+            &db.pool,
+            seg_seq,
+            "worker",
+            1,
+            "trellis_quarantine_test",
+            &StagedWatermark::saturated(),
+        )
+        .await
+        {
             Ok(Some(outcome)) => break outcome,
             Ok(None) => panic!("drain_once claimed nothing on a still-undrained segment"),
             Err(_) => {
@@ -1229,6 +1287,8 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
         first_seen: SystemTime::now(),
         group_key: None,
         is_truncate: false,
+        relationship_reverse_deferred: None,
+        retry_count: 0,
     }];
 
     let result = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 0)
@@ -1247,5 +1307,88 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
         key_deaths_count(&client, "orders", "1").await,
         Some(10),
         "threshold 0 short-circuits before touching key_deaths at all"
+    );
+}
+
+/// Review follow-up to issue #134/#135: a `rel_reverse_deferred`
+/// `FoldedChange` must never be probed, poisoned, or parked by
+/// `isolate_and_evict` — its synthetic `src_table` (a per-relationship
+/// sentinel, `staging::apply::relationship_reverse_deferred_src_table`) is
+/// not a real table, `poison_held` has no columns for its
+/// `relationship_id`/`retry_count` and no matching `op` value in its own
+/// CHECK constraint, and a later `release_key` would re-append it as a
+/// bogus `StagedChange::Cdc` against a table name that doesn't exist. This
+/// pins the fix directly against `isolate_and_evict` (no ring/DB staging
+/// needed at all: the skip happens before this function ever calls
+/// `apply::compute`, so a synthetic key that doesn't correspond to
+/// anything real is sufficient to prove it) — even given an *otherwise
+/// maximally poison-prone* input (a `threshold` of 1, guaranteeing
+/// eviction on the very first death for anything that *is* probed), the
+/// deferred row must come out completely untouched: no probe, no death
+/// charge, no poison marker, no parked contribution — and `isolate_and_evict`
+/// itself must report nothing evicted, so its caller (`classify_and_retry`'s
+/// `Isolate` arm) surfaces the original failure loudly instead of retrying
+/// forever against an unresolvable "poisoned" synthetic key.
+#[tokio::test]
+async fn isolate_and_evict_never_probes_or_poisons_a_deferred_relationship_reverse() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    // A synthetic sentinel `src_table` shaped exactly like
+    // `relationship_reverse_deferred_src_table` produces — deliberately
+    // not backed by any real table, relationship, or definition: if this
+    // function ever tried to `compute()`/apply it, that alone would fail
+    // loudly (a `SourceTableDropped`-shaped or catalog-lookup error), which
+    // is precisely the point — this input has no legitimate way to
+    // succeed except by being skipped outright.
+    let sentinel_src_table = "\u{1f}trellis-rel-reverse-deferred:999";
+
+    let folded = vec![FoldedChange {
+        src_table: sentinel_src_table.to_string(),
+        key: "1".to_string(),
+        new_image: Some(r#"{"id":1,"v":2}"#.to_string()),
+        old_image: Some(r#"{"id":1,"v":1}"#.to_string()),
+        src_changed: None,
+        origin_lsn: None,
+        lsn: Some(PgLsn::from(1u64)),
+        hop_gen: 0,
+        first_seen: SystemTime::now(),
+        group_key: None,
+        is_truncate: false,
+        relationship_reverse_deferred: Some(999),
+        retry_count: 1,
+    }];
+
+    let result = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 1)
+        .await
+        .expect(
+            "isolate_and_evict must not error on a deferred reverse — it must be skipped \
+             outright, never probed",
+        );
+    assert!(
+        result.is_none(),
+        "a batch containing only a deferred reverse must report nothing evicted, so the \
+         caller surfaces the original failure instead of silently 'resolving' it"
+    );
+
+    assert!(
+        !poison_marker_exists(&client, sentinel_src_table, "1").await,
+        "a deferred reverse must never be poisoned under its synthetic src_table"
+    );
+    assert_eq!(
+        key_deaths_count(&client, sentinel_src_table, "1").await,
+        None,
+        "a deferred reverse must never be charged a death"
+    );
+    let poison_held_rows: i64 = client
+        .query_one("select count(*) from poison_held", &[])
+        .await
+        .expect("count poison_held")
+        .get(0);
+    assert_eq!(
+        poison_held_rows, 0,
+        "a deferred reverse must never be parked into poison_held under its synthetic \
+         src_table — release_key has no way to safely re-append it later"
     );
 }

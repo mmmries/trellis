@@ -14,12 +14,21 @@ use trellis::defs::{
 
 /// A bare table with an integer primary key named `pk_col` — good enough to
 /// stand in as a relationship's to-side when the test wants a `UNIQUE`/`PK`
-/// column present (cardinality `ToOne`).
+/// column present (cardinality `ToOne`). Carries `REPLICA IDENTITY FULL`
+/// unconditionally (issue #129, epic #127): every to-one relationship's
+/// to-side now needs it for `create_relationship` to accept the
+/// relationship at all (its settled parent projection reads old images —
+/// see `assert_replica_identity_supports_projection`), and this helper is
+/// overwhelmingly used to build a to-one relationship's to-side across this
+/// file's tests. Harmless for the handful of from-side uses too — `REPLICA
+/// IDENTITY FULL` only ever widens what a pre-image carries, never rejects
+/// anything on the from-side.
 async fn create_table_with_pk(pool: &trellis::pool::Pool, name: &str, pk_col: &str) {
     let client = pool.get().await.expect("get connection");
     client
         .batch_execute(&format!(
-            "create table {name} ({pk_col} serial primary key)"
+            "create table {name} ({pk_col} serial primary key); \
+             alter table {name} replica identity full"
         ))
         .await
         .expect("create table with pk");
@@ -37,12 +46,14 @@ async fn create_table_with_plain_column(pool: &trellis::pool::Pool, name: &str, 
 }
 
 /// A table with a plain-`UNIQUE` (not primary-key) integer column — the
-/// other route to cardinality `ToOne` per ADR-0006.
+/// other route to cardinality `ToOne` per ADR-0006. `REPLICA IDENTITY FULL`
+/// for the same reason [`create_table_with_pk`] carries it now (issue #129).
 async fn create_table_with_unique_column(pool: &trellis::pool::Pool, name: &str, col: &str) {
     let client = pool.get().await.expect("get connection");
     client
         .batch_execute(&format!(
-            "create table {name} ({col} integer unique, other_col integer)"
+            "create table {name} ({col} integer unique, other_col integer); \
+             alter table {name} replica identity full"
         ))
         .await
         .expect("create table with unique column");
@@ -637,7 +648,10 @@ async fn compatible_integer_widths_are_accepted() {
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
     let client = db.pool.get().await.expect("get connection");
     client
-        .batch_execute("create table products (id bigint primary key)")
+        .batch_execute(
+            "create table products (id bigint primary key); \
+             alter table products replica identity full",
+        )
         .await
         .expect("create products with bigint pk");
     drop(client);
@@ -662,7 +676,10 @@ async fn text_and_varchar_are_accepted_as_comparable() {
     create_table_with_text_column(&db.pool, "order_line_items", "sku").await;
     let client = db.pool.get().await.expect("get connection");
     client
-        .batch_execute("create table products (sku character varying(255) primary key)")
+        .batch_execute(
+            "create table products (sku character varying(255) primary key); \
+             alter table products replica identity full",
+        )
         .await
         .expect("create products with varchar pk");
     drop(client);
@@ -688,7 +705,8 @@ async fn varchar_columns_with_different_lengths_are_accepted() {
     client
         .batch_execute(
             "create table order_line_items (sku character varying(50));
-             create table products (sku character varying(255) primary key)",
+             create table products (sku character varying(255) primary key);
+             alter table products replica identity full",
         )
         .await
         .expect("create tables with differing varchar lengths");
@@ -1120,7 +1138,9 @@ async fn a_relationship_edge_that_would_close_a_cycle_is_rejected() {
     client
         .batch_execute(
             "create table a (id serial primary key, b_id integer);
-             create table b (id serial primary key, a_id integer)",
+             create table b (id serial primary key, a_id integer);
+             alter table a replica identity full;
+             alter table b replica identity full",
         )
         .await
         .expect("create a and b");
@@ -1374,6 +1394,17 @@ async fn a_relationship_to_table_resolves_a_bare_name_chained_off_a_non_default_
     .await
     .expect("def A installs with an explicit non-default target schema");
 
+    // custom.t2 becomes the relationship's to-side below — issue #129's
+    // unconditional projection gate needs REPLICA IDENTITY FULL on it, same
+    // as any other to-one relationship's to-side.
+    db.pool
+        .get()
+        .await
+        .expect("get connection")
+        .batch_execute("alter table custom.t2 replica identity full")
+        .await
+        .expect("set replica identity full on custom.t2");
+
     // The relationship's bare `TO t2.id` must still resolve to def A's
     // `custom.t2` — a plain `search_path` walk alone (what `to_regclass`
     // does inside `column_type_in_txn`/`to_col_cardinality_in_txn`) would
@@ -1444,6 +1475,17 @@ async fn a_calculated_field_relationship_path_resolves_a_to_table_chained_off_a_
     )
     .await
     .expect("def A installs with an explicit non-default target schema");
+
+    // custom.t2 becomes the relationship's to-side below — issue #129's
+    // unconditional projection gate needs REPLICA IDENTITY FULL on it, same
+    // as any other to-one relationship's to-side.
+    db.pool
+        .get()
+        .await
+        .expect("get connection")
+        .batch_execute("alter table custom.t2 replica identity full")
+        .await
+        .expect("set replica identity full on custom.t2");
 
     // The relationship's bare `TO t2.id` must resolve to def A's `custom.t2`
     // (already covered by the test above; needed here as this test's own

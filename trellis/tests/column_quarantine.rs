@@ -23,8 +23,10 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     TransformStatus, chunk_queue, create_aggregate_target_table, create_definition,
-    create_target_table, install_definition, source_primary_key,
+    create_relationship, create_target_table, install_definition, relationship_projection,
+    source_primary_key,
 };
+use trellis::staging::StagedWatermark;
 use trellis::staging::apply::{self, ApplyError};
 use trellis::staging::quarantine::{self, DEFAULT_COLUMN_DEATH_THRESHOLD};
 use trellis::{BlockingTrellis, Config, Trellis, TrellisOptions};
@@ -225,8 +227,15 @@ async fn stage_bad_orders(client: &mut Client, pool: &trellis::Pool, ids: &[i64]
         .await;
     }
     let seg_seq = seal_active_segment(client).await;
-    let result =
-        apply::drain_once(pool, seg_seq, "worker", 1, "trellis_column_quarantine_test").await;
+    let result = apply::drain_once(
+        pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
     assert!(
         matches!(result, Err(ApplyError::Eval(_))),
         "a malformed numeric field must still surface as an evaluator failure, got {result:?}"
@@ -366,6 +375,7 @@ async fn paused_column_freezes_instead_of_going_null_or_being_overwritten() {
         "worker",
         1,
         "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -408,6 +418,7 @@ async fn paused_column_freezes_instead_of_going_null_or_being_overwritten() {
         "worker",
         1,
         "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -550,6 +561,7 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
         "worker",
         1,
         "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -920,6 +932,7 @@ async fn an_existing_row_level_fuse_scenario_is_unaffected() {
             "worker",
             1,
             "trellis_column_quarantine_test",
+            &StagedWatermark::saturated(),
         )
         .await
         {
@@ -1161,6 +1174,7 @@ async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate()
         "worker",
         1,
         "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -1177,6 +1191,7 @@ async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate()
         "worker",
         1,
         "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -1477,6 +1492,7 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
         "worker",
         1,
         "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
     )
     .await;
     assert!(
@@ -1692,6 +1708,7 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
         "worker",
         1,
         "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -1762,5 +1779,165 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
             .is_some(),
         "the cascaded-onto column must remain paused: its definition still isn't live, so \
          resume_column must have left it exactly as it was rather than stranding or dropping it"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (l) Issue #130, epic #127: `recompute_column`'s to-one relationship read
+//     moved onto the settled parent projection (#129), same as the ordinary
+//     forward-apply path (`staging::apply::compute`) — quarantine replay
+//     (this call site) must see the exact same semantics as normal drain,
+//     not a live re-read that happens to disagree with it.
+// ---------------------------------------------------------------------
+
+/// `resume_column`'s recompute (`recompute_column`, the second of
+/// `build_relationship_context`'s two call sites) must resolve a to-one
+/// relationship path the same way the live CDC-apply path now does (#130):
+/// from the settled parent projection, not a live read of the parent. Proved
+/// by renaming the live `categories` row *after* the projection has already
+/// settled on its original name, with no reverse recompute or projection
+/// advance in between (#131 doesn't exist yet) — a live read would pick up
+/// the rename; the projection cannot, because #130 alone never advances a
+/// projection row's data columns on a parent-side mutation.
+#[tokio::test]
+async fn resume_column_resolves_a_to_one_relationship_from_the_projection_not_live_state() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table categories (id integer primary key, name text); \
+             alter table categories replica identity full; \
+             insert into categories (id, name) values (10, 'Tech'); \
+             create table articles (id integer primary key, category_id integer); \
+             insert into articles (id, category_id) values (1, 10)",
+        )
+        .await
+        .expect("create + seed tables");
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP category FROM articles.category_id TO categories.id",
+    )
+    .await
+    .expect("create to-one relationship");
+
+    // Front door (issue #40): `create_definition`'s own widen call (#129)
+    // catches category 10's `name` = 'Tech' into the projection right here,
+    // while it's still the row's only-ever value.
+    let source_columns = numeric_columns(&["id", "category_id"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM article_cat FROM articles SELECT category.name AS category_name",
+        &source_columns,
+    )
+    .await
+    .expect("create to-one enrichment definition");
+
+    let article_cat_def = TransformDef {
+        target: "article_cat".to_string(),
+        source: "articles".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "category_name".to_string(),
+            expr: Expr::RelationshipPath {
+                rel: "category".to_string(),
+                column: "name".to_string(),
+            },
+        }],
+        predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
+    };
+    let pk = source_primary_key(&db.pool, "articles")
+        .await
+        .expect("introspect articles pk");
+    create_target_table(
+        &db.pool,
+        &article_cat_def,
+        "public",
+        &pk,
+        &source_columns,
+        &article_cat_def.source,
+    )
+    .await
+    .expect("create target table");
+
+    // Sentinel, distinct from either the live or the projected name, so a
+    // successful recompute is unambiguous.
+    client
+        .execute(
+            "insert into article_cat (id, category_name) values (1, 'SENTINEL')",
+            &[],
+        )
+        .await
+        .expect("seed sentinel target row");
+
+    // Reached past the mechanism, same convention as this file's other
+    // tests: seed `column_status` directly rather than driving a real
+    // failure to trip the fuse.
+    client
+        .execute(
+            "insert into column_status (transform_table, column_name, last_error, local_fuse) \
+             values ('article_cat', 'category_name', 'synthetic pause', true)",
+            &[],
+        )
+        .await
+        .expect("seed column_status");
+
+    // Rename the live category — no CDC staged, no reverse recompute, no
+    // projection advance. Only #131 (not built) would keep the projection in
+    // step with this.
+    client
+        .execute("update categories set name = 'Renamed' where id = 10", &[])
+        .await
+        .expect("mutate the live category without touching the projection");
+
+    // Confirm the projection genuinely still disagrees with live truth
+    // before asserting anything about the recompute's output — otherwise a
+    // passing assertion below wouldn't distinguish "read the projection"
+    // from "coincidentally read the right value some other way".
+    let projection = relationship_projection(&db.pool, relationship.id)
+        .await
+        .expect("read projection catalog row")
+        .expect("to-one relationship has a projection");
+    let projected_name: Option<String> = client
+        .query_one(
+            &format!(
+                "select name from {} where id = 10",
+                projection.projection_table
+            ),
+            &[],
+        )
+        .await
+        .expect("read projection row")
+        .get(0);
+    assert_eq!(
+        projected_name.as_deref(),
+        Some("Tech"),
+        "sanity check: the projection must still hold the pre-rename name"
+    );
+
+    let resumed = quarantine::resume_column(&db.pool, "article_cat", "category_name")
+        .await
+        .expect("resume_column");
+    assert_eq!(
+        resumed,
+        vec![("article_cat".to_string(), "category_name".to_string())]
+    );
+
+    let recomputed: Option<String> = client
+        .query_one("select category_name from article_cat where id = 1", &[])
+        .await
+        .expect("read article_cat")
+        .get(0);
+    assert_eq!(
+        recomputed.as_deref(),
+        Some("Tech"),
+        "recompute_column (the quarantine-replay call site) must resolve the to-one \
+         relationship from the settled projection, exactly like normal drain's forward \
+         path (#130) — not the live category row, which was renamed to 'Renamed' after \
+         the projection had already settled"
     );
 }

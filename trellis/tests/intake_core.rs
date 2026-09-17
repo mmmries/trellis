@@ -23,8 +23,9 @@ use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::create_relationship;
 use trellis::intake::{self, IntakeError, replica_identity};
-use trellis::staging::{CdcOp, StagedChange, TRUNCATE_SENTINEL_KEY};
+use trellis::staging::{CdcOp, StagedChange, StagedWatermark, TRUNCATE_SENTINEL_KEY};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`) and pins
 /// `search_path`, matching `trellis/tests/staging_ring.rs`'s helper of the
@@ -370,7 +371,7 @@ async fn end_to_end_happy_path_stages_a_change_and_advances_the_watermark() {
         spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: intake::spill::DEFAULT_HARD_CAP,
     };
-    let mut consumer = intake::Intake::connect(&config)
+    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await
         .expect("connect intake");
 
@@ -473,7 +474,7 @@ async fn a_full_replica_identity_change_extracts_the_primary_key_not_the_whole_r
         spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: intake::spill::DEFAULT_HARD_CAP,
     };
-    let mut consumer = intake::Intake::connect(&config)
+    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await
         .expect("connect intake");
 
@@ -562,7 +563,7 @@ async fn a_truncate_message_becomes_a_staged_sentinel_not_dropped() {
         spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: intake::spill::DEFAULT_HARD_CAP,
     };
-    let mut consumer = intake::Intake::connect(&config)
+    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await
         .expect("connect intake");
 
@@ -607,4 +608,116 @@ async fn a_truncate_message_becomes_a_staged_sentinel_not_dropped() {
     assert_eq!(key, TRUNCATE_SENTINEL_KEY);
     assert_eq!(old_image, None, "a truncate sentinel must be image-less");
     assert_eq!(new_image, None, "a truncate sentinel must be image-less");
+}
+
+/// Issue #133: real intake — decoding a live `pgoutput` stream, not the
+/// low-level ring-staging helpers `apply_relationship_reverse.rs`'s own
+/// #133 tests use to simulate the signal — populates `group_key` for a
+/// from-side row whose table has a declared outbound (`from_table`)
+/// relationship, via `Intake`'s `GroupKeyColumns` cache
+/// (`handle_xlog_data`'s `touched_group_key` call). Mirrors the happy-path
+/// test above's real-slot/real-stream shape, with a `RELATIONSHIP`
+/// declared before the row is inserted.
+#[tokio::test]
+async fn intake_populates_group_key_for_a_from_side_row_with_an_outbound_relationship() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let setup = connect_raw(db.dsn()).await;
+    setup
+        .batch_execute(
+            "create table categories (id bigint primary key, name text not null); \
+             create table articles (id bigint primary key, category_id bigint not null); \
+             alter table categories replica identity full; \
+             alter table articles replica identity full; \
+             create publication intake_pub for table categories, articles; \
+             insert into categories (id, name) values (10, 'Tech');",
+        )
+        .await
+        .expect("create source tables, publication, and seed a category");
+    let slot_row = setup
+        .query_one(
+            "select slot_name from pg_create_logical_replication_slot('intake_slot', 'pgoutput')",
+            &[],
+        )
+        .await
+        .expect("create replication slot");
+    let _: String = slot_row.get(0);
+    seed_progress(&setup, "intake_slot", 0).await;
+
+    // Declared before intake connects, so `GroupKeyColumns`' first (empty)
+    // cache lookup for `articles` is a genuine catalog miss that finds it —
+    // proving the cache-population path, not just a pre-seeded map.
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP category FROM articles.category_id TO categories.id",
+    )
+    .await
+    .expect("create the outbound relationship");
+
+    // The change intake should pick up, made *after* the slot exists so it
+    // is guaranteed to be in the stream.
+    setup
+        .execute("insert into articles (id, category_id) values (1, 10)", &[])
+        .await
+        .expect("insert source row");
+
+    let config = intake::IntakeConfig {
+        dsn: db.dsn().to_string(),
+        schema: DEFAULT_SCHEMA.to_string(),
+        host: db.socket_dir().display().to_string(),
+        port: db.port(),
+        user: "postgres".to_string(),
+        password: String::new(),
+        database: db.name().to_string(),
+        slot: "intake_slot".to_string(),
+        publication: "intake_pub".to_string(),
+        wake_channel: "wake".to_string(),
+        spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
+        hard_cap: intake::spill::DEFAULT_HARD_CAP,
+    };
+    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
+        .await
+        .expect("connect intake");
+
+    tokio::spawn(async move {
+        let _ = consumer.run().await;
+    });
+
+    let observer = connect_raw(db.dsn()).await;
+    let articles_src_table = format!("{DEFAULT_SCHEMA}.articles");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let count: i64 = observer
+            .query_one(
+                "select count(*) from seg_0 where src_table = $1 and key = '1'",
+                &[&articles_src_table],
+            )
+            .await
+            .expect("count staged articles row")
+            .get(0);
+        if count >= 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the change to be staged"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let group_key: Option<Vec<String>> = observer
+        .query_one(
+            "select group_key from seg_0 where src_table = $1 and key = '1'",
+            &[&articles_src_table],
+        )
+        .await
+        .expect("read staged group_key")
+        .get(0);
+    assert_eq!(
+        group_key,
+        Some(vec!["10".to_string()]),
+        "intake must populate group_key from the row's own outbound \
+         relationship column (category_id), via the cached catalog lookup"
+    );
 }
