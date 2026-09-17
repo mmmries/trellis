@@ -775,7 +775,15 @@ async fn an_unsupported_primary_key_type_source_is_never_quarantined_and_stops_t
         .expect("halting_stop_stats before");
 
     let seg_seq = seal_active_segment(&mut client).await;
-    let result = apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await;
+    let result = apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
     match result {
         Err(ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType { .. })) => {}
         other => panic!("expected UnsupportedPrimaryKeyType to propagate, got {other:?}"),

@@ -173,12 +173,24 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// the one thing this test actually cares about — the target reaching live
 /// again — already happened.
 async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &str) {
+    // Issue #132: see `drain_to_quiescence`'s own comment — no live `Intake`
+    // is running here either, so a throwaway, always-caught-up watermark is
+    // correct.
+    let watermark = trellis::staging::StagedWatermark::saturated();
+    let watermark = &watermark;
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
-        while apply::drain_once(pool, seg, "status_lifecycle_test", 1, "trellis_status_test")
-            .await
-            .expect("drain_once")
-            .is_some()
+        while apply::drain_once(
+            pool,
+            seg,
+            "status_lifecycle_test",
+            1,
+            "trellis_status_test",
+            watermark,
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
         {}
         retire_drained_segments(client)
             .await
@@ -569,6 +581,10 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     // `DEFAULT_TRANSFORM_DEATH_THRESHOLD` (5) takes five external failures,
     // the fifth of which evicts all five keys together and lets the
     // (now-empty) retry drain succeed within that same call.
+    // Issue #132: see `drain_to_quiescence`'s own comment — no live `Intake`
+    // is running here either, so a throwaway, always-caught-up watermark is
+    // correct.
+    let watermark = trellis::staging::StagedWatermark::saturated();
     let mut real_failures = 0;
     loop {
         match apply::drain_once(
@@ -577,6 +593,7 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
             "status_lifecycle_test",
             1,
             "trellis_status_test",
+            &watermark,
         )
         .await
         {
