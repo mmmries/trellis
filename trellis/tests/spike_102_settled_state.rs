@@ -141,7 +141,7 @@ async fn run_campaign(client: &Client, design: &str, runs: i32) -> FuzzResult {
         // implicitly one transaction).
         client
             .batch_execute(
-                "vacuum chg, rev, rev_hold, rev_hold_rows, drained, segs, proj, attr, tgt",
+                "vacuum chg, rev, rev_hold, rev_hold_rows, drained, segs, proj, attr, tgt, src_posts, src_post_tags",
             )
             .await
             .expect("vacuum model tables between chunks");
