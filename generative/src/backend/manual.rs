@@ -33,7 +33,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     CatalogError, DdlError, TransformStatus, create_relationship, install_definition,
-    qualified_target_table, source_primary_key,
+    qualified_target_table, require_single_column_pk, source_primary_key,
 };
 use trellis::staging::{StagingError, await_converged, watermark_token};
 use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
@@ -1028,7 +1028,16 @@ impl super::Backend for ManualBackend {
             let qualified = qualified_target_table("public", def);
             let rows = match &def.key_space {
                 KeySpace::OneToOne => {
-                    let pk = source_primary_key(&self.pool, &def.source).await?;
+                    // A `KeySpace::OneToOne` target's primary key is always a
+                    // single column (`ddl::require_single_column_pk`'s own
+                    // doc comment) — `source_primary_key` itself now accepts
+                    // an arbitrary-arity source primary key (issue #126), so
+                    // narrow it back down here the same way
+                    // `catalog::install_definition` does at definition time.
+                    let pk = require_single_column_pk(
+                        source_primary_key(&self.pool, &def.source).await?,
+                        &def.source,
+                    )?;
                     let target_columns: Vec<Column> = std::iter::once(Column {
                         name: pk.name.clone(),
                         value_type: ValueType::Numeric,

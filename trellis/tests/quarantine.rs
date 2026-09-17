@@ -20,7 +20,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     DdlError, create_aggregate_target_table, create_definition, create_target_table, parse,
-    recompute, source_primary_key,
+    recompute, require_single_column_pk, source_primary_key,
 };
 use trellis::staging::apply::{self, ApplyError, MAX_HOP_GEN};
 use trellis::staging::converge;
@@ -160,9 +160,13 @@ async fn seed_order_totals(db: &TestDatabase, client: &Client) -> TransformDef {
     .await
     .expect("create definition");
     let def = order_totals_def();
-    let pk = source_primary_key(&db.pool, &def.source)
-        .await
-        .expect("introspect source primary key");
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, &def.source)
+            .await
+            .expect("introspect source primary key"),
+        &def.source,
+    )
+    .expect("single-column pk");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -564,9 +568,13 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
     )
     .await
     .expect("create order_summary definition");
-    let pk = source_primary_key(&db.pool, &def.source)
-        .await
-        .expect("introspect source primary key");
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, &def.source)
+            .await
+            .expect("introspect source primary key"),
+        &def.source,
+    )
+    .expect("single-column pk");
     create_target_table(
         &db.pool,
         &summary_def.def,

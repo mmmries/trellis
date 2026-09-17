@@ -23,7 +23,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     create_definition, create_relationship, create_target_table, install_definition,
-    relationship_projection, source_primary_key,
+    relationship_projection, require_single_column_pk, source_primary_key,
 };
 use trellis::staging::apply::{self, ApplyPlan};
 use trellis::staging::{StagedWatermark, claim, fold, has_pending, retire_drained_segments};
@@ -1202,9 +1202,13 @@ async fn issue_133_a_within_batch_repoint_still_bumps_the_erased_intermediate_pa
     )
     .await
     .expect("create to-one enrichment definition");
-    let pk = source_primary_key(&db.pool, "articles")
-        .await
-        .expect("introspect articles pk");
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, "articles")
+            .await
+            .expect("introspect articles pk"),
+        "articles",
+    )
+    .expect("single-column pk");
     create_target_table(
         &db.pool,
         &article_cat_def(),
@@ -1872,9 +1876,13 @@ async fn a_one_to_one_target_still_converges_via_the_fallback_mechanism() {
     )
     .await
     .expect("create to-one enrichment definition");
-    let pk = source_primary_key(&db.pool, "articles")
-        .await
-        .expect("introspect articles pk");
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, "articles")
+            .await
+            .expect("introspect articles pk"),
+        "articles",
+    )
+    .expect("single-column pk");
     create_target_table(
         &db.pool,
         &article_cat_def(),

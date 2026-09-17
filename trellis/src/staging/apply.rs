@@ -519,26 +519,57 @@ async fn decode_image(pool: &Pool, image_text: &str) -> Result<Row, ApplyError> 
 /// never for a live refetch. A key absent from the returned map means its
 /// row is gone (already deleted, or never existed), which [`compute`]
 /// treats as a delete, matching `read_live_row`'s old `None` case exactly.
+///
+/// `pk` may be a composite (multi-column) primary key (issue #126): `keys`
+/// are each [`ddl::pk_key_sql_expr`]'s U+001F-joined text — the same
+/// [`crate::intake::extract_key`] shape every [`FoldedChange::key`] already
+/// carries for a composite-PK source, whether staged by real CDC intake or
+/// by this crate's own reverse-relationship path
+/// ([`from_side_rows_for_join_txn`]/`from_side_keys_for_join`'s callers) —
+/// so the two agree on one row identity regardless of which produced it.
+/// The batch match itself is a keyset join, one bind-parameter array per
+/// `pk` column (mirroring `staging::apply_aggregate`'s `keyset_unnest`/
+/// `keyset_match`), rather than a single `= any($1)` — `pk.len() == 1`
+/// degenerates to exactly that single-array-parameter shape, so the
+/// single-column case (still the overwhelmingly common one) pays no extra
+/// cost.
 async fn read_live_rows_batch(
     pool: &Pool,
     source_table: &str,
-    pk: &PrimaryKeyColumn,
+    pk: &[PrimaryKeyColumn],
     keys: &[&str],
 ) -> Result<HashMap<String, Row>, ApplyError> {
     if keys.is_empty() {
         return Ok(HashMap::new());
     }
     let client = pool.get().await?;
-    let pk_ident = quote_ident(&pk.name);
+    let columns = ddl::transpose_pk_keys(pk, source_table, keys)?;
+    let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
+    let arrays: Vec<String> = pk
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("${}::text[]::{}[]", i + 1, c.data_type))
+        .collect();
+    let u_cols: Vec<String> = (0..pk.len()).map(|i| format!("c{i}")).collect();
+    let join_cond = pk_idents
+        .iter()
+        .zip(&u_cols)
+        .map(|(ident, u_col)| format!("t.{ident} = u.{u_col}"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let k_expr = ddl::pk_key_sql_expr(pk, Some("t"));
     let sql = format!(
         "select m.k, e.key, e.value \
-         from (select {pk_ident}::text as k, to_jsonb(t.*) as doc from {} t \
-               where {pk_ident} = any($1::text[]::{}[])) m \
+         from (select {k_expr} as k, to_jsonb(t.*) as doc from {} t \
+               join unnest({}) as u({}) on {join_cond}) m \
          cross join lateral jsonb_each_text(m.doc) e",
         ddl::qualified_source_table(source_table),
-        pk.data_type,
+        arrays.join(", "),
+        u_cols.join(", "),
     );
-    let db_rows = client.query(&sql, &[&keys]).await?;
+    let params: Vec<&(dyn ToSql + Sync)> =
+        columns.iter().map(|c| c as &(dyn ToSql + Sync)).collect();
+    let db_rows = client.query(&sql, &params).await?;
     let mut rows: HashMap<String, Row> = HashMap::new();
     for db_row in db_rows {
         let key: String = db_row.get(0);
@@ -616,10 +647,16 @@ fn key_array_filter(col_ident: &str, pg_type: Option<&str>) -> String {
 /// related-row change's `hop_gen` — that pulled it in. A `NULL` `from_col`
 /// never matches (SQL `NULL`), so such rows are absent, exactly like the
 /// evaluator's LEFT JOIN no-match.
+///
+/// `from_pk` may be composite (issue #126): the returned `from_pk_text` is
+/// [`ddl::pk_key_sql_expr`]'s row identity, in the same U+001F-joined shape
+/// [`read_live_rows_batch`] later decodes it back with — `from_col` itself
+/// (the relationship's own join column) is always a single column regardless
+/// of the from-table's primary key arity, so its matching is unaffected.
 async fn from_side_keys_for_join(
     pool: &Pool,
     from_table: &str,
-    from_pk: &PrimaryKeyColumn,
+    from_pk: &[PrimaryKeyColumn],
     from_col: &str,
     join_keys: &[String],
 ) -> Result<Vec<(String, String)>, ApplyError> {
@@ -631,10 +668,10 @@ async fn from_side_keys_for_join(
     let pg_type = key_column_pg_type(pool, from_table, from_col).await?;
     let filter = key_array_filter(&col_ident, pg_type.as_deref());
     let sql = format!(
-        "select {pk}::text, {col_ident}::text \
+        "select {pk}, {col_ident}::text \
          from {tbl} \
          where {filter}",
-        pk = quote_ident(&from_pk.name),
+        pk = ddl::pk_key_sql_expr(from_pk, None),
         tbl = quote_ident(from_table),
     );
     let rows = client.query(&sql, &[&join_keys]).await?;
@@ -658,13 +695,13 @@ async fn from_side_keys_for_join(
 async fn from_side_keys_with_non_null_join(
     pool: &Pool,
     from_table: &str,
-    from_pk: &PrimaryKeyColumn,
+    from_pk: &[PrimaryKeyColumn],
     from_col: &str,
 ) -> Result<Vec<String>, ApplyError> {
     let client = pool.get().await?;
     let sql = format!(
-        "select {pk}::text from {tbl} where {col} is not null",
-        pk = quote_ident(&from_pk.name),
+        "select {pk} from {tbl} where {col} is not null",
+        pk = ddl::pk_key_sql_expr(from_pk, None),
         col = quote_ident(from_col),
         tbl = quote_ident(from_table),
     );
@@ -991,7 +1028,10 @@ pub(crate) struct ReverseRelationshipShape {
     to_col: String,
     from_table: String,
     from_col: String,
-    from_pk: PrimaryKeyColumn,
+    /// The from-table's primary key, possibly composite (issue #126) — see
+    /// [`from_side_rows_for_join_txn`]'s doc comment for how a multi-column
+    /// key's row identity is encoded/decoded.
+    from_pk: Vec<PrimaryKeyColumn>,
     /// Fully-invertible, single-relationship aggregate targets reading this
     /// relationship — the issue #131 fast (true-delta) path. See
     /// [`build_reverse_relationship_shape`]'s doc comment for exactly which
@@ -1517,15 +1557,15 @@ async fn from_side_rows_for_join_txn(
     txn: &Transaction<'_>,
     from_table: &str,
     from_col: &str,
-    from_pk: &PrimaryKeyColumn,
+    from_pk: &[PrimaryKeyColumn],
     join_key: &str,
 ) -> Result<Vec<(String, Row)>, ApplyError> {
     let sql = format!(
         "select m.k, e.key, e.value \
-         from (select {pk}::text as k, to_jsonb(t.*) as doc from {tbl} t \
+         from (select {pk} as k, to_jsonb(t.*) as doc from {tbl} t \
                where {col}::text = $1) m \
          cross join lateral jsonb_each_text(m.doc) e",
-        pk = quote_ident(&from_pk.name),
+        pk = ddl::pk_key_sql_expr(from_pk, Some("t")),
         col = quote_ident(from_col),
         tbl = ddl::qualified_source_table(from_table),
     );
@@ -2860,9 +2900,13 @@ mod tests {
         )
         .await
         .expect("create definition");
-        let pk = crate::defs::source_primary_key(&pool, source)
-            .await
-            .expect("introspect source primary key");
+        let pk = crate::defs::require_single_column_pk(
+            crate::defs::source_primary_key(&pool, source)
+                .await
+                .expect("introspect source primary key"),
+            source,
+        )
+        .expect("single-column pk");
         crate::defs::create_target_table(
             &pool,
             &definition.def,
@@ -3789,10 +3833,23 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         .unzip()
                 };
 
+                // Issue #126: `pk` is this source's full (possibly
+                // composite) primary key, shared with the `KeySpace::Aggregate`
+                // branch above (which needs no single-column narrowing at
+                // all). A `KeySpace::OneToOne` definition, though, could only
+                // ever have been installed against a single-column source
+                // primary key (`catalog::install_definition`'s own
+                // `ddl::require_single_column_pk` gate) — so this narrowing
+                // can never actually fail for a definition that reached this
+                // point live; it's still routed through the typed error
+                // (rather than an `expect`) to match this module's own
+                // "don't trust an invariant it can't itself enforce"
+                // convention.
+                let target_pk = ddl::require_single_column_pk(pk.clone(), qualified_source)?;
                 let plan = targets
                     .entry(def.def.target.clone())
                     .or_insert_with(|| TargetPlan {
-                        pk: pk.clone(),
+                        pk: target_pk,
                         field_names: field_names.clone(),
                         field_types: field_types.clone(),
                         writes: Vec::new(),
@@ -4217,6 +4274,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         });
                 }
                 KeySpace::OneToOne => {
+                    // Issue #126: same narrowing, and the same "can never
+                    // actually fail here" reasoning, as the by-source loop's
+                    // identical `TargetPlan` construction above.
+                    let target_pk = ddl::require_single_column_pk(pk.clone(), &change.src_table)?;
                     clears
                         .entry(def.def.target.clone())
                         .and_modify(|existing| {
@@ -4225,7 +4286,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                                 earliest_src_changed(existing.src_changed, change.src_changed);
                         })
                         .or_insert(ClearPlan {
-                            pk: pk.clone(),
+                            pk: target_pk,
                             hop_gen: change.hop_gen,
                             qualified_target: def.target_table.clone(),
                             src_changed: change.src_changed,

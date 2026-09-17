@@ -121,9 +121,13 @@ async fn setup_source_and_target(pool: &Pool, raw: &Client) -> trellis::defs::Pr
     .await
     .expect("create definition");
 
-    let pk = source_primary_key(pool, "orders")
-        .await
-        .expect("introspect source primary key");
+    let pk = trellis::defs::require_single_column_pk(
+        source_primary_key(pool, "orders")
+            .await
+            .expect("introspect source primary key"),
+        "orders",
+    )
+    .expect("single-column pk");
     create_target_table(
         pool,
         &totals_def(),
@@ -426,9 +430,13 @@ async fn a_transform_registered_against_a_new_source_table_backfills_without_a_c
     )
     .await
     .expect("register comments_calc against the new source table");
-    let comments_pk = trellis::defs::source_primary_key(&db.pool, "comments")
-        .await
-        .expect("introspect comments primary key");
+    let comments_pk = trellis::defs::require_single_column_pk(
+        trellis::defs::source_primary_key(&db.pool, "comments")
+            .await
+            .expect("introspect comments primary key"),
+        "comments",
+    )
+    .expect("single-column pk");
     create_target_table(
         &db.pool,
         &comments_calc_def(),
@@ -555,9 +563,13 @@ async fn a_transform_registered_against_an_explicitly_qualified_non_default_sche
     )
     .await
     .expect("register comments_calc against the explicitly-qualified source");
-    let comments_pk = trellis::defs::source_primary_key(&db.pool, "custom.comments")
-        .await
-        .expect("introspect custom.comments primary key");
+    let comments_pk = trellis::defs::require_single_column_pk(
+        trellis::defs::source_primary_key(&db.pool, "custom.comments")
+            .await
+            .expect("introspect custom.comments primary key"),
+        "custom.comments",
+    )
+    .expect("single-column pk");
     create_target_table(
         &db.pool,
         &comments_calc_custom_schema_def(),
