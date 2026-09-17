@@ -1811,6 +1811,7 @@ async fn resume_column_resolves_a_to_one_relationship_from_the_projection_not_li
              alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'); \
              create table articles (id integer primary key, category_id integer); \
+             alter table articles replica identity full; \
              insert into articles (id, category_id) values (1, 10)",
         )
         .await

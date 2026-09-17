@@ -1524,11 +1524,15 @@ pub async fn create_relationship(
     // #129, epic #127) unconditionally — see
     // [`assert_replica_identity_supports_projection`]'s own doc comment for
     // why this is gated on cardinality alone, exactly like the to-many arm,
-    // rather than on whether a consumer exists yet.
+    // rather than on whether a consumer exists yet. Issue #158: a to-one
+    // relationship also needs its *from*-side (child) table on `REPLICA
+    // IDENTITY FULL`, not just its to-side — see that same function's doc
+    // comment for why both endpoints share one gate.
     if cardinality == RelationshipCardinality::ToMany {
         assert_replica_identity_supports_to_many(&txn, &def, &qualified_to).await?;
     } else {
-        assert_replica_identity_supports_projection(&txn, &def, &qualified_to).await?;
+        assert_replica_identity_supports_projection(&txn, &def.to_table, &qualified_to).await?;
+        assert_replica_identity_supports_projection(&txn, &def.from_table, &qualified_from).await?;
     }
 
     let mut warnings = Vec::new();
@@ -2647,23 +2651,39 @@ async fn assert_replica_identity_supports_aggregate(
         .map_err(CatalogError::ReplicaIdentityRequired)
 }
 
-/// Rejects a to-one relationship (issue #129, epic #127) whose to-side
-/// table's replica identity can't guarantee an old row image. Every to-one
-/// relationship gets a settled parent projection unconditionally — see
-/// [`create_relationship`]'s own call site — and the projection's
-/// reverse-applied advance (#131) needs the to-side row's *entire* old image
-/// to detect and apply a parent update/delete/re-key, the same requirement
-/// [`assert_replica_identity_supports_aggregate`] already enforces for an
-/// aggregate's source; see that function's doc comment for why only
-/// `REPLICA IDENTITY FULL` — not the narrower `USING INDEX` a single-column
-/// `to_col` check ([`assert_replica_identity_supports_to_many`]) would
-/// accept — is enough for an old image of unpredictably-many columns, and
-/// for why this delegates to [`crate::intake::require_replica_identity_full`]
-/// rather than duplicating its rejection text: that function's own
-/// `needs_old_image` parameter is unconditional, so this queries
-/// `pg_class.relreplident` itself first and only passes `true` through when
-/// the to-side table is actually inadequate today, exactly mirroring
-/// [`assert_replica_identity_supports_aggregate`]'s own two-step shape.
+/// Rejects a to-one relationship (issue #129, epic #127) whose to-side or
+/// from-side table's replica identity can't guarantee an old row image.
+/// Every to-one relationship gets a settled parent projection
+/// unconditionally — see [`create_relationship`]'s own call site — and the
+/// projection's reverse-applied advance (#131) needs the to-side row's
+/// *entire* old image to detect and apply a parent update/delete/re-key, the
+/// same requirement [`assert_replica_identity_supports_aggregate`] already
+/// enforces for an aggregate's source; see that function's doc comment for
+/// why only `REPLICA IDENTITY FULL` — not the narrower `USING INDEX` a
+/// single-column `to_col` check ([`assert_replica_identity_supports_to_many`])
+/// would accept — is enough for an old image of unpredictably-many columns,
+/// and for why this delegates to
+/// [`crate::intake::require_replica_identity_full`] rather than duplicating
+/// its rejection text: that function's own `needs_old_image` parameter is
+/// unconditional, so this queries `pg_class.relreplident` itself first and
+/// only passes `true` through when the checked table is actually inadequate
+/// today, exactly mirroring [`assert_replica_identity_supports_aggregate`]'s
+/// own two-step shape.
+///
+/// **Issue #158: the from-side (child) table needs this too, not just the
+/// to-side.** A to-one relationship's `from_col` is an ordinary non-key
+/// column on `from_table` (the foreign key), so under that table's *default*
+/// replica identity (primary key only) an `UPDATE` that re-points the FK —
+/// changes `from_col` without touching the PK — ships `old_image = None`
+/// from `pgoutput`: no pre-image at all, not merely one missing the changed
+/// column. That breaks anything reading a from-side row's prior state off a
+/// replication message, including the `group_key` union mechanism (issue
+/// #133) that recovers a row's true prior parent. The to-side's own gate
+/// (above) can't catch this — it only ever inspects `to_table`, and a
+/// from-side re-point doesn't touch the to-side row at all — so this
+/// function takes the table to check as a plain parameter and is called once
+/// per relationship endpoint ([`create_relationship`]) rather than being
+/// hardcoded to `to_table`.
 ///
 /// **Gated on cardinality alone, not on whether the relationship has a
 /// consumer yet.** A relationship must be declared before anything can
@@ -2672,9 +2692,9 @@ async fn assert_replica_identity_supports_aggregate(
 /// already-persisted row), so at the point this runs — inside
 /// [`create_relationship`], before that row is even committed — no consumer
 /// can exist yet. Gating on "has a consumer today" would therefore never
-/// fire: it would silently accept a to-one relationship whose to-side can
-/// never actually satisfy a projection some *later* definition needs,
-/// discovered only when that later definition's widen
+/// fire: it would silently accept a to-one relationship whose to-side (or
+/// from-side) can never actually satisfy a projection some *later*
+/// definition needs, discovered only when that later definition's widen
 /// ([`ensure_relationship_projection_in_txn`]) fails partway through
 /// *its* transaction — a confusing place to first learn the real problem is
 /// this relationship's declaration. Rejecting here instead matches
@@ -2684,18 +2704,18 @@ async fn assert_replica_identity_supports_aggregate(
 /// relationship itself, not deferred until first use.
 async fn assert_replica_identity_supports_projection(
     txn: &tokio_postgres::Transaction<'_>,
-    def: &RelationshipDef,
-    to_table: &str,
+    reported_table: &str,
+    qualified_table: &str,
 ) -> Result<(), CatalogError> {
     let is_full: bool = txn
         .query_one(
             "select relreplident = 'f' from pg_class where oid = pg_catalog.to_regclass($1)",
-            &[&to_table],
+            &[&qualified_table],
         )
         .await?
         .get(0);
 
-    crate::intake::require_replica_identity_full(&def.to_table, !is_full)
+    crate::intake::require_replica_identity_full(reported_table, !is_full)
         .map_err(CatalogError::ReplicaIdentityRequired)
 }
 

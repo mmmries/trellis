@@ -528,6 +528,7 @@ async fn install_definition_ring_fallback_ends_up_live() {
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
              alter table categories replica identity full; \
+             alter table articles replica identity full; \
              insert into categories (id, name) values (10, 'Tech'); \
              insert into articles (id, category_id, title) values (1, 10, 'a1')",
         )
@@ -956,6 +957,7 @@ async fn install_definition_falls_back_to_ring_for_relationship_enriched_definit
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
              alter table categories replica identity full; \
+             alter table articles replica identity full; \
              insert into categories (id, name) values (10, 'Tech'), (20, 'News'); \
              insert into articles (id, category_id, title) values \
              (1, 10, 'a1'), (2, 20, 'a2'), (3, 99, 'a3')",
@@ -1463,7 +1465,16 @@ async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chai
     // this relationship's `from_table` is itself the chained, non-default-
     // schema target under test, so declaring it also exercises this same
     // fix's `create_relationship`-side gap (see `defs_relationship_catalog.rs`'s
-    // own regression test).
+    // own regression test). Issue #158: the from-side needs `REPLICA IDENTITY
+    // FULL` unconditionally too, same as the to-side, regardless of whether
+    // its join column happens to be the primary key.
+    db.pool
+        .get()
+        .await
+        .expect("get connection")
+        .batch_execute("alter table custom.t replica identity full")
+        .await
+        .expect("set replica identity full on custom.t");
     create_relationship(&db.pool, "RELATIONSHIP tagrel FROM t.id TO tags.id")
         .await
         .expect("relationship's bare FROM must resolve to custom.t");

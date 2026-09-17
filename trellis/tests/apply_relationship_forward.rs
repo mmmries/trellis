@@ -214,7 +214,8 @@ async fn forward_to_one_resolves_from_the_projection_not_live_parent_state() {
             "create table categories (id integer primary key, name text); \
              alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'); \
-             create table articles (id integer primary key, category_id integer)",
+             create table articles (id integer primary key, category_id integer); \
+             alter table articles replica identity full",
         )
         .await
         .expect("create + seed tables");
@@ -304,7 +305,8 @@ async fn forward_apply_bumps_gen_once_per_touched_parent_even_with_two_touching_
             "create table categories (id integer primary key, name text); \
              alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'); \
-             create table articles (id integer primary key, category_id integer)",
+             create table articles (id integer primary key, category_id integer); \
+             alter table articles replica identity full",
         )
         .await
         .expect("create + seed tables");
@@ -409,6 +411,7 @@ async fn forward_apply_re_point_bumps_gen_for_both_old_and_new_parent() {
              alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'), (20, 'News'); \
              create table articles (id integer primary key, category_id integer); \
+             alter table articles replica identity full; \
              insert into articles (id, category_id) values (1, 10)",
         )
         .await

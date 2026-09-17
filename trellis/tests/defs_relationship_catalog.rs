@@ -89,7 +89,10 @@ async fn create_table_with_typed_column(
 
 /// Sets `REPLICA IDENTITY FULL` on `name` — the to-side prerequisite (#41)
 /// for a to-many relationship, whose non-PK join key must appear in
-/// delete/re-parent pre-images for reverse recompute.
+/// delete/re-parent pre-images for reverse recompute; also the from-side
+/// prerequisite (issue #158) for a to-one relationship, whose `from_col` is
+/// itself an ordinary non-PK column and so needs the same guarantee for a
+/// re-pointing `UPDATE` to carry an old image at all.
 async fn set_replica_identity_full(pool: &trellis::pool::Pool, name: &str) {
     let client = pool.get().await.expect("get connection");
     client
@@ -103,6 +106,10 @@ async fn a_relationship_round_trips_through_the_catalog() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    // Issue #158: a to-one relationship's from-side needs `REPLICA IDENTITY
+    // FULL` too — see `assert_replica_identity_supports_projection`'s doc
+    // comment.
+    set_replica_identity_full(&db.pool, "order_line_items").await;
     create_table_with_pk(&db.pool, "products", "id").await;
 
     let created = create_relationship(
@@ -160,6 +167,7 @@ async fn a_relationship_appears_as_a_typed_edge_in_the_resolver() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "posts", "author_id").await;
+    set_replica_identity_full(&db.pool, "posts").await;
     create_table_with_pk(&db.pool, "users", "id").await;
 
     create_relationship(
@@ -210,7 +218,10 @@ async fn a_duplicate_name_on_the_same_from_table_is_rejected() {
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("get connection");
     client
-        .batch_execute("create table posts (author_id integer, editor_id integer)")
+        .batch_execute(
+            "create table posts (author_id integer, editor_id integer); \
+             alter table posts replica identity full",
+        )
         .await
         .expect("create posts");
     drop(client);
@@ -247,7 +258,9 @@ async fn the_same_relationship_name_is_allowed_on_different_from_tables() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "posts", "owner_id").await;
+    set_replica_identity_full(&db.pool, "posts").await;
     create_table_with_plain_column(&db.pool, "comments", "owner_id").await;
+    set_replica_identity_full(&db.pool, "comments").await;
     create_table_with_pk(&db.pool, "users", "id").await;
 
     create_relationship(
@@ -284,6 +297,7 @@ async fn creating_a_relationship_issues_no_ddl_against_the_source_tables() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    set_replica_identity_full(&db.pool, "order_line_items").await;
     create_table_with_pk(&db.pool, "products", "id").await;
 
     create_relationship(
@@ -646,6 +660,7 @@ async fn compatible_integer_widths_are_accepted() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    set_replica_identity_full(&db.pool, "order_line_items").await;
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute(
@@ -674,6 +689,7 @@ async fn text_and_varchar_are_accepted_as_comparable() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_text_column(&db.pool, "order_line_items", "sku").await;
+    set_replica_identity_full(&db.pool, "order_line_items").await;
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute(
@@ -705,6 +721,7 @@ async fn varchar_columns_with_different_lengths_are_accepted() {
     client
         .batch_execute(
             "create table order_line_items (sku character varying(50));
+             alter table order_line_items replica identity full;
              create table products (sku character varying(255) primary key);
              alter table products replica identity full",
         )
@@ -776,6 +793,7 @@ async fn a_primary_key_to_column_determines_to_one_cardinality() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    set_replica_identity_full(&db.pool, "order_line_items").await;
     create_table_with_pk(&db.pool, "products", "id").await;
 
     let created = create_relationship(
@@ -800,6 +818,7 @@ async fn a_plain_unique_to_column_determines_to_one_cardinality() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "accounts", "profile_code").await;
+    set_replica_identity_full(&db.pool, "accounts").await;
     create_table_with_unique_column(&db.pool, "profiles", "code").await;
 
     let created = create_relationship(
@@ -881,6 +900,7 @@ async fn a_missing_from_side_index_surfaces_a_performance_warning() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    set_replica_identity_full(&db.pool, "order_line_items").await;
     create_table_with_pk(&db.pool, "products", "id").await;
 
     let created = create_relationship(
@@ -924,6 +944,7 @@ async fn a_usable_from_side_index_suppresses_the_performance_warning() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    set_replica_identity_full(&db.pool, "order_line_items").await;
     create_table_with_pk(&db.pool, "products", "id").await;
     let client = db.pool.get().await.expect("get connection");
     client
@@ -970,7 +991,10 @@ async fn an_index_where_the_join_column_is_not_leading_still_warns() {
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("get connection");
     client
-        .batch_execute("create table order_line_items (other_col integer, product_id integer)")
+        .batch_execute(
+            "create table order_line_items (other_col integer, product_id integer); \
+             alter table order_line_items replica identity full",
+        )
         .await
         .expect("create from-table");
     client
@@ -1006,7 +1030,10 @@ async fn a_composite_index_led_by_the_join_column_suppresses_the_warning() {
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("get connection");
     client
-        .batch_execute("create table order_line_items (product_id integer, other_col integer)")
+        .batch_execute(
+            "create table order_line_items (product_id integer, other_col integer); \
+             alter table order_line_items replica identity full",
+        )
         .await
         .expect("create from-table");
     client
@@ -1036,7 +1063,10 @@ async fn a_partial_index_on_the_join_column_still_warns() {
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("get connection");
     client
-        .batch_execute("create table order_line_items (product_id integer, active boolean)")
+        .batch_execute(
+            "create table order_line_items (product_id integer, active boolean); \
+             alter table order_line_items replica identity full",
+        )
         .await
         .expect("create from-table");
     client
@@ -1070,6 +1100,7 @@ async fn an_expression_index_on_the_join_column_still_warns() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    set_replica_identity_full(&db.pool, "order_line_items").await;
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute("create index on order_line_items ((product_id + 0))")
@@ -1102,6 +1133,7 @@ async fn a_hash_index_on_the_join_column_still_warns() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
+    set_replica_identity_full(&db.pool, "order_line_items").await;
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute("create index on order_line_items using hash (product_id)")
@@ -1207,7 +1239,10 @@ async fn a_relationship_from_a_transform_target_back_to_its_own_source_is_accept
 
     let client = db.pool.get().await.expect("get connection");
     client
-        .batch_execute("alter table order_totals add column order_ref integer")
+        .batch_execute(
+            "alter table order_totals add column order_ref integer; \
+             alter table order_totals replica identity full",
+        )
         .await
         .expect("add fk-shaped column to target table");
     drop(client);
@@ -1375,7 +1410,8 @@ async fn a_relationship_to_table_resolves_a_bare_name_chained_off_a_non_default_
             "create schema custom; \
              create table s (id bigint primary key, a numeric); \
              insert into s (id, a) values (1, 10), (2, 20); \
-             create table order_line_items (id integer primary key, t2_id integer)",
+             create table order_line_items (id integer primary key, t2_id integer); \
+             alter table order_line_items replica identity full",
         )
         .await
         .expect("seed tables and the custom schema");
@@ -1457,6 +1493,7 @@ async fn a_calculated_field_relationship_path_resolves_a_to_table_chained_off_a_
              create table s (id bigint primary key, a numeric); \
              insert into s (id, a) values (1, 10), (2, 20); \
              create table order_line_items (id integer primary key, t2_id integer); \
+             alter table order_line_items replica identity full; \
              insert into order_line_items (id, t2_id) values (1, 1), (2, 2)",
         )
         .await

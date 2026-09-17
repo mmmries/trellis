@@ -227,6 +227,7 @@ async fn to_one_enrichment_nulls_out_when_the_related_row_appears_then_disappear
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
              alter table categories replica identity full; \
+             alter table articles replica identity full; \
              insert into articles (id, category_id, title) values (1, 10, 'a1')",
         )
         .await

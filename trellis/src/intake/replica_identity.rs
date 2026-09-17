@@ -19,8 +19,9 @@
 //! doesn't call [`needs_old_image`] itself, since it needs to distinguish
 //! "the source is already `REPLICA IDENTITY FULL`" from "it needs to be" —
 //! see that function's own doc comment). `defs::catalog::assert_replica_identity_supports_projection`
-//! (issue #129, epic #127) is the analogous gate for a to-one relationship's
-//! to-side table — not `needs_old_image`-driven either, and not part of
+//! (issue #129, epic #127; extended to the from-side by issue #158) is the
+//! analogous gate for a to-one relationship's to-side *and* from-side
+//! tables — not `needs_old_image`-driven either, and not part of
 //! this predicate, since a relationship's own [`crate::defs::ast::RelationshipDef`]
 //! isn't a [`TransformDef`] at all.
 use super::error::IntakeError;
