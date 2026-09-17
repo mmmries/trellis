@@ -1,0 +1,69 @@
+name: Nightly
+
+# The deep half of the fast/deep split ci.yml's PR-time job can't afford:
+#
+# - issue #138 part 1's settled-state validation model
+#   (trellis/tests/spike_102_settled_state.rs): the full 8-design, 3000-run
+#   campaign. 3000 runs is not "more is better" -- per that model's own
+#   header and trellis/tests/spikes/README.md, one of the shipped design's
+#   four guards (the per-parent reverse-ordering check) only shows corruption
+#   from being disabled at 3000 runs; it showed zero extra corruption at
+#   200-1500 runs in the original hand-run campaign. Running it on every PR
+#   was measured at several minutes for the full campaign -- too slow to pay
+#   on every push, but this deep lane can afford it.
+# - the generative crate's own expensive property
+#   (`convergence_holds_for_trivial_programs`), at a much higher case count
+#   than its 16-case PR-time default -- generative/README.md documented this
+#   split but it had never actually been wired into any workflow before now.
+#
+# Both lanes' `FileFailurePersistence`/regression-persistence behavior
+# (proptest's `tests/proptest-regressions/*.txt`) means a failure found here
+# should be committed as a fixture the fast lane will also replay -- see
+# generative/README.md.
+on:
+  schedule:
+    # 06:00 UTC daily -- outside any contributor's typical working hours in
+    # every timezone the project has seen activity from, so a failure is
+    # waiting when someone next looks rather than interrupting anyone live.
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deep:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.98.0"
+          components: rustfmt, clippy
+
+      - name: Install PostgreSQL server binaries
+        run: |
+          set -euo pipefail
+          pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin 2>/dev/null | sort -V | tail -n1 || true)"
+          if [ -z "$pg_bin" ]; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql
+            pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin | sort -V | tail -n1)"
+          fi
+          echo "using PostgreSQL server binaries from: $pg_bin"
+          echo "$pg_bin" >> "$GITHUB_PATH"
+
+      - name: Issue #138 settled-state validation -- full 3000-run x 8-design campaign
+        run: cargo test -p trellis --test spike_102_settled_state -- --ignored --nocapture
+        env:
+          SPIKE_102_CAMPAIGN_RUNS: "3000"
+
+      - name: Generative deep property -- convergence_holds_for_trivial_programs at PROPTEST_CASES=200
+        # generative/README.md's own recommended deep-lane invocation.
+        run: cargo test -p generative --test convergence convergence_holds_for_trivial_programs
+        env:
+          PROPTEST_CASES: "200"

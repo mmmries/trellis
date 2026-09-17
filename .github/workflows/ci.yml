@@ -54,3 +54,13 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --exclude generative
+
+      - name: Test generative (fast lane)
+        # generative/README.md's designed-but-never-applied fast/deep split:
+        # skip only the expensive property (`convergence_holds_for_trivial_programs`,
+        # ~130-290s at its 16-case default -- see the README's cost writeup),
+        # keep everything else in the crate (the lib, coverage, meta, oracle,
+        # backend_seam, backfill, every other property at its own default
+        # case count). The full property runs nightly instead, at a much
+        # higher case count -- see nightly.yml.
+        run: cargo test -p generative -- --skip convergence_holds_for_trivial_programs
