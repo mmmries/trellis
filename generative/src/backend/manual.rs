@@ -35,7 +35,10 @@ use trellis::defs::{
     CatalogError, DdlError, TransformStatus, create_relationship, install_definition,
     qualified_target_table, require_single_column_pk, source_primary_key,
 };
-use trellis::staging::{StagingError, await_converged, watermark_token};
+use trellis::staging::{
+    StagingError, await_converged, has_pending as staging_has_pending, seal_phase1, seal_phase2,
+    watermark_token,
+};
 use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
 
 use super::Snapshot;
@@ -467,6 +470,52 @@ impl ManualBackend {
             )
             .await?;
         Ok(row.get(0))
+    }
+
+    /// Whether anything committed so far is still sitting in the ring,
+    /// un-drained (issue #138, epic #127 phase 2): a thin wrapper around
+    /// `trellis::staging::has_pending`, exposed so a caller stressing the
+    /// relationship-delta interleaving scenarios
+    /// (`crate::generate::build_relationship_interleaving_scenario`) can
+    /// poll for "the op I just committed has actually reached the ring"
+    /// before calling [`ManualBackend::force_seal_active_segment`] — sealing
+    /// before intake has consumed the change just seals an empty (or stale)
+    /// active segment, silently defeating the deterministic seal-boundary
+    /// reproduction the caller is trying to build.
+    ///
+    /// Not a substitute for [`ManualBackend::quiesce`]: this only reports
+    /// whether intake has *staged* something, not whether it has been
+    /// applied/drained — exactly the distinction #138's "intake-lag window"
+    /// scenario needs a caller to be able to observe.
+    pub async fn has_pending(&self) -> Result<bool, ManualBackendError> {
+        Ok(staging_has_pending(&self.raw).await?)
+    }
+
+    /// Forces whatever is currently active in the ring to seal immediately
+    /// (issue #138, epic #127 phase 2), returning the sealed segment's
+    /// `seg_seq`: a direct wrapper around
+    /// `trellis::staging::seal_phase1`/`seal_phase2`, the same two-phase
+    /// seal the engine's own maintenance loop performs on its normal
+    /// cadence. Mirrors `trellis/tests/spike_102.rs`'s
+    /// `spike_a2_a_from_side_insert_drains_before_the_parents_reverse_work`
+    /// (branch `spike/issue-102-validation-v2`): sealing the parent's own
+    /// change into its own segment, then sealing a from-side change into a
+    /// strictly later one, lands the two in different segments
+    /// deterministically instead of hoping a maintenance tick's timing does
+    /// it for you.
+    ///
+    /// Callers **must** first confirm the change they mean to seal has
+    /// actually reached the ring (poll [`ManualBackend::has_pending`]) —
+    /// see that method's doc comment.
+    ///
+    /// This module is the one place the backend seam allows direct access
+    /// to `trellis::staging`'s seal machinery — see the module doc comment
+    /// and [`ManualBackend::max_bucket_count`]'s own precedent for the same
+    /// door.
+    pub async fn force_seal_active_segment(&mut self) -> Result<i64, ManualBackendError> {
+        let outcome = seal_phase1(&mut self.raw).await?;
+        seal_phase2(&self.raw, outcome.sealed_seg_seq).await?;
+        Ok(outcome.sealed_seg_seq)
     }
 
     async fn create_source_table(&self, table: &Table) -> Result<(), ManualBackendError> {
