@@ -438,13 +438,52 @@ impl AggregateTargetPlan {
 
 /// The `GROUP BY` columns' text values off `row`, in `group_by`'s order (a
 /// missing or SQL-`NULL` column folds to `None`, matching every other
-/// "absent column" convention in this crate), plus a length-prefixed
-/// encoding of them suitable as a `HashMap` key — the same collision-safe
-/// scheme `defs::oracle::group_key` uses for exactly the same reason (a
-/// bare separator could itself appear inside a `Text` grouping column's
-/// value), duplicated locally since that one is private to the oracle
-/// module and this is the one other place a group needs to be named as a
-/// single string.
+/// "absent column" convention in this crate), plus a key suitable as a
+/// `HashMap` key naming that group.
+///
+/// For a **composite** (multi-column) `GROUP BY`, the key is the same
+/// length-prefixed encoding (`"{len}:{value}"` per column, concatenated)
+/// `defs::oracle::group_key` uses for exactly the same reason (a bare
+/// separator could itself appear inside a `Text` grouping column's value),
+/// duplicated locally since that one is private to the oracle module and
+/// this is the one other place a group needs to be named as a single
+/// string. Every consumer of this encoded form *within this crate*
+/// (`plan.groups`, `written`/`deleted` diffing, the grain-migration
+/// old-key/new-key comparison above) only ever treats it as an opaque,
+/// injective token — never decodes it — so the encoding's exact shape is
+/// free to differ from the single-column case below. It matters for a
+/// different reason: [`ddl::source_primary_key`] rejects a composite
+/// grouping key's aggregate target as an unsupported
+/// (`CompositePrimaryKeyUnsupported`) 1-1 source, so this encoded string
+/// never has to double as a real Postgres primary key value downstream —
+/// it never survives long enough to reach a chained definition's live
+/// refetch.
+///
+/// For a **single-column** `GROUP BY`, the key is that one column's own
+/// text value, completely unencoded — no length prefix. This case *does*
+/// need to double as a real primary key value: the aggregate target's
+/// actual Postgres identity (its `UNIQUE NULLS NOT DISTINCT` grouping-column
+/// constraint, the same one [`ddl::source_primary_key`] falls back to for a
+/// chained definition) is genuinely that one column, unencoded — and
+/// `ddl::source_primary_key` does *not* reject a single-column source, so a
+/// second definition can legally chain onto this aggregate target and read
+/// this key as its source row's primary key. Before this fix, the
+/// length-prefixed encoding leaked into that path too: `written`/`deleted`
+/// (via `apply::apply_and_mark_drained_many`'s downstream-propagation step)
+/// staged a `Recompute` keyed by the *encoded* string, which a later
+/// `apply::read_live_rows_batch` then tried to bind as this literal
+/// primary-key value — `"2:10"` is not a valid `numeric`, so that batch's
+/// live refetch failed outright (issue #103); for a text primary key it
+/// would silently look up the wrong row instead of failing loudly. Matching
+/// the target table's real single-column PK shape exactly (see
+/// [`ddl::create_aggregate_target_table`]) closes that gap.
+///
+/// A NULL grouping value and a genuine empty-string value are
+/// indistinguishable either way (both fold to `""` here, same as the
+/// composite encoding's own `"0:"` collision for the same two cases) — a
+/// pre-existing quirk this function doesn't introduce or worsen for the
+/// single-column case, just carries over unchanged.
+///
 /// `pub(super)`: issue #131's reverse-delta apply path derives a live
 /// from-side row's group key the same way this batch-driven caller does.
 pub(super) fn derive_group_key(row: &Row, group_by: &[String]) -> (Vec<Option<String>>, String) {
@@ -452,13 +491,21 @@ pub(super) fn derive_group_key(row: &Row, group_by: &[String]) -> (Vec<Option<St
         .iter()
         .map(|c| row.get(c).cloned().flatten())
         .collect();
-    let text = values
-        .iter()
-        .map(|v| {
-            let s = v.clone().unwrap_or_default();
-            format!("{}:{s}", s.len())
-        })
-        .collect::<String>();
+    let text = if values.len() == 1 {
+        // Single-column GROUP BY: the key must match the aggregate target's
+        // real (unencoded) single-column primary key shape exactly, since a
+        // chained definition's live refetch binds it as that literal PK
+        // value (issue #103) — see this function's doc comment.
+        values[0].clone().unwrap_or_default()
+    } else {
+        values
+            .iter()
+            .map(|v| {
+                let s = v.clone().unwrap_or_default();
+                format!("{}:{s}", s.len())
+            })
+            .collect::<String>()
+    };
     (values, text)
 }
 
