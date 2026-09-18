@@ -556,6 +556,13 @@ pub async fn install_definition(
             let pk = ddl::source_primary_key(pool, &qualified_source)
                 .await
                 .map_err(CatalogError::Ddl)?;
+            // Issue #126: `source_primary_key` itself now accepts a
+            // composite source primary key, but the 1-1 target table's own
+            // primary key (built just below) still mirrors the source's as
+            // one column — narrow back down here, at the one 1-1-specific
+            // call site, rather than inside `source_primary_key` itself.
+            let pk =
+                ddl::require_single_column_pk(pk, &qualified_source).map_err(CatalogError::Ddl)?;
             ddl::create_target_table(
                 pool,
                 &def,

@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
-    DdlError, create_aggregate_target_table, create_target_table, source_primary_key,
+    DdlError, create_aggregate_target_table, create_target_table, require_single_column_pk,
+    source_primary_key,
 };
 
 fn order_totals_def() -> TransformDef {
@@ -47,9 +48,13 @@ async fn target_table_is_created_with_inherited_pk_and_numeric_calculated_column
         .expect("seed source table");
 
     let def = order_totals_def();
-    let pk = source_primary_key(&db.pool, &def.source)
-        .await
-        .expect("introspect source primary key");
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, &def.source)
+            .await
+            .expect("introspect source primary key"),
+        &def.source,
+    )
+    .expect("single-column pk");
     assert_eq!(pk.name, "id");
     assert_eq!(pk.data_type, "integer");
 
@@ -113,9 +118,13 @@ async fn target_table_defaults_to_the_public_schema_not_the_trellis_instance_sch
         .expect("seed source table");
 
     let def = order_totals_def();
-    let pk = source_primary_key(&db.pool, &def.source)
-        .await
-        .expect("introspect source primary key");
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, &def.source)
+            .await
+            .expect("introspect source primary key"),
+        &def.source,
+    )
+    .expect("single-column pk");
 
     create_target_table(
         &db.pool,
@@ -158,9 +167,13 @@ async fn target_table_is_created_in_a_configured_non_default_schema() {
         .expect("seed source table and target schema");
 
     let def = order_totals_def();
-    let pk = source_primary_key(&db.pool, &def.source)
-        .await
-        .expect("introspect source primary key");
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, &def.source)
+            .await
+            .expect("introspect source primary key"),
+        &def.source,
+    )
+    .expect("single-column pk");
 
     create_target_table(
         &db.pool,
@@ -198,9 +211,13 @@ async fn creating_the_target_table_twice_is_a_no_op() {
         .expect("seed source table");
 
     let def = order_totals_def();
-    let pk = source_primary_key(&db.pool, &def.source)
-        .await
-        .expect("introspect source primary key");
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, &def.source)
+            .await
+            .expect("introspect source primary key"),
+        &def.source,
+    )
+    .expect("single-column pk");
 
     create_target_table(
         &db.pool,
@@ -258,9 +275,13 @@ async fn text_and_boolean_calculated_fields_get_matching_target_column_types() {
         ("active".to_string(), ValueType::Boolean),
     ]);
 
-    let pk = source_primary_key(&db.pool, &def.source)
-        .await
-        .expect("introspect source primary key");
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, &def.source)
+            .await
+            .expect("introspect source primary key"),
+        &def.source,
+    )
+    .expect("single-column pk");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table with text/boolean columns");
@@ -322,9 +343,13 @@ async fn uuid_column_passthrough_gets_a_matching_target_column_type() {
     };
     let source_columns = HashMap::from([("author".to_string(), ValueType::Uuid)]);
 
-    let pk = source_primary_key(&db.pool, &def.source)
-        .await
-        .expect("introspect source primary key");
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, &def.source)
+            .await
+            .expect("introspect source primary key"),
+        &def.source,
+    )
+    .expect("single-column pk");
     assert_eq!(pk.data_type, "uuid");
 
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
@@ -415,9 +440,13 @@ async fn integer_family_passthrough_keeps_its_concrete_type_but_arithmetic_widen
     };
     let source_columns = numeric_columns(&["author", "views", "rank"]);
 
-    let pk = source_primary_key(&db.pool, &def.source)
-        .await
-        .expect("introspect source primary key");
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, &def.source)
+            .await
+            .expect("introspect source primary key"),
+        &def.source,
+    )
+    .expect("single-column pk");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -497,9 +526,13 @@ async fn numeric_family_passthrough_keeps_its_own_concrete_type() {
     };
     let source_columns = numeric_columns(&["price", "ratio", "amount"]);
 
-    let pk = source_primary_key(&db.pool, &def.source)
-        .await
-        .expect("introspect source primary key");
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, &def.source)
+            .await
+            .expect("introspect source primary key"),
+        &def.source,
+    )
+    .expect("single-column pk");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -952,8 +985,47 @@ async fn a_source_table_without_a_primary_key_is_rejected() {
     }
 }
 
+/// Issue #126: `source_primary_key` itself no longer rejects a composite
+/// (multi-column) primary key — it returns every column, in the key's own
+/// declared order, for every consumer except the 1-1 target-DDL slice (and
+/// its key-range-chunked direct backfill) to use. Column order matters here:
+/// this table's primary key is declared `(line_no, order_id)` — the reverse
+/// of declaration order in the `CREATE TABLE` column list — so a test that
+/// happened to return columns in `pg_attribute` scan order instead of the
+/// key's own declared order would still pass with a *single*-column key but
+/// silently mismatch a composite one.
 #[tokio::test]
-async fn a_source_table_with_a_composite_primary_key_is_rejected() {
+async fn a_source_table_with_a_composite_primary_key_is_returned_in_declared_column_order() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+
+    client
+        .batch_execute(
+            "create table order_lines (order_id integer, line_no integer, price numeric,
+             primary key (line_no, order_id))",
+        )
+        .await
+        .expect("seed source table with a composite primary key");
+
+    let pk = source_primary_key(&db.pool, "order_lines")
+        .await
+        .expect("a composite primary key is now accepted");
+    let names: Vec<&str> = pk.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["line_no", "order_id"],
+        "columns come back in the key's own declared order, not source-column order"
+    );
+    assert!(pk.iter().all(|c| c.data_type == "integer"));
+}
+
+/// The 1-1 target-DDL slice (and its key-range-chunked direct backfill) still
+/// can't work with more than one primary-key column — `require_single_column_pk`
+/// is where that narrower requirement is enforced now that `source_primary_key`
+/// itself accepts a composite key (issue #126).
+#[tokio::test]
+async fn require_single_column_pk_rejects_a_composite_primary_key() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("connection");
@@ -966,9 +1038,10 @@ async fn a_source_table_with_a_composite_primary_key_is_rejected() {
         .await
         .expect("seed source table with a composite primary key");
 
-    let err = source_primary_key(&db.pool, "order_lines")
+    let pk = source_primary_key(&db.pool, "order_lines")
         .await
-        .unwrap_err();
+        .expect("a composite primary key is now accepted by source_primary_key itself");
+    let err = require_single_column_pk(pk, "order_lines").unwrap_err();
     match err {
         DdlError::CompositePrimaryKeyUnsupported { source_table } => {
             assert_eq!(source_table, "order_lines")
@@ -1076,8 +1149,12 @@ async fn a_not_null_unique_index_is_accepted_as_a_primary_key_stand_in() {
         .await
         .expect("seed source table with a not-null unique column");
 
-    let pk = source_primary_key(&db.pool, "widgets")
-        .await
-        .expect("a not-null unique index should stand in for a primary key");
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, "widgets")
+            .await
+            .expect("a not-null unique index should stand in for a primary key"),
+        "widgets",
+    )
+    .expect("single-column pk");
     assert_eq!(pk.name, "label");
 }

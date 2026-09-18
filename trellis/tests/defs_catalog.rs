@@ -223,9 +223,13 @@ async fn a_definitions_target_table_matches_a_chained_definitions_source_table()
     // `create_definition` never issues target-table DDL itself (`install_definition`'s
     // job) — materialize `b` for real before chaining `c` off of it, mirroring
     // `defs_edges.rs`'s `materialize_chained_target` helper.
-    let pk = trellis::defs::source_primary_key(&db.pool, "a")
-        .await
-        .expect("introspect a's primary key");
+    let pk = trellis::defs::require_single_column_pk(
+        trellis::defs::source_primary_key(&db.pool, "a")
+            .await
+            .expect("introspect a's primary key"),
+        "a",
+    )
+    .expect("single-column pk");
     let b_def = trellis::defs::parse("TRANSFORM b FROM a SELECT id AS total")
         .expect("parse b's definition");
     trellis::defs::create_target_table(
@@ -412,9 +416,13 @@ async fn an_explicitly_qualified_target_still_triggers_the_suffix_collision_guar
     // Materialize `custom.foo` by hand — `create_definition` (the ring-path
     // entry point) assumes its caller already created the physical target
     // table, exactly like the chained-definition test above.
-    let pk = trellis::defs::source_primary_key(&db.pool, "orders")
-        .await
-        .expect("introspect orders' primary key");
+    let pk = trellis::defs::require_single_column_pk(
+        trellis::defs::source_primary_key(&db.pool, "orders")
+            .await
+            .expect("introspect orders' primary key"),
+        "orders",
+    )
+    .expect("single-column pk");
     let custom_foo_def =
         trellis::defs::parse("TRANSFORM custom.foo FROM orders SELECT price AS total")
             .expect("parse the explicitly-qualified definition");

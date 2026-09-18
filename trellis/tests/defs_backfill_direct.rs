@@ -15,7 +15,7 @@ use testkit::TestCluster;
 use trellis::defs::{
     ValueType, backfill_definition, create_aggregate_target_table,
     create_definition_without_backfill, create_target_table, parse, render_aggregate_select_sql,
-    source_primary_key,
+    require_single_column_pk, source_primary_key,
 };
 
 fn numeric(names: &[&str]) -> HashMap<String, ValueType> {
@@ -62,7 +62,8 @@ async fn one_to_one_build_is_exhaustive_across_chunk_boundaries() {
     create_definition_without_backfill(&db.pool, "TRANSFORM t FROM s SELECT a + a AS x", &cols)
         .await
         .expect("create def");
-    let pk = source_primary_key(&db.pool, "s").await.expect("pk");
+    let pk = require_single_column_pk(source_primary_key(&db.pool, "s").await.expect("pk"), "s")
+        .expect("single-column pk");
     create_target_table(&db.pool, &def, "public", &pk, &cols, &def.source)
         .await
         .expect("create target");
@@ -118,7 +119,8 @@ async fn one_to_one_build_handles_pk_gaps() {
     create_definition_without_backfill(&db.pool, "TRANSFORM t FROM s SELECT a AS a", &cols)
         .await
         .expect("create def");
-    let pk = source_primary_key(&db.pool, "s").await.expect("pk");
+    let pk = require_single_column_pk(source_primary_key(&db.pool, "s").await.expect("pk"), "s")
+        .expect("single-column pk");
     create_target_table(&db.pool, &def, "public", &pk, &cols, &def.source)
         .await
         .expect("create target");

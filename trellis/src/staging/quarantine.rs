@@ -1231,7 +1231,20 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
         });
     }
 
-    let pk = ddl::source_primary_key(pool, &def.source_table).await?;
+    // Issue #126: `source_primary_key` now accepts a composite source
+    // primary key, but this resume path's write-back below filters the
+    // *target* table by this same column name/value (`where {pk_ident} =
+    // ...`), which only lines up for a 1-1 target — its primary key column
+    // is copied verbatim from the source's own (`ddl::create_target_table`).
+    // An Aggregate target's primary key is its `GROUP BY` columns, unrelated
+    // to the source's primary key, so this whole function is already only
+    // meaningful for a 1-1 definition regardless of arity; narrowing here
+    // just makes that pre-existing assumption an explicit, typed rejection
+    // instead of a confusing "column does not exist" from the `UPDATE` below.
+    let pk = ddl::require_single_column_pk(
+        ddl::source_primary_key(pool, &def.source_table).await?,
+        &def.source_table,
+    )?;
     let source_ident = ddl::qualified_source_table(&def.source_table);
     let pk_ident = quote_ident(&pk.name);
 

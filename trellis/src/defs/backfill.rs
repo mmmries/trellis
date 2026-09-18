@@ -72,7 +72,8 @@ use crate::pool::{Client, Pool, quote_ident};
 
 use super::ast::{Expr, KeySpace, Operator, RelationshipDef, TransformDef, ValueType};
 use super::ddl::{
-    self, PrimaryKeyColumn, avg_sum_column, qualified_target_table, source_primary_key,
+    self, PrimaryKeyColumn, avg_sum_column, qualified_target_table, require_single_column_pk,
+    source_primary_key,
 };
 use super::invertibility::{AggregateArg, CountArg, classify};
 use super::model::RelationshipCardinality;
@@ -193,7 +194,17 @@ pub async fn backfill_definition(
 ) -> Result<(), BackfillError> {
     match &def.key_space {
         KeySpace::OneToOne => {
-            let pk = source_primary_key(pool, source_table).await?;
+            // Issue #126: the 1-1 direct build's PK-range chunking
+            // (`discover_pk_ranges`/`write_one_to_one_range`) only knows how
+            // to order/compare a single scalar column — narrow down here,
+            // same as `catalog::install_definition`'s own DDL call site (in
+            // practice this def's target table already failed DDL for a
+            // composite-PK source before backfill is ever reached, so this
+            // is a defensive re-check, not the primary enforcement point).
+            let pk = require_single_column_pk(
+                source_primary_key(pool, source_table).await?,
+                source_table,
+            )?;
             if uses_relationships(def) {
                 backfill_relationship_one_to_one(pool, def, target_schema, source_table, &pk).await
             } else {
@@ -635,7 +646,7 @@ pub(crate) async fn plan_one_to_one_chunks(
     source_table: &str,
 ) -> Result<Vec<(Option<String>, String)>, BackfillError> {
     let _ = substitute_all_fields(def)?;
-    let pk = source_primary_key(pool, source_table).await?;
+    let pk = require_single_column_pk(source_primary_key(pool, source_table).await?, source_table)?;
     let source = ddl::qualified_source_table(source_table);
     let client = pool.get().await?;
     discover_pk_ranges(&client, &source, &pk).await
@@ -656,7 +667,7 @@ pub(crate) async fn execute_one_to_one_chunk(
     lo: Option<&str>,
     hi: &str,
 ) -> Result<(), BackfillError> {
-    let pk = source_primary_key(pool, source_table).await?;
+    let pk = require_single_column_pk(source_primary_key(pool, source_table).await?, source_table)?;
     let substituted = substitute_all_fields(def)?;
     let client = pool.get().await?;
     write_one_to_one_range(

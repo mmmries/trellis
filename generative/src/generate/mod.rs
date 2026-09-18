@@ -1660,6 +1660,232 @@ pub fn build_program_multi_with_relationships(
     attach_relationship_fields(program, rel_fields)
 }
 
+// ---------------------------------------------------------------------
+// Issue #138 (epic #127 phase 2): the relationship-delta interleaving
+// scenarios. #34 already gave every table a to-one-capable relationship
+// key/FK pair and #34/#132 the reverse-propagation machinery that keeps a
+// to-one enrichment settled; what #138 asks the generative suite to stress
+// is *timing* — a parent (to-side) change landing close enough to a
+// from-side change on the *same* parent that the two can race across a
+// seal boundary, an intake-lag window, or an out-of-order segment drain
+// (see `trellis/tests/spike_102.rs`'s `spike_a2_a_from_side_insert_drains_before_the_parents_reverse_work`,
+// branch `spike/issue-102-validation-v2`, for the real-engine scenario
+// shape this mirrors).
+//
+// [`build_program_multi_with_shapes_and_derived`] can't produce that shape
+// at all: it emits one table's *entire* seed+mutate stream before the
+// next table's (see `render_mutate`'s call site above), and a relationship
+// always points from a lower-indexed table to a higher-indexed one, so a
+// from-side op and a parent-side op can never land adjacent to each other
+// in a generated op stream — the parent table's ops always come strictly
+// after every from-side op. [`build_relationship_interleaving_scenario`]
+// below still reuses that machinery for the base schema/relationship/
+// definition (via [`build_program_multi_with_relationships`]), then
+// appends the two critical, deliberately-adjacent ops by hand.
+// ---------------------------------------------------------------------
+
+/// Which shape the parent-side and from-side halves of a
+/// [`build_relationship_interleaving_scenario`] take. The first is the
+/// canonical shape (the parent's own enriched field changes while a
+/// from-side row starts pointing at it); the remaining four are #138's own
+/// named variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelInterleavingVariant {
+    /// The parent (pk 1, key `k1`) already exists; its own `c1` changes
+    /// while a brand-new from-side row is inserted pointing at it.
+    ParentFieldUpdate,
+    /// The parent does not exist yet: it is inserted (a fresh key, `k3`)
+    /// while a brand-new from-side row that names that same fresh key is
+    /// inserted alongside it.
+    ParentInsert,
+    /// The parent (pk 1, key `k1`) is deleted while a still-live from-side
+    /// row (previously pointing at the *other* seeded parent) is
+    /// re-pointed onto it in the same window.
+    ParentDelete,
+    /// The parent's own `c1` changes while, in the same window, the
+    /// from-side row that used to point at it re-points to a key that
+    /// names no row at all.
+    RepointToNonexistentParent,
+    /// The parent's own `c1` changes while, in the same window, the
+    /// from-side row that used to point at it has its foreign key set to
+    /// `NULL`.
+    RepointToNullParent,
+}
+
+/// One [`Program`] built by [`build_relationship_interleaving_scenario`],
+/// plus the indices of its two deliberately-adjacent critical ops: the
+/// parent-side change ([`RelInterleavingScenario::parent_op`]) and the
+/// from-side change on the same parent
+/// ([`RelInterleavingScenario::from_side_op`], always `parent_op + 1`).
+/// Every op before `parent_op` is ordinary seeding, safe to apply and
+/// quiesce on one at a time; a caller stressing #138's race applies
+/// `parent_op` and `from_side_op` back-to-back with no intervening
+/// `quiesce()` (and, for a deterministic seal-boundary reproduction,
+/// forces a seal between them — see `generative::backend::ManualBackend::
+/// force_seal_active_segment`).
+#[derive(Debug, Clone)]
+pub struct RelInterleavingScenario {
+    pub program: Program,
+    pub parent_op: usize,
+    pub from_side_op: usize,
+}
+
+/// Builds the base two-table relationship program every
+/// [`RelInterleavingVariant`] shares (issue #138): `tables[0]` is the
+/// from-side ("child"/`post_tags`-shaped) table, `tables[1]` the to-side
+/// ("parent"/`posts`-shaped) one, joined by a to-one bare enrichment
+/// (`rel_enrich = <rel>.c1`, exactly [`RelFieldKind::ToOneBare`]) — the
+/// shape that reads the parent's own `c1` back onto every from-side row,
+/// so a parent-side `c1` change is exactly the kind of change whose
+/// reverse propagation this whole scenario stresses.
+///
+/// Seeds three from-side rows (pk 1 -> key `k1`, pk 2 -> key `k2`, pk 3 ->
+/// `NULL`) and two parent rows (pk 1 = key `k1`/`c1` 100, pk 2 = key
+/// `k2`/`c1` 200) — parent 2 and from-side rows 2/3 are decoys that no
+/// variant's critical section ever touches, so a divergence localizes to
+/// the row the scenario actually interleaves rather than a blanket
+/// relationship bug.
+fn base_interleaving_program() -> Program {
+    let from_side = TableSpec {
+        seed_values: vec![(Some(10), None), (Some(20), None), (Some(30), None)],
+        text_values: vec![None; 3],
+        bool_values: vec![None; 3],
+        uuid_values: vec![None; 3],
+        grain_values: vec![None; 3],
+        rel_fk_values: vec![Some("k1".to_string()), Some("k2".to_string()), None],
+        mutates: Vec::new(),
+    };
+    let to_side = TableSpec {
+        seed_values: vec![(Some(100), None), (Some(200), None)],
+        text_values: vec![None; 2],
+        bool_values: vec![None; 2],
+        uuid_values: vec![None; 2],
+        grain_values: vec![None; 2],
+        rel_fk_values: vec![None; 2],
+        mutates: Vec::new(),
+    };
+    build_program_multi_with_relationships(
+        &[from_side, to_side],
+        &[(0, DefShape::OneToOne)],
+        &[None],
+        &[Some(RelFieldSpec {
+            to_table: 1,
+            kind: RelFieldKind::ToOneBare,
+        })],
+    )
+}
+
+/// Builds one [`RelInterleavingScenario`] for `variant` (issue #138). See
+/// [`RelInterleavingVariant`] for what each variant's two critical ops are.
+pub fn build_relationship_interleaving_scenario(
+    variant: RelInterleavingVariant,
+) -> RelInterleavingScenario {
+    let mut program = base_interleaving_program();
+
+    let from_table = program.tables[0].name.clone();
+    let from_pk_col = program.tables[0].pk_col.clone();
+    let from_c1_col = program.tables[0].columns[1].name.clone();
+    let from_fk_col = program.tables[0].columns[REL_FK_COLUMN].name.clone();
+    let to_table = program.tables[1].name.clone();
+    let to_pk_col = program.tables[1].pk_col.clone();
+    let to_c1_col = program.tables[1].columns[1].name.clone();
+    let to_key_col = program.tables[1].columns[REL_KEY_COLUMN].name.clone();
+
+    match variant {
+        RelInterleavingVariant::ParentFieldUpdate => {
+            program.ops.push(Op::Update {
+                table: to_table,
+                pk: "1".to_string(),
+                changes: vec![(to_c1_col, Some("999".to_string()))],
+                expect: OpOutcome::Succeeds,
+            });
+            program.ops.push(Op::Insert {
+                table: from_table,
+                row: vec![
+                    (from_pk_col, Some("4".to_string())),
+                    (from_c1_col, Some("40".to_string())),
+                    (from_fk_col, Some("k1".to_string())),
+                ],
+                expect: OpOutcome::Succeeds,
+            });
+        }
+        RelInterleavingVariant::ParentInsert => {
+            let fresh_key = rel_key_value(3);
+            program.ops.push(Op::Insert {
+                table: to_table,
+                row: vec![
+                    (to_pk_col, Some("3".to_string())),
+                    (to_c1_col, Some("777".to_string())),
+                    (to_key_col, Some(fresh_key.clone())),
+                ],
+                expect: OpOutcome::Succeeds,
+            });
+            program.ops.push(Op::Insert {
+                table: from_table,
+                row: vec![
+                    (from_pk_col, Some("4".to_string())),
+                    (from_c1_col, Some("40".to_string())),
+                    (from_fk_col, Some(fresh_key)),
+                ],
+                expect: OpOutcome::Succeeds,
+            });
+        }
+        RelInterleavingVariant::ParentDelete => {
+            program.ops.push(Op::Delete {
+                table: to_table,
+                pk: "1".to_string(),
+                expect: OpOutcome::Succeeds,
+            });
+            // From-side pk 2 was pointing at the *other*, untouched parent
+            // (key `k2`); re-pointing it onto the parent being deleted in
+            // the same window is the sharper case: its enrichment must
+            // land NULL, never a stale copy of the deleted parent's `c1`.
+            program.ops.push(Op::Update {
+                table: from_table,
+                pk: "2".to_string(),
+                changes: vec![(from_fk_col, Some("k1".to_string()))],
+                expect: OpOutcome::Succeeds,
+            });
+        }
+        RelInterleavingVariant::RepointToNonexistentParent => {
+            program.ops.push(Op::Update {
+                table: to_table,
+                pk: "1".to_string(),
+                changes: vec![(to_c1_col, Some("999".to_string()))],
+                expect: OpOutcome::Succeeds,
+            });
+            program.ops.push(Op::Update {
+                table: from_table,
+                pk: "1".to_string(),
+                changes: vec![(from_fk_col, Some("k9".to_string()))],
+                expect: OpOutcome::Succeeds,
+            });
+        }
+        RelInterleavingVariant::RepointToNullParent => {
+            program.ops.push(Op::Update {
+                table: to_table,
+                pk: "1".to_string(),
+                changes: vec![(to_c1_col, Some("999".to_string()))],
+                expect: OpOutcome::Succeeds,
+            });
+            program.ops.push(Op::Update {
+                table: from_table,
+                pk: "1".to_string(),
+                changes: vec![(from_fk_col, None)],
+                expect: OpOutcome::Succeeds,
+            });
+        }
+    }
+
+    let from_side_op = program.ops.len() - 1;
+    let parent_op = from_side_op - 1;
+    RelInterleavingScenario {
+        program,
+        parent_op,
+        from_side_op,
+    }
+}
+
 /// [`build_program_multi_with_derived`] is [`build_program_multi_with_shapes_and_derived`]'s
 /// convenience wrapper for the common "every def is `OneToOne`" case
 /// (improvement-plan task B2, kept at its original `&[usize]`/`&[DerivedShape]`
