@@ -2818,6 +2818,42 @@ mod tests {
     use tokio_postgres::NoTls;
     use tokio_postgres::types::PgLsn;
 
+    /// Issue #180's step-4 guard: a key this batch both deleted (with a
+    /// captured pre-delete image) and wrote — reachable when the forward
+    /// aggregate apply and a per-record reverse-relationship apply touch one
+    /// group inside a single batch — must be reported as written, so the
+    /// captured image never rides downstream and annihilates the write's own
+    /// image-less `Recompute` in the fold.
+    #[test]
+    fn a_key_both_deleted_and_written_in_one_batch_counts_as_written() {
+        let touched: Vec<ChangedKey> = vec![
+            (
+                "gone".to_string(),
+                0,
+                None,
+                Some(r#"{"g":"gone"}"#.to_string()),
+            ),
+            (
+                "moved".to_string(),
+                0,
+                None,
+                Some(r#"{"g":"moved"}"#.to_string()),
+            ),
+            ("moved".to_string(), 0, None, None),
+            ("fresh".to_string(), 0, None, None),
+        ];
+        let written = keys_written_without_image(&touched);
+        assert!(
+            written.contains("moved"),
+            "a key deleted and then rewritten in the same batch must count as written"
+        );
+        assert!(written.contains("fresh"), "a plain write counts as written");
+        assert!(
+            !written.contains("gone"),
+            "a key only ever deleted must keep its image-bearing propagation"
+        );
+    }
+
     #[test]
     fn earliest_src_changed_picks_the_lesser_of_two_known_origins() {
         let earlier = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
@@ -4659,11 +4695,38 @@ const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
 
 /// One physically-touched target key, as [`apply_and_mark_drained_many`]'s
 /// `changed` accumulator and downstream-propagation step track it: the key
-/// text, the `hop_gen` it carries forward, and (issues #51/#52's multi-hop
-/// gap) the `src_changed` origin it carries forward — `None` for an
-/// aggregate target's group key (see the 3b step's doc comment) or any
-/// other touched key with no traceable origin.
-type ChangedKey = (String, i32, Option<std::time::SystemTime>);
+/// text, the `hop_gen` it carries forward, (issues #51/#52's multi-hop gap)
+/// the `src_changed` origin it carries forward — `None` for an aggregate
+/// target's group key (see the 3b step's doc comment) or any other touched
+/// key with no traceable origin — and (issue #180) the key's pre-delete
+/// image, `Some` only when this entry is a genuine deletion whose prior row
+/// state was captured at delete time (an extinct aggregate group's
+/// `AggregateApplyResult::deleted` entry today), `None` for every written
+/// key and for a deletion no producer captures an image for yet (the 1-1
+/// target delete and truncate-clear cases — see step 4's own doc comment on
+/// why only the aggregate-deleted case is threaded through so far). Step 4
+/// reads this to decide whether a downstream `Recompute` can stay
+/// image-less (safe whenever a live refetch would find the *right* row —
+/// true for every write, and true for a delete only once a downstream
+/// chain's own live refetch is known to correctly see "gone") or must
+/// become an image-bearing delete instead, so a chained aggregate can
+/// subtract the extinct row's last-known contribution rather than silently
+/// dropping the change (issue #180).
+type ChangedKey = (String, i32, Option<std::time::SystemTime>, Option<String>);
+
+/// Every key in one target's [`ChangedKey`] accumulator that this batch
+/// *wrote* (no captured pre-delete image), as a lookup set — the guard
+/// [`apply_and_mark_drained_many`]'s step 4 checks before it lets a
+/// captured image ride downstream as a real delete. See that call site's own
+/// comment for why a key that is both deleted and written inside one batch
+/// must propagate image-less.
+fn keys_written_without_image(touched: &[ChangedKey]) -> std::collections::HashSet<&str> {
+    touched
+        .iter()
+        .filter(|(_, _, _, old_image)| old_image.is_none())
+        .map(|(key, _, _, _)| key.as_str())
+        .collect()
+}
 
 /// Runs one target table's ordered pre-lock, then its no-op-suppressed
 /// upsert and delete, returning the keys Postgres actually wrote to vs.
@@ -5071,9 +5134,13 @@ pub async fn apply_and_mark_drained_many(
         if cleared.is_empty() {
             continue;
         }
+        // A truncate clear's own downstream propagation stays image-less
+        // (`None`, the 4th [`ChangedKey`] field) — that gap is #98/#165/#168's
+        // tracked territory, not issue #180's (which only threads an image
+        // through the aggregate-group-extinction case below).
         let touched: Vec<ChangedKey> = cleared
             .into_iter()
-            .map(|k| (k, clear.hop_gen, clear.src_changed))
+            .map(|k| (k, clear.hop_gen, clear.src_changed, None))
             .collect();
         changed.entry(target.as_str()).or_default().extend(touched);
     }
@@ -5127,13 +5194,18 @@ pub async fn apply_and_mark_drained_many(
             src_changed_of.insert(d.pk_text.as_str(), d.src_changed);
         }
 
+        // A 1-1 target delete's downstream propagation also stays image-less
+        // today (`None`) — the same "same failure family, different
+        // producer" gap issue #180's own writeup calls out, but its fix here
+        // is scoped to the aggregate-group-extinction case below; widening
+        // this one is a follow-up, not this fix.
         let touched: Vec<ChangedKey> = written
             .into_iter()
             .chain(deleted)
             .map(|key| {
                 let hop_gen = hop_gen_of.get(key.as_str()).copied().unwrap_or(0);
                 let src_changed = src_changed_of.get(key.as_str()).copied().flatten();
-                (key, hop_gen, src_changed)
+                (key, hop_gen, src_changed, None)
             })
             .collect();
         changed.entry(target.as_str()).or_default().extend(touched);
@@ -5166,6 +5238,15 @@ pub async fn apply_and_mark_drained_many(
     // [#104](https://github.com/salesforce-misc/trellis/issues/104), a
     // known, live gap in the latency histograms for any transform chained
     // off an aggregate target, independent of #103's fix above.
+    //
+    // Issue #180: `result.deleted` additionally carries each extinct group's
+    // pre-delete image (`AggregateApplyResult::deleted`'s own doc comment) —
+    // threaded through as this `ChangedKey`'s 4th field so step 4 below can
+    // stage a real image-bearing delete instead of an image-less `Recompute`
+    // for exactly this case, closing the gap
+    // `defs_aggregate_chained_composite_group_key.rs`'s
+    // `a_live_insert_and_an_extinct_composite_group_both_propagate_downstream`
+    // (formerly `..._hits_the_image_less_gap`) now pins as fixed.
     for (target, agg_plan) in &plan.aggregate_targets {
         // `&agg_plan.target` (issue #73's persisted identity), not the bare
         // `target` map key — see `AggregateTargetPlan::target`'s doc
@@ -5183,8 +5264,13 @@ pub async fn apply_and_mark_drained_many(
             result
                 .written
                 .into_iter()
-                .chain(result.deleted)
-                .map(|(key, hop_gen)| (key, hop_gen, None)),
+                .map(|(key, hop_gen)| (key, hop_gen, None, None))
+                .chain(
+                    result
+                        .deleted
+                        .into_iter()
+                        .map(|(key, hop_gen, old_image)| (key, hop_gen, None, old_image)),
+                ),
         );
     }
 
@@ -5599,6 +5685,10 @@ pub async fn apply_and_mark_drained_many(
             keys_written += result.written.len();
             keys_deleted += result.deleted.len();
             if !result.written.is_empty() || !result.deleted.is_empty() {
+                // Issue #180: same image-threading as the forward path's 3b
+                // step above — `result.deleted`'s pre-delete image lets step
+                // 4 stage a real image-bearing delete for an extinct group
+                // reached through the reverse-relationship fast path too.
                 changed
                     .entry(agg_shape.target.as_str())
                     .or_default()
@@ -5606,8 +5696,10 @@ pub async fn apply_and_mark_drained_many(
                         result
                             .written
                             .into_iter()
-                            .chain(result.deleted)
-                            .map(|(key, hop_gen)| (key, hop_gen, record.src_changed)),
+                            .map(|(key, hop_gen)| (key, hop_gen, record.src_changed, None))
+                            .chain(result.deleted.into_iter().map(|(key, hop_gen, old_image)| {
+                                (key, hop_gen, record.src_changed, old_image)
+                            })),
                     );
             }
         }
@@ -5667,20 +5759,84 @@ pub async fn apply_and_mark_drained_many(
         {
             continue;
         }
-        for (key, hop_gen, src_changed) in touched {
+        // Issue #180 hardening: one batch can physically touch the same
+        // target key more than once. The forward aggregate step (3b) and
+        // *each* per-record reverse-relationship fast-path apply (3d) extend
+        // this very same vector, so a group whose last from-side row moves
+        // away under one reverse record and whose first from-side row
+        // arrives under another is deleted by one apply and rewritten by
+        // the next, inside this one batch. Staging both an image-bearing
+        // delete and an image-less `Recompute` for such a key would be
+        // strictly worse than staging neither: [`fold::fold`]'s
+        // arg-extremes only ever consider image-bearing rows, so the
+        // delete's `old_image` (and its absent `new_image`) wins *both*
+        // halves and the recompute is annihilated — a chained downstream
+        // aggregate would then subtract a still-live group's contribution
+        // and never learn its new value. A key this batch also wrote
+        // therefore gives up its image and stays an ordinary `Recompute`,
+        // whose downstream live refetch finds the surviving row and
+        // re-derives the group correctly — exactly the pre-#180 behaviour,
+        // which was only ever wrong for a key that really is gone.
+        let rewritten = keys_written_without_image(touched);
+        for (key, hop_gen, src_changed, deleted_old_image) in touched {
             let next_hop = hop_gen + 1;
             if next_hop > MAX_HOP_GEN {
                 hop_bound_tables.push(target.to_string());
                 worst_hop_gen = worst_hop_gen.max(next_hop);
                 continue;
             }
-            recompute_changes.push(StagedChange::Recompute {
-                src_table: target.to_string(),
-                key: key.clone(),
-                hop_gen: next_hop,
-                group_key: None,
-                src_changed: *src_changed,
-            });
+            // Issue #180: a deletion whose pre-delete image was captured
+            // (today, only an extinct aggregate group's `deleted` entry —
+            // see [`ChangedKey`]'s doc comment) stages as a real
+            // image-bearing delete instead of an image-less `Recompute`, so
+            // a chained downstream aggregate can subtract the extinct row's
+            // last-known contribution (`accumulate_changes`'s `(Some(old_row),
+            // None)` branch) rather than have its live refetch find nothing
+            // and silently drop the change (the module doc comment's "A
+            // known gap: image-less changes"). An ordinary write still stays
+            // image-less — a downstream live refetch always finds the
+            // *right* current row for those, except for a `NULL`-keyed
+            // group, which cannot be resolved by key text at all and never
+            // reaches a chained reader in the first place (issue #195, a
+            // gap upstream of this one).
+            //
+            // `lsn: None`, like every other row this step stages: a
+            // propagated hop has no source LSN of its own. Two fold-side
+            // predicates read `lsn` and were written when "no `lsn`" implied
+            // "no images" — both stay sound for this row, but only by
+            // argument, so re-check them if either changes: [`fold::fold`]'s
+            // truncate-void filter (`(t.lsn, t.change_id) > (f.lsn,
+            // f.change_id)` is `NULL`, so a truncate on the target never
+            // voids this delete — harmless, since subtracting a group that a
+            // truncate also erased reaches the same answer), and
+            // [`from_side_change_in_flight`]'s `r.lsn <= $2` (this row is
+            // invisible to that in-flight probe, exactly as its pre-#180
+            // `Recompute` was).
+            match deleted_old_image {
+                Some(old_image) if !rewritten.contains(key.as_str()) => {
+                    recompute_changes.push(StagedChange::Cdc {
+                        src_table: target.to_string(),
+                        key: key.clone(),
+                        op: append::CdcOp::Delete,
+                        lsn: None,
+                        old_image: Some(old_image.clone()),
+                        new_image: None,
+                        origin_lsn: None,
+                        src_changed: *src_changed,
+                        hop_gen: next_hop,
+                        group_key: None,
+                    });
+                }
+                _ => {
+                    recompute_changes.push(StagedChange::Recompute {
+                        src_table: target.to_string(),
+                        key: key.clone(),
+                        hop_gen: next_hop,
+                        group_key: None,
+                        src_changed: *src_changed,
+                    });
+                }
+            }
         }
     }
 
