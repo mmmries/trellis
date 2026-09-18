@@ -1,5 +1,5 @@
 ---
-status: draft
+status: accepted
 date: 2026-08-20
 deciders: Michael Ries
 consulted: 
@@ -10,288 +10,163 @@ informed:
 
 Because [data-flow](../data-flow.md) commits invalid source data before a
 derivation runs, a failing transform or bad row must be **quarantined** rather
-than block the write. This ADR settles the questions of where per-row status
-lives, and what API applications use to discover and clear quarantines — plus a
-guardrail for when quarantine itself is the wrong tool.
+than block the write. This ADR settles where per-row and per-column status
+lives, the API applications use to discover and clear quarantines, and how the
+fuse guarding against runaway per-row tracking behaves.
 
-**Amendment (2026-09-12):** the original proposal below tracked one exception
-per `(target_row_pk, transform_id)` and fused a whole transform at once. In
-practice (see [ADR-0008](0008-public-api-design.md) for the discussion
-that surfaced this) a single `TRANSFORM` can compute several calculated
-columns, and a failure in one column's formula (a broken relationship, a
-function that only errors for one field) shouldn't force every other healthy
-column on that same transform into quarantine. This amendment adds a **column**
-dimension throughout: exception detail is still one record per poisoned
-*source* row for the existing whole-key fuse, but a failure attributable to
-one column is now tracked separately (see "Exception table shape" below), and
-the fuse trips per `(transform, column)` rather than per transform. A transform's
-overall lifecycle status ([transforms — Status](../transforms.md#status)) is
-unaffected by this — it still describes the whole keyspace — but a `live`
-transform can now carry one or more individually `paused` columns without the
-whole transform going `quarantined`. The sections below are updated in place;
-nothing from the original proposal survives unchanged except the sparse-table
-rationale in "Options considered".
+## Decision
 
-**Implementation note (2026-09-13):** the column-fuse machinery described
-below shipped in `V21__column_quarantine.sql` with one deliberate departure
-from this ADR's literal text, decided during implementation review: rather
-than a `poison.failures` jsonb array + GIN index, per-column failure detail
-lives in its own dedicated `column_failures` table, and the column-status
-table is keyed on `(transform_table, column_name)` rather than
-`(transform_id, column_name)`. Reason: a row landing in `poison` at all means
-"globally excluded from folding," which is correct for the whole-key fuse but
-wrong for a column-only failure (a paused column freezes its value rather
-than evicting the row from every other column/transform that still computes
-cleanly) — so `poison.failures` would have been write-once, read-never
-overhead with a real correctness footgun if anything had used it as an
-eviction signal. `column_failures`/`column_deaths` (an incrementally
-maintained counter, mirroring `key_deaths`) serve the "sample quarantined
-rows" and fuse-threshold reads instead. All "Undecided" items below are now
-settled; see "Amendment (2026-09-13): open questions resolved" at the end of
-this document.
+Quarantine is tracked at two independent fuse tiers, with no auto-escalation:
 
-## Proposal
+* **Whole-key fuse** — a sparse **`poison`** exception table
+  (`V13__quarantine.sql`), one row per poisoned *source* row. Tripping it moves
+  the whole transform to `quarantined`; resuming re-runs the full backfill.
+* **Per-`(transform, column)` fuse** — `column_failures`, `column_status`, and a
+  `column_deaths` counter (`V21__column_quarantine.sql`). A failure in one
+  column's formula pauses only that column, leaving healthy columns on the same
+  transform computing.
 
-Track quarantine status in a **separate, sparse exception table**, populated
-only for source rows that fail to propagate. A healthy row never appears, so
-the common case costs nothing beyond the neighbor-table write it already
-makes. This matches what's actually implemented (`poison`, `V13__quarantine.sql`)
-rather than the original proposal's `(target_row_pk, transform_id)` keying: a
-single *source* row's change can fan out to several downstream
-transforms/columns at once, so the natural exception key is the source row
-(`src_table`, `key`) that failed to fold, not any one of its downstream
-targets. That row's exception record carries a `failures` array — one entry
-per `(transform, column)` pair that failed while propagating this row, each
-with its own error message — so one poisoned source row can implicate several
-transforms/columns without needing several exception rows.
+A `TRANSFORM` can compute several columns, so a `live` transform can carry one or
+more `paused` columns. A transform's overall lifecycle status
+([transforms — Status](../transforms.md#status)) describes the whole keyspace and
+is unaffected by column pausing.
 
-Expose this through three client-library reads (list what's currently
-paused/quarantined across every transform and column, then page sample rows
-for one, per the addressing scheme below) rather than the original's two — see
-"Client library API". If poisoned-row counts for a given `(transform, column)`
-pair cross a threshold, trip a **column-level fuse**: stop per-row tracking for
-that column and mark it `paused` until a backfill clears it. A transform's
-whole keyspace can still go `quarantined` (the original all-or-nothing fuse),
-but that's now a coarser, separate tier from column pausing — see "Fuse" below
-for how the two relate.
+Applications discover and clear quarantines through three client-library reads
+(below).
 
 ## Options considered
 
-* **In the neighbor table.** Status columns beside the derived values.
-  Cheapest to read (no join), but a target row can be written by several
-  transforms, so avoiding conflated failures needs one column per transform —
-  the table grows wider with every transform chained onto it.
-* **A dense `(row, transform)` status table.** One row per key regardless of
-  health, written alongside every neighbor-table write. Right granularity, but
-  doubles write amplification on the hot path — at 180k+ source changes/sec,
-  a second write for every successful row, not just failures.
-* **Sparse exception table (chosen).** Dense-table shape, but only failing
-  rows are inserted; a row's absence *is* its healthy status. Steady-state
-  write cost stays near zero (>99% of rows never touch it) while still
-  answering "is this row valid" and giving the error API a table to query.
+Storage granularity for row/column status:
 
-The tradeoff: checking validity on read means checking for *absence*, not
-reading a column in hand. We mitigate with the primary key on `(src_table,
-key)` for the whole-key path, and `column_failures`' own primary key for the
-column-grain path (see "Exception table shape"), and expect most consumers to
-ask "is transform X (or column X.Y) quarantining anything" (via the API
-below) rather than check rows inline.
+* **In the neighbor table** — status columns beside the derived values. Cheapest
+  to read, but a target row can be written by several transforms, so avoiding
+  conflated failures needs one column per transform: the table widens with every
+  chained transform.
+* **Dense `(row, transform)` status table** — one row per key regardless of
+  health, written alongside every neighbor-table write. Right granularity, but
+  doubles write amplification on the hot path — at 180k+ source changes/sec, a
+  second write for every *successful* row.
+* **Sparse exception table (chosen)** — dense-table shape, but only failing rows
+  are inserted; a row's absence *is* its healthy status. Steady-state write cost
+  stays near zero (>99% of rows never touch it) while still answering "is this
+  row valid" and giving the error API a table to query.
+
+The tradeoff: validity is checked on read as *absence*, not a column in hand. We
+mitigate with primary keys on both paths (below) and expect most consumers to
+ask the API "is transform X (or column X.Y) quarantining anything" rather than
+check rows inline.
 
 ## Exception table shape
 
-One record per poisoned **source** row for the whole-key fuse — the existing
-`poison` table (`src_table`, `key` primary key, `last_error text`) is
-unchanged by this amendment.
+The exception key is the source row, not any downstream target: one source
+row's change fans out to several transforms/columns at once, so the natural key
+for a fold failure is the `(src_table, key)` that failed to fold.
 
-**As shipped (2026-09-13), superseding this section's original proposal:**
-rather than folding column-level failure detail into `poison` via a
-`failures` jsonb array + GIN index, it lives in its own dedicated
-`column_failures` table (`V21__column_quarantine.sql`), keyed on
-`(transform_table, column_name, src_table, key)`: one row per
-`(transform, column)` pair that failed while propagating a given source row,
-with its own `error`/`failed_at`. See "Column status table" below for why —
-in short, a row landing in `poison` means "globally excluded from folding,"
-which is correct for the whole-key fuse but wrong for a column-only failure.
+* **`poison`** — `(src_table, key)` primary key, one record per poisoned source
+  row, for the whole-key fuse.
+* **`column_failures`** — keyed on `(transform_table, column_name, src_table,
+  key)`, one row per `(transform, column)` pair that failed while propagating a
+  source row.
 
-Retry-with-backoff vs. immediate quarantine, and whether older entries move to
-a dead-letter area, are still open — this ADR fixes storage and the read APIs,
-not retry policy.
+Column detail is separate from `poison` rather than a `failures` array on it,
+because landing in `poison` means "globally excluded from folding" — correct for
+the whole-key fuse but wrong for a column-only failure, where a paused column
+freezes its value rather than evicting the row from every other column that
+still computes cleanly.
 
 ## Column status table
 
-Separate from the exception detail above: a small, dense table recording each
+`column_status` (`V21__column_quarantine.sql`) is a small dense table of each
 transform's currently-paused columns, so "is anything paused right now" is a
-cheap read over a handful of rows rather than a scan/aggregate over per-row
-failure detail. As shipped (`column_status`, `V21__column_quarantine.sql`):
+cheap read rather than a scan over per-row failure detail. Keyed on
+`(transform_table, column_name)`; carries `paused_at` and `last_error`.
 
-* `transform_table`, `column_name` — primary key (keyed on the target table's
-  name, not a surrogate `transform_id` — matching how `transform_definitions`
-  itself is keyed).
-* `paused_at`.
-* `last_error` — the most recent failure's message, for a quick glance without
-  paging exception detail.
-* `local_fuse` — distinguishes *why* a row is paused: `true` means this
-  `(transform, column)` pair's own fuse tripped; `false` means it's paused
-  only because an upstream column it reads was paused (see "propagation" in
-  the resolved open questions below). A column can be both at once.
-
-A transform with no rows here has every column live. This is the table the
-per-column fuse writes to when it trips, and clears from when a resume clears
-the column — mirroring how the transform-wide `quarantined` lifecycle
-state already works, just at column grain. It does **not** replace the
-transform's own overall lifecycle status
-([transforms — Status](../transforms.md#status)): a transform can be `live`
-overall while this table lists one or more of its columns as paused.
+`local_fuse` distinguishes *why* a column is paused: `true` means its own fuse
+tripped; `false` means an upstream column it reads was paused (see
+"Propagation"). A column can be both. A transform absent from this table has
+every column live; the table does not replace the transform's overall lifecycle
+status.
 
 ## Client library API
 
-Three calls now, still separated by cost so a caller can cheaply poll before
-paying for detail:
+Three calls, separated by cost:
 
 1. **List paused/quarantined targets** — a flat list across every transform,
-   each entry addressed as `transform` (the whole keyspace, from the
-   transform-wide fuse/lifecycle) or `transform.column` (a single paused
-   column, from the column status table above). Cheap — reads the column
-   status table plus each transform's own lifecycle status, no join against
+   each addressed as `transform` (whole keyspace) or `transform.column`. Cheap:
+   reads `column_status` plus each transform's lifecycle status, no join against
    exception detail. This is the one dashboards/health-checks poll.
 2. **Status for one target** — given `transform` or `transform.column`, its
-   current state (`live`/`paused`/`quarantined` as applicable) and, for a
-   paused column, when it tripped and its last error.
-3. **Sample quarantined rows** — for a `transform` or `transform.column`
-   target, a paginated batch of `(src_table, key, error_message)` triples
-   pulled from `poison` (whole-key target) or `column_failures`
-   (`transform.column` target — see "Exception table shape"), to diagnose and
-   clear the cause. `column_failures` rows for a column are cleared once it's
-   resumed, not as each individual row re-evaluates cleanly — see "Fuse"
-   below.
+   current state and, for a paused column, when it tripped and its last error.
+3. **Sample quarantined rows** — a paginated batch of `(src_table, key,
+   error_message)` from `poison` or `column_failures`. `column_failures` rows are
+   cleared when the column is resumed, not as each row re-evaluates cleanly.
 
 ## Fuse: per-column, then transform-wide
 
 Per-row quarantine assumes failures are the exception. When a large fraction of
-one column's rows fail (a broken formula for that field, an incompatible
-upstream schema change touching just the columns it reads), tracking each one
-individually stops being useful — the application doesn't need a million
-identical error rows, it needs to know that one column is broken.
+one column's rows fail (a broken formula, an incompatible upstream schema
+change), tracking each individually stops being useful — the application needs
+to know that *one column* is broken, not a million identical error rows.
 
-When poisoned-row counts for a `(transform, column)` pair cross a threshold,
-the **column fuse** trips: row-level tracking for that pair stops (its
-`column_failures` rows are retained, not cleared, as the evidence base for
-"sample quarantined rows" until the column is resumed), and the column is
-marked `paused` in the column status table above. Resuming a single paused
-column re-runs the backfill for just that column's formula against
-already-built rows, without touching the rest of the transform's columns or
-its overall lifecycle status.
+When `column_deaths` for a pair crosses the threshold, the **column fuse** trips:
+row-level tracking stops (its `column_failures` rows are retained as evidence
+until resume) and the column is marked `paused`. Resuming re-runs the backfill
+for just that column's formula, without touching other columns or the
+transform's lifecycle status.
 
-The original **transform-wide fuse** still exists as a coarser, separate tier:
-if a failure isn't attributable to one column (e.g. a key-shape/DDL failure
-that dooms every column's write for that row alike), it trips the whole
-transform to `quarantined` exactly as before, and resuming re-runs the full
-backfill (see [data-flow](../data-flow.md)). `quarantined` remains one state of
-a transform's broader **lifecycle status**
-(`waiting_to_backfill` → `backfilling` → `live`, plus `quarantined`).
+The **transform-wide fuse** trips when a failure isn't attributable to one
+column (e.g. a key-shape/DDL failure dooming every column's write for a row),
+moving the whole transform to `quarantined`. `quarantined` is one state of the
+lifecycle (`waiting_to_backfill` → `backfilling` → `live`, plus `quarantined`);
+resuming re-runs the full backfill (see [data-flow](../data-flow.md)).
 
-**Amendment (2026-09-13): open questions resolved.** The items below were
-"Undecided" as of the previous amendment; each is now settled and shipped in
-`V21__column_quarantine.sql`/`staging::quarantine`:
+Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
 
-* **Threshold:** a fixed count, matching the existing row-level fuse's
-  `DEFAULT_DEATH_THRESHOLD` pattern — not percentage-based, not configurable
-  per transform/column (consistent with the row-level fuse's own threshold
-  today).
-* **Counter mechanism:** an incrementally-maintained counter table
-  (`column_deaths`), the same `key_deaths`-style write-amplification
-  tradeoff the row-level fuse already makes, rather than a live
-  aggregate/GIN query over failure detail.
-* **Escalation:** the two fuse tiers (per-column, transform-wide) stay fully
-  independent — no auto-escalation. A transform can sit at "every column but
-  one paused" indefinitely.
-* **Paused-column value semantics:** freeze at the last successfully computed
-  value — a paused column's target data is never nulled out. Staleness is
-  discoverable via `column_status`/the client library's status read, not an
-  in-band per-row marker.
-* **Propagation:** tripping either fuse cascades the pause to every
-  dependent/downstream transform reading the paused column's output
-  (`column_pause_cascades`, `defs::catalog::column_dependents`) — a
-  downstream reader never silently consumes a frozen/stale upstream value
-  with no signal. Restricted to 1-1 downstream transforms only: an aggregate
-  transform reading a paused upstream column is *not* cascaded into (aggregate
-  accumulation has no per-column pause concept — see
-  `staging::apply_aggregate`), which is a known, deliberate gap rather than an
-  oversight.
+* **Threshold** — a fixed count, matching the row-level fuse's
+  `DEFAULT_DEATH_THRESHOLD`; not percentage-based, not per-transform configurable.
+* **Counter** — an incrementally-maintained `column_deaths` table, the same
+  `key_deaths`-style write-amplification tradeoff, not a live aggregate query.
+* **Paused-column value** — freezes at the last computed value; never nulled.
+  Staleness is discoverable via `column_status`/the API, not an in-band marker.
+* **Propagation** — tripping either fuse cascades the pause to 1-1 downstream
+  transforms reading the paused column (`column_pause_cascades`,
+  `defs::catalog::column_dependents`), so no downstream reader silently consumes
+  a frozen value. Aggregate transforms are *not* cascaded into — aggregate
+  accumulation has no per-column pause concept (`staging::apply_aggregate`), a
+  deliberate gap.
 
-**Amendment (2026-09-18): resuming a transform re-arms its fuse (issue
-#160).** The transform-wide fuse counts the distinct evicted keys for a
-source table — rows in `poison` — and `staging::quarantine::resume_transform`
-originally left that table completely untouched, so a source that had ever
-reached the threshold stayed at/above it forever and the *next single* new
-eviction, for any key and any reason, re-quarantined the transform
-immediately. "Five fresh failures re-trips" silently became "one failure
-re-trips, forever, after the first trip."
+## Resume re-arms the fuse
 
-Decided: a resume **re-arms** the fuse rather than erasing quarantine
-history. `resume_transform` stamps `transform_definitions.fuse_rearmed_at`
-(`V29__transform_fuse_rearm.sql`) in the same transaction as the status drop,
-and `trip_transform_fuse_if_crossed` counts only `poison` rows evicted after
-that instant — a full, fresh threshold's budget of *new* evictions. `null`
-(never resumed) reads as `-infinity`, i.e. exactly the pre-#160 count.
+The transform-wide fuse counts distinct evicted keys (`poison` rows) for a
+source table. A resume **re-arms** the fuse rather than erasing history:
+`staging::quarantine::resume_transform` stamps
+`transform_definitions.fuse_rearmed_at` (`V29__transform_fuse_rearm.sql`) in the
+same transaction as the status drop, and `trip_transform_fuse_if_crossed` counts
+only `poison` rows evicted after that instant — a full fresh threshold's budget
+of *new* evictions (`null` reads as `-infinity`). Without this, a source that
+ever hit the threshold stayed there forever, and the next single new eviction
+re-quarantined immediately.
 
-The rejected alternative was deleting the source table's `poison`/`key_deaths`
-rows on resume:
+The rejected alternative — deleting the source's `poison`/`key_deaths` rows on
+resume — fails because:
 
-* `poison` is not just a counter, it is the **marker** the fold consults
-  (`poisoned_keys_among`) to exclude a key globally, and each of its keys may
-  own real parked work in `poison_held`. Only `release_key` knows how to
-  replay that work (per key, with original origin positions preserved);
-  deleting the marker without it would silently strand the parked changes.
-* The fuse is keyed per source table, but a resume is per *transform*, and one
-  source can back several transforms. Clearing the shared rows while resuming
-  one of them would un-evict those keys out from under the siblings, which are
-  not being re-backfilled and would lose their parked deltas for good.
-* Keeping the rows keeps the operator-visible audit trail of what was ever
-  evicted and why (`poisoned_at`/`last_error`) — the same reasoning
-  `trip_column_fuse` already documents for not clearing `column_failures` when
-  the column fuse trips.
+* `poison` is not just a counter but the **marker** the fold consults
+  (`poisoned_keys_among`) to exclude a key globally, and each key may own parked
+  work in `poison_held` that only `release_key` knows how to replay (per key,
+  origin positions preserved). Deleting the marker strands that work.
+* The fuse is keyed per source table but a resume is per *transform*, and one
+  source can back several transforms. Clearing shared rows would un-evict keys
+  out from under siblings that aren't being re-backfilled, losing their parked
+  deltas.
+* Keeping the rows keeps the audit trail of what was evicted and why.
 
-The per-key (`key_deaths`) and per-column (`column_deaths`) tiers are
-deliberately unaffected: they are cleared by a clean drain of the key itself
-and by `resume_column` respectively, and a whole-transform resume makes no
-claim about any individual key's or column's health.
+The `key_deaths` (per-key) and `column_deaths` (per-column) tiers are
+deliberately unaffected by a whole-transform resume: they clear on a clean drain
+of the key and on `resume_column` respectively, and a whole-transform resume
+makes no claim about any individual key's or column's health.
 
-**Amendment (2026-09-18): the transform-wide fuse counts behind a gate (issue
-#159).** `trip_transform_fuse_if_crossed` counts `poison` rows inside the same
-transaction as the eviction that triggered the check — read-your-own-writes
-correct for one caller, blind to a sibling. Two `isolate_and_evict` calls for
-the same source (different segments, different workers) each counted their own
-new row plus whatever had already committed, never the other's concurrent,
-uncommitted insert: two workers landing a source's 4th and 5th eviction at
-once both saw 4, neither tripped, and the transform stayed live past its fuse
-point until some later, unrelated eviction happened to re-run the check. It
-could undercount, never overcount, so no false trip was ever possible — only a
-missed one.
+## Open questions
 
-Decided: a per-source-table **gate row** (`transform_fuse_gate`,
-`V30__transform_fuse_gate.sql`), taken by an atomic
-`INSERT ... ON CONFLICT DO UPDATE` as the first statement of the fuse check.
-That is the same row-lock serialization the per-key and per-column fuses have
-always had via `key_deaths`/`column_deaths`, which is why neither of them ever
-had this bug. Concurrent evictions for one source queue on that row; the
-second one through starts counting only after the first has committed, and its
-counts — a fresh statement snapshot under READ COMMITTED — include the
-sibling's rows. `ON CONFLICT DO UPDATE` rather than `SELECT ... FOR UPDATE`
-because the gate row may not exist yet (a source's first-ever eviction) and
-`FOR UPDATE` over zero rows locks nothing, so two concurrent first evictions
-would each sail through.
-
-The gate holds no count. The threshold decision stays a `count(*)` over
-`poison`, because `poison` is the only table that can also answer the
-*windowed*, per-definition form of the same question the amendment above
-introduced (`poisoned_at > fuse_rearmed_at`), so a maintained total would have
-had to coexist with the `count(*)` anyway — two representations of one fact,
-one of which can drift, and one needing matching rewinds in `release_key` and
-`purge_dropped_table`. The two mechanisms compose cleanly and orthogonally:
-**the gate decides when a transaction may count, the re-arm window decides
-which rows that count includes.** Cost is one indexed upsert per eviction, on
-the transaction's existing connection — notably not a second pool connection
-taken while that transaction is open, and in front of (not instead of) the
-pre-threshold fast path that keeps a below-threshold eviction from paying for
-the per-definition loop at all.
+* Retry-with-backoff vs. immediate quarantine, and whether older entries move to
+  a dead-letter area, are still open. This ADR fixes storage and the read APIs,
+  not retry policy.
