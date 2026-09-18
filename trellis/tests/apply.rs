@@ -1840,8 +1840,11 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
         "the live refetch for this bucket's {N} keys must be exactly one query, not one per key:\n{log}"
     );
     assert!(
-        refetch_queries[0].contains("= any("),
-        "the one refetch query must batch every key via `= any($1)`, not a single-key `= $1`:\n{}",
+        refetch_queries[0].contains("::text[]::"),
+        "the one refetch query must batch every key via one bound array parameter \
+         (`read_live_rows_batch`'s `join unnest($1::text[]::<type>[])`, issue #126 — no \
+         longer literally `= any($1)` once the live refetch had to generalize to an \
+         arbitrary-arity primary key), not a single-key `= $1`:\n{}",
         refetch_queries[0]
     );
 
@@ -2106,8 +2109,9 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
         "the bare-recompute subset (1, 3, 5) must still cost exactly one batched refetch:\n{log}"
     );
     assert!(
-        refetch_queries[0].contains("= any("),
-        "the one refetch query must batch its keys via `= any($1)`:\n{}",
+        refetch_queries[0].contains("::text[]::"),
+        "the one refetch query must batch its keys via one bound array parameter \
+         (`read_live_rows_batch`'s `join unnest($1::text[]::<type>[])`, issue #126):\n{}",
         refetch_queries[0]
     );
 
