@@ -463,8 +463,8 @@ fn catalog_source_key(src_table: &str) -> &str {
 ///    bare-target-suffix fallback: the name can only be some other live
 ///    definition's own target.
 /// 2. A reverse-recompute trigger for a relationship's from-side
-///    (`from_side_keys_for_join`/`from_side_keys_with_non_null_join`'s
-///    callers below, staging `rel.def.from_table` as `src_table`) —
+///    (`from_side_keys`'s callers below, staging `rel.def.from_table` as
+///    `src_table`) —
 ///    `relationship_definitions.from_table` is always bare (ADR-0007's
 ///    "Scope" section leaves relationship endpoints unqualified) and is a
 ///    genuine *source* table, never anyone's target, so the bare-target-
@@ -526,7 +526,7 @@ async fn decode_image(pool: &Pool, image_text: &str) -> Result<Row, ApplyError> 
 /// [`crate::intake::extract_key`] shape every [`FoldedChange::key`] already
 /// carries for a composite-PK source, whether staged by real CDC intake or
 /// by this crate's own reverse-relationship path
-/// ([`from_side_rows_for_join_txn`]/`from_side_keys_for_join`'s callers) —
+/// ([`from_side_rows_for_trigger_txn`]/`from_side_keys`'s callers) —
 /// so the two agree on one row identity regardless of which produced it.
 /// The batch match itself is a keyset join, one bind-parameter array per
 /// `pk` column (mirroring `staging::apply_aggregate`'s `keyset_unnest`/
@@ -680,77 +680,112 @@ fn key_array_filter(col_ident: &str, pg_type: Option<&str>) -> String {
     }
 }
 
-/// The from-side keys whose `from_col` matches any of `join_keys` (compared
-/// at `from_col`'s own native type via [`key_column_pg_type`] — issue #125 —
-/// falling back to the old `::text` comparison if the column can't be
-/// introspected; the relationship join-key convention is otherwise shared
-/// with the evaluator: exact for the integer/uuid/text keys relationships
-/// allow, numeric keys being rejected at definition time). Returns
-/// `(from_pk_text, from_col_text)` so the reverse-recompute caller can map
-/// each matched from-side row back to the join value — hence the triggering
-/// related-row change's `hop_gen` — that pulled it in. A `NULL` `from_col`
-/// never matches (SQL `NULL`), so such rows are absent, exactly like the
-/// evaluator's LEFT JOIN no-match.
+/// Issue #173 phase 3: what a to-side (parent) event implies about the
+/// from-side rows a relationship-propagation path must reprocess — the one
+/// shared decision every path in `docs/relationship-propagation.md`'s
+/// obligation table that enumerates from-side rows in reaction to a to-side
+/// change is built to make by constructing one of these and driving its own
+/// enumeration off a `match` over it, rather than deciding independently
+/// (which is exactly how TRUNCATE's key-less sentinel got forgotten three
+/// times — #98, regressed by epic #127 and re-filed as #165, re-filed again
+/// as #168).
+///
+/// Deliberately just two variants, both closed, with no path in this module
+/// matching on it via a wildcard `_` arm: adding a third variant later is a
+/// compile error at every one of those match sites, forcing whoever adds it
+/// to decide what the new case means for each existing path instead of
+/// leaving a silent gap the way the pre-#173 per-path ad hoc key lookups
+/// could.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReverseTrigger<'a> {
+    /// One or more specific to-side `to_col` values changed, and every
+    /// from-side row whose `from_col` currently equals one of them must be
+    /// reprocessed — an ordinary to-side insert/update/delete. A single
+    /// to-side row change contributes its own old and/or new key; the
+    /// to-many reverse path's batched sweep across every to-side change one
+    /// `compute()` call folded contributes the whole set in one lookup.
+    Keys(&'a [String]),
+    /// The to-side table was `TRUNCATE`d (issue #98): the staged change
+    /// carries no image and no key, so there is no specific set of join-key
+    /// *values* to match against — the to-side table is now completely
+    /// empty. Every from-side row that still points at *something* must
+    /// therefore re-derive to `NULL`: there's no way to tell, after the
+    /// fact, which of those rows previously matched a real to-side row (and
+    /// so must newly go stale) versus already pointed at nothing (and so
+    /// were already `NULL`) — both converge to the same `NULL` result once
+    /// the to-side is empty, so both are recomputed rather than trying to
+    /// distinguish them.
+    WholeKeyspace,
+}
+
+/// The from-side keys a [`ReverseTrigger`] implies, live, in one round trip —
+/// [`ReverseTrigger::Keys`] matches `from_col` against the native-typed key
+/// array (issue #125: compared at `from_col`'s own type via
+/// [`key_column_pg_type`], falling back to the old `::text` comparison if
+/// the column can't be introspected; the relationship join-key convention is
+/// otherwise shared with the evaluator — exact for the integer/uuid/text
+/// keys relationships allow, numeric keys being rejected at definition
+/// time), while [`ReverseTrigger::WholeKeyspace`] instead selects every
+/// currently non-`NULL` `from_col` row, matching nothing about a specific
+/// value at all (see that variant's own doc comment for why). Returns
+/// `(from_pk_text, matched_join_text)`: `matched_join_text` is `Some` for a
+/// `Keys` trigger (so the reverse-recompute caller can map each matched
+/// from-side row back to the join value — hence the triggering related-row
+/// change's `hop_gen` — that pulled it in) and always `None` for
+/// `WholeKeyspace` (there is no single value a match is "against"; every
+/// caller of that arm assigns one flat hop to the whole result instead). A
+/// `NULL` `from_col` never matches either arm (SQL `NULL`, or the explicit
+/// `is not null` filter), exactly like the evaluator's LEFT JOIN no-match.
 ///
 /// `from_pk` may be composite (issue #126): the returned `from_pk_text` is
 /// [`ddl::pk_key_sql_expr`]'s row identity, in the same U+001F-joined shape
 /// [`read_live_rows_batch`] later decodes it back with — `from_col` itself
 /// (the relationship's own join column) is always a single column regardless
 /// of the from-table's primary key arity, so its matching is unaffected.
-async fn from_side_keys_for_join(
+async fn from_side_keys(
     pool: &Pool,
     from_table: &str,
     from_pk: &[PrimaryKeyColumn],
     from_col: &str,
-    join_keys: &[String],
-) -> Result<Vec<(String, String)>, ApplyError> {
-    if join_keys.is_empty() {
-        return Ok(Vec::new());
+    trigger: &ReverseTrigger<'_>,
+) -> Result<Vec<(String, Option<String>)>, ApplyError> {
+    match trigger {
+        ReverseTrigger::Keys(join_keys) => {
+            if join_keys.is_empty() {
+                return Ok(Vec::new());
+            }
+            let client = pool.get().await?;
+            let col_ident = quote_ident(from_col);
+            let pg_type = key_column_pg_type(pool, from_table, from_col).await?;
+            let filter = key_array_filter(&col_ident, pg_type.as_deref());
+            let sql = format!(
+                "select {pk}, {col_ident}::text \
+                 from {tbl} \
+                 where {filter}",
+                pk = ddl::pk_key_sql_expr(from_pk, None),
+                tbl = quote_ident(from_table),
+            );
+            let rows = client.query(&sql, &[join_keys]).await?;
+            Ok(rows
+                .into_iter()
+                .map(|r| (r.get::<_, String>(0), Some(r.get::<_, String>(1))))
+                .collect())
+        }
+        ReverseTrigger::WholeKeyspace => {
+            let client = pool.get().await?;
+            let sql = format!(
+                "select {pk} from {tbl} where {col} is not null",
+                pk = ddl::pk_key_sql_expr(from_pk, None),
+                col = quote_ident(from_col),
+                tbl = quote_ident(from_table),
+            );
+            let rows = client.query(&sql, &[]).await?;
+            Ok(rows
+                .into_iter()
+                .map(|r| (r.get::<_, String>(0), None))
+                .collect())
+        }
     }
-    let client = pool.get().await?;
-    let col_ident = quote_ident(from_col);
-    let pg_type = key_column_pg_type(pool, from_table, from_col).await?;
-    let filter = key_array_filter(&col_ident, pg_type.as_deref());
-    let sql = format!(
-        "select {pk}, {col_ident}::text \
-         from {tbl} \
-         where {filter}",
-        pk = ddl::pk_key_sql_expr(from_pk, None),
-        tbl = quote_ident(from_table),
-    );
-    let rows = client.query(&sql, &[&join_keys]).await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
-        .collect())
-}
-
-/// Every from-side key whose `from_col` is currently non-`NULL` (issue #98).
-/// A `TRUNCATE` stages one key-less sentinel (`append::TRUNCATE_SENTINEL_KEY`),
-/// not per-row images, so unlike [`from_side_keys_for_join`] there is no
-/// specific set of join-key *values* to match against — the to-side table is
-/// now completely empty. Every from-side row that still points at
-/// *something* must therefore re-derive to `NULL`: there's no way to tell,
-/// after the fact, which of those rows previously matched a real to-side row
-/// (and so must newly go stale) versus already pointed at nothing (and so
-/// were already `NULL`) — both converge to the same `NULL` result once the
-/// to-side is empty, so both are recomputed rather than trying to
-/// distinguish them.
-async fn from_side_keys_with_non_null_join(
-    pool: &Pool,
-    from_table: &str,
-    from_pk: &[PrimaryKeyColumn],
-    from_col: &str,
-) -> Result<Vec<String>, ApplyError> {
-    let client = pool.get().await?;
-    let sql = format!(
-        "select {pk} from {tbl} where {col} is not null",
-        pk = ddl::pk_key_sql_expr(from_pk, None),
-        col = quote_ident(from_col),
-        tbl = quote_ident(from_table),
-    );
-    let rows = client.query(&sql, &[]).await?;
-    Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
 /// One to-one relationship's settled-parent projection keys a batch's
@@ -1073,8 +1108,8 @@ pub(crate) struct ReverseRelationshipShape {
     from_table: String,
     from_col: String,
     /// The from-table's primary key, possibly composite (issue #126) — see
-    /// [`from_side_rows_for_join_txn`]'s doc comment for how a multi-column
-    /// key's row identity is encoded/decoded.
+    /// [`from_side_rows_for_trigger_txn`]'s doc comment for how a
+    /// multi-column key's row identity is encoded/decoded.
     from_pk: Vec<PrimaryKeyColumn>,
     /// Fully-invertible, single-relationship aggregate targets reading this
     /// relationship — the issue #131 fast (true-delta) path. See
@@ -1381,14 +1416,14 @@ async fn build_reverse_relationship_shape(
     let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
     // `transforms_for_source` matches `schema_nodes.table_name` exactly
     // (ADR-0007's fully-qualified keying) and every SQL-emitting site below
-    // (`AggregateTargetPlan::source`, `from_side_rows_for_join_txn`'s
+    // (`AggregateTargetPlan::source`, `from_side_rows_for_trigger_txn`'s
     // `ddl::qualified_source_table`) documents the same requirement — unlike
     // `source_primary_key` above (a `to_regclass` resolution that already
     // tolerates a bare name via `search_path`), so this shape stores the
     // qualified form of `from_table` throughout, not `rel.def.from_table`
     // verbatim (which the to-many arm elsewhere in this module can get away
     // with, since it only ever feeds `source_primary_key`/
-    // `from_side_keys_for_join`).
+    // `from_side_keys`).
     let qualified_from_table = qualified_schema_node_key(pool, &rel.def.from_table).await?;
     let defs = catalog::transforms_for_source(pool, &qualified_from_table).await?;
 
@@ -1666,9 +1701,11 @@ async fn capture_reverse_guard_state(
 // Issue #131, epic #127: Phase 3 helpers for the reverse-delta apply
 // ---------------------------------------------------------------------
 
-/// Live-enumerates `from_table`'s rows whose `from_col` matches `join_key`,
-/// full row images, inside the already-locked Phase 3 transaction —
-/// [`apply_and_mark_drained_many`]'s "3d" step's from-side enumeration.
+/// Live-enumerates `from_table`'s rows a [`ReverseTrigger`] matches, full row
+/// images, inside the already-locked Phase 3 transaction —
+/// [`apply_and_mark_drained_many`]'s "3d" step's from-side enumeration, used
+/// by both the reverse-delta fast path (`diff_pass`) and the reverse
+/// fallback ([`stage_reverse_recompute_fallback`]).
 ///
 /// **This reads live state** — safe only because [`check_reverse_guards`]
 /// (issue #132) has already run, immediately before every call site below,
@@ -1683,29 +1720,56 @@ async fn capture_reverse_guard_state(
 /// anything in this function itself — this function still does nothing on
 /// its own to enforce it, so a *new* caller added later must run the guard
 /// check first too.
-async fn from_side_rows_for_join_txn(
+///
+/// [`ReverseTrigger::Keys`] is looped one join key at a time — the exact
+/// per-key round trip both callers below already made before issue #173
+/// phase 3 folded their own loops into this function; a caller passing both
+/// an old and new key that happen to be equal still issues one query per
+/// slice entry, unchanged from before (the caller's own `seen_keys` dedup is
+/// what collapses the resulting duplicate rows, exactly as it always has).
+/// [`ReverseTrigger::WholeKeyspace`] is unreachable here: a `TRUNCATE`'s
+/// key-less sentinel never has an image to build a
+/// [`RelationshipReverseRecord`] from in the first place (see that struct's
+/// own construction site, and `ReverseTrigger`'s doc comment), so neither of
+/// this function's callers — both exclusively fed by
+/// `RelationshipReverseRecord`s — can ever reach this function with that
+/// variant. A future path that legitimately needs to resolve a
+/// `WholeKeyspace` trigger against live, transactional full row images would
+/// need to implement and test that arm for real, not rely on this one.
+async fn from_side_rows_for_trigger_txn(
     txn: &Transaction<'_>,
     from_table: &str,
     from_col: &str,
     from_pk: &[PrimaryKeyColumn],
-    join_key: &str,
+    trigger: &ReverseTrigger<'_>,
 ) -> Result<Vec<(String, Row)>, ApplyError> {
-    let sql = format!(
-        "select m.k, e.key, e.value \
-         from (select {pk} as k, to_jsonb(t.*) as doc from {tbl} t \
-               where {col}::text = $1) m \
-         cross join lateral jsonb_each_text(m.doc) e",
-        pk = ddl::pk_key_sql_expr(from_pk, Some("t")),
-        col = quote_ident(from_col),
-        tbl = ddl::qualified_source_table(from_table),
-    );
-    let db_rows = txn.query(&sql, &[&join_key]).await?;
+    let join_keys: &[String] = match trigger {
+        ReverseTrigger::Keys(join_keys) => join_keys,
+        ReverseTrigger::WholeKeyspace => unreachable!(
+            "a TRUNCATE never produces a RelationshipReverseRecord (no image to build one \
+             from — see ReverseTrigger's doc comment and docs/relationship-propagation.md's \
+             TRUNCATE row); the reverse delta/fallback path this function serves can \
+             therefore never be asked to resolve a whole-keyspace trigger"
+        ),
+    };
     let mut rows: HashMap<String, Row> = HashMap::new();
-    for db_row in db_rows {
-        let key: String = db_row.get(0);
-        let field: String = db_row.get(1);
-        let value: Option<String> = db_row.get(2);
-        rows.entry(key).or_default().insert(field, value);
+    for join_key in join_keys {
+        let sql = format!(
+            "select m.k, e.key, e.value \
+             from (select {pk} as k, to_jsonb(t.*) as doc from {tbl} t \
+                   where {col}::text = $1) m \
+             cross join lateral jsonb_each_text(m.doc) e",
+            pk = ddl::pk_key_sql_expr(from_pk, Some("t")),
+            col = quote_ident(from_col),
+            tbl = ddl::qualified_source_table(from_table),
+        );
+        let db_rows = txn.query(&sql, &[join_key]).await?;
+        for db_row in db_rows {
+            let key: String = db_row.get(0);
+            let field: String = db_row.get(1);
+            let value: Option<String> = db_row.get(2);
+            rows.entry(key).or_default().insert(field, value);
+        }
     }
     Ok(rows.into_iter().collect())
 }
@@ -2317,16 +2381,14 @@ async fn stage_reverse_recompute_fallback(
     seen_keys: &mut std::collections::HashSet<String>,
     fallback: &mut Vec<(String, String, i32, Option<std::time::SystemTime>)>,
 ) -> Result<(), ApplyError> {
-    for key in [old_key.as_deref(), new_key.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        let from_rows = from_side_rows_for_join_txn(
+    for key in [old_key.clone(), new_key.clone()].into_iter().flatten() {
+        let trigger = ReverseTrigger::Keys(std::slice::from_ref(&key));
+        let from_rows = from_side_rows_for_trigger_txn(
             txn,
             &shape.from_table,
             &shape.from_col,
             &shape.from_pk,
-            key,
+            &trigger,
         )
         .await?;
         for (from_key, _) in from_rows {
@@ -2498,7 +2560,7 @@ async fn apply_projection_advance(
 /// `to_col`'s own native type via [`key_column_pg_type`] — issue #125,
 /// falling back to the old `::text` comparison if the column can't be
 /// introspected), grouped by that key's `::text` (the evaluator's key
-/// convention, shared with [`from_side_keys_for_join`]). A `NULL` `to_col` is
+/// convention, shared with [`from_side_keys`]). A `NULL` `to_col` is
 /// absent (SQL `NULL` never joins) — matching the evaluator's requirement
 /// that such a to-side row carry no key. To-one relationships get exactly one
 /// row per key (`to_col` is UNIQUE); to-many get the full related set.
@@ -3266,7 +3328,7 @@ mod tests {
     }
 
     /// Issue #125's actual regression: three relationship key-lookup sites
-    /// in this module (`from_side_keys_for_join`, `fetch_to_side_rows`,
+    /// in this module (`from_side_keys`, `fetch_to_side_rows`,
     /// `fetch_relationship_projection_rows`) used to render their join-key
     /// filter as `col::text = any($1::text[])` — a cast on the *column*,
     /// which Postgres can never satisfy with a plain btree index on that
@@ -3487,7 +3549,7 @@ pub struct ApplyPlan {
     /// each `(from_table, from_key_text, hop_gen)` here is a from-side row
     /// whose relationship enrichment depends on that changed related row and
     /// so must be re-derived. Resolved in Phase 2 (a live join-key lookup on
-    /// `from_table` — see [`from_side_keys_for_join`]) and emitted as ordinary
+    /// `from_table` — see [`from_side_keys`]) and emitted as ordinary
     /// image-less [`StagedChange::Recompute`]s by [`apply_and_mark_drained`],
     /// reusing the same async staging/apply/fence pipeline forward propagation
     /// uses rather than any bespoke persisted reverse index. `hop_gen` is the
@@ -3896,15 +3958,19 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 }
                 let join_keys: Vec<String> = key_hops.keys().cloned().collect();
                 let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
-                let matches = from_side_keys_for_join(
+                let matches = from_side_keys(
                     pool,
                     &rel.def.from_table,
                     &from_pk,
                     &rel.def.from_col,
-                    &join_keys,
+                    &ReverseTrigger::Keys(&join_keys),
                 )
                 .await?;
                 for (from_key, join_text) in matches {
+                    // `Keys` always reports which key matched — see
+                    // `from_side_keys`'s own doc comment.
+                    let join_text = join_text
+                        .expect("ReverseTrigger::Keys always reports the matched join value");
                     let hop = key_hops.get(&join_text).copied().unwrap_or(0) + 1;
                     let src_changed = key_src_changed.get(&join_text).copied().flatten();
                     reverse_recomputes
@@ -4541,10 +4607,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // the reverse-recompute mechanism (issue #30) that the row-driven
         // `by_source` loop above feeds for exactly this situation, staging
         // every from-side row currently pointing at this (now-empty) table
-        // as an image-less recompute — see
-        // `from_side_keys_with_non_null_join`'s doc comment for why "every
-        // non-NULL join column", not a specific value list, is the right
-        // query for a TRUNCATE. Pushed into the same `reverse_recomputes`
+        // as an image-less recompute — see `ReverseTrigger::WholeKeyspace`'s
+        // doc comment for why "every non-NULL join column", not a specific
+        // value list, is the right query for a TRUNCATE. Pushed into the
+        // same `reverse_recomputes`
         // accumulator the row-driven path uses, so it's deduped the same way
         // (issue #79) and drained through the same image-less `Recompute`
         // pipeline below — no separate emission path needed.
@@ -4584,15 +4650,16 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 );
             }
             let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
-            let from_keys = from_side_keys_with_non_null_join(
+            let from_keys = from_side_keys(
                 pool,
                 &rel.def.from_table,
                 &from_pk,
                 &rel.def.from_col,
+                &ReverseTrigger::WholeKeyspace,
             )
             .await?;
             let hop = change.hop_gen + 1;
-            for from_key in from_keys {
+            for (from_key, _) in from_keys {
                 reverse_recomputes
                     .entry((rel.def.from_table.clone(), from_key))
                     .and_modify(|(h, sc)| {
@@ -5493,7 +5560,7 @@ pub async fn apply_and_mark_drained_many(
     // on the widen-only catch-up gap #131 closes) simply bumps nothing — no
     // error, same as any `UPDATE ... WHERE` matching zero rows. Plain
     // `key_col::text = any($1::text[])`, not the native-typed cast
-    // `from_side_keys_for_join`'s own doc comment flags as unindexed
+    // `from_side_keys`'s own doc comment flags as unindexed
     // (P0.1/plan doc §6) — out of scope here, matches this module's other
     // untyped relationship lookups. The touched-key array is sorted before
     // binding (review follow-up to #132) — see the inline comment at that
@@ -5761,12 +5828,14 @@ pub async fn apply_and_mark_drained_many(
                                    old_parent: &Option<Row>,
                                    new_parent: &Option<Row>|
                    -> Result<(), ApplyError> {
-                let from_rows = from_side_rows_for_join_txn(
+                let pass_key = pass_key.to_string();
+                let trigger = ReverseTrigger::Keys(std::slice::from_ref(&pass_key));
+                let from_rows = from_side_rows_for_trigger_txn(
                     txn,
                     &shape.from_table,
                     &shape.from_col,
                     &shape.from_pk,
-                    pass_key,
+                    &trigger,
                 )
                 .await?;
                 for (_, from_row) in from_rows {
