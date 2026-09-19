@@ -30,6 +30,10 @@
 //! - [`watermark`] is issue #132's in-process "staged-through" LSN (guard
 //!   (a), "the watermark barrier") — a small, injectable handle intake
 //!   advances and the reverse-delta apply path (`apply`) reads.
+//! - [`self_check`] is issue #174's production recompute audit
+//!   (ADR-0013): a read-only, keyset-bounded comparison of a persisted 1-1
+//!   target against an independently-rendered Postgres recompute — see
+//!   [`crate::app::Trellis::self_check`] for the public facade.
 //! - [`error`] is this module's error type.
 //!
 //! What this module does *not* do: delta arithmetic for aggregate
@@ -52,6 +56,7 @@ pub mod liveness;
 pub mod quarantine;
 pub mod retire;
 pub mod seal;
+pub mod self_check;
 pub mod session;
 pub mod state;
 pub mod watermark;
@@ -85,6 +90,9 @@ pub use retire::retire_drained_segments;
 pub use seal::{
     SealConfig, SealOutcome, fenced_rows, recover_stuck_seals, seal_if_active_nonempty,
     seal_phase1, seal_phase2,
+};
+pub use self_check::{
+    Divergence, SelfCheckError, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, SelfCheckScope,
 };
 pub use session::{PRODUCER_SINGLETON_LOCK_KEY, ProducerSession};
 pub use state::{SegmentState, segment_state_counts};
