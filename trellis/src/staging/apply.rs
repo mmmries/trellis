@@ -5355,18 +5355,25 @@ pub async fn apply_and_mark_drained_many(
         // before. A `None` decode is skipped: `apply_target` never returns
         // such a key in `written`/`deleted` (see that function's own doc
         // comment), so it would never be looked up anyway.
-        let mut hop_gen_of: HashMap<String, i32> = HashMap::new();
-        let mut src_changed_of: HashMap<String, Option<std::time::SystemTime>> = HashMap::new();
+        // Keyed by `Cow`, not `String`, so the no-op decode path stays
+        // allocation-free the way the pre-#205 `&str` keys were: a not-null
+        // PK column's decode hands back a `Cow::Borrowed` straight out of
+        // `pk_text` (which outlives this loop), and cloning that for the
+        // second map is a pointer copy, not a heap copy. `Cow<'_, str>:
+        // Borrow<str>` and hashes as its `str`, so the `get(key.as_str())`
+        // lookups below need no wrapping and match a `Cow::Owned` key (a
+        // genuinely decoded one) just the same.
+        let mut hop_gen_of: HashMap<Cow<'_, str>, i32> = HashMap::new();
+        let mut src_changed_of: HashMap<Cow<'_, str>, Option<std::time::SystemTime>> =
+            HashMap::new();
         for w in &target_plan.writes {
             if let Some(decoded) = decode_target_pk_text(&target_plan.pk, target, &w.pk_text)? {
-                let decoded = decoded.into_owned();
                 hop_gen_of.insert(decoded.clone(), w.hop_gen);
                 src_changed_of.insert(decoded, w.src_changed);
             }
         }
         for d in &target_plan.deletes {
             if let Some(decoded) = decode_target_pk_text(&target_plan.pk, target, &d.pk_text)? {
-                let decoded = decoded.into_owned();
                 hop_gen_of.insert(decoded.clone(), d.hop_gen);
                 src_changed_of.insert(decoded, d.src_changed);
             }
