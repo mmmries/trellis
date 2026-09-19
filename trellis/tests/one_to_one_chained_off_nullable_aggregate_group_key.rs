@@ -193,7 +193,8 @@ fn sku_totals_columns() -> HashMap<String, ValueType> {
 }
 
 const SKU_TOTALS: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total";
-const SKU_TOTALS_ECHO: &str = "TRANSFORM sku_totals_echo FROM sku_totals SELECT total AS echo_total";
+const SKU_TOTALS_ECHO: &str =
+    "TRANSFORM sku_totals_echo FROM sku_totals SELECT total AS echo_total";
 
 /// `sales` needs `REPLICA IDENTITY FULL` because it's an aggregate source
 /// (`sku_totals`' own delta path needs the old row image to find which group

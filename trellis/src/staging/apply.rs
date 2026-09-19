@@ -5048,8 +5048,7 @@ async fn apply_target(
     // decoded keys (issue #205) — the same values actually bound as this
     // target's real PK, and so the same values `delete_keys` below matches
     // against.
-    let write_keys: std::collections::HashSet<&str> =
-        writable.iter().map(|(_, k)| *k).collect();
+    let write_keys: std::collections::HashSet<&str> = writable.iter().map(|(_, k)| *k).collect();
 
     let mut deleted = Vec::new();
     // A `None`-decoded delete has no matching write (a NULL-keyed group
