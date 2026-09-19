@@ -1522,7 +1522,7 @@ async fn guard_c_in_flight_check_rejects_and_the_pipeline_still_converges() {
     // than falling back to a live from-side enumeration — the retry's own
     // fast-path delta (once row 20's segment has drained and the in-flight
     // condition clears) is what ends up picking up row 20 live, via the
-    // same `from_side_rows_for_join_txn` read the pre-#134 fallback used.
+    // same `from_side_rows_for_trigger_txn` read the pre-#134 fallback used.
     assert_eq!(
         staged_deferred_reverses(&client, relationship.id).await,
         vec![("1".to_string(), 1, 0)],
