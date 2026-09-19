@@ -3440,6 +3440,179 @@ mod tests {
             .map(|row| row.get::<_, String>(0))
             .collect()
     }
+
+    // -----------------------------------------------------------------
+    // Issue #173 phase 3: ReverseTrigger — one test per variant, per
+    // shared enumeration function, pinning that each existing
+    // propagation path's own from-side determination (unchanged by this
+    // refactor — see the full trellis test suite, which exercises the
+    // to-many reverse, TRUNCATE-clear, reverse-delta, and reverse-fallback
+    // paths end to end through these same two functions) is driven by the
+    // exhaustive match this issue introduces, not by ad hoc per-path SQL.
+    // -----------------------------------------------------------------
+
+    /// A small from-side fixture shared by every `ReverseTrigger` test
+    /// below: two rows share `join_key = 'a'`, one carries `'b'`, and one
+    /// is `NULL` — enough to distinguish "matches a specific key,"
+    /// "matches nothing," and "excluded because NULL" in one table.
+    async fn seed_reverse_trigger_fixture(
+        client: &tokio_postgres::Client,
+    ) -> Vec<PrimaryKeyColumn> {
+        client
+            .batch_execute(
+                "create table from_side_fixture (id bigint primary key, join_key text); \
+                 insert into from_side_fixture (id, join_key) values \
+                 (1, 'a'), (2, 'a'), (3, 'b'), (4, null);",
+            )
+            .await
+            .expect("seed the from-side fixture");
+        vec![PrimaryKeyColumn {
+            name: "id".to_string(),
+            data_type: "bigint".to_string(),
+            nullable: false,
+        }]
+    }
+
+    /// [`ReverseTrigger::Keys`] via [`from_side_keys`] — the shape the
+    /// to-many reverse path (`compute`'s by-source loop) and the
+    /// keyed half of every other path construct. Matches exactly the rows
+    /// whose `join_key` is in the requested set, reporting back which key
+    /// each one matched (so a caller can attribute `hop_gen`/`src_changed`
+    /// per key, per this function's own doc comment) — a key present in
+    /// the trigger but matching no row (`"z"`) contributes nothing, and the
+    /// `NULL`-keyed row is never returned for any key.
+    #[tokio::test]
+    async fn reverse_trigger_keys_matches_from_side_keys_and_reports_the_matched_value() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let from_pk = seed_reverse_trigger_fixture(&client).await;
+
+        let pool_config =
+            crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = crate::pool::Pool::new(&pool_config).expect("build a same-crate pool");
+
+        let join_keys = vec!["a".to_string(), "z".to_string()];
+        let mut matches = from_side_keys(
+            &pool,
+            "from_side_fixture",
+            &from_pk,
+            "join_key",
+            &ReverseTrigger::Keys(&join_keys),
+        )
+        .await
+        .expect("from_side_keys(Keys)");
+        matches.sort();
+        assert_eq!(
+            matches,
+            vec![
+                ("1".to_string(), Some("a".to_string())),
+                ("2".to_string(), Some("a".to_string())),
+            ],
+            "only the rows matching a requested key come back, each reporting which \
+             key it matched; a requested key with no match (\"z\") and the NULL-keyed \
+             row must both be absent"
+        );
+    }
+
+    /// [`ReverseTrigger::WholeKeyspace`] via [`from_side_keys`] — the
+    /// TRUNCATE-clear path's shape (issue #98/#165/#168): every currently
+    /// non-`NULL` `join_key` row comes back, regardless of its specific
+    /// value (there is no value list to match against — see the variant's
+    /// own doc comment), and each is reported with `None` rather than a
+    /// specific matched key, since none was matched against.
+    #[tokio::test]
+    async fn reverse_trigger_whole_keyspace_matches_every_non_null_row_via_from_side_keys() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let from_pk = seed_reverse_trigger_fixture(&client).await;
+
+        let pool_config =
+            crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = crate::pool::Pool::new(&pool_config).expect("build a same-crate pool");
+
+        let mut matches = from_side_keys(
+            &pool,
+            "from_side_fixture",
+            &from_pk,
+            "join_key",
+            &ReverseTrigger::WholeKeyspace,
+        )
+        .await
+        .expect("from_side_keys(WholeKeyspace)");
+        matches.sort();
+        assert_eq!(
+            matches,
+            vec![
+                ("1".to_string(), None),
+                ("2".to_string(), None),
+                ("3".to_string(), None),
+            ],
+            "every non-NULL-keyed row must come back regardless of its specific value \
+             (rows 1-3), the NULL-keyed row (4) must not, and none of them report a \
+             specific matched key"
+        );
+    }
+
+    /// [`ReverseTrigger::Keys`] via [`from_side_rows_for_trigger_txn`] — the
+    /// full-row, transactional shape [`stage_reverse_recompute_fallback`]
+    /// and the reverse-delta fast path's `diff_pass` both drive, inside
+    /// Phase 3's already-open transaction. Proves the enum-driven dispatch
+    /// still returns full row images (not just the primary key
+    /// [`from_side_keys`] returns), and still excludes a key with no match
+    /// and the NULL-keyed row.
+    #[tokio::test]
+    async fn reverse_trigger_keys_fetches_full_rows_via_from_side_rows_for_trigger_txn() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let from_pk = seed_reverse_trigger_fixture(&client).await;
+
+        let txn = client.transaction().await.expect("open txn");
+        let join_keys = vec!["a".to_string()];
+        let mut rows = from_side_rows_for_trigger_txn(
+            &txn,
+            "from_side_fixture",
+            "join_key",
+            &from_pk,
+            &ReverseTrigger::Keys(&join_keys),
+        )
+        .await
+        .expect("from_side_rows_for_trigger_txn(Keys)");
+        txn.rollback().await.expect("rollback");
+
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["1", "2"],
+            "both rows matching join_key = 'a' must come back, full row images"
+        );
+        for (_, row) in &rows {
+            assert_eq!(
+                row.get("join_key"),
+                Some(&Some("a".to_string())),
+                "the full row image must carry the matched column's real value, not \
+                 just its primary key"
+            );
+        }
+    }
 }
 
 /// Phase 2's output: an in-memory plan Phase 3 applies inside one
