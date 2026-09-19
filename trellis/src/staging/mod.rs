@@ -30,6 +30,9 @@
 //! - [`watermark`] is issue #132's in-process "staged-through" LSN (guard
 //!   (a), "the watermark barrier") — a small, injectable handle intake
 //!   advances and the reverse-delta apply path (`apply`) reads.
+//! - [`worker_registry`] is issue #144's worker-level liveness registry:
+//!   one row per live drain worker, independent of whether it currently
+//!   holds a claim — the read behind `Trellis::has_live_drain_workers`.
 //! - [`error`] is this module's error type.
 //!
 //! What this module does *not* do: delta arithmetic for aggregate
@@ -55,6 +58,7 @@ pub mod seal;
 pub mod session;
 pub mod state;
 pub mod watermark;
+pub mod worker_registry;
 
 pub use append::{
     CdcOp, RING_SIZE, StagedChange, TRUNCATE_SENTINEL_KEY, append, ring_slot_is_free,
@@ -73,9 +77,10 @@ pub use converge::{
 pub use error::StagingError;
 pub use fold::{BucketFilter, FoldedChange, fold, merge_folded_changes};
 pub use liveness::{
-    FENCE_MISS_INITIAL_DELAY, FENCE_MISS_MAX_DELAY, FenceMissBackoff, HeartbeatDaemon,
-    HeartbeatDaemonConfig, acquire_pause_lease, claim_unless_paused, claiming_is_paused,
-    heartbeat_inline, heartbeat_pause_lease, reclaim_stale, release, release_pause_lease,
+    DEFAULT_RECLAIM_TTL, FENCE_MISS_INITIAL_DELAY, FENCE_MISS_MAX_DELAY, FenceMissBackoff,
+    HeartbeatDaemon, HeartbeatDaemonConfig, acquire_pause_lease, claim_unless_paused,
+    claiming_is_paused, heartbeat_inline, heartbeat_pause_lease, reclaim_stale, release,
+    release_pause_lease,
 };
 pub use quarantine::{
     DEFAULT_DEATH_THRESHOLD, FailureClass, HaltingStopStats, classify, halting_stop_stats,
@@ -89,3 +94,6 @@ pub use seal::{
 pub use session::{PRODUCER_SINGLETON_LOCK_KEY, ProducerSession};
 pub use state::{SegmentState, segment_state_counts};
 pub use watermark::StagedWatermark;
+pub use worker_registry::{
+    deregister_worker, has_live_workers, reclaim_stale_workers, register_worker,
+};

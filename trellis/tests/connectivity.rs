@@ -30,7 +30,7 @@ async fn migrate_up_is_idempotent() {
         first_run,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            26, 27, 28, 29, 30
+            26, 27, 28, 29, 30, 31
         ],
         // Issue #73 added V22 (drops `column_status`'s now-unenforceable
         // `target_table` foreign key). Its reviewer follow-up added V23
@@ -57,8 +57,10 @@ async fn migrate_up_is_idempotent() {
         // (`transform_fuse_gate`, the per-source-table row lock that
         // serializes concurrent evictions' whole-transform fuse checks so a
         // threshold crossing reached by two workers at once cannot be
-        // undercounted by both of them).
-        "expected exactly V1 through V24 and V26 through V30 to be applied"
+        // undercounted by both of them). Issue #144 added V31
+        // (`worker_registry`, one row per live drain worker — the read
+        // behind `Trellis::has_live_drain_workers`).
+        "expected exactly V1 through V24 and V26 through V31 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.

@@ -96,7 +96,7 @@ use crate::error_code::{self, ErrorCode};
 use crate::pool::Pool;
 use crate::staging::apply::ApplyError;
 use crate::staging::quarantine;
-use crate::staging::{StagingError, converge};
+use crate::staging::{DEFAULT_RECLAIM_TTL, StagingError, converge, worker_registry};
 
 /// Options a client sets when it [`connect`](Trellis::connect)s.
 ///
@@ -715,6 +715,43 @@ impl Trellis {
             client.shutdown().await.map_err(TrellisError::Client)?;
         }
         Ok(())
+    }
+
+    /// Whether at least one live drain worker (a connection running with
+    /// `drain_threads > 0`) is registered anywhere in this fleet right now
+    /// (issue #144; `docs/decisions/0010-embeddable-clients.md`, decision 3
+    /// — the epic #140 hazard this closes). A single, cheap `exists(...)`
+    /// query with no joins — meant to sit behind an application health check
+    /// that runs on a timer, not just be called once at boot.
+    ///
+    /// **What this detects.** The recommended embedded-deployment shape runs
+    /// web/migration processes at `drain_threads: 0` and a dedicated worker
+    /// process doing drain work. Forget to deploy that process, or scale it
+    /// to zero, and every transform this fleet defines sits in
+    /// [`TransformStatus::WaitingToBackfill`] forever — nothing errors,
+    /// nothing looks broken, the pipeline just never starts. `false` here is
+    /// that misconfiguration, directly observable rather than inferred from
+    /// a transform that never seems to finish backfilling. See
+    /// `docs/embedding.md`'s health-check section for a worked Phoenix/Rails
+    /// example.
+    ///
+    /// **"Live" reuses the reclaim TTL's own notion of liveness** rather
+    /// than inventing a second one, per the issue's explicit instruction:
+    /// this compares each worker's last heartbeat against
+    /// [`DEFAULT_RECLAIM_TTL`] — the exact threshold
+    /// [`crate::staging::liveness::reclaim_stale`] already uses to decide a
+    /// *claim* is dead, and the same value [`ClientOptions::default`]'s own
+    /// `reclaim_ttl` carries (this facade never exposes a way to override
+    /// it — every [`Trellis::connect`] call already gets this one value
+    /// today, background `Client` or not). See
+    /// [`crate::staging::worker_registry`]'s doc comment for why this is a
+    /// read-time comparison rather than something that needs a reclaim pass
+    /// to have already run — a design that did would be wrong precisely in
+    /// the all-`drain_threads: 0` fleet this method exists to catch, since
+    /// nothing in such a fleet would ever run one.
+    pub async fn has_live_drain_workers(&self) -> Result<bool, TrellisError> {
+        let client = self.pool.get().await?;
+        Ok(worker_registry::has_live_workers(&**client, DEFAULT_RECLAIM_TTL).await?)
     }
 
     /// A read-your-writes watermark (issue #192): `pg_current_wal_lsn()`,

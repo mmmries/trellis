@@ -71,6 +71,7 @@ enum Job {
         oneshot::Sender<Result<Vec<(String, String)>, TrellisError>>,
     ),
     ResumeTransform(String, oneshot::Sender<Result<(), TrellisError>>),
+    HasLiveDrainWorkers(oneshot::Sender<Result<bool, TrellisError>>),
     WatermarkToken(oneshot::Sender<Result<PgLsn, TrellisError>>),
     AwaitConverged(PgLsn, Duration, oneshot::Sender<Result<(), TrellisError>>),
     Shutdown(oneshot::Sender<Result<(), TrellisError>>),
@@ -249,6 +250,14 @@ impl BlockingTrellis {
         self.submit(|reply| Job::ResumeTransform(target, reply))
     }
 
+    /// Whether at least one live drain worker is registered anywhere in
+    /// this fleet right now — the health-check-shaped read a Phoenix/Rails
+    /// host is meant to poll on a timer. See
+    /// [`Trellis::has_live_drain_workers`].
+    pub fn has_live_drain_workers(&self) -> Result<bool, TrellisError> {
+        self.submit(Job::HasLiveDrainWorkers)
+    }
+
     /// A read-your-writes watermark token. See [`Trellis::watermark_token`].
     pub fn watermark_token(&self) -> Result<PgLsn, TrellisError> {
         self.submit(Job::WatermarkToken)
@@ -406,6 +415,9 @@ async fn run(
             }
             Job::ResumeTransform(target, reply) => {
                 let _ = reply.send(trellis.resume_transform(&target).await);
+            }
+            Job::HasLiveDrainWorkers(reply) => {
+                let _ = reply.send(trellis.has_live_drain_workers().await);
             }
             Job::WatermarkToken(reply) => {
                 let _ = reply.send(trellis.watermark_token().await);

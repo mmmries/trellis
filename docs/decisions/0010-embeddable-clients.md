@@ -167,4 +167,6 @@ where there is one implementation to get right — decision 2 applied to types.
 #82 / [ADR-0008](0008-public-api-design.md) (the public API these bindings
 wrap), #55 (the status lifecycle behind the poll-to-`live` contract), #49 /
 [ADR-0009](0009-observability-decisions.md) (the metrics and logs an embedder
-surfaces).
+surfaces), #144 (the worker-registry heartbeat and `Trellis::has_live_drain_workers`
+health check this decision's third point implies a fleet needs — see
+[docs/embedding.md](../embedding.md)).
