@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use trellis::app::qualified_source_tables;
 use trellis::defs::{create_definition, create_relationship};
+use trellis::{Config, Trellis, TrellisOptions};
 
 /// A bare table with an integer primary key named `id`.
 async fn create_table_with_pk(pool: &trellis::pool::Pool, name: &str) {
@@ -77,4 +78,211 @@ async fn includes_relationship_to_tables_not_just_direct_anchors() {
         tables,
         vec!["trellis.authors".to_string(), "trellis.posts".to_string()]
     );
+}
+
+/// Issue #108 regression: [`Trellis::define`]'s own source-column
+/// introspection (`Trellis::source_columns`, private) used to classify a
+/// column's type by matching `information_schema.columns.data_type` text
+/// against a small hardcoded list that didn't even include `"uuid"` — so a
+/// `uuid` source column was silently *dropped* from the type map the
+/// validator sees, and referencing it in a definition failed with an
+/// unresolved-column error before type-checking ever ran. A `jsonb` column
+/// fared no better: also absent from that list, also dropped.
+///
+/// Now that introspection classifies every column via the PG-OID registry
+/// (`pg_type::value_type_for_oid`), both a bare `uuid` passthrough and a
+/// bare `jsonb` passthrough must `define()` successfully through the real
+/// public facade — and the `jsonb` column's target must land as genuine
+/// `jsonb`, not `text`.
+#[tokio::test]
+async fn define_accepts_a_uuid_and_a_jsonb_passthrough_column() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    db.pool
+        .get()
+        .await
+        .expect("get connection")
+        .batch_execute(
+            "create table events (
+                 id integer primary key,
+                 tag uuid not null,
+                 payload jsonb not null
+             )",
+        )
+        .await
+        .expect("seed source table");
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+
+    trellis
+        .define("TRANSFORM events_calc FROM events SELECT tag AS tag, payload AS payload")
+        .await
+        .expect(
+            "a uuid/jsonb passthrough must define successfully — pre-#108 the uuid column \
+             would have been silently dropped from source_columns and failed as an \
+             unresolved column reference",
+        );
+
+    let client = db.pool.get().await.expect("connection");
+    let columns: Vec<(String, String)> = client
+        .query(
+            "select column_name, data_type from information_schema.columns \
+             where table_name = 'events_calc' order by ordinal_position",
+            &[],
+        )
+        .await
+        .expect("introspect target columns")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        columns,
+        vec![
+            ("id".to_string(), "integer".to_string()),
+            ("tag".to_string(), "uuid".to_string()),
+            ("payload".to_string(), "jsonb".to_string()),
+        ],
+        "the jsonb column must keep its native type, not collapse to text"
+    );
+}
+
+/// Issue #108 review regression: a source column whose Postgres type the OID
+/// registry can't place at all — an enum, whose OID is assigned per
+/// `CREATE TYPE` rather than being a fixed builtin constant, like arrays,
+/// ranges, composites, domains and `citext` — must stay out of the
+/// validator's type map, exactly as the pre-#108 `pg_value_type` dropped it.
+///
+/// Classifying it as `ValueType::Other(PgType::Unrecognized)` and admitting
+/// it was strictly worse than dropping it: `PgType::name`'s `"unrecognized"`
+/// token is not a Postgres type, so it leaked into generated DDL and casts.
+/// `GROUP BY <enum column>` failed at `create table` with a raw
+/// `type "unrecognized" does not exist` (SQLSTATE 42704) instead of a named
+/// validation error, and a bare enum passthrough `define()`d *successfully*
+/// only to fail later in `apply_target`'s `$n::text::<type>` cast — a
+/// runtime pipeline failure in place of a define-time rejection. Both must
+/// be the clean [`ValidationError::UnresolvedColumn`] instead.
+#[tokio::test]
+async fn a_column_of_an_unrecognized_type_is_not_admitted_to_the_validators_view() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    db.pool
+        .get()
+        .await
+        .expect("get connection")
+        .batch_execute(
+            "create type mood as enum ('sad', 'ok', 'happy');
+             create table people (id integer primary key, m mood not null, n numeric)",
+        )
+        .await
+        .expect("seed source table");
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+
+    let passthrough = trellis
+        .define("TRANSFORM people_calc FROM people SELECT m AS m")
+        .await
+        .expect_err("an enum passthrough must be rejected at define time, not at apply time");
+    let rendered = passthrough.to_string();
+    assert!(
+        rendered.contains("m") && !rendered.contains("unrecognized"),
+        "expected a named unresolved-column error, got: {rendered}"
+    );
+
+    let grouped = trellis
+        .define("TRANSFORM mood_totals FROM people GROUP BY m SELECT SUM(n) AS total")
+        .await
+        .expect_err("an enum GROUP BY key must be rejected at define time");
+    let rendered = grouped.to_string();
+    assert!(
+        !rendered.contains("unrecognized"),
+        "a fake `unrecognized` pg type must never reach generated SQL, got: {rendered}"
+    );
+
+    // Neither rejected definition may have left a half-built target table
+    // behind.
+    let leftovers: i64 = db
+        .pool
+        .get()
+        .await
+        .expect("connection")
+        .query_one(
+            "select count(*) from information_schema.tables \
+             where table_name in ('people_calc', 'mood_totals')",
+            &[],
+        )
+        .await
+        .expect("count target tables")
+        .get(0);
+    assert_eq!(leftovers, 0);
+}
+
+/// Issue #108 review regression, the *to-side* half of the one above: an
+/// unrecognized-typed column on a relationship's to-table is reached by a
+/// different producer — `catalog::resolve_relationships`, which types every
+/// to-side column through the same OID registry but (unlike
+/// `Trellis::source_columns`) legitimately keeps them, since a
+/// `<rel>.<column>` enrichment field is a pure text projection
+/// (`jsonb_each_text(to_jsonb(p.*))`), never a typed read.
+///
+/// Pre-#108 those columns typed as `ValueType::Text` via the `_ => Text`
+/// fallthrough, so the target column was created as `text` and the
+/// enrichment worked. Tagging them `Other(Unrecognized)` and rendering
+/// `PgType::name` into DDL broke that outright — `create table ... (mood
+/// unrecognized)`. `PgType::sql_type_name` restores the `text` rendering for
+/// exactly this case.
+#[tokio::test]
+async fn an_unrecognized_to_side_enrichment_column_still_lands_as_text() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    db.pool
+        .get()
+        .await
+        .expect("get connection")
+        .batch_execute(
+            "create type mood as enum ('sad', 'ok', 'happy');
+             create table authors (id integer primary key, m mood not null);
+             create table posts (id integer primary key, author_id integer);
+             alter table authors replica identity full;
+             alter table posts replica identity full;",
+        )
+        .await
+        .expect("seed tables");
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP author FROM posts.author_id TO authors.id",
+    )
+    .await
+    .expect("to-one relationship should be stored");
+
+    trellis
+        .define("TRANSFORM posts_calc FROM posts SELECT author.m AS mood")
+        .await
+        .expect("an enum to-side enrichment column must keep working as a text projection");
+
+    let data_type: String = db
+        .pool
+        .get()
+        .await
+        .expect("connection")
+        .query_one(
+            "select data_type from information_schema.columns \
+             where table_name = 'posts_calc' and column_name = 'mood'",
+            &[],
+        )
+        .await
+        .expect("introspect target column")
+        .get(0);
+    assert_eq!(data_type, "text");
 }

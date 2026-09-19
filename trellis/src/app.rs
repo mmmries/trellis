@@ -755,16 +755,31 @@ impl Trellis {
                 .map_err(CatalogError::from)?,
             None => defs::catalog::resolve_graph_identity(&self.pool, source_table).await?,
         };
-        let (schema, table) = qualified
-            .split_once('.')
-            .expect("resolve_graph_identity/qualify always return a schema.table-shaped string");
+        debug_assert!(
+            qualified.contains('.'),
+            "resolve_graph_identity/qualify always return a schema.table-shaped string"
+        );
 
+        // Issue #108: queries `pg_attribute` directly for each column's raw
+        // `atttypid` OID, classified via `defs::pg_type::value_type_for_oid`
+        // — the same `to_regclass`-bound introspection `defs::catalog` uses
+        // — rather than `information_schema.columns.data_type` text matched
+        // against a small hardcoded list (`pg_value_type`, since removed).
+        // That old mapping silently *dropped* every column whose type it
+        // didn't recognize, `uuid` included, so referencing a `uuid` source
+        // column in a definition failed before validation ever saw it, and
+        // any other Postgres type (`bytea`, `jsonb`, `timestamptz`, ...) was
+        // invisible to the validator entirely rather than being an honestly
+        // typed passthrough column.
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "select column_name, data_type from information_schema.columns \
-                 where table_schema = $1 and table_name = $2",
-                &[&schema, &table],
+                "select a.attname::text, a.atttypid \
+                 from pg_attribute a \
+                 where a.attrelid = pg_catalog.to_regclass($1) \
+                   and a.attnum > 0 \
+                   and not a.attisdropped",
+                &[&qualified],
             )
             .await?;
 
@@ -776,8 +791,28 @@ impl Trellis {
             .into_iter()
             .filter_map(|row| {
                 let column_name: String = row.get(0);
-                let data_type: String = row.get(1);
-                pg_value_type(&data_type).map(|value_type| (column_name, value_type))
+                let type_oid: u32 = row.get(1);
+                match defs::pg_type::value_type_for_oid(type_oid) {
+                    // Issue #108 review: a column whose OID the registry
+                    // can't place at all (an enum — enum OIDs are assigned
+                    // per `CREATE TYPE`, not fixed builtins — an array, a
+                    // range, a composite, a domain, `citext`, ...) stays
+                    // *out* of the validator's view, exactly as the old
+                    // `pg_value_type` dropped it. `Other(Unrecognized)` is an
+                    // honest label but not an actionable one: everything
+                    // downstream is keyed on knowing the column's real
+                    // Postgres type, and this doesn't. Admitting it made
+                    // `GROUP BY <enum col>` fail at `create table` with a raw
+                    // `type "unrecognized" does not exist`, and let a bare
+                    // enum passthrough `define()` succeed only to fail later
+                    // in `apply_target`'s `$n::text::<type>` cast — both
+                    // strictly worse than the clean
+                    // `ValidationError::UnknownColumn` this drop preserves.
+                    // Promoting these families is `docs/type-support.md`'s
+                    // deferred work (#117 for enums, #122 for the rest).
+                    ValueType::Other(defs::PgType::Unrecognized) => None,
+                    value_type => Some((column_name, value_type)),
+                }
             })
             .collect())
     }
@@ -801,21 +836,6 @@ impl Trellis {
 /// from the crate root, so it isn't part of [`Trellis`]'s public surface.
 pub async fn qualified_source_tables(pool: &Pool) -> Result<Vec<String>, TrellisError> {
     Ok(defs::all_source_tables(pool).await?)
-}
-
-/// Maps a Postgres `information_schema.columns.data_type` string to the
-/// [`ValueType`] the definition validator understands. A column of a type not
-/// mapped here is simply omitted from the validator's view (the same behavior
-/// the POC's own introspection had).
-fn pg_value_type(data_type: &str) -> Option<ValueType> {
-    match data_type {
-        "smallint" | "integer" | "bigint" | "numeric" | "real" | "double precision" => {
-            Some(ValueType::Numeric)
-        }
-        "text" | "character varying" | "character" | "citext" => Some(ValueType::Text),
-        "boolean" => Some(ValueType::Boolean),
-        _ => None,
-    }
 }
 
 /// One registered transform definition, as [`Trellis::definitions`] reports

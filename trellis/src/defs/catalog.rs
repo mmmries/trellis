@@ -104,6 +104,7 @@ use super::model::{
     SchemaNode, TransformStatus,
 };
 use super::parser::{parse, parse_relationship};
+use super::pg_type::PgType;
 use super::validate::{
     RelationshipTypeMismatch, RelationshipWarning, ResolvedRelationship, ValidationError, validate,
 };
@@ -1882,7 +1883,7 @@ pub(crate) async fn resolve_relationships(
         };
         let to_table = reldef.def.to_table.clone();
         // Reviewer follow-up to issue #74 (epic #78's own whole-branch
-        // review, 4th gap): `column_type` below queries `pg_attribute`
+        // review, 4th gap): `column_type_oid` below queries `pg_attribute`
         // straight off this bare `to_table` — a `to_regclass` `search_path`
         // walk with no fallback, same as `create_relationship`'s own
         // pg_catalog checks had before [`resolve_relationship_endpoint_in_txn`]
@@ -1896,12 +1897,12 @@ pub(crate) async fn resolve_relationships(
         // [`resolve_relationship_endpoint_in_txn`], same best-effort
         // fallback-to-bare-on-total-miss behavior — so a genuinely
         // nonexistent to-table still reports its own precise error out of
-        // `column_type` below, not this resolution's.
+        // `column_type_oid` below, not this resolution's.
         let query_to_table = resolve_relationship_endpoint(pool, &to_table).await?;
         let mut column_types = HashMap::with_capacity(columns.len());
         for column in columns {
-            let pg_type = column_type(pool, &query_to_table, &to_table, &column).await?;
-            column_types.insert(column, value_type_from_pg(&pg_type));
+            let type_oid = column_type_oid(pool, &query_to_table, &to_table, &column).await?;
+            column_types.insert(column, super::pg_type::value_type_for_oid(type_oid));
         }
         resolved.insert(
             rel,
@@ -2312,16 +2313,26 @@ async fn defer_if_fence_unsettled(
 /// `reldef.def.to_table` as `display_table`, so a reported
 /// [`ValidationError::UnknownRelationshipColumn`] still names the table
 /// exactly as the relationship's own source text did.
-async fn column_type(
+///
+/// Renamed from `column_type` (issue #108): its one caller
+/// ([`resolve_relationships`]) only ever fed the result straight into
+/// `value_type_from_pg`'s `format_type`-text matching, which is exactly the
+/// `_ => Text` fallthrough this issue replaces. Selecting the raw
+/// `atttypid` OID instead — and classifying it via
+/// [`super::pg_type::value_type_for_oid`] — sidesteps that matching (and its
+/// `(...)` modifier-stripping) entirely, since a type's OID doesn't vary
+/// with `numeric(10,2)` vs. `numeric`'s modifier the way its `format_type`
+/// text does.
+async fn column_type_oid(
     pool: &Pool,
     query_table: &str,
     display_table: &str,
     column: &str,
-) -> Result<String, CatalogError> {
+) -> Result<u32, CatalogError> {
     let client = pool.get().await?;
     let row = client
         .query_opt(
-            "select pg_catalog.format_type(a.atttypid, a.atttypmod)
+            "select a.atttypid
              from pg_attribute a
              where a.attrelid = pg_catalog.to_regclass($1)
                and a.attname = $2
@@ -2337,24 +2348,6 @@ async fn column_type(
             column: column.to_string(),
         }
         .into()),
-    }
-}
-
-/// Maps a Postgres `format_type` rendering to the evaluator's [`ValueType`].
-/// A copy of `staging::apply`'s same-named helper (the `defs` layer is
-/// upstream of `staging`, so it can't reuse it without a backward
-/// dependency); keep the two in sync. Anything not clearly numeric, boolean,
-/// or uuid is treated as text, the safe verbatim-passthrough default for a
-/// to-side enrichment column.
-fn value_type_from_pg(pg_type: &str) -> ValueType {
-    let base = pg_type.split('(').next().unwrap_or(pg_type).trim();
-    match base {
-        "uuid" => ValueType::Uuid,
-        "boolean" => ValueType::Boolean,
-        "smallint" | "integer" | "bigint" | "numeric" | "real" | "double precision" => {
-            ValueType::Numeric
-        }
-        _ => ValueType::Text,
     }
 }
 
@@ -3443,6 +3436,39 @@ pub async fn edges_from(
         .collect())
 }
 
+/// The stable token a [`ValueType`] persists as in
+/// `transform_definitions.source_columns` — the write side of
+/// [`decode_value_type`], which every read site below (`dependents_of`,
+/// `definition_by_id`, `definition_by_target`) shares rather than
+/// re-implementing its own copy of this match, the way three independent
+/// copies used to (issue #108 review).
+fn encode_value_type(value_type: &ValueType) -> &'static str {
+    match value_type {
+        ValueType::Numeric => "numeric",
+        ValueType::Text => "text",
+        ValueType::Boolean => "boolean",
+        ValueType::Uuid => "uuid",
+        // `PgType::name` doubles as this persisted token (issue #108): every
+        // name is already a distinct, stable string disjoint from the four
+        // above (see that method's doc comment).
+        ValueType::Other(pg_type) => pg_type.name(),
+    }
+}
+
+/// The inverse of [`encode_value_type`]. `None` for a token this build
+/// doesn't recognize — every call site turns that into
+/// [`CatalogError::UnknownValueType`], the same forward-compat guard the
+/// three duplicated inline matches enforced before this was pulled out.
+fn decode_value_type(text: &str) -> Option<ValueType> {
+    Some(match text {
+        "numeric" => ValueType::Numeric,
+        "text" => ValueType::Text,
+        "boolean" => ValueType::Boolean,
+        "uuid" => ValueType::Uuid,
+        other => ValueType::Other(PgType::from_name(other)?),
+    })
+}
+
 /// Splits `source_columns` into the parallel key/value text arrays
 /// `jsonb_object`'s two-array form wants (see `create_definition`'s insert
 /// and [`transforms_for_source`]'s matching read side).
@@ -3451,12 +3477,7 @@ fn encode_type_map(source_columns: &HashMap<String, ValueType>) -> (Vec<&str>, V
     let mut vals = Vec::with_capacity(source_columns.len());
     for (name, value_type) in source_columns {
         keys.push(name.as_str());
-        vals.push(match value_type {
-            ValueType::Numeric => "numeric",
-            ValueType::Text => "text",
-            ValueType::Boolean => "boolean",
-            ValueType::Uuid => "uuid",
-        });
+        vals.push(encode_value_type(value_type));
     }
     (keys, vals)
 }
@@ -3565,17 +3586,11 @@ pub async fn dependents_of(
         });
 
         if let (Some(key), Some(value)) = (key, value) {
-            let value_type = match value.as_str() {
-                "numeric" => ValueType::Numeric,
-                "text" => ValueType::Text,
-                "boolean" => ValueType::Boolean,
-                "uuid" => ValueType::Uuid,
-                other => {
-                    return Err(CatalogError::UnknownValueType {
-                        column: key,
-                        text: other.to_string(),
-                    });
-                }
+            let Some(value_type) = decode_value_type(&value) else {
+                return Err(CatalogError::UnknownValueType {
+                    column: key,
+                    text: value,
+                });
             };
             pending.source_columns.insert(key, value_type);
         }
@@ -3778,17 +3793,11 @@ pub(crate) async fn definition_by_id(
         let key: Option<String> = row.get(5);
         let value: Option<String> = row.get(6);
         if let (Some(key), Some(value)) = (key, value) {
-            let value_type = match value.as_str() {
-                "numeric" => ValueType::Numeric,
-                "text" => ValueType::Text,
-                "boolean" => ValueType::Boolean,
-                "uuid" => ValueType::Uuid,
-                other => {
-                    return Err(CatalogError::UnknownValueType {
-                        column: key,
-                        text: other.to_string(),
-                    });
-                }
+            let Some(value_type) = decode_value_type(&value) else {
+                return Err(CatalogError::UnknownValueType {
+                    column: key,
+                    text: value,
+                });
             };
             source_columns.insert(key, value_type);
         }
@@ -3858,17 +3867,11 @@ pub async fn definition_by_target(
         let key: Option<String> = row.get(6);
         let value: Option<String> = row.get(7);
         if let (Some(key), Some(value)) = (key, value) {
-            let value_type = match value.as_str() {
-                "numeric" => ValueType::Numeric,
-                "text" => ValueType::Text,
-                "boolean" => ValueType::Boolean,
-                "uuid" => ValueType::Uuid,
-                other => {
-                    return Err(CatalogError::UnknownValueType {
-                        column: key,
-                        text: other.to_string(),
-                    });
-                }
+            let Some(value_type) = decode_value_type(&value) else {
+                return Err(CatalogError::UnknownValueType {
+                    column: key,
+                    text: value,
+                });
             };
             source_columns.insert(key, value_type);
         }
@@ -4063,7 +4066,11 @@ mod error_code_tests {
         assert_eq!(
             CatalogError::UnknownValueType {
                 column: "price".to_string(),
-                text: "money".to_string(),
+                // Issue #108: `money` used to be this test's example of an
+                // unrecognized persisted token — it isn't anymore (the OID
+                // registry now classifies it as `ValueType::Other(PgType::Money)`),
+                // so a genuinely made-up token stands in instead.
+                text: "frobnicate".to_string(),
             }
             .code(),
             ErrorCode::Internal
@@ -4098,5 +4105,55 @@ mod error_code_tests {
 
         assert_eq!(wrapped.code(), expected);
         assert_eq!(wrapped.code(), ErrorCode::Conflict);
+    }
+}
+
+/// Issue #108: [`encode_value_type`]/[`decode_value_type`] are the
+/// persistence codec for `transform_definitions.source_columns` — every
+/// [`ValueType`] a real column can carry must round-trip through it exactly,
+/// and an unrecognized token must be rejected rather than silently
+/// misparsed, since `dependents_of`/`definition_by_id`/`definition_by_target`
+/// all trust this pair to reconstruct a live [`TransformDef`]'s typing.
+#[cfg(test)]
+mod value_type_codec_tests {
+    use super::*;
+
+    #[test]
+    fn every_value_type_round_trips_through_the_persisted_token() {
+        let all = [
+            ValueType::Numeric,
+            ValueType::Text,
+            ValueType::Boolean,
+            ValueType::Uuid,
+            ValueType::Other(PgType::Bytea),
+            ValueType::Other(PgType::Jsonb),
+            ValueType::Other(PgType::TimestampTz),
+            ValueType::Other(PgType::Unrecognized),
+        ];
+        for value_type in all {
+            let token = encode_value_type(&value_type);
+            assert_eq!(
+                decode_value_type(token),
+                Some(value_type),
+                "token {token:?} did not round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn the_four_original_tokens_are_unchanged() {
+        // Issue #108 review: the pre-existing lattice's persisted spelling
+        // must stay byte-identical — these tokens are already durably stored
+        // in real `transform_definitions` rows, so changing them would break
+        // every definition persisted before this issue.
+        assert_eq!(encode_value_type(&ValueType::Numeric), "numeric");
+        assert_eq!(encode_value_type(&ValueType::Text), "text");
+        assert_eq!(encode_value_type(&ValueType::Boolean), "boolean");
+        assert_eq!(encode_value_type(&ValueType::Uuid), "uuid");
+    }
+
+    #[test]
+    fn an_unrecognized_token_does_not_decode() {
+        assert_eq!(decode_value_type("frobnicate"), None);
     }
 }
