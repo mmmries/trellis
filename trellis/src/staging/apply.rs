@@ -203,6 +203,21 @@ pub enum ApplyError {
     /// no-op, mirroring [`ApplyError::ColumnNotPaused`]'s same discipline
     /// for the column-level tier.
     TransformNotQuarantined { transform: String },
+    /// [`from_side_rows_for_trigger_txn`] was asked to resolve a
+    /// [`ReverseTrigger::WholeKeyspace`] against live, transactional full row
+    /// images. Not reachable today — both of that function's call sites
+    /// construct [`ReverseTrigger::Keys`] inline from a single join key they
+    /// already hold, and no function in this module takes a `ReverseTrigger`
+    /// and forwards one, so no dynamically-chosen variant can ever arrive
+    /// there. Kept as a typed error rather than a panic per this module's own
+    /// convention of not trusting invariants it cannot enforce itself (see
+    /// [`ApplyError::Validate`] and [`ApplyError::Backfill`], which document
+    /// the same reasoning) — and specifically because that function's own doc
+    /// comment already concedes it cannot enforce its preconditions against a
+    /// *new* caller added later. A future path that legitimately needs
+    /// whole-keyspace full row images must implement and test that arm; until
+    /// then this fails one drain visibly instead of aborting the worker.
+    ReverseTriggerNotResolvable { from_table: String },
 }
 
 impl ApplyError {
@@ -227,7 +242,8 @@ impl ApplyError {
             ApplyError::Pool(err) => err.code(),
             ApplyError::ClaimLost
             | ApplyError::VersionFenceMiss { .. }
-            | ApplyError::HopBoundExceeded { .. } => ErrorCode::Internal,
+            | ApplyError::HopBoundExceeded { .. }
+            | ApplyError::ReverseTriggerNotResolvable { .. } => ErrorCode::Internal,
             ApplyError::SourceTableDropped { .. } => ErrorCode::NotFound,
             ApplyError::ColumnNotPaused { .. } => ErrorCode::NotFound,
             // The definition's persisted status conflicts with what
@@ -301,6 +317,14 @@ impl fmt::Display for ApplyError {
                 "'{transform}' is not currently quarantined; resuming it re-runs its full \
                  backfill, which is only valid from `quarantined`"
             ),
+            ApplyError::ReverseTriggerNotResolvable { from_table } => write!(
+                f,
+                "cannot resolve a whole-keyspace reverse trigger against live full row images \
+                 for from-table '{from_table}': a TRUNCATE carries no image, so the reverse \
+                 delta/fallback path has no per-row old/new parent to diff against; this \
+                 combination is unreachable from any current call site and indicates a newly \
+                 added caller that must implement the whole-keyspace arm for real"
+            ),
         }
     }
 }
@@ -324,7 +348,8 @@ impl std::error::Error for ApplyError {
             | ApplyError::ColumnNotPaused { .. }
             | ApplyError::DefinitionNotLive { .. }
             | ApplyError::TransformNotFound { .. }
-            | ApplyError::TransformNotQuarantined { .. } => None,
+            | ApplyError::TransformNotQuarantined { .. }
+            | ApplyError::ReverseTriggerNotResolvable { .. } => None,
         }
     }
 }
@@ -1727,15 +1752,27 @@ async fn capture_reverse_guard_state(
 /// an old and new key that happen to be equal still issues one query per
 /// slice entry, unchanged from before (the caller's own `seen_keys` dedup is
 /// what collapses the resulting duplicate rows, exactly as it always has).
-/// [`ReverseTrigger::WholeKeyspace`] is unreachable here: a `TRUNCATE`'s
-/// key-less sentinel never has an image to build a
-/// [`RelationshipReverseRecord`] from in the first place (see that struct's
-/// own construction site, and `ReverseTrigger`'s doc comment), so neither of
-/// this function's callers — both exclusively fed by
-/// `RelationshipReverseRecord`s — can ever reach this function with that
-/// variant. A future path that legitimately needs to resolve a
-/// `WholeKeyspace` trigger against live, transactional full row images would
-/// need to implement and test that arm for real, not rely on this one.
+/// [`ReverseTrigger::WholeKeyspace`] is unreachable here, for two independent
+/// reasons. Structurally: both call sites construct [`ReverseTrigger::Keys`]
+/// inline from a single join key they already hold, and no function in this
+/// module takes a `ReverseTrigger` and forwards one, so no dynamically-chosen
+/// variant can arrive here at all. Semantically: a `TRUNCATE`'s key-less
+/// sentinel never has an image to build a [`RelationshipReverseRecord`] from
+/// in the first place (see that struct's own construction site, and
+/// `ReverseTrigger`'s doc comment), so neither caller — both exclusively fed
+/// by `RelationshipReverseRecord`s — would have one to pass even if the
+/// plumbing allowed it.
+///
+/// It is nonetheless a typed [`ApplyError::ReverseTriggerNotResolvable`]
+/// rather than a panic, per this module's own convention of not trusting
+/// invariants it cannot enforce itself (the same reasoning
+/// [`ApplyError::Validate`] and [`ApplyError::Backfill`] document) — and
+/// pointedly because the paragraph above already concedes this function does
+/// nothing to enforce its own preconditions against a *new* caller added
+/// later. A future path that legitimately needs to resolve a `WholeKeyspace`
+/// trigger against live, transactional full row images must implement and
+/// test that arm for real; it must not be silently satisfied by a
+/// `Keys`-shaped read, and it must not abort the drain worker either.
 async fn from_side_rows_for_trigger_txn(
     txn: &Transaction<'_>,
     from_table: &str,
@@ -1745,12 +1782,11 @@ async fn from_side_rows_for_trigger_txn(
 ) -> Result<Vec<(String, Row)>, ApplyError> {
     let join_keys: &[String] = match trigger {
         ReverseTrigger::Keys(join_keys) => join_keys,
-        ReverseTrigger::WholeKeyspace => unreachable!(
-            "a TRUNCATE never produces a RelationshipReverseRecord (no image to build one \
-             from — see ReverseTrigger's doc comment and docs/relationship-propagation.md's \
-             TRUNCATE row); the reverse delta/fallback path this function serves can \
-             therefore never be asked to resolve a whole-keyspace trigger"
-        ),
+        ReverseTrigger::WholeKeyspace => {
+            return Err(ApplyError::ReverseTriggerNotResolvable {
+                from_table: from_table.to_string(),
+            });
+        }
     };
     let mut rows: HashMap<String, Row> = HashMap::new();
     for join_key in join_keys {
@@ -3611,6 +3647,56 @@ mod tests {
                 "the full row image must carry the matched column's real value, not \
                  just its primary key"
             );
+        }
+    }
+
+    /// [`ReverseTrigger::WholeKeyspace`] via
+    /// [`from_side_rows_for_trigger_txn`] — no current call site can reach
+    /// this (both construct [`ReverseTrigger::Keys`] inline, and nothing in
+    /// the module forwards a `ReverseTrigger`), but the arm is a typed
+    /// [`ApplyError::ReverseTriggerNotResolvable`] rather than a panic, per
+    /// this module's stated convention for invariants a function cannot
+    /// enforce itself. Pinned so a future caller that wires a whole-keyspace
+    /// trigger into the reverse delta/fallback path gets a visible failed
+    /// drain rather than an aborted worker — and so nobody "fixes" this by
+    /// quietly falling through to a `Keys`-shaped read, which would silently
+    /// enumerate nothing.
+    #[tokio::test]
+    async fn reverse_trigger_whole_keyspace_is_a_typed_error_not_a_panic_in_the_txn_lookup() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let from_pk = seed_reverse_trigger_fixture(&client).await;
+
+        let txn = client.transaction().await.expect("open txn");
+        let err = from_side_rows_for_trigger_txn(
+            &txn,
+            "from_side_fixture",
+            "join_key",
+            &from_pk,
+            &ReverseTrigger::WholeKeyspace,
+        )
+        .await
+        .expect_err("a whole-keyspace trigger must not resolve against full row images");
+        txn.rollback().await.expect("rollback");
+
+        match err {
+            ApplyError::ReverseTriggerNotResolvable { from_table } => {
+                assert_eq!(
+                    from_table, "from_side_fixture",
+                    "the error must name the from-table whose enumeration was asked for, so an \
+                     operator can locate the offending relationship"
+                );
+            }
+            other => panic!(
+                "expected a typed ReverseTriggerNotResolvable, got {other:?} — the whole-keyspace \
+                 arm must stay a typed error, not a panic and not a silent empty result"
+            ),
         }
     }
 }
