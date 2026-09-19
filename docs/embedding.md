@@ -41,7 +41,7 @@ let worker = Trellis::connect(
 This shape has one sharp edge: **if the dedicated worker process is never
 deployed, or gets scaled to zero, nothing errors.** Every `define()` call
 still succeeds, every transform still gets registered — it just sits in
-[`TransformStatus::WaitingToBackfill`] forever, because nothing in the fleet
+`TransformStatus::WaitingToBackfill` forever, because nothing in the fleet
 is running with `drain_threads > 0` to pick the work up. Read paths against
 the target table quietly return nothing (or stale data, for a transform that
 was already live before the worker process disappeared), with no exception,

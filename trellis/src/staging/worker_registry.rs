@@ -98,15 +98,10 @@ pub async fn has_live_workers(
     Ok(live)
 }
 
-/// Sweeps every worker row whose `last_seen` is older than `ttl` — table
-/// hygiene after an unclean shutdown (crash, `kill -9`, a dropped `Client`
-/// that never called `shutdown`), mirroring
-/// [`super::liveness::reclaim_stale`]'s `WITH ... DELETE` shape (including
-/// the `for update skip locked` reasoning: a row a concurrent heartbeat is
-/// mid-upsert on is not a dead worker, and this sweep must never block
-/// behind one) and the same `ttl` value. Returns how many rows it removed.
-/// [`has_live_workers`] never depends on this having run — see the module
-/// doc comment.
+/// The `WITH ... DELETE` sweep behind [`reclaim_stale_workers`], mirroring
+/// `super::liveness`'s own `RECLAIM_STALE_SQL` shape — including the `for
+/// update skip locked`: a row a concurrent heartbeat is mid-upsert on is not
+/// a dead worker, and this sweep must never block behind one.
 const RECLAIM_STALE_WORKERS_SQL: &str = "\
     with dead as ( \
         select worker_id from worker_registry \
@@ -115,6 +110,16 @@ const RECLAIM_STALE_WORKERS_SQL: &str = "\
     ) \
     delete from worker_registry where worker_id in (select worker_id from dead)";
 
+/// Runs `RECLAIM_STALE_WORKERS_SQL`: sweeps every worker row whose
+/// `last_seen` is older than `ttl`, returning how many it removed. Purely
+/// table hygiene after an unclean shutdown elsewhere in the fleet (crash,
+/// `kill -9`, a dropped `Client` that never called `shutdown`) — it bounds
+/// the table's growth and nothing more. Uses the same `ttl` value
+/// [`super::liveness::reclaim_stale`] applies to a claim.
+///
+/// [`has_live_workers`] never depends on this having run — see the module
+/// doc comment for why requiring a reclaim pass before the read would be
+/// wrong in precisely the fleet this feature exists to catch.
 pub async fn reclaim_stale_workers(
     client: &impl GenericClient,
     ttl: Duration,
