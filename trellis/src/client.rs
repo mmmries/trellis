@@ -132,7 +132,7 @@ impl Default for ClientOptions {
             slot: "trellis_slot".to_string(),
             publication: "trellis_pub".to_string(),
             wake_channel: "trellis_wake".to_string(),
-            reclaim_ttl: Duration::from_secs(30),
+            reclaim_ttl: staging::DEFAULT_RECLAIM_TTL,
             maintenance_interval: Duration::from_millis(300),
             reconcile_interval: Duration::from_secs(5),
             drainer_window: staging::DEFAULT_DRAINER_WINDOW,
@@ -484,6 +484,23 @@ async fn run(
     }
 
     let client_id = format!("trellis-client-{}", uniqueish_id());
+
+    // Issue #144, ADR-0010 decision 3: register this process in the
+    // worker registry the moment it starts running drain workers — before
+    // any app-worker task is even spawned, so a health check racing
+    // `Client::start` sees this worker as soon as it's real. Deliberately
+    // one row per `Client` (keyed by `client_id`, not per app-worker task's
+    // own `claimed_by`): the question `Trellis::has_live_drain_workers`
+    // answers is "does a live process exist to drain work," not "how many
+    // worker tasks does it run." Only when `application_threads > 0` — a
+    // staging-only client (CDC intake + ring maintenance, no app workers)
+    // does no draining, so it must not register as though it did.
+    if options.application_threads > 0
+        && let Ok(conn) = pool.get().await
+    {
+        let _ = staging::register_worker(&**conn, &client_id).await;
+    }
+
     let mut app_worker_tasks = Vec::with_capacity(options.application_threads);
     for i in 0..options.application_threads {
         let claimed_by = format!("{client_id}-app-{i}");
@@ -493,6 +510,7 @@ async fn run(
             schema: config.schema().to_string(),
             target_schema: config.target_schema().to_string(),
             claimed_by,
+            worker_id: client_id.clone(),
             wake_channel: options.wake_channel.clone(),
             drainer_window: options.drainer_window,
             heartbeat_config: options.heartbeat.clone(),
@@ -527,6 +545,20 @@ async fn run(
     }
     for task in app_worker_tasks {
         let _ = task.await;
+    }
+
+    // Issue #144: clean-shutdown removal, once every app-worker task this
+    // process registered under `client_id` has actually stopped — the
+    // counterpart to the registration above. An unclean shutdown (a crash,
+    // `kill -9`, or a dropped `Client` that never reaches this point at all)
+    // leaves the row behind; that's expected, not a bug — see
+    // `staging::worker_registry`'s doc comment for how `has_live_workers`
+    // and `reclaim_stale_workers` handle that case via the reused reclaim
+    // TTL rather than requiring this line to have run.
+    if options.application_threads > 0
+        && let Ok(conn) = pool.get().await
+    {
+        let _ = staging::deregister_worker(&**conn, &client_id).await;
     }
 }
 
@@ -748,6 +780,17 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                     .is_err();
             }
             if !failed {
+                // Issue #144: table hygiene for `worker_registry` after an
+                // unclean shutdown elsewhere in the fleet — a crashed
+                // drain-only client's row would otherwise sit forever.
+                // `staging::has_live_workers` never depends on this having
+                // run (see `staging::worker_registry`'s doc comment); this
+                // is purely about bounding the table's size over time.
+                failed = staging::reclaim_stale_workers(c, reclaim_ttl)
+                    .await
+                    .is_err();
+            }
+            if !failed {
                 failed = staging::retire_drained_segments(c).await.is_err();
             }
             if !failed {
@@ -907,6 +950,12 @@ struct AppWorkerConfig {
     /// own `target_schema` field.
     target_schema: String,
     claimed_by: String,
+    /// This `Client`'s own worker-registry key (issue #144) — the same
+    /// `client_id` every app-worker task of this `Client` shares, distinct
+    /// from `claimed_by`'s per-task suffix. One row represents the process,
+    /// not each individual task, so every task of the same `Client` heartbeats
+    /// the same row (a harmless, idempotent upsert either way).
+    worker_id: String,
     wake_channel: String,
     drainer_window: Duration,
     heartbeat_config: HeartbeatDaemonConfig,
@@ -966,6 +1015,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         schema,
         target_schema,
         claimed_by,
+        worker_id,
         wake_channel,
         drainer_window,
         heartbeat_config,
@@ -986,6 +1036,11 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
     // Due immediately on the very first tick, same as `maintenance_loop`'s
     // own `next_reconcile` — see `sweep_stale_chunks_if_due`.
     let mut next_chunk_reclaim = Instant::now();
+    // Issue #144: same "due immediately" reasoning — `Client::run` already
+    // registers `worker_id` once before this loop starts, but that row's
+    // `last_seen` must keep advancing on this same cadence for the whole
+    // life of the worker, not just once at startup.
+    let mut next_worker_heartbeat = Instant::now();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -1006,6 +1061,18 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
             reclaim_ttl,
             chunk_reclaim_interval,
             &mut next_chunk_reclaim,
+        )
+        .await;
+
+        // Issue #144: keeps this process's worker-registry row alive on the
+        // same cadence as the chunk-reclaim sweep above, for the same
+        // "independent of `staging_worker`" reason — a drain-only fleet has
+        // no `maintenance_loop` anywhere to do this instead.
+        heartbeat_worker_if_due(
+            &pool,
+            &worker_id,
+            chunk_reclaim_interval,
+            &mut next_worker_heartbeat,
         )
         .await;
 
@@ -1146,6 +1213,29 @@ async fn sweep_stale_chunks_if_due(
     }
     if let Ok(client) = pool.get().await {
         let _ = chunk_queue::reclaim_stale_chunks(&**client, reclaim_ttl).await;
+    }
+    *next_due = Instant::now() + interval;
+}
+
+/// Refreshes `worker_id`'s [`staging::worker_registry`] row (issue #144) if
+/// `interval` has elapsed since `next_due`, else does nothing — same
+/// due-timer shape as [`sweep_stale_chunks_if_due`], and for the same
+/// underlying reason: `Client::run`'s registration at startup is a single
+/// point-in-time write, but the row's `last_seen` must keep advancing for
+/// [`staging::has_live_workers`] to keep reporting this worker live, on a
+/// cadence that has to work whether or not this `Client` also runs
+/// `maintenance_loop` (i.e. regardless of `staging_worker`).
+async fn heartbeat_worker_if_due(
+    pool: &Pool,
+    worker_id: &str,
+    interval: Duration,
+    next_due: &mut Instant,
+) {
+    if Instant::now() < *next_due {
+        return;
+    }
+    if let Ok(client) = pool.get().await {
+        let _ = staging::register_worker(&**client, worker_id).await;
     }
     *next_due = Instant::now() + interval;
 }

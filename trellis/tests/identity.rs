@@ -270,12 +270,13 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // (`relationship_reverse_deferred`). Issue #160 added V29
     // (`transform_definitions.fuse_rearmed_at`, the whole-transform fuse's
     // re-arm point). Issue #159 added V30 (`transform_fuse_gate`, that same
-    // fuse's per-source-table serialization point).
+    // fuse's per-source-table serialization point). Issue #144 added V31
+    // (`worker_registry`, one row per live drain worker).
     assert_eq!(
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            26, 27, 28, 29, 30
+            26, 27, 28, 29, 30, 31
         ]
     );
 }

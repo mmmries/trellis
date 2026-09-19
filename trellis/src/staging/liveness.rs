@@ -111,6 +111,18 @@ const RECLAIM_STALE_SQL: &str = "\
     ) \
     delete from seg_claims where ctid in (select ctid from dead)";
 
+/// The fleet's default reclaim TTL: how long a claim (or, since issue #144,
+/// a [`super::worker_registry`] row) may go unrefreshed before it's treated
+/// as dead. [`crate::client::ClientOptions::default`] uses this for its own
+/// `reclaim_ttl` field; [`crate::app::Trellis::has_live_drain_workers`] uses
+/// it directly, since [`crate::app::TrellisOptions`] has no knob of its own
+/// to override it with — every `Trellis::connect` call already gets this
+/// same value today, whether or not that particular connection starts a
+/// background `Client`. Kept here, one constant, rather than the literal
+/// `30` duplicated at each call site — issue #144's explicit instruction to
+/// reuse this notion of liveness rather than invent a second one.
+pub const DEFAULT_RECLAIM_TTL: Duration = Duration::from_secs(30);
+
 /// Runs [`RECLAIM_STALE_SQL`] and returns how many claims it reclaimed.
 pub async fn reclaim_stale(
     client: &impl GenericClient,
