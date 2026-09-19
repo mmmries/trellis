@@ -56,36 +56,60 @@ pub mod session;
 pub mod state;
 pub mod watermark;
 
-pub use append::{
-    CdcOp, RING_SIZE, StagedChange, TRUNCATE_SENTINEL_KEY, append, ring_slot_is_free,
-};
-pub use apply::{
-    ApplyError, ApplyOutcome, ApplyPlan, MAX_COALESCE_SEGMENTS, MAX_HOP_GEN, ManyApplyOutcome,
-    drain_many, drain_once, next_claimable_segment, next_claimable_segments,
-};
-pub use claim::{
-    DEFAULT_DRAINER_WINDOW, MIN_ROWS_TO_SPLIT, SEG_BUCKETS, claim, count_live_drainers,
-    owned_bucket_filter, register_drainer,
-};
-pub use converge::{
-    await_converged, converged_through, has_pending, pending_count, watermark_token,
-};
+// This module is tier 3 (`pub(crate)`, ADR-0012), so these flattened
+// re-exports are a convenience for the engine itself and for the two gated
+// doors onto it — see `crate::dev` and `Cargo.toml`'s `internals` feature.
+// Names the engine does not use are split out below and compiled only behind
+// those gates, which is what keeps a plain `cargo build` free of
+// `unused_imports` rather than an `allow`.
+#[cfg(any(test, feature = "internals"))]
+pub use append::append;
+pub use append::{CdcOp, StagedChange};
+pub use apply::{ApplyError, MAX_COALESCE_SEGMENTS, drain_many, next_claimable_segments};
+pub use claim::{DEFAULT_DRAINER_WINDOW, claim, count_live_drainers, register_drainer};
 pub use error::StagingError;
+pub use liveness::{HeartbeatDaemon, HeartbeatDaemonConfig, reclaim_stale, release};
+pub use retire::retire_drained_segments;
+pub use seal::{SealConfig, recover_stuck_seals, seal_if_active_nonempty};
+pub use session::ProducerSession;
+pub use state::segment_state_counts;
+pub use watermark::StagedWatermark;
+
+// Reached from `crate::dev` (ADR-0012's sanctioned exception) by
+// `generative`'s backend drivers.
+#[cfg(any(test, feature = "test-util"))]
+pub use converge::{await_converged, has_pending, watermark_token};
+#[cfg(any(test, feature = "test-util"))]
+pub use seal::{seal_phase1, seal_phase2};
+
+// Reached only by this crate's own `tests/*.rs`, through the `internals`
+// feature (ADR-0012; see `Cargo.toml`). Not part of `dev`.
+#[cfg(any(test, feature = "internals"))]
+pub use append::{RING_SIZE, TRUNCATE_SENTINEL_KEY, ring_slot_is_free};
+#[cfg(any(test, feature = "internals"))]
+pub use apply::next_claimable_segment;
+#[cfg(any(test, feature = "internals"))]
+pub use apply::{ApplyOutcome, ApplyPlan, MAX_HOP_GEN, ManyApplyOutcome, drain_once};
+#[cfg(any(test, feature = "internals"))]
+pub use claim::{MIN_ROWS_TO_SPLIT, SEG_BUCKETS, owned_bucket_filter};
+#[cfg(any(test, feature = "internals"))]
+pub use converge::{converged_through, pending_count};
+#[cfg(any(test, feature = "internals"))]
 pub use fold::{BucketFilter, FoldedChange, fold, merge_folded_changes};
+#[cfg(any(test, feature = "internals"))]
 pub use liveness::{
-    FENCE_MISS_INITIAL_DELAY, FENCE_MISS_MAX_DELAY, FenceMissBackoff, HeartbeatDaemon,
-    HeartbeatDaemonConfig, acquire_pause_lease, claim_unless_paused, claiming_is_paused,
-    heartbeat_inline, heartbeat_pause_lease, reclaim_stale, release, release_pause_lease,
+    FENCE_MISS_INITIAL_DELAY, FENCE_MISS_MAX_DELAY, FenceMissBackoff, acquire_pause_lease,
+    claim_unless_paused, claiming_is_paused, heartbeat_inline, heartbeat_pause_lease,
+    release_pause_lease,
 };
+#[cfg(any(test, feature = "internals"))]
 pub use quarantine::{
     DEFAULT_DEATH_THRESHOLD, FailureClass, HaltingStopStats, classify, halting_stop_stats,
     isolate_and_evict, purge_dropped_table, record_halting_stop, release_key,
 };
-pub use retire::retire_drained_segments;
-pub use seal::{
-    SealConfig, SealOutcome, fenced_rows, recover_stuck_seals, seal_if_active_nonempty,
-    seal_phase1, seal_phase2,
-};
-pub use session::{PRODUCER_SINGLETON_LOCK_KEY, ProducerSession};
-pub use state::{SegmentState, segment_state_counts};
-pub use watermark::StagedWatermark;
+#[cfg(any(test, feature = "internals"))]
+pub use seal::{SealOutcome, fenced_rows};
+#[cfg(any(test, feature = "internals"))]
+pub use session::PRODUCER_SINGLETON_LOCK_KEY;
+#[cfg(any(test, feature = "internals"))]
+pub use state::SegmentState;

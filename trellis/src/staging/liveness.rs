@@ -21,6 +21,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::MissedTickBehavior;
 use tokio_postgres::{Client, GenericClient, NoTls};
 
+#[cfg(any(test, feature = "internals"))]
 use super::claim::claim;
 use super::error::StagingError;
 
@@ -35,6 +36,7 @@ use super::error::StagingError;
 /// outlive the reclaim window on this alone — needs [`HeartbeatDaemon`]
 /// too, because the cadence must be a function of wall time, not of how
 /// many source tables the batch touches.
+#[cfg(any(test, feature = "internals"))]
 pub async fn heartbeat_inline(
     client: &impl GenericClient,
     seg_seq: i64,
@@ -293,7 +295,13 @@ type Registry = Arc<AsyncMutex<HashSet<(i64, String)>>>;
 /// claim registered much later still gets picked up and reopens one.
 pub struct HeartbeatDaemon {
     registry: Registry,
+    // Read only by `connections_opened`/`is_connected`, which exist for
+    // `tests/liveness.rs`'s lazy-connect and idle-exit assertions. The
+    // spawned task keeps its own `Arc` clones, so a build without the
+    // `internals` feature simply doesn't carry these handles.
+    #[cfg(any(test, feature = "internals"))]
     connections_opened: Arc<AtomicU64>,
+    #[cfg(any(test, feature = "internals"))]
     connected: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -324,7 +332,9 @@ impl HeartbeatDaemon {
 
         Self {
             registry,
+            #[cfg(any(test, feature = "internals"))]
             connections_opened,
+            #[cfg(any(test, feature = "internals"))]
             connected,
             task,
         }
@@ -351,12 +361,14 @@ impl HeartbeatDaemon {
     /// How many times the daemon has opened a connection over its whole
     /// lifetime. Test observability for the lazy-connect claim: it should
     /// stay `0` for a claim that never outlived one full interval.
+    #[cfg(any(test, feature = "internals"))]
     pub fn connections_opened(&self) -> u64 {
         self.connections_opened.load(Ordering::Relaxed)
     }
 
     /// Whether the daemon currently holds an open connection. Test
     /// observability for the idle-exit claim.
+    #[cfg(any(test, feature = "internals"))]
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
@@ -464,6 +476,7 @@ async fn run_daemon(
 /// row is only overwritten if it has already lapsed, so a live holder's
 /// lease can't be taken out from under it. Returns whether this call now
 /// holds the lease.
+#[cfg(any(test, feature = "internals"))]
 const ACQUIRE_PAUSE_LEASE_SQL: &str = "\
     insert into pause_leases (lease_id, holder, acquired_at, expires_at) \
     values ($1, $2, now(), now() + (interval '1 second' * $3)) \
@@ -472,6 +485,7 @@ const ACQUIRE_PAUSE_LEASE_SQL: &str = "\
             expires_at = excluded.expires_at \
         where pause_leases.expires_at <= now()";
 
+#[cfg(any(test, feature = "internals"))]
 pub async fn acquire_pause_lease(
     client: &impl GenericClient,
     lease_id: &str,
@@ -496,6 +510,7 @@ pub async fn acquire_pause_lease(
 /// lease had already lapsed, never existed, or is now held by someone else,
 /// and the caller must re-[`acquire_pause_lease`] rather than assume it still
 /// holds it.
+#[cfg(any(test, feature = "internals"))]
 pub async fn heartbeat_pause_lease(
     client: &impl GenericClient,
     lease_id: &str,
@@ -519,6 +534,7 @@ pub async fn heartbeat_pause_lease(
 /// and a *different* holder re-acquired the same `lease_id`, this holder's
 /// late clean-shutdown release must not delete the successor's live lease
 /// and silently un-pause the fleet under an auditor still relying on it.
+#[cfg(any(test, feature = "internals"))]
 pub async fn release_pause_lease(
     client: &impl GenericClient,
     lease_id: &str,
@@ -535,6 +551,7 @@ pub async fn release_pause_lease(
 
 /// Whether claiming is currently paused fleet-wide: any lease row with
 /// `expires_at` still in the future.
+#[cfg(any(test, feature = "internals"))]
 pub async fn claiming_is_paused(client: &impl GenericClient) -> Result<bool, StagingError> {
     let paused: bool = client
         .query_one(
@@ -563,6 +580,7 @@ pub async fn claiming_is_paused(client: &impl GenericClient) -> Result<bool, Sta
 /// finishes normally," not "no claim ever starts within one lease
 /// acquisition's window," so this matches the design rather than falling
 /// short of it.
+#[cfg(any(test, feature = "internals"))]
 pub async fn claim_unless_paused(
     client: &impl GenericClient,
     seg_seq: i64,
