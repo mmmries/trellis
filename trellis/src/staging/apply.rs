@@ -24,6 +24,7 @@
 //! up next" query a real drain loop (not assembled here — see doc 04's
 //! [`super::liveness::claim_unless_paused`]) would call before it.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -4748,6 +4749,57 @@ fn flush_relationship_reverse_fairness_escalation_metric(count: u64) {
 /// 65535 regardless of column count.
 const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
 
+/// Decodes one [`TargetWrite::pk_text`]/[`TargetDelete::pk_text`] — this
+/// crate's shared key-contract text ([`ddl::pk_key_sql_expr`]/[`ddl::join_pk_key`],
+/// or a source row's own PK straight from CDC/backfill) — back into the real
+/// value [`apply_target`] must treat `key` as, via [`ddl::split_pk_key`]
+/// (issue #205).
+///
+/// `pk` is always exactly one column here: a [`KeySpace::OneToOne`] target's
+/// own primary key is narrowed to a single column at definition time
+/// (`catalog::create_definition_inner`'s issue #177 gate, backed by
+/// [`ddl::require_single_column_pk`]), so [`TargetPlan::pk`] is never
+/// composite — unlike [`ddl::split_pk_key`]'s general (possibly
+/// multi-column) contract, there is no arity to worry about here.
+///
+/// For the overwhelmingly common case — [`PrimaryKeyColumn::nullable`] is
+/// `false`, true of every genuine, never-NULL primary key (an intake source
+/// table, or any other real `PRIMARY KEY`) — this is a byte-identical no-op:
+/// [`ddl::split_pk_key`] returns a not-null column's single part unchanged
+/// (see that function's doc comment), so `key` itself comes back out,
+/// `Cow::Borrowed`. It only differs for a [`KeySpace::OneToOne`] definition
+/// chained directly off an aggregate target's own (nullable) grouping-column
+/// PK: `key` may then carry issue #110's `NULL_KEY_SENTINEL`/escape
+/// treatment, which this undoes — `None` means a genuine NULL-keyed group.
+///
+/// A `None` result can never be stored as this target's own primary-key
+/// value: [`ddl::create_target_table`] always declares it a real `primary
+/// key` column, which Postgres makes `NOT NULL` unconditionally, regardless
+/// of whether the *source* column this target's key was narrowed from is
+/// itself nullable. [`apply_target`]'s callers treat `None` as "no
+/// representable row" and skip the key entirely — the same outcome
+/// `defs::backfill::discover_pk_ranges`'s ordered `(lo, hi]` PK-range walk
+/// already, structurally, produces for a NULL-keyed source row: `max()`
+/// ignores `NULL`, and every range's `<=`/`>` bound is `NULL` (unknown) for
+/// a `NULL` operand, so such a row is never selected by any chunk's `WHERE`
+/// and a full backfill never attempts to insert it either. Skipping here
+/// keeps live CDC apply's answer — "this group has no row in the target" —
+/// consistent with backfill's, rather than attempting an insert Postgres's
+/// own `NOT NULL` constraint would reject anyway (a hard per-transaction
+/// error, not a silent one, but one this target shape can never avoid by
+/// definition, so there is nothing more useful decoding to `NULL` could do
+/// here than recognizing exactly this and omitting the row).
+fn decode_target_pk_text<'a>(
+    pk: &PrimaryKeyColumn,
+    target: &str,
+    key: &'a str,
+) -> Result<Option<Cow<'a, str>>, ApplyError> {
+    Ok(ddl::split_pk_key(std::slice::from_ref(pk), target, key)?
+        .into_iter()
+        .next()
+        .flatten())
+}
+
 /// One physically-touched target key, as [`apply_and_mark_drained_many`]'s
 /// `changed` accumulator and downstream-propagation step track it: the key
 /// text, the `hop_gen` it carries forward, (issues #51/#52's multi-hop gap)
@@ -4853,11 +4905,32 @@ async fn apply_target(
     let target_ident = ddl::qualified_target_table_ident(&plan.qualified_target);
     let field_idents: Vec<String> = plan.field_names.iter().map(|n| quote_ident(n)).collect();
 
-    let mut lock_keys: Vec<&str> = plan
+    // Issue #205: `write.pk_text`/`delete.pk_text` is this target's shared
+    // key-contract text, not necessarily a raw PK value yet — decode each
+    // one through `decode_target_pk_text` before treating it as a literal PK
+    // value (or a lock/match key) anywhere below. See that function's doc
+    // comment: `None` (a genuine NULL-keyed group, only reachable for a
+    // `KeySpace::OneToOne` definition chained off a nullable aggregate
+    // grouping key) can never be this target's own stored PK value, so such
+    // a key is simply dropped from every step below, rather than bound as a
+    // literal `NULL_KEY_SENTINEL`/escaped string (the corruption this issue
+    // closes) or as a literal SQL `NULL` (which this target's own `NOT NULL`
+    // primary-key column would just as reliably reject).
+    let decoded_writes: Vec<Option<Cow<'_, str>>> = plan
         .writes
         .iter()
-        .map(|w| w.pk_text.as_str())
-        .chain(plan.deletes.iter().map(|d| d.pk_text.as_str()))
+        .map(|w| decode_target_pk_text(&plan.pk, target, &w.pk_text))
+        .collect::<Result<_, _>>()?;
+    let decoded_deletes: Vec<Option<Cow<'_, str>>> = plan
+        .deletes
+        .iter()
+        .map(|d| decode_target_pk_text(&plan.pk, target, &d.pk_text))
+        .collect::<Result<_, _>>()?;
+
+    let mut lock_keys: Vec<&str> = decoded_writes
+        .iter()
+        .chain(decoded_deletes.iter())
+        .filter_map(|k| k.as_deref())
         .collect();
     lock_keys.sort_unstable();
     lock_keys.dedup();
@@ -4883,8 +4956,18 @@ async fn apply_target(
         .collect::<Vec<_>>()
         .join(", ");
 
+    // Only a write whose key actually decoded to a representable (non-NULL)
+    // PK value is a candidate for insertion — see `decode_target_pk_text`'s
+    // doc comment on why a NULL-decoded write has no row to write at all.
+    let writable: Vec<(&TargetWrite, &str)> = plan
+        .writes
+        .iter()
+        .zip(decoded_writes.iter())
+        .filter_map(|(w, k)| k.as_deref().map(|k| (w, k)))
+        .collect();
+
     let mut written = Vec::new();
-    if !plan.writes.is_empty() {
+    if !writable.is_empty() {
         let cols_per_row = 1 + plan.field_names.len();
         let rows_per_chunk = (MAX_WRITE_PARAMS_PER_STATEMENT / cols_per_row).max(1);
 
@@ -4923,14 +5006,14 @@ async fn apply_target(
             )
         };
 
-        for chunk in plan.writes.chunks(rows_per_chunk) {
+        for chunk in writable.chunks(rows_per_chunk) {
             let mut rows_sql = Vec::with_capacity(chunk.len());
             let mut params: Vec<&(dyn ToSql + Sync)> =
                 Vec::with_capacity(chunk.len() * cols_per_row);
-            for (i, write) in chunk.iter().enumerate() {
+            for (i, (write, pk_text)) in chunk.iter().enumerate() {
                 let base = i * cols_per_row;
                 let mut row_parts = vec![format!("${}::text::{pk_cast}", base + 1)];
-                params.push(&write.pk_text);
+                params.push(pk_text);
                 for (j, pg_type) in field_pg_types.iter().enumerate() {
                     row_parts.push(format!("${}::text::{pg_type}", base + 2 + j));
                     params.push(&write.values[j]);
@@ -4961,15 +5044,21 @@ async fn apply_target(
     // and delete into separate sequential statements (above/below) loses
     // that guarantee — the delete would now run against a snapshot that
     // already includes the write — so it's restored explicitly here
-    // instead: never delete a key this same call just wrote.
+    // instead: never delete a key this same call just wrote. Compared as
+    // decoded keys (issue #205) — the same values actually bound as this
+    // target's real PK, and so the same values `delete_keys` below matches
+    // against.
     let write_keys: std::collections::HashSet<&str> =
-        plan.writes.iter().map(|w| w.pk_text.as_str()).collect();
+        writable.iter().map(|(_, k)| *k).collect();
 
     let mut deleted = Vec::new();
-    let delete_keys: Vec<&str> = plan
-        .deletes
+    // A `None`-decoded delete has no matching write (a NULL-keyed group
+    // never reaches `writable` either) and no representable row to delete —
+    // see `decode_target_pk_text`'s doc comment — so it's dropped here the
+    // same way a `None`-decoded write is dropped above.
+    let delete_keys: Vec<&str> = decoded_deletes
         .iter()
-        .map(|d| d.pk_text.as_str())
+        .filter_map(|k| k.as_deref())
         .filter(|k| !write_keys.contains(k))
         .collect();
     if !delete_keys.is_empty() {
@@ -5255,15 +5344,32 @@ pub async fn apply_and_mark_drained_many(
             continue;
         }
 
-        let mut hop_gen_of: HashMap<&str, i32> = HashMap::new();
-        let mut src_changed_of: HashMap<&str, Option<std::time::SystemTime>> = HashMap::new();
+        // Issue #205: `written`/`deleted` are keyed by `apply_target`'s
+        // *decoded* PK text (the value actually stored/matched, per
+        // `decode_target_pk_text`), which for a target chained off a
+        // nullable grouping key can differ from `target_plan.writes`/
+        // `.deletes`' own `pk_text` (the shared key-contract's still-encoded
+        // form). Re-decode here too, so this lookup is keyed the same way —
+        // for every not-null-PK target (the overwhelming majority) decoding
+        // is a no-op and this is byte-identical to a plain `pk_text` key, as
+        // before. A `None` decode is skipped: `apply_target` never returns
+        // such a key in `written`/`deleted` (see that function's own doc
+        // comment), so it would never be looked up anyway.
+        let mut hop_gen_of: HashMap<String, i32> = HashMap::new();
+        let mut src_changed_of: HashMap<String, Option<std::time::SystemTime>> = HashMap::new();
         for w in &target_plan.writes {
-            hop_gen_of.insert(w.pk_text.as_str(), w.hop_gen);
-            src_changed_of.insert(w.pk_text.as_str(), w.src_changed);
+            if let Some(decoded) = decode_target_pk_text(&target_plan.pk, target, &w.pk_text)? {
+                let decoded = decoded.into_owned();
+                hop_gen_of.insert(decoded.clone(), w.hop_gen);
+                src_changed_of.insert(decoded, w.src_changed);
+            }
         }
         for d in &target_plan.deletes {
-            hop_gen_of.insert(d.pk_text.as_str(), d.hop_gen);
-            src_changed_of.insert(d.pk_text.as_str(), d.src_changed);
+            if let Some(decoded) = decode_target_pk_text(&target_plan.pk, target, &d.pk_text)? {
+                let decoded = decoded.into_owned();
+                hop_gen_of.insert(decoded.clone(), d.hop_gen);
+                src_changed_of.insert(decoded, d.src_changed);
+            }
         }
 
         // Issue #196: a deleted 1-1 target row's downstream propagation used
