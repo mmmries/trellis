@@ -7,12 +7,16 @@
 //!
 //! ## Running
 //!
+//! This binary carries `required-features = ["engine-access"]` (ADR-0012; see
+//! `Cargo.toml`), so every invocation must pass `--features engine-access` —
+//! without it Cargo skips the target and `cargo run` fails outright:
+//!
 //! ```text
-//! cargo run -p benchmark --release -- high-cardinality
-//! cargo run -p benchmark --release -- low-cardinality
-//! cargo run -p benchmark --release -- both
-//! cargo run -p benchmark --release -- custom --n 200000 --g 500 --ceiling-secs 60
-//! cargo run -p benchmark --release -- relationship-aggregate
+//! cargo run -p benchmark --features engine-access --release -- high-cardinality
+//! cargo run -p benchmark --features engine-access --release -- low-cardinality
+//! cargo run -p benchmark --features engine-access --release -- both
+//! cargo run -p benchmark --features engine-access --release -- custom --n 200000 --g 500 --ceiling-secs 60
+//! cargo run -p benchmark --features engine-access --release -- relationship-aggregate
 //! ```
 //!
 //! `--release` matters: this pushes 1M rows through a real Postgres
@@ -20,8 +24,8 @@
 //! enough to distort the numbers. Each scenario prints one line of JSON to
 //! stdout (see [`scenario::BenchResult::to_json`]) and the process exits
 //! non-zero if the aggregate-backfill phase exceeds its regression
-//! ceiling — wire this into CI as `cargo run -p benchmark --release --
-//! high-cardinality`.
+//! ceiling — wire this into CI as `cargo run -p benchmark --features
+//! engine-access --release -- high-cardinality`.
 
 mod generate;
 mod scenario;
@@ -31,7 +35,7 @@ use std::time::Duration;
 
 /// Post-M3 this shape's aggregate phase measures ~0.7-0.8s on this
 /// harness/box across repeated runs — the direct, single-pass-then-chunked
-/// build ([`trellis::defs::backfill_definition`], issue #63) replaced the ring
+/// build ([`trellis::dev::defs::backfill_definition`], issue #63) replaced the ring
 /// drain that took ~55-58s here (and ~1m50s on the issue's poc cluster). The
 /// M3-review fix (aggregate the source once into a staging table, then chunk
 /// the writes from that small table instead of re-scanning the source per

@@ -22,14 +22,14 @@
 //! their doc comments in `defs::catalog`) rather than deleted outright, so
 //! this migration doesn't have to be one big-bang change.
 //!
-//! [`needs_old_image`] is the older, narrower predicate over a single
-//! [`TransformDef`] — `false` for [`KeySpace::OneToOne`] (a pure function of
-//! the *current* row) and `true` for [`KeySpace::Aggregate`] (issue #47: a
-//! row leaving or re-entering a group needs the row's old image to know
-//! which group it's leaving) — kept for its own existing tests and callers;
-//! [`required_source_guarantees`] reuses the same underlying rule
-//! ([`needs_old_image_for_key_space`]) rather than re-deriving it a second
-//! time. [`require_replica_identity_full`] takes a plain `bool`, so its own
+//! The underlying rule is [`needs_old_image_for_key_space`]: `false` for
+//! [`KeySpace::OneToOne`] (a pure function of the *current* row) and `true`
+//! for [`KeySpace::Aggregate`] (issue #47: a row leaving or re-entering a
+//! group needs the row's old image to know which group it's leaving).
+//! [`required_source_guarantees`] is its only caller — a `needs_old_image`
+//! wrapper over a whole `TransformDef` existed until phase 2 left it with
+//! no callers but its own test, and issue #190 removed it.
+//! [`require_replica_identity_full`] takes a plain `bool`, so its own
 //! test can exercise the `true` side directly rather than having to
 //! construct a `KeySpace::Aggregate` definition just to reach it; it's also
 //! what [`crate::defs::catalog::check_source_guarantees`] calls per derived
@@ -38,12 +38,14 @@
 //! needs it" vs. "the table already has it") is why this function takes a
 //! bare bool instead of doing its own `pg_catalog` lookup.
 use super::error::IntakeError;
-use crate::defs::ast::{KeySpace, TransformDef};
+use crate::defs::ast::KeySpace;
+#[cfg(test)]
+use crate::defs::ast::TransformDef;
 
 /// Whether `key_space` needs the old image of a row — `false` for
 /// [`KeySpace::OneToOne`], `true` for [`KeySpace::Aggregate`] (see the
-/// module doc). The shared rule behind both [`needs_old_image`] and
-/// [`required_source_guarantees`]'s `Transform` arm.
+/// module doc). The rule behind [`required_source_guarantees`]'s
+/// `Transform` arm.
 fn needs_old_image_for_key_space(key_space: &KeySpace) -> bool {
     match key_space {
         KeySpace::OneToOne => false,
@@ -53,12 +55,6 @@ fn needs_old_image_for_key_space(key_space: &KeySpace) -> bool {
         // leaving.
         KeySpace::Aggregate { .. } => true,
     }
-}
-
-/// Whether `def`'s derivation needs the old image of a row — `false` for
-/// every shape the current grammar can express (see the module doc).
-pub fn needs_old_image(def: &TransformDef) -> bool {
-    needs_old_image_for_key_space(&def.key_space)
 }
 
 /// A source-table guarantee some resolved plan's propagation paths depend
@@ -190,7 +186,9 @@ mod tests {
 
     #[test]
     fn one_to_one_transforms_never_need_the_old_image() {
-        assert!(!needs_old_image(&one_to_one_def("orders")));
+        assert!(!needs_old_image_for_key_space(
+            &one_to_one_def("orders").key_space
+        ));
     }
 
     #[test]
