@@ -395,8 +395,21 @@ pub(crate) async fn enumerate_and_append(
             // use — `primary_key_columns` above already reports the key's
             // columns in `array_position(i.indkey, a.attnum)` order for
             // exactly that reason (issue #163).
+            //
+            // The raw column text, *not* `ddl::encode_key_part` (issue
+            // #110): `primary_key_columns` above filters on
+            // `pg_index.indisprimary`, so every column here is a real
+            // PRIMARY KEY column and therefore NOT NULL — nothing for the
+            // NULL sentinel to encode, and `ddl::pk_key_sql_expr` renders a
+            // not-null key column raw for the same reason, so this producer
+            // and that one agree byte-for-byte. Encoding here would also
+            // double a genuine U+0001 into the text a 1-1 target stores as
+            // its own literal primary-key value (`apply::apply_target`),
+            // which `defs::backfill`/`staging::quarantine`/`defs::oracle`
+            // write and read raw — see `ddl::encode_key_part`'s
+            // "`PrimaryKeyColumn::nullable` selects the encoding" section.
             let key =
-                crate::defs::ddl::join_pk_key((0..pk_cols.len()).map(|i| row.get::<_, String>(i)));
+                crate::defs::ddl::join_pk_key((0..pk_cols.len()).map(|i| row.get::<_, &str>(i)));
             page.push(StagedChange::Recompute {
                 src_table: src_table.to_string(),
                 key,
