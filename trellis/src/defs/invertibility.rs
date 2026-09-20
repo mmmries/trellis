@@ -51,11 +51,34 @@
 //!   enumerates the partial-field roles a given invertible aggregate needs;
 //!   `SUM`/`COUNT` need only their own value (no hidden partials), `AVG`
 //!   needs `Sum` and `Count`.
-//! - **Float `Inf`/`NaN` tracking**: deferred. The issue's note that floats
-//!   should be "kept in exact decimal" with `Inf`/`NaN` "tracked as counts"
-//!   has nothing to hang off today, since [`ValueType`] has no float variant
-//!   (only `Numeric`, which this codebase treats as exact/decimal already).
-//!   Revisit this module once a float `ValueType` variant exists.
+//! - **`SUM`/`AVG` over a float** (issue #112, now that
+//!   [`ValueType::Float`] exists): **not invertible**, unlike every exact
+//!   numeric type. Issue #11's gate rule anticipated this ("floats kept in
+//!   exact decimal, `Inf`/`NaN` tracked as counts"); with a real float type
+//!   in hand the honest verdict is `RecomputeOnly`, because binary float
+//!   addition has no exact inverse. Three independent reasons, each checked
+//!   against a live server rather than reasoned from IEEE:
+//!
+//!   1. **It isn't associative, so a delta isn't well-defined.**
+//!      `select (1e16::float8 + 1) - 1e16::float8` is `0`, while
+//!      `select (1e16::float8 - 1e16::float8) + 1` is `1`. "Old sum minus
+//!      the deleted row" and "recompute the group" are different numbers,
+//!      and the ADR-0013 self-check compares against the latter.
+//!   2. **It isn't order-independent either.** `1e16 + 1 + 1 + 1 + 1` is
+//!      `1e+16` but `1 + 1 + 1 + 1 + 1e16` is `1.0000000000000004e+16`, so
+//!      even a pure insert stream would drift from a server-side `sum()`
+//!      whose input order differs.
+//!   3. **`NaN` and `Infinity` are absorbing.** Once a group's running sum
+//!      is `NaN`, no subtraction recovers it: `('NaN'::float8 + 1) -
+//!      'NaN'::float8` is `NaN`, and `('Infinity'::float8 + 1) -
+//!      'Infinity'::float8` is `NaN` too. Deleting the row that introduced
+//!      the special value must recompute.
+//!
+//!   The "`Inf`/`NaN` tracked as counts" half of issue #11's note is a
+//!   possible *future* refinement — track how many rows in the group are
+//!   special, and delta the finite part — but it does not rescue reasons 1
+//!   and 2, so it would still need a bounded-error contract this engine has
+//!   not chosen to offer. Never approximate an inverse.
 
 use super::ast::ValueType;
 
@@ -168,22 +191,43 @@ pub fn classify(function: &str, arg: AggregateArg) -> Option<Verdict> {
     match (function, arg) {
         ("COUNT", AggregateArg::Count(_)) => Some(Verdict::invertible(&[])),
 
-        ("SUM", AggregateArg::Column(ValueType::Numeric)) => Some(Verdict::invertible(&[])),
+        // Issue #111: an exact-integer argument is as invertible as a
+        // `numeric` one, and for the same reason — `SUM`/`AVG` fold through
+        // `staging::apply_aggregate`'s `numeric` running partials either
+        // way (`sum(int2|int4)` is a `bigint` column fed by a `numeric`
+        // delta, `avg(<int>)` is `numeric` outright). Enumerating it here
+        // rather than leaving it to the `_ => None` fallback below is the
+        // point: `None` means "a call shape the grammar could never
+        // produce", and since #111 an integer-argument aggregate is a shape
+        // the grammar produces routinely.
+        ("SUM", AggregateArg::Column(ValueType::Numeric | ValueType::Integer(_))) => {
+            Some(Verdict::invertible(&[]))
+        }
         (
             "SUM",
             AggregateArg::Column(
-                ValueType::Text | ValueType::Boolean | ValueType::Uuid | ValueType::Other(_),
+                ValueType::Float(_)
+                | ValueType::Text
+                | ValueType::Boolean
+                | ValueType::Uuid
+                | ValueType::Other(_),
             ),
         ) => Some(Verdict::recompute_only()),
 
-        ("AVG", AggregateArg::Column(ValueType::Numeric)) => Some(Verdict::invertible(&[
-            PartialField::Sum,
-            PartialField::Count,
-        ])),
+        ("AVG", AggregateArg::Column(ValueType::Numeric | ValueType::Integer(_))) => {
+            Some(Verdict::invertible(&[
+                PartialField::Sum,
+                PartialField::Count,
+            ]))
+        }
         (
             "AVG",
             AggregateArg::Column(
-                ValueType::Text | ValueType::Boolean | ValueType::Uuid | ValueType::Other(_),
+                ValueType::Float(_)
+                | ValueType::Text
+                | ValueType::Boolean
+                | ValueType::Uuid
+                | ValueType::Other(_),
             ),
         ) => Some(Verdict::recompute_only()),
 
@@ -232,6 +276,32 @@ mod tests {
         assert_eq!(verdict.partials, &[PartialField::Sum, PartialField::Count]);
     }
 
+    /// Issue #111: every exact-integer width classifies exactly as `numeric`
+    /// does — `None` here would mean the gate had silently fallen through to
+    /// its "shape the grammar could never produce" arm for a shape the
+    /// grammar produces on any `SUM(<int column>)`.
+    #[test]
+    fn sum_and_avg_over_every_integer_width_classify_like_numeric() {
+        for width in crate::integer::IntWidth::ALL {
+            let arg = AggregateArg::Column(ValueType::Integer(width));
+            let sum =
+                classify("SUM", arg).unwrap_or_else(|| panic!("SUM over {width} must classify"));
+            assert!(sum.is_invertible(), "SUM over {width}");
+            assert_eq!(sum.partials, &[] as &[PartialField]);
+
+            let avg =
+                classify("AVG", arg).unwrap_or_else(|| panic!("AVG over {width} must classify"));
+            assert!(avg.is_invertible(), "AVG over {width}");
+            assert_eq!(avg.partials, &[PartialField::Sum, PartialField::Count]);
+
+            for name in ["MIN", "MAX"] {
+                let verdict = classify(name, arg)
+                    .unwrap_or_else(|| panic!("{name} over {width} must classify"));
+                assert_eq!(verdict.invertibility, Invertibility::RecomputeOnly);
+            }
+        }
+    }
+
     #[test]
     fn min_is_always_recompute_only_regardless_of_type() {
         for ty in [ValueType::Numeric, ValueType::Text, ValueType::Boolean] {
@@ -247,6 +317,27 @@ mod tests {
             let verdict = classify("MAX", AggregateArg::Column(ty)).unwrap();
             assert_eq!(verdict.invertibility, Invertibility::RecomputeOnly);
             assert_eq!(verdict.partials, &[] as &[PartialField]);
+        }
+    }
+
+    /// Issue #112: floats are the one *numeric* argument type `SUM`/`AVG`
+    /// are not invertible over. `Invertible` here would mean the delta path
+    /// silently drifting from a server-side `sum()` — see this module's doc
+    /// comment for the three live-server counterexamples.
+    #[test]
+    fn sum_and_avg_over_floats_are_recompute_only() {
+        for width in crate::float::FloatWidth::ALL {
+            let arg = AggregateArg::Column(ValueType::Float(width));
+            for name in ["SUM", "AVG", "MIN", "MAX"] {
+                let verdict = classify(name, arg)
+                    .unwrap_or_else(|| panic!("{name} over {width} must classify"));
+                assert_eq!(
+                    verdict.invertibility,
+                    Invertibility::RecomputeOnly,
+                    "{name} over {width}"
+                );
+                assert_eq!(verdict.partials, &[] as &[PartialField]);
+            }
         }
     }
 

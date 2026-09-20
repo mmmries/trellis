@@ -199,17 +199,16 @@ fn the_typed_literal_and_cast_spellings_parse_to_one_ast() {
     .expect("CAST spelling parses");
 
     assert_eq!(typed, cast);
-    for ((field, (_, _, text, _)), expected_type) in
-        typed
-            .fields
-            .iter()
-            .zip(CASES)
-            .zip([PgType::Date, PgType::Timestamp, PgType::Bytea])
+    for ((field, (_, _, text, _)), expected_type) in typed
+        .fields
+        .iter()
+        .zip(CASES)
+        .zip([PgType::Date, PgType::Timestamp, PgType::Bytea].map(ValueType::Other))
     {
         assert_eq!(
             field.expr,
             Expr::TypedLiteral {
-                pg_type: expected_type,
+                value_type: expected_type,
                 text: text.to_string(),
             }
         );
@@ -240,7 +239,7 @@ fn type_keywords_are_case_insensitive_and_do_not_shadow_a_column_named_date() {
     assert_eq!(
         def.fields[1].expr,
         Expr::TypedLiteral {
-            pg_type: PgType::Date,
+            value_type: ValueType::Other(PgType::Date),
             text: "2024-01-01".to_string(),
         }
     );
@@ -571,7 +570,9 @@ async fn a_hostile_database_level_output_guc_does_not_change_what_the_engine_rea
         client
             .batch_execute(&format!(
                 "alter database \"{}\" set datestyle to 'SQL, MDY'; \
-                 alter database \"{}\" set bytea_output to 'escape'",
+                 alter database \"{}\" set bytea_output to 'escape'; \
+                 alter database \"{}\" set extra_float_digits to 0",
+                db.name(),
                 db.name(),
                 db.name()
             ))
@@ -626,6 +627,27 @@ async fn a_hostile_database_level_output_guc_does_not_change_what_the_engine_rea
     assert_eq!(
         rendered_bytea, "\\x0102ff",
         "a pooled connection must render hex regardless of the database's bytea_output"
+    );
+    // Issue #112's half of the same hazard. `extra_float_digits = 0` is the
+    // pre-Postgres-12 default and rounds to `DBL_DIG` significant digits,
+    // which is *lossy*: `0.1::float8 + 0.2::float8` renders `0.3` under `0`
+    // and `0.30000000000000004` under `1`. `float::render` reproduces the
+    // `>= 1` spelling, so a connection that inherited `0` would make the
+    // evaluator and the server disagree byte-for-byte on a converged value.
+    let rendered_float: String = pooled
+        .query_one("select (0.1::float8 + 0.2::float8)::text", &[])
+        .await
+        .expect("render a float8 on a pooled session")
+        .get(0);
+    assert_eq!(
+        rendered_float, "0.30000000000000004",
+        "a pooled connection must render shortest-round-trip floats regardless of the \
+         database's extra_float_digits"
+    );
+    assert_eq!(
+        rendered_float,
+        trellis::float::render(0.1 + 0.2, trellis::FloatWidth::Float8),
+        "and `float::render` must agree with it"
     );
     drop(pooled);
 

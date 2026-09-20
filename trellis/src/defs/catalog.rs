@@ -92,6 +92,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::error_code::{self, ErrorCode};
+use crate::float::FloatWidth;
+use crate::integer::IntWidth;
 use crate::pool::{Pool, quote_ident};
 
 use super::ast::{Expr, KeySpace, RelationshipDef, TransformDef, ValueType};
@@ -2502,9 +2504,13 @@ fn type_family(pg_type: &str) -> &str {
 ///
 /// Only the join key's *own* type matters for this list, not what it's
 /// compared against, so allowed/rejected status is a per-type fact.
-/// Anything not named here — `numeric`/`real`/`double precision`
-/// (fractional/arbitrary-precision: `1.0::text` != `1.00::text` though
-/// numerically equal), `character`/`citext` (blank-padding or
+/// Anything not named here — `numeric` (`1.0::text` != `1.00::text` though
+/// numerically equal), `real`/`double precision` (issue #112: `-0` and `0`
+/// are `=` in Postgres but render as `'-0'` and `'0'`, so text matching
+/// splits one value across two keys; verified on a live server, and the
+/// unlock is #110's typed key index comparing decoded values through
+/// `crate::float::compare`, not a new encoding), `character`/`citext`
+/// (blank-padding or
 /// case-insensitivity native to the type but not its `::text` form),
 /// `timestamp`/`timestamptz`/`date`/`time` (`::text` is session-TimeZone- or
 /// style-dependent), `boolean`, `bytea`, `json`/`jsonb`, or any unknown
@@ -2513,6 +2519,14 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "smallint",
     "integer",
     "bigint",
+    // Issue #111: `oid` is an *unsigned* 32-bit integer whose `oid_out`
+    // rendering is canonical decimal — no sign, no leading zeros, no
+    // padding — so `a::text = b::text` agrees with `oid`'s native `=` for
+    // every value, exactly as it does for the three signed widths above.
+    // It is not a `ValueType::Integer` (Postgres gives it no arithmetic at
+    // all; see `pg_type::PgType::Oid`), but text-stability is a property of
+    // the *rendering*, not of the operator set, so it belongs here.
+    "oid",
     "uuid",
     "text",
     "character varying",
@@ -3575,6 +3589,16 @@ pub async fn edges_from(
 fn encode_value_type(value_type: &ValueType) -> &'static str {
     match value_type {
         ValueType::Numeric => "numeric",
+        // Issue #111: an exact integer persists under its own Postgres
+        // spelling (`smallint`/`integer`/`bigint`), which is distinct from
+        // every other token here *and* from every `PgType::name`, so all
+        // three namespaces still share one column unambiguously. The
+        // `every_value_type_round_trips_through_the_persisted_token` test
+        // pins that.
+        ValueType::Integer(width) => width.pg_name(),
+        // Issue #112: same shape — `real`/`double precision`, each distinct
+        // from every other token in all three namespaces.
+        ValueType::Float(width) => width.pg_name(),
         ValueType::Text => "text",
         ValueType::Boolean => "boolean",
         ValueType::Uuid => "uuid",
@@ -3595,7 +3619,14 @@ fn decode_value_type(text: &str) -> Option<ValueType> {
         "text" => ValueType::Text,
         "boolean" => ValueType::Boolean,
         "uuid" => ValueType::Uuid,
-        other => ValueType::Other(PgType::from_name(other)?),
+        other => match (
+            IntWidth::from_pg_name(other),
+            FloatWidth::from_pg_name(other),
+        ) {
+            (Some(width), _) => ValueType::Integer(width),
+            (_, Some(width)) => ValueType::Float(width),
+            _ => ValueType::Other(PgType::from_name(other)?),
+        },
     })
 }
 
@@ -4260,6 +4291,14 @@ mod value_type_codec_tests {
             ValueType::Other(PgType::TimestampTz),
             ValueType::Other(PgType::Unrecognized),
         ];
+        // Issue #111's widths, from `IntWidth::ALL` so a future width is
+        // covered by construction rather than by remembering to add it.
+        let all = all
+            .into_iter()
+            .chain(IntWidth::ALL.into_iter().map(ValueType::Integer))
+            // Issue #112's widths, from `FloatWidth::ALL` for the same
+            // reason: a future width is covered by construction.
+            .chain(FloatWidth::ALL.into_iter().map(ValueType::Float));
         for value_type in all {
             let token = encode_value_type(&value_type);
             assert_eq!(

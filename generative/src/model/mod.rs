@@ -7,6 +7,7 @@
 //! this crate generates is byte-for-byte the same shape the parser produces
 //! from concrete syntax.
 
+use trellis::IntWidth;
 use trellis::dev::defs::ast::{TransformDef, ValueType};
 
 /// One column on a [`Table`].
@@ -40,50 +41,42 @@ pub struct Table {
     pub unique_cols: Vec<String>,
 }
 
-/// The Postgres type every generated table's primary-key column is declared
-/// with.
+/// The [`ValueType`] every generated table's primary-key column carries.
 ///
-/// Not derived from a [`ValueType`] on purpose. The generator seeds primary
-/// keys as consecutive integers (`1..=seed_count`, see
-/// `crate::generate::build_program_multi_with_shapes`), but [`ValueType`]'s
-/// only numeric variant maps to Postgres `numeric` — and the engine rejects a
-/// `numeric` primary key outright with
-/// `defs::ddl::DdlError::UnsupportedPrimaryKeyType`, because
-/// `source_primary_key` gates the resolved PK type on
-/// `is_text_stable_join_key_type`'s allowlist (issue #107): every consumer
-/// compares that key via a `::text` cast, and `numeric` is not text-stable
-/// (`1.0::text != 1.00::text` though the two are numerically equal).
+/// The generator seeds primary keys as consecutive integers
+/// (`1..=seed_count`, see `crate::generate::build_program_multi_with_shapes`),
+/// and since issue #111 [`ValueType`] can finally *say* that: `bigint`.
 ///
-/// Declaring the PK `numeric` therefore made *every* generated program fail
-/// to install, which is what broke `backend_seam` and the `backfill.rs` /
-/// `bulk_operations.rs` suites. `bigint` is on that allowlist, is what the
-/// hand-written engine tests actually use (`trellis/tests/apply.rs`'s
-/// `orders` table declares `id integer primary key`), and comfortably holds
-/// the `i64` pks the generator mints.
-pub const PRIMARY_KEY_PG_TYPE: &str = "bigint";
+/// This used to be a bare `PRIMARY_KEY_PG_TYPE: &str = "bigint"` constant
+/// that every DDL and cast site had to special-case, precisely because the
+/// `ValueType` on the PK's own [`Column`] could not name the type the column
+/// was declared with. The only numeric variant mapped to Postgres `numeric`,
+/// which the engine rejects as a primary key outright
+/// (`defs::ddl::DdlError::UnsupportedPrimaryKeyType`, issue #107: `::text`
+/// key matching is not sound for `numeric`, since `1.0::text != 1.00::text`
+/// though the two are numerically equal) — so declaring the PK from its
+/// `ValueType` made *every* generated program fail to install. Recording the
+/// real type removes the special case and, as a bonus, gives the whole
+/// generative suite continuous end-to-end coverage of an exact-integer
+/// primary key against the Postgres oracle.
+pub const PRIMARY_KEY_VALUE_TYPE: ValueType = ValueType::Integer(IntWidth::Int8);
 
 impl Table {
     /// Builds a table from `pool`, giving it a primary-key column
     /// unconditionally — before any of `column_types` — so no future shrink
     /// step can strand a definition that references it (design doc §1).
     ///
-    /// The PK column's Postgres type is [`PRIMARY_KEY_PG_TYPE`], *not* the
-    /// [`ValueType`] stored on its [`Column`]. [`ValueType`] is
-    /// `trellis::dev::defs::ast`'s expression-level type and has no integer
-    /// variant, so it simply cannot name the type a primary key needs; the
-    /// `ValueType::Numeric` recorded below is an unavoidable placeholder.
-    /// Nothing may render the PK column's type from it — see
-    /// [`PRIMARY_KEY_PG_TYPE`] for why a `numeric` PK is rejected outright by
-    /// the engine, and `crate::backend::manual`'s `column_pg_type`, which is
-    /// the one place every DDL and cast site resolves a column's declared
-    /// type through.
+    /// The PK column's [`ValueType`] is [`PRIMARY_KEY_VALUE_TYPE`], and
+    /// since issue #111 that is an honest `bigint` rather than a
+    /// `ValueType::Numeric` placeholder the DDL and cast sites had to
+    /// override — see that constant.
     pub fn new(pool: &mut NamePool, column_types: &[ValueType]) -> Table {
         let name = pool.next_table_name();
         let pk_col = pool.next_column_name();
         let mut columns = Vec::with_capacity(column_types.len() + 1);
         columns.push(Column {
             name: pk_col.clone(),
-            value_type: ValueType::Numeric,
+            value_type: PRIMARY_KEY_VALUE_TYPE,
         });
         for value_type in column_types {
             columns.push(Column {
@@ -498,7 +491,14 @@ mod tests {
         let table = Table::new(&mut pool, &[]);
         assert_eq!(table.columns.len(), 1);
         assert_eq!(table.columns[0].name, table.pk_col);
-        assert_eq!(table.columns[0].value_type, ValueType::Numeric);
+        // Issue #111: an honest `bigint`, not the `Numeric` placeholder the
+        // DDL and cast sites used to have to override — see
+        // [`PRIMARY_KEY_VALUE_TYPE`].
+        assert_eq!(table.columns[0].value_type, PRIMARY_KEY_VALUE_TYPE);
+        assert_eq!(
+            table.columns[0].value_type,
+            ValueType::Integer(IntWidth::Int8)
+        );
     }
 
     #[test]

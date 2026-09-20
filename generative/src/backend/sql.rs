@@ -25,7 +25,7 @@ use trellis::dev::defs::ast::{
     Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
 
-use crate::model::{Column, Op, PRIMARY_KEY_PG_TYPE, Relationship, Table};
+use crate::model::{Column, Op, Relationship, Table};
 
 /// Quotes a Postgres identifier for safe interpolation into SQL text,
 /// mirroring `trellis::pool`'s own (crate-private) helper of the same name.
@@ -37,6 +37,11 @@ pub(super) fn quote_ident(ident: &str) -> String {
 pub(super) fn pg_type_name(value_type: ValueType) -> &'static str {
     match value_type {
         ValueType::Numeric => "numeric",
+        // Issue #111: an exact integer renders as its own Postgres width,
+        // mirroring `defs::ddl::pg_type_name`.
+        ValueType::Integer(width) => width.pg_name(),
+        // Issue #112: likewise `real`/`double precision`.
+        ValueType::Float(width) => width.pg_name(),
         ValueType::Text => "text",
         ValueType::Boolean => "boolean",
         ValueType::Uuid => "uuid",
@@ -93,9 +98,9 @@ pub(super) fn render_expr(expr: &Expr) -> String {
         // same node, so either would round-trip; the typed-literal form is
         // the shorter one and keeps the generated definition text closer to
         // how the docs spell it.
-        Expr::TypedLiteral { pg_type, text } => format!(
+        Expr::TypedLiteral { value_type, text } => format!(
             "{} '{}'",
-            pg_type.sql_type_name().to_ascii_uppercase(),
+            pg_type_name(*value_type).to_ascii_uppercase(),
             text.replace('\'', "''")
         ),
         Expr::BinaryOp { op, lhs, rhs } => {
@@ -154,19 +159,19 @@ pub(super) struct Assignment {
 }
 
 /// The Postgres type `column` on `table` was actually declared with in
-/// [`create_source_table`] — the single source of truth every `$n::text::<type>`
-/// cast renders from. A primary-key column resolves to [`PRIMARY_KEY_PG_TYPE`]
-/// rather than to [`pg_type_name`] of its [`ValueType`] — see
-/// `ManualBackend`'s former doc comment (git history) for why.
+/// [`create_source_table`] — the single source of truth every
+/// `$n::text::<type>` cast renders from.
+///
+/// Since issue #111 this is just [`pg_type_name`] of the column's own
+/// [`ValueType`], including for the primary key: `ValueType` can now name
+/// `bigint`, so the PK no longer needs the override it carried while its
+/// recorded type was a `Numeric` placeholder (see
+/// `crate::model::PRIMARY_KEY_VALUE_TYPE`).
 pub(super) fn column_pg_type(
     tables: &HashMap<String, Table>,
     table: &str,
     column: &str,
 ) -> &'static str {
-    let is_pk = tables.get(table).is_some_and(|t| t.pk_col == column);
-    if is_pk {
-        return PRIMARY_KEY_PG_TYPE;
-    }
     pg_type_name(
         tables
             .get(table)
@@ -195,7 +200,8 @@ pub(super) fn assignment(
 }
 
 /// Creates `table` as a source table: one column per [`Column`], the primary
-/// key declared [`PRIMARY_KEY_PG_TYPE`], a single-column `UNIQUE` constraint
+/// key declared from its own [`crate::model::PRIMARY_KEY_VALUE_TYPE`]
+/// (`bigint`), a single-column `UNIQUE` constraint
 /// on every column named in `table.unique_cols`, and (unconditionally, issue
 /// #34/task B4) `REPLICA IDENTITY FULL` — see `ManualBackend`'s former doc
 /// comment (git history) for why every table gets full replica identity
@@ -212,7 +218,7 @@ pub(super) async fn create_source_table(
         sql.push_str(&quote_ident(&column.name));
         sql.push(' ');
         if column.name == table.pk_col {
-            sql.push_str(PRIMARY_KEY_PG_TYPE);
+            sql.push_str(pg_type_name(column.value_type));
             sql.push_str(" primary key");
         } else {
             sql.push_str(pg_type_name(column.value_type));
@@ -313,7 +319,7 @@ pub(super) async fn apply_op(
                 quote_ident(table),
                 quote_ident(&pk_col),
                 changes.len() + 1,
-                PRIMARY_KEY_PG_TYPE,
+                column_pg_type(tables, table, &pk_col),
             );
             let mut params: Vec<Option<String>> =
                 assignments.into_iter().map(|a| a.value).collect();
@@ -333,7 +339,7 @@ pub(super) async fn apply_op(
                 "delete from {} where {}=$1::text::{}",
                 quote_ident(table),
                 quote_ident(&pk_col),
-                PRIMARY_KEY_PG_TYPE,
+                column_pg_type(tables, table, &pk_col),
             );
             raw.execute(&sql, &[pk]).await?
         }

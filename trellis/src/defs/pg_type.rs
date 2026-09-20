@@ -27,6 +27,8 @@
 use std::fmt;
 
 use super::ast::ValueType;
+use crate::float::FloatWidth;
+use crate::integer::IntWidth;
 
 /// A recognized Postgres type family that doesn't (yet) have its own
 /// first-class [`ValueType`] variant. Carried inside [`ValueType::Other`]
@@ -40,8 +42,22 @@ use super::ast::ValueType;
 /// `Copy`-friendly like every other bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PgType {
-    /// `oid` — behaves like an integer, but kept out of `ValueType::Numeric`
-    /// until #111 decides how exact integer types split out.
+    /// `oid` — an *unsigned* 32-bit row/object identifier.
+    ///
+    /// Issue #111 decided it does **not** join [`ValueType::Integer`]'s
+    /// family (see [`crate::integer`]'s module doc): Postgres gives `oid` no
+    /// arithmetic operators at all — `pg_operator` carries only the
+    /// comparison family for it, there is no `oidpl` — and its range is
+    /// unsigned, so modelling it as a signed, addable `IntWidth` would
+    /// invent semantics the oracle doesn't have.
+    ///
+    /// It stays a passthrough [`PgType`] and gains only the roles it can
+    /// honestly hold. Its text rendering *is* canonical (unsigned decimal,
+    /// no sign, no leading zeros), so unlike every other family here it is
+    /// genuinely text-stable: #111 admits it as a relationship/join key, a
+    /// primary key (`catalog::TEXT_STABLE_JOIN_KEY_TYPES`), a `GROUP BY` key
+    /// (`validate`'s key gate) and a typed literal
+    /// (`typed_literal::TYPED_LITERALS`).
     Oid,
     Bytea,
     Date,
@@ -227,9 +243,16 @@ pub fn value_type_for_oid(type_oid: u32) -> ValueType {
     match type_oid {
         oid::BOOL => ValueType::Boolean,
         oid::UUID => ValueType::Uuid,
-        oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8 => {
-            ValueType::Numeric
-        }
+        // Issues #111 and #112: the six types that used to share one
+        // `ValueType::Numeric` bucket are now three families. `numeric` —
+        // and only `numeric` — is the arbitrary-precision decimal the
+        // bucket was always named after.
+        oid::INT2 => ValueType::Integer(IntWidth::Int2),
+        oid::INT4 => ValueType::Integer(IntWidth::Int4),
+        oid::INT8 => ValueType::Integer(IntWidth::Int8),
+        oid::FLOAT4 => ValueType::Float(FloatWidth::Float4),
+        oid::FLOAT8 => ValueType::Float(FloatWidth::Float8),
+        oid::NUMERIC => ValueType::Numeric,
         oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME => ValueType::Text,
         oid::OID => ValueType::Other(PgType::Oid),
         oid::BYTEA => ValueType::Other(PgType::Bytea),
@@ -265,10 +288,29 @@ mod tests {
         assert_eq!(value_type_for_oid(oid::UUID), ValueType::Uuid);
         assert_eq!(value_type_for_oid(oid::TEXT), ValueType::Text);
         assert_eq!(value_type_for_oid(oid::VARCHAR), ValueType::Text);
-        assert_eq!(value_type_for_oid(oid::INT4), ValueType::Numeric);
-        assert_eq!(value_type_for_oid(oid::INT8), ValueType::Numeric);
+        assert_eq!(
+            value_type_for_oid(oid::INT2),
+            ValueType::Integer(IntWidth::Int2)
+        );
+        assert_eq!(
+            value_type_for_oid(oid::INT4),
+            ValueType::Integer(IntWidth::Int4)
+        );
+        assert_eq!(
+            value_type_for_oid(oid::INT8),
+            ValueType::Integer(IntWidth::Int8)
+        );
         assert_eq!(value_type_for_oid(oid::NUMERIC), ValueType::Numeric);
-        assert_eq!(value_type_for_oid(oid::FLOAT8), ValueType::Numeric);
+        // Issue #112: `real`/`double precision` are their own family now,
+        // no longer aliases of the arbitrary-precision decimal.
+        assert_eq!(
+            value_type_for_oid(oid::FLOAT4),
+            ValueType::Float(FloatWidth::Float4)
+        );
+        assert_eq!(
+            value_type_for_oid(oid::FLOAT8),
+            ValueType::Float(FloatWidth::Float8)
+        );
         assert_eq!(
             value_type_for_oid(oid::BYTEA),
             ValueType::Other(PgType::Bytea)

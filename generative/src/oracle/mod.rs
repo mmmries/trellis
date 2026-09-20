@@ -38,6 +38,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
+use trellis::IntWidth;
 use trellis::Pool;
 use trellis::dev::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::dev::defs::oracle::{OracleError, recompute, recompute_aggregate};
@@ -63,12 +64,24 @@ enum Comparison {
     /// Decimal by value, ignoring scale (`2.50 ≡ 2.5`), via
     /// [`trellis::numeric::Numeric`] rather than hand-rolled parsing.
     DecimalByValue,
-    /// Combined absolute+relative tolerance for floats. **Unreachable
-    /// today**: [`ValueType`] has no float variant, so no column or
-    /// derivation can ever produce one, so this is never constructed. Left
-    /// as an explicit stub (rather than silently omitted) so the day the
-    /// value language gains floats, the missing tolerance logic is a loud
-    /// `unimplemented!`, not a wrong exact-equality comparison.
+    /// Combined absolute+relative tolerance for `real`/`double precision`
+    /// (issue #112, which added [`ValueType::Float`] and so made this arm
+    /// constructible for the first time).
+    ///
+    /// Tolerance rather than [`Comparison::Exact`] even though
+    /// `trellis::float::render` reproduces `float4out`/`float8out`
+    /// byte-for-byte, because the *values* being compared can legitimately
+    /// differ in their last bits: float addition isn't associative, so an
+    /// engine-side fold and a server-side `sum()` over the same rows in a
+    /// different order really do produce different doubles
+    /// (`1e16::float8+1+1+1+1` is `1e+16`, `1+1+1+1+1e16` is
+    /// `1.0000000000000004e+16`). That is not a bug to report — it is the
+    /// reason `defs::invertibility` routes float `SUM`/`AVG` to the
+    /// recompute path.
+    ///
+    /// `NaN`/`±Infinity` are compared by Postgres's own float equality
+    /// ([`trellis::float::equal`]: `NaN = NaN` is true), not IEEE's, so a
+    /// converged `NaN` column doesn't report as a perpetual divergence.
     #[allow(dead_code)]
     FloatTolerance,
 }
@@ -78,6 +91,16 @@ impl Comparison {
     fn for_type(value_type: ValueType) -> Comparison {
         match value_type {
             ValueType::Numeric => Comparison::DecimalByValue,
+            // Issue #111: an exact integer has exactly one text rendering
+            // per value on both sides — Postgres's `int4out` and Rust's
+            // `i64` `Display` agree character for character — so byte-exact
+            // comparison is both correct *and* strictly stronger than
+            // `DecimalByValue` here: it would catch a scale or padding
+            // difference that a by-value decimal compare would forgive, and
+            // for this type any such difference is a real bug.
+            ValueType::Integer(_) => Comparison::Exact,
+            // Issue #112: see `Comparison::FloatTolerance`.
+            ValueType::Float(_) => Comparison::FloatTolerance,
             // Issue #108: `Other` is passthrough-only (no arithmetic, no
             // scale-insensitive semantics defined for it yet), same footing
             // as `Text`/`Boolean`/`Uuid` — byte-exact text equality is the
@@ -103,15 +126,46 @@ impl Comparison {
                 },
                 _ => false,
             },
-            Comparison::FloatTolerance => {
-                unimplemented!(
-                    "float tolerance comparison: the value language has no float type yet \
-                     (ValueType has no Float variant), so this is unreachable; implement a \
-                     combined absolute+relative tolerance here when floats are added"
-                )
-            }
+            Comparison::FloatTolerance => match (expected, got) {
+                (None, None) => true,
+                (Some(a), Some(b)) => match (a.parse::<f64>(), b.parse::<f64>()) {
+                    (Ok(a), Ok(b)) => floats_close(a, b),
+                    // Text that isn't a float at all (`NaN`, `Infinity`,
+                    // `-Infinity` all *do* parse in Rust, so this is a
+                    // genuinely unparseable rendering) can only be compared
+                    // exactly, same fallback `DecimalByValue` takes.
+                    _ => a == b,
+                },
+                _ => false,
+            },
         }
     }
+}
+
+/// Whether two floats agree within the combined absolute+relative tolerance
+/// [`Comparison::FloatTolerance`] applies.
+///
+/// Equality is checked first, through [`trellis::float::equal`] rather than
+/// `==`, so that `NaN`/`NaN` and `-0`/`0` pairs agree exactly as Postgres
+/// says they do. Only then does the tolerance apply, and it is deliberately
+/// tight: `1e-9` relative is roughly 10^7 times the `f64` epsilon, enough to
+/// absorb reassociation of a realistic fold but far too small to hide a
+/// genuinely wrong computation. The absolute floor handles values near zero,
+/// where a relative bound degenerates.
+fn floats_close(a: f64, b: f64) -> bool {
+    const RELATIVE: f64 = 1e-9;
+    const ABSOLUTE: f64 = 1e-12;
+    if trellis::float::equal(a, b) {
+        return true;
+    }
+    // A special value that isn't equal to the other side (e.g. `NaN` vs `1`,
+    // or `Infinity` vs `-Infinity`) is a real divergence, not a rounding
+    // difference — no tolerance can bridge it.
+    if !a.is_finite() || !b.is_finite() {
+        return false;
+    }
+    let diff = (a - b).abs();
+    diff <= ABSOLUTE || diff <= RELATIVE * a.abs().max(b.abs())
 }
 
 /// One differing cell, row, or column found while comparing a candidate
@@ -311,7 +365,7 @@ fn render_expr(expr: &Expr) -> String {
         Expr::Column(name) => quote_ident(name),
         Expr::NumberLiteral(text) => text.clone(),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
-        Expr::TypedLiteral { pg_type, text } => typed_literal::render_sql(*pg_type, text),
+        Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = match op {
                 Operator::Add => "+",
@@ -483,7 +537,7 @@ fn render_rel_expr(expr: &Expr, source: &str, rels: &RelIndex<'_>) -> String {
         Expr::Column(name) => format!("{}.{}", quote_ident(source), quote_ident(name)),
         Expr::NumberLiteral(text) => text.clone(),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
-        Expr::TypedLiteral { pg_type, text } => typed_literal::render_sql(*pg_type, text),
+        Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = match op {
                 Operator::Add => "+",
@@ -1005,12 +1059,56 @@ fn field_value_type(
                  on the def's actual source table)"
             )
         }),
-        Expr::NumberLiteral(_) => ValueType::Numeric,
+        // Issue #111: Postgres's own literal-typing rule — a bare integral
+        // literal is `integer` if it fits, else `bigint`; anything else is
+        // `numeric`.
+        Expr::NumberLiteral(text) => match text.contains('.') {
+            false => match text.parse::<i64>() {
+                Ok(value) => ValueType::Integer(IntWidth::narrowest_for(value)),
+                Err(_) => ValueType::Numeric,
+            },
+            true => ValueType::Numeric,
+        },
         Expr::StringLiteral(_) => ValueType::Text,
-        Expr::TypedLiteral { pg_type, .. } => typed_literal::value_type(*pg_type),
-        Expr::BinaryOp { op, .. } => registry::operator_spec(*op).return_type,
+        Expr::TypedLiteral { value_type, .. } => *value_type,
+        // Issue #111: `+`'s result type depends on its operands (`int4 +
+        // int4` is `integer`, `int4 + numeric` is `numeric`), so it has to
+        // be resolved rather than read off a constant.
+        Expr::BinaryOp { op, lhs, rhs } => {
+            let lhs_t = field_value_type(lhs, source_columns, rels);
+            let rhs_t = field_value_type(rhs, source_columns, rels);
+            registry::operator_result_type(*op, lhs_t, rhs_t).unwrap_or_else(|| {
+                panic!(
+                    "oracle: operator {op:?} has no result type for operands \
+                     {lhs_t}/{rhs_t} — the generator only ever builds \
+                     well-typed expressions"
+                )
+            })
+        }
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
             field_value_type(&args[0], source_columns, rels)
+        }
+        // Issue #111: likewise for the aggregates — `sum(int4)` is `bigint`,
+        // `sum(numeric)` is `numeric`. `COUNT` is excluded on purpose: it is
+        // type-agnostic row-counting, so `registry::aggregate_result_type`
+        // deliberately has no row for it and its constant `FunctionSpec`
+        // return type (below) is the right answer. Its one-argument form
+        // (`COUNT(<rel>.<col>)` over a to-many relationship) is why this
+        // needs naming rather than falling out of the `args.is_empty()`
+        // guard.
+        Expr::FunctionCall { name, args }
+            if name != "COUNT"
+                && registry::lookup_aggregate_function(name).is_some()
+                && !args.is_empty() =>
+        {
+            let arg_t = field_value_type(&args[0], source_columns, rels);
+            registry::aggregate_result_type(name, arg_t).unwrap_or_else(|| {
+                panic!(
+                    "oracle: aggregate {name:?} has no result type for argument \
+                     {arg_t} — the generator only ever builds well-typed \
+                     expressions"
+                )
+            })
         }
         Expr::FunctionCall { name, .. } => registry::lookup_function(name)
             .or_else(|| registry::lookup_aggregate_function(name))
@@ -1698,8 +1796,10 @@ mod tests {
         );
     }
 
-    /// Every one of the five scalar functions type-checks to its registered
-    /// return type (all `Numeric` today) via [`field_value_type`], and
+    /// Every one of the four scalar functions type-checks to its registered
+    /// return type via [`field_value_type`] — `integer` since issue #111,
+    /// which gave them the return type `pg_proc.prorettype` actually
+    /// reports instead of the `Numeric` they collapsed into — and
     /// `COALESCE` specifically types as its first argument's type rather
     /// than a fixed registry entry.
     #[test]
@@ -1719,8 +1819,8 @@ mod tests {
             };
             assert_eq!(
                 field_value_type(&expr, &source_columns, &RelIndex::new(&empty_program())),
-                ValueType::Numeric,
-                "{name} must type-check as Numeric"
+                ValueType::Integer(IntWidth::Int4),
+                "{name} must type-check as integer"
             );
         }
 

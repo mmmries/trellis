@@ -443,7 +443,7 @@ impl ManualBackend {
     }
 
     /// Delegates to the shared [`sql::create_source_table`] — see that
-    /// function's doc comment for the exact DDL shape (`PRIMARY_KEY_PG_TYPE`
+    /// function's doc comment for the exact DDL shape (`crate::model::PRIMARY_KEY_VALUE_TYPE`
     /// pk, per-column `UNIQUE`, unconditional `REPLICA IDENTITY FULL`).
     async fn create_source_table(&self, table: &Table) -> Result<(), ManualBackendError> {
         Ok(sql::create_source_table(&self.raw, table).await?)
