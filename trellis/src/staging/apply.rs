@@ -41,7 +41,7 @@ use crate::defs::eval::{
 use crate::defs::model::{RelationshipCardinality, RelationshipDefinition};
 use crate::defs::validate::{self, ValidationError};
 use crate::error_code::{self, ErrorCode};
-use crate::pool::{Pool, quote_ident};
+use crate::pool::{Pool, quote_ident, quote_literal};
 
 use super::append::{self, StagedChange};
 use super::apply_aggregate::{self, AggregateTargetPlan};
@@ -598,9 +598,13 @@ async fn read_live_rows_batch(
         .collect();
     let join_cond = live_rows_join_cond(&pk_idents, &u_cols, &null_safe);
     let k_expr = ddl::pk_key_sql_expr(pk, Some("t"));
+    // Issue #248: an explicit per-column `jsonb_build_object`, not
+    // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment for why.
+    let row_columns = live_row_columns(&**client, source_table).await?;
+    let doc_expr = row_as_text_jsonb_sql("t", &row_columns);
     let sql = format!(
         "select m.k, e.key, e.value \
-         from (select {k_expr} as k, to_jsonb(t.*) as doc from {} t \
+         from (select {k_expr} as k, {doc_expr} as doc from {} t \
                join unnest({}) as u({}) on {join_cond}) m \
          cross join lateral jsonb_each_text(m.doc) e",
         ddl::qualified_source_table(source_table),
@@ -705,6 +709,97 @@ fn key_array_filter(col_ident: &str, pg_type: Option<&str>) -> String {
         Some(ty) => format!("{col_ident} = any($1::text[]::{ty}[])"),
         None => format!("{col_ident}::text = any($1::text[])"),
     }
+}
+
+/// The live, `attnum`-ordered column names of `table` — the same
+/// `to_regclass`-bound `pg_attribute` introspection [`to_column_types`]/
+/// [`key_column_pg_type`] already use, but the whole live column list rather
+/// than a caller-supplied subset. `table` may be either the bare/qualified
+/// form `to_regclass` parses unquoted (e.g. `key_column_pg_type`'s own
+/// `table` argument) or an already `quote_ident`-quoted `"schema"."table"`
+/// string (e.g. [`ddl::qualified_relationship_projection_table`]'s output):
+/// `to_regclass` parses a quoted-identifier bind parameter exactly the way
+/// the SQL parser would parse the same text in a `FROM` clause, so either
+/// shape resolves to the right relation.
+///
+/// Issue #248: every `to_jsonb(t.*)`-based row decode in this crate needs
+/// this to build an explicit per-column `jsonb_build_object` (see
+/// [`row_as_text_jsonb_sql`]) instead — `to_jsonb` renders a `timestamp`/
+/// `timestamptz` column with its own ISO-8601 writer rather than calling the
+/// column's real output function, so it disagrees with every other `<col>::
+/// text` cast in Trellis specifically for those two types. That divergence
+/// is invisible until the two renderings of one value are compared as raw
+/// text — a join/`GROUP BY`/primary-key key, or a `MIN`/`MAX` fold that
+/// returns one of its inputs verbatim — at which point it reads as *two*
+/// distinct keys/values for one underlying row.
+pub async fn live_row_columns(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<Vec<String>, ApplyError> {
+    let rows = client
+        .query(
+            "select a.attname::text \
+             from pg_attribute a \
+             where a.attrelid = pg_catalog.to_regclass($1) \
+               and a.attnum > 0 \
+               and not a.attisdropped \
+             order by a.attnum",
+            &[&table],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+}
+
+/// [`live_row_columns`], memoized per `table` in `cache` — the caching
+/// counterpart Phase 3's reverse-trigger loop needs
+/// (`apply_and_mark_drained_many`'s "3d" step, via
+/// [`stage_reverse_recompute_fallback`] and its `diff_pass` closure).
+///
+/// That loop runs once per distinct touched parent key in the batch, and
+/// every record for one relationship shares the same `from_table` — a wide
+/// reverse-relationship batch can touch many parent keys in one drain, so an
+/// uncached [`live_row_columns`] call per record would be a real per-record
+/// `pg_catalog` round trip this fix did not add before issue #248
+/// introduced the `row_columns` parameter [`from_side_rows_for_trigger_txn`]
+/// now needs. `table`'s column list cannot change mid-transaction (DDL on it
+/// would take a lock this transaction already holds something incompatible
+/// with, for any table this crate reads), so caching it for the lifetime of
+/// one Phase 3 transaction is sound.
+async fn cached_row_columns<'c>(
+    txn: &Transaction<'_>,
+    cache: &'c mut HashMap<String, Vec<String>>,
+    table: &str,
+) -> Result<&'c [String], ApplyError> {
+    if !cache.contains_key(table) {
+        let columns = live_row_columns(txn, table).await?;
+        cache.insert(table.to_string(), columns);
+    }
+    Ok(cache
+        .get(table)
+        .expect("just inserted if it wasn't already present"))
+}
+
+/// `to_jsonb(<alias>.*)`'s replacement (issue #248): an explicit
+/// `jsonb_build_object('<col>', <alias>."<col>"::text, ...)` over `columns`,
+/// so every value lands the same way an ordinary `<col>::text` cast would —
+/// including `timestamp`/`timestamptz`, where `to_jsonb`'s own writer
+/// disagrees with the type's real output function (a space where `::text`
+/// renders one, `to_jsonb` renders a `T`). Downstream, every caller of this
+/// SQL fragment still decodes the result via `jsonb_each_text`, whose key for
+/// each pair is exactly the quoted literal given here — the *raw* column
+/// name, matching the key `to_jsonb(t.*)` itself would have produced, so no
+/// downstream field lookup needs to change.
+///
+/// `columns` is expected non-empty in practice (every table this crate reads
+/// has a primary key, so [`live_row_columns`] never returns an empty list for
+/// a real relation) — an empty slice still renders valid SQL
+/// (`jsonb_build_object()`), just an empty object, rather than panicking.
+pub fn row_as_text_jsonb_sql(alias: &str, columns: &[String]) -> String {
+    let pairs: Vec<String> = columns
+        .iter()
+        .map(|col| format!("{}, {alias}.{}::text", quote_literal(col), quote_ident(col)))
+        .collect();
+    format!("jsonb_build_object({})", pairs.join(", "))
 }
 
 /// Issue #173 phase 3: what a to-side (parent) event implies about the
@@ -1808,6 +1903,21 @@ async fn capture_reverse_guard_state(
 /// an old and new key that happen to be equal still issues one query per
 /// slice entry, unchanged from before (the caller's own `seen_keys` dedup is
 /// what collapses the resulting duplicate rows, exactly as it always has).
+///
+/// `row_columns` is `from_table`'s live column list (issue #248's
+/// `row_as_text_jsonb_sql` needs it in place of `to_jsonb(t.*)` — see that
+/// function's doc comment), **resolved by the caller, not here**: this
+/// function is called once per distinct touched parent key in Phase 3's own
+/// `for record in &plan.relationship_reverses` loop
+/// (`apply_and_mark_drained_many`'s "3d" step, both directly from
+/// [`stage_reverse_recompute_fallback`] and from the reverse-delta fast
+/// path's `diff_pass` closure), and `from_table` is invariant across many
+/// records sharing one relationship — introspecting it fresh on every call
+/// would be a real per-record `pg_catalog` round trip on a path that already
+/// fans out with wide reverse-relationship batches (a regression this fix
+/// did not have before issue #248 introduced this parameter). The caller
+/// resolves it once per distinct `from_table`, cached across that whole
+/// loop, and passes the same slice into every call.
 /// [`ReverseTrigger::WholeKeyspace`] is unreachable here, for two independent
 /// reasons. Structurally: both call sites construct [`ReverseTrigger::Keys`]
 /// inline from a single join key they already hold, and no function in this
@@ -1835,6 +1945,7 @@ async fn from_side_rows_for_trigger_txn(
     from_col: &str,
     from_pk: &[PrimaryKeyColumn],
     trigger: &ReverseTrigger<'_>,
+    row_columns: &[String],
 ) -> Result<Vec<(String, Row)>, ApplyError> {
     let join_keys: &[String] = match trigger {
         ReverseTrigger::Keys(join_keys) => join_keys,
@@ -1844,11 +1955,19 @@ async fn from_side_rows_for_trigger_txn(
             });
         }
     };
+    if join_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Issue #248: an explicit per-column `jsonb_build_object`, not
+    // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment.
+    // `row_columns` arrives pre-resolved (see this function's own doc
+    // comment on why it isn't introspected here).
+    let doc_expr = row_as_text_jsonb_sql("t", row_columns);
     let mut rows: HashMap<String, Row> = HashMap::new();
     for join_key in join_keys {
         let sql = format!(
             "select m.k, e.key, e.value \
-             from (select {pk} as k, to_jsonb(t.*) as doc from {tbl} t \
+             from (select {pk} as k, {doc_expr} as doc from {tbl} t \
                    where {col}::text = $1) m \
              cross join lateral jsonb_each_text(m.doc) e",
             pk = ddl::pk_key_sql_expr(from_pk, Some("t")),
@@ -2462,6 +2581,15 @@ async fn reverse_ordering_still_holds(
 /// forward evaluation already is — which is exactly why issue #135's
 /// fairness escalation (see this module's own design section above) can
 /// lean on it as the always-safe exit from the guard-gated retry loop.
+///
+/// `row_columns` is `shape.from_table`'s live column list, resolved once by
+/// the caller via [`cached_row_columns`] — not re-introspected per call here
+/// — since this function's own caller (the "3d" step's `for record in
+/// &plan.relationship_reverses` loop) runs once per distinct touched parent
+/// key in the batch, and many records touching one relationship all share
+/// this same `from_table`. See [`from_side_rows_for_trigger_txn`]'s doc
+/// comment for why that function takes the same parameter rather than
+/// introspecting it itself.
 #[allow(clippy::too_many_arguments)]
 async fn stage_reverse_recompute_fallback(
     txn: &Transaction<'_>,
@@ -2472,6 +2600,7 @@ async fn stage_reverse_recompute_fallback(
     src_changed: Option<std::time::SystemTime>,
     seen_keys: &mut std::collections::HashSet<String>,
     fallback: &mut Vec<(String, String, i32, Option<std::time::SystemTime>)>,
+    row_columns: &[String],
 ) -> Result<(), ApplyError> {
     for key in [old_key.clone(), new_key.clone()].into_iter().flatten() {
         let trigger = ReverseTrigger::Keys(std::slice::from_ref(&key));
@@ -2481,6 +2610,7 @@ async fn stage_reverse_recompute_fallback(
             &shape.from_col,
             &shape.from_pk,
             &trigger,
+            row_columns,
         )
         .await?;
         for (from_key, _) in from_rows {
@@ -2672,11 +2802,15 @@ async fn fetch_to_side_rows(
     let tbl_ident = quote_ident(to_table);
     let pg_type = key_column_pg_type(pool, to_table, to_col).await?;
     let filter = key_array_filter(&col_ident, pg_type.as_deref());
+    // Issue #248: an explicit per-column `jsonb_build_object`, not
+    // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment.
+    let row_columns = live_row_columns(&**client, to_table).await?;
+    let doc_expr = row_as_text_jsonb_sql("t", &row_columns);
     let sql = format!(
         "select m.jk, m.rn, e.key, e.value \
          from (select {col_ident}::text as jk, \
                       row_number() over () as rn, \
-                      to_jsonb(t.*) as doc \
+                      {doc_expr} as doc \
                from {tbl_ident} t \
                where {filter}) m \
          cross join lateral jsonb_each_text(m.doc) e",
@@ -2725,7 +2859,13 @@ async fn fetch_to_side_rows(
 /// agree, and `to_table` is a plain bare/qualified table name `to_regclass`
 /// resolves directly — unlike `qualified_projection`, which arrives here
 /// already `quote_ident`-quoted for direct interpolation, not in the shape
-/// `to_regclass` expects as a bind parameter.
+/// `to_regclass` expects for *this* lookup (`to_table`/`key_col` is a
+/// same-named-column shortcut, not a general rule about quoted input:
+/// [`live_row_columns`], just below, binds `qualified_projection` itself as
+/// a `to_regclass` parameter to read the projection's own live columns, and
+/// that works fine — `to_regclass` parses an already-quoted qualified name
+/// exactly like the SQL parser would parse the same text in a `FROM`
+/// clause).
 async fn fetch_relationship_projection_rows(
     pool: &Pool,
     qualified_projection: &str,
@@ -2740,10 +2880,14 @@ async fn fetch_relationship_projection_rows(
     let key_ident = quote_ident(key_col);
     let pg_type = key_column_pg_type(pool, to_table, key_col).await?;
     let filter = key_array_filter(&format!("p.{key_ident}"), pg_type.as_deref());
+    // Issue #248: an explicit per-column `jsonb_build_object`, not
+    // `to_jsonb(p.*)` — see `row_as_text_jsonb_sql`'s doc comment.
+    let row_columns = live_row_columns(&**client, qualified_projection).await?;
+    let doc_expr = row_as_text_jsonb_sql("p", &row_columns);
     let sql = format!(
         "select p.{key_ident}::text as jk, e.key, e.value \
          from {qualified_projection} p \
-         cross join lateral jsonb_each_text(to_jsonb(p.*)) e \
+         cross join lateral jsonb_each_text({doc_expr}) e \
          where {filter}"
     );
     let db_rows = client.query(&sql, &[&join_keys]).await?;
@@ -3679,12 +3823,16 @@ mod tests {
 
         let txn = client.transaction().await.expect("open txn");
         let join_keys = vec!["a".to_string()];
+        let row_columns = live_row_columns(&txn, "from_side_fixture")
+            .await
+            .expect("introspect from_side_fixture's columns");
         let mut rows = from_side_rows_for_trigger_txn(
             &txn,
             "from_side_fixture",
             "join_key",
             &from_pk,
             &ReverseTrigger::Keys(&join_keys),
+            &row_columns,
         )
         .await
         .expect("from_side_rows_for_trigger_txn(Keys)");
@@ -3731,12 +3879,16 @@ mod tests {
         let from_pk = seed_reverse_trigger_fixture(&client).await;
 
         let txn = client.transaction().await.expect("open txn");
+        // `WholeKeyspace` errors out before `row_columns` is ever read (see
+        // the function's own early `match trigger`), so an empty slice is
+        // fine here — this test is about the error arm, not the row decode.
         let err = from_side_rows_for_trigger_txn(
             &txn,
             "from_side_fixture",
             "join_key",
             &from_pk,
             &ReverseTrigger::WholeKeyspace,
+            &[],
         )
         .await
         .expect_err("a whole-keyspace trigger must not resolve against full row images");
@@ -5278,8 +5430,11 @@ type ChangedKey = (String, i32, Option<std::time::SystemTime>, Option<String>);
 
 /// One row [`apply_target`]'s delete statement actually removed: its key,
 /// paired with the pre-delete image captured by that statement's own
-/// `RETURNING ... to_jsonb(t.*)::text` (issue #196) — the 1-1-target
-/// counterpart to `apply_aggregate::AggregateApplyResult::deleted`'s tuple.
+/// `RETURNING ...` (issue #196) — an explicit per-column
+/// `jsonb_build_object(..., <col>::text, ...)::text`, not `to_jsonb(t.*)::text`
+/// (issue #248: see `row_as_text_jsonb_sql`'s doc comment for why) — the
+/// 1-1-target counterpart to `apply_aggregate::AggregateApplyResult::deleted`'s
+/// tuple.
 type TargetDeletedKey = (String, String);
 
 /// Every key in one target's [`ChangedKey`] accumulator that this batch
@@ -5301,9 +5456,10 @@ fn keys_written_without_image(touched: &[ChangedKey]) -> std::collections::HashS
 /// deleted (as opposed to every key this batch merely *proposed* — the
 /// no-op-suppression `WHERE ... IS DISTINCT FROM ...` guard can mean a
 /// proposed write physically changes nothing). Issue #196: each deleted key
-/// is paired with its pre-delete image (`RETURNING ... to_jsonb(t.*)::text`,
-/// the same encoding `apply_aggregate::delete_group_row`'s issue #180 fix
-/// captures for an extinct aggregate group), so `apply_and_mark_drained_many`
+/// is paired with its pre-delete image (`RETURNING ...`, an explicit
+/// per-column `jsonb_build_object` per issue #248 — see [`TargetDeletedKey`]'s
+/// doc comment — the same shape `apply_aggregate::delete_group_row`'s issue
+/// #180 fix captures for an extinct aggregate group), so `apply_and_mark_drained_many`
 /// can stage a real image-bearing delete for a deleted 1-1 target row
 /// instead of an image-less `Recompute` — see [`ChangedKey`]'s doc comment.
 ///
@@ -5358,6 +5514,18 @@ async fn apply_target(
     // and `ddl::qualified_target_table_ident`'s.
     let target_ident = ddl::qualified_target_table_ident(&plan.qualified_target);
     let field_idents: Vec<String> = plan.field_names.iter().map(|n| quote_ident(n)).collect();
+
+    // Issue #248: an explicit per-column `jsonb_build_object`, not
+    // `to_jsonb(t.*)`, for the delete `RETURNING` below — see
+    // `row_as_text_jsonb_sql`'s doc comment for why. This target's full
+    // column set is exactly `pk` plus `field_names` (`ddl::create_target_table`'s
+    // own DDL never declares any other column), so — unlike the read paths
+    // above, which read tables this function doesn't control the shape of —
+    // no live `pg_catalog` introspection is needed here.
+    let old_image_columns: Vec<String> = std::iter::once(plan.pk.name.clone())
+        .chain(plan.field_names.iter().cloned())
+        .collect();
+    let old_image_expr = row_as_text_jsonb_sql("t", &old_image_columns);
 
     // Issue #205: `write.pk_text`/`delete.pk_text` is this target's shared
     // key-contract text, not necessarily a raw PK value yet — decode each
@@ -5515,7 +5683,9 @@ async fn apply_target(
         .filter(|k| !write_keys.contains(k))
         .collect();
     if !delete_keys.is_empty() {
-        // Issue #196: `as t` + `to_jsonb(t.*)::text` captures each deleted
+        // Issue #196: `as t` + `old_image_expr` (an explicit per-column
+        // `jsonb_build_object`, issue #248 — not `to_jsonb(t.*)`, see
+        // `row_as_text_jsonb_sql`'s doc comment) captures each deleted
         // row's exact pre-delete state, the same `apply_aggregate`'s
         // `delete_group_row` does for an extinct aggregate group (issue
         // #180) — see this function's own doc comment and `ChangedKey`'s for
@@ -5527,7 +5697,7 @@ async fn apply_target(
                 &format!(
                     "delete from {target_ident} as t \
                      where {pk_ident} = any($1::text[]::{pk_cast}[]) \
-                     returning {pk_ident}::text as pk, to_jsonb(t.*)::text as old_image"
+                     returning {pk_ident}::text as pk, {old_image_expr}::text as old_image"
                 ),
                 &[&delete_keys],
             )
@@ -5837,7 +6007,8 @@ pub async fn apply_and_mark_drained_many(
         // different producer" gap issue #180 fixed for extinct aggregate
         // groups, left unthreaded for this producer at the time. `deleted`
         // now carries each row's pre-delete image straight from
-        // `apply_target`'s own `RETURNING to_jsonb(t.*)::text`, so it stages
+        // `apply_target`'s own `RETURNING` (an explicit per-column
+        // `jsonb_build_object`, issue #248), so it stages
         // the same way 3b's extinct-group `deleted` entries do below —
         // `Some(old_image)`, letting a chained downstream aggregate subtract
         // this row's last-known contribution (`accumulate_changes`'s
@@ -6011,10 +6182,27 @@ pub async fn apply_and_mark_drained_many(
     // `MAX_HOP_GEN` below) — appended separately, after this loop, via its
     // own `append::append` call.
     let mut relationship_reverse_deferrals: Vec<StagedChange> = Vec::new();
+    // Issue #248 review follow-up: `from_side_rows_for_trigger_txn` needs
+    // each touched `from_table`'s live column list (`row_as_text_jsonb_sql`,
+    // in place of `to_jsonb(t.*)`), and this loop runs once per distinct
+    // touched parent key in the batch — many records sharing one
+    // relationship all share one `from_table`. Caching per `from_table`
+    // across the *whole* loop (not just within one record) is what keeps
+    // that at one `pg_catalog` round trip per distinct `from_table`, not one
+    // per record, on a path that already fans out with wide
+    // reverse-relationship batches.
+    let mut row_columns_cache: HashMap<String, Vec<String>> = HashMap::new();
     for record in &plan.relationship_reverses {
         let shape = &record.shape;
         let old_key = relationship_key_text(&record.old_row, &shape.to_col);
         let new_key = relationship_key_text(&record.new_row, &shape.to_col);
+        // Resolved once per record from the batch-wide cache above — every
+        // `from_side_rows_for_trigger_txn` call this record makes (via
+        // `diff_pass` below and/or `stage_reverse_recompute_fallback`)
+        // reuses this same slice.
+        let row_columns = cached_row_columns(txn, &mut row_columns_cache, &shape.from_table)
+            .await?
+            .to_vec();
 
         // Issue #132: all four guards, checked together — see
         // `check_reverse_guards`'s own doc comment for the mechanism, the
@@ -6056,6 +6244,7 @@ pub async fn apply_and_mark_drained_many(
                     record.src_changed,
                     &mut seen_keys,
                     &mut relationship_reverse_fallback,
+                    &row_columns,
                 )
                 .await?;
                 apply_projection_advance(
@@ -6217,6 +6406,7 @@ pub async fn apply_and_mark_drained_many(
                     &shape.from_col,
                     &shape.from_pk,
                     &trigger,
+                    &row_columns,
                 )
                 .await?;
                 for (_, from_row) in from_rows {
@@ -6387,6 +6577,7 @@ pub async fn apply_and_mark_drained_many(
                 record.src_changed,
                 &mut seen_keys,
                 &mut relationship_reverse_fallback,
+                &row_columns,
             )
             .await?;
         }
