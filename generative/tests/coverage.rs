@@ -39,7 +39,8 @@ fn sorted_value_types(types: impl IntoIterator<Item = ValueType>) -> Vec<&'stati
     names
 }
 
-/// Every scalar type appears both as a plain column and via a derivation.
+/// Every **value** column's scalar type appears both as a plain column and
+/// via a derivation.
 ///
 /// Improvement-plan task B1 widened the generator's whole type surface past
 /// Numeric-only (design doc §3): every table now also gets one `Text`, one
@@ -50,12 +51,22 @@ fn sorted_value_types(types: impl IntoIterator<Item = ValueType>) -> Vec<&'stati
 /// without a matching derivation landing alongside it — exactly the
 /// "coverage that silently drops out" the design doc warns about — so its
 /// expected-surface assertion is widened here, not weakened or dropped.
+///
+/// The **primary-key** column is excluded, and that exclusion is the
+/// assertion's shape, not a hole in it: the pk exists to be a *key*, and its
+/// `bigint` type (`model::PRIMARY_KEY_VALUE_TYPE`, honest since issue #111
+/// rather than the `Numeric` placeholder it used to carry) is exercised on
+/// every single op of every single program — as the target's own primary
+/// key, as the identity every `Update`/`Delete` addresses a row by, and as
+/// the value every snapshot comparison is keyed on. Requiring it to *also*
+/// appear inside a derivation would pin a passthrough field the generator
+/// has no reason to emit, since a 1-1 target already carries the key column.
 #[test]
 fn every_column_scalar_type_appears_via_a_derivation() {
     let program = build_program(&[(Some(1), Some(2))], &[]);
     let source = &program.tables[0];
 
-    let column_types = sorted_value_types(source.columns.iter().map(|c| c.value_type));
+    let column_types = sorted_value_types(value_column_types(source));
     assert_eq!(
         column_types,
         vec!["boolean", "numeric", "text", "uuid"],
@@ -78,6 +89,17 @@ fn every_column_scalar_type_appears_via_a_derivation() {
         derivation_types, column_types,
         "every column scalar type must appear via a derivation, not just as a column"
     );
+}
+
+/// Every column's [`ValueType`] *except* the primary key's — see
+/// [`every_column_scalar_type_appears_via_a_derivation`] for why the pk is
+/// held to the key role rather than the derivation role.
+fn value_column_types(table: &Table) -> impl Iterator<Item = ValueType> + '_ {
+    table
+        .columns
+        .iter()
+        .filter(|c| c.name != table.pk_col)
+        .map(|c| c.value_type)
 }
 
 fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
@@ -448,11 +470,27 @@ fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
         // *every* sampled program, not just "at least one of 500", the
         // stronger form the task calls for where it actually holds.
         for table in &program.tables {
-            let types = sorted_value_types(table.columns.iter().map(|c| c.value_type));
+            let types = sorted_value_types(value_column_types(table));
             assert_eq!(
                 types,
                 vec!["boolean", "numeric", "text", "uuid"],
-                "every table must always have exactly this type surface: {program:#?}"
+                "every table must always have exactly this value-column type surface: \
+                 {program:#?}"
+            );
+            // The pk is excluded above because it is a key, not a value —
+            // but it is still pinned, since issue #111 made its recorded
+            // type an honest `bigint` that every DDL and cast site now
+            // renders straight from (`backend::sql::column_pg_type`).
+            let pk = table
+                .columns
+                .iter()
+                .find(|c| c.name == table.pk_col)
+                .expect("every table has its pk column");
+            assert_eq!(
+                pk.value_type,
+                generative::model::PRIMARY_KEY_VALUE_TYPE,
+                "the primary key's recorded type must stay the one the DDL renders: \
+                 {program:#?}"
             );
         }
 
