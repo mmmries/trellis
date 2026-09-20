@@ -92,6 +92,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::error_code::{self, ErrorCode};
+use crate::integer::IntWidth;
 use crate::pool::{Pool, quote_ident};
 
 use super::ast::{Expr, KeySpace, RelationshipDef, TransformDef, ValueType};
@@ -2513,6 +2514,14 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "smallint",
     "integer",
     "bigint",
+    // Issue #111: `oid` is an *unsigned* 32-bit integer whose `oid_out`
+    // rendering is canonical decimal — no sign, no leading zeros, no
+    // padding — so `a::text = b::text` agrees with `oid`'s native `=` for
+    // every value, exactly as it does for the three signed widths above.
+    // It is not a `ValueType::Integer` (Postgres gives it no arithmetic at
+    // all; see `pg_type::PgType::Oid`), but text-stability is a property of
+    // the *rendering*, not of the operator set, so it belongs here.
+    "oid",
     "uuid",
     "text",
     "character varying",
@@ -3575,6 +3584,12 @@ pub async fn edges_from(
 fn encode_value_type(value_type: &ValueType) -> &'static str {
     match value_type {
         ValueType::Numeric => "numeric",
+        // Issue #111: an exact integer persists under its own Postgres
+        // spelling (`smallint`/`integer`/`bigint`), which is distinct from
+        // every other token here *and* from every `PgType::name`, so all
+        // three namespaces still share one column unambiguously. The
+        // `every_value_type_token_is_distinct` test pins that.
+        ValueType::Integer(width) => width.pg_name(),
         ValueType::Text => "text",
         ValueType::Boolean => "boolean",
         ValueType::Uuid => "uuid",
@@ -3595,7 +3610,10 @@ fn decode_value_type(text: &str) -> Option<ValueType> {
         "text" => ValueType::Text,
         "boolean" => ValueType::Boolean,
         "uuid" => ValueType::Uuid,
-        other => ValueType::Other(PgType::from_name(other)?),
+        other => match IntWidth::from_pg_name(other) {
+            Some(width) => ValueType::Integer(width),
+            None => ValueType::Other(PgType::from_name(other)?),
+        },
     })
 }
 

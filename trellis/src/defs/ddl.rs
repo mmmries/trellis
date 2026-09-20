@@ -71,6 +71,10 @@ use super::validate::ValidationError;
 pub(crate) fn pg_type_name(value_type: ValueType) -> &'static str {
     match value_type {
         ValueType::Numeric => "numeric",
+        // Issue #111: a derived exact-integer column is declared with the
+        // width Postgres would give the same expression, not the `numeric`
+        // every integer used to collapse into.
+        ValueType::Integer(width) => width.pg_name(),
         ValueType::Text => "text",
         ValueType::Boolean => "boolean",
         ValueType::Uuid => "uuid",

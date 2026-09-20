@@ -25,6 +25,7 @@ use std::fmt;
 
 use regex::Regex;
 
+use crate::integer::{self, IntWidth, IntegerError};
 use crate::numeric::{Numeric, NumericParseError};
 
 use super::ast::{Expr, FieldDef, GroupByKey, KeySpace, Operator, TransformDef, ValueType};
@@ -175,9 +176,17 @@ impl RelationshipContext {
 /// like `Uuid`/`Text` — this is the "typed CDC round-trip" the issue asks
 /// for, a value now remembers its real Postgres type family all the way
 /// through [`parse_value`] instead of arriving pre-flattened to `Text`.
+///
+/// [`Value::Integer`] (issue #111) is the exact-integer family's value-level
+/// twin, carrying its [`IntWidth`] alongside the value for the same reason
+/// [`ValueType::Integer`] does: the width *is* the overflow boundary, so no
+/// operation could reproduce Postgres's `22003` without it. It holds a real
+/// `i64` — not text, and not a [`Numeric`] — so arithmetic on it is checked
+/// rather than arbitrary-precision.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Numeric(Numeric),
+    Integer(IntWidth, i64),
     Text(String),
     Boolean(bool),
     Uuid(String),
@@ -185,10 +194,14 @@ pub enum Value {
 }
 
 impl Value {
-    #[cfg(test)]
+    /// This value's [`ValueType`]. Issue #111 promoted it out of
+    /// `#[cfg(test)]`: the aggregate folds now dispatch on whether a value
+    /// is in the exact-numeric family, so the mapping is production code,
+    /// not just a test convenience.
     pub fn value_type(&self) -> ValueType {
         match self {
             Value::Numeric(_) => ValueType::Numeric,
+            Value::Integer(width, _) => ValueType::Integer(*width),
             Value::Text(_) => ValueType::Text,
             Value::Boolean(_) => ValueType::Boolean,
             Value::Uuid(_) => ValueType::Uuid,
@@ -201,6 +214,13 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Numeric(n) => write!(f, "{n}"),
+            // Rust's own `i64` formatting *is* Postgres's canonical integer
+            // output: an optional `-`, then digits, with no `+`, no leading
+            // zeros and no separators. That agreement is what lets an
+            // integer value round-trip through the still-text-keyed
+            // join/primary-key/`GROUP BY` paths byte-for-byte — see
+            // `catalog::TEXT_STABLE_JOIN_KEY_TYPES`.
+            Value::Integer(_, n) => write!(f, "{n}"),
             Value::Text(s) => write!(f, "{s}"),
             Value::Boolean(b) => write!(f, "{b}"),
             Value::Uuid(u) => write!(f, "{u}"),
@@ -224,6 +244,22 @@ pub enum EvalError {
     /// A `Boolean`-typed column's text value isn't a recognized boolean
     /// spelling (Postgres's own `t`/`f` text encoding, or `true`/`false`).
     InvalidBoolean { field: String, text: String },
+    /// An exact-integer (`smallint`/`integer`/`bigint`) operation left its
+    /// result type's range, or a column's text didn't decode as a value of
+    /// its declared width (issue #111).
+    ///
+    /// **Unlike every other variant here, this one is not defense-in-depth.**
+    /// It is a genuine, *data-dependent* runtime failure that a perfectly
+    /// valid definition can hit on one row and not the next — and it is
+    /// exactly the failure Postgres itself raises
+    /// (`22003 numeric_value_out_of_range`, `"integer out of range"`) for
+    /// the same expression, which ADR-0004 requires Trellis to reproduce
+    /// rather than silently widening to arbitrary precision. Per ADR-0003's
+    /// column-level quarantine amendment it pauses the offending
+    /// `(transform, column)` pair, which is the right outcome: that column's
+    /// definition overflows for this data and needs a human, while every
+    /// other column on the same target keeps flowing.
+    IntegerOutOfRange { field: String, source: IntegerError },
     /// A calculated field was re-entered while still being resolved on the
     /// current recursion path. The validator (#23) is supposed to reject
     /// cyclic definitions before they reach here, but `evaluate` is `pub`
@@ -262,11 +298,20 @@ pub enum EvalError {
 
 impl EvalError {
     /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
-    /// decision 3). Every variant here is defense-in-depth for an invariant
-    /// [`super::validate::validate`] is supposed to have already enforced
-    /// before evaluation runs (see this type's own doc comment) — reaching
-    /// any of them means something upstream didn't hold, not that the
-    /// caller supplied bad input, so all of them report [`ErrorCode::Internal`].
+    /// decision 3). Every variant here *except* [`EvalError::IntegerOutOfRange`]
+    /// is defense-in-depth for an invariant [`super::validate::validate`] is
+    /// supposed to have already enforced before evaluation runs (see this
+    /// type's own doc comment) — reaching one of those means something
+    /// upstream didn't hold, not that the caller supplied bad input.
+    ///
+    /// `IntegerOutOfRange` (issue #111) is data-dependent rather than an
+    /// engine-invariant breach, but it still reports [`ErrorCode::Internal`],
+    /// which ADR-0008 decision 3 designates as the catch-all "anything
+    /// else". Minting a new [`ErrorCode`] variant for it would be a breaking
+    /// change to a public, deliberately coarse enum, for a condition a
+    /// caller can't act on any differently — the actionable detail (which
+    /// column, and Postgres's own "integer out of range" wording) is already
+    /// in the `Display` and in the quarantine record ADR-0003 writes.
     pub fn code(&self) -> ErrorCode {
         ErrorCode::Internal
     }
@@ -284,6 +329,7 @@ impl EvalError {
             EvalError::MissingColumn { field, .. }
             | EvalError::InvalidNumber { field, .. }
             | EvalError::InvalidBoolean { field, .. }
+            | EvalError::IntegerOutOfRange { field, .. }
             | EvalError::UnsupportedRelationshipPath { field, .. }
             | EvalError::UnknownRelationship { field, .. }
             | EvalError::AggregateRequiredForToMany { field, .. } => field,
@@ -312,6 +358,9 @@ impl fmt::Display for EvalError {
                 f,
                 "calculated field '{field}' could not parse '{text}' as a boolean"
             ),
+            EvalError::IntegerOutOfRange { field, source } => {
+                write!(f, "calculated field '{field}': {source}")
+            }
             EvalError::Cycle(field) => write!(
                 f,
                 "calculated field '{field}' is part of a cyclic reference"
@@ -340,6 +389,7 @@ impl std::error::Error for EvalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             EvalError::InvalidNumber { source, .. } => Some(source),
+            EvalError::IntegerOutOfRange { source, .. } => Some(source),
             EvalError::MissingColumn { .. }
             | EvalError::InvalidBoolean { .. }
             | EvalError::Cycle(_)
@@ -624,9 +674,7 @@ fn eval_expr(
                 }),
             }
         }
-        Expr::NumberLiteral(text) => {
-            parse_number(field_name, text).map(|n| Some(Value::Numeric(n)))
-        }
+        Expr::NumberLiteral(text) => number_literal(field_name, text).map(Some),
         Expr::StringLiteral(text) => Ok(Some(Value::Text(text.clone()))),
         // Issue #109: a typed literal evaluates to its own family-tagged
         // value, carrying the literal source text verbatim exactly as
@@ -712,7 +760,7 @@ fn eval_expr(
                 in_progress,
                 regex_cache,
             )?;
-            Ok(apply_operator(*op, lhs, rhs))
+            apply_operator(*op, lhs, rhs, field_name)
         }
         // A to-many relationship enrichment (issue #29): an aggregate function
         // whose sole argument is a `<rel>.<column>` path. Unlike a GROUP BY
@@ -845,12 +893,13 @@ fn eval_to_many_aggregate(
         .get(column)
         .copied()
         .unwrap_or(ValueType::Numeric);
-    let mut values: Vec<Numeric> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
     for row in related {
         match row.get(column) {
             Some(Some(text)) => {
-                if let Value::Numeric(n) = parse_value(field_name, value_type, text)? {
-                    values.push(n);
+                let value = parse_value(field_name, value_type, text)?;
+                if value.value_type().is_exact_numeric_family() {
+                    values.push(value);
                 }
             }
             Some(None) => {}
@@ -862,7 +911,7 @@ fn eval_to_many_aggregate(
             }
         }
     }
-    Ok(reduce_numeric_aggregate(name, values))
+    reduce_numeric_aggregate(name, values, field_name)
 }
 
 /// Evaluates every calculated field of an [`KeySpace::Aggregate`] definition
@@ -1000,9 +1049,7 @@ fn eval_aggregate_expr(
                 regex_cache,
             )
         }
-        Expr::NumberLiteral(text) => {
-            parse_number(field_name, text).map(|n| Some(Value::Numeric(n)))
-        }
+        Expr::NumberLiteral(text) => number_literal(field_name, text).map(Some),
         Expr::StringLiteral(text) => Ok(Some(Value::Text(text.clone()))),
         // Issue #109: a typed literal evaluates to its own family-tagged
         // value, carrying the literal source text verbatim exactly as
@@ -1038,7 +1085,7 @@ fn eval_aggregate_expr(
                 in_progress,
                 regex_cache,
             )?;
-            Ok(apply_operator(*op, lhs, rhs))
+            apply_operator(*op, lhs, rhs, field_name)
         }
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             // `COUNT(*)` (issue #75): counts every row in the group,
@@ -1150,7 +1197,7 @@ fn fold_aggregate(
     fields_by_name: &HashMap<&str, &FieldDef>,
     regex_cache: &mut RegexCache,
 ) -> Result<Option<Value>, EvalError> {
-    let mut values: Vec<Numeric> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
     // The aggregate path does not wire relationships (issue #29 handles a
     // to-many relationship's aggregate-wrapped enrichment); a bare path in an
     // aggregate argument therefore errors as unknown, defense-in-depth.
@@ -1169,27 +1216,108 @@ fn fold_aggregate(
             &mut per_row_in_progress,
             regex_cache,
         )?;
-        if let Some(Value::Numeric(n)) = value {
-            values.push(n);
+        if let Some(value) = value
+            && value.value_type().is_exact_numeric_family()
+        {
+            values.push(value);
         }
-        // A `NULL` (`None`) or non-Numeric evaluation is skipped: `NULL` per
-        // Postgres's aggregate semantics above, and a non-Numeric value here
-        // would mean a hand-built AST bypassed the validator's Numeric-only
-        // check on these four functions' argument (defense-in-depth, as
-        // elsewhere in this module).
+        // A `NULL` (`None`) or non-exact-numeric evaluation is skipped:
+        // `NULL` per Postgres's aggregate semantics above, and any other
+        // value here would mean a hand-built AST bypassed the validator's
+        // type check on these four functions' argument (defense-in-depth,
+        // as elsewhere in this module).
     }
 
-    Ok(reduce_numeric_aggregate(name, values))
+    reduce_numeric_aggregate(name, values, field_name)
 }
 
-/// Reduces the collected non-`NULL` numeric values of `SUM`/`MIN`/`MAX`/`AVG`
-/// to the aggregate's result, or `None` (SQL `NULL`) when `values` is empty —
-/// Postgres's "aggregate of zero non-NULL values is NULL" rule. Shared by
-/// [`fold_aggregate`] (a GROUP BY group's rows) and [`eval_to_many_aggregate`]
-/// (a to-many relationship's related rows) so both fold identically.
-fn reduce_numeric_aggregate(name: &str, values: Vec<Numeric>) -> Option<Value> {
+/// Reduces the collected non-`NULL` exact-numeric values of
+/// `SUM`/`MIN`/`MAX`/`AVG` to the aggregate's result, or `None` (SQL `NULL`)
+/// when `values` is empty — Postgres's "aggregate of zero non-NULL values is
+/// NULL" rule. Shared by [`fold_aggregate`] (a GROUP BY group's rows) and
+/// [`eval_to_many_aggregate`] (a to-many relationship's related rows) so
+/// both fold identically.
+///
+/// # Integer arguments (issue #111)
+///
+/// The result type follows [`super::registry::aggregate_result_type`], which
+/// follows Postgres:
+///
+/// * `MIN`/`MAX` keep the argument's own type, so `max(int4_col)` stays
+///   `integer` rather than widening to `numeric`. No fold of a column's own
+///   values can leave that column's range, so neither can ever raise.
+/// * `SUM` over `smallint`/`integer` is Postgres's `int8` sum: it
+///   accumulates in `bigint` and **raises `22003` on overflow**, exactly as
+///   `sum(int4_col)` does server-side. It does *not* silently widen to
+///   arbitrary precision, which is what made Trellis and a backfill of the
+///   same definition disagree before this issue.
+/// * `SUM` over `bigint` is Postgres's `numeric` sum — unbounded, so it
+///   cannot raise — and `AVG` over any exact-integer width is likewise
+///   `numeric`. Both keep going through [`Numeric`], unchanged from before,
+///   which is what keeps `staging::apply_aggregate`'s `numeric`-partial
+///   delta model exactly as correct for them as it already was.
+fn reduce_numeric_aggregate(
+    name: &str,
+    values: Vec<Value>,
+    field_name: &str,
+) -> Result<Option<Value>, EvalError> {
     if values.is_empty() {
-        return None;
+        return Ok(None);
+    }
+
+    // The integer fold applies only when **every** value is an exact
+    // integer, and its width is the *widest* present — not the first value's.
+    // Both details are load-bearing, and both are reachable through
+    // `COALESCE`, whose evaluation picks whichever argument is non-`NULL`
+    // per row rather than coercing to the field's inferred type: a
+    // `SUM(COALESCE(numeric_col, 0))` yields `Numeric` on some rows and the
+    // literal's `Integer` on others, and a `MAX(COALESCE(int8_col, 0))`
+    // mixes `Int8` column values with the literal's `Int4`. Keying off
+    // `values.first()` alone would silently drop every value of the other
+    // shape, or tag a `bigint`-sized result as `integer`.
+    let widest = values.iter().try_fold(IntWidth::Int2, |acc, v| match v {
+        Value::Integer(width, _) => Some(acc.wider(*width)),
+        _ => None,
+    });
+
+    if let Some(width) = widest {
+        let ints = || {
+            values.iter().filter_map(|v| match v {
+                Value::Integer(_, n) => Some(*n),
+                _ => None,
+            })
+        };
+        match name {
+            "MIN" => {
+                let min = ints().min().expect("checked non-empty above");
+                return Ok(Some(Value::Integer(width, min)));
+            }
+            "MAX" => {
+                let max = ints().max().expect("checked non-empty above");
+                return Ok(Some(Value::Integer(width, max)));
+            }
+            // `sum(smallint)`/`sum(integer)` accumulate in `bigint`. The
+            // `bigint` case deliberately falls through to the `numeric`
+            // path below, matching `sum(bigint) -> numeric`.
+            "SUM" if width != IntWidth::Int8 => {
+                let mut acc: i64 = 0;
+                for n in ints() {
+                    let (next, _) = integer::checked_add(acc, IntWidth::Int8, n, IntWidth::Int8)
+                        .map_err(|source| EvalError::IntegerOutOfRange {
+                            field: field_name.to_string(),
+                            source,
+                        })?;
+                    acc = next;
+                }
+                return Ok(Some(Value::Integer(IntWidth::Int8, acc)));
+            }
+            _ => {}
+        }
+    }
+
+    let values: Vec<Numeric> = values.into_iter().filter_map(as_numeric).collect();
+    if values.is_empty() {
+        return Ok(None);
     }
 
     let result = match name {
@@ -1229,28 +1357,80 @@ fn reduce_numeric_aggregate(name: &str, values: Vec<Numeric>) -> Option<Value> {
         }
         _ => unreachable!("reduce_numeric_aggregate is only called for SUM/MIN/MAX/AVG"),
     };
-    Some(Value::Numeric(result))
+    Ok(Some(Value::Numeric(result)))
 }
 
-/// `+` and `>` are both Numeric-operand operators (per ADR-0004, neither
-/// gains an implicit string form); a non-Numeric operand here would mean the
-/// validator (#23) let a type-mismatched definition through, so this falls
-/// back to `None` rather than a panic, matching this module's existing
-/// defense-in-depth posture toward validator bugs. Postgres's own `>` on
-/// `numeric` is `STRICT` (any `NULL` operand yields `NULL`), matched by the
-/// same `None` fallback.
-fn apply_operator(op: Operator, lhs: Option<Value>, rhs: Option<Value>) -> Option<Value> {
-    match op {
+/// `+` and `>` both take exact-numeric-family operands — [`Value::Numeric`]
+/// or [`Value::Integer`] (per ADR-0004, neither gains an implicit string
+/// form). An operand of any other type here would mean the validator (#23)
+/// let a type-mismatched definition through, so this falls back to `None`
+/// rather than a panic, matching this module's existing defense-in-depth
+/// posture toward validator bugs. Postgres's own `+`/`>` on these types are
+/// `STRICT` (any `NULL` operand yields `NULL`), matched by the same `None`
+/// fallback.
+///
+/// # Mixed operands (issue #111)
+///
+/// The dispatch mirrors [`super::registry::operator_result_type`] exactly,
+/// because it must: `Integer op Integer` runs Postgres's *bounded* integer
+/// operator (so `int4 + int4` can raise `22003`), while any mix with
+/// `Numeric` promotes through Postgres's implicit `int -> numeric` cast and
+/// runs the *unbounded* `numeric` operator (so it cannot). Anything else
+/// would make the evaluator and the validator disagree about a field's
+/// result type — and therefore about its target column's declared type — or
+/// make Trellis and a server-side backfill of the same expression disagree
+/// about whether it errors at all.
+fn apply_operator(
+    op: Operator,
+    lhs: Option<Value>,
+    rhs: Option<Value>,
+    field_name: &str,
+) -> Result<Option<Value>, EvalError> {
+    let (Some(lhs), Some(rhs)) = (lhs, rhs) else {
+        return Ok(None);
+    };
+    Ok(match op {
         Operator::Add => match (lhs, rhs) {
-            (Some(Value::Numeric(a)), Some(Value::Numeric(b))) => Some(Value::Numeric(a.add(&b))),
-            _ => None,
+            (Value::Integer(aw, a), Value::Integer(bw, b)) => {
+                let (sum, width) = integer::checked_add(a, aw, b, bw).map_err(|source| {
+                    EvalError::IntegerOutOfRange {
+                        field: field_name.to_string(),
+                        source,
+                    }
+                })?;
+                Some(Value::Integer(width, sum))
+            }
+            (lhs, rhs) => match (as_numeric(lhs), as_numeric(rhs)) {
+                (Some(a), Some(b)) => Some(Value::Numeric(a.add(&b))),
+                _ => None,
+            },
         },
         Operator::GreaterThan => match (lhs, rhs) {
-            (Some(Value::Numeric(a)), Some(Value::Numeric(b))) => {
-                Some(Value::Boolean(a.compare(&b) == std::cmp::Ordering::Greater))
-            }
-            _ => None,
+            (Value::Integer(_, a), Value::Integer(_, b)) => Some(Value::Boolean(a > b)),
+            (lhs, rhs) => match (as_numeric(lhs), as_numeric(rhs)) {
+                (Some(a), Some(b)) => {
+                    Some(Value::Boolean(a.compare(&b) == std::cmp::Ordering::Greater))
+                }
+                _ => None,
+            },
         },
+    })
+}
+
+/// A value as a [`Numeric`], for the mixed `Integer`/`Numeric` operand case
+/// Postgres resolves by implicitly casting the integer side up. `None` for
+/// any value outside the exact-numeric family (defense-in-depth against a
+/// validator bug, as above).
+///
+/// An `i64` always renders as a valid plain decimal, so the reparse can't
+/// fail for a real [`Value::Integer`]; going through [`Numeric::parse`]
+/// rather than a bespoke constructor keeps `Numeric`'s normalization
+/// invariants in one place, exactly as [`int_numeric`] already does.
+fn as_numeric(value: Value) -> Option<Numeric> {
+    match value {
+        Value::Numeric(n) => Some(n),
+        Value::Integer(_, n) => Numeric::parse(&n.to_string()).ok(),
+        _ => None,
     }
 }
 
@@ -1276,14 +1456,18 @@ fn apply_function(
         }
     }
 
-    let result = match (name, texts.as_slice()) {
-        ("OCTET_LENGTH", [text]) => int_numeric(text.len()),
-        ("CHAR_LENGTH", [text]) => int_numeric(text.chars().count()),
-        ("STRPOS", [haystack, needle]) => int_numeric(strpos(haystack, needle)),
-        ("REGEXP_COUNT", [text, pattern]) => int_numeric(regexp_count(text, pattern, regex_cache)?),
+    let result: usize = match (name, texts.as_slice()) {
+        ("OCTET_LENGTH", [text]) => text.len(),
+        ("CHAR_LENGTH", [text]) => text.chars().count(),
+        ("STRPOS", [haystack, needle]) => strpos(haystack, needle),
+        ("REGEXP_COUNT", [text, pattern]) => regexp_count(text, pattern, regex_cache)?,
         _ => return None,
     };
-    Some(Value::Numeric(result))
+    // All four are `integer`-returning in Postgres (issue #111, see
+    // `registry::FUNCTIONS`), and all four are bounded by the length of a
+    // `text` value, which Postgres itself caps at 1GB — so every result
+    // here is at most ~2^30 and provably fits `int4` with no range check.
+    Some(Value::Integer(IntWidth::Int4, result as i64))
 }
 
 fn int_numeric(n: usize) -> Numeric {
@@ -1351,6 +1535,17 @@ fn regexp_count(text: &str, pattern: &str, regex_cache: &mut RegexCache) -> Opti
 fn parse_value(field_name: &str, value_type: ValueType, text: &str) -> Result<Value, EvalError> {
     match value_type {
         ValueType::Numeric => parse_number(field_name, text).map(Value::Numeric),
+        // Issue #111: an exact-integer column's text decodes to a real,
+        // range-checked `i64` of the column's own width, not to unbounded
+        // decimal digits. The range check is what turns a value that could
+        // never have come out of a column of this type into a named error
+        // instead of an integer that silently doesn't fit its own type.
+        ValueType::Integer(width) => integer::parse(text, width)
+            .map(|value| Value::Integer(width, value))
+            .map_err(|source| EvalError::IntegerOutOfRange {
+                field: field_name.to_string(),
+                source,
+            }),
         ValueType::Text => Ok(Value::Text(text.to_string())),
         ValueType::Boolean => parse_boolean(field_name, text).map(Value::Boolean),
         ValueType::Uuid => Ok(Value::Uuid(text.to_string())),
@@ -1360,6 +1555,30 @@ fn parse_value(field_name: &str, value_type: ValueType, text: &str) -> Result<Va
         // through tagged with its real type instead of mislabeling it.
         ValueType::Other(pg_type) => Ok(Value::Other(pg_type, text.to_string())),
     }
+}
+
+/// Types an unadorned numeric literal the way Postgres's own lexer does
+/// (issue #111): a literal with no decimal point that fits `integer` *is*
+/// `integer`, one that only fits `bigint` is `bigint`, and anything else —
+/// a fractional literal, or an integral one too wide even for `bigint` — is
+/// `numeric`.
+///
+/// This is why `int_col + 1` has type `integer` rather than `numeric`, and
+/// therefore why it overflows exactly where Postgres overflows. Getting the
+/// rule wrong in either direction would be visible: typing every literal
+/// `integer` would make `numeric_col + 1` fail to resolve, and typing every
+/// literal `numeric` would silently promote all integer arithmetic back to
+/// arbitrary precision — the exact lie this issue removes.
+///
+/// [`super::validate`]'s `number_literal_type` is the type-level twin of
+/// this function and must agree with it.
+fn number_literal(field_name: &str, text: &str) -> Result<Value, EvalError> {
+    if !text.contains('.')
+        && let Ok(value) = text.parse::<i64>()
+    {
+        return Ok(Value::Integer(IntWidth::narrowest_for(value), value));
+    }
+    parse_number(field_name, text).map(Value::Numeric)
 }
 
 fn parse_number(field_name: &str, text: &str) -> Result<Numeric, EvalError> {
@@ -1658,10 +1877,17 @@ mod tests {
             .collect()
     }
 
+    /// The text of an exact-numeric result, whichever of the two exact
+    /// value shapes it landed in. Issue #111 split `integer` out of
+    /// `Numeric`, and the four scalar functions below now return `integer`
+    /// (as they do in Postgres) — these tests are about the *value* each
+    /// computes, so they read it either way; the *type* is pinned
+    /// separately by `scalar_functions_return_integer_like_postgres`.
     fn numeric_of(result: &HashMap<String, Option<Value>>, field: &str) -> String {
         match result[field].as_ref().unwrap() {
             Value::Numeric(n) => n.to_string(),
-            other => panic!("expected Numeric, got {other:?}"),
+            Value::Integer(_, n) => n.to_string(),
+            other => panic!("expected an exact-numeric value, got {other:?}"),
         }
     }
 
@@ -1938,10 +2164,16 @@ mod tests {
         }]);
         let r = row(&[("a", None), ("b", None)]);
         let result = eval(&d, &r, &numeric_types(&["a", "b"])).unwrap();
-        match result["out"].as_ref().unwrap() {
-            Value::Numeric(n) => assert_eq!(n.to_string(), "0"),
-            other => panic!("expected Numeric, got {other:?}"),
-        }
+        // The literal wins, and issue #111 types a bare `0` as `integer`
+        // (`select pg_typeof(0)`), the same as Postgres. The field's own
+        // inferred type is still `numeric` — `validate::common_numeric_type`
+        // unifies the `numeric` columns with the `integer` literal — and
+        // the text is "0" either way, which is what the target column's
+        // cast consumes.
+        assert_eq!(
+            result["out"].as_ref().unwrap(),
+            &Value::Integer(IntWidth::Int4, 0)
+        );
     }
 
     #[test]
@@ -2042,10 +2274,13 @@ mod tests {
             &mut RegexCache::new(),
         )
         .unwrap();
-        match result["total"].as_ref().unwrap() {
-            Value::Numeric(n) => assert_eq!(n.to_string(), "0"),
-            other => panic!("expected Numeric, got {other:?}"),
-        }
+        // `COALESCE(SUM(amount), 0)` over an all-NULL group falls through
+        // to the literal, which issue #111 types as `integer` (Postgres
+        // types a bare `0` the same way). The *field* is still `numeric` —
+        // `validate`'s `common_numeric_type` unifies the two arms — and the
+        // text written is identical either way, which is what the target
+        // column's `::numeric` cast consumes.
+        assert_eq!(result["total"].as_ref().unwrap().to_string(), "0");
     }
 
     // --- to-one relationship path resolution (issue #28) ---

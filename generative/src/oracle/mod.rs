@@ -38,6 +38,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
+use trellis::IntWidth;
 use trellis::Pool;
 use trellis::dev::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::dev::defs::oracle::{OracleError, recompute, recompute_aggregate};
@@ -78,6 +79,14 @@ impl Comparison {
     fn for_type(value_type: ValueType) -> Comparison {
         match value_type {
             ValueType::Numeric => Comparison::DecimalByValue,
+            // Issue #111: an exact integer has exactly one text rendering
+            // per value on both sides — Postgres's `int4out` and Rust's
+            // `i64` `Display` agree character for character — so byte-exact
+            // comparison is both correct *and* strictly stronger than
+            // `DecimalByValue` here: it would catch a scale or padding
+            // difference that a by-value decimal compare would forgive, and
+            // for this type any such difference is a real bug.
+            ValueType::Integer(_) => Comparison::Exact,
             // Issue #108: `Other` is passthrough-only (no arithmetic, no
             // scale-insensitive semantics defined for it yet), same footing
             // as `Text`/`Boolean`/`Uuid` — byte-exact text equality is the
@@ -1005,12 +1014,56 @@ fn field_value_type(
                  on the def's actual source table)"
             )
         }),
-        Expr::NumberLiteral(_) => ValueType::Numeric,
+        // Issue #111: Postgres's own literal-typing rule — a bare integral
+        // literal is `integer` if it fits, else `bigint`; anything else is
+        // `numeric`.
+        Expr::NumberLiteral(text) => match text.contains('.') {
+            false => match text.parse::<i64>() {
+                Ok(value) => ValueType::Integer(IntWidth::narrowest_for(value)),
+                Err(_) => ValueType::Numeric,
+            },
+            true => ValueType::Numeric,
+        },
         Expr::StringLiteral(_) => ValueType::Text,
         Expr::TypedLiteral { pg_type, .. } => typed_literal::value_type(*pg_type),
-        Expr::BinaryOp { op, .. } => registry::operator_spec(*op).return_type,
+        // Issue #111: `+`'s result type depends on its operands (`int4 +
+        // int4` is `integer`, `int4 + numeric` is `numeric`), so it has to
+        // be resolved rather than read off a constant.
+        Expr::BinaryOp { op, lhs, rhs } => {
+            let lhs_t = field_value_type(lhs, source_columns, rels);
+            let rhs_t = field_value_type(rhs, source_columns, rels);
+            registry::operator_result_type(*op, lhs_t, rhs_t).unwrap_or_else(|| {
+                panic!(
+                    "oracle: operator {op:?} has no result type for operands \
+                     {lhs_t}/{rhs_t} — the generator only ever builds \
+                     well-typed expressions"
+                )
+            })
+        }
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
             field_value_type(&args[0], source_columns, rels)
+        }
+        // Issue #111: likewise for the aggregates — `sum(int4)` is `bigint`,
+        // `sum(numeric)` is `numeric`. `COUNT` is excluded on purpose: it is
+        // type-agnostic row-counting, so `registry::aggregate_result_type`
+        // deliberately has no row for it and its constant `FunctionSpec`
+        // return type (below) is the right answer. Its one-argument form
+        // (`COUNT(<rel>.<col>)` over a to-many relationship) is why this
+        // needs naming rather than falling out of the `args.is_empty()`
+        // guard.
+        Expr::FunctionCall { name, args }
+            if name != "COUNT"
+                && registry::lookup_aggregate_function(name).is_some()
+                && !args.is_empty() =>
+        {
+            let arg_t = field_value_type(&args[0], source_columns, rels);
+            registry::aggregate_result_type(name, arg_t).unwrap_or_else(|| {
+                panic!(
+                    "oracle: aggregate {name:?} has no result type for argument \
+                     {arg_t} — the generator only ever builds well-typed \
+                     expressions"
+                )
+            })
         }
         Expr::FunctionCall { name, .. } => registry::lookup_function(name)
             .or_else(|| registry::lookup_aggregate_function(name))
@@ -1698,8 +1751,10 @@ mod tests {
         );
     }
 
-    /// Every one of the five scalar functions type-checks to its registered
-    /// return type (all `Numeric` today) via [`field_value_type`], and
+    /// Every one of the four scalar functions type-checks to its registered
+    /// return type via [`field_value_type`] — `integer` since issue #111,
+    /// which gave them the return type `pg_proc.prorettype` actually
+    /// reports instead of the `Numeric` they collapsed into — and
     /// `COALESCE` specifically types as its first argument's type rather
     /// than a fixed registry entry.
     #[test]
@@ -1719,8 +1774,8 @@ mod tests {
             };
             assert_eq!(
                 field_value_type(&expr, &source_columns, &RelIndex::new(&empty_program())),
-                ValueType::Numeric,
-                "{name} must type-check as Numeric"
+                ValueType::Integer(IntWidth::Int4),
+                "{name} must type-check as integer"
             );
         }
 

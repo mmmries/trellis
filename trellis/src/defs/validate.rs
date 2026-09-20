@@ -19,7 +19,9 @@ use regex::Regex;
 
 use super::ast::{Expr, GroupByKey, KeySpace, Predicate, TransformDef, ValueType};
 use super::model::RelationshipCardinality;
+use super::pg_type::PgType;
 use crate::error_code::ErrorCode;
+use crate::integer::IntWidth;
 
 /// A relationship referenced by a definition, resolved by the caller
 /// ([`super::catalog`]) against the persisted relationship catalog and live
@@ -1028,7 +1030,31 @@ fn reject_unsupported_group_by_key_type(
     value_type: ValueType,
 ) -> Result<(), ValidationError> {
     match value_type {
-        ValueType::Numeric | ValueType::Text | ValueType::Boolean | ValueType::Uuid => Ok(()),
+        // Issue #111: an exact integer's text rendering is canonical (no
+        // leading zeros, no `+`, no whitespace), so it round-trips through
+        // the still-text-keyed group-key path byte-for-byte — the same
+        // property that already puts `smallint`/`integer`/`bigint` on
+        // `catalog::TEXT_STABLE_JOIN_KEY_TYPES`.
+        //
+        // `Numeric` is admitted here as it always has been, and that is
+        // knowingly weaker: `1.0` and `1.00` are equal to Postgres but
+        // distinct under `::text` matching, which is exactly why `numeric`
+        // is *rejected* as a relationship join key and as a primary key
+        // (#107). Tightening the `GROUP BY` gate to match belongs with the
+        // typed key index (#110) and the float/`numeric` split (#112), not
+        // here — see the note on issue #111.
+        ValueType::Integer(_)
+        | ValueType::Numeric
+        | ValueType::Text
+        | ValueType::Boolean
+        | ValueType::Uuid => Ok(()),
+        // `oid` is the one `Other` family admitted as a key (issue #111):
+        // Postgres renders it as canonical unsigned decimal, so it is
+        // text-stable in exactly the way `interval`/`timestamptz`/`bytea`
+        // are not. It stays an `Other` rather than joining
+        // `ValueType::Integer` because Postgres gives it no arithmetic at
+        // all — see `pg_type::PgType::Oid`.
+        ValueType::Other(PgType::Oid) => Ok(()),
         ValueType::Other(_) => Err(ValidationError::UnsupportedGroupByKeyType {
             column: column.to_string(),
             value_type,
@@ -1128,7 +1154,11 @@ fn infer_expr(
                 .copied()
                 .unwrap_or(ValueType::Numeric))
         }
-        Expr::NumberLiteral(_) => Ok(ValueType::Numeric),
+        // Issue #111: an unadorned literal is typed exactly as Postgres's
+        // own lexer types it — `integer` if it fits, else `bigint`, else
+        // (or if fractional) `numeric`. `eval::number_literal` is the
+        // value-level twin of this rule and must agree with it.
+        Expr::NumberLiteral(text) => Ok(number_literal_type(text)),
         Expr::StringLiteral(_) => Ok(ValueType::Text),
         Expr::TypedLiteral { pg_type, text } => {
             // Checked here, not in the parser, for the same reason
@@ -1192,22 +1222,31 @@ fn infer_expr(
                 types,
                 in_progress,
             )?;
+            // Issue #111: operand admissibility *and* the result type both
+            // come from `registry::operator_result_type`, which models
+            // Postgres's family of `+`/`>` operators (`int4pl`,
+            // `numeric_add`, and the implicit `int -> numeric` coercion
+            // between them) rather than the single exact signature this used
+            // to compare against. `OperatorSpec::arg_types` survives only as
+            // the canonical shape a `TypeMismatch` names.
+            if let Some(result) = super::registry::operator_result_type(*op, lhs_t, rhs_t) {
+                return Ok(result);
+            }
+            // Blame the operand that actually isn't admissible. At least one
+            // of them isn't (or resolution above would have succeeded), and
+            // the left one is reported first so the error reads in source
+            // order.
             let spec = super::registry::operator_spec(*op);
-            if lhs_t != spec.arg_types.0 {
-                return Err(ValidationError::TypeMismatch {
-                    field: field_name.to_string(),
-                    expected: spec.arg_types.0,
-                    found: lhs_t,
-                });
-            }
-            if rhs_t != spec.arg_types.1 {
-                return Err(ValidationError::TypeMismatch {
-                    field: field_name.to_string(),
-                    expected: spec.arg_types.1,
-                    found: rhs_t,
-                });
-            }
-            Ok(spec.return_type)
+            let (found, expected) = if lhs_t.is_exact_numeric_family() {
+                (rhs_t, spec.arg_types.1)
+            } else {
+                (lhs_t, spec.arg_types.0)
+            };
+            Err(ValidationError::TypeMismatch {
+                field: field_name.to_string(),
+                expected,
+                found,
+            })
         }
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
             let mut common_type = None;
@@ -1222,14 +1261,26 @@ fn infer_expr(
                     in_progress,
                 )?;
                 if let Some(ct) = common_type {
-                    if ct != arg_t {
-                        return Err(ValidationError::FunctionArgTypeMismatch {
-                            field: field_name.to_string(),
-                            function: name.clone(),
-                            arg_index: i,
-                            expected: ct,
-                            found: arg_t,
-                        });
+                    // Issue #111: `COALESCE`'s arguments used to have to be
+                    // the identical `ValueType`. Splitting exact integers
+                    // out of `Numeric` would otherwise have *newly rejected*
+                    // `coalesce(int_col, numeric_col)` — and even
+                    // `coalesce(smallint_col, bigint_col)` — both of which
+                    // Postgres resolves happily, through the same implicit
+                    // coercions `registry::operator_result_type` encodes.
+                    // `common_numeric_type` is that rule applied pairwise;
+                    // every other type still has to match exactly.
+                    match common_numeric_type(ct, arg_t) {
+                        Some(unified) => common_type = Some(unified),
+                        None => {
+                            return Err(ValidationError::FunctionArgTypeMismatch {
+                                field: field_name.to_string(),
+                                function: name.clone(),
+                                arg_index: i,
+                                expected: ct,
+                                found: arg_t,
+                            });
+                        }
                     }
                 } else {
                     common_type = Some(arg_t);
@@ -1245,8 +1296,9 @@ fn infer_expr(
             // check against, so it type-checks as Numeric, matching this
             // function's own fallback for an unresolved column reference
             // just above.
-            let spec = super::registry::lookup_function(name)
-                .or_else(|| super::registry::lookup_aggregate_function(name));
+            let aggregate_spec = super::registry::lookup_aggregate_function(name);
+            let is_aggregate = aggregate_spec.is_some();
+            let spec = super::registry::lookup_function(name).or(aggregate_spec);
             let Some(spec) = spec else {
                 for arg in args {
                     infer_expr(
@@ -1261,6 +1313,7 @@ fn infer_expr(
                 }
                 return Ok(ValueType::Numeric);
             };
+            let mut arg_types: Vec<ValueType> = Vec::with_capacity(args.len());
             for (i, (arg, expected)) in args.iter().zip(spec.arg_types).enumerate() {
                 let arg_t = infer_expr(
                     arg,
@@ -1271,7 +1324,19 @@ fn infer_expr(
                     types,
                     in_progress,
                 )?;
-                if arg_t != *expected {
+                // Issue #111: a `Numeric`-declared *aggregate* argument now
+                // means "any exact-numeric type" — `SUM`/`AVG`/`MIN`/`MAX`
+                // accept every exact-integer width as well as `numeric`, and
+                // the result type depends on which one
+                // (`registry::aggregate_result_type`). A scalar function's
+                // argument list stays an exact match: all four of those take
+                // `Text`, and Postgres would not coerce an integer into one.
+                let admissible = if is_aggregate && *expected == ValueType::Numeric {
+                    arg_t.is_exact_numeric_family()
+                } else {
+                    arg_t == *expected
+                };
+                if !admissible {
                     return Err(ValidationError::FunctionArgTypeMismatch {
                         field: field_name.to_string(),
                         function: name.clone(),
@@ -1280,15 +1345,59 @@ fn infer_expr(
                         found: arg_t,
                     });
                 }
+                arg_types.push(arg_t);
             }
             if name == "REGEXP_COUNT"
                 && let Some(pattern_arg) = args.get(1)
             {
                 validate_regexp_pattern(field_name, pattern_arg)?;
             }
+            if is_aggregate
+                && let Some(&arg_t) = arg_types.first()
+                && let Some(result) = super::registry::aggregate_result_type(name, arg_t)
+            {
+                return Ok(result);
+            }
             Ok(spec.return_type)
         }
     }
+}
+
+/// The [`ValueType`] an unadorned numeric literal carries, matching
+/// Postgres's own rule: an integral literal that fits `integer` is
+/// `integer`, one that only fits `bigint` is `bigint`, and a fractional
+/// literal (or an integral one too wide even for `bigint`) is `numeric`.
+///
+/// The type-level twin of [`super::eval`]'s `number_literal`; the two must
+/// agree, or the validator and the evaluator would disagree about a field's
+/// target column type.
+fn number_literal_type(text: &str) -> ValueType {
+    if !text.contains('.')
+        && let Ok(value) = text.parse::<i64>()
+    {
+        return ValueType::Integer(IntWidth::narrowest_for(value));
+    }
+    ValueType::Numeric
+}
+
+/// The type two operands unify to, mirroring Postgres's own implicit
+/// coercions *within the exact-numeric family* (issue #111): two integers
+/// unify to the wider width, and any mix with `numeric` unifies to
+/// `numeric`. `None` for anything outside that family, or for two genuinely
+/// different types — this is deliberately not a general coercion lattice,
+/// only the same closed set [`super::registry::operator_result_type`]
+/// admits.
+fn common_numeric_type(a: ValueType, b: ValueType) -> Option<ValueType> {
+    if a == b {
+        return Some(a);
+    }
+    if !a.is_exact_numeric_family() || !b.is_exact_numeric_family() {
+        return None;
+    }
+    Some(match (a, b) {
+        (ValueType::Integer(x), ValueType::Integer(y)) => ValueType::Integer(x.wider(y)),
+        _ => ValueType::Numeric,
+    })
 }
 
 /// Checks `regexp_count`'s pattern argument is a string literal that

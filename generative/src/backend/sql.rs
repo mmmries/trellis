@@ -37,6 +37,9 @@ pub(super) fn quote_ident(ident: &str) -> String {
 pub(super) fn pg_type_name(value_type: ValueType) -> &'static str {
     match value_type {
         ValueType::Numeric => "numeric",
+        // Issue #111: an exact integer renders as its own Postgres width,
+        // mirroring `defs::ddl::pg_type_name`.
+        ValueType::Integer(width) => width.pg_name(),
         ValueType::Text => "text",
         ValueType::Boolean => "boolean",
         ValueType::Uuid => "uuid",

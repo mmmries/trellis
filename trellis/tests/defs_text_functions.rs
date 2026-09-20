@@ -56,12 +56,20 @@ fn row2(a_name: &str, a: Option<&str>, b_name: &str, b: Option<&str>) -> Row {
     row
 }
 
+/// The evaluator's result for a single `out` field, as text.
+///
+/// Issue #111 gave these four functions their real Postgres return type
+/// (`integer`, per `pg_proc.prorettype`) instead of the `Numeric` they
+/// collapsed into before, so the value arrives as `Value::Integer`. The
+/// comparisons below are against Postgres's own `::text` rendering, and an
+/// exact integer's text is identical on both sides, so reading the value out
+/// as text is exactly the right granularity here.
 fn evaluator_numeric(def: &TransformDef, row: &Row, arg_names: &[&str]) -> String {
     let result = evaluate(def, row, &text_types(arg_names), &mut RegexCache::new())
         .expect("evaluation succeeds");
     match result.get("out").unwrap().as_ref().unwrap() {
-        Value::Numeric(n) => n.to_string(),
-        other => panic!("expected Numeric, got {other:?}"),
+        value @ (Value::Numeric(_) | Value::Integer(..)) => value.to_string(),
+        other => panic!("expected an exact-numeric value, got {other:?}"),
     }
 }
 

@@ -13,6 +13,7 @@
 use std::fmt;
 
 use super::pg_type::PgType;
+use crate::integer::IntWidth;
 
 /// A parsed transform definition, ready for the validator (issue #23) and
 /// evaluator (issue #24).
@@ -242,19 +243,53 @@ pub enum Expr {
 /// target — until the type family's own epic child (#109, #111–#122)
 /// promotes it to a real variant with real semantics. This issue's job is
 /// only to stop lying about what the column is, not to add those semantics.
+///
+/// [`ValueType::Integer`] (issue #111) is the first such promotion, and the
+/// first variant whose payload means something other than "this family is
+/// still opaque": `smallint`/`integer`/`bigint` used to *share*
+/// [`ValueType::Numeric`] with `numeric`/`real`/`double precision`, which
+/// made every exact-integer computation arbitrary-precision (so it never
+/// overflowed where Postgres does) and every derived integer column
+/// `numeric`. See [`crate::integer`] for the full rationale, including why
+/// the width rides along as an [`IntWidth`] payload on one variant — the
+/// `Other(PgType)` shape — rather than becoming three sibling variants, and
+/// why `oid` deliberately stays an `Other(PgType::Oid)` instead of joining
+/// this family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueType {
     Numeric,
+    /// An exact integer of a known Postgres width. Match `Integer(_)` unless
+    /// the width genuinely matters (range/overflow, DDL rendering).
+    Integer(IntWidth),
     Text,
     Boolean,
     Uuid,
     Other(PgType),
 }
 
+impl ValueType {
+    /// Whether this is an *exact-numeric-family* type — either
+    /// [`ValueType::Numeric`] itself or any [`ValueType::Integer`] width.
+    ///
+    /// This is the set Postgres's implicit `int -> numeric` coercion makes
+    /// mutually admissible, and it is the single predicate every site that
+    /// used to test `== ValueType::Numeric` for "can this be added /
+    /// compared / summed" should use instead (see
+    /// [`super::registry::operator_result_type`],
+    /// [`super::registry::aggregate_result_type`], and `validate`'s
+    /// `COALESCE` unification). Writing the test this way, rather than
+    /// enumerating widths at each call site, is what keeps a future width
+    /// (or a future decision to admit `oid` here) a one-line change.
+    pub fn is_exact_numeric_family(self) -> bool {
+        matches!(self, ValueType::Numeric | ValueType::Integer(_))
+    }
+}
+
 impl fmt::Display for ValueType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ValueType::Numeric => write!(f, "numeric"),
+            ValueType::Integer(width) => write!(f, "{width}"),
             ValueType::Text => write!(f, "text"),
             ValueType::Boolean => write!(f, "boolean"),
             ValueType::Uuid => write!(f, "uuid"),

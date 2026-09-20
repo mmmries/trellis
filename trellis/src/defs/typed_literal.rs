@@ -161,8 +161,19 @@ pub struct TypedLiteralSpec {
 ///   rather than half-landed here; `interval` additionally has no canonical
 ///   text at all (`'1 day'` and `'24 hours'` are `=` but render
 ///   differently), which is its own design question.
-/// * **`oid`, `inet`, `cidr`, `macaddr`, `macaddr8`, `bit`, `varbit`** —
-///   each waits for its own child (#111, #116, #118).
+/// * **`inet`, `cidr`, `macaddr`, `macaddr8`, `bit`, `varbit`** — each
+///   waits for its own child (#116, #118).
+/// * **`smallint`, `integer`, `bigint`** — these *do* have literal syntax of
+///   their own since issue #111, and it is Postgres's own: a bare `5` is
+///   `integer` and a bare `3000000000` is `bigint`, exactly as
+///   `pg_typeof(5)` reports, so `INTEGER '5'` would be a second spelling of
+///   something already spellable. A `smallint` constant is the one gap — it
+///   has no bare spelling in Postgres either — and closing it would mean
+///   widening [`super::ast::Expr::TypedLiteral`] from a [`PgType`] to a
+///   full [`ValueType`]; that is noted as a follow-up on #111 rather than
+///   done here.
+///
+/// `oid` (#111) *is* in the allowlist below.
 /// * **`money`, `json`, `xml`, `tsvector`, `tsquery`** — excluded from the
 ///   whole epic by `docs/type-support.md` (locale-dependent text I/O, or no
 ///   useful immutable equality), so they can never earn a row here.
@@ -183,6 +194,15 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         keyword: "BYTEA",
         pg_type: PgType::Bytea,
         canonical: canonical_bytea,
+    },
+    // Issue #111. `oid` clears both bars this module sets easily: `oidin`
+    // and `oidout` are `IMMUTABLE` (no session state, no relative
+    // spellings), and `oid_out`'s canonical form is plain unsigned decimal,
+    // which needs no normalizer to check.
+    TypedLiteralSpec {
+        keyword: "OID",
+        pg_type: PgType::Oid,
+        canonical: canonical_oid,
     },
 ];
 
@@ -227,6 +247,30 @@ pub fn render_sql(pg_type: PgType, text: &str) -> String {
         text.replace('\'', "''"),
         pg_type.sql_type_name()
     )
+}
+
+/// Plain unsigned decimal in `0 ..= 4294967295`, the spelling `oid_out`
+/// emits (issue #111).
+///
+/// `oid` is Postgres's *unsigned* 32-bit identifier: `oid_out` never emits a
+/// sign, never pads, and never emits a leading zero, so a canonical literal
+/// is just digits with no redundant leading `0`. A negative or
+/// `+`-prefixed spelling is rejected even though `oidin` would accept
+/// `-1` (wrapping it to `4294967295`) — a literal whose own text differs
+/// from what the value renders back as is precisely what breaks the
+/// evaluator/oracle round-trip this module's doc comment describes.
+fn canonical_oid(text: &str) -> Result<(), &'static str> {
+    const SHAPE: &str = "an unsigned decimal in 0..=4294967295, with no sign and no leading zeros";
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(SHAPE);
+    }
+    if text.len() > 1 && text.starts_with('0') {
+        return Err(SHAPE);
+    }
+    match text.parse::<u32>() {
+        Ok(_) => Ok(()),
+        Err(_) => Err(SHAPE),
+    }
 }
 
 /// `YYYY-MM-DD`, the spelling `date_out` emits under the ISO `DateStyle`.
