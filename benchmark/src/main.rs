@@ -19,6 +19,7 @@
 //! cargo run -p benchmark --features engine-access --release -- relationship-aggregate
 //! cargo run -p benchmark --features engine-access --release -- hop-ladder
 //! cargo run -p benchmark --features engine-access --release -- hop-latency --depth 10 --rate 10 --duration-secs 60
+//! cargo run -p benchmark --features engine-access --release -- hop-latency --depth 10 --rate 10 --maintenance-interval-ms 10 --poll-interval-ms 20 --duration-secs 30
 //! cargo run -p benchmark --features engine-access --release -- throughput-ramp --rates 1000,5000,10000 --duration-secs 20 --grace-secs 30
 //! cargo run -p benchmark --features engine-access --release -- intake-ceiling --rows-per-commit 1000 --duration-secs 20
 //! cargo run -p benchmark --features engine-access --release -- seal-cadence-sweep --intervals-ms 300,100,30,10 --depths 1,2,3,5,10
@@ -35,8 +36,17 @@
 //!
 //! - `hop-ladder` runs the full depth-1/2/3/5/10 latency sweep;
 //!   `hop-latency --depth N` runs one depth alone (for a future
-//!   regression-guard lane once a baseline exists). Both accept `--rate
-//!   <commits/sec>` and `--duration-secs <secs>` (defaults: 10/s, 60s).
+//!   regression-guard lane once a baseline exists, and for issue #268's X1
+//!   wake-edge-diagnostic sweeps). Both accept `--rate <commits/sec>` and
+//!   `--duration-secs <secs>` (defaults: 10/s, 60s); `hop-latency` also
+//!   accepts `--maintenance-interval-ms <ms>` (default 300) and
+//!   `--poll-interval-ms <ms>` (default 200, `ClientOptions::poll_interval`'s
+//!   own default) — X1a sweeps the latter, X1b sweeps `--rate`, both at a
+//!   fixed 10ms `--maintenance-interval-ms` and `--depth 10`. Every result
+//!   line also reports `per_hop_mean_ms`: exact mean latency for *every* hop
+//!   in the chain (`trellis_transform_latency_seconds_sum`/`_count`), not
+//!   just the terminal hop's T1 bucket fractions — promoted from #266's E1
+//!   scratch decomposition into a committed capability.
 //! - `throughput-ramp` (B2) ramps single-hop 1-1 throughput until a
 //!   candidate rate's backlog fails to drain within `--grace-secs`
 //!   (default 30s) after a `--duration-secs` (default 20s) offered window;
@@ -176,16 +186,30 @@ fn main() {
         let duration = parse_flag(&args, "--duration-secs")
             .map(|v| Duration::from_secs(v as u64))
             .unwrap_or(HOP_LADDER_DEFAULT_DURATION);
+        // Issue #268's X1: both fields already existed on `ClientOptions`
+        // (`maintenance_interval` since E2, `poll_interval` since the
+        // engine's wake path itself) — X1 only needed these two small CLI
+        // additions to `hop-latency`, not a new scenario, to run the
+        // wake-edge diagnostic sweeps.
+        let maintenance_interval_ms = parse_flag(&args, "--maintenance-interval-ms")
+            .map(|v| v as u64)
+            .unwrap_or_else(|_| {
+                streaming::b1_hop_ladder::DEFAULT_MAINTENANCE_INTERVAL.as_millis() as u64
+            });
+        let poll_interval_ms = parse_flag(&args, "--poll-interval-ms")
+            .map(|v| v as u64)
+            .unwrap_or_else(|_| streaming::b1_hop_ladder::DEFAULT_POLL_INTERVAL.as_millis() as u64);
 
         let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
         let results = if name == "hop-latency" {
             let depth =
                 parse_flag(&args, "--depth").expect("hop-latency requires --depth <hops>") as usize;
-            vec![runtime.block_on(streaming::b1_hop_ladder::run_depth(
+            vec![runtime.block_on(streaming::b1_hop_ladder::run_depth_with_poll_interval(
                 depth,
                 rate,
                 duration,
-                streaming::b1_hop_ladder::DEFAULT_MAINTENANCE_INTERVAL,
+                Duration::from_millis(maintenance_interval_ms),
+                Duration::from_millis(poll_interval_ms),
             ))]
         } else {
             runtime.block_on(streaming::b1_hop_ladder::run_ladder(rate, duration))

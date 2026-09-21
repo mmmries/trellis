@@ -142,6 +142,63 @@ pub fn counter_value(rendered: &str, metric: &str, transform: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// A histogram's `_sum` line for one `metric{transform="target"}` series —
+/// same lookup shape as [`counter_value`]/[`total_count`], just the `_sum`
+/// suffix instead of `_count`. `0.0` if absent.
+fn sum_value(rendered: &str, metric: &str, transform: &str) -> f64 {
+    let sum_metric = format!("{metric}_sum");
+    rendered
+        .lines()
+        .find(|line| {
+            line.starts_with(&sum_metric) && line.contains(&format!("transform=\"{transform}\""))
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0)
+}
+
+/// One hop's exact mean latency (issue #268: "per-hop mean latency via
+/// `trellis_transform_latency_seconds_sum`/`_count` for every hop" —
+/// promoted here from #266's E1 scratch-only decomposition into a real,
+/// committed harness capability). `sum`/`count` are already cumulative
+/// Prometheus counters, so a plain post-minus-pre subtraction over a
+/// measurement window is exact — no bucket-boundary estimation error, unlike
+/// the T1 bucket-fraction read [`HistogramSnapshot`] does. Returns `None`
+/// when the window's count is `0` (nothing observed for this hop yet, or a
+/// snapshot taken before this transform had ever fired) rather than
+/// reporting a bogus `0.0/0 = NaN`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SumCountSnapshot {
+    pub sum: f64,
+    pub count: u64,
+}
+
+impl SumCountSnapshot {
+    pub fn capture(rendered: &str, metric: &str, transform: &str) -> Self {
+        Self {
+            sum: sum_value(rendered, metric, transform),
+            count: total_count(rendered, metric, transform),
+        }
+    }
+
+    pub fn since(&self, baseline: &SumCountSnapshot) -> SumCountSnapshot {
+        SumCountSnapshot {
+            sum: (self.sum - baseline.sum).max(0.0),
+            count: self.count.saturating_sub(baseline.count),
+        }
+    }
+
+    /// Exact mean latency in milliseconds over this window, or `None` if
+    /// `count == 0`.
+    pub fn mean_ms(&self) -> Option<f64> {
+        if self.count == 0 {
+            None
+        } else {
+            Some(self.sum / self.count as f64 * 1000.0)
+        }
+    }
+}
+
 /// T1's three targets (issue #266), evaluated as cumulative-bucket-fraction
 /// pass/fail against one histogram window. Deliberately reports fractions,
 /// not an interpolated percentile — the issue's own "Two consequences to
@@ -271,5 +328,37 @@ trellis_end_to_end_latency_seconds_count{transform=\"t\"} 15\n";
         let eval = T1Evaluation::evaluate(&empty);
         assert_eq!(eval.count, 0);
         assert!(!eval.all_pass());
+    }
+
+    const SUM_SAMPLE: &str = "\
+trellis_transform_latency_seconds_sum{transform=\"h1\"} 2.5\n\
+trellis_transform_latency_seconds_count{transform=\"h1\"} 10\n";
+
+    #[test]
+    fn sum_count_snapshot_computes_exact_mean_ms() {
+        let snap = SumCountSnapshot::capture(SUM_SAMPLE, "trellis_transform_latency_seconds", "h1");
+        assert_eq!(snap.sum, 2.5);
+        assert_eq!(snap.count, 10);
+        assert_eq!(snap.mean_ms(), Some(250.0));
+    }
+
+    #[test]
+    fn sum_count_snapshot_since_diffs_a_window() {
+        let baseline =
+            SumCountSnapshot::capture(SUM_SAMPLE, "trellis_transform_latency_seconds", "h1");
+        let later = "\
+trellis_transform_latency_seconds_sum{transform=\"h1\"} 3.5\n\
+trellis_transform_latency_seconds_count{transform=\"h1\"} 20\n";
+        let after = SumCountSnapshot::capture(later, "trellis_transform_latency_seconds", "h1");
+        let window = after.since(&baseline);
+        assert_eq!(window.count, 10);
+        assert_eq!(window.sum, 1.0);
+        assert_eq!(window.mean_ms(), Some(100.0));
+    }
+
+    #[test]
+    fn sum_count_snapshot_zero_count_has_no_mean() {
+        let empty = SumCountSnapshot::default();
+        assert_eq!(empty.mean_ms(), None);
     }
 }

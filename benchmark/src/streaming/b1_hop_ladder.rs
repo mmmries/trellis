@@ -15,7 +15,13 @@ use trellis::{Client as TrellisClient, ClientOptions};
 
 use super::chain::{create_chain_source_table, install_chain_hops, wait_for_chain_live, warm_up};
 use super::load::{LoadConfig, run_controlled_load};
-use super::metrics_scrape::{HistogramSnapshot, T1_BOUNDS, T1Evaluation, counter_value};
+use super::metrics_scrape::{
+    HistogramSnapshot, SumCountSnapshot, T1_BOUNDS, T1Evaluation, counter_value,
+};
+
+/// The transform-latency metric [`SumCountSnapshot`] reads for every hop —
+/// see `trellis::metrics::TRANSFORM_LATENCY_METRIC`.
+const TRANSFORM_LATENCY_METRIC: &str = "trellis_transform_latency_seconds";
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
 /// `benchmark/src/scenario.rs`'s `connect_raw` and `trellis`'s own
@@ -43,6 +49,7 @@ async fn connect_raw(dsn: &str) -> RawClient {
 pub struct HopLatencyResult {
     pub depth: usize,
     pub maintenance_interval_ms: u64,
+    pub poll_interval_ms: u64,
     pub offered_commits_per_sec: f64,
     pub duration_secs: f64,
     pub commits_issued: u64,
@@ -56,19 +63,38 @@ pub struct HopLatencyResult {
     pub t1_p50_pass: bool,
     pub t1_p99_pass: bool,
     pub t1_all_pass: bool,
+    /// Issue #268: exact mean latency (ms), cumulative from source commit,
+    /// for *every* hop in the chain — not just the terminal one. Promoted
+    /// from #266's E1 scratch-only decomposition into a committed harness
+    /// capability (`trellis_transform_latency_seconds_sum`/`_count`, which
+    /// already fires per-transform). `None` for a hop with zero samples in
+    /// the window. Index 0 is hop 1.
+    pub per_hop_mean_ms: Vec<Option<f64>>,
 }
 
 impl HopLatencyResult {
     pub fn to_json(&self) -> String {
+        let per_hop_json = self
+            .per_hop_mean_ms
+            .iter()
+            .map(|v| match v {
+                Some(ms) => format!("{ms:.3}"),
+                None => "null".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
             "{{\"scenario\":\"hop-ladder\",\"depth\":{},\"maintenance_interval_ms\":{},\
+             \"poll_interval_ms\":{},\
              \"offered_commits_per_sec\":{},\
              \"duration_secs\":{},\"commits_issued\":{},\"rows_issued\":{},\
              \"actual_elapsed_secs\":{:.3},\"changes_applied_terminal\":{},\
              \"e2e_count\":{},\"e2e_p50_bucket_frac\":{:.4},\"e2e_p99_bucket_frac\":{:.4},\
-             \"e2e_max_under_1s\":{},\"t1_p50_pass\":{},\"t1_p99_pass\":{},\"t1_all_pass\":{}}}",
+             \"e2e_max_under_1s\":{},\"t1_p50_pass\":{},\"t1_p99_pass\":{},\"t1_all_pass\":{},\
+             \"per_hop_mean_ms\":[{}]}}",
             self.depth,
             self.maintenance_interval_ms,
+            self.poll_interval_ms,
             self.offered_commits_per_sec,
             self.duration_secs,
             self.commits_issued,
@@ -82,6 +108,7 @@ impl HopLatencyResult {
             self.t1_p50_pass,
             self.t1_p99_pass,
             self.t1_all_pass,
+            per_hop_json,
         )
     }
 }
@@ -100,6 +127,34 @@ pub async fn run_depth(
     duration: Duration,
     maintenance_interval: Duration,
 ) -> HopLatencyResult {
+    run_depth_with_poll_interval(
+        depth,
+        commits_per_sec,
+        duration,
+        maintenance_interval,
+        DEFAULT_POLL_INTERVAL,
+    )
+    .await
+}
+
+/// `ClientOptions::poll_interval`'s own default (200ms) — what
+/// [`run_depth`]/[`run_ladder`] measure against; issue #268's X1a/X1b sweeps
+/// are the only callers that vary this.
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Same as [`run_depth`], plus an explicit `poll_interval` — issue #268's X1
+/// wake-edge diagnostic: sweeping this (X1a) alongside the offered commit
+/// rate (X1b, already a parameter of [`run_depth`]) at a fixed, aggressive
+/// `maintenance_interval` is the gate for the rest of #268's experiments. If
+/// the per-hop residual doesn't track either knob, the wake-discovery
+/// diagnosis is wrong.
+pub async fn run_depth_with_poll_interval(
+    depth: usize,
+    commits_per_sec: f64,
+    duration: Duration,
+    maintenance_interval: Duration,
+    poll_interval: Duration,
+) -> HopLatencyResult {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -111,6 +166,7 @@ pub async fn run_depth(
         staging_worker: true,
         application_threads: 4,
         source_tables: vec![format!("public.{source}")],
+        poll_interval,
         // Deliberately long, not short: a live upstream trellis bug
         // (salesforce-misc/trellis#267) means an intermediate
         // hop table that gets added to the CDC publication by the periodic
@@ -152,6 +208,11 @@ pub async fn run_depth(
         &T1_BOUNDS,
     );
     let changes_before = counter_value(&rendered_before, "trellis_changes_applied_total", terminal);
+    let per_hop_baseline: Vec<SumCountSnapshot> = chain
+        .hops
+        .iter()
+        .map(|hop| SumCountSnapshot::capture(&rendered_before, TRANSFORM_LATENCY_METRIC, hop))
+        .collect();
 
     let load = run_controlled_load(
         &raw,
@@ -195,11 +256,22 @@ pub async fn run_depth(
 
     let eval = T1Evaluation::evaluate(&window);
 
+    let per_hop_mean_ms: Vec<Option<f64>> = chain
+        .hops
+        .iter()
+        .zip(per_hop_baseline.iter())
+        .map(|(hop, base)| {
+            let now = SumCountSnapshot::capture(&rendered_after, TRANSFORM_LATENCY_METRIC, hop);
+            now.since(base).mean_ms()
+        })
+        .collect();
+
     client.shutdown().await.expect("client shutdown");
 
     HopLatencyResult {
         depth,
         maintenance_interval_ms: maintenance_interval.as_millis() as u64,
+        poll_interval_ms: poll_interval.as_millis() as u64,
         offered_commits_per_sec: commits_per_sec,
         duration_secs: duration.as_secs_f64(),
         commits_issued: load.commits_issued,
@@ -213,6 +285,7 @@ pub async fn run_depth(
         t1_p50_pass: eval.p50_pass,
         t1_p99_pass: eval.p99_pass,
         t1_all_pass: eval.all_pass(),
+        per_hop_mean_ms,
     }
 }
 
