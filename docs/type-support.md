@@ -917,5 +917,3 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
   other argument type remains unadmitted, since only the `jsonb`-argument
   case has been shown to exclude the GUC-dependent hazard its `STABLE`
   marking is really about.
-</content>
-</invoke>
