@@ -803,7 +803,40 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         }
 
         if let Some(c) = client.as_mut() {
-            let mut failed = staging::seal_if_active_nonempty(c).await.is_err();
+            let seal_result = staging::seal_if_active_nonempty(c).await;
+            let mut failed = seal_result.is_err();
+            if let Ok(Some(_)) = &seal_result {
+                // Issue #268 X2: the one transition that makes work
+                // claimable (a seal actually completing) previously sent no
+                // NOTIFY at all — every app-worker wake toward it depended
+                // on an incidental notify from unrelated activity or the
+                // `poll_interval` backstop (default 200ms), even though this
+                // is exactly the edge a listener wants to hear about.
+                // `seal_if_active_nonempty` only returns `Some` once
+                // `seal_phase2` has already published the segment's fence
+                // (see staging::seal), so this never wakes a listener toward
+                // a segment `next_claimable_segments`/the fold can't yet
+                // actually use. Best-effort (`let _`): a dropped notify here
+                // costs one tick of wake latency, recovered by the next
+                // incidental notify or the poll backstop — never
+                // correctness, matching every other failure in this loop's
+                // "drop the connection and retry next tick" policy.
+                //
+                // Not wrapped in the same transaction as `seal_phase2`'s own
+                // UPDATE (unlike `intake::advance_watermark_and_notify`'s
+                // discipline): `seal_phase2` is a widely-used public
+                // function (~50 integration tests and one direct call in
+                // `staging::apply` construct their own seals via
+                // `seal_phase1`/`seal_phase2` directly), so threading
+                // `wake_channel` through its signature for this one caller
+                // was judged too large a blast radius for what #268 frames
+                // as a small change. Firing immediately after, on the same
+                // connection, in the same tick, is not atomic with the
+                // fence-publishing commit, but the gap is a single
+                // statement round trip — negligible against the
+                // hundreds-of-ms wake budget this is meant to close.
+                let _ = c.execute("select pg_notify($1, '')", &[&wake_channel]).await;
+            }
             if !failed {
                 failed = staging::recover_stuck_seals(c, &seal_config).await.is_err();
             }
