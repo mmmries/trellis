@@ -21,14 +21,17 @@
 //! cargo run -p benchmark --features engine-access --release -- hop-latency --depth 10 --rate 10 --duration-secs 60
 //! cargo run -p benchmark --features engine-access --release -- throughput-ramp --rates 1000,5000,10000 --duration-secs 20 --grace-secs 30
 //! cargo run -p benchmark --features engine-access --release -- intake-ceiling --rows-per-commit 1000 --duration-secs 20
+//! cargo run -p benchmark --features engine-access --release -- seal-cadence-sweep --intervals-ms 300,100,30,10 --depths 1,2,3,5,10
+//! cargo run -p benchmark --features engine-access --release -- transaction-shape --shapes 1,100,10000 --target-rate 20000
 //! ```
 //!
-//! `hop-ladder`/`hop-latency`/`throughput-ramp`/`intake-ceiling` (issue
-//! #266's B0/B1/B2/E3) are a different shape from every other scenario
-//! here: they drive the real streaming path (a live `trellis::Client`, CDC
-//! intake -> ring -> seal -> claim -> fold -> apply — see `streaming`)
-//! rather than the direct, ring-bypassing backfill build the scenarios
-//! above time.
+//! `hop-ladder`/`hop-latency`/`throughput-ramp`/`intake-ceiling`/
+//! `seal-cadence-sweep`/`transaction-shape` (issue #266's B0/B1/B2/B4/E2/E3)
+//! are a different shape
+//! from every other scenario here: they drive the real streaming path (a
+//! live `trellis::Client`, CDC intake -> ring -> seal -> claim -> fold ->
+//! apply — see `streaming`) rather than the direct, ring-bypassing backfill
+//! build the scenarios above time.
 //!
 //! - `hop-ladder` runs the full depth-1/2/3/5/10 latency sweep;
 //!   `hop-latency --depth N` runs one depth alone (for a future
@@ -44,6 +47,13 @@
 //! - `intake-ceiling` (E3, tests H2) measures CDC decode + ring append
 //!   alone (`application_threads: 0`, no transforms) — the hard ceiling
 //!   `throughput-ramp` sits under.
+//! - `seal-cadence-sweep` (E2, tests H1) reruns `hop-ladder`'s depths at
+//!   each `--intervals-ms` candidate (default 300/100/30/10, the issue's
+//!   own numbers) — does a shorter `maintenance_interval` actually buy back
+//!   the latency B1 misses, and does it scale the way H1 predicts?
+//! - `transaction-shape` (B4) holds `--target-rate` (default 20k rows/sec)
+//!   fixed and sweeps `--shapes` (default 1,100,10000 rows/commit) —
+//!   separates per-commit cost from per-row cost.
 //!
 //! `--release` matters: this pushes 1M rows through a real Postgres
 //! instance and a real CDC pipeline, and the debug-build overhead is large
@@ -140,6 +150,21 @@ const INTAKE_CEILING_DEFAULT_ROWS_PER_COMMIT: usize = 1000;
 const INTAKE_CEILING_DEFAULT_DURATION: Duration = Duration::from_secs(20);
 const INTAKE_CEILING_DEFAULT_GRACE: Duration = Duration::from_secs(30);
 
+/// E2's default sweep, straight from the issue's own text ("Sweep
+/// `maintenance_interval` at 300 / 100 / 30 / 10 ms").
+const SEAL_CADENCE_SWEEP_DEFAULT_INTERVALS_MS: &[f64] = &[300.0, 100.0, 30.0, 10.0];
+const SEAL_CADENCE_SWEEP_DEFAULT_DEPTHS: &[f64] = &[1.0, 2.0, 3.0, 5.0, 10.0];
+const SEAL_CADENCE_SWEEP_DEFAULT_RATE: f64 = 10.0;
+const SEAL_CADENCE_SWEEP_DEFAULT_DURATION: Duration = Duration::from_secs(15);
+
+/// B4's default target rate: comfortably under B2's measured ~220-250k
+/// rows/sec single-hop ceiling on this box, so a `sustained: false` result
+/// here means the transaction shape hurt, not that the rate alone would
+/// already have saturated regardless of shape.
+const TRANSACTION_SHAPE_DEFAULT_TARGET_RATE: f64 = 20_000.0;
+const TRANSACTION_SHAPE_DEFAULT_DURATION: Duration = Duration::from_secs(20);
+const TRANSACTION_SHAPE_DEFAULT_GRACE: Duration = Duration::from_secs(30);
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let name = args.first().map(String::as_str).unwrap_or("both");
@@ -156,7 +181,12 @@ fn main() {
         let results = if name == "hop-latency" {
             let depth =
                 parse_flag(&args, "--depth").expect("hop-latency requires --depth <hops>") as usize;
-            vec![runtime.block_on(streaming::b1_hop_ladder::run_depth(depth, rate, duration))]
+            vec![runtime.block_on(streaming::b1_hop_ladder::run_depth(
+                depth,
+                rate,
+                duration,
+                streaming::b1_hop_ladder::DEFAULT_MAINTENANCE_INTERVAL,
+            ))]
         } else {
             runtime.block_on(streaming::b1_hop_ladder::run_ladder(rate, duration))
         };
@@ -262,6 +292,72 @@ fn main() {
         return;
     }
 
+    if name == "seal-cadence-sweep" {
+        let intervals_ms: Vec<u64> = parse_rate_list(&args, "--intervals-ms")
+            .unwrap_or_else(|| SEAL_CADENCE_SWEEP_DEFAULT_INTERVALS_MS.to_vec())
+            .into_iter()
+            .map(|v| v as u64)
+            .collect();
+        let depths: Vec<usize> = parse_rate_list(&args, "--depths")
+            .unwrap_or_else(|| SEAL_CADENCE_SWEEP_DEFAULT_DEPTHS.to_vec())
+            .into_iter()
+            .map(|v| v as usize)
+            .collect();
+        let rate = parse_flag(&args, "--rate")
+            .map(|v| v as f64)
+            .unwrap_or(SEAL_CADENCE_SWEEP_DEFAULT_RATE);
+        let duration = parse_flag(&args, "--duration-secs")
+            .map(|v| Duration::from_secs(v as u64))
+            .unwrap_or(SEAL_CADENCE_SWEEP_DEFAULT_DURATION);
+
+        let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
+        let results = runtime.block_on(streaming::e2_seal_cadence_sweep::run_sweep(
+            &intervals_ms,
+            &depths,
+            rate,
+            duration,
+        ));
+
+        for result in &results {
+            println!("{}", result.to_json());
+        }
+        return;
+    }
+
+    if name == "transaction-shape" {
+        let shapes: Vec<usize> = parse_rate_list(&args, "--shapes")
+            .unwrap_or_else(|| {
+                streaming::b4_transaction_shape::DEFAULT_SHAPES
+                    .iter()
+                    .map(|&v| v as f64)
+                    .collect()
+            })
+            .into_iter()
+            .map(|v| v as usize)
+            .collect();
+        let target_rate = parse_flag(&args, "--target-rate")
+            .map(|v| v as f64)
+            .unwrap_or(TRANSACTION_SHAPE_DEFAULT_TARGET_RATE);
+        let duration = parse_flag(&args, "--duration-secs")
+            .map(|v| Duration::from_secs(v as u64))
+            .unwrap_or(TRANSACTION_SHAPE_DEFAULT_DURATION);
+        let grace = parse_flag(&args, "--grace-secs")
+            .map(|v| Duration::from_secs(v as u64))
+            .unwrap_or(TRANSACTION_SHAPE_DEFAULT_GRACE);
+
+        let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
+        let probes = runtime.block_on(streaming::b4_transaction_shape::run_sweep(
+            &shapes,
+            target_rate,
+            duration,
+            grace,
+        ));
+        for probe in &probes {
+            println!("{}", probe.to_json("transaction-shape"));
+        }
+        return;
+    }
+
     if name == "relationship-aggregate" {
         let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
         let result = runtime.block_on(scenario_relationship::run(
@@ -358,7 +454,7 @@ fn parse_args(args: &[String], name: &str) -> Result<Vec<Scenario>, String> {
         other => Err(format!(
             "unknown scenario {other:?} — expected one of: high-cardinality, low-cardinality, \
              both, relationship-aggregate, custom, hop-ladder, hop-latency, throughput-ramp, \
-             intake-ceiling"
+             intake-ceiling, seal-cadence-sweep, transaction-shape"
         )),
     }
 }

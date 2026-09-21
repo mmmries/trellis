@@ -20,13 +20,23 @@
 //!   output, plus the T1 boundary-fraction evaluation the issue specifies.
 //! - [`b1_hop_ladder`]: B1, the hop-depth latency ladder — the direct test
 //!   of H1 (the seal-cadence hypothesis).
+//! - [`single_hop_probe`]: shared single-hop probe scaffolding B2 and B4
+//!   both build on.
 //! - [`b2_throughput_ramp`]: B2, the single-hop 1-1 throughput ramp.
+//! - [`b4_transaction_shape`]: B4, transaction-shape sensitivity (same
+//!   rows/sec at 1/100/10k rows per commit).
+//! - [`e2_seal_cadence_sweep`]: E2, sweeps `maintenance_interval` against
+//!   B1's depth ladder to measure whether a shorter seal cadence actually
+//!   fixes what H1 predicts it does.
 //! - [`e3_intake_ceiling`]: E3, the CDC-intake-alone throughput ceiling
 //!   (tests H2) — the hard ceiling B2/B3 sit under.
 
 pub mod b1_hop_ladder;
 pub mod b2_throughput_ramp;
+pub mod b4_transaction_shape;
 pub mod chain;
+pub mod e2_seal_cadence_sweep;
 pub mod e3_intake_ceiling;
 pub mod load;
 pub mod metrics_scrape;
+pub mod single_hop_probe;

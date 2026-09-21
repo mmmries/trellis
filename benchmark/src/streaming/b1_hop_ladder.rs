@@ -42,6 +42,7 @@ async fn connect_raw(dsn: &str) -> RawClient {
 #[derive(Debug)]
 pub struct HopLatencyResult {
     pub depth: usize,
+    pub maintenance_interval_ms: u64,
     pub offered_commits_per_sec: f64,
     pub duration_secs: f64,
     pub commits_issued: u64,
@@ -60,12 +61,14 @@ pub struct HopLatencyResult {
 impl HopLatencyResult {
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"scenario\":\"hop-ladder\",\"depth\":{},\"offered_commits_per_sec\":{},\
+            "{{\"scenario\":\"hop-ladder\",\"depth\":{},\"maintenance_interval_ms\":{},\
+             \"offered_commits_per_sec\":{},\
              \"duration_secs\":{},\"commits_issued\":{},\"rows_issued\":{},\
              \"actual_elapsed_secs\":{:.3},\"changes_applied_terminal\":{},\
              \"e2e_count\":{},\"e2e_p50_bucket_frac\":{:.4},\"e2e_p99_bucket_frac\":{:.4},\
              \"e2e_max_under_1s\":{},\"t1_p50_pass\":{},\"t1_p99_pass\":{},\"t1_all_pass\":{}}}",
             self.depth,
+            self.maintenance_interval_ms,
             self.offered_commits_per_sec,
             self.duration_secs,
             self.commits_issued,
@@ -85,11 +88,18 @@ impl HopLatencyResult {
 
 /// Runs one depth's measurement against a fresh, ephemeral cluster: builds a
 /// `depth`-hop 1-1 chain, starts a real streaming `Client`
-/// (`staging_worker: true`), warms the pipeline up, then offers
-/// `commits_per_sec` for `duration` and evaluates T1 against the terminal
-/// hop's `trellis_end_to_end_latency_seconds` histogram — diffed against a
+/// (`staging_worker: true`) with the given `maintenance_interval` (the seal
+/// cadence H1/E2 are about — B1 always calls this with the 300ms default;
+/// E2 sweeps it), warms the pipeline up, then offers `commits_per_sec` for
+/// `duration` and evaluates T1 against the terminal hop's
+/// `trellis_end_to_end_latency_seconds` histogram — diffed against a
 /// pre-load baseline scrape (see `metrics_scrape`'s doc comment on why).
-pub async fn run_depth(depth: usize, commits_per_sec: f64, duration: Duration) -> HopLatencyResult {
+pub async fn run_depth(
+    depth: usize,
+    commits_per_sec: f64,
+    duration: Duration,
+    maintenance_interval: Duration,
+) -> HopLatencyResult {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -124,6 +134,7 @@ pub async fn run_depth(depth: usize, commits_per_sec: f64, duration: Duration) -
         // table is unaffected (it's already published via `source_tables`
         // at `Client::start` time, before this ever matters).
         reconcile_interval: Duration::from_secs(3600),
+        maintenance_interval,
         ..Default::default()
     };
     let client = TrellisClient::start(db.dsn(), options).expect("client start");
@@ -158,7 +169,8 @@ pub async fn run_depth(depth: usize, commits_per_sec: f64, duration: Duration) -
     // scraping: H1's seal cadence means the last handful of commits can
     // still be in flight for up to ~depth * maintenance_interval after the
     // load generator stops, plus normal claim/fold/apply latency on top.
-    let drain_grace_deadline = Instant::now() + Duration::from_millis(300 * depth as u64 + 5_000);
+    let drain_grace_deadline =
+        Instant::now() + maintenance_interval * depth as u32 + Duration::from_secs(5);
     loop {
         let rendered = trellis::metrics::Metrics::new().render_prometheus();
         let changes_now = counter_value(&rendered, "trellis_changes_applied_total", terminal);
@@ -187,6 +199,7 @@ pub async fn run_depth(depth: usize, commits_per_sec: f64, duration: Duration) -
 
     HopLatencyResult {
         depth,
+        maintenance_interval_ms: maintenance_interval.as_millis() as u64,
         offered_commits_per_sec: commits_per_sec,
         duration_secs: duration.as_secs_f64(),
         commits_issued: load.commits_issued,
@@ -203,13 +216,26 @@ pub async fn run_depth(depth: usize, commits_per_sec: f64, duration: Duration) -
     }
 }
 
+/// `ClientOptions::maintenance_interval`'s own default (300ms) — what B1
+/// always measures against; E2 is the only caller that varies this.
+pub const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(300);
+
 /// The full ladder: depths 1/2/3/5/10, per the issue's B1 spec, at
 /// `commits_per_sec` (the issue's own example: 10/s, "low offered rate") for
-/// `duration` each — each depth against its own fresh `TestCluster`.
+/// `duration` each — each depth against its own fresh `TestCluster`, at the
+/// default `maintenance_interval`.
 pub async fn run_ladder(commits_per_sec: f64, duration: Duration) -> Vec<HopLatencyResult> {
     let mut results = Vec::new();
     for depth in [1usize, 2, 3, 5, 10] {
-        results.push(run_depth(depth, commits_per_sec, duration).await);
+        results.push(
+            run_depth(
+                depth,
+                commits_per_sec,
+                duration,
+                DEFAULT_MAINTENANCE_INTERVAL,
+            )
+            .await,
+        );
     }
     results
 }
