@@ -328,6 +328,65 @@ pub enum EvalError {
     /// disagreement. Per ADR-0003 it pauses the offending
     /// `(transform, column)` pair rather than the whole transform.
     IntervalOutOfRange { field: String },
+    /// A `BIT_AND`/`BIT_OR` fold was handed two bit strings of different
+    /// lengths within the same group (issue #118).
+    ///
+    /// Not defense-in-depth in the *evaluator*: a per-column `bit(n)`
+    /// argument can never trigger this (every row shares the column's one
+    /// fixed length), but an unconstrained `bit varying` argument genuinely
+    /// can, and Postgres itself refuses the combination rather than
+    /// padding/truncating — `select bit_and(v) from (values
+    /// ('1'::bit varying), ('01'::bit varying)) t(v)` raises `cannot AND
+    /// bit strings of different sizes` on a live server, so silently
+    /// picking a length here would compute a value no server-side
+    /// `bit_and`/`bit_or` would ever agree with. `op` names which of the
+    /// two folds hit it (`"AND"`/`"OR"`, matching Postgres's own error
+    /// wording), `len_a`/`len_b` the two disagreeing bit-string lengths in
+    /// encounter order.
+    ///
+    /// **This variant's own reachability is narrower than
+    /// `IntervalOutOfRange`'s, though, and worth stating precisely rather
+    /// than by analogy.** `bit_and`/`bit_or` are always
+    /// [`super::invertibility::Invertibility::RecomputeOnly`]
+    /// (`KeySpace::Aggregate` only), so `staging::apply_aggregate` never
+    /// folds a group through this Rust evaluator at all for its own written
+    /// value — it pushes the rendered aggregate expression straight to a
+    /// live Postgres (`probe_recompute_fields_bulk`/
+    /// `apply_forced_groups_bulk`), which raises *its own* native "cannot
+    /// AND/OR bit strings of different sizes" error, surfacing as
+    /// [`crate::staging::apply::ApplyError::Db`], not this variant. The one
+    /// production caller that does invoke `evaluate_aggregate`
+    /// (`staging::apply_aggregate::row_contribution`) only ever passes a
+    /// single-row slice per call, so the ≥2-value comparison this variant
+    /// needs can never actually see two disagreeing lengths there either.
+    /// In practice this variant is exercised only by this module's own unit
+    /// tests and by the test-only `defs::oracle::recompute_aggregate`
+    /// cross-check (`#[cfg(any(test, feature = "test-util"))]`), which does
+    /// call `evaluate_aggregate` over a whole multi-row group. It still
+    /// participates in the ordinary `field()`/`Display`/`code()` machinery
+    /// every `EvalError` variant does (so it degrades safely — `Internal`,
+    /// same as every other data-dependent variant here — on the unlikely
+    /// day some future caller does reach it with a real multi-row group),
+    /// but there is no live-pipeline scenario today where it fires.
+    ///
+    /// Also worth being precise about, since a v1 draft of this comment
+    /// overclaimed it: **this is not a case the ADR-0003 column-level pause
+    /// fuse would ever isolate**, even hypothetically. That fuse
+    /// (`staging::quarantine`'s "Column-level fuse" section) only ever
+    /// activates for `KeySpace::OneToOne` definitions — `bit_and`/`bit_or`
+    /// only ever appear in a `KeySpace::Aggregate` (`GROUP BY`) definition,
+    /// which the fuse explicitly excludes by design (see
+    /// `staging::quarantine`'s own doc comment on that scope cut, which
+    /// predates and is unrelated to this issue). A real occurrence — via
+    /// the `ApplyError::Db` path above, not this variant — is handled by
+    /// the ordinary row-level fuse instead, the same as any other
+    /// aggregate's data-dependent runtime failure in a `GROUP BY` context.
+    BitStringLengthMismatch {
+        field: String,
+        op: &'static str,
+        len_a: usize,
+        len_b: usize,
+    },
     /// A calculated field was re-entered while still being resolved on the
     /// current recursion path. The validator (#23) is supposed to reject
     /// cyclic definitions before they reach here, but `evaluate` is `pub`
@@ -401,6 +460,7 @@ impl EvalError {
             | EvalError::IntegerOutOfRange { field, .. }
             | EvalError::FloatOutOfRange { field, .. }
             | EvalError::IntervalOutOfRange { field }
+            | EvalError::BitStringLengthMismatch { field, .. }
             | EvalError::UnsupportedRelationshipPath { field, .. }
             | EvalError::UnknownRelationship { field, .. }
             | EvalError::AggregateRequiredForToMany { field, .. } => field,
@@ -438,6 +498,16 @@ impl fmt::Display for EvalError {
             EvalError::IntervalOutOfRange { field } => {
                 write!(f, "calculated field '{field}': interval out of range")
             }
+            EvalError::BitStringLengthMismatch {
+                field,
+                op,
+                len_a,
+                len_b,
+            } => write!(
+                f,
+                "calculated field '{field}': cannot {op} bit strings of different sizes \
+                 ({len_a} and {len_b})"
+            ),
             EvalError::Cycle(field) => write!(
                 f,
                 "calculated field '{field}' is part of a cyclic reference"
@@ -471,6 +541,7 @@ impl std::error::Error for EvalError {
             EvalError::MissingColumn { .. }
             | EvalError::InvalidBoolean { .. }
             | EvalError::IntervalOutOfRange { .. }
+            | EvalError::BitStringLengthMismatch { .. }
             | EvalError::Cycle(_)
             | EvalError::UnsupportedRelationshipPath { .. }
             | EvalError::UnknownRelationship { .. }
@@ -1419,6 +1490,15 @@ fn reduce_numeric_aggregate(
         return reduce_boolean_aggregate(name, values);
     }
 
+    // Issue #118: `bit_and`/`bit_or` fold `Value::Other(PgType::Bit |
+    // PgType::VarBit, _)` rather than the numeric family — the bit-string
+    // sibling of the `Boolean` early return just above. `is_temporal`
+    // (checked first, above) is false for both bit-string `PgType`s, so
+    // this never races that arm.
+    if matches!(&values[0], Value::Other(PgType::Bit | PgType::VarBit, _)) {
+        return reduce_bit_aggregate(name, values, field_name);
+    }
+
     // Issue #112: a float anywhere in the group makes the whole fold a
     // float fold, at the widest float width present — the same
     // widest-wins reasoning as the integer fold below, and the same
@@ -1811,6 +1891,90 @@ fn reduce_boolean_aggregate(name: &str, values: Vec<Value>) -> Result<Option<Val
         _ => unreachable!("reduce_boolean_aggregate is only called for BOOL_AND/BOOL_OR"),
     };
     Ok(Some(Value::Boolean(result)))
+}
+
+/// Folds a group of `Value::Other(PgType::Bit | PgType::VarBit, _)` bit
+/// strings for `bit_and`/`bit_or` (issue #118) — the bit-string sibling of
+/// [`reduce_boolean_aggregate`], reached the same early-return way.
+///
+/// Matches Postgres's own semantics: a per-*bit-position* `AND`/`OR` fold
+/// across the group, `NULL` skipped (already true by the time `values`
+/// reaches here) and an all-`NULL`/empty group folding to `NULL` (the
+/// empty-`values` check at the top of [`reduce_numeric_aggregate`] already
+/// covers that, since this function is only ever reached with at least one
+/// value). Unlike [`reduce_boolean_aggregate`], there is one operand-shape
+/// hazard to reproduce rather than paper over: Postgres itself refuses to
+/// combine two differently-sized bit strings (`select bit_and(v) from
+/// (values ('1'::bit varying), ('01'::bit varying)) t(v)` raises `cannot AND
+/// bit strings of different sizes` on a live server) rather than
+/// padding/truncating either one — see [`EvalError::BitStringLengthMismatch`],
+/// whose own doc comment is the authoritative account of exactly which
+/// callers can (and, today, cannot) actually reach that branch. A
+/// per-column `bit(n)` argument can never trigger this (every row shares
+/// the column's one fixed length), but an unconstrained `bit varying`
+/// argument genuinely can — in a multi-row caller; the one production
+/// caller of this function only ever hands it one row at a time.
+///
+/// [`super::invertibility::classify`]'s `BIT_AND`/`BIT_OR` arm is
+/// `RecomputeOnly` regardless — see that arm's own doc comment for the
+/// concrete two-deletions demonstration of why a running fold can't invert a
+/// delete — so this function's result, like [`reduce_boolean_aggregate`]'s,
+/// is only ever checked against a live server-side recompute, never
+/// incrementally maintained itself.
+///
+/// The result is always tagged [`PgType::VarBit`], never the argument's own
+/// [`PgType::Bit`] — mirroring `registry::aggregate_result_type`'s
+/// deliberate widening (see that function's own `BIT_AND`/`BIT_OR` doc
+/// comment for the DDL-typmod reason bare `bit` can't be a target column).
+/// `bit_out`/`varbit_out` render identically (bare `'0'`/`'1'` characters,
+/// no type-identifying wrapper), so retagging the family changes nothing
+/// about the text this function produces.
+fn reduce_bit_aggregate(
+    name: &str,
+    values: Vec<Value>,
+    field_name: &str,
+) -> Result<Option<Value>, EvalError> {
+    // Defense-in-depth, as everywhere else in this module: a value of
+    // another family here would mean a hand-built AST bypassed the
+    // validator's own argument check.
+    let bits: Vec<String> = values
+        .into_iter()
+        .filter_map(|value| match value {
+            Value::Other(PgType::Bit | PgType::VarBit, text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    if bits.is_empty() {
+        return Ok(None);
+    }
+    let op = match name {
+        "BIT_AND" => "AND",
+        "BIT_OR" => "OR",
+        _ => unreachable!("reduce_bit_aggregate is only called for BIT_AND/BIT_OR"),
+    };
+
+    let mut bits = bits.into_iter();
+    let mut acc = bits.next().expect("checked non-empty above");
+    for next in bits {
+        if next.len() != acc.len() {
+            return Err(EvalError::BitStringLengthMismatch {
+                field: field_name.to_string(),
+                op,
+                len_a: acc.len(),
+                len_b: next.len(),
+            });
+        }
+        acc = acc
+            .bytes()
+            .zip(next.bytes())
+            .map(|(a, b)| {
+                let (a, b) = (a == b'1', b == b'1');
+                let bit = if op == "AND" { a && b } else { a || b };
+                if bit { '1' } else { '0' }
+            })
+            .collect();
+    }
+    Ok(Some(Value::Other(PgType::VarBit, acc)))
 }
 
 /// `+` and `>` both take exact-numeric-family operands — [`Value::Numeric`]
