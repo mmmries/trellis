@@ -30,6 +30,9 @@
 //!   fixes what H1 predicts it does.
 //! - [`e3_intake_ceiling`]: E3, the CDC-intake-alone throughput ceiling
 //!   (tests H2) — the hard ceiling B2/B3 sit under.
+//! - [`e6_idle_cost`]: issue #268's X6, a fully idle install's background
+//!   transactions/sec and WAL bytes/sec — the control measurement for
+//!   whether an engine change trades background load for latency.
 
 pub mod b1_hop_ladder;
 pub mod b2_throughput_ramp;
@@ -37,6 +40,7 @@ pub mod b4_transaction_shape;
 pub mod chain;
 pub mod e2_seal_cadence_sweep;
 pub mod e3_intake_ceiling;
+pub mod e6_idle_cost;
 pub mod load;
 pub mod metrics_scrape;
 pub mod single_hop_probe;

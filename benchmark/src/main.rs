@@ -24,6 +24,7 @@
 //! cargo run -p benchmark --features engine-access --release -- intake-ceiling --rows-per-commit 1000 --duration-secs 20
 //! cargo run -p benchmark --features engine-access --release -- seal-cadence-sweep --intervals-ms 300,100,30,10 --depths 1,2,3,5,10
 //! cargo run -p benchmark --features engine-access --release -- transaction-shape --shapes 1,100,10000 --target-rate 20000
+//! cargo run -p benchmark --features engine-access --release -- idle-cost --application-threads 8 --warmup-secs 10 --duration-secs 20
 //! ```
 //!
 //! `hop-ladder`/`hop-latency`/`throughput-ramp`/`intake-ceiling`/
@@ -174,6 +175,14 @@ const SEAL_CADENCE_SWEEP_DEFAULT_DURATION: Duration = Duration::from_secs(15);
 const TRANSACTION_SHAPE_DEFAULT_TARGET_RATE: f64 = 20_000.0;
 const TRANSACTION_SHAPE_DEFAULT_DURATION: Duration = Duration::from_secs(20);
 const TRANSACTION_SHAPE_DEFAULT_GRACE: Duration = Duration::from_secs(30);
+
+/// X6's defaults: 8 drain threads (matching #268's own "staging worker plus
+/// 8 drain threads" idle-cost description), a 10s warmup so start-of-day
+/// work (publication reconcile, first maintenance tick) never pollutes the
+/// steady-state sample, then a 20s idle measurement window.
+const IDLE_COST_DEFAULT_APPLICATION_THREADS: usize = 8;
+const IDLE_COST_DEFAULT_WARMUP: Duration = Duration::from_secs(10);
+const IDLE_COST_DEFAULT_DURATION: Duration = Duration::from_secs(20);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -382,6 +391,24 @@ fn main() {
         return;
     }
 
+    if name == "idle-cost" {
+        let application_threads = parse_flag(&args, "--application-threads")
+            .map(|v| v as usize)
+            .unwrap_or(IDLE_COST_DEFAULT_APPLICATION_THREADS);
+        let warmup = parse_flag(&args, "--warmup-secs")
+            .map(|v| Duration::from_secs(v as u64))
+            .unwrap_or(IDLE_COST_DEFAULT_WARMUP);
+        let duration = parse_flag(&args, "--duration-secs")
+            .map(|v| Duration::from_secs(v as u64))
+            .unwrap_or(IDLE_COST_DEFAULT_DURATION);
+
+        let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
+        let result =
+            runtime.block_on(streaming::e6_idle_cost::run(application_threads, warmup, duration));
+        println!("{}", result.to_json());
+        return;
+    }
+
     if name == "relationship-aggregate" {
         let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
         let result = runtime.block_on(scenario_relationship::run(
@@ -478,7 +505,7 @@ fn parse_args(args: &[String], name: &str) -> Result<Vec<Scenario>, String> {
         other => Err(format!(
             "unknown scenario {other:?} — expected one of: high-cardinality, low-cardinality, \
              both, relationship-aggregate, custom, hop-ladder, hop-latency, throughput-ramp, \
-             intake-ceiling, seal-cadence-sweep, transaction-shape"
+             intake-ceiling, seal-cadence-sweep, transaction-shape, idle-cost"
         )),
     }
 }
