@@ -393,13 +393,17 @@ fn main() {
         let grace = parse_flag(&args, "--grace-secs")
             .map(|v| Duration::from_secs(v as u64))
             .unwrap_or(TRANSACTION_SHAPE_DEFAULT_GRACE);
+        let seal_mode = parse_seal_mode(&args);
+        let group_commit = parse_group_commit(&args);
 
         let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
-        let probes = runtime.block_on(streaming::b4_transaction_shape::run_sweep(
+        let probes = runtime.block_on(streaming::b4_transaction_shape::run_sweep_full(
             &shapes,
             target_rate,
             duration,
             grace,
+            seal_mode,
+            group_commit,
         ));
         for probe in &probes {
             println!("{}", probe.to_json("transaction-shape"));
@@ -549,6 +553,31 @@ fn parse_seal_mode(args: &[String]) -> trellis::SealMode {
             "--seal-mode {other:?} must be one of: timer, demand-naive, demand-gated"
         ),
     }
+}
+
+/// Parses `--group-commit <max_rows>,<max_delay_ms>` (issue #268's X4),
+/// absent by default (`None` — `ClientOptions::group_commit`'s own default,
+/// the pre-X4 one-ring-transaction-per-source-commit behavior unchanged).
+fn parse_group_commit(args: &[String]) -> Option<trellis::GroupCommitConfig> {
+    let raw = args
+        .iter()
+        .position(|a| a == "--group-commit")
+        .and_then(|i| args.get(i + 1))?;
+    let (max_rows, max_delay_ms) = raw.split_once(',').unwrap_or_else(|| {
+        panic!("--group-commit value {raw:?} must be \"<max_rows>,<max_delay_ms>\"")
+    });
+    Some(trellis::GroupCommitConfig {
+        max_rows: max_rows
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("--group-commit max_rows {max_rows:?}: {e}")),
+        max_delay: Duration::from_millis(
+            max_delay_ms
+                .trim()
+                .parse()
+                .unwrap_or_else(|e| panic!("--group-commit max_delay_ms {max_delay_ms:?}: {e}")),
+        ),
+    })
 }
 
 fn parse_flag(args: &[String], flag: &str) -> Result<i64, String> {

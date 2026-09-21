@@ -141,6 +141,12 @@ pub use app::{
 };
 pub use blocking::BlockingTrellis;
 pub use client::{Client, ClientError, ClientOptions, SealMode};
+/// Re-exported at the crate root regardless of the `internals` feature —
+/// `ClientOptions::group_commit` (issue #268 X4) names this type in a
+/// public field, so it must be nameable by every embedder, not just
+/// internals-feature tooling, the same reasoning `SealMode` above already
+/// follows for `ClientOptions::seal_mode`.
+pub use intake::GroupCommitConfig;
 
 // --- Tier 2: composable primitives ----------------------------------------
 pub use config::Config;

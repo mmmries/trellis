@@ -89,6 +89,31 @@ pub async fn run_probe(
     grace: Duration,
     seal_mode: trellis::SealMode,
 ) -> ThroughputProbe {
+    run_probe_full(
+        rows_per_commit,
+        commits_per_sec,
+        application_threads,
+        offered_duration,
+        grace,
+        seal_mode,
+        None,
+    )
+    .await
+}
+
+/// Same as [`run_probe`], plus an explicit `group_commit` — issue #268's
+/// X4: batches several source transactions into one ring transaction,
+/// tested against exactly the pathological shape B4 (`transaction-shape`)
+/// found worst (1 row/commit at a high aggregate rate).
+pub async fn run_probe_full(
+    rows_per_commit: usize,
+    commits_per_sec: f64,
+    application_threads: usize,
+    offered_duration: Duration,
+    grace: Duration,
+    seal_mode: trellis::SealMode,
+    group_commit: Option<trellis::GroupCommitConfig>,
+) -> ThroughputProbe {
     let target_rows_per_sec = commits_per_sec * rows_per_commit as f64;
 
     let cluster = TestCluster::start();
@@ -111,6 +136,7 @@ pub async fn run_probe(
         // table added mid-run.
         reconcile_interval: Duration::from_secs(3600),
         seal_mode,
+        group_commit,
         ..Default::default()
     };
     let client = TrellisClient::start(db.dsn(), options).expect("client start");

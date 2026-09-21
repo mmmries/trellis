@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use super::single_hop_probe::{ThroughputProbe, run_probe};
+use super::single_hop_probe::ThroughputProbe;
 
 const APPLICATION_THREADS: usize = 8;
 
@@ -25,22 +25,32 @@ pub const DEFAULT_SHAPES: &[usize] = &[1, 100, 10_000];
 /// (`target_rows_per_sec / rows_per_commit`), which is the whole point:
 /// 1 row/commit at a high target rate means a very high commit rate, and
 /// this measures what that costs relative to a few large commits.
-pub async fn run_sweep(
+///
+/// `seal_mode`/`group_commit` (issue #268's X3/X4) default to stock
+/// (`trellis::SealMode::Timer`/`None`) when `main.rs`'s `transaction-shape`
+/// CLI arm doesn't pass `--seal-mode`/`--group-commit` — X4 targets exactly
+/// this scenario's worst shape (1 row/commit): "the shape #266 found
+/// worst" is the direct test of whether group-commit moves the 1-row/commit
+/// wall.
+pub async fn run_sweep_full(
     shapes: &[usize],
     target_rows_per_sec: f64,
     offered_duration: Duration,
     grace: Duration,
+    seal_mode: trellis::SealMode,
+    group_commit: Option<trellis::GroupCommitConfig>,
 ) -> Vec<ThroughputProbe> {
     let mut probes = Vec::new();
     for &rows_per_commit in shapes {
         let commits_per_sec = target_rows_per_sec / rows_per_commit as f64;
-        let probe = run_probe(
+        let probe = super::single_hop_probe::run_probe_full(
             rows_per_commit,
             commits_per_sec,
             APPLICATION_THREADS,
             offered_duration,
             grace,
-            trellis::SealMode::Timer,
+            seal_mode,
+            group_commit,
         )
         .await;
         probes.push(probe);
