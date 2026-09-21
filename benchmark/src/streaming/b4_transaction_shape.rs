@@ -40,6 +40,7 @@ pub async fn run_sweep(
             APPLICATION_THREADS,
             offered_duration,
             grace,
+            trellis::SealMode::Timer,
         )
         .await;
         probes.push(probe);

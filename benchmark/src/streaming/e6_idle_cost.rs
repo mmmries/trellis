@@ -109,7 +109,15 @@ impl IdleCostResult {
 /// first maintenance tick, drainer registration) to finish so it doesn't
 /// pollute the steady-state reading, then samples `pg_stat_database.xact_commit`
 /// and `pg_current_wal_lsn()` before/after a `duration`-long idle window.
-pub async fn run(application_threads: usize, warmup: Duration, duration: Duration) -> IdleCostResult {
+/// Issue #268's X6: `seal_mode` lets this control measurement be re-run
+/// after X2/X3 to check whether a latency win quietly costs background
+/// load.
+pub async fn run_with_seal_mode(
+    application_threads: usize,
+    warmup: Duration,
+    duration: Duration,
+    seal_mode: trellis::SealMode,
+) -> IdleCostResult {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -120,6 +128,7 @@ pub async fn run(application_threads: usize, warmup: Duration, duration: Duratio
         staging_worker: true,
         application_threads,
         source_tables: vec![format!("public.{source}")],
+        seal_mode,
         ..Default::default()
     };
     let client = TrellisClient::start(db.dsn(), options).expect("client start");

@@ -121,6 +121,39 @@ pub struct ClientOptions {
     /// delivery, and the only wake source if the listener connection itself
     /// couldn't be opened).
     pub poll_interval: Duration,
+    /// Issue #268 X3, experimental: how `maintenance_loop` decides *when*
+    /// to seal. Defaults to [`SealMode::Timer`] — the original,
+    /// unconditional-per-tick behavior, byte-for-byte unchanged from before
+    /// this field existed. The two demand-driven modes are a research
+    /// experiment, not a recommended production setting yet: see
+    /// [`SealMode`]'s own doc comment.
+    pub seal_mode: SealMode,
+}
+
+/// How [`maintenance_loop`] decides when to attempt a seal (issue #268 X3:
+/// "Demand-driven sealing"). The hypothesis under test: sealing on a fixed
+/// wall-clock timer sets batch boundaries from something that knows nothing
+/// about load — fast ticks waste WAL/CPU when idle, slow ticks add latency
+/// when busy — and reacting to actual staging activity instead should buy
+/// back latency without the throughput cost a naive "seal on every commit"
+/// approach would pay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SealMode {
+    /// The original behavior: attempt a seal unconditionally on every
+    /// `maintenance_interval` tick, sleeping for the full interval between
+    /// attempts regardless of activity.
+    #[default]
+    Timer,
+    /// X3 "naive": `maintenance_loop` additionally `LISTEN`s on
+    /// `wake_channel` (intake's own linchpin notify, X2's new
+    /// seal-completion notify, and apply's downstream-propagation notify
+    /// all fire it), and attempts a seal on every wake — `maintenance_interval`
+    /// becomes a liveness backstop, not the seal cadence. Still seals
+    /// unconditionally whenever the active segment is non-empty
+    /// (`seal_if_active_nonempty`'s own long-standing busy-loop guard), so
+    /// a burst of small commits can produce a burst of small segments —
+    /// this is the variant #268 predicts may cost throughput.
+    DemandNaive,
 }
 
 impl Default for ClientOptions {
@@ -140,6 +173,7 @@ impl Default for ClientOptions {
             hard_cap: intake::spill::DEFAULT_HARD_CAP,
             heartbeat: HeartbeatDaemonConfig::default(),
             poll_interval: Duration::from_millis(200),
+            seal_mode: SealMode::Timer,
         }
     }
 }
@@ -516,6 +550,7 @@ async fn run(
             interval: options.maintenance_interval,
             reclaim_ttl: options.reclaim_ttl,
             reconcile_interval: options.reconcile_interval,
+            seal_mode: options.seal_mode,
         };
         maintenance_task = Some(tokio::spawn(maintenance_loop(
             maintenance_config,
@@ -760,6 +795,7 @@ struct MaintenanceConfig {
     interval: Duration,
     reclaim_ttl: Duration,
     reconcile_interval: Duration,
+    seal_mode: SealMode,
 }
 
 /// Runs seal-on-demand, stuck-seal recovery, stale-claim reclaim,
@@ -783,6 +819,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         interval,
         reclaim_ttl,
         reconcile_interval,
+        seal_mode,
     } = config;
 
     let seal_config = SealConfig::default();
@@ -792,6 +829,18 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     // reconciliation pass at that point, but this makes the loop's own
     // cadence not depend on when it happens to first observe `Instant::now()`.
     let mut next_reconcile = Instant::now();
+
+    // Issue #268 X3: demand-driven modes additionally `LISTEN` on
+    // `wake_channel` (the same channel intake's linchpin, X2's new
+    // seal-completion notify, and apply's downstream propagation all fire),
+    // so this loop's own cadence can react to real staging activity instead
+    // of only a fixed tick. `SealMode::Timer` never opens this connection —
+    // its behavior is byte-for-byte the pre-X3 loop.
+    let mut wake = if seal_mode != SealMode::Timer {
+        wake_listener(&dsn, &schema, &wake_channel).await.ok()
+    } else {
+        None
+    };
 
     loop {
         if *shutdown_rx.borrow() {
@@ -803,6 +852,14 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         }
 
         if let Some(c) = client.as_mut() {
+            // Issue #268 X3 "naive": `SealMode::DemandNaive` reaches this
+            // exact call unconditionally, same as `SealMode::Timer` always
+            // has — the only thing that changes for the naive variant is
+            // *when* this iteration runs (see the wake-driven tail below),
+            // not whether it seals. `seal_if_active_nonempty`'s own
+            // long-standing busy-loop guard (only seals a non-empty active
+            // segment) is the only gate naive has; the "gated" variant
+            // (issue #268 X3, a follow-up commit) adds a second one here.
             let seal_result = staging::seal_if_active_nonempty(c).await;
             let mut failed = seal_result.is_err();
             if let Ok(Some(_)) = &seal_result {
@@ -898,9 +955,13 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
             }
         }
 
-        tokio::select! {
-            _ = shutdown_rx.changed() => return,
-            _ = tokio::time::sleep(interval) => {}
+        if seal_mode == SealMode::Timer {
+            tokio::select! {
+                _ = shutdown_rx.changed() => return,
+                _ = tokio::time::sleep(interval) => {}
+            }
+        } else if wait_for_wake(&mut wake, &mut shutdown_rx, interval).await {
+            return;
         }
     }
 }

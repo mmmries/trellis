@@ -87,6 +87,7 @@ pub async fn run_probe(
     application_threads: usize,
     offered_duration: Duration,
     grace: Duration,
+    seal_mode: trellis::SealMode,
 ) -> ThroughputProbe {
     let target_rows_per_sec = commits_per_sec * rows_per_commit as f64;
 
@@ -109,6 +110,7 @@ pub async fn run_probe(
         // anyway for consistency and because this scenario never needs a
         // table added mid-run.
         reconcile_interval: Duration::from_secs(3600),
+        seal_mode,
         ..Default::default()
     };
     let client = TrellisClient::start(db.dsn(), options).expect("client start");

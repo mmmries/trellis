@@ -137,6 +137,28 @@ pub async fn run_depth(
     .await
 }
 
+/// Same as [`run_depth_with_poll_interval`], plus an explicit `seal_mode` —
+/// issue #268's X3: the demand-driven-sealing variants (naive/gated) are
+/// compared against the stock timer-driven ladder at the same depths.
+pub async fn run_depth_full(
+    depth: usize,
+    commits_per_sec: f64,
+    duration: Duration,
+    maintenance_interval: Duration,
+    poll_interval: Duration,
+    seal_mode: trellis::SealMode,
+) -> HopLatencyResult {
+    run_depth_inner(
+        depth,
+        commits_per_sec,
+        duration,
+        maintenance_interval,
+        poll_interval,
+        seal_mode,
+    )
+    .await
+}
+
 /// `ClientOptions::poll_interval`'s own default (200ms) — what
 /// [`run_depth`]/[`run_ladder`] measure against; issue #268's X1a/X1b sweeps
 /// are the only callers that vary this.
@@ -155,6 +177,25 @@ pub async fn run_depth_with_poll_interval(
     maintenance_interval: Duration,
     poll_interval: Duration,
 ) -> HopLatencyResult {
+    run_depth_inner(
+        depth,
+        commits_per_sec,
+        duration,
+        maintenance_interval,
+        poll_interval,
+        trellis::SealMode::Timer,
+    )
+    .await
+}
+
+async fn run_depth_inner(
+    depth: usize,
+    commits_per_sec: f64,
+    duration: Duration,
+    maintenance_interval: Duration,
+    poll_interval: Duration,
+    seal_mode: trellis::SealMode,
+) -> HopLatencyResult {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -167,6 +208,7 @@ pub async fn run_depth_with_poll_interval(
         application_threads: 4,
         source_tables: vec![format!("public.{source}")],
         poll_interval,
+        seal_mode,
         // Deliberately long, not short: a live upstream trellis bug
         // (salesforce-misc/trellis#267) means an intermediate
         // hop table that gets added to the CDC publication by the periodic
@@ -293,22 +335,3 @@ pub async fn run_depth_with_poll_interval(
 /// always measures against; E2 is the only caller that varies this.
 pub const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(300);
 
-/// The full ladder: depths 1/2/3/5/10, per the issue's B1 spec, at
-/// `commits_per_sec` (the issue's own example: 10/s, "low offered rate") for
-/// `duration` each — each depth against its own fresh `TestCluster`, at the
-/// default `maintenance_interval`.
-pub async fn run_ladder(commits_per_sec: f64, duration: Duration) -> Vec<HopLatencyResult> {
-    let mut results = Vec::new();
-    for depth in [1usize, 2, 3, 5, 10] {
-        results.push(
-            run_depth(
-                depth,
-                commits_per_sec,
-                duration,
-                DEFAULT_MAINTENANCE_INTERVAL,
-            )
-            .await,
-        );
-    }
-    results
-}

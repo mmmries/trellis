@@ -208,20 +208,35 @@ fn main() {
         let poll_interval_ms = parse_flag(&args, "--poll-interval-ms")
             .map(|v| v as u64)
             .unwrap_or_else(|_| streaming::b1_hop_ladder::DEFAULT_POLL_INTERVAL.as_millis() as u64);
+        // Issue #268's X3: which of stock/naive/gated `maintenance_loop`
+        // uses to decide when to seal — see `parse_seal_mode`.
+        let seal_mode = parse_seal_mode(&args);
 
         let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
         let results = if name == "hop-latency" {
             let depth =
                 parse_flag(&args, "--depth").expect("hop-latency requires --depth <hops>") as usize;
-            vec![runtime.block_on(streaming::b1_hop_ladder::run_depth_with_poll_interval(
+            vec![runtime.block_on(streaming::b1_hop_ladder::run_depth_full(
                 depth,
                 rate,
                 duration,
                 Duration::from_millis(maintenance_interval_ms),
                 Duration::from_millis(poll_interval_ms),
+                seal_mode,
             ))]
         } else {
-            runtime.block_on(streaming::b1_hop_ladder::run_ladder(rate, duration))
+            let mut results = Vec::new();
+            for depth in [1usize, 2, 3, 5, 10] {
+                results.push(runtime.block_on(streaming::b1_hop_ladder::run_depth_full(
+                    depth,
+                    rate,
+                    duration,
+                    Duration::from_millis(maintenance_interval_ms),
+                    Duration::from_millis(poll_interval_ms),
+                    seal_mode,
+                )));
+            }
+            results
         };
 
         let mut any_missed_t1 = false;
@@ -266,10 +281,11 @@ fn main() {
             .unwrap_or(THROUGHPUT_RAMP_DEFAULT_GRACE);
         let rates = parse_rate_list(&args, "--rates")
             .unwrap_or_else(|| THROUGHPUT_RAMP_DEFAULT_RATES.to_vec());
+        let seal_mode = parse_seal_mode(&args);
 
         let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
-        let probes = runtime.block_on(streaming::b2_throughput_ramp::run_ramp(
-            &rates, duration, grace,
+        let probes = runtime.block_on(streaming::b2_throughput_ramp::run_ramp_with_seal_mode(
+            &rates, duration, grace, seal_mode,
         ));
 
         for probe in &probes {
@@ -401,10 +417,15 @@ fn main() {
         let duration = parse_flag(&args, "--duration-secs")
             .map(|v| Duration::from_secs(v as u64))
             .unwrap_or(IDLE_COST_DEFAULT_DURATION);
+        let seal_mode = parse_seal_mode(&args);
 
         let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
-        let result =
-            runtime.block_on(streaming::e6_idle_cost::run(application_threads, warmup, duration));
+        let result = runtime.block_on(streaming::e6_idle_cost::run_with_seal_mode(
+            application_threads,
+            warmup,
+            duration,
+            seal_mode,
+        ));
         println!("{}", result.to_json());
         return;
     }
@@ -507,6 +528,25 @@ fn parse_args(args: &[String], name: &str) -> Result<Vec<Scenario>, String> {
              both, relationship-aggregate, custom, hop-ladder, hop-latency, throughput-ramp, \
              intake-ceiling, seal-cadence-sweep, transaction-shape, idle-cost"
         )),
+    }
+}
+
+/// Parses `--seal-mode <timer|demand-naive>` (issue #268's X3), defaulting
+/// to `SealMode::Timer` — the pre-X3 behavior — when the flag is absent,
+/// matching every other scenario flag's "opt in explicitly" default.
+fn parse_seal_mode(args: &[String]) -> trellis::SealMode {
+    match args
+        .iter()
+        .position(|a| a == "--seal-mode")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+    {
+        None => trellis::SealMode::Timer,
+        Some("timer") => trellis::SealMode::Timer,
+        Some("demand-naive") => trellis::SealMode::DemandNaive,
+        Some(other) => panic!(
+            "--seal-mode {other:?} must be one of: timer, demand-naive"
+        ),
     }
 }
 

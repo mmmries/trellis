@@ -140,7 +140,7 @@ pub use app::{
     QuarantineTarget, RelationshipSummary, Trellis, TrellisError, TrellisOptions,
 };
 pub use blocking::BlockingTrellis;
-pub use client::{Client, ClientError, ClientOptions};
+pub use client::{Client, ClientError, ClientOptions, SealMode};
 
 // --- Tier 2: composable primitives ----------------------------------------
 pub use config::Config;

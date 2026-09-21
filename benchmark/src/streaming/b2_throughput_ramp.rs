@@ -50,10 +50,16 @@ const RAMP_COMMITS_PER_SEC: f64 = 50.0;
 /// its backlog within `grace`, or the list is exhausted. Returns every probe
 /// run, in order — the caller reads the last `sustained: true` entry (if
 /// any) as the candidate saturation rate.
-pub async fn run_ramp(
+/// Issue #268's X3: `seal_mode` selects stock timer-driven sealing or one of
+/// the naive/gated demand-driven variants, compared against each other on
+/// this exact knee. `main.rs`'s `throughput-ramp` CLI arm always passes this
+/// explicitly (`trellis::SealMode::Timer` when `--seal-mode` isn't given, via
+/// `parse_seal_mode`'s own default).
+pub async fn run_ramp_with_seal_mode(
     candidate_rates: &[f64],
     offered_duration: Duration,
     grace: Duration,
+    seal_mode: trellis::SealMode,
 ) -> Vec<ThroughputProbe> {
     let mut probes = Vec::new();
     for &target_rows_per_sec in candidate_rates {
@@ -65,6 +71,7 @@ pub async fn run_ramp(
             APPLICATION_THREADS,
             offered_duration,
             grace,
+            seal_mode,
         )
         .await;
         let sustained = probe.sustained;
