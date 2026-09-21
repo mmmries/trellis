@@ -3,10 +3,12 @@
 //! sampled for transactions/sec and WAL bytes/sec — the two efficiency
 //! counters #268 asks to be sampled *from Postgres directly*
 //! (`pg_stat_database.xact_commit`, `pg_current_wal_lsn()`), not new engine
-//! metrics. Run this against stock and again after X2/X3 to see whether a
-//! latency win quietly costs background load — the issue's own explicit
-//! concern ("if X3 improves latency but X6 gets worse, that's a trade, and
-//! it should be reported as one").
+//! metrics — plus seals/sec, read the same way (`segment_pointer.active_seq`
+//! advances by exactly 1 per successful seal, so a before/after delta is an
+//! exact count, not a new metric either). Run this against stock and again
+//! after X2/X3 to see whether a latency win quietly costs background load —
+//! the issue's own explicit concern ("if X3 improves latency but X6 gets
+//! worse, that's a trade, and it should be reported as one").
 //!
 //! **On "queries/sec"**: #268's idle-cost prediction talks about queries/sec
 //! (`~100 queries/sec doing nothing`), but there is no direct query-count
@@ -61,6 +63,18 @@ async fn wal_lsn(raw: &RawClient) -> String {
         .get(0)
 }
 
+/// The active segment pointer's `seg_seq` — each successful seal advances
+/// this by exactly 1 (`seal_phase1`'s `next_seg_seq = active_seq + 1`), so a
+/// before/after delta over a window is an exact seal count with no new
+/// engine metric needed. Read directly from `segment_pointer`, the same
+/// table `staging::seal`'s own `active_pointer` reads.
+async fn active_seg_seq(raw: &RawClient) -> i64 {
+    raw.query_one("select active_seq from segment_pointer", &[])
+        .await
+        .expect("read segment_pointer.active_seq")
+        .get(0)
+}
+
 async fn wal_bytes_since(raw: &RawClient, start_lsn: &str) -> i64 {
     // `pg_wal_lsn_diff` returns `numeric`, which `tokio_postgres` has no
     // built-in `FromSql` for — cast to `bigint` explicitly (a WAL delta over
@@ -82,6 +96,8 @@ pub struct IdleCostResult {
     pub xact_commit_per_sec: f64,
     pub wal_bytes_delta: i64,
     pub wal_bytes_per_sec: f64,
+    pub seals_delta: i64,
+    pub seals_per_sec: f64,
 }
 
 impl IdleCostResult {
@@ -90,7 +106,8 @@ impl IdleCostResult {
             "{{\"scenario\":\"idle-cost\",\"application_threads\":{},\"duration_secs\":{:.3},\
              \"xact_commit_delta\":{},\"xact_commit_per_sec\":{:.2},\
              \"queries_per_sec_proxy\":{:.2},\
-             \"wal_bytes_delta\":{},\"wal_bytes_per_sec\":{:.1}}}",
+             \"wal_bytes_delta\":{},\"wal_bytes_per_sec\":{:.1},\
+             \"seals_delta\":{},\"seals_per_sec\":{:.3}}}",
             self.application_threads,
             self.duration_secs,
             self.xact_commit_delta,
@@ -98,6 +115,8 @@ impl IdleCostResult {
             self.xact_commit_per_sec,
             self.wal_bytes_delta,
             self.wal_bytes_per_sec,
+            self.seals_delta,
+            self.seals_per_sec,
         )
     }
 }
@@ -137,6 +156,7 @@ pub async fn run_with_seal_mode(
 
     let commit_before = xact_commit(&raw).await;
     let lsn_before = wal_lsn(&raw).await;
+    let seg_seq_before = active_seg_seq(&raw).await;
     let start = Instant::now();
 
     tokio::time::sleep(duration).await;
@@ -144,10 +164,12 @@ pub async fn run_with_seal_mode(
     let elapsed = start.elapsed().as_secs_f64();
     let commit_after = xact_commit(&raw).await;
     let wal_delta = wal_bytes_since(&raw, &lsn_before).await;
+    let seg_seq_after = active_seg_seq(&raw).await;
 
     client.shutdown().await.expect("client shutdown");
 
     let commit_delta = commit_after - commit_before;
+    let seals_delta = seg_seq_after - seg_seq_before;
     IdleCostResult {
         application_threads,
         duration_secs: elapsed,
@@ -155,5 +177,7 @@ pub async fn run_with_seal_mode(
         xact_commit_per_sec: commit_delta as f64 / elapsed,
         wal_bytes_delta: wal_delta,
         wal_bytes_per_sec: wal_delta as f64 / elapsed,
+        seals_delta,
+        seals_per_sec: seals_delta as f64 / elapsed,
     }
 }
