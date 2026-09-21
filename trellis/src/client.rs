@@ -154,6 +154,15 @@ pub enum SealMode {
     /// a burst of small commits can produce a burst of small segments —
     /// this is the variant #268 predicts may cost throughput.
     DemandNaive,
+    /// X3 "gated": same wake-driven cadence as [`SealMode::DemandNaive`],
+    /// plus one extra guard — skip sealing this wake if a previously
+    /// sealed-or-draining segment hasn't finished draining yet
+    /// (`staging::has_pending_sealed_segment`). The hypothesis under test:
+    /// this lets the active segment keep absorbing rows while a worker
+    /// drains the prior batch, so segments self-batch under load instead of
+    /// shrinking — protecting throughput in a way the naive variant does
+    /// not.
+    DemandGated,
 }
 
 impl Default for ClientOptions {
@@ -852,15 +861,27 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         }
 
         if let Some(c) = client.as_mut() {
-            // Issue #268 X3 "naive": `SealMode::DemandNaive` reaches this
-            // exact call unconditionally, same as `SealMode::Timer` always
-            // has — the only thing that changes for the naive variant is
-            // *when* this iteration runs (see the wake-driven tail below),
-            // not whether it seals. `seal_if_active_nonempty`'s own
+            // Issue #268 X3: `SealMode::Timer`/`DemandNaive` reach the seal
+            // call below unconditionally — `seal_if_active_nonempty`'s own
             // long-standing busy-loop guard (only seals a non-empty active
-            // segment) is the only gate naive has; the "gated" variant
-            // (issue #268 X3, a follow-up commit) adds a second one here.
-            let seal_result = staging::seal_if_active_nonempty(c).await;
+            // segment) is their only gate. `SealMode::DemandGated` adds a
+            // second one: skip sealing this wake entirely if a previously
+            // sealed-or-draining segment hasn't finished draining yet, so
+            // the active segment keeps absorbing rows while a worker drains
+            // the prior batch instead of sealing a second, smaller one
+            // right behind it — the mechanism the gated variant's
+            // self-batching-under-load prediction depends on.
+            let should_seal = match seal_mode {
+                SealMode::Timer | SealMode::DemandNaive => true,
+                SealMode::DemandGated => {
+                    !staging::has_pending_sealed_segment(c).await.unwrap_or(false)
+                }
+            };
+            let seal_result = if should_seal {
+                staging::seal_if_active_nonempty(c).await
+            } else {
+                Ok(None)
+            };
             let mut failed = seal_result.is_err();
             if let Ok(Some(_)) = &seal_result {
                 // Issue #268 X2: the one transition that makes work

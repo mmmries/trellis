@@ -389,6 +389,28 @@ async fn analyze_sealed_slot_best_effort(client: &Client, ring_slot: i16) {
         .await;
 }
 
+/// Issue #268 X3 "gated" demand-driven sealing: whether any segment is
+/// currently sealed-or-draining and not yet fully drained — the same
+/// claimability condition [`super::apply::next_claimable_segments`] scopes
+/// its own selection to (`state in ('sealed', 'draining')` and
+/// `drained_mask` short of every bucket), read here as a plain existence
+/// check rather than a row list. `maintenance_loop` (`client.rs`) uses this
+/// to skip sealing while a previous batch is still outstanding, so the
+/// active segment keeps absorbing rows instead of sealing a second, smaller
+/// batch right behind the first — the mechanism the gated variant's
+/// self-batching-under-load prediction depends on.
+pub async fn has_pending_sealed_segment(client: &impl GenericClient) -> Result<bool, StagingError> {
+    let row = client
+        .query_one(
+            "select exists (select 1 from segments \
+             where state in ('sealed', 'draining') \
+               and drained_mask <> ((1::bigint << bucket_count) - 1))",
+            &[],
+        )
+        .await?;
+    Ok(row.get(0))
+}
+
 /// Age-gated crash recovery: finds every segment stuck `state = 'sealed'`
 /// with `seal_step1` set, `fence_snapshot` still `NULL`, and sealed longer
 /// ago than `age_gate`, and reconstructs its fence via [`seal_phase2`].

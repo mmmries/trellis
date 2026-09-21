@@ -81,7 +81,7 @@ pub use liveness::{
     DEFAULT_RECLAIM_TTL, HeartbeatDaemon, HeartbeatDaemonConfig, reclaim_stale, release,
 };
 pub use retire::retire_drained_segments;
-pub use seal::{SealConfig, recover_stuck_seals, seal_if_active_nonempty};
+pub use seal::{SealConfig, has_pending_sealed_segment, recover_stuck_seals, seal_if_active_nonempty};
 // `self_check`'s non-error types are reached through `lib.rs`'s own
 // crate-root re-export (`Divergence`/`SelfCheckMode`/etc. traffic in
 // `Trellis::self_check`'s public signature, tier 2 per ADR-0012), which

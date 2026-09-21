@@ -531,9 +531,9 @@ fn parse_args(args: &[String], name: &str) -> Result<Vec<Scenario>, String> {
     }
 }
 
-/// Parses `--seal-mode <timer|demand-naive>` (issue #268's X3), defaulting
-/// to `SealMode::Timer` — the pre-X3 behavior — when the flag is absent,
-/// matching every other scenario flag's "opt in explicitly" default.
+/// Parses `--seal-mode <timer|demand-naive|demand-gated>` (issue #268's X3),
+/// defaulting to `SealMode::Timer` — the pre-X3 behavior — when the flag is
+/// absent, matching every other scenario flag's "opt in explicitly" default.
 fn parse_seal_mode(args: &[String]) -> trellis::SealMode {
     match args
         .iter()
@@ -544,8 +544,9 @@ fn parse_seal_mode(args: &[String]) -> trellis::SealMode {
         None => trellis::SealMode::Timer,
         Some("timer") => trellis::SealMode::Timer,
         Some("demand-naive") => trellis::SealMode::DemandNaive,
+        Some("demand-gated") => trellis::SealMode::DemandGated,
         Some(other) => panic!(
-            "--seal-mode {other:?} must be one of: timer, demand-naive"
+            "--seal-mode {other:?} must be one of: timer, demand-naive, demand-gated"
         ),
     }
 }
