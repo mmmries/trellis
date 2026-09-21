@@ -128,6 +128,11 @@ pub struct ClientOptions {
     /// experiment, not a recommended production setting yet: see
     /// [`SealMode`]'s own doc comment.
     pub seal_mode: SealMode,
+    /// Issue #268 X4, experimental: batches several source transactions
+    /// into one ring transaction. `None` (the default) preserves the
+    /// original one-ring-transaction-per-source-commit behavior exactly.
+    /// See [`intake::GroupCommitConfig`]'s own doc comment.
+    pub group_commit: Option<intake::GroupCommitConfig>,
 }
 
 /// How [`maintenance_loop`] decides when to attempt a seal (issue #268 X3:
@@ -183,6 +188,7 @@ impl Default for ClientOptions {
             heartbeat: HeartbeatDaemonConfig::default(),
             poll_interval: Duration::from_millis(200),
             seal_mode: SealMode::Timer,
+            group_commit: None,
         }
     }
 }
@@ -784,6 +790,7 @@ fn build_intake_config(
         wake_channel: options.wake_channel.clone(),
         spill_threshold: options.spill_threshold,
         hard_cap: options.hard_cap,
+        group_commit: options.group_commit,
     })
 }
 
