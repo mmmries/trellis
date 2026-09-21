@@ -4,12 +4,16 @@
 //! `testkit::CrashGuard` is a SIGKILL-based subprocess crash primitive, the
 //! wrong tool here: the generative harness runs `trellis::Client` in-process
 //! (`generative::backend::ManualBackend` owns it directly), not as a separate
-//! OS process. Instead this exercises `trellis::Client`'s own `Drop` impl — a
-//! real client's `Drop` already performs a best-effort, non-graceful shutdown
-//! signal with no draining, a faithful, free stand-in for "the process died"
-//! (see `Backend::restart`'s doc comment) — plus "scale out": starting an
-//! additional application-worker-only client alongside the existing one,
-//! against the same source tables.
+//! OS process. Instead this exercises tearing down and replacing that
+//! in-process `trellis::Client`, a faithful, free stand-in for "the process
+//! died" (see `Backend::restart`'s doc comment) — plus "scale out": starting
+//! an additional application-worker-only client alongside the existing one,
+//! against the same source tables. Issue #251: that teardown now awaits
+//! `trellis::Client::shutdown` rather than just dropping the old client —
+//! `Drop`'s own shutdown signal is best-effort and doesn't join the
+//! background thread, which raced the old producer's advisory-lock release
+//! against the new client's acquire and sporadically failed with
+//! `ProducerAlreadyRunning`.
 //!
 //! Reuses the shared-cluster/isolated-database-per-case `Harness` pattern
 //! from `tests/convergence.rs`.
@@ -349,5 +353,105 @@ async fn restart_then_scale_out_are_independently_usable_against_a_live_backend(
     assert!(
         diverged.is_none(),
         "post-restart/scale-out update must still converge onto the target: {diverged:?}"
+    );
+}
+
+/// Regression coverage for issue #251: `ManualBackend::restart` used to just
+/// drop the outgoing primary `trellis::Client` and immediately start a
+/// replacement, relying on `Client`'s `Drop` impl — a fire-and-forget
+/// shutdown *signal*, not a join (see its own doc comment) — to have already
+/// released the old producer's `pg_try_advisory_lock`-held session by the
+/// time the new producer tried to acquire it. That's a race, not a
+/// guarantee: back-to-back restarts with no delay between them (exactly
+/// what this test does), run under enough CPU contention to widen the
+/// window (a busy CI runner's normal condition), reliably lost it pre-fix —
+/// observed here as `Client(Intake(Staging(ProducerAlreadyRunning)))` within
+/// the first handful of iterations — matching the CI failure this issue
+/// links (`generative/tests/concurrent_convergence.rs`'s
+/// `a_restart_and_a_scale_out_interleaved_still_converge_under_the_concurrent_backend`).
+///
+/// Two fix layers, both load-bearing (see `ManualBackend::restart`'s own
+/// doc comment for the full mechanism of each):
+///
+/// 1. `restart` awaits the outgoing client's `shutdown()` — which joins the
+///    background thread before returning — closing the *client-side* half
+///    of the race. Measured directly (40 saturating CPU-bound processes
+///    across this box's 16 cores, the same artificial-contention recipe
+///    used throughout this investigation): layer 1 alone cut the failure
+///    rate from roughly 1 in 5 external repeats of this loop (pre-fix) to
+///    roughly 1 in 8 (shutdown-only) — a large reduction, not an
+///    elimination. `shutdown` only guarantees *this process's* connection
+///    object is torn down, not that the Postgres backend serving it has
+///    actually been scheduled to notice the closed socket and release the
+///    advisory lock — a scheduling gap, not something this process's own
+///    state can observe.
+/// 2. `restart` now also retries `EngineClient::start_with_config` with a
+///    short bounded backoff specifically on that residual
+///    `ProducerAlreadyRunning`, rather than propagating it immediately
+///    (`start_with_producer_retry`). Measured the same way, same load
+///    recipe, 50 external repeats of this exact loop: **0 failures**,
+///    against the shutdown-only layer's 6-failures-in-50 baseline. That is
+///    not a claim the race is now provably impossible — the retry budget is
+///    bounded on purpose, and an adversarial-enough scheduling delay could
+///    in principle still exceed it — but 0/50 under the same contention
+///    that broke the shutdown-only fix repeatedly is a real, measured
+///    result, not a small-sample artifact (a single-digit sample size was
+///    exactly what made an earlier pass at this measurement misleading — an
+///    8/8-clean run that didn't hold up once independently re-measured at
+///    higher volume).
+///
+/// A failure in this test is still a genuine regression signal — nothing
+/// about `is_producer_already_running`'s bounded retry is supposed to
+/// *reduce* below what's already been measured — but see
+/// `RESTART_PRODUCER_RETRY_ATTEMPTS`'s own doc comment before assuming a
+/// single flake here means the fix regressed rather than an unusually
+/// extreme scheduling delay exceeding the bounded retry budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn restarting_the_primary_client_back_to_back_never_races_the_advisory_lock() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program(&[(Some(1), Some(2))], &[]);
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    backend.install(&program).await.expect("install program");
+    backend.quiesce().await.expect("quiesce after install");
+
+    // No delay between restarts, deliberately: this is exactly the timing
+    // shape that raced the old producer's advisory-lock release against the
+    // new one's acquire pre-fix (issue #251).
+    for i in 0..25 {
+        backend.restart().await.unwrap_or_else(|e| {
+            panic!("restart #{i} raced the old producer's advisory-lock release: {e:?}")
+        });
+    }
+
+    // The client left behind by the loop must still be usable: a normal op
+    // applied after it still folds through and converges, proving the loop
+    // didn't leave the pipeline stuck even when every restart succeeds.
+    backend
+        .apply(&generative::model::Op::Update {
+            table: program.tables[0].name.clone(),
+            pk: "1".to_string(),
+            changes: vec![(
+                program.tables[0].columns[1].name.clone(),
+                Some("42".to_string()),
+            )],
+            expect: generative::model::OpOutcome::Succeeds,
+        })
+        .await
+        .expect("apply update after the restart loop");
+    backend.quiesce().await.expect("quiesce after update");
+
+    let snapshot = backend.snapshot().await.expect("snapshot");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+    let diverged = check_program(&pool, &program, &snapshot)
+        .await
+        .expect("oracle check must run");
+    assert!(
+        diverged.is_none(),
+        "post-restart-loop update must still converge onto the target: {diverged:?}"
     );
 }
