@@ -25,6 +25,7 @@
 //! cargo run -p benchmark --features engine-access --release -- seal-cadence-sweep --intervals-ms 300,100,30,10 --depths 1,2,3,5,10
 //! cargo run -p benchmark --features engine-access --release -- transaction-shape --shapes 1,100,10000 --target-rate 20000
 //! cargo run -p benchmark --features engine-access --release -- idle-cost --application-threads 8 --warmup-secs 10 --duration-secs 20
+//! cargo run -p benchmark --features engine-access --release -- fold-in-ratio --ratios 10,100,1000 --target-rate 400000 --duration-secs 20
 //! ```
 //!
 //! `hop-ladder`/`hop-latency`/`throughput-ramp`/`intake-ceiling`/
@@ -180,6 +181,14 @@ const TRANSACTION_SHAPE_DEFAULT_GRACE: Duration = Duration::from_secs(30);
 /// 8 drain threads" idle-cost description), a 10s warmup so start-of-day
 /// work (publication reconcile, first maintenance tick) never pollutes the
 /// steady-state sample, then a 20s idle measurement window.
+/// B3's own defaults: the issue's own ratio list, at T3's 400k rows/sec
+/// target — same application-thread count B2/B4 use for consistency.
+const FOLD_IN_DEFAULT_RATIOS: &[f64] = &[10.0, 100.0, 1000.0];
+const FOLD_IN_DEFAULT_TARGET_RATE: f64 = 400_000.0;
+const FOLD_IN_DEFAULT_DURATION: Duration = Duration::from_secs(20);
+const FOLD_IN_DEFAULT_GRACE: Duration = Duration::from_secs(30);
+const FOLD_IN_DEFAULT_APPLICATION_THREADS: usize = 8;
+
 const IDLE_COST_DEFAULT_APPLICATION_THREADS: usize = 8;
 const IDLE_COST_DEFAULT_WARMUP: Duration = Duration::from_secs(10);
 const IDLE_COST_DEFAULT_DURATION: Duration = Duration::from_secs(20);
@@ -407,6 +416,43 @@ fn main() {
         ));
         for probe in &probes {
             println!("{}", probe.to_json("transaction-shape"));
+        }
+        return;
+    }
+
+    if name == "fold-in-ratio" {
+        let ratios: Vec<usize> = parse_rate_list(&args, "--ratios")
+            .unwrap_or_else(|| FOLD_IN_DEFAULT_RATIOS.to_vec())
+            .into_iter()
+            .map(|v| v as usize)
+            .collect();
+        let target_rate = parse_flag(&args, "--target-rate")
+            .map(|v| v as f64)
+            .unwrap_or(FOLD_IN_DEFAULT_TARGET_RATE);
+        let duration = parse_flag(&args, "--duration-secs")
+            .map(|v| Duration::from_secs(v as u64))
+            .unwrap_or(FOLD_IN_DEFAULT_DURATION);
+        let grace = parse_flag(&args, "--grace-secs")
+            .map(|v| Duration::from_secs(v as u64))
+            .unwrap_or(FOLD_IN_DEFAULT_GRACE);
+        let application_threads = parse_flag(&args, "--application-threads")
+            .map(|v| v as usize)
+            .unwrap_or(FOLD_IN_DEFAULT_APPLICATION_THREADS);
+        let seal_mode = parse_seal_mode(&args);
+        let group_commit = parse_group_commit(&args);
+
+        let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
+        for &ratio in &ratios {
+            let result = runtime.block_on(streaming::b3_fold_in_ratio::run_probe_full(
+                ratio,
+                target_rate,
+                duration,
+                grace,
+                application_threads,
+                seal_mode,
+                group_commit,
+            ));
+            println!("{}", result.to_json());
         }
         return;
     }

@@ -36,6 +36,7 @@
 
 pub mod b1_hop_ladder;
 pub mod b2_throughput_ramp;
+pub mod b3_fold_in_ratio;
 pub mod b4_transaction_shape;
 pub mod chain;
 pub mod e2_seal_cadence_sweep;
