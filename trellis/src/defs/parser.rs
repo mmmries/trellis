@@ -47,8 +47,8 @@
 //! storage are all separate, later issues.
 
 use super::ast::{
-    DefinitionRef, Expr, FieldDef, GroupByKey, KeySpace, Predicate, RelationshipDef, Statement,
-    TransformDef, TransformRef,
+    AlterClause, AlterTransform, DefinitionRef, Expr, FieldDef, GroupByKey, KeySpace, Predicate,
+    RelationshipDef, Statement, TransformDef, TransformRef,
 };
 use super::error::ParseError;
 use super::lexer::{Token, lex};
@@ -66,7 +66,7 @@ const OPERATOR_CHARS: &[char] = &['+', '-', '*', '/', '%', '>', '<', '='];
 /// (the parser still recognizes each keyword positionally, via
 /// [`Parser::peek_is_keyword`], the way every other keyword here works).
 const STATEMENT_KEYWORDS: &str =
-    "a statement keyword: TRANSFORM, RELATIONSHIP, PAUSE, RESUME or DROP";
+    "a statement keyword: TRANSFORM, RELATIONSHIP, PAUSE, RESUME, DROP or ALTER";
 
 /// Parses a transform definition's source text into a [`TransformDef`].
 ///
@@ -114,7 +114,8 @@ pub fn parse_relationship(input: &str) -> Result<RelationshipDef, ParseError> {
 /// have grown that external sniffing (and every embedder's copy of it). Here,
 /// a new form is a new arm.
 ///
-/// The five forms, in full (issue #228's settled grammar):
+/// The forms, in full (issue #228's settled grammar, plus ADR-0015's
+/// `ALTER TRANSFORM`, issues #241/#242):
 ///
 /// ```text
 /// TRANSFORM <target> FROM <source> [GROUP BY <keys>] SELECT <fields> [WHERE <predicate>]
@@ -124,10 +125,13 @@ pub fn parse_relationship(input: &str) -> Result<RelationshipDef, ParseError> {
 /// RESUME TRANSFORM <target>[.<column>]
 /// DROP   TRANSFORM <target>
 /// DROP   RELATIONSHIP [<schema>.]<from_table>.<relationship_name>
+///
+/// ALTER TRANSFORM <target> <clause>[, <clause> ...]
+///   where <clause> is  ADD <expr> AS <field>  |  DROP <field>  |  ALTER <field> AS <expr>
 /// ```
 ///
-/// That list is exhaustive — in particular **there is no
-/// `PAUSE`/`RESUME RELATIONSHIP`**: pausing is a transform-only operation,
+/// Beyond that list, in particular, **there is no `PAUSE`/`RESUME
+/// RELATIONSHIP`**: pausing is a transform-only operation,
 /// because a relationship is a reusable component of a transform rather than
 /// something that does work of its own to suspend. `PAUSE RELATIONSHIP x.y` is
 /// therefore just an unrecognized keyword where `TRANSFORM` was expected, no
@@ -135,11 +139,15 @@ pub fn parse_relationship(input: &str) -> Result<RelationshipDef, ParseError> {
 /// since a relationship is a definition and definitions can be retired.
 ///
 /// `PAUSE`/`RESUME`/`DROP` keep the kind keyword (issue #228 decision 1 — the
-/// two kinds don't share a namespace) and are flat imperatives rather than
-/// `ALTER TRANSFORM x PAUSE` (decision 4). They need no lexer changes:
-/// `PAUSE`/`RESUME`/`DROP` lex as plain `Ident`s and are matched
-/// case-insensitively by [`Parser::peek_is_keyword`], exactly like
-/// `TRANSFORM`/`FROM`/`TO` already are.
+/// two kinds don't share a namespace) and are flat imperatives rather than a
+/// `PAUSE`/`RESUME`-flavoured spelling of `ALTER TRANSFORM x PAUSE` (decision
+/// 4 — that specific spelling is still not accepted; `ALTER TRANSFORM` itself
+/// later became real grammar under ADR-0015, but only for the `ADD`/`DROP`/
+/// `ALTER` field-editing clauses above, never as an alternate way to spell
+/// `PAUSE`/`RESUME`/`DROP`). They need no lexer changes: `PAUSE`/`RESUME`/
+/// `DROP` lex as plain `Ident`s and are matched case-insensitively by
+/// [`Parser::peek_is_keyword`], exactly like `TRANSFORM`/`FROM`/`TO` already
+/// are.
 ///
 /// [`parse`] and [`parse_relationship`] remain as the narrower, single-form
 /// entry points the engine itself uses when it re-parses text it persisted and
@@ -362,6 +370,9 @@ impl Parser {
             return self
                 .parse_relationship_def()
                 .map(Statement::DefineRelationship);
+        }
+        if self.peek_is_keyword("ALTER") {
+            return self.parse_alter_transform().map(Statement::AlterTransform);
         }
 
         let verb = if self.peek_is_keyword("PAUSE") {
@@ -610,6 +621,75 @@ impl Parser {
             from_col,
             to_table,
             to_col,
+        })
+    }
+
+    /// Parses `ALTER TRANSFORM <target> <clause>[, <clause> ...]` (ADR-0015,
+    /// issues #241/#242). `<target>` is a bare identifier
+    /// ([`Self::expect_ident`], not [`Self::parse_table_ref`]) — an edit
+    /// addresses an already-registered definition by its bare operator-facing
+    /// identity, the same convention [`Self::parse_transform_address`] uses
+    /// for `PAUSE`/`RESUME`/`DROP TRANSFORM`, not the schema-qualifiable table
+    /// reference `TRANSFORM`/`FROM` accept when *declaring* one.
+    fn parse_alter_transform(&mut self) -> Result<AlterTransform, ParseError> {
+        self.expect_keyword("ALTER")?;
+        self.expect_keyword("TRANSFORM")?;
+        let target = self.expect_ident()?;
+
+        let mut clauses = vec![self.parse_alter_clause()?];
+        while self.peek_is_symbol(',') {
+            self.advance();
+            clauses.push(self.parse_alter_clause()?);
+        }
+        self.expect_eof()?;
+
+        Ok(AlterTransform { target, clauses })
+    }
+
+    /// Parses one `ADD <expr> AS <field>` / `DROP <field>` /
+    /// `ALTER <field> AS <expr>` clause of an `ALTER TRANSFORM` statement.
+    ///
+    /// `is_aggregate` stays `false` for every expression parsed here (the
+    /// same fixed setting a plain 1-1 `TRANSFORM ... SELECT` list parses
+    /// under), regardless of the target's actual key-space: this grammar slot
+    /// doesn't repeat `GROUP BY`, so the parser has no way to know the
+    /// target's key-space at parse time. That still accepts every shape a
+    /// 1-1 definition's own field list does, including an aggregate-function
+    /// call over a to-many relationship path (the one aggregate shape a
+    /// row-grain definition already allows) — only a *plain* `SUM`/`COUNT(*)`
+    /// grouping aggregate is unavailable here, matching the current release's
+    /// scope of `ALTER TRANSFORM` to 1-1 targets (see
+    /// [`super::catalog::alter_transform`]'s own doc comment).
+    fn parse_alter_clause(&mut self) -> Result<AlterClause, ParseError> {
+        if self.peek_is_keyword("ADD") {
+            self.advance();
+            let expr = self.parse_expr()?;
+            self.expect_keyword("AS")?;
+            let name = self.expect_ident()?;
+            return Ok(AlterClause::Add(FieldDef { name, expr }));
+        }
+        if self.peek_is_keyword("DROP") {
+            self.advance();
+            let name = self.expect_ident()?;
+            return Ok(AlterClause::Drop(name));
+        }
+        if self.peek_is_keyword("ALTER") {
+            self.advance();
+            let name = self.expect_ident()?;
+            self.expect_keyword("AS")?;
+            let expr = self.parse_expr()?;
+            return Ok(AlterClause::Alter(FieldDef { name, expr }));
+        }
+
+        let found = self.peek().describe();
+        Err(match self.peek() {
+            Token::Eof => ParseError::UnexpectedEof {
+                expected: "'ADD', 'DROP' or 'ALTER'".to_string(),
+            },
+            _ => ParseError::UnexpectedToken {
+                expected: "'ADD', 'DROP' or 'ALTER'".to_string(),
+                found,
+            },
         })
     }
 

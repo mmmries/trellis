@@ -359,7 +359,25 @@ impl Trellis {
             defs::Statement::Pause(reference) => self.apply_pause(reference).await,
             defs::Statement::Resume(reference) => self.apply_resume(reference).await,
             defs::Statement::Drop(reference) => self.apply_drop(reference).await,
+            defs::Statement::AlterTransform(alter) => self.apply_alter(&alter).await,
         }
+    }
+
+    /// [`Statement::AlterTransform`](defs::Statement::AlterTransform)'s half
+    /// of [`apply`](Trellis::apply) (ADR-0015, issues #241/#242) — a thin
+    /// facade wrapper over [`defs::alter_transform`], which does the actual
+    /// work (idempotency, validation, DDL, single-pass backfill, version
+    /// fencing); see that function's own doc comment for the full contract.
+    async fn apply_alter(&self, alter: &defs::AlterTransform) -> Result<Applied, TrellisError> {
+        let outcome = defs::alter_transform(&self.pool, alter)
+            .await
+            .map_err(TrellisError::Catalog)?;
+        Ok(Applied::Altered {
+            definition: outcome.definition,
+            added: outcome.added,
+            dropped: outcome.dropped,
+            altered: outcome.altered,
+        })
     }
 
     /// [`Statement::Pause`](defs::Statement::Pause)'s half of
@@ -1263,7 +1281,7 @@ impl Trellis {
             // user-defined enum type (a connection is only ever used for an
             // OID this process hasn't already classified as a fixed
             // builtin — see that function's own doc comment).
-            match defs::pg_type::value_type_for_oid(&client, type_oid).await? {
+            match defs::pg_type::value_type_for_oid(&**client, type_oid).await? {
                 // Issue #108 review: a column whose OID the registry still
                 // can't place at all (an array, a range, a composite, a
                 // domain, `citext`, ...) stays *out* of the validator's
@@ -1377,6 +1395,20 @@ pub enum Applied {
     /// A `DROP ...` statement removed its subject — or found it already gone,
     /// which ADR-0014 makes the same success.
     Dropped,
+    /// An `ALTER TRANSFORM ...` statement edited its subject's calculated
+    /// fields (ADR-0015, issues #241/#242). `definition` is the edited
+    /// definition's new state; `added`/`dropped`/`altered` name exactly the
+    /// fields this call actually changed, excluding any clause that turned
+    /// out to be an idempotent no-op (re-adding an existing field with the
+    /// same formula, re-altering to the formula it already had, dropping an
+    /// already-absent field) — all three lists are empty for a statement
+    /// whose every clause was one of those.
+    Altered {
+        definition: Definition,
+        added: Vec<String>,
+        dropped: Vec<String>,
+        altered: Vec<String>,
+    },
 }
 
 impl Applied {
