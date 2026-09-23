@@ -731,9 +731,11 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// cleanly. The pass then stops rather than waiting again on the remaining
 /// markers: each later horizon is at least as far ahead, so every one would
 /// most likely time out too, and the maintenance loop seals nothing while
-/// this waits. A caller with no intake running yet must not call this at all
-/// (see `client::setup_staging`); tests with no CDC stream pass
-/// [`crate::staging::StagedWatermark::saturated`].
+/// this waits. A discharge that fails outright (a failed `DECLARE`, append,
+/// marker delete or commit) takes the same rollback-and-revert path before
+/// returning its error (issue #387). A caller with no intake running yet must
+/// not call this at all (see `client::setup_staging`); tests with no CDC
+/// stream pass [`crate::staging::StagedWatermark::saturated`].
 ///
 /// # Dropping what the source no longer backs (issue #330)
 ///
@@ -815,21 +817,25 @@ pub(crate) async fn run_pending_backfills_until(
         )
         .await?;
 
-        let txn = client.transaction().await?;
-        // Issue #330: before the enumeration's `DECLARE` and its intake wait; see
-        // "Dropping what the source no longer backs" above. On the rollback
-        // below, the deletes roll back with everything else.
-        super::resume_orphans::delete_orphaned_target_rows(&txn, &marker.table, &advancing).await?;
-        let staged = if coverage_covers(&txn, &marker.table).await? {
-            false
-        } else {
-            declare_enumeration(&txn, &marker.table).await?;
-            let horizon: PgLsn = txn
-                .query_one("select pg_current_wal_insert_lsn()", &[])
-                .await?
-                .get(0);
-            if !intake_caught_up(watermark, horizon, catch_up_timeout, stop).await {
-                txn.rollback().await?;
+        // Issue #387: `advancing` is already committed as `backfilling`, and a
+        // later pass only promotes `waiting_to_backfill` definitions. So every
+        // way out of the discharge short of its commit (a deferral *or* an
+        // error) must hand them back, or they never go live.
+        match discharge_marker(
+            client,
+            &marker,
+            &advancing,
+            wake_channel,
+            watermark,
+            catch_up_timeout,
+            stop,
+        )
+        .await
+        {
+            Ok(Discharge::Committed) => {
+                mark_definitions_live(client, &advancing).await?;
+            }
+            Ok(Discharge::Deferred { horizon }) => {
                 revert_to_waiting(client, &advancing).await?;
                 tracing::debug!(
                     table = %marker.table,
@@ -839,35 +845,96 @@ pub(crate) async fn run_pending_backfills_until(
                 );
                 break;
             }
-            append_enumeration(&txn, &marker.table).await?;
-            true
-        };
-        // Delete only the marker this pass read (issues #311/#367). A park
-        // since then gave the row a new generation, so it stays for the next
-        // pass: this enumeration's snapshot may predate that park's change.
-        // `skip locked` covers a park that is still in flight: the row stays
-        // either way. If that park commits, its generation is new anyway; if
-        // it rolls back, the next pass re-runs this marker, which is
-        // redundant but safe. Waiting for it instead would hold the
-        // maintenance loop on a caller's transaction.
-        txn.execute(
-            "delete from pending_backfill where table_name in ( \
-                 select table_name from pending_backfill \
-                 where table_name = $1 and generation = $2 \
-                 for update skip locked)",
-            &[&marker.table, &marker.generation],
-        )
-        .await?;
-        if staged {
-            txn.execute("select pg_notify($1, '')", &[&wake_channel])
-                .await?;
+            Err(error) => {
+                // The maintenance loop only asks `is_err()` of this pass, so
+                // this is the one place the failure is reported.
+                tracing::warn!(
+                    table = %marker.table,
+                    error = %error,
+                    "backfill discharge failed; its marker stays for the next pass"
+                );
+                if let Err(revert_error) = revert_to_waiting(client, &advancing).await {
+                    tracing::warn!(
+                        table = %marker.table,
+                        ids = ?advancing,
+                        error = %revert_error,
+                        "could not return definitions to waiting_to_backfill after a failed discharge"
+                    );
+                }
+                return Err(error);
+            }
         }
-        txn.commit().await?;
-
-        mark_definitions_live(client, &advancing).await?;
     }
     tracing::Span::current().record("settled", settled);
     Ok(())
+}
+
+/// How [`discharge_marker`] ended short of an error.
+enum Discharge {
+    /// The enumeration (if the table needed one) and the marker's delete
+    /// committed together.
+    Committed,
+    /// Intake had not staged through `horizon` in time, so the transaction
+    /// rolled back and the marker stays.
+    Deferred { horizon: PgLsn },
+}
+
+/// Runs `marker`'s discharge in one transaction: the enumeration, unless
+/// coverage already stands in for it, then the marker's delete. An error
+/// drops the transaction, which rolls it back, so the marker survives either
+/// way the discharge falls short.
+async fn discharge_marker(
+    client: &mut tokio_postgres::Client,
+    marker: &PendingBackfill,
+    advancing: &[i64],
+    wake_channel: &str,
+    watermark: &StagedWatermark,
+    catch_up_timeout: Duration,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<Discharge, IntakeError> {
+    let txn = client.transaction().await?;
+    // Issue #330: before the enumeration's `DECLARE` and its intake wait; see
+    // "Dropping what the source no longer backs" above. On the rollback
+    // below (including the `Deferred` and error paths, since both drop
+    // `txn` without committing), the deletes roll back with everything else.
+    super::resume_orphans::delete_orphaned_target_rows(&txn, &marker.table, advancing).await?;
+    let staged = if coverage_covers(&txn, &marker.table).await? {
+        false
+    } else {
+        declare_enumeration(&txn, &marker.table).await?;
+        let horizon: PgLsn = txn
+            .query_one("select pg_current_wal_insert_lsn()", &[])
+            .await?
+            .get(0);
+        if !intake_caught_up(watermark, horizon, catch_up_timeout, stop).await {
+            txn.rollback().await?;
+            return Ok(Discharge::Deferred { horizon });
+        }
+        append_enumeration(&txn, &marker.table).await?;
+        true
+    };
+    // Delete only the marker this pass read (issues #311/#367). A park
+    // since then gave the row a new generation, so it stays for the next
+    // pass: this enumeration's snapshot may predate that park's change.
+    // `skip locked` covers a park that is still in flight: the row stays
+    // either way. If that park commits, its generation is new anyway; if
+    // it rolls back, the next pass re-runs this marker, which is
+    // redundant but safe. Waiting for it instead would hold the
+    // maintenance loop on a caller's transaction.
+    txn.execute(
+        "delete from pending_backfill where table_name in ( \
+             select table_name from pending_backfill \
+             where table_name = $1 and generation = $2 \
+             for update skip locked)",
+        &[&marker.table, &marker.generation],
+    )
+    .await?;
+    if staged {
+        txn.execute("select pg_notify($1, '')", &[&wake_channel])
+            .await?;
+    }
+    txn.commit().await?;
+    Ok(Discharge::Committed)
 }
 
 /// How often [`intake_caught_up`] re-reads the in-process watermark. The read
@@ -896,9 +963,17 @@ async fn intake_caught_up(
 }
 
 /// Undoes [`advance_deferred_definitions`]'s `waiting_to_backfill` ->
-/// `backfilling` promotion for exactly `ids`, when the enumeration that
-/// promotion announced was deferred instead of run. Scoped to `ids` and to
-/// the `backfilling` status for the same reason that function is.
+/// `backfilling` promotion for exactly `ids`, when the discharge that
+/// promotion announced was deferred or failed instead of committing. Scoped to
+/// `ids` and to the `backfilling` status for the same reason that function
+/// is, so a definition an operator paused or quarantined meanwhile stays
+/// frozen.
+///
+/// After a failed discharge this runs on the same connection as the
+/// transaction that just failed. That transaction may be aborted, and it was
+/// dropped rather than rolled back explicitly. It is still safe: dropping a
+/// `tokio_postgres::Transaction` queues its `ROLLBACK` on the connection's
+/// request channel synchronously, so the server runs it before this update.
 async fn revert_to_waiting(client: &impl GenericClient, ids: &[i64]) -> Result<(), IntakeError> {
     if ids.is_empty() {
         return Ok(());
@@ -1636,6 +1711,196 @@ mod catch_up_tests {
             .await
             .expect("the in-flight park's marker must survive the older discharge");
         assert_ne!(after, before, "the surviving marker is the racing park's");
+    }
+
+    /// Issue #387: a discharge that fails partway (here its `DECLARE`, since
+    /// `public.nokey` has no identity key) must hand back the definitions it
+    /// promoted to `backfilling`. A later pass only promotes definitions still
+    /// in `waiting_to_backfill`, so one left in `backfilling` would never go
+    /// live. The marker must survive too, so the retry has something to run.
+    #[tokio::test]
+    async fn a_failed_discharge_returns_its_definitions_to_waiting() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        client
+            .batch_execute(
+                "create table public.nokey (id bigint not null); \
+                 insert into public.nokey values (1); \
+                 create publication test_pub; \
+                 insert into source_table_versions (source_table, version) \
+                 values ('public.nokey', 1);",
+            )
+            .await
+            .expect("seed a source table with no identity key");
+        reconcile_publication(&mut client, "test_pub", &["public.nokey".to_string()])
+            .await
+            .expect("reconcile parks a marker");
+        let id: i64 = client
+            .query_one(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.d', 'public.nokey', 1, $1, 'waiting_to_backfill') \
+                 returning id",
+                &[&"TRANSFORM d FROM nokey SELECT id AS x"],
+            )
+            .await
+            .expect("seed a deferred definition")
+            .get(0);
+        async fn status(client: &tokio_postgres::Client, id: i64) -> String {
+            client
+                .query_one(
+                    "select status from transform_definitions where id = $1",
+                    &[&id],
+                )
+                .await
+                .expect("read status")
+                .get(0)
+        }
+
+        match run_pending_backfills(
+            &mut client,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::from_secs(600),
+        )
+        .await
+        {
+            Err(IntakeError::MissingKeyValue { table }) => assert_eq!(table, "public.nokey"),
+            other => panic!("expected the enumeration to fail, got {other:?}"),
+        }
+        assert_eq!(status(&client, id).await, "waiting_to_backfill");
+        let markers: i64 = client
+            .query_one("select count(*) from pending_backfill", &[])
+            .await
+            .expect("count markers")
+            .get(0);
+        assert_eq!(markers, 1, "the marker must survive for the next pass");
+
+        // Once the cause is fixed, the next pass picks the definition back up.
+        client
+            .batch_execute("alter table public.nokey add primary key (id)")
+            .await
+            .expect("give the source a primary key");
+        run_pending_backfills(
+            &mut client,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::from_secs(600),
+        )
+        .await
+        .expect("the retry discharges");
+        assert_eq!(status(&client, id).await, "live");
+    }
+
+    /// Issue #387, the server-side case: the marker delete fails inside the
+    /// discharge transaction (forced here by a trigger), which leaves that
+    /// transaction aborted. Dropping it must roll it back *before* the revert
+    /// runs on the same connection, or the revert fails with "current
+    /// transaction is aborted". Meanwhile an operator pauses one promoted
+    /// definition and quarantines another while the discharge waits for
+    /// intake. The revert must hand back only the one still `backfilling`.
+    #[tokio::test]
+    async fn a_failed_discharge_after_an_operator_freeze_reverts_only_backfilling() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut discharger, operator) = one_settled_marker(&db).await;
+        discharger
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.t', 1); \
+                 create function fail_marker_delete() returns trigger \
+                 language plpgsql as $$ begin raise exception 'marker delete fails'; end $$; \
+                 create trigger fail_marker_delete before delete on pending_backfill \
+                 for each row execute function fail_marker_delete();",
+            )
+            .await
+            .expect("make the marker delete fail");
+        let mut ids = Vec::new();
+        for target in ["public.d1", "public.d2", "public.d3"] {
+            let id: i64 = discharger
+                .query_one(
+                    "insert into transform_definitions \
+                     (target_table, source_table, source_version, definition_text, status) \
+                     values ($1, 'public.t', 1, $2, 'waiting_to_backfill') \
+                     returning id",
+                    &[&target, &"TRANSFORM d FROM t SELECT id AS x"],
+                )
+                .await
+                .expect("seed a deferred definition")
+                .get(0);
+            ids.push(id);
+        }
+        let (kept, paused, quarantined) = (ids[0], ids[1], ids[2]);
+
+        let watermark = StagedWatermark::new();
+        let waiting = tokio::sync::Notify::new();
+        // `stop` is polled only while the enumeration waits for intake, which
+        // is after the promotion to `backfilling` has committed.
+        let stop = || {
+            waiting.notify_one();
+            false
+        };
+        let discharge = run_pending_backfills_until(
+            &mut discharger,
+            "wake",
+            &watermark,
+            Duration::from_secs(600),
+            &stop,
+        );
+        let freeze = async {
+            waiting.notified().await;
+            operator
+                .execute(
+                    "update transform_definitions set status = 'paused' where id = $1",
+                    &[&paused],
+                )
+                .await
+                .expect("pause mid-discharge");
+            operator
+                .execute(
+                    "update transform_definitions set status = 'quarantined' where id = $1",
+                    &[&quarantined],
+                )
+                .await
+                .expect("quarantine mid-discharge");
+            watermark.advance(PgLsn::from(u64::MAX));
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(discharge, freeze)
+        })
+        .await
+        .expect("the discharge finishes");
+        match result {
+            Err(IntakeError::Db(error)) => assert_eq!(
+                error.code(),
+                Some(&tokio_postgres::error::SqlState::RAISE_EXCEPTION)
+            ),
+            other => panic!("expected the marker delete to fail, got {other:?}"),
+        }
+
+        let statuses: Vec<(i64, String)> = operator
+            .query(
+                "select id, status from transform_definitions where id = any($1) order by id",
+                &[&ids],
+            )
+            .await
+            .expect("read statuses")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (kept, "waiting_to_backfill".to_string()),
+                (paused, "paused".to_string()),
+                (quarantined, "quarantined".to_string()),
+            ]
+        );
+        assert!(
+            marker_generation(&operator).await.is_some(),
+            "the marker must survive for the next pass"
+        );
     }
 
     /// A second park keeps the later of the two fences, whichever order they
