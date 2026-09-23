@@ -224,6 +224,15 @@ pub enum CatalogError {
     /// backfill...") would misdescribe a definition-time rejection as a
     /// backfill failure.
     ReplicaIdentityRequired(crate::intake::IntakeError),
+    /// Issue #376: the definition's source would be read over logical
+    /// replication, but intake can't key that table's changes (see
+    /// [`crate::intake::change_keyed`]). Publishing it would either make
+    /// Postgres refuse the table's own updates and deletes (no replica
+    /// identity) or stop intake on its first change (`MissingKeyValue`).
+    /// The case that motivated this is another Trellis instance's aggregate
+    /// target: this instance's own targets are exempt, since their writes
+    /// reach their readers in the writing transaction rather than over CDC.
+    SourceNotChangeKeyed { source_table: String },
     /// [`install_definition`]'s target-table DDL (run before either backfill
     /// path) failed.
     Ddl(DdlError),
@@ -348,6 +357,7 @@ impl CatalogError {
             // `ValidationError::DuplicateRelationshipName` reports.
             CatalogError::TargetTableSuffixCollision { .. } => ErrorCode::Conflict,
             CatalogError::ReplicaIdentityRequired(err) => err.code(),
+            CatalogError::SourceNotChangeKeyed { .. } => ErrorCode::Validation,
             CatalogError::Ddl(err) => err.code(),
             CatalogError::DirectBackfill(err) => err.code(),
             CatalogError::TransformNotFound { .. } => ErrorCode::NotFound,
@@ -412,6 +422,14 @@ impl fmt::Display for CatalogError {
                  name under different schemas"
             ),
             CatalogError::ReplicaIdentityRequired(err) => write!(f, "{err}"),
+            CatalogError::SourceNotChangeKeyed { source_table } => write!(
+                f,
+                "Trellis can't key source table \"{source_table}\"'s changes from logical \
+                 replication: it needs a primary key under REPLICA IDENTITY DEFAULT or FULL, or \
+                 REPLICA IDENTITY USING INDEX. If it is another Trellis instance's aggregate \
+                 target, define this transform in that instance instead: an instance propagates \
+                 writes to its own targets without logical replication"
+            ),
             CatalogError::Ddl(err) => write!(f, "failed to create target table: {err}"),
             CatalogError::DirectBackfill(err) => write!(f, "direct backfill failed: {err}"),
             CatalogError::TransformNotFound { transform } => {
@@ -484,6 +502,7 @@ impl std::error::Error for CatalogError {
             CatalogError::SourceTableNotFound(_) => None,
             CatalogError::TargetTableSuffixCollision { .. } => None,
             CatalogError::ReplicaIdentityRequired(err) => Some(err),
+            CatalogError::SourceNotChangeKeyed { .. } => None,
             CatalogError::Ddl(err) => Some(err),
             CatalogError::DirectBackfill(err) => Some(err),
             CatalogError::TransformNotFound { .. } => None,
@@ -727,6 +746,9 @@ pub async fn install_definition(
     // definition's not-yet-live target (see `reject_non_live_upstream`).
     reject_non_live_upstream(&**pool.get().await?, &qualified_source).await?;
 
+    // Issue #376: `reject_unkeyed_source` fails fast in both arms, before the
+    // DDL builds a target table a rejected definition would leave behind.
+    // `create_definition_inner` repeats it as the authoritative check.
     match &def.key_space {
         KeySpace::OneToOne => {
             // Issue #121: the 1-1 target table's own primary key mirrors the
@@ -737,6 +759,7 @@ pub async fn install_definition(
             let pk = ddl::source_primary_key(pool, &qualified_source)
                 .await
                 .map_err(CatalogError::Ddl)?;
+            reject_unkeyed_source(&**pool.get().await?, &qualified_source).await?;
             ddl::create_target_table(
                 pool,
                 &def,
@@ -749,6 +772,7 @@ pub async fn install_definition(
             .map_err(CatalogError::Ddl)?;
         }
         KeySpace::Aggregate { .. } => {
+            reject_unkeyed_source(&**pool.get().await?, &qualified_source).await?;
             ddl::create_aggregate_target_table(pool, &def, target_schema, source_columns)
                 .await
                 .map_err(CatalogError::Ddl)?;
@@ -2299,6 +2323,10 @@ async fn create_definition_inner(
             .await
             .map_err(CatalogError::Ddl)?;
     }
+    // Issue #376: the authoritative copy of `install_definition`'s fail-fast
+    // check, placed with the 1-1 key check above because it reads the live
+    // source relation (an own-target source is exempt before that query).
+    reject_unkeyed_source(&*txn, &qualified_source).await?;
 
     // Issue #23: a definition's initial backfill is one enumeration of its
     // source table, staged as `Recompute` triggers into the active ring
@@ -4071,6 +4099,49 @@ async fn assert_replica_identity_supports_to_many(
         }
         .into())
     }
+}
+
+/// Issue #376: rejects a definition whose source would reach this instance
+/// over logical replication with changes intake can't key
+/// ([`crate::intake::change_keyed`]) — [`CatalogError::SourceNotChangeKeyed`].
+///
+/// This instance's own targets are exempt. Every write to one goes through
+/// the target-mutation seam (`staging::target_mutations`, issue #315), which
+/// stages each changed key for the target's readers in the writing
+/// transaction, keyed by the same code that wrote the row, so an aggregate
+/// target's missing primary key never matters to its own instance.
+///
+/// Another instance's target gets no such exemption, because nothing in this
+/// catalog names it: that instance's seam stages downstream rows only into
+/// its own ring, so this instance's only view of the table is CDC through its
+/// own publication. For a 1-1 target that works, since it mirrors its
+/// source's primary key. For an aggregate target it can't: publishing it
+/// makes Postgres refuse the owning instance's own updates to it (no replica
+/// identity), or, with `REPLICA IDENTITY FULL`, stops this instance's intake
+/// on its first change.
+///
+/// The rule is about the table, not about who owns it, so a plain source
+/// table intake can't key is rejected too (no primary key under `DEFAULT` or
+/// `FULL` identity, or `REPLICA IDENTITY NOTHING`). It fails the same two
+/// ways at runtime.
+async fn reject_unkeyed_source(
+    client: &impl GenericClient,
+    qualified_source: &str,
+) -> Result<(), CatalogError> {
+    if is_definition_target(client, qualified_source).await? {
+        return Ok(());
+    }
+    let Some((schema, table)) = qualified_source.split_once('.') else {
+        return Err(CatalogError::SourceTableNotFound(
+            qualified_source.to_string(),
+        ));
+    };
+    if crate::intake::change_keyed(client, schema, table).await? {
+        return Ok(());
+    }
+    Err(CatalogError::SourceNotChangeKeyed {
+        source_table: qualified_source.to_string(),
+    })
 }
 
 /// Checks every guarantee [`crate::intake::required_source_guarantees`]
