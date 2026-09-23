@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use crate::streaming::tuning::EngineTuning;
 use crate::streaming::{
-    fold_in, generator_reach, hop_latency, idle_cost, intake_ceiling, load, throughput,
+    aggregate_ceiling, fold_in, generator_reach, hop_latency, idle_cost, intake_ceiling, load,
+    throughput,
 };
 
 /// Every scenario name this module handles, for `main.rs`'s usage message.
@@ -22,6 +23,7 @@ pub const SCENARIOS: &[&str] = &[
     "intake-ceiling",
     "idle-cost",
     "generator-reach",
+    "aggregate-ceiling",
 ];
 
 /// The latency ladder's defaults. #266: "low offered rate (e.g. 10
@@ -79,6 +81,21 @@ const INTAKE_DEFAULT_GRACE: Duration = Duration::from_secs(30);
 /// than a handful.
 const IDLE_DEFAULT_WARMUP: Duration = Duration::from_secs(10);
 const IDLE_DEFAULT_DURATION: Duration = Duration::from_secs(60);
+
+/// The aggregate ceiling search's defaults (issue #317). The bracket spans
+/// well under and over intake's own ~118k rows/sec at 1,000 rows/commit, the
+/// hard ceiling an aggregate sits under. 10,000 groups keeps drain workers off
+/// each other's target rows (#277's low-group-count regime) while still
+/// folding several rows per group per sealed batch at these rates. The window
+/// is longer than the other throughput scenarios' so the settled fit spans
+/// tens of seal cycles.
+const AGG_CEILING_DEFAULT_MIN_RATE: f64 = 20_000.0;
+const AGG_CEILING_DEFAULT_MAX_RATE: f64 = 160_000.0;
+const AGG_CEILING_DEFAULT_RESOLUTION: f64 = 0.05;
+const AGG_CEILING_DEFAULT_GROUPS: usize = 10_000;
+const AGG_CEILING_DEFAULT_ROWS_PER_COMMIT: usize = 1000;
+const AGG_CEILING_DEFAULT_WINDOW: Duration = Duration::from_secs(30);
+const AGG_CEILING_DEFAULT_GRACE: Duration = Duration::from_secs(90);
 
 const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
 
@@ -473,6 +490,59 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                 runtime().block_on(generator_reach::run(connections, rows_per_commit, duration));
             println!("{}", result.to_json());
             Some(true)
+        }
+
+        "aggregate-ceiling" => {
+            let template = aggregate_ceiling::ProbeConfig {
+                rate: 0.0,
+                groups: number(args, "--groups").map_or(AGG_CEILING_DEFAULT_GROUPS, |v| v as usize),
+                rows_per_commit: number(args, "--rows-per-commit")
+                    .map_or(AGG_CEILING_DEFAULT_ROWS_PER_COMMIT, |v| v as usize),
+                connections: connections(args).unwrap_or(load::DEFAULT_CONNECTIONS),
+                window: secs(args, "--duration-secs").unwrap_or(AGG_CEILING_DEFAULT_WINDOW),
+                grace: secs(args, "--grace-secs").unwrap_or(AGG_CEILING_DEFAULT_GRACE),
+            };
+            let tuning = throughput_tuning(args);
+            let rt = runtime();
+
+            // `--rate <r>` runs one probe; otherwise search the bracket.
+            if let Some(rate) = number(args, "--rate") {
+                let probe = rt.block_on(aggregate_ceiling::run_probe(
+                    aggregate_ceiling::ProbeConfig { rate, ..template },
+                    &tuning,
+                ));
+                println!("{}", probe.to_json());
+                return Some(probe.oracle_ok != Some(false));
+            }
+
+            let min = number(args, "--min-rate").unwrap_or(AGG_CEILING_DEFAULT_MIN_RATE);
+            let max = number(args, "--max-rate").unwrap_or(AGG_CEILING_DEFAULT_MAX_RATE);
+            let resolution = number(args, "--resolution").unwrap_or(AGG_CEILING_DEFAULT_RESOLUTION);
+            let result = rt.block_on(aggregate_ceiling::search(
+                template, min, max, resolution, &tuning,
+            ));
+            let ok = result.probes.iter().all(|p| p.oracle_ok != Some(false));
+            if !ok {
+                eprintln!("CORRECTNESS FAILURE: a probe's aggregate disagrees with the oracle");
+            }
+            if result.probes.iter().any(|p| p.generator_bound) {
+                eprintln!(
+                    "GENERATOR-BOUND: a probe's generator undershot its rate; raise --connections"
+                );
+            }
+            match (result.ceiling, result.first_failing) {
+                (Some(c), Some(f)) => eprintln!(
+                    "aggregate ceiling ({} groups, {} rows/commit): kept pace at {c:.0} rows/sec, \
+                     fell behind at {f:.0}",
+                    template.groups, template.rows_per_commit
+                ),
+                (Some(c), None) => {
+                    eprintln!("kept pace at the top of the bracket ({c:.0}); raise --max-rate")
+                }
+                (None, Some(f)) => eprintln!("fell behind even at --min-rate ({f:.0}); lower it"),
+                (None, None) => eprintln!("no engine verdict (generator-bound)"),
+            }
+            Some(ok)
         }
 
         _ => None,

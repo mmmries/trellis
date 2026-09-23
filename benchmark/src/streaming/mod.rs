@@ -48,9 +48,12 @@
 //! - [`fold_in`]: the aggregate fold-in-ratio sweep (V-AGG / T3).
 //! - [`intake_ceiling`]: CDC decode + ring append alone, the ceiling every
 //!   other throughput number sits under.
+//! - [`aggregate_ceiling`]: the highest new-row rate an aggregate folds in
+//!   while it arrives, searched for at a fixed group count (issue #317).
 //! - [`idle_cost`]: a zero-traffic install's transactions/sec, WAL bytes/sec
 //!   and seals/sec (V-IDLE).
 
+pub mod aggregate_ceiling;
 pub mod chain;
 pub mod cli;
 pub mod fold_in;
