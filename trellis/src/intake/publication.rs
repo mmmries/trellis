@@ -854,12 +854,16 @@ async fn intake_caught_up(
 /// `backfilling` promotion for exactly `ids`, when the enumeration that
 /// promotion announced was deferred instead of run. Scoped to `ids` and to
 /// the `backfilling` status for the same reason that function is.
-/// Issue #330 spike, option 1: empties the target table of every definition
-/// in `ids` (the ones [`advance_deferred_definitions`] just promoted for the
-/// marker being discharged), so the enumeration that follows rebuilds each
-/// from nothing. A target with downstream readers is itself a published
-/// source, so the deletes reach chained definitions as ordinary CDC.
+/// Issue #330 spike, option 1 (on top of #315's seam): empties the target
+/// table of every definition in `ids` (the ones
+/// [`advance_deferred_definitions`] just promoted for the marker being
+/// discharged) through `apply::clear_target`, so each removed key is
+/// reported to a [`TargetMutations`] and, for a target some `live`
+/// definition reads, staged as a downstream `Recompute` (with its prior
+/// image) in this same transaction. The enumeration that follows then
+/// rebuilds each target from nothing.
 async fn clear_advancing_targets(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> {
+    use crate::staging::target_mutations::TargetMutations;
     if ids.is_empty() {
         return Ok(());
     }
@@ -869,12 +873,20 @@ async fn clear_advancing_targets(txn: &Transaction<'_>, ids: &[i64]) -> Result<(
             &[&ids],
         )
         .await?;
+    let mut mutations = TargetMutations::new();
     for row in targets {
         let target: String = row.get(0);
-        let ident = crate::defs::ddl::qualified_target_table_ident(&target);
-        let cleared = txn.execute(&format!("delete from {ident}"), &[]).await?;
+        let pk = crate::defs::ddl::identity_key_columns(txn, &target).await?;
+        let cleared =
+            crate::staging::apply::clear_target(txn, &target, &pk, 0, None, &mut mutations)
+                .await
+                .map_err(|e| IntakeError::Transport(e.to_string()))?;
         tracing::info!(target = %target, cleared, "resume rebuild: cleared the target before re-enumeration");
     }
+    mutations
+        .flush(txn)
+        .await
+        .map_err(|e| IntakeError::Transport(e.to_string()))?;
     Ok(())
 }
 

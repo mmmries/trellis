@@ -6279,7 +6279,7 @@ async fn apply_target(
 /// matching `apply_aggregate::derive_group_key`) and, when something reads
 /// the target, its image reported to `mutations` as the key's prior image
 /// (issue #315). Returns how many rows it deleted.
-async fn clear_target(
+pub(crate) async fn clear_target(
     txn: &Transaction<'_>,
     qualified_target: &str,
     pk: &[PrimaryKeyColumn],

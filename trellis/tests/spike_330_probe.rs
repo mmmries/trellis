@@ -32,19 +32,54 @@ async fn one<T: for<'a> tokio_postgres::types::FromSql<'a>>(c: &Client, sql: &st
 }
 
 fn env_or(name: &str, default: i64) -> i64 {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+#[derive(Clone, PartialEq, Debug)]
+struct TargetSample {
+    n: i64,
+    /// expected rows absent from the target
+    missing: i64,
+    /// target rows that should not exist any more
+    extra: i64,
+    /// rows present on both sides with a different value
+    wrong: i64,
+}
+
+impl TargetSample {
+    fn bad(&self) -> i64 {
+        self.missing + self.extra + self.wrong
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
 struct Sample {
     ms: u128,
     statuses: String,
-    rollup_n: i64,
-    rollup_wrong: i64,
-    doubles_n: i64,
-    doubles_wrong: i64,
-    echo_n: i64,
-    echo_wrong: i64,
+    rollup: TargetSample,
+    doubles: TargetSample,
+    echo: TargetSample,
+}
+
+fn target_sql(target: &str, expected: &str, key: &str, tcol: &str, ecol: &str) -> String {
+    format!(
+        "(select count(*) from {target}), \
+         (select count(*) from {expected} e left join {target} t on t.{key} = e.{key} where t.{key} is null), \
+         (select count(*) from {target} t left join {expected} e on t.{key} = e.{key} where e.{key} is null), \
+         (select count(*) from {target} t join {expected} e on t.{key} = e.{key} where t.{tcol} is distinct from e.{ecol})"
+    )
+}
+
+fn read_target(row: &tokio_postgres::Row, at: usize) -> TargetSample {
+    TargetSample {
+        n: row.get(at),
+        missing: row.get(at + 1),
+        extra: row.get(at + 2),
+        wrong: row.get(at + 3),
+    }
 }
 
 async fn sample(c: &Client, started: Instant) -> Sample {
@@ -54,12 +89,10 @@ async fn sample(c: &Client, started: Instant) -> Sample {
             &format!(
                 "select \
                  (select string_agg(split_part(target_table,'.',2) || '=' || status, ',' order by target_table) from transform_definitions), \
-                 (select count(*) from {t}.order_rollup), \
-                 (select count(*) from exp_rollup e full join {t}.order_rollup r on r.g = e.g where r.total is distinct from e.total), \
-                 (select count(*) from {t}.order_doubles), \
-                 (select count(*) from exp_doubles e full join {t}.order_doubles d on d.id = e.id where d.x is distinct from e.x), \
-                 (select count(*) from {t}.rollup_echo), \
-                 (select count(*) from exp_rollup e full join {t}.rollup_echo r on r.g = e.g where r.t is distinct from e.total)"
+                 {}, {}, {}",
+                target_sql(&format!("{t}.order_rollup"), "exp_rollup", "g", "total", "total"),
+                target_sql(&format!("{t}.order_doubles"), "exp_doubles", "id", "x", "x"),
+                target_sql(&format!("{t}.rollup_echo"), "exp_rollup", "g", "t", "total"),
             ),
             &[],
         )
@@ -68,12 +101,9 @@ async fn sample(c: &Client, started: Instant) -> Sample {
     Sample {
         ms: started.elapsed().as_millis(),
         statuses: row.get(0),
-        rollup_n: row.get(1),
-        rollup_wrong: row.get(2),
-        doubles_n: row.get(3),
-        doubles_wrong: row.get(4),
-        echo_n: row.get(5),
-        echo_wrong: row.get(6),
+        rollup: read_target(&row, 1),
+        doubles: read_target(&row, 5),
+        echo: read_target(&row, 9),
     }
 }
 
@@ -86,7 +116,10 @@ where
         if predicate().await {
             return;
         }
-        assert!(Instant::now() < deadline, "timed out after {timeout:?}: {message}");
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {timeout:?}: {message}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -123,9 +156,11 @@ async fn resume_visibility_window_probe() {
     ] {
         definer.apply(stmt).await.expect(stmt);
     }
-    raw.batch_execute(&format!("alter table {t}.order_rollup replica identity full"))
-        .await
-        .expect("replica identity on the chained source");
+    raw.batch_execute(&format!(
+        "alter table {t}.order_rollup replica identity full"
+    ))
+    .await
+    .expect("replica identity on the chained source");
     definer
         .apply("TRANSFORM rollup_echo FROM order_rollup GROUP BY g SELECT sum(total) AS t")
         .await
@@ -151,16 +186,28 @@ async fn resume_visibility_window_probe() {
     .await
     .expect("expectations");
     let started = Instant::now();
-    poll_until(Duration::from_secs(300), "initial convergence", async || {
-        let s = sample(&raw, started).await;
-        s.rollup_wrong == 0 && s.doubles_wrong == 0 && s.echo_wrong == 0
-            && s.statuses.split(',').all(|p| p.ends_with("=live"))
-    })
+    poll_until(
+        Duration::from_secs(300),
+        "initial convergence",
+        async || {
+            let s = sample(&raw, started).await;
+            s.rollup.bad() == 0
+                && s.doubles.bad() == 0
+                && s.echo.bad() == 0
+                && s.statuses.split(',').all(|p| p.ends_with("=live"))
+        },
+    )
     .await;
     let build_ms = started.elapsed().as_millis();
 
-    running.apply("PAUSE TRANSFORM order_rollup").await.expect("pause rollup");
-    running.apply("PAUSE TRANSFORM order_doubles").await.expect("pause doubles");
+    running
+        .apply("PAUSE TRANSFORM order_rollup")
+        .await
+        .expect("pause rollup");
+    running
+        .apply("PAUSE TRANSFORM order_doubles")
+        .await
+        .expect("pause doubles");
 
     // The gap: every row of the first 10% of groups goes away, every 10th
     // remaining row goes away, and a handful of new rows arrive.
@@ -176,10 +223,18 @@ async fn resume_visibility_window_probe() {
     .await
     .expect("gap writes");
     // Let intake drain the gap's CDC (nothing applies to the paused targets).
-    poll_until(Duration::from_secs(60), "ring quiescent after the gap", async || {
-        let sealed: i64 = one(&raw, "select count(*) from segments where state in ('sealed','draining')").await;
-        sealed == 0
-    })
+    poll_until(
+        Duration::from_secs(60),
+        "ring quiescent after the gap",
+        async || {
+            let sealed: i64 = one(
+                &raw,
+                "select count(*) from segments where state in ('sealed','draining')",
+            )
+            .await;
+            sealed == 0
+        },
+    )
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let before = sample(&raw, started).await;
@@ -196,46 +251,74 @@ async fn resume_visibility_window_probe() {
         let mut max_staged: i64 = 0;
         let mut staged_ops = String::new();
         while started.elapsed() < Duration::from_secs(8) {
-            let n: i64 = one(&raw, &format!("select count(*) from {t}.rollup_echo where g = {victim}")).await;
+            let n: i64 = one(
+                &raw,
+                &format!("select count(*) from {t}.rollup_echo where g = {victim}"),
+            )
+            .await;
             let row = raw.query_one("select count(*), coalesce(string_agg(distinct op || ':' || left(key, 12), ' '), '') from (select * from seg_0 union all select * from seg_1 union all select * from seg_2 union all select * from seg_3) r where src_table like '%order_rollup%'", &[]).await.expect("ring");
             let staged: i64 = row.get(0);
-            if staged > max_staged { max_staged = staged; staged_ops = row.get(1); }
+            if staged > max_staged {
+                max_staged = staged;
+                staged_ops = row.get(1);
+            }
             if n == 0 && reacted.is_none() {
                 reacted = Some(started.elapsed().as_millis());
             }
-            if reacted.is_some() && started.elapsed() > Duration::from_secs(2) { break; }
+            if reacted.is_some() && started.elapsed() > Duration::from_secs(2) {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         // Is intake still alive after that? Write to the real source and
         // watch for its ring row.
         let probe_id = rows + 1000;
-        raw.batch_execute(&format!("insert into orders (id, g, a) values ({probe_id}, {victim}, 1)")).await.expect("liveness insert");
+        raw.batch_execute(&format!(
+            "insert into orders (id, g, a) values ({probe_id}, {victim}, 1)"
+        ))
+        .await
+        .expect("liveness insert");
         let started = Instant::now();
         let mut intake_alive = None;
         while started.elapsed() < Duration::from_secs(8) {
             let n: i64 = one(&raw, &format!("select count(*) from (select key, src_table from seg_0 union all select key, src_table from seg_1 union all select key, src_table from seg_2 union all select key, src_table from seg_3) r where src_table like '%orders' and key = '{probe_id}'")).await;
-            if n > 0 { intake_alive = Some(started.elapsed().as_millis()); break; }
+            if n > 0 {
+                intake_alive = Some(started.elapsed().as_millis());
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let progress: String = one(&raw, "select coalesce(string_agg(confirmed_flush_lsn::text, ','), '') from pg_replication_slots").await;
-        println!("--- intake liveness after the manual delete: source insert staged after {intake_alive:?} ms; slot confirmed_flush={progress}");
+        println!(
+            "--- intake liveness after the manual delete: source insert staged after {intake_alive:?} ms; slot confirmed_flush={progress}"
+        );
         let published: String = one(&raw, "select coalesce(string_agg(schemaname || '.' || tablename, ',' order by 1), '') from pg_publication_tables").await;
-        println!("--- manual delete of rollup group {victim}: echo dropped it after {reacted:?} ms; max ring rows on order_rollup seen={max_staged} [{staged_ops}]; published=[{published}]");
+        println!(
+            "--- manual delete of rollup group {victim}: echo dropped it after {reacted:?} ms; max ring rows on order_rollup seen={max_staged} [{staged_ops}]; published=[{published}]"
+        );
     }
     // RESUME, then settle the xmin fence so the discharge isn't waiting on us.
     let t0 = Instant::now();
-    running.apply("RESUME TRANSFORM order_rollup").await.expect("resume rollup");
-    running.apply("RESUME TRANSFORM order_doubles").await.expect("resume doubles");
-    raw.batch_execute("select txid_current()").await.expect("xid");
+    running
+        .apply("RESUME TRANSFORM order_rollup")
+        .await
+        .expect("resume rollup");
+    running
+        .apply("RESUME TRANSFORM order_doubles")
+        .await
+        .expect("resume doubles");
+    raw.batch_execute("select txid_current()")
+        .await
+        .expect("xid");
 
     let mut samples: Vec<Sample> = Vec::new();
     let mut converged_since: Option<Instant> = None;
     let deadline = t0 + Duration::from_secs(env_or("SPIKE_TIMEOUT_S", 60) as u64);
     loop {
         let s = sample(&raw, t0).await;
-        let good = s.rollup_wrong == 0
-            && s.doubles_wrong == 0
-            && s.echo_wrong == 0
+        let good = s.rollup.bad() == 0
+            && s.doubles.bad() == 0
+            && s.echo.bad() == 0
             && s.statuses.split(',').all(|p| p.ends_with("=live"));
         samples.push(s);
         if good {
@@ -254,15 +337,29 @@ async fn resume_visibility_window_probe() {
     // Is intake still alive after the resume? Write to the real source and
     // watch for its ring row (or, if already drained, its target row).
     let probe_id = rows + 5000;
-    raw.batch_execute(&format!("insert into orders (id, g, a) values ({probe_id}, {}, 1)", groups - 1)).await.expect("liveness insert");
+    raw.batch_execute(&format!(
+        "insert into orders (id, g, a) values ({probe_id}, {}, 1)",
+        groups - 1
+    ))
+    .await
+    .expect("liveness insert");
     let started = Instant::now();
     let mut intake_alive = None;
     while started.elapsed() < Duration::from_secs(8) {
         let n: i64 = one(&raw, &format!("select (select count(*) from (select key, src_table from seg_0 union all select key, src_table from seg_1 union all select key, src_table from seg_2 union all select key, src_table from seg_3) r where src_table like '%orders' and key = '{probe_id}') + (select count(*) from {t}.order_doubles where id = {probe_id})")).await;
-        if n > 0 { intake_alive = Some(started.elapsed().as_millis()); break; }
+        if n > 0 {
+            intake_alive = Some(started.elapsed().as_millis());
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    println!("intake alive after resume: {}", match intake_alive { Some(ms) => format!("yes (source insert staged after {ms} ms)"), None => "NO (source insert never staged within 8 s)".to_string() });
+    println!(
+        "intake alive after resume: {}",
+        match intake_alive {
+            Some(ms) => format!("yes (source insert staged after {ms} ms)"),
+            None => "NO (source insert never staged within 8 s)".to_string(),
+        }
+    );
     if std::env::var("SPIKE_DEBUG").is_ok() {
         let rows = raw
             .query(
@@ -285,7 +382,11 @@ async fn resume_visibility_window_probe() {
             let xt: Option<String> = r.get(3);
             println!("{g:?} {e:?} {rt:?} {xt:?}");
         }
-        let segs: String = one(&raw, "select coalesce(string_agg(seg_seq || ':' || state, ','), '') from segments").await;
+        let segs: String = one(
+            &raw,
+            "select coalesce(string_agg(seg_seq || ':' || state, ','), '') from segments",
+        )
+        .await;
         let pend: i64 = one(&raw, "select count(*) from pending_backfill").await;
         let quarantined: i64 = one(&raw, "select count(*) from poison").await;
         println!("--- debug: segments [{segs}] pending_backfill={pend} poison={quarantined}");
@@ -294,41 +395,115 @@ async fn resume_visibility_window_probe() {
 
     std::fs::create_dir_all(&out_dir).expect("out dir");
     let mut f = std::fs::File::create(format!("{out_dir}/{label}.csv")).expect("csv");
-    writeln!(f, "ms,statuses,rollup_n,rollup_wrong,doubles_n,doubles_wrong,echo_n,echo_wrong").unwrap();
+    writeln!(f, "ms,statuses,rollup_n,rollup_missing,rollup_extra,rollup_wrong,doubles_n,doubles_missing,doubles_extra,doubles_wrong,echo_n,echo_missing,echo_extra,echo_wrong").unwrap();
     for s in &samples {
-        writeln!(f, "{},{},{},{},{},{},{},{}", s.ms, s.statuses.replace(',', ";"), s.rollup_n, s.rollup_wrong, s.doubles_n, s.doubles_wrong, s.echo_n, s.echo_wrong).unwrap();
+        writeln!(
+            f,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            s.ms,
+            s.statuses.replace(',', ";"),
+            s.rollup.n,
+            s.rollup.missing,
+            s.rollup.extra,
+            s.rollup.wrong,
+            s.doubles.n,
+            s.doubles.missing,
+            s.doubles.extra,
+            s.doubles.wrong,
+            s.echo.n,
+            s.echo.missing,
+            s.echo.extra,
+            s.echo.wrong
+        )
+        .unwrap();
     }
 
     // Summary.
-    let exp_rollup_n: i64 = one(&raw, "select count(*) from exp_rollup").await;
-    let exp_doubles_n: i64 = one(&raw, "select count(*) from exp_doubles").await;
-    let first = |pred: &dyn Fn(&Sample) -> bool| samples.iter().find(|s| pred(s)).map(|s| s.ms);
-    let converged = |wrong: &dyn Fn(&Sample) -> i64| -> Option<u128> {
-        // first sample after which `wrong` stays 0
-        let mut last_bad = None;
-        for s in &samples { if wrong(s) != 0 { last_bad = Some(s.ms); } }
-        match last_bad {
+    let last = samples.last().unwrap();
+    let live_at = samples
+        .iter()
+        .find(|s| s.statuses.split(',').all(|p| p.ends_with("=live")))
+        .map(|s| s.ms);
+    println!(
+        "=== spike #330 probe [{label}] rows={rows} groups={groups} samples={} initial_build_ms={build_ms}",
+        samples.len()
+    );
+    println!(
+        "before resume: rollup {:?} | doubles {:?} | echo {:?}",
+        before.rollup, before.doubles, before.echo
+    );
+    println!(
+        "discharge (status leaves waiting_to_backfill): {:?} ms; all live: {live_at:?} ms",
+        samples
+            .iter()
+            .find(|s| !s.statuses.contains("waiting_to_backfill"))
+            .map(|s| s.ms)
+    );
+    let report = |name: &str, pick: &dyn Fn(&Sample) -> &TargetSample| {
+        let peak_missing = samples.iter().map(|s| pick(s).missing).max().unwrap_or(0);
+        let first_missing = samples.iter().find(|s| pick(s).missing > 0).map(|s| s.ms);
+        let last_missing = samples
+            .iter()
+            .filter(|s| pick(s).missing > 0)
+            .map(|s| s.ms)
+            .last();
+        let last_extra = samples
+            .iter()
+            .filter(|s| pick(s).extra > 0)
+            .map(|s| s.ms)
+            .last();
+        let last_wrong = samples
+            .iter()
+            .filter(|s| pick(s).wrong > 0)
+            .map(|s| s.ms)
+            .last();
+        let last_bad = samples
+            .iter()
+            .filter(|s| pick(s).bad() > 0)
+            .map(|s| s.ms)
+            .last();
+        let converged = match last_bad {
             None => samples.first().map(|s| s.ms),
             Some(lb) => samples.iter().find(|s| s.ms > lb).map(|s| s.ms),
+        };
+        // ms-weighted integral of "bad rows" after live: how much wrongness readers were exposed to
+        let mut exposure: f64 = 0.0;
+        for w in samples.windows(2) {
+            if let Some(l) = live_at {
+                if w[0].ms >= l {
+                    exposure += pick(&w[0]).bad() as f64 * (w[1].ms - w[0].ms) as f64 / 1000.0;
+                }
+            }
         }
+        println!(
+            "{name:<7}: missing peak={peak_missing} from {first_missing:?} to {last_missing:?} ms | extra (stale, should be gone) until {last_extra:?} ms | wrong-value until {last_wrong:?} ms | converged {converged:?} ms | final {:?} | bad-row-seconds after live={exposure:.1}",
+            pick(last)
+        );
     };
-    let min_by = |n: &dyn Fn(&Sample) -> i64| samples.iter().map(|s| (n(s), s.ms)).min();
-    let last = samples.last().unwrap();
-    println!("=== spike #330 probe [{label}] rows={rows} groups={groups} samples={} initial_build_ms={build_ms}", samples.len());
-    println!("before resume: rollup n={} wrong={} | doubles n={} wrong={} | echo n={} wrong={}", before.rollup_n, before.rollup_wrong, before.doubles_n, before.doubles_wrong, before.echo_n, before.echo_wrong);
-    println!("expected after: rollup n={exp_rollup_n} doubles n={exp_doubles_n} echo n={exp_rollup_n}");
-    println!("discharge (status leaves waiting_to_backfill): {:?} ms", first(&|s| !s.statuses.contains("waiting_to_backfill")));
-    println!("all live: {:?} ms", first(&|s| s.statuses.split(',').all(|p| p.ends_with("=live"))));
-    println!("rollup : min n={:?} (n,ms); first n<expected at {:?} ms; converged at {:?} ms; final n={} wrong={}", min_by(&|s| s.rollup_n), first(&|s| s.rollup_n < exp_rollup_n), converged(&|s| s.rollup_wrong), last.rollup_n, last.rollup_wrong);
-    println!("doubles: min n={:?} (n,ms); first n<expected at {:?} ms; converged at {:?} ms; final n={} wrong={}", min_by(&|s| s.doubles_n), first(&|s| s.doubles_n < exp_doubles_n), converged(&|s| s.doubles_wrong), last.doubles_n, last.doubles_wrong);
-    println!("echo   : min n={:?} (n,ms); first n<expected at {:?} ms; converged at {:?} ms; final n={} wrong={}", min_by(&|s| s.echo_n), first(&|s| s.echo_n < exp_rollup_n), converged(&|s| s.echo_wrong), last.echo_n, last.echo_wrong);
+    report("rollup", &|s| &s.rollup);
+    report("doubles", &|s| &s.doubles);
+    report("echo", &|s| &s.echo);
     println!("--- transitions (first 40) ---");
     let mut prev: Option<&Sample> = None;
     let mut shown = 0;
     for s in &samples {
-        let changed = prev.map_or(true, |p| p.statuses != s.statuses || p.rollup_n != s.rollup_n || p.rollup_wrong != s.rollup_wrong || p.doubles_n != s.doubles_n || p.doubles_wrong != s.doubles_wrong || p.echo_n != s.echo_n || p.echo_wrong != s.echo_wrong);
+        let changed = prev.map_or(true, |p| {
+            p.statuses != s.statuses
+                || p.rollup != s.rollup
+                || p.doubles != s.doubles
+                || p.echo != s.echo
+        });
         if changed && shown < 40 {
-            println!("{:>7} ms | {} | rollup {}/{} | doubles {}/{} | echo {}/{}", s.ms, s.statuses, s.rollup_n, s.rollup_wrong, s.doubles_n, s.doubles_wrong, s.echo_n, s.echo_wrong);
+            let f =
+                |t: &TargetSample| format!("n={} m={} x={} w={}", t.n, t.missing, t.extra, t.wrong);
+            println!(
+                "{:>7} ms | {} | rollup {} | doubles {} | echo {}",
+                s.ms,
+                s.statuses.replace("order_", "").replace("rollup_", ""),
+                f(&s.rollup),
+                f(&s.doubles),
+                f(&s.echo)
+            );
             shown += 1;
         }
         prev = Some(s);
