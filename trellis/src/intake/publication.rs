@@ -793,6 +793,18 @@ pub(crate) async fn run_pending_backfills_until(
                 );
                 break;
             }
+            // Spike for issue #330, option 1 ("clear and rebuild"): a
+            // definition moving out of `waiting_to_backfill` on this marker
+            // is either a resumed one (whose target still holds every row
+            // it had when it froze, including rows whose source rows have
+            // since been deleted) or a deferred fresh one (whose target is
+            // still empty, so this is a no-op). Emptying the target here,
+            // inside the discharge transaction, makes the enumeration below
+            // a genuine from-scratch rebuild: a key the source no longer
+            // has is never staged, so nothing else would ever remove it.
+            // In the transaction, so the intake-timeout rollback above
+            // undoes it too.
+            clear_advancing_targets(&txn, &advancing).await?;
             append_enumeration(&txn, &marker.table).await?;
             true
         };
@@ -842,6 +854,30 @@ async fn intake_caught_up(
 /// `backfilling` promotion for exactly `ids`, when the enumeration that
 /// promotion announced was deferred instead of run. Scoped to `ids` and to
 /// the `backfilling` status for the same reason that function is.
+/// Issue #330 spike, option 1: empties the target table of every definition
+/// in `ids` (the ones [`advance_deferred_definitions`] just promoted for the
+/// marker being discharged), so the enumeration that follows rebuilds each
+/// from nothing. A target with downstream readers is itself a published
+/// source, so the deletes reach chained definitions as ordinary CDC.
+async fn clear_advancing_targets(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let targets = txn
+        .query(
+            "select target_table from transform_definitions where id = any($1)",
+            &[&ids],
+        )
+        .await?;
+    for row in targets {
+        let target: String = row.get(0);
+        let ident = crate::defs::ddl::qualified_target_table_ident(&target);
+        let cleared = txn.execute(&format!("delete from {ident}"), &[]).await?;
+        tracing::info!(target = %target, cleared, "resume rebuild: cleared the target before re-enumeration");
+    }
+    Ok(())
+}
+
 async fn revert_to_waiting(client: &impl GenericClient, ids: &[i64]) -> Result<(), IntakeError> {
     if ids.is_empty() {
         return Ok(());
