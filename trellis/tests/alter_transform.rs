@@ -19,6 +19,12 @@
 //! - the column-granularity pause state: the new column reports paused while
 //!   backfilling, and the rest of the target stays live and queryable
 //!   (`the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stays_live`)
+//! - that pause is only ever undone for a field the `ALTER` itself paused,
+//!   including when another pause lands mid-backfill, and `DROP <field>`
+//!   clears the dropped column's quarantine bookkeeping (issue #309:
+//!   `an_alter_leaves_a_pause_it_did_not_create_in_place`,
+//!   `a_pause_landing_mid_alter_backfill_survives_the_alters_unpause`,
+//!   `dropping_a_paused_field_clears_its_quarantine_state`)
 //! - idempotency in both directions for all three edit kinds
 //!   (`edits_are_idempotent_in_both_directions`), and the two genuine
 //!   conflicts that are *not* idempotent no-ops
@@ -809,6 +815,286 @@ async fn the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stay
         .expect("status");
     assert_eq!(entry.state, trellis::QuarantineState::Live);
 
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// `(local_fuse, cascade edges into it)` for `transform.column`'s
+/// `column_status` row, or `None` when the column isn't paused at all.
+async fn column_pause_state(raw: &Client, transform: &str, column: &str) -> Option<(bool, i64)> {
+    raw.query_opt(
+        "select s.local_fuse, \
+                (select count(*) from column_pause_cascades c \
+                 where c.downstream_transform = s.transform_table \
+                   and c.downstream_column = s.column_name) \
+         from column_status s \
+         where s.transform_table = $1 and s.column_name = $2",
+        &[&transform, &column],
+    )
+    .await
+    .expect("read column_status")
+    .map(|row| (row.get(0), row.get(1)))
+}
+
+/// Issue #309: `ALTER TRANSFORM`'s own column pause (held while it backfills
+/// a changed field) must only ever be undone for a field whose pause *it*
+/// created. A field an operator paused, or one paused by cascade from an
+/// upstream column, stays paused through an `ALTER` of that same field —
+/// its recovery belongs to `RESUME`, not to an unrelated edit.
+#[tokio::test]
+async fn an_alter_leaves_a_pause_it_did_not_create_in_place() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_orders(&raw, 6).await;
+
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
+        .await
+        .expect("define the upstream 1-1 target");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+    raw.batch_execute(&format!(
+        "alter table {DEFAULT_TARGET_SCHEMA}.order_calc replica identity full"
+    ))
+    .await
+    .expect("a chained target's source needs a full replica identity");
+    trellis
+        .apply("TRANSFORM order_next FROM order_calc SELECT total AS t2, a AS a2")
+        .await
+        .expect("define the chained 1-1 target");
+    wait_for_live(&raw, "order_next").await;
+
+    // An operator pause on `order_calc.total`, which cascades onto
+    // `order_next.t2` (the only field reading it).
+    trellis
+        .apply("PAUSE TRANSFORM order_calc.total")
+        .await
+        .expect("pause the column");
+    assert_eq!(
+        column_pause_state(&raw, "order_calc", "total").await,
+        Some((true, 0))
+    );
+    assert_eq!(
+        column_pause_state(&raw, "order_next", "t2").await,
+        Some((false, 1))
+    );
+
+    // ALTER the operator-paused field, together with an ADD whose pause is
+    // this call's own.
+    trellis
+        .apply("ALTER TRANSFORM order_calc ALTER total AS a + b + b, ADD a + a AS double_a")
+        .await
+        .expect("alter a paused field");
+    assert_eq!(
+        column_pause_state(&raw, "order_calc", "total").await,
+        Some((true, 0)),
+        "the operator's pause must survive an ALTER of the same field"
+    );
+    assert_eq!(
+        column_pause_state(&raw, "order_calc", "double_a").await,
+        None,
+        "the ALTER's own pause on the field it added must be cleared"
+    );
+
+    // ALTER the cascade-paused field downstream.
+    trellis
+        .apply("ALTER TRANSFORM order_next ALTER t2 AS total + 1")
+        .await
+        .expect("alter a cascade-paused field");
+    assert_eq!(
+        column_pause_state(&raw, "order_next", "t2").await,
+        Some((false, 1)),
+        "a pause cascaded from a still-paused upstream column must survive an ALTER"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// `ALTER TRANSFORM ... DROP <field>` takes the dropped column's quarantine
+/// bookkeeping with it, the same "quarantine state follows its owner" rule
+/// `DROP TRANSFORM` applies to a whole target. Otherwise a stale pause would
+/// outlive its column and silently land on a later `ADD` of the same name,
+/// now that an `ALTER` no longer clears pauses it didn't create (#309).
+#[tokio::test]
+async fn dropping_a_paused_field_clears_its_quarantine_state() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_orders(&raw, 6).await;
+
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    trellis
+        .apply("PAUSE TRANSFORM order_calc.b")
+        .await
+        .expect("pause the column");
+    raw.batch_execute(
+        "insert into column_deaths (transform_table, column_name, deaths) \
+             values ('order_calc', 'b', 1); \
+         insert into column_failures (transform_table, column_name, src_table, key, error) \
+             values ('order_calc', 'b', 'orders', '1', 'boom');",
+    )
+    .await
+    .expect("seed column-fuse bookkeeping for b");
+
+    trellis
+        .apply("ALTER TRANSFORM order_calc DROP b")
+        .await
+        .expect("drop the paused field");
+    for table in ["column_status", "column_deaths", "column_failures"] {
+        let n: i64 = raw
+            .query_one(
+                &format!(
+                    "select count(*) from {table} \
+                     where transform_table = 'order_calc' and column_name = 'b'"
+                ),
+                &[],
+            )
+            .await
+            .expect("count bookkeeping rows")
+            .get(0);
+        assert_eq!(n, 0, "{table} must not outlive the dropped column");
+    }
+
+    // Re-adding the same name starts clean and live.
+    trellis
+        .apply("ALTER TRANSFORM order_calc ADD b AS b")
+        .await
+        .expect("re-add the field");
+    assert_eq!(column_pause_state(&raw, "order_calc", "b").await, None);
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Issue #309, the mid-backfill half: a pause that lands on a field *while*
+/// `ALTER TRANSFORM`'s own backfill of it is still running takes that pause
+/// over, so the `ALTER`'s closing unpause must leave it alone. An operator
+/// pause upgrades the `ALTER`'s row to `local_fuse`; an upstream pause
+/// cascading onto it leaves the row as it was but records an edge into it.
+///
+/// Deterministic rather than timing-based: the test holds an `ACCESS
+/// EXCLUSIVE` lock on the edited definition's source table, which blocks the
+/// backfill's first read of it (its own pause is committed before that
+/// read), so the `ALTER` cannot reach its unpause until the lock is released.
+#[tokio::test]
+async fn a_pause_landing_mid_alter_backfill_survives_the_alters_unpause() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_orders(&raw, 6).await;
+
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
+        .await
+        .expect("define the upstream 1-1 target");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+    raw.batch_execute(&format!(
+        "alter table {DEFAULT_TARGET_SCHEMA}.order_calc replica identity full"
+    ))
+    .await
+    .expect("a chained target's source needs a full replica identity");
+    trellis
+        .apply("TRANSFORM order_next FROM order_calc SELECT total AS t2, a AS a2")
+        .await
+        .expect("define the chained 1-1 target");
+    wait_for_live(&raw, "order_next").await;
+
+    // Freeze the backfill: `order_calc` is `order_next`'s source.
+    let mut locker = connect_raw(db.dsn()).await;
+    let lock = locker.transaction().await.expect("begin the lock holder");
+    lock.batch_execute(&format!(
+        "lock table {DEFAULT_TARGET_SCHEMA}.order_calc in access exclusive mode"
+    ))
+    .await
+    .expect("lock the ALTER's source table");
+
+    let alter = {
+        let dsn = db.dsn().to_string();
+        tokio::spawn(async move {
+            let trellis = define_only(&dsn).await;
+            let applied = trellis
+                .apply(
+                    "ALTER TRANSFORM order_next \
+                     ADD total + total AS t3, ADD a2 + 1 AS a3, ADD a2 + 2 AS a4",
+                )
+                .await
+                .expect("add three columns");
+            trellis.shutdown().await.expect("shutdown");
+            applied
+        })
+    };
+
+    // The ALTER's own pauses are committed before its backfill touches the
+    // (locked) source, so seeing all three means it is parked mid-backfill.
+    poll_until(
+        Duration::from_secs(30),
+        "the ALTER must commit its own pauses before backfilling",
+        async || {
+            let n: i64 = raw
+                .query_one(
+                    "select count(*) from column_status \
+                     where transform_table = 'order_next' \
+                       and column_name in ('t3', 'a3', 'a4')",
+                    &[],
+                )
+                .await
+                .expect("count the ALTER's pauses")
+                .get(0);
+            n == 3
+        },
+    )
+    .await;
+    assert!(!alter.is_finished(), "the backfill must still be blocked");
+
+    let operator = define_only(db.dsn()).await;
+    // An operator pause on one field the ALTER is backfilling...
+    operator
+        .apply("PAUSE TRANSFORM order_next.a3")
+        .await
+        .expect("pause a3 mid-backfill");
+    // ...and an upstream pause that cascades onto another (`t3` reads
+    // `total`).
+    operator
+        .apply("PAUSE TRANSFORM order_calc.total")
+        .await
+        .expect("pause the upstream column mid-backfill");
+    assert!(!alter.is_finished(), "the backfill must still be blocked");
+
+    lock.rollback().await.expect("release the source lock");
+    alter.await.expect("alter task");
+
+    assert_eq!(
+        column_pause_state(&raw, "order_next", "a3").await,
+        Some((true, 0)),
+        "an operator pause taken mid-backfill must survive the ALTER's unpause"
+    );
+    assert_eq!(
+        column_pause_state(&raw, "order_next", "t3").await,
+        Some((false, 1)),
+        "a cascade onto the field mid-backfill must survive the ALTER's unpause"
+    );
+    assert_eq!(
+        column_pause_state(&raw, "order_next", "a4").await,
+        None,
+        "a field nothing else paused is still released by the ALTER"
+    );
+
+    operator.shutdown().await.expect("shutdown");
     trellis.shutdown().await.expect("shutdown");
 }
 
