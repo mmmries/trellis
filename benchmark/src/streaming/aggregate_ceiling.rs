@@ -239,6 +239,48 @@ async fn ring_rows_sql(raw: &RawClient) -> String {
     format!("select ({sum})::bigint")
 }
 
+/// `AGG_CEILING_DIAGNOSE=1`: prints the segment registry, per-ring-table row
+/// counts, claims and non-idle engine backends — to stderr, about once a
+/// second — so a probe that falls behind shows which stage stalled.
+async fn diagnose(raw: &RawClient, at: f64, folded: f64, ring_rows: i64) {
+    let segs: Vec<String> = raw
+        .query(
+            "select format('%s/slot%s/%s/fence=%s/age=%sms/mask=%s', seg_seq, ring_slot, state, \
+                    fence_snapshot is not null, \
+                    (extract(epoch from now() - coalesce(sealed_at, created_at)) * 1000)::bigint, \
+                    bucket_mask) \
+             from segments order by seg_seq",
+            &[],
+        )
+        .await
+        .map(|rows| rows.into_iter().map(|r| r.get(0)).collect())
+        .unwrap_or_else(|e| vec![format!("segments: {e}")]);
+    let per_slot: String = raw
+        .query_one(
+            "select format('%s,%s,%s,%s', (select count(*) from seg_0), (select count(*) from seg_1), \
+                    (select count(*) from seg_2), (select count(*) from seg_3))",
+            &[],
+        )
+        .await
+        .map(|r| r.get(0))
+        .unwrap_or_else(|e| format!("{e}"));
+    let activity: Vec<String> = raw
+        .query(
+            "select format('%s:%s:%s', state, coalesce(wait_event_type,'-')||'/'||coalesce(wait_event,'-'), \
+                    left(regexp_replace(query, '\\s+', ' ', 'g'), 60)) \
+             from pg_stat_activity \
+             where datname = current_database() and pid <> pg_backend_pid() and state <> 'idle' \
+               and query not ilike 'insert into public.agg_ceiling_src%'",
+            &[],
+        )
+        .await
+        .map(|rows| rows.into_iter().map(|r| r.get(0)).collect())
+        .unwrap_or_else(|e| vec![format!("activity: {e}")]);
+    eprintln!(
+        "DIAG t={at:.1}s folded={folded:.0} ring={ring_rows} per_slot=[{per_slot}] segs={segs:?}\n  active={activity:?}"
+    );
+}
+
 async fn sample_window(
     raw: &RawClient,
     terminal: &str,
@@ -257,6 +299,9 @@ async fn sample_window(
             .await
             .expect("count ring rows")
             .get(0);
+        if std::env::var_os("AGG_CEILING_DIAGNOSE").is_some() && samples.len() % 4 == 0 {
+            diagnose(raw, at, folded, ring_rows).await;
+        }
         samples.push(Sample {
             at,
             folded,
