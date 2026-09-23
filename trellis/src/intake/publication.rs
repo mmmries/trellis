@@ -160,6 +160,34 @@ pub async fn reconcile_publication(
     Ok(())
 }
 
+/// Parks a catch-up marker for `definition_id`'s *target* table when some
+/// `live` definition reads it (issue #315). Called wherever a definition goes
+/// live after a build that wrote its target outside the target-mutation seam
+/// (`staging::target_mutations`): a reader already attached (only possible
+/// for a rebuilt, resumed upstream, since `defs::catalog` refuses to attach a
+/// new one to a non-`live` target) re-derives from the rebuilt state once
+/// the marker discharges. A no-op for a target nothing reads.
+pub(crate) async fn park_target_catchup_if_read(
+    client: &impl GenericClient,
+    definition_id: i64,
+) -> Result<(), IntakeError> {
+    let target: Option<String> = client
+        .query_opt(
+            "select d.target_table from transform_definitions d \
+             where d.id = $1 and exists ( \
+                 select 1 from transform_definitions r \
+                 where r.source_table = d.target_table and r.status = 'live' \
+             )",
+            &[&definition_id],
+        )
+        .await?
+        .map(|row| row.get(0));
+    if let Some(target) = target {
+        park_backfill_catchup(client, &target).await?;
+    }
+    Ok(())
+}
+
 /// Parks a fresh catch-up marker for `qualified_table`, reusing the exact
 /// `pending_backfill` mechanism [`reconcile_publication`] already relies on
 /// for a table newly joining the publication (docs/decisions/0007's
@@ -424,6 +452,7 @@ async fn append_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<()
                 // pre-existing row — nothing "changed" it; see
                 // `StagedChange::Recompute`'s doc comment.
                 src_changed: None,
+                prior_image: None,
             });
         }
         append::append(txn, &page).await?;
@@ -920,6 +949,31 @@ async fn mark_definitions_live(
             "transform status transition: backfill enumeration committed"
         );
     }
+    for id in &flipped {
+        park_target_catchup_if_read(client, *id).await?;
+    }
+    // Issue #315: a flipped definition whose source is another definition's
+    // target was enumerated while it was still `backfilling`, which the
+    // target-mutation seam skips, and that target is never in the
+    // publication. A write to it between the enumeration and this flip
+    // reached nobody, so park a fresh catch-up for the source now that the
+    // flip has committed (see `defs::catalog::create_definition_inner`'s
+    // matching step). The next discharge flips nothing, so this doesn't loop.
+    let sources: Vec<String> = client
+        .query(
+            "select distinct d.source_table from transform_definitions d \
+             where d.id = any($1) and exists ( \
+                 select 1 from transform_definitions u where u.target_table = d.source_table \
+             )",
+            &[&flipped],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    for source in sources {
+        park_backfill_catchup(client, &source).await?;
+    }
     if flipped.len() < ids.len() {
         let skipped: Vec<i64> = ids
             .iter()
@@ -1143,6 +1197,57 @@ mod tests {
         let s = Snapshot::parse("10:20:11,15").unwrap();
         assert_eq!(s.xmin, 10);
         assert_eq!(s.xmax, 20);
+    }
+
+    /// Issue #315: a definition reading another definition's target was
+    /// enumerated while `backfilling`, when the target-mutation seam skips
+    /// it, and the target is never published. Going live must park a fresh
+    /// catch-up on that target, or a write landing between the enumeration
+    /// and the flip reaches nobody.
+    #[tokio::test]
+    async fn going_live_over_a_target_parks_a_catchup_on_that_target() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("acquire connection");
+
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.orders', 1), ('public.t', 1); \
+                 insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.t', 'public.orders', 1, '', 'live')",
+            )
+            .await
+            .expect("seed the upstream definition");
+        let reader: i64 = client
+            .query_one(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.d', 'public.t', 1, '', 'backfilling') returning id",
+                &[],
+            )
+            .await
+            .expect("seed the chained definition")
+            .get(0);
+
+        let flipped = mark_definitions_live(&**client, &[reader])
+            .await
+            .expect("mark_definitions_live");
+        assert_eq!(flipped, [reader]);
+
+        let markers: Vec<String> = client
+            .query("select table_name from pending_backfill", &[])
+            .await
+            .expect("read pending_backfill")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            markers,
+            ["public.t"],
+            "a catch-up on the upstream target, and none on the unread public.d"
+        );
     }
 
     #[test]
