@@ -871,7 +871,9 @@ async fn delete_orphans_sql(
             &[&ids],
         )
         .await?;
+    use crate::staging::target_mutations::TargetMutations;
     let source_ident = ddl::qualified_source_table(source_table);
+    let mut mutations = TargetMutations::new();
     for row in defs {
         let text: String = row.get(0);
         let target: String = row.get(1);
@@ -922,18 +924,41 @@ async fn delete_orphans_sql(
                 }
             }
         };
-        let deleted = txn
-            .execute(
+        // Issue #315's seam: report each deleted key (with its prior image,
+        // when something reads this target) so the delete reaches chained
+        // readers as a downstream `Recompute` in this same transaction.
+        let key_cols = ddl::identity_key_columns(txn, &target).await?;
+        let key_expr = ddl::pk_key_sql_expr(&key_cols, Some("t"));
+        let image_expr = mutations
+            .image_sql(txn, &target, "t")
+            .await
+            .map_err(|e| IntakeError::Transport(e.to_string()))?;
+        let image_select = match &image_expr {
+            Some(expr) => format!(", ({expr})::text"),
+            None => String::new(),
+        };
+        let rows = txn
+            .query(
                 &format!(
-                    "delete from {target_ident} t \
-                     where not exists (select 1 from {source_ident} s where {})",
+                    "delete from {target_ident} as t \
+                     where not exists (select 1 from {source_ident} s where {}) \
+                     returning {key_expr}{image_select}",
                     on.join(" and ")
                 ),
                 &[],
             )
             .await?;
+        let deleted = rows.len();
+        for row in rows {
+            let prior = image_expr.as_ref().map(|_| row.get::<_, String>(1));
+            mutations.record(&target, row.get(0), prior, 0, None);
+        }
         tracing::info!(target = %target, deleted, "resume sweep: deleted target rows the source no longer has");
     }
+    mutations
+        .flush(txn)
+        .await
+        .map_err(|e| IntakeError::Transport(e.to_string()))?;
     Ok(())
 }
 
