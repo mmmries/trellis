@@ -794,6 +794,8 @@ pub(crate) async fn run_pending_backfills_until(
                 break;
             }
             append_enumeration(&txn, &marker.table).await?;
+            // Spike for issue #330, option 2 ("sweep only orphaned keys").
+            stage_orphan_sweep(&txn, &marker.table, &advancing).await?;
             true
         };
         txn.execute(
@@ -842,6 +844,122 @@ async fn intake_caught_up(
 /// `backfilling` promotion for exactly `ids`, when the enumeration that
 /// promotion announced was deferred instead of run. Scoped to `ids` and to
 /// the `backfilling` status for the same reason that function is.
+/// Issue #330 spike, option 2: after the source's current keys have been
+/// enumerated, stages one recompute per *target* key the source no longer
+/// has, for every definition this marker just promoted out of
+/// `waiting_to_backfill` (a resumed definition; a deferred fresh one has an
+/// empty target and contributes nothing).
+///
+/// - 1-1: the target's primary key mirrors the source's, so an anti-join
+///   yields the orphaned keys directly; each is staged as an ordinary
+///   image-less `Recompute` on the source, whose live re-read finds no row
+///   and so deletes the target row (with downstream propagation).
+/// - Aggregate: the target's grouping columns are anti-joined against the
+///   source's `GROUP BY` columns (plain-column keys only in this spike; a
+///   relationship-path key falls back to sweeping every group), and each
+///   orphaned group is staged as a target-group-addressed recompute
+///   (`apply::group_recompute_src_table`) that `compute` routes to a forced
+///   full recompute of that one group.
+///
+/// Runs after `DECLARE`, so its statement snapshot is at or past the
+/// cursor's: a key deleted in between is in the enumeration (whose live
+/// re-read deletes it), and one re-inserted in between is simply not
+/// orphaned. Everything later is ordinary CDC.
+async fn stage_orphan_sweep(
+    txn: &Transaction<'_>,
+    source_table: &str,
+    ids: &[i64],
+) -> Result<(), IntakeError> {
+    use crate::defs::ast::{GroupByKey, KeySpace};
+    use crate::defs::ddl;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let defs = txn
+        .query(
+            "select definition_text, target_table from transform_definitions where id = any($1)",
+            &[&ids],
+        )
+        .await?;
+    let source_ident = ddl::qualified_source_table(source_table);
+    for row in defs {
+        let text: String = row.get(0);
+        let target: String = row.get(1);
+        let def = crate::defs::parse(&text)
+            .unwrap_or_else(|e| panic!("persisted definition failed to parse: {e}"));
+        let target_ident = ddl::qualified_target_table_ident(&target);
+        let (sql, src_table) = match &def.key_space {
+            KeySpace::OneToOne => {
+                let pk = ddl::source_primary_key_in_txn(txn, source_table)
+                    .await
+                    .map_err(|e| IntakeError::Transport(e.to_string()))?;
+                let key_expr = ddl::pk_key_sql_expr(&pk, Some("t"));
+                let on: Vec<String> = pk
+                    .iter()
+                    .map(|c| {
+                        let c = quote_ident(&c.name);
+                        format!("s.{c} is not distinct from t.{c}")
+                    })
+                    .collect();
+                (
+                    format!(
+                        "select {key_expr} from {target_ident} t \
+                         where not exists (select 1 from {source_ident} s where {})",
+                        on.join(" and ")
+                    ),
+                    source_table.to_string(),
+                )
+            }
+            KeySpace::Aggregate { group_by } => {
+                // `identity_key_columns`, not `source_primary_key_in_txn`:
+                // the target's grouping columns need no 1-1 key-type check.
+                let group_cols = ddl::identity_key_columns(txn, &target).await?;
+                let key_expr = ddl::pk_key_sql_expr(&group_cols, Some("t"));
+                let plain: Option<Vec<String>> = group_by
+                    .iter()
+                    .zip(group_cols.iter())
+                    .map(|(k, tc)| match k {
+                        GroupByKey::Column(c) => Some(format!(
+                            "s.{} is not distinct from t.{}",
+                            quote_ident(c.as_str()),
+                            quote_ident(&tc.name)
+                        )),
+                        GroupByKey::RelationshipPath { .. } => None,
+                    })
+                    .collect();
+                let sql = match plain {
+                    Some(on) => format!(
+                        "select {key_expr} from {target_ident} t \
+                         where not exists (select 1 from {source_ident} s where {})",
+                        on.join(" and ")
+                    ),
+                    None => format!("select {key_expr} from {target_ident} t"),
+                };
+                (
+                    sql,
+                    crate::staging::apply::group_recompute_src_table(&target),
+                )
+            }
+        };
+        let orphans = txn.query(&sql, &[]).await?;
+        tracing::info!(target = %target, orphans = orphans.len(), "resume sweep: staging recomputes for keys the source no longer has");
+        for page in orphans.chunks(BACKFILL_PAGE_ROWS as usize) {
+            let rows: Vec<StagedChange> = page
+                .iter()
+                .map(|r| StagedChange::Recompute {
+                    src_table: src_table.clone(),
+                    key: r.get(0),
+                    hop_gen: 0,
+                    group_key: None,
+                    src_changed: None,
+                })
+                .collect();
+            append::append(txn, &rows).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn revert_to_waiting(client: &impl GenericClient, ids: &[i64]) -> Result<(), IntakeError> {
     if ids.is_empty() {
         return Ok(());

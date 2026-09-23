@@ -38,7 +38,7 @@ use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::eval::{
     self, EvalError, RelationshipContext, Row, ToManyRelationship, ToOneRelationship,
 };
-use crate::defs::model::{RelationshipCardinality, RelationshipDefinition};
+use crate::defs::model::{RelationshipCardinality, RelationshipDefinition, TransformStatus};
 use crate::defs::validate::{self, ValidationError};
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident, quote_literal};
@@ -415,6 +415,92 @@ impl From<crate::error::Error> for ApplyError {
 // ---------------------------------------------------------------------
 // src_table qualification
 // ---------------------------------------------------------------------
+
+/// Issue #330 spike: one aggregate target's plan template (its `GROUP BY`
+/// shape, field strategies and relationship joins), built the way
+/// [`compute`]'s by-source loop always has — factored out so a
+/// target-group-addressed recompute (`group_recompute_src_table`) reaching
+/// `compute` outside that loop builds the identical plan.
+async fn aggregate_plan_template(
+    pool: &Pool,
+    def: &crate::defs::Definition,
+    group_by: &[GroupByKey],
+    qualified_source: &str,
+) -> Result<AggregateTargetPlan, ApplyError> {
+    let substituted_exprs = crate::defs::backfill::substituted_field_exprs(&def.def)?;
+    // Issue #94: a to-one relationship path an aggregate field folds
+    // (`SUM(post.word_count)`) needs its relationship's endpoints (to
+    // build the recompute's LEFT JOIN) and its to-side column's type
+    // (to type the target column). Issue #137: a `GROUP BY` key can
+    // read a relationship too, typed the same way. Both come from the
+    // same catalog resolution `defs::catalog` validates against; a
+    // relationship-free aggregate resolves to an empty map and costs
+    // one cheap no-op.
+    let relationships = catalog::resolve_relationships(pool, &def.def).await?;
+    let group_by_types: Vec<ValueType> = group_by
+        .iter()
+        .map(|key| match key {
+            GroupByKey::Column(c) => def
+                .source_columns
+                .get(c)
+                .copied()
+                .unwrap_or(ValueType::Numeric),
+            GroupByKey::RelationshipPath { rel, column } => relationships
+                .get(rel)
+                .and_then(|r| r.column_types.get(column))
+                .copied()
+                .unwrap_or(ValueType::Numeric),
+        })
+        .collect();
+    let field_plans = apply_aggregate::classify_fields(
+        &def.def,
+        group_by,
+        &def.source_columns,
+        &substituted_exprs,
+        &relationships,
+    )?;
+    let mut rel_joins: Vec<apply_aggregate::RelJoin> = Vec::new();
+    for rel_name in relationships.keys() {
+        // Endpoints (`from_col` especially) come from the stored
+        // relationship row; `ResolvedRelationship` carries only the
+        // to-side, since that's all the validator needs.
+        if let Some(reldef) = catalog::relationship_by_name(pool, &def.def.source, rel_name).await?
+        {
+            // Mirrors `defs::backfill::resolve_to_one_joins`'s guard:
+            // the validator makes a to-many path in an aggregate
+            // unreachable today, but this loop has no other cardinality
+            // check of its own, and a silent to-many LEFT JOIN here
+            // would fan out source rows and inflate every SUM instead
+            // of failing loudly like the direct-build path does.
+            if reldef.cardinality != RelationshipCardinality::ToOne {
+                return Err(crate::defs::backfill::BackfillError::Unsupported(
+                    "an aggregate over a to-many relationship".to_string(),
+                )
+                .into());
+            }
+            rel_joins.push(apply_aggregate::RelJoin {
+                name: rel_name.clone(),
+                to_table: reldef.def.to_table,
+                to_col: reldef.def.to_col,
+                from_col: reldef.def.from_col,
+            });
+        }
+    }
+    rel_joins.sort_by(|a, b| a.name.cmp(&b.name));
+    let field_exprs: HashMap<String, crate::defs::ast::Expr> = substituted_exprs
+        .into_iter()
+        .filter(|(name, _)| !group_by_contains(group_by, name))
+        .collect();
+    Ok(AggregateTargetPlan::new(
+        group_by,
+        group_by_types,
+        field_plans,
+        qualified_source.to_string(),
+        def.target_table.clone(),
+        field_exprs,
+        rel_joins,
+    ))
+}
 
 /// The catalog's lookup key for a folded record's `src_table`: everything
 /// after the last `.`, if any.
@@ -1512,6 +1598,24 @@ fn synthetic_relationship_column(column: &str) -> String {
 /// the same "no real qualified table name contains this" assumption
 /// [`append::TRUNCATE_SENTINEL_KEY`] already relies on — a real
 /// `information_schema`-qualified table name can't contain it.
+/// Issue #330 spike, option 2: the synthetic `src_table` a "re-derive group
+/// `key` of aggregate target `target`" ring row carries. Same trick as
+/// [`relationship_reverse_deferred_src_table`]: a U+001F prefix no real
+/// qualified table name can contain, so these rows never fold with genuine
+/// CDC, and `compute` can route them to the target's aggregate plan as a
+/// forced full recompute of that one group (which deletes the group's row
+/// when the source no longer has any row for it). Staged as a plain
+/// `op = 'recompute'` row: image-less, so no ring-format change is needed.
+pub(crate) fn group_recompute_src_table(qualified_target: &str) -> String {
+    format!("\u{1f}trellis-group-recompute:{qualified_target}")
+}
+
+/// The qualified target a [`group_recompute_src_table`] identity names, or
+/// `None` for any other `src_table`.
+fn group_recompute_target(src_table: &str) -> Option<&str> {
+    src_table.strip_prefix("\u{1f}trellis-group-recompute:")
+}
+
 pub(crate) fn relationship_reverse_deferred_src_table(relationship_id: i64) -> String {
     format!("\u{1f}trellis-rel-reverse-deferred:{relationship_id}")
 }
@@ -4140,7 +4244,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // `catalog_source_key`, exactly as before.
     let mut canonical_srcs = quarantine::CanonicalSrcTables::default();
     for change in folded {
-        if change.is_truncate || change.relationship_reverse_deferred.is_some() {
+        if change.is_truncate
+            || change.relationship_reverse_deferred.is_some()
+            || group_recompute_target(&change.src_table).is_some()
+        {
             continue;
         }
         canonical_srcs.get(pool, &change.src_table).await?;
@@ -4153,7 +4260,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     };
     let canonical_candidates: Vec<(String, String)> = folded
         .iter()
-        .filter(|c| !c.is_truncate && c.relationship_reverse_deferred.is_none())
+        .filter(|c| {
+            !c.is_truncate
+                && c.relationship_reverse_deferred.is_none()
+                && group_recompute_target(&c.src_table).is_none()
+        })
         .map(|c| (canonical_of(&c.src_table), c.key.clone()))
         .collect();
     let candidates: Vec<(&str, &str)> = canonical_candidates
@@ -4182,6 +4293,9 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // `RelationshipReverseRecord` in its own loop, right after `by_source`'s
     // — see that loop's comment.
     let mut relationship_reverse_deferrals: Vec<&FoldedChange> = Vec::new();
+    // Issue #330 spike, option 2: target-group-addressed recomputes (see
+    // `group_recompute_src_table`), routed after the by-source loop.
+    let mut group_recomputes: Vec<&FoldedChange> = Vec::new();
     let mut poisoned_park: Vec<FoldedChange> = Vec::new();
     let mut applied_keys: Vec<(String, String)> = Vec::new();
     for change in folded {
@@ -4191,6 +4305,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         }
         if change.relationship_reverse_deferred.is_some() {
             relationship_reverse_deferrals.push(change);
+            continue;
+        }
+        if group_recompute_target(&change.src_table).is_some() {
+            group_recomputes.push(change);
             continue;
         }
         // Canonical on all three lines below, per this function's `poisoned`
@@ -4893,84 +5011,12 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // one substitution pass — see
             // `defs::backfill::substituted_field_exprs`'s doc comment for why
             // the raw, un-substituted `Expr` can't be rendered as SQL.
-            let substituted_exprs = crate::defs::backfill::substituted_field_exprs(&def.def)?;
-            // Issue #94: a to-one relationship path an aggregate field folds
-            // (`SUM(post.word_count)`) needs its relationship's endpoints (to
-            // build the recompute's LEFT JOIN) and its to-side column's type
-            // (to type the target column). Issue #137: a `GROUP BY` key can
-            // read a relationship too, typed the same way. Both come from the
-            // same catalog resolution `defs::catalog` validates against; a
-            // relationship-free aggregate resolves to an empty map and costs
-            // one cheap no-op.
-            let relationships = catalog::resolve_relationships(pool, &def.def).await?;
-            let group_by_types: Vec<ValueType> = group_by
-                .iter()
-                .map(|key| match key {
-                    GroupByKey::Column(c) => def
-                        .source_columns
-                        .get(c)
-                        .copied()
-                        .unwrap_or(ValueType::Numeric),
-                    GroupByKey::RelationshipPath { rel, column } => relationships
-                        .get(rel)
-                        .and_then(|r| r.column_types.get(column))
-                        .copied()
-                        .unwrap_or(ValueType::Numeric),
-                })
-                .collect();
-            let field_plans = apply_aggregate::classify_fields(
-                &def.def,
-                group_by,
-                &def.source_columns,
-                &substituted_exprs,
-                &relationships,
-            )?;
-            let mut rel_joins: Vec<apply_aggregate::RelJoin> = Vec::new();
-            for rel_name in relationships.keys() {
-                // Endpoints (`from_col` especially) come from the stored
-                // relationship row; `ResolvedRelationship` carries only the
-                // to-side, since that's all the validator needs.
-                if let Some(reldef) =
-                    catalog::relationship_by_name(pool, &def.def.source, rel_name).await?
-                {
-                    // Mirrors `defs::backfill::resolve_to_one_joins`'s guard:
-                    // the validator makes a to-many path in an aggregate
-                    // unreachable today, but this loop has no other cardinality
-                    // check of its own, and a silent to-many LEFT JOIN here
-                    // would fan out source rows and inflate every SUM instead
-                    // of failing loudly like the direct-build path does.
-                    if reldef.cardinality != RelationshipCardinality::ToOne {
-                        return Err(crate::defs::backfill::BackfillError::Unsupported(
-                            "an aggregate over a to-many relationship".to_string(),
-                        )
-                        .into());
-                    }
-                    rel_joins.push(apply_aggregate::RelJoin {
-                        name: rel_name.clone(),
-                        to_table: reldef.def.to_table,
-                        to_col: reldef.def.to_col,
-                        from_col: reldef.def.from_col,
-                    });
+            let target_plan = match aggregate_targets.entry(def.def.target.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(aggregate_plan_template(pool, def, group_by, qualified_source).await?)
                 }
-            }
-            rel_joins.sort_by(|a, b| a.name.cmp(&b.name));
-            let field_exprs: HashMap<String, crate::defs::ast::Expr> = substituted_exprs
-                .into_iter()
-                .filter(|(name, _)| !group_by_contains(group_by, name))
-                .collect();
-            let target_plan = aggregate_targets
-                .entry(def.def.target.clone())
-                .or_insert_with(|| {
-                    AggregateTargetPlan::new(
-                        group_by,
-                        group_by_types,
-                        field_plans,
-                        qualified_source.to_string(),
-                        def.target_table.clone(),
-                        field_exprs,
-                        rel_joins,
-                    )
-                });
+            };
 
             // Issue #136: a relationship-reading aggregate's ordinary
             // (non-image-less) per-row delta now resolves its `<rel>.<column>`
@@ -5131,6 +5177,57 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             src_changed: change.src_changed,
             retry_count: change.retry_count,
         });
+    }
+
+    // Issue #330 spike, option 2: target-group-addressed recomputes. Each
+    // names one aggregate target and one of its group keys (the target's own
+    // grouping-column key text, `ddl::pk_key_sql_expr` over its unique
+    // columns). The group is marked for a forced full recompute on the
+    // target's plan: `apply_forced_groups_bulk` re-derives it from the live
+    // source, and deletes its row when no source row maps to it any more —
+    // which is exactly the case the resume sweep stages these for.
+    for change in &group_recomputes {
+        let qualified_target =
+            group_recompute_target(&change.src_table).expect("partitioned on this prefix above");
+        let bare_target = qualified_target
+            .rsplit('.')
+            .next()
+            .unwrap_or(qualified_target);
+        let Some(def) = catalog::definition_by_target(pool, bare_target).await? else {
+            continue; // dropped meanwhile
+        };
+        if def.status != TransformStatus::Live {
+            continue; // frozen again meanwhile; its own resume rebuilds it
+        }
+        let KeySpace::Aggregate { group_by } = &def.def.key_space else {
+            continue;
+        };
+        let source_key = catalog_source_key(&def.source_table);
+        if !versions.contains_key(source_key) {
+            let version = catalog::source_table_version(pool, source_key).await?;
+            versions.insert(source_key.to_string(), version);
+        }
+        let target_plan = match aggregate_targets.entry(def.def.target.clone()) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(aggregate_plan_template(pool, &def, group_by, &def.source_table).await?)
+            }
+        };
+        let group_cols = {
+            let client = pool.get().await?;
+            ddl::identity_key_columns(&**client, &def.target_table).await?
+        };
+        let values: Vec<Option<String>> =
+            ddl::split_pk_key(&group_cols, &def.target_table, &change.key)?
+                .into_iter()
+                .map(|part| part.map(|c| c.into_owned()))
+                .collect();
+        let group = target_plan
+            .groups
+            .entry(change.key.clone())
+            .or_insert_with(|| apply_aggregate::GroupPlan::new(values));
+        group.force_full_recompute = true;
+        group.hop_gen = group.hop_gen.max(change.hop_gen);
     }
 
     // Truncate clears (issue #60): for each truncated src_table, resolve its
