@@ -12,6 +12,12 @@
 //! `groups = target_rows_per_sec / fold_in_ratio`: at 10:1 offering 400k
 //! rows/sec that's 40,000 groups each taking ~10 rows/sec; at 1000:1, 400
 //! groups each taking ~1,000 rows/sec.
+//!
+//! Load comes from the multi-connection generator, paced at the target
+//! ([`run_parallel_load`]): before issue #276 a single connection offered
+//! this scenario's 400k rows/sec target, undershot it at every ratio, and
+//! still reported `sustained: true` — a verdict on the generator that read
+//! like one on T3. `generator_bound` now flags exactly that combination.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -21,11 +27,14 @@ use tokio_postgres::Client as RawClient;
 
 use crate::scenario::connect_raw;
 use crate::streaming::chain::{numeric_columns, wait_for_live, warm_up_aggregate};
-use crate::streaming::load::{LoadConfig, run_controlled_load};
+use crate::streaming::load::{
+    GENERATOR_UNDERSHOOT_TOLERANCE, Pace, ParallelLoad, generator_bound, run_parallel_load,
+};
 use crate::streaming::scrape::{
     CHANGES_APPLIED_METRIC, END_TO_END_LATENCY_METRIC, HistogramSnapshot, LE_MAX, LE_P50, LE_P99,
     T1_BOUNDS, counter_value, scrape,
 };
+use crate::streaming::throughput::Offer;
 use crate::streaming::tuning::EngineTuning;
 
 /// A mid-sized commit shape — deliberately neither of the transaction-shape
@@ -45,13 +54,44 @@ pub struct FoldInResult {
     pub fold_in_ratio: usize,
     pub groups: usize,
     pub target_rows_per_sec: f64,
+    /// Generator writer connections.
+    pub connections: usize,
     pub offered_duration_secs: f64,
     pub rows_issued: u64,
     pub achieved_rows_per_sec: f64,
+    /// Issue #276's self-check: the generator undershot the target and the
+    /// aggregate still drained everything it got — `sustained` then says
+    /// nothing about T3 at `target_rows_per_sec`.
+    pub generator_bound: bool,
     pub changes_applied: u64,
     /// Whether apply activity went quiet before the grace deadline — see
     /// [`run_probe`] on why this scenario can't use a row-count backlog.
     pub sustained: bool,
+    /// Source rows over the time from the offer window opening until the
+    /// target had folded in every one of them. `None` when the target never
+    /// caught up within the grace period.
+    ///
+    /// Informational, and biased low: its denominator includes the
+    /// pipeline's end-to-end latency on the last rows plus the drain poll's
+    /// granularity, so even a pipeline that keeps up exactly reads
+    /// `duration / (duration + tail)` of the target — ~93% on a 5s window at
+    /// a T1-compliant few hundred ms. T3's verdict uses
+    /// `in_window_folded_rows_per_sec` instead.
+    pub folded_rows_per_sec: Option<f64>,
+    /// The rate the aggregate folded rows at *while* load was arriving: the
+    /// least-squares slope of `sum(row_count)` sampled across the offer
+    /// window after its first [`FOLD_RATE_SETTLE_FRACTION`]. A pipeline that
+    /// keeps up tracks the offered rate at a constant lag, so the slope equals
+    /// the offered rate whatever that lag is; one that falls behind folds at
+    /// its own lower rate. `None` if too few samples landed to fit a line.
+    pub in_window_folded_rows_per_sec: Option<f64>,
+    /// T3's yes-or-no at this ratio: the target drained (`sustained`) **and**
+    /// `in_window_folded_rows_per_sec` kept up with the target within
+    /// [`GENERATOR_UNDERSHOOT_TOLERANCE`]. `sustained` alone can't answer
+    /// T3: it only says the backlog drained within `grace`, and a long grace
+    /// lets a pipeline running at a fraction of the target pass. Only
+    /// meaningful when `generator_bound` is false.
+    pub kept_target_rate: bool,
     pub e2e_count: u64,
     pub e2e_p50_bucket_frac: f64,
     pub e2e_p99_bucket_frac: f64,
@@ -67,19 +107,26 @@ impl FoldInResult {
     pub fn to_json(&self) -> String {
         format!(
             "{{\"scenario\":\"fold-in-ratio\",\"fold_in_ratio\":{},\"groups\":{},\
-             \"target_rows_per_sec\":{},\"offered_duration_secs\":{:.3},\"rows_issued\":{},\
-             \"achieved_rows_per_sec\":{:.1},\"changes_applied\":{},\"sustained\":{},\
+             \"target_rows_per_sec\":{},\"connections\":{},\"offered_duration_secs\":{:.3},\
+             \"rows_issued\":{},\"achieved_rows_per_sec\":{:.1},\"generator_bound\":{},\
+             \"changes_applied\":{},\"sustained\":{},\"folded_rows_per_sec\":{},\
+             \"in_window_folded_rows_per_sec\":{},\"kept_target_rate\":{},\
              \"e2e_count\":{},\"e2e_p50_bucket_frac\":{:.4},\"e2e_p99_bucket_frac\":{:.4},\
              \"e2e_max_bucket_frac\":{:.4},\"oracle_ok\":{},\"oracle_groups\":{},\
              \"oracle_mismatched_groups\":{}}}",
             self.fold_in_ratio,
             self.groups,
             self.target_rows_per_sec,
+            self.connections,
             self.offered_duration_secs,
             self.rows_issued,
             self.achieved_rows_per_sec,
+            self.generator_bound,
             self.changes_applied,
             self.sustained,
+            json_rate(self.folded_rows_per_sec),
+            json_rate(self.in_window_folded_rows_per_sec),
+            self.kept_target_rate,
             self.e2e_count,
             self.e2e_p50_bucket_frac,
             self.e2e_p99_bucket_frac,
@@ -160,10 +207,74 @@ async fn folded_rows(raw: &RawClient, terminal: &str) -> i64 {
     folded.unwrap_or(0)
 }
 
+/// How much of the offer window to skip before sampling the fold rate: long
+/// enough for the pipeline's start-up lag (first seal, first claim) to pass,
+/// short enough to leave most of the window to fit over.
+const FOLD_RATE_SETTLE_FRACTION: f64 = 0.25;
+const FOLD_RATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Samples [`folded_rows`] every [`FOLD_RATE_SAMPLE_INTERVAL`] from
+/// `FOLD_RATE_SETTLE_FRACTION` of the way into the offer window until it
+/// closes, as `(seconds since offer_start, rows folded)` pairs. Runs
+/// alongside the generator, on `raw` — never on a generator connection.
+async fn sample_fold_progress(
+    raw: &RawClient,
+    terminal: &str,
+    offer_start: Instant,
+    duration: Duration,
+) -> Vec<(f64, f64)> {
+    tokio::time::sleep_until((offer_start + duration.mul_f64(FOLD_RATE_SETTLE_FRACTION)).into())
+        .await;
+    let window_end = offer_start + duration;
+    let mut samples = Vec::new();
+    while Instant::now() < window_end {
+        // The query reads one snapshot as of its start, so stamp it then.
+        let at = offer_start.elapsed().as_secs_f64();
+        samples.push((at, folded_rows(raw, terminal).await as f64));
+        tokio::time::sleep(FOLD_RATE_SAMPLE_INTERVAL).await;
+    }
+    samples
+}
+
+/// Least-squares slope of `samples`' `y` over `x` — rows folded per second.
+/// A fit over many samples rather than a two-point difference, because the
+/// aggregate folds in batches: `sum(row_count)` is a step function, and two
+/// points can each land anywhere in a step. `None` with fewer than two
+/// distinct `x`s.
+fn fold_rate(samples: &[(f64, f64)]) -> Option<f64> {
+    let n = samples.len() as f64;
+    if samples.len() < 2 {
+        return None;
+    }
+    let mean_x = samples.iter().map(|(x, _)| x).sum::<f64>() / n;
+    let mean_y = samples.iter().map(|(_, y)| y).sum::<f64>() / n;
+    let (mut sxy, mut sxx) = (0.0, 0.0);
+    for (x, y) in samples {
+        sxy += (x - mean_x) * (y - mean_y);
+        sxx += (x - mean_x) * (x - mean_x);
+    }
+    (sxx > 0.0).then(|| sxy / sxx)
+}
+
+/// T3's verdict: drained, and folded at the target rate while it was offered.
+fn kept_target_rate(drained: bool, in_window_rate: Option<f64>, target_rows_per_sec: f64) -> bool {
+    drained
+        && in_window_rate.is_some_and(|rate| {
+            rate >= target_rows_per_sec * (1.0 - GENERATOR_UNDERSHOOT_TOLERANCE)
+        })
+}
+
+fn json_rate(rate: Option<f64>) -> String {
+    match rate {
+        Some(rate) => format!("{rate:.1}"),
+        None => "null".to_string(),
+    }
+}
+
 /// One probe: installs a single `SUM`/`COUNT` aggregate over a fresh source
-/// table, offers `target_rows_per_sec` for `offered_duration` spread across
-/// `groups` group keys, then waits up to `grace` for apply activity to go
-/// quiet.
+/// table, offers `target_rows_per_sec` for `offer.duration` from
+/// `offer.connections` writers, spread across `groups` group keys, then waits
+/// up to `offer.grace` for the target to fold in every row.
 ///
 /// "Caught up" here can't wait for `changes_applied` to reach `rows_issued`
 /// the way the 1-1 probes do: an aggregate's applied-change count is bounded
@@ -173,12 +284,10 @@ async fn folded_rows(raw: &RawClient, terminal: &str) -> i64 {
 pub async fn run_probe(
     fold_in_ratio: usize,
     target_rows_per_sec: f64,
-    offered_duration: Duration,
-    grace: Duration,
+    offer: Offer,
     tuning: &EngineTuning,
 ) -> FoldInResult {
     let groups = ((target_rows_per_sec / fold_in_ratio as f64).round() as usize).max(1);
-    let commits_per_sec = target_rows_per_sec / ROWS_PER_COMMIT as f64;
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -216,18 +325,19 @@ pub async fn run_probe(
         HistogramSnapshot::capture(&before, END_TO_END_LATENCY_METRIC, &terminal, &T1_BOUNDS);
     let changes_before = counter_value(&before, CHANGES_APPLIED_METRIC, &terminal);
 
-    let load = run_controlled_load(
-        &raw,
-        SOURCE_TABLE,
-        1,
-        &LoadConfig {
-            commits_per_sec,
-            rows_per_commit: ROWS_PER_COMMIT,
-            duration: offered_duration,
-            groups: Some(groups),
-        },
-    )
-    .await;
+    let load_cfg = ParallelLoad {
+        connections: offer.connections,
+        rows_per_commit: ROWS_PER_COMMIT,
+        duration: offer.duration,
+        groups: Some(groups),
+        pace: Pace::RowsPerSec(target_rows_per_sec),
+    };
+    let offer_start = Instant::now();
+    let (load, fold_samples) = tokio::join!(
+        run_parallel_load(db.dsn(), SOURCE_TABLE, 1, &load_cfg),
+        sample_fold_progress(&raw, &terminal, offer_start, offer.duration),
+    );
+    let in_window_folded_rows_per_sec = fold_rate(&fold_samples);
 
     // An aggregate has an exact convergence signal that a 1-1 chain's row
     // count is the analogue of: every source row is counted into exactly one
@@ -243,15 +353,16 @@ pub async fn run_probe(
     // also why its aggregate runs carried no oracle check that could have
     // caught it.
     let expected_rows = load.rows_issued as i64 + 1; // + the warm-up row
-    let grace_deadline = Instant::now() + grace;
-    let mut drained = false;
+    let grace_deadline = Instant::now() + offer.grace;
+    let mut drained_after = None;
     while Instant::now() < grace_deadline {
         if folded_rows(&raw, &terminal).await >= expected_rows {
-            drained = true;
+            drained_after = Some(offer_start.elapsed());
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    let drained = drained_after.is_some();
 
     let after = scrape();
     let changes_now = counter_value(&after, CHANGES_APPLIED_METRIC, &terminal);
@@ -263,15 +374,27 @@ pub async fn run_probe(
 
     client.shutdown().await.expect("client shutdown");
 
+    let achieved_rows_per_sec = load.achieved_rows_per_sec();
+    let folded_rows_per_sec =
+        drained_after.map(|elapsed| load.rows_issued as f64 / elapsed.as_secs_f64());
     FoldInResult {
         fold_in_ratio,
         groups,
         target_rows_per_sec,
+        connections: offer.connections,
         offered_duration_secs: load.elapsed.as_secs_f64(),
         rows_issued: load.rows_issued,
-        achieved_rows_per_sec: load.achieved_rows_per_sec(),
+        achieved_rows_per_sec,
+        generator_bound: generator_bound(Some(target_rows_per_sec), achieved_rows_per_sec, drained),
         changes_applied: changes_now.saturating_sub(changes_before),
         sustained: drained,
+        folded_rows_per_sec,
+        in_window_folded_rows_per_sec,
+        kept_target_rate: kept_target_rate(
+            drained,
+            in_window_folded_rows_per_sec,
+            target_rows_per_sec,
+        ),
         e2e_count: window.count,
         e2e_p50_bucket_frac: window.fraction(LE_P50),
         e2e_p99_bucket_frac: window.fraction(LE_P99),
@@ -286,13 +409,76 @@ pub async fn run_probe(
 pub async fn run_sweep(
     ratios: &[usize],
     target_rows_per_sec: f64,
-    offered_duration: Duration,
-    grace: Duration,
+    offer: Offer,
     tuning: &EngineTuning,
 ) -> Vec<FoldInResult> {
     let mut results = Vec::with_capacity(ratios.len());
     for &ratio in ratios {
-        results.push(run_probe(ratio, target_rows_per_sec, offered_duration, grace, tuning).await);
+        results.push(run_probe(ratio, target_rows_per_sec, offer, tuning).await);
     }
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `sum(row_count)` for a pipeline offered `rate` rows/sec that folds in
+    /// batches every `batch_secs`, each batch landing `lag_secs` after the
+    /// rows it holds were committed — sampled every 200ms across `span`.
+    fn batched_fold(
+        rate: f64,
+        lag_secs: f64,
+        batch_secs: f64,
+        span: (f64, f64),
+    ) -> Vec<(f64, f64)> {
+        let mut samples = Vec::new();
+        let mut t = span.0;
+        while t < span.1 {
+            let visible_through = t - lag_secs;
+            let batches = (visible_through / batch_secs).floor().max(0.0);
+            samples.push((t, rate * batches * batch_secs));
+            t += 0.2;
+        }
+        samples
+    }
+
+    #[test]
+    fn a_pipeline_that_keeps_up_at_a_lag_folds_at_the_offered_rate() {
+        // 400k rows/sec over a 5s window, folded in 150ms batches half a
+        // second behind: T1-compliant, and keeping up exactly. The drain-time
+        // rate reads this as 5 / 5.5 of the target — a false T3 NO — but the
+        // in-window slope doesn't depend on the lag.
+        let samples = batched_fold(400_000.0, 0.5, 0.15, (1.25, 5.0));
+        let rate = fold_rate(&samples).expect("enough samples");
+        assert!(
+            (rate - 400_000.0).abs() < 400_000.0 * 0.01,
+            "slope {rate} should track the offered 400k"
+        );
+        assert!(kept_target_rate(true, Some(rate), 400_000.0));
+    }
+
+    #[test]
+    fn a_pipeline_that_falls_behind_folds_at_its_own_rate() {
+        let samples = batched_fold(85_000.0, 0.5, 0.15, (5.0, 20.0));
+        let rate = fold_rate(&samples).expect("enough samples");
+        assert!((rate - 85_000.0).abs() < 85_000.0 * 0.01, "slope {rate}");
+        assert!(!kept_target_rate(true, Some(rate), 400_000.0));
+    }
+
+    #[test]
+    fn kept_target_rate_needs_a_drain_and_a_fit() {
+        assert!(!kept_target_rate(false, Some(400_000.0), 400_000.0));
+        assert!(!kept_target_rate(true, None, 400_000.0));
+        assert!(kept_target_rate(true, Some(393_000.0), 400_000.0));
+        assert!(!kept_target_rate(true, Some(390_000.0), 400_000.0));
+    }
+
+    #[test]
+    fn too_few_samples_fit_no_line() {
+        assert_eq!(fold_rate(&[]), None);
+        assert_eq!(fold_rate(&[(1.0, 10.0)]), None);
+        assert_eq!(fold_rate(&[(1.0, 10.0), (1.0, 20.0)]), None);
+        assert_eq!(fold_rate(&[(1.0, 10.0), (2.0, 30.0)]), Some(20.0));
+    }
 }
