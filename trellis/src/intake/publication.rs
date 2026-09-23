@@ -964,6 +964,7 @@ async fn stage_orphan_sweep(
                     hop_gen: 0,
                     group_key: None,
                     src_changed: None,
+                    prior_image: None,
                 })
                 .collect();
             append::append(txn, &rows).await?;
