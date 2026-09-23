@@ -793,6 +793,10 @@ pub(crate) async fn run_pending_backfills_until(
                 );
                 break;
             }
+            // Spike for issue #330, option 3 ("SQL anti-join delete at
+            // discharge"): delete, directly, every target row whose key the
+            // source no longer has, before the enumeration is appended.
+            delete_orphans_sql(&txn, &marker.table, &advancing).await?;
             append_enumeration(&txn, &marker.table).await?;
             true
         };
@@ -842,6 +846,85 @@ async fn intake_caught_up(
 /// `backfilling` promotion for exactly `ids`, when the enumeration that
 /// promotion announced was deferred instead of run. Scoped to `ids` and to
 /// the `backfilling` status for the same reason that function is.
+/// Issue #330 spike, option 3: for every definition this marker just
+/// promoted out of `waiting_to_backfill`, deletes the target rows whose key
+/// (1-1: primary key; aggregate: grouping columns, plain-column keys only in
+/// this spike) has no matching source row, with one anti-join `DELETE` each.
+/// Runs inside the discharge transaction, after `DECLARE`, so a key deleted
+/// between the cursor's snapshot and this statement is still enumerated
+/// (and its live re-read deletes it), and one re-inserted in between is
+/// simply not orphaned. The target's downstream readers see the deletes as
+/// ordinary CDC on the target table.
+async fn delete_orphans_sql(
+    txn: &Transaction<'_>,
+    source_table: &str,
+    ids: &[i64],
+) -> Result<(), IntakeError> {
+    use crate::defs::ast::{GroupByKey, KeySpace};
+    use crate::defs::ddl;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let defs = txn
+        .query(
+            "select definition_text, target_table from transform_definitions where id = any($1)",
+            &[&ids],
+        )
+        .await?;
+    let source_ident = ddl::qualified_source_table(source_table);
+    for row in defs {
+        let text: String = row.get(0);
+        let target: String = row.get(1);
+        let def = crate::defs::parse(&text)
+            .unwrap_or_else(|e| panic!("persisted definition failed to parse: {e}"));
+        let target_ident = ddl::qualified_target_table_ident(&target);
+        let on: Vec<String> = match &def.key_space {
+            KeySpace::OneToOne => ddl::identity_key_columns(txn, source_table)
+                .await?
+                .iter()
+                .map(|c| {
+                    let c = quote_ident(&c.name);
+                    format!("s.{c} is not distinct from t.{c}")
+                })
+                .collect(),
+            KeySpace::Aggregate { group_by } => {
+                let group_cols = ddl::identity_key_columns(txn, &target).await?;
+                let plain: Option<Vec<String>> = group_by
+                    .iter()
+                    .zip(group_cols.iter())
+                    .map(|(k, tc)| match k {
+                        GroupByKey::Column(c) => Some(format!(
+                            "s.{} is not distinct from t.{}",
+                            quote_ident(c.as_str()),
+                            quote_ident(&tc.name)
+                        )),
+                        GroupByKey::RelationshipPath { .. } => None,
+                    })
+                    .collect();
+                match plain {
+                    Some(on) => on,
+                    None => {
+                        tracing::warn!(target = %target, "resume sweep: relationship-path GROUP BY key; orphaned groups not swept in this spike");
+                        continue;
+                    }
+                }
+            }
+        };
+        let deleted = txn
+            .execute(
+                &format!(
+                    "delete from {target_ident} t \
+                     where not exists (select 1 from {source_ident} s where {})",
+                    on.join(" and ")
+                ),
+                &[],
+            )
+            .await?;
+        tracing::info!(target = %target, deleted, "resume sweep: deleted target rows the source no longer has");
+    }
+    Ok(())
+}
+
 async fn revert_to_waiting(client: &impl GenericClient, ids: &[i64]) -> Result<(), IntakeError> {
     if ids.is_empty() {
         return Ok(());

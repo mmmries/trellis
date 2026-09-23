@@ -174,7 +174,7 @@ async fn create_orders(client: &Client) {
 /// The issue's repro: pause an aggregate, delete every source row of one
 /// group, resume. The rebuilt target must not hold that group's row.
 #[tokio::test]
-#[ignore = "issue #330: fix needs a design decision; see the issue"]
+
 async fn resume_drops_an_aggregate_group_whose_rows_were_all_deleted_while_paused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -234,7 +234,7 @@ async fn resume_drops_an_aggregate_group_whose_rows_were_all_deleted_while_pause
 /// The 1-1 twin of the test above. A deleted source row's target row must be
 /// gone after the rebuild, just as a live 1-1 transform would delete it.
 #[tokio::test]
-#[ignore = "issue #330: fix needs a design decision; see the issue"]
+
 async fn resume_drops_a_one_to_one_row_whose_source_row_was_deleted_while_paused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
