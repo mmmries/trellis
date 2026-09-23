@@ -897,8 +897,15 @@ async fn stage_orphan_sweep(
                 let on: Vec<String> = pk
                     .iter()
                     .map(|c| {
+                        // `=` on a not-null column keeps the anti-join
+                        // hashable (see apply_aggregate's `keyset_match`).
+                        let op = if c.nullable {
+                            "is not distinct from"
+                        } else {
+                            "="
+                        };
                         let c = quote_ident(&c.name);
-                        format!("s.{c} is not distinct from t.{c}")
+                        format!("s.{c} {op} t.{c}")
                     })
                     .collect();
                 (
@@ -920,8 +927,13 @@ async fn stage_orphan_sweep(
                     .zip(group_cols.iter())
                     .map(|(k, tc)| match k {
                         GroupByKey::Column(c) => Some(format!(
-                            "s.{} is not distinct from t.{}",
+                            "s.{} {} t.{}",
                             quote_ident(c.as_str()),
+                            if tc.nullable {
+                                "is not distinct from"
+                            } else {
+                                "="
+                            },
                             quote_ident(&tc.name)
                         )),
                         GroupByKey::RelationshipPath { .. } => None,
