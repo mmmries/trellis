@@ -693,10 +693,8 @@ pub async fn isolate_and_evict(
 /// column failures went unattributed — both entirely silently, since an
 /// unqualified argument is an empty result set, not an error. Issue #267
 /// stopped `apply.rs` *emitting* bare `src_table` going forward, but durable
-/// pre-#267 ring rows, `relationship_definitions.from_table`-shaped bare
-/// names (ADR-0007 leaves relationship endpoints unqualified), and the
-/// crate's own integration fixtures that stage bare `src_table` by hand all
-/// still reach here.
+/// pre-#267 ring rows and the crate's own integration fixtures that stage
+/// bare `src_table` by hand still reach here.
 ///
 /// **Unresolvable names fall through to the raw spelling rather than
 /// erroring**, which is the one deliberate difference from
@@ -1910,7 +1908,7 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
         // rather than applied in any transaction (there isn't one spanning
         // this whole function to apply it in).
         let (ctx, _gen_bumps) =
-            apply::build_relationship_context(pool, &def.def.source, &def.def, &rows, None, None)
+            apply::build_relationship_context(pool, &def.source_table, &def.def, &rows, None, None)
                 .await?;
         ctx
     };
