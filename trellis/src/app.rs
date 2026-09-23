@@ -619,15 +619,9 @@ impl Trellis {
             });
         }
 
-        client
-            .execute(
-                "insert into pending_backfill (table_name, fence_snapshot) \
-                 values ($1, pg_current_snapshot()) \
-                 on conflict (table_name) \
-                 do update set fence_snapshot = excluded.fence_snapshot, added_at = now()",
-                &[&qualified],
-            )
-            .await?;
+        // A failure here is a plain `Db` error. `TrellisError::Publication`
+        // describes a post-DROP reconcile failure and would misreport it.
+        crate::intake::publication::park_marker(&**client, &qualified).await?;
         Ok(())
     }
 
