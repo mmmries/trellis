@@ -214,16 +214,26 @@ async fn catchup_marker_on_an_aggregate_target_feeding_a_one_to_one_discharges()
         .await
         .expect("update sku_totals");
 
-    publication::run_pending_backfills(&mut client, "wake")
-        .await
-        .expect("issue #308: discharging a marker on an aggregate target must not fail");
+    publication::run_pending_backfills(
+        &mut client,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("issue #308: discharging a marker on an aggregate target must not fail");
     assert!(
         pending_markers(&client).await.is_empty(),
         "the discharged marker is deleted, not left to wedge the next pass"
     );
-    publication::run_pending_backfills(&mut client, "wake")
-        .await
-        .expect("a later pass is a clean no-op");
+    publication::run_pending_backfills(
+        &mut client,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("a later pass is a clean no-op");
 
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(
@@ -293,9 +303,14 @@ async fn catchup_marker_on_an_aggregate_target_feeding_an_aggregate_discharges()
         .await
         .expect("update sku_totals");
 
-    publication::run_pending_backfills(&mut client, "wake")
-        .await
-        .expect("issue #308: discharging a marker on an aggregate target must not fail");
+    publication::run_pending_backfills(
+        &mut client,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("issue #308: discharging a marker on an aggregate target must not fail");
     assert!(
         pending_markers(&client).await.is_empty(),
         "the discharged marker is deleted, not left to wedge the next pass"

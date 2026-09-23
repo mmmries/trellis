@@ -579,6 +579,8 @@ async fn run(
             interval: options.maintenance_interval,
             reclaim_ttl: options.reclaim_ttl,
             reconcile_interval: options.reconcile_interval,
+            watermark: watermark.clone(),
+            backfill_catch_up_timeout: BACKFILL_CATCH_UP_TIMEOUT,
         };
         maintenance_task = Some(tokio::spawn(maintenance_loop(
             maintenance_config,
@@ -681,12 +683,13 @@ fn uniqueish_id() -> String {
 // ---------------------------------------------------------------------
 
 /// Reconciles the publication's membership against
-/// `options.source_tables`, then either runs the initial snapshot handshake
-/// (fresh slot — no `replication_progress` row yet) or discharges any
-/// settled backfill markers (a slot this client has already set up, e.g.
-/// restarted). Not safe to call concurrently with another client's own
-/// staging setup against the same slot — callers are expected to run
-/// exactly one staging worker per fleet, per this module's doc comment.
+/// `options.source_tables`, then runs the initial snapshot handshake if the
+/// slot is fresh (no `replication_progress` row yet). An existing slot's
+/// backfill markers are left for the maintenance loop (issue #312; see the
+/// comment in the body). Not safe to call concurrently with another
+/// client's own staging setup against the same slot — callers are expected
+/// to run exactly one staging worker per fleet, per this module's doc
+/// comment.
 ///
 /// Uses a dedicated [`ProducerSession`] (not the pool): the session guards
 /// (`synchronous_commit`, the producer singleton advisory lock) are
@@ -718,10 +721,14 @@ async fn setup_staging(
         .await?
         .get(0);
 
-    if has_progress {
-        intake::publication::run_pending_backfills(session.client_mut(), &options.wake_channel)
-            .await?;
-    } else {
+    // An existing slot's pending backfill markers are deliberately *not*
+    // discharged here. Intake isn't running yet, so an enumeration now would
+    // stage `Recompute` rows ahead of the CDC it is about to replay for
+    // changes that enumeration already saw, and an aggregate would count
+    // those changes twice (issue #312). The maintenance loop's first pass,
+    // which runs as soon as intake is up, discharges them behind
+    // `run_pending_backfills`'s wait for intake instead.
+    if !has_progress {
         intake::publication::initial_snapshot_handshake(
             &mut session,
             &options.slot,
@@ -827,6 +834,12 @@ struct MaintenanceConfig {
     interval: Duration,
     reclaim_ttl: Duration,
     reconcile_interval: Duration,
+    /// Intake's staged-through watermark, which a backfill enumeration waits
+    /// on before staging (issue #312; see
+    /// [`intake::publication::run_pending_backfills`]).
+    watermark: staging::StagedWatermark,
+    /// [`BACKFILL_CATCH_UP_TIMEOUT`] outside tests.
+    backfill_catch_up_timeout: Duration,
 }
 
 /// Runs seal-on-demand, stuck-seal recovery, stale-claim reclaim,
@@ -850,6 +863,8 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         interval,
         reclaim_ttl,
         reconcile_interval,
+        watermark,
+        backfill_catch_up_timeout,
     } = config;
 
     let seal_config = SealConfig::default();
@@ -916,12 +931,23 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 }
             }
             if !failed && Instant::now() >= next_reconcile {
+                // A backfill enumeration can sit waiting for intake to catch
+                // up (issue #312), and intake is the first task shutdown
+                // stops. The wait therefore watches the shutdown signal
+                // itself and gives up through its own revert path. Dropping
+                // this future on shutdown instead would strand a definition
+                // it had already promoted to `backfilling` (see
+                // `run_pending_backfills_until`).
+                let shutting_down = || *shutdown_rx.borrow();
                 failed = reconcile_source_tables(
                     c,
                     &pool,
                     &publication,
                     &base_source_tables,
                     &wake_channel,
+                    &watermark,
+                    backfill_catch_up_timeout,
+                    &shutting_down,
                 )
                 .await
                 .is_err();
@@ -975,6 +1001,18 @@ impl From<IntakeError> for ReconcileError {
     }
 }
 
+/// How long one discharge pass lets a backfill enumeration wait for intake
+/// to stage through the enumeration's snapshot before deferring it to the
+/// next pass (issue #312; see [`intake::publication::run_pending_backfills`]).
+/// Intake normally trails the source by milliseconds. The wait only runs this
+/// long when intake is replaying a backlog. The maintenance loop does no
+/// sealing while it waits, so this is also the longest seal stall one pass
+/// can add. A deferral ends the pass, so the stall is not repeated per marker.
+/// The value is a judgement call, not a measured bound. While intake stays
+/// further behind than this, markers keep deferring and their definitions
+/// stay `waiting_to_backfill`.
+const BACKFILL_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Issue #14: re-derives the desired source-table set as the union of
 /// `base_source_tables` (whatever [`ClientOptions::source_tables`] was at
 /// [`Client::start`] time — kept so an embedder that only ever passes an
@@ -982,10 +1020,10 @@ impl From<IntakeError> for ReconcileError {
 /// gets exactly the old, static behavior) and every source table
 /// [`defs::all_source_tables`] finds registered in the catalog right now,
 /// then reconciles the publication and discharges any resulting backfill
-/// against that set — the same two calls [`setup_staging`] makes once at
-/// startup, just re-run periodically so a transform registered against a
+/// against that set, re-run periodically so a transform registered against a
 /// new table while this client is already running is picked up without a
-/// restart.
+/// restart. [`setup_staging`] reconciles once at startup but leaves the
+/// discharge to this function's first run, once intake is up.
 ///
 /// Issue #75, ADR-0007: [`defs::all_source_tables`] returns each table's own
 /// actual, already-persisted qualified identity — this used to instead
@@ -1002,12 +1040,16 @@ impl From<IntakeError> for ReconcileError {
 /// see [`intake::publication::reconcile_publication`]'s doc comment for why
 /// a fresh `ProducerSession` isn't available here (intake's own session
 /// holds the producer singleton for the client's whole lifetime).
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_source_tables(
     client: &mut tokio_postgres::Client,
     pool: &Pool,
     publication: &str,
     base_source_tables: &[String],
     wake_channel: &str,
+    watermark: &staging::StagedWatermark,
+    catch_up_timeout: Duration,
+    stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), ReconcileError> {
     let mut desired: std::collections::BTreeSet<String> =
         base_source_tables.iter().cloned().collect();
@@ -1015,7 +1057,14 @@ async fn reconcile_source_tables(
     let desired: Vec<String> = desired.into_iter().collect();
 
     intake::publication::reconcile_publication(client, publication, &desired).await?;
-    intake::publication::run_pending_backfills(client, wake_channel).await?;
+    intake::publication::run_pending_backfills_until(
+        client,
+        wake_channel,
+        watermark,
+        catch_up_timeout,
+        stop,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1743,5 +1792,121 @@ mod backfill_chunk_claim_tests {
             .expect("read status")
             .get(0);
         assert_eq!(status, "live");
+    }
+}
+
+#[cfg(test)]
+mod backfill_shutdown_tests {
+    use super::*;
+    use crate::config::DEFAULT_SCHEMA;
+    use crate::defs::ast::ValueType;
+    use crate::defs::model::TransformStatus;
+
+    async fn status_of(client: &tokio_postgres::Client) -> TransformStatus {
+        let text: String = client
+            .query_one(
+                "select status from transform_definitions where target_table = 'public.t'",
+                &[],
+            )
+            .await
+            .expect("query status")
+            .get(0);
+        TransformStatus::from_persisted(&text).expect("known status")
+    }
+
+    /// Issue #312 review: shutting down while a backfill enumeration waits
+    /// for intake must hand its definition back to `waiting_to_backfill`.
+    /// The wait follows the definition's committed promotion to
+    /// `backfilling`, and only `waiting_to_backfill` definitions are ever
+    /// promoted again, so a definition left in `backfilling` would never
+    /// reach `live`. The catch-up timeout here is far longer than the test
+    /// waits for shutdown, so only the shutdown signal can end the wait.
+    #[tokio::test]
+    async fn shutdown_during_a_backfill_wait_returns_the_definition_to_waiting() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut raw = connect_plain(db.dsn(), DEFAULT_SCHEMA)
+            .await
+            .expect("connect");
+        raw.batch_execute(
+            "create table public.s (id bigint primary key, a numeric); \
+             insert into public.s (id, a) select g, g from generate_series(1, 5) g; \
+             create publication test_pub;",
+        )
+        .await
+        .expect("seed source table and publication");
+
+        // An open transaction pins the marker's fence, so the definition
+        // defers to `waiting_to_backfill` instead of enumerating inline.
+        let straggler = testkit::crash::OpenTransaction::begin(db.dsn()).await;
+        straggler.execute("select txid_current()").await;
+        intake::publication::reconcile_publication(&mut raw, "test_pub", &["public.s".to_string()])
+            .await
+            .expect("reconcile leaves an unsettled marker");
+        // `testkit`'s pool is the published crate's `Pool`, a different type
+        // from this `--lib` build's own, so build one from the same DSN.
+        let pool = crate::pool::Pool::new(
+            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid config"),
+        )
+        .expect("build a same-crate pool");
+        let columns = std::collections::HashMap::from([("a".to_string(), ValueType::Numeric)]);
+        crate::defs::install_definition(
+            &pool,
+            "TRANSFORM t FROM s SELECT a + a AS x",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("install_definition defers");
+        assert_eq!(status_of(&raw).await, TransformStatus::WaitingToBackfill);
+        straggler.commit().await;
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = MaintenanceConfig {
+            dsn: db.dsn().to_string(),
+            schema: DEFAULT_SCHEMA.to_string(),
+            pool,
+            publication: "test_pub".to_string(),
+            base_source_tables: vec!["public.s".to_string()],
+            wake_channel: "wake".to_string(),
+            interval: Duration::from_millis(50),
+            reclaim_ttl: Duration::from_secs(30),
+            reconcile_interval: Duration::from_secs(3600),
+            // Intake never runs, so the enumeration waits on this forever.
+            watermark: staging::StagedWatermark::new(),
+            backfill_catch_up_timeout: Duration::from_secs(600),
+        };
+        let task = tokio::spawn(maintenance_loop(config, shutdown_rx));
+
+        // The first pass promotes the definition, then waits on intake.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while status_of(&raw).await != TransformStatus::Backfilling {
+            assert!(
+                Instant::now() < deadline,
+                "the first maintenance pass never started the enumeration"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        shutdown_tx.send(true).expect("signal shutdown");
+        tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("the maintenance loop must stop promptly on shutdown")
+            .expect("maintenance task");
+
+        assert_eq!(
+            status_of(&raw).await,
+            TransformStatus::WaitingToBackfill,
+            "a shutdown mid-wait must not strand the definition in backfilling"
+        );
+        let markers: i64 = raw
+            .query_one("select count(*) from pending_backfill", &[])
+            .await
+            .expect("count markers")
+            .get(0);
+        assert_eq!(
+            markers, 1,
+            "the deferred marker must survive for the next start"
+        );
     }
 }
