@@ -21,6 +21,8 @@ use tokio_postgres::Client as RawClient;
 use trellis::Pool;
 use trellis::dev::defs::{ValueType, install_definition};
 
+use crate::streaming::scrape::{CHANGES_APPLIED_METRIC, counter_value, scrape};
+
 /// The id [`warm_up`] sends through the chain. Negative, and never reused by
 /// [`crate::streaming::load`] (whose ids start at 1), so it can never collide
 /// with — or be miscounted among — the load generator's own rows.
@@ -143,6 +145,46 @@ pub async fn wait_for_chain_live(raw: &RawClient, chain: &Chain, timeout: Durati
     }
 }
 
+/// Polls until no `pending_backfill` marker is left, or panics at `deadline`.
+/// Call it after the transforms are live and **before** the first source row
+/// is written, warm-up row included.
+///
+/// A definition going live parks a catch-up marker on its source, and the
+/// staging worker discharges it on its next reconcile pass, up to
+/// `reconcile_interval` later. The discharge enumerates every row the source
+/// holds at that moment as an image-less `Recompute` and stages it. Each one
+/// is applied and counted into `trellis_changes_applied_total` like any other
+/// staged row, although nothing about the row changed. If the pass lands
+/// inside the measurement window, the probe measures a re-derive of however
+/// much of the table exists by then on top of the offered load, and the
+/// counter runs ahead of the rows committed by that many. Issue #423 measured
+/// exactly that: at 20k rows/sec the discharge ran about 5 s into the offer
+/// and added 95,878-100,001 to each 400,000-row probe.
+///
+/// Waiting here, while the source is still empty, lets the catch-up discharge
+/// enumerate nothing.
+pub async fn wait_for_catch_up_discharged(raw: &RawClient, deadline: Instant) {
+    loop {
+        let pending: Vec<String> = raw
+            .query("select table_name from pending_backfill", &[])
+            .await
+            .expect("read pending_backfill")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "catch-up backfill markers for {pending:?} never discharged in time (the staging \
+             worker discharges them on its reconcile pass; is `reconcile_interval` longer \
+             than the setup timeout?)"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Polls until `predicate_sql` (a `select 1 ... ` returning at most one row)
 /// matches, or panics at `deadline` with `what` in the message.
 async fn wait_for_row(raw: &RawClient, predicate_sql: &str, what: &str, deadline: Instant) {
@@ -165,12 +207,35 @@ async fn wait_for_row(raw: &RawClient, predicate_sql: &str, what: &str, deadline
     }
 }
 
+/// Polls until `transform`'s `trellis_changes_applied_total` has moved past
+/// `baseline`, or panics at `deadline` with `what` in the message.
+///
+/// A drain worker bumps the counter right after its apply commits, so the
+/// applied row can be visible to another connection a moment before it is
+/// counted. A warm-up that returned on the row alone could let the scrape
+/// that opens the measurement window land in that gap, and the warm-up row's
+/// count would then fall inside the window, one more than the rows committed
+/// in it, which `report_probes` rejects as a re-stage (#423).
+async fn wait_for_counted(transform: &str, baseline: u64, what: &str, deadline: Instant) {
+    while counter_value(&scrape(), CHANGES_APPLIED_METRIC, transform) <= baseline {
+        assert!(
+            Instant::now() < deadline,
+            "{what} landed but `{CHANGES_APPLIED_METRIC}` for {transform} never counted it"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Sends one reserved-id row ([`WARM_UP_ID`]) through the whole chain and
 /// waits for it to reach the terminal hop — proving CDC intake -> ring ->
 /// seal -> claim -> fold -> apply is actually flowing (in particular that
 /// every intermediate hop has joined the publication via the periodic
-/// `reconcile_source_tables` pass) before a measurement window opens.
+/// `reconcile_source_tables` pass) before a measurement window opens — and
+/// for the terminal hop's apply counter to include it
+/// ([`wait_for_counted`]).
 pub async fn warm_up(raw: &RawClient, chain: &Chain, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let baseline = counter_value(&scrape(), CHANGES_APPLIED_METRIC, chain.terminal());
     raw.execute(
         &format!(
             "insert into public.{} (id, val) values ($1::bigint, $1::numeric)",
@@ -188,14 +253,15 @@ pub async fn warm_up(raw: &RawClient, chain: &Chain, timeout: Duration) {
             chain.terminal()
         ),
         "the warm-up row",
-        Instant::now() + timeout,
+        deadline,
     )
     .await;
+    wait_for_counted(chain.terminal(), baseline, "the warm-up row", deadline).await;
 }
 
 /// Inserts one reserved-id row into an aggregate scenario's source table and
-/// waits for its group to appear in `terminal`. Same discipline as
-/// [`warm_up`], for a topology that isn't a [`Chain`].
+/// waits for its group to appear in `terminal` and be counted. Same
+/// discipline as [`warm_up`], for a topology that isn't a [`Chain`].
 pub async fn warm_up_aggregate(
     raw: &RawClient,
     source: &str,
@@ -203,6 +269,8 @@ pub async fn warm_up_aggregate(
     group_column: &str,
     timeout: Duration,
 ) {
+    let deadline = Instant::now() + timeout;
+    let baseline = counter_value(&scrape(), CHANGES_APPLIED_METRIC, terminal);
     raw.execute(
         &format!(
             "insert into public.{source} (id, {group_column}, val) \
@@ -217,9 +285,10 @@ pub async fn warm_up_aggregate(
         raw,
         &format!("select 1 from public.{terminal} where {group_column} = {WARM_UP_ID}"),
         "the aggregate warm-up row",
-        Instant::now() + timeout,
+        deadline,
     )
     .await;
+    wait_for_counted(terminal, baseline, "the aggregate warm-up row", deadline).await;
 }
 
 /// The independent oracle verdict for a 1-1 chain (every scenario carries
