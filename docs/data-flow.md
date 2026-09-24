@@ -54,6 +54,179 @@ change becomes a durable staged row, and why the slot is acknowledged only
   which all changes have been ingested. Downstream progress is tracked in the
   same LSN space (see [Reading derived data](#reading-derived-data)).
 
+The stream carries changes only. The rows a table already holds when a
+transform starts reading it are captured separately, by the path below.
+
+## Capturing a table's existing rows
+
+A new transform's target has to reflect every row its source already holds,
+not only the changes that arrive after it's defined. Replication doesn't carry
+those rows, so Trellis reads them from the table: the **capture**. The capture
+and the stream have to meet exactly. Every commit to the source is either seen
+by the capture or delivered by the stream afterward, and a commit that both see
+is counted once.
+
+There is one capture path, and every definition's initial build goes through
+it ([ADR-0016](decisions/0016-single-background-capture-path.md)). Resumes,
+explicit `request_backfill` calls and go-live catch-ups use it too.
+
+> **Status.** This section describes the design ADR-0016 settles. Parts marked
+> **Planned** aren't implemented yet. Each marker names the issue that
+> implements it and says what happens today instead. ADR-0016's inventory lists
+> every path that still differs.
+
+### Registration
+
+Registering a transform (`Trellis::apply` with a `TRANSFORM` statement)
+validates the definition, creates the target table, writes the catalog row as
+`waiting_to_backfill`, and returns. It reads no source rows and makes no
+replication change, so its latency doesn't depend on the table's size.
+
+*Planned (#418, #419):* today registration still reads the source.
+`create_definition` enumerates it into the ring inside the registration
+transaction. A plain 1-1 definition cuts and enqueues its chunks at
+registration, returning `backfilling`. An aggregate or relationship-enriched
+1-1 definition runs its whole direct build before `apply` returns. Only a
+source with an unsettled marker already defers to the path below.
+
+### The four steps
+
+Everything after registration runs in the background, driven by the staging
+worker's maintenance loop. Chunked builds, and possibly direct builds (#419's
+call), execute on drain threads.
+
+1. **Join.** The source gets a `pending_backfill` marker. Its **fence** is the
+   snapshot (`pg_current_snapshot()`) of the transaction that parks it.
+   - If the table isn't in the publication yet, the staging worker's reconcile
+     pass (`reconcile_publication`) adds it and parks the marker in the same
+     transaction. The fence has to cover every transaction that could have
+     written the table before the join committed. A fence taken inside the
+     `ALTER`'s own transaction falls short of a writer that starts between the
+     fence and the commit, so the discharge re-fences a marker the first time it
+     sees it, at a snapshot that postdates the commit
+     ([ADR-0016](decisions/0016-single-background-capture-path.md#the-join-fence);
+     *Planned (#431)*).
+   - If the source needs no publication change, registration parks the marker
+     itself, in the catalog row's transaction. That covers a table that is
+     already published and a source that is another definition's target, which
+     is never published (#315). *Planned (#418):* registration doesn't park
+     one yet.
+
+   Only the staging worker changes the publication, including the shrink after
+   a `DROP` (*Planned (#427)*). A table has at most one
+   marker, and a second park merges into it, keeping the later fence
+   ([intake](staging-and-claiming/01-intake-and-lsn-confirmation.md#adjacent-invariants-that-are-easy-to-miss)).
+2. **Wait.** The discharge (`run_pending_backfills_until`, once per maintenance
+   pass) skips a marker until its fence settles: every transaction that was
+   open when it was parked has ended (`now.xmin > fence.xmax`). Because `xmin`
+   is cluster-wide, an unrelated long transaction can hold this step up. That
+   is safe, and the definition's `waiting_to_backfill` status is the signal
+   ([observability](observability.md#backfill-status-and-the-xmin-caveat)).
+   Once the fence settles, the discharge also waits for intake to stage through
+   the WAL position its read snapshot was taken at (#312), so the stream's copy
+   of any commit the read also sees is staged no later than the read's output.
+3. **Capture and build.** The discharge promotes the table's
+   `waiting_to_backfill` definitions to `backfilling`, takes the capture
+   snapshot, and dispatches each definition's build:
+
+   | Build | Used for | How it runs |
+   |---|---|---|
+   | Ring enumeration | any shape; the fallback for a shape the direct build can't render | one cursor inside the discharge transaction appends an image-less `Recompute` per source row, which drain workers fold like any batch |
+   | Plain 1-1 chunks | plain (no relationship) 1-1 definitions | the discharge cuts the source's key range into `backfill_chunks`, and drain threads claim and execute them ([ADR-0007](decisions/0007-direct-set-based-backfill.md#backgrounding-and-resumability)) |
+   | Direct set-based build | aggregates and relationship-enriched 1-1 definitions | one background job running ADR-0007's `INSERT … SELECT` build |
+
+   *Planned (#418):* the discharge only runs ring enumeration today. Chunks are
+   cut at registration. *Planned (#419):* direct builds run inside
+   registration. Whether the job runs on the staging worker or a drain thread
+   is #419's call.
+4. **Go live.** The definition flips to `live` when its build finishes. For
+   ring enumeration that's right after the discharge transaction commits. For
+   chunks it's when the last chunk commits. For a direct build it's when the
+   job commits. Apply doesn't fold a live change into a definition until it's
+   `live`, so a reader sees a partial target while the status says
+   `backfilling`. `live` doesn't yet mean complete, though. A ring
+   enumeration's rows are staged but not yet drained when it flips, and a
+   chunked or direct build flips with its go-live catch-up (below) still
+   waiting for a later maintenance pass.
+
+### Why the path is gap-free
+
+- **Nothing falls between the read and the stream.** The capture snapshot is
+  taken after the fence settles. A transaction that was open at the join ended
+  before that, so the snapshot sees its commit (except for step 1's known gap).
+  Any commit the snapshot
+  doesn't see belongs to a transaction that began after the join, and the
+  stream carries it.
+- **A commit both see is counted once.** Commits between the join and the
+  capture snapshot are read *and* streamed. For a 1-1 target that's harmless,
+  because apply re-evaluates the row from live state. For an aggregate, the
+  read's image-less `Recompute` re-derives the whole group, and the recompute
+  horizon keeps the streamed delta from counting the commit a second time
+  ([stage 05](staging-and-claiming/05-apply-and-exactly-once-deltas.md#aggregate-groups-the-recompute-horizon)).
+  #312's wait for intake only makes those re-derivations rarer.
+- **Changes during the build aren't lost.** Apply skips a definition that
+  isn't `live`, so a change that drains while the build runs doesn't reach it.
+  For ring enumeration on a published source that can't happen: the maintenance
+  loop that runs the discharge is also the only sealer, so nothing staged
+  after the pass starts drains before the flip to `live`, and everything
+  staged before it committed before the capture snapshot. A source that is
+  another definition's target is different. Its writes reach readers through
+  the target-mutation seam, from drain workers that don't wait for a seal, and
+  only to `live` ones, so going live parks a catch-up marker on it
+  (`mark_definitions_live`, #315). Chunked and direct builds read the source
+  through many snapshots over a longer time, so going live parks a fresh
+  catch-up marker (`complete_direct_backfill`). Its discharge, through this
+  same path, re-derives the definition from the source's current state, which
+  for an aggregate also corrects a change the build read whose streamed delta
+  was folded again after the flip. *Planned (#419):* today's in-registration
+  direct build parks that catch-up only when its source is another
+  definition's target, so on an already-published source a change that drains
+  during the build is lost. A `backfill_coverage` record can let a catch-up
+  skip re-reading a table that provably hasn't changed since the build. That
+  saves work but never decides correctness.
+- **A resumed target drops rows its source no longer backs.** Before the read,
+  the discharge deletes every row of a promoted definition's target that no
+  current source row backs (#330, `intake::resume_orphans`), since the read
+  only reaches keys the source still has.
+
+### A fresh install
+
+A fresh install creates the replication slot and makes sure every published
+table has a marker. It reads no source table itself. The first discharge pass
+reads each table after the slot exists, so every commit the read misses comes
+after the slot's consistent point and is streamed. A lost slot is recovered the
+same way (`intake::slot_loss`): the slot is recreated without a read, and each
+paused transform's resume parks its own marker.
+
+*Planned (#417):* today `initial_snapshot_handshake` reads every source table
+in the slot-creation transaction. Its snapshot predates the slot's consistent
+point, so a row committed during slot creation is neither read nor streamed
+(#393). A table the same setup's `reconcile_publication` just added gets a join
+marker, and its discharge on the first maintenance pass re-reads the table and
+repairs the gap. A table that was already in the publication gets no marker,
+so its gap stays open until #417.
+
+### What it asks of a deployment
+
+- **No transform is `live` when `apply` returns.** Poll `Trellis::status` until
+  it is, then take `Trellis::watermark_token` and `await_converged` on it.
+  `await_converged` checks the ring and intake's progress, never a
+  definition's status, so on its own it doesn't wait for a build that hasn't
+  started. After `live` it does wait for a ring enumeration's staged rows to
+  drain. Neither signal waits for a chunked or direct build's go-live catch-up,
+  which a later maintenance pass discharges
+  ([ADR-0016](decisions/0016-single-background-capture-path.md#consequences)).
+- **A staging worker must be running.** Nothing joins, waits, captures or goes
+  live without its maintenance loop. Chunked builds also need drain threads
+  ([embedding](embedding.md#the-silent-stall-hazard-issue-144)).
+- **Only the staging worker needs publication and replication privileges.** A
+  process that only registers transforms needs catalog access and the right to
+  create target tables. *Planned (#427):* `DROP` still reconciles the publication
+  from whichever process applies it
+  ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md#the-publication-shrinks-by-reconciliation));
+  the decided design moves that shrink to the staging worker's reconcile pass,
+  driven from the catalog.
+
 ## Staging and batching
 
 Staged changes are **collapsed** before touching any target:
@@ -64,8 +237,9 @@ Staged changes are **collapsed** before touching any target:
   (or key pairs) affected.
 
 Collapsing turns a burst of source writes into the minimal set of target writes,
-and is the same machinery used for backfill (a new transform stages its existing
-source rows as one large batch).
+and is the same machinery a ring-enumeration backfill uses: it stages a table's
+existing rows as one large batch (see
+[Capturing a table's existing rows](#capturing-a-tables-existing-rows)).
 
 Physically, a batch boundary is cut by *sealing* the active segment
 ([stage 03](staging-and-claiming/03-sealing-and-the-fence.md)), and the collapse
