@@ -203,28 +203,63 @@ async fn assert_design(client: &Client, design: &str, runs: i32, expect_corrupti
 }
 
 /// Fast lane: runs on every `cargo test`. Cheap enough to pay on every PR
-/// (a few hundred runs per design, four designs), while still giving real
-/// signal: the negative controls (D0/D1/D3) must still show corruption --
-/// proof the model can detect anything at all -- and the shipped design (D5)
-/// must still show none.
+/// (a few hundred runs per design, four designs run side by side), while
+/// still giving real signal: the negative controls (D0/D1/D3) must still
+/// show corruption -- proof the model can detect anything at all -- and the
+/// shipped design (D5) must still show none.
 ///
 /// Deliberately does NOT include the guard-ablation designs (D5-a..D5-d):
 /// see the module docs and
 /// [`campaign_deep_lane_confirms_every_guard_is_load_bearing`] for why those
 /// need the full 3000-run count to mean anything.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn campaign_fast_lane_confirms_the_shipped_design_and_negative_controls() {
     let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect(db.dsn()).await;
-    load_model(&client).await;
-
     let runs = campaign_runs(200);
+    assert_designs_concurrently(
+        &cluster,
+        &[("D0", true), ("D1", true), ("D3", true), ("D5", false)],
+        runs,
+    )
+    .await;
+}
 
-    for design in ["D0", "D1", "D3"] {
-        assert_design(&client, design, runs, true).await;
+/// Runs each `(design, expect_corruption)` campaign through [`assert_design`]
+/// at the same time, each against its own isolated database with its own copy
+/// of the model. A campaign is one long single-connection PL/pgSQL loop, so
+/// running the designs one after another left all but one core idle. Every
+/// design's result is independent of the others: the model lives entirely in
+/// its own database's `m` schema, and nothing a campaign does in one database
+/// is visible to another. A campaign's corruption count is deterministic for a
+/// given design on a fresh database, though not purely a function of the
+/// seeds: the model picks rows with `order by random()`, so the physical row
+/// order a table's history leaves behind feeds into which row is chosen.
+///
+/// Every design runs every run, controls included. The controls' own verdict
+/// (`corrupted > 0`) could stop at the first corrupting chunk, but the harness
+/// self-check (`HARNESS_VIOLATION_unstaged_below_watermark == 0`) is asserted
+/// across every run of every design, and stopping early would quietly shrink
+/// that coverage. It would not save wall-clock time either: D5 must run every
+/// run regardless, and the campaigns run side by side.
+async fn assert_designs_concurrently(cluster: &TestCluster, designs: &[(&str, bool)], runs: i32) {
+    let mut campaigns = tokio::task::JoinSet::new();
+    for &(design, expect_corruption) in designs {
+        let db = cluster.create_isolated_database().await;
+        let design = design.to_string();
+        campaigns.spawn(async move {
+            let client = connect(db.dsn()).await;
+            load_model(&client).await;
+            assert_design(&client, &design, runs, expect_corruption).await;
+            // Keep the database alive until its campaign is done with it.
+            drop(db);
+        });
     }
-    assert_design(&client, "D5", runs, false).await;
+    while let Some(result) = campaigns.join_next().await {
+        if let Err(err) = result {
+            // Re-raise a campaign's own assertion failure with its message.
+            std::panic::resume_unwind(err.into_panic());
+        }
+    }
 }
 
 /// Deep lane: the full 8-design, 3000-run-per-design campaign
@@ -236,21 +271,24 @@ async fn campaign_fast_lane_confirms_the_shipped_design_and_negative_controls() 
 /// per the epic's own measurements, guard (d)'s necessity is invisible below
 /// 3000 runs, so asserting it at the fast lane's case count would silently
 /// test nothing.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "3000-run x 8-design campaign; run via nightly.yml or explicitly with --ignored"]
 async fn campaign_deep_lane_confirms_every_guard_is_load_bearing() {
     let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect(db.dsn()).await;
-    load_model(&client).await;
-
     let runs = campaign_runs(3000);
-
-    for design in ["D0", "D1", "D3"] {
-        assert_design(&client, design, runs, true).await;
-    }
-    assert_design(&client, "D5", runs, false).await;
-    for design in ["D5-a", "D5-b", "D5-c", "D5-d"] {
-        assert_design(&client, design, runs, true).await;
-    }
+    assert_designs_concurrently(
+        &cluster,
+        &[
+            ("D0", true),
+            ("D1", true),
+            ("D3", true),
+            ("D5", false),
+            ("D5-a", true),
+            ("D5-b", true),
+            ("D5-c", true),
+            ("D5-d", true),
+        ],
+        runs,
+    )
+    .await;
 }

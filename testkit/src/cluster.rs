@@ -294,14 +294,25 @@ impl Drop for TestCluster {
         // skip shutdown and leak the SysV shared memory segment it allocates
         // as a startup interlock — one per teardown, quickly exhausting the
         // (often tiny, e.g. macOS's 32-segment) system table and breaking
-        // every subsequent `initdb`. Stop gracefully first (`pg_ctl stop`
-        // cleans up shared memory), falling back to SIGKILL only on timeout.
-        let stopped_gracefully = Command::new("pg_ctl")
+        // every subsequent `initdb`. Stop through `pg_ctl` first (the
+        // postmaster frees its segment on the way out), falling back to
+        // SIGKILL only on timeout.
+        //
+        // `immediate`, not `fast`: the data directory is deleted right after
+        // this, so the shutdown checkpoint `fast` writes buys nothing. And
+        // `fast` waits for every walsender to finish streaming and for its
+        // client to confirm it. A test that leaves a replication consumer
+        // attached at teardown (an `Intake` spawned onto the runtime, say)
+        // never sends that confirmation, so `fast` sat out the whole `-t`
+        // timeout and then SIGKILLed anyway, about 10s per test. `immediate`
+        // still goes through the postmaster, which releases the SysV segment
+        // before it exits.
+        let stopped_via_pg_ctl = Command::new("pg_ctl")
             .arg("stop")
             .arg("-D")
             .arg(&self.data_dir)
             .arg("-m")
-            .arg("fast")
+            .arg("immediate")
             .arg("-w")
             .arg("-t")
             .arg("10")
@@ -312,11 +323,11 @@ impl Drop for TestCluster {
             .unwrap_or(false);
 
         let server = self.server.get_mut().unwrap_or_else(|e| e.into_inner());
-        if !stopped_gracefully {
-            // The graceful stop timed out; SIGKILL can't clean up, so free the
-            // segment ourselves from the pidfile before it's lost. Log it: a
-            // fallback here is the one leak path teardown *can* see, and a
-            // silent one turns into flaky `initdb` failures later.
+        if !stopped_via_pg_ctl {
+            // `pg_ctl stop` failed or timed out; SIGKILL can't clean up, so
+            // free the segment ourselves from the pidfile before it's lost.
+            // Log it: a fallback here is the one leak path teardown *can*
+            // see, and a silent one turns into flaky `initdb` failures later.
             eprintln!(
                 "testkit: `pg_ctl stop` did not stop postgres cleanly (pid {}); \
                  falling back to SIGKILL and reaping its shmem segment",

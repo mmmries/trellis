@@ -24,10 +24,38 @@ async fn harness_starts_runs_a_query_and_tears_down_cleanly() {
     let value: i32 = row.get(0);
     assert_eq!(value, 1);
 
+    // Line 7 of `postmaster.pid` is the SysV segment's "key id" pair. Read
+    // it before teardown deletes the file. The shm checks are Linux-only
+    // because they read `/proc/sysvipc/shm`.
+    #[cfg(target_os = "linux")]
+    let shmid: String = std::fs::read_to_string(root.join("data").join("postmaster.pid"))
+        .expect("read postmaster.pid")
+        .lines()
+        .nth(6)
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("shmem key/id line in postmaster.pid")
+        .to_string();
+    // Guard the post-teardown check below against passing vacuously (a
+    // misparsed id, or a Postgres that stopped using a SysV segment).
+    #[cfg(target_os = "linux")]
+    assert!(
+        sysv_segment_live(&shmid),
+        "shared memory segment {shmid} from postmaster.pid should be live before teardown"
+    );
+
     drop(db);
     drop(cluster);
 
     assert!(!root.exists(), "temp dir should be removed on teardown");
+
+    // Teardown stops the server with `pg_ctl stop -m immediate`, which must
+    // still free the SysV segment (issue #43: leaked segments break every
+    // later `initdb`).
+    #[cfg(target_os = "linux")]
+    assert!(
+        !sysv_segment_live(&shmid),
+        "shared memory segment {shmid} should be freed on teardown"
+    );
 
     // `kill -0` sends no signal; it just checks whether the process still
     // exists. A non-zero exit means it doesn't (ESRCH), proving the server
@@ -44,6 +72,17 @@ async fn harness_starts_runs_a_query_and_tears_down_cleanly() {
         !still_alive,
         "postgres process {pid} should have exited on teardown"
     );
+}
+
+/// Whether SysV shared memory segment `shmid` currently exists.
+/// `/proc/sysvipc/shm` lists live segments with the id in its second column.
+#[cfg(target_os = "linux")]
+fn sysv_segment_live(shmid: &str) -> bool {
+    std::fs::read_to_string("/proc/sysvipc/shm")
+        .expect("read /proc/sysvipc/shm")
+        .lines()
+        .skip(1)
+        .any(|line| line.split_whitespace().nth(1) == Some(shmid))
 }
 
 #[tokio::test]
