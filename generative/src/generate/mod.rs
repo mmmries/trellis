@@ -2430,6 +2430,7 @@ pub fn adversarial_noise_table() -> Table {
 #[cfg(feature = "proptest")]
 mod strategy {
     use super::*;
+    use crate::model::{DbAdminAction, DbAdminEvent, DbAdminPlan, RestartMode, SlotLossKind};
     use proptest::prelude::*;
 
     /// One in this many awkward-value draws comes back `None` (SQL `NULL`)
@@ -3155,6 +3156,46 @@ mod strategy {
         })
     }
 
+    /// Issue #236: one [`DbAdminAction`] other than a slot loss, weighted
+    /// toward the cheap ones.
+    fn db_admin_in_place_action() -> impl Strategy<Value = DbAdminAction> {
+        prop_oneof![
+            2 => Just(DbAdminAction::Checkpoint),
+            2 => Just(DbAdminAction::RestartPostgres(RestartMode::Fast)),
+            1 => Just(DbAdminAction::RestartPostgres(RestartMode::Immediate)),
+        ]
+    }
+
+    fn slot_loss_kind() -> impl Strategy<Value = SlotLossKind> {
+        prop_oneof![
+            // Invalidating writes and checkpoints ~20MB of WAL per round, so
+            // it's drawn less often than a plain drop.
+            2 => Just(SlotLossKind::Dropped),
+            1 => Just(SlotLossKind::Invalidated),
+        ]
+    }
+
+    /// Issue #236: a database-administration plan for `program`, 0-3 events
+    /// anchored anywhere in its ops.
+    ///
+    /// At most three, because every [`RestartMode`] restart makes the
+    /// engine's intake supervisor wait out a backoff that doubles from 1s
+    /// and resets only after an attempt stays up for 60s. Four restarts in
+    /// one short program already cost 1+2+4+8s.
+    ///
+    /// A slot loss can land on any op, a delete or truncate included: the
+    /// loss puts that op in the gap, and since issue #330 the operator's
+    /// `RESUME` drops target rows whose source rows the gap removed.
+    pub fn db_admin_plan_for(program: &Program) -> impl Strategy<Value = DbAdminPlan> + use<> {
+        let op_count = program.ops.len();
+        let action = prop_oneof![
+            3 => db_admin_in_place_action(),
+            2 => slot_loss_kind().prop_map(DbAdminAction::LoseSlot),
+        ];
+        let event = (0..op_count, action).prop_map(|(op, action)| DbAdminEvent { op, action });
+        prop::collection::vec(event, 0..=3).prop_map(|events| DbAdminPlan { events })
+    }
+
     /// Improvement-plan task E2: draws a [`trivial_program_with`] program,
     /// then defers exactly one of its definitions' installs
     /// ([`defer_def_install`]) to some point strictly after the first seed
@@ -3336,9 +3377,9 @@ mod strategy {
 
 #[cfg(feature = "proptest")]
 pub use strategy::{
-    bulk_insert_program, checkpoint_plan_for, noise_plan_for, program_with_client_restart,
-    program_with_mid_stream_def_install, program_with_scale_out, trivial_one_to_one_program_with,
-    trivial_program, trivial_program_with,
+    bulk_insert_program, checkpoint_plan_for, db_admin_plan_for, noise_plan_for,
+    program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
+    trivial_one_to_one_program_with, trivial_program, trivial_program_with,
 };
 
 #[cfg(test)]
