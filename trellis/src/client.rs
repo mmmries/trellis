@@ -1100,6 +1100,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
 
     let seal_config = SealConfig::default();
     let mut client: Option<tokio_postgres::Client> = None;
+    let mut failures = StepFailures::default();
     // Due immediately on the very first tick rather than waiting a full
     // `reconcile_interval` after startup — `setup_staging` already ran one
     // reconciliation pass at that point, but this makes the loop's own
@@ -1116,29 +1117,28 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         }
 
         if client.is_none() {
-            client = connect_plain(&dsn, &schema).await.ok();
+            let connected = connect_plain(&dsn, &schema).await;
+            client = failures.check("connect", connected).ok();
         }
 
         if let Some(c) = client.as_mut() {
-            let mut failed = staging::seal_if_active_nonempty(c, &wake_channel)
-                .await
-                .is_err();
+            let sealed = staging::seal_if_active_nonempty(c, &wake_channel).await;
+            let mut failed = failures.check("seal", sealed).is_err();
             if !failed {
-                failed = staging::recover_stuck_seals(c, &seal_config, &wake_channel)
-                    .await
-                    .is_err();
+                let recovered = staging::recover_stuck_seals(c, &seal_config, &wake_channel).await;
+                failed = failures.check("recover_stuck_seals", recovered).is_err();
             }
             if !failed {
-                failed = staging::reclaim_stale(c, reclaim_ttl).await.is_err();
+                let reclaimed = staging::reclaim_stale(c, reclaim_ttl).await;
+                failed = failures.check("reclaim_stale", reclaimed).is_err();
             }
             if !failed {
                 // Backfill chunks' own reclaim-stale sweep (docs/decisions/0007's
                 // amendment): a drain worker that died mid-chunk leaves a
                 // stale claim here, freed the same way a stale `seg_claims`
                 // row is above.
-                failed = chunk_queue::reclaim_stale_chunks(c, reclaim_ttl)
-                    .await
-                    .is_err();
+                let reclaimed = chunk_queue::reclaim_stale_chunks(c, reclaim_ttl).await;
+                failed = failures.check("reclaim_stale_chunks", reclaimed).is_err();
             }
             if !failed {
                 // Issue #144: table hygiene for `worker_registry` after an
@@ -1147,19 +1147,20 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 // `staging::has_live_workers` never depends on this having
                 // run (see `staging::worker_registry`'s doc comment); this
                 // is purely about bounding the table's size over time.
-                failed = staging::reclaim_stale_workers(c, reclaim_ttl)
-                    .await
-                    .is_err();
+                let reclaimed = staging::reclaim_stale_workers(c, reclaim_ttl).await;
+                failed = failures.check("reclaim_stale_workers", reclaimed).is_err();
             }
             if !failed {
-                failed = staging::retire_drained_segments(c).await.is_err();
+                let retired = staging::retire_drained_segments(c).await;
+                failed = failures.check("retire_drained_segments", retired).is_err();
             }
             if !failed {
                 // ADR-0009 decision 5's staging_segments{state} gauge: cheap
                 // to read here since maintenance_loop already ticks on this
                 // connection regardless, and a failed read just skips a
                 // gauge refresh rather than derailing the tick's other work.
-                if let Ok(counts) = staging::segment_state_counts(c).await {
+                let counts = staging::segment_state_counts(c).await;
+                if let Ok(counts) = failures.check("segment_state_counts", counts) {
                     for (state, count) in counts {
                         crate::metrics::set_staging_segments(state.as_sql(), count as u64);
                     }
@@ -1168,7 +1169,8 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
             if !failed && Instant::now() >= next_slot_loss_reminder {
                 // Best-effort like the gauge above: a failed read skips one
                 // reminder, and the next is at most a minute away.
-                let _ = intake::slot_loss::log_slot_loss_reminder(&*c).await;
+                let reminded = intake::slot_loss::log_slot_loss_reminder(&*c).await;
+                let _ = failures.check("slot_loss_reminder", reminded);
                 next_slot_loss_reminder =
                     Instant::now() + intake::slot_loss::SLOT_LOSS_REMINDER_INTERVAL;
             }
@@ -1181,7 +1183,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 // it had already promoted to `backfilling` (see
                 // `run_pending_backfills_until`).
                 let shutting_down = || *shutdown_rx.borrow();
-                failed = reconcile_source_tables(
+                let reconciled = reconcile_source_tables(
                     c,
                     &pool,
                     &publication,
@@ -1191,8 +1193,10 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                     backfill_catch_up_timeout,
                     &shutting_down,
                 )
-                .await
-                .is_err();
+                .await;
+                failed = failures
+                    .check("reconcile_source_tables", reconciled)
+                    .is_err();
                 next_reconcile = Instant::now() + reconcile_interval;
             }
             if failed {
@@ -1211,11 +1215,88 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     }
 }
 
+/// How often [`StepFailures`] repeats the `warn` for a step that keeps
+/// failing tick after tick. The ticks in between log at `debug`.
+const STEP_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Issue #408: reports [`maintenance_loop`]'s step failures, which it used
+/// to discard. Every step is retried, so a failure is worth a `warn` but not
+/// a flood of them: the loop ticks every `maintenance_interval` (300ms by
+/// default), and a database outage fails the connect on every one. So each
+/// step warns on its first failure and then at most once per
+/// [`STEP_FAILURE_WARN_INTERVAL`] while it keeps failing, logging the
+/// attempts in between at `debug`, and the step's next success logs one
+/// `info` that it has recovered.
+///
+/// Tracked per step, and only by the step's own outcome: a tick on which a
+/// step didn't run (skipped after an earlier step failed, or not due yet,
+/// like the reconcile every `reconcile_interval`) says nothing about it. A
+/// tick-wide "no step failed" would call a reconcile that fails every pass
+/// recovered on each tick in between, and so re-warn every pass.
+#[derive(Default)]
+struct StepFailures {
+    /// Each step whose latest run failed.
+    failing: std::collections::HashMap<&'static str, FailingStep>,
+}
+
+struct FailingStep {
+    /// Consecutive failed runs.
+    failures: u64,
+    last_warned: Instant,
+}
+
+impl StepFailures {
+    /// Records `step`'s outcome and hands `result` back.
+    fn check<T, E: fmt::Display>(
+        &mut self,
+        step: &'static str,
+        result: Result<T, E>,
+    ) -> Result<T, E> {
+        match &result {
+            Ok(_) => self.succeeded(step),
+            Err(error) => self.failed(step, error, Instant::now()),
+        }
+        result
+    }
+
+    fn failed(&mut self, step: &'static str, error: &dyn fmt::Display, now: Instant) {
+        let entry = self.failing.entry(step).or_insert(FailingStep {
+            failures: 0,
+            last_warned: now,
+        });
+        entry.failures += 1;
+        if entry.failures == 1
+            || now.duration_since(entry.last_warned) >= STEP_FAILURE_WARN_INTERVAL
+        {
+            entry.last_warned = now;
+            tracing::warn!(
+                step,
+                error = %error,
+                failures = entry.failures,
+                "maintenance step failed; retrying"
+            );
+        } else {
+            tracing::debug!(step, error = %error, failures = entry.failures, "maintenance step failed again");
+        }
+    }
+
+    fn succeeded(&mut self, step: &'static str) {
+        if let Some(failing) = self.failing.remove(step) {
+            tracing::info!(
+                step,
+                failures = failing.failures,
+                "maintenance step recovered"
+            );
+        }
+    }
+}
+
 /// Failure modes [`reconcile_source_tables`] composes, purely so its `?`
 /// call sites don't have to hand-unwrap two unrelated error enums
 /// ([`CatalogError`] from the desired-table-set query, [`IntakeError`] from
-/// the reconcile/backfill calls themselves) — [`maintenance_loop`] only ever
-/// asks `.is_err()` of the result, so this never needs to be more than that.
+/// the reconcile/backfill calls themselves) — [`maintenance_loop`] only
+/// needs to know it failed and to log it, so this never needs to be more
+/// than that.
 #[derive(Debug)]
 enum ReconcileError {
     Catalog(CatalogError),
@@ -2038,13 +2119,13 @@ mod intake_supervisor_tests {
     use super::*;
 
     #[derive(Debug, Clone)]
-    struct CapturedEvent {
-        level: tracing::Level,
-        fields: HashMap<String, String>,
+    pub(super) struct CapturedEvent {
+        pub(super) level: tracing::Level,
+        pub(super) fields: HashMap<String, String>,
     }
 
     #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<CapturedEvent>>>);
+    pub(super) struct Captured(pub(super) Arc<Mutex<Vec<CapturedEvent>>>);
 
     struct FieldVisitor(HashMap<String, String>);
 
@@ -2068,7 +2149,7 @@ mod intake_supervisor_tests {
         }
     }
 
-    fn install_capture() -> (tracing::subscriber::DefaultGuard, Captured) {
+    pub(super) fn install_capture() -> (tracing::subscriber::DefaultGuard, Captured) {
         let captured = Captured::default();
         let subscriber = tracing_subscriber::registry().with(CaptureLayer(captured.clone()));
         (tracing::subscriber::set_default(subscriber), captured)
@@ -2383,6 +2464,145 @@ mod intake_supervisor_tests {
             Some(0.0),
             "an attempt that stays up past the healthy window clears the streak"
         );
+    }
+}
+
+#[cfg(test)]
+mod maintenance_failure_tests {
+    //! Issue #408: [`maintenance_loop`] used to drop every step's error.
+
+    use super::intake_supervisor_tests::{CapturedEvent, install_capture};
+    use super::*;
+
+    fn step_of(event: &CapturedEvent) -> Option<&str> {
+        event.fields.get("step").map(|s| s.trim_matches('"'))
+    }
+
+    fn levels(events: &[CapturedEvent]) -> Vec<(tracing::Level, String)> {
+        events
+            .iter()
+            .map(|e| (e.level, step_of(e).unwrap_or("-").to_string()))
+            .collect()
+    }
+
+    /// A step's first failure warns with its error. While it keeps failing,
+    /// only once per interval warns and the rest log at `debug`; another
+    /// step's first failure still warns; the step's next success logs one
+    /// recovery, after which a new failure warns straight away.
+    #[test]
+    fn step_failures_warn_once_per_interval_and_report_recovery() {
+        let (_guard, captured) = install_capture();
+        let mut failures = StepFailures::default();
+        let start = Instant::now();
+
+        failures.failed("seal", &"boom", start);
+        failures.failed("seal", &"boom", start + Duration::from_secs(1));
+        failures.failed("reclaim_stale", &"bang", start + Duration::from_secs(1));
+        failures.failed("seal", &"boom", start + STEP_FAILURE_WARN_INTERVAL);
+        failures.succeeded("seal");
+        // A step that never failed has nothing to recover from.
+        failures.succeeded("retire_drained_segments");
+        failures.failed("seal", &"boom", start + STEP_FAILURE_WARN_INTERVAL);
+
+        let events = captured.0.lock().unwrap().clone();
+        assert_eq!(
+            levels(&events),
+            vec![
+                (tracing::Level::WARN, "seal".to_string()),
+                (tracing::Level::DEBUG, "seal".to_string()),
+                (tracing::Level::WARN, "reclaim_stale".to_string()),
+                (tracing::Level::WARN, "seal".to_string()),
+                (tracing::Level::INFO, "seal".to_string()),
+                (tracing::Level::WARN, "seal".to_string()),
+            ],
+            "{events:?}"
+        );
+        assert!(events[0].fields["error"].contains("boom"), "{events:?}");
+        assert_eq!(events[3].fields["failures"], "3", "{events:?}");
+        assert_eq!(events[4].fields["failures"], "3", "{events:?}");
+        assert_eq!(events[5].fields["failures"], "1", "{events:?}");
+    }
+
+    /// Review of #408: the reconcile runs only every `reconcile_interval`,
+    /// so the ticks between two failing passes don't run it at all. Those
+    /// ticks mustn't count as its recovery, or a reconcile that fails every
+    /// pass would log a recovery and a fresh `warn` each pass (every 5s by
+    /// default) instead of one `warn` a minute.
+    #[test]
+    fn a_step_that_did_not_run_has_not_recovered() {
+        let (_guard, captured) = install_capture();
+        let mut failures = StepFailures::default();
+        let start = Instant::now();
+
+        failures.failed("reconcile_source_tables", &"boom", start);
+        // The ticks in between run every other step cleanly.
+        for _ in 0..3 {
+            let _ = failures.check("seal", Ok::<(), &str>(()));
+        }
+        failures.failed(
+            "reconcile_source_tables",
+            &"boom",
+            start + Duration::from_secs(5),
+        );
+
+        let events = captured.0.lock().unwrap().clone();
+        assert_eq!(
+            levels(&events),
+            vec![
+                (tracing::Level::WARN, "reconcile_source_tables".to_string()),
+                (tracing::Level::DEBUG, "reconcile_source_tables".to_string()),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// The loop itself: pointed at a schema with no Trellis tables, the
+    /// first step (seal) fails on its first tick, and that failure must be
+    /// logged rather than silently dropped.
+    #[tokio::test]
+    async fn a_failing_step_is_logged_by_the_loop() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (_guard, captured) = install_capture();
+        let pool = crate::pool::Pool::new(
+            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid config"),
+        )
+        .expect("build a same-crate pool");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = MaintenanceConfig {
+            dsn: db.dsn().to_string(),
+            schema: "no_trellis_here".to_string(),
+            pool,
+            publication: "test_pub".to_string(),
+            base_source_tables: Vec::new(),
+            wake_channel: "wake".to_string(),
+            interval: Duration::from_millis(20),
+            reclaim_ttl: Duration::from_secs(30),
+            reconcile_interval: Duration::from_secs(3600),
+            watermark: staging::StagedWatermark::new(),
+            backfill_catch_up_timeout: Duration::from_secs(1),
+        };
+        let seal_warning = || {
+            captured.0.lock().unwrap().iter().any(|e| {
+                e.level == tracing::Level::WARN
+                    && step_of(e) == Some("seal")
+                    && e.fields["error"].contains("does not exist")
+            })
+        };
+        let watcher = async {
+            // An event, not a convergence budget: the bound only turns a
+            // hang into a failure.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !seal_warning() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the seal failure was never logged"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            shutdown_tx.send(true).expect("signal shutdown");
+        };
+        tokio::join!(maintenance_loop(config, shutdown_rx), watcher);
     }
 }
 
