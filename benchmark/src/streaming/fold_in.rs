@@ -308,11 +308,11 @@ fn json_rate(rate: Option<f64>) -> String {
 /// `offer.connections` writers, spread across `groups` group keys, then waits
 /// up to `offer.grace` for the target to fold in every row.
 ///
-/// "Caught up" here can't wait for `changes_applied` to reach `rows_issued`
-/// the way the 1-1 probes do: an aggregate's applied-change count is bounded
-/// by group touches per batch, not by row count, so it converges to something
-/// at or *below* the row count. This instead polls and calls the ring drained
-/// once a poll finds no new applied changes since the previous one.
+/// "Caught up" is the target's own `sum(row_count)` reaching the committed
+/// row count (see the comment at the drain loop below), not
+/// `changes_applied`. That counter counts staged source rows too (#409), but
+/// it's an in-process tally recorded after each apply commits, not the
+/// target's own state, so the target is the authoritative signal.
 pub async fn run_probe(
     groups: usize,
     target_rows_per_sec: f64,
