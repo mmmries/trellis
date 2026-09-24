@@ -45,6 +45,20 @@ async fn recompute_count(client: &Client, src_table: &str) -> i64 {
         .get(0)
 }
 
+/// Registers a definition reading `widgets`, so the discharge has a reader to
+/// stage for (issue #417). Called while `widgets` is still empty, so the
+/// registration's own read stages nothing and every counted `Recompute` is
+/// the discharge's.
+async fn register_reader(db: &testkit::TestDatabase) {
+    trellis::defs::create_definition(
+        &db.pool,
+        "TRANSFORM widgets_reader FROM widgets SELECT id AS total",
+        &HashMap::from([("id".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect("register a definition reading widgets");
+}
+
 async fn pending_marker_count(client: &Client) -> i64 {
     client
         .query_one("select count(*) from pending_backfill", &[])
@@ -65,9 +79,13 @@ async fn covered_and_unchanged_table_skips_enumeration() {
     client
         .batch_execute(
             "create table widgets (id bigint primary key); \
-             insert into widgets (id) values (1), (2), (3); \
              create publication test_pub;",
         )
+        .await
+        .expect("create source");
+    register_reader(&db).await;
+    client
+        .batch_execute("insert into widgets (id) values (1), (2), (3)")
         .await
         .expect("seed source with pre-existing rows");
 
@@ -115,9 +133,13 @@ async fn a_write_after_the_coverage_fence_forces_full_enumeration() {
     client
         .batch_execute(
             "create table widgets (id bigint primary key); \
-             insert into widgets (id) values (1), (2), (3); \
              create publication test_pub;",
         )
+        .await
+        .expect("create source");
+    register_reader(&db).await;
+    client
+        .batch_execute("insert into widgets (id) values (1), (2), (3)")
         .await
         .expect("seed source");
 
@@ -165,9 +187,13 @@ async fn a_table_with_no_coverage_is_enumerated_as_before() {
     client
         .batch_execute(
             "create table widgets (id bigint primary key); \
-             insert into widgets (id) values (1), (2), (3); \
              create publication test_pub;",
         )
+        .await
+        .expect("create source");
+    register_reader(&db).await;
+    client
+        .batch_execute("insert into widgets (id) values (1), (2), (3)")
         .await
         .expect("seed source");
 
@@ -206,9 +232,13 @@ async fn an_update_after_the_coverage_fence_forces_full_enumeration() {
     client
         .batch_execute(
             "create table widgets (id bigint primary key, label text); \
-             insert into widgets (id, label) values (1, 'a'), (2, 'b'), (3, 'c'); \
              create publication test_pub;",
         )
+        .await
+        .expect("create source");
+    register_reader(&db).await;
+    client
+        .batch_execute("insert into widgets (id, label) values (1, 'a'), (2, 'b'), (3, 'c')")
         .await
         .expect("seed source");
 
@@ -262,9 +292,13 @@ async fn a_write_during_the_build_window_forces_full_enumeration() {
     client
         .batch_execute(
             "create table widgets (id bigint primary key, label text); \
-             insert into widgets (id, label) values (1, 'a'), (2, 'b'), (3, 'c'); \
              create publication test_pub;",
         )
+        .await
+        .expect("create source");
+    register_reader(&db).await;
+    client
+        .batch_execute("insert into widgets (id, label) values (1, 'a'), (2, 'b'), (3, 'c')")
         .await
         .expect("seed source");
 
@@ -398,6 +432,68 @@ async fn install_definition_records_coverage_and_a_to_side_join_skips() {
         recompute_count(&client, "public.posts").await,
         0,
         "a fast-built to-side table's catch-up is skipped"
+    );
+    assert_eq!(pending_marker_count(&client).await, 0);
+}
+
+/// Issue #417: the discharge skips a table no definition reads, but a table a
+/// definition reads only through a relationship still has a reader. Its marker
+/// must be enumerated, or a to-side row the definition never saw (#393's gap
+/// on a fresh install, say) would never re-derive the rows that depend on it.
+#[tokio::test]
+async fn a_table_read_only_through_a_relationship_is_still_enumerated() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table public.authors (id integer primary key, name text); \
+             create table public.posts (id integer primary key, author_id integer, words integer); \
+             alter table public.posts replica identity full; \
+             insert into public.authors (id, name) values (1, 'a'), (2, 'b'); \
+             insert into public.posts (id, author_id, words) values (100, 1, 10), (101, 2, 5); \
+             create publication test_pub;",
+        )
+        .await
+        .expect("seed authors + posts");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP posts FROM authors.id TO posts.author_id",
+    )
+    .await
+    .expect("create posts relationship");
+    install_definition(
+        &db.pool,
+        "TRANSFORM author_words FROM authors SELECT SUM(posts.words) AS word_sum",
+        &HashMap::from([("id".to_string(), ValueType::Numeric)]),
+        "public",
+    )
+    .await
+    .expect("install_definition via the direct relationship path");
+    // A write after the build's coverage fence, so coverage can't skip the
+    // enumeration either: only the reader check decides.
+    client
+        .batch_execute("insert into public.posts (id, author_id, words) values (102, 1, 7)")
+        .await
+        .expect("write posts after the build");
+
+    publication::reconcile_publication(&mut client, "test_pub", &["public.posts".to_string()])
+        .await
+        .expect("reconcile adds public.posts");
+    publication::run_pending_backfills(
+        &mut client,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
+
+    assert_eq!(
+        recompute_count(&client, "public.posts").await,
+        3,
+        "a table read through a relationship has a reader, so it is enumerated"
     );
     assert_eq!(pending_marker_count(&client).await, 0);
 }
