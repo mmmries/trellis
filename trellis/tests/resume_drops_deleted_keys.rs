@@ -192,7 +192,35 @@ async fn resume_drops_an_aggregate_group_whose_rows_were_all_deleted_while_pause
     )
     .await
     .expect("install the aggregate");
+    // Registration only records the aggregate (#419): run its direct-build
+    // job, then discharge the catch-up marker going live parks, so the only
+    // marker the rebuild below sees is the resume's.
+    drain_backfill_chunks(&db.pool).await;
+    publication::run_pending_backfills(
+        &mut client,
+        "wake",
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("discharge the build's catch-up marker");
     drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(status(&client, "order_rollup").await, "live");
+    let built: Vec<(i64, String)> = client
+        .query(
+            "select g::bigint, total::text from order_rollup order by g",
+            &[],
+        )
+        .await
+        .expect("read order_rollup")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(
+        built,
+        vec![(0, "12".to_string()), (1, "9".to_string())],
+        "precondition: group 0 is built before the pause"
+    );
 
     let operator = define_only(db.dsn()).await;
     operator
@@ -718,6 +746,10 @@ async fn resume_leaves_a_live_sibling_on_the_same_source_alone() {
 /// (issue #312) and rolls back. The orphan delete is in that transaction,
 /// so the target must come out exactly as the pause left it: no rows gone,
 /// and nothing staged for a chained reader. The retry then drops them.
+///
+/// The resumed aggregate's rebuild is a direct-build job, which doesn't wait
+/// for intake (#419), so a live 1-1 sibling on the same source is what makes
+/// this discharge enumerate (its catch-up) and wait.
 #[tokio::test]
 async fn a_discharge_that_times_out_waiting_for_intake_leaves_the_target_as_it_was() {
     let cluster = TestCluster::start();
@@ -727,7 +759,10 @@ async fn a_discharge_that_times_out_waiting_for_intake_leaves_the_target_as_it_w
     let operator = define_only(db.dsn()).await;
     apply_all(
         &operator,
-        &["TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total"],
+        &[
+            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM order_doubles FROM orders SELECT a + a AS x",
+        ],
     )
     .await;
     settle(&db.pool, &mut client).await;
