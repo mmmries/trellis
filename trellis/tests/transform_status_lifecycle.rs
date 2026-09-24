@@ -46,6 +46,9 @@
 //! committed while the slot is being created still reaches the target (#393),
 //! and a definition that defers while the slot is being created still goes
 //! live (#323).
+//!
+//! The last (issue #407) checks that a source whose backfill keeps failing
+//! shows its retry state through `Trellis::status` until the cause is fixed.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -1307,4 +1310,109 @@ async fn a_definition_deferred_during_fresh_slot_creation_goes_live() {
     raw.execute("select pg_drop_replication_slot('defer_slot')", &[])
         .await
         .expect("drop the slot");
+}
+
+/// Issue #407 (ADR-0016): a definition whose source's backfill keeps failing
+/// stays `waiting_to_backfill`, and `Trellis::status` says why: the marker's
+/// attempt count, last error and next attempt. Once the cause is fixed, a
+/// fresh `request_backfill` resets the backoff, the next attempt goes through
+/// and the failure clears.
+#[tokio::test]
+async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.widgets (id bigint primary key, price numeric); \
+         insert into public.widgets values (1, 2);",
+    )
+    .await
+    .expect("seed the source");
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis");
+    trellis
+        .apply("TRANSFORM widget_totals FROM widgets SELECT price + price AS total")
+        .await
+        .expect("register a plain 1-1 transform");
+    // Its build plans chunks over the source's primary key, so without one
+    // every discharge of the source's marker fails.
+    raw.batch_execute("alter table public.widgets drop constraint widgets_pkey")
+        .await
+        .expect("drop the source's primary key");
+
+    let error = publication::discharge_registrations(&db.pool)
+        .await
+        .expect_err("the discharge fails on the missing key");
+    let status = trellis
+        .status("widget_totals")
+        .await
+        .expect("status")
+        .expect("the transform is registered");
+    assert_eq!(status.status, TransformStatus::WaitingToBackfill);
+    let failure = status
+        .backfill_failure
+        .expect("status reports the failing backfill");
+    assert_eq!(failure.source_table, "public.widgets");
+    assert_eq!(failure.attempts, 1);
+    assert_eq!(failure.last_error, error.to_string());
+    assert!(
+        failure.last_error.contains("no primary key"),
+        "the error names the cause, got {:?}",
+        failure.last_error
+    );
+    assert!(
+        failure.next_attempt_at > std::time::SystemTime::now(),
+        "the retry is backed off"
+    );
+
+    // Fix the cause, then ask for a fresh backfill rather than waiting the
+    // backoff out: a new park resets the marker's retry state, so the table
+    // is due at once and `status` stops reporting the old failure while the
+    // marker is still there.
+    raw.batch_execute(
+        "alter table public.widgets add primary key (id); \
+         create publication trellis_pub for table public.widgets",
+    )
+    .await
+    .expect("restore the primary key and publish the source");
+    trellis
+        .request_backfill("widgets")
+        .await
+        .expect("request a fresh backfill");
+    let markers: i64 = raw
+        .query_one(
+            "select count(*) from pending_backfill where table_name = 'public.widgets'",
+            &[],
+        )
+        .await
+        .expect("count markers")
+        .get(0);
+    assert_eq!(markers, 1, "the re-parked marker is still pending");
+    let status = trellis
+        .status("widget_totals")
+        .await
+        .expect("status")
+        .expect("the transform is registered");
+    assert_eq!(
+        status.backfill_failure, None,
+        "a marker with no recorded failure reports none"
+    );
+    publication::discharge_registrations(&db.pool)
+        .await
+        .expect("the retry goes through");
+    let status = trellis
+        .status("widget_totals")
+        .await
+        .expect("status")
+        .expect("the transform is registered");
+    assert_eq!(status.backfill_failure, None);
+    assert_eq!(
+        status.status,
+        TransformStatus::Backfilling,
+        "the retry dispatched the build"
+    );
 }
