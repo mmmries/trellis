@@ -24,6 +24,7 @@ use std::time::Duration;
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
+use trellis::CatalogError;
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Predicate, RelationshipDef, TransformDef};
 use trellis::defs::{
@@ -1853,4 +1854,287 @@ async fn registering_a_direct_build_shape_reads_no_source_rows() {
         .expect("compare the enriched target to the source")
         .get(0);
     assert_eq!(enriched_mismatches, 0, "every source row is enriched");
+}
+
+// ---------------------------------------------------------------------
+// Issue #440: registration never adopts a relation it didn't create, and a
+// failed registration leaves nothing behind that would block a retry.
+// ---------------------------------------------------------------------
+
+async fn relation_exists(client: &Client, schema: &str, name: &str) -> bool {
+    client
+        .query_one(
+            "select exists (select 1 from pg_class c \
+             join pg_namespace n on n.oid = c.relnamespace \
+             where n.nspname = $1 and c.relname = $2)",
+            &[&schema, &name],
+        )
+        .await
+        .expect("check pg_class")
+        .get(0)
+}
+
+async fn definition_count(client: &Client) -> i64 {
+    client
+        .query_one("select count(*) from transform_definitions", &[])
+        .await
+        .expect("count definitions")
+        .get(0)
+}
+
+/// A user table, a view, or another definition's target under the target's
+/// qualified name is refused with `TargetTableExists`, and the existing
+/// relation (and its rows) is left exactly as it was.
+#[tokio::test]
+async fn install_definition_refuses_a_target_name_that_already_exists() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table public.s (id bigint primary key, a numeric); \
+             insert into public.s values (1, 1), (2, 2); \
+             create table public.users_table (note text); \
+             insert into public.users_table values ('keep me'), ('and me'); \
+             create view public.users_view as select 1 as one",
+        )
+        .await
+        .expect("seed the source and the user's relations");
+    let cols = numeric(&["a"]);
+
+    for existing in ["users_table", "users_view"] {
+        let err = install_definition(
+            &db.pool,
+            &format!("TRANSFORM {existing} FROM s SELECT a + a AS x"),
+            &cols,
+            "public",
+        )
+        .await
+        .expect_err("a pre-existing relation must be refused, not adopted");
+        match &err {
+            CatalogError::TargetTableExists { table } => {
+                assert_eq!(table, &format!("public.{existing}"));
+            }
+            other => panic!("expected TargetTableExists for {existing}, got {other:?}"),
+        }
+        assert!(
+            err.to_string()
+                .contains(&format!("\"public.{existing}\" already exists")),
+            "the message names the table and says it exists: {err}"
+        );
+    }
+
+    // The user's table is untouched: same shape, same rows.
+    let notes: Vec<String> = client
+        .query("select note from public.users_table order by note", &[])
+        .await
+        .expect("the user's table still reads with its own shape")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(notes, vec!["and me".to_string(), "keep me".to_string()]);
+    assert_eq!(definition_count(&client).await, 0, "nothing was registered");
+
+    // Another definition's target is refused the same way.
+    install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT a + a AS x",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("the first registration creates public.t");
+    let err = install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT a AS y",
+        &cols,
+        "public",
+    )
+    .await
+    .expect_err("a second registration on the same target is refused");
+    assert!(
+        matches!(&err, CatalogError::TargetTableExists { table } if table == "public.t"),
+        "expected TargetTableExists, got {err:?}"
+    );
+    assert_eq!(definition_count(&client).await, 1);
+}
+
+/// A registration that fails after its target's `create table` has run rolls
+/// the table back with the catalog row, so the same registration succeeds on
+/// retry. The failure is injected on the catalog insert, the last write
+/// registration makes.
+#[tokio::test]
+async fn a_registration_that_fails_partway_leaves_no_target_and_can_be_retried() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(&format!(
+            "create table public.s (id bigint primary key, a numeric); \
+             insert into public.s values (1, 1), (2, 2); \
+             create function public.fail_registration() returns trigger \
+             language plpgsql as $$ begin raise exception 'injected registration failure'; end $$; \
+             create trigger fail_registration before insert on {DEFAULT_SCHEMA}.transform_definitions \
+             for each row execute function public.fail_registration()"
+        ))
+        .await
+        .expect("seed the source and the failing trigger");
+    let cols = numeric(&["a"]);
+    let text = "TRANSFORM t FROM s SELECT a + a AS x";
+
+    let err = install_definition(&db.pool, text, &cols, "public")
+        .await
+        .expect_err("the injected failure fails registration");
+    assert!(
+        err.to_string().contains("injected registration failure"),
+        "the injected failure is what failed it: {err}"
+    );
+    assert!(
+        !relation_exists(&client, "public", "t").await,
+        "a failed registration must not leave its target table behind"
+    );
+    assert_eq!(definition_count(&client).await, 0);
+
+    client
+        .batch_execute(&format!(
+            "drop trigger fail_registration on {DEFAULT_SCHEMA}.transform_definitions"
+        ))
+        .await
+        .expect("clear the injected failure");
+
+    let def = install_definition(&db.pool, text, &cols, "public")
+        .await
+        .expect("the retry registers under the same target name");
+    assert_eq!(def.target_table, "public.t");
+    assert_eq!(def.status, TransformStatus::WaitingToBackfill);
+    assert!(relation_exists(&client, "public", "t").await);
+}
+
+/// A registration racing a concurrent creator of the same target name is
+/// refused with `TargetTableExists`, not a raw database error. Made
+/// deterministic by holding the rival's `create table` open in its own
+/// transaction until registration is blocked behind it (it passed the
+/// existence check, since the rival's table isn't visible yet), then
+/// committing the rival.
+#[tokio::test]
+async fn a_registration_that_loses_a_create_race_is_refused_as_already_existing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut rival = connect_raw(db.dsn()).await;
+    let observer = connect_raw(db.dsn()).await;
+
+    rival
+        .batch_execute(
+            "create table public.s (id bigint primary key, a numeric); \
+             insert into public.s values (1, 1)",
+        )
+        .await
+        .expect("seed the source");
+    let rival_txn = rival.transaction().await.expect("begin the rival");
+    rival_txn
+        .batch_execute("create table public.t (id bigint primary key)")
+        .await
+        .expect("the rival creates the target name, uncommitted");
+
+    let pool = db.pool.clone();
+    let registration = tokio::spawn(async move {
+        install_definition(
+            &pool,
+            "TRANSFORM t FROM s SELECT a + a AS x",
+            &numeric(&["a"]),
+            "public",
+        )
+        .await
+    });
+
+    // Wait until registration's `create table` is blocked behind the rival.
+    let mut blocked = false;
+    for _ in 0..500 {
+        let waiting: i64 = observer
+            .query_one(
+                "select count(*) from pg_stat_activity \
+                 where datname = current_database() and wait_event_type = 'Lock' \
+                 and query ilike 'create table%'",
+                &[],
+            )
+            .await
+            .expect("poll pg_stat_activity")
+            .get(0);
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        blocked,
+        "registration never blocked behind the rival's create"
+    );
+    rival_txn.commit().await.expect("commit the rival");
+
+    let err = registration
+        .await
+        .expect("registration task")
+        .expect_err("the rival's table must be refused, not adopted");
+    assert!(
+        matches!(&err, CatalogError::TargetTableExists { table } if table == "public.t"),
+        "expected TargetTableExists, got {err:?}"
+    );
+    assert_eq!(definition_count(&observer).await, 0);
+}
+
+/// A definition that closes a table cycle is refused as a cycle, not as a
+/// taken target name, even though a cycle-closing target always already
+/// exists: the target is only created after the definition's own checks
+/// pass, so the error is about what's wrong with the definition.
+#[tokio::test]
+async fn a_cycle_closing_registration_reports_the_cycle_not_the_existing_target() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute("create table public.s (id bigint primary key, a numeric)")
+        .await
+        .expect("seed the source");
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM b FROM s SELECT a + a AS x",
+        &numeric(&["a"]),
+        "public",
+    )
+    .await
+    .expect("s -> b registers");
+    // Stand in for b's build finishing, so b is a valid upstream.
+    client
+        .execute(
+            "update transform_definitions set status = 'live' where target_table = 'public.b'",
+            &[],
+        )
+        .await
+        .expect("flip b live");
+
+    let err = install_definition(
+        &db.pool,
+        "TRANSFORM s FROM b SELECT x AS a",
+        &numeric(&["x"]),
+        "public",
+    )
+    .await
+    .expect_err("b -> s closes a cycle with s -> b");
+    assert!(
+        matches!(
+            &err,
+            CatalogError::Validate(trellis::defs::ValidationError::TableCycle { .. })
+        ),
+        "expected TableCycle, got {err:?}"
+    );
+    assert_eq!(
+        definition_count(&client).await,
+        1,
+        "only s -> b is registered"
+    );
 }
