@@ -1094,6 +1094,9 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     // paused by an earlier slot loss names them right away rather than a
     // minute in.
     let mut next_slot_loss_reminder = Instant::now();
+    // Issue #476: whether a fresh marker may pull the next reconcile pass
+    // forward. See [`early_pass_allowed`].
+    let mut early_pass = true;
 
     loop {
         if *shutdown_rx.borrow() {
@@ -1158,6 +1161,17 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 next_slot_loss_reminder =
                     Instant::now() + intake::slot_loss::SLOT_LOSS_REMINDER_INTERVAL;
             }
+            if !failed && early_pass && Instant::now() < next_reconcile {
+                // Issue #476: a marker nothing has fenced yet (a finished
+                // build's go-live catch-up, say) is discharged on this tick,
+                // not a whole `reconcile_interval` later.
+                let wanted = intake::publication::discharge_wanted(&*c).await;
+                match failures.check("discharge_wanted", wanted) {
+                    Ok(true) => next_reconcile = Instant::now(),
+                    Ok(false) => {}
+                    Err(_) => failed = true,
+                }
+            }
             if !failed && Instant::now() >= next_reconcile {
                 // A backfill enumeration can sit waiting for intake to catch
                 // up (issue #312), and intake is the first task shutdown
@@ -1166,6 +1180,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 // its definitions `waiting_to_backfill` for the next start
                 // (see `run_pending_backfills_until`).
                 let shutting_down = || *shutdown_rx.borrow();
+                let started = Instant::now();
                 let reconciled = reconcile_source_tables(
                     c,
                     &pool,
@@ -1179,6 +1194,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 failed = failures
                     .check("reconcile_source_tables", reconciled)
                     .is_err();
+                early_pass = early_pass_allowed(started.elapsed(), backfill_catch_up_timeout);
                 next_reconcile = Instant::now() + reconcile_interval;
             }
             if failed {
@@ -1195,6 +1211,23 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
             _ = tokio::time::sleep(interval) => {}
         }
     }
+}
+
+/// Whether [`maintenance_loop`] may run its next reconcile pass early, as
+/// soon as `intake::publication::discharge_wanted` finds a fresh marker
+/// (issue #476), given how long its last pass took.
+///
+/// A pass that took a whole `catch_up_timeout` spent it waiting: on a fresh
+/// fence that a long transaction elsewhere in the cluster holds open, or on
+/// intake. The loop is the only sealer, so it seals nothing meanwhile.
+/// Issue #431 bounds that stall to one timeout per pass, and passes used to
+/// come one `reconcile_interval` apart. Early passes don't, so markers
+/// parked one after another (a batch of builds finishing) behind such a
+/// transaction would each start a pass that waits it out, back to back, and
+/// sealing would all but stop. After a pass like that, the next one waits
+/// for the regular interval, as every pass did before #476.
+fn early_pass_allowed(last_pass: Duration, catch_up_timeout: Duration) -> bool {
+    last_pass < catch_up_timeout
 }
 
 /// How often [`StepFailures`] repeats the `warn` for a step that keeps
@@ -2498,6 +2531,18 @@ mod maintenance_failure_tests {
     use super::intake_supervisor_tests::{CapturedEvent, install_capture};
     use super::*;
 
+    /// Issue #476: a pass that ran out a whole catch-up timeout (a fence a
+    /// long transaction holds, or intake behind) sends the next one back to
+    /// the regular interval, so fresh markers can't start waiting passes back
+    /// to back while the loop seals nothing.
+    #[test]
+    fn a_pass_that_ran_out_its_timeout_suspends_early_passes() {
+        let timeout = Duration::from_secs(5);
+        assert!(early_pass_allowed(Duration::from_millis(40), timeout));
+        assert!(!early_pass_allowed(timeout, timeout));
+        assert!(!early_pass_allowed(Duration::from_secs(6), timeout));
+    }
+
     fn step_of(event: &CapturedEvent) -> Option<&str> {
         event.fields.get("step").map(|s| s.trim_matches('"'))
     }
@@ -2881,7 +2926,7 @@ mod backfill_chunk_claim_tests {
             .await
             .expect("read status")
             .get(0);
-        assert_eq!(status, "live");
+        assert_eq!(status, "catching_up", "the build finished");
     }
 }
 
