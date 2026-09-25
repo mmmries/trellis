@@ -91,7 +91,7 @@
 //!
 //! [`GroupPlan::force_full_recompute`]/[`apply_forced_groups_bulk`]'s
 //! live-`JOIN` machinery is **not** dead code, though: an **image-less**
-//! change (a bare recompute trigger — reverse propagation's own fallback
+//! change (a recompute trigger — reverse propagation's own fallback
 //! path for anything the issue #131 fast path doesn't cover, definition
 //! re-derive, backfill) still forces its group onto it below, for the exact
 //! reason the "Image-less changes" section below explains — no prior
@@ -125,13 +125,25 @@
 //! group's *every* field (not just the [`AggFieldKind::RecomputeOnly`] ones)
 //! is re-derived by probe in Phase 3, sidestepping the ambiguity at the cost
 //! of losing the delta's O(1)-per-touch cost for that one group, that one
-//! batch. **If the image-less change's live re-read finds the key already
-//! gone, there is no group to locate at all** (its prior group, if any, is
-//! unknowable) **and the change is dropped** — this module's own logic here
-//! is unchanged, and the gap is still real for a genuinely bare recompute
-//! trigger reaching an already-vanished key (reverse propagation, definition
-//! re-derive, or backfill racing a delete — not exercised by today's
-//! producers).
+//! batch.
+//!
+//! The live re-read only names the group the row is in *now*. The group it
+//! was in before, if different, is named only when the change carries a
+//! prior-image hint ([`FoldedChange::prior_image`], issue #315), so every
+//! producer whose recompute can follow a move between groups has to stage
+//! one. Two do: a target write's downstream propagation (the row's
+//! pre-write image, issue #315), and a to-one relationship's reverse
+//! fallback, `super::apply::stage_reverse_recompute_fallback`, which stages
+//! the from-side row with every `GROUP BY` relationship's pre-change value
+//! already spliced in (issue #516 — a renamed, deleted or inserted parent
+//! moves every row grouped by it; [`augment_row_with_forward_relationships`]
+//! keeps those values rather than re-resolving them from the
+//! already-advanced projections).
+//! Backfill, definition re-derive and the other reverse recomputes stage
+//! none. **If a hint-less change's live re-read finds the key already gone,
+//! there is no group to locate at all and the change is dropped**, leaving
+//! the group the key was in to the key's own delete (whose old image names
+//! it) — a real gap wherever a bare recompute trigger races a delete.
 //!
 //! Issue #180 closes this gap for the one producer that *can* know the prior
 //! state and previously threw it away: a chained aggregate's own upstream
@@ -1003,6 +1015,31 @@ fn forward_relationship_synthetic_column(rel: &str, column: &str) -> String {
     format!("__trellis_fwd_{rel}_{column}")
 }
 
+/// Issue #516: the key a relationship reverse fallback's `Recompute` prior
+/// image carries relationship `rel`'s `column` value under, as it stood
+/// before the parent change (see
+/// `super::apply::stage_reverse_recompute_fallback`).
+/// [`augment_row_with_forward_relationships`] takes a value found under it as
+/// given rather than resolving it from the projection, which has already
+/// moved on.
+///
+/// Every such key starts with [`PRE_CHANGE_RELATIONSHIP_PREFIX`], which is
+/// longer than any Postgres identifier (63 bytes), so no real column of a
+/// source row, CDC image or target row can carry it: only the fallback puts
+/// a value there. The forward synthetic name
+/// ([`forward_relationship_synthetic_column`]) has no such guarantee, since a
+/// table may have a column literally named `__trellis_fwd_...`.
+pub(super) fn pre_change_relationship_column(rel: &str, column: &str) -> String {
+    format!("{PRE_CHANGE_RELATIONSHIP_PREFIX}{rel}.{column}")
+}
+
+/// See [`pre_change_relationship_column`].
+const PRE_CHANGE_RELATIONSHIP_PREFIX: &str =
+    "__trellis_pre_change_relationship_value/longer_than_any_postgres_identifier/";
+
+// Postgres truncates an identifier to NAMEDATALEN - 1 = 63 bytes.
+const _: () = assert!(PRE_CHANGE_RELATIONSHIP_PREFIX.len() > 63);
+
 /// One resolved `<rel>.<column>` reference [`build_forward_relationship_shape`]
 /// rewrote into a synthetic `Column` — `from_col` is the from-row's own join
 /// key column (read fresh per row, per side, in
@@ -1014,6 +1051,8 @@ struct ForwardRelationshipSynthetic {
     from_col: String,
     to_col: String,
     synthetic: String,
+    /// [`pre_change_relationship_column`] for this reference (issue #516).
+    pre_change: String,
 }
 
 /// Issue #136's forward-path counterpart to [`super::apply`]'s
@@ -1103,6 +1142,7 @@ fn build_forward_relationship_shape(
                 from_col: join.from_col.clone(),
                 to_col: column.clone(),
                 synthetic: synthetic_name.clone(),
+                pre_change: pre_change_relationship_column(&join.name, column),
             });
             synthetic_map.insert(column.clone(), synthetic_name);
         }
@@ -1188,6 +1228,10 @@ fn group_by_row_columns(group_by: &[GroupByKey]) -> Vec<String> {
 /// augmented row, it just has no resolved value for this particular
 /// row/side.
 ///
+/// A value `row` carries under [`pre_change_relationship_column`] is taken
+/// as given (issue #516): only a reverse fallback's prior image carries one,
+/// holding the value the row read before its parent changed.
+///
 /// # Panics
 ///
 /// If `shape.synthetic` is non-empty but `rel_ctx` is `None` — see
@@ -1208,6 +1252,14 @@ fn augment_row_with_forward_relationships<'a>(
     );
     let mut augmented = row.clone();
     for s in synthetic {
+        // Issue #516: a reverse fallback's prior image already carries the
+        // value this row read before its parent changed. The projection has
+        // moved on to the new value by now, so resolving it again would name
+        // the row's current group, not the one it left.
+        if let Some(value) = row.get(&s.pre_change) {
+            augmented.insert(s.synthetic.clone(), value.clone());
+            continue;
+        }
         let value = row.get(&s.from_col).cloned().flatten().and_then(|key| {
             ctx.to_one(&s.rel_name)
                 .and_then(|r| r.to_rows_by_key.get(&key))
@@ -4844,6 +4896,59 @@ mod tests {
             accum.subs.is_empty(),
             "a plain insert has nothing to subtract"
         );
+    }
+
+    /// Issue #516: a row carrying a relationship's pre-change value (a
+    /// reverse fallback's prior image, holding the parent's value before it
+    /// changed) keeps it; any other row resolves it from the settled
+    /// projection, which already holds the new value. That includes a row
+    /// with a real column that happens to share the forward synthetic name:
+    /// only the out-of-band pre-change key counts.
+    #[test]
+    fn a_pre_change_relationship_value_is_not_resolved_again() {
+        use crate::defs::model::RelationshipCardinality;
+        let synthetic_name = forward_relationship_synthetic_column("buyer", "name");
+        let synthetic = vec![ForwardRelationshipSynthetic {
+            rel_name: "buyer".to_string(),
+            from_col: "user_id".to_string(),
+            to_col: "name".to_string(),
+            synthetic: synthetic_name.clone(),
+            pre_change: pre_change_relationship_column("buyer", "name"),
+        }];
+        let rel_ctx = eval::RelationshipContext::new(HashMap::from([(
+            "buyer".to_string(),
+            eval::ToOneRelationship {
+                from_col: "user_id".to_string(),
+                cardinality: RelationshipCardinality::ToOne,
+                to_columns: HashMap::from([("name".to_string(), ValueType::Text)]),
+                to_rows_by_key: HashMap::from([(
+                    "1".to_string(),
+                    Row::from([
+                        ("id".to_string(), Some("1".to_string())),
+                        ("name".to_string(), Some("c".to_string())),
+                    ]),
+                )]),
+            },
+        )]));
+        let live = Row::from([
+            ("id".to_string(), Some("10".to_string())),
+            ("user_id".to_string(), Some("1".to_string())),
+        ]);
+        let mut prior = live.clone();
+        prior.insert(
+            pre_change_relationship_column("buyer", "name"),
+            Some("a".to_string()),
+        );
+        let mut colliding = live.clone();
+        colliding.insert(synthetic_name.clone(), Some("a real column".to_string()));
+
+        let resolved = augment_row_with_forward_relationships(&live, Some(&rel_ctx), &synthetic);
+        assert_eq!(resolved.get(&synthetic_name), Some(&Some("c".to_string())));
+        let kept = augment_row_with_forward_relationships(&prior, Some(&rel_ctx), &synthetic);
+        assert_eq!(kept.get(&synthetic_name), Some(&Some("a".to_string())));
+        let not_kept =
+            augment_row_with_forward_relationships(&colliding, Some(&rel_ctx), &synthetic);
+        assert_eq!(not_kept.get(&synthetic_name), Some(&Some("c".to_string())));
     }
 
     /// A plan with `Sum`, `Avg`, `Count`, and `RecomputeOnly` fields over
