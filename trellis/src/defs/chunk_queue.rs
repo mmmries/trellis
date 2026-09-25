@@ -302,8 +302,114 @@ pub(crate) async fn dispatch_direct_build(
 /// never completes the definition, whose rebuild (the resume's own discharge,
 /// which may enqueue fresh chunks) owns its way back to `live`:
 /// [`release_chunk`]/[`reclaim_stale_chunks`]/[`finish_chunk`] discard it
-/// rather than freeing or completing it.
+/// rather than freeing or completing it. It writes nothing after the resume
+/// either ([`ClaimFence`]).
 const STALE: &str = "bc.fuse_rearmed_at is distinct from d.fuse_rearmed_at";
+
+/// The claim a drain worker holds on one chunk, which fences every target
+/// write the chunk makes (issue #434).
+///
+/// A chunk's write bypasses the target-mutation seam
+/// (`staging::target_mutations`), which is only safe while nothing reads the
+/// target: while its definition is still being built. A chunk a worker holds
+/// across a pause and a resume ([`STALE`]) would break that if its write
+/// could land once the resumed definition's rebuild has finished, since
+/// readers can attach from then on (`catching_up` is applying). A
+/// relationship declared on the target, or a definition reading it, would
+/// never hear of that write: when the source change it carries drains, apply
+/// finds the target already current, and changes and stages nothing.
+///
+/// So every target write runs in a transaction that first [`hold`]s the
+/// claim: it takes a `for key share` lock on the chunk's row and checks that
+/// the claim is still this worker's and not [`STALE`]. Resume locks each
+/// chunk a worker holds `for update` before it commits
+/// (`staging::quarantine::resume_transform`), so the two serialize:
+///
+/// - a write in flight when the resume arrives commits before the resume
+///   does, while the definition is still frozen, and the rebuild overwrites
+///   it;
+/// - a write that starts after the resume committed sees the chunk stale
+///   and writes nothing ([`BackfillError::Superseded`]).
+///
+/// No write of a chunk from before a resume lands after it, so a discarded
+/// chunk leaves nothing to repair. The fence also stops a worker whose claim
+/// was reclaimed from under it (its heartbeat stalled) from writing after the
+/// chunk's new holder has finished it.
+///
+/// `for key share` leaves the heartbeat's refresh of `claimed_at`
+/// ([`touch_chunk_claim`], a non-key update) free to run alongside the
+/// write, while the stale-claim sweep's `for update skip locked` passes the
+/// chunk over.
+///
+/// Both of those waits last only as long as the write, provided its worker
+/// keeps running. A worker that stalls inside the transaction (a frozen
+/// process, or a network partition the server hasn't noticed) would hold the
+/// lock until its session ended, which nothing else bounds. So [`hold`] sets
+/// the transaction's `idle_in_transaction_session_timeout` to the fleet's
+/// reclaim TTL first: the server ends a session left idle mid-transaction
+/// that long, releasing its locks, at the point the stale-claim sweep would
+/// have given up on the claim anyway.
+///
+/// [`hold`]: ClaimFence::hold
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClaimFence<'a> {
+    chunk_id: i64,
+    claimed_by: &'a str,
+    /// The fleet's reclaim TTL: how long the fenced transaction may sit idle
+    /// before the server ends its session.
+    idle_timeout: Duration,
+}
+
+impl ClaimFence<'_> {
+    /// Locks the claim for the rest of `txn` and returns whether it still
+    /// holds: the chunk is undone, still claimed by this worker, and not
+    /// [`STALE`]. The caller writes nothing in `txn` when it doesn't.
+    ///
+    /// Sets `txn`'s `idle_in_transaction_session_timeout` to the reclaim
+    /// TTL before it takes the lock. `set local` is enough: the server arms
+    /// that timer each time the session goes idle inside a transaction, from
+    /// the setting's value at that moment.
+    pub(crate) async fn hold(
+        &self,
+        txn: &impl GenericClient,
+    ) -> Result<bool, tokio_postgres::Error> {
+        // Zero would disable the timeout, and the setting is an `int` of
+        // milliseconds.
+        let idle_ms = self.idle_timeout.as_millis().clamp(1, i32::MAX as u128);
+        txn.batch_execute(&format!(
+            "set local idle_in_transaction_session_timeout = {idle_ms}"
+        ))
+        .await?;
+        let claimed = txn
+            .query_opt(
+                "select 1 from backfill_chunks \
+                 where id = $1 and claimed_by = $2 and not done for key share",
+                &[&self.chunk_id, &self.claimed_by],
+            )
+            .await?
+            .is_some();
+        if !claimed {
+            return Ok(false);
+        }
+        // A separate statement, so its snapshot is taken after the lock above
+        // was granted: a resume that held the chunk row has committed, and
+        // its `fuse_rearmed_at` stamp is visible here. Reading the definition
+        // row in the locking statement would miss it, since a lock wait
+        // re-checks only the rows the statement locks.
+        let stale: bool = txn
+            .query_one(
+                &format!(
+                    "select {STALE} from backfill_chunks bc \
+                     join transform_definitions d on d.id = bc.definition_id \
+                     where bc.id = $1"
+                ),
+                &[&self.chunk_id],
+            )
+            .await?
+            .get(0);
+        Ok(!stale)
+    }
+}
 
 /// Claims up to `limit` unclaimed, undone chunks for `claimed_by` in one
 /// statement — the backfill-chunk analogue of `staging::claim`/
@@ -401,8 +507,7 @@ pub async fn reclaim_stale_chunks(
     // `skip locked` on both tables: the sweep never waits, neither behind a
     // live claimant's in-flight write nor behind a pause, resume or
     // completion holding the definition row. A chunk skipped here is swept
-    // on a later pass. (Discarding a chunk parks a marker, which can still
-    // wait briefly on a concurrent park of the same table's marker row.)
+    // on a later pass.
     let rows = txn
         .query(
             &format!(
@@ -437,6 +542,15 @@ pub async fn release_chunk(
     claimed_by: &str,
 ) -> Result<u64, ChunkQueueError> {
     let txn = client.transaction().await?;
+    // The definition row first, then the chunk: the order resume takes them
+    // in (it locks a held chunk to wait out its write, issue #434), so the
+    // two can't deadlock.
+    txn.execute(
+        "select 1 from transform_definitions \
+         where id = (select definition_id from backfill_chunks where id = $1) for share",
+        &[&id],
+    )
+    .await?;
     let rows = txn
         .query(
             &format!(
@@ -551,11 +665,7 @@ pub async fn fail_chunk(
 /// chunk held across its definition's resume ([`STALE`]) is deleted
 /// instead (issue #360): resume discarded its unclaimed siblings and left
 /// this one only so its worker could finish it (#332), and running it again
-/// would redo work the resumed definition's rebuild already covers. Its
-/// worker's write may still have landed some of its range after that rebuild
-/// went live, so the catch-up marker the rerun's completion would have parked
-/// ([`super::catalog::complete_direct_backfill`]) is parked here instead,
-/// unless the definition is frozen again (its next resume parks its own).
+/// would redo work the resumed definition's rebuild already covers.
 ///
 /// The share lock is what makes `stale` trustworthy: resume holds the
 /// definition row `for update` while it deletes unclaimed chunks, so it runs
@@ -579,44 +689,19 @@ async fn free_or_discard_claims(
     discard_resumed_chunks(txn, &discard).await
 }
 
-/// Deletes the chunks `ids`, each held across its definition's resume, and
-/// parks the catch-up marker for each one's source unless its definition is
-/// frozen again (see [`free_or_discard_claims`] for why). The caller holds a
-/// lock on each chunk row and on its definition row.
+/// Deletes the chunks `ids`, each held across its definition's resume. It
+/// leaves nothing to repair: the chunk's writes all committed before the
+/// resume did, if at all ([`ClaimFence`]), and the resume's rebuild re-reads
+/// the source. The caller holds a lock on each chunk row and on its
+/// definition row.
 async fn discard_resumed_chunks(
     txn: &tokio_postgres::Transaction<'_>,
     ids: &[i64],
 ) -> Result<(), ChunkQueueError> {
-    if ids.is_empty() {
-        return Ok(());
+    if !ids.is_empty() {
+        txn.execute("delete from backfill_chunks where id = any($1)", &[&ids])
+            .await?;
     }
-    let discarded = txn
-        .query(
-            "delete from backfill_chunks bc using transform_definitions d \
-             where bc.id = any($1) and d.id = bc.definition_id \
-             returning d.source_table, d.status, d.id",
-            &[&ids],
-        )
-        .await?;
-    let mut sources = std::collections::BTreeSet::new();
-    let mut definitions = std::collections::BTreeSet::new();
-    for row in discarded {
-        let status_text: String = row.get(1);
-        let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-            panic!("transform_definitions.status held unrecognized value '{status_text}'")
-        });
-        if !status.is_frozen() {
-            sources.insert(row.get::<_, String>(0));
-            definitions.insert(row.get::<_, i64>(2));
-        }
-    }
-    // Issue #476: a rebuild that already went `live` is missing the repair
-    // until the marker discharges, so it reports `catching_up` until then.
-    let sources: Vec<String> = sources.into_iter().collect();
-    let definitions: Vec<i64> = definitions.into_iter().collect();
-    crate::intake::publication::park_catch_up(txn, &definitions, &sources)
-        .await
-        .map_err(CatalogError::from)?;
     Ok(())
 }
 
@@ -638,6 +723,9 @@ async fn discard_resumed_chunks(
 /// [`crate::client::Client`] pass its `ClientOptions::heartbeat`'s own
 /// interval, matching the same margin the ring's own
 /// [`crate::staging::HeartbeatDaemon`] keeps against `reclaim_ttl` there.
+/// `reclaim_ttl` is that fleet TTL: a worker that stalls inside one of the
+/// chunk's fenced write transactions loses its session after that long idle
+/// ([`ClaimFence`]).
 ///
 /// The target schema comes from the definition's own persisted, qualified
 /// `target_table` identity, never from the running worker's configuration
@@ -646,11 +734,18 @@ async fn discard_resumed_chunks(
 /// the table there. A chunk re-deriving it from whatever schema the worker
 /// happens to be configured with would write into the wrong (usually
 /// nonexistent) table. Same derivation `catalog::alter_transform` uses.
+///
+/// Every target write is fenced by the claim ([`ClaimFence`], issue #434).
+/// A chunk whose claim no longer holds, because its definition was resumed
+/// or the claim was reclaimed, stops before its next write and returns
+/// `Ok`: the caller's [`finish_chunk`] then discards it, or leaves it to its
+/// new holder.
 pub async fn run_claimed_chunk(
     pool: &Pool,
     chunk: &ClaimedChunk,
     claimed_by: &str,
     heartbeat_interval: Duration,
+    reclaim_ttl: Duration,
 ) -> Result<(), ChunkQueueError> {
     let definition = catalog::definition_by_id(pool, chunk.definition_id)
         .await?
@@ -671,23 +766,39 @@ pub async fn run_claimed_chunk(
         heartbeat_interval,
     );
 
-    match &chunk.work {
-        ChunkWork::Range { lo, hi } => {
-            backfill::execute_one_to_one_chunk(
-                pool,
-                &definition.def,
-                target_schema,
-                &definition.source_table,
-                lo.as_deref(),
-                hi,
-            )
-            .await?;
+    let fence = ClaimFence {
+        chunk_id: chunk.id,
+        claimed_by,
+        idle_timeout: reclaim_ttl,
+    };
+    let ran = match &chunk.work {
+        ChunkWork::Range { lo, hi } => backfill::execute_one_to_one_chunk(
+            pool,
+            &definition.def,
+            target_schema,
+            &definition.source_table,
+            lo.as_deref(),
+            hi,
+            fence,
+        )
+        .await
+        .map_err(ChunkQueueError::from),
+        ChunkWork::DirectBuild => run_direct_build(pool, &definition, target_schema, fence).await,
+    };
+    match ran {
+        // The fence stopped the write (issue #434). The caller's
+        // `finish_chunk` then discards a chunk held across a resume, and
+        // leaves one reclaimed from this worker to its new holder.
+        Err(ChunkQueueError::Backfill(BackfillError::Superseded)) => {
+            tracing::info!(
+                chunk_id = chunk.id,
+                definition_id = chunk.definition_id,
+                "backfill chunk superseded before its write; wrote nothing further"
+            );
+            Ok(())
         }
-        ChunkWork::DirectBuild => {
-            run_direct_build(pool, &definition, target_schema).await?;
-        }
+        ran => ran,
     }
-    Ok(())
 }
 
 /// Runs a [`ChunkWork::DirectBuild`] job: the whole direct set-based build
@@ -701,13 +812,15 @@ async fn run_direct_build(
     pool: &Pool,
     definition: &super::model::Definition,
     target_schema: &str,
+    fence: ClaimFence<'_>,
 ) -> Result<(), ChunkQueueError> {
-    backfill::backfill_definition(
+    backfill::backfill_definition_fenced(
         pool,
         &definition.def,
         target_schema,
         &definition.source_table,
         &definition.source_columns,
+        Some(fence),
     )
     .await?;
 
@@ -826,8 +939,8 @@ impl Drop for ChunkHeartbeat {
 /// #397).** The resumed definition goes live through its rebuild, which the
 /// resume's own discharge dispatches (fresh chunks, or a ring read). Completing
 /// it from a chunk of the superseded build would flip it `live` early. So a
-/// [`STALE`] chunk is discarded instead, parking the same catch-up marker its
-/// completion would have (see [`free_or_discard_claims`]). [`STALE`] is read
+/// [`STALE`] chunk is discarded instead (see [`free_or_discard_claims`]),
+/// with nothing to repair ([`ClaimFence`]). [`STALE`] is read
 /// under this function's `for update` lock on the definition row, which
 /// resume and the discharge's dispatch take too.
 pub async fn finish_chunk(
@@ -1117,9 +1230,9 @@ mod tests {
     }
 
     /// Issue #360, race 1 (write failed): a chunk held across the resume and
-    /// then released is discarded, not handed out again. Its failed write may
-    /// have committed part of its range, so the catch-up marker the rerun's
-    /// completion would have parked is parked here instead.
+    /// then released is discarded, not handed out again. Nothing is parked
+    /// for it: any part of its range its failed write committed landed before
+    /// the resume (issue #434), and the resume's own marker rebuilds it.
     #[tokio::test]
     async fn releasing_a_chunk_held_across_a_resume_discards_it() {
         let cluster = testkit::TestCluster::start();
@@ -1145,9 +1258,10 @@ mod tests {
                 .is_empty(),
             "nothing is claimable again"
         );
-        assert!(
-            marker_generation(&raw, "public.orders").await > parked,
-            "the catch-up the rerun would have parked is parked"
+        assert_eq!(
+            marker_generation(&raw, "public.orders").await,
+            parked,
+            "the discard parks nothing"
         );
     }
 
@@ -1178,9 +1292,10 @@ mod tests {
         assert_eq!(reclaimed, 2, "both stale claims are dealt with");
 
         assert_eq!(chunk_count(&raw, id).await, 0, "the chunk was discarded");
-        assert!(
-            marker_generation(&raw, "public.orders").await > parked,
-            "the catch-up the rerun would have parked is parked"
+        assert_eq!(
+            marker_generation(&raw, "public.orders").await,
+            parked,
+            "the discard parks nothing"
         );
         let reclaimable = claim_chunks(&raw, WORKER, 100).await.expect("claim");
         assert_eq!(
@@ -1197,8 +1312,8 @@ mod tests {
     /// too. A chunk held across the resume that finishes while the rebuild's
     /// own chunks are outstanding must not complete the definition, and must
     /// not keep the rebuild from completing: the rebuild's last chunk
-    /// completes it (`catching_up`, issue #476). The held chunk is retired and the catch-up its completion
-    /// would have parked is parked.
+    /// completes it (`catching_up`, issue #476). The held chunk is retired,
+    /// parking nothing.
     #[tokio::test]
     async fn a_chunk_held_across_a_resume_neither_completes_nor_blocks_the_rebuild() {
         let cluster = testkit::TestCluster::start();
@@ -1229,14 +1344,21 @@ mod tests {
             "backfilling",
             "the held chunk doesn't complete the rebuild"
         );
-        assert!(
-            marker_generation(&raw, "public.orders").await > parked,
-            "the catch-up the held chunk's completion would have parked is parked"
+        assert_eq!(
+            marker_generation(&raw, "public.orders").await,
+            parked,
+            "the discard parks nothing"
         );
 
-        run_claimed_chunk(&pool, &rebuild[0], WORKER, Duration::from_secs(5))
-            .await
-            .expect("run rebuild chunk");
+        run_claimed_chunk(
+            &pool,
+            &rebuild[0],
+            WORKER,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("run rebuild chunk");
         finish_chunk(&pool, &rebuild[0], WORKER)
             .await
             .expect("finish rebuild chunk");
@@ -1261,9 +1383,15 @@ mod tests {
             .expect("claim rebuild");
         assert_eq!(rebuild.len(), 1);
 
-        run_claimed_chunk(&pool, &rebuild[0], WORKER, Duration::from_secs(5))
-            .await
-            .expect("run rebuild chunk");
+        run_claimed_chunk(
+            &pool,
+            &rebuild[0],
+            WORKER,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("run rebuild chunk");
         finish_chunk(&pool, &rebuild[0], WORKER)
             .await
             .expect("finish rebuild chunk");
@@ -1361,9 +1489,15 @@ mod tests {
 
         let job = claim_chunks(&raw, WORKER, 10).await.expect("claim again");
         assert_eq!(job.len(), 1);
-        run_claimed_chunk(&pool, &job[0], WORKER, Duration::from_secs(5))
-            .await
-            .expect("run the job");
+        run_claimed_chunk(
+            &pool,
+            &job[0],
+            WORKER,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("run the job");
         finish_chunk(&pool, &job[0], WORKER)
             .await
             .expect("finish the job");
@@ -1418,9 +1552,15 @@ mod tests {
         dispatch_job(&pool, id, 2).await;
 
         let job = claim_chunks(&raw, WORKER, 10).await.expect("claim");
-        let error = run_claimed_chunk(&pool, &job[0], WORKER, Duration::from_secs(5))
-            .await
-            .expect_err("the build has no target to write");
+        let error = run_claimed_chunk(
+            &pool,
+            &job[0],
+            WORKER,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect_err("the build has no target to write");
         let given_up = fail_chunk(&pool, &job[0], WORKER, &error.to_string())
             .await
             .expect("fail the job");
@@ -1469,5 +1609,381 @@ mod tests {
         assert_eq!(status_of(&raw, id).await, "paused");
         assert_eq!(chunk_count(&raw, id).await, 0);
         assert_eq!(marker_generation(&raw, "public.orders").await, None);
+    }
+
+    /// Issue #434: a chunk held across a pause and a completed resume must
+    /// not write the target once the rebuild has finished. By then the
+    /// target is applying (`catching_up`, then `live`), so readers can attach
+    /// to it, here a relationship declared on it in that gap, and they only
+    /// learn of its changes through the target-mutation seam, which a
+    /// chunk's write bypasses.
+    ///
+    /// The source row changed after the rebuild read it, and its streamed
+    /// delta hasn't drained yet. Had the held chunk written the new value,
+    /// that delta's apply would find the target already current, write
+    /// nothing and stage nothing for the relationship's consumers, and so
+    /// would the discharge of the source's catch-up: they would keep the old
+    /// value for good.
+    #[tokio::test]
+    async fn a_chunk_held_across_a_completed_resume_writes_nothing() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
+        let held =
+            hold_a_chunk_across_a_resume(&pool, &raw, id, &def, "order_doubles", "public.orders")
+                .await;
+
+        // The resume's rebuild runs to completion around the held chunk.
+        dispatch(&pool, id, &def, "public.orders").await;
+        let rebuild = claim_chunks(&raw, "rebuild-worker", 100)
+            .await
+            .expect("claim rebuild");
+        assert_eq!(rebuild.len(), 1);
+        run_claimed_chunk(
+            &pool,
+            &rebuild[0],
+            "rebuild-worker",
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("run rebuild chunk");
+        finish_chunk(&pool, &rebuild[0], "rebuild-worker")
+            .await
+            .expect("finish rebuild chunk");
+        assert_eq!(status_of(&raw, id).await, "catching_up");
+
+        // A relationship on the rebuilt target, declared in the gap: the
+        // target is applying, so `create_relationship` accepts it.
+        raw.batch_execute(
+            "create table public.reports (id bigint primary key, oid bigint); \
+             alter table public.reports replica identity full; \
+             alter table public.order_doubles replica identity full; \
+             insert into public.reports values (1, 1)",
+        )
+        .await
+        .expect("seed the relationship's from-side");
+        catalog::create_relationship(
+            &pool,
+            "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
+        )
+        .await
+        .expect("declare a relationship on the rebuilt target");
+
+        // A source change whose streamed delta hasn't drained yet.
+        raw.execute("update public.orders set a = 100 where id = 1", &[])
+            .await
+            .expect("update the source");
+
+        run_claimed_chunk(
+            &pool,
+            &held,
+            WORKER,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("run the held chunk");
+        finish_chunk(&pool, &held, WORKER)
+            .await
+            .expect("finish the held chunk");
+
+        let x: i64 = raw
+            .query_one(
+                "select x::bigint from public.order_doubles where id = 1",
+                &[],
+            )
+            .await
+            .expect("read the target")
+            .get(0);
+        assert_eq!(
+            x, 2,
+            "the held chunk wrote the applying target outside the seam; only the \
+             delta's apply may move it, so its readers hear of the change"
+        );
+        assert_eq!(
+            chunk_count(&raw, id).await,
+            0,
+            "the held chunk is discarded"
+        );
+    }
+
+    /// Issue #434, for a direct-build job: a job held across a pause and a
+    /// resume writes nothing when it runs, and is discarded.
+    #[tokio::test]
+    async fn a_direct_build_job_held_across_a_resume_writes_nothing() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        let id = seed_waiting_aggregate(&pool, &raw, true).await;
+        dispatch_job(&pool, id, 0).await;
+        let held = claim_chunks(&raw, WORKER, 10).await.expect("claim");
+        assert_eq!(held.len(), 1);
+        pause_transform(&pool, "rollup").await.expect("pause");
+        resume_transform(&pool, "rollup").await.expect("resume");
+
+        run_claimed_chunk(
+            &pool,
+            &held[0],
+            WORKER,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("a superseded job is not a failure");
+        let rows: i64 = raw
+            .query_one("select count(*) from public.rollup", &[])
+            .await
+            .expect("count target rows")
+            .get(0);
+        assert_eq!(rows, 0, "the held job wrote nothing");
+
+        finish_chunk(&pool, &held[0], WORKER)
+            .await
+            .expect("finish the held job");
+        assert_eq!(chunk_count(&raw, id).await, 0, "the held job is discarded");
+        assert_eq!(status_of(&raw, id).await, "waiting_to_backfill");
+    }
+
+    /// The fence also covers a claim reclaimed from a worker that is still
+    /// running (its heartbeat stalled): that worker's late write lands
+    /// nowhere, whoever holds the chunk now.
+    #[tokio::test]
+    async fn a_worker_whose_claim_was_reclaimed_writes_nothing() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw) = connect(&db).await;
+        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
+        dispatch(&pool, id, &def, "public.orders").await;
+        let stalled = claim_chunks(&raw, "stalled-worker", 1)
+            .await
+            .expect("claim");
+        assert_eq!(stalled.len(), 1);
+        reclaim_stale_chunks(&mut raw, Duration::ZERO)
+            .await
+            .expect("reclaim");
+        let reclaimed = claim_chunks(&raw, WORKER, 1).await.expect("reclaim claim");
+        assert_eq!(reclaimed.len(), 1);
+
+        run_claimed_chunk(
+            &pool,
+            &stalled[0],
+            "stalled-worker",
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("a superseded chunk is not a failure");
+        let rows: i64 = raw
+            .query_one("select count(*) from public.order_doubles", &[])
+            .await
+            .expect("count target rows")
+            .get(0);
+        assert_eq!(rows, 0, "the stalled worker wrote nothing");
+    }
+
+    /// Issue #434: resume waits out a chunk write still in flight, so the
+    /// write commits before the resume does or not at all. The in-flight
+    /// write is stood in for by a transaction holding the chunk's fence, and
+    /// the resume runs under a short `lock_timeout` so its wait shows up as an
+    /// error instead of a hang.
+    #[tokio::test]
+    async fn a_resume_waits_out_a_chunk_write_in_flight() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw) = connect(&db).await;
+        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
+        dispatch(&pool, id, &def, "public.orders").await;
+        let held = claim_chunks(&raw, WORKER, 1).await.expect("claim");
+        assert_eq!(held.len(), 1);
+        pause_transform(&pool, "order_doubles")
+            .await
+            .expect("pause");
+        let fence = ClaimFence {
+            chunk_id: held[0].id,
+            claimed_by: WORKER,
+            idle_timeout: Duration::from_secs(60),
+        };
+
+        let impatient = Pool::new(
+            &crate::config::Config::from_dsn(format!("{} options='-c lock_timeout=100'", db.dsn()))
+                .expect("valid dsn"),
+        )
+        .expect("pool");
+        let writing = raw.transaction().await.expect("begin");
+        assert!(fence.hold(&writing).await.expect("hold"), "the claim holds");
+        let err = resume_transform(&impatient, "order_doubles")
+            .await
+            .expect_err("the resume waits for the write in flight");
+        assert!(
+            err.to_string().contains("lock timeout"),
+            "the resume timed out waiting for the chunk's lock, got: {err}"
+        );
+        writing.commit().await.expect("the write commits");
+        assert_eq!(status_of(&raw, id).await, "paused");
+
+        resume_transform(&impatient, "order_doubles")
+            .await
+            .expect("resume once the write is done");
+        let writing = raw.transaction().await.expect("begin");
+        assert!(
+            !fence.hold(&writing).await.expect("hold"),
+            "a write after the resume is fenced out"
+        );
+    }
+
+    /// Issue #434: a write that reaches its fence while a resume holds the
+    /// chunk's row waits for the resume to commit, and then sees it. The
+    /// staleness check is a statement of its own for exactly this: in the
+    /// locking statement, the lock wait would re-check only the chunk row,
+    /// against a definition row read before the resume committed.
+    ///
+    /// The real resume is held after it has locked the chunk (at its marker
+    /// park, behind a table lock the test holds), so the fence arrives while
+    /// the chunk's row is locked, not before or after.
+    #[tokio::test]
+    async fn a_fence_that_waited_out_a_resume_sees_it() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
+        dispatch(&pool, id, &def, "public.orders").await;
+        let held = claim_chunks(&raw, WORKER, 1).await.expect("claim");
+        assert_eq!(held.len(), 1);
+        pause_transform(&pool, "order_doubles")
+            .await
+            .expect("pause");
+
+        let mut blocker = pool.get().await.expect("blocker connection");
+        let blocking = blocker.transaction().await.expect("begin");
+        blocking
+            .batch_execute("lock table pending_backfill in exclusive mode")
+            .await
+            .expect("hold the resume at its marker park");
+        let resuming = tokio::spawn({
+            let pool = pool.clone();
+            async move { resume_transform(&pool, "order_doubles").await }
+        });
+        let wait_for_lock_waiters = async |n: i64| {
+            for _ in 0..500 {
+                let waiting: i64 = raw
+                    .query_one(
+                        "select count(*) from pg_stat_activity \
+                         where datname = current_database() and wait_event_type = 'Lock'",
+                        &[],
+                    )
+                    .await
+                    .expect("read pg_stat_activity")
+                    .get(0);
+                if waiting == n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("never saw {n} lock waiters");
+        };
+        wait_for_lock_waiters(1).await;
+        let fenced = tokio::spawn({
+            let pool = pool.clone();
+            let chunk_id = held[0].id;
+            async move {
+                let mut client = pool.get().await.expect("connection");
+                let txn = client.transaction().await.expect("begin");
+                let fence = ClaimFence {
+                    chunk_id,
+                    claimed_by: WORKER,
+                    idle_timeout: Duration::from_secs(60),
+                };
+                fence.hold(&*txn).await.expect("hold")
+            }
+        });
+        wait_for_lock_waiters(2).await;
+
+        blocking.commit().await.expect("release the resume");
+        resuming.await.expect("join").expect("resume");
+        assert!(
+            !fenced.await.expect("join"),
+            "a fence that waited for the resume's lock sees the resume"
+        );
+    }
+
+    /// A worker that stalls inside a fenced write transaction loses its
+    /// session once it has sat idle for the reclaim TTL, so its lock can't
+    /// keep a resume waiting or the chunk from being reclaimed past the point
+    /// the stale-claim sweep would have given up on it anyway. The stalled
+    /// worker is a transaction that holds the fence and then does nothing,
+    /// under a 200 ms TTL.
+    #[tokio::test]
+    async fn a_fenced_transaction_left_idle_past_the_reclaim_ttl_loses_its_lock() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw) = connect(&db).await;
+        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
+        dispatch(&pool, id, &def, "public.orders").await;
+        let held = claim_chunks(&raw, WORKER, 1).await.expect("claim");
+        assert_eq!(held.len(), 1);
+        let fence = ClaimFence {
+            chunk_id: held[0].id,
+            claimed_by: WORKER,
+            idle_timeout: Duration::from_millis(200),
+        };
+
+        let (_, mut stalled) = connect(&db).await;
+        let stalled_pid: i32 = stalled
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("read the stalled session's pid")
+            .get(0);
+        let writing = stalled.transaction().await.expect("begin");
+        assert!(fence.hold(&writing).await.expect("hold"), "the claim holds");
+        assert_eq!(
+            reclaim_stale_chunks(&mut raw, Duration::ZERO)
+                .await
+                .expect("reclaim"),
+            0,
+            "the sweep passes over a chunk whose write holds its fence"
+        );
+
+        // Waits for the server to end the idle session, not for a duration.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let alive: bool = raw
+                .query_one(
+                    "select exists (select 1 from pg_stat_activity where pid = $1)",
+                    &[&stalled_pid],
+                )
+                .await
+                .expect("read pg_stat_activity")
+                .get(0);
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the idle fenced transaction was never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            reclaim_stale_chunks(&mut raw, Duration::ZERO)
+                .await
+                .expect("reclaim"),
+            1,
+            "with the session gone, the claim is reclaimed"
+        );
+        assert_eq!(
+            claim_chunks(&raw, "next-worker", 1)
+                .await
+                .expect("claim again")
+                .len(),
+            1,
+            "and the chunk can be claimed again"
+        );
+        assert!(
+            writing.commit().await.is_err(),
+            "the stalled worker's transaction is gone with its session"
+        );
     }
 }
