@@ -890,8 +890,7 @@ mod tests {
         let raw = session(db.dsn()).await;
         let def = catalog_definition(&raw, "live").await;
         raw.execute(
-            "insert into pending_backfill (table_name, fence_snapshot) \
-             values ($1, pg_current_snapshot())",
+            "insert into pending_backfill (table_name) values ($1)",
             &[&SOURCE],
         )
         .await
@@ -944,8 +943,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
             engine
                 .execute(
-                    "insert into pending_backfill (table_name, fence_snapshot) \
-                     values ($1, pg_current_snapshot())",
+                    "insert into pending_backfill (table_name) values ($1)",
                     &[&SOURCE],
                 )
                 .await
@@ -984,8 +982,7 @@ mod tests {
         let raw = session(db.dsn()).await;
         let def = catalog_definition(&raw, "live").await;
         raw.execute(
-            "insert into pending_backfill (table_name, fence_snapshot) \
-             values ($1, pg_current_snapshot())",
+            "insert into pending_backfill (table_name) values ($1)",
             &[&SOURCE],
         )
         .await
