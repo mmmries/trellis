@@ -48,7 +48,7 @@ use crate::streaming::chain::{
 use crate::streaming::load::{Pace, ParallelLoad, generator_bound, run_parallel_load};
 use crate::streaming::rate::{
     COUNTER_SAMPLE_INTERVAL, InWindowRate, in_window_rate, json_in_window, kept_target_rate,
-    progress_step_secs, sample_progress,
+    progress_step_secs, restaged_in_window, sample_progress,
 };
 use crate::streaming::scrape::{
     CHANGES_APPLIED_METRIC, END_TO_END_LATENCY_METRIC, HistogramSnapshot, LE_MAX, LE_P50, LE_P99,
@@ -105,8 +105,11 @@ pub struct ThroughputProbe {
     /// ([`in_window_rate`]).
     pub in_window_applied: Option<InWindowRate>,
     /// This probe's verdict: `drained` **and** `in_window_applied` within its
-    /// tolerance of the offered rate ([`kept_target_rate`]). Only meaningful
-    /// when `generator_bound` is false.
+    /// tolerance of the offered rate, **and** `changes_applied` agrees with
+    /// `rows_issued` ([`probe_kept_target_rate`]). Only meaningful when
+    /// `generator_bound` is false. A probe that fails only on the counter
+    /// ([`ThroughputProbe::counter_disagrees`]) is void rather than slow, and
+    /// doesn't stop a ramp ([`ThroughputProbe::stops_ramp`]).
     pub kept_target_rate: bool,
     pub e2e_count: u64,
     pub e2e_p50_bucket_frac: f64,
@@ -116,6 +119,22 @@ pub struct ThroughputProbe {
 }
 
 impl ThroughputProbe {
+    /// The counter the in-window rate is fitted from disagrees with the rows
+    /// committed ([`counter_disagrees`]): this probe's rate went unmeasured,
+    /// and the run fails on it.
+    pub fn counter_disagrees(&self) -> bool {
+        counter_disagrees(self.drained, self.changes_applied, self.rows_issued)
+    }
+
+    /// This probe measurably failed its target rate, so a ramp stops here
+    /// ([`run_ramp`]). A void probe ([`Self::counter_disagrees`]) reads
+    /// `kept_target_rate: false` but doesn't stop the ramp: it measured
+    /// nothing, and every probe runs on a fresh cluster, so one re-staged
+    /// window mustn't cut the ramp short below the real knee.
+    pub fn stops_ramp(&self) -> bool {
+        !self.kept_target_rate && !self.counter_disagrees()
+    }
+
     pub fn to_json(&self, scenario: &str) -> String {
         format!(
             "{{\"scenario\":\"{}\",\"target_rows_per_sec\":{},\"rows_per_commit\":{},\
@@ -304,11 +323,13 @@ pub async fn run_probe(
     let backlog = load.rows_issued as i64 - landed;
     let achieved_rows_per_sec = load.achieved_rows_per_sec();
     let drained = backlog <= 0;
-    let kept = kept_target_rate(
+    let kept = probe_kept_target_rate(
         drained,
         in_window_applied,
         target_rows_per_sec,
         achieved_rows_per_sec,
+        changes_applied,
+        load.rows_issued,
     );
     ThroughputProbe {
         target_rows_per_sec,
@@ -332,10 +353,48 @@ pub async fn run_probe(
     }
 }
 
-/// Ramps through `candidate_rates` (ascending) until a probe fails to keep
-/// the target rate ([`ThroughputProbe::kept_target_rate`]), or the list is
-/// exhausted. Returns every probe run, in order: [`knee`] is the candidate
-/// knee, and a trailing `kept_target_rate: false` one the rate that broke it.
+/// The #266 metric cross-check: a drained probe landed every committed row,
+/// so the counter must have counted every one. A shortfall means the counter,
+/// and with it the in-window rate fitted from it, missed rows.
+pub fn counter_short_of_drain(drained: bool, changes_applied: u64, rows_issued: u64) -> bool {
+    drained && changes_applied < rows_issued
+}
+
+/// The counter the in-window rate is fitted from disagrees with the rows
+/// committed, in either direction ([`counter_short_of_drain`],
+/// [`restaged_in_window`]). Either one fails the run.
+pub fn counter_disagrees(drained: bool, changes_applied: u64, rows_issued: u64) -> bool {
+    counter_short_of_drain(drained, changes_applied, rows_issued)
+        || restaged_in_window(changes_applied, rows_issued)
+}
+
+/// A throughput probe's verdict: [`kept_target_rate`], unless the counter
+/// the in-window rate is fitted from disagrees with the rows committed
+/// ([`counter_disagrees`]). That fails the run, and a probe whose JSON said
+/// `kept_target_rate: true` under a failed exit status would be read as a
+/// pass by anything consuming the JSON alone (#509).
+pub fn probe_kept_target_rate(
+    drained: bool,
+    in_window_applied: Option<InWindowRate>,
+    target_rows_per_sec: f64,
+    achieved_rows_per_sec: f64,
+    changes_applied: u64,
+    rows_issued: u64,
+) -> bool {
+    kept_target_rate(
+        drained,
+        in_window_applied,
+        target_rows_per_sec,
+        achieved_rows_per_sec,
+    ) && !counter_disagrees(drained, changes_applied, rows_issued)
+}
+
+/// Ramps through `candidate_rates` (ascending) until a probe measurably fails
+/// to keep the target rate ([`ThroughputProbe::stops_ramp`]), or the list is
+/// exhausted. A void probe, whose counter disagreed with its rows, is kept in
+/// the list and fails the run, but the ramp steps past it. Returns every
+/// probe run, in order: [`knee`] is the candidate knee, and a trailing probe
+/// that [`stops_ramp`](ThroughputProbe::stops_ramp) the rate that broke it.
 pub async fn run_ramp(
     candidate_rates: &[f64],
     offer: Offer,
@@ -346,9 +405,9 @@ pub async fn run_ramp(
         let rows_per_commit =
             ((target_rows_per_sec / RAMP_COMMITS_PER_SEC).round() as usize).max(1);
         let probe = run_probe(rows_per_commit, RAMP_COMMITS_PER_SEC, offer, tuning).await;
-        let kept = probe.kept_target_rate;
+        let stop = probe.stops_ramp();
         probes.push(probe);
-        if !kept {
+        if stop {
             break;
         }
     }
