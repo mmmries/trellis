@@ -775,6 +775,15 @@ async fn key_column_pg_type(
     column: &str,
 ) -> Result<Option<String>, ApplyError> {
     let client = pool.get().await?;
+    key_column_pg_type_in(&**client, table, column).await
+}
+
+/// [`key_column_pg_type`] on an already-held connection (Phase 3's `txn`).
+async fn key_column_pg_type_in(
+    client: &impl GenericClient,
+    table: &str,
+    column: &str,
+) -> Result<Option<String>, ApplyError> {
     let row = client
         .query_opt(
             "select pg_catalog.format_type(a.atttypid, a.atttypmod) \
@@ -1437,10 +1446,9 @@ pub(crate) struct ReverseRelationshipShape {
     /// relationship changes in the same batch. Empty whenever
     /// `group_by_columns` is.
     group_by_siblings: Vec<GroupBySibling>,
-    /// Set when the relationship's to-side is one of this instance's own
-    /// targets, fed to this reverse path by the target-mutation seam (issue
-    /// #507, [`to_side_superseded`]).
-    seam_fed_to_side: Option<SeamFedToSide>,
+    /// The relationship's to-side, read by key for the live-row check
+    /// ([`superseded_to_side`]).
+    to_side: ToSide,
 }
 
 /// One other to-one relationship a [`ReverseRelationshipShape`]'s fallback
@@ -1458,15 +1466,42 @@ struct GroupBySibling {
     columns: Vec<String>,
 }
 
-/// A relationship to-side that is one of this instance's own targets (issue
-/// #507): what Phase 3 needs to read its live row by key.
+/// A relationship's to-side as Phase 3 reads its live row by key (issues
+/// #507, #531).
 #[derive(Debug)]
-struct SeamFedToSide {
+struct ToSide {
     /// The to-side table, quoted and qualified for direct interpolation.
     table: String,
+    /// Whether the to-side is one of this instance's own targets, fed to
+    /// the reverse path by the target-mutation seam (issue #507), so every
+    /// record on it takes the live-row check. A source to-side's record
+    /// takes it only at or below the relationship's refresh stamp (issue
+    /// #531, [`overtaken_by_refresh`]).
+    seam_fed: bool,
     /// `to_col`'s type ([`key_column_pg_type`]), so the lookup by key can
-    /// use the to-side's own unique index on it.
-    key_pg_type: Option<String>,
+    /// use the to-side's own unique index on it. Resolved in Phase 3 by the
+    /// first record that takes the live-row check, so a batch where none
+    /// does never reads it.
+    key_pg_type: std::sync::OnceLock<Option<String>>,
+}
+
+impl ToSide {
+    /// The `where` condition matching the to-side row whose `to_col` is
+    /// `$1` (text), aliased `t`.
+    async fn key_filter(&self, txn: &Transaction<'_>, to_col: &str) -> Result<String, ApplyError> {
+        let key_pg_type = match self.key_pg_type.get() {
+            Some(ty) => ty,
+            None => {
+                let ty = key_column_pg_type_in(txn, &self.table, to_col).await?;
+                self.key_pg_type.get_or_init(|| ty)
+            }
+        };
+        let key_ident = quote_ident(to_col);
+        Ok(match key_pg_type {
+            Some(ty) => format!("t.{key_ident} = $1::text::{ty}"),
+            None => format!("t.{key_ident}::text = $1"),
+        })
+    }
 }
 
 /// One aggregate target's issue #131 fast-path shape: everything needed to
@@ -1958,16 +1993,14 @@ async fn build_reverse_relationship_shape(
     let (group_by_columns, group_by_siblings) =
         group_by_relationships(pool, rel, &qualified_from_table, &defs).await?;
     let qualified_to_table = rel.qualified_to_table();
-    let to_side_is_target = {
+    let seam_fed = {
         let client = pool.get().await?;
         catalog::is_definition_target(&**client, &qualified_to_table).await?
     };
-    let seam_fed_to_side = if to_side_is_target {
-        let table = ddl::qualified_source_table(&qualified_to_table);
-        let key_pg_type = key_column_pg_type(pool, &table, &rel.def.to_col).await?;
-        Some(SeamFedToSide { table, key_pg_type })
-    } else {
-        None
+    let to_side = ToSide {
+        table: ddl::qualified_source_table(&qualified_to_table),
+        seam_fed,
+        key_pg_type: std::sync::OnceLock::new(),
     };
 
     Ok(ReverseRelationshipShape {
@@ -1984,7 +2017,7 @@ async fn build_reverse_relationship_shape(
         needs_recompute_fallback,
         group_by_columns,
         group_by_siblings,
-        seam_fed_to_side,
+        to_side,
     })
 }
 
@@ -3323,47 +3356,74 @@ async fn apply_projection_advance(
     Ok(())
 }
 
-/// Issue #507: whether a reverse record on a seam-fed to-side (one of this
-/// instance's own targets) carries images its to-side has since moved past
-/// by a write that no later seam row will bring: the live row for its new
-/// key no longer equals its new image, or a row it deleted (or moved off
-/// `old_key`) is back.
+/// Issue #531: whether a reverse record at `lsn` on a source to-side may
+/// carry images the relationship's last projection refresh overtook: the
+/// refresh stamped the relationship at `stamp`
+/// (`relationship_projections.refreshed_lsn`, read `for share` by Phase 3),
+/// and the record's change is at or below it. A record above the stamp, or
+/// on a relationship never refreshed, applies its images unchecked, so the
+/// steady state pays no live-row read. A record with no `lsn` (never staged
+/// by CDC for a source to-side) is checked whenever a stamp exists.
+fn overtaken_by_refresh(lsn: Option<PgLsn>, stamp: Option<PgLsn>) -> bool {
+    match (lsn, stamp) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(lsn), Some(stamp)) => lsn <= stamp,
+    }
+}
+
+/// Issue #531: whether a to-side `TRUNCATE` at `lsn` is one the
+/// relationship's last projection refresh (stamped at `stamp`) already read,
+/// so clearing the projection for it would drop what the refresh found
+/// written after it. The refresh holds `ACCESS SHARE` on the to-side from its
+/// first read until it commits, so a truncate either committed before that
+/// read (and its commit is at or below the stamp) or waits for the refresh
+/// to commit (and lands above it). Unlike [`overtaken_by_refresh`], a
+/// truncate with no `lsn` is never treated as read: skipping a clear is not
+/// the conservative choice.
+fn truncate_overtaken_by_refresh(lsn: Option<PgLsn>, stamp: Option<PgLsn>) -> bool {
+    matches!((lsn, stamp), (Some(lsn), Some(stamp)) if lsn <= stamp)
+}
+
+/// Issues #507/#531: whether a reverse record carries images its to-side has
+/// since moved past by a write that no later record will bring: the live row
+/// for its new key no longer equals its new image, or a row it deleted (or
+/// moved off `old_key`) is back.
 ///
-/// A source to-side is fed by CDC, which carries every write, so its last
-/// image for a key is always the key's latest state and the projection
-/// follows its images. A target to-side is fed by the target-mutation seam,
-/// which a resumed definition's rebuild bypasses. That rebuild's changes
-/// reach the projection through its go-live catch-up instead
-/// (`catalog::refresh_relationship_projections_in_txn`), and a seam row
-/// staged before the rebuild but drained after that refresh would put the
-/// pre-rebuild image back, with nothing after it to correct it. So a record
-/// whose images the live row contradicts writes the projection from the live
-/// row ([`apply_projection_from_live`]) and re-derives its from-side rows
-/// with the image-less fallback, never a delta from images that no longer
-/// hold. A record that merely lags a newer seam write to the same key (both
-/// rows pending in different segments) lands here too. That is correct as
-/// well, since the newer row finds the projection already at its image, but
-/// it costs an aggregate consumer the delta fast path for that record. Only
-/// a to-side that is one of this instance's targets pays the extra keyed
-/// read.
+/// A to-side's records carry every write the projection hears about, so the
+/// projection normally follows their images. Two kinds of write reach it only
+/// through a refresh from the to-side's rows
+/// (`catalog::refresh_relationship_projections_in_txn`), and a record
+/// staged before that refresh but drained after it would put an older image
+/// back with nothing after it to correct it. For a target to-side (fed by
+/// the target-mutation seam) that is a resumed definition's rebuild, which
+/// bypasses the seam. For a source to-side it is a change whose CDC was lost
+/// after the pending record's (a table out of the publication, or a lost
+/// slot), which the refresh read and no record carries. So a record whose
+/// images the live row contradicts writes the projection from the live row
+/// ([`apply_projection_from_live`]) and re-derives its from-side rows with
+/// the image-less fallback, never a delta from images that no longer hold. A
+/// record that merely lags a newer write to the same key (both pending in
+/// different segments) lands here too. That is correct as well, since the
+/// newer record finds the projection already at its image, but it costs an
+/// aggregate consumer the delta fast path for that record.
+///
+/// Every record on a target to-side pays this keyed read. A source
+/// to-side's record pays it only at or below the relationship's refresh
+/// stamp ([`overtaken_by_refresh`]).
 async fn to_side_superseded(
     txn: &Transaction<'_>,
     shape: &ReverseRelationshipShape,
-    to_side: &SeamFedToSide,
     to_side_columns: &[String],
     old_key: &Option<String>,
     new_key: &Option<String>,
     new_image: Option<&str>,
 ) -> Result<bool, ApplyError> {
-    let key_ident = quote_ident(&shape.to_col);
-    let filter = match &to_side.key_pg_type {
-        Some(ty) => format!("t.{key_ident} = $1::text::{ty}"),
-        None => format!("t.{key_ident}::text = $1"),
-    };
+    let filter = shape.to_side.key_filter(txn, &shape.to_col).await?;
     let doc = row_as_text_jsonb_sql("t", to_side_columns);
     let sql = format!(
         "select ({doc}) is not distinct from $2::text::jsonb from {} t where {filter}",
-        to_side.table
+        shape.to_side.table
     );
     // The live row for `key` equals `image`, or is absent when `image` is.
     let holds = async |key: &str, image: Option<&str>| -> Result<bool, ApplyError> {
@@ -3387,32 +3447,64 @@ async fn to_side_superseded(
     Ok(false)
 }
 
-/// `record`'s seam-fed to-side when [`to_side_superseded`] finds its images
-/// stale, else `None` (always `None` for a to-side that isn't a target).
-async fn superseded_to_side<'r>(
+/// Whether [`to_side_superseded`] finds `record`'s images stale, checked
+/// only for a record that may be stale: every record on a seam-fed to-side,
+/// and one on a source to-side at or below its relationship's refresh stamp
+/// in `refresh_stamps` ([`overtaken_by_refresh`]).
+async fn superseded_to_side(
     txn: &Transaction<'_>,
     row_columns_cache: &mut HashMap<String, Vec<String>>,
-    record: &'r RelationshipReverseRecord,
+    refresh_stamps: &HashMap<i64, PgLsn>,
+    record: &RelationshipReverseRecord,
     old_key: &Option<String>,
     new_key: &Option<String>,
-) -> Result<Option<&'r SeamFedToSide>, ApplyError> {
-    let Some(to_side) = &record.shape.seam_fed_to_side else {
-        return Ok(None);
-    };
-    let columns = cached_row_columns(txn, row_columns_cache, &to_side.table)
+) -> Result<bool, ApplyError> {
+    let shape = &record.shape;
+    if !shape.to_side.seam_fed
+        && !overtaken_by_refresh(record.lsn, refresh_stamps.get(&shape.id).copied())
+    {
+        return Ok(false);
+    }
+    let columns = cached_row_columns(txn, row_columns_cache, &shape.to_side.table)
         .await?
         .to_vec();
-    let stale = to_side_superseded(
+    to_side_superseded(
         txn,
-        &record.shape,
-        to_side,
+        shape,
         &columns,
         old_key,
         new_key,
         record.new_image.as_deref(),
     )
-    .await?;
-    Ok(stale.then_some(to_side))
+    .await
+}
+
+/// Issue #531: each of `relationship_ids`' refresh stamp
+/// (`relationship_projections.refreshed_lsn`), keyed by `relationship_id`,
+/// read under a `for share` lock taken in `relationship_id` order. A
+/// relationship never refreshed has no entry. No query at all when
+/// `relationship_ids` is empty.
+async fn relationship_refresh_stamps(
+    txn: &Transaction<'_>,
+    relationship_ids: impl Iterator<Item = i64>,
+) -> Result<HashMap<i64, PgLsn>, ApplyError> {
+    let mut ids: Vec<i64> = relationship_ids.collect();
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let rows = txn
+        .query(
+            "select relationship_id, refreshed_lsn from relationship_projections \
+             where relationship_id = any($1) order by relationship_id for share",
+            &[&ids],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| Some((row.get::<_, i64>(0), row.get::<_, Option<PgLsn>>(1)?)))
+        .collect())
 }
 
 /// [`apply_projection_advance`] for a record [`to_side_superseded`] found
@@ -3424,7 +3516,6 @@ async fn superseded_to_side<'r>(
 async fn apply_projection_from_live(
     txn: &Transaction<'_>,
     shape: &ReverseRelationshipShape,
-    to_side: &SeamFedToSide,
     old_key: &Option<String>,
     new_key: &Option<String>,
     lsn: Option<PgLsn>,
@@ -3432,11 +3523,9 @@ async fn apply_projection_from_live(
     if shape.qualified_projection.is_empty() {
         return Ok(());
     }
+    let to_side = &shape.to_side;
     let key_ident = quote_ident(&shape.to_col);
-    let filter = match &to_side.key_pg_type {
-        Some(ty) => format!("t.{key_ident} = $1::text::{ty}"),
-        None => format!("t.{key_ident}::text = $1"),
-    };
+    let filter = to_side.key_filter(txn, &shape.to_col).await?;
     let data_columns = projection_data_columns(
         txn,
         &shape.projection_schema,
@@ -4685,6 +4774,47 @@ mod tests {
         );
     }
 
+    /// Issue #531: only a record at or below its relationship's refresh
+    /// stamp takes the live-row check. A relationship never refreshed, or a
+    /// record above the stamp (every change after the refresh), reads
+    /// nothing extra.
+    #[test]
+    fn only_a_record_at_or_below_the_refresh_stamp_is_overtaken() {
+        let stamp = PgLsn::from(0x2000);
+        assert!(!overtaken_by_refresh(Some(PgLsn::from(0x1000)), None));
+        assert!(!overtaken_by_refresh(None, None));
+        assert!(!overtaken_by_refresh(
+            Some(PgLsn::from(0x2001)),
+            Some(stamp)
+        ));
+        assert!(overtaken_by_refresh(Some(stamp), Some(stamp)));
+        assert!(overtaken_by_refresh(Some(PgLsn::from(0x1000)), Some(stamp)));
+        assert!(overtaken_by_refresh(None, Some(stamp)));
+    }
+
+    /// Issue #531: a to-side truncate's projection clear is skipped only
+    /// when the truncate is at or below the refresh stamp. With no stamp, or
+    /// no `lsn` to compare, the clear runs.
+    #[test]
+    fn only_a_truncate_at_or_below_the_refresh_stamp_skips_its_clear() {
+        let stamp = PgLsn::from(0x2000);
+        assert!(!truncate_overtaken_by_refresh(
+            Some(PgLsn::from(0x1000)),
+            None
+        ));
+        assert!(!truncate_overtaken_by_refresh(None, None));
+        assert!(!truncate_overtaken_by_refresh(None, Some(stamp)));
+        assert!(!truncate_overtaken_by_refresh(
+            Some(PgLsn::from(0x2001)),
+            Some(stamp)
+        ));
+        assert!(truncate_overtaken_by_refresh(Some(stamp), Some(stamp)));
+        assert!(truncate_overtaken_by_refresh(
+            Some(PgLsn::from(0x1000)),
+            Some(stamp)
+        ));
+    }
+
     /// Issue #125 regression pin, part 1: [`key_array_filter`] renders the
     /// fixed, indexable shape — the bound `$1` array cast to the column's
     /// own type, the column reference itself left uncast — when the
@@ -5262,7 +5392,20 @@ pub struct ApplyPlan {
     /// [`ApplyPlan::aggregate_clears`]. See the `compute` truncate loop's
     /// own comment on why this can't reuse [`ApplyPlan::relationship_reverses`]
     /// (a `TRUNCATE`'s sentinel carries no image to upsert or delete with).
-    relationship_projection_clears: std::collections::HashSet<String>,
+    /// Keyed by `relationship_id`.
+    relationship_projection_clears: std::collections::BTreeMap<i64, RelationshipProjectionClear>,
+}
+
+/// One entry of [`ApplyPlan::relationship_projection_clears`].
+#[derive(Debug, Clone)]
+struct RelationshipProjectionClear {
+    /// The settled projection, qualified.
+    qualified_projection: String,
+    /// The latest truncating commit this batch carries for the to-side
+    /// (the folded truncate's `lsn`). Issue #531: a truncate at or below
+    /// the relationship's refresh stamp is one the refresh already read, so
+    /// the clear is skipped ([`truncate_overtaken_by_refresh`]).
+    lsn: Option<PgLsn>,
 }
 
 /// The image [`compute`] decodes as a change's *old side*: its folded
@@ -5470,8 +5613,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // projection silently keeps serving every to-side row's last-known
     // value forever after the physical table is emptied — see the
     // `truncated` loop below, where this is populated, for the full story.
-    let mut relationship_projection_clears: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut relationship_projection_clears: std::collections::BTreeMap<
+        i64,
+        RelationshipProjectionClear,
+    > = std::collections::BTreeMap::new();
 
     for (source_key, changes) in by_source {
         tracing::debug!(
@@ -6517,7 +6662,13 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             if rel.cardinality == RelationshipCardinality::ToOne
                 && let Some(projection) = catalog::relationship_projection(pool, rel.id).await?
             {
-                relationship_projection_clears.insert(projection.qualified_table());
+                relationship_projection_clears
+                    .entry(rel.id)
+                    .and_modify(|clear| clear.lsn = clear.lsn.max(change.lsn))
+                    .or_insert(RelationshipProjectionClear {
+                        qualified_projection: projection.qualified_table(),
+                        lsn: change.lsn,
+                    });
             }
             // Issue #267: canonicalized to qualified identity for the same
             // reason [`accumulate_from_side_recomputes`] does it — this shares
@@ -7838,21 +7989,6 @@ pub async fn apply_and_mark_drained_many(
         .await?;
     }
 
-    // 2c. Issue #168: settled parent projection clears — a `TRUNCATE` on a
-    // to-one relationship's to-side table empties that relationship's
-    // projection too, as a whole-table delete: every row this projection held
-    // for this relationship just vanished along with the to-side's. No
-    // downstream propagation of its own — the projection is not a target
-    // table, and the from-side recompute this same truncate
-    // stages via `ApplyPlan::reverse_recomputes` is what actually reaches a
-    // definition; the projection is only ever read by
-    // `build_relationship_context`/the reverse-guard machinery, never a
-    // definition's own downstream consumer.
-    for qualified_projection in &plan.relationship_projection_clears {
-        txn.execute(&format!("delete from {qualified_projection}"), &[])
-            .await?;
-    }
-
     // 3. Ordered pre-lock + upsert/delete, per target table, each under
     // issue #344's per-key ordering lock (taken for every target up front).
     lock_one_to_one_keys(txn, &plan.targets).await?;
@@ -7884,6 +8020,50 @@ pub async fn apply_and_mark_drained_many(
         .await?;
         keys_written += written;
         keys_deleted += deleted;
+    }
+
+    // Before 2c and 3c, issue #531: the refresh stamp of every relationship
+    // this batch carries a reverse record or a projection clear for, locked
+    // `for share` before this transaction touches any projection row (2c,
+    // 3c and 3d below), in `relationship_id` order. A projection refresh
+    // locks the same rows `for update`, in the same order, before it touches
+    // a projection row (`catalog::refresh_relationship_projections_in_txn`),
+    // so either it commits first and a record at or below its stamp reads
+    // the stamp here (and takes the live-row check, `superseded_to_side`, or
+    // for a truncate skips the clear), or this transaction commits first and
+    // the refresh reads what it wrote. Taken after the target writes (steps
+    // 2 to 3b), the order the discharge takes the same kinds of row in (its
+    // orphan sweep, then the refresh). One keyed read per batch with reverse
+    // records or projection clears, none without.
+    let refresh_stamps = relationship_refresh_stamps(
+        txn,
+        plan.relationship_reverses
+            .iter()
+            .map(|r| r.shape.id)
+            .chain(plan.relationship_projection_clears.keys().copied()),
+    )
+    .await?;
+
+    // 2c. Issue #168: settled parent projection clears — a `TRUNCATE` on a
+    // to-one relationship's to-side empties that relationship's
+    // projection too, as a whole-table delete: every row this projection held
+    // for this relationship just vanished along with the to-side's. No
+    // downstream propagation of its own — the projection is not a target
+    // table, and the from-side recompute this same truncate
+    // stages via `ApplyPlan::reverse_recomputes` is what actually reaches a
+    // definition; the projection is only ever read by
+    // `build_relationship_context`/the reverse-guard machinery, never a
+    // definition's own downstream consumer. Run after the target writes
+    // rather than beside the target clears (step 2) so the stamp lock above
+    // precedes it. Issue #531: a truncate at or below the relationship's
+    // refresh stamp is one the refresh already read, so emptying the
+    // projection would drop the rows the refresh found written after it.
+    for (relationship_id, clear) in &plan.relationship_projection_clears {
+        if truncate_overtaken_by_refresh(clear.lsn, refresh_stamps.get(relationship_id).copied()) {
+            continue;
+        }
+        txn.execute(&format!("delete from {}", clear.qualified_projection), &[])
+            .await?;
     }
 
     // 3c. Relationship settled-parent projection gen bump (issue #130, epic
@@ -8033,26 +8213,27 @@ pub async fn apply_and_mark_drained_many(
                     &row_columns,
                 )
                 .await?;
-                match superseded_to_side(txn, &mut row_columns_cache, record, &old_key, &new_key)
+                let superseded = superseded_to_side(
+                    txn,
+                    &mut row_columns_cache,
+                    &refresh_stamps,
+                    record,
+                    &old_key,
+                    &new_key,
+                )
+                .await?;
+                if superseded {
+                    apply_projection_from_live(txn, shape, &old_key, &new_key, record.lsn).await?
+                } else {
+                    apply_projection_advance(
+                        txn,
+                        shape,
+                        &old_key,
+                        &new_key,
+                        record.new_image.as_deref(),
+                        record.lsn,
+                    )
                     .await?
-                {
-                    Some(to_side) => {
-                        apply_projection_from_live(
-                            txn, shape, to_side, &old_key, &new_key, record.lsn,
-                        )
-                        .await?
-                    }
-                    None => {
-                        apply_projection_advance(
-                            txn,
-                            shape,
-                            &old_key,
-                            &new_key,
-                            record.new_image.as_deref(),
-                            record.lsn,
-                        )
-                        .await?
-                    }
                 }
                 continue;
             }
@@ -8158,22 +8339,27 @@ pub async fn apply_and_mark_drained_many(
         {
             fast_path_keys.push(k);
         }
-        // Issue #507: a record whose images a seam-fed to-side has moved
+        // Issues #507/#531: a record whose images its to-side has moved
         // past (see `to_side_superseded`) takes the fallback, and the
         // projection follows the live row.
-        let superseded =
-            superseded_to_side(txn, &mut row_columns_cache, record, &old_key, &new_key).await?;
+        let superseded = superseded_to_side(
+            txn,
+            &mut row_columns_cache,
+            &refresh_stamps,
+            record,
+            &old_key,
+            &new_key,
+        )
+        .await?;
         // Issue #520: a record landing after its to-side's `TRUNCATE` in this
         // batch diffs against the cleared projection (an insert against "no
         // parent"), but the target still groups the rows under their
         // pre-truncate parent until the truncate's recomputes drain. Its
         // delta would come off the wrong group, so it takes the fallback,
         // whose recomputes fold with the truncate's.
-        let fast_path_safe = superseded.is_none()
+        let fast_path_safe = !superseded
             && record.retry_count == 0
-            && !plan
-                .relationship_projection_clears
-                .contains(&shape.qualified_projection)
+            && !plan.relationship_projection_clears.contains_key(&shape.id)
             && relationship_fast_path_precondition_holds(
                 txn,
                 &shape.from_table,
@@ -8392,22 +8578,18 @@ pub async fn apply_and_mark_drained_many(
         // step 3c's forward `__trellis_gen` bump above (never touched
         // here; see `apply_projection_advance`'s doc comment for the
         // distinction).
-        match superseded {
-            Some(to_side) => {
-                apply_projection_from_live(txn, shape, to_side, &old_key, &new_key, record.lsn)
-                    .await?
-            }
-            None => {
-                apply_projection_advance(
-                    txn,
-                    shape,
-                    &old_key,
-                    &new_key,
-                    record.new_image.as_deref(),
-                    record.lsn,
-                )
-                .await?
-            }
+        if superseded {
+            apply_projection_from_live(txn, shape, &old_key, &new_key, record.lsn).await?
+        } else {
+            apply_projection_advance(
+                txn,
+                shape,
+                &old_key,
+                &new_key,
+                record.new_image.as_deref(),
+                record.lsn,
+            )
+            .await?
         }
     }
 
