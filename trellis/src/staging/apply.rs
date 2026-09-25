@@ -792,7 +792,7 @@ async fn key_column_pg_type_in(
                and a.attname = $2 \
                and a.attnum > 0 \
                and not a.attisdropped",
-            &[&table, &column],
+            &[&ddl::regclass_arg(table), &column],
         )
         .await?;
     Ok(row.map(|r| r.get(0)))
@@ -821,13 +821,10 @@ fn key_array_filter(col_ident: &str, pg_type: Option<&str>) -> String {
 /// The live, `attnum`-ordered column names of `table` — the same
 /// `to_regclass`-bound `pg_attribute` introspection [`to_column_types`]/
 /// [`key_column_pg_type`] already use, but the whole live column list rather
-/// than a caller-supplied subset. `table` may be either the bare/qualified
-/// form `to_regclass` parses unquoted (e.g. `key_column_pg_type`'s own
-/// `table` argument) or an already `quote_ident`-quoted `"schema"."table"`
-/// string (e.g. [`ddl::qualified_relationship_projection_table`]'s output):
-/// `to_regclass` parses a quoted-identifier bind parameter exactly the way
-/// the SQL parser would parse the same text in a `FROM` clause, so either
-/// shape resolves to the right relation.
+/// than a caller-supplied subset. `table` is the unquoted `schema.table`
+/// identity, quoted for the lookup by [`ddl::regclass_arg`] (issue #561).
+/// An already-quoted name (e.g. a [`ddl::qualified_relationship_projection_table`]
+/// output) is quoted twice, finds nothing, and yields an empty column list.
 ///
 /// Issue #248: every `to_jsonb(t.*)`-based row decode in this crate needs
 /// this to build an explicit per-column `jsonb_build_object` (see
@@ -851,7 +848,7 @@ pub async fn live_row_columns(
                and a.attnum > 0 \
                and not a.attisdropped \
              order by a.attnum",
-            &[&table],
+            &[&ddl::regclass_arg(table)],
         )
         .await?;
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
@@ -1199,10 +1196,11 @@ pub(crate) async fn build_relationship_context(
         };
         let from_col = reldef.def.from_col.clone();
         let to_col = reldef.def.to_col.clone();
-        // Issue #372: the to-side the relationship was declared against, quoted
-        // for interpolation and `to_regclass`, never the bare `to_table`
-        // re-resolved through this session's `search_path`.
-        let to_table = ddl::qualified_source_table(&reldef.qualified_to_table());
+        // Issue #372: the to-side the relationship was declared against,
+        // never the bare `to_table` re-resolved through this session's
+        // `search_path`. Unquoted (issue #561): the lookups below quote it
+        // for `to_regclass`, and `fetch_to_side_rows` for interpolation.
+        let to_table = reldef.qualified_to_table();
 
         // The join keys we need on the to-side: the distinct non-NULL
         // `from_col` values of the from-side rows this batch evaluates.
@@ -1239,14 +1237,10 @@ pub(crate) async fn build_relationship_context(
                     .as_ref()
                     .map(catalog::RelationshipProjection::qualified_table);
 
-                let to_rows_by_key = match &qualified_projection {
-                    Some(qualified_projection) => {
+                let to_rows_by_key = match &projection {
+                    Some(projection) => {
                         fetch_relationship_projection_rows(
-                            pool,
-                            qualified_projection,
-                            &to_table,
-                            &to_col,
-                            &join_keys,
+                            pool, projection, &to_table, &to_col, &join_keys,
                         )
                         .await?
                     }
@@ -1472,6 +1466,9 @@ struct GroupBySibling {
 struct ToSide {
     /// The to-side table, quoted and qualified for direct interpolation.
     table: String,
+    /// The to-side's unquoted `schema.table` identity, for catalog lookups
+    /// ([`ddl::regclass_arg`], issue #561).
+    identity: String,
     /// Whether the to-side is one of this instance's own targets, fed to
     /// the reverse path by the target-mutation seam (issue #507), so every
     /// record on it takes the live-row check. A source to-side's record
@@ -1492,7 +1489,7 @@ impl ToSide {
         let key_pg_type = match self.key_pg_type.get() {
             Some(ty) => ty,
             None => {
-                let ty = key_column_pg_type_in(txn, &self.table, to_col).await?;
+                let ty = key_column_pg_type_in(txn, &self.identity, to_col).await?;
                 self.key_pg_type.get_or_init(|| ty)
             }
         };
@@ -1999,6 +1996,7 @@ async fn build_reverse_relationship_shape(
     };
     let to_side = ToSide {
         table: ddl::qualified_source_table(&qualified_to_table),
+        identity: qualified_to_table,
         seam_fed,
         key_pg_type: std::sync::OnceLock::new(),
     };
@@ -2092,8 +2090,8 @@ async fn group_by_snapshot_source(
     let qualified_projection = projection.qualified_table();
     // A column the projection doesn't hold resolves as `NULL`, the same as
     // the forward path's projection read.
-    let projection_columns = live_row_columns(&**pool.get().await?, &qualified_projection).await?;
-    let to_table = ddl::qualified_source_table(&rel.qualified_to_table());
+    let projection_columns = live_row_columns(&**pool.get().await?, &projection.identity()).await?;
+    let to_table = rel.qualified_to_table();
     Ok(Some(GroupBySibling {
         name: name.to_string(),
         from_col: rel.def.from_col.clone(),
@@ -3465,7 +3463,7 @@ async fn superseded_to_side(
     {
         return Ok(false);
     }
-    let columns = cached_row_columns(txn, row_columns_cache, &shape.to_side.table)
+    let columns = cached_row_columns(txn, row_columns_cache, &shape.to_side.identity)
         .await?
         .to_vec();
     to_side_superseded(
@@ -3584,8 +3582,8 @@ async fn apply_projection_from_live(
 /// that such a to-side row carry no key. To-one relationships get exactly one
 /// row per key (`to_col` is UNIQUE); to-many get the full related set.
 /// Decodes each row's columns via the same in-SQL `jsonb_each_text` unnest
-/// [`read_live_rows_batch`] uses. `to_table` is the to-side's quoted,
-/// qualified name ([`ddl::qualified_source_table`], issue #372).
+/// [`read_live_rows_batch`] uses. `to_table` is the to-side's unquoted,
+/// qualified identity (issues #372, #561), quoted here for interpolation.
 async fn fetch_to_side_rows(
     pool: &Pool,
     to_table: &str,
@@ -3597,7 +3595,7 @@ async fn fetch_to_side_rows(
     }
     let client = pool.get().await?;
     let col_ident = quote_ident(to_col);
-    let tbl_ident = to_table;
+    let tbl_ident = ddl::qualified_source_table(to_table);
     let pg_type = key_column_pg_type(pool, to_table, to_col).await?;
     let filter = key_array_filter(&col_ident, pg_type.as_deref());
     // Issue #248: an explicit per-column `jsonb_build_object`, not
@@ -3633,8 +3631,7 @@ async fn fetch_to_side_rows(
 
 /// The settled parent projection's rows whose key column matches any of
 /// `join_keys` (issue #130, epic #127) — [`build_relationship_context`]'s
-/// to-one counterpart to [`fetch_to_side_rows`], reading `qualified_projection`
-/// (already schema-qualified via [`ddl::qualified_relationship_projection_table`])
+/// to-one counterpart to [`fetch_to_side_rows`], reading `projection`
 /// instead of the live to-side table. The projection's key column is a real
 /// `primary key` (`catalog::ensure_relationship_projection_in_txn`'s DDL), so
 /// unlike `fetch_to_side_rows` there is at most one row per key — no
@@ -3654,12 +3651,11 @@ async fn fetch_to_side_rows(
 /// relationship's live to-side table) rather than the projection itself:
 /// `catalog::ensure_relationship_projection_in_txn` creates the projection's
 /// key column with exactly `to_table`'s `to_col` type, so the two always
-/// agree. `to_table` is the to-side's quoted, qualified name (issue #372);
-/// `to_regclass` parses an already-quoted qualified name exactly like the SQL
-/// parser would parse the same text in a `FROM` clause.
+/// agree. `to_table` is the to-side's unquoted, qualified identity (issues
+/// #372, #561).
 async fn fetch_relationship_projection_rows(
     pool: &Pool,
-    qualified_projection: &str,
+    projection: &catalog::RelationshipProjection,
     to_table: &str,
     key_col: &str,
     join_keys: &[String],
@@ -3673,7 +3669,8 @@ async fn fetch_relationship_projection_rows(
     let filter = key_array_filter(&format!("p.{key_ident}"), pg_type.as_deref());
     // Issue #248: an explicit per-column `jsonb_build_object`, not
     // `to_jsonb(p.*)` — see `row_as_text_jsonb_sql`'s doc comment.
-    let row_columns = live_row_columns(&**client, qualified_projection).await?;
+    let row_columns = live_row_columns(&**client, &projection.identity()).await?;
+    let qualified_projection = projection.qualified_table();
     let doc_expr = row_as_text_jsonb_sql("p", &row_columns);
     let sql = format!(
         "select p.{key_ident}::text as jk, e.key, e.value \
@@ -3716,7 +3713,7 @@ pub(crate) async fn to_column_types(
                and a.attname = any($2::text[]) \
                and a.attnum > 0 \
                and not a.attisdropped",
-            &[&table, &columns],
+            &[&ddl::regclass_arg(table), &columns],
         )
         .await?;
     let mut types = HashMap::with_capacity(rows.len());
@@ -5081,6 +5078,56 @@ mod tests {
              (rows 1-3), the NULL-keyed row (4) must not, and none of them report a \
              specific matched key"
         );
+    }
+
+    /// Issue #561: a [`ToSide`] types its key filter from the catalog entry
+    /// of its unquoted `identity`, and reads the row under its quoted
+    /// `table`. Handed the quoted name, the lookup would find nothing
+    /// (`to_regclass` of a twice-quoted name is `NULL`) and the filter would
+    /// silently fall back to casting the column, which no index serves
+    /// (#125) — correct rows, so nothing downstream notices. Pinned here on a
+    /// mixed-case to-side in a mixed-case schema.
+    #[tokio::test]
+    async fn to_side_key_filter_types_a_mixed_case_to_side_by_its_identity() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create schema \"Shop\"; \
+                 create table \"Shop\".\"Catalog\" (id bigint primary key, price numeric); \
+                 insert into \"Shop\".\"Catalog\" (id, price) values (1, 10)",
+            )
+            .await
+            .expect("seed a mixed-case to-side");
+
+        let identity = "Shop.Catalog".to_string();
+        let to_side = ToSide {
+            table: ddl::qualified_source_table(&identity),
+            identity,
+            seam_fed: true,
+            key_pg_type: std::sync::OnceLock::new(),
+        };
+        let txn = client.transaction().await.expect("open txn");
+        let filter = to_side.key_filter(&txn, "id").await.expect("key filter");
+        assert_eq!(
+            filter, r#"t."id" = $1::text::bigint"#,
+            "the key filter compares the native column, typed from the catalog"
+        );
+        let price: String = txn
+            .query_one(
+                &format!("select price::text from {} t where {filter}", to_side.table),
+                &[&"1"],
+            )
+            .await
+            .expect("read the to-side row by key")
+            .get(0);
+        assert_eq!(price, "10");
     }
 
     /// [`ReverseTrigger::Keys`] via [`from_side_rows_for_trigger_txn`] — the
