@@ -201,11 +201,14 @@ can't loop.
   #431). This discharge is the **only** capture path:
   every definition's initial build, resume and catch-up reads its source through
   it, and registration reads nothing
-  ([data-flow](../data-flow.md#capturing-a-tables-existing-rows)). Only the
+  ([data-flow](../data-flow.md#capturing-a-tables-existing-rows)). The two
+  exceptions rebuild some columns of a `live` transform: a column resume and
+  an `ALTER TRANSFORM` that adds columns still read those columns in-call
+  (#425, #426). Only the
   staging worker runs the `ALTER`, including the shrink after a `DROP`: a `DROP`
   removes catalog rows and the worker's reconcile pass takes the table back out
-  ([ADR-0016](../decisions/0016-single-background-capture-path.md#consequences);
-  *Planned, #427*). The inventory in
+  ([ADR-0016](../decisions/0016-single-background-capture-path.md#consequences),
+  #427). The inventory in
   [ADR-0016](../decisions/0016-single-background-capture-path.md#inventory-of-capture-paths)
   lists every capture path and its role.
 - **A marker is deleted only by the discharge that read it.** A table has one
@@ -245,8 +248,8 @@ can't loop.
   and, as the `lsn`, a write token read after the writer's last row lock.
 - **A fresh install reads nothing while it creates the slot.** It creates the
   slot, seeds `replication_progress` at the slot's consistent point, and parks a
-  `pending_backfill` marker on every configured source table, all in one
-  transaction (`intake::publication::create_slot_and_park_markers`). The first
+  `pending_backfill` marker on every table the catalog says to publish, all
+  in one transaction (`intake::publication::create_slot_and_park_markers`). The first
   discharge then reads each table at a snapshot taken after the slot exists, so
   anything that read misses commits after the consistent point and is streamed.
   Slot-loss recovery already works this way (`intake::slot_loss`). Reading
@@ -260,7 +263,11 @@ can't loop.
   replication client Trellis uses supports it
   ([ADR-0016](../decisions/0016-single-background-capture-path.md#rejected-alternatives)).
   The discharge skips a table no definition reads yet, since no apply would
-  consume its `Recompute` rows.
+  consume its `Recompute` rows. A catalog that outlived its old slot can
+  already hold applying definitions, so each marker is a go-live catch-up
+  for the table's applying readers: they report `catching_up` until its
+  discharge has re-read the table and swept their targets
+  ([ADR-0016](../decisions/0016-single-background-capture-path.md#a-fresh-install)).
 
 ## The load-bearing invariants
 

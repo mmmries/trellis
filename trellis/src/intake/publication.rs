@@ -364,30 +364,6 @@ pub(crate) async fn park_catch_up(
     Ok(())
 }
 
-/// Parks a fresh catch-up marker for `qualified_table`, reusing the exact
-/// `pending_backfill` mechanism [`reconcile_publication`] already relies on
-/// for a table newly joining the publication (docs/decisions/0007's
-/// amendment). It moves no definition to `catching_up`: a caller whose
-/// catch-up is some definition's go-live parks through [`park_catch_up`]
-/// instead, as `defs::catalog::complete_direct_backfill` does, once per
-/// table the build read, the moment a chunk- or job-built definition's
-/// build finishes: while it was building,
-/// [`super::super::defs::dependents_of`]'s status filter kept any live CDC
-/// delta for `qualified_table` from being folded into its target, so the
-/// definition's target may be missing whatever changed on that table during
-/// the build. The marker's later discharge ([`run_pending_backfills`])
-/// re-derives every definition on `qualified_table` from current source
-/// state, folding in anything skipped meanwhile.
-///
-/// See [`park_marker`] for what happens when a marker for this table already
-/// exists.
-pub(crate) async fn park_backfill_catchup(
-    client: &impl GenericClient,
-    qualified_table: &str,
-) -> Result<(), IntakeError> {
-    Ok(park_marker(client, qualified_table).await?)
-}
-
 /// Parks a `pending_backfill` marker for `qualified_table`, with no fence
 /// yet: the discharge takes it the first time it reads the marker
 /// ([`confirm_fence`]). Every writer of a marker goes through here.
@@ -435,7 +411,6 @@ pub(crate) async fn park_marker(
              on conflict (table_name) do update set \
                fence_xid = null, \
                generation = default, \
-               added_at = now(), \
                attempts = 0, \
                last_error = null, \
                next_attempt_at = null",
@@ -941,8 +916,8 @@ pub(super) async fn fetch_read(
 /// background-built definitions (chunks or a direct-build job, which read the
 /// table themselves) reads the table (a catch-up for applying readers). A
 /// marker on a table only background-built definitions read, or nothing
-/// reads at all (issue #417: a fresh install parks a marker on every
-/// configured source table, [`create_slot_and_park_markers`]), is discharged
+/// reads at all (issue #417: a fresh install parks a marker on every table
+/// the catalog publishes, [`create_slot_and_park_markers`]), is discharged
 /// without enumerating.
 ///
 /// A go-live catch-up always enumerates. An earlier optimization let a
@@ -1766,11 +1741,24 @@ pub async fn discharge_registrations(pool: &crate::pool::Pool) -> Result<(), Int
 /// just added already has a join marker, which the park here merges into
 /// ([`park_marker`]).
 ///
-/// Every table in `tables` gets a marker, not only the newly published ones:
-/// a table already in the publication has no marker of its own, and without
-/// one its rows would never be captured. The discharge skips a table no
-/// definition reads yet ([`run_pending_backfills`]'s "A table nothing
-/// reads").
+/// Every table in `tables` gets a marker, not only the newly published ones
+/// or those with a `waiting_to_backfill` definition (which the worker's
+/// reconcile pass would park anyway, [`park_registration_markers`]). A slot
+/// is fresh whenever this `replication_progress` row is missing, so the
+/// catalog can already hold applying definitions: it outlived the slot it
+/// was built under (setup pointed at a new slot name, say; a slot lost under
+/// the same name is `slot_loss`'s case instead). Such a definition has missed
+/// whatever committed before this slot's consistent point, and only this
+/// marker's discharge repairs it. So the markers are go-live catch-ups
+/// ([`park_catch_up`]) for every applying reader of the tables: each reader
+/// reports `catching_up` until the discharge has re-read the table, which
+/// re-derives the rows it still has, and swept the reader's target for rows
+/// it no longer backs, which a re-read can't reach (issue #393's regression
+/// tests, `a_row_committed_during_fresh_slot_creation_reaches_the_target`
+/// and `a_delete_committed_during_fresh_slot_creation_reaches_a_live_target`).
+/// On a first install nothing reads the tables yet, so this parks plain
+/// markers, and the discharge skips a table no definition reads
+/// ([`run_pending_backfills`]'s "When the table is enumerated").
 ///
 /// **Not one atomic unit.** `pg_create_logical_replication_slot` persists the
 /// slot to disk the moment it returns, independent of the surrounding
@@ -1808,8 +1796,8 @@ pub async fn create_slot_and_park_markers(
     let txn = session.transaction().await?;
     // Slot creation must come before any write in this transaction (Postgres
     // refuses to create a logical slot in a transaction that has written).
-    // Read committed, so each marker's fence below is a fresh snapshot taken
-    // after slot creation returned, not one taken before it waited.
+    // The markers below carry no fence: the discharge takes each one after
+    // reading it committed, so after slot creation returned (issue #431).
     let slot_row = txn
         .query_one(
             "select lsn from pg_create_logical_replication_slot($1, 'pgoutput')",
@@ -1817,9 +1805,13 @@ pub async fn create_slot_and_park_markers(
         )
         .await?;
     let consistent_point: PgLsn = slot_row.get(0);
+    let mut readers = Vec::new();
     for table in tables {
-        park_marker(&txn, table).await?;
+        readers.extend(crate::defs::catalog::applying_readers(&txn, table).await?);
     }
+    readers.sort_unstable();
+    readers.dedup();
+    park_catch_up(&txn, &readers, tables).await?;
     txn.execute(
         "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
         &[&slot, &consistent_point],
@@ -2581,7 +2573,7 @@ mod catch_up_tests {
 
         let parker_ref = &parker;
         discharge_racing(&mut discharger, |go, _done| async move {
-            park_backfill_catchup(parker_ref, "public.t")
+            park_marker(parker_ref, "public.t")
                 .await
                 .expect("park during discharge");
             go.send(()).expect("release discharge");
@@ -2607,7 +2599,7 @@ mod catch_up_tests {
         let parker_ref = &mut parker;
         discharge_racing(&mut discharger, |go, done| async move {
             let txn = parker_ref.transaction().await.expect("begin park");
-            park_backfill_catchup(&txn, "public.t")
+            park_marker(&txn, "public.t")
                 .await
                 .expect("park during discharge");
             go.send(()).expect("release discharge");
@@ -2854,7 +2846,7 @@ mod catch_up_tests {
         );
 
         // A new park of the table starts it over, due at once.
-        park_backfill_catchup(&client, "public.nokey")
+        park_marker(&client, "public.nokey")
             .await
             .expect("re-park the broken table");
         assert_eq!(
@@ -2891,7 +2883,7 @@ mod catch_up_tests {
 
         let parker_ref = &parker;
         discharge_racing(&mut discharger, |go, _done| async move {
-            park_backfill_catchup(parker_ref, "public.t")
+            park_marker(parker_ref, "public.t")
                 .await
                 .expect("park during discharge");
             go.send(()).expect("release discharge");
@@ -3534,9 +3526,7 @@ mod catch_up_tests {
             .expect("the open transaction holds the marker");
         assert!(marker_fence(&discharger).await.is_some(), "fenced");
 
-        park_backfill_catchup(&parker, "public.t")
-            .await
-            .expect("park again");
+        park_marker(&parker, "public.t").await.expect("park again");
         assert_ne!(marker_generation(&discharger).await, Some(fenced));
         assert_eq!(
             marker_fence(&discharger).await,
@@ -3565,7 +3555,7 @@ mod catch_up_tests {
         let db = cluster.create_isolated_database().await;
         let (discharger, parker) = one_settled_marker(&db).await;
         let read = marker_generation(&discharger).await.expect("parked");
-        park_backfill_catchup(&parker, "public.t")
+        park_marker(&parker, "public.t")
             .await
             .expect("park again after the read");
         let current = marker_generation(&discharger).await.expect("re-parked");

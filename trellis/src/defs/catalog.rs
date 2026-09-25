@@ -137,11 +137,11 @@ pub enum CatalogError {
     /// A definition's persisted `source_columns` jsonb held a value other
     /// than `"numeric"`/`"text"`/`"boolean"`/`"uuid"` for some column —
     /// meaning the row was written by something other than
-    /// [`create_definition`], since that's the only writer and it only ever
-    /// encodes [`ValueType`]'s variants.
+    /// `create_definition_inner`, the only writer, which only ever encodes
+    /// [`ValueType`]'s variants.
     UnknownValueType { column: String, text: String },
-    /// The definition's initial backfill (issue #23) failed to enumerate its
-    /// source table.
+    /// An intake-side step failed: resolving a qualified table name, parking
+    /// a catch-up marker, or checking that a source is change-keyed.
     Backfill(crate::intake::IntakeError),
     /// `def.source` doesn't resolve to any schema on this connection's
     /// search path (see [`resolve_source_schema_in_txn`]) — the table was
@@ -252,13 +252,13 @@ pub enum CatalogError {
     /// definition's source ([`CatalogError::SourceNotChangeKeyed`]); the case
     /// that motivated it is another instance's aggregate target.
     RelationshipEndpointNotChangeKeyed { endpoint: String },
-    /// [`install_definition`]'s target-table DDL (run before either backfill
-    /// path) failed.
+    /// [`install_definition`]'s target-table DDL failed.
     Ddl(DdlError),
-    /// [`install_definition`]'s direct backfill attempt
-    /// ([`backfill::backfill_definition`]) failed with something other than
-    /// [`BackfillError::Unsupported`] — an `Unsupported` shape instead falls
-    /// back to the ring ([`create_definition`]) rather than surfacing here.
+    /// A direct-build step failed with something other than
+    /// [`BackfillError::Unsupported`]: the backfill discharge's shape check
+    /// (`intake::publication`), or an `ALTER TRANSFORM`'s added-column build.
+    /// An `Unsupported` shape gets the ring enumeration instead of surfacing
+    /// here.
     DirectBackfill(BackfillError),
     /// [`super::lifecycle::pause_transform`] was asked to pause a target with
     /// no corresponding `transform_definitions` row at all (issue #142). Its
@@ -674,14 +674,12 @@ pub async fn create_definition(
     Ok(definition)
 }
 
-/// Like [`create_definition`], but stages *no* ring-enumeration backfill: the
-/// definition and its version bump are persisted `live`, but the source table
-/// is not enumerated into the ring. Callers that build the target directly
-/// (`defs::backfill::backfill_definition` — issue #63 M3's set-based,
-/// key-range-chunked source→target build) use this so the from-scratch build
-/// doesn't *also* flood the ring with one `Recompute` marker per source row;
-/// the ring is then left to handle only live CDC deltas after the direct
-/// build's fence.
+/// Test fixture: like [`create_definition`], but reads nothing. The
+/// definition and its version bump are persisted `live` with no backfill of
+/// any kind, for a test or benchmark that builds the target itself (with
+/// `defs::backfill::backfill_definition`, issue #63 M3's set-based build) or
+/// needs none. No production path calls this: every real definition is
+/// built through the backfill discharge (ADR-0016).
 #[cfg(any(test, feature = "test-util"))]
 pub async fn create_definition_without_backfill(
     pool: &Pool,
@@ -772,7 +770,7 @@ pub async fn install_definition(
     // failure partway through this function.
     // `create_definition_inner` (below) repeats both checks inside its own
     // transaction; that repeat is the *authoritative* one — it's the only
-    // check the ring-path entry points ([`create_definition`]/
+    // check the test-fixture entry points ([`create_definition`]/
     // [`create_definition_without_backfill`], which never call this
     // function) ever run. This one is a pure fail-fast nicety for the far
     // more common `install_definition` path, redundant-but-harmless on the
@@ -1373,8 +1371,8 @@ pub(crate) async fn is_definition_target(
 /// **Single-pass backfill.** Every `ADD`/`ALTER`ed field this call actually
 /// changes is populated by *one* enumeration of the source
 /// ([`backfill::backfill_altered_columns`]), never a backfill per column —
-/// the same single-pass contract [`install_definition`]'s own initial build
-/// already honors, reused rather than reimplemented.
+/// the same single-pass contract a definition's initial build honors,
+/// reused rather than reimplemented.
 ///
 /// **The pause-state reuse.** While a changed field's single-pass backfill
 /// runs, it is parked in `column_status` — the exact mechanism
@@ -1756,9 +1754,8 @@ pub async fn alter_transform(
 
     // Outside the transaction (and, deliberately, holding no lock): the
     // single-pass backfill below is the same "one enumeration of the source"
-    // shape `install_definition`'s own build is, sized for however large the
-    // source table is — exactly the work a first `define` already does
-    // without holding a transaction open across it.
+    // shape a definition's initial build is, sized for however large the
+    // source table is, so it holds no transaction open across it either.
     if !real_adds.is_empty() || !real_alters.is_empty() {
         let mut written_fields: HashSet<String> =
             real_adds.iter().map(|f| f.name.clone()).collect();
@@ -3135,7 +3132,7 @@ pub(crate) async fn resolve_relationships(
 
 /// [`resolve_relationships`] for a definition not yet persisted — the define
 /// and `ALTER` paths, which validate `def` before they've resolved (or, for
-/// the ring-path entry points, recorded) its qualified source. Resolves it
+/// the test-fixture entry points, recorded) its qualified source. Resolves it
 /// the same way [`install_definition`] does ([`resolve_source_for_install`]),
 /// but only when `def` references a relationship at all.
 ///
@@ -3213,7 +3210,7 @@ async fn resolve_source_schema_in_txn(
 ///    (issue #73's `transform_definitions.target_table`) — a legitimate
 ///    chained `FROM`/relationship endpoint, but not guaranteed to be backed
 ///    by a physical table at the instant this call names it: the
-///    catalog-only ring-path entry points
+///    catalog-only test-fixture entry points
 ///    ([`create_definition`]/[`create_definition_without_backfill`]) are
 ///    documented as expecting their *caller* to have already created the
 ///    physical target (see [`install_definition`]'s doc comment on its own
@@ -3386,15 +3383,11 @@ fn effective_target_schema<'a>(def: &'a TransformDef, target_schema: &'a str) ->
 }
 
 /// Pooled (non-transaction) counterpart to [`resolve_source_schema_in_txn`],
-/// for [`install_definition`]'s own DDL/direct-build steps ([`ddl::source_primary_key`],
-/// [`ddl::target_table_ddl`], [`backfill::backfill_definition`]), which
-/// run on plain pooled connections
-/// before that function's own [`create_definition_inner`] call opens a
-/// transaction and computes its own, independent, authoritative copy —
-/// mirrors [`column_type`]/[`column_type_in_txn`]'s same pool-vs-txn split.
-/// Same `search_path` walk, same [`CatalogError::SourceTableNotFound`] on no
-/// match. Also covers [`install_definition`]'s issue #55 fence check, which
-/// likewise runs before any transaction of its own is open.
+/// the `search_path` step of [`resolve_graph_identity`], for callers on plain
+/// pooled connections outside a catalog transaction — mirrors
+/// [`column_type`]/[`column_type_in_txn`]'s same pool-vs-txn split. Same
+/// `search_path` walk, same [`CatalogError::SourceTableNotFound`] on no
+/// match.
 async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String, CatalogError> {
     let client = pool.get().await?;
     let row = client
@@ -3410,12 +3403,11 @@ async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String
         .ok_or_else(|| CatalogError::SourceTableNotFound(source_table.to_string()))
 }
 
-/// The fully-qualified source [`install_definition`]'s own DDL/direct-build
-/// steps read from (issue #76, ADR-0007 grammar clause 4) — computed once,
-/// early in that function, exactly like `target_schema`/[`effective_target_schema`]
+/// The fully-qualified source [`install_definition`]'s own DDL steps read
+/// from (issue #76, ADR-0007 grammar clause 4) — computed once, early in
+/// that function, exactly like `target_schema`/[`effective_target_schema`]
 /// immediately above it, and threaded through every one of those steps
-/// (`ddl::source_primary_key`, `ddl::target_table_ddl`,
-/// `backfill::backfill_definition`) so none of them can independently
+/// (`ddl::source_primary_key`, `ddl::target_table_ddl`) so none of them can independently
 /// re-derive a different answer, and so every physical SQL builder among them
 /// emits the qualified identity rather than a bare `def.source` left to the
 /// executing connection's own `search_path` — the gap a reviewer flagged
@@ -3427,7 +3419,7 @@ async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String
 /// `create_definition_inner` (further below) computes its *own* copy inside
 /// its own transaction rather than receiving this one as a parameter — see
 /// that function's doc comment on `qualified_source` for why: it's the sole,
-/// authoritative resolution the ring-path entry points ([`create_definition`]/
+/// authoritative resolution the test-fixture entry points ([`create_definition`]/
 /// [`create_definition_without_backfill`], which never call this function)
 /// ever get, so it must stand on its own regardless of what this function
 /// computed a few statements earlier. The two are expected to agree (same
