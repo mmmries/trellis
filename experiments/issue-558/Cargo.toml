@@ -1,0 +1,14 @@
+[package]
+name = "exp558"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone: not a member of the trellis workspace, so `verify` never builds or runs it.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio-postgres = "0.7"
+rand = "0.9"
+anyhow = "1"
