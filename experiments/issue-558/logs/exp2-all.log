@@ -1,0 +1,100 @@
+exp2: mode=lsn enumeration=ledger
+  PASS  2  #344 stalled enumeration, C before its snapshot   rederive=rederived then apply=skip:visible
+  PASS  2b #344 stalled enumeration, C after its snapshot    rederive=rederived then apply=applied (blocked on I1 lock)
+  PASS  3  #321 commit lands before the re-derive            apply after re-derive: skip:visible
+  PASS  4  #389 concurrent group creation, sorted batches    0 deadlocks (retried), oracle matches
+  PASS  4c #389 control: unsorted per-row locking            22 deadlocks in 20s with per-row interleaved locking (control: I5 is necessary)
+  PASS  5  #494 a->z->b folded while z rebuilds              folded a->z->b: applied; z untouched
+  PASS  5b #494 a->z, z->b split, drained out of order       out-of-order split: C2=applied then C1=skip:lsn
+  PASS  6  #516 rename with from-side CDC pending            reverse: rederived 1, skipped 0; pending from-side apply: skip:visible
+  FAIL  6b #528 in-flight move vs rename enumeration         target != oracle: oracle uno=30(2), target one=20(1), target uno=10(1)
+  PASS  6c #520 to-side truncate with CDC pending            re-derived 2 children after truncate; pending apply: skip:visible
+  PASS  7  #549 forced recompute then reverse record         reverse: rederived 1, skipped 1
+  PASS  8  #531 lost reverse record, catch-up re-derive      catch-up re-derive then pending apply: skip:visible
+  PASS  8b #529 deleted parent reached via ledger            reverse for deleted parent: rederived 1, skipped 0; pending apply: skip:visible
+  PASS  9  tombstone: delete then older update               delete drains, then the older update: applied, skip:lsn
+  PASS  9b delete then newer re-insert                       delete drains, then the newer re-insert: applied, applied
+  PASS  9c same-key updates out of order                     newer update drains, then the older: applied, skip:lsn
+  PASS  9d same-key updates in order                         updates drain in order: applied, applied
+  PASS  10 change in flight at the basis snapshot            xid in basis xip: true; apply: applied
+exp2 mode=lsn enumeration=ledger: 1 failed
+exp2: mode=literal enumeration=ledger
+  PASS  2  #344 stalled enumeration, C before its snapshot   rederive=rederived then apply=skip:visible
+  PASS  2b #344 stalled enumeration, C after its snapshot    rederive=rederived then apply=applied (blocked on I1 lock)
+  PASS  3  #321 commit lands before the re-derive            apply after re-derive: skip:visible
+  PASS  4  #389 concurrent group creation, sorted batches    0 deadlocks (retried), oracle matches
+  PASS  4c #389 control: unsorted per-row locking            22 deadlocks in 20s with per-row interleaved locking (control: I5 is necessary)
+  PASS  5  #494 a->z->b folded while z rebuilds              folded a->z->b: applied; z untouched
+  FAIL  5b #494 a->z, z->b split, drained out of order       target != oracle: oracle b=70(2), oracle z=50(1), target b=60(1), target z=60(2)
+  PASS  6  #516 rename with from-side CDC pending            reverse: rederived 1, skipped 0; pending from-side apply: skip:visible
+  FAIL  6b #528 in-flight move vs rename enumeration         target != oracle: oracle uno=30(2), target one=20(1), target uno=10(1)
+  PASS  6c #520 to-side truncate with CDC pending            re-derived 2 children after truncate; pending apply: skip:visible
+  PASS  7  #549 forced recompute then reverse record         reverse: rederived 1, skipped 1
+  PASS  8  #531 lost reverse record, catch-up re-derive      catch-up re-derive then pending apply: skip:visible
+  PASS  8b #529 deleted parent reached via ledger            reverse for deleted parent: rederived 1, skipped 0; pending apply: skip:visible
+  FAIL  9  tombstone: delete then older update               target != oracle: oracle one=20(1), target one=35(2)
+  PASS  9b delete then newer re-insert                       delete drains, then the newer re-insert: applied, applied
+  FAIL  9c same-key updates out of order                     target != oracle: oracle one=37(2), target one=35(2)
+  PASS  9d same-key updates in order                         updates drain in order: applied, applied
+  PASS  10 change in flight at the basis snapshot            xid in basis xip: true; apply: applied
+exp2 mode=literal enumeration=ledger: 4 failed
+exp2: mode=literal-snap enumeration=ledger
+  PASS  2  #344 stalled enumeration, C before its snapshot   rederive=rederived then apply=skip:visible
+  PASS  2b #344 stalled enumeration, C after its snapshot    rederive=rederived then apply=applied (blocked on I1 lock)
+  PASS  3  #321 commit lands before the re-derive            apply after re-derive: skip:visible
+  PASS  4  #389 concurrent group creation, sorted batches    0 deadlocks (retried), oracle matches
+  PASS  4c #389 control: unsorted per-row locking            19 deadlocks in 20s with per-row interleaved locking (control: I5 is necessary)
+  PASS  5  #494 a->z->b folded while z rebuilds              folded a->z->b: applied; z untouched
+  PASS  5b #494 a->z, z->b split, drained out of order       out-of-order split: C2=applied then C1=skip:visible
+  PASS  6  #516 rename with from-side CDC pending            reverse: rederived 1, skipped 0; pending from-side apply: skip:visible
+  FAIL  6b #528 in-flight move vs rename enumeration         target != oracle: oracle uno=30(2), target one=20(1), target uno=10(1)
+  PASS  6c #520 to-side truncate with CDC pending            re-derived 2 children after truncate; pending apply: skip:visible
+  PASS  7  #549 forced recompute then reverse record         reverse: rederived 1, skipped 1
+  PASS  8  #531 lost reverse record, catch-up re-derive      catch-up re-derive then pending apply: skip:visible
+  PASS  8b #529 deleted parent reached via ledger            reverse for deleted parent: rederived 1, skipped 0; pending apply: skip:visible
+  PASS  9  tombstone: delete then older update               delete drains, then the older update: applied, skip:visible
+  FAIL  9b delete then newer re-insert                       target != oracle: oracle one=50(2), target one=20(1)
+  PASS  9c same-key updates out of order                     newer update drains, then the older: applied, skip:visible
+  FAIL  9d same-key updates in order                         target != oracle: oracle one=37(2), target one=35(2)
+  PASS  10 change in flight at the basis snapshot            xid in basis xip: true; apply: applied
+exp2 mode=literal-snap enumeration=ledger: 3 failed
+exp2: mode=lsn enumeration=ledger+source
+  PASS  2  #344 stalled enumeration, C before its snapshot   rederive=rederived then apply=skip:visible
+  PASS  2b #344 stalled enumeration, C after its snapshot    rederive=rederived then apply=applied (blocked on I1 lock)
+  PASS  3  #321 commit lands before the re-derive            apply after re-derive: skip:visible
+  PASS  4  #389 concurrent group creation, sorted batches    0 deadlocks (retried), oracle matches
+  PASS  4c #389 control: unsorted per-row locking            20 deadlocks in 20s with per-row interleaved locking (control: I5 is necessary)
+  PASS  5  #494 a->z->b folded while z rebuilds              folded a->z->b: applied; z untouched
+  PASS  5b #494 a->z, z->b split, drained out of order       out-of-order split: C2=applied then C1=skip:lsn
+  PASS  6  #516 rename with from-side CDC pending            reverse: rederived 1, skipped 0; pending from-side apply: skip:visible
+  PASS  6b #528 in-flight move vs rename enumeration         apply=applied; reverse=rederived 2, skipped 0 (waited for the move)
+  PASS  6c #520 to-side truncate with CDC pending            re-derived 2 children after truncate; pending apply: skip:visible
+  PASS  7  #549 forced recompute then reverse record         reverse: rederived 1, skipped 1
+  PASS  8  #531 lost reverse record, catch-up re-derive      catch-up re-derive then pending apply: skip:visible
+  PASS  8b #529 deleted parent reached via ledger            reverse for deleted parent: rederived 1, skipped 0; pending apply: skip:visible
+  PASS  9  tombstone: delete then older update               delete drains, then the older update: applied, skip:lsn
+  PASS  9b delete then newer re-insert                       delete drains, then the newer re-insert: applied, applied
+  PASS  9c same-key updates out of order                     newer update drains, then the older: applied, skip:lsn
+  PASS  9d same-key updates in order                         updates drain in order: applied, applied
+  PASS  10 change in flight at the basis snapshot            xid in basis xip: true; apply: applied
+exp2 mode=lsn enumeration=ledger+source: 0 failed
+exp2: mode=lsn enumeration=ledger+deplock
+  PASS  2  #344 stalled enumeration, C before its snapshot   rederive=rederived then apply=skip:visible
+  PASS  2b #344 stalled enumeration, C after its snapshot    rederive=rederived then apply=applied (blocked on I1 lock)
+  PASS  3  #321 commit lands before the re-derive            apply after re-derive: skip:visible
+  PASS  4  #389 concurrent group creation, sorted batches    0 deadlocks (retried), oracle matches
+  PASS  4c #389 control: unsorted per-row locking            20 deadlocks in 20s with per-row interleaved locking (control: I5 is necessary)
+  PASS  5  #494 a->z->b folded while z rebuilds              folded a->z->b: applied; z untouched
+  PASS  5b #494 a->z, z->b split, drained out of order       out-of-order split: C2=applied then C1=skip:lsn
+  PASS  6  #516 rename with from-side CDC pending            reverse: rederived 1, skipped 0; pending from-side apply: skip:visible
+  PASS  6b #528 in-flight move vs rename enumeration         apply=applied; reverse=rederived 2, skipped 0 (waited for the move)
+  PASS  6c #520 to-side truncate with CDC pending            re-derived 2 children after truncate; pending apply: skip:visible
+  PASS  7  #549 forced recompute then reverse record         reverse: rederived 1, skipped 1
+  PASS  8  #531 lost reverse record, catch-up re-derive      catch-up re-derive then pending apply: skip:visible
+  PASS  8b #529 deleted parent reached via ledger            reverse for deleted parent: rederived 1, skipped 0; pending apply: skip:visible
+  PASS  9  tombstone: delete then older update               delete drains, then the older update: applied, skip:lsn
+  PASS  9b delete then newer re-insert                       delete drains, then the newer re-insert: applied, applied
+  PASS  9c same-key updates out of order                     newer update drains, then the older: applied, skip:lsn
+  PASS  9d same-key updates in order                         updates drain in order: applied, applied
+  PASS  10 change in flight at the basis snapshot            xid in basis xip: true; apply: applied
+exp2 mode=lsn enumeration=ledger+deplock: 0 failed

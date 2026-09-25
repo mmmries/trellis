@@ -1,0 +1,42 @@
+=== --rows 100000 --think-ms 0
+load: 325951 commits/s over 10.0s
+bases: 230318; xip non-empty: 216849 (94.2%); mean xip len 2.50; p50 2; max 19
+READ COMMITTED control: 35540 of 35787 snapshot-then-read statement pairs saw a different snapshot
+decidability over 819690 (base, commit) pairs: 11288 between xmin and xmax not in xip (visible), 1793 in xip (not visible), 0 disagreements
+per locked row: 4 of 230318 bases (0.002%) had >=1 in-flight change for that row (4 ambiguous changes in all); in the first 2000 bases, 0 ambiguous vs 64789 plainly-future changes for the row (0.0000% of the changes a base will be checked against)
+basis exactness: 0 of 200 bases read a value that disagrees with the commits their snapshot says are visible
+=== --rows 100000 --think-ms 2
+load: 5309 commits/s over 10.0s
+bases: 728176; xip non-empty: 728088 (100.0%); mean xip len 15.93; p50 16; max 19
+READ COMMITTED control: 64862 of 111348 snapshot-then-read statement pairs saw a different snapshot
+decidability over 60000 (base, commit) pairs: 67 between xmin and xmax not in xip (visible), 4582 in xip (not visible), 0 disagreements
+per locked row: 115 of 728176 bases (0.016%) had >=1 in-flight change for that row (115 ambiguous changes in all); in the first 2000 bases, 0 ambiguous vs 1058 plainly-future changes for the row (0.0000% of the changes a base will be checked against)
+basis exactness: 0 of 200 bases read a value that disagrees with the commits their snapshot says are visible
+=== --rows 1000 --think-ms 0
+load: 395447 commits/s over 10.0s
+bases: 270207; xip non-empty: 254691 (94.3%); mean xip len 2.44; p50 2; max 19
+READ COMMITTED control: 40640 of 40772 snapshot-then-read statement pairs saw a different snapshot
+decidability over 1119128 (base, commit) pairs: 11242 between xmin and xmax not in xip (visible), 610 in xip (not visible), 0 disagreements
+per locked row: 189 of 270207 bases (0.070%) had >=1 in-flight change for that row (191 ambiguous changes in all); in the first 2000 bases, 0 ambiguous vs 7880033 plainly-future changes for the row (0.0000% of the changes a base will be checked against)
+basis exactness: 0 of 200 bases read a value that disagrees with the commits their snapshot says are visible
+=== --rows 1000 --think-ms 2
+load: 5231 commits/s over 10.0s
+bases: 809245; xip non-empty: 808743 (99.9%); mean xip len 15.97; p50 16; max 19
+READ COMMITTED control: 73924 of 122231 snapshot-then-read statement pairs saw a different snapshot
+decidability over 60000 (base, commit) pairs: 16 between xmin and xmax not in xip (visible), 4623 in xip (not visible), 0 disagreements
+per locked row: 12710 of 809245 bases (1.571%) had >=1 in-flight change for that row (12792 ambiguous changes in all); in the first 2000 bases, 35 ambiguous vs 104589 plainly-future changes for the row (0.0335% of the changes a base will be checked against)
+basis exactness: 0 of 200 bases read a value that disagrees with the commits their snapshot says are visible
+=== --rows 16 --think-ms 0
+load: 358193 commits/s over 10.0s
+bases: 266325; xip non-empty: 257350 (96.6%); mean xip len 3.44; p50 3; max 18
+READ COMMITTED control: 41478 of 41746 snapshot-then-read statement pairs saw a different snapshot
+decidability over 1092585 (base, commit) pairs: 8985 between xmin and xmax not in xip (visible), 905 in xip (not visible), 0 disagreements
+per locked row: 23966 of 266325 bases (8.999%) had >=1 in-flight change for that row (32748 ambiguous changes in all); in the first 2000 bases, 338 ambiguous vs 446112553 plainly-future changes for the row (0.0001% of the changes a base will be checked against)
+basis exactness: 0 of 200 bases read a value that disagrees with the commits their snapshot says are visible
+=== --rows 16 --think-ms 2
+load: 3219 commits/s over 10.0s
+bases: 768708; xip non-empty: 768708 (100.0%); mean xip len 16.06; p50 16; max 19
+READ COMMITTED control: 70517 of 120642 snapshot-then-read statement pairs saw a different snapshot
+decidability over 60133 (base, commit) pairs: 1248 between xmin and xmax not in xip (visible), 4670 in xip (not visible), 0 disagreements
+per locked row: 459525 of 768708 bases (59.779%) had >=1 in-flight change for that row (757784 ambiguous changes in all); in the first 2000 bases, 2014 ambiguous vs 4013136 plainly-future changes for the row (0.0502% of the changes a base will be checked against)
+basis exactness: 0 of 200 bases read a value that disagrees with the commits their snapshot says are visible
