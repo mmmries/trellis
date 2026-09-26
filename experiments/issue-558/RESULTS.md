@@ -323,23 +323,66 @@ parent updates (100/s or 1,000/s) and, at the same time, single-row child update
 "Converged" is the first moment the target equals a from-scratch oracle; the tail is how long
 that took past the window.
 
-### Baseline: `main`'s reverse fast path (ledger off)
+### Results
 
-| children/parent | parents | parent updates/s | converged | tail after the window | WAL | oracle |
-|---|---|---|---|---|---|---|
-| 10 | 100k | 100 | 23.1 s | 3.1 s | 507 MB | ✓ |
-| 10 | 100k | 1,000 | 62.0 s | 42.0 s | 221 MB | ✓ |
-| 1k | 1k | 100 | 21.2 s | 1.2 s | 325 MB | ✓ |
-| 1k | 1k | 1,000 | 21.2 s | 1.2 s | 339 MB | ✓ |
-| 100k | 10 | 100 | 21.2 s | 1.2 s | 328 MB | ✓ |
-| 100k | 10 | 1,000 | 21.2 s | 1.2 s | 337 MB | ✓ |
+The first baseline run (before the probe waited for a quiet ring) converged everywhere in
+21–62 s; every later run showed the same protocol on `main` failing, and a pre-existing fold
+pathology (#581: a refilled ring slot's stale statistics make the fold plan an O(n²) nested
+loop) turned out to contaminate everything with 50k-row segments. The matrix below is the
+final one: `main` is a true `main` checkout plus the probe and the one-line fold fix
+(`set local enable_nestloop = off` before the fold statement), the ledger modes carry the
+same fix, and every mode waits for a quiet ring before seeding and before the window.
 
-Two things to know before reading the ledger side against it. The 100k-child shape has only
-10 parents, so 20,000 updates fold to ~10 reverse records per batch and the fast path scans
-each parent's 100k children once per batch, not once per update; that is why it is the
-cheapest row. And the one slow baseline row is the *many-parents* shape at 1,000 updates/s:
-100k distinct parents means little folding and one reverse record (guards, ring scans, a
-live from-side scan) per parent per batch.
+| children/parent | parents | parent upd/s | `main` converged (tail) | `contrib` converged (tail) | contrib / main | `membership` | WAL MB main / contrib | deadlocks main / contrib |
+|---|---|---|---|---|---|---|---|---|
+| 10 | 100k | 100 | 113.4 s (93.4) | **20.7 s (0.7)** | 0.18 | wrong | 132 / 262 | 28 / 0 |
+| 10 | 100k | 1,000 | **never, wrong** | **42.6 s (22.6)** | – | wrong | 139 / 345 | 134 / 0 |
+| 1k | 1k | 100 | 79.5 s (59.5) | **39.8 s (19.8)** | 0.50 | wrong | 361 / 1,004 | 1 / 0 |
+| 1k | 1k | 1,000 | 112.6 s (92.6) | **76.8 s (56.8)** | 0.68 | wrong | 404 / 2,100 | 7 / 0 |
+| 100k | 10 | 100 | **24.0 s (4.0)** | 73.8 s (53.8) | **3.08** | wrong | 390 / 2,203 | 0 / 0 |
+| 100k | 10 | 1,000 | **24.0 s (4.0)** | 54.3 s (34.3) | **2.26** | 397 / 1,693 | 0 / 0 |
+
+`contrib` matched the oracle on all six shapes with zero deadlocks, zero guard rejections and
+zero fallbacks. `main` logged 12,177 guard rejections, 534 fairness escalations and 27
+"transient failure retries exhausted … deadlock detected" batch failures across the six, and
+the 10-children / 1,000 updates-per-second shape **never converged and ended with a wrong
+target** (weights short by 200–260 per group, `val` short by ~20: lost updates), reproducibly
+across three runs. `membership` (no stored contributions) produced wrong targets on both
+shapes it ran, as predicted: without a stored old side, Apply's old side comes from the
+image, and a child whose parent moved between Phase 2 and Phase 3 is diffed against the wrong
+prior state.
+
+### What experiment 4 says
+
+- **Against the pass bar** (100k-child case within 3x of `main`'s fast path, 10 and 1k cases
+  within 1.5x): the 10 and 1k shapes are not merely within 1.5x, they are 1.5–5x **faster**
+  than `main` and, unlike `main`, correct. The 100k-child shapes are 2.26x and 3.08x: one
+  point just over the bar. Note what that shape is: 10 parents in total, so 20,000 updates
+  fold to a handful of reverse records per batch, and `main` scans each parent's 100k
+  children once per batch while the ledger **rewrites** 100k entries per touched parent per
+  batch. That rewrite, not the read, is the cost.
+- **Write amplification is the number the note said would decide the design, and here it is:**
+  2.6–5.6x `main`'s WAL at 1k and 100k fan-out (1–2.2 GB for a 20 s window). Each parent
+  update rewrites every child's entry (contribution + basis snapshot, ~100 bytes of tuple).
+  The note's fallback for a hot parent, the set-based delta from stored contributions,
+  removes the *compute* but not the write: the contributions must still be rewritten or a
+  later child Apply subtracts a stale old side (exactly `membership`'s failure). A design
+  that wants to keep this shape cheap needs the to-side value factored out of the stored
+  contribution (store the from-side part and the join key; derive the to-side part from the
+  parent's *current* value under I1), so a parent change touches the group and the parent,
+  not every child. That is a real change to I3 and worth deciding on before experiment 5.
+- **What the ledger buys:** no guards, no ring scans, no deferrals, no fallback recomputes,
+  no deadlocks, and correctness under a load that makes `main` lose updates. The forward
+  validation against the live to-side (the projection as a pure cache) fired on ~4% of
+  child changes under churn and was always sufficient.
+- **Two more things the prototype forced into the open:** the fold's planner pathology
+  (#581), and that this probe finds a `main` correctness failure the suite does not (filed
+  separately).
+
+**Experiment 4 verdict: at the bar, not clearly past it.** Correctness and the realistic
+shapes pass decisively; the hot-parent shape sits at 3.08x with 5x WAL, and that is the
+per-child rewrite the note itself flagged as the deciding cost. The user's call: accept the
+hot-parent cost, or factor the to-side value out of I3 before experiment 5.
 
 ### The ledger side (prototype, same branch, `TRELLIS_EXP558_LEDGER=contrib|membership`)
 
