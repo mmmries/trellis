@@ -1599,6 +1599,8 @@ struct ReverseAggregateShape {
 /// same projection row.
 #[derive(Debug, Clone)]
 pub(crate) struct RelationshipReverseRecord {
+    /// Issue #558: the source transaction (xid8 text) for I2's skip rule.
+    src_xid: Option<String>,
     shape: Arc<ReverseRelationshipShape>,
     /// The parent's decoded pre-image row, or `None` for a parent INSERT.
     old_row: Option<Row>,
@@ -2571,6 +2573,75 @@ async fn rederive_children_via_ledger(
     target_plan.ledger_rows = ledger_rows;
     target_plan.rel_check = None;
     Ok(target_plan)
+}
+
+/// Issue #558, factored variant: a to-side attribute change is applied to the
+/// groups through the parent's per-(group, parent) partials, `n × (new − old)`
+/// per factored field, under the parent row's lock (I1), skipped when the
+/// change is already reflected (I2). No child is read or rewritten.
+async fn rederive_partials(
+    txn: &Transaction<'_>,
+    plan: &mut AggregateTargetPlan,
+    record: &RelationshipReverseRecord,
+    keys: &[String],
+) -> Result<(), ApplyError> {
+    let Some(rc) = plan.rel_check.clone() else {
+        return Ok(());
+    };
+    let fields = plan.fields.clone();
+    let arity = plan.group_by_types.len();
+    for k in keys {
+        // no parent row: nothing was ever applied under this parent
+        let Some(parent) = plan.parent_rows.get(k).cloned() else {
+            continue;
+        };
+        if parent.skip {
+            continue;
+        }
+        let new_vals: Vec<Option<String>> = rc
+            .synthetic
+            .iter()
+            .map(|(to_col, _)| {
+                record
+                    .new_row
+                    .as_ref()
+                    .and_then(|r| r.get(to_col))
+                    .cloned()
+                    .flatten()
+            })
+            .collect();
+        if new_vals != parent.vals {
+            let rows = apply_aggregate::read_partials_for_parent(
+                txn,
+                &plan.target,
+                k,
+                &rc,
+                &parent.vals,
+                &new_vals,
+            )
+            .await?;
+            for (g, old_c, new_c) in rows {
+                let group = plan.groups.entry(g.clone()).or_insert_with(|| {
+                    apply_aggregate::GroupPlan::new(apply_aggregate::group_values_from_key(
+                        &g, arity,
+                    ))
+                });
+                group.hop_gen = group.hop_gen.max(record.hop_gen);
+                group.src_changed = earliest_src_changed(group.src_changed, record.src_changed);
+                group.note_origin(record.origin_lsn);
+                apply_aggregate::diff_contributions(&fields, group, &old_c, &new_c);
+            }
+        }
+        plan.parent_updates.push((
+            k.clone(),
+            apply_aggregate::vals_to_text(&new_vals),
+            record.lsn,
+        ));
+        if let Some(p) = plan.parent_rows.get_mut(k) {
+            p.vals = new_vals;
+        }
+    }
+    Ok(())
 }
 
 async fn from_side_rows_for_trigger_txn(
@@ -6301,6 +6372,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     old_image: change.old_image.clone(),
                     new_image: change.new_image.clone(),
                     lsn: change.lsn,
+                    src_xid: change.src_xid.clone(),
                     min_image_lsn: change.min_image_lsn,
                     prev_lsn: capture.prev_lsn,
                     prev_gen: capture.prev_gen,
@@ -6803,6 +6875,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             old_image: change.old_image.clone(),
             new_image: change.new_image.clone(),
             lsn: change.lsn,
+            src_xid: change.src_xid.clone(),
             min_image_lsn: change.min_image_lsn,
             prev_lsn: capture.prev_lsn,
             prev_gen: capture.prev_gen,
@@ -8398,7 +8471,58 @@ pub async fn apply_and_mark_drained_many(
             if target_jobs.is_empty() && forward_keys.is_empty() {
                 continue;
             }
-            let join_keys: Vec<&str> = {
+            let factored = apply_aggregate::ledger_mode() == apply_aggregate::LedgerMode::Factored;
+            // factored: the target's plan exists before anything is locked (a
+            // reverse-only target gets the template), with its RelCheck, so the
+            // batch knows whether this target's to-side reads are factorable
+            let mut use_partials = false;
+            let plan_key = existing_key.clone().unwrap_or_else(|| target.clone());
+            if factored {
+                apply_aggregate::ensure_ledger(
+                    txn,
+                    &target,
+                    &apply_aggregate::ledger_ident(&target),
+                )
+                .await?;
+                if existing_key.is_none() {
+                    agg_plans.insert(target.clone(), target_jobs[0].agg_shape.template.clone());
+                }
+                let plan = agg_plans.get_mut(&plan_key).expect("target plan");
+                if plan.rel_check.is_none()
+                    && let Some(job) = target_jobs.first()
+                    && let Some(rj) = plan.rel_joins.first().cloned()
+                {
+                    let synthetic = job.agg_shape.synthetic_columns.clone();
+                    let factored_fields = apply_aggregate::factored_fields(
+                        &plan.field_exprs,
+                        &plan.fields,
+                        &rj.name,
+                        &synthetic,
+                    );
+                    let factored_ok = apply_aggregate::factored_target_ok(
+                        &plan.field_exprs,
+                        &plan.group_by_source,
+                        &factored_fields,
+                    );
+                    plan.rel_check = Some(apply_aggregate::RelCheck {
+                        to_table: rj.to_table.clone(),
+                        to_col: rj.to_col.clone(),
+                        from_col: rj.from_col.clone(),
+                        synthetic,
+                        contribution_def: job.agg_shape.contribution_def.clone(),
+                        source_columns: job.agg_shape.source_columns.clone(),
+                        group_by_row_columns: job.agg_shape.group_by_row_columns.clone(),
+                        factored: factored_fields,
+                        factored_ok,
+                    });
+                }
+                use_partials = plan.is_factored();
+            }
+            // partials: a parent change touches its partials and the groups,
+            // never its children, so the ledger lock covers the forward keys only
+            let join_keys: Vec<&str> = if use_partials {
+                Vec::new()
+            } else {
                 let mut v: Vec<&str> = target_jobs
                     .iter()
                     .flat_map(|j| j.keys.iter().map(String::as_str))
@@ -8415,6 +8539,38 @@ pub async fn apply_and_mark_drained_many(
                 &join_keys,
             )
             .await?;
+            if use_partials {
+                let plan = agg_plans.get_mut(&plan_key).expect("target plan");
+                let rc = plan
+                    .rel_check
+                    .clone()
+                    .expect("factored plan has a RelCheck");
+                // I1 for the to-side, in one sorted statement: every parent a
+                // forward row reads (new and old join keys) plus every parent
+                // with a reverse record in this batch
+                let mut want: BTreeMap<String, (Option<String>, Option<PgLsn>)> = BTreeMap::new();
+                for r in &plan.ledger_rows {
+                    if let Some(jk) = &r.join_key {
+                        want.entry(jk.clone()).or_default();
+                    }
+                }
+                for (_, _, jk) in entries.values() {
+                    if let Some(jk) = jk {
+                        want.entry(jk.clone()).or_default();
+                    }
+                }
+                for job in &target_jobs {
+                    for k in &job.keys {
+                        want.insert(k.clone(), (job.record.src_xid.clone(), job.record.lsn));
+                    }
+                }
+                plan.parent_rows =
+                    apply_aggregate::lock_parent_rows(txn, &target, &rc, &want).await?;
+                for job in &target_jobs {
+                    rederive_partials(txn, plan, job.record, &job.keys).await?;
+                }
+                continue;
+            }
             for job in &target_jobs {
                 let keys: Vec<&str> = job.keys.iter().map(String::as_str).collect();
                 let rp = rederive_children_via_ledger(

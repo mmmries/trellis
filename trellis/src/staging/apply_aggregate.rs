@@ -593,6 +593,93 @@ pub(super) struct RelCheck {
     pub contribution_def: TransformDef,
     pub source_columns: HashMap<String, ValueType>,
     pub group_by_row_columns: Vec<String>,
+    /// Factored variant: `(field, synthetic column)` for every field that is
+    /// `SUM`/`AVG` of a bare to-one path (linear in the to-side value with a
+    /// from-side factor of 1), and whether the whole target qualifies (no
+    /// relationship group key, no other field reading the relationship).
+    pub factored: Vec<(String, String)>,
+    pub factored_ok: bool,
+}
+
+/// Factored variant: a to-side row as the ledger applied it.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ParentRow {
+    /// The applied to-side values, in [`RelCheck::synthetic`] order.
+    pub vals: Vec<Option<String>>,
+    /// The reverse record for this parent is already reflected (I2).
+    pub skip: bool,
+}
+
+pub(super) fn expr_reads_relationship(expr: &Expr) -> bool {
+    match expr {
+        Expr::RelationshipPath { .. } => true,
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            expr_reads_relationship(lhs) || expr_reads_relationship(rhs)
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(expr_reads_relationship),
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. } => false,
+    }
+}
+
+/// Factored variant: the fields whose contribution is one to-side value times
+/// a from-side factor of 1 (`SUM(<rel>.<col>)`, `AVG(<rel>.<col>)`), as
+/// `(field, synthetic column)`.
+pub(super) fn factored_fields(
+    field_exprs: &HashMap<String, Expr>,
+    fields: &[AggFieldPlan],
+    rel_name: &str,
+    synthetic: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for f in fields {
+        if !matches!(f.kind, AggFieldKind::Sum | AggFieldKind::Avg) {
+            continue;
+        }
+        if let Some(Expr::FunctionCall { args, .. }) = field_exprs.get(&f.name)
+            && let [Expr::RelationshipPath { rel, column }] = args.as_slice()
+            && rel == rel_name
+            && let Some((_, syn)) = synthetic.iter().find(|(c, _)| c == column)
+        {
+            out.push((f.name.clone(), syn.clone()));
+        }
+    }
+    out
+}
+
+/// Whether every to-side read of this target is factorable.
+pub(super) fn factored_target_ok(
+    field_exprs: &HashMap<String, Expr>,
+    group_by_source: &[Expr],
+    factored: &[(String, String)],
+) -> bool {
+    if group_by_source.iter().any(expr_reads_relationship) {
+        return false;
+    }
+    field_exprs.iter().all(|(name, expr)| {
+        !expr_reads_relationship(expr) || factored.iter().any(|(f, _)| f == name)
+    })
+}
+
+impl AggregateTargetPlan {
+    pub(super) fn is_factored(&self) -> bool {
+        ledger_mode() == LedgerMode::Factored
+            && self.rel_check.as_ref().is_some_and(|rc| rc.factored_ok)
+    }
+
+    /// The fields whose stored ledger contribution is blank (their to-side
+    /// part lives on the parent row).
+    pub(super) fn factored_names(&self) -> Vec<String> {
+        if !self.is_factored() {
+            return Vec::new();
+        }
+        self.rel_check
+            .as_ref()
+            .map(|rc| rc.factored.iter().map(|(f, _)| f.clone()).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Which ledger the #558 prototype writes, from `TRELLIS_EXP558_LEDGER`:
@@ -604,6 +691,10 @@ pub(super) enum LedgerMode {
     Off,
     Contrib,
     Membership,
+    /// The to-side value factored out of I3: the ledger keeps the from-side
+    /// part, `<target>__partial` keeps per-(group, join key) membership
+    /// counts, `<target>__parent` keeps each parent's applied to-side values.
+    Factored,
 }
 
 pub(super) fn ledger_mode() -> LedgerMode {
@@ -611,6 +702,7 @@ pub(super) fn ledger_mode() -> LedgerMode {
     *MODE.get_or_init(|| match std::env::var("TRELLIS_EXP558_LEDGER").as_deref() {
         Ok("contrib") => LedgerMode::Contrib,
         Ok("membership") => LedgerMode::Membership,
+        Ok("factored") => LedgerMode::Factored,
         _ => LedgerMode::Off,
     })
 }
@@ -627,6 +719,12 @@ pub(super) struct AggregateTargetPlan {
     /// Issue #558 experiment 4: keys a reverse re-derive in this batch rewrote;
     /// a forward row for one of them is skipped (the re-derive read it live).
     pub reverse_keys: std::collections::HashSet<String>,
+    /// Factored variant: this batch's per-(group, join key) membership deltas.
+    pub partial_deltas: HashMap<(String, String), i64>,
+    /// Factored variant: the parent rows this batch locked, by join key.
+    pub parent_rows: HashMap<String, ParentRow>,
+    /// Factored variant: parent rows to advance (join key, values, position).
+    pub parent_updates: Vec<(String, String, Option<PgLsn>)>,
     /// Every `GROUP BY` key's **target** column name, in `GROUP BY` order —
     /// what DDL created the target's primary key columns as
     /// (`GroupByKey::target_column_name`), used by every statement that
@@ -751,6 +849,9 @@ impl AggregateTargetPlan {
             rel_check: None,
             ledger_written: false,
             reverse_keys: std::collections::HashSet::new(),
+            partial_deltas: HashMap::new(),
+            parent_rows: HashMap::new(),
+            parent_updates: Vec::new(),
             group_by: group_by
                 .iter()
                 .map(|k| k.target_column_name().to_string())
@@ -1494,26 +1595,33 @@ pub(super) fn accumulate_changes(
     let ledger_on = ledger != LedgerMode::Off && plan.rel_joins.len() <= 1;
     if ledger_on && plan.rel_joins.len() == 1 && plan.rel_check.is_none() {
         let rj = &plan.rel_joins[0];
+        let synthetic: Vec<(String, String)> = shape
+            .synthetic
+            .iter()
+            .map(|s| (s.to_col.clone(), s.synthetic.clone()))
+            .collect();
+        let factored = factored_fields(&plan.field_exprs, &plan.fields, &rj.name, &synthetic);
+        let factored_ok = factored_target_ok(&plan.field_exprs, &plan.group_by_source, &factored);
         plan.rel_check = Some(RelCheck {
             to_table: rj.to_table.clone(),
             to_col: rj.to_col.clone(),
             from_col: rj.from_col.clone(),
-            synthetic: shape
-                .synthetic
-                .iter()
-                .map(|s| (s.to_col.clone(), s.synthetic.clone()))
-                .collect(),
+            synthetic,
             contribution_def: shape.contribution_def.clone(),
             source_columns: shape.source_columns.clone(),
             group_by_row_columns: group_by_cols.clone(),
+            factored,
+            factored_ok,
         });
     }
-    let contrib_text = |contrib: &HashMap<String, Option<String>>, fields: &[AggFieldPlan]| {
-        if ledger != LedgerMode::Contrib {
-            return None;
-        }
-        Some(contrib_to_text(contrib, fields))
-    };
+    let contrib_text =
+        |contrib: &HashMap<String, Option<String>>, fields: &[AggFieldPlan], blank: &[String]| {
+            match ledger {
+                LedgerMode::Contrib => Some(contrib_to_text(contrib, fields)),
+                LedgerMode::Factored => Some(contrib_to_text_from_side(contrib, fields, blank)),
+                _ => None,
+            }
+        };
     let ledger_row = |key: &str,
                       group_key: Option<String>,
                       contrib: Option<&HashMap<String, Option<String>>>,
@@ -1536,7 +1644,7 @@ pub(super) fn accumulate_changes(
         LedgerRow {
             from_key: key.to_string(),
             group_key,
-            contrib: contrib.and_then(|c| contrib_text(c, &plan.fields)),
+            contrib: contrib.and_then(|c| contrib_text(c, &plan.fields, &plan.factored_names())),
             lsn,
             join_key,
             basis: None,
@@ -4011,6 +4119,26 @@ pub(super) fn contrib_to_text(
         .join(&ddl::COMPOSITE_KEY_SEPARATOR.to_string())
 }
 
+/// [`contrib_to_text`] with the factored fields blanked (their to-side part is
+/// the parent row's applied value, not a stored one).
+pub(super) fn contrib_to_text_from_side(
+    contrib: &HashMap<String, Option<String>>,
+    fields: &[AggFieldPlan],
+    blank: &[String],
+) -> String {
+    fields
+        .iter()
+        .map(|f| {
+            if blank.iter().any(|b| b == &f.name) {
+                String::new()
+            } else {
+                contrib.get(&f.name).cloned().flatten().unwrap_or_default()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(&ddl::COMPOSITE_KEY_SEPARATOR.to_string())
+}
+
 /// Inverse of [`contrib_to_text`].
 pub(super) fn contrib_from_text(
     text: &str,
@@ -4072,6 +4200,24 @@ async fn reconcile_with_ledger(
     let arity = plan.group_by.len();
     let fields = plan.fields.clone();
     let types = plan.group_by_types.clone();
+    let factored = plan.is_factored();
+    let factored_names = plan.factored_names();
+    // factored field -> index into RelCheck::synthetic (the parent value it is)
+    let factored_idx: Vec<(String, usize)> = plan
+        .rel_check
+        .as_ref()
+        .map(|rc| {
+            rc.factored
+                .iter()
+                .filter_map(|(f, syn)| {
+                    rc.synthetic
+                        .iter()
+                        .position(|(_, s)| s == syn)
+                        .map(|i| (f.clone(), i))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mut keys: Vec<&str> = plan
         .ledger_rows
         .iter()
@@ -4091,7 +4237,8 @@ async fn reconcile_with_ledger(
         .filter(|r| r.row.is_some() || r.old_group_key.is_some())
         .map(|r| (r.from_key.as_str(), r.xid.as_deref(), r.lsn))
         .collect();
-    let mut entries: HashMap<String, (Option<String>, Option<String>, bool)> = HashMap::new();
+    type Entry = (Option<String>, Option<String>, bool, Option<String>);
+    let mut entries: HashMap<String, Entry> = HashMap::new();
     if !fwd.is_empty() {
         let ks: Vec<&str> = fwd.iter().map(|f| f.0).collect();
         let xs: Vec<Option<&str>> = fwd.iter().map(|f| f.1).collect();
@@ -4101,7 +4248,8 @@ async fn reconcile_with_ledger(
                 &format!(
                     "select v.k, l.group_key, l.contrib, \
                        ((l.basis is not null and v.x is not null and pg_visible_in_snapshot(v.x::xid8, l.basis)) \
-                        or (l.applied_lsn is not null and v.l is not null and l.applied_lsn >= v.l)) as skip \
+                        or (l.applied_lsn is not null and v.l is not null and l.applied_lsn >= v.l)) as skip, \
+                       l.join_key \
                      from unnest($1::text[], $2::text[], $3::pg_lsn[]) v(k, x, l) \
                      join {ledger} l on l.from_key = v.k"
                 ),
@@ -4109,12 +4257,13 @@ async fn reconcile_with_ledger(
             )
             .await?;
         for r in rows {
-            entries.insert(r.get(0), (r.get(1), r.get(2), r.get(3)));
+            entries.insert(r.get(0), (r.get(1), r.get(2), r.get(3), r.get(4)));
         }
     }
     let mut skipped = 0;
     let mut no_entry = 0usize;
     let mut replaced = 0usize;
+    let mut p_minus: Vec<(String, String)> = Vec::new();
     let mut kept = Vec::with_capacity(plan.ledger_rows.len());
     let rows = std::mem::take(&mut plan.ledger_rows);
     for lr in rows {
@@ -4143,12 +4292,25 @@ async fn reconcile_with_ledger(
             }
             continue;
         }
-        if let Some((lg, lc, _)) = entry {
+        if let Some((lg, lc, _, ljk)) = entry {
             // the ledger knows the row: its old side replaces the image's
-            let ledger_old = match (lg, lc) {
+            let mut ledger_old = match (lg, lc) {
                 (Some(g), Some(c)) => Some((g.clone(), contrib_from_text(c, &fields))),
                 _ => None,
             };
+            if factored && let Some((_, c)) = ledger_old.as_mut() {
+                // the old side's to-side part is the parent's applied value
+                let pvals = ljk
+                    .as_deref()
+                    .and_then(|jk| plan.parent_rows.get(jk))
+                    .map(|p| p.vals.clone());
+                for (f, i) in &factored_idx {
+                    c.insert(
+                        f.clone(),
+                        pvals.as_ref().and_then(|v| v.get(*i).cloned().flatten()),
+                    );
+                }
+            }
             if ledger_old.is_some() || lg.is_none() {
                 replaced += 1;
                 if let (Some(g), Some(c)) = (&lr.old_group_key, &lr.old_contrib_map)
@@ -4164,13 +4326,16 @@ async fn reconcile_with_ledger(
                     sub_contributions(&fields, group, &c);
                 }
             }
+            if factored && let (Some(g), Some(jk)) = (lg, ljk) {
+                p_minus.push((g.clone(), jk.clone()));
+            }
         }
         kept.push(lr);
     }
     plan.ledger_rows = kept;
     tracing::debug!(no_entry, replaced, skipped, "exp4: reconcile forward rows");
 
-    // 3. the to-side, live
+    // 3. the to-side: live (contrib), or as applied (factored: the locked parent rows)
     let mut corrected = 0;
     if let Some(rc) = plan.rel_check.clone() {
         let join_keys: Vec<&str> = {
@@ -4185,25 +4350,37 @@ async fn reconcile_with_ledger(
             v
         };
         if !join_keys.is_empty() {
-            let to_ident = ddl::qualified_source_table(&rc.to_table);
-            let to_col = quote_ident(&rc.to_col);
-            let to_type = column_type(txn, &rc.to_table, &rc.to_col).await?;
-            let rows = txn
-                .query(
-                    &format!(
-                        "select p.{to_col}::text, e.key, e.value from {to_ident} p \
-                         cross join lateral jsonb_each_text(to_jsonb(p)) e \
-                         where p.{to_col} = any($1::text[]::{to_type}[])"
-                    ),
-                    &[&join_keys],
-                )
-                .await?;
             let mut parents: HashMap<String, Row> = HashMap::new();
-            for r in rows {
-                let k: String = r.get(0);
-                let field: String = r.get(1);
-                let value: Option<String> = r.get(2);
-                parents.entry(k).or_default().insert(field, value);
+            if factored {
+                for jk in &join_keys {
+                    if let Some(p) = plan.parent_rows.get(*jk) {
+                        let mut row = Row::new();
+                        for ((to_col, _), v) in rc.synthetic.iter().zip(p.vals.iter()) {
+                            row.insert(to_col.clone(), v.clone());
+                        }
+                        parents.insert((*jk).to_string(), row);
+                    }
+                }
+            } else {
+                let to_ident = ddl::qualified_source_table(&rc.to_table);
+                let to_col = quote_ident(&rc.to_col);
+                let to_type = column_type(txn, &rc.to_table, &rc.to_col).await?;
+                let rows = txn
+                    .query(
+                        &format!(
+                            "select p.{to_col}::text, e.key, e.value from {to_ident} p \
+                             cross join lateral jsonb_each_text(to_jsonb(p)) e \
+                             where p.{to_col} = any($1::text[]::{to_type}[])"
+                        ),
+                        &[&join_keys],
+                    )
+                    .await?;
+                for r in rows {
+                    let k: String = r.get(0);
+                    let field: String = r.get(1);
+                    let value: Option<String> = r.get(2);
+                    parents.entry(k).or_default().insert(field, value);
+                }
             }
             let mut regex_cache = RegexCache::new();
             for i in 0..plan.ledger_rows.len() {
@@ -4254,9 +4431,31 @@ async fn reconcile_with_ledger(
                 add_contributions(&fields, group, &new_contrib);
                 let lr = &mut plan.ledger_rows[i];
                 lr.group_key = Some(new_key);
-                lr.contrib = (ledger_mode() == LedgerMode::Contrib)
-                    .then(|| contrib_to_text(&new_contrib, &fields));
+                lr.contrib = match ledger_mode() {
+                    LedgerMode::Contrib => Some(contrib_to_text(&new_contrib, &fields)),
+                    LedgerMode::Factored => Some(contrib_to_text_from_side(
+                        &new_contrib,
+                        &fields,
+                        &factored_names,
+                    )),
+                    _ => None,
+                };
                 lr.contrib_map = Some(new_contrib);
+            }
+        }
+    }
+    if factored {
+        for (g, jk) in p_minus {
+            *plan.partial_deltas.entry((g, jk)).or_default() -= 1;
+        }
+        for lr in &plan.ledger_rows {
+            if lr.row.is_some()
+                && let (Some(g), Some(jk)) = (&lr.group_key, &lr.join_key)
+            {
+                *plan
+                    .partial_deltas
+                    .entry((g.clone(), jk.clone()))
+                    .or_default() += 1;
             }
         }
     }
@@ -4274,16 +4473,27 @@ pub(super) async fn ledger_stage(
     targets.sort();
     for target in targets {
         let plan = plans.get_mut(&target).expect("target plan");
-        if plan.ledger_rows.is_empty() || plan.rel_joins.len() > 1 {
+        if (plan.ledger_rows.is_empty() && plan.parent_updates.is_empty())
+            || plan.rel_joins.len() > 1
+        {
             continue;
         }
         let ledger = ledger_ident(&plan.target);
         ensure_ledger(txn, &plan.target, &ledger).await?;
         let before = plan.ledger_rows.len();
-        let (skipped, corrected) = reconcile_with_ledger(txn, plan, &ledger).await?;
-        tracing::debug!(target = %plan.target, rows_before = before, rows_after = plan.ledger_rows.len(), skipped, corrected, reverse_keys = plan.reverse_keys.len(), "exp4: ledger stage");
+        let (skipped, corrected) = if plan.ledger_rows.is_empty() {
+            (0, 0)
+        } else {
+            reconcile_with_ledger(txn, plan, &ledger).await?
+        };
+        tracing::debug!(target = %plan.target, rows_before = before, rows_after = plan.ledger_rows.len(), skipped, corrected, reverse_keys = plan.reverse_keys.len(), partial_deltas = plan.partial_deltas.len(), parent_updates = plan.parent_updates.len(), "exp4: ledger stage");
         if !plan.ledger_rows.is_empty() {
             write_ledger(txn, &plan.target, plan).await?;
+        }
+        if plan.is_factored() {
+            let target = plan.target.clone();
+            write_partials(txn, &target, plan).await?;
+            apply_parent_updates(txn, &target, plan).await?;
         }
         plan.ledger_written = true;
     }
@@ -4291,7 +4501,7 @@ pub(super) async fn ledger_stage(
 }
 
 /// Creates the ledger table on first use (serialized; see the body).
-async fn ensure_ledger(
+pub(super) async fn ensure_ledger(
     txn: &Transaction<'_>,
     target: &str,
     ledger: &str,
@@ -4312,6 +4522,19 @@ async fn ensure_ledger(
              create index if not exists {jindex} on {ledger} (join_key)"
         ))
         .await?;
+        if ledger_mode() == LedgerMode::Factored {
+            let partial = partial_ident(target);
+            let parent = parent_ident(target);
+            let pindex = quote_ident(&format!("{}__partial_jk", target.replace('.', "_")));
+            txn.batch_execute(&format!(
+                "create table if not exists {partial} (group_key text not null, join_key text not null, \
+                 n bigint not null, primary key (group_key, join_key)); \
+                 create index if not exists {pindex} on {partial} (join_key); \
+                 create table if not exists {parent} (join_key text primary key, vals text, \
+                 applied_lsn pg_lsn, basis pg_snapshot)"
+            ))
+            .await?;
+        }
     }
     Ok(())
 }
@@ -4335,7 +4558,7 @@ async fn write_ledger(
     let lsns: Vec<Option<PgLsn>> = rows.iter().map(|r| r.lsn).collect();
     let join_keys: Vec<Option<&str>> = rows.iter().map(|r| r.join_key.as_deref()).collect();
     let bases: Vec<Option<&str>> = rows.iter().map(|r| r.basis.as_deref()).collect();
-    if ledger_mode() == LedgerMode::Contrib {
+    if matches!(ledger_mode(), LedgerMode::Contrib | LedgerMode::Factored) {
         let contribs: Vec<Option<&str>> = rows.iter().map(|r| r.contrib.as_deref()).collect();
         txn.execute(
             &format!(
@@ -4366,6 +4589,235 @@ async fn write_ledger(
         .await?;
     }
     Ok(())
+}
+
+pub(super) fn partial_ident(target: &str) -> String {
+    ddl::qualified_target_table_ident(&format!("{target}__partial"))
+}
+
+pub(super) fn parent_ident(target: &str) -> String {
+    ddl::qualified_target_table_ident(&format!("{target}__parent"))
+}
+
+pub(super) fn vals_to_text(vals: &[Option<String>]) -> String {
+    vals.iter()
+        .map(|v| v.clone().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(&ddl::COMPOSITE_KEY_SEPARATOR.to_string())
+}
+
+fn vals_from_text(text: &str, n: usize) -> Vec<Option<String>> {
+    let mut v: Vec<Option<String>> = text
+        .split(ddl::COMPOSITE_KEY_SEPARATOR)
+        .map(|s| {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        })
+        .collect();
+    v.resize(n, None);
+    v
+}
+
+/// Factored variant, I1 for the to-side: lock the parent rows for `keys` in
+/// key order in one statement, creating a missing one from the live to-side
+/// row under that lock with the read's own snapshot as its basis. For a key
+/// carrying a reverse record's `(xid, lsn)`, I2's skip is decided against the
+/// parent row's basis and applied position.
+pub(super) async fn lock_parent_rows(
+    txn: &Transaction<'_>,
+    target: &str,
+    rc: &RelCheck,
+    keys: &std::collections::BTreeMap<String, (Option<String>, Option<PgLsn>)>,
+) -> Result<HashMap<String, ParentRow>, ApplyError> {
+    let mut out = HashMap::new();
+    if keys.is_empty() {
+        return Ok(out);
+    }
+    let parent = parent_ident(target);
+    let to_ident = ddl::qualified_source_table(&rc.to_table);
+    let to_col = quote_ident(&rc.to_col);
+    let to_type = column_type(txn, &rc.to_table, &rc.to_col).await?;
+    let sep = format!("E'\\x{:02x}'", ddl::COMPOSITE_KEY_SEPARATOR as u32);
+    let vals_expr = format!(
+        "array_to_string(array[{}], {sep}, '')",
+        rc.synthetic
+            .iter()
+            .map(|(c, _)| format!("p.{}::text", quote_ident(c)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let ks: Vec<&str> = keys.keys().map(String::as_str).collect();
+    let xs: Vec<Option<&str>> = keys.values().map(|(x, _)| x.as_deref()).collect();
+    let ls: Vec<Option<PgLsn>> = keys.values().map(|(_, l)| *l).collect();
+    let rows = txn
+        .query(
+            &format!(
+                "with want as (select k, x, l from unnest($1::text[], $2::text[], $3::pg_lsn[]) v(k, x, l)), \
+                      ins as (insert into {parent} as t (join_key, vals, applied_lsn, basis) \
+                              select w.k, {vals_expr}, null, pg_current_snapshot() \
+                                from want w join {to_ident} p on p.{to_col} = w.k::{to_type} \
+                                order by w.k \
+                              on conflict (join_key) do update set join_key = excluded.join_key \
+                              returning t.join_key, t.vals, t.applied_lsn, t.basis) \
+                 select i.join_key, i.vals, \
+                        ((i.basis is not null and w.x is not null and pg_visible_in_snapshot(w.x::xid8, i.basis)) \
+                         or (i.applied_lsn is not null and w.l is not null and i.applied_lsn >= w.l)) as skip \
+                   from ins i join want w on w.k = i.join_key"
+            ),
+            &[&ks, &xs, &ls],
+        )
+        .await?;
+    for r in rows {
+        let jk: String = r.get(0);
+        let vals: Option<String> = r.get(1);
+        let skip: bool = r.get(2);
+        out.insert(
+            jk,
+            ParentRow {
+                vals: vals
+                    .as_deref()
+                    .map(|t| vals_from_text(t, rc.synthetic.len()))
+                    .unwrap_or_else(|| vec![None; rc.synthetic.len()]),
+                skip,
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// Factored variant: this batch's membership deltas into `<target>__partial`,
+/// in (group, join key) order.
+async fn write_partials(
+    txn: &Transaction<'_>,
+    target: &str,
+    plan: &mut AggregateTargetPlan,
+) -> Result<(), ApplyError> {
+    let mut rows: Vec<((String, String), i64)> = plan
+        .partial_deltas
+        .drain()
+        .filter(|(_, d)| *d != 0)
+        .collect();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    rows.sort();
+    let partial = partial_ident(target);
+    let gs: Vec<&str> = rows.iter().map(|((g, _), _)| g.as_str()).collect();
+    let js: Vec<&str> = rows.iter().map(|((_, j), _)| j.as_str()).collect();
+    let ds: Vec<i64> = rows.iter().map(|(_, d)| *d).collect();
+    txn.execute(
+        &format!(
+            "insert into {partial} as p (group_key, join_key, n) \
+             select g, j, d from unnest($1::text[], $2::text[], $3::bigint[]) v(g, j, d) order by g, j \
+             on conflict (group_key, join_key) do update set n = p.n + excluded.n"
+        ),
+        &[&gs, &js, &ds],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Factored variant: advance the applied to-side values of the parents this
+/// batch's reverse records changed.
+async fn apply_parent_updates(
+    txn: &Transaction<'_>,
+    target: &str,
+    plan: &mut AggregateTargetPlan,
+) -> Result<(), ApplyError> {
+    if plan.parent_updates.is_empty() {
+        return Ok(());
+    }
+    let parent = parent_ident(target);
+    let mut last: std::collections::BTreeMap<String, (String, Option<PgLsn>)> =
+        std::collections::BTreeMap::new();
+    for (k, v, l) in std::mem::take(&mut plan.parent_updates) {
+        last.insert(k, (v, l));
+    }
+    let ks: Vec<&str> = last.keys().map(String::as_str).collect();
+    let vs: Vec<&str> = last.values().map(|(v, _)| v.as_str()).collect();
+    let ls: Vec<Option<PgLsn>> = last.values().map(|(_, l)| *l).collect();
+    txn.execute(
+        &format!(
+            "update {parent} as t set vals = v.vals, applied_lsn = greatest(t.applied_lsn, v.l) \
+             from unnest($1::text[], $2::text[], $3::pg_lsn[]) v(k, vals, l) where t.join_key = v.k"
+        ),
+        &[&ks, &vs, &ls],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Factored variant, the reverse path's read: every (group, n) partial of one
+/// parent, locked in group order, with each factored field's old and new
+/// group contribution (`n × value`) computed in SQL.
+pub(super) async fn read_partials_for_parent(
+    txn: &Transaction<'_>,
+    target: &str,
+    join_key: &str,
+    rc: &RelCheck,
+    old_vals: &[Option<String>],
+    new_vals: &[Option<String>],
+) -> Result<
+    Vec<(
+        String,
+        HashMap<String, Option<String>>,
+        HashMap<String, Option<String>>,
+    )>,
+    ApplyError,
+> {
+    let partial = partial_ident(target);
+    let factored_idx: Vec<(String, usize)> = rc
+        .factored
+        .iter()
+        .filter_map(|(f, syn)| {
+            rc.synthetic
+                .iter()
+                .position(|(_, s)| s == syn)
+                .map(|i| (f.clone(), i))
+        })
+        .collect();
+    let ov: Vec<Option<String>> = factored_idx
+        .iter()
+        .map(|(_, i)| old_vals.get(*i).cloned().flatten())
+        .collect();
+    let nv: Vec<Option<String>> = factored_idx
+        .iter()
+        .map(|(_, i)| new_vals.get(*i).cloned().flatten())
+        .collect();
+    let mut select = String::from("select group_key");
+    for j in 0..factored_idx.len() {
+        select.push_str(&format!(
+            ", (n * ${}::numeric)::text, (n * ${}::numeric)::text",
+            2 + 2 * j,
+            3 + 2 * j
+        ));
+    }
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&join_key];
+    for j in 0..factored_idx.len() {
+        params.push(&ov[j]);
+        params.push(&nv[j]);
+    }
+    let rows = txn
+        .query(
+            &format!("{select} from {partial} where join_key = $1 and n <> 0 order by group_key for update"),
+            &params,
+        )
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let g: String = r.get(0);
+        let mut oc = HashMap::new();
+        let mut nc = HashMap::new();
+        for (j, (f, _)) in factored_idx.iter().enumerate() {
+            oc.insert(f.clone(), r.get::<_, Option<String>>(1 + 2 * j));
+            nc.insert(f.clone(), r.get::<_, Option<String>>(2 + 2 * j));
+        }
+        out.push((g, oc, nc));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
