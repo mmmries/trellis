@@ -39,7 +39,7 @@ use tokio_postgres::Client as RawClient;
 use crate::scenario::connect_raw;
 use crate::streaming::chain::{numeric_columns, wait_for_live, warm_up_aggregate};
 use crate::streaming::contention::{self, ContentionSummary};
-use crate::streaming::idle_cost;
+use crate::streaming::disk_tier;
 use crate::streaming::load::{Pace, ParallelLoad, generator_bound, run_parallel_load};
 use crate::streaming::rate::{
     self, InWindowRate, QUERY_SAMPLE_INTERVAL, in_window_rate, json_in_window, json_rate,
@@ -151,6 +151,8 @@ pub struct FoldInResult {
     pub wal_bytes_per_row: f64,
     /// `TRELLIS_EXP558_LEDGER` as the engine saw it (`off` when unset).
     pub ledger_mode: String,
+    /// Experiment 5's disk-tier columns over the same window as `wal_bytes`.
+    pub disk: disk_tier::DiskTier,
 }
 
 impl FoldInResult {
@@ -165,7 +167,7 @@ impl FoldInResult {
              \"e2e_count\":{},\"e2e_p50_bucket_frac\":{:.4},\"e2e_p99_bucket_frac\":{:.4},\
              \"e2e_max_bucket_frac\":{:.4},\"oracle_ok\":{},\"oracle_groups\":{},\
              \"oracle_mismatched_groups\":{},\"deadlocks\":{},\"xact_rollbacks\":{},\
-             \"wal_bytes\":{},\"wal_bytes_per_row\":{:.1},\"ledger_mode\":\"{}\",\
+             \"wal_bytes\":{},\"wal_bytes_per_row\":{:.1},\"ledger_mode\":\"{}\",{},\
              \"contention\":{}}}",
             scenario,
             self.fold_in_ratio,
@@ -201,6 +203,7 @@ impl FoldInResult {
             self.wal_bytes,
             self.wal_bytes_per_row,
             self.ledger_mode,
+            self.disk.json_fields(),
             self.contention.to_json(),
         )
     }
@@ -334,7 +337,7 @@ pub async fn run_probe(
         pace: Pace::RowsPerSec(target_rows_per_sec),
     };
     let (deadlocks_before, rollbacks_before) = contention::deadlocks_and_rollbacks(&sampler).await;
-    let wal_start = idle_cost::wal_lsn(&sampler).await;
+    let disk_start = disk_tier::sample(&sampler).await;
     let offer_start = Instant::now();
     let (raw_ref, terminal_ref) = (&raw, terminal.as_str());
     let (load, fold_samples, contention) = tokio::join!(
@@ -386,7 +389,8 @@ pub async fn run_probe(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     let drained = drained_after.is_some();
-    let wal_bytes = idle_cost::wal_bytes_since(&sampler, &wal_start).await;
+    let disk = disk_tier::since(&sampler, &disk_start).await;
+    let wal_bytes = disk.wal_bytes;
 
     let after = scrape();
     let changes_now = counter_value(&after, CHANGES_APPLIED_METRIC, &terminal);
@@ -439,6 +443,7 @@ pub async fn run_probe(
         wal_bytes,
         wal_bytes_per_row: wal_bytes as f64 / load.rows_issued.max(1) as f64,
         ledger_mode: std::env::var("TRELLIS_EXP558_LEDGER").unwrap_or_else(|_| "off".into()),
+        disk,
     }
 }
 

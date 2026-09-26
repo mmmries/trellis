@@ -10,7 +10,8 @@ use std::time::Duration;
 use crate::streaming::rate::{human_rate, restaged_in_window};
 use crate::streaming::tuning::EngineTuning;
 use crate::streaming::{
-    fold_in, generator_reach, hop_latency, idle_cost, intake_ceiling, load, rel_churn, throughput,
+    build_under_load, fold_in, generator_reach, hop_latency, idle_cost, intake_ceiling, load,
+    rel_churn, throughput,
 };
 
 /// Every scenario name this module handles, for `main.rs`'s usage message.
@@ -25,6 +26,7 @@ pub const SCENARIOS: &[&str] = &[
     "idle-cost",
     "generator-reach",
     "rel-churn",
+    "build-under-load",
 ];
 
 /// The latency ladder's defaults. #266: "low offered rate (e.g. 10
@@ -88,6 +90,29 @@ const IDLE_DEFAULT_WARMUP: Duration = Duration::from_secs(10);
 const IDLE_DEFAULT_DURATION: Duration = Duration::from_secs(60);
 
 const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
+
+/// `build-under-load`'s knobs (issue #558 experiment 5), parsed over the
+/// experiment's defaults: 10M rows over 100k groups (the real run passes
+/// `--rows 100000000`), 8 writers at 2,000 statements/sec in total, 20s of
+/// load after `live`, 600s for the target to converge after it stops.
+fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad {
+    let positive = |name: &str, default: f64| {
+        let v = number(args, name).unwrap_or(default);
+        assert!(v > 0.0, "{name} must be positive, got {v}");
+        v
+    };
+    build_under_load::BuildUnderLoad {
+        rows: positive("--rows", 10_000_000.0) as u64,
+        groups: positive("--groups", 100_000.0) as i32,
+        loaders: positive("--loaders", 4.0) as usize,
+        writers: positive("--writers", 8.0) as usize,
+        write_rate: positive("--write-rate", 2_000.0),
+        pre_define: secs(args, "--pre-define-secs").unwrap_or(Duration::from_secs(2)),
+        post_live: secs(args, "--duration-secs").unwrap_or(Duration::from_secs(20)),
+        build_timeout: secs(args, "--build-timeout-secs").unwrap_or(Duration::from_secs(3600)),
+        grace: secs(args, "--grace-secs").unwrap_or(Duration::from_secs(600)),
+    }
+}
 
 /// `--connections <n>`: the multi-connection generator's
 /// ([`load::run_parallel_load`]) writer count, for every scenario that uses
@@ -424,6 +449,16 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                 }
             }
             Some(ok)
+        }
+
+        // Issue #558 experiment 5: a large aggregate build under write load.
+        "build-under-load" => {
+            let cfg = build_under_load_config(args);
+            let tuning = throughput_tuning(args);
+            let result = runtime().block_on(build_under_load::run(cfg, &tuning));
+            println!("{}", result.to_json(name));
+            eprintln!("{}", result.human());
+            Some(result.oracle_ok && result.writes.errors == 0)
         }
 
         "intake-ceiling" => {
@@ -944,6 +979,10 @@ mod tests {
             contention: Default::default(),
             deadlocks: 0,
             xact_rollbacks: 0,
+            wal_bytes: 0,
+            wal_bytes_per_row: 0.0,
+            ledger_mode: "off".into(),
+            disk: Default::default(),
         }
     }
 
@@ -1125,6 +1164,36 @@ mod tests {
         assert!(json.contains("\"kept_target_rate\":false"), "{json}");
         assert!(json.contains("\"drained\":true"), "{json}");
         assert!(!json.contains("sustained"), "{json}");
+    }
+
+    #[test]
+    fn build_under_load_defaults_and_flags() {
+        let d = build_under_load_config(&argv(&["build-under-load"]));
+        assert_eq!(
+            (d.rows, d.groups, d.loaders, d.writers, d.write_rate),
+            (10_000_000, 100_000, 4, 8, 2_000.0)
+        );
+        assert_eq!(d.post_live, Duration::from_secs(20));
+        assert_eq!(d.grace, Duration::from_secs(600));
+        let c = build_under_load_config(&argv(&[
+            "build-under-load",
+            "--rows",
+            "200000",
+            "--groups",
+            "1000",
+            "--writers",
+            "2",
+            "--write-rate",
+            "500",
+            "--duration-secs",
+            "5",
+            "--grace-secs",
+            "60",
+        ]));
+        assert_eq!((c.rows, c.groups, c.writers), (200_000, 1000, 2));
+        assert_eq!(c.write_rate, 500.0);
+        assert_eq!(c.post_live, Duration::from_secs(5));
+        assert_eq!(c.grace, Duration::from_secs(60));
     }
 
     #[test]
