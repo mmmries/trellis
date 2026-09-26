@@ -381,8 +381,8 @@ pub async fn run_probe(
             let ledger_sum: Option<String> = if ledger_mode != "off" {
                 raw.query_one(
                     &format!(
-                        "select 'w=' || sum(split_part(contrib, chr(31), 1)::numeric)::text || ' v=' || sum(split_part(contrib, chr(31), 2)::numeric)::text || ' n=' || count(*) \
-                         from public.{terminal}__ledger where group_key = $1 and contrib is not null"
+                        "select coalesce('w=' || sum(split_part(contrib, chr(31), 1)::numeric)::text || ' v=' || sum(split_part(contrib, chr(31), 2)::numeric)::text, 'no contributions') || ' n=' || count(*) \
+                         from public.{terminal}__ledger where group_key = $1"
                     ),
                     &[&r.get::<_, Option<String>>(0)],
                 )
