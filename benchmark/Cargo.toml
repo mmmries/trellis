@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+rand = "0.9"
 trellis = { path = "../trellis" }
 testkit = { path = "../testkit" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

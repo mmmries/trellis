@@ -66,6 +66,7 @@ pub mod idle_cost;
 pub mod intake_ceiling;
 pub mod load;
 pub mod rate;
+pub mod rel_churn;
 pub mod scrape;
 pub mod throughput;
 pub mod tuning;
