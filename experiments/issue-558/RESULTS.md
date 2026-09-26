@@ -505,5 +505,170 @@ prototyped here; experiment 4's `rederive_children_via_ledger` is the inline for
 
 ### Results
 
-_(filled in from `logs/exp4-factored-*.jsonl`, `logs/exp4-*-forward-only.jsonl`,
-`logs/exp3-factored-*.jsonl` and `logs/disk/` once the queues finish)_
+Same probe as experiment 4 (`bench rel-churn`, 1M children, 8 writers, 20 s of paced parent
+updates plus 1,000 child updates/s, converged = target equals the from-scratch oracle), same
+`main` and `contrib` rows as experiment 4's table, `factored` from lane g
+(`TRELLIS_EXP558_LEDGER=factored`, `logs/exp4-factored-rel-churn.jsonl`). tmpfs, so CPU and
+locks only; the disk-backed rows are in the disk tier section below.
+
+| children/parent | parent upd/s | `main` converged (tail) | `contrib` (tail) | `factored` (tail) | WAL MB main / contrib / factored | deadlocks main / contrib / factored |
+|---|---|---|---|---|---|---|
+| 10 | 100 | 113 s (93) | 21 s (0.7) | **21 s (0.7)** | 132 / 263 / 209 | 28 / 0 / 0 |
+| 10 | 1,000 | never, wrong target | 43 s (23) | **35 s (15)** | 139 / 346 / 237 | 134 / 0 / 0 |
+| 1k | 100 | 80 s (60) | 40 s (20) | **21 s (0.7)** | 362 / 1,005 / 227 | 1 / 0 / 0 |
+| 1k | 1,000 | 113 s (93) | 77 s (57) | **21 s (0.6)** | 404 / 2,101 / 248 | 7 / 0 / 0 |
+| 100k | 100 | 24 s (4) | 74 s (54) | **21 s (0.6)** | 390 / 2,203 / 263 | 0 / 0 / 0 |
+| 100k | 1,000 | 24 s (4) | 54 s (34) | **21 s (0.6)** | 398 / 1,694 / 263 | 0 / 0 / 0 |
+
+- `factored` matched the oracle on all six shapes with zero deadlocks. Five of the six converge
+  within a second of the write window closing: the drain keeps up with the offered load, so the
+  tail is the last batch. The exception is 10 children per parent at 1,000 parent updates/s,
+  the shape with the most distinct parents touched per batch (each one a T row lock and a P
+  scan), where the tail is 15 s against `contrib`'s 23 s.
+- **The hot-parent shape is no longer special.** At 100k children per parent a parent change
+  rewrites 100k ledger entries under `contrib` (2.2 GB of WAL in the window, 3.08x `main`) and
+  touches one T row plus that parent's P rows under `factored`: 263 MB, below `main`'s 390 MB,
+  and the same 21 s as every other shape. The parent's children are never read or written.
+- **WAL is below `main` on every shape** (0.6–1.6x, against `contrib`'s 2.0–5.6x), because the
+  ledger's per-child rewrite is gone and the projection refresh that `main` pays for is not
+  there either.
+
+**Forward path in isolation** (child updates only, 5,000/s for 20 s, no parent updates; the cost
+of the P row per child change; `logs/exp4-{contrib,factored}-forward-only.jsonl`):
+
+| children/parent | `contrib` converged (tail) | `factored` converged (tail) | WAL MB contrib → factored |
+|---|---|---|---|
+| 10 | 20.7 s (0.7) | 20.7 s (0.7) | 367 → 503 (1.37x) |
+| 1k | 20.6 s (0.6) | 20.6 s (0.6) | 369 → 353 (0.96x) |
+
+Both kept up with 5,000 child updates/s, so this is a WAL measurement, not a throughput one.
+At fan-out 10 the P row costs 37% more WAL: with ~1M distinct (group, parent) pairs the P heap
+and index are as large as L's, and a random child update touches a cold P page (a full-page
+image after every checkpoint, even on tmpfs). At fan-out 1k P has ~1k parents' worth of rows,
+its pages stay hot, and the extra row is free. The forward-path cost is therefore a
+low-fan-out cost and a disk cost, which the disk tier should size before it is accepted.
+
+**Plain aggregates** (`fold-in-ratio` 100 and 1000, tmpfs, 8 workers): the first `factored`
+runs folded 33–49k rows/s in the window and never drained, against `off`'s 76–90k measured the
+day before, which would have contradicted "unchanged by construction". A same-lane, same-hour
+control settled it: the box was slower that day for every mode (another session's harness was
+running trigger-capture correctness runs with 16 pgbench clients between my measurements, and
+part of its work does not sit under the benchmark lock).
+
+| mode (lane g, same binary, back to back) | 100:1 / 4k groups | 1000:1 / 400 groups | WAL/row |
+|---|---|---|---|
+| `off` | 55.5k | 44.2k | 419 |
+| `contrib` | 32.0k | 41.5k | 677 |
+| `factored` | 50.4k | 41.4k | 669–682 |
+
+In-window folded rows/s; none of the six drained within the 120 s grace. `factored` is at or
+above `contrib` on both shapes and within noise of `off` on the second; the day-before `off`
+figures (`logs/exp3-off-fold-in-ratio.jsonl`, 76–90k) are the clean ones. WAL per row is the
+same as `contrib` (669–682 vs 677 B), as it must be: P and T are never touched without a
+relationship. Answer for the fold-in case: no measurable cost beyond `contrib`'s, and no WAL
+beyond it.
+
+### What experiment 4b says
+
+- The hot-parent shape stops being a shape: a parent change costs one T row, that parent's P
+  rows and the group deltas, so 100k-fan-out converges in the same 21 s as 10-fan-out, with
+  0.6–1.6x `main`'s WAL instead of `contrib`'s 2.6–5.6x, on tmpfs and on disk.
+- The 1-1 case is untouched by construction; the plain-aggregate path emits the same statements
+  as `contrib` and measures the same.
+- What it costs: one P row per child change (the forward path), which is a cold-page cost at
+  low fan-out (+37% WAL at fan-out 10 in the forward-only probe, nothing at fan-out 1k), and
+  the restriction that only fields separable in the to-side value (SUM/AVG of a bare to-one
+  path, times a from-side factor) can be factored; a target that reads the to-side
+  non-linearly keeps the per-child path.
+- It is more code than `contrib` (two more tables per relationship target, a partial rederive
+  path, a parent-row lock statement), but it removes the 6b "index ∪ live scan" amendment:
+  the T row is the dependency lock, so a parent change never enumerates children at all.
+
+## Disk tier: the cheap shapes disk-backed
+
+Every number above is a tmpfs number (`/tmp`, 16 GB tmpfs): fsync, full-page writes and WAL
+bandwidth are free, so they measure CPU and locks. These reruns put the cluster on the box's
+NVMe (`/home/mike/exp558/tmpdisk`, btrfs with `chattr +C`, the same layout `bench --disk`
+uses; Postgres's default durability, `fsync`, `synchronous_commit` and `full_page_writes` on).
+Same session, same binaries as the tmpfs runs they are compared with; the `main` control is
+the true-`main` lane. Logs under `logs/disk/`.
+
+### Experiment 4's shapes, all six, disk-backed
+
+| children/parent | parent upd/s | `main` converged (tail) | `contrib` (tail) | `factored` (tail) | WAL MB main / contrib / factored |
+|---|---|---|---|---|---|
+| 10 | 100 | 96 s (76) | 21 s (0.7) | **21 s (0.7)** | 131 / 305 / 221 |
+| 10 | 1,000 | never, wrong target (991 groups) | 53 s (33) | **41 s (21)** | 142 / 418 / 268 |
+| 1k | 100 | 78 s (58) | 56 s (36) | **21 s (0.7)** | 353 / 1,374 / 228 |
+| 1k | 1,000 | 104 s (84) | 105 s (85) | **21 s (1.0)** | 392 / 1,981 / 246 |
+| 100k | 100 | 24 s (4) | 68 s (48) | **21 s (0.6)** | 397 / 1,646 / 258 |
+| 100k | 1,000 | 23 s (3) | 57 s (37) | **21 s (0.7)** | 403 / 1,505 / 272 |
+
+- The disk moves `contrib`, not `main` or `factored`: `contrib`'s per-child rewrite goes from
+  40 s → 56 s and 77 s → 105 s at 1k fan-out (1.4–2 GB of WAL through a real device, full-page
+  images on every rewritten ledger page), which is the write-amplification cost the note
+  predicted and tmpfs hid. `factored` writes less WAL than `main` and converges in the same
+  21 s on disk as on tmpfs. `main`'s lost-update failure at 10 / 1,000 reproduces on disk.
+- Oracle matched on every `contrib` and `factored` run. `factored` had 9 deadlocks on 1k / 100
+  and 16 / 9 on the two 100k shapes (0 on tmpfs), all retried within the batch retry budget;
+  on disk a parent batch holds its T and P locks for longer, which is where a child batch
+  arriving in the other order meets it. Sorted P and T locking is in the prototype; the
+  remaining cycle is between a parent batch's P rows and a child batch's group pre-lock and
+  needs a look before this is more than an experiment.
+- The 100k shape, the one the I3 decision turns on: `contrib` 2.4–2.9x `main` on disk
+  (2.3–3.1x on tmpfs), `factored` 0.9x `main` with 0.65x its WAL.
+
+### #565 E1 (write-path tax) disk-backed, same harness, `TC565_BASE` on the NVMe
+
+| variant | rows/commit | clients | rows/s tmpfs → disk | p50 / p99 ms tmpfs | p50 / p99 ms disk | WAL B/row tmpfs → disk | disk top wait |
+|---|---|---|---|---|---|---|---|
+| none | 1 | 1 | 70,961 → 1,624 | 0.013 / 0.02 | 0.358 / 5.0 | 186.7 → 188.5 | IO:WalSync 94% |
+| none | 1 | 16 | 400,067 → 11,863 | 0.032 / 0.098 | 0.746 / 9.491 | 200.3 → 200.3 | LWLock:WALWrite 91% |
+| none | 1000 | 1 | 1,610,206 → 454,169 | 0.586 / 1.14 | 1.544 / 13.01 | 138.6 → 138.6 | CPU:- 40% |
+| none | 1000 | 16 | 5,285,981 → 736,155 | 2.643 / 6.592 | 9.129 / 133.361 | 152.3 → 152.3 | LWLock:WALWrite 73% |
+| slot | 1 | 1 | 63,768 → 1,319 | 0.014 / 0.026 | 0.394 / 6.462 | 462.9 → 476.7 | IO:WalSync 71% |
+| slot | 1 | 16 | 313,267 → 13,291 | 0.042 / 0.126 | 0.711 / 7.478 | 485.6 → 485.7 | LWLock:WALWrite 89% |
+| slot | 1000 | 1 | 1,511,029 → 492,909 | 0.604 / 1.521 | 1.102 / 16.164 | 417.6 → 417.6 | CPU:- 47% |
+| slot | 1000 | 16 | 4,166,015 → 826,682 | 3.471 / 7.926 | 7.027 / 329.06 | 438.9 → 438.9 | LWLock:WALWrite 72% |
+| stmt | 1 | 1 | 32,648 → 1,293 | 0.029 / 0.043 | 0.435 / 6.267 | 462.7 → 464.6 | IO:WalSync 89% |
+| stmt | 1 | 16 | 188,551 → 11,744 | 0.073 / 0.2 | 0.791 / 9.29 | 486.8 → 486.7 | LWLock:WALWrite 87% |
+| stmt | 1000 | 1 | 413,615 → 190,833 | 2.33 / 4.317 | 3.671 / 28.296 | 417.5 → 417.5 | CPU:- 46% |
+| stmt | 1000 | 16 | 1,875,880 → 363,526 | 8.214 / 13.637 | 25.71 / 215.381 | 440.3 → 440.2 | LWLock:WALWrite 52% |
+
+- **At 1 row per commit the tax disappears into the fsync.** A single writer does 1.3–1.6k
+  commits/s on this NVMe whatever the capture (`IO:WalSync` 71–94% of wait time); 16 writers
+  reach 11.7–13.3k, WAL-write-lock bound, and the statement trigger is within 1% of no capture.
+  The +16 µs that doubled a 13 µs tmpfs commit is invisible under a 0.4 ms fsync.
+- **At 1,000 rows per commit the trigger's cost survives and grows.** 16 writers: no capture
+  736k rows/s, slot 827k, statement trigger 364k (0.49x), with p99 commit latency 133 → 215 ms
+  and `LWLock:WALWrite` on top. That is the WAL-bandwidth ceiling the trigger halves by writing
+  ~440 B/row of ring instead of ~150 B/row of source (2.9x the WAL, the same ratio as tmpfs).
+  The slot's decoding reads WAL that on tmpfs was free; on disk it still keeps pace here.
+- p99 at 1 row/commit: 5–9.5 ms on disk against 20–200 µs on tmpfs, all variants alike.
+
+### Experiment 3's shapes disk-backed: nothing drains, and the day was noisy
+
+`fold-in-ratio` 100:1 / 1000:1 and `group-contention` 400 / 4k groups x 1 / 8 workers, 400k
+offered rows/s, 120 s grace (`logs/disk/exp3-*.jsonl`; the `off` fold-in pair was rerun quietly,
+`exp3-off-fold-in-ratio-rerun.jsonl`, and matched the first pass):
+
+| shape | workers | `off` in-window rows/s | `contrib` in-window rows/s | WAL/row off → contrib |
+|---|---|---|---|---|
+| fold-in 100:1 / 4k groups | 8 | 22.8k (rerun 31.3k) | 30.3k | 394–405 → 602 |
+| fold-in 1000:1 / 400 groups | 8 | 29.7k (rerun 23.3k) | 20.6k | 391–422 → 642 |
+| group-contention 400 | 1 / 8 | 34.6k / 22.2k | 24.8k / 21.2k | 368–413 → 599–657 |
+| group-contention 4k | 1 / 8 | 23.1k / 7.1k | 21.1k / 18.1k | 414–506 → 632–717 |
+
+- No run drained in either mode: on disk the drain folds 7–35k rows/s against 70–90k on
+  tmpfs, so at this offered rate the shapes are I/O-bound before the ledger matters.
+- `contrib` vs `off` is inside the run-to-run spread both ways (30k vs 23k, 21k vs 30k). The
+  ledger's extra write is not visible at this level; its WAL ratio is the tmpfs one (1.5–1.6x).
+- **These absolute numbers are not clean.** The same day, the same binaries on tmpfs measured
+  33–55k where experiment 3 had measured 76–90k (`logs/exp3-off-fold-in-ratio-today.jsonl`,
+  lane c's binary; `logs/exp3-*-laneg.jsonl`, lane g's): another session's trigger-capture
+  correctness harness (16 pgbench clients plus a trellis drain) ran between and, in part,
+  alongside these runs without holding the benchmark lock. Within-session comparisons stand;
+  the disk-vs-tmpfs ratio needs a quiet-box rerun before it is quoted. The rel-churn disk rows
+  above are less exposed (converged-time, not throughput, and `main` was measured in the same
+  hour), but carry the same caveat.
+

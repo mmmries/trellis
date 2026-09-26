@@ -1,0 +1,13 @@
+storage: /home/mike/exp558/tmpdisk (btrfs)
+waiting for in-flight verify runs / benchmarks to release /tmp/trellis-bench.lock ...
+[2m2026-09-26T23:29:54.000037Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 0 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+rel-churn: ledger seeded with 1000000 entries in 34.7s
+[2m2026-09-26T23:30:57.536078Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 3 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-26T23:31:03.065829Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 0 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-26T23:33:11.646889Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: db error
+rel-churn: 100000 children/parent, parents at 100/s, children at 1000/s: 2000 parent + 20000 child updates; converged after 68.4s (tail 48.4s), oracle_ok=Some(true), wal 1646 MB
+[2m2026-09-26T23:33:57.443398Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 0 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+rel-churn: ledger seeded with 1000000 entries in 35.8s
+[2m2026-09-26T23:35:01.732045Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 3 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-26T23:36:49.622138Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: db error
+rel-churn: 100000 children/parent, parents at 1000/s, children at 1000/s: 20000 parent + 20000 child updates; converged after 57.0s (tail 37.0s), oracle_ok=Some(true), wal 1504 MB

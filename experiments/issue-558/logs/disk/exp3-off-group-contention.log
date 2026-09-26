@@ -1,0 +1,38 @@
+storage: /home/mike/exp558/tmpdisk (btrfs)
+waiting for in-flight verify runs / benchmarks to release /tmp/trellis-bench.lock ...
+oracle SKIPPED: 400 groups — the target never folded in every row within the grace period, so this probe's correctness was not checked
+fold-in 1000:1 (400 groups) — T3 NO at 400000 rows/sec: folded 34590 rows/sec while offered, never caught up within the grace period (offered 386560/sec)
+400 groups x 1 drain workers: folded 34590 rows/sec while offered; engine busy 1.44 backends, 0.00 waiting on row locks (0%, 0.00 in the aggregate pre-lock), 0.85 running, 0.16 idle in txn; 0 deadlocks, 0 rollbacks
+      0.21 lwlock      COMMIT
+      0.16 running     insert into seg_1 (src_table, key, op, lsn, old_image, new_image, origin
+      0.16 running     insert into seg_2 (src_table, key, op, lsn, old_image, new_image, origin
+      0.15 running     insert into seg_0 (src_table, key, op, lsn, old_image, new_image, origin
+      0.12 running     insert into seg_3 (src_table, key, op, lsn, old_image, new_image, origin
+      0.12 running     with fenced as (select src_table, key, old_image::text as old_image, new
+oracle SKIPPED: 400 groups — the target never folded in every row within the grace period, so this probe's correctness was not checked
+fold-in 1000:1 (400 groups) — T3 NO at 400000 rows/sec: folded 22162 rows/sec while offered, never caught up within the grace period (offered 337220/sec)
+400 groups x 8 drain workers: folded 22162 rows/sec while offered; engine busy 9.04 backends, 4.61 waiting on row locks (51%, 2.05 in the aggregate pre-lock), 1.09 running, 0.21 idle in txn; 7 deadlocks, 29 rollbacks
+      2.05 row_lock    select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t j
+      2.02 row_lock    with taken as ( select bucket from seg_claims where seg_seq = $1 ), free
+      1.53 lwlock      insert into drainers (drainer_id, last_seen) values ($1, now()) on confl
+      0.76 lwlock      COMMIT
+      0.31 other_lock  COMMIT
+      0.22 row_lock    update segments set drained_mask = drained_mask | $2::bigint, state = ca
+oracle SKIPPED: 4000 groups — the target never folded in every row within the grace period, so this probe's correctness was not checked
+fold-in 100:1 (4000 groups) — T3 NO at 400000 rows/sec: folded 23123 rows/sec while offered, never caught up within the grace period (offered 339690/sec)
+4000 groups x 1 drain workers: folded 23123 rows/sec while offered; engine busy 2.07 backends, 0.01 waiting on row locks (1%, 0.00 in the aggregate pre-lock), 0.93 running, 0.21 idle in txn; 0 deadlocks, 70 rollbacks
+      0.49 lwlock      COMMIT
+      0.34 running     select exists(select 1 from "public"."agg_src" s where s."grp" is not di
+      0.15 io          COMMIT
+      0.14 other_lock  COMMIT
+      0.13 running     insert into seg_3 (src_table, key, op, lsn, old_image, new_image, origin
+      0.11 running     insert into seg_0 (src_table, key, op, lsn, old_image, new_image, origin
+oracle SKIPPED: 4000 groups — the target never folded in every row within the grace period, so this probe's correctness was not checked
+fold-in 100:1 (4000 groups) — T3 NO at 400000 rows/sec: folded 7126 rows/sec while offered, never caught up within the grace period (offered 248400/sec)
+4000 groups x 8 drain workers: folded 7126 rows/sec while offered; engine busy 9.30 backends, 6.13 waiting on row locks (66%, 5.02 in the aggregate pre-lock), 0.80 running, 0.26 idle in txn; 9 deadlocks, 131 rollbacks
+      5.02 row_lock    select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t j
+      0.69 row_lock    with taken as ( select bucket from seg_claims where seg_seq = $1 ), free
+      0.56 lwlock      COMMIT
+      0.48 lwlock      insert into drainers (drainer_id, last_seen) values ($1, now()) on confl
+      0.41 lwlock      with targets(seg_seq, claimed_by) as ( select * from unnest($1::bigint[]
+      0.37 row_lock    update "public"."agg_totals" set "val" = case when k.f0_active then case
