@@ -3969,7 +3969,12 @@ pub(super) async fn column_type(
     static TYPES: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String), String>>> =
         std::sync::OnceLock::new();
     let key = (qualified_table.to_string(), column.to_string());
-    if let Some(t) = TYPES.get_or_init(Default::default).lock().expect("types").get(&key) {
+    if let Some(t) = TYPES
+        .get_or_init(Default::default)
+        .lock()
+        .expect("types")
+        .get(&key)
+    {
         return Ok(t.clone());
     }
     let ident = ddl::qualified_source_table(qualified_table);
@@ -3981,7 +3986,11 @@ pub(super) async fn column_type(
         )
         .await?
         .get(0);
-    TYPES.get_or_init(Default::default).lock().expect("types").insert(key, t.clone());
+    TYPES
+        .get_or_init(Default::default)
+        .lock()
+        .expect("types")
+        .insert(key, t.clone());
     Ok(t)
 }
 

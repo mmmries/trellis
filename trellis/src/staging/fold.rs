@@ -270,6 +270,12 @@ pub async fn fold(
     params.push(&bucket.bucket_count);
     params.push(&bucket.buckets);
 
+    // A segment refilled since its slot was last analyzed is estimated at one
+    // row, and the planner then joins the (actually tens of thousands of rows)
+    // `filtered` CTE to `group_keys` with an unparameterized nested loop whose
+    // join filter is O(n²): minutes per fold. Found during #558 experiment 4;
+    // the plan is identical on main. Transaction-local, Phase 1 only.
+    txn.batch_execute("set local enable_nestloop = off").await?;
     let rows = txn.query(&sql, &params).await?;
     Ok(rows
         .into_iter()
