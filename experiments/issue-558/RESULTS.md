@@ -423,3 +423,87 @@ reverse shape names the qualified one, so the reverse plan was applied beside th
 plan instead of merged into it (a child's delta counted twice); the go-live catch-up's
 image-less parent records were being taken by the ledger reverse path with an unknown old
 side; and the seeding rows folded with the catch-up's recomputes.
+
+## Experiment 4b: the to-side value factored out of I3
+
+Branch `exp/issue-558-factored` (lane g, on top of this branch), `TRELLIS_EXP558_LEDGER=factored`.
+Asked for after experiment 4: factor the to-side value out of the ledger entry so a parent
+change touches the group and the parent, not every child, "similar to how we treat multi-step
+hops with chained tables", and say whether that makes the 1-1 case or the aggregate fold-in
+case more expensive.
+
+### The design
+
+Three tables per relationship-reading aggregate target, in place of experiment 4's one:
+
+| table | key | holds | written by |
+|---|---|---|---|
+| `<target>__ledger` (L) | `from_key` | `group_key`, `join_key`, the **from-side part** of the row's contribution (a factored field's part is blank), `applied_lsn`, `basis` | Apply (child change) |
+| `<target>__partial` (P) | `(group_key, join_key)` | `n`, the number of ledger entries with that group and parent (in general, the sum of each factored field's from-side factor) | Apply (child change), `±1` per (group, parent) the row left or entered |
+| `<target>__parent` (T) | `join_key` | the parent's **applied** to-side values, `applied_lsn`, `basis` | created by the first Apply that needs the parent (read live under the lock, the read's snapshot as basis); advanced by the parent's own change |
+
+A factored field is one whose contribution is linear in the to-side value with a from-side
+factor: `SUM(parent.weight)` (factor 1, so P's `n` is the whole partial), `AVG(parent.weight)`
+(the same, with the hidden count), and, once the evaluator has `*`, `SUM(val * parent.weight)`
+(factor `val`, so P would carry `Σ val` per factored field beside `n`). The group's value of
+such a field is, by construction, `Σ_parent P[group, parent] × T[parent]`.
+
+- **Apply, a child change** (`reconcile_with_ledger` in `factored` mode): lock the batch's L
+  entries in key order; lock, in **one** sorted statement, the T row of every parent the batch
+  reads (the rows' new join keys, the locked entries' old join keys, and every parent with a
+  reverse record in the batch), creating a missing one from the live parent under that lock
+  (`lock_parent_rows`); the new contribution is computed with **T's applied values**, never the
+  projection's and never the live parent's; the old side is the entry's from-side part with
+  T's applied value of its old parent filled in; the P deltas are `−1` at the old (group,
+  parent) and `+1` at the new; then L, P and T are written and the groups are locked and
+  updated as before. Lock order everywhere: L → T → P → groups, each sorted.
+- **Apply, a parent attribute change** (`rederive_partials`): T[p] is already locked by the
+  statement above; skip iff the change's xid is visible in T's basis or its position is at or
+  below T's applied position (I2, exact per parent because T[p]'s row lock serialises the
+  parent's changes); read P's rows for p in group order `for update`; each group gets
+  `n × (new − old)` per factored field (as a diff, so hidden counts net to zero); T[p] := new.
+  **No child is read or written.** Cost is the number of distinct groups under p, at most
+  `min(children_p, groups)`.
+- **6b disappears for aggregates.** Experiment 2's amendment (enumerate ledger index ∪ live
+  from-side scan, or a per-parent dependency lock) was needed because a child moving into p is
+  invisible to p's enumeration until it commits. Here p is never enumerated: a child's Apply
+  and p's Apply both take T[p], so the child either sees p's applied value (and P counts it
+  after p's read) or is counted in P before p's read. The T row *is* the dependency lock the
+  scenario asked for, materialised, and it carries I2's state for the parent too.
+- **The chained-hop reading.** P is exactly the first hop of the two-definition chain
+  `GROUP BY grp, parent SELECT COUNT(*)` → `GROUP BY grp SELECT SUM(parent.weight × n)`, and the
+  target is the second hop. The engine-internal form keeps one transaction and one ring row per
+  child change instead of a seam round trip and a second batch of latency, and the second hop's
+  "parent change re-derives its dependents" is the P read above with fan-out = groups, not
+  children.
+
+What stays per-child: a **1-1 target** reading parent columns (one target row per child; a
+parent change must rewrite those rows under any design), and an aggregate whose argument mixes
+child and parent non-linearly (`SUM(GREATEST(val, parent.w))`). `MIN`/`MAX(parent.w)` and
+`COUNT(parent.w)` are group-level over P ∪ T (the group's min is the min over its P rows'
+parents), so they need no per-child write either, only a group recompute over P. For the
+per-child cases the "like a hop" mechanism is to **re-stage the dependent keys into the ring**
+(one ring row per child, drained by every worker in batches, each child's Apply under I1/I2)
+instead of rewriting them inside the parent's transaction. That is #354's shape and was not
+prototyped here; experiment 4's `rederive_children_via_ledger` is the inline form of it.
+
+### Does it make the 1-1 case or the fold-in case more expensive?
+
+- **1-1: no, by construction.** A 1-1 row's ledger entry is `(from_key, join_key, applied_lsn,
+  basis)` with no contribution at all (the target row is the state); nothing in it is factored
+  or unfactored. Its reverse path enumerates the parent's children either way. The only thing
+  this design offers the 1-1 case is the T row as its dependency lock, replacing the live
+  from-side scan of 6b with one row lock per parent.
+- **Plain aggregates (fold-in): no, by construction.** P and T exist only for a target with a
+  relationship join; the single-source path emits the same statements as `contrib`. Measured
+  below to confirm nothing leaked into the shared code.
+- **Relationship aggregates, the forward path: yes, by one row.** Every child change upserts one
+  P row (two if it moved) beside its L row, and locks one T row per distinct parent in the
+  batch. At fan-out 1 P is as large as L (a second heap tuple and index entry per change); at
+  high fan-out P is small and its rows are hot (every child batch touching group g under
+  parent p updates `P[g, p]`), like group rows are today. Measured below.
+
+### Results
+
+_(filled in from `logs/exp4-factored-*.jsonl`, `logs/exp4-*-forward-only.jsonl`,
+`logs/exp3-factored-*.jsonl` and `logs/disk/` once the queues finish)_
