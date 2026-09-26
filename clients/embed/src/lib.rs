@@ -15,22 +15,31 @@
 //! | any error's `code()` + `Display` | `(code, message)` | [`PlainError`] |
 //! | [`trellis::Definition`] | summary fields + column name → type name | [`PlainDefinition`] |
 //! | [`trellis::DefinitionSummary`] | summary fields | [`PlainDefinitionSummary`] |
+//! | [`trellis::DefinitionStatus`] | status word + backfill failure | [`PlainDefinitionStatus`] |
 //! | `SystemTime` | epoch microseconds | [`epoch_micros`] / [`system_time_from_epoch_micros`] |
 //! | [`trellis::TransformStatus`] / [`trellis::QuarantineState`] | their `as_str()` word | [`transform_status`] / [`quarantine_state`] |
 //! | [`trellis::QuarantineTarget`] | `transform` / `transform.column` | [`quarantine_address`] |
 //! | `sample_quarantined`'s `(src_table, key)` cursor | an opaque string | [`next_cursor`] / [`decode_cursor`] |
+//!
+//! One piece of shared logic isn't flattening: [`require_transform_statement`]
+//! is the check a binding's `define` makes before calling `apply`, so that a
+//! `DROP` or `PAUSE` handed to `define` is refused rather than carried out.
 
 mod cursor;
 mod definition;
 mod error;
 mod quarantine;
+mod statement;
 mod status;
 mod time;
 
 pub use cursor::{decode_cursor, encode_cursor, next_cursor};
-pub use definition::{PlainDefinition, PlainDefinitionSummary};
+pub use definition::{
+    PlainBackfillFailure, PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary,
+};
 pub use error::{CodedError, ERROR_CODES, PlainError};
 pub use quarantine::quarantine_address;
+pub use statement::require_transform_statement;
 pub use status::{
     quarantine_state, quarantine_state_names, transform_status, transform_status_names,
 };
