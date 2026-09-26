@@ -1,0 +1,5 @@
+/.bundle/
+/vendor/
+# The native extension `rake compile` copies out of the Cargo workspace's target/.
+/lib/trellis/*.so
+/lib/trellis/*.bundle

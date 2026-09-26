@@ -6,6 +6,21 @@ members = [
     "cli",
     "clients/embed",
     "clients/elixir/native/trellis_nif",
+    "clients/ruby/ext/trellis_ruby",
+    "generative",
+    "testkit",
+]
+# Every member but the Ruby extension, so a command that names no package
+# (`cargo clippy --all-targets --all-features`, `cargo build`) never turns on
+# its `ruby` feature, whose `rb-sys` build script needs a Ruby install and
+# libclang. `--workspace` still builds it, with the feature off, as an empty
+# library; see clients/ruby/ext/trellis_ruby/Cargo.toml.
+default-members = [
+    "trellis",
+    "benchmark",
+    "cli",
+    "clients/embed",
+    "clients/elixir/native/trellis_nif",
     "generative",
     "testkit",
 ]

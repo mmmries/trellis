@@ -148,7 +148,9 @@ about an individual transform's own progress.
 
 The bindings are in progress (epic #140): the Elixir binding in
 `clients/elixir` wraps the whole `BlockingTrellis` surface (issues #146,
-#147 and #587), and the Ruby binding doesn't exist yet. Each is a thin
+#147 and #587), and the Ruby binding in `clients/ruby` is so far a vertical
+slice (#151: connect, migrate, define, status, shutdown), without these
+checks. Each is a thin
 Rustler/Magnus wrapper over the `Trellis` shape above, per ADR-0010
 decision 1. In Elixir the two checks are `Trellis.has_live_drain_workers/1`
 and `Trellis.has_live_staging_worker/1`, each returning `{:ok, boolean}`
@@ -189,11 +191,12 @@ every web request:
 ```ruby
 class TrellisWorkerHealthCheck
   def self.perform
-    unless Trellis.instance.has_live_drain_workers?
+    # The process's one handle is the `Trellis` module's (ADR-0010 decision 3).
+    unless Trellis.has_live_drain_workers?
       Rails.logger.error("no live Trellis drain workers — every transform is stalled")
       # ... page, raise, whatever this app's alerting expects ...
     end
-    unless Trellis.instance.has_live_staging_worker?
+    unless Trellis.has_live_staging_worker?
       Rails.logger.error("no live Trellis staging worker — no change is captured")
       # ... same ...
     end

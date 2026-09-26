@@ -199,3 +199,85 @@ jobs:
         run: |
           mix compile --warnings-as-errors
           mix test
+
+  ruby:
+    # The Ruby binding (clients/ruby, issue #151). Its extension crate is a
+    # workspace member, but everything in it is behind the `ruby` feature,
+    # because rb-sys needs a Ruby install to build (see its Cargo.toml): the
+    # `ci` job only formats it and builds it empty. This job lints it with
+    # the feature on, then builds it into a Ruby and runs the Minitest suite
+    # against a `trellis-testkit` cluster.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.98.0"
+          components: clippy
+
+      - name: Restore Cargo dependency cache
+        # The `ci` job's entry, restore-only: that job is the one that saves.
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-deps-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-line-tables-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-deps-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-line-tables-
+
+      - name: Install PostgreSQL server binaries
+        # trellis-testkit shells out to initdb/postgres/pg_ctl/createdb, the
+        # same as the `ci` job's tests; see that job's step.
+        run: |
+          set -euo pipefail
+          pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin 2>/dev/null | sort -V | tail -n1 || true)"
+          if [ -z "$pg_bin" ]; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql
+            pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin | sort -V | tail -n1)"
+          fi
+          echo "using PostgreSQL server binaries from: $pg_bin"
+          echo "$pg_bin" >> "$GITHUB_PATH"
+
+      - name: Install Ruby
+        # The version clients/ruby/.tool-versions pins, from ruby-builder's
+        # builds. The token only authenticates the digest lookup.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .github/scripts/setup-ruby.sh clients/ruby/.tool-versions
+
+      - name: Build trellis-testkit onto PATH
+        # The suite's setup (test/support/test_cluster.rb) spawns it from PATH.
+        run: |
+          cargo build -p testkit --bin trellis-testkit
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp target/debug/trellis-testkit "$RUNNER_TEMP/bin/"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Clippy
+        # rb-sys's build script finds the Ruby installed above on PATH.
+        run: cargo clippy -p trellis_ruby --features ruby -- -D warnings
+
+      - name: Install gems
+        working-directory: clients/ruby
+        env:
+          BUNDLE_FROZEN: "true"
+          BUNDLE_PATH: vendor/bundle
+        run: bundle install
+
+      - name: Test
+        # `rake test` first builds the extension through Cargo (debug, into
+        # the workspace's target/, reusing the restored dependencies).
+        working-directory: clients/ruby
+        env:
+          BUNDLE_FROZEN: "true"
+          BUNDLE_PATH: vendor/bundle
+        run: bundle exec rake test
