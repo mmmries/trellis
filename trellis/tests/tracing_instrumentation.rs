@@ -520,6 +520,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
         .expect("seed source row");
 
     let folded = vec![FoldedChange {
+        src_xid: None,
         src_table: "orders".to_string(),
         key: "1".to_string(),
         new_image: Some(r#"{"price":"not-a-number","tax":"1.50"}"#.to_string()),
