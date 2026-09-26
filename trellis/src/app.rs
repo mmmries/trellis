@@ -1497,14 +1497,20 @@ pub enum QuarantineTarget {
 }
 
 impl QuarantineTarget {
-    /// Parses `"transform"` or `"transform.column"`. A dotted address splits
-    /// on the *first* `.`, so a target table name that itself contains a dot
-    /// (unusual, but not forbidden by this crate) still parses as intended:
-    /// everything after the first dot is the column name, matching how a
-    /// calculated field's own qualified references work elsewhere in this
-    /// crate. An address with either half empty (`"."`, `"orders."`,
-    /// `".total"`) is treated as a bare transform name — [`fmt::Display`]
-    /// never produces such a string, so this only matters for a
+    /// Parses `"transform"` or `"transform.column"`, splitting on the *first*
+    /// `.`: everything after it is the column name.
+    ///
+    /// Transform and column names are grammar identifiers
+    /// (`[A-Za-z_][A-Za-z0-9_]*`), so neither half of any target this crate
+    /// reports contains a dot, and `parse(&target.to_string())` gives back
+    /// `target`. A hand-built target whose *transform* half contains a dot
+    /// does not round-trip: `Column("a.b", "c")` displays as `"a.b.c"`, which
+    /// parses as `Column("a", "b.c")`. The address has no quoting rule to
+    /// tell the two apart. A dot in the column half does survive.
+    ///
+    /// An address with either half empty (`"."`, `"orders."`, `".total"`) is
+    /// treated as a bare transform name. [`fmt::Display`] never produces such
+    /// a string from identifier names, so this only matters for a
     /// caller-supplied one.
     pub fn parse(address: &str) -> Self {
         match address.split_once('.') {
@@ -1565,6 +1571,37 @@ pub enum QuarantineState {
     /// [`QuarantineState::Quarantined`] is, reached by the other of
     /// ADR-0014's two triggers.
     Paused,
+}
+
+impl QuarantineState {
+    /// Every variant, once — the closed set an embedding binding allocates
+    /// its host-side names (Elixir atoms, Ruby symbols) from at load time
+    /// (`docs/decisions/0010-embeddable-clients.md`, decision 4), so it never
+    /// has to hard-code the set itself. A new variant fails
+    /// `every_variant_is_listed_in_all` below until it is added here too.
+    pub const ALL: [QuarantineState; 6] = [
+        QuarantineState::Live,
+        QuarantineState::WaitingToBackfill,
+        QuarantineState::Backfilling,
+        QuarantineState::CatchingUp,
+        QuarantineState::Quarantined,
+        QuarantineState::Paused,
+    ];
+
+    /// A stable, lowercase `snake_case` name for this state — the form that
+    /// crosses an FFI boundary. Each state [`TransformStatus`] mirrors uses
+    /// that status's own [`TransformStatus::as_str`] word, so a host sees one
+    /// name for one state whichever read reported it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuarantineState::Live => "live",
+            QuarantineState::WaitingToBackfill => "waiting_to_backfill",
+            QuarantineState::Backfilling => "backfilling",
+            QuarantineState::CatchingUp => "catching_up",
+            QuarantineState::Quarantined => "quarantined",
+            QuarantineState::Paused => "paused",
+        }
+    }
 }
 
 impl From<TransformStatus> for QuarantineState {
@@ -1843,6 +1880,72 @@ impl From<StagingError> for TrellisError {
 impl From<SelfCheckError> for TrellisError {
     fn from(err: SelfCheckError) -> Self {
         TrellisError::SelfCheck(err)
+    }
+}
+
+#[cfg(test)]
+mod quarantine_target_tests {
+    use super::*;
+
+    fn column(transform: &str, column: &str) -> QuarantineTarget {
+        QuarantineTarget::Column(transform.to_string(), column.to_string())
+    }
+
+    /// Every target this crate reports has identifier names, and those
+    /// round-trip through their address.
+    #[test]
+    fn identifier_targets_round_trip_through_their_address() {
+        for target in [
+            QuarantineTarget::Transform("order_totals".to_string()),
+            column("order_totals", "total"),
+            column("_t2", "_c9"),
+            // A dot in the column half survives: the split is on the first dot.
+            column("order_totals", "a.b"),
+        ] {
+            assert_eq!(QuarantineTarget::parse(&target.to_string()), target);
+        }
+    }
+
+    /// The limit `parse`'s doc states: a dot in the transform half is
+    /// indistinguishable from the separator.
+    #[test]
+    fn a_dotted_transform_name_does_not_round_trip() {
+        let target = column("a.b", "c");
+        assert_eq!(target.to_string(), "a.b.c");
+        assert_eq!(QuarantineTarget::parse("a.b.c"), column("a", "b.c"));
+    }
+}
+
+#[cfg(test)]
+mod quarantine_state_tests {
+    use super::*;
+
+    /// [`QuarantineState::ALL`] is exactly the enum's variants, each with its
+    /// own `as_str` word: a state missing from it would reach a host as a
+    /// name outside the set it allocated at load time.
+    #[test]
+    fn every_variant_is_listed_in_all() {
+        crate::error_code::assert_all_is_every_variant!(
+            QuarantineState: Live,
+            WaitingToBackfill,
+            Backfilling,
+            CatchingUp,
+            Quarantined,
+            Paused,
+        );
+        let names: std::collections::HashSet<&str> =
+            QuarantineState::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(names.len(), QuarantineState::ALL.len());
+    }
+
+    /// A state that mirrors a [`TransformStatus`] is named exactly as that
+    /// status is, so a host binding sees one word per state across
+    /// [`Trellis::status`] and [`Trellis::quarantine_status`].
+    #[test]
+    fn mirrored_states_share_the_status_word() {
+        for status in TransformStatus::ALL {
+            assert_eq!(QuarantineState::from(status).as_str(), status.as_str());
+        }
     }
 }
 
