@@ -1,0 +1,10 @@
+storage: /tmp (tmpfs) -- CPU-only numbers; use --disk for I/O costs
+waiting for in-flight verify runs / benchmarks to release /tmp/trellis-bench.lock ...
+[2m2026-09-26T20:11:37.162031Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 0 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+rel-churn: ledger seeded with 1000000 entries in 38.1s
+[2m2026-09-26T20:13:08.079749Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: db error
+rel-churn: 10 children/parent, parents at 0/s, children at 5000/s: 0 parent + 100000 child updates; converged after 20.7s (tail 0.7s), oracle_ok=Some(true), wal 366 MB
+[2m2026-09-26T20:13:47.810595Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 0 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+rel-churn: ledger seeded with 1000000 entries in 35.9s
+[2m2026-09-26T20:15:13.040541Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: db error
+rel-churn: 1000 children/parent, parents at 0/s, children at 5000/s: 0 parent + 100000 child updates; converged after 20.6s (tail 0.6s), oracle_ok=Some(true), wal 368 MB

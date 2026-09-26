@@ -1,0 +1,6 @@
+storage: /home/mike/exp558/tmpdisk (btrfs)
+waiting for in-flight verify runs / benchmarks to release /tmp/trellis-bench.lock ...
+oracle SKIPPED: 4000 groups — the target never folded in every row within the grace period, so this probe's correctness was not checked
+fold-in 100:1 (4000 groups) — T3 NO at 400000 rows/sec: folded 31272 rows/sec while offered, never caught up within the grace period (offered 370660/sec)
+oracle SKIPPED: 400 groups — the target never folded in every row within the grace period, so this probe's correctness was not checked
+fold-in 1000:1 (400 groups) — T3 NO at 400000 rows/sec: folded 23322 rows/sec while offered, never caught up within the grace period (offered 327810/sec)
