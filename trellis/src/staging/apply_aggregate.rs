@@ -4790,7 +4790,7 @@ pub(super) async fn read_partials_for_parent(
     let mut select = String::from("select group_key");
     for j in 0..factored_idx.len() {
         select.push_str(&format!(
-            ", (n * ${}::numeric)::text, (n * ${}::numeric)::text",
+            ", (n * ${}::text::numeric)::text, (n * ${}::text::numeric)::text",
             2 + 2 * j,
             3 + 2 * j
         ));

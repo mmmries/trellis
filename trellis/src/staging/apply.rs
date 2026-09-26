@@ -2593,9 +2593,11 @@ async fn rederive_partials(
     for k in keys {
         // no parent row: nothing was ever applied under this parent
         let Some(parent) = plan.parent_rows.get(k).cloned() else {
+            tracing::debug!(key = %k, "exp5: no parent row");
             continue;
         };
         if parent.skip {
+            tracing::debug!(key = %k, "exp5: parent skip");
             continue;
         }
         let new_vals: Vec<Option<String>> = rc
@@ -2632,6 +2634,7 @@ async fn rederive_partials(
                 apply_aggregate::diff_contributions(&fields, group, &old_c, &new_c);
             }
         }
+        tracing::debug!(key = %k, changed = new_vals != parent.vals, "exp5: parent applied");
         plan.parent_updates.push((
             k.clone(),
             apply_aggregate::vals_to_text(&new_vals),
@@ -8424,6 +8427,15 @@ pub async fn apply_and_mark_drained_many(
         for record in &plan.relationship_reverses {
             let shape = &record.shape;
             if !ledger_reverse_eligible(record) {
+                tracing::debug!(
+                    aggregate_shapes = shape.aggregate_shapes.len(),
+                    fallback = shape.needs_recompute_fallback,
+                    old_image = record.old_image.is_some(),
+                    new_image = record.new_image.is_some(),
+                    old_row = record.old_row.is_some(),
+                    new_row = record.new_row.is_some(),
+                    "exp5: reverse record not eligible"
+                );
                 continue;
             }
             let old_key = relationship_key_text(&record.old_row, &shape.to_col);
@@ -8517,6 +8529,7 @@ pub async fn apply_and_mark_drained_many(
                     });
                 }
                 use_partials = plan.is_factored();
+                tracing::debug!(target = %target, jobs = target_jobs.len(), use_partials, forward = forward_keys.len(), "exp5: target");
             }
             // partials: a parent change touches its partials and the groups,
             // never its children, so the ledger lock covers the forward keys only
