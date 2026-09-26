@@ -2287,9 +2287,13 @@ async fn lock_ledger_entries(
     }
     let rows = txn
         .query(
+            // one statement (I5), but the OR of two indexed predicates planned as a
+            // sequential scan over the whole ledger; a semi-join keeps both index paths
             &format!(
                 "select from_key, group_key, contrib, join_key from {ledger} \
-                 where from_key = any($1) or join_key = any($2) order by from_key for update"
+                 where from_key = any(select unnest($1::text[]) \
+                                      union select from_key from {ledger} where join_key = any($2::text[])) \
+                 order by from_key for update"
             ),
             &[&from_keys, &join_keys],
         )
@@ -2358,8 +2362,12 @@ async fn rederive_children_via_ledger(
     // typed comparisons so the from-side's join-key index and primary key are usable
     let from_type = apply_aggregate::column_type(txn, &shape.from_table, &shape.from_col).await?;
     let pk_match = if shape.from_pk.len() == 1 {
-        let pk_type = apply_aggregate::column_type(txn, &shape.from_table, &shape.from_pk[0].name).await?;
-        format!("t.{} = any($2::text[]::{pk_type}[])", quote_ident(&shape.from_pk[0].name))
+        let pk_type =
+            apply_aggregate::column_type(txn, &shape.from_table, &shape.from_pk[0].name).await?;
+        format!(
+            "t.{} = any($2::text[]::{pk_type}[])",
+            quote_ident(&shape.from_pk[0].name)
+        )
     } else {
         format!("({pk_expr}) = any($2)")
     };
