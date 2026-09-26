@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::streaming::rate::{human_rate, restaged_in_window};
 use crate::streaming::tuning::EngineTuning;
 use crate::streaming::{
-    fold_in, generator_reach, hop_latency, idle_cost, intake_ceiling, load, throughput,
+    fold_in, generator_reach, hop_latency, idle_cost, intake_ceiling, load, rel_churn, throughput,
 };
 
 /// Every scenario name this module handles, for `main.rs`'s usage message.
@@ -24,6 +24,7 @@ pub const SCENARIOS: &[&str] = &[
     "intake-ceiling",
     "idle-cost",
     "generator-reach",
+    "rel-churn",
 ];
 
 /// The latency ladder's defaults. #266: "low offered rate (e.g. 10
@@ -374,6 +375,52 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                         runtime.block_on(fold_in::run_probe(g, target_rate, offer, &tuning));
                     ok &= report_fold_in(std::slice::from_ref(&result), name);
                     report_contention(&result);
+                }
+            }
+            Some(ok)
+        }
+
+        // Issue #558 experiment 4: to-side churn against a relationship aggregate.
+        "rel-churn" => {
+            let children = usize_list(args, "--children", &[10, 1000, 100_000]);
+            let total = number(args, "--total-children").unwrap_or(1_000_000.0) as usize;
+            let parent_rates =
+                number_list(args, "--parent-rate").unwrap_or_else(|| vec![100.0, 1000.0]);
+            let child_rate = number(args, "--child-rate").unwrap_or(1000.0);
+            let offer = offer(args, FOLD_IN_DEFAULT_DURATION, Duration::from_secs(600));
+            let tuning = throughput_tuning(args);
+            let runtime = runtime();
+            let mut ok = true;
+            for &c in &children {
+                for &parent_rate in &parent_rates {
+                    let result = runtime.block_on(rel_churn::run_probe(
+                        c,
+                        total,
+                        parent_rate,
+                        child_rate,
+                        offer,
+                        &tuning,
+                    ));
+                    println!("{}", result.to_json(name));
+                    eprintln!(
+                        "rel-churn: {} children/parent, parents at {}/s, children at {}/s: {} parent + {} child updates; converged after {} (tail {}), oracle_ok={:?}, wal {} MB",
+                        result.children_per_parent,
+                        result.parent_rate,
+                        result.child_rate,
+                        result.parent_updates_issued,
+                        result.child_updates_issued,
+                        result
+                            .converged_secs
+                            .map(|s| format!("{s:.1}s"))
+                            .unwrap_or_else(|| "never".into()),
+                        result
+                            .tail_secs
+                            .map(|s| format!("{s:.1}s"))
+                            .unwrap_or_else(|| "-".into()),
+                        result.oracle_ok,
+                        result.wal_bytes / 1_000_000,
+                    );
+                    ok &= result.oracle_ok == Some(true);
                 }
             }
             Some(ok)
