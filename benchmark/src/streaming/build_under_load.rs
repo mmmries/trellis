@@ -10,7 +10,12 @@
 //! **before** `GROUP BY grp SELECT SUM(amt) AS total, COUNT(*) AS n` is
 //! defined, and keep it up through the build and for `--duration-secs`
 //! after the definition reads `live`. Once they stop, the target must equal
-//! a from-scratch `GROUP BY` over the source within `--grace-secs`.
+//! a from-scratch `GROUP BY` over the source within `--grace-secs`. That
+//! comparison is a full scan, so it only runs once the definition is `live`
+//! and the ring is empty, and after a mismatch waits
+//! `max(--oracle-poll-min-secs, 2 x its last duration)` before the next
+//! (`oracle_checks`/`oracle_check_secs` record how many ran and how long the
+//! last took).
 //!
 //! What it measures: the build's wall time and chunk progress (sampled from
 //! `backfill_chunks` every [`MONITOR_POLL`]), define-to-live time (which,
@@ -64,6 +69,9 @@ pub struct BuildUnderLoad {
     pub build_timeout: Duration,
     /// Deadline for convergence once the writers stop.
     pub grace: Duration,
+    /// After a mismatched oracle comparison, the next waits at least this
+    /// long, or twice the comparison's own duration if that is longer.
+    pub oracle_poll_min: Duration,
 }
 
 /// Writer statement kinds, in [`WriterTally::issued`] order.
@@ -122,6 +130,10 @@ pub struct BuildUnderLoadResult {
     pub tail_secs: Option<f64>,
     pub oracle_ok: bool,
     pub oracle_mismatched_groups: i64,
+    /// Full-source oracle comparisons run inside the measured window.
+    pub oracle_checks: u32,
+    /// How long the last of those took (`None` if none ran).
+    pub oracle_check_secs: Option<f64>,
     /// Writer start -> writer stop.
     pub writer_secs: f64,
     pub achieved_write_rate: f64,
@@ -154,7 +166,8 @@ impl BuildUnderLoadResult {
              \"index_secs\":{:.3},\"build_secs\":{:.3},\"chunks\":{},\"first_claim_secs\":{},\
              \"first_chunk_secs\":{},\"chunks_per_sec\":{},\"define_to_live_secs\":{:.3},\
              \"post_live_secs\":{:.3},\"converged_secs\":{},\"tail_secs\":{},\"oracle_ok\":{},\
-             \"oracle_mismatched_groups\":{},\"writer_secs\":{:.3},\"achieved_write_rate\":{:.1},\
+             \"oracle_mismatched_groups\":{},\"oracle_checks\":{},\"oracle_check_secs\":{},\
+             \"writer_secs\":{:.3},\"achieved_write_rate\":{:.1},\
              \"kept_target_rate\":{},\"writes_issued\":{{{}}},\"writes_noop\":{},\
              \"writer_errors\":{},\"writer_lat_p50_ms\":{},\"writer_lat_p99_ms\":{},\
              \"writer_lat_build_p50_ms\":{},\"writer_lat_build_p99_ms\":{},\
@@ -180,6 +193,8 @@ impl BuildUnderLoadResult {
             opt_f(self.tail_secs),
             self.oracle_ok,
             self.oracle_mismatched_groups,
+            self.oracle_checks,
+            opt_f(self.oracle_check_secs),
             self.writer_secs,
             self.achieved_write_rate,
             self.kept_target_rate,
@@ -203,7 +218,7 @@ impl BuildUnderLoadResult {
         let w = &self.writes;
         format!(
             "build-under-load: {} rows / {} groups, loaded at {:.0} rows/s; build {:.1}s over {} \
-             chunks (first done {}), live after {:.1}s; converged {} (tail {}), oracle_ok={} \
+             chunks (first done {}), live after {:.1}s; converged {} (tail {}, {} oracle checks of {}), oracle_ok={} \
              ({} mismatched); writers {:.0}/{} stmt/s (kept={}), commit p50/p99 {}/{} ms \
              overall, {}/{} ms during build; {}; ledger={} build={}",
             self.cfg.rows,
@@ -220,6 +235,10 @@ impl BuildUnderLoadResult {
                 .unwrap_or_else(|| "never".into()),
             self.tail_secs
                 .map(|s| format!("{s:.1}s"))
+                .unwrap_or_else(|| "-".into()),
+            self.oracle_checks,
+            self.oracle_check_secs
+                .map(|s| format!("{s:.2}s"))
                 .unwrap_or_else(|| "-".into()),
             self.oracle_ok,
             self.oracle_mismatched_groups,
@@ -465,6 +484,22 @@ async fn monitor_build(
     }
 }
 
+/// How long to wait after a mismatched oracle comparison that took `took`:
+/// `max(min, 2 * took)`, so a slow full-source scan never runs back to back.
+fn oracle_backoff(min: Duration, took: Duration) -> Duration {
+    min.max(took * 2)
+}
+
+async fn is_live(raw: &RawClient, terminal: &str) -> bool {
+    raw.query_opt(
+        "select 1 from transform_definitions where target_table = $1 and status = 'live'",
+        &[&format!("public.{terminal}")],
+    )
+    .await
+    .expect("read definition status")
+    .is_some()
+}
+
 /// Groups where the target disagrees with a from-scratch `GROUP BY` over the
 /// source, computed entirely on the server.
 async fn mismatched_groups(raw: &RawClient, terminal: &str) -> i64 {
@@ -581,21 +616,33 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     let writer_secs = stopped_at.duration_since(shared.start).as_secs_f64();
     let achieved_write_rate = writes.total() as f64 / writer_secs;
 
-    // Converged: the ring holds nothing staged, and the target equals the
-    // oracle. The ring check is the cheap one, so the full-source GROUP BY
-    // only runs once there is nothing left in flight.
+    // Converged: the definition is live, the ring holds nothing staged, and
+    // the target equals the oracle. The first two are cheap and polled every
+    // CONVERGE_POLL; the oracle is a full-source GROUP BY (a full scan at
+    // 100M rows, inside the disk window), so it runs only once both hold,
+    // and after a mismatch not again for oracle_backoff.
     let deadline = stopped_at + cfg.grace;
     let mut converged_at = None;
     let mut mismatched = None;
+    let mut oracle_checks = 0u32;
+    let mut oracle_check_secs = None;
+    let mut next_oracle = Instant::now();
     loop {
         let observed = Instant::now();
-        if ring_pending(&raw).await == 0 {
+        if observed >= next_oracle
+            && ring_pending(&raw).await == 0
+            && is_live(&raw, &terminal).await
+        {
             let m = mismatched_groups(&raw, &terminal).await;
+            let took = observed.elapsed();
+            oracle_checks += 1;
+            oracle_check_secs = Some(took.as_secs_f64());
             mismatched = Some(m);
             if m == 0 {
                 converged_at = Some(observed);
                 break;
             }
+            next_oracle = Instant::now() + oracle_backoff(cfg.oracle_poll_min, took);
         }
         if Instant::now() >= deadline {
             break;
@@ -604,6 +651,8 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     }
     let disk = disk_tier::since(&sampler, &disk_start).await;
     let (deadlocks_after, rollbacks_after) = contention::deadlocks_and_rollbacks(&sampler).await;
+    // Unconverged: a fresh count for the verdict, outside the disk window
+    // and not counted in oracle_checks.
     let mismatched = match mismatched {
         Some(m) if converged_at.is_some() => m,
         _ => mismatched_groups(&raw, &terminal).await,
@@ -630,6 +679,8 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         tail_secs: converged_at.map(|t| t.duration_since(stopped_at).as_secs_f64()),
         oracle_ok: mismatched == 0,
         oracle_mismatched_groups: mismatched,
+        oracle_checks,
+        oracle_check_secs,
         writer_secs,
         achieved_write_rate,
         kept_target_rate: achieved_write_rate
@@ -646,6 +697,16 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oracle_backoff_is_the_floor_or_twice_the_last_check() {
+        let min = Duration::from_secs(5);
+        assert_eq!(oracle_backoff(min, Duration::from_millis(40)), min);
+        assert_eq!(
+            oracle_backoff(min, Duration::from_secs(8)),
+            Duration::from_secs(16)
+        );
+    }
 
     #[test]
     fn tallies_merge_counts_and_latencies() {

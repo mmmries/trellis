@@ -94,7 +94,8 @@ const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
 /// `build-under-load`'s knobs (issue #558 experiment 5), parsed over the
 /// experiment's defaults: 10M rows over 100k groups (the real run passes
 /// `--rows 100000000`), 8 writers at 2,000 statements/sec in total, 20s of
-/// load after `live`, 600s for the target to converge after it stops.
+/// load after `live`, 600s for the target to converge after it stops, and at
+/// least 5s between full-source oracle comparisons after a mismatch.
 fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad {
     let positive = |name: &str, default: f64| {
         let v = number(args, name).unwrap_or(default);
@@ -111,6 +112,7 @@ fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad 
         post_live: secs(args, "--duration-secs").unwrap_or(Duration::from_secs(20)),
         build_timeout: secs(args, "--build-timeout-secs").unwrap_or(Duration::from_secs(3600)),
         grace: secs(args, "--grace-secs").unwrap_or(Duration::from_secs(600)),
+        oracle_poll_min: secs(args, "--oracle-poll-min-secs").unwrap_or(Duration::from_secs(5)),
     }
 }
 
@@ -1175,6 +1177,7 @@ mod tests {
         );
         assert_eq!(d.post_live, Duration::from_secs(20));
         assert_eq!(d.grace, Duration::from_secs(600));
+        assert_eq!(d.oracle_poll_min, Duration::from_secs(5));
         let c = build_under_load_config(&argv(&[
             "build-under-load",
             "--rows",
@@ -1189,7 +1192,10 @@ mod tests {
             "5",
             "--grace-secs",
             "60",
+            "--oracle-poll-min-secs",
+            "2.5",
         ]));
+        assert_eq!(c.oracle_poll_min, Duration::from_millis(2500));
         assert_eq!((c.rows, c.groups, c.writers), (200_000, 1000, 2));
         assert_eq!(c.write_rate, 500.0);
         assert_eq!(c.post_live, Duration::from_secs(5));
