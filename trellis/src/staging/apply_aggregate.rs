@@ -3821,24 +3821,38 @@ async fn write_ledger(
     static CREATED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     let ledger = ddl::qualified_target_table_ident(&format!("{target}__ledger"));
-    let is_new = !CREATED
+    let known = CREATED
         .get_or_init(Default::default)
         .lock()
         .expect("ledger set")
         .contains(target);
-    if is_new {
-        let index = quote_ident(&format!("{}__ledger_gk", target.replace('.', "_")));
-        txn.batch_execute(&format!(
-            "create table if not exists {ledger} (from_key text primary key, group_key text, \
-             contrib text, applied_lsn pg_lsn, basis pg_snapshot); \
-             create index if not exists {index} on {ledger} (group_key)"
-        ))
-        .await?;
-        CREATED
-            .get_or_init(Default::default)
-            .lock()
-            .expect("ledger set")
-            .insert(target.to_string());
+    if !known {
+        // Only a committed table is cached: a batch that created it and then
+        // rolled back must not leave later batches writing into nothing. And
+        // concurrent `create table if not exists` from several first batches
+        // races on the catalog (duplicate key on pg_type), so creation is
+        // serialized behind a transaction-scoped advisory lock.
+        let exists: bool = txn
+            .query_one("select to_regclass($1) is not null", &[&ledger])
+            .await?
+            .get(0);
+        if exists {
+            CREATED
+                .get_or_init(Default::default)
+                .lock()
+                .expect("ledger set")
+                .insert(target.to_string());
+        } else {
+            let index = quote_ident(&format!("{}__ledger_gk", target.replace('.', "_")));
+            txn.execute("select pg_advisory_xact_lock(hashtext($1))", &[&ledger])
+                .await?;
+            txn.batch_execute(&format!(
+                "create table if not exists {ledger} (from_key text primary key, group_key text, \
+                 contrib text, applied_lsn pg_lsn, basis pg_snapshot); \
+                 create index if not exists {index} on {ledger} (group_key)"
+            ))
+            .await?;
+        }
     }
     let mut rows: Vec<&LedgerRow> = plan.ledger_rows.iter().collect();
     rows.sort_by(|a, b| a.from_key.cmp(&b.from_key));
