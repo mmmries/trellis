@@ -306,7 +306,7 @@ pub async fn run_probe(
             lo += chunk;
         }
         let ledger = format!("public.{terminal}__ledger");
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline = Instant::now() + SETUP_TIMEOUT;
         loop {
             let n: i64 = raw
                 .query_one(&format!("select count(*) from {ledger}"), &[])

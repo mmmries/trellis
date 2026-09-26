@@ -2355,11 +2355,20 @@ async fn rederive_children_via_ledger(
     let doc_expr = row_as_text_jsonb_sql("t", row_columns);
     let from_col = quote_ident(&shape.from_col);
     let to_col = quote_ident(&rj.to_col);
+    // typed comparisons so the from-side's join-key index and primary key are usable
+    let from_type = apply_aggregate::column_type(txn, &shape.from_table, &shape.from_col).await?;
+    let pk_match = if shape.from_pk.len() == 1 {
+        let pk_type = apply_aggregate::column_type(txn, &shape.from_table, &shape.from_pk[0].name).await?;
+        format!("t.{} = any($2::text[]::{pk_type}[])", quote_ident(&shape.from_pk[0].name))
+    } else {
+        format!("({pk_expr}) = any($2)")
+    };
+    let to_type = apply_aggregate::column_type(txn, &rj.to_table, &rj.to_col).await?;
     let sql = format!(
         "with c as (select {pk_expr} as k, {doc_expr} as cdoc, t.{from_col}::text as jk \
-                    from {from_tbl} t where t.{from_col}::text = any($1) or ({pk_expr}) = any($2)), \
+                    from {from_tbl} t where t.{from_col} = any($1::text[]::{from_type}[]) or {pk_match}), \
               j as (select c.k, c.jk, c.cdoc, to_jsonb(p) as pdoc from c \
-                    left join {to_tbl} p on p.{to_col}::text = c.jk) \
+                    left join {to_tbl} p on p.{to_col} = c.jk::{to_type}) \
          select j.k, j.jk, 'c' as side, e.key, e.value, pg_current_snapshot()::text \
            from j cross join lateral jsonb_each_text(j.cdoc) e \
          union all \

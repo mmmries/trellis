@@ -1431,6 +1431,7 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
         .expect("seed a death count already past the default threshold");
 
     let folded = vec![FoldedChange {
+        src_xid: None,
         src_table: "orders".to_string(),
         key: "1".to_string(),
         new_image: Some(r#"{"price":"not-a-number","tax":"1.50"}"#.to_string()),
@@ -1505,6 +1506,7 @@ async fn isolate_and_evict_never_probes_or_poisons_a_deferred_relationship_rever
     let sentinel_src_table = "\u{1f}trellis-rel-reverse-deferred:999";
 
     let folded = vec![FoldedChange {
+        src_xid: None,
         src_table: sentinel_src_table.to_string(),
         key: "1".to_string(),
         new_image: Some(r#"{"id":1,"v":2}"#.to_string()),
@@ -1875,6 +1877,7 @@ async fn an_unresolvable_src_table_leaves_the_fuse_a_quiet_no_op() {
 /// already uses to drive that function directly.
 fn unevaluable_change(src_table: &str, key: &str) -> FoldedChange {
     FoldedChange {
+        src_xid: None,
         src_table: src_table.to_string(),
         key: key.to_string(),
         new_image: Some(r#"{"price":"not-a-number","tax":"1.50"}"#.to_string()),

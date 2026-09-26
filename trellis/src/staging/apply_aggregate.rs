@@ -3957,6 +3957,34 @@ pub(super) async fn apply_aggregate_target(
     Ok(counts)
 }
 
+/// Issue #558 experiment 4: a column's SQL type name, so a live read can
+/// compare typed values (`col = any($1::text[]::<type>[])`) and use the
+/// column's index instead of casting every row to text. Cached per
+/// (table, column) for the process (benchmark-only prototype).
+pub(super) async fn column_type(
+    txn: &Transaction<'_>,
+    qualified_table: &str,
+    column: &str,
+) -> Result<String, ApplyError> {
+    static TYPES: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String), String>>> =
+        std::sync::OnceLock::new();
+    let key = (qualified_table.to_string(), column.to_string());
+    if let Some(t) = TYPES.get_or_init(Default::default).lock().expect("types").get(&key) {
+        return Ok(t.clone());
+    }
+    let ident = ddl::qualified_source_table(qualified_table);
+    let t: String = txn
+        .query_one(
+            "select format_type(a.atttypid, a.atttypmod) from pg_attribute a \
+             where a.attrelid = $1::text::regclass and a.attname = $2 and not a.attisdropped",
+            &[&ident, &column],
+        )
+        .await?
+        .get(0);
+    TYPES.get_or_init(Default::default).lock().expect("types").insert(key, t.clone());
+    Ok(t)
+}
+
 pub(super) fn ledger_ident(target: &str) -> String {
     ddl::qualified_target_table_ident(&format!("{target}__ledger"))
 }
@@ -4150,11 +4178,13 @@ async fn reconcile_with_ledger(
         if !join_keys.is_empty() {
             let to_ident = ddl::qualified_source_table(&rc.to_table);
             let to_col = quote_ident(&rc.to_col);
+            let to_type = column_type(txn, &rc.to_table, &rc.to_col).await?;
             let rows = txn
                 .query(
                     &format!(
                         "select p.{to_col}::text, e.key, e.value from {to_ident} p \
-                         cross join lateral jsonb_each_text(to_jsonb(p)) e where p.{to_col}::text = any($1)"
+                         cross join lateral jsonb_each_text(to_jsonb(p)) e \
+                         where p.{to_col} = any($1::text[]::{to_type}[])"
                     ),
                     &[&join_keys],
                 )
