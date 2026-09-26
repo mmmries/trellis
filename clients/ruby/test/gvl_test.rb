@@ -30,9 +30,11 @@ class GvlTest < Minitest::Test
     ticker.kill.join
 
     assert_operator elapsed, :>=, 0.5, "the call wasn't slow: it didn't wait for the lock"
-    # A call holding the GVL would starve the ticker completely for its
-    # whole duration; ~100 ticks fit in a second when it doesn't.
-    assert_operator ticks, :>=, 20,
+    # A call holding the GVL starves the ticker for its whole duration: it
+    # ticks 0 times (checked by making the extension wait with the GVL held).
+    # ~100 ticks fit in a second when the call releases it; 3 leaves a slow
+    # CI runner plenty of room while still telling the two apart.
+    assert_operator ticks, :>=, 3,
                     "the ticker ran only #{ticks} times in #{elapsed.round(2)}s: the call held the GVL"
   ensure
     release&.close

@@ -32,7 +32,8 @@ require_relative "trellis/trellis_ruby"
 #
 # A handle doesn't survive `fork`. Connect after forking (Puma's
 # on_worker_boot, Passenger's starting_worker_process); a forked child's
-# calls on a handle it inherited raise Trellis::ForkedHandleError.
+# calls on a handle it inherited raise Trellis::ForkedHandleError, except
+# Trellis.shutdown, which leaves the parent's handle alone and does nothing.
 module Trellis
   @handle = nil
   @lock = Mutex.new
@@ -123,18 +124,23 @@ module Trellis
     end
 
     # Stops this process's handle: its background work, its connections and
-    # its runtime thread, and waits for them. Does nothing if not connected.
+    # its runtime thread, and waits for them. Does nothing if not connected,
+    # which includes a forked child holding only the handle it inherited: that
+    # one is the parent's, so it's left in place, untouched, and the child's
+    # other calls on it still raise ForkedHandleError. A child's cleanup code
+    # (Puma's on_worker_shutdown, say) can call this whether or not the child
+    # connected.
     def shutdown
       @lock.synchronize do
-        handle = @handle
-        return nil if handle.nil?
+        return nil unless connected?
 
+        handle = @handle
         begin
-          # Raises ForkedHandleError, having touched nothing, on a handle
-          # this process inherited.
           handle.shutdown
         ensure
-          @handle = nil if handle.owner_pid == Process.pid
+          # Also when the shutdown raised or was interrupted: its call still
+          # takes the instance out of the handle, so the handle is spent.
+          @handle = nil
         end
       end
       nil
@@ -160,9 +166,9 @@ module Trellis
     end
 
     # The backstop for a process that exits without calling shutdown. A
-    # forked child that inherited the handle leaves it alone.
+    # forked child that inherited the handle leaves it alone (see #shutdown).
     def shutdown_at_exit
-      shutdown if connected?
+      shutdown
     rescue Error => e
       warn "trellis: shutting down at exit failed: #{e.class}: #{e.message}"
     end

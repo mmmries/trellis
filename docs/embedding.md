@@ -186,7 +186,8 @@ end
 **Rails**, as a scheduled check (e.g. a recurring Sidekiq job or a
 `rails-healthcheck`-style route) rather than on every request — this check
 is a fleet-wide question, not something that needs to be re-answered on
-every web request:
+every web request. The Ruby binding doesn't have these two methods yet: they
+come with its full surface (#152), and this is the shape they will take:
 
 ```ruby
 class TrellisWorkerHealthCheck

@@ -61,14 +61,22 @@ definition ever reaches `:live`.
   threads (Puma's request threads, say) keep running, and `Thread#kill`,
   `Thread#raise` and Ctrl-C interrupt a thread waiting in one. An interrupt
   abandons the wait, not the work: a `define` that was interrupted may still
-  register its transform.
+  register its transform (`Trellis.status` tells you whether it did), and
+  the handle serves no other call until the abandoned one has finished.
 - **A handle doesn't survive `fork`.** Connect after forking: Puma's
   `on_worker_boot`, Passenger's `starting_worker_process`. A forked child's
   calls on a handle it inherited raise `Trellis::ForkedHandleError` rather
-  than hang, and `connect` in the child replaces it.
+  than hang, and `connect` in the child replaces it. `Trellis.shutdown` in a
+  child that hasn't connected does nothing. If the parent connects too (to
+  migrate, say), shut it down before forking: a child forked while the
+  parent's handle is busy can inherit a lock one of its threads held.
 
   ```ruby
   # config/puma.rb
+  before_fork do
+    Trellis.shutdown
+  end
+
   on_worker_boot do
     Trellis.connect(url: ENV.fetch("TRELLIS_URL"), drain_threads: 1)
   end

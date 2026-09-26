@@ -254,6 +254,21 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: .github/scripts/setup-ruby.sh clients/ruby/.tool-versions
 
+      - name: Install libclang
+        # rb-sys generates its bindings with bindgen, which loads libclang
+        # when the extension builds. The runner image's LLVM toolchains may
+        # or may not ship it, so install it unless one is already there.
+        run: |
+          set -euo pipefail
+          # libclang itself, not libclang-cpp, which lacks the C API.
+          if compgen -G "/usr/lib/llvm-*/lib/libclang.so*" >/dev/null ||
+             compgen -G "/usr/lib/x86_64-linux-gnu/libclang-[0-9]*.so*" >/dev/null; then
+            echo "libclang found"
+          else
+            sudo apt-get update
+            sudo apt-get install -y libclang-dev
+          fi
+
       - name: Build trellis-testkit onto PATH
         # The suite's setup (test/support/test_cluster.rb) spawns it from PATH.
         run: |

@@ -20,7 +20,10 @@ class ForkTest < Minitest::Test
         "status" => -> { Trellis.status("no_such_target") },
         "migrate" => -> { Trellis.migrate },
         "define" => -> { Trellis.define("TRANSFORM t FROM no_such_source SELECT a AS a") },
-        "shutdown" => -> { Trellis.shutdown }
+        # Not connected in this process, so shutdown does nothing, and leaves
+        # the inherited handle in place for the calls after it to refuse.
+        "shutdown" => -> { Trellis.shutdown },
+        "status after shutdown" => -> { Trellis.status("no_such_target") }
       }.each do |name, call|
         call.call
         out_w.puts "#{name}: returned"
@@ -40,7 +43,7 @@ class ForkTest < Minitest::Test
     assert status.success?, output
 
     lines = output.lines(chomp: true)
-    %w[status migrate define shutdown].each do |name|
+    ["status", "migrate", "define", "status after shutdown"].each do |name|
       assert_includes lines,
                       "#{name}: Trellis::ForkedHandleError: this Trellis handle was connected by " \
                       "process #{parent}, and this is process #{child}: a handle does not survive " \
@@ -48,6 +51,7 @@ class ForkTest < Minitest::Test
                       "on_worker_boot, Passenger's starting_worker_process)",
                       output
     end
+    assert_includes lines, "shutdown: returned", output
     assert_includes lines, "connected?: false"
 
     # The parent's handle is untouched.
