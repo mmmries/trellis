@@ -22,7 +22,7 @@ use tokio_postgres::Client as RawClient;
 use crate::scenario::connect_raw;
 use crate::streaming::chain::{numeric_columns, wait_for_live};
 use crate::streaming::contention;
-use crate::streaming::idle_cost;
+use crate::streaming::disk_tier::{self, LatencyHistogram, json_ms};
 use crate::streaming::throughput::Offer;
 use crate::streaming::tuning::EngineTuning;
 
@@ -54,6 +54,10 @@ pub struct RelChurnResult {
     pub deadlocks: i64,
     pub xact_rollbacks: i64,
     pub ledger_mode: String,
+    /// Experiment 5's disk-tier columns over the same window as `wal_bytes`.
+    pub disk: disk_tier::DiskTier,
+    /// Both writers' per-update commit latency over the offer window.
+    pub writer_latency: LatencyHistogram,
 }
 
 impl RelChurnResult {
@@ -73,7 +77,8 @@ impl RelChurnResult {
              \"parent_rate\":{},\"child_rate\":{},\"application_threads\":{},\"connections\":{},\
              \"offered_duration_secs\":{:.3},\"parent_updates_issued\":{},\"child_updates_issued\":{},\
              \"converged_secs\":{},\"tail_secs\":{},\"oracle_ok\":{},\"oracle_mismatched_groups\":{},\
-             \"wal_bytes\":{},\"deadlocks\":{},\"xact_rollbacks\":{},\"ledger_mode\":\"{}\"}}",
+             \"wal_bytes\":{},\"deadlocks\":{},\"xact_rollbacks\":{},\"ledger_mode\":\"{}\",\
+             {},\"writer_lat_p50_ms\":{},\"writer_lat_p99_ms\":{}}}",
             scenario,
             self.children_per_parent,
             self.parents,
@@ -93,13 +98,17 @@ impl RelChurnResult {
             self.deadlocks,
             self.xact_rollbacks,
             self.ledger_mode,
+            self.disk.json_fields(),
+            json_ms(self.writer_latency.quantile_ms(0.5)),
+            json_ms(self.writer_latency.quantile_ms(0.99)),
         )
     }
 }
 
 /// Paced single-row updates: commit `k` is due at `k / rate` seconds into
 /// the window, taken by whichever of `connections` writers is free; each
-/// picks a uniformly random id below `ids`. Returns how many were issued.
+/// picks a uniformly random id below `ids`. Returns how many were issued,
+/// and their commit latencies.
 async fn paced_updates(
     dsn: &str,
     sql: &str,
@@ -108,9 +117,9 @@ async fn paced_updates(
     connections: usize,
     start: Instant,
     duration: Duration,
-) -> u64 {
+) -> (u64, LatencyHistogram) {
     if rate <= 0.0 || ids <= 0 {
-        return 0;
+        return (0, LatencyHistogram::default());
     }
     let next = Arc::new(AtomicU64::new(0));
     let issued = Arc::new(AtomicU64::new(0));
@@ -124,6 +133,7 @@ async fn paced_updates(
             let client = connect_raw(&dsn).await;
             let stmt = client.prepare(&sql).await.expect("prepare paced update");
             let mut rng = rand::rngs::StdRng::seed_from_u64(0x558 + w as u64);
+            let mut latency = LatencyHistogram::default();
             loop {
                 let k = next.fetch_add(1, Ordering::Relaxed);
                 let due = start + Duration::from_secs_f64(k as f64 / rate);
@@ -132,15 +142,19 @@ async fn paced_updates(
                 }
                 tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
                 let id: i64 = rng.random_range(0..ids);
+                let t0 = Instant::now();
                 client.execute(&stmt, &[&id]).await.expect("paced update");
+                latency.record(t0.elapsed());
                 issued.fetch_add(1, Ordering::Relaxed);
             }
+            latency
         }));
     }
+    let mut latency = LatencyHistogram::default();
     for t in tasks {
-        t.await.expect("paced update worker");
+        latency.merge(&t.await.expect("paced update worker"));
     }
-    issued.load(Ordering::Relaxed)
+    (issued.load(Ordering::Relaxed), latency)
 }
 
 /// Groups where the target disagrees with the oracle (`None` = equal).
@@ -161,6 +175,30 @@ async fn mismatched_groups(raw: &RawClient, terminal: &str, oracle_sql: &str) ->
     .get(0)
 }
 
+/// Rows staged in any segment not yet drained.
+pub(crate) async fn ring_pending(raw: &RawClient) -> i64 {
+    let slots: Vec<i16> = raw
+        .query(
+            "select ring_slot from trellis.segments where state <> 'drained'",
+            &[],
+        )
+        .await
+        .expect("read segments")
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let mut pending: i64 = 0;
+    for slot in slots {
+        let n: i64 = raw
+            .query_one(&format!("select count(*) from trellis.seg_{slot}"), &[])
+            .await
+            .expect("count ring rows")
+            .get(0);
+        pending += n;
+    }
+    pending
+}
+
 /// Waits until no undrained segment holds a staged row, three polls in a
 /// row: the go-live catch-up floods the ring with recomputes that fold with
 /// (and force) anything staged meanwhile, so a measurement must start after
@@ -168,25 +206,7 @@ async fn mismatched_groups(raw: &RawClient, terminal: &str, oracle_sql: &str) ->
 async fn wait_ring_quiet(raw: &RawClient, deadline: Instant) {
     let mut quiet_polls = 0;
     loop {
-        let slots: Vec<i16> = raw
-            .query(
-                "select ring_slot from trellis.segments where state <> 'drained'",
-                &[],
-            )
-            .await
-            .expect("read segments")
-            .iter()
-            .map(|r| r.get(0))
-            .collect();
-        let mut pending: i64 = 0;
-        for slot in slots {
-            let n: i64 = raw
-                .query_one(&format!("select count(*) from trellis.seg_{slot}"), &[])
-                .await
-                .expect("count ring rows")
-                .get(0);
-            pending += n;
-        }
+        let pending = ring_pending(raw).await;
         if pending == 0 {
             quiet_polls += 1;
             if quiet_polls >= 3 {
@@ -334,9 +354,9 @@ pub async fn run_probe(
     }
 
     let (deadlocks_before, rollbacks_before) = contention::deadlocks_and_rollbacks(&sampler).await;
-    let wal_start = idle_cost::wal_lsn(&sampler).await;
+    let disk_start = disk_tier::sample(&sampler).await;
     let offer_start = Instant::now();
-    let (parent_updates_issued, child_updates_issued) = tokio::join!(
+    let ((parent_updates_issued, mut writer_latency), (child_updates_issued, child_latency)) = tokio::join!(
         paced_updates(
             db.dsn(),
             "update public.parents set weight = weight + 1 where id = $1",
@@ -359,7 +379,9 @@ pub async fn run_probe(
     let converged =
         wait_for_oracle(&raw, &terminal, &oracle_sql, Instant::now() + offer.grace).await;
     let converged_secs = converged.then(|| offer_start.elapsed().as_secs_f64());
-    let wal_bytes = idle_cost::wal_bytes_since(&sampler, &wal_start).await;
+    writer_latency.merge(&child_latency);
+    let disk = disk_tier::since(&sampler, &disk_start).await;
+    let wal_bytes = disk.wal_bytes;
     let (deadlocks_after, rollbacks_after) = contention::deadlocks_and_rollbacks(&sampler).await;
     let mismatched = mismatched_groups(&raw, &terminal, &oracle_sql).await;
     if mismatched > 0 {
@@ -426,5 +448,7 @@ pub async fn run_probe(
         deadlocks: deadlocks_after - deadlocks_before,
         xact_rollbacks: rollbacks_after - rollbacks_before,
         ledger_mode: std::env::var("TRELLIS_EXP558_LEDGER").unwrap_or_else(|_| "off".into()),
+        disk,
+        writer_latency,
     }
 }
