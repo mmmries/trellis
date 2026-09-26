@@ -510,6 +510,22 @@ impl GroupPlan {
     /// a missing side. Also called by the relationship reverse fast path
     /// (`super::apply`), whose deltas come from a parent's folded change
     /// rather than a from-side one.
+    /// Issue #558 experiment 4: fold another plan's pending deltas for the
+    /// same group into this one.
+    pub(super) fn merge(&mut self, other: GroupPlan) {
+        for (field, acc) in other.field_accum {
+            let mine = self.field_accum.entry(field).or_default();
+            mine.adds.extend(acc.adds);
+            mine.subs.extend(acc.subs);
+        }
+        self.hop_gen = self.hop_gen.max(other.hop_gen);
+        self.src_changed = super::apply::earliest_src_changed(self.src_changed, other.src_changed);
+        self.note_origin(other.origin.get());
+        self.force_full_recompute |= other.force_full_recompute;
+        self.note_image_lsn(other.min_image_lsn);
+        self.horizon_check_only &= other.horizon_check_only;
+    }
+
     pub(super) fn note_image_lsn(&mut self, lsn: Option<PgLsn>) {
         self.min_image_lsn = match (self.min_image_lsn, lsn) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -542,6 +558,41 @@ pub(super) struct LedgerRow {
     pub group_key: Option<String>,
     pub contrib: Option<String>,
     pub lsn: Option<PgLsn>,
+    /// Experiment 4: the join key (from-side column value) the row references,
+    /// `None` for a tombstone.
+    pub join_key: Option<String>,
+    /// Experiment 4: the snapshot a Re-derive read this row under (text
+    /// `pg_snapshot`); `None` from Apply, which reads nothing.
+    pub basis: Option<String>,
+    /// Experiment 4, forward validation (see [`RelCheck`]): the new row and
+    /// the contribution / to-side values Phase 2 computed it with.
+    pub row: Option<Row>,
+    pub contrib_map: Option<HashMap<String, Option<String>>>,
+    pub used_parent: Vec<Option<String>>,
+    /// The image's old side as Phase 2 folded it (undone when the ledger
+    /// holds the row's real prior state, or when the change is skipped).
+    pub old_group_key: Option<String>,
+    pub old_contrib_map: Option<HashMap<String, Option<String>>>,
+    /// The source transaction id (xid8 text) for the skip rule.
+    pub xid: Option<String>,
+}
+
+/// Experiment 4: what [`apply_aggregate_target`] needs to re-check, under the
+/// ledger lock, that the to-side value Phase 2 read from the projection is
+/// still the live one ("a from-side change reads the to-side live under I1",
+/// with the projection kept as a cache), and to recompute a row whose parent
+/// moved in between.
+#[derive(Debug, Clone)]
+pub(super) struct RelCheck {
+    pub to_table: String,
+    pub to_col: String,
+    pub from_col: String,
+    /// `(to-side column, synthetic column name)` for every to-side value the
+    /// contribution or group key reads.
+    pub synthetic: Vec<(String, String)>,
+    pub contribution_def: TransformDef,
+    pub source_columns: HashMap<String, ValueType>,
+    pub group_by_row_columns: Vec<String>,
 }
 
 /// Which ledger the #558 prototype writes, from `TRELLIS_EXP558_LEDGER`:
@@ -568,6 +619,14 @@ pub(super) fn ledger_mode() -> LedgerMode {
 pub(super) struct AggregateTargetPlan {
     /// Issue #558 experiment 3: this batch's per-source-row ledger writes.
     pub ledger_rows: Vec<LedgerRow>,
+    /// Issue #558 experiment 4: set for a one-relationship plan under the ledger.
+    pub rel_check: Option<RelCheck>,
+    /// Issue #558 experiment 4: [`ledger_stage`] already reconciled and wrote
+    /// this plan's ledger rows (so [`apply_aggregate_target`] must not).
+    pub ledger_written: bool,
+    /// Issue #558 experiment 4: keys a reverse re-derive in this batch rewrote;
+    /// a forward row for one of them is skipped (the re-derive read it live).
+    pub reverse_keys: std::collections::HashSet<String>,
     /// Every `GROUP BY` key's **target** column name, in `GROUP BY` order —
     /// what DDL created the target's primary key columns as
     /// (`GroupByKey::target_column_name`), used by every statement that
@@ -689,6 +748,9 @@ impl AggregateTargetPlan {
         }));
         AggregateTargetPlan {
             ledger_rows: Vec::new(),
+            rel_check: None,
+            ledger_written: false,
+            reverse_keys: std::collections::HashSet::new(),
             group_by: group_by
                 .iter()
                 .map(|k| k.target_column_name().to_string())
@@ -1426,26 +1488,87 @@ pub(super) fn accumulate_changes(
     // [`forward_row_contribution`] below is a plain passthrough to
     // [`row_contribution`] for the overwhelmingly common case.
     let shape = build_forward_relationship_shape(def, &plan.rel_joins, rel_ctx, source_columns);
-    // Issue #558 experiment 3: plain single-source aggregates only.
+    // Issue #558 experiment 3: plain single-source aggregates; experiment 4
+    // extends it to one to-one relationship.
     let ledger = ledger_mode();
-    let ledger_on = ledger != LedgerMode::Off && plan.rel_joins.is_empty();
+    let ledger_on = ledger != LedgerMode::Off && plan.rel_joins.len() <= 1;
+    if ledger_on && plan.rel_joins.len() == 1 && plan.rel_check.is_none() {
+        let rj = &plan.rel_joins[0];
+        plan.rel_check = Some(RelCheck {
+            to_table: rj.to_table.clone(),
+            to_col: rj.to_col.clone(),
+            from_col: rj.from_col.clone(),
+            synthetic: shape
+                .synthetic
+                .iter()
+                .map(|s| (s.to_col.clone(), s.synthetic.clone()))
+                .collect(),
+            contribution_def: shape.contribution_def.clone(),
+            source_columns: shape.source_columns.clone(),
+            group_by_row_columns: group_by_cols.clone(),
+        });
+    }
     let contrib_text = |contrib: &HashMap<String, Option<String>>, fields: &[AggFieldPlan]| {
         if ledger != LedgerMode::Contrib {
             return None;
         }
-        Some(
-            fields
-                .iter()
-                .map(|f| contrib.get(&f.name).cloned().flatten().unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join(&ddl::COMPOSITE_KEY_SEPARATOR.to_string()),
-        )
+        Some(contrib_to_text(contrib, fields))
+    };
+    let ledger_row = |key: &str,
+                      group_key: Option<String>,
+                      contrib: Option<&HashMap<String, Option<String>>>,
+                      change: &FoldedChange,
+                      row: Option<&Row>,
+                      augmented: Option<&Row>,
+                      old_side: Option<(&str, &HashMap<String, Option<String>>)>,
+                      plan: &AggregateTargetPlan| {
+        let lsn = change.lsn;
+        let (join_key, used_parent) = match (plan.rel_check.as_ref(), row, augmented) {
+            (Some(rc), Some(row), Some(aug)) => (
+                row.get(&rc.from_col).cloned().flatten(),
+                rc.synthetic
+                    .iter()
+                    .map(|(_, syn)| aug.get(syn).cloned().flatten())
+                    .collect(),
+            ),
+            _ => (None, Vec::new()),
+        };
+        LedgerRow {
+            from_key: key.to_string(),
+            group_key,
+            contrib: contrib.and_then(|c| contrib_text(c, &plan.fields)),
+            lsn,
+            join_key,
+            basis: None,
+            row: if plan.rel_check.is_some() {
+                row.cloned()
+            } else {
+                None
+            },
+            contrib_map: if plan.rel_check.is_some() {
+                contrib.cloned()
+            } else {
+                None
+            },
+            used_parent,
+            old_group_key: old_side.map(|(g, _)| g.to_string()),
+            old_contrib_map: if plan.rel_check.is_some() {
+                old_side.map(|(_, c)| c.clone())
+            } else {
+                None
+            },
+            xid: change.src_xid.clone(),
+        }
     };
 
+    let mut exp4_forced = 0usize;
     for (i, change) in changes.iter().enumerate() {
         let is_image_less = change.old_image.is_none() && change.new_image.is_none();
         let old_row = &old_rows[i];
         let new_row = &rows[i];
+        if is_image_less || change.has_recompute {
+            exp4_forced += 1;
+        }
 
         // Issues #392/#486: groups only `named_rows` names. Issue #137
         // applies to every group key derived here and below: even on the
@@ -1502,12 +1625,17 @@ pub(super) fn accumulate_changes(
                     derive_group_key(&augmented, &group_by_cols, &plan.group_by_types);
                 let contrib = forward_row_contribution(&shape, &augmented, regex_cache)?;
                 if ledger_on {
-                    plan.ledger_rows.push(LedgerRow {
-                        from_key: change.key.clone(),
-                        group_key: Some(key.clone()),
-                        contrib: contrib_text(&contrib, &plan.fields),
-                        lsn: change.lsn,
-                    });
+                    let lr = ledger_row(
+                        &change.key,
+                        Some(key.clone()),
+                        Some(&contrib),
+                        change,
+                        Some(new_row),
+                        Some(&augmented),
+                        None,
+                        plan,
+                    );
+                    plan.ledger_rows.push(lr);
                 }
                 let group = plan
                     .groups
@@ -1523,12 +1651,17 @@ pub(super) fn accumulate_changes(
                     derive_group_key(&augmented, &group_by_cols, &plan.group_by_types);
                 let contrib = forward_row_contribution(&shape, &augmented, regex_cache)?;
                 if ledger_on {
-                    plan.ledger_rows.push(LedgerRow {
-                        from_key: change.key.clone(),
-                        group_key: None,
-                        contrib: None,
-                        lsn: change.lsn,
-                    });
+                    let lr = ledger_row(
+                        &change.key,
+                        None,
+                        None,
+                        change,
+                        None,
+                        None,
+                        Some((key.as_str(), &contrib)),
+                        plan,
+                    );
+                    plan.ledger_rows.push(lr);
                 }
                 let group = plan
                     .groups
@@ -1549,12 +1682,17 @@ pub(super) fn accumulate_changes(
                 let old_contrib = forward_row_contribution(&shape, &old_augmented, regex_cache)?;
                 let new_contrib = forward_row_contribution(&shape, &new_augmented, regex_cache)?;
                 if ledger_on {
-                    plan.ledger_rows.push(LedgerRow {
-                        from_key: change.key.clone(),
-                        group_key: Some(new_key.clone()),
-                        contrib: contrib_text(&new_contrib, &plan.fields),
-                        lsn: change.lsn,
-                    });
+                    let lr = ledger_row(
+                        &change.key,
+                        Some(new_key.clone()),
+                        Some(&new_contrib),
+                        change,
+                        Some(new_row),
+                        Some(&new_augmented),
+                        Some((old_key.as_str(), &old_contrib)),
+                        plan,
+                    );
+                    plan.ledger_rows.push(lr);
                 }
 
                 if old_key == new_key {
@@ -1595,6 +1733,14 @@ pub(super) fn accumulate_changes(
         }
     }
 
+    if ledger_on {
+        tracing::debug!(
+            changes = changes.len(),
+            forced = exp4_forced,
+            ledger_rows = plan.ledger_rows.len(),
+            "exp4: accumulate"
+        );
+    }
     Ok(())
 }
 
@@ -3592,6 +3738,12 @@ pub(super) async fn apply_aggregate_target(
     plan: &AggregateTargetPlan,
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
+    // Issue #558 experiment 3: ledger entries in key order, then group rows.
+    // Experiment 4: a relationship plan's rows are first validated against
+    // the live to-side under those locks; the corrected plan is used below.
+    if !plan.ledger_written && !plan.ledger_rows.is_empty() && plan.rel_joins.len() <= 1 {
+        write_ledger(txn, target, plan).await?;
+    }
     let mut group_keys: Vec<&String> = plan.groups.keys().collect();
     group_keys.sort();
     if group_keys.is_empty() {
@@ -3603,13 +3755,9 @@ pub(super) async fn apply_aggregate_target(
     // persisted, fully-qualified identity, not a bare `def.def.target`; see
     // `super::apply::apply_and_mark_drained_many`'s call site.
     let target_ident = ddl::qualified_target_table_ident(target);
-    let all_groups: Vec<&GroupPlan> = group_keys.iter().map(|k| &plan.groups[*k]).collect();
     let arity = plan.group_by.len();
 
-    // Issue #558 experiment 3: ledger entries in key order, then group rows.
-    if !plan.ledger_rows.is_empty() && plan.rel_joins.is_empty() {
-        write_ledger(txn, target, plan).await?;
-    }
+    let all_groups: Vec<&GroupPlan> = group_keys.iter().map(|k| &plan.groups[*k]).collect();
 
     // Ascending-ordered pre-lock over every touched group's existing target
     // row, in one statement — see this function's doc comment. Locks nothing
@@ -3809,6 +3957,326 @@ pub(super) async fn apply_aggregate_target(
     Ok(counts)
 }
 
+pub(super) fn ledger_ident(target: &str) -> String {
+    ddl::qualified_target_table_ident(&format!("{target}__ledger"))
+}
+
+/// Issue #558: a row's per-field contribution as one text (fields in plan
+/// order, U+001F-joined, an absent contribution as the empty string).
+pub(super) fn contrib_to_text(
+    contrib: &HashMap<String, Option<String>>,
+    fields: &[AggFieldPlan],
+) -> String {
+    fields
+        .iter()
+        .map(|f| contrib.get(&f.name).cloned().flatten().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(&ddl::COMPOSITE_KEY_SEPARATOR.to_string())
+}
+
+/// Inverse of [`contrib_to_text`].
+pub(super) fn contrib_from_text(
+    text: &str,
+    fields: &[AggFieldPlan],
+) -> HashMap<String, Option<String>> {
+    fields
+        .iter()
+        .zip(text.split(ddl::COMPOSITE_KEY_SEPARATOR))
+        .map(|(f, v)| {
+            (
+                f.name.clone(),
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                },
+            )
+        })
+        .collect()
+}
+
+/// The `GROUP BY` values encoded in a group key (the inverse of
+/// [`derive_group_key`]'s encoding), for a group named only by a ledger entry.
+pub(super) fn group_values_from_key(key: &str, arity: usize) -> Vec<Option<String>> {
+    let parts: Vec<Option<String>> = if arity <= 1 {
+        vec![ddl::decode_key_part(key).map(|c| c.into_owned())]
+    } else {
+        key.split(ddl::COMPOSITE_KEY_SEPARATOR)
+            .map(|p| ddl::decode_key_part(p).map(|c| c.into_owned()))
+            .collect()
+    };
+    if parts.len() == arity {
+        parts
+    } else {
+        vec![None; arity]
+    }
+}
+
+/// Experiment 4, forward path (I1 + I2 for Apply), under the ledger lock:
+///
+/// 1. lock this batch's entries in key order and read each one's group,
+///    contribution, and whether the change is already reflected: its
+///    transaction visible in the entry's basis, or its position at or below
+///    the entry's applied position, or its key rewritten by a reverse
+///    re-derive in this same batch. A skipped change's Phase 2 delta is undone
+///    and its row dropped.
+/// 2. for a kept change whose entry is present with a stored contribution,
+///    the old side comes from the ledger, not the image: the image's old side
+///    is undone and the ledger's subtracted (the membership variant, which
+///    stores none, keeps the image's).
+/// 3. read the to-side live for every join key and, for a row whose parent no
+///    longer carries the values Phase 2 computed with, recompute its
+///    contribution and group from the live parent.
+async fn reconcile_with_ledger(
+    txn: &Transaction<'_>,
+    plan: &mut AggregateTargetPlan,
+    ledger: &str,
+) -> Result<(usize, usize), ApplyError> {
+    let arity = plan.group_by.len();
+    let fields = plan.fields.clone();
+    let types = plan.group_by_types.clone();
+    let mut keys: Vec<&str> = plan
+        .ledger_rows
+        .iter()
+        .map(|r| r.from_key.as_str())
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    txn.execute(
+        &format!("select 1 from {ledger} where from_key = any($1) order by from_key for update"),
+        &[&keys],
+    )
+    .await?;
+    // entries + skip flags for the forward rows (the reverse rows have no `row`)
+    let fwd: Vec<(&str, Option<&str>, Option<PgLsn>)> = plan
+        .ledger_rows
+        .iter()
+        .filter(|r| r.row.is_some() || r.old_group_key.is_some())
+        .map(|r| (r.from_key.as_str(), r.xid.as_deref(), r.lsn))
+        .collect();
+    let mut entries: HashMap<String, (Option<String>, Option<String>, bool)> = HashMap::new();
+    if !fwd.is_empty() {
+        let ks: Vec<&str> = fwd.iter().map(|f| f.0).collect();
+        let xs: Vec<Option<&str>> = fwd.iter().map(|f| f.1).collect();
+        let ls: Vec<Option<PgLsn>> = fwd.iter().map(|f| f.2).collect();
+        let rows = txn
+            .query(
+                &format!(
+                    "select v.k, l.group_key, l.contrib, \
+                       ((l.basis is not null and v.x is not null and pg_visible_in_snapshot(v.x::xid8, l.basis)) \
+                        or (l.applied_lsn is not null and v.l is not null and l.applied_lsn >= v.l)) as skip \
+                     from unnest($1::text[], $2::text[], $3::pg_lsn[]) v(k, x, l) \
+                     join {ledger} l on l.from_key = v.k"
+                ),
+                &[&ks, &xs, &ls],
+            )
+            .await?;
+        for r in rows {
+            entries.insert(r.get(0), (r.get(1), r.get(2), r.get(3)));
+        }
+    }
+    let mut skipped = 0;
+    let mut no_entry = 0usize;
+    let mut replaced = 0usize;
+    let mut kept = Vec::with_capacity(plan.ledger_rows.len());
+    let rows = std::mem::take(&mut plan.ledger_rows);
+    for lr in rows {
+        let forward = lr.row.is_some() || lr.old_group_key.is_some();
+        if !forward {
+            kept.push(lr);
+            continue;
+        }
+        let entry = entries.get(&lr.from_key);
+        if entry.is_none() {
+            no_entry += 1;
+        }
+        let skip = entry.is_some_and(|e| e.2) || plan.reverse_keys.contains(&lr.from_key);
+        if skip {
+            skipped += 1;
+            // undo the Phase 2 delta: add the old side back, take the new side out
+            if let (Some(g), Some(c)) = (&lr.old_group_key, &lr.old_contrib_map)
+                && let Some(group) = plan.groups.get_mut(g)
+            {
+                add_contributions(&fields, group, c);
+            }
+            if let (Some(g), Some(c)) = (&lr.group_key, &lr.contrib_map)
+                && let Some(group) = plan.groups.get_mut(g)
+            {
+                sub_contributions(&fields, group, c);
+            }
+            continue;
+        }
+        if let Some((lg, lc, _)) = entry {
+            // the ledger knows the row: its old side replaces the image's
+            let ledger_old = match (lg, lc) {
+                (Some(g), Some(c)) => Some((g.clone(), contrib_from_text(c, &fields))),
+                _ => None,
+            };
+            if ledger_old.is_some() || lg.is_none() {
+                replaced += 1;
+                if let (Some(g), Some(c)) = (&lr.old_group_key, &lr.old_contrib_map)
+                    && let Some(group) = plan.groups.get_mut(g)
+                {
+                    add_contributions(&fields, group, c);
+                }
+                if let Some((g, c)) = ledger_old {
+                    let group = plan
+                        .groups
+                        .entry(g.clone())
+                        .or_insert_with(|| GroupPlan::new(group_values_from_key(&g, arity)));
+                    sub_contributions(&fields, group, &c);
+                }
+            }
+        }
+        kept.push(lr);
+    }
+    plan.ledger_rows = kept;
+    tracing::debug!(no_entry, replaced, skipped, "exp4: reconcile forward rows");
+
+    // 3. the to-side, live
+    let mut corrected = 0;
+    if let Some(rc) = plan.rel_check.clone() {
+        let join_keys: Vec<&str> = {
+            let mut v: Vec<&str> = plan
+                .ledger_rows
+                .iter()
+                .filter(|r| r.row.is_some())
+                .filter_map(|r| r.join_key.as_deref())
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        if !join_keys.is_empty() {
+            let to_ident = ddl::qualified_source_table(&rc.to_table);
+            let to_col = quote_ident(&rc.to_col);
+            let rows = txn
+                .query(
+                    &format!(
+                        "select p.{to_col}::text, e.key, e.value from {to_ident} p \
+                         cross join lateral jsonb_each_text(to_jsonb(p)) e where p.{to_col}::text = any($1)"
+                    ),
+                    &[&join_keys],
+                )
+                .await?;
+            let mut parents: HashMap<String, Row> = HashMap::new();
+            for r in rows {
+                let k: String = r.get(0);
+                let field: String = r.get(1);
+                let value: Option<String> = r.get(2);
+                parents.entry(k).or_default().insert(field, value);
+            }
+            let mut regex_cache = RegexCache::new();
+            for i in 0..plan.ledger_rows.len() {
+                let (row, used_parent, used_group, used_contrib, join_key) = {
+                    let lr = &plan.ledger_rows[i];
+                    let (Some(row), Some(jk)) = (lr.row.as_ref(), lr.join_key.as_deref()) else {
+                        continue;
+                    };
+                    (
+                        row.clone(),
+                        lr.used_parent.clone(),
+                        lr.group_key.clone(),
+                        lr.contrib_map.clone(),
+                        jk.to_string(),
+                    )
+                };
+                let live = parents.get(&join_key);
+                let live_vals: Vec<Option<String>> = rc
+                    .synthetic
+                    .iter()
+                    .map(|(to_col, _)| live.and_then(|p| p.get(to_col)).cloned().flatten())
+                    .collect();
+                if live_vals == used_parent {
+                    continue;
+                }
+                corrected += 1;
+                let mut augmented = row.clone();
+                for ((_, syn), v) in rc.synthetic.iter().zip(live_vals.iter()) {
+                    augmented.insert(syn.clone(), v.clone());
+                }
+                let new_contrib = row_contribution(
+                    &rc.contribution_def,
+                    &augmented,
+                    &rc.source_columns,
+                    &mut regex_cache,
+                )?;
+                let (new_values, new_key) =
+                    derive_group_key(&augmented, &rc.group_by_row_columns, &types);
+                if let (Some(g), Some(c)) = (used_group.as_ref(), used_contrib.as_ref())
+                    && let Some(group) = plan.groups.get_mut(g)
+                {
+                    sub_contributions(&fields, group, c);
+                }
+                let group = plan
+                    .groups
+                    .entry(new_key.clone())
+                    .or_insert_with(|| GroupPlan::new(new_values));
+                add_contributions(&fields, group, &new_contrib);
+                let lr = &mut plan.ledger_rows[i];
+                lr.group_key = Some(new_key);
+                lr.contrib = (ledger_mode() == LedgerMode::Contrib)
+                    .then(|| contrib_to_text(&new_contrib, &fields));
+                lr.contrib_map = Some(new_contrib);
+            }
+        }
+    }
+    Ok((skipped, corrected))
+}
+
+/// Issue #558 experiment 4, I5 across targets: every aggregate target's ledger
+/// work (locks, reconcile, upsert) for this batch, in target order, before
+/// any group row is locked by [`apply_aggregate_target`].
+pub(super) async fn ledger_stage(
+    txn: &Transaction<'_>,
+    plans: &mut HashMap<String, AggregateTargetPlan>,
+) -> Result<(), ApplyError> {
+    let mut targets: Vec<String> = plans.keys().cloned().collect();
+    targets.sort();
+    for target in targets {
+        let plan = plans.get_mut(&target).expect("target plan");
+        if plan.ledger_rows.is_empty() || plan.rel_joins.len() > 1 {
+            continue;
+        }
+        let ledger = ledger_ident(&plan.target);
+        ensure_ledger(txn, &plan.target, &ledger).await?;
+        let before = plan.ledger_rows.len();
+        let (skipped, corrected) = reconcile_with_ledger(txn, plan, &ledger).await?;
+        tracing::debug!(target = %plan.target, rows_before = before, rows_after = plan.ledger_rows.len(), skipped, corrected, reverse_keys = plan.reverse_keys.len(), "exp4: ledger stage");
+        if !plan.ledger_rows.is_empty() {
+            write_ledger(txn, &plan.target, plan).await?;
+        }
+        plan.ledger_written = true;
+    }
+    Ok(())
+}
+
+/// Creates the ledger table on first use (serialized; see the body).
+async fn ensure_ledger(
+    txn: &Transaction<'_>,
+    target: &str,
+    ledger: &str,
+) -> Result<(), ApplyError> {
+    let exists: bool = txn
+        .query_one("select to_regclass($1) is not null", &[&ledger])
+        .await?
+        .get(0);
+    if !exists {
+        let index = quote_ident(&format!("{}__ledger_gk", target.replace('.', "_")));
+        let jindex = quote_ident(&format!("{}__ledger_jk", target.replace('.', "_")));
+        txn.execute("select pg_advisory_xact_lock(hashtext($1))", &[&ledger])
+            .await?;
+        txn.batch_execute(&format!(
+            "create table if not exists {ledger} (from_key text primary key, group_key text, \
+             contrib text, join_key text, applied_lsn pg_lsn, basis pg_snapshot); \
+             create index if not exists {index} on {ledger} (group_key); \
+             create index if not exists {jindex} on {ledger} (join_key)"
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
 /// Issue #558 experiment 3: upsert this batch's [`LedgerRow`]s into the
 /// target's ledger table (`<target>__ledger`, created on first use), in key
 /// order, in the same transaction as the group deltas. `applied_lsn` only
@@ -3818,57 +4286,43 @@ async fn write_ledger(
     target: &str,
     plan: &AggregateTargetPlan,
 ) -> Result<(), ApplyError> {
-    let ledger = ddl::qualified_target_table_ident(&format!("{target}__ledger"));
-    // One catalog lookup per batch, no process-wide cache: the benchmark runs
-    // several isolated databases with the same target name in one process,
-    // and a cache keyed by target name skipped creation in the second one.
-    // Concurrent `create table if not exists` from several first batches
-    // races on the catalog (duplicate key on pg_type), so creation is
-    // serialized behind a transaction-scoped advisory lock.
-    let exists: bool = txn
-        .query_one("select to_regclass($1) is not null", &[&ledger])
-        .await?
-        .get(0);
-    if !exists {
-        let index = quote_ident(&format!("{}__ledger_gk", target.replace('.', "_")));
-        txn.execute("select pg_advisory_xact_lock(hashtext($1))", &[&ledger])
-            .await?;
-        txn.batch_execute(&format!(
-            "create table if not exists {ledger} (from_key text primary key, group_key text, \
-             contrib text, applied_lsn pg_lsn, basis pg_snapshot); \
-             create index if not exists {index} on {ledger} (group_key)"
-        ))
-        .await?;
-    }
+    let ledger = ledger_ident(target);
+    ensure_ledger(txn, target, &ledger).await?;
     let mut rows: Vec<&LedgerRow> = plan.ledger_rows.iter().collect();
     rows.sort_by(|a, b| a.from_key.cmp(&b.from_key));
     rows.dedup_by(|a, b| a.from_key == b.from_key);
     let keys: Vec<&str> = rows.iter().map(|r| r.from_key.as_str()).collect();
     let groups: Vec<Option<&str>> = rows.iter().map(|r| r.group_key.as_deref()).collect();
     let lsns: Vec<Option<PgLsn>> = rows.iter().map(|r| r.lsn).collect();
+    let join_keys: Vec<Option<&str>> = rows.iter().map(|r| r.join_key.as_deref()).collect();
+    let bases: Vec<Option<&str>> = rows.iter().map(|r| r.basis.as_deref()).collect();
     if ledger_mode() == LedgerMode::Contrib {
         let contribs: Vec<Option<&str>> = rows.iter().map(|r| r.contrib.as_deref()).collect();
         txn.execute(
             &format!(
-                "insert into {ledger} as l (from_key, group_key, contrib, applied_lsn) \
-                 select k, g, c, x from unnest($1::text[], $2::text[], $3::text[], $4::pg_lsn[]) \
-                   as v(k, g, c, x) \
+                "insert into {ledger} as l (from_key, group_key, contrib, join_key, applied_lsn, basis) \
+                 select k, g, c, j, x, b::pg_snapshot from unnest($1::text[], $2::text[], $3::text[], \
+                   $4::text[], $5::pg_lsn[], $6::text[]) as v(k, g, c, j, x, b) \
                  on conflict (from_key) do update set group_key = excluded.group_key, \
-                   contrib = excluded.contrib, \
-                   applied_lsn = greatest(l.applied_lsn, excluded.applied_lsn)"
+                   contrib = excluded.contrib, join_key = excluded.join_key, \
+                   applied_lsn = greatest(l.applied_lsn, excluded.applied_lsn), \
+                   basis = coalesce(excluded.basis, l.basis)"
             ),
-            &[&keys, &groups, &contribs, &lsns],
+            &[&keys, &groups, &contribs, &join_keys, &lsns, &bases],
         )
         .await?;
     } else {
         txn.execute(
             &format!(
-                "insert into {ledger} as l (from_key, group_key, applied_lsn) \
-                 select k, g, x from unnest($1::text[], $2::text[], $3::pg_lsn[]) as v(k, g, x) \
+                "insert into {ledger} as l (from_key, group_key, join_key, applied_lsn, basis) \
+                 select k, g, j, x, b::pg_snapshot from unnest($1::text[], $2::text[], $3::text[], \
+                   $4::pg_lsn[], $5::text[]) as v(k, g, j, x, b) \
                  on conflict (from_key) do update set group_key = excluded.group_key, \
-                   applied_lsn = greatest(l.applied_lsn, excluded.applied_lsn)"
+                   join_key = excluded.join_key, \
+                   applied_lsn = greatest(l.applied_lsn, excluded.applied_lsn), \
+                   basis = coalesce(excluded.basis, l.basis)"
             ),
-            &[&keys, &groups, &lsns],
+            &[&keys, &groups, &join_keys, &lsns, &bases],
         )
         .await?;
     }
@@ -4905,6 +5359,7 @@ mod tests {
     /// own logic doesn't read is a cheap, meaningless placeholder.
     fn insert_change(key: &str) -> FoldedChange {
         FoldedChange {
+            src_xid: None,
             src_table: "post_tags".to_string(),
             key: key.to_string(),
             new_image: Some("{}".to_string()),

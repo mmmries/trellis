@@ -82,6 +82,10 @@ impl BucketFilter {
 /// `::text` rather than a `serde_json::Value` `FromSql`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoldedChange {
+    /// Issue #558: the source transaction id (`xid8` as text) of the LAST
+    /// image-bearing row, or `None` when nothing image-bearing was staged
+    /// by intake. Apply's skip rule checks it against a ledger basis.
+    pub src_xid: Option<String>,
     pub src_table: String,
     pub key: String,
     /// LAST image-bearing row's post-image, by `(lsn, change_id)` — highest.
@@ -237,7 +241,7 @@ pub struct FoldedChange {
 /// on `op` (see the discriminator comment below).
 const FOLD_COLUMNS: &str = "src_table, key, old_image::text as old_image, \
      new_image::text as new_image, lsn, origin_lsn, src_changed, hop_gen, \
-     group_key, appended_at, change_id, route, op, relationship_id, retry_count";
+     group_key, appended_at, change_id, route, op, relationship_id, retry_count, src_xid";
 
 /// Runs the claim-time fold over `seg_seq`'s fenced window, restricted to
 /// `bucket`. One [`FoldedChange`] per `(src_table, key)` present in that
@@ -270,6 +274,7 @@ pub async fn fold(
     Ok(rows
         .into_iter()
         .map(|row| FoldedChange {
+            src_xid: row.get(18),
             src_table: row.get(0),
             key: row.get(1),
             new_image: row.get(2),
@@ -450,7 +455,9 @@ fn fold_sql(window_sql: &str, fence_param_count: usize) -> String {
                        max(old_image collate \"C\") \
                            filter (where new_image is null and old_image is not null \
                                      and op <> 'recompute')], null) \
-             end as vanished_images \
+             end as vanished_images, \
+             (array_agg(src_xid::text order by lsn desc, change_id desc) \
+                 filter (where src_xid is not null))[1] as src_xid \
          from filtered \
          left join group_keys \
              on group_keys.src_table = filtered.src_table and group_keys.key = filtered.key \
@@ -671,6 +678,7 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
     vanished_images.dedup();
 
     FoldedChange {
+        src_xid: later.src_xid.or(earlier.src_xid),
         src_table: earlier.src_table,
         key: earlier.key,
         new_image,
@@ -781,6 +789,7 @@ mod merge_tests {
 
     fn base(key: &str) -> FoldedChange {
         FoldedChange {
+            src_xid: None,
             src_table: "orders".to_string(),
             key: key.to_string(),
             new_image: None,

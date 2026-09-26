@@ -423,9 +423,22 @@ pub(crate) fn ring_table_name(ring_slot: i16) -> Result<&'static str, StagingErr
 /// locking it would serialize every append against every seal. A stale read
 /// is expected and is what the fence (stage 03) accounts for.
 pub async fn append(txn: &Transaction<'_>, changes: &[StagedChange]) -> Result<(), StagingError> {
+    append_with_xid(txn, changes, None).await
+}
+
+/// [`append`] with the source transaction's 32-bit id (issue #558): every row
+/// gets `src_xid`, the id widened to `xid8` against the ring writer's own
+/// transaction id, which was assigned after the source commit and so is the
+/// nearest anchor (experiment 1a: `anchor - ((low32(anchor) - x) mod 2^32)`).
+pub async fn append_with_xid(
+    txn: &Transaction<'_>,
+    changes: &[StagedChange],
+    src_xid: Option<u32>,
+) -> Result<(), StagingError> {
     if changes.is_empty() {
         return Ok(());
     }
+    let src_xid: Option<i64> = src_xid.map(i64::from);
 
     let ring_slot: i16 = txn
         .query_one("select ring_slot from segment_pointer", &[])
@@ -434,7 +447,7 @@ pub async fn append(txn: &Transaction<'_>, changes: &[StagedChange]) -> Result<(
     let table = ring_table_name(ring_slot)?;
 
     const COLUMNS: &str = "src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, \
-         hop_gen, group_key, retry_count, relationship_id";
+         hop_gen, group_key, retry_count, relationship_id, src_xid";
     const COLS_PER_ROW: usize = 12;
     // Postgres's wire protocol caps a Bind message's parameter count at
     // i16::MAX (65535); 5000 rows keeps every chunk's param count
@@ -445,14 +458,21 @@ pub async fn append(txn: &Transaction<'_>, changes: &[StagedChange]) -> Result<(
 
     for chunk in rows.chunks(MAX_ROWS_PER_STATEMENT) {
         let mut sql = format!("insert into {table} ({COLUMNS}) values ");
-        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(chunk.len() * COLS_PER_ROW);
+        let mut params: Vec<&(dyn ToSql + Sync)> =
+            Vec::with_capacity(chunk.len() * COLS_PER_ROW + 1);
+        let xid_param = chunk.len() * COLS_PER_ROW + 1;
+        let xid_expr = format!(
+            "(case when ${xid_param}::bigint is null then null else \
+             (pg_current_xact_id()::text::numeric - mod(mod(pg_current_xact_id()::text::numeric, 4294967296) \
+              - ${xid_param}::bigint::numeric + 4294967296, 4294967296))::bigint::text::xid8 end)"
+        );
         for (i, row) in chunk.iter().enumerate() {
             if i > 0 {
                 sql.push_str(", ");
             }
             let base = i * COLS_PER_ROW;
             sql.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}::text::jsonb, ${}::text::jsonb, ${}, ${}, ${}, ${}, ${}, ${})",
+                "(${}, ${}, ${}, ${}, ${}::text::jsonb, ${}::text::jsonb, ${}, ${}, ${}, ${}, ${}, ${}, {xid_expr})",
                 base + 1,
                 base + 2,
                 base + 3,
@@ -479,6 +499,7 @@ pub async fn append(txn: &Transaction<'_>, changes: &[StagedChange]) -> Result<(
             params.push(&row.retry_count);
             params.push(&row.relationship_id);
         }
+        params.push(&src_xid);
 
         txn.execute(sql.as_str(), &params).await?;
     }
