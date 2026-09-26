@@ -55,10 +55,18 @@
 //!   other throughput number sits under.
 //! - [`idle_cost`]: a zero-traffic install's transactions/sec, WAL bytes/sec
 //!   and seals/sec (V-IDLE).
+//! - [`rel_churn`]: issue #558 experiment 4, to-side churn against a
+//!   relationship aggregate.
+//! - [`build_under_load`]: issue #558 experiment 5, a large aggregate build
+//!   under a paced mixed write load.
+//! - [`disk_tier`]: WAL/fsync/checkpoint deltas over a window, the cluster's
+//!   storage, and the writers' commit-latency histogram.
 
+pub mod build_under_load;
 pub mod chain;
 pub mod cli;
 pub mod contention;
+pub mod disk_tier;
 pub mod fold_in;
 pub mod generator_reach;
 pub mod hop_latency;
