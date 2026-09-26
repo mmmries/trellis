@@ -30,6 +30,7 @@ use crate::app::{
     RelationshipSummary, Trellis, TrellisError, TrellisOptions,
 };
 use crate::config::Config;
+use crate::staging::{SelfCheckMode, SelfCheckReport, SelfCheckScope};
 
 /// One [`BlockingTrellis`] method call, carried over a channel to the
 /// dedicated background thread that owns the real, async [`Trellis`] (see
@@ -65,6 +66,13 @@ enum Job {
     HasLiveStagingWorker(oneshot::Sender<Result<bool, TrellisError>>),
     WatermarkToken(oneshot::Sender<Result<PgLsn, TrellisError>>),
     AwaitConverged(PgLsn, Duration, oneshot::Sender<Result<(), TrellisError>>),
+    SelfCheck(
+        String,
+        SelfCheckScope,
+        SelfCheckMode,
+        Duration,
+        oneshot::Sender<Result<SelfCheckReport, TrellisError>>,
+    ),
     Shutdown(oneshot::Sender<Result<(), TrellisError>>),
 }
 
@@ -86,8 +94,21 @@ enum Job {
 /// [`TrellisError::CalledFromAsyncContext`] rather than blocking, since
 /// blocking such a thread would deadlock/panic inside `tokio` itself. Use
 /// the async [`Trellis`] directly in that context instead.
+///
+/// Every public [`Trellis`] method has a twin here except one, left
+/// async-only on purpose: [`Trellis::pool`]. The pool hands out async
+/// connections, which a caller with no `tokio` runtime of its own (the whole
+/// audience of this type) can't drive, and which were never meant to cross
+/// an FFI boundary. A caller that needs its own queries against the target
+/// tables opens its own connection. The `surface_tests` module below checks
+/// that no other method is missing.
 pub struct BlockingTrellis {
     job_tx: mpsc::UnboundedSender<Job>,
+    /// A copy of the configuration the background thread's [`Trellis`]
+    /// connected with, so [`BlockingTrellis::config`] can hand out a
+    /// reference without a round trip. [`Config`] is immutable once built, so
+    /// the copy can't drift from the original.
+    config: Config,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -103,6 +124,7 @@ impl BlockingTrellis {
     pub fn connect(config: Config, options: TrellisOptions) -> Result<Self, TrellisError> {
         let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), TrellisError>>();
+        let kept_config = config.clone();
 
         let thread = std::thread::Builder::new()
             .name("trellis-blocking".to_string())
@@ -121,6 +143,7 @@ impl BlockingTrellis {
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(BlockingTrellis {
                 job_tx,
+                config: kept_config,
                 thread: Some(thread),
             }),
             Ok(Err(err)) => {
@@ -135,6 +158,14 @@ impl BlockingTrellis {
                 Err(TrellisError::BlockingThreadExitedBeforeReady)
             }
         }
+    }
+
+    /// The resolved configuration (schema names, DSN) this instance connected
+    /// with. See [`Trellis::config`]. Like [`BlockingTrellis::metrics`], this
+    /// doesn't round-trip through the background thread: the handle keeps its
+    /// own copy of the (immutable) [`Config`] it was connected with.
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// Applies Trellis's schema migrations. See [`Trellis::migrate`].
@@ -257,6 +288,26 @@ impl BlockingTrellis {
     /// on a shared handle, not just this one. Size it accordingly.
     pub fn await_converged(&self, token: PgLsn, timeout: Duration) -> Result<(), TrellisError> {
         self.submit(|reply| Job::AwaitConverged(token, timeout, reply))
+    }
+
+    /// Audits one page of `target_table` against an independent recompute of
+    /// its definition from the source. See [`Trellis::self_check`] for what
+    /// `scope`, `mode` and `timeout` mean and what the report holds.
+    ///
+    /// Like [`BlockingTrellis::await_converged`], this can hold the
+    /// background thread for up to `timeout` per convergence await it makes
+    /// (one under [`SelfCheckMode::Strict`], up to two under
+    /// [`SelfCheckMode::Standard`]), plus the comparison itself, so every
+    /// other call on a shared handle queues behind it for that long.
+    pub fn self_check(
+        &self,
+        target_table: &str,
+        scope: SelfCheckScope,
+        mode: SelfCheckMode,
+        timeout: Duration,
+    ) -> Result<SelfCheckReport, TrellisError> {
+        let target_table = target_table.to_string();
+        self.submit(|reply| Job::SelfCheck(target_table, scope, mode, timeout, reply))
     }
 
     /// Stops any background work this connection started and waits for the
@@ -399,6 +450,9 @@ async fn run(
             Job::AwaitConverged(token, timeout, reply) => {
                 let _ = reply.send(trellis.await_converged(token, timeout).await);
             }
+            Job::SelfCheck(table, scope, mode, timeout, reply) => {
+                let _ = reply.send(trellis.self_check(&table, scope, mode, timeout).await);
+            }
             Job::Shutdown(reply) => {
                 let _ = reply.send(trellis.shutdown().await);
                 return;
@@ -463,5 +517,159 @@ mod tests {
             err.to_string().contains("worker_threads"),
             "error should name the offending option, got: {err}"
         );
+    }
+}
+
+/// Issue #587: a public [`Trellis`] method with no [`BlockingTrellis`] twin
+/// is unreachable from every binding, and nothing else notices the gap. This
+/// reads the crate's source and fails naming any method missing from the
+/// blocking side, so adding one to `Trellis` without bridging it (or listing
+/// it in `ASYNC_ONLY` with a reason on [`BlockingTrellis`]'s doc) breaks the
+/// build's tests rather than a binding author's afternoon.
+///
+/// It reads source text rather than a hand-kept list of both method sets, so
+/// the only thing maintained by hand is the deliberate exception. `syn` would
+/// be exact but is a heavy dev-dependency for one check; the scan instead
+/// relies on `rustfmt`'s layout, which `verify`'s fmt check guarantees: an
+/// inherent `impl` header on one line ending in `{`, closed by a `}` at the
+/// same indent, its methods one level in. It visits every `.rs` file under
+/// `src/` and every inherent `impl` block of each type, however the type is
+/// pathed, so a method added in a second block or another module is still
+/// seen. A method generated by a macro is invisible to it.
+#[cfg(test)]
+mod surface_tests {
+    use std::path::Path;
+
+    /// Public `Trellis` methods deliberately left async-only; see
+    /// [`super::BlockingTrellis`]'s doc comment for why.
+    const ASYNC_ONLY: &[&str] = &["pool"];
+
+    /// Every `.rs` file under `dir`, recursively, as its text.
+    fn sources(dir: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(std::fs::read_to_string(&path).expect("read source file"));
+            }
+        }
+    }
+
+    /// Whether `line` opens an inherent `impl` block of `type_name`
+    /// (`impl Trellis {`, `impl crate::app::Trellis {`, ...), not a trait
+    /// impl (`impl Display for Trellis {`).
+    fn opens_inherent_impl(line: &str, type_name: &str) -> bool {
+        let Some(self_type) = line
+            .trim_start()
+            .strip_prefix("impl ")
+            .and_then(|rest| rest.strip_suffix(" {"))
+        else {
+            return false;
+        };
+        !self_type.contains(" for ") && self_type.rsplit("::").next() == Some(type_name)
+    }
+
+    /// The name of the `pub` method `line` declares, if it declares one at
+    /// `indent`, whatever its qualifiers (`const`, `async`, `unsafe`).
+    fn public_method_name(line: &str, indent: &str) -> Option<String> {
+        let mut rest = line.strip_prefix(indent)?.strip_prefix("pub ")?;
+        for qualifier in ["const ", "async ", "unsafe "] {
+            rest = rest.strip_prefix(qualifier).unwrap_or(rest);
+        }
+        let rest = rest.strip_prefix("fn ")?;
+        let end = rest.find(['(', '<'])?;
+        Some(rest[..end].to_string())
+    }
+
+    /// The names of the `pub` methods in every inherent `impl <type_name>`
+    /// block across `sources`, and how many such blocks there were.
+    fn public_methods(sources: &[String], type_name: &str) -> (Vec<String>, usize) {
+        let mut methods = Vec::new();
+        let mut blocks = 0;
+        for source in sources {
+            let mut lines = source.lines();
+            while let Some(line) = lines.next() {
+                if !opens_inherent_impl(line, type_name) {
+                    continue;
+                }
+                blocks += 1;
+                let outer = &line[..line.len() - line.trim_start().len()];
+                let close = format!("{outer}}}");
+                let inner = format!("{outer}    ");
+                for line in lines.by_ref().take_while(|line| *line != close) {
+                    methods.extend(public_method_name(line, &inner));
+                }
+            }
+        }
+        (methods, blocks)
+    }
+
+    #[test]
+    fn every_public_trellis_method_has_a_blocking_twin() {
+        let mut all = Vec::new();
+        sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut all);
+        let (trellis, trellis_blocks) = public_methods(&all, "Trellis");
+        let (blocking, blocking_blocks) = public_methods(&all, "BlockingTrellis");
+        // Guards the scan itself: finding nothing would pass vacuously. Both
+        // names sit near the far end of their blocks, so a scan that stopped
+        // early misses them too.
+        assert!(
+            trellis_blocks > 0 && blocking_blocks > 0,
+            "no impl blocks found"
+        );
+        assert!(trellis.contains(&"self_check".to_string()), "{trellis:?}");
+        assert!(blocking.contains(&"self_check".to_string()), "{blocking:?}");
+
+        let missing: Vec<&String> = trellis
+            .iter()
+            .filter(|name| !ASYNC_ONLY.contains(&name.as_str()) && !blocking.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "public Trellis methods with no BlockingTrellis twin: {missing:?}. Bridge each in \
+             blocking.rs, or add it to ASYNC_ONLY and say why on BlockingTrellis's doc comment"
+        );
+
+        for name in ASYNC_ONLY {
+            assert!(
+                trellis.iter().any(|method| method == name),
+                "ASYNC_ONLY lists `{name}`, which is no longer a public Trellis method"
+            );
+        }
+    }
+
+    /// The scan's own edge cases, on text small enough to read at a glance.
+    /// The fixture names a type other than `Trellis` because the real scan
+    /// reads this file too.
+    #[test]
+    fn the_scan_sees_every_inherent_block_and_qualifier() {
+        let source = "\
+impl Fixture {
+    pub async fn first(&self) {}
+    pub(crate) fn hidden(&self) {}
+    fn private(&self) {}
+    pub fn generic<T>(&self) {}
+}
+
+impl fmt::Display for Fixture {
+    pub fn not_inherent(&self) {}
+}
+
+mod nested {
+    impl crate::app::Fixture {
+        pub const fn pathed(&self) {}
+        pub unsafe fn qualified(&self) {}
+    }
+}
+
+impl OtherFixture {
+    pub fn someone_else(&self) {}
+}
+"
+        .to_string();
+        let (methods, blocks) = public_methods(&[source], "Fixture");
+        assert_eq!(blocks, 2);
+        assert_eq!(methods, ["first", "generic", "pathed", "qualified"]);
     }
 }
