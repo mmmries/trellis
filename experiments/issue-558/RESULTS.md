@@ -236,3 +236,78 @@ same-key order, and the reverse path's enumeration has a gap.**
 entry; reverse enumeration must see in-flight dependents) and one implementation
 constraint (I5 as a two-phase batch).** Neither amendment adds a mechanism outside the
 ledger; both should go into the note before experiment 3 prototypes Apply.
+
+## Experiment 3: what does the ledger cost on the hot path?
+
+Prototype (commit "Experiment 3 prototype" on this branch): plain single-source aggregates
+only, Apply only, nothing removed. `accumulate_changes` records one `LedgerRow` per
+delta-path change (from key, group key, per-field contribution text, the change's commit
+position); `apply_aggregate_target` upserts them into `<target>__ledger`
+(`from_key text primary key, group_key text, contrib text, applied_lsn pg_lsn, basis
+pg_snapshot`, index on `group_key`) **in key order, before the group pre-lock, in the same
+Phase 3 transaction** as today's delta apply:
+
+```sql
+insert into <ledger> as l (from_key, group_key, contrib, applied_lsn)
+select k, g, c, x from unnest($1::text[], $2::text[], $3::text[], $4::pg_lsn[]) as v(k, g, c, x)
+on conflict (from_key) do update set group_key = excluded.group_key, contrib = excluded.contrib,
+  applied_lsn = greatest(l.applied_lsn, excluded.applied_lsn)
+```
+
+`TRELLIS_EXP558_LEDGER` selects `off` (byte-identical to `main`; the same-session control),
+`contrib` (membership + contributions + position) or `membership` (no contributions). The
+fold-in benchmark gained `wal_bytes` / `wal_bytes_per_row` over the probe (source writes and
+engine writes together, offer open → drained). Runs go through `bench` (exclusive lock), via
+`bench3.sh`: `fold-in-ratio --ratios 1,10,100,1000` (20 s offer, 400k rows/s target, 8
+workers) and the #326 shape `group-contention --groups 400,4000,40000 --threads 1,8`.
+
+Two harness bugs cost the first attempt (both fixed on the branch, neither a design finding):
+concurrent `create table if not exists` from several first batches raced on the catalog, and
+a process-wide "ledger exists" cache keyed by target name survived across the benchmark's
+isolated databases. The final matrix is one clean pass per mode, `off` measured in the same
+session as the control.
+
+Results: in-window folded rows/s (least-squares fold rate while load was arriving), and WAL
+bytes per source row over the probe. Every drained probe's oracle passed in every mode.
+
+| shape | groups | workers | off | contrib | ratio | membership | ratio | WAL/row off | contrib | x | membership | x |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| group-contention | 400 | 1 | 85.3k | 69.3k | 0.81 | 70.0k | 0.82 | 448 | 736 | 1.64 | 728 | 1.62 |
+| group-contention | 400 | 8 | 88.4k | 86.7k | 0.98 | 87.9k | 0.99 | 469 | 757 | 1.61 | 749 | 1.60 |
+| group-contention | 4k | 1 | 72.3k | 58.5k | 0.81 | 58.4k | 0.81 | 456 | 756 | 1.66 | 744 | 1.63 |
+| group-contention | 4k | 8 | 72.6k | 66.0k | 0.91 | 75.3k | 1.04 | 476 | 790 | 1.66 | 775 | 1.63 |
+| group-contention | 40k | 1 | 2.8k | 0.8k | 0.27 | 2.9k | 1.04 | 452 | 612 | 1.35 | 627 | 1.39 |
+| group-contention | 40k | 8 | 2.5k | 2.3k | 0.94 | 2.9k | 1.18 | 460 | 688 | 1.50 | 487 | 1.06 |
+| fold-in-ratio 1000:1 | 400 | 8 | 89.6k | 85.5k | 0.95 | 88.5k | 0.99 | 468 | 757 | 1.62 | 749 | 1.60 |
+| fold-in-ratio 100:1 | 4k | 8 | 75.9k | 76.8k | 1.01 | 72.4k | 0.95 | 466 | 783 | 1.68 | 779 | 1.67 |
+| fold-in-ratio 10:1 | 40k | 8 | 1.9k | 2.6k | 1.38 | 3.0k | 1.60 | 461 | 486 | 1.06 | 487 | 1.06 |
+| fold-in-ratio 1:1 | 400k | 8 | 0 | 0 | – | 2.0k | – | 451 | 458 | 1.02 | 490 | 1.09 |
+
+Reading it:
+
+- **Throughput.** With 8 workers (the shipped default) the ledger costs 1–9% at 400 and 4k
+  groups, and nothing measurable at 40k+. With a single worker it costs 19% on both the 400
+  and 4k shapes: the extra statement's round trip and lock time land on the one worker's
+  critical path, where 8 workers overlap it. The 40k-group shapes never drain in any mode
+  (the #326 existence-probe sequential scan dominates; ~2–3k rows/s), so their ratios are
+  noise — the single-worker `contrib` 0.27 and the `membership` 1.04 on the identical shape
+  bracket the same behaviour, and no one should read either as a ledger effect.
+- **WAL.** 1.6–1.7x per source row for either variant. The ledger row itself is what costs,
+  not the contributions: `membership` (no `contrib` column) writes within 1–2% of `contrib`.
+  For this target (one numeric SUM, one COUNT) the contribution text is ~10 bytes; a wider
+  target would widen the gap, but the fixed cost of a heap tuple + primary-key index entry
+  per source row is the floor.
+- **Not measured here:** the win the note expects at high group counts from deleting the
+  probe and pre-lock. This prototype keeps every existing mechanism (as the experiment
+  specifies), so the 40k shape still pays the probe and the ledger cannot show its upside.
+  That upside is exactly the #326 cost the `off` column shows.
+
+**Against the proposed bar** (within 25% of `main` at ratio 1 and 10 on folded rows/s, no
+regression at 40k groups, WAL under 2x): passes on every 8-worker shape and on WAL; the
+single-worker shapes sit at 19%, inside the bar but not comfortably. Ratio 1 and 10 (400k and
+40k groups) cannot be judged on this prototype because `main` itself never drains them.
+
+**Experiment 3 verdict: not falsified.** The ledger write is affordable with batching, and the
+membership-only variant buys nothing on WAL, so the design can keep contributions. The
+single-worker cost is the number to re-measure once the probe and pre-lock are actually
+removed (experiment 5's build, or a later prototype that deletes them).

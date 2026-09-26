@@ -1,0 +1,51 @@
+waiting for in-flight verify runs / benchmarks to release /tmp/trellis-bench.lock ...
+fold-in 1000:1 (400 groups) — T3 NO at 400000 rows/sec: folded 69281 rows/sec while offered, 70804 rows/sec end to end (offered 400000/sec)
+400 groups x 1 drain workers: folded 69281 rows/sec while offered; engine busy 1.88 backends, 0.17 waiting on row locks (9%, 0.00 in the aggregate pre-lock), 1.29 running, 0.38 idle in txn; 0 deadlocks, 72 rollbacks
+      0.34 running     insert into "public"."agg_totals__ledger" as l (from_key, group_key, con
+      0.25 running     with fenced as (select src_table, key, old_image::text as old_image, new
+      0.17 row_lock    update segments set seal_step2 = (select seal_step1 from segments where 
+      0.14 running     insert into seg_1 (src_table, key, op, lsn, old_image, new_image, origin
+      0.14 running     insert into seg_2 (src_table, key, op, lsn, old_image, new_image, origin
+      0.12 running     insert into seg_0 (src_table, key, op, lsn, old_image, new_image, origin
+fold-in 1000:1 (400 groups) — T3 NO at 400000 rows/sec: folded 86745 rows/sec while offered, 86586 rows/sec end to end (offered 400000/sec)
+400 groups x 8 drain workers: folded 86745 rows/sec while offered; engine busy 7.83 backends, 3.90 waiting on row locks (50%, 0.03 in the aggregate pre-lock), 2.73 running, 0.85 idle in txn; 0 deadlocks, 20 rollbacks
+      3.87 row_lock    with taken as ( select bucket from seg_claims where seg_seq = $1 ), free
+      0.69 running     with fenced as (select src_table, key, old_image::text as old_image, new
+      0.51 running     insert into "public"."agg_totals__ledger" as l (from_key, group_key, con
+      0.30 idle_in_txn select exists(select 1 from "public"."agg_src" s where s."grp" is not di
+      0.18 running     with taken as ( select bucket from seg_claims where seg_seq = $1 ), free
+      0.18 running     select exists(select 1 from "public"."agg_src" s where s."grp" is not di
+fold-in 100:1 (4000 groups) — T3 NO at 400000 rows/sec: folded 58531 rows/sec while offered, 64766 rows/sec end to end (offered 400000/sec)
+4000 groups x 1 drain workers: folded 58531 rows/sec while offered; engine busy 1.93 backends, 0.21 waiting on row locks (11%, 0.00 in the aggregate pre-lock), 1.26 running, 0.39 idle in txn; 0 deadlocks, 80 rollbacks
+      0.29 running     insert into "public"."agg_totals__ledger" as l (from_key, group_key, con
+      0.21 running     with fenced as (select src_table, key, old_image::text as old_image, new
+      0.21 row_lock    update segments set seal_step2 = (select seal_step1 from segments where 
+      0.19 running     insert into seg_3 (src_table, key, op, lsn, old_image, new_image, origin
+      0.13 running     insert into seg_2 (src_table, key, op, lsn, old_image, new_image, origin
+      0.11 running     insert into seg_0 (src_table, key, op, lsn, old_image, new_image, origin
+fold-in 100:1 (4000 groups) — T3 NO at 400000 rows/sec: folded 66005 rows/sec while offered, 80544 rows/sec end to end (offered 400000/sec)
+4000 groups x 8 drain workers: folded 66005 rows/sec while offered; engine busy 8.63 backends, 5.54 waiting on row locks (64%, 5.54 in the aggregate pre-lock), 2.31 running, 0.57 idle in txn; 0 deadlocks, 118 rollbacks
+      5.54 row_lock    select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t j
+      0.57 running     with fenced as (select src_table, key, old_image::text as old_image, new
+      0.49 running     select exists(select 1 from "public"."agg_src" s where s."grp" is not di
+      0.39 running     insert into "public"."agg_totals__ledger" as l (from_key, group_key, con
+      0.28 idle_in_txn select exists(select 1 from "public"."agg_src" s where s."grp" is not di
+      0.18 running     insert into seg_2 (src_table, key, op, lsn, old_image, new_image, origin
+oracle SKIPPED: 40000 groups — the target never folded in every row within the grace period, so this probe's correctness was not checked
+fold-in 10:1 (40000 groups) — T3 NO at 400000 rows/sec: folded 754 rows/sec while offered, never caught up within the grace period (offered 400000/sec)
+40000 groups x 1 drain workers: folded 754 rows/sec while offered; engine busy 1.91 backends, 0.00 waiting on row locks (0%, 0.00 in the aggregate pre-lock), 1.65 running, 0.16 idle in txn; 0 deadlocks, 125 rollbacks
+      0.85 running     select exists(select 1 from "public"."agg_src" s where s."grp" is not di
+      0.64 running     insert into seg_0 (src_table, key, op, lsn, old_image, new_image, origin
+      0.09 running     insert into seg_3 (src_table, key, op, lsn, old_image, new_image, origin
+      0.06 idle_in_txn select ring_slot from segment_pointer
+      0.05 io          select exists(select 1 from "public"."agg_src" s where s."grp" is not di
+      0.04 idle_in_txn insert into seg_0 (src_table, key, op, lsn, old_image, new_image, origin
+oracle SKIPPED: 40000 groups — the target never folded in every row within the grace period, so this probe's correctness was not checked
+fold-in 10:1 (40000 groups) — T3 NO at 400000 rows/sec: folded 2332 rows/sec while offered, never caught up within the grace period (offered 400000/sec)
+40000 groups x 8 drain workers: folded 2332 rows/sec while offered; engine busy 8.84 backends, 6.77 waiting on row locks (77%, 6.73 in the aggregate pre-lock), 1.70 running, 0.27 idle in txn; 0 deadlocks, 124 rollbacks
+      6.73 row_lock    select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t j
+      0.85 running     select exists(select 1 from "public"."agg_src" s where s."grp" is not di
+      0.60 running     insert into seg_1 (src_table, key, op, lsn, old_image, new_image, origin
+      0.10 idle_in_txn insert into seg_1 (src_table, key, op, lsn, old_image, new_image, origin
+      0.09 idle_in_txn select exists(select 1 from "public"."agg_src" s where s."grp" is not di
+      0.08 io          select exists(select 1 from "public"."agg_src" s where s."grp" is not di
