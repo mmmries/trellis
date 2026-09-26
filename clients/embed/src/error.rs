@@ -9,8 +9,10 @@ use trellis::{
     SelfCheckError, StagingError, TrellisError, ValidationError,
 };
 
-/// Every error code the bindings map explicitly: one Elixir atom and one Ruby
-/// `Trellis::Error` subclass each, allocated from this list at load time.
+/// Every error code the bindings map explicitly: one Elixir atom (a literal in
+/// `Trellis.Error`'s code map, never built from the string that crosses) and
+/// one Ruby `Trellis::Error` subclass each. Each host's own test reads this
+/// list back to check its mapping covers it.
 ///
 /// Written out by hand rather than derived from [`ErrorCode::ALL`] on purpose.
 /// [`ErrorCode`] is `#[non_exhaustive]`, so each host also needs a fallback
@@ -18,12 +20,13 @@ use trellis::{
 /// grows a code this list lacks, so adding one is a deliberate binding change
 /// (a new atom, a new exception subclass) rather than a silent downgrade to
 /// the fallback.
-pub const ERROR_CODES: [&str; 6] = [
+pub const ERROR_CODES: [&str; 7] = [
     "parse",
     "validation",
     "connectivity",
     "conflict",
     "not_found",
+    "timeout",
     "internal",
 ];
 
@@ -176,6 +179,21 @@ mod tests {
 
         assert_eq!(plain.code, "validation");
         assert_eq!(plain.message, message);
+    }
+
+    /// Issue #586: `await_converged` running out of time crosses as
+    /// `timeout`, so a host can retry it instead of reading `internal` ("a
+    /// Trellis bug").
+    #[test]
+    fn a_convergence_timeout_crosses_as_timeout() {
+        let err = TrellisError::Staging(StagingError::ConvergenceTimeout {
+            token: "0/16B3748".parse().unwrap(),
+            waited: std::time::Duration::from_millis(80),
+        });
+
+        let plain = PlainError::from(err);
+
+        assert_eq!(plain.code, "timeout");
     }
 
     #[test]
