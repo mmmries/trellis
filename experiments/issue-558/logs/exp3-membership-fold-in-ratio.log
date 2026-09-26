@@ -1,0 +1,7 @@
+waiting for in-flight verify runs / benchmarks to release /tmp/trellis-bench.lock ...
+oracle SKIPPED: 400000 groups — the target never folded in every row within the grace period, so this probe's correctness was not checked
+fold-in 1:1 (400000 groups) — T3 NO at 400000 rows/sec: folded 2038 rows/sec while offered, never caught up within the grace period (offered 400000/sec)
+oracle SKIPPED: 40000 groups — the target never folded in every row within the grace period, so this probe's correctness was not checked
+fold-in 10:1 (40000 groups) — T3 NO at 400000 rows/sec: folded 3033 rows/sec while offered, never caught up within the grace period (offered 400000/sec)
+fold-in 100:1 (4000 groups) — T3 NO at 400000 rows/sec: folded 72369 rows/sec while offered, 81789 rows/sec end to end (offered 400000/sec)
+fold-in 1000:1 (400 groups) — T3 NO at 400000 rows/sec: folded 88486 rows/sec while offered, 88142 rows/sec end to end (offered 400000/sec)
