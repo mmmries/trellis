@@ -311,3 +311,72 @@ single-worker shapes sit at 19%, inside the bar but not comfortably. Ratio 1 and
 membership-only variant buys nothing on WAL, so the design can keep contributions. The
 single-worker cost is the number to re-measure once the probe and pre-lock are actually
 removed (experiment 5's build, or a later prototype that deletes them).
+
+## Experiment 4: does a relationship survive without a projection?
+
+Probe: `bench rel-churn` (`benchmark/src/streaming/rel_churn.rs`). `children(id, grp, parent, val)`
+references `parents(id, weight)` through `RELATIONSHIP parent`; the target is
+`GROUP BY grp SELECT SUM(parent.weight), SUM(val), COUNT(*)` (1,000 groups), so every parent
+update changes every child's contribution. 1M children split into parents of 10, 1k or 100k
+children (so 100k, 1k or **10** parents). For a 20 s window, 8 writers issue paced single-row
+parent updates (100/s or 1,000/s) and, at the same time, single-row child updates (1,000/s).
+"Converged" is the first moment the target equals a from-scratch oracle; the tail is how long
+that took past the window.
+
+### Baseline: `main`'s reverse fast path (ledger off)
+
+| children/parent | parents | parent updates/s | converged | tail after the window | WAL | oracle |
+|---|---|---|---|---|---|---|
+| 10 | 100k | 100 | 23.1 s | 3.1 s | 507 MB | ✓ |
+| 10 | 100k | 1,000 | 62.0 s | 42.0 s | 221 MB | ✓ |
+| 1k | 1k | 100 | 21.2 s | 1.2 s | 325 MB | ✓ |
+| 1k | 1k | 1,000 | 21.2 s | 1.2 s | 339 MB | ✓ |
+| 100k | 10 | 100 | 21.2 s | 1.2 s | 328 MB | ✓ |
+| 100k | 10 | 1,000 | 21.2 s | 1.2 s | 337 MB | ✓ |
+
+Two things to know before reading the ledger side against it. The 100k-child shape has only
+10 parents, so 20,000 updates fold to ~10 reverse records per batch and the fast path scans
+each parent's 100k children once per batch, not once per update; that is why it is the
+cheapest row. And the one slow baseline row is the *many-parents* shape at 1,000 updates/s:
+100k distinct parents means little folding and one reverse record (guards, ring scans, a
+live from-side scan) per parent per batch.
+
+### The ledger side (prototype, same branch, `TRELLIS_EXP558_LEDGER=contrib|membership`)
+
+What was built on top of experiment 3's ledger, all of it behind the flag:
+
+- **The source xid is staged.** Intake keeps the BEGIN xid on its transaction buffer and
+  `append` widens it to `xid8` in SQL against the ring writer's own `pg_current_xact_id()`
+  (experiment 1a's rule; migration `V52` adds `src_xid` to the ring). The fold carries the
+  xid of the last image-bearing row (`FoldedChange::src_xid`).
+- **Ledger entries carry `join_key`** (indexed) and `basis` (`pg_snapshot`), set only by a
+  Re-derive.
+- **Apply under I1/I2** (`reconcile_with_ledger`, run for every aggregate target of the batch
+  in target order before any group row is locked, I5 across targets): lock the batch's
+  entries in key order; a change is **skipped** if its xid is visible in the entry's basis,
+  or its position is at or below the entry's applied position, or a Re-derive in this same
+  batch rewrote the key; a skipped change's Phase 2 delta is undone. A kept change's **old
+  side comes from the ledger** (its stored group and contribution), not from the image; the
+  image's old side is undone. Then the to-side is read live for every join key in the batch
+  and a row whose parent no longer carries the values Phase 2 computed with (the projection
+  is a cache) is recomputed from the live parent.
+- **A to-side attribute update re-derives its children through the ledger**
+  (`rederive_children_via_ledger`): lock the entries whose `join_key` is the parent, in key
+  order; in one statement (one snapshot, the basis) read every live child of that key **plus**
+  every locked entry's row by primary key (experiment 2's 6b union), each joined to its
+  parent read live; diff each child's stored contribution against its live one; rewrite the
+  entries with the new contribution and basis. No guards, no ring scans, no deferral, no
+  fallback: I1 orders it against every concurrent Apply. The projection is still advanced,
+  as a cache only. Catch-up records, parent inserts/deletes and key changes keep `main`'s
+  path in this prototype (the build writes no ledger here, so their old side is unknown).
+- **The probe seeds the ledger** after backfill with a no-op update of every child through
+  the real Apply path (standing in for the build's ledger write), and waits for the ring to
+  be quiet before seeding and before the offer window in every mode, because the go-live
+  catch-up floods the ring with recomputes that force anything staged meanwhile.
+
+Bugs found while getting the prototype to pass the oracle under combined churn, none of them
+design findings: the batch's aggregate plans are keyed by the bare target name while the
+reverse shape names the qualified one, so the reverse plan was applied beside the forward
+plan instead of merged into it (a child's delta counted twice); the go-live catch-up's
+image-less parent records were being taken by the ledger reverse path with an unknown old
+side; and the seeding rows folded with the catch-up's recomputes.

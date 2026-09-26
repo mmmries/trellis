@@ -46,6 +46,8 @@ static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 /// spilling bounds memory, but an unbounded transaction still needs a floor
 /// somewhere.
 pub struct TxnBuffer {
+    /// The source transaction's id, from the BEGIN message (issue #558).
+    xid: Option<u32>,
     head: Vec<StagedChange>,
     spill: Option<SpillFile>,
     spill_threshold: usize,
@@ -57,6 +59,7 @@ pub struct TxnBuffer {
 impl TxnBuffer {
     pub fn new(spill_threshold: usize, hard_cap: usize) -> Self {
         Self {
+            xid: None,
             head: Vec::new(),
             spill: None,
             spill_threshold,
@@ -70,6 +73,7 @@ impl TxnBuffer {
     /// `spill_threshold`. `xid` is only used to name the spill file and the
     /// hard-cap error — it plays no role in staging order or content.
     pub fn push(&mut self, change: StagedChange, xid: u32) -> Result<(), IntakeError> {
+        self.xid = Some(xid);
         self.count += 1;
         if self.count > self.hard_cap {
             return Err(IntakeError::TransactionTooLarge {
@@ -165,6 +169,7 @@ impl TxnBuffer {
         changed_at: SystemTime,
     ) -> Result<(), IntakeError> {
         let replay_chunk_size = self.spill_threshold;
+        let xid = self.xid;
         if let Some(spill) = self.spill {
             let mut reader = spill.into_reader()?;
             loop {
@@ -173,12 +178,12 @@ impl TxnBuffer {
                     break;
                 }
                 super::stamp_commit_metadata(&mut chunk, end_lsn, changed_at);
-                append::append(txn, &chunk).await?;
+                append::append_with_xid(txn, &chunk, xid).await?;
             }
         }
         let mut head = self.head;
         super::stamp_commit_metadata(&mut head, end_lsn, changed_at);
-        append::append(txn, &head).await?;
+        append::append_with_xid(txn, &head, xid).await?;
         Ok(())
     }
 }
