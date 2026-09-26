@@ -500,7 +500,13 @@ async fn run(
         }
     };
 
+    // #565 spike: capture comes from AFTER triggers appending to the ring, so
+    // there is no publication, slot or intake; the maintenance loop (seal,
+    // retire, reclaim, reconcile) still runs.
+    let trigger_capture = std::env::var_os("TRELLIS_SPIKE_TRIGGER_CAPTURE").is_some();
+
     if options.staging_worker
+        && !trigger_capture
         && let Err(err) = setup_staging(&dsn, &config, &options, &pool).await
     {
         let _ = ready_tx.send(Err(err));
@@ -534,7 +540,7 @@ async fn run(
 
     let mut intake_task = None;
     let mut maintenance_task = None;
-    if options.staging_worker {
+    if options.staging_worker && !trigger_capture {
         let intake_config = match build_intake_config(&dsn, &config, &options) {
             Ok(cfg) => cfg,
             Err(err) => {
@@ -576,7 +582,8 @@ async fn run(
             })
             .await;
         }));
-
+    }
+    if options.staging_worker {
         let maintenance_config = MaintenanceConfig {
             dsn: dsn.clone(),
             schema: config.schema().to_string(),
