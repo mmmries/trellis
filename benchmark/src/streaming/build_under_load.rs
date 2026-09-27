@@ -261,10 +261,21 @@ struct XminSample {
 fn capture_trigger_ddl() -> String {
     let dir = std::env::var("TRELLIS_EXP5_CAPTURE_SQL_DIR")
         .unwrap_or_else(|_| "experiments/issue-565".to_string());
+    let shape = trigger_shape();
+    let new_only = if shape.contains("new_only") {
+        "True"
+    } else {
+        "False"
+    };
+    let skip_noop = if shape.contains("skip_noop") {
+        "True"
+    } else {
+        "False"
+    };
     let script = format!(
         "import sys; sys.path.insert(0, {dir:?}); import capture_sql as c; \
          c.PTR['mode'] = 'mirror'; c.ENC.update(mode='format', pin=True); \
-         c.SHAPE.update(new_only=True, skip_noop=True); \
+         c.SHAPE.update(new_only={new_only}, skip_noop={skip_noop}); \
          print(c.stmt_trigger({SOURCE:?}, ['id', 'grp', 'amt'], ['id']))"
     );
     let out = std::process::Command::new("python3")
@@ -277,6 +288,12 @@ fn capture_trigger_ddl() -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout).expect("capture DDL is UTF-8")
+}
+
+/// The statement-trigger shape, `TRELLIS_EXP5_TRIGGER_SHAPE` (default
+/// `new_only,skip_noop`, the one #617 specifies).
+fn trigger_shape() -> String {
+    std::env::var("TRELLIS_EXP5_TRIGGER_SHAPE").unwrap_or_else(|_| "new_only,skip_noop".into())
 }
 
 /// Total on-disk size of the ledger tables, the source and the target.
@@ -672,6 +689,103 @@ async fn is_live(raw: &RawClient, terminal: &str) -> bool {
     .is_some()
 }
 
+/// On a failed run: up to 20 mismatched groups, target vs oracle, with the
+/// ledger's member count for each (stderr), so the log carries the shape.
+async fn dump_mismatches(raw: &RawClient, terminal: &str) {
+    let rows = raw
+        .query(
+            &format!(
+                "with o as (select grp, sum(amt) as total, count(*) as n \
+                     from public.{SOURCE} group by grp) \
+                 select coalesce(t.grp::text, o.grp::text), t.total::text, o.total::text, \
+                        t.n::text, o.n::text, \
+                        (select count(*) from pg_class c where c.relname = '{terminal}__ledger') \
+                 from o full outer join public.{terminal} t on t.grp::numeric = o.grp::numeric \
+                 where t.grp is null or o.grp is null \
+                    or t.total::numeric is distinct from o.total::numeric \
+                    or t.n::bigint is distinct from o.n \
+                 order by 1 limit 20"
+            ),
+            &[],
+        )
+        .await
+        .expect("list mismatched groups");
+    for r in rows {
+        let g: String = r.get(0);
+        let members: Option<i64> = if r.get::<_, i64>(5) > 0 {
+            raw.query_one(
+                &format!(
+                    "select count(*) from public.{terminal}__ledger \
+                     where group_key = $1 or group_key like $1 || chr(31) || '%'"
+                ),
+                &[&g],
+            )
+            .await
+            .ok()
+            .map(|r| r.get(0))
+        } else {
+            None
+        };
+        if members.is_some() {
+            // The ledger entries this group counts whose source row is gone
+            // or lives in another group, with the entry's basis and position.
+            let strays = raw
+                .query(
+                    &format!(
+                        "select l.from_key, s.grp::text, l.basis::text, l.applied_lsn::text \
+                         from public.{terminal}__ledger l \
+                         left join public.{SOURCE} s on s.id::text = l.from_key \
+                         where l.group_key = $1 and (s.id is null or s.grp::text <> l.group_key)"
+                    ),
+                    &[&g],
+                )
+                .await
+                .unwrap_or_default();
+            for st in strays {
+                let key: String = st.get(0);
+                eprintln!(
+                    "build-under-load:   stray key={key} source grp={:?} basis={:?} applied_lsn={:?}",
+                    st.get::<_, Option<String>>(1),
+                    st.get::<_, Option<String>>(2),
+                    st.get::<_, Option<String>>(3),
+                );
+                for seg in 0..4 {
+                    let ring = raw
+                        .query(
+                            &format!(
+                                "select op, old_image::text, new_image::text, lsn::text, \
+                                        row_txid::text, change_id::text \
+                                 from trellis.seg_{seg} where key = $1 order by change_id"
+                            ),
+                            &[&key],
+                        )
+                        .await
+                        .unwrap_or_default();
+                    for r in ring {
+                        eprintln!(
+                            "build-under-load:     seg_{seg} op={:?} old={:?} new={:?} lsn={:?} txid={:?} change_id={:?}",
+                            r.get::<_, Option<String>>(0),
+                            r.get::<_, Option<String>>(1),
+                            r.get::<_, Option<String>>(2),
+                            r.get::<_, Option<String>>(3),
+                            r.get::<_, Option<String>>(4),
+                            r.get::<_, Option<String>>(5),
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "build-under-load: MISMATCH grp={g} target total={:?} n={:?} oracle total={:?} n={:?} \
+             ledger members={members:?}",
+            r.get::<_, Option<String>>(1),
+            r.get::<_, Option<String>>(3),
+            r.get::<_, Option<String>>(2),
+            r.get::<_, Option<String>>(4),
+        );
+    }
+}
+
 /// Groups where the target disagrees with a from-scratch `GROUP BY` over the
 /// source, computed entirely on the server.
 async fn mismatched_groups(raw: &RawClient, terminal: &str) -> i64 {
@@ -748,7 +862,10 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         raw.batch_execute(&ddl)
             .await
             .expect("install the #565 capture triggers on the source");
-        eprintln!("build-under-load: capture by statement triggers (new_only, skip_noop)");
+        eprintln!(
+            "build-under-load: capture by statement triggers ({})",
+            trigger_shape()
+        );
     }
 
     let disk_start = disk_tier::sample(&sampler).await;
@@ -853,6 +970,9 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         Some(m) if converged_at.is_some() => m,
         _ => mismatched_groups(&raw, &terminal).await,
     };
+    if mismatched != 0 {
+        dump_mismatches(&raw, &terminal).await;
+    }
 
     client.shutdown().await.expect("client shutdown");
 
