@@ -514,7 +514,9 @@ impl Trellis {
         let rows = txn
             .query(
                 "select d.id, d.target_table, d.source_table, d.source_version, d.created_at, \
-                        pb.table_name, pb.attempts, pb.last_error, pb.next_attempt_at \
+                        pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
+                        pb.last_error as backfill_last_error, \
+                        pb.next_attempt_at as backfill_next_attempt_at \
                  from transform_definitions d \
                  left join pending_backfill pb \
                    on pb.table_name = d.source_table and pb.last_error is not null \
@@ -535,7 +537,7 @@ impl Trellis {
                     source_version: row.get(3),
                     status: reported[&id],
                     created_at: row.get(4),
-                    backfill_failure: backfill_failure_at(&row, 5),
+                    backfill_failure: backfill_failure(&row),
                 }
             })
             .collect())
@@ -588,8 +590,10 @@ impl Trellis {
             .await?;
         let row = txn
             .query_opt(
-                "select d.status, pb.table_name, pb.attempts, pb.last_error, pb.next_attempt_at, \
-                        d.id \
+                "select d.status, d.id, \
+                        pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
+                        pb.last_error as backfill_last_error, \
+                        pb.next_attempt_at as backfill_next_attempt_at \
                  from transform_definitions d \
                  left join pending_backfill pb \
                    on pb.table_name = d.source_table and pb.last_error is not null \
@@ -603,12 +607,12 @@ impl Trellis {
             let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
                 panic!("transform_definitions.status held unrecognized value '{status_text}'")
             });
-            status = Some(reported_status(&*txn, row.get(5), stored).await?);
+            status = Some(reported_status(&*txn, row.get(1), stored).await?);
         }
         txn.commit().await?;
         Ok(row.zip(status).map(|(row, status)| DefinitionStatus {
             status,
-            backfill_failure: backfill_failure_at(&row, 1),
+            backfill_failure: backfill_failure(&row),
         }))
     }
 
@@ -1328,17 +1332,20 @@ async fn reported_status(
         .unwrap_or(stored))
 }
 
-/// The [`BackfillFailure`] in the four columns starting at `first`
-/// (`pending_backfill`'s `table_name, attempts, last_error, next_attempt_at`,
-/// left-joined on the definition's source table where `last_error` is set),
-/// or `None` when the join found no failing marker.
-fn backfill_failure_at(row: &tokio_postgres::Row, first: usize) -> Option<BackfillFailure> {
-    row.get::<_, Option<String>>(first)
+/// The [`BackfillFailure`] in a row of [`Trellis::status`]'s or
+/// [`Trellis::definitions`]' query: `pending_backfill`'s `table_name`,
+/// `attempts`, `last_error` and `next_attempt_at`, selected as
+/// `backfill_table`, `backfill_attempts`, `backfill_last_error` and
+/// `backfill_next_attempt_at` from a left join on the definition's source
+/// table where `last_error` is set. `None` when the join found no failing
+/// marker. Read by name, so the two queries can order their columns freely.
+fn backfill_failure(row: &tokio_postgres::Row) -> Option<BackfillFailure> {
+    row.get::<_, Option<String>>("backfill_table")
         .map(|source_table| BackfillFailure {
             source_table,
-            attempts: u32::try_from(row.get::<_, i32>(first + 1)).unwrap_or(0),
-            last_error: row.get(first + 2),
-            next_attempt_at: row.get(first + 3),
+            attempts: u32::try_from(row.get::<_, i32>("backfill_attempts")).unwrap_or(0),
+            last_error: row.get("backfill_last_error"),
+            next_attempt_at: row.get("backfill_next_attempt_at"),
         })
 }
 

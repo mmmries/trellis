@@ -372,6 +372,32 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_line_backfill_error_stays_on_its_line() {
+        let def = DefinitionSummary {
+            id: 7,
+            target_table: "public.order_totals".to_string(),
+            source_table: "public.orders".to_string(),
+            source_version: 1,
+            status: trellis::TransformStatus::WaitingToBackfill,
+            created_at: UNIX_EPOCH,
+            backfill_failure: Some(trellis::BackfillFailure {
+                source_table: "public.orders".to_string(),
+                attempts: 1,
+                last_error: "db error: ERROR: permission denied for table orders\n\
+                             DETAIL: role lacks SELECT\nHINT: grant it"
+                    .to_string(),
+                next_attempt_at: UNIX_EPOCH,
+            }),
+        };
+        let formatted = format_definitions(std::slice::from_ref(&def));
+        assert_eq!(formatted.lines().count(), 2, "got {formatted:?}");
+        assert!(
+            formatted.contains(r"orders\nDETAIL: role lacks SELECT\nHINT: grant it"),
+            "got {formatted:?}"
+        );
+    }
+
+    #[test]
     fn a_relationship_is_formatted_with_its_fields() {
         let rel = RelationshipSummary {
             id: 3,

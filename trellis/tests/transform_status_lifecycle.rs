@@ -1449,7 +1449,13 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
         .apply("TRANSFORM widget_totals FROM widgets SELECT price + price AS total")
         .await
         .expect("register a plain 1-1 transform");
-    // Its build plans chunks over the source's primary key, so without one
+    // A second reader of the same source, so the listing shows the one
+    // marker's failure on both (issue #461).
+    trellis
+        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .await
+        .expect("register a second transform on the same source");
+    // Their build plans chunks over the source's primary key, so without one
     // every discharge of the source's marker fails.
     raw.batch_execute("alter table public.widgets drop constraint widgets_pkey")
         .await
@@ -1467,10 +1473,11 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
     let failure = status
         .backfill_failure
         .expect("status reports the failing backfill");
-    // Issue #461: the definitions listing reports the same failure.
+    // Issue #461: the definitions listing reports the same failure, once
+    // per definition reading the source.
     assert_eq!(
         backfill_failures_listed(&trellis).await,
-        vec![Some(failure.clone())],
+        vec![Some(failure.clone()), Some(failure.clone())],
         "definitions() reports the failure status does"
     );
     assert_eq!(failure.source_table, "public.widgets");
@@ -1518,7 +1525,7 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
         status.backfill_failure, None,
         "a marker with no recorded failure reports none"
     );
-    assert_eq!(backfill_failures_listed(&trellis).await, vec![None]);
+    assert_eq!(backfill_failures_listed(&trellis).await, vec![None, None]);
     publication::discharge_registrations(&db.pool)
         .await
         .expect("the retry goes through");
