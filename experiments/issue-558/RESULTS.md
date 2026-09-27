@@ -672,3 +672,78 @@ offered rows/s, 120 s grace (`logs/disk/exp3-*.jsonl`; the `off` fold-in pair wa
   above are less exposed (converged-time, not throughput, and `main` was measured in the same
   hour), but carry the same caveat.
 
+## Experiment 5: a ledger-writing chunked build under write load (#617)
+
+The question (#617): does a build that writes the ledger and applies CDC from its first chunk
+converge to the oracle at scale, under a write load, with no go-live re-read, and what does it
+cost? `build-under-load` (`benchmark/src/streaming/build_under_load.rs`): `agg_src(id, grp,
+amt)` COPY-loaded, then 8 paced writers at 2,000 statements/s (70% `amt` updates, 15% group
+moves, 10% inserts, 5% deletes) from 2 s before `define` until 20 s after `live`; `GROUP BY grp
+SELECT SUM(amt), COUNT(*)`; 8 drain workers; the target must equal a from-scratch `GROUP BY`
+once the writers stop and the ring drains. Disk-backed: the NVMe under btrfs `+C`,
+`shared_buffers=1GB checkpoint_timeout=1min max_wal_size=4GB`, default durability. The control
+is today's path (flags unset: one `GROUP BY` into the target, then the go-live re-read); the
+ledger build is `TRELLIS_EXP558_LEDGER=contrib TRELLIS_EXP558_BUILD=ledger`
+(`trellis/src/staging/ledger_build.rs`: 10k-row PK-range chunks claimed by every drain worker,
+each one transaction that placeholder-locks its keys' ledger entries, reads the rows and
+`pg_current_snapshot()` in one statement and adds deltas; the definition applies CDC from the
+first chunk and goes straight to `live`). Logs under `logs/exp5/`.
+
+Columns added for #617: `peak_xmin_age_xids` / `peak_xmin_hold_secs` (the oldest client
+backend `xmin` from define to the writers' stop, and the longest one value stayed oldest),
+`peak_xact_secs` / `peak_xact_query` (the oldest open client transaction with an xid),
+`ledger_bytes` (every `*__ledger` table, heap + indexes + toast, after convergence),
+`in_xip_changes` (changes whose xid sat in an entry's basis in-progress list: applied, never
+re-derived), `skipped_changes` (changes a chunk's basis already showed), `imageless_rederives`.
+The first ledger run's xmin columns also counted autovacuum workers (fixed before run 2) and
+it has no `peak_xact_*` columns.
+
+### Step 2: 10M rows, 100k groups, slot capture
+
+| | control (today's path) | ledger build, run 1 | ledger build, run 2 |
+|---|---|---|---|
+| build (define → built) | 4.6 s, 1 chunk | 672 s, 1,001 chunks (1.50/s) | 716 s, 1,001 chunks (1.41/s) |
+| define → `live` | **226 s** | **672 s** | **716 s** |
+| converged (from define) / tail after writers stop | 399 s / 153 s | 782 s / 90 s | 949 s / 213 s |
+| oracle | ok | ok | ok |
+| WAL MB/s / total | 14.5 / 5.8 GB | 36.9 / 29.3 GB | 31.1 / 29.8 GB |
+| fsyncs/s | 502 | 468 | 486 |
+| checkpoint buffers (timed + requested) | 359k (6 + 0) | 741k (8 + 5) | 699k (13 + 2) |
+| writer p99 overall / during build; rate | 21.1 / 20.9 ms; 1,930/s | 44.3 / 42.8 ms; 1,894/s | 36.1 / 35.1 ms; 1,901/s |
+| deadlocks / rollbacks | 3 / 672 | 6 / 4,820 | 15 / 5,852 |
+| ledger on disk (source 0.79–0.82 GB) | – | 2.34 GB | 2.56 GB |
+| target on disk | – | 0.39 GB | 0.78 GB |
+| peak `xmin` hold / age | not sampled | (272 s, autovacuum included) | 658 s / 1.30M xids |
+| skipped by basis / in-progress ids / image-less re-derives | – | 196k / 0 / 169 | 361k / 0 / 401 |
+
+- **Correct.** The oracle matched on both ledger runs with no re-read and no orphan sweep. The
+  chunks' bases skipped 196–361k changes the chunk had already read; no change's xid was in a
+  basis's in-progress list (expected to be rare: a writer must be in flight on one of the
+  chunk's 10k keys, below `xmax`, at the chunk's snapshot); 169–401 image-less changes were
+  re-derived under the entry lock.
+- **Slower to `live`, not faster.** define-to-live is 3.0–3.2x the control's (672–716 s vs
+  226 s), and it is the build itself: 8 workers do 1.4–1.5 chunks/s, about 14–15k source rows/s.
+  The per-chunk cost grows with the table: 3.2, 3.8 and 5.7 worker-seconds per 10k-row chunk at
+  1M, 5M and 10M rows (smoke and diagnostic runs, `logs/exp5/diag-*`). The control's build is one
+  4.6 s `GROUP BY`; its 226 s is the re-read lapping the ring.
+- **5x the WAL.** 29.3–29.8 GB against 5.8 GB, 2.1–2.5x the MB/s over a window twice as long:
+  the ledger is 3x the source's size and is written once per row by the build and again per
+  change, with full-page images after every 1-minute checkpoint. The target bloats to 2x
+  (additive group updates, 100k groups rewritten by every chunk that touches them). fsyncs/s
+  are level with the control.
+- **Long transactions.** One client transaction held the oldest `xmin` for 658 s of run 2's
+  716 s build (1.3M xids of age); in the 5M diagnostic the oldest open transaction reached
+  143 s, caught in the ledger build's group-existence read. Chunks and Apply batches meet on
+  the same ledger placeholders (sorted, so they queue rather than deadlock; the 6–15 deadlocks
+  and 4.8–5.9k rollbacks are retried), and a batch that queues behind several chunks holds its
+  xid the whole time. The ring stayed full for most of the build (seal refused "would lap
+  unretired work" from the first minute to the end of run 1's build): the drain workers were
+  busy with chunks, and the tail after `live` (90–213 s) is that backlog.
+- Writers kept 95% of their target rate in both paths (1,894–1,930/s of 2,000); p99 commit
+  latency is 1.7–2.1x the control's during the ledger build.
+
+Bar (#617 step 2): oracle ok — **met**; define-to-live about equal to the build time (no
+re-read) — **met** (they are the same number), but the build is 3x the control's whole
+define-to-live; tail small — **not met** (90–213 s against the control's 153 s); WAL and fsync
+rate beside the control's — above. Whether that is out of proportion is the user's call.
+
