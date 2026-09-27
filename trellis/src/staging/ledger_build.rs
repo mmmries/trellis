@@ -217,6 +217,7 @@ pub(crate) async fn execute_chunk(
 /// [`execute_chunk`] with no claim to hold: runs `(lo, hi]` of the
 /// definition's source as one build chunk, however many times it is called
 /// (tests drive chunks, re-runs included, in a chosen order with this).
+#[allow(dead_code)] // the tests reach it through `internals`
 pub async fn execute_range(
     pool: &Pool,
     definition: &Definition,

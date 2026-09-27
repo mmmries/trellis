@@ -1,0 +1,30 @@
+storage: /home/mike/exp558/tmpdisk (btrfs)
+warning: function `execute_range` is never used
+   --> trellis/src/staging/ledger_build.rs:220:14
+    |
+220 | pub async fn execute_range(
+    |              ^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+build-under-load: loaded 10000000 rows in 1.0s (9821003 rows/s)
+[2m2026-09-27T04:33:46.736839Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 0 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T04:34:23.149130Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T04:34:27.234739Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 3 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T04:34:34.906970Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 1 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T04:34:35.545292Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T04:35:35.847516Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m198
+[2m2026-09-27T04:36:35.895118Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m394
+[2m2026-09-27T04:37:36.001019Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m591
+[2m2026-09-27T04:38:36.190974Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m788
+[2m2026-09-27T04:39:13.673861Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 0 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T04:39:52.734403Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 1 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T04:40:52.876050Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 1 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m197
+[2m2026-09-27T04:41:53.009064Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 1 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m394
+[2m2026-09-27T04:42:53.227696Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 1 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m591
+[2m2026-09-27T04:43:53.445490Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 1 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m788
+build-under-load: built in 671.7s (1001 chunks), live after 671.7s; writers continue 20s
+[2m2026-09-27T04:44:47.935167Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 3 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T04:45:48.008687Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 3 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m183
+[2m2026-09-27T04:46:44.518985Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: db error
+build-under-load: 10000000 rows / 100000 groups, loaded at 9821003 rows/s; build 671.7s over 1001 chunks (first done 5.4s), live after 671.7s; converged 782.5s (tail 90.4s, 1 oracle checks of 8.11s), oracle_ok=true (0 mismatched); writers 1894/2000 stmt/s (kept=false), commit p50/p99 0.787/44.288 ms overall, 0.787/42.752 ms during build; wal 36.9 MB/s, 468 fsyncs/s, 741389 checkpoint buffers (8 timed + 5 requested checkpoints); ledger=contrib build=ledger
