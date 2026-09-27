@@ -43,7 +43,9 @@ for the cross-instance rules.
 ## Granularity
 
 Granularity determines the target's primary-key space — what a single target row
-represents relative to its source row(s). Trellis supports three.
+represents relative to its source row(s). The design has three: 1-1 and
+aggregate are accepted today, and cross-join isn't yet (a `JOIN` clause is a
+parse error).
 
 ### 1-1
 
@@ -65,9 +67,11 @@ of grouping columns; many source rows can map to one target row, and adding,
 removing, or changing a source row can insert, delete, or update a target row.
 
 Grouping-key columns may be referenced directly; any other source column must be
-wrapped in exactly one of `SUM`, `AVG`, `MIN`, or `MAX` (numeric-only). `COUNT(*)`
-counts rows in the group (#75); `COUNT(<column>)` is not yet implemented (see
-ADR-0004).
+wrapped in exactly one aggregate: `SUM`, `AVG`, `MIN`, `MAX`, `COUNT`,
+`BOOL_AND`, `BOOL_OR`, `BIT_AND`, `BIT_OR` or `JSONB_AGG`. `COUNT(*)` counts
+rows in the group (#75), and `COUNT(<expr>)` counts the rows where `<expr>`
+isn't null (#120). Which column types each aggregate accepts is in the
+[type-support matrix](type-support.md).
 
 A grouping key can also be a to-one relationship path (`GROUP BY post.author`).
 Each key becomes a target column named after its bare column, and keys can't be
@@ -108,6 +112,9 @@ an aggregate with tens of thousands of groups written concurrently, benchmark
 it first (`benchmark group-contention --groups <n>`).
 
 ### Cross-join
+
+**Not yet supported:** a `JOIN` clause is refused with a parse error. This
+section describes the design.
 
 The primary-key space is the join of two source tables, mirroring the rows a
 `JOIN` returns. Each unique pairing of source primary keys that satisfies the
@@ -197,6 +204,9 @@ before it runs, keeping evaluation order well-defined.
 
 ## Partial data
 
+**Not yet supported:** the grammar accepts only `WHERE TRUE`, and any other
+predicate is a parse error. This section describes the design.
+
 Any target table, regardless of granularity, may be defined over a *subset* of
 its source rows via a row-level predicate. Like a partial index, materializing
 only a narrow, high-value slice keeps the write load small; excluded rows never
@@ -255,7 +265,7 @@ Every defined transform carries an observable **status**:
   quarantined column is resumed.
 * **`live`** — the steady state: once a transform reports `live`, awaiting a
   watermark token taken after a commit guarantees its target reflects that
-  commit ([embedding](embedding.md)).
+  commit ([embedding — Reading your own writes](embedding.md#reading-your-own-writes)).
 * **`quarantined`** — broken and no longer maintained (the quarantine fuse tripped);
   resuming re-runs the backfill, returning it to `waiting_to_backfill`.
 * **`paused`** — frozen deliberately, by an operator's `PAUSE` rather than by the
@@ -270,7 +280,9 @@ Every defined transform carries an observable **status**:
   ([intake failure modes](staging-and-claiming/01-intake-and-lsn-confirmation.md#failure-modes)).
 
 An application can list defined transforms and read each one's status — enough to
-tell a newly-defined transform is still populating, without a metrics pipeline.
+tell a newly-defined transform is still populating, without a metrics pipeline
+([embedding — Poll to `live`, don't wait](embedding.md#poll-to-live-dont-wait)
+has the polling pattern).
 
 A transform can sit in `waiting_to_backfill` while a long-lived cluster
 transaction holds the backfill's fence open — a safe wait, explained with its
