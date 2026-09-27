@@ -89,7 +89,12 @@ pub const DEFAULT_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// schema names via [`validate_schema_name`], so there is no way to hold a
 /// `Config` whose schema hasn't been checked — see [`Config::with_schema`]
 /// and [`Config::with_target_schema`].
-#[derive(Debug, Clone)]
+///
+/// `Debug` is written by hand rather than derived so a `{:?}` (a `tracing`
+/// field, a panic message, an embedder's log line) can't print the DSN's
+/// password (issue #591). It shows a password-free DSN as written and
+/// replaces any other with `<redacted>`.
+#[derive(Clone)]
 pub struct Config {
     /// A Postgres connection string, in either URL (`postgresql://...`) or
     /// libpq keyword/value (`host=... user=...`) form.
@@ -246,10 +251,82 @@ impl Config {
         let port = std::env::var("PGPORT").unwrap_or_else(|_| "5432".to_string());
         let user = std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_string());
         let dbname = std::env::var("PGDATABASE").unwrap_or_else(|_| user.clone());
+        let password = std::env::var("PGPASSWORD").ok();
+        keyword_value_dsn(&host, &port, &user, password.as_deref(), &dbname)
+    }
+}
 
-        match std::env::var("PGPASSWORD") {
-            Ok(password) => format!("postgresql://{user}:{password}@{host}:{port}/{dbname}"),
-            Err(_) => format!("postgresql://{user}@{host}:{port}/{dbname}"),
+/// Assembles a keyword/value DSN from the `PG*` environment values.
+///
+/// Every value is single-quoted with `\` and `'` backslash-escaped, so it
+/// reaches the connection exactly as given. A URL would need each part
+/// percent-encoded instead: interpolated raw, a `PGPASSWORD` holding `@`
+/// moved the rest of the password into the host, and a `PGHOST` socket
+/// directory (`/var/run/postgresql`) became part of the database name.
+fn keyword_value_dsn(
+    host: &str,
+    port: &str,
+    user: &str,
+    password: Option<&str>,
+    dbname: &str,
+) -> String {
+    fn quoted(value: &str) -> String {
+        format!("'{}'", value.replace('\\', r"\\").replace('\'', r"\'"))
+    }
+    let mut dsn = format!(
+        "host={} port={} user={} dbname={}",
+        quoted(host),
+        quoted(port),
+        quoted(user),
+        quoted(dbname),
+    );
+    if let Some(password) = password {
+        dsn.push_str(" password=");
+        dsn.push_str(&quoted(password));
+    }
+    dsn
+}
+
+impl fmt::Debug for Config {
+    /// Destructures `self` so a new field can't be added without deciding
+    /// here whether it's safe to print.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            dsn,
+            schema,
+            target_schema,
+            pool_max_size,
+            pool_wait_timeout,
+        } = self;
+        f.debug_struct("Config")
+            .field("dsn", &RedactedDsn(dsn))
+            .field("schema", schema)
+            .field("target_schema", target_schema)
+            .field("pool_max_size", pool_max_size)
+            .field("pool_wait_timeout", pool_wait_timeout)
+            .finish()
+    }
+}
+
+/// `Debug`s a DSN without its password (issue #591).
+///
+/// Rather than masking the password in place, which would mean
+/// re-implementing the connection-string grammar and getting every quoting
+/// and escaping rule right, this asks [`tokio_postgres::Config`]'s own
+/// parser (the one [`crate::Pool`] connects with) whether the DSN carries a
+/// password at all. A DSN that parses and carries none prints as written,
+/// so the host, port, user and database stay visible for debugging. Any
+/// other DSN prints as `<redacted>`. That includes one that fails to parse,
+/// since there's no telling where its password would be. It also covers a
+/// URL whose password holds an unencoded `@`, which the parser splits at
+/// the first `@`, so part of the password would land in the host.
+pub(crate) struct RedactedDsn<'a>(pub(crate) &'a str);
+
+impl fmt::Debug for RedactedDsn<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.parse::<tokio_postgres::Config>() {
+            Ok(parsed) if parsed.get_password().is_none() => fmt::Debug::fmt(self.0, f),
+            _ => f.write_str("<redacted>"),
         }
     }
 }
@@ -392,6 +469,44 @@ mod tests {
         assert!(matches!(err, Error::Config(_)));
     }
 
+    /// The `PG*` values reach the connection exactly as given, whatever
+    /// characters they hold: a `PGPASSWORD` with `@`, `:`, `/`, quotes or
+    /// backslashes, and a `PGHOST` socket directory.
+    // `Host::Unix` only exists on unix.
+    #[cfg(unix)]
+    #[test]
+    fn env_dsn_carries_pg_values_through_verbatim() {
+        let password = r#"p@ss:w/rd?#&'q'\ x"#;
+        let dsn = keyword_value_dsn(
+            "/var/run/postgresql",
+            "5433",
+            "o'brien@corp",
+            Some(password),
+            "my db",
+        );
+        let parsed: tokio_postgres::Config = dsn.parse().expect("the assembled DSN parses");
+        assert_eq!(parsed.get_password(), Some(password.as_bytes()));
+        assert_eq!(parsed.get_user(), Some("o'brien@corp"));
+        assert_eq!(parsed.get_dbname(), Some("my db"));
+        assert_eq!(parsed.get_ports(), [5433]);
+        assert_eq!(
+            parsed.get_hosts(),
+            [tokio_postgres::config::Host::Unix(
+                "/var/run/postgresql".into()
+            )]
+        );
+
+        let parsed: tokio_postgres::Config =
+            keyword_value_dsn("db.example.com", "5432", "alice", None, "app")
+                .parse()
+                .expect("the assembled DSN parses");
+        assert_eq!(parsed.get_password(), None);
+        assert_eq!(
+            parsed.get_hosts(),
+            [tokio_postgres::config::Host::Tcp("db.example.com".into())]
+        );
+    }
+
     #[test]
     fn empty_dsn_is_rejected() {
         let err = Config::resolve(Some(String::new())).unwrap_err();
@@ -474,5 +589,51 @@ mod tests {
             .unwrap()
             .with_pool_wait_timeout(Duration::from_millis(250));
         assert_eq!(config.pool_wait_timeout(), Duration::from_millis(250));
+    }
+
+    /// Issue #591: neither `{:?}` nor `{}` on a [`Config`] may print the
+    /// DSN's password, whichever form carries it.
+    #[test]
+    fn config_debug_and_display_never_print_the_password() {
+        for dsn in [
+            "postgresql://alice:s3cret@db.example.com:5432/app",
+            "postgres://alice:s3cret@db.example.com/app?sslmode=disable",
+            "postgresql://alice@db.example.com/app?password=s3cret&sslmode=disable",
+            // An unencoded `@` in the password: the parser splits at the
+            // first `@`, so the tail would otherwise surface as the host.
+            "postgresql://alice:s3cret@s3cret@db.example.com/app",
+            "host=db.example.com user=alice password=s3cret dbname=app",
+            "host=db.example.com user=alice password = 's3cret with spaces' dbname=app",
+            // Unparseable (an unknown keyword): redacted whole.
+            "host=db.example.com sslpassword=s3cret",
+            "host=db.example.com password='s3cret",
+        ] {
+            let config = Config::with_schema(dsn, "app_trellis").unwrap();
+            let debug = format!("{config:?}");
+            let pretty = format!("{config:#?}");
+            let display = format!("{config}");
+            for printed in [&debug, &pretty, &display] {
+                assert!(!printed.contains("s3cret"), "{dsn:?} leaked: {printed}");
+            }
+            assert!(debug.contains("dsn: <redacted>"), "{debug}");
+            // The rest of the configuration stays visible.
+            assert!(debug.contains(r#"schema: "app_trellis""#), "{debug}");
+            assert!(debug.contains("pool_max_size"), "{debug}");
+        }
+    }
+
+    /// A DSN with no password has nothing to hide, so `{:?}` prints it as
+    /// written, keeping the host, port, user and database visible.
+    #[test]
+    fn config_debug_prints_a_password_free_dsn_as_written() {
+        for dsn in [
+            "postgresql://alice@db.example.com:5432/app",
+            "postgresql:///app?host=/tmp/sockets",
+            "host=/tmp/sockets port=5433 user=postgres dbname=app",
+        ] {
+            let config = Config::from_dsn(dsn).unwrap();
+            let debug = format!("{config:?}");
+            assert!(debug.contains(&format!("dsn: {dsn:?}")), "{debug}");
+        }
     }
 }
