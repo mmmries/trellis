@@ -366,7 +366,11 @@ impl BuildUnderLoadResult {
             self.disk.json_fields(),
             disk_tier::json_escape(&self.ledger_mode),
             disk_tier::json_escape(&self.build_mode),
-            if self.cfg.trigger_capture { "trigger" } else { "slot" },
+            if self.cfg.trigger_capture {
+                "trigger"
+            } else {
+                "slot"
+            },
             self.peak_xmin_age_xids,
             self.peak_xmin_hold_secs,
             disk_tier::json_escape(&self.peak_xmin_holder),
