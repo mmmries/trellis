@@ -125,6 +125,9 @@ pub async fn run(
     let baseline_ring_rows = total_ring_rows(&raw).await;
 
     let load = run_max_rate_load(&raw, "e3_src", 1, rows_per_commit, offered_duration).await;
+    // SCRATCH (issue #317 repro): not in the original; observation only.
+    let scratch_in_window = total_ring_rows(&raw).await - baseline_ring_rows;
+    let scratch_grace_start = Instant::now();
 
     let deadline = Instant::now() + catch_up_grace;
     let ring_rows_now = loop {
@@ -139,6 +142,18 @@ pub async fn run(
 
     let appended = ring_rows_now - baseline_ring_rows;
     let backlog = load.rows_issued as i64 - appended;
+    let scratch_grace = scratch_grace_start.elapsed().as_secs_f64();
+    let scratch_total = load.elapsed.as_secs_f64() + scratch_grace;
+    eprintln!(
+        "SCRATCH: load.elapsed={:.3}s in_window_appended={} ({:.0}/s over window) \
+         grace_used={:.3}s appended_total={} => appended/(window+grace_used)={:.0}/s",
+        load.elapsed.as_secs_f64(),
+        scratch_in_window,
+        scratch_in_window as f64 / load.elapsed.as_secs_f64(),
+        scratch_grace,
+        appended,
+        appended as f64 / scratch_total
+    );
 
     client.shutdown().await.expect("client shutdown");
 
