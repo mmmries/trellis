@@ -78,6 +78,7 @@
 //! against the entry the chunk wrote, which is the snapshot's state).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::defs::ast::{GroupByKey, KeySpace, ValueType, group_by_contains};
 use crate::defs::backfill::{self, BackfillError};
@@ -89,6 +90,39 @@ use crate::pool::Pool;
 use super::apply::ApplyError;
 use super::apply_aggregate::{self, AggregateTargetPlan, RederiveCtx};
 use super::target_mutations::TargetMutations;
+
+/// Experiment 5 counters, process-wide, read by the `build-under-load`
+/// benchmark through `trellis::dev::staging::exp5_counters`.
+///
+/// Changes checked against a ledger basis whose in-progress list (`xip`) held
+/// the change's transaction: decided "not visible" and applied, never
+/// re-derived (experiment 1b's decidability result, counted at scale).
+pub(crate) static IN_XIP_CHANGES: AtomicU64 = AtomicU64::new(0);
+/// Changes skipped because the entry's basis or applied position already
+/// showed them (a chunk read the row after the change committed).
+pub(crate) static SKIPPED_CHANGES: AtomicU64 = AtomicU64::new(0);
+/// Keys re-derived for an image-less (or recompute-folded) change.
+pub(crate) static IMAGELESS_REDERIVES: AtomicU64 = AtomicU64::new(0);
+/// Source keys the build chunks read.
+pub(crate) static CHUNK_KEYS: AtomicU64 = AtomicU64::new(0);
+
+/// The experiment 5 counters, see [`IN_XIP_CHANGES`] and its siblings.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Exp5Counters {
+    pub in_xip_changes: u64,
+    pub skipped_changes: u64,
+    pub imageless_rederives: u64,
+    pub chunk_keys: u64,
+}
+
+pub fn exp5_counters() -> Exp5Counters {
+    Exp5Counters {
+        in_xip_changes: IN_XIP_CHANGES.load(Ordering::Relaxed),
+        skipped_changes: SKIPPED_CHANGES.load(Ordering::Relaxed),
+        imageless_rederives: IMAGELESS_REDERIVES.load(Ordering::Relaxed),
+        chunk_keys: CHUNK_KEYS.load(Ordering::Relaxed),
+    }
+}
 
 /// Source rows per build chunk, from `TRELLIS_EXP558_BUILD_CHUNK_ROWS`
 /// (default 10,000: small enough that a few hundred thousand rows spread
@@ -203,6 +237,7 @@ async fn run_chunk_in_txn(
     let pk = ddl::source_primary_key_in_txn(txn, source_table).await?;
     plan.rederive_keys = backfill::keys_in_pk_range(txn, source_table, &pk, lo, hi).await?;
     let keys = plan.rederive_keys.len();
+    CHUNK_KEYS.fetch_add(keys as u64, Ordering::Relaxed);
     let target = plan.target.clone();
     let mut plans = HashMap::from([(target.clone(), plan)]);
     apply_aggregate::ledger_stage(txn, &mut plans).await?;

@@ -1660,6 +1660,8 @@ pub(super) fn accumulate_changes(
         // member. The groups its images name need nothing either: the ledger
         // names the key's old group and the live read its new one.
         if build && (is_image_less || change.has_recompute) {
+            super::ledger_build::IMAGELESS_REDERIVES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             plan.rederive_keys.push(change.key.clone());
             continue;
         }
@@ -4244,7 +4246,9 @@ async fn reconcile_with_ledger(
                 &format!(
                     "select v.k, l.group_key, l.contrib, \
                        ((l.basis is not null and v.x is not null and pg_visible_in_snapshot(v.x::xid8, l.basis)) \
-                        or (l.applied_lsn is not null and v.l is not null and l.applied_lsn >= v.l)) as skip \
+                        or (l.applied_lsn is not null and v.l is not null and l.applied_lsn >= v.l)) as skip, \
+                       (l.basis is not null and v.x is not null \
+                        and v.x::xid8 in (select pg_snapshot_xip(l.basis))) as in_xip \
                      from unnest($1::text[], $2::text[], $3::pg_lsn[]) v(k, x, l) \
                      join {ledger} l on l.from_key = v.k"
                 ),
@@ -4252,6 +4256,10 @@ async fn reconcile_with_ledger(
             )
             .await?;
         for r in rows {
+            if build && r.get::<_, bool>(4) {
+                super::ledger_build::IN_XIP_CHANGES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             entries.insert(r.get(0), (r.get(1), r.get(2), r.get(3)));
         }
     }
@@ -4427,6 +4435,8 @@ pub(super) async fn ledger_stage(
         let before = plan.ledger_rows.len();
         let (skipped, corrected) = reconcile_with_ledger(txn, plan, &ledger).await?;
         if plan_ledger_build(plan) {
+            super::ledger_build::SKIPPED_CHANGES
+                .fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
             let rederived = rederive_via_ledger(txn, plan, &ledger).await?;
             tracing::debug!(target = %plan.target, rederived, "exp5: ledger re-derive");
         }
