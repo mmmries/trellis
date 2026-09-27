@@ -89,7 +89,13 @@ defmodule Trellis.ApplyTest do
 
     covered = MapSet.put(covered, "define_transform")
 
-    assert [%DefinitionSummary{target_table: "public.pet_weights", created_at: %DateTime{}}] =
+    assert [
+             %DefinitionSummary{
+               target_table: "public.pet_weights",
+               created_at: %DateTime{},
+               backfill_failure: nil
+             }
+           ] =
              Enum.filter(Trellis.definitions!(trellis), &(&1.id == definition.id))
 
     await_status(trellis, "pet_weights", :live)

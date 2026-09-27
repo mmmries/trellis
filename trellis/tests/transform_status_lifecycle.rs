@@ -1409,6 +1409,20 @@ async fn a_definition_deferred_during_fresh_slot_creation_goes_live() {
         .expect("drop the slot");
 }
 
+/// Every definition's [`trellis::DefinitionSummary::backfill_failure`], in
+/// `Trellis::definitions`' order.
+async fn backfill_failures_listed(
+    trellis: &trellis::Trellis,
+) -> Vec<Option<trellis::BackfillFailure>> {
+    trellis
+        .definitions()
+        .await
+        .expect("definitions")
+        .into_iter()
+        .map(|summary| summary.backfill_failure)
+        .collect()
+}
+
 /// Issue #407 (ADR-0016): a definition whose source's backfill keeps failing
 /// stays `waiting_to_backfill`, and `Trellis::status` says why: the marker's
 /// attempt count, last error and next attempt. Once the cause is fixed, a
@@ -1435,7 +1449,13 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
         .apply("TRANSFORM widget_totals FROM widgets SELECT price + price AS total")
         .await
         .expect("register a plain 1-1 transform");
-    // Its build plans chunks over the source's primary key, so without one
+    // A second reader of the same source, so the listing shows the one
+    // marker's failure on both (issue #461).
+    trellis
+        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .await
+        .expect("register a second transform on the same source");
+    // Their build plans chunks over the source's primary key, so without one
     // every discharge of the source's marker fails.
     raw.batch_execute("alter table public.widgets drop constraint widgets_pkey")
         .await
@@ -1453,6 +1473,13 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
     let failure = status
         .backfill_failure
         .expect("status reports the failing backfill");
+    // Issue #461: the definitions listing reports the same failure, once
+    // per definition reading the source.
+    assert_eq!(
+        backfill_failures_listed(&trellis).await,
+        vec![Some(failure.clone()), Some(failure.clone())],
+        "definitions() reports the failure status does"
+    );
     assert_eq!(failure.source_table, "public.widgets");
     assert_eq!(failure.attempts, 1);
     assert_eq!(failure.last_error, error.to_string());
@@ -1498,6 +1525,7 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
         status.backfill_failure, None,
         "a marker with no recorded failure reports none"
     );
+    assert_eq!(backfill_failures_listed(&trellis).await, vec![None, None]);
     publication::discharge_registrations(&db.pool)
         .await
         .expect("the retry goes through");

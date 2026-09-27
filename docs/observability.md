@@ -261,7 +261,10 @@ is surfaced (issue #407,
   attempt count, the last error and the next attempt time. The source table's
   backfill also runs the catch-up of its `live` readers, so every transform
   reading that table reports the failure, whatever its status. It clears once
-  an attempt goes through.
+  an attempt goes through. `Trellis::definitions` reports the same value on
+  every `DefinitionSummary`, and the CLI's `trellis status` prints it on an
+  indented line under each affected definition, so one listing shows every
+  stuck backfill.
 
 ## Dependencies
 

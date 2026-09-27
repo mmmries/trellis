@@ -13,7 +13,9 @@
 //! What this prints today: every registered transform definition
 //! ([`Trellis::definitions`]) — id, tables, `created_at`, and its whole-
 //! keyspace lifecycle status (issue #55's `TransformStatus`:
-//! `waiting_to_backfill`/`backfilling`/`live`/`quarantined`) — and every
+//! `waiting_to_backfill`/`backfilling`/`live`/`quarantined`), plus, on a
+//! line of its own, the failure of its source's backfill if that keeps
+//! failing (`backfill_failure`, issue #461) — and every
 //! relationship ([`Trellis::relationships`]). Finer-grained per-`(transform,
 //! column)` pause state (docs/decisions/0008-public-api-design.md's
 //! "Decision 5" and the amendment to
@@ -155,14 +157,26 @@ fn format_definitions(definitions: &[DefinitionSummary]) -> String {
     definitions
         .iter()
         .map(|def| {
-            format!(
+            let mut line = format!(
                 "  id={} source={} target={} status={} created_at={}\n",
                 def.id,
                 def.source_table,
                 def.target_table,
                 def.status.as_str(),
                 format_timestamp(def.created_at)
-            )
+            );
+            // Issue #461: a failing backfill is retried forever, so without
+            // this a definition stuck on one only shows as its status.
+            if let Some(failure) = &def.backfill_failure {
+                line.push_str(&format!(
+                    "    backfill of {} failing: attempts={} next_attempt_at={} error={:?}\n",
+                    failure.source_table,
+                    failure.attempts,
+                    format_timestamp(failure.next_attempt_at),
+                    failure.last_error
+                ));
+            }
+            line
         })
         .collect()
 }
@@ -302,6 +316,7 @@ mod tests {
             source_version: 1,
             status: trellis::TransformStatus::Live,
             created_at: UNIX_EPOCH,
+            backfill_failure: None,
         };
         let formatted = format_definitions(std::slice::from_ref(&def));
         assert!(formatted.contains("id=7"));
@@ -309,6 +324,77 @@ mod tests {
         assert!(formatted.contains("target=order_totals"));
         assert!(formatted.contains("status=live"));
         assert!(formatted.contains("1970-01-01 00:00:00 UTC"));
+    }
+
+    #[test]
+    fn a_healthy_definition_is_one_line() {
+        let def = DefinitionSummary {
+            id: 7,
+            target_table: "order_totals".to_string(),
+            source_table: "orders".to_string(),
+            source_version: 1,
+            status: trellis::TransformStatus::Live,
+            created_at: UNIX_EPOCH,
+            backfill_failure: None,
+        };
+        let formatted = format_definitions(std::slice::from_ref(&def));
+        assert_eq!(formatted.lines().count(), 1, "got {formatted:?}");
+        assert!(!formatted.contains("backfill"), "got {formatted:?}");
+    }
+
+    #[test]
+    fn a_failing_backfill_is_shown_under_its_definition() {
+        // `date -u -d "2024-01-01 00:00:00" +%s` => 1704067200
+        let next_attempt_at = UNIX_EPOCH + Duration::from_secs(1_704_067_200);
+        let def = DefinitionSummary {
+            id: 7,
+            target_table: "public.order_totals".to_string(),
+            source_table: "public.orders".to_string(),
+            source_version: 1,
+            status: trellis::TransformStatus::WaitingToBackfill,
+            created_at: UNIX_EPOCH,
+            backfill_failure: Some(trellis::BackfillFailure {
+                source_table: "public.orders".to_string(),
+                attempts: 3,
+                last_error: "table \"public.orders\" has no primary key".to_string(),
+                next_attempt_at,
+            }),
+        };
+        let formatted = format_definitions(std::slice::from_ref(&def));
+        assert_eq!(
+            formatted,
+            "  id=7 source=public.orders target=public.order_totals \
+             status=waiting_to_backfill created_at=1970-01-01 00:00:00 UTC\n    \
+             backfill of public.orders failing: attempts=3 \
+             next_attempt_at=2024-01-01 00:00:00 UTC \
+             error=\"table \\\"public.orders\\\" has no primary key\"\n"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_backfill_error_stays_on_its_line() {
+        let def = DefinitionSummary {
+            id: 7,
+            target_table: "public.order_totals".to_string(),
+            source_table: "public.orders".to_string(),
+            source_version: 1,
+            status: trellis::TransformStatus::WaitingToBackfill,
+            created_at: UNIX_EPOCH,
+            backfill_failure: Some(trellis::BackfillFailure {
+                source_table: "public.orders".to_string(),
+                attempts: 1,
+                last_error: "db error: ERROR: permission denied for table orders\n\
+                             DETAIL: role lacks SELECT\nHINT: grant it"
+                    .to_string(),
+                next_attempt_at: UNIX_EPOCH,
+            }),
+        };
+        let formatted = format_definitions(std::slice::from_ref(&def));
+        assert_eq!(formatted.lines().count(), 2, "got {formatted:?}");
+        assert!(
+            formatted.contains(r"orders\nDETAIL: role lacks SELECT\nHINT: grant it"),
+            "got {formatted:?}"
+        );
     }
 
     #[test]

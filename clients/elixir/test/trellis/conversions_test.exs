@@ -104,6 +104,13 @@ defmodule Trellis.ConversionsTest do
     }
   end
 
+  # What the NIF's `definitions/1` returns for one definition.
+  defp native_summary do
+    native_definition()
+    |> Map.delete(:source_columns)
+    |> Map.merge(%{created_at_micros: @micros, backfill_failure: nil})
+  end
+
   defp native_relationship do
     %{
       id: 2,
@@ -175,12 +182,8 @@ defmodule Trellis.ConversionsTest do
   end
 
   test "creation times become DateTimes" do
-    assert %DefinitionSummary{created_at: @time} =
-             DefinitionSummary.from_native(
-               native_definition()
-               |> Map.delete(:source_columns)
-               |> Map.put(:created_at_micros, @micros)
-             )
+    assert %DefinitionSummary{created_at: @time, backfill_failure: nil} =
+             DefinitionSummary.from_native(native_summary())
 
     assert %RelationshipSummary{created_at: @time, cardinality: :many} =
              RelationshipSummary.from_native(
@@ -188,6 +191,24 @@ defmodule Trellis.ConversionsTest do
                |> Map.delete(:warnings)
                |> Map.merge(%{cardinality: :many, created_at_micros: @micros})
              )
+  end
+
+  test "a summary's backfill failure becomes a BackfillFailure" do
+    failure = %{
+      source_table: "public.orders",
+      attempts: 2,
+      last_error: "permission denied",
+      next_attempt_at_micros: @micros
+    }
+
+    assert %DefinitionSummary{
+             backfill_failure: %Trellis.BackfillFailure{
+               source_table: "public.orders",
+               attempts: 2,
+               last_error: "permission denied",
+               next_attempt_at: @time
+             }
+           } = DefinitionSummary.from_native(%{native_summary() | backfill_failure: failure})
   end
 
   test "a paused column's pause time becomes a DateTime, and a missing one stays nil" do
