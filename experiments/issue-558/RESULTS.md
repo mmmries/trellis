@@ -736,10 +736,11 @@ it has no `peak_xact_*` columns.
   143 s, caught in the ledger build's group-existence read. Chunks and Apply batches meet on
   the same ledger placeholders (sorted, so they queue rather than deadlock; the 6–15 deadlocks
   and 4.8–5.9k rollbacks are retried), and a batch that queues behind several chunks holds its
-  xid the whole time. The ring stayed full for most of the build (seal refused "would lap
-  unretired work" from the first minute to the end of run 1's build): the drain workers were
-  busy with chunks, and the tail after `live` (90–213 s) is that backlog.
-- Writers kept 95% of their target rate in both paths (1,894–1,930/s of 2,000); p99 commit
+  xid the whole time. The ring backed up during the build: seal was refused ("would lap unretired
+  work") repeatedly from the first minute of run 1's build to its last (the control logged
+  the same for 2 minutes of its re-read). The drain workers were busy with chunks, and the
+  tail after `live` (90–213 s) is that backlog.
+- Writers kept about 95% of their target rate in both paths (1,894–1,930/s of 2,000); p99 commit
   latency is 1.7–2.1x the control's during the ledger build.
 
 Bar (#617 step 2): oracle ok — **met**; define-to-live about equal to the build time (no
