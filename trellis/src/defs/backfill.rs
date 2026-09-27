@@ -595,7 +595,7 @@ async fn backfill_one_to_one(
 
     let source = ddl::qualified_source_table(source_table);
     let mut client = pool.get().await?;
-    for (lo, hi) in discover_pk_ranges(&**client, &source, pk).await? {
+    for (lo, hi) in discover_pk_ranges(&**client, &source, pk, BACKFILL_CHUNK_ROWS).await? {
         write_fenced(&mut client, fence, async |client| {
             write_one_to_one_range(
                 client,
@@ -663,7 +663,7 @@ pub(crate) async fn backfill_altered_columns(
     // through the target-mutation seam in the chunk's own transaction.
     let qualified_target = crate::intake::publication::qualify(target_schema, &def.target)
         .map_err(|err| BackfillError::Unsupported(err.to_string()))?;
-    for (lo, hi) in discover_pk_ranges(&**client, &source, &pk).await? {
+    for (lo, hi) in discover_pk_ranges(&**client, &source, &pk, BACKFILL_CHUNK_ROWS).await? {
         let txn = client.transaction().await?;
         let mut mutations = TargetMutations::new();
         let prior_image_expr = mutations.image_sql(&txn, &qualified_target, "t").await?;
@@ -911,7 +911,7 @@ pub(crate) async fn plan_one_to_one_chunks(
     let _ = substitute_all_fields(def)?;
     let pk = ddl::source_primary_key_in_txn(client, source_table).await?;
     let source = ddl::qualified_source_table(source_table);
-    let ranges = discover_pk_ranges(client, &source, &pk).await?;
+    let ranges = discover_pk_ranges(client, &source, &pk, BACKFILL_CHUNK_ROWS).await?;
     // `backfill_chunks.lo`/`.hi` (V20__backfill_chunks.sql) are each a single
     // `text` column — issue #121 reuses this crate's existing composite-key
     // identity text ([`ddl::join_pk_key`], the same encoding
@@ -923,6 +923,57 @@ pub(crate) async fn plan_one_to_one_chunks(
     Ok(ranges
         .into_iter()
         .map(|(lo, hi)| (lo.map(ddl::join_pk_key), ddl::join_pk_key(hi)))
+        .collect())
+}
+
+/// Issue #558 experiment 5: [`plan_one_to_one_chunks`]'s `(lo, hi]` PK-range
+/// boundaries for any source table, `chunk_rows` rows each, encoded the same
+/// way, for a plain aggregate built by ledger re-derive chunks
+/// (`staging::ledger_build`).
+pub(crate) async fn plan_pk_range_chunks(
+    client: &impl GenericClient,
+    source_table: &str,
+    chunk_rows: i64,
+) -> Result<Vec<(Option<String>, String)>, BackfillError> {
+    let pk = ddl::source_primary_key_in_txn(client, source_table).await?;
+    let source = ddl::qualified_source_table(source_table);
+    let ranges = discover_pk_ranges(client, &source, &pk, chunk_rows).await?;
+    Ok(ranges
+        .into_iter()
+        .map(|(lo, hi)| (lo.map(ddl::join_pk_key), ddl::join_pk_key(hi)))
+        .collect())
+}
+
+/// Experiment 5: the keys (as [`ddl::pk_key_sql_expr`] text, the identity
+/// CDC keys carry) of every `source_table` row in the encoded `(lo, hi]`
+/// range, read on `client`.
+pub(crate) async fn keys_in_pk_range(
+    client: &impl GenericClient,
+    source_table: &str,
+    pk: &[PrimaryKeyColumn],
+    lo: Option<&str>,
+    hi: &str,
+) -> Result<Vec<String>, BackfillError> {
+    let decode = |text: &str| -> Result<Vec<String>, BackfillError> {
+        Ok(ddl::split_pk_key(pk, source_table, text)?
+            .into_iter()
+            .map(|part| part.map(|c| c.into_owned()).unwrap_or_default())
+            .collect())
+    };
+    let lo = lo.map(decode).transpose()?;
+    let hi = decode(hi)?;
+    let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
+    let sql = format!(
+        "select {} from {} t where {}",
+        ddl::pk_key_sql_expr(pk, Some("t")),
+        ddl::qualified_source_table(source_table),
+        pk_range_where(&pk_idents, pk, &lo),
+    );
+    Ok(client
+        .query(&sql, &range_params(&lo, &hi))
+        .await?
+        .into_iter()
+        .map(|r| r.get(0))
         .collect())
 }
 
@@ -1001,6 +1052,7 @@ async fn discover_pk_ranges(
     client: &impl GenericClient,
     source: &str,
     pk: &[PrimaryKeyColumn],
+    chunk_rows: i64,
 ) -> Result<Vec<(Option<Vec<String>>, Vec<String>)>, BackfillError> {
     let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
     let col_list = pk_idents.join(", ");
@@ -1064,7 +1116,7 @@ async fn discover_pk_ranges(
                         &format!(
                             "select {hi_select} from \
                              (select {col_list} from {source} where {not_null_filter} \
-                              order by {col_list} limit {BACKFILL_CHUNK_ROWS}) s \
+                              order by {col_list} limit {chunk_rows}) s \
                              order by {order_desc} limit 1"
                         ),
                         &[],
@@ -1081,7 +1133,7 @@ async fn discover_pk_ranges(
                             "select {hi_select} from \
                              (select {col_list} from {source} \
                               where {where_clause} and {not_null_filter} \
-                              order by {col_list} limit {BACKFILL_CHUNK_ROWS}) s \
+                              order by {col_list} limit {chunk_rows}) s \
                              order by {order_desc} limit 1"
                         ),
                         &params,
@@ -2201,7 +2253,7 @@ async fn backfill_relationship_one_to_one(
         .collect::<Vec<_>>()
         .join(" ");
 
-    for (lo, hi) in discover_pk_ranges(&**client, &source, pk).await? {
+    for (lo, hi) in discover_pk_ranges(&**client, &source, pk, BACKFILL_CHUNK_ROWS).await? {
         let where_clause = pk_range_where(&pk_qualified, pk, &lo);
         let insert_sql = format!(
             "insert into {target} ({insert_cols}) \

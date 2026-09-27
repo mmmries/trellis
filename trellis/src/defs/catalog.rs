@@ -5477,6 +5477,14 @@ pub async fn dependents_of(
     node_table: &str,
     kind: EdgeKind,
 ) -> Result<Vec<Definition>, CatalogError> {
+    // Issue #558 experiment 5: a ledger-built plain aggregate applies from its
+    // first build chunk, so a `backfilling` one is a reader too (filtered to
+    // the eligible shape below, once parsed).
+    let ledger_build = crate::staging::apply_aggregate::ledger_build_on();
+    let mut statuses = TransformStatus::applying();
+    if ledger_build {
+        statuses.push(TransformStatus::Backfilling.as_str());
+    }
     let client = pool.get().await?;
     let rows = client
         .query(
@@ -5489,7 +5497,7 @@ pub async fn dependents_of(
              left join lateral jsonb_each_text(t.source_columns) e on true
              where from_node.table_name = $1 and t.status = any($3)
              order by t.id",
-            &[&node_table, &kind.as_str(), &TransformStatus::applying()],
+            &[&node_table, &kind.as_str(), &statuses],
         )
         .await?;
 
@@ -5534,6 +5542,11 @@ pub async fn dependents_of(
     for id in order {
         let pending = by_id.remove(&id).expect("id was just pushed to order");
         let def = parse(&pending.text)?;
+        if pending.status == TransformStatus::Backfilling
+            && !crate::staging::apply_aggregate::ledger_build_eligible(&def)
+        {
+            continue;
+        }
         result.push(Definition {
             id,
             source_version: pending.source_version,

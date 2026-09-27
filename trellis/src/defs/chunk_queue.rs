@@ -772,6 +772,24 @@ pub async fn run_claimed_chunk(
         idle_timeout: reclaim_ttl,
     };
     let ran = match &chunk.work {
+        // Issue #558 experiment 5: only a ledger-built plain aggregate
+        // enqueues range chunks for an aggregate definition.
+        ChunkWork::Range { lo, hi }
+            if matches!(
+                definition.def.key_space,
+                super::ast::KeySpace::Aggregate { .. }
+            ) =>
+        {
+            crate::staging::ledger_build::execute_chunk(
+                pool,
+                &definition,
+                lo.as_deref(),
+                hi,
+                Some(fence),
+            )
+            .await
+            .map_err(ChunkQueueError::from)
+        }
         ChunkWork::Range { lo, hi } => backfill::execute_one_to_one_chunk(
             pool,
             &definition.def,
@@ -1027,6 +1045,49 @@ async fn complete_if_no_chunks_remain_in_txn(
         .get(0);
     if remaining {
         return Ok(None);
+    }
+    // Issue #558 experiment 5: a ledger-built aggregate applied every change
+    // from its first chunk, so it has nothing to catch up on and goes
+    // straight to `live`.
+    let text: Option<String> = txn
+        .query_opt(
+            "select definition_text from transform_definitions where id = $1",
+            &[&definition_id],
+        )
+        .await?
+        .map(|row| row.get(0));
+    if let Some(text) = text
+        && crate::staging::apply_aggregate::ledger_build_eligible(&super::parse(&text)?)
+    {
+        let moved = txn
+            .execute(
+                "update transform_definitions set status = $1 where id = $2 and status = $3",
+                &[
+                    &TransformStatus::Live.as_str(),
+                    &definition_id,
+                    &TransformStatus::Backfilling.as_str(),
+                ],
+            )
+            .await?;
+        if moved == 1 {
+            tracing::info!(
+                definition_id,
+                from = %TransformStatus::Backfilling.as_str(),
+                to = %TransformStatus::Live.as_str(),
+                "transform status transition: ledger build finished"
+            );
+            return Ok(Some(TransformStatus::Live));
+        }
+        let status: String = txn
+            .query_one(
+                "select status from transform_definitions where id = $1",
+                &[&definition_id],
+            )
+            .await?
+            .get(0);
+        return Ok(Some(
+            TransformStatus::from_persisted(&status).unwrap_or(TransformStatus::Backfilling),
+        ));
     }
     Ok(Some(
         catalog::complete_direct_backfill(txn, definition_id).await?,
