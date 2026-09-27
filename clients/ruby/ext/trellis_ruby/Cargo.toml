@@ -1,0 +1,34 @@
+[package]
+name = "trellis_ruby"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+# The Ruby binding's native extension (docs/decisions/0010-embeddable-clients.md):
+# a thin Magnus wrapper over `trellis::BlockingTrellis`. Plain-data flattening
+# and error codes live in `trellis-embed`, shared with the Elixir binding; this
+# crate only turns those plain values into Ruby objects.
+[lib]
+crate-type = ["cdylib"]
+# No Rust tests live here: the conversions are `trellis-embed`'s and tested
+# there, and everything else needs a Ruby VM, so it is tested by `rake test`.
+test = false
+doctest = false
+
+# Unlike Rustler, `rb-sys` can't build without Ruby: its build script asks a
+# Ruby install for its headers and link flags, and generates bindings with
+# libclang. The Rust CI job and `verify` have neither, and still build this
+# crate (`cargo test --workspace`), so everything in it sits behind `ruby`,
+# which is off by default: without it the crate is an empty library and
+# `rb-sys` isn't built at all. The root manifest leaves the crate out of
+# `default-members`, so `--all-features` without `--workspace` doesn't turn
+# it on either. `rake compile` (clients/ruby/Rakefile) turns it on, and the
+# `ruby` CI job lints it the same way.
+[features]
+ruby = ["dep:magnus", "dep:rb-sys"]
+
+[dependencies]
+trellis = { path = "../../../../trellis" }
+trellis-embed = { path = "../../../embed" }
+magnus = { version = "0.9", optional = true, default-features = false, features = ["rb-sys"] }
+rb-sys = { version = "0.9", optional = true }

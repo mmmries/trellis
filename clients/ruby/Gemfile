@@ -1,0 +1,8 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+# Development only: the binding itself has no gem dependencies.
+gem "minitest", "~> 5.25"
+gem "pg", "~> 1.6" # the tests' own connection to the testkit cluster
+gem "rake", "~> 13.3"
