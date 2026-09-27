@@ -508,10 +508,17 @@ impl Trellis {
             .read_only(true)
             .start()
             .await?;
+        // Issue #461: the same `pending_backfill` join `status` reads its
+        // `backfill_failure` from, in the one listing query (`table_name` is
+        // the table's primary key, so it adds at most one row per definition).
         let rows = txn
             .query(
-                "select id, target_table, source_table, source_version, created_at \
-                 from transform_definitions order by id",
+                "select d.id, d.target_table, d.source_table, d.source_version, d.created_at, \
+                        pb.table_name, pb.attempts, pb.last_error, pb.next_attempt_at \
+                 from transform_definitions d \
+                 left join pending_backfill pb \
+                   on pb.table_name = d.source_table and pb.last_error is not null \
+                 order by d.id",
                 &[],
             )
             .await?;
@@ -528,6 +535,7 @@ impl Trellis {
                     source_version: row.get(3),
                     status: reported[&id],
                     created_at: row.get(4),
+                    backfill_failure: backfill_failure_at(&row, 5),
                 }
             })
             .collect())
@@ -598,19 +606,9 @@ impl Trellis {
             status = Some(reported_status(&*txn, row.get(5), stored).await?);
         }
         txn.commit().await?;
-        Ok(row.zip(status).map(|(row, status)| {
-            let backfill_failure =
-                row.get::<_, Option<String>>(1)
-                    .map(|source_table| BackfillFailure {
-                        source_table,
-                        attempts: u32::try_from(row.get::<_, i32>(2)).unwrap_or(0),
-                        last_error: row.get(3),
-                        next_attempt_at: row.get(4),
-                    });
-            DefinitionStatus {
-                status,
-                backfill_failure,
-            }
+        Ok(row.zip(status).map(|(row, status)| DefinitionStatus {
+            status,
+            backfill_failure: backfill_failure_at(&row, 1),
         }))
     }
 
@@ -1330,6 +1328,20 @@ async fn reported_status(
         .unwrap_or(stored))
 }
 
+/// The [`BackfillFailure`] in the four columns starting at `first`
+/// (`pending_backfill`'s `table_name, attempts, last_error, next_attempt_at`,
+/// left-joined on the definition's source table where `last_error` is set),
+/// or `None` when the join found no failing marker.
+fn backfill_failure_at(row: &tokio_postgres::Row, first: usize) -> Option<BackfillFailure> {
+    row.get::<_, Option<String>>(first)
+        .map(|source_table| BackfillFailure {
+            source_table,
+            attempts: u32::try_from(row.get::<_, i32>(first + 1)).unwrap_or(0),
+            last_error: row.get(first + 2),
+            next_attempt_at: row.get(first + 3),
+        })
+}
+
 /// One registered transform definition's status, as [`Trellis::status`]
 /// reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1377,6 +1389,10 @@ pub struct DefinitionSummary {
     /// [`TransformStatus`].
     pub status: TransformStatus,
     pub created_at: SystemTime,
+    /// Why the backfill of this definition's source table keeps failing, if
+    /// it does: the same value [`DefinitionStatus::backfill_failure`] reports
+    /// (issue #461).
+    pub backfill_failure: Option<BackfillFailure>,
 }
 
 /// One registered relationship declaration, as [`Trellis::relationships`]

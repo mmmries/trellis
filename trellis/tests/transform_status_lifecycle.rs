@@ -1409,6 +1409,20 @@ async fn a_definition_deferred_during_fresh_slot_creation_goes_live() {
         .expect("drop the slot");
 }
 
+/// Every definition's [`trellis::DefinitionSummary::backfill_failure`], in
+/// `Trellis::definitions`' order.
+async fn backfill_failures_listed(
+    trellis: &trellis::Trellis,
+) -> Vec<Option<trellis::BackfillFailure>> {
+    trellis
+        .definitions()
+        .await
+        .expect("definitions")
+        .into_iter()
+        .map(|summary| summary.backfill_failure)
+        .collect()
+}
+
 /// Issue #407 (ADR-0016): a definition whose source's backfill keeps failing
 /// stays `waiting_to_backfill`, and `Trellis::status` says why: the marker's
 /// attempt count, last error and next attempt. Once the cause is fixed, a
@@ -1453,6 +1467,12 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
     let failure = status
         .backfill_failure
         .expect("status reports the failing backfill");
+    // Issue #461: the definitions listing reports the same failure.
+    assert_eq!(
+        backfill_failures_listed(&trellis).await,
+        vec![Some(failure.clone())],
+        "definitions() reports the failure status does"
+    );
     assert_eq!(failure.source_table, "public.widgets");
     assert_eq!(failure.attempts, 1);
     assert_eq!(failure.last_error, error.to_string());
@@ -1498,6 +1518,7 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
         status.backfill_failure, None,
         "a marker with no recorded failure reports none"
     );
+    assert_eq!(backfill_failures_listed(&trellis).await, vec![None]);
     publication::discharge_registrations(&db.pool)
         .await
         .expect("the retry goes through");

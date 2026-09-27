@@ -64,6 +64,9 @@ pub struct PlainDefinitionSummary {
     pub status: &'static str,
     /// When the definition was registered, as [`crate::epoch_micros`].
     pub created_at_micros: i64,
+    /// Set while the definition's source table's backfill keeps failing to
+    /// discharge; see [`DefinitionSummary::backfill_failure`].
+    pub backfill_failure: Option<PlainBackfillFailure>,
 }
 
 impl From<&DefinitionSummary> for PlainDefinitionSummary {
@@ -75,6 +78,10 @@ impl From<&DefinitionSummary> for PlainDefinitionSummary {
             source_version: summary.source_version,
             status: transform_status(summary.status),
             created_at_micros: epoch_micros(summary.created_at),
+            backfill_failure: summary
+                .backfill_failure
+                .as_ref()
+                .map(PlainBackfillFailure::from),
         }
     }
 }
@@ -188,6 +195,7 @@ mod tests {
             source_version: 3,
             status: TransformStatus::Live,
             created_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_123_456),
+            backfill_failure: None,
         };
 
         let plain = PlainDefinitionSummary::from(&summary);
@@ -201,7 +209,36 @@ mod tests {
                 source_version: 3,
                 status: "live",
                 created_at_micros: 1_727_222_400_123_456,
+                backfill_failure: None,
             }
+        );
+    }
+
+    #[test]
+    fn a_summary_carries_its_backfill_failure() {
+        let summary = DefinitionSummary {
+            id: 7,
+            target_table: "public.order_totals".to_string(),
+            source_table: "public.orders".to_string(),
+            source_version: 3,
+            status: TransformStatus::WaitingToBackfill,
+            created_at: UNIX_EPOCH,
+            backfill_failure: Some(BackfillFailure {
+                source_table: "public.orders".to_string(),
+                attempts: 2,
+                last_error: "permission denied for table orders".to_string(),
+                next_attempt_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
+            }),
+        };
+
+        assert_eq!(
+            PlainDefinitionSummary::from(&summary).backfill_failure,
+            Some(PlainBackfillFailure {
+                source_table: "public.orders".to_string(),
+                attempts: 2,
+                last_error: "permission denied for table orders".to_string(),
+                next_attempt_at_micros: 1_727_222_400_654_321,
+            })
         );
     }
 

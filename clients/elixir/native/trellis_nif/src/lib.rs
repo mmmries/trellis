@@ -226,6 +226,7 @@ struct DefinitionSummaryTerm {
     source_version: i64,
     status: Atom,
     created_at_micros: i64,
+    backfill_failure: Option<BackfillFailureTerm>,
 }
 
 /// A relationship `apply/2` registered.
@@ -494,6 +495,7 @@ fn definitions(env: Env, handle: ResourceArc<Handle>) -> NifReply<Vec<Definition
                 source_version: summary.source_version,
                 status: word_atom(env, summary.status)?,
                 created_at_micros: summary.created_at_micros,
+                backfill_failure: summary.backfill_failure.map(BackfillFailureTerm::from),
             })
         })
         .collect()

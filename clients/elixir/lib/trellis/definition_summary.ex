@@ -5,6 +5,8 @@ defmodule Trellis.DefinitionSummary do
   its source columns.
 
   `target_table` and `source_table` are fully qualified (`schema.table`).
+  `backfill_failure` is set while the backfill of the source table keeps
+  failing, as in `Trellis.Status`.
   """
 
   @type t :: %__MODULE__{
@@ -13,17 +15,27 @@ defmodule Trellis.DefinitionSummary do
           source_table: String.t(),
           source_version: integer(),
           status: Trellis.Status.status(),
-          created_at: DateTime.t()
+          created_at: DateTime.t(),
+          backfill_failure: Trellis.BackfillFailure.t() | nil
         }
 
-  @enforce_keys [:id, :target_table, :source_table, :source_version, :status, :created_at]
+  @enforce_keys [
+    :id,
+    :target_table,
+    :source_table,
+    :source_version,
+    :status,
+    :created_at,
+    :backfill_failure
+  ]
   defstruct @enforce_keys
 
   @doc false
-  def from_native(%{created_at_micros: micros} = summary) do
+  def from_native(%{created_at_micros: micros, backfill_failure: failure} = summary) do
     summary
     |> Map.delete(:created_at_micros)
     |> Map.put(:created_at, Trellis.Time.from_micros(micros))
+    |> Map.put(:backfill_failure, failure && Trellis.BackfillFailure.from_native(failure))
     |> then(&struct!(__MODULE__, &1))
   end
 end
