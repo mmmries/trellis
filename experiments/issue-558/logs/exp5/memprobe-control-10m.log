@@ -1,0 +1,7 @@
+storage: /home/mike/exp558/tmpdisk (btrfs)
+build-under-load: loaded 10000000 rows in 0.8s (12477679 rows/s)
+build-under-load: built in 4.6s (1 chunks), live after 221.4s; writers continue 20s
+[2m2026-09-27T16:14:45.047333Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T16:15:45.230872Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m138
+[2m2026-09-27T16:16:54.728089Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: db error
+build-under-load: 10000000 rows / 100000 groups, loaded at 12477679 rows/s; build 4.6s over 1 chunks (first done 4.6s), live after 221.4s; converged 360.4s (tail 119.1s, 1 oracle checks of 0.73s), oracle_ok=true (0 mismatched); writers 2000/2000 stmt/s (kept=true), commit p50/p99 0.659/6.303 ms overall, 0.651/5.984 ms during build; wal 15.6 MB/s, 1048 fsyncs/s, 296325 checkpoint buffers (6 timed + 0 requested checkpoints); ledger=off build=off

@@ -1,0 +1,24 @@
+storage: /home/mike/exp558/tmpdisk (btrfs)
+build-under-load: loaded 100000000 rows in 7.7s (12943048 rows/s)
+[2m2026-09-27T13:43:08.367960Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 3 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T13:43:10.591983Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mstaging ring database error: db error: ERROR: deadlock detected
+DETAIL: Process 4105191 waits for ExclusiveLock on tuple (1,31) of relation 16480 of database 16384; blocked by process 4105045.
+Process 4105045 waits for ShareLock on transaction 61073; blocked by process 4105051.
+Process 4105051 waits for ShareLock on transaction 62794; blocked by process 4105055.
+Process 4105055 waits for ExclusiveLock on tuple (1,31) of relation 16480 of database 16384; blocked by process 4105191.
+HINT: See server log for query details. [3mfailures[0m[2m=[0m1
+[2m2026-09-27T13:43:13.332396Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mstaging ring database error: db error: ERROR: deadlock detected
+DETAIL: Process 4105192 waits for ExclusiveLock on tuple (1,5) of relation 16480 of database 16384; blocked by process 4105056.
+Process 4105056 waits for ShareLock on transaction 63318; blocked by process 4105058.
+Process 4105058 waits for ShareLock on transaction 64678; blocked by process 4105051.
+Process 4105051 waits for ExclusiveLock on tuple (1,5) of relation 16480 of database 16384; blocked by process 4105192.
+HINT: See server log for query details. [3mfailures[0m[2m=[0m1
+[2m2026-09-27T13:43:16.871668Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 0 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T13:43:20.644759Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mstaging ring database error: db error: ERROR: deadlock detected
+DETAIL: Process 4105247 waits for ExclusiveLock on tuple (2,5) of relation 16480 of database 16384; blocked by process 4105050.
+Process 4105050 waits for ShareLock on transaction 84258; blocked by process 4105052.
+Process 4105052 waits for ShareLock on transaction 84839; blocked by process 4105045.
+Process 4105045 waits for ExclusiveLock on tuple (2,5) of relation 16480 of database 16384; blocked by process 4105247.
+HINT: See server log for query details. [3mfailures[0m[2m=[0m1
+[2m2026-09-27T13:43:21.605678Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+build-under-load: built in 37.6s (1 chunks), live after 2322.4s; writers continue 20s

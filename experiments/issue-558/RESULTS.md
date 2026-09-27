@@ -790,3 +790,89 @@ keep the OLD image on deletes.
 Per #617 this stops step 4: no 100M trigger run was made with this shape, and the shape was not
 changed on my own.
 
+
+### Step 3 blocked: today's path runs out of memory draining the go-live re-read
+
+Step 3 (100M rows, 1M groups, on disk) never finished a control run. Three attempts went down
+in the phase after `live`, and so did a 20M sizing run. The first died of ENOSPC. The other two,
+and the 20M run, were reported as "container restarts", but `journalctl -k` shows the kernel's
+global OOM killer killing `benchmark` each time. It ran inside `claude-rc.service`, so the
+session went down with it:
+
+| run | killed | `benchmark` anon-rss at the kill |
+|---|---|---|
+| 20M sizing control (`sizing-control-20m-disk.*`) | about 24 min after the re-read's segment began draining, after swapping | 23.3 GB |
+| 100M control, attempt 2 (`control-100m-disk-restart-killed.*`) | about 5 min after `live` (live at 2,322 s) | 27.0 GB |
+| 100M control, attempt 3 (`control-100m-disk-oom-killed-2.*`) | about 4 min after `live` (live at 2,305 s) | 23.9 GB |
+
+The memory is the **engine's**, not the harness's. The harness holds a few counters, two
+fixed-size latency histograms and the xmin sampler's last values, and its oracle is one
+server-side `count(*)` over a `FULL OUTER JOIN` (`mismatched_groups`). No run lived long enough
+to reach the oracle. Small runs, each under
+`systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0`, with
+`tools/memsample.sh` sampling `VmRSS`/`VmHWM` and the ring's segments every 1–5 s
+(`logs/exp5/mem/*.tsv`, runs `logs/exp5/memprobe-*`):
+
+| run | RSS up to `live` | go-live segment rows | rows per drain batch (1 of 8 buckets) | peak RSS | outcome |
+|---|---|---|---|---|---|
+| control 5M / 50k groups | 87–142 MB | 5,212,157 | ~650k | **3.47 GB** | converged, tail 47 s, oracle ok |
+| control 10M / 100k groups | 84–127 MB | 10,433,347 | ~1.30M | **6.32 GB** | converged, tail 119 s, oracle ok |
+| control 20M / 200k groups | 97–122 MB | 20,885,602 | 2,510,829–2,516,748 (logged) | **≥13.8 GB**, cap kill 2 min 20 s into the drain | killed by the 16G cap (memcg OOM, anon-rss 14.7 GB); the session was unaffected |
+| ledger build 10M / 100k groups | 730–860 MB | – (no re-read) | backlog segment 607,005 rows | **3.68 GB** | converged, tail 5.1 s, oracle ok |
+
+The shape in every control run: RSS stays flat at about 100 MB through the load, the build and
+the whole catch-up, then jumps the moment the segment holding the go-live re-read is sealed and
+starts draining (5M: 133 MB to 1.3 GB in 3 s; 20M: 97 MB to 2.9 GB in 7 s). The sampler catches the re-read landing: at 5M the active segment goes from 210,273 rows to 5,212,157 between two 1 s samples, when the discharge commits. It climbs while that
+segment drains and does not come back down afterwards (5M sits at 2.75 GB for the rest of the
+run: glibc keeps the freed heap). Peak scales linearly with the segment: about 650 B per staged
+row at 5M and 10M, with every bucket in flight at once.
+
+**Where it goes.** The go-live catch-up's discharge (`intake/publication.rs`,
+`run_pending_backfills`) enumerates every current source key as an image-less `Recompute`,
+10k rows per `FETCH`, into the active segment, all in the discharge's one transaction. So one
+segment holds the whole source plus the writes, 20.9M rows at 20M and about 100M at 100M. The
+seal splits it into `SEG_BUCKETS` = 8 buckets (`staging/claim.rs`). Each drain worker claims
+`ceil(free / live_workers)` of them and `drain_many` (`staging/apply.rs`) then:
+
+1. `fold::fold` runs the claim-time fold for its bucket as one `txn.query` and collects every
+   row into a `Vec<FoldedChange>` (`staging/fold.rs`). There is no row bound, so it is 1/8 of
+   the segment per worker, 2.5M `FoldedChange`s at 20M.
+2. `compute` re-reads the live source row of every image-less key in one query,
+   `read_live_rows_batch` (a `Vec<Row>` of key/field/value triples, then a
+   `HashMap<String, HashMap<..>>`), and builds the plan for the whole batch before apply.
+
+At 20M the apply span's debug log shows six 2.51M-change batches starting within 2 min
+(16:29:25, 16:29:44, 16:30:10, 16:30:34, 16:31:01, 16:31:27 UTC). RSS rose by about
+2.5–3 GB with each: roughly 1 KB per change while a batch is folded, re-read and planned. So
+memory grows with the rows in the segment and, over the drain, with how many of its batches
+are in flight together. Nothing bounds that total: fewer drain workers only give each one more
+buckets per batch, and there is no batch-size or segment-size setting to turn down. At 100M a
+single bucket is about 12.5M changes, over 10 GB by the 20M rate, and two in flight exceed the
+box's 31 GB. That matches the kills 4–5 min after `live` at 24–27 GB.
+
+**Reproduction.** `build-under-load --rows 5000000 --groups 50000` (control, flags unset) under
+the cap, with `tools/memsample.sh <out.tsv> <disk-dir> 1` alongside. It peaks at 3.5 GB about
+2 minutes after define, and the peak is the drain of the segment the sampler shows as
+`N@slot:draining:5212157`.
+
+**The ledger build.** It has no re-read, so the problem above does not reach it, but its
+memory is not flat either. It holds 730–860 MB while its chunks run. The ring backed up again:
+seal was refused for about 5 min while the drain workers were busy with chunks, and the active
+segment reached 607k CDC rows. Draining that segment took RSS to 3.4–3.7 GB, about 4 KB per
+row: these are image-bearing changes, which cost more per row than image-less recomputes. That
+segment's size depends on how long seal stays refused, which is write rate × time, not table
+size. The 100M build runs about 10x longer, so a 100M ledger run is not safe to assume under a
+16G cap. It would have to be run to find out.
+
+**Also seen, not investigated:** `seal` fails with `deadlock detected` a few times per run,
+during the catch-up (a tuple lock on one relation, 4-process cycles;
+`control-100m-disk-oom-killed-2.log`, `memprobe-control-10m.log`). It is retried, and the
+"ring slot N still holds a live registry row" failures that follow are the ring's backpressure
+while the big segment drains, not a separate fault.
+
+Per the manager's instruction the engine was not patched. Whether to bound the drain (a row cap
+on the fold/compute batch, or a go-live re-read that seals as it pages) or to run step 3 some
+other way is the user's call. Every benchmark run now goes under the 16G scope:
+`tools/queue-617-step3.sh` wraps each run in `systemd-run --user --scope -p MemoryMax=$MEMCAP
+-p MemorySwapMax=0`, samples RSS into `logs/exp5/mem/<tag>.tsv`, and stops the queue if a run
+leaves no result.

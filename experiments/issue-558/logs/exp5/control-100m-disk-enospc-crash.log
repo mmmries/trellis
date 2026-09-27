@@ -1,0 +1,85 @@
+storage: /home/mike/exp558/tmpdisk (btrfs)
+build-under-load: loaded 100000000 rows in 21.9s (4565621 rows/s)
+[2m2026-09-27T05:48:58.129374Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:49:00.362825Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mstaging ring database error: db error: ERROR: deadlock detected
+DETAIL: Process 3661159 waits for ExclusiveLock on tuple (1,5) of relation 16480 of database 16384; blocked by process 3661113.
+Process 3661113 waits for ShareLock on transaction 29930; blocked by process 3661148.
+Process 3661148 waits for ShareLock on transaction 30681; blocked by process 3661110.
+Process 3661110 waits for ExclusiveLock on tuple (1,5) of relation 16480 of database 16384; blocked by process 3661159.
+HINT: See server log for query details. [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:49:02.793776Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mstaging ring database error: db error: ERROR: deadlock detected
+DETAIL: Process 3661172 waits for ExclusiveLock on tuple (1,18) of relation 16480 of database 16384; blocked by process 3661141.
+Process 3661141 waits for ShareLock on transaction 33328; blocked by process 3661111.
+Process 3661111 waits for ShareLock on transaction 33923; blocked by process 3661110.
+Process 3661110 waits for ExclusiveLock on tuple (1,18) of relation 16480 of database 16384; blocked by process 3661172.
+HINT: See server log for query details. [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:49:14.299398Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mstaging ring database error: db error: ERROR: deadlock detected
+DETAIL: Process 3661175 waits for ExclusiveLock on tuple (2,5) of relation 16480 of database 16384; blocked by process 3661115.
+Process 3661115 waits for ShareLock on transaction 60105; blocked by process 3661112.
+Process 3661112 waits for ShareLock on transaction 65724; blocked by process 3661110.
+Process 3661110 waits for ExclusiveLock on tuple (2,5) of relation 16480 of database 16384; blocked by process 3661175.
+HINT: See server log for query details. [3mfailures[0m[2m=[0m1
+[2m2026-09-27T06:22:03.617304Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m wake listener's LISTEN connection closed; polling until it reopens [3mretry_in[0m[2m=[0m250ms
+[2m2026-09-27T06:21:56.179945Z[0m [31mERROR[0m [2mpgwire_replication::client::tokio_client[0m[2m:[0m replication worker terminated with error: server error: could not write to file "pg_logical/snapshots/C-E9093AF0.snap.3661105.tmp": No space left on device (SQLSTATE 53100)
+[2m2026-09-27T06:22:03.617392Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m wake listener's LISTEN connection closed; polling until it reopens [3mretry_in[0m[2m=[0m250ms
+[2m2026-09-27T06:21:56.187019Z[0m [33m WARN[0m [2mtrellis::intake::publication[0m[2m:[0m backfill discharge failed; its marker stays and is retried after a backoff [3mtable[0m[2m=[0mpublic.agg_src [3merror[0m[2m=[0mstaging ring database error: db error: ERROR: could not extend file "base/16384/16961.8": No space left on device
+HINT: Check free disk space. [3mattempts[0m[2m=[0m1 [3mretry_in_secs[0m[2m=[0m10
+[2m2026-09-27T06:22:03.617308Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m wake listener's LISTEN connection closed; polling until it reopens [3mretry_in[0m[2m=[0m250ms
+[2m2026-09-27T06:22:03.618422Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m wake listener's LISTEN connection closed; polling until it reopens [3mretry_in[0m[2m=[0m250ms
+[2m2026-09-27T06:22:03.618441Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m wake listener's LISTEN connection closed; polling until it reopens [3mretry_in[0m[2m=[0m250ms
+[2m2026-09-27T06:22:03.618462Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m wake listener's LISTEN connection closed; polling until it reopens [3mretry_in[0m[2m=[0m250ms
+[2m2026-09-27T06:22:03.618480Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m wake listener's LISTEN connection closed; polling until it reopens [3mretry_in[0m[2m=[0m250ms
+[2m2026-09-27T06:22:03.618855Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: connection closed
+[2m2026-09-27T06:22:03.621412Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m wake listener's LISTEN connection closed; polling until it reopens [3mretry_in[0m[2m=[0m250ms
+[2m2026-09-27T06:22:03.624480Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: connection closed
+[2m2026-09-27T06:22:03.629475Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: connection closed
+[2m2026-09-27T06:22:03.640287Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: error communicating with the server
+[2m2026-09-27T06:22:03.640345Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection could not be recycled: Connection closed
+[2m2026-09-27T06:22:03.640369Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection could not be recycled: Connection closed
+[2m2026-09-27T06:22:03.640376Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection could not be recycled: Connection closed
+build-under-load: writer update_amt failed: connection closed
+build-under-load: writer update_grp failed: connection closed
+build-under-load: writer update_amt failed: connection closed
+[2m2026-09-27T06:22:03.640610Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: connection closed
+[2m2026-09-27T06:22:03.640624Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection could not be recycled: Connection closed
+[2m2026-09-27T06:22:03.640816Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: connection closed
+[2m2026-09-27T06:22:03.640824Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection could not be recycled: Connection closed
+build-under-load: writer update_amt failed: connection closed
+build-under-load: writer update_amt failed: connection closed
+build-under-load: writer update_amt failed: connection closed
+build-under-load: writer update_amt failed: connection closed
+build-under-load: writer update_amt failed: connection closed
+build-under-load: writer update_amt failed: connection closed
+[2m2026-09-27T06:22:03.641012Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: connection closed
+build-under-load: writer update_grp failed: connection closed
+[2m2026-09-27T06:22:03.641034Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection could not be recycled: Connection closed
+build-under-load: writer update_amt failed: connection closed
+build-under-load: writer update_amt failed: connection closed
+[2m2026-09-27T06:21:56.661626Z[0m [31mERROR[0m [2mtrellis::client[0m[2m:[0m CDC intake stopped with an error; source changes are not being staged until it restarts [3mslot[0m[2m=[0mtrellis_slot [3merror[0m[2m=[0mreplication transport error: task error: replication worker panicked: task 47 panicked with message "failed printing to stderr: No space left on device (os error 28)" [3mcode[0m[2m=[0mConnectivity [3mran_for[0m[2m=[0m1997.601591719s [3mretry_in[0m[2m=[0m1s [3mrestarts[0m[2m=[0m1 [3mconsecutive_failures[0m[2m=[0m1
+[2m2026-09-27T06:22:03.641108Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: connection closed
+[2m2026-09-27T06:22:03.641132Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection could not be recycled: Connection closed
+build-under-load: writer insert failed: connection closed
+build-under-load: writer update_amt failed: connection closed
+build-under-load: writer insert failed: connection closed
+build-under-load: writer delete failed: connection closed
+build-under-load: writer update_amt failed: connection closed
+build-under-load: writer update_amt failed: connection closed
+build-under-load: writer update_amt failed: connection closed
+build-under-load: writer update_amt failed: connection closed
+build-under-load: writer update_grp failed: connection closed
+
+thread 'main' (3660783) panicked at benchmark/src/streaming/build_under_load.rs:590:14:
+read build progress: Error { kind: Closed, cause: None }
+[2m2026-09-27T06:22:03.644232Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: error communicating with the server
+build-under-load: writer update_grp failed: connection closed
+build-under-load: writer update_amt failed: connection closed
+build-under-load: writer update_amt failed: connection closed
+[2m2026-09-27T06:22:03.645184Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: connection closed
+[2m2026-09-27T06:22:03.648125Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: connection closed
+[2m2026-09-27T06:22:03.648157Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection could not be recycled: Connection closed
+[2m2026-09-27T06:22:03.648176Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection could not be recycled: Connection closed
+[2m2026-09-27T06:22:03.648180Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection could not be recycled: Connection closed
+
+thread 'tokio-rt-worker' (3660905) panicked at benchmark/src/streaming/build_under_load.rs:191:14:
+sample backend xmin: Error { kind: Closed, cause: None }
+testkit: could not drop database trellis_test_3660783-1 after 50 attempts; it and any replication slot on it are leaked

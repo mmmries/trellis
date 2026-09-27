@@ -1,0 +1,33 @@
+storage: /home/mike/exp558/tmpdisk (btrfs)
+build-under-load: loaded 100000000 rows in 7.5s (13397019 rows/s)
+[2m2026-09-27T15:08:45.558215Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mstaging ring database error: db error: ERROR: deadlock detected
+DETAIL: Process 4108217 waits for ExclusiveLock on tuple (1,5) of relation 16480 of database 16384; blocked by process 4108219.
+Process 4108219 waits for ShareLock on transaction 49297; blocked by process 4108218.
+Process 4108218 waits for ShareLock on transaction 50866; blocked by process 4108213.
+Process 4108213 waits for ExclusiveLock on tuple (1,5) of relation 16480 of database 16384; blocked by process 4108217.
+HINT: See server log for query details. [3mfailures[0m[2m=[0m1
+[2m2026-09-27T15:08:47.884340Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mstaging ring database error: db error: ERROR: deadlock detected
+DETAIL: Process 4108390 waits for ExclusiveLock on tuple (1,32) of relation 16480 of database 16384; blocked by process 4108224.
+Process 4108224 waits for ShareLock on transaction 55710; blocked by process 4108213.
+Process 4108213 waits for ShareLock on transaction 56401; blocked by process 4108223.
+Process 4108223 waits for ExclusiveLock on tuple (1,32) of relation 16480 of database 16384; blocked by process 4108390.
+HINT: See server log for query details. [3mfailures[0m[2m=[0m1
+[2m2026-09-27T15:08:50.209566Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mstaging ring database error: db error: ERROR: deadlock detected
+DETAIL: Process 4108396 waits for ExclusiveLock on tuple (2,5) of relation 16480 of database 16384; blocked by process 4108224.
+Process 4108224 waits for ShareLock on transaction 61682; blocked by process 4108228.
+Process 4108228 waits for ShareLock on transaction 62779; blocked by process 4108231.
+Process 4108231 waits for ExclusiveLock on tuple (2,5) of relation 16480 of database 16384; blocked by process 4108396.
+HINT: See server log for query details. [3mfailures[0m[2m=[0m1
+[2m2026-09-27T15:08:52.260843Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mstaging ring database error: db error: ERROR: deadlock detected
+DETAIL: Process 4108397 waits for ExclusiveLock on tuple (2,18) of relation 16480 of database 16384; blocked by process 4108223.
+Process 4108223 waits for ShareLock on transaction 65871; blocked by process 4108231.
+Process 4108231 waits for ShareLock on transaction 66781; blocked by process 4108219.
+Process 4108219 waits for ExclusiveLock on tuple (2,18) of relation 16480 of database 16384; blocked by process 4108397.
+HINT: See server log for query details. [3mfailures[0m[2m=[0m1
+[2m2026-09-27T15:08:58.921901Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mstaging ring database error: db error: ERROR: deadlock detected
+DETAIL: Process 4108398 waits for ExclusiveLock on tuple (2,33) of relation 16480 of database 16384; blocked by process 4108228.
+Process 4108228 waits for ShareLock on transaction 82874; blocked by process 4108213.
+Process 4108213 waits for ShareLock on transaction 83596; blocked by process 4108356.
+Process 4108356 waits for ExclusiveLock on tuple (2,33) of relation 16480 of database 16384; blocked by process 4108398.
+HINT: See server log for query details. [3mfailures[0m[2m=[0m1
+build-under-load: built in 37.4s (1 chunks), live after 2304.7s; writers continue 20s
