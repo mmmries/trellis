@@ -1481,12 +1481,26 @@ const CATCH_UP_POLL: Duration = Duration::from_millis(5);
 /// Waits until `watermark` reaches `horizon`, `timeout` elapses, or `stop`
 /// returns `true`. Returns whether intake got there — see
 /// [`run_pending_backfills`]'s "Waiting for intake before staging".
+/// Issue #617 (#558 experiment 5 on the #565 spike): `TRELLIS_SPIKE_TRIGGER_CAPTURE`
+/// is set, so AFTER triggers append each change to the ring inside its own
+/// source transaction and there is no publication, slot or intake.
+pub(crate) fn spike_trigger_capture() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TRELLIS_SPIKE_TRIGGER_CAPTURE").is_some())
+}
+
 async fn intake_caught_up(
     watermark: &StagedWatermark,
     horizon: PgLsn,
     timeout: Duration,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> bool {
+    // Under trigger capture a change's ring rows commit with the change, so
+    // every change the enumeration's snapshot shows is already in the ring:
+    // there is no intake to wait for, and its watermark never moves.
+    if spike_trigger_capture() {
+        return true;
+    }
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if watermark.get() >= horizon {

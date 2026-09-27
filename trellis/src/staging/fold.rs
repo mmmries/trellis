@@ -243,6 +243,24 @@ const FOLD_COLUMNS: &str = "src_table, key, old_image::text as old_image, \
      new_image::text as new_image, lsn, origin_lsn, src_changed, hop_gen, \
      group_key, appended_at, change_id, route, op, relationship_id, retry_count, src_xid";
 
+/// Issue #617 (#558 experiment 5 on the #565 spike): under trigger capture
+/// the ring row is written by the source transaction itself, so its
+/// `row_txid` *is* the source xid and V52's `src_xid` (filled by intake from
+/// the decoder) stays empty. The ledger's identity reads `row_txid` then.
+const FOLD_COLUMNS_TRIGGER: &str = "src_table, key, old_image::text as old_image, \
+     new_image::text as new_image, lsn, origin_lsn, src_changed, hop_gen, \
+     group_key, appended_at, change_id, route, op, relationship_id, retry_count, \
+     row_txid as src_xid";
+
+fn fold_columns() -> &'static str {
+    static TRIGGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *TRIGGER.get_or_init(|| std::env::var_os("TRELLIS_SPIKE_TRIGGER_CAPTURE").is_some()) {
+        FOLD_COLUMNS_TRIGGER
+    } else {
+        FOLD_COLUMNS
+    }
+}
+
 /// Runs the claim-time fold over `seg_seq`'s fenced window, restricted to
 /// `bucket`. One [`FoldedChange`] per `(src_table, key)` present in that
 /// window. See the module doc and docs/.../04-claiming-and-the-fold.md for
@@ -260,7 +278,7 @@ pub async fn fold(
 ) -> Result<Vec<FoldedChange>, StagingError> {
     txn.batch_execute(FOLD_WORK_MEM).await?;
 
-    let (window_sql, fence_params) = fenced_window(txn, seg_seq, FOLD_COLUMNS).await?;
+    let (window_sql, fence_params) = fenced_window(txn, seg_seq, fold_columns()).await?;
     let sql = fold_sql(&window_sql, fence_params.len());
 
     let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
@@ -1289,7 +1307,7 @@ mod plan_tests {
             let txn = client.transaction().await.expect("begin");
             txn.batch_execute(FOLD_WORK_MEM).await.expect("work_mem");
             let (window_sql, fence_params) =
-                fenced_window(&txn, outcome.sealed_seg_seq, FOLD_COLUMNS)
+                fenced_window(&txn, outcome.sealed_seg_seq, fold_columns())
                     .await
                     .expect("fenced window");
             let sql = fold_sql(&window_sql, fence_params.len());

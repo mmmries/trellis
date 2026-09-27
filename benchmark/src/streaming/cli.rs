@@ -113,6 +113,11 @@ fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad 
         build_timeout: secs(args, "--build-timeout-secs").unwrap_or(Duration::from_secs(3600)),
         grace: secs(args, "--grace-secs").unwrap_or(Duration::from_secs(600)),
         oracle_poll_min: secs(args, "--oracle-poll-min-secs").unwrap_or(Duration::from_secs(5)),
+        trigger_capture: match flag(args, "--capture").unwrap_or("slot") {
+            "slot" => false,
+            "trigger" => true,
+            other => panic!("--capture must be slot or trigger, got {other:?}"),
+        },
     }
 }
 

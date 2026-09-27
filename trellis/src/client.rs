@@ -1407,7 +1407,10 @@ async fn reconcile_source_tables(
 ) -> Result<(), ReconcileError> {
     let desired = defs::publication_tables(pool).await?;
 
-    intake::publication::reconcile_publication(client, publication, &desired).await?;
+    // #617: under trigger capture there is no publication to reconcile.
+    if !intake::publication::spike_trigger_capture() {
+        intake::publication::reconcile_publication(client, publication, &desired).await?;
+    }
     // The markers whose discharge failed are already logged and backed off on
     // their own rows (issue #407). Only a failure of the pass itself errors,
     // and costs this connection a reconnect.
