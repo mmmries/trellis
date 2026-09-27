@@ -1,0 +1,25 @@
+storage: /home/mike/exp558/tmpdisk (btrfs)
+build-under-load: loaded 1000000 rows in 0.2s (5270085 rows/s)
+build-under-load: capture by statement triggers (new_only, skip_noop)
+[2m2026-09-27T05:38:37.752861Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 0 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:38:41.527341Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 0 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:38:42.144079Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 1 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:38:46.475688Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 0 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:38:48.975703Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 1 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:38:58.432156Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 0 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:39:01.231493Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 1 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:39:03.988002Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+build-under-load: built in 33.4s (101 chunks), live after 33.4s; writers continue 10s
+build-under-load: MISMATCH grp=1309 target total=Some("53273") n=Some("109") oracle total=Some("52561") n=Some("108") ledger members=Some(109)
+build-under-load: MISMATCH grp=2589 target total=Some("48805") n=Some("102") oracle total=Some("47816") n=Some("101") ledger members=Some(102)
+build-under-load: MISMATCH grp=2738 target total=Some("52280") n=Some("98") oracle total=Some("51607") n=Some("97") ledger members=Some(98)
+build-under-load: MISMATCH grp=3262 target total=Some("53844") n=Some("103") oracle total=Some("52949") n=Some("102") ledger members=Some(103)
+build-under-load: MISMATCH grp=4032 target total=Some("46969") n=Some("99") oracle total=Some("46405") n=Some("98") ledger members=Some(99)
+build-under-load: MISMATCH grp=6141 target total=Some("57321") n=Some("121") oracle total=Some("56944") n=Some("120") ledger members=Some(121)
+build-under-load: MISMATCH grp=6328 target total=Some("61385") n=Some("110") oracle total=Some("61080") n=Some("109") ledger members=Some(110)
+build-under-load: MISMATCH grp=6338 target total=Some("51559") n=Some("106") oracle total=Some("50776") n=Some("105") ledger members=Some(106)
+build-under-load: MISMATCH grp=7077 target total=Some("58138") n=Some("113") oracle total=Some("57518") n=Some("112") ledger members=Some(113)
+build-under-load: MISMATCH grp=746 target total=Some("49168") n=Some("97") oracle total=Some("48880") n=Some("96") ledger members=Some(97)
+build-under-load: MISMATCH grp=7965 target total=Some("44067") n=Some("93") oracle total=Some("43626") n=Some("92") ledger members=Some(93)
+[2m2026-09-27T05:41:17.356041Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: db error
+build-under-load: 1000000 rows / 10000 groups, loaded at 5270085 rows/s; build 33.4s over 101 chunks (first done 4.9s), live after 33.4s; converged never (tail -, 24 oracle checks of 0.06s), oracle_ok=false (11 mismatched); writers 1995/2000 stmt/s (kept=true), commit p50/p99 0.795/15.040 ms overall, 0.795/16.320 ms during build; wal 8.4 MB/s, 321 fsyncs/s, 61353 checkpoint buffers (2 timed + 0 requested checkpoints); ledger=contrib build=ledger

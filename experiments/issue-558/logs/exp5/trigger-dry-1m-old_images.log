@@ -1,0 +1,11 @@
+storage: /home/mike/exp558/tmpdisk (btrfs)
+build-under-load: loaded 1000000 rows in 0.2s (5384434 rows/s)
+build-under-load: capture by statement triggers (skip_noop)
+[2m2026-09-27T05:44:38.299229Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:44:38.917235Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 3 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:44:45.168376Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:44:46.077554Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 3 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+build-under-load: built in 40.5s (101 chunks), live after 40.5s; writers continue 10s
+[2m2026-09-27T05:45:11.471531Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 1 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:45:21.850514Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: db error
+build-under-load: 1000000 rows / 10000 groups, loaded at 5384434 rows/s; build 40.5s over 101 chunks (first done 5.0s), live after 40.5s; converged 51.2s (tail 0.6s, 1 oracle checks of 0.06s), oracle_ok=true (0 mismatched); writers 2000/2000 stmt/s (kept=true), commit p50/p99 0.755/16.320 ms overall, 0.748/17.023 ms during build; wal 22.2 MB/s, 1023 fsyncs/s, 0 checkpoint buffers (0 timed + 0 requested checkpoints); ledger=contrib build=ledger

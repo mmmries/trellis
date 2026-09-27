@@ -1,0 +1,36 @@
+storage: /home/mike/exp558/tmpdisk (btrfs)
+build-under-load: loaded 1000000 rows in 0.2s (5349159 rows/s)
+build-under-load: capture by statement triggers (new_only, skip_noop)
+[2m2026-09-27T05:41:56.804472Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:42:03.750217Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:42:06.890474Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 3 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:42:10.440661Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 0 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T05:42:23.802678Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 1 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+build-under-load: built in 39.8s (101 chunks), live after 39.8s; writers continue 10s
+[2m2026-09-27T05:42:30.291898Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 3 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+build-under-load:   stray key=1005386 source grp=None basis=None applied_lsn=Some("0/36503898")
+build-under-load: MISMATCH grp=1263 target total=Some("56474") n=Some("109") oracle total=Some("56215") n=Some("108") ledger members=Some(109)
+build-under-load:   stray key=1004488 source grp=None basis=None applied_lsn=Some("0/30637298")
+build-under-load: MISMATCH grp=2430 target total=Some("46291") n=Some("96") oracle total=Some("45351") n=Some("95") ledger members=Some(96)
+build-under-load:   stray key=730998 source grp=None basis=Some("58740:59311:58740,58814,58893,59058,59132,59217,59300,59304") applied_lsn=Some("0/3A9316F8")
+build-under-load: MISMATCH grp=2673 target total=Some("48593") n=Some("101") oracle total=Some("47738") n=Some("100") ledger members=Some(101)
+build-under-load:   stray key=1006945 source grp=None basis=None applied_lsn=Some("0/401741D8")
+build-under-load: MISMATCH grp=2738 target total=Some("51271") n=Some("95") oracle total=Some("50598") n=Some("94") ledger members=Some(95)
+build-under-load:   stray key=918546 source grp=None basis=None applied_lsn=Some("0/3A9C3718")
+build-under-load: MISMATCH grp=3305 target total=Some("43644") n=Some("85") oracle total=Some("42852") n=Some("84") ledger members=Some(85)
+build-under-load:   stray key=203513 source grp=None basis=Some("21188:21503:21188,21202,21264,21335,21369,21405,21455") applied_lsn=Some("0/3AC76A30")
+build-under-load: MISMATCH grp=3628 target total=Some("55569") n=Some("103") oracle total=Some("55557") n=Some("102") ledger members=Some(103)
+build-under-load:   stray key=649153 source grp=None basis=Some("51530:51958:51530,51593,51706,51782,51844,51930") applied_lsn=Some("0/36053A78")
+build-under-load: MISMATCH grp=4052 target total=Some("41083") n=Some("88") oracle total=Some("40974") n=Some("87") ledger members=Some(88)
+build-under-load:   stray key=978924 source grp=None basis=None applied_lsn=Some("0/2BAF13B0")
+build-under-load: MISMATCH grp=4784 target total=Some("49034") n=Some("100") oracle total=Some("48601") n=Some("99") ledger members=Some(100)
+build-under-load:   stray key=306825 source grp=None basis=Some("23600:23890:23600,23644,23678,23712,23763,23828,23871") applied_lsn=Some("0/3B007B68")
+build-under-load: MISMATCH grp=5766 target total=Some("55352") n=Some("108") oracle total=Some("54958") n=Some("107") ledger members=Some(108)
+build-under-load:   stray key=103490 source grp=None basis=None applied_lsn=Some("0/E44D0F8")
+build-under-load: MISMATCH grp=6227 target total=Some("52973") n=Some("100") oracle total=Some("52700") n=Some("99") ledger members=Some(100)
+build-under-load:   stray key=505031 source grp=None basis=Some("33461:39002:33461,38378,38440,38493,38617,38675,38733") applied_lsn=Some("0/3097DE60")
+build-under-load: MISMATCH grp=6790 target total=Some("67158") n=Some("118") oracle total=Some("66332") n=Some("117") ledger members=Some(118)
+build-under-load:   stray key=449480 source grp=None basis=Some("33426:33887:33426,33461,33510,33551,33643,33691,33761") applied_lsn=Some("0/2BB98DC8")
+build-under-load: MISMATCH grp=976 target total=Some("59942") n=Some("121") oracle total=Some("59757") n=Some("120") ledger members=Some(121)
+[2m2026-09-27T05:43:40.863121Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: db error
+build-under-load: 1000000 rows / 10000 groups, loaded at 5349159 rows/s; build 39.8s over 101 chunks (first done 4.8s), live after 39.8s; converged never (tail -, 12 oracle checks of 0.06s), oracle_ok=false (12 mismatched); writers 2000/2000 stmt/s (kept=true), commit p50/p99 0.771/16.767 ms overall, 0.748/16.512 ms during build; wal 12.7 MB/s, 498 fsyncs/s, 42526 checkpoint buffers (1 timed + 0 requested checkpoints); ledger=contrib build=ledger

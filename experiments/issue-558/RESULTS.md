@@ -748,3 +748,45 @@ re-read) — **met** (they are the same number), but the build is 3x the control
 define-to-live; tail small — **not met** (90–213 s against the control's 153 s); WAL and fsync
 rate beside the control's — above. Whether that is out of proportion is the user's call.
 
+### Step 4 dry run: trigger capture at 1M rows — the oracle mismatches with the `new_only` shape
+
+Branch [`exp/issue-558-exp5-trigger`](https://github.com/mmmries/trellis/tree/exp/issue-558-exp5-trigger)
+is this branch rebased onto `spike/565-trigger-capture`, plus the hooks trigger capture needs.
+`build-under-load --capture trigger` installs `capture_sql.py`'s statement triggers on
+`agg_src` after the load and before the writers start, with the settings the spike's own
+`v_e2e.py` uses (slot-mirror pointer, `format` encoding with pinned output settings) and the
+`new_only` + `skip_noop` shape #617 specifies. Trellis runs with
+`TRELLIS_SPIKE_TRIGGER_CAPTURE=1`. Under that flag the ledger's xid is the ring row's
+`row_txid`: the fold reads it as `src_xid`, and V52 stays empty. The reconcile parks the
+registration markers without touching a publication, and a discharge doesn't wait for intake.
+Without the marker the definition sat in `waiting_to_backfill` forever. A dry run at 1M rows
+and 10k groups, on disk, is where it failed. Logs: `logs/exp5/trigger-dry-1m-*`.
+
+| shape | build / live | converged (tail) | oracle | deletes issued | image-less re-derives | in-progress ids |
+|---|---|---|---|---|---|---|
+| `new_only,skip_noop` run 1 | 33.4 s | never (120 s grace) | **11 groups off** | 4,603 | 4,087 | 2 |
+| `new_only,skip_noop` run 2 | 39.8 s | never (60 s grace) | **12 groups off** | 5,223 | 4,693 | 0 |
+| `skip_noop` (old images kept), diagnostic | 40.5 s | 51.2 s (0.6 s) | ok | 5,297 | 15 | 0 |
+
+The failing shape: every mismatched group counts exactly one extra member (target `n` = oracle
+`n` + 1, and `total` too high by one row's `amt`), and the ledger agrees with the target. The
+extra member is always a **deleted** row. Some were inserted by a writer and then deleted
+(`basis` NULL, only ever applied by CDC); some were loaded rows the build had counted and
+later deleted (`basis` set by their chunk). Every one has an `applied_lsn`, so the delete was
+applied as something other than a delete.
+
+Cause, read from `staging/fold.rs`: the fold picks a key's net NEW image as "the latest ring
+row with any image" and never looks at `op`. A `new_only` delete carries no image at all, so
+when a key's delete shares a fold window with an earlier insert or update of the same key, the
+fold drops the delete, and the net change is that earlier row's NEW image with the delete's
+LSN. Apply then counts the row. A delete alone in its window comes through image-less and is
+re-derived correctly under the ledger (the ~4,100–4,700 image-less re-derives, about one per
+delete); only the shared-window ones are lost (about 0.2% of deletes). Keeping the old images
+(`skip_noop` only) converges with a 0.6 s tail. So the ledger build itself holds up under
+trigger capture. What breaks is how the `new_only` shape meets today's fold. The fold would have
+to treat an image-less `op = 'delete'` as the key's final state, or the trigger would have to
+keep the OLD image on deletes.
+
+Per #617 this stops step 4: no 100M trigger run was made with this shape, and the shape was not
+changed on my own.
+
