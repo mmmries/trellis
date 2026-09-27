@@ -1,0 +1,9 @@
+storage: /home/mike/exp558/tmpdisk (btrfs)
+waiting for in-flight verify runs / benchmarks to release /tmp/trellis-bench.lock ...
+build-under-load: loaded 10000000 rows in 1.1s (9270221 rows/s)
+build-under-load: built in 4.6s (1 chunks), live after 226.0s; writers continue 20s
+[2m2026-09-27T00:11:20.586611Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m1
+[2m2026-09-27T00:12:23.101585Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m139
+[2m2026-09-27T00:13:23.271083Z[0m [33m WARN[0m [2mtrellis::client[0m[2m:[0m maintenance step failed; retrying [3mstep[0m[2m=[0m"seal" [3merror[0m[2m=[0mring slot 2 still holds a live registry row; sealing into it would lap unretired work [3mfailures[0m[2m=[0m307
+[2m2026-09-27T00:14:03.908624Z[0m [33m WARN[0m [2mdeadpool.postgres[0m[2m:[0m Connection error: db error
+build-under-load: 10000000 rows / 100000 groups, loaded at 9270221 rows/s; build 4.6s over 1 chunks (first done 4.6s), live after 226.0s; converged 398.9s (tail 152.6s, 1 oracle checks of 0.75s), oracle_ok=true (0 mismatched); writers 1930/2000 stmt/s (kept=false), commit p50/p99 0.820/21.119 ms overall, 0.811/20.863 ms during build; wal 14.5 MB/s, 502 fsyncs/s, 358568 checkpoint buffers (6 timed + 0 requested checkpoints); ledger=off build=off
