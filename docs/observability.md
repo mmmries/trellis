@@ -157,6 +157,14 @@ pipeline's shape observable and carries per-hop latency for free — the
 per-transform latency histogram is *derived from* span durations captured during
 apply, not instrumented independently. Gates issue #56's design.
 
+The crate never installs a subscriber; the embedder does. The Elixir binding
+does it on the host's behalf: `Trellis.LogBridge` installs one at application
+start that forwards events (not spans) to `Logger`. A host can opt out, but
+composing its own subscriber means building its own NIF around the crate:
+the global subscriber belongs to the copy of `tracing` linked into the NIF
+library, so one installed from another library never sees the engine's
+events (`clients/elixir/README.md`, issue #149).
+
 ## Transform status lifecycle
 
 Rather than instrument the backfill with bespoke metrics, every transform carries
