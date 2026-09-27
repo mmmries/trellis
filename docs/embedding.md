@@ -200,14 +200,15 @@ about an individual transform's own progress.
 ### Wiring it into a host health check
 
 The bindings are in progress (epic #140): the Elixir binding in
-`clients/elixir` wraps the whole `BlockingTrellis` surface (issues #146,
-#147 and #587), and the Ruby binding in `clients/ruby` is so far a vertical
-slice (#151: connect, migrate, define, status, shutdown), without these
-checks. Each is a thin
+`clients/elixir` and `clients/ruby` each wrap the whole `BlockingTrellis`
+surface (issues #146, #147, #587, #151 and #152). Each is a thin
 Rustler/Magnus wrapper over the `Trellis` shape above, per ADR-0010
 decision 1. In Elixir the two checks are `Trellis.has_live_drain_workers/1`
 and `Trellis.has_live_staging_worker/1`, each returning `{:ok, boolean}`
-(or the boolean itself from the bang variant). A plain boolean needs no
+(or the boolean itself from the bang variant); in Ruby they are the
+predicates `Trellis.has_live_drain_workers?` and
+`Trellis.has_live_staging_worker?`, on the process's one handle, raising a
+`Trellis::Error` if the database can't answer. A plain boolean needs no
 flattening to cross the boundary (ADR-0010 decision 4).
 
 **Phoenix**, wired as a `Plug` health-check endpoint polled by the
@@ -239,8 +240,7 @@ end
 **Rails**, as a scheduled check (e.g. a recurring Sidekiq job or a
 `rails-healthcheck`-style route) rather than on every request — this check
 is a fleet-wide question, not something that needs to be re-answered on
-every web request. The Ruby binding doesn't have these two methods yet: they
-come with its full surface (#152), and this is the shape they will take:
+every web request:
 
 ```ruby
 class TrellisWorkerHealthCheck
@@ -370,8 +370,7 @@ statement for a target that already exists is an `ALTER TRANSFORM`
 define. To remove a transform deliberately, apply `PAUSE TRANSFORM
 order_totals` and then `DROP TRANSFORM order_totals`: `DROP` refuses a
 transform that isn't paused, and takes the target table's data with it. In
-Ruby, those statements need `Trellis.apply`, which comes with the binding's
-full surface (#152).
+Ruby, run those statements with `Trellis.apply`.
 
 ## Poll to `live`, don't wait
 
@@ -528,6 +527,11 @@ token = Trellis.watermark_token!(trellis)
 :ok = Trellis.await_converged!(trellis, token, 30_000)
 ```
 
+```ruby
+token = Trellis.watermark_token
+Trellis.await_converged(token, timeout_ms: 30_000)
+```
+
 `await_converged` waits for captured changes only; it doesn't read status. A
 transform that isn't `live` yet, `catching_up` included, can still be missing
 rows after it returns, which is why the poll comes first. When the timeout
@@ -535,7 +539,6 @@ runs out first, it fails with a `timeout` error, not `internal`: the target is
 behind, not broken, so retry or allow longer. A binding handle runs one call
 at a time, so every other call on it waits behind an `await_converged` for up
 to its timeout; keep the timeout short on a handle that also serves requests.
-Ruby gets `watermark_token` and `await_converged` with its full surface (#152).
 
 ## What the engine maintains today
 
