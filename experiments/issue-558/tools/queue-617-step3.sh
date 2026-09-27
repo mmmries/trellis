@@ -22,7 +22,10 @@ MEMCAP=${MEMCAP:-16G}
 # ring's segment sizes (count(*) per segment) and the definition's status, in <tag>.ring.tsv.
 RUNS=${RUNS:-control ledger}
 RING_SAMPLE=${RING_SAMPLE:-0}
-ARGS="--rows 100000000 --groups 1000000 --build-timeout-secs 36000 --grace-secs 1800"
+ARGS=${ARGS:-"--rows 100000000 --groups 1000000 --build-timeout-secs 36000 --grace-secs 1800"}
+# LEDGER_TAG renames the ledger run (e.g. the 10M 100k-row-chunk rerun, with ARGS and
+# TRELLIS_EXP558_BUILD_CHUNK_ROWS set by the caller).
+LEDGER_TAG=${LEDGER_TAG:-ledger-100m-disk}
 rm -f "$ABORT"
 
 clean() {
@@ -81,7 +84,7 @@ run() {
   kill "$m" $r 2>/dev/null; wait "$m" $r 2>/dev/null
   echo "=== $(date +%T) $tag peak benchmark RSS: $(awk -F'\t' 'NR>1 && $4+0>p {p=$4} END {print p+0}' "$L/mem/$tag.tsv") MB"
   echo "=== $(date +%T) $tag disk: $(cat "$L/$tag.dfpeak.summary")"
-  if [ ! -s "$L/$tag.jsonl" ]; then
+  if [ ! -s "$L/$tag.jsonl" ] && [ ! -e "$ABORT" ]; then
     echo "$(date +%T) $tag produced no result (rc=$rc; memory cap $MEMCAP kill? see journalctl -k)" > "$ABORT"
   fi
   clean
@@ -93,7 +96,7 @@ case " $RUNS " in *" control "*)
   if [ -e "$ABORT" ]; then echo "=== $(date +%T) aborted after control: $(cat "$ABORT")"; echo "=== $(date +%T) queue done"; exit 1; fi
 esac
 case " $RUNS " in *" ledger "*)
-  run ledger-100m-disk env TRELLIS_EXP558_LEDGER=contrib TRELLIS_EXP558_BUILD=ledger ./run-exp5.sh j ledger-100m-disk $ARGS
+  run "$LEDGER_TAG" env TRELLIS_EXP558_LEDGER=contrib TRELLIS_EXP558_BUILD=ledger ./run-exp5.sh j "$LEDGER_TAG" $ARGS
   [ -e "$ABORT" ] && echo "=== $(date +%T) aborted during ledger: $(cat "$ABORT")"
 esac
 echo "=== $(date +%T) queue done"

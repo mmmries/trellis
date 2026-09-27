@@ -1,0 +1,433 @@
+=== 2026-09-27 11:03:12  pg_wal 80G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 79 GB          | 124 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        2896 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 00:35:40.917731 | {4152948} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4152948 | Lock            | transactionid | 00:00:16.167385 | {4152953} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152953 | Lock            | transactionid | 00:00:13.016708 | {4153117} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152956 | Lock            | transactionid | 00:00:06.826861 | {4152948} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 11:08:12  pg_wal 89G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 88 GB          | 335 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        3012 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 00:40:40.995275 | {4152953} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4152953 | Lock            | transactionid | 00:00:38.747405 | {4152971} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4153121 | Lock            | transactionid | 00:00:26.105682 | {4152953} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152954 | Lock            | transactionid | 00:00:14.912836 | {4153121} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 11:13:12  pg_wal 97G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 97 GB          | 207 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        3162 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 00:45:41.169992 | {4153120} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4153120 | Lock            | transactionid | 00:00:32.91489  | {4152956} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152955 | Lock            | tuple         | 00:00:31.311488 | {4153117} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152943 | Lock            | transactionid | 00:00:10.787494 | {4153120} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 11:18:12  pg_wal 106G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 105 GB         | 219 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        3298 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 00:50:41.245263 | {4152943} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4152943 | LWLock          | WALWrite      | 00:00:28.959592 | {}        | select distinct group_key from "public"."agg_totals__ledger" where gro
+ 4153116 | Lock            | transactionid | 00:00:26.087155 | {4152943} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152955 | Lock            | transactionid | 00:00:09.146494 | {4153116} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 11:23:13  pg_wal 114G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 113 GB         | 20 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        3414 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 00:55:41.97472  | {4153120} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4153120 | LWLock          | WALWrite      | 00:00:29.777439 | {}        | COMMIT
+ 4153116 | Lock            | transactionid | 00:00:21.389151 | {4152948} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152943 | Lock            | transactionid | 00:00:15.473161 | {4153120} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 11:28:13  pg_wal 122G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 121 GB         | 195 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        3526 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 01:00:42.0861   | {4152961} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4152961 | Lock            | transactionid | 00:00:33.555285 | {4153119} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4153121 | Lock            | transactionid | 00:00:29.056651 | {4152961} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152956 | Lock            | transactionid | 00:00:24.294534 | {4153121} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 11:33:13  pg_wal 130G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 129 GB         | 13 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        3623 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 01:05:42.182956 | {4152961} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4152961 | Lock            | transactionid | 00:00:28.037306 | {4153116} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152971 | Lock            | transactionid | 00:00:26.691547 | {4152949} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152953 | IO              | DataFileRead  | 00:00:18.322384 | {}        | update "public"."agg_totals" set "total" = case when k.f0_active then 
+(4 rows)
+
+=== 2026-09-27 11:38:13  pg_wal 137G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 137 GB         | 193 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        3720 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 01:10:42.442999 | {4152956} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4152956 | Lock            | transactionid | 00:00:27.47025  | {4152953} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152943 | Lock            | transactionid | 00:00:19.282274 | {4153117} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4153119 | Lock            | transactionid | 00:00:13.928915 | {4153117} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 11:43:13  pg_wal 144G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 144 GB         | 206 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        3801 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 01:15:42.527094 | {4153119} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4153119 | Lock            | transactionid | 00:00:43.666866 | {4152948} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152949 | LWLock          | WALWrite      | 00:00:37.923237 | {}        | select distinct group_key from "public"."agg_totals__ledger" where gro
+ 4153121 | Lock            | transactionid | 00:00:34.93667  | {4153119} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 11:48:13  pg_wal 152G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 151 GB         | 28 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        3872 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 01:20:42.611942 | {4152954} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4152954 |                 |               | 00:01:02.223377 | {}        | select distinct group_key from "public"."agg_totals__ledger" where gro
+ 4152948 | Lock            | transactionid | 00:00:34.953415 | {4152954} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4153117 | Lock            | transactionid | 00:00:30.842883 | {4152948} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 11:53:13  pg_wal 159G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 159 GB         | 97 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        3935 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 01:25:42.667636 | {4152948} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4152948 | Lock            | transactionid | 00:01:24.081542 | {4153117} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152953 | Lock            | transactionid | 00:00:47.417163 | {4152955} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152961 | Lock            | transactionid | 00:00:35.421174 | {4153117} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 11:58:14  pg_wal 166G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 166 GB         | 28 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        3992 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 01:30:43.263974 | {4152953} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4152953 | Lock            | transactionid | 00:00:59.62806  | {4153121} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152961 | Lock            | transactionid | 00:00:37.869735 | {4153121} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152943 | Lock            | transactionid | 00:00:33.653216 | {4152953} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 12:03:14  pg_wal 172G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 172 GB         | 1066 kB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        4031 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 01:35:43.337622 | {4152961} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4152961 | Lock            | transactionid | 00:01:10.45216  | {4152943} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152953 | Lock            | transactionid | 00:00:58.285245 | {4152961} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4153121 | Lock            | transactionid | 00:00:33.702298 | {4152953} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 12:08:14  pg_wal 179G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 178 GB         | 158 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        4073 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 01:40:43.578776 | {4153120} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4153120 |                 |               | 00:01:30.458448 | {}        | select distinct group_key from "public"."agg_totals__ledger" where gro
+ 4152953 | Lock            | transactionid | 00:01:07.712029 | {4153120} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4153121 | Lock            | transactionid | 00:00:36.957717 | {4153120} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 12:13:14  pg_wal 185G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 184 GB         | 55 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        4108 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 01:45:43.643431 | {4152949} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4152949 |                 |               | 00:01:28.081888 | {}        | select distinct group_key from "public"."agg_totals__ledger" where gro
+ 4153121 | Lock            | transactionid | 00:00:59.682923 | {4152949} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152955 | Lock            | transactionid | 00:00:46.840263 | {4153121} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 12:18:14  pg_wal 190G
+  slot_name   | behind_restart | behind_confirmed 
+--------------+----------------+------------------
+ trellis_slot | 190 GB         | 85 MB
+(1 row)
+
+   status    | chunks_done | chunks 
+-------------+-------------+--------
+ backfilling |        4131 |  10001
+(1 row)
+
+ seg_seq | ring_slot |  state   
+---------+-----------+----------
+       8 |         3 | drained
+       9 |         0 | draining
+      10 |         1 | drained
+      11 |         2 | active
+(4 rows)
+
+   pid   | wait_event_type |  wait_event   |    xact_age     | blockers  |                                   q                                    
+---------+-----------------+---------------+-----------------+-----------+------------------------------------------------------------------------
+ 4153118 | Lock            | transactionid | 01:50:43.705221 | {4153119} | insert into "public"."agg_totals__ledger" (from_key) select k from unn
+ 4153119 | Lock            | transactionid | 00:03:50.114638 | {4152949} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+ 4152949 | IO              | DataFileRead  | 00:01:54.042341 | {}        | update "public"."agg_totals" set "total" = case when k.f0_active then 
+ 4152971 | Lock            | transactionid | 00:01:08.215747 | {4152949} | select k.ord, t."__trellis_recompute_lsn" from "public"."agg_totals" t
+(4 rows)
+
+=== 2026-09-27 12:23:14 cluster gone

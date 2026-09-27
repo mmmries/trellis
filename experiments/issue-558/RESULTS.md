@@ -876,3 +876,97 @@ other way is the user's call. Every benchmark run now goes under the 16G scope:
 `tools/queue-617-step3.sh` wraps each run in `systemd-run --user --scope -p MemoryMax=$MEMCAP
 -p MemorySwapMax=0`, samples RSS into `logs/exp5/mem/<tag>.tsv`, and stops the queue if a run
 leaves no result.
+
+The user's decision: no engine patch and no 100M control rerun. The finding is recorded in #556
+as an implementation requirement: drain memory must be bounded by a batch cap, not by segment
+size ([comment](https://github.com/salesforce-misc/trellis/issues/556#issuecomment-5859042432)).
+
+### Step 3, ledger build at 100M: stopped by the disk guard; a starved drain batch pins the slot's WAL
+
+The user's decision after the control's OOM was to run the 100M ledger build alone, with the
+issue's parameters, under the 16G cap and with the df guard (`RUNS=ledger RING_SAMPLE=1
+tools/queue-617-step3.sh`). It started at 10:13:16 PDT on a quiet box. At 12:22:23 the df guard
+stopped it: free space was down to 29 GB, 249 GB above the baseline. It left no converged, oracle
+or WAL-window numbers. Logs: `logs/exp5/ledger-100m-disk.*`. That includes `.pgstate`, a
+Postgres snapshot every 5 min from 11:03 (`tools/pgstate.sh`), and `mem/ledger-100m-disk.tsv`
+(RSS, 5 s) and `.ring.tsv` (segments, 30 s). The lane-i build marker
+(`/tmp/lane-i-build.active`) was watched from 10:52 to the end and never appeared. The window
+from 10:13 to 10:52 wasn't watched.
+
+| | 100M ledger build |
+|---|---|
+| load | 100M rows in 7.6 s |
+| build progress at the stop | 4,131 of 10,001 chunks in about 2 h 8 min. The rate fell from 0.96/s over the first 50 min to about 0.4/s later |
+| status at the stop | `backfilling` (never `live`) |
+| peak RSS | **6.45 GB**, reached at 10:33 and flat from then on (cap 16G) |
+| ledger on disk | 7.0 GB at 2,896 chunks |
+| `pg_wal` | 80 GB at 11:03, 190 GB at 12:18 (+1.5 GB/min). The slot's `restart_lsn` was 190 GB behind; `confirmed_flush` only 85–140 MB behind |
+| oldest transaction | one drain batch's `insert into agg_totals__ledger (from_key) select k from unnest($1)`, open 1 h 50 min at the stop and waiting on `transactionid` locks. Its blockers were chunk transactions, which queue on each other on target group rows |
+| ring | backlog segment 7 (617,792 rows) drained 10:21–10:27; segment 9 (775,399 rows) went `draining` at about 10:27 and **never finished**. From then on seal was refused, and active segment 11 grew to **6,094,870 rows** |
+
+- **Not memory this time: the disk ran out.** RSS peaked at 6.45 GB while segments 7 and 9
+  drained, at about 4 KB per backlog row as at 10M, and then stayed flat. Segment 9's drain
+  never got past one batch, and the 6.09M-row active segment was never sealed or drained. At
+  10M's rate of about 4 KB per image-bearing row, draining it would be about 24 GB. That is an
+  extrapolation, not a measurement, but it is over the 16G cap. So a starved sealer's backlog
+  does threaten the ledger path's memory too. It just never got that far.
+- **What stopped it: a drain batch starved behind the chunks.** A batch's ledger placeholder
+  insert waited on chunk transactions for 1 h 50 min. Each chunk placeholder-locks the ledger
+  entries of its 10k-key PK range. The batch's ~97k keys (775k rows over 8 buckets) are spread
+  over the whole key space, so some in-flight chunk always holds one of them, and the chunks
+  in turn queue on each other on target group rows.
+  At 10M the same shape held the oldest `xmin` for 658 s (step 2). At 100M it doesn't end.
+  While that transaction is open, logical decoding can't advance the slot's `restart_lsn`, so
+  no WAL is recycled (`max_wal_size=4GB` doesn't apply). `pg_wal` grew by the build's whole
+  WAL rate until the guard stopped it. On this box, with the snapper snapshots pinning the
+  rewritten files as well, that was about 2 h.
+- **The build was also slowing.** It did 0.96 chunks/s for the first 50 min and about 0.4/s
+  after. At that rate the remaining 5,870 chunks would take about 4 more hours.
+- **Correctness is untested at 100M.** Nothing converged, so there is no oracle comparison.
+
+### 10M ledger build with 100k-row chunks: chunk size is not what makes it 2–3x
+
+The question was whether step 2's 3x define-to-live and 5x WAL were caused by the 10k-row chunk
+size. So I ran the same 10M ledger build with `TRELLIS_EXP558_BUILD_CHUNK_ROWS=100000` (the
+existing knob in `ledger_build.rs`; no code change). Everything else matched step 2: quiet box
+(no cargo, rustc, mix or beam; lane i's marker absent), under the 16G cap, df guard on. Log:
+`logs/exp5/ledger-10m-disk-100k-chunks.*`. The third 10k column is the capped memory probe from
+earlier today (`memprobe-ledger-10m`, same settings plus a 2 s ring sampler).
+
+| | control (step 2) | 10k chunks, run 1 | 10k chunks, run 2 | 10k chunks, probe | **100k chunks** |
+|---|---|---|---|---|---|
+| chunks | 1 | 1,001 | 1,001 | 1,001 | **101** |
+| build = define → `live` | 226 s (build 4.6 s) | 672 s | 716 s | 562 s | **450 s** |
+| vs the control's define → `live` | 1x | 3.0x | 3.2x | 2.5x | **2.0x** |
+| converged / tail | 399 s / 153 s | 782 s / 90 s | 949 s / 213 s | 587 s / 5 s | 531 s / 61 s |
+| oracle | ok | ok | ok | ok | **ok** |
+| WAL total (vs control's 5.8 GB) | 5.8 GB | 29.3 GB (5.0x) | 29.8 GB (5.1x) | 28.5 GB (4.9x) | **21.7 GB (3.7x)** |
+| WAL MB/s / fsyncs/s | 14.5 / 502 | 36.9 / 468 | 31.1 / 486 | 48.2 / 1,122 | 40.2 / 357 |
+| writer rate / p99 | 1,930/s / 21 ms | 1,894/s / 44 ms | 1,901/s / 36 ms | 2,000/s / 18 ms | **1,580/s** / 54 ms |
+| worker-seconds per 10k source rows | – | 5.4 | 5.7 | 4.5 | 3.6 |
+| deadlocks / rollbacks | 3 / 672 | 6 / 4,820 | 15 / 5,852 | 6 / 3,982 | 0 / 2,795 |
+| ledger / target on disk | – | 2.34 / 0.39 GB | 2.56 / 0.78 GB | 2.26 / 0.53 GB | 2.46 / 0.45 GB |
+| peak `xmin` hold | – | – | 658 s | 303 s | 270 s |
+| peak RSS | – | – | – | 3.68 GB | 4.46 GB |
+
+- **Correct again**, with 0 in-progress-id changes and 88 image-less re-derives.
+- **10x bigger chunks cut the build by a third, not by the 3x.** Define-to-live fell from
+  672–716 s to 450 s. That is still 2.0x the control's 226 s, and 0.8x of today's 562 s probe.
+  WAL fell about a quarter, from 28.5–29.8 GB to 21.7 GB, and is still 3.7x the control's. So
+  per-chunk overhead is part of the cost, and most of it isn't: the per-row cost dropped only
+  from 4.5–5.7 to 3.6 worker-seconds per 10k rows. The writers also fell to 1,580/s of 2,000,
+  which the 10k-chunk runs didn't.
+- **So the per-row cost needs profiling before #556's plan is written.** This run has no
+  wait-event trace, but the 100M run's snapshots (`ledger-100m-disk.pgstate`) show where the
+  time goes. Chunk transactions sit on `transactionid` locks behind each other on the target's
+  group rows. With 100k groups, one 100k-row chunk touches about 63% of them, so concurrent
+  chunks mostly serialize. The rest wait on `WALWrite`. The ledger itself is written once per
+  source row by the build and again per change, and it is 3x the source.
+
+### Step 4 (100M on trigger capture): skipped
+
+The user skipped it. The 1M dry run already showed the ledger build converging under trigger
+capture with the OLD image kept on deletes (0.6 s tail, oracle ok). The `new_only` mismatch is a
+fold rule: an image-less delete must be taken as the key's final state. That is settled by
+reasoning, not by scale. With step 3's control unable to finish at 100M, there would be no slot
+baseline to compare it against. The rebase onto the trigger spike isn't needed.
