@@ -347,6 +347,14 @@ pub async fn run_probe(cfg: ProbeConfig, tuning: &EngineTuning) -> ProbeResult {
     ))
     .await
     .expect("create aggregate source table");
+    // SCRATCH EXPERIMENT (#317): an index on the group column.
+    if std::env::var_os("AGG_CEILING_INDEX_GRP").is_some() {
+        raw.batch_execute(&format!(
+            "create index on public.{SOURCE_TABLE} ({GROUP_COLUMN})"
+        ))
+        .await
+        .expect("create group index");
+    }
 
     let client = trellis::Client::start(
         db.dsn(),
@@ -461,10 +469,12 @@ pub struct CeilingSearch {
     pub probes: Vec<ProbeResult>,
 }
 
-/// Next rate to probe inside `(lo, hi)`, or `None` once the bracket is within
-/// `resolution` (relative to `hi`).
+/// Next rate to probe strictly inside `(lo, hi)`, rounded to 500 rows/sec, or
+/// `None` once the bracket is within `resolution` (relative to `hi`) or no
+/// rounded rate lies strictly between the two.
 fn next_rate(lo: f64, hi: f64, resolution: f64) -> Option<f64> {
-    ((hi - lo) / hi > resolution).then(|| ((lo + hi) / 2.0 / 1000.0).round() * 1000.0)
+    let mid = ((lo + hi) / 2.0 / 500.0).round() * 500.0;
+    ((hi - lo) / hi > resolution && mid > lo && mid < hi).then_some(mid)
 }
 
 /// Bisects for the ceiling between `min_rate` and `max_rate`. A
@@ -569,5 +579,9 @@ mod tests {
         assert_eq!(next_rate(50_000.0, 200_000.0, 0.05), Some(125_000.0));
         assert_eq!(next_rate(96_000.0, 100_000.0, 0.05), None);
         assert_eq!(next_rate(94_000.0, 100_000.0, 0.05), Some(97_000.0));
+        // Never re-probes a bound: 11,500 is strictly inside, and nothing
+        // rounded to 500 is strictly inside (11,000, 11,500).
+        assert_eq!(next_rate(11_000.0, 12_000.0, 0.05), Some(11_500.0));
+        assert_eq!(next_rate(11_000.0, 11_500.0, 0.01), None);
     }
 }

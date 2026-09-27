@@ -1599,7 +1599,18 @@ async fn probe_group_exists(
     plan: &AggregateTargetPlan,
     values: &[Option<String>],
 ) -> Result<bool, ApplyError> {
-    let where_sql = group_where_clause_source(plan, 1, "s");
+    // SCRATCH EXPERIMENT (#317): not for merge.
+    // TRELLIS_EXP_SKIP_PROBE: assume every touched group still exists (only
+    // correct for insert-only loads — an upper bound on what the probe costs).
+    // TRELLIS_EXP_SARGABLE_PROBE: `=` instead of `is not distinct from`, so an
+    // index on the group column can serve it (wrong for NULL group keys).
+    if std::env::var_os("TRELLIS_EXP_SKIP_PROBE").is_some() {
+        return Ok(true);
+    }
+    let mut where_sql = group_where_clause_source(plan, 1, "s");
+    if std::env::var_os("TRELLIS_EXP_SARGABLE_PROBE").is_some() {
+        where_sql = where_sql.replace(" is not distinct from ", " = ");
+    }
     let sql = format!(
         "select exists(select 1 from {} s{} where {where_sql})",
         ddl::qualified_source_table(&plan.source),
