@@ -78,6 +78,8 @@ pub mod staging {
     /// `await_converged`, for a harness that must re-check the ring once
     /// without starting another wait.
     pub use crate::staging::converge::converged_through;
+    /// Issue #558 experiment 5's process-wide counters (benchmark only).
+    pub use crate::staging::ledger_build::{Exp5Counters, exp5_counters};
     pub use crate::staging::{
         StagingError, await_converged, has_pending, retire_drained_segments, seal_phase1,
         seal_phase2, watermark_token,

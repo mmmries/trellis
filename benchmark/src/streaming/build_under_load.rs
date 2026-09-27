@@ -52,6 +52,7 @@ const LOAD_BATCH_ROWS: u64 = 1_000_000;
 const COPY_BUFFER_BYTES: usize = 1 << 20;
 const MONITOR_POLL: Duration = Duration::from_millis(100);
 const CONVERGE_POLL: Duration = Duration::from_millis(500);
+const XMIN_POLL: Duration = Duration::from_millis(250);
 
 /// The scenario's knobs; see the module doc and `cli.rs` for defaults.
 #[derive(Debug, Clone, Copy)]
@@ -144,6 +145,69 @@ pub struct BuildUnderLoadResult {
     pub disk: disk_tier::DiskTier,
     pub ledger_mode: String,
     pub build_mode: String,
+    /// The oldest backend `xmin` seen from define to the writers' stop, as an
+    /// age in transaction ids, and the longest time one `xmin` value stayed
+    /// the oldest (a held horizon: what vacuum could not clean past).
+    pub peak_xmin_age_xids: i64,
+    pub peak_xmin_hold_secs: f64,
+    /// Every `*__ledger` table's total size (heap, indexes, toast) after
+    /// convergence, and the source's and target's for scale.
+    pub ledger_bytes: i64,
+    pub source_bytes: i64,
+    pub target_bytes: i64,
+    /// Experiment 5's in-process counters (zero with the flags unset).
+    pub exp5: trellis::dev::staging::Exp5Counters,
+}
+
+/// Samples the oldest backend `xmin` on its own connection until `stop`;
+/// see [`BuildUnderLoadResult::peak_xmin_age_xids`].
+async fn sample_xmin(raw: RawClient, stop: Arc<AtomicBool>) -> (i64, f64) {
+    let mut peak_age = 0i64;
+    let mut peak_hold = 0f64;
+    let mut held: Option<(String, Instant)> = None;
+    while !stop.load(Ordering::Relaxed) {
+        let row = raw
+            .query_one(
+                "select (select backend_xmin::text from pg_stat_activity \
+                         where backend_xmin is not null and pid <> pg_backend_pid() \
+                         order by age(backend_xmin) desc limit 1), \
+                        coalesce((select max(age(backend_xmin)) from pg_stat_activity \
+                         where backend_xmin is not null and pid <> pg_backend_pid()), 0)::bigint",
+                &[],
+            )
+            .await
+            .expect("sample backend xmin");
+        let oldest: Option<String> = row.get(0);
+        peak_age = peak_age.max(row.get(1));
+        let now = Instant::now();
+        held = match (held, oldest) {
+            (Some((x, since)), Some(o)) if x == o => {
+                peak_hold = peak_hold.max(now.duration_since(since).as_secs_f64());
+                Some((x, since))
+            }
+            (_, Some(o)) => Some((o, now)),
+            (_, None) => None,
+        };
+        tokio::time::sleep(XMIN_POLL).await;
+    }
+    (peak_age, peak_hold)
+}
+
+/// Total on-disk size of the ledger tables, the source and the target.
+async fn relation_sizes(raw: &RawClient, terminal: &str) -> (i64, i64, i64) {
+    let row = raw
+        .query_one(
+            &format!(
+                "select coalesce((select sum(pg_total_relation_size(c.oid)) from pg_class c \
+                     where c.relkind = 'r' and c.relname like '%\\_\\_ledger'), 0)::bigint, \
+                 pg_total_relation_size('public.{SOURCE}'), \
+                 pg_total_relation_size('public.{terminal}')"
+            ),
+            &[],
+        )
+        .await
+        .expect("read relation sizes");
+    (row.get(0), row.get(1), row.get(2))
 }
 
 fn opt_f(v: Option<f64>) -> String {
@@ -172,7 +236,10 @@ impl BuildUnderLoadResult {
              \"writer_errors\":{},\"writer_lat_p50_ms\":{},\"writer_lat_p99_ms\":{},\
              \"writer_lat_build_p50_ms\":{},\"writer_lat_build_p99_ms\":{},\
              \"deadlocks\":{},\"xact_rollbacks\":{},\"wal_bytes\":{},{},\
-             \"ledger_mode\":\"{}\",\"build_mode\":\"{}\"}}",
+             \"ledger_mode\":\"{}\",\"build_mode\":\"{}\",\
+             \"peak_xmin_age_xids\":{},\"peak_xmin_hold_secs\":{:.3},\"ledger_bytes\":{},\
+             \"source_bytes\":{},\"target_bytes\":{},\"in_xip_changes\":{},\
+             \"skipped_changes\":{},\"imageless_rederives\":{},\"chunk_keys\":{}}}",
             scenario,
             self.cfg.rows,
             self.cfg.groups,
@@ -211,6 +278,15 @@ impl BuildUnderLoadResult {
             self.disk.json_fields(),
             disk_tier::json_escape(&self.ledger_mode),
             disk_tier::json_escape(&self.build_mode),
+            self.peak_xmin_age_xids,
+            self.peak_xmin_hold_secs,
+            self.ledger_bytes,
+            self.source_bytes,
+            self.target_bytes,
+            self.exp5.in_xip_changes,
+            self.exp5.skipped_changes,
+            self.exp5.imageless_rederives,
+            self.exp5.chunk_keys,
         )
     }
 
@@ -589,6 +665,8 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         "TRANSFORM agg_totals FROM public.{SOURCE} GROUP BY grp \
          SELECT grp AS grp, SUM(amt) AS total, COUNT(*) AS n"
     );
+    let xmin_stop = Arc::new(AtomicBool::new(false));
+    let xmin_task = tokio::spawn(sample_xmin(connect_raw(db.dsn()).await, xmin_stop.clone()));
     let define_at = Instant::now();
     shared.phase.store(PHASE_BUILD, Ordering::Relaxed);
     let def = trellis::dev::defs::install_definition(&db.pool, &source_text, &columns, "public")
@@ -613,6 +691,10 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         writes.merge(&w.await.expect("writer task"));
     }
     let stopped_at = Instant::now();
+    // Up to here, not through convergence: the oracle's full scan would be
+    // the oldest snapshot of all.
+    xmin_stop.store(true, Ordering::Relaxed);
+    let (peak_xmin_age_xids, peak_xmin_hold_secs) = xmin_task.await.expect("xmin sampler");
     let writer_secs = stopped_at.duration_since(shared.start).as_secs_f64();
     let achieved_write_rate = writes.total() as f64 / writer_secs;
 
@@ -650,6 +732,7 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         tokio::time::sleep(CONVERGE_POLL).await;
     }
     let disk = disk_tier::since(&sampler, &disk_start).await;
+    let (ledger_bytes, source_bytes, target_bytes) = relation_sizes(&raw, &terminal).await;
     let (deadlocks_after, rollbacks_after) = contention::deadlocks_and_rollbacks(&sampler).await;
     // Unconverged: a fresh count for the verdict, outside the disk window
     // and not counted in oracle_checks.
@@ -691,6 +774,12 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         disk,
         ledger_mode,
         build_mode,
+        peak_xmin_age_xids,
+        peak_xmin_hold_secs,
+        ledger_bytes,
+        source_bytes,
+        target_bytes,
+        exp5: trellis::dev::staging::exp5_counters(),
     }
 }
 
