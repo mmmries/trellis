@@ -626,8 +626,8 @@ async fn read_live_rows_batch(
 
 /// [`read_live_rows_batch`]'s statement and the arrays it binds: one
 /// [`LiveRowsArm`] per pattern of `NULL` key columns among the batch's keys.
-struct LiveRowsQuery<'a> {
-    sql: String,
+pub(super) struct LiveRowsQuery<'a> {
+    pub(super) sql: String,
     arms: Vec<LiveRowsArm<'a>>,
 }
 
@@ -642,7 +642,7 @@ struct LiveRowsArm<'a> {
 
 impl LiveRowsQuery<'_> {
     /// The bind parameters, in the order `sql` numbers them.
-    fn params(&self) -> Vec<&(dyn ToSql + Sync)> {
+    pub(super) fn params(&self) -> Vec<&(dyn ToSql + Sync)> {
         self.arms
             .iter()
             .flat_map(|arm| arm.parts.iter().map(|part| part as &(dyn ToSql + Sync)))
@@ -664,7 +664,7 @@ impl LiveRowsQuery<'_> {
 /// indexable: one `NULL`-keyed group in a batch turned the refetch into a
 /// nested loop over a sequential scan of the source. This is the same split
 /// `target_mutations::read_new_images` makes (issue #433).
-fn live_rows_query<'a>(
+pub(super) fn live_rows_query<'a>(
     source_table: &str,
     pk: &[PrimaryKeyColumn],
     row_columns: &[String],
@@ -2265,6 +2265,7 @@ async fn capture_reverse_guard_state(
 ///    path does; the new ones from the live row and live parent. Diff into
 ///    the group plan; the entry is rewritten with the new group,
 ///    contribution, join key and basis, or tombstoned if the row is gone.
+///
 /// Issue #558 experiment 4, I5: every ledger entry this batch will touch on
 /// one target (the forward rows' keys and every child of the to-side keys
 /// being re-derived), locked in key order in one statement, returning each
@@ -2274,7 +2275,7 @@ async fn lock_ledger_entries(
     ledger: &str,
     from_keys: &[&str],
     join_keys: &[&str],
-) -> Result<HashMap<String, (Option<String>, Option<String>, Option<String>)>, ApplyError> {
+) -> Result<LedgerEntries, ApplyError> {
     let exists: bool = txn
         .query_one("select to_regclass($1) is not null", &[&ledger])
         .await?
@@ -2302,6 +2303,9 @@ async fn lock_ledger_entries(
     Ok(entries)
 }
 
+/// A ledger entry's group, contribution and join key, by `from_key`.
+type LedgerEntries = HashMap<String, (Option<String>, Option<String>, Option<String>)>;
+
 /// Issue #558 experiment 4: which reverse records the ledger prototype
 /// handles — a plain to-side attribute update (both images, same key) of a
 /// relationship with fast-path-eligible aggregate readers. A catch-up
@@ -2328,7 +2332,7 @@ async fn rederive_children_via_ledger(
     record: &RelationshipReverseRecord,
     keys: &[&str],
     row_columns: &[String],
-    all_entries: &HashMap<String, (Option<String>, Option<String>, Option<String>)>,
+    all_entries: &LedgerEntries,
 ) -> Result<AggregateTargetPlan, ApplyError> {
     let mut target_plan = agg_shape.template.clone();
     if keys.is_empty() {
@@ -8442,7 +8446,15 @@ pub async fn apply_and_mark_drained_many(
                 .and_then(|k| agg_plans.get(k))
                 .map(|p| p.ledger_rows.iter().map(|r| r.from_key.clone()).collect())
                 .unwrap_or_default();
-            if target_jobs.is_empty() && forward_keys.is_empty() {
+            // Experiment 5: a plain aggregate under the ledger build has no
+            // reverse jobs, and `ledger_stage` locks its keys (placeholders
+            // included) in one ordered pass; locking the existing ones here
+            // first would take them out of that order.
+            let build_plan = existing_key
+                .as_ref()
+                .and_then(|k| agg_plans.get(k))
+                .is_some_and(apply_aggregate::plan_ledger_build);
+            if target_jobs.is_empty() && (forward_keys.is_empty() || build_plan) {
                 continue;
             }
             let join_keys: Vec<&str> = {
