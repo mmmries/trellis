@@ -1295,7 +1295,18 @@ async fn plan_waiting_builds(
         let def = crate::defs::parse(&text).map_err(CatalogError::from)?;
         let chunked =
             matches!(def.key_space, KeySpace::OneToOne) && !backfill::uses_relationships(&def);
-        let planned = if chunked {
+        // Issue #558 experiment 5: a plain aggregate built by ledger
+        // re-derive chunks, claimed by every drain worker.
+        let ledger_built = crate::staging::apply_aggregate::ledger_build_eligible(&def);
+        let planned = if ledger_built {
+            backfill::plan_pk_range_chunks(
+                client,
+                table,
+                crate::staging::ledger_build::chunk_rows(),
+            )
+            .await
+            .map(Build::Chunks)
+        } else if chunked {
             backfill::plan_one_to_one_chunks(client, &def, table)
                 .await
                 .map(Build::Chunks)

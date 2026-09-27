@@ -615,6 +615,75 @@ pub(super) fn ledger_mode() -> LedgerMode {
     })
 }
 
+/// Issue #558 experiment 5: how an aggregate target is built, from
+/// `TRELLIS_EXP558_BUILD`. `ledger` builds a plain aggregate by re-deriving
+/// PK-range chunks of its source through the ledger, with the definition
+/// applying CDC from the first chunk (see [`super::ledger_build`]); anything
+/// else keeps today's build. Only effective with `TRELLIS_EXP558_LEDGER=contrib`
+/// ([`ledger_build_on`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BuildMode {
+    Direct,
+    Ledger,
+}
+
+pub(super) fn build_mode() -> BuildMode {
+    static MODE: std::sync::OnceLock<BuildMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("TRELLIS_EXP558_BUILD").as_deref() {
+        Ok("ledger") => BuildMode::Ledger,
+        _ => BuildMode::Direct,
+    })
+}
+
+/// Experiment 5 is on: the ledger build, over the contribution ledger.
+pub(crate) fn ledger_build_on() -> bool {
+    build_mode() == BuildMode::Ledger && ledger_mode() == LedgerMode::Contrib
+}
+
+/// Whether `def` is built and maintained under experiment 5's rules: the
+/// flag is on and `def` is a plain aggregate (one source, no relationship
+/// anywhere in its fields or `GROUP BY`).
+pub(crate) fn ledger_build_eligible(def: &TransformDef) -> bool {
+    ledger_build_on()
+        && matches!(def.key_space, KeySpace::Aggregate { .. })
+        && eval::relationship_references(def).is_empty()
+}
+
+/// [`ledger_build_eligible`] for a plan: every Apply of a plain aggregate
+/// target runs under experiment 5's rules while the flag is on.
+pub(super) fn plan_ledger_build(plan: &AggregateTargetPlan) -> bool {
+    ledger_build_on() && plan.rel_joins.is_empty()
+}
+
+/// Experiment 5: what a key-level Re-derive needs that the plan alone
+/// doesn't carry (see [`rederive_via_ledger`]).
+#[derive(Debug, Clone)]
+pub(super) struct RederiveCtx {
+    pub contribution_def: TransformDef,
+    pub source_columns: HashMap<String, ValueType>,
+    pub group_by_row_columns: Vec<String>,
+}
+
+impl RederiveCtx {
+    /// For a plain (relationship-free) aggregate `def`: exactly the
+    /// contribution definition, columns and `GROUP BY` row columns
+    /// [`accumulate_changes`] evaluates a change's image with, so a re-derived
+    /// row and an applied change encode groups and contributions identically.
+    pub(super) fn for_plain(
+        def: &TransformDef,
+        source_columns: &HashMap<String, ValueType>,
+    ) -> Self {
+        let KeySpace::Aggregate { group_by } = &def.key_space else {
+            panic!("RederiveCtx::for_plain called on a non-aggregate definition");
+        };
+        RederiveCtx {
+            contribution_def: contribution_def(def),
+            source_columns: source_columns.clone(),
+            group_by_row_columns: group_by_row_columns(group_by),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct AggregateTargetPlan {
     /// Issue #558 experiment 3: this batch's per-source-row ledger writes.
@@ -627,6 +696,11 @@ pub(super) struct AggregateTargetPlan {
     /// Issue #558 experiment 4: keys a reverse re-derive in this batch rewrote;
     /// a forward row for one of them is skipped (the re-derive read it live).
     pub reverse_keys: std::collections::HashSet<String>,
+    /// Issue #558 experiment 5: source keys this batch re-derives through the
+    /// ledger (a build chunk's keys, or an image-less change's) rather than
+    /// applying a delta for, and what that needs. See [`rederive_via_ledger`].
+    pub rederive_keys: Vec<String>,
+    pub rederive_ctx: Option<RederiveCtx>,
     /// Every `GROUP BY` key's **target** column name, in `GROUP BY` order —
     /// what DDL created the target's primary key columns as
     /// (`GroupByKey::target_column_name`), used by every statement that
@@ -751,6 +825,8 @@ impl AggregateTargetPlan {
             rel_check: None,
             ledger_written: false,
             reverse_keys: std::collections::HashSet::new(),
+            rederive_keys: Vec::new(),
+            rederive_ctx: None,
             group_by: group_by
                 .iter()
                 .map(|k| k.target_column_name().to_string())
@@ -1508,6 +1584,15 @@ pub(super) fn accumulate_changes(
             group_by_row_columns: group_by_cols.clone(),
         });
     }
+    // Issue #558 experiment 5: a plain aggregate under the ledger build.
+    let build = ledger_on && plan_ledger_build(plan);
+    if build && plan.rederive_ctx.is_none() {
+        plan.rederive_ctx = Some(RederiveCtx {
+            contribution_def: shape.contribution_def.clone(),
+            source_columns: shape.source_columns.clone(),
+            group_by_row_columns: group_by_cols.clone(),
+        });
+    }
     let contrib_text = |contrib: &HashMap<String, Option<String>>, fields: &[AggFieldPlan]| {
         if ledger != LedgerMode::Contrib {
             return None;
@@ -1533,6 +1618,9 @@ pub(super) fn accumulate_changes(
             ),
             _ => (None, Vec::new()),
         };
+        // Experiment 5: reconcile undoes a skipped or ledger-replaced change's
+        // Phase 2 delta from these maps, so a plain aggregate keeps them too.
+        let keep_maps = plan.rel_check.is_some() || build;
         LedgerRow {
             from_key: key.to_string(),
             group_key,
@@ -1545,14 +1633,10 @@ pub(super) fn accumulate_changes(
             } else {
                 None
             },
-            contrib_map: if plan.rel_check.is_some() {
-                contrib.cloned()
-            } else {
-                None
-            },
+            contrib_map: if keep_maps { contrib.cloned() } else { None },
             used_parent,
             old_group_key: old_side.map(|(g, _)| g.to_string()),
-            old_contrib_map: if plan.rel_check.is_some() {
+            old_contrib_map: if keep_maps {
                 old_side.map(|(_, c)| c.clone())
             } else {
                 None
@@ -1568,6 +1652,16 @@ pub(super) fn accumulate_changes(
         let new_row = &rows[i];
         if is_image_less || change.has_recompute {
             exp4_forced += 1;
+        }
+        // Experiment 5: an image-less change (or one that folded a
+        // `recompute`) re-derives its key through the ledger under the lock
+        // (`rederive_via_ledger`) instead of forcing its groups: a forced
+        // recompute would overwrite groups the ledger accounts for member by
+        // member. The groups its images name need nothing either: the ledger
+        // names the key's old group and the live read its new one.
+        if build && (is_image_less || change.has_recompute) {
+            plan.rederive_keys.push(change.key.clone());
+            continue;
         }
 
         // Issues #392/#486: groups only `named_rows` names. Issue #137
@@ -3808,12 +3902,17 @@ pub(super) async fn apply_aggregate_target(
     // it needs no extinct horizon. A live read that counted its vanished key
     // would have written a row, and whatever removed that row since was a
     // live read that found the group without the key.
-    let extinct_horizon = if group_keys.iter().any(|k| {
-        let group = &plan.groups[*k];
-        !group.force_full_recompute
-            && !group.horizon_check_only
-            && !row_horizons.contains_key(k.as_str())
-    }) {
+    // Experiment 5: the ledger's skip rule replaces both horizons, so a
+    // plain aggregate under the ledger build never reads or raises them, and
+    // never routes a delta to the re-deriving path by them.
+    let build = plan_ledger_build(plan);
+    let extinct_horizon = if !build
+        && group_keys.iter().any(|k| {
+            let group = &plan.groups[*k];
+            !group.force_full_recompute
+                && !group.horizon_check_only
+                && !row_horizons.contains_key(k.as_str())
+        }) {
         read_extinct_horizon(txn, target).await?
     } else {
         None
@@ -3829,7 +3928,7 @@ pub(super) async fn apply_aggregate_target(
         .iter()
         .filter(|k| {
             let group = &plan.groups[**k];
-            !group.force_full_recompute && {
+            !build && !group.force_full_recompute && {
                 let horizon = match row_horizons.get(k.as_str()) {
                     Some(horizon) => *horizon,
                     None if group.horizon_check_only => None,
@@ -3864,6 +3963,31 @@ pub(super) async fn apply_aggregate_target(
         deleted.extend(d);
     }
 
+    // Experiment 5: a group exists while some ledger entry counts a member
+    // in it, read after the pre-lock so a concurrent writer of the group has
+    // committed its entries. The source can't answer this during the build:
+    // it holds rows whose chunk hasn't counted them yet.
+    let ledger_members: Option<HashSet<String>> = if build {
+        let keys: Vec<&str> = group_keys
+            .iter()
+            .filter(|k| !takes_forced_path(k, &plan.groups[**k]))
+            .map(|k| k.as_str())
+            .collect();
+        let ledger = ledger_ident(target);
+        ensure_ledger(txn, target, &ledger).await?;
+        let rows = txn
+            .query(
+                &format!(
+                    "select distinct group_key from {ledger} where group_key = any($1::text[])"
+                ),
+                &[&keys],
+            )
+            .await?;
+        Some(rows.into_iter().map(|r| r.get(0)).collect())
+    } else {
+        None
+    };
+
     let mut delta_groups: Vec<(&String, &GroupPlan)> = Vec::new();
     for &key in &group_keys {
         let group = &plan.groups[key];
@@ -3879,7 +4003,10 @@ pub(super) async fn apply_aggregate_target(
         if group.horizon_check_only && !row_horizons.contains_key(key.as_str()) {
             continue;
         }
-        let exists = probe_group_exists(txn, plan, &group.group_values).await?;
+        let exists = match &ledger_members {
+            Some(members) => members.contains(key.as_str()),
+            None => probe_group_exists(txn, plan, &group.group_values).await?,
+        };
 
         if !exists {
             found_extinct = true;
@@ -3941,7 +4068,7 @@ pub(super) async fn apply_aggregate_target(
     // the group leaves no row either way, and the delete's delta must not
     // later land on a recreated group. Taken after those reads, like the
     // forced path's own horizon.
-    if found_extinct {
+    if found_extinct && !build {
         raise_extinct_horizon(txn, target).await?;
     }
 
@@ -4072,23 +4199,39 @@ async fn reconcile_with_ledger(
     let arity = plan.group_by.len();
     let fields = plan.fields.clone();
     let types = plan.group_by_types.clone();
+    // Experiment 5: a plain aggregate has no reverse rows, so every ledger row
+    // is a forward one (an insert included), and the keys this batch
+    // re-derives are locked in the same ordered statement.
+    let build = plan_ledger_build(plan);
     let mut keys: Vec<&str> = plan
         .ledger_rows
         .iter()
         .map(|r| r.from_key.as_str())
+        .chain(
+            build
+                .then_some(plan.rederive_keys.iter().map(String::as_str))
+                .into_iter()
+                .flatten(),
+        )
         .collect();
     keys.sort_unstable();
     keys.dedup();
-    txn.execute(
-        &format!("select 1 from {ledger} where from_key = any($1) order by from_key for update"),
-        &[&keys],
-    )
-    .await?;
+    if build {
+        lock_ledger_keys_with_placeholders(txn, ledger, &keys).await?;
+    } else {
+        txn.execute(
+            &format!(
+                "select 1 from {ledger} where from_key = any($1) order by from_key for update"
+            ),
+            &[&keys],
+        )
+        .await?;
+    }
     // entries + skip flags for the forward rows (the reverse rows have no `row`)
     let fwd: Vec<(&str, Option<&str>, Option<PgLsn>)> = plan
         .ledger_rows
         .iter()
-        .filter(|r| r.row.is_some() || r.old_group_key.is_some())
+        .filter(|r| build || r.row.is_some() || r.old_group_key.is_some())
         .map(|r| (r.from_key.as_str(), r.xid.as_deref(), r.lsn))
         .collect();
     let mut entries: HashMap<String, (Option<String>, Option<String>, bool)> = HashMap::new();
@@ -4118,7 +4261,7 @@ async fn reconcile_with_ledger(
     let mut kept = Vec::with_capacity(plan.ledger_rows.len());
     let rows = std::mem::take(&mut plan.ledger_rows);
     for lr in rows {
-        let forward = lr.row.is_some() || lr.old_group_key.is_some();
+        let forward = build || lr.row.is_some() || lr.old_group_key.is_some();
         if !forward {
             kept.push(lr);
             continue;
@@ -4274,13 +4417,19 @@ pub(super) async fn ledger_stage(
     targets.sort();
     for target in targets {
         let plan = plans.get_mut(&target).expect("target plan");
-        if plan.ledger_rows.is_empty() || plan.rel_joins.len() > 1 {
+        if (plan.ledger_rows.is_empty() && plan.rederive_keys.is_empty())
+            || plan.rel_joins.len() > 1
+        {
             continue;
         }
         let ledger = ledger_ident(&plan.target);
         ensure_ledger(txn, &plan.target, &ledger).await?;
         let before = plan.ledger_rows.len();
         let (skipped, corrected) = reconcile_with_ledger(txn, plan, &ledger).await?;
+        if plan_ledger_build(plan) {
+            let rederived = rederive_via_ledger(txn, plan, &ledger).await?;
+            tracing::debug!(target = %plan.target, rederived, "exp5: ledger re-derive");
+        }
         tracing::debug!(target = %plan.target, rows_before = before, rows_after = plan.ledger_rows.len(), skipped, corrected, reverse_keys = plan.reverse_keys.len(), "exp4: ledger stage");
         if !plan.ledger_rows.is_empty() {
             write_ledger(txn, &plan.target, plan).await?;
@@ -4290,8 +4439,193 @@ pub(super) async fn ledger_stage(
     Ok(())
 }
 
+/// Experiment 5: locks `keys`' ledger entries in key order, first creating a
+/// placeholder entry (no group, no contribution, no basis, no position) for
+/// every key that has none. Under the ledger build an absent entry and a
+/// placeholder mean the same thing, "nothing counted for this row yet", but
+/// only a row can be locked: without the placeholder, a build chunk and an
+/// Apply that both find no entry for a key would each add the row's full
+/// contribution. The insert runs in key order and waits out a concurrent
+/// inserter of the same key, so two writers meet on the first key they share
+/// and never deadlock; the lock statement that follows takes the same order.
+pub(super) async fn lock_ledger_keys_with_placeholders(
+    txn: &Transaction<'_>,
+    ledger: &str,
+    keys: &[&str],
+) -> Result<(), ApplyError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    txn.execute(
+        &format!(
+            "insert into {ledger} (from_key) \
+             select k from unnest($1::text[]) as k order by k \
+             on conflict (from_key) do nothing"
+        ),
+        &[&keys],
+    )
+    .await?;
+    txn.execute(
+        &format!("select 1 from {ledger} where from_key = any($1) order by from_key for update"),
+        &[&keys],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Experiment 5, Re-derive(r) for every key in [`AggregateTargetPlan::rederive_keys`]
+/// (a build chunk's keys, or an image-less change's), with the entries
+/// already locked by [`reconcile_with_ledger`]:
+///
+/// 1. read each entry's group and contribution (what the target counts for
+///    the row today; nothing for a placeholder or a tombstone);
+/// 2. in ONE statement, read `pg_current_snapshot()` and the keys' current
+///    source rows, so the rows are exactly what that snapshot shows;
+/// 3. per key, the delta is the live contribution minus the entry's: the
+///    entry's contribution leaves its group, the live one enters its group
+///    (or a same-group diff), and nothing when they agree. A key with no live
+///    row leaves its group and becomes a tombstone;
+/// 4. the entry is rewritten with the live group and contribution and the
+///    snapshot as its basis (its applied position is kept), so a change whose
+///    transaction the snapshot already shows is skipped when it drains.
+///
+/// Idempotent: a second run over the same keys finds the entries equal to
+/// the live rows and adds nothing.
+async fn rederive_via_ledger(
+    txn: &Transaction<'_>,
+    plan: &mut AggregateTargetPlan,
+    ledger: &str,
+) -> Result<usize, ApplyError> {
+    let mut keys = std::mem::take(&mut plan.rederive_keys);
+    keys.sort_unstable();
+    keys.dedup();
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let ctx = plan
+        .rederive_ctx
+        .clone()
+        .expect("a plan with keys to re-derive carries its re-derive context");
+    let fields = plan.fields.clone();
+    let types = plan.group_by_types.clone();
+    let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+
+    let mut entries: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+    for r in txn
+        .query(
+            &format!("select from_key, group_key, contrib from {ledger} where from_key = any($1)"),
+            &[&key_refs],
+        )
+        .await?
+    {
+        entries.insert(r.get(0), (r.get(1), r.get(2)));
+    }
+
+    let pk = ddl::source_primary_key_in_txn(txn, &plan.source).await?;
+    let row_columns = super::apply::live_row_columns(txn, &plan.source).await?;
+    let live_query = super::apply::live_rows_query(&plan.source, &pk, &row_columns, &key_refs)?;
+    let rows = txn
+        .query(
+            &format!(
+                "select s.snap, q.k, q.key, q.value \
+                 from (select pg_current_snapshot()::text as snap) s \
+                 left join ({}) q on true",
+                live_query.sql
+            ),
+            &live_query.params(),
+        )
+        .await?;
+    let snapshot: String = rows
+        .first()
+        .expect("the snapshot row is always returned")
+        .get(0);
+    let mut live: HashMap<String, Row> = HashMap::new();
+    for r in rows {
+        let Some(k) = r.get::<_, Option<String>>(1) else {
+            continue;
+        };
+        let field: String = r.get(2);
+        let value: Option<String> = r.get(3);
+        live.entry(k).or_default().insert(field, value);
+    }
+
+    let mut regex_cache = RegexCache::new();
+    let mut changed = 0usize;
+    for key in &keys {
+        let (old_group, old_text) = entries.get(key).cloned().unwrap_or((None, None));
+        let old = old_group.map(|g| {
+            let c = contrib_from_text(old_text.as_deref().unwrap_or_default(), &fields);
+            (g, old_text.clone().unwrap_or_default(), c)
+        });
+        let new = match live.get(key) {
+            Some(row) => {
+                let (values, group_key) = derive_group_key(row, &ctx.group_by_row_columns, &types);
+                let contrib = row_contribution(
+                    &ctx.contribution_def,
+                    row,
+                    &ctx.source_columns,
+                    &mut regex_cache,
+                )?;
+                let text = contrib_to_text(&contrib, &fields);
+                Some((values, group_key, text, contrib))
+            }
+            None => None,
+        };
+        match (&old, &new) {
+            (Some((og, ot, _)), Some((_, ng, nt, _))) if og == ng && ot == nt => {}
+            (Some((og, _, oc)), Some((values, ng, _, nc))) if og == ng => {
+                changed += 1;
+                let group = plan
+                    .groups
+                    .entry(ng.clone())
+                    .or_insert_with(|| GroupPlan::new(values.clone()));
+                diff_contributions(&fields, group, oc, nc);
+            }
+            _ => {
+                if let Some((og, _, oc)) = &old {
+                    changed += 1;
+                    let group = plan
+                        .groups
+                        .entry(og.clone())
+                        .or_insert_with(|| GroupPlan::new(group_values_from_key(og, types.len())));
+                    sub_contributions(&fields, group, oc);
+                }
+                if let Some((values, ng, _, nc)) = &new {
+                    changed += 1;
+                    let group = plan
+                        .groups
+                        .entry(ng.clone())
+                        .or_insert_with(|| GroupPlan::new(values.clone()));
+                    add_contributions(&fields, group, nc);
+                }
+            }
+        }
+        plan.ledger_rows.push(LedgerRow {
+            from_key: key.clone(),
+            group_key: new.as_ref().map(|(_, g, _, _)| g.clone()),
+            contrib: new.as_ref().map(|(_, _, t, _)| t.clone()),
+            lsn: None,
+            join_key: None,
+            basis: Some(snapshot.clone()),
+            row: None,
+            contrib_map: None,
+            used_parent: Vec::new(),
+            old_group_key: None,
+            old_contrib_map: None,
+            xid: None,
+        });
+    }
+    Ok(changed)
+}
+
 /// Creates the ledger table on first use (serialized; see the body).
-async fn ensure_ledger(
+///
+/// The advisory lock is held to the end of the caller's transaction, so a
+/// caller that does a lot of work after this should ensure the ledger in a
+/// short transaction of its own first (experiment 5's build chunks do:
+/// otherwise every chunk that starts before the table exists queues behind
+/// the one creating it, then behind each other).
+pub(super) async fn ensure_ledger(
     txn: &Transaction<'_>,
     target: &str,
     ledger: &str,
