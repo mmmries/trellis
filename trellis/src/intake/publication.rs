@@ -115,6 +115,15 @@ pub async fn reconcile_publication(
     publication: &str,
     desired_tables: &[String],
 ) -> Result<(), IntakeError> {
+    // #617: under trigger capture there is no publication; every desired
+    // table counts as captured (its triggers are installed by the harness),
+    // so only the registration markers are parked.
+    if spike_trigger_capture() {
+        let txn = client.transaction().await?;
+        park_registration_markers(&txn, desired_tables).await?;
+        txn.commit().await?;
+        return Ok(());
+    }
     let current = current_publication_tables(client, publication).await?;
     let desired: BTreeSet<&String> = desired_tables.iter().collect();
 
