@@ -257,7 +257,8 @@ designed out — but we still enforce the shape:
 A seed reproduces the *program*, not reliably a *race*, and does not survive
 generator refactors. Three artifact kinds:
 
-- **Saved seeds**, replayed first every run — cheap exact-regression catching.
+- **Saved seeds**, replayed first on the next local run — cheap exact-regression
+  catching while the generator keeps its shape. Kept local, never checked in (§9).
 - **Hand-built minimized programs** in the model's types — durable pins that double
   as documentation, immune to generator refactors.
 - **A control test beside each finding** — a case that must *converge* — proving the
@@ -352,7 +353,10 @@ Two structural notes for when faults enter the stream:
   between them. Serialize shared-cluster access through a process-wide lock.
 - Dial case counts down (12–24 per property, env override for deep runs); give each
   property its own count by cost; give shrinking a generous iteration cap.
-- Persist failing seeds to a checked-in regression file, replayed first.
+- Persist failing seeds locally, replayed first on the next run, but never check
+  them in: a seed only names the same program while the strategy keeps its shape,
+  so a checked-in seed goes stale on the next generator change (#505). A failure
+  worth keeping becomes a hand-built pin.
 - Document how to run one property alone on a clean database; every property
   bootstraps what it reads, so it never depends on run order.
 
