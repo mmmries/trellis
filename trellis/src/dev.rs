@@ -66,6 +66,10 @@ pub mod defs {
 
 /// The engine items `generative`'s backend drivers reach for under `staging`.
 pub mod staging {
+    /// Read, never set: the concurrent tier's coverage report (issue #557)
+    /// counts bursts large enough to seal into a split batch, and must follow
+    /// the threshold if it moves.
+    pub use crate::staging::claim::MIN_ROWS_TO_SPLIT;
     /// `seal_phase1`/`seal_phase2` force a seal boundary at a deterministic
     /// point so two changes land in distinct segments instead of depending on
     /// a maintenance tick's timing. There is no facade equivalent — "seal
