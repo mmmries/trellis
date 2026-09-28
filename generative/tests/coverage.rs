@@ -11,11 +11,12 @@ use std::collections::HashSet;
 use generative::generate::{
     Mutate, build_program, bulk_insert_program, checkpoint_plan_for, noise_plan_for,
     program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
-    trivial_program, trivial_program_with,
+    table_streams, trivial_program, trivial_program_with,
 };
 use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
+use generative::run::RelPath;
 use proptest::strategy::{Strategy, ValueTree};
-use proptest::test_runner::TestRunner;
+use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestError, TestRng, TestRunner};
 use trellis::dev::defs::ast::{Expr, KeySpace, Operator, ValueType};
 use trellis::dev::defs::invertibility::{AggregateArg, CountArg, Invertibility, classify};
 
@@ -1432,5 +1433,94 @@ fn trivial_program_draws_matching_missing_and_null_relationship_foreign_keys() {
         saw_match && saw_miss && saw_null,
         "relationship foreign keys must cover all three join outcomes across 500 samples \
          (matching={saw_match}, missing={saw_miss}, null={saw_null})"
+    );
+}
+
+/// Issue #505: every relationship shape reaches every reverse-propagation
+/// path ([`RelPath`]), including a from-side write landing after the parent
+/// it joins changed. That last path needs the tables' op streams
+/// interleaved (`generate::interleave_tables`): with each table's whole
+/// stream emitted in turn, every parent-side op came after every from-side
+/// op, and it was never drawn at all.
+///
+/// Sampled with [`TestRunner::deterministic`], so this pins what a fixed
+/// seed draws rather than being a probabilistic floor.
+#[test]
+fn trivial_program_drives_every_relationship_reverse_path() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = trivial_program();
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..1_000 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    for shape in [
+        "to_one_bare",
+        "to_many_in_aggregate",
+        "to_one_in_aggregate_def",
+    ] {
+        for path in RelPath::ALL {
+            let path = path.name();
+            assert!(
+                coverage
+                    .relationship_path_cases
+                    .get(&(shape, path))
+                    .is_some_and(|&n| n > 0),
+                "the {shape} relationship shape must reach the {path} reverse path across 1,000 \
+                 deterministic samples: {coverage}"
+            );
+        }
+    }
+}
+
+/// Issue #505: a failure that doesn't need the tables interleaved shrinks
+/// back to the table-by-table order, within proptest's real shrink budget
+/// (`4 * cases` iterations; `16` is the convergence properties' default
+/// case count). The planted failure is "a `TRUNCATE` in a program with at
+/// least two tables", which op order can't affect. Each run is seeded, so
+/// this pins what the shrinker does rather than being a probabilistic floor.
+#[test]
+fn an_order_independent_failure_shrinks_to_the_table_by_table_order() {
+    let is_table_ordered = |program: &Program| {
+        let order: Vec<usize> = table_streams(program).concat();
+        order.iter().copied().eq(0..program.ops.len())
+    };
+    let (mut failures, mut table_ordered) = (0, 0);
+    for seed in 1..=40u8 {
+        let mut runner = TestRunner::new_with_rng(
+            Config {
+                cases: 16,
+                failure_persistence: None,
+                ..Config::default()
+            },
+            TestRng::from_seed(RngAlgorithm::ChaCha, &[seed; 32]),
+        );
+        let result = runner.run(&trivial_program(), |program| {
+            let truncates = program
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::Truncate { .. }));
+            if truncates && program.tables.len() >= 2 {
+                Err(TestCaseError::fail("planted"))
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(TestError::Fail(_, shrunk)) = result {
+            failures += 1;
+            table_ordered += usize::from(is_table_ordered(&shrunk));
+        }
+    }
+    assert!(
+        failures >= 20,
+        "the planted failure must be found: {failures}/40 seeds"
+    );
+    assert!(
+        table_ordered * 10 >= failures * 9,
+        "an order-independent failure must shrink to the table-by-table order: only \
+         {table_ordered} of {failures} shrunk counterexamples did"
     );
 }
