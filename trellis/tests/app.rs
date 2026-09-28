@@ -515,6 +515,133 @@ async fn request_backfill_parks_a_marker_and_reports_a_park_failure_as_db() {
     );
 }
 
+/// Issue #641: `request_backfill` checks membership in the publication this
+/// connection was configured with, not the default one. It used to read
+/// `ClientOptions::default().publication`, so an instance running a
+/// non-default publication got `TableNotPublished` for every table.
+#[tokio::test]
+async fn request_backfill_checks_the_configured_publication() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table widgets (id bigint primary key); \
+             create table gadgets (id bigint primary key); \
+             create publication custom_pub for table widgets; \
+             create publication trellis_pub for table gadgets;",
+        )
+        .await
+        .expect("seed one table per publication");
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(
+        config,
+        TrellisOptions {
+            publication: Some("custom_pub".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect");
+
+    trellis
+        .request_backfill("widgets")
+        .await
+        .expect("widgets is in the configured publication");
+    let parked: i64 = client
+        .query_one(
+            "select count(*) from pending_backfill where table_name = 'trellis.widgets'",
+            &[],
+        )
+        .await
+        .expect("read markers")
+        .get(0);
+    assert_eq!(parked, 1, "request_backfill parks one marker");
+
+    let err = trellis
+        .request_backfill("gadgets")
+        .await
+        .expect_err("gadgets is only in the default publication");
+    match err {
+        trellis::TrellisError::TableNotPublished { table, publication } => {
+            assert_eq!(table, "trellis.gadgets");
+            assert_eq!(publication, "custom_pub");
+        }
+        other => panic!("expected TableNotPublished, got {other:?}: {other}"),
+    }
+}
+
+/// Issue #641 review: a staging connection configured with a non-default
+/// publication creates and reconciles *that* publication, never the default
+/// one, and its own `request_backfill` accepts the tables it published there.
+/// `connect` returns only once staging setup has reconciled the publication,
+/// so this reads the result directly, with no convergence wait.
+#[tokio::test]
+async fn a_staging_connection_publishes_into_the_configured_publication() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let client = db.pool.get().await.expect("connection");
+    client
+        .batch_execute("create table widgets (id integer primary key, price integer)")
+        .await
+        .expect("create source table");
+
+    let definer = Trellis::connect(config.clone(), TrellisOptions::default())
+        .await
+        .expect("connect definer");
+    definer
+        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shutdown definer");
+
+    let running = Trellis::connect(
+        config,
+        TrellisOptions {
+            staging: true,
+            publication: Some("custom_pub".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect a staging worker on custom_pub");
+
+    let members: Vec<String> = client
+        .query(
+            "select pubname::text from pg_publication_tables where tablename = 'widgets' \
+             order by 1",
+            &[],
+        )
+        .await
+        .expect("read publication membership")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(members, vec!["custom_pub".to_string()]);
+    let default_exists: bool = client
+        .query_one(
+            "select exists(select 1 from pg_publication where pubname = 'trellis_pub')",
+            &[],
+        )
+        .await
+        .expect("read publications")
+        .get(0);
+    assert!(
+        !default_exists,
+        "a custom_pub handle never creates trellis_pub"
+    );
+
+    running
+        .request_backfill("widgets")
+        .await
+        .expect("the handle's own publication holds widgets");
+    drop(client);
+
+    running.shutdown().await.expect("shutdown");
+}
+
 /// Issue #427: the staging worker reads what to publish from the catalog
 /// itself, so it no longer needs a definition registered before it can start
 /// (this used to fail with `TrellisError::NoDefinitions`). It starts with an
