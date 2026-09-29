@@ -129,6 +129,53 @@ async fn isolated_databases_do_not_bleed_into_each_other() {
     assert_eq!(rows_b, vec![(1, "from-b".to_string())]);
 }
 
+/// Issue #665: every test database collates the same on every machine,
+/// whatever `LANG` the test runs under. Unpinned, this box's `en_US.UTF-8`
+/// leaked in while CI got `C.UTF-8`, and a test's `ORDER BY` could pass here
+/// and fail on CI. The default is ICU `en-US`, so a query that needs bytewise
+/// order has to say `collate "C"` everywhere, not just on CI.
+#[tokio::test]
+async fn test_databases_default_to_the_icu_en_us_collation() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    let row = client
+        .query_one(
+            // PG 17 renamed `daticulocale` to `datlocale`; CI runs 16.
+            "select datlocprovider::text, \
+                    coalesce(to_jsonb(d) ->> 'datlocale', to_jsonb(d) ->> 'daticulocale'), \
+                    datcollate, datctype, pg_encoding_to_char(encoding) \
+             from pg_database d where datname = current_database()",
+            &[],
+        )
+        .await
+        .expect("read the database's locale");
+    let locale: (String, Option<String>, String, String, String) =
+        (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+    assert_eq!(
+        locale,
+        (
+            "i".to_string(),
+            Some("en-US".to_string()),
+            "C.UTF-8".to_string(),
+            "C.UTF-8".to_string(),
+            "UTF8".to_string(),
+        ),
+        "(provider, ICU locale, lc_collate, lc_ctype, encoding)"
+    );
+
+    // The point of the pin: the default collation is linguistic, so 'a'
+    // sorts before 'B', where bytewise ("C") order would put 'B' first.
+    let order: Vec<String> = client
+        .query("select v from (values ('B'), ('a')) t(v) order by v", &[])
+        .await
+        .expect("order under the default collation")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(order, ["a", "B"]);
+}
+
 /// `dropdb --force` refuses a database whose logical slot is still being
 /// streamed from, which is what a case whose client hasn't finished shutting
 /// down leaves. Dropping the handle must still remove the database and the

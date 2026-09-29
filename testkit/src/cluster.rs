@@ -298,14 +298,7 @@ impl TestCluster {
                 // A failed `initdb` can leave a partial data dir it would then
                 // refuse to reuse, so clear it before each attempt.
                 let _ = fs::remove_dir_all(&data_dir);
-                let mut cmd = Command::new("initdb");
-                cmd.arg("-D")
-                    .arg(&data_dir)
-                    .arg("-U")
-                    .arg("postgres")
-                    .arg("--auth=trust")
-                    .arg("--no-sync");
-                cmd
+                initdb_command(&data_dir)
             },
             "initdb",
         );
@@ -1248,6 +1241,36 @@ fn process_alive(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
+/// The `initdb` every test (and benchmark) cluster is made with.
+///
+/// The collation is pinned rather than taken from `LANG`, so a test database
+/// orders text the same on every machine (issue #665). Unpinned, this box's
+/// `en_US.UTF-8` gave linguistic ordering while GitHub's ubuntu runners
+/// (`C.UTF-8`) gave bytewise ordering, and a test could pass here and fail on
+/// CI.
+///
+/// The default collation is ICU `en-US`: ICU sorts the same everywhere
+/// (libc locales don't), a query that forgets `collate "C"` where it needs
+/// bytewise order fails in every test rather than only on some machines, and
+/// benchmarks pay the collation cost a production database would. UTF8 is
+/// what ICU needs. `initdb` still wants a libc locale for `lc_ctype` and
+/// `lc_collate`; `C.UTF-8` is present on every glibc since 2.35 and is what
+/// CI's runners default to.
+fn initdb_command(data_dir: &Path) -> Command {
+    let mut cmd = Command::new("initdb");
+    cmd.arg("-D")
+        .arg(data_dir)
+        .arg("-U")
+        .arg("postgres")
+        .arg("--auth=trust")
+        .arg("--no-sync")
+        .arg("--encoding=UTF8")
+        .arg("--locale=C.UTF-8")
+        .arg("--locale-provider=icu")
+        .arg("--icu-locale=en-US");
+    cmd
+}
+
 /// Like [`run_to_completion`] but retries on failure with linear backoff,
 /// re-building the command each attempt (so a per-attempt reset — e.g.
 /// clearing a partial data dir — can live in the closure). Panics with the
@@ -1614,14 +1637,7 @@ mod tests {
             run_with_retries(
                 || {
                     let _ = fs::remove_dir_all(&data_dir);
-                    let mut cmd = Command::new("initdb");
-                    cmd.arg("-D")
-                        .arg(&data_dir)
-                        .arg("-U")
-                        .arg("postgres")
-                        .arg("--auth=trust")
-                        .arg("--no-sync");
-                    cmd
+                    initdb_command(&data_dir)
                 },
                 "initdb",
             );
