@@ -9285,7 +9285,9 @@ pub async fn drain_many(
 /// tripped, or a bucket has a cursor from an earlier claimant), the first
 /// segment drains alone and any other is released for a later call. Its held
 /// buckets are grouped by cursor (all at the start, normally) and each group
-/// is walked in pages of at most `drain_batch_cap` records, keyset-ordered on
+/// is folded once, from its cursor, into a session `TEMP` table on an
+/// unpooled connection ([`super::page::MaterializedPages`]), then walked in
+/// pages of at most `drain_batch_cap` records, keyset-ordered on
 /// [`fold::PageKey`] with the truncate sentinel first. Each page is its own
 /// compute-and-apply transaction: a non-final page checks the claim and
 /// advances the cursor, the final page completes (see [`end_segment_step`]).
@@ -9613,13 +9615,26 @@ async fn drain_segments(
         fairness_escalations: 0,
         pages: 0,
     };
-    let mut records = 0usize;
+    let mut records = 0u64;
+    // One unpooled session for the whole call: each cursor group folds its
+    // share into the session's `TEMP` table once, and its pages read that
+    // table back. Dropping `pages` on any exit, `?` included, closes the
+    // session and drops the table with it.
+    let started = std::time::Instant::now();
+    let mut materialize_time = std::time::Duration::ZERO;
+    let mut read_time = std::time::Duration::ZERO;
+    let mut pages = super::page::MaterializedPages::open(pool, share.seg_seq).await?;
     for (start, buckets) in groups {
-        let mut source = super::page::RescanPages::new(pool, share.seg_seq, share.filter(&buckets));
+        let materialize_started = std::time::Instant::now();
+        records += pages
+            .materialize(&share.filter(&buckets), start.as_ref())
+            .await?;
+        materialize_time += materialize_started.elapsed();
         let mut after = start;
         loop {
-            let page = super::page::PageSource::next_page(&mut source, after.as_ref(), cap).await?;
-            records += page.records.len();
+            let read_started = std::time::Instant::now();
+            let page = pages.next_page(after.as_ref(), cap).await?;
+            read_time += read_started.elapsed();
             let step = SegmentStep {
                 seg_seq: share.seg_seq,
                 page: Some(PageClaim {
@@ -9659,6 +9674,9 @@ async fn drain_segments(
         pages = total.pages,
         records,
         cap,
+        materialize_ms = materialize_time.as_millis() as u64,
+        page_read_ms = read_time.as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
         "paged drain: the share was larger than the drain batch cap"
     );
     Ok(Some(total))
