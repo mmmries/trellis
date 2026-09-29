@@ -150,21 +150,54 @@ pub fn classify(err: &ApplyError) -> FailureClass {
     }
 }
 
+/// Whether `err` is a transient Postgres or pool failure, whichever
+/// [`ApplyError`] variant wraps it (issue #653). The drain reaches the same
+/// deadlock or dropped connection through `ApplyError::Db`, through a nested
+/// module's error (`StagingError::Db` from `append::append`,
+/// `CatalogError::Db`, `DdlError::Db`, ...), and through a pool checkout
+/// (`ApplyError::Pool`), so this walks the [`std::error::Error::source`]
+/// chain rather than matching one variant. The first
+/// [`tokio_postgres::Error`] on the chain decides: by its SQLSTATE
+/// ([`is_transient_sqlstate`]), or as a lost connection however it was
+/// reported. A dropped connection reaches the caller either with no SQLSTATE
+/// (the socket closed first) or as the server's own `FATAL` (`08xxx`,
+/// `57P01` from `pg_terminate_backend`, `57P02`, `57P03`, `57P05`), whichever
+/// arrives first, and [`crate::error_code::classify_pg_error`] already maps
+/// both to [`crate::error_code::ErrorCode::Connectivity`]. A pool timeout
+/// (waiting for a free connection, creating one, or recycling one) is
+/// transient too, since it is load or a briefly unreachable server, not
+/// anything a record did.
+fn is_transient(err: &ApplyError) -> bool {
+    let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(err) = link {
+        if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
+            return is_transient_sqlstate(pg.code())
+                || crate::error_code::classify_pg_error(pg)
+                    == crate::error_code::ErrorCode::Connectivity;
+        }
+        if let Some(deadpool_postgres::PoolError::Timeout(_)) =
+            err.downcast_ref::<deadpool_postgres::PoolError>()
+        {
+            return true;
+        }
+        link = err.source();
+    }
+    false
+}
+
 /// The transient SQLSTATEs doc 05 names (`40001`/`40P01`, lock-not-available,
 /// statement timeout) plus a dropped connection — [`tokio_postgres::Error::code`]
 /// is `None` for a connection-level failure (never reached the server to get
 /// a SQLSTATE at all), which is exactly the "dropped connection" case doc 05
 /// lists alongside the coded ones.
-fn is_transient(err: &ApplyError) -> bool {
-    let ApplyError::Db(db_err) = err else {
-        return false;
-    };
-    match db_err.code() {
+fn is_transient_sqlstate(code: Option<&tokio_postgres::error::SqlState>) -> bool {
+    use tokio_postgres::error::SqlState;
+    match code {
         Some(code) => {
-            *code == tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE
-                || *code == tokio_postgres::error::SqlState::T_R_DEADLOCK_DETECTED
-                || *code == tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE
-                || *code == tokio_postgres::error::SqlState::QUERY_CANCELED
+            *code == SqlState::T_R_SERIALIZATION_FAILURE
+                || *code == SqlState::T_R_DEADLOCK_DETECTED
+                || *code == SqlState::LOCK_NOT_AVAILABLE
+                || *code == SqlState::QUERY_CANCELED
         }
         None => true,
     }
@@ -2602,6 +2635,259 @@ mod unit_tests {
         // an unattributable isolate-classified error still surfaces rather
         // than getting blamed on something.)
         assert_eq!(classify(&ApplyError::ClaimLost), FailureClass::Isolate);
+    }
+
+    /// A `tokio_postgres::Error` with no SQLSTATE, the shape a dropped
+    /// connection takes. `tokio_postgres` has no public constructor for a
+    /// connection error, so this takes the one uncoded error its public API
+    /// builds without a server: a connection string that doesn't parse.
+    /// These tests cover routing (whichever variant wraps the Postgres
+    /// error, `classify` must reach it);
+    /// [`classify_decides_wrapped_errors_by_their_real_sqlstate`] covers
+    /// real coded errors and a real dropped connection against a server.
+    fn uncoded_pg_error() -> tokio_postgres::Error {
+        let err = "port=not-a-port"
+            .parse::<tokio_postgres::Config>()
+            .expect_err("an unparseable port is a config error");
+        assert!(err.code().is_none(), "a config error carries no SQLSTATE");
+        err
+    }
+
+    fn pool_timeout() -> crate::error::Error {
+        crate::error::Error::Pool(deadpool_postgres::PoolError::Timeout(
+            deadpool_postgres::TimeoutType::Wait,
+        ))
+    }
+
+    #[test]
+    fn classify_finds_a_transient_pg_error_whichever_variant_wraps_it() {
+        // Issue #653: only `ApplyError::Db` used to be inspected, so the same
+        // dropped connection surfaced through a nested module's error was
+        // `Isolate`, and the drain probed the whole page one record at a time
+        // for a failure no single record could reproduce.
+        use crate::defs::backfill::BackfillError;
+        use crate::defs::catalog::CatalogError;
+        use crate::intake::IntakeError;
+        use crate::staging::error::StagingError;
+        let wrapped = [
+            ("Db", ApplyError::Db(uncoded_pg_error())),
+            (
+                "Staging(Db)",
+                ApplyError::Staging(StagingError::Db(uncoded_pg_error())),
+            ),
+            (
+                "Catalog(Db)",
+                ApplyError::Catalog(CatalogError::Db(uncoded_pg_error())),
+            ),
+            (
+                "Catalog(Ddl(Db))",
+                ApplyError::Catalog(CatalogError::Ddl(DdlError::Db(uncoded_pg_error()))),
+            ),
+            ("Ddl(Db)", ApplyError::Ddl(DdlError::Db(uncoded_pg_error()))),
+            (
+                "Backfill(Db)",
+                ApplyError::Backfill(BackfillError::Db(uncoded_pg_error())),
+            ),
+            (
+                "Intake(Db)",
+                ApplyError::Intake(IntakeError::Db(uncoded_pg_error())),
+            ),
+            (
+                "Pool(Connect)",
+                ApplyError::Pool(crate::error::Error::Connect(uncoded_pg_error())),
+            ),
+            (
+                "Pool(Pool(Backend))",
+                ApplyError::Pool(crate::error::Error::Pool(
+                    deadpool_postgres::PoolError::Backend(uncoded_pg_error()),
+                )),
+            ),
+        ];
+        for (name, err) in wrapped {
+            assert_eq!(classify(&err), FailureClass::Transient, "{name}");
+        }
+    }
+
+    #[test]
+    fn classify_treats_a_pool_timeout_as_transient_whichever_variant_wraps_it() {
+        use crate::defs::catalog::CatalogError;
+        use crate::staging::error::StagingError;
+        let wrapped = [
+            ("Pool", ApplyError::Pool(pool_timeout())),
+            (
+                "Staging(Config)",
+                ApplyError::Staging(StagingError::Config(pool_timeout())),
+            ),
+            (
+                "Catalog(Pool)",
+                ApplyError::Catalog(CatalogError::Pool(pool_timeout())),
+            ),
+            ("Ddl(Pool)", ApplyError::Ddl(DdlError::Pool(pool_timeout()))),
+        ];
+        for (name, err) in wrapped {
+            assert_eq!(classify(&err), FailureClass::Transient, "{name}");
+        }
+        for timeout in [
+            deadpool_postgres::TimeoutType::Create,
+            deadpool_postgres::TimeoutType::Recycle,
+        ] {
+            let err = ApplyError::Pool(crate::error::Error::Pool(
+                deadpool_postgres::PoolError::Timeout(timeout),
+            ));
+            assert_eq!(classify(&err), FailureClass::Transient, "{timeout:?}");
+        }
+    }
+
+    #[test]
+    fn is_transient_sqlstate_matches_doc_05s_set() {
+        use tokio_postgres::error::SqlState;
+        for code in [
+            SqlState::T_R_SERIALIZATION_FAILURE,
+            SqlState::T_R_DEADLOCK_DETECTED,
+            SqlState::LOCK_NOT_AVAILABLE,
+            SqlState::QUERY_CANCELED,
+        ] {
+            assert!(is_transient_sqlstate(Some(&code)), "{}", code.code());
+        }
+        assert!(
+            is_transient_sqlstate(None),
+            "no SQLSTATE: dropped connection"
+        );
+        for code in [
+            SqlState::UNIQUE_VIOLATION,
+            SqlState::UNDEFINED_TABLE,
+            SqlState::DIVISION_BY_ZERO,
+        ] {
+            assert!(!is_transient_sqlstate(Some(&code)), "{}", code.code());
+        }
+    }
+
+    #[test]
+    fn classify_keeps_non_transient_pool_failures_as_isolate() {
+        // A closed pool means shutdown, and a config error never heals by
+        // retrying; neither is a transient failure.
+        let closed = ApplyError::Pool(crate::error::Error::Pool(
+            deadpool_postgres::PoolError::Closed,
+        ));
+        assert_eq!(classify(&closed), FailureClass::Isolate);
+        let config = ApplyError::Pool(crate::error::Error::Config("bad dsn".to_string()));
+        assert_eq!(classify(&config), FailureClass::Isolate);
+    }
+
+    /// The routing tests above only see uncoded errors, so they can't tell
+    /// "the first Postgres error decides by its SQLSTATE" from "any Postgres
+    /// error is transient". This raises real errors on a real server: a
+    /// non-transient SQLSTATE must stay `Isolate` whichever variant wraps
+    /// it, and a statement timeout (`57014`) and a dropped connection must be
+    /// `Transient`.
+    #[tokio::test]
+    async fn classify_decides_wrapped_errors_by_their_real_sqlstate() {
+        use crate::defs::catalog::CatalogError;
+        use crate::staging::error::StagingError;
+        use tokio_postgres::error::SqlState;
+
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let connect = || async {
+            let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        };
+        let client = connect().await;
+
+        let division = || async {
+            let err = client
+                .simple_query("select 1 / 0")
+                .await
+                .expect_err("division by zero");
+            assert_eq!(err.code(), Some(&SqlState::DIVISION_BY_ZERO));
+            err
+        };
+        let wrapped_division = [
+            ("Db", ApplyError::Db(division().await)),
+            (
+                "Staging(Db)",
+                ApplyError::Staging(StagingError::Db(division().await)),
+            ),
+            (
+                "Catalog(Ddl(Db))",
+                ApplyError::Catalog(CatalogError::Ddl(DdlError::Db(division().await))),
+            ),
+            (
+                "Pool(Pool(Backend))",
+                ApplyError::Pool(crate::error::Error::Pool(
+                    deadpool_postgres::PoolError::Backend(division().await),
+                )),
+            ),
+        ];
+        for (name, err) in wrapped_division {
+            assert_eq!(classify(&err), FailureClass::Isolate, "{name}");
+        }
+
+        let canceled = client
+            .batch_execute("set statement_timeout = '10ms'; select pg_sleep(5)")
+            .await
+            .expect_err("statement timeout");
+        assert_eq!(canceled.code(), Some(&SqlState::QUERY_CANCELED));
+        let err = ApplyError::Staging(StagingError::Db(canceled));
+        assert_eq!(classify(&err), FailureClass::Transient, "statement timeout");
+
+        // A connection the server has gone away from: terminate it from a
+        // second session (waiting until the backend has exited), then use it.
+        let (doomed, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect the doomed session");
+        let connection = tokio::spawn(connection);
+        let pid: i32 = doomed
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("backend pid")
+            .get(0);
+        let terminated: bool = client
+            .query_one("select pg_terminate_backend($1, 5000)", &[&pid])
+            .await
+            .expect("terminate")
+            .get(0);
+        assert!(terminated, "the doomed backend exits within the timeout");
+        // Wait for the client to see the socket close, so the next query
+        // can't race the server's own `57P01` goodbye and take it as its
+        // response.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), connection)
+            .await
+            .expect("the doomed connection ends once its backend exits");
+        let dropped = doomed
+            .simple_query("select 1")
+            .await
+            .expect_err("the connection is gone");
+        assert!(dropped.code().is_none(), "{dropped:?}");
+        let err = ApplyError::Staging(StagingError::Db(dropped));
+        assert_eq!(
+            classify(&err),
+            FailureClass::Transient,
+            "dropped connection"
+        );
+
+        // The same dropped connection can instead reach the caller as the
+        // server's own `FATAL` (`57P01` admin shutdown here, what
+        // `pg_terminate_backend` sends), depending on which arrives first.
+        // A session terminating itself gets it deterministically, as the
+        // query's own error.
+        let suicidal = connect().await;
+        let goodbye = suicidal
+            .simple_query("select pg_terminate_backend(pg_backend_pid())")
+            .await
+            .expect_err("the session terminates itself");
+        assert_eq!(goodbye.code(), Some(&SqlState::ADMIN_SHUTDOWN));
+        let err = ApplyError::Staging(StagingError::Db(goodbye));
+        assert_eq!(
+            classify(&err),
+            FailureClass::Transient,
+            "57P01 admin shutdown"
+        );
     }
     /// `EXPLAIN`'s plan text for `sql` with `params` bound, one line per row.
     async fn explain_plan(
