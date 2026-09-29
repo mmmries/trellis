@@ -30,7 +30,9 @@
 //! quarantining it individually cannot help — the fix is schema-shaped, not
 //! key-shaped.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Range;
 #[cfg(any(test, feature = "internals"))]
 use std::time::SystemTime;
 
@@ -485,6 +487,12 @@ pub enum IsolationOutcome {
     /// No single key reproduced an isolate-eligible failure on its own: the
     /// failure is not attributable to a key, so nothing was charged.
     NothingReproduced,
+    /// Isolation ran [`MAX_ISOLATION_PROBES`] probes without pinning the
+    /// failure on any key, and stopped with parts of the batch unprobed (issue
+    /// #655). Nothing was charged. Distinct from [`Self::NothingReproduced`],
+    /// which means every part of the batch that could hold a failing key was
+    /// probed.
+    ProbeLimitReached { probes: usize },
     /// At least one key reproduced the failure alone and was charged a death,
     /// but none reached the threshold, so nothing was evicted. Every entry in
     /// `charged` is below the threshold.
@@ -551,11 +559,340 @@ fn partition_by_threshold(
     (evict_now, below)
 }
 
-/// Runs `folded`'s (non-truncate) records one at a time, each computed and
-/// applied *alone* inside a probe transaction that always rolls back
-/// (skipping the drained mark), to attribute an isolate-eligible failure to
-/// the specific key(s) that fail on their own — doc 06's "Isolate before
-/// blaming." Every key that reproduces is charged one death.
+/// The most probes one [`isolate_and_evict`] call runs (issue #655).
+///
+/// Bisection finds one failing key in about `2 * log2(n)` probes, at most 34 for a
+/// page at the default `drain_batch_cap` of 100,000 records; this cap leaves
+/// room for about seven such keys in a page that size, and for many more in a
+/// smaller one. It bounds the cases where bisection alone is not cheap:
+/// most of a page failing on its own (up to `2n` probes to find them all),
+/// a run of probes that each hit a transient error, or a dead end's
+/// single-record probes (see [`Bisector`]). Hitting it charges
+/// whatever keys were already pinned; the keys it didn't reach are probed
+/// again on the batch's next failed drain.
+pub const MAX_ISOLATION_PROBES: usize = 256;
+
+/// What one isolation probe of a run of records showed (issue #655).
+#[derive(Debug)]
+enum ProbeVerdict<E> {
+    /// The run computed and applied cleanly (and was rolled back).
+    Clean,
+    /// The run failed with a [`FailureClass::Isolate`] error, carried here:
+    /// something in it fails, alone or together with others in the run.
+    Failed(E),
+    /// The run failed in a way that says nothing about its records: a
+    /// transient error, or a version fence miss. For a run of several records
+    /// that means "look closer", the same as [`Self::Failed`]; for a single
+    /// record it means "not reproduced", as it always has.
+    Unknown,
+}
+
+/// What a [`Bisector`] found.
+#[derive(Debug)]
+struct Bisection<E> {
+    /// Each single-record run that failed on its own, as its index and its
+    /// error, in index order.
+    failing: Vec<(usize, E)>,
+    /// How many probes ran.
+    probes: usize,
+    /// Whether it stopped at the probe limit with runs still unprobed.
+    exhausted: bool,
+}
+
+/// One entry on a [`Bisector`]'s stack of work still to do.
+#[derive(Debug)]
+enum Pending {
+    /// Probe `run`. `half_of` is the index in [`Bisector::splits`] of the
+    /// failing run it is a half of, or `None` for a run split because it
+    /// hit a transient error, or for a lone record.
+    Run {
+        run: Range<usize>,
+        half_of: Option<usize>,
+    },
+    /// Probe each record of `region` alone: the fallback for a dead end (see
+    /// [`Bisector`]). `step` counts the records already handed out; they run
+    /// from [`Bisector::dead_end_offset`] (modulo the region's length) up,
+    /// wrapping around to the region's start.
+    Singles { region: Range<usize>, step: usize },
+}
+
+/// A failing run that [`Bisector`] split, and how many of its two halves
+/// have come back clean.
+#[derive(Debug)]
+struct Split {
+    run: Range<usize>,
+    clean_halves: u8,
+}
+
+/// Adaptive group testing over records `0..n` (issue #655): probes the two
+/// halves of the batch, and splits and probes again only the halves that fail,
+/// down to single records. A single record that fails is reported in
+/// [`Bisection::failing`]; nothing larger ever is, so the caller can only
+/// blame a record that was shown to fail on its own.
+///
+/// The caller drives it: [`Self::next_run`] names the next run of records to
+/// probe, and [`Self::record`] takes what that probe showed. The batch as a
+/// whole is never probed: it already failed, which is why this runs. At most
+/// `max_probes` runs are handed out; past that, [`Bisection::exhausted`] is
+/// set.
+///
+/// With `k` records that fail alone, this takes at most about
+/// `2 * k * log2(n)` probes, two per halving on each failing record's path,
+/// against the `n` of probing each record alone. The probes cover `2n`
+/// records in total for one failing record (each halving covers half of what
+/// the one before it did, two runs at a time).
+///
+/// **Dead ends.** A failing run whose halves both come back clean fails only
+/// through records on both sides of the split. That is a failure that only
+/// appears in combination, or a record that fails alone masked by a
+/// batch-mate in its own half: an aggregate group's sum, say, where one
+/// record's delta alone crosses a check and a batch-mate's negative delta
+/// cancels it. Bisection alone would miss that record on every drain, where
+/// probing each record alone found it (review of #655). So at a dead end each
+/// record of both halves is probed alone, within `max_probes`. A dead end
+/// high in a large batch has more records than the probe limit leaves room
+/// for, so those probes start at `dead_end_offset` into the dead end and wrap
+/// around: [`isolate_and_evict`] picks the offset at random on each call, so
+/// across repeated drains of a wedged page every record is eventually probed
+/// alone (in about `len / max_probes` drains), where a fixed start would miss
+/// a masked record past the window on every drain. Everything else runs
+/// lowest index first, and [`Bisection::failing`] is in index order however
+/// the records were reached.
+struct Bisector<E> {
+    /// Work still to do. A stack, so the search is depth first and lowest
+    /// index first: a failing record is pinned (and so charged) before the
+    /// probe limit can stop the search, and in the batch's own order.
+    pending: Vec<Pending>,
+    /// Every failing run split so far, for detecting dead ends.
+    splits: Vec<Split>,
+    /// The `half_of` of the run [`Self::next_run`] handed out last.
+    current_half_of: Option<usize>,
+    /// Where a dead end's single-record probes start, modulo its length.
+    dead_end_offset: usize,
+    max_probes: usize,
+    found: Bisection<E>,
+}
+
+impl<E> Bisector<E> {
+    fn new(n: usize, max_probes: usize, dead_end_offset: usize) -> Self {
+        let mut bisector = Bisector {
+            pending: Vec::new(),
+            splits: Vec::new(),
+            current_half_of: None,
+            dead_end_offset,
+            max_probes,
+            found: Bisection {
+                failing: Vec::new(),
+                probes: 0,
+                exhausted: false,
+            },
+        };
+        match n {
+            0 => {}
+            1 => bisector.pending.push(Pending::Run {
+                run: 0..1,
+                half_of: None,
+            }),
+            // The whole batch already failed with an isolate-class error.
+            _ => bisector.split(0..n, true),
+        }
+        bisector
+    }
+
+    /// Pushes `run`'s two halves, the lower on top so it is probed first.
+    /// `failed` records `run` as a failing split, whose halves both coming
+    /// back clean is a dead end; a run that only hit a transient error is not.
+    fn split(&mut self, run: Range<usize>, failed: bool) {
+        let mid = run.start + run.len() / 2;
+        let half_of = failed.then(|| {
+            self.splits.push(Split {
+                run: run.clone(),
+                clean_halves: 0,
+            });
+            self.splits.len() - 1
+        });
+        self.pending.push(Pending::Run {
+            run: mid..run.end,
+            half_of,
+        });
+        self.pending.push(Pending::Run {
+            run: run.start..mid,
+            half_of,
+        });
+    }
+
+    /// The next run to probe, counted as a probe, or `None` once the search
+    /// is done or has hit the probe limit.
+    fn next_run(&mut self) -> Option<Range<usize>> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        if self.found.probes == self.max_probes {
+            self.found.exhausted = true;
+            return None;
+        }
+        self.found.probes += 1;
+        match self.pending.pop()? {
+            Pending::Run { run, half_of } => {
+                self.current_half_of = half_of;
+                Some(run)
+            }
+            Pending::Singles { region, step } => {
+                self.current_half_of = None;
+                let len = region.len();
+                let index = region.start + (self.dead_end_offset % len + step) % len;
+                if step + 1 < len {
+                    self.pending.push(Pending::Singles {
+                        region,
+                        step: step + 1,
+                    });
+                }
+                Some(index..index + 1)
+            }
+        }
+    }
+
+    /// What probing `run` (the last [`Self::next_run`]) showed.
+    fn record(&mut self, run: Range<usize>, verdict: ProbeVerdict<E>) {
+        let half_of = self.current_half_of.take();
+        match verdict {
+            ProbeVerdict::Clean => {
+                if let Some(index) = half_of {
+                    let split = &mut self.splits[index];
+                    split.clean_halves += 1;
+                    if split.clean_halves == 2 {
+                        let dead_end = split.run.clone();
+                        self.probe_halves_alone(dead_end);
+                    }
+                }
+            }
+            ProbeVerdict::Failed(err) if run.len() == 1 => {
+                self.found.failing.push((run.start, err))
+            }
+            ProbeVerdict::Unknown if run.len() == 1 => {}
+            ProbeVerdict::Failed(_) => self.split(run, true),
+            ProbeVerdict::Unknown => self.split(run, false),
+        }
+    }
+
+    /// A dead end at `run`: queues each record of its halves to be probed
+    /// alone, skipping a half that is one record (already probed alone).
+    fn probe_halves_alone(&mut self, run: Range<usize>) {
+        let mid = run.start + run.len() / 2;
+        let region = match run.len() {
+            // Both halves are single records.
+            0..=2 => return,
+            // The lower half is a single record.
+            3 => mid..run.end,
+            _ => run,
+        };
+        self.pending.push(Pending::Singles { region, step: 0 });
+    }
+
+    fn finish(mut self) -> Bisection<E> {
+        // A dead end's single-record probes can wrap around; everything else
+        // already finds records in index order.
+        self.found.failing.sort_by_key(|(index, _)| *index);
+        self.found
+    }
+}
+
+/// A fresh random [`Bisector::dead_end_offset`] for one isolation call, so a
+/// dead end larger than the probe limit is probed from a different place on
+/// each drain. No crate dependency: [`RandomState`] is randomly keyed per
+/// instance.
+///
+/// [`RandomState`]: std::collections::hash_map::RandomState
+fn random_dead_end_offset() -> usize {
+    use std::hash::BuildHasher;
+    std::collections::hash_map::RandomState::new().hash_one(std::time::SystemTime::now()) as usize
+}
+
+/// Computes and applies `records` inside a transaction that always rolls
+/// back (so it never commits the drained mark), and returns the error it
+/// failed with, if any. `Err` only for failing to check out a connection or
+/// open the transaction.
+async fn probe_records(
+    pool: &Pool,
+    seg_seq: i64,
+    claimed_by: &str,
+    wake_channel: &str,
+    records: &[FoldedChange],
+) -> Result<Option<ApplyError>, ApplyError> {
+    let plan = match apply::compute(pool, records).await {
+        Ok(plan) => plan,
+        Err(err) => return Ok(Some(err)),
+    };
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    // This probe applies-then-rolls-back purely to classify a poisoned
+    // key's failure in isolation — it never commits, so a guard (a)
+    // rejection here would only ever muddy the diagnosis of an
+    // unrelated failure, never protect real state. `saturated()`
+    // (issue #132) makes guard (a) a no-op for this probe, matching how
+    // every other guard here is unaffected too: a guard rejection is an
+    // `Ok` outcome (the fallback-Recompute path), never the
+    // `ApplyError` this probe is specifically trying to reproduce.
+    let outcome = apply::apply_and_mark_drained(
+        &txn,
+        seg_seq,
+        claimed_by,
+        &plan,
+        wake_channel,
+        &StagedWatermark::saturated(),
+    )
+    .await;
+    let _ = txn.rollback().await;
+    Ok(outcome.err())
+}
+
+/// Attributes an isolate-eligible failure in `folded` to the specific key(s)
+/// that fail on their own — doc 06's "Isolate before blaming" — and charges
+/// each one death. Every probe computes and applies a run of `folded`'s
+/// records inside a transaction that always rolls back (skipping the drained
+/// mark).
+///
+/// **Bisection, not one probe per record (issue #655).** Probing each record
+/// alone cost one compute and one rollback-only apply per record: minutes for
+/// a few thousand records, hours at the default `drain_batch_cap`, all while
+/// the worker held the page's buckets. [`Bisector`] probes the batch's two
+/// halves and splits only the halves that fail, so one failing key costs
+/// about `2 * log2(n)` probes, over `2n` records in total. A probe of many
+/// records costs about what the page's own compute and apply do, so the
+/// whole isolation costs a few page applies plus a few dozen fixed probe
+/// overheads, against `n` fixed overheads before. Only a single record that
+/// fails alone is ever charged, exactly as before; bisection only decides
+/// which single records get probed. [`MAX_ISOLATION_PROBES`] caps the total.
+///
+/// **Dead ends.** Bisection relies on a run holding a record that fails
+/// alone failing too, and a batch-mate can mask it: in an aggregate group,
+/// one record's delta alone can cross a check that another record's negative
+/// delta in the same half cancels. Then some failing run has two clean
+/// halves, which is also what a failure that only appears in combination
+/// (two records fine alone, failing together) looks like. Bisection can't
+/// tell the two apart, and descending no further would miss the masked key
+/// on every drain, where probing each record alone charged it and so
+/// eventually evicted it. So at a dead end [`Bisector`] probes each record of
+/// both halves alone, within [`MAX_ISOLATION_PROBES`]. A dead end deep in the
+/// search is small and costs a few probes. One high in a large page spends
+/// the rest of the limit on single records (cheap probes) and ends
+/// `ProbeLimitReached` unless a key was pinned. Those probes start at a
+/// random offset into the dead end on each call and wrap around, so a masked
+/// key beyond one call's reach is found on a later drain: after about
+/// `len / MAX_ISOLATION_PROBES` drains on average, each bounded by the limit,
+/// where probing each record alone took one unbounded drain. A
+/// combination-only failure charges nothing either way, as before.
+///
+/// **A transient error or version fence miss inside a probe** says nothing
+/// about the probed records. For a run of several records it is treated like
+/// a failure, so bisection looks inside it rather than skipping a half that
+/// may hold a failing key; for a single record it is not a reproduction and
+/// charges nothing, as before. Probing smaller runs is also what gives a probe
+/// that hit lock contention or a statement timeout its best chance of an
+/// answer. A persistently failing database ends at the probe limit (or
+/// propagates as `Err` once checking out a connection fails).
+///
+/// `folded`'s truncates and deferred relationship reverses are never probed.
 ///
 /// Returns (see [`IsolationOutcome`]'s variants):
 /// - `Ok(FuseDisabled)` if `threshold == 0`, without probing anything.
@@ -563,6 +900,8 @@ fn partition_by_threshold(
 ///   failure (the error is surfaced, not blamed —
 ///   [`super::apply::drain_once`] returns the *original* failure it already
 ///   holds, unmodified).
+/// - `Ok(ProbeLimitReached { .. })` if the probe limit stopped isolation
+///   before it pinned any key; handled as `NothingReproduced` is.
 /// - `Ok(ChargedBelowThreshold { .. })` if keys reproduced and were charged
 ///   but none reached `threshold`; the caller surfaces the original failure,
 ///   exactly as for `NothingReproduced`, but can say which keys it pinned.
@@ -571,7 +910,9 @@ fn partition_by_threshold(
 /// - `Err(_)` if a probe itself hit a [`FailureClass::Halting`] error: this
 ///   propagates immediately, unattributed to any key, per doc 06's "What
 ///   must never be quarantined" — discovered during isolation is no
-///   different from discovered on the whole batch.
+///   different from discovered on the whole batch. Likewise
+///   `Err(ApplyError::ClaimLost)` if a probe found the claim gone (issue
+///   #620), with nothing charged.
 ///
 /// **Accepted trade-off, not a bug — one charge per drain call**: when no key
 /// reaches `threshold`, `apply::classify_and_retry` surfaces the
@@ -609,137 +950,141 @@ pub async fn isolate_and_evict(
     // and the `retry_folded` filter at the end): those compare against
     // `folded`'s own strings, which are the ring's, not quarantine's.
     let mut canonical_srcs = CanonicalSrcTables::default();
-    let mut poisoned: Vec<PoisonedProbe> = Vec::new();
-    for change in folded {
-        // Issue #134/#135 review follow-up: a `rel_reverse_deferred` row
-        // must never be probed/poisoned/parked here, for the same reason
-        // `park_batch_contribution`/`poisoned_park` already exclude it at
-        // the `compute()` level (that module's own comment) — `poison_held`
-        // has no columns for `relationship_id`/`retry_count` and no
-        // `rel_reverse_deferred` `op` value in its own CHECK constraint
-        // (`V13__quarantine.sql`, deliberately not widened when V28 added
-        // the new ring op — see that migration's own doc comment), so
-        // parking one would silently derive a *wrong* `op` from image shape
-        // alone (`folded_change_op`), drop `relationship_id`/`retry_count`
-        // entirely, and — worse — `release_key` would later re-append it as
-        // a bogus `StagedChange::Cdc` against this op's synthetic sentinel
-        // `src_table` (`apply::relationship_reverse_deferred_src_table`),
-        // which is not a real table at all. Skipping it here is the loud,
-        // safe failure mode doc 06 asks for: if nothing else in this batch
-        // reproduces the error in isolation, `poisoned` stays empty and the
-        // caller (`classify_and_retry`'s `Isolate` arm) surfaces the
-        // original failure rather than silently corrupting quarantine
-        // state. A complete fix — genuinely quarantine-safe deferred
-        // reverses, with their own `poison_held` columns/op mirroring this
-        // issue's V28 migration — is real and larger than this follow-up;
-        // tracked separately rather than attempted here.
-        if change.is_truncate || change.relationship_reverse_deferred.is_some() {
-            continue;
-        }
-        let singleton = std::slice::from_ref(change);
-        let plan = match apply::compute(pool, singleton).await {
-            Ok(plan) => plan,
-            Err(err) => {
-                let class = classify(&err);
-                if class == FailureClass::Halting {
-                    tracing::error!(
-                        src_table = %change.src_table,
-                        key = %change.key,
-                        error = %err,
-                        "halting failure diagnosing a probed key's compute; propagating, \
-                         never quarantined"
-                    );
-                    record_halting_stop(pool, &err.to_string()).await?;
-                    return Err(err);
-                }
-                if class == FailureClass::Isolate {
-                    // ADR-0003's amendment, layered alongside (not instead
-                    // of) the row-level charge just below: a probe failure
-                    // that's specifically an evaluator error names the
-                    // calculated field it broke on
-                    // ([`crate::defs::eval::EvalError::field`]), which this
-                    // attributes to a `(transform, column)` pair and charges
-                    // toward that pair's own, independent fuse. See
-                    // [`attribute_column_failure`]'s doc comment for why
-                    // this never changes what gets returned from *this*
-                    // function — the existing row-level fuse below is
-                    // completely unmodified by this call. Also see that same
-                    // doc comment's "Ambiguous match -> no attribution,
-                    // deliberately": if the failing field name matches more
-                    // than one sibling transform on this source, this call
-                    // intentionally attributes nothing rather than guess,
-                    // and the row-level fuse below is exactly what still
-                    // protects against the failure going otherwise unhandled.
-                    let canonical = canonical_srcs.get(pool, &change.src_table).await?;
-                    attribute_column_failure(pool, &canonical, &change.key, &err).await?;
-                    poisoned.push(PoisonedProbe {
-                        raw_src_table: change.src_table.clone(),
-                        canonical_src_table: canonical,
-                        key: change.key.clone(),
-                        last_error: err.to_string(),
-                    });
-                }
-                continue;
-            }
-        };
 
-        let mut client = pool.get().await?;
-        let txn = client.transaction().await?;
-        // This probe applies-then-rolls-back purely to classify a poisoned
-        // key's failure in isolation — it never commits, so a guard (a)
-        // rejection here would only ever muddy the diagnosis of an
-        // unrelated failure, never protect real state. `saturated()`
-        // (issue #132) makes guard (a) a no-op for this probe, matching how
-        // every other guard here is unaffected too: a guard rejection is an
-        // `Ok` outcome (the fallback-Recompute path), never the
-        // `ApplyError` this probe is specifically trying to reproduce.
-        let outcome = apply::apply_and_mark_drained(
-            &txn,
-            seg_seq,
-            claimed_by,
-            &plan,
-            wake_channel,
-            &StagedWatermark::saturated(),
-        )
-        .await;
-        let _ = txn.rollback().await;
-        if let Err(err) = outcome {
-            // Issue #620: a probe that finds its claim gone reproduced the
-            // lost claim, not this key's failure, and every later probe would
-            // reproduce it too, charging every key in the page a death. Stop
-            // and surface it, as `apply::classify_and_retry` does for a
-            // page's own `ClaimLost`: whoever holds the buckets now re-drains
-            // the page, and a genuinely failing key is charged then.
-            if matches!(err, ApplyError::ClaimLost) {
-                return Err(err);
-            }
-            let class = classify(&err);
-            if class == FailureClass::Halting {
+    // Issue #134/#135 review follow-up: a `rel_reverse_deferred` row
+    // must never be probed/poisoned/parked here, for the same reason
+    // `park_batch_contribution`/`poisoned_park` already exclude it at
+    // the `compute()` level (that module's own comment) — `poison_held`
+    // has no columns for `relationship_id`/`retry_count` and no
+    // `rel_reverse_deferred` `op` value in its own CHECK constraint
+    // (`V13__quarantine.sql`, deliberately not widened when V28 added
+    // the new ring op — see that migration's own doc comment), so
+    // parking one would silently derive a *wrong* `op` from image shape
+    // alone (`folded_change_op`), drop `relationship_id`/`retry_count`
+    // entirely, and — worse — `release_key` would later re-append it as
+    // a bogus `StagedChange::Cdc` against this op's synthetic sentinel
+    // `src_table` (`apply::relationship_reverse_deferred_src_table`),
+    // which is not a real table at all. Skipping it here is the loud,
+    // safe failure mode doc 06 asks for: if nothing else in this batch
+    // reproduces the error in isolation, `poisoned` stays empty and the
+    // caller (`classify_and_retry`'s `Isolate` arm) surfaces the
+    // original failure rather than silently corrupting quarantine
+    // state. A complete fix — genuinely quarantine-safe deferred
+    // reverses, with their own `poison_held` columns/op mirroring this
+    // issue's V28 migration — is real and larger than this follow-up;
+    // tracked separately rather than attempted here.
+    let probeable = |c: &FoldedChange| !c.is_truncate && c.relationship_reverse_deferred.is_none();
+    let candidates: Cow<'_, [FoldedChange]> = if folded.iter().all(probeable) {
+        Cow::Borrowed(folded)
+    } else {
+        Cow::Owned(folded.iter().filter(|c| probeable(c)).cloned().collect())
+    };
+
+    let mut bisector = Bisector::new(
+        candidates.len(),
+        MAX_ISOLATION_PROBES,
+        random_dead_end_offset(),
+    );
+    while let Some(run) = bisector.next_run() {
+        let records = &candidates[run.clone()];
+        let Some(err) = probe_records(pool, seg_seq, claimed_by, wake_channel, records).await?
+        else {
+            bisector.record(run, ProbeVerdict::Clean);
+            continue;
+        };
+        // Issue #620: a probe that finds its claim gone reproduced the lost
+        // claim, not this run's failure, and every later probe would
+        // reproduce it too, charging every key in the page a death. Stop and
+        // surface it, as `apply::classify_and_retry` does for a page's own
+        // `ClaimLost`: whoever holds the buckets now re-drains the page, and
+        // a genuinely failing key is charged then.
+        if matches!(err, ApplyError::ClaimLost) {
+            return Err(err);
+        }
+        let verdict = match classify(&err) {
+            FailureClass::Halting => {
                 tracing::error!(
-                    src_table = %change.src_table,
-                    key = %change.key,
+                    src_table = %records[0].src_table,
+                    key = %records[0].key,
+                    records = records.len(),
                     error = %err,
-                    "halting failure diagnosing a probed key's apply; propagating, never \
+                    "halting failure diagnosing an isolation probe; propagating, never \
                      quarantined"
                 );
                 record_halting_stop(pool, &err.to_string()).await?;
                 return Err(err);
             }
-            if class == FailureClass::Isolate {
-                let canonical = canonical_srcs.get(pool, &change.src_table).await?;
-                attribute_column_failure(pool, &canonical, &change.key, &err).await?;
-                poisoned.push(PoisonedProbe {
-                    raw_src_table: change.src_table.clone(),
-                    canonical_src_table: canonical,
-                    key: change.key.clone(),
-                    last_error: err.to_string(),
-                });
+            FailureClass::Isolate => {
+                if let [change] = records {
+                    // ADR-0003's amendment, layered alongside (not instead
+                    // of) the row-level charge below: a probe failure that's
+                    // specifically an evaluator error names the calculated
+                    // field it broke on
+                    // ([`crate::defs::eval::EvalError::field`]), which this
+                    // attributes to a `(transform, column)` pair and charges
+                    // toward that pair's own, independent fuse. See
+                    // [`attribute_column_failure`]'s doc comment for why this
+                    // never changes what gets returned from *this* function
+                    // — the row-level fuse below is completely unmodified by
+                    // this call. Also see that same doc comment's "Ambiguous
+                    // match -> no attribution, deliberately": if the failing
+                    // field name matches more than one sibling transform on
+                    // this source, this call intentionally attributes nothing
+                    // rather than guess, and the row-level fuse below is
+                    // exactly what still protects against the failure going
+                    // otherwise unhandled. Only a single record's failure is
+                    // attributed, since a run's names no one key; and it is
+                    // attributed as each key is pinned, so a column fuse that
+                    // trips mid-isolation pauses the column for the probes
+                    // after it.
+                    let canonical = canonical_srcs.get(pool, &change.src_table).await?;
+                    attribute_column_failure(pool, &canonical, &change.key, &err).await?;
+                }
+                ProbeVerdict::Failed(err)
             }
-        }
+            FailureClass::Transient | FailureClass::VersionFenceMiss => ProbeVerdict::Unknown,
+        };
+        bisector.record(run, verdict);
+    }
+    let bisection = bisector.finish();
+
+    tracing::debug!(
+        seg_seq,
+        records = candidates.len(),
+        probes = bisection.probes,
+        reproduced = bisection.failing.len(),
+        "isolation probes finished"
+    );
+    if bisection.exhausted {
+        tracing::warn!(
+            seg_seq,
+            records = candidates.len(),
+            probes = bisection.probes,
+            reproduced = bisection.failing.len(),
+            "isolation stopped at its probe limit; records it did not reach are not charged \
+             this drain"
+        );
+    }
+
+    let mut poisoned: Vec<PoisonedProbe> = Vec::with_capacity(bisection.failing.len());
+    for (index, err) in bisection.failing {
+        let change = &candidates[index];
+        poisoned.push(PoisonedProbe {
+            raw_src_table: change.src_table.clone(),
+            canonical_src_table: canonical_srcs.get(pool, &change.src_table).await?,
+            key: change.key.clone(),
+            last_error: err.to_string(),
+        });
     }
 
     if poisoned.is_empty() {
-        return Ok(IsolationOutcome::NothingReproduced);
+        return Ok(if bisection.exhausted {
+            IsolationOutcome::ProbeLimitReached {
+                probes: bisection.probes,
+            }
+        } else {
+            IsolationOutcome::NothingReproduced
+        });
     }
 
     let mut charged: Vec<(PoisonedProbe, i32)> = Vec::with_capacity(poisoned.len());
@@ -2522,6 +2867,291 @@ mod unit_tests {
             key: key.to_string(),
             last_error: "boom".to_string(),
         }
+    }
+
+    /// `ceil(log2(n))`: how many halvings take `n` records down to one.
+    fn halvings(n: usize) -> usize {
+        (usize::BITS - (n - 1).leading_zeros()) as usize
+    }
+
+    /// Drives a [`Bisector`] over `n` records with a synthetic probe:
+    /// `verdict` decides each run's outcome from its range alone.
+    fn bisect_with(
+        n: usize,
+        max_probes: usize,
+        verdict: impl Fn(&Range<usize>) -> ProbeVerdict<()>,
+    ) -> Bisection<()> {
+        bisect_from(n, max_probes, 0, verdict)
+    }
+
+    /// [`bisect_with`], with dead ends' single-record probes starting at
+    /// `dead_end_offset`.
+    fn bisect_from(
+        n: usize,
+        max_probes: usize,
+        dead_end_offset: usize,
+        verdict: impl Fn(&Range<usize>) -> ProbeVerdict<()>,
+    ) -> Bisection<()> {
+        let mut bisector = Bisector::new(n, max_probes, dead_end_offset);
+        while let Some(run) = bisector.next_run() {
+            let outcome = verdict(&run);
+            bisector.record(run, outcome);
+        }
+        bisector.finish()
+    }
+
+    /// A run fails when it holds any of `poisoned`, each of which fails alone.
+    fn fails_alone(poisoned: &[usize]) -> impl Fn(&Range<usize>) -> ProbeVerdict<()> + '_ {
+        move |run| {
+            if poisoned.iter().any(|p| run.contains(p)) {
+                ProbeVerdict::Failed(())
+            } else {
+                ProbeVerdict::Clean
+            }
+        }
+    }
+
+    fn failing_indexes(found: &Bisection<()>) -> Vec<usize> {
+        found.failing.iter().map(|(index, ())| *index).collect()
+    }
+
+    /// Issue #655: one poisoned record, the only failure in a page at the
+    /// default `drain_batch_cap`, is found in two probes per halving (34),
+    /// not one probe per record (100,000), wherever it sits in the page.
+    #[test]
+    fn bisect_finds_the_one_poisoned_record_in_two_probes_per_halving() {
+        let n = 100_000;
+        for p in [0, 1, 49_999, 50_000, 73_421, n - 1] {
+            let found = bisect_with(n, MAX_ISOLATION_PROBES, fails_alone(&[p]));
+            assert_eq!(failing_indexes(&found), vec![p]);
+            assert!(
+                found.probes <= 2 * halvings(n),
+                "record {p}: {} probes, more than 2 per halving ({})",
+                found.probes,
+                2 * halvings(n)
+            );
+            assert!(!found.exhausted);
+        }
+    }
+
+    /// Issue #655: two poisoned records are both found, in at most two probes
+    /// per halving each, whether their paths split at the top or share every
+    /// halving but the last.
+    #[test]
+    fn bisect_finds_two_poisoned_records() {
+        let n = 100_000;
+        for poisoned in [[17, 90_000], [500, 501], [0, n - 1]] {
+            let found = bisect_with(n, MAX_ISOLATION_PROBES, fails_alone(&poisoned));
+            assert_eq!(failing_indexes(&found), poisoned.to_vec());
+            assert!(
+                found.probes <= 2 * 2 * halvings(n),
+                "{poisoned:?}: {} probes",
+                found.probes
+            );
+            assert!(!found.exhausted);
+        }
+    }
+
+    #[test]
+    fn bisect_probes_a_single_record_batch_once_and_an_empty_one_never() {
+        let found = bisect_with(1, MAX_ISOLATION_PROBES, fails_alone(&[0]));
+        assert_eq!((failing_indexes(&found), found.probes), (vec![0], 1));
+        let found = bisect_with(1, MAX_ISOLATION_PROBES, fails_alone(&[]));
+        assert_eq!((failing_indexes(&found), found.probes), (vec![], 1));
+        let found = bisect_with(0, MAX_ISOLATION_PROBES, fails_alone(&[]));
+        assert_eq!((failing_indexes(&found), found.probes), (vec![], 0));
+    }
+
+    /// Two records that are fine alone but fail together: bisection follows
+    /// the pair down until the halving that splits it, where neither half
+    /// fails. That dead end probes each record of both halves alone, finds
+    /// nothing to blame, and blames nothing. Deep in the search that is a few
+    /// probes; at the top of a large page it is the rest of the probe limit.
+    #[test]
+    fn bisect_blames_nothing_for_a_failure_that_only_appears_in_combination() {
+        let n = 100_000;
+        let pair = |a: usize, b: usize| {
+            move |run: &Range<usize>| {
+                if run.contains(&a) && run.contains(&b) {
+                    ProbeVerdict::Failed(())
+                } else {
+                    ProbeVerdict::Clean
+                }
+            }
+        };
+        // Split deep in the search: a small dead end.
+        let found = bisect_with(n, MAX_ISOLATION_PROBES, pair(10, 11));
+        assert!(found.failing.is_empty(), "{:?}", found.failing);
+        assert!(!found.exhausted);
+        assert!(found.probes <= 2 * halvings(n), "{} probes", found.probes);
+        // Split by the first halving: the dead end is the whole page.
+        for (a, b) in [(10, 60_000), (49_999, 50_000)] {
+            let found = bisect_with(n, MAX_ISOLATION_PROBES, pair(a, b));
+            assert!(found.failing.is_empty(), "({a}, {b}): {:?}", found.failing);
+            assert!(found.exhausted);
+            assert_eq!(found.probes, MAX_ISOLATION_PROBES);
+        }
+        // A two-record page: its halves are single records, already probed
+        // alone, so the dead end costs nothing more.
+        let found = bisect_with(2, MAX_ISOLATION_PROBES, pair(0, 1));
+        assert_eq!((found.failing.len(), found.probes), (0, 2));
+    }
+
+    /// Review of #655: a dead end larger than the probe limit is probed from
+    /// `dead_end_offset` and wraps around, so a masked record out of reach of
+    /// one call's window is reached by a call with another offset, and random
+    /// offsets reach it within a bounded number of calls.
+    #[test]
+    fn bisect_rotates_a_large_dead_ends_single_record_probes() {
+        let n = 100_000;
+        let masked = |k: usize| {
+            move |run: &Range<usize>| {
+                let holds = |i: usize| run.contains(&i);
+                if holds(k) && (!holds(5) || holds(90_000)) {
+                    ProbeVerdict::Failed(())
+                } else {
+                    ProbeVerdict::Clean
+                }
+            }
+        };
+        // Record 30,000 is masked by record 5 in the lower half, and 90,000
+        // in the upper half completes the failure: a dead end at the top.
+        // Out of reach from offset 0: the window is records 0..254.
+        let found = bisect_from(n, MAX_ISOLATION_PROBES, 0, masked(30_000));
+        assert!(found.failing.is_empty());
+        assert!(found.exhausted);
+        // An offset whose window covers it finds it.
+        let found = bisect_from(n, MAX_ISOLATION_PROBES, 29_900, masked(30_000));
+        assert_eq!(failing_indexes(&found), vec![30_000]);
+        // The window wraps from the dead end's last record to its first.
+        let found = bisect_from(n, MAX_ISOLATION_PROBES, n - 100, masked(50));
+        assert_eq!(failing_indexes(&found), vec![50]);
+        // The offset is taken modulo the dead end's length.
+        let found = bisect_from(n, MAX_ISOLATION_PROBES, 3 * n + 29_900, masked(30_000));
+        assert_eq!(failing_indexes(&found), vec![30_000]);
+
+        // Seeded offsets (splitmix64), one per call as `isolate_and_evict`
+        // draws them: the masked record is found well within the bound. Each
+        // call's window covers 254 of 100,000 records, so about 394 calls are
+        // expected; 4,000 is ten times that.
+        let mut seed: u64 = 0x655;
+        let mut next_offset = || {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            (z ^ (z >> 31)) as usize
+        };
+        let calls = (1..=4_000)
+            .find(|_| {
+                let found = bisect_from(n, MAX_ISOLATION_PROBES, next_offset(), masked(30_000));
+                assert!(found.probes <= MAX_ISOLATION_PROBES);
+                !found.failing.is_empty()
+            })
+            .expect("a masked record out of one window's reach is found within 4,000 calls");
+        assert!(
+            calls > 1,
+            "the first seeded offset should not happen to cover it"
+        );
+    }
+
+    /// Review of #655: a record that fails alone, masked inside its half by a
+    /// batch-mate (a run fails only if it holds `k` without `m`, or `k`, `m`
+    /// and `r` together, as an aggregate sum crossing a check might). The
+    /// failing run whose halves both come back clean is a dead end, and
+    /// probing its records alone pins `k`, as probing every record alone
+    /// did before bisection.
+    #[test]
+    fn bisect_pins_a_record_masked_by_a_batch_mate_in_its_half() {
+        let masked = |k: usize, m: usize, r: usize| {
+            move |run: &Range<usize>| {
+                let holds = |i: usize| run.contains(&i);
+                if holds(k) && (!holds(m) || holds(r)) {
+                    ProbeVerdict::Failed(())
+                } else {
+                    ProbeVerdict::Clean
+                }
+            }
+        };
+        // Halves {0, 1} and {2, 3} both pass: two half probes, four singles.
+        let found = bisect_with(4, MAX_ISOLATION_PROBES, masked(1, 0, 3));
+        assert_eq!(failing_indexes(&found), vec![1]);
+        assert_eq!(found.probes, 6);
+        assert!(!found.exhausted);
+
+        // A dead end deep in a large page is small and cheap.
+        let n = 100_000;
+        let found = bisect_with(n, MAX_ISOLATION_PROBES, masked(1001, 1000, 1010));
+        assert_eq!(failing_indexes(&found), vec![1001]);
+        assert!(!found.exhausted);
+        assert!(
+            found.probes <= 2 * halvings(n) + 8,
+            "{} probes",
+            found.probes
+        );
+
+        // A dead end at the top of a large page: the single-record probes
+        // reach a masked record near its start before the probe limit, and
+        // the limit stops them past that.
+        let found = bisect_with(n, MAX_ISOLATION_PROBES, masked(100, 5, 90_000));
+        assert_eq!(failing_indexes(&found), vec![100]);
+        assert!(found.exhausted);
+        // Only single records are probed past the first two halves.
+        let found = bisect_with(n, MAX_ISOLATION_PROBES, masked(1000, 5, 90_000));
+        assert!(found.failing.is_empty());
+        assert!(found.exhausted);
+    }
+
+    /// A transient error says nothing about the run. Bisection looks inside a
+    /// run that hit one rather than skipping a half that may hold a failing
+    /// record, and never blames a single record for one.
+    #[test]
+    fn bisect_looks_inside_a_transient_run_and_never_blames_a_record_for_it() {
+        let n = 1000;
+        // Record 100 makes every run holding it hit a transient error; 900
+        // fails alone, and so does 150, which shares 100's half.
+        let found = bisect_with(n, MAX_ISOLATION_PROBES, |run| {
+            if run.contains(&900) || run.contains(&150) {
+                ProbeVerdict::Failed(())
+            } else if run.contains(&100) {
+                ProbeVerdict::Unknown
+            } else {
+                ProbeVerdict::Clean
+            }
+        });
+        assert_eq!(failing_indexes(&found), vec![150, 900]);
+        assert!(!found.exhausted);
+
+        // A run that hits a transient error on every probe is searched down
+        // to single records, none of which is blamed.
+        let found = bisect_with(8, MAX_ISOLATION_PROBES, |_| ProbeVerdict::Unknown);
+        assert!(found.failing.is_empty());
+        assert_eq!(
+            found.probes, 14,
+            "every run of a full binary tree over 8 but the root"
+        );
+    }
+
+    /// The probe limit stops the search, keeping what it pinned so far. Depth
+    /// first, lowest index first: the lowest failing records are pinned before
+    /// the limit, so repeated isolations of the same batch charge the same
+    /// keys and drive them to eviction.
+    #[test]
+    fn bisect_stops_at_the_probe_limit_keeping_what_it_pinned() {
+        let found = bisect_with(1000, 64, |_| ProbeVerdict::Failed(()));
+        assert_eq!(found.probes, 64);
+        assert!(found.exhausted);
+        let failing = failing_indexes(&found);
+        assert!(!failing.is_empty());
+        assert_eq!(failing, (0..failing.len()).collect::<Vec<_>>());
+
+        // Exactly enough probes finishes without being exhausted.
+        let needed = bisect_with(1000, MAX_ISOLATION_PROBES, fails_alone(&[123])).probes;
+        let found = bisect_with(1000, needed, fails_alone(&[123]));
+        assert!(!found.exhausted);
+        assert_eq!(failing_indexes(&found), vec![123]);
+        let found = bisect_with(1000, needed - 1, fails_alone(&[123]));
+        assert!(found.exhausted);
     }
 
     #[test]
