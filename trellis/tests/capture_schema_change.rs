@@ -1066,3 +1066,112 @@ async fn the_partial_images_keep_odd_identifiers() {
     );
     assert_eq!(markers(&raw, since).await.len(), 3, "one per statement");
 }
+
+/// A definition paused for a missing column no longer holds its table's
+/// catch-up marker for every other definition on it (#705). `ta` is edited
+/// to read `spare`, a column nothing imaged yet, so its new field waits for
+/// a capture imaging `spare` (`column_status.awaiting_capture`) and its
+/// catch-up marker's discharge holds until one does. Before any pass widens
+/// capture, `a` (which only `ta` reads) is renamed, so the drain pauses `ta`
+/// with a capture failure and capture stops imaging for it: `a` is gone and
+/// `spare` is read by no one else, so capture can never image them. `tb`'s
+/// own edit then parks a catch-up on the same table. The discharge must not
+/// wait on the paused `ta`'s columns, so `tb` catches up and goes live
+/// while `ta` stays paused. `ta`'s status names only its capture failure,
+/// not a capture wait on the table. Once the column is back, resuming `ta`
+/// releases `spare2` and rebuilds it over every write made meanwhile.
+#[tokio::test]
+async fn a_definition_paused_for_a_missing_column_does_not_hold_the_tables_catch_up() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+
+    trellis
+        .apply("ALTER TRANSFORM ta ADD spare AS spare2")
+        .await
+        .expect("alter ta");
+    let awaiting: bool = raw
+        .query_one(
+            "select exists (select 1 from column_status \
+             where transform_table = 'ta' and column_name = 'spare2' and awaiting_capture)",
+            &[],
+        )
+        .await
+        .expect("read column_status")
+        .get(0);
+    assert!(awaiting, "spare2 waits for a capture imaging spare");
+
+    raw.batch_execute("alter table public.u rename column a to a2; update public.u set b = b + 1")
+        .await
+        .expect("writes after the rename");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "ta").await, TransformStatus::Paused);
+
+    trellis
+        .apply("ALTER TRANSFORM tb ADD b AS b3")
+        .await
+        .expect("alter tb");
+    assert_eq!(status(&raw, "tb").await, TransformStatus::CatchingUp);
+
+    bring_live(&mut raw, &db.pool, &["tb"]).await;
+    assert_eq!(
+        rows(&raw, "select id::text, b3::text from public.tb order by id").await,
+        rows(&raw, "select id::text, b::text from public.u order by id").await,
+        "tb's new field caught up"
+    );
+    // A lock wait on the table's capture, as a pass records one, is not
+    // what the paused `ta` waits on, though its `spare2` still awaits
+    // capture: only the resume its capture failure asks for gets it going.
+    raw.batch_execute(
+        "insert into capture_holdups \
+             (table_name, since, operation, lock_mode, observed_at, blockers) \
+         values ('public.u', now(), 'widen', 'ShareRowExclusiveLock', now(), '{}')",
+    )
+    .await
+    .expect("record a lock wait");
+    let reported = trellis.status("ta").await.expect("status").expect("ta");
+    assert_eq!(reported.status, TransformStatus::Paused);
+    assert_eq!(reported.capture_wait, None, "{reported:?}");
+    assert_eq!(
+        reported.capture_failure.expect("the reason").columns,
+        vec!["a".to_string()]
+    );
+    raw.batch_execute("delete from capture_holdups")
+        .await
+        .expect("clear the lock wait");
+
+    // Once the column is back, resuming `ta` counts it again: the widen
+    // images `a` and `spare`, `spare2` is released, and the rebuild covers
+    // every write made while `ta` was left out.
+    raw.batch_execute(
+        "alter table public.u rename column a2 to a; \
+         update public.u set a = a + 5, spare = id * 7",
+    )
+    .await
+    .expect("rename back and write");
+    trellis.apply("RESUME TRANSFORM ta").await.expect("resume");
+    bring_live(&mut raw, &db.pool, &["ta", "tb"]).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, a::text, spare2::text from public.ta order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select id::text, a::text, spare::text from public.u order by id"
+        )
+        .await,
+        "the resumed ta rebuilt with its edited field"
+    );
+    let left: i64 = raw
+        .query_one(
+            "select count(*) from column_status where transform_table = 'ta'",
+            &[],
+        )
+        .await
+        .expect("read column_status")
+        .get(0);
+    assert_eq!(left, 0, "spare2 no longer waits");
+}
