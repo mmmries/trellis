@@ -199,10 +199,10 @@
 //!
 //! # The Trellis role (#622 plan Q3)
 //!
-//! One role does everything Trellis does: it owns the instance schema and
-//! the ring, runs the migrations and the staging worker, and installs and
-//! owns the capture functions. There is no separate capture role. What that
-//! role needs:
+//! One role does everything Trellis does: it owns the ring (and the
+//! instance schema, unless a DBA pre-created it, below), runs the migrations
+//! and the staging worker, and installs and owns the capture functions.
+//! There is no separate capture role. What that role needs:
 //!
 //! - **On each captured table, ownership or membership in the owning
 //!   role.** `CREATE TRIGGER` needs the `TRIGGER` privilege, but `ALTER TABLE
@@ -214,10 +214,20 @@
 //!
 //! The functions are `SECURITY DEFINER`, so they run as their owner, the
 //! Trellis role, whichever application role writes the table, and the
-//! application needs no privilege on Trellis's schema. A session that isn't
-//! the schema's owner itself but a member of it (a login role granted the
-//! Trellis role, say) hands the functions to the owner with `ALTER FUNCTION
-//! … OWNER TO` in the same transaction.
+//! application needs no privilege on Trellis's schema. What they write is the
+//! ring (`seg_*`, the `change_id` sequence and `ring_slot_mirror`), so their
+//! owner is the ring's owner, the role that ran the migrations. A session
+//! that isn't that role itself but a member of it (a login role granted the
+//! Trellis role, say) hands the functions to it with `ALTER FUNCTION … OWNER
+//! TO` in the same transaction, and a session that isn't a member fails
+//! there, loudly, instead of installing functions that can't write.
+//!
+//! The schema's owner is not a stand-in for the ring's (issue #701). A DBA
+//! can pre-create the schema as one role and have a login role that is a
+//! member of it run the migrations: `create schema if not exists` keeps the
+//! DBA's role as the schema's owner, while the ring belongs to the login
+//! role, and the schema's owner has no privilege on it. Functions owned by
+//! the schema's owner would fail every captured write.
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -528,7 +538,7 @@ pub async fn narrow(
     schema: &str,
     spec: &CaptureSpec,
 ) -> Result<(), CaptureError> {
-    let owner = foreign_schema_owner(&*client, schema).await?;
+    let owner = foreign_ring_owner(&*client, schema).await?;
     let txn = client.transaction().await?;
     for statement in sql::function_statements(schema, spec)? {
         txn.batch_execute(&statement).await?;
@@ -656,7 +666,7 @@ async fn attempt(
 ) -> Result<(), CaptureError> {
     let table = op.table();
     let owner = match op {
-        Op::Install(_) | Op::Widen(_) => foreign_schema_owner(&*client, schema).await?,
+        Op::Install(_) | Op::Widen(_) => foreign_ring_owner(&*client, schema).await?,
         Op::Uninstall(_) => None,
     };
     let txn = client.transaction().await?;
@@ -717,22 +727,36 @@ async fn attempt(
     Ok(())
 }
 
-/// The role that owns instance schema `schema`, when the session's role
-/// isn't it: the functions are handed to it (see "The Trellis role").
-async fn foreign_schema_owner(
+/// A scalar subquery for the oid of the role that owns the ring of the
+/// instance schema bound to `$1`, the role the capture functions belong to
+/// (see "The Trellis role"); `null` when the schema has no ring. `seg_0`
+/// stands for the ring: the migrations create every ring table as one role,
+/// and `self_check`'s capture audit, which expects the functions to belong
+/// to this same role, also checks that it holds every privilege their body
+/// uses on the other ring objects.
+pub(crate) const RING_OWNER: &str = "(select c.relowner from pg_catalog.pg_class c \
+     join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+     where n.nspname = $1 and c.relname = 'seg_0')";
+
+/// The role that owns instance schema `schema`'s ring ([`RING_OWNER`]), when
+/// the session's role isn't it: the functions are handed to it (see "The
+/// Trellis role").
+async fn foreign_ring_owner(
     client: &impl GenericClient,
     schema: &str,
 ) -> Result<Option<String>, CaptureError> {
     let row = client
-        .query_opt(
-            "select case when n.nspowner = r.oid then null \
-                         else pg_catalog.pg_get_userbyid(n.nspowner)::text end \
-             from pg_catalog.pg_namespace n, pg_catalog.pg_roles r \
-             where n.nspname = $1 and r.rolname = current_user",
+        .query_one(
+            &format!(
+                "select case when o.owner = r.oid then null \
+                             else pg_catalog.pg_get_userbyid(o.owner)::text end \
+                 from (select {RING_OWNER} as owner) o, pg_catalog.pg_roles r \
+                 where r.rolname = current_user"
+            ),
             &[&schema],
         )
         .await?;
-    Ok(row.and_then(|row| row.get(0)))
+    Ok(row.get(0))
 }
 
 /// The longest query text a [`Blocker`] carries, in characters.
