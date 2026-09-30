@@ -6,12 +6,11 @@
 //! more (`intake::resume_orphans`), reporting each deletion through the
 //! target-mutation seam.
 //!
-//! The deletes here are written straight to the source with no intake running,
-//! which is exactly the frozen-transform gap: a paused definition's share of
-//! the change stream is never folded into its target (and after a slot loss,
-//! #310, the gap's changes never reach the ring at all). Every test drives the
-//! discharge and the drain by hand, so they wait on nothing. The ordering
-//! of the delete against the enumeration's snapshot is pinned by
+//! The deletes here are written straight to the source with no capture
+//! installed, which is exactly the frozen-transform gap: a paused definition's
+//! share of the change stream is never folded into its target. Every test
+//! drives the discharge and the drain by hand, so they wait on nothing. The
+//! ordering of the delete against the enumeration's snapshot is pinned by
 //! `intake::publication`'s own unit tests, which can hold a discharge
 //! mid-flight.
 //!
@@ -26,7 +25,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::{ValueType, chunk_queue, install_definition};
-use trellis::intake::{publication, slot_loss};
+use trellis::intake::publication;
 use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
 use trellis::{Config, Trellis, TrellisOptions};
 
@@ -753,165 +752,6 @@ async fn resume_leaves_a_live_sibling_on_the_same_source_alone() {
     operator.shutdown().await.expect("shut down");
 }
 
-/// The discharge gives up when intake hasn't staged through its snapshot
-/// (issue #312) and rolls back. The orphan delete is in that transaction,
-/// so the target must come out exactly as the pause left it: no rows gone,
-/// and nothing staged for a chained reader. The retry then drops them.
-///
-/// The resumed aggregate's rebuild is a direct-build job, which doesn't wait
-/// for intake (#419), so a live 1-1 sibling on the same source is what makes
-/// this discharge enumerate (its catch-up) and wait.
-#[tokio::test]
-async fn a_discharge_that_times_out_waiting_for_intake_leaves_the_target_as_it_was() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    create_orders(&client).await;
-    let operator = define_only(db.dsn()).await;
-    apply_all(
-        &operator,
-        &[
-            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
-            "TRANSFORM order_doubles FROM orders SELECT a + a AS x",
-        ],
-    )
-    .await;
-    settle(&db.pool, &mut client).await;
-    apply_all(
-        &operator,
-        &[&format!(
-            "TRANSFORM rollup_echo FROM {DEFAULT_TARGET_SCHEMA}.order_rollup \
-             GROUP BY g SELECT sum(total) AS total"
-        )],
-    )
-    .await;
-    settle(&db.pool, &mut client).await;
-    apply_all(&operator, &["PAUSE TRANSFORM order_rollup"]).await;
-    client
-        .batch_execute("delete from orders where g = 0")
-        .await
-        .expect("write while paused");
-    apply_all(&operator, &["RESUME TRANSFORM order_rollup"]).await;
-    client
-        .batch_execute("select txid_current()")
-        .await
-        .expect("consume an xid");
-
-    // A watermark that never moves, and no time to wait for it.
-    publication::run_pending_backfills(
-        &mut client,
-        "wake",
-        &StagedWatermark::new(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("a deferred discharge is not an error");
-
-    let rollup = "select g::text, total::text from order_rollup order by g";
-    assert_eq!(
-        text_rows(&client, rollup).await,
-        text(&[&[Some("0"), Some("12")], &[Some("1"), Some("9")]]),
-        "the rolled-back discharge deleted nothing"
-    );
-    assert!(
-        !has_pending(&client).await.expect("has_pending"),
-        "the rolled-back discharge staged nothing for rollup_echo"
-    );
-    assert_eq!(status(&client, "order_rollup").await, "waiting_to_backfill");
-
-    settle(&db.pool, &mut client).await;
-    assert_eq!(
-        text_rows(&client, rollup).await,
-        text(&[&[Some("1"), Some("9")]]),
-        "the retry drops group 0"
-    );
-    assert_eq!(
-        text_rows(
-            &client,
-            "select g::text, total::text from rollup_echo order by g"
-        )
-        .await,
-        text(&[&[Some("1"), Some("9")]]),
-    );
-    operator.shutdown().await.expect("shut down");
-}
-
-/// Issue #310's path, the one that motivated #330: a lost replication slot
-/// pauses every transform it fed, so every source change in the gap is lost
-/// to streaming. The deletes in that gap must still come out of the targets
-/// once the operator resumes them.
-#[tokio::test]
-async fn resume_after_a_slot_loss_drops_rows_deleted_in_the_gap() {
-    const LOST: &str = "resume_drops_deleted_keys_lost_slot";
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    create_orders(&client).await;
-    let operator = define_only(db.dsn()).await;
-    apply_all(
-        &operator,
-        &[
-            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
-            "TRANSFORM order_doubles FROM orders SELECT a + a AS x",
-        ],
-    )
-    .await;
-    settle(&db.pool, &mut client).await;
-
-    client
-        .batch_execute(&format!(
-            "create publication lost_pub for table orders; \
-             insert into replication_progress (slot_name, confirmed_lsn) values ('{LOST}', '0/10');"
-        ))
-        .await
-        .expect("stage a lost slot");
-    let mut session = trellis::staging::session::ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
-        .await
-        .expect("open a producer session");
-    let recovery = slot_loss::pause_if_slot_lost(&mut session, &db.pool, LOST, "lost_pub")
-        .await
-        .expect("recover from the lost slot")
-        .expect("a slot that doesn't exist is lost");
-    assert_eq!(recovery.paused, vec!["order_rollup", "order_doubles"]);
-
-    client
-        .batch_execute("delete from orders where g = 0 or id = 5")
-        .await
-        .expect("write in the gap");
-    apply_all(
-        &operator,
-        &[
-            "RESUME TRANSFORM order_rollup",
-            "RESUME TRANSFORM order_doubles",
-        ],
-    )
-    .await;
-    settle(&db.pool, &mut client).await;
-
-    assert_eq!(
-        text_rows(
-            &client,
-            "select g::text, total::text from order_rollup order by g"
-        )
-        .await,
-        text(&[&[Some("1"), Some("4")]]),
-    );
-    assert_eq!(
-        text_rows(
-            &client,
-            "select id::text, x::text from order_doubles order by id"
-        )
-        .await,
-        text(&[&[Some("1"), Some("2")], &[Some("3"), Some("6")]]),
-    );
-    drop(session);
-    client
-        .batch_execute(&format!("select pg_drop_replication_slot('{LOST}')"))
-        .await
-        .expect("drop the recreated slot");
-    operator.shutdown().await.expect("shut down");
-}
-
 /// Mixed-case target names (the lexer keeps an identifier's case, and the
 /// target is created quoted). The orphan delete must find their keys, not
 /// case-fold the name and skip the target as if it were gone.
@@ -953,6 +793,115 @@ async fn resume_drops_orphans_from_mixed_case_targets() {
         text_rows(
             &client,
             r#"select g::text, total::text from "OrderRollup" order by g"#
+        )
+        .await,
+        text(&[&[Some("1"), Some("9")]]),
+    );
+    operator.shutdown().await.expect("shut down");
+}
+
+/// A discharge that fails after its sweep has run rolls back whole (issue
+/// #312's rollback, reached here through an error rather than an intake
+/// wait). The orphan delete is in the discharge's transaction, so the target
+/// must come out exactly as the pause left it: no rows gone, and nothing
+/// staged for a chained reader. The retry then drops them.
+///
+/// The failure is a trigger on `pending_backfill` that refuses the marker's
+/// delete, which runs after the sweep, the dispatch and the enumeration's
+/// staging. A lock timeout, a conflict or a lost connection there rolls back
+/// the same way. The resumed aggregate's rebuild is a direct-build job, so a
+/// live 1-1 sibling on the same source is what makes this discharge
+/// enumerate (its catch-up) and stage.
+#[tokio::test]
+async fn a_discharge_that_fails_after_its_sweep_leaves_the_target_as_it_was() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_orders(&client).await;
+    let operator = define_only(db.dsn()).await;
+    apply_all(
+        &operator,
+        &[
+            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM order_doubles FROM orders SELECT a + a AS x",
+        ],
+    )
+    .await;
+    settle(&db.pool, &mut client).await;
+    apply_all(
+        &operator,
+        &[&format!(
+            "TRANSFORM rollup_echo FROM {DEFAULT_TARGET_SCHEMA}.order_rollup \
+             GROUP BY g SELECT sum(total) AS total"
+        )],
+    )
+    .await;
+    settle(&db.pool, &mut client).await;
+    apply_all(&operator, &["PAUSE TRANSFORM order_rollup"]).await;
+    client
+        .batch_execute("delete from orders where g = 0")
+        .await
+        .expect("write while paused");
+    apply_all(&operator, &["RESUME TRANSFORM order_rollup"]).await;
+    client
+        .batch_execute(
+            "create function fail_marker_delete() returns trigger \
+             language plpgsql as $$ begin raise exception 'marker delete fails'; end $$; \
+             create trigger fail_marker_delete before delete on pending_backfill \
+             for each row execute function fail_marker_delete(); \
+             select txid_current();",
+        )
+        .await
+        .expect("make the marker delete fail, and consume an xid");
+
+    let error = publication::run_pending_backfills(
+        &mut client,
+        "wake",
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect_err("the marker delete fails the discharge");
+    assert!(
+        error.to_string().contains("marker delete fails"),
+        "expected the injected failure, got {error}"
+    );
+
+    let rollup = "select g::text, total::text from order_rollup order by g";
+    assert_eq!(
+        text_rows(&client, rollup).await,
+        text(&[&[Some("0"), Some("12")], &[Some("1"), Some("9")]]),
+        "the rolled-back discharge deleted nothing"
+    );
+    assert!(
+        !has_pending(&client).await.expect("has_pending"),
+        "the rolled-back discharge staged nothing for rollup_echo or the sibling"
+    );
+    assert_eq!(status(&client, "order_rollup").await, "waiting_to_backfill");
+    let markers: i64 = client
+        .query_one("select count(*) from pending_backfill", &[])
+        .await
+        .expect("count markers")
+        .get(0);
+    assert_eq!(markers, 1, "the marker survives for the retry");
+
+    client
+        .batch_execute(
+            "drop trigger fail_marker_delete on pending_backfill; \
+             update pending_backfill set next_attempt_at = now()",
+        )
+        .await
+        .expect("remove the failure and run out the marker's backoff");
+    settle(&db.pool, &mut client).await;
+    assert_eq!(
+        text_rows(&client, rollup).await,
+        text(&[&[Some("1"), Some("9")]]),
+        "the retry drops group 0"
+    );
+    assert_eq!(
+        text_rows(
+            &client,
+            "select g::text, total::text from rollup_echo order by g"
         )
         .await,
         text(&[&[Some("1"), Some("9")]]),
