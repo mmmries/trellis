@@ -240,17 +240,16 @@ pub enum CatalogError {
     /// backfill...") would misdescribe a definition-time rejection as a
     /// backfill failure.
     ReplicaIdentityRequired(crate::intake::IntakeError),
-    /// Issue #376: the definition's source would be read over logical
-    /// replication, but intake can't key that table's changes (see
-    /// [`crate::intake::change_keyed`]). Publishing it would either make
-    /// Postgres refuse the table's own updates and deletes (no replica
-    /// identity) or stop intake on its first change (`MissingKeyValue`).
+    /// Issue #376: the definition's source would be captured by triggers,
+    /// but they can't key that table's changes (see [`change_keyed`]): it
+    /// has no primary key, or isn't a plain table (a partitioned table, say).
     /// The case that motivated this is another Trellis instance's aggregate
     /// target: this instance's own targets are exempt, since their writes
-    /// reach their readers in the writing transaction rather than over CDC.
+    /// reach their readers in the writing transaction rather than through
+    /// capture.
     SourceNotChangeKeyed { source_table: String },
     /// Issue #375: a relationship endpoint that isn't one of this instance's
-    /// targets fails [`crate::intake::change_keyed`]. The relationship walk in
+    /// targets fails [`change_keyed`]. The relationship walk in
     /// [`all_source_tables`] publishes it, so it is held to the same rule as a
     /// definition's source ([`CatalogError::SourceNotChangeKeyed`]); the case
     /// that motivated it is another instance's aggregate target.
@@ -495,18 +494,16 @@ impl fmt::Display for CatalogError {
             CatalogError::ReplicaIdentityRequired(err) => write!(f, "{err}"),
             CatalogError::SourceNotChangeKeyed { source_table } => write!(
                 f,
-                "Trellis can't key source table \"{source_table}\"'s changes from logical \
-                 replication: it needs a primary key under REPLICA IDENTITY DEFAULT or FULL, or \
-                 REPLICA IDENTITY USING INDEX. If it is another Trellis instance's aggregate \
-                 target, define this transform in that instance instead: an instance propagates \
-                 writes to its own targets without logical replication"
+                "Trellis can't capture source table \"{source_table}\"'s changes: it must be a \
+                 plain table (not partitioned) with a primary key. If it is another Trellis \
+                 instance's aggregate target, define this transform in that instance instead: \
+                 an instance propagates writes to its own targets without capturing them"
             ),
             CatalogError::RelationshipEndpointNotChangeKeyed { side, endpoint } => write!(
                 f,
-                "Trellis can't key {side} relationship endpoint \"{endpoint}\"'s changes from logical \
-                 replication: it needs a primary key under REPLICA IDENTITY DEFAULT or FULL, or \
-                 REPLICA IDENTITY USING INDEX. If it is another Trellis instance's aggregate \
-                 target, it can't be a relationship endpoint here"
+                "Trellis can't capture {side} relationship endpoint \"{endpoint}\"'s changes: it \
+                 must be a plain table (not partitioned) with a primary key. If it is another \
+                 Trellis instance's aggregate target, it can't be a relationship endpoint here"
             ),
             CatalogError::RelationshipEndpointUnsupportedKey {
                 name,
@@ -1485,6 +1482,23 @@ pub(crate) async fn is_definition_target(
 /// way [`super::lifecycle::drop_transform`]'s own use of it is): a dropped
 /// field refuses, naming the specific reader, iff some other definition's
 /// field or `GROUP BY` key resolves to exactly this `(target, field)` pair.
+///
+/// **The capture widen (issue #622).** An edited field can read a source
+/// column the old formula didn't, which the source's capture triggers may
+/// not image yet. The staging worker widens them in the background, not on
+/// this call's path, once it can take the table's lock, and a row the old
+/// capture function staged lacks the column: evaluating the field over it
+/// fails with `MissingColumn` and quarantines the key. So such an edit
+/// leaves its own pauses in place when its backfill ends, marked
+/// `column_status.awaiting_capture`, and parks its catch-up as usual. That
+/// marker's discharge clears them once the installed capture images every
+/// column the definition reads, and it waits for the widen's capture gate
+/// first, so every row the old function staged has drained through the
+/// paused field by then (`intake::publication`'s
+/// `release_columns_awaiting_capture`). The enumeration the same discharge
+/// stages re-derives every row with the field unpaused. An edit that reads
+/// only columns the definition already read unpauses at once, as before:
+/// those columns have been imaged since the definition was dispatched.
 pub async fn alter_transform(
     pool: &Pool,
     alter: &AlterTransform,
@@ -1868,17 +1882,32 @@ pub async fn alter_transform(
         // it), and an upstream pause cascading onto it records an edge in
         // `column_pause_cascades`. Either way the row now belongs to that
         // other reason, and its `RESUME` is what recovers the column.
+        //
+        // **The capture widen (issue #622).** A field reading a source column
+        // the old formula didn't read can't unpause here: see "The capture
+        // widen" in this function's doc comment. Its pause is marked
+        // `awaiting_capture` instead, and the catch-up marker's discharge
+        // clears it.
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
+        let awaits_capture = reads_new_source_columns(&current.def, &merged)
+            && !is_definition_target(&*txn, &current.source_table).await?;
+        let release = if awaits_capture {
+            "update column_status s set awaiting_capture = true"
+        } else {
+            "delete from column_status s"
+        };
         for field in &self_paused {
             txn.execute(
-                "delete from column_status s \
-                 where s.transform_table = $1 and s.column_name = $2 \
-                   and not s.local_fuse \
-                   and not exists ( \
-                       select 1 from column_pause_cascades c \
-                       where c.downstream_transform = s.transform_table \
-                         and c.downstream_column = s.column_name)",
+                &format!(
+                    "{release} \
+                     where s.transform_table = $1 and s.column_name = $2 \
+                       and not s.local_fuse \
+                       and not exists ( \
+                           select 1 from column_pause_cascades c \
+                           where c.downstream_transform = s.transform_table \
+                             and c.downstream_column = s.column_name)"
+                ),
                 &[&alter.target, field],
             )
             .await?;
@@ -1904,6 +1933,17 @@ pub async fn alter_transform(
         dropped,
         altered,
     })
+}
+
+/// Whether `edited` reads a source column `original` doesn't (issue #622):
+/// one the source's capture triggers may not image yet. A column `original`
+/// already read has been imaged since the definition was dispatched, since no
+/// capture narrows away a column a registered definition reads.
+fn reads_new_source_columns(original: &TransformDef, edited: &TransformDef) -> bool {
+    let before = super::oracle::referenced_source_columns(original);
+    super::oracle::referenced_source_columns(edited)
+        .iter()
+        .any(|column| !before.contains(column))
 }
 
 /// [`alter_transform`]'s output: the edited definition's new state, plus
@@ -3218,6 +3258,8 @@ pub async fn relationships_to_table(
 /// union of join-key values that row's change touched). Schema-scoped (issue
 /// #288) so a same-named table in another schema doesn't contribute its own
 /// relationships' `from_col`s.
+// Only intake used this; C8 deletes it (issue #622).
+#[allow(dead_code)]
 pub async fn relationships_from_table(
     pool: &Pool,
     from_schema: &str,
@@ -4731,9 +4773,40 @@ async fn assert_replica_identity_supports_to_many(
     }
 }
 
-/// Issue #376: rejects a definition whose source would reach this instance
-/// over logical replication with changes intake can't key
-/// ([`crate::intake::change_keyed`]) — [`CatalogError::SourceNotChangeKeyed`].
+/// Whether trigger capture can key `schema.table`'s changes (issue #622 C5):
+/// it is a plain table (`relkind = 'r'`) with a primary key. Every ring row a
+/// capture trigger writes is keyed by the primary key, so a table without
+/// one can't be captured, whatever its replica identity: `REPLICA IDENTITY
+/// USING INDEX` without a primary key is refused too, which also rules out
+/// #589's key mismatch between the index and the primary key.
+///
+/// A partitioned table (`relkind = 'p'`) is refused as well. Statement
+/// triggers on the parent miss writes aimed at a partition directly, and a
+/// partition attached later gets no triggers, so it could only be captured
+/// partially. A view, foreign table or anything else has no triggers of this
+/// kind at all. `false` for a table that doesn't exist.
+pub(crate) async fn change_keyed(
+    client: &impl GenericClient,
+    schema: &str,
+    table: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    let regclass = format!("{}.{}", quote_ident(schema), quote_ident(table));
+    let keyed: Option<bool> = client
+        .query_opt(
+            "select c.relkind = 'r' and exists ( \
+                 select 1 from pg_index i where i.indrelid = c.oid and i.indisprimary) \
+             from pg_class c where c.oid = pg_catalog.to_regclass($1)",
+            &[&regclass],
+        )
+        .await?
+        .map(|row| row.get(0));
+    Ok(keyed.unwrap_or(false))
+}
+
+/// Issue #376: rejects a definition whose source this instance would capture
+/// by triggers when the triggers can't key its changes ([`change_keyed`]: a
+/// plain table with a primary key, issue #622) —
+/// [`CatalogError::SourceNotChangeKeyed`].
 ///
 /// This instance's own targets are exempt. Every write to one goes through
 /// the target-mutation seam (`staging::target_mutations`, issue #315), which
@@ -4743,17 +4816,12 @@ async fn assert_replica_identity_supports_to_many(
 ///
 /// Another instance's target gets no such exemption, because nothing in this
 /// catalog names it: that instance's seam stages downstream rows only into
-/// its own ring, so this instance's only view of the table is CDC through its
-/// own publication. For a 1-1 target that works, since it mirrors its
-/// source's primary key. For an aggregate target it can't: publishing it
-/// makes Postgres refuse the owning instance's own updates to it (no replica
-/// identity), or, with `REPLICA IDENTITY FULL`, stops this instance's intake
-/// on its first change.
+/// its own ring, so this instance's only view of the table is its own
+/// capture triggers. For a 1-1 target that works, since it mirrors its
+/// source's primary key. An aggregate target has none.
 ///
 /// The rule is about the table, not about who owns it, so a plain source
-/// table intake can't key is rejected too (no primary key under `DEFAULT` or
-/// `FULL` identity, or `REPLICA IDENTITY NOTHING`). It fails the same two
-/// ways at runtime.
+/// table without a primary key is rejected too, as is a partitioned one.
 async fn reject_unkeyed_source(
     client: &impl GenericClient,
     qualified_source: &str,
@@ -4766,7 +4834,7 @@ async fn reject_unkeyed_source(
             qualified_source.to_string(),
         ));
     };
-    if crate::intake::change_keyed(client, schema, table).await? {
+    if change_keyed(client, schema, table).await? {
         return Ok(());
     }
     Err(CatalogError::SourceNotChangeKeyed {
@@ -4774,8 +4842,8 @@ async fn reject_unkeyed_source(
     })
 }
 
-/// Issue #375: rejects a relationship endpoint that would reach this
-/// instance's publication with changes intake can't key.
+/// Issue #375: rejects a relationship endpoint this instance would capture
+/// by triggers when they can't key its changes ([`change_keyed`]).
 ///
 /// - This instance's own targets, aggregate targets included, are exempt,
 ///   for the reason [`reject_unkeyed_source`] gives: they are never published
@@ -4783,7 +4851,7 @@ async fn reject_unkeyed_source(
 ///   changes, CDC-shaped for an endpoint, keyed by the code that wrote them
 ///   (#375's direction 1, #403).
 /// - Anything else, including another instance's aggregate target, must
-///   pass [`crate::intake::change_keyed`]
+///   pass [`change_keyed`]
 ///   ([`CatalogError::RelationshipEndpointNotChangeKeyed`]), the rule
 ///   [`reject_unkeyed_source`] holds a definition's source to:
 ///   [`all_source_tables`]' relationship walk publishes it.
@@ -4796,7 +4864,7 @@ async fn reject_unkeyed_relationship_endpoint(
         return Ok(());
     }
     let keyed = match qualified_endpoint.split_once('.') {
-        Some((schema, table)) => crate::intake::change_keyed(client, schema, table).await?,
+        Some((schema, table)) => change_keyed(client, schema, table).await?,
         None => false,
     };
     if keyed {

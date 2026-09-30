@@ -253,6 +253,64 @@ pub(crate) async fn park_registration_markers(
     Ok(())
 }
 
+/// Parks a `pending_backfill` marker on the source of every definition in
+/// `ready` that is still `waiting_to_backfill` and whose source has no marker
+/// yet: the trigger-capture form of [`park_registration_markers`] (issue
+/// #622 C5). `ready` is what the staging worker's reconcile pass found
+/// dispatchable ([`crate::capture::reconcile`]): every table the definition
+/// reads is captured by triggers that image the columns it needs, or is
+/// another definition's target, fed by the target-mutation seam. A
+/// definition whose capture is still waiting for a lock is left without a
+/// marker, so no discharge can dispatch it before its capture covers it.
+pub async fn park_ready_registration_markers(
+    client: &impl GenericClient,
+    ready: &[i64],
+) -> Result<(), IntakeError> {
+    let tables: Vec<String> = client
+        .query(
+            "select distinct d.source_table from transform_definitions d \
+             where d.id = any($2) and d.status = $1 \
+               and not exists ( \
+                   select 1 from pending_backfill pb where pb.table_name = d.source_table \
+               ) \
+             order by 1",
+            &[&TransformStatus::WaitingToBackfill.as_str(), &ready],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    for table in tables {
+        park_marker(client, &table).await?;
+    }
+    Ok(())
+}
+
+/// Parks the marker a capture widen of `table` commits with (issue #622,
+/// `capture::install`'s "Widening and the capture gate"), and, when `table`
+/// is a relationship's to-side, asks its discharge to refresh the settled
+/// projections on it ([`request_projection_refresh`]).
+///
+/// The refresh is what makes a to-side widen safe for a projection. A
+/// definition that reads a new to-side column through a to-one relationship
+/// widens the projection and back-fills the column from the live table when
+/// it registers, but until the widen lands the capture function images rows
+/// without that column, and applying such a row's image writes the column as
+/// `NULL` into the projection. The widen's marker holds its discharge until
+/// every row staged before the widen has drained (its capture gate), so the
+/// refresh runs after the last of them and re-reads the column from the
+/// table.
+pub(crate) async fn park_widen_marker(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<(), IntakeError> {
+    park_marker(client, table).await?;
+    if is_relationship_to_side(client, table).await? {
+        request_projection_refresh(client, &[table.to_string()]).await?;
+    }
+    Ok(())
+}
+
 /// Parks a catch-up marker for `definition_id`'s *target* table when
 /// something reads it (issue #315), moving each reader that is `live` to
 /// `catching_up` until the marker is discharged (issue #476). Called wherever
@@ -1148,6 +1206,36 @@ pub(crate) async fn run_pending_backfills_until(
     catch_up_timeout: Duration,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<Vec<FailedDischarge>, IntakeError> {
+    run_pending_backfills_for(
+        client,
+        wake_channel,
+        watermark,
+        catch_up_timeout,
+        stop,
+        None,
+    )
+    .await
+}
+
+/// [`run_pending_backfills_until`], dispatching only the `waiting_to_backfill`
+/// definitions in `ready` (every one, with `None`).
+///
+/// The staging worker's pass (issue #622 C5) passes the definitions whose
+/// capture its reconcile just brought current
+/// ([`crate::capture::reconcile`]): every table they read has triggers
+/// imaging every column they need. A definition registered after the pass
+/// read the catalog, or one whose table's install or widen is still waiting
+/// for a lock, stays `waiting_to_backfill` even when a marker on its source
+/// discharges; the reconcile pass that brings its capture current parks it a
+/// marker of its own ([`park_ready_registration_markers`]).
+pub(crate) async fn run_pending_backfills_for(
+    client: &mut tokio_postgres::Client,
+    wake_channel: &str,
+    watermark: &StagedWatermark,
+    catch_up_timeout: Duration,
+    stop: &(dyn Fn() -> bool + Sync),
+    ready: Option<&[i64]>,
+) -> Result<Vec<FailedDischarge>, IntakeError> {
     let mut pending = fetch_pending_backfills(client).await?;
     tracing::Span::current().record("pending", pending.len());
     if pending.is_empty() {
@@ -1230,10 +1318,18 @@ pub(crate) async fn run_pending_backfills_until(
             watermark,
             intake_timeout,
             stop,
+            ready,
         )
         .await
         {
             Ok(Discharge::Committed) => {}
+            Ok(Discharge::AwaitingCapture) => {
+                tracing::debug!(
+                    table = %marker.table,
+                    "backfill marker held: an ALTER TRANSFORM field reads a column the table's \
+                     capture doesn't image yet"
+                );
+            }
             Ok(Discharge::Deferred { horizon }) => {
                 tracing::debug!(
                     table = %marker.table,
@@ -1325,6 +1421,134 @@ enum Discharge {
     /// Intake had not staged through `horizon` in time, so the transaction
     /// rolled back and the marker stays.
     Deferred { horizon: PgLsn },
+    /// An `ALTER TRANSFORM` field on the table is still paused awaiting a
+    /// capture that images its columns ([`release_columns_awaiting_capture`]),
+    /// so the transaction rolled back and the marker stays for a later pass.
+    AwaitingCapture,
+}
+
+/// Unpauses the `ALTER TRANSFORM` fields on definitions sourced from `table`
+/// that wait for a capture imaging the columns they read
+/// (`column_status.awaiting_capture`, issue #622; see
+/// `defs::catalog::alter_transform`'s "The capture widen"), if it now does.
+/// `false` means some still wait, and the discharge must not go on: its
+/// enumeration re-derives every row, which must happen with them unpaused.
+///
+/// Called by the discharge of `table`'s marker, which has already waited
+/// for the marker's capture gate, so every row a narrower capture function
+/// staged has drained. The staging worker is the only process that changes
+/// capture, and it runs this discharge after its own capture pass, so the
+/// installed capture read here can't change before this commits. It covers
+/// the fields when:
+///
+/// - `table` is another definition's target, fed by the target-mutation
+///   seam rather than captured;
+/// - nothing is installed on it: no row lacking a column can exist, and the
+///   install, from a catalog read after this edit, images them all;
+/// - or its installed functions are current and image every source column
+///   each such definition reads.
+///
+/// The pauses go only where the edit still owns them (issue #309's rule, as
+/// in `alter_transform`); every other one just stops waiting.
+async fn release_columns_awaiting_capture(
+    txn: &Transaction<'_>,
+    table: &str,
+) -> Result<bool, IntakeError> {
+    let awaiting: BTreeSet<String> = txn
+        .query(
+            "select distinct transform_table from column_status where awaiting_capture",
+            &[],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    if awaiting.is_empty() {
+        return Ok(true);
+    }
+    // `column_status` names a transform as its definition does (the
+    // definition's own `target`), not by the qualified `target_table`.
+    let mut targets = Vec::new();
+    let mut read = BTreeSet::new();
+    for row in txn
+        .query(
+            "select target_table, definition_text from transform_definitions \
+             where source_table = $1",
+            &[&table],
+        )
+        .await?
+    {
+        let target_table: &str = row.get(0);
+        let def = crate::defs::parse(row.get::<_, &str>(1))
+            .map_err(crate::defs::catalog::CatalogError::from)?;
+        let bare = target_table
+            .split_once('.')
+            .map_or(target_table, |(_, t)| t);
+        let named = [def.target.as_str(), bare]
+            .into_iter()
+            .find(|name| awaiting.contains(*name));
+        if let Some(name) = named {
+            targets.push(name.to_string());
+            read.extend(crate::defs::oracle::referenced_source_columns(&def));
+        }
+    }
+    if targets.is_empty() {
+        return Ok(true);
+    }
+    if !capture_images(txn, table, &read).await? {
+        return Ok(false);
+    }
+    txn.execute(
+        "delete from column_status s \
+         where s.awaiting_capture and s.transform_table = any($1) \
+           and not s.local_fuse \
+           and not exists ( \
+               select 1 from column_pause_cascades c \
+               where c.downstream_transform = s.transform_table \
+                 and c.downstream_column = s.column_name)",
+        &[&targets],
+    )
+    .await?;
+    txn.execute(
+        "update column_status set awaiting_capture = false \
+         where awaiting_capture and transform_table = any($1)",
+        &[&targets],
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Whether every row staged for `table` from now on carries `columns`
+/// ([`release_columns_awaiting_capture`]'s three cases).
+async fn capture_images(
+    client: &impl GenericClient,
+    table: &str,
+    columns: &BTreeSet<String>,
+) -> Result<bool, IntakeError> {
+    use crate::capture::{CaptureError, install::Installed};
+
+    if crate::defs::catalog::is_definition_target(client, table).await? {
+        return Ok(true);
+    }
+    let schema: String = client
+        .query_one("select pg_catalog.current_schema()::text", &[])
+        .await?
+        .get(0);
+    let installed = crate::capture::install::installed(client, &schema, table)
+        .await
+        .map_err(|err| match err {
+            CaptureError::Db(err) => IntakeError::Db(err),
+            CaptureError::Catalog(err) => err.into(),
+            CaptureError::Marker(err) => err,
+            other => IntakeError::InvalidTableName(other.to_string()),
+        })?;
+    Ok(match installed {
+        Installed::Absent => true,
+        Installed::Partial { .. } => false,
+        Installed::Complete { spec, current } => {
+            current && columns.iter().all(|c| spec.columns().contains(c))
+        }
+    })
 }
 
 /// The build [`discharge_marker`] dispatches for one `waiting_to_backfill`
@@ -1348,6 +1572,7 @@ enum Build {
 async fn plan_waiting_builds(
     client: &tokio_postgres::Client,
     table: &str,
+    ready: Option<&[i64]>,
 ) -> Result<Vec<(i64, Build)>, IntakeError> {
     use crate::defs::ast::KeySpace;
     use crate::defs::backfill::{self, BackfillError};
@@ -1356,8 +1581,10 @@ async fn plan_waiting_builds(
     let rows = client
         .query(
             "select id, definition_text from transform_definitions \
-             where source_table = $1 and status = $2 order by id",
-            &[&table, &TransformStatus::WaitingToBackfill.as_str()],
+             where source_table = $1 and status = $2 \
+               and ($3::bigint[] is null or id = any($3)) \
+             order by id",
+            &[&table, &TransformStatus::WaitingToBackfill.as_str(), &ready],
         )
         .await?;
     let mut builds = Vec::with_capacity(rows.len());
@@ -1409,8 +1636,9 @@ async fn discharge_marker(
     watermark: &StagedWatermark,
     catch_up_timeout: Duration,
     stop: &(dyn Fn() -> bool + Sync),
+    ready: Option<&[i64]>,
 ) -> Result<Discharge, IntakeError> {
-    let builds = plan_waiting_builds(client, &marker.table).await?;
+    let builds = plan_waiting_builds(client, &marker.table, ready).await?;
     let waiting: Vec<i64> = builds.iter().map(|(id, _)| *id).collect();
     // Definitions whose build reads the table itself, in the background.
     let background: Vec<i64> = builds
@@ -1425,6 +1653,10 @@ async fn discharge_marker(
         .collect();
 
     let txn = client.transaction().await?;
+    if !release_columns_awaiting_capture(&txn, &marker.table).await? {
+        txn.rollback().await?;
+        return Ok(Discharge::AwaitingCapture);
+    }
     // Issues #330, #485, #436: the targets whose unbacked rows this discharge
     // deletes, judged on its read's snapshot; see "Dropping what the source
     // no longer backs" above.
@@ -1453,9 +1685,6 @@ async fn discharge_marker(
             .query_one("select pg_current_wal_insert_lsn()", &[])
             .await?
             .get(0);
-        // On a quiet stream nothing else would carry intake past `horizon`
-        // until its next keepalive (issue #452).
-        crate::staging::converge::request_intake_confirm(&txn).await?;
         if !intake_caught_up(watermark, horizon, catch_up_timeout, stop).await {
             txn.rollback().await?;
             return Ok(Discharge::Deferred { horizon });

@@ -1,8 +1,8 @@
 //! Installs, widens, narrows and uninstalls one table's capture triggers
 //! (#622 C3), and reads back what is installed.
 //!
-//! Nothing at runtime calls this yet. C5's reconcile pass computes each
-//! captured table's [`CaptureSpec`] from the catalog
+//! The staging worker's reconcile pass ([`super::reconcile`], C5) computes
+//! each captured table's [`CaptureSpec`] from the catalog
 //! ([`super::columns::capture_spec`]) and hands it to [`reconcile`], one
 //! table at a time, so a table whose lock is held doesn't hold back another
 //! table's join.
@@ -49,7 +49,7 @@
 //! whole vacuum out.)
 //!
 //! Waiting is kept off `apply`'s path: defining a transform only registers
-//! it, and C5's background reconcile does the install. So a wait has to be
+//! it, and the staging worker's background reconcile does the install. So a wait has to be
 //! visible some other way, and that is the [`LockWait`] report. The
 //! `deadline` an operation takes bounds one pass. When the retries run out
 //! of it, the operation returns [`Progress::Waiting`], having changed
@@ -57,8 +57,9 @@
 //! pass began waiting, and every session that holds or is queued for a
 //! conflicting lock ([`Blocker`]: its pid, or a prepared transaction's gid;
 //! its backend type; its lock mode; since when; and the start of its query).
-//! C5 retries on its next pass and surfaces the report in a definition's
-//! detailed status (Q5). Without a deadline an operation waits until it
+//! The reconcile pass retries on its next pass and keeps the report in
+//! memory, where `Trellis::status` reports it as a waiting definition's
+//! `capture_wait` (Q5). Without a deadline an operation waits until it
 //! lands. While it retries, it logs the blockers at most every five seconds.
 //!
 //! `pg_stat_activity` shows another role's backend only to a superuser or a
@@ -133,14 +134,15 @@
 //! `T` for a new definition sourced from the from-side `U` (it reads a new
 //! column of `T` through the relationship) gates `T`'s marker, but the new
 //! definition waits on `U`'s marker, which no gate holds. A pre-widen `T` row
-//! then reaches it through the reverse path, and a deferred reverse
+//! then reaches it through the reverse path, as could a deferred reverse
 //! (`rel_reverse_deferred`, staged under a synthetic `src_table`) carrying
-//! `T`'s old images isn't counted by
-//! [`crate::staging::converge::table_changes_pending_through`] either. C5
-//! must close this before it wires widening to to-side columns: for example,
-//! by gating the marker of every table a waiting reader of `T` is sourced
-//! from on `T`'s pending changes, counting deferred reverses whose
-//! relationship's to-side is `T`.
+//! `T`'s old images. C5 closes this in the reconcile pass
+//! ([`super::reconcile`], rule 3): such a definition isn't dispatched while
+//! `T` has a gated marker pending, and
+//! [`crate::staging::converge::table_changes_pending_through`] counts the
+//! deferred reverses whose relationship's to-side is `T`. A to-side widen's
+//! marker also refreshes `T`'s settled projections
+//! (`intake::publication::park_widen_marker`).
 //!
 //! Why not the alternatives:
 //!
@@ -168,8 +170,7 @@
 //! follow an uninstall whose last rows haven't drained, and those were imaged
 //! for a column set that may not cover the new reader.
 //!
-//! **C5 must also order the reconcile before the discharge**, as today's
-//! publication reconcile runs before it: a definition registered on a
+//! **The reconcile runs before the discharge**, on the same connection: a definition registered on a
 //! captured table must not be dispatched by a discharge that runs before the
 //! widen its columns need. On one staging worker the two run in sequence.
 //!
@@ -177,9 +178,10 @@
 //!
 //! A narrow replaces the functions with ones that image fewer columns, with
 //! no table lock and no marker. A writer still running the old body stages
-//! rows with more columns than anyone reads, which harms nothing. C5 must
-//! narrow only after the definition that read the dropped columns has
-//! stopped applying (its drop committed), since the next rows lack them.
+//! rows with more columns than anyone reads, which harms nothing. The
+//! reconcile pass narrows only from a catalog read after the drop of the
+//! definition that read the dropped columns committed, since the next rows
+//! lack them.
 //!
 //! # What is installed
 //!
@@ -192,9 +194,8 @@
 //!
 //! Nothing else this module writes is installed state. The capture gate
 //! belongs to a pending marker and goes with it. A [`LockWait`] is returned,
-//! not stored: it describes other sessions, so nothing can re-derive it
-//! from the defined transforms, and C5 may persist it for the detailed
-//! status (Q9).
+//! not stored in the database; the reconcile pass keeps the latest one per
+//! table in memory (Q9).
 //!
 //! # The Trellis role (#622 plan Q3)
 //!
@@ -296,50 +297,64 @@ fn narrows(installed: &CaptureSpec, desired: &CaptureSpec) -> bool {
 /// Reads what instance `schema` has installed for `table` (an unquoted
 /// `schema.table` identity) from `pg_trigger`, `pg_proc` and the functions'
 /// comments.
+///
+/// One statement reads all four events, so a read racing an install or
+/// uninstall sees it either whole or not at all, never a spurious
+/// [`Installed::Partial`].
 pub async fn installed(
     client: &impl GenericClient,
     schema: &str,
     table: &str,
 ) -> Result<Installed, CaptureError> {
     let regclass = crate::defs::ddl::regclass_arg(table);
+    let mut functions = Vec::with_capacity(CaptureEvent::ALL.len());
+    let mut triggers = Vec::with_capacity(CaptureEvent::ALL.len());
+    for event in CaptureEvent::ALL {
+        functions.push(sql::function_name(table, event)?);
+        triggers.push(sql::trigger_name(schema, event));
+    }
+    // A comment this generator didn't write reads as no spec, rather than
+    // failing the cast.
+    let rows = client
+        .query(
+            "select p.oid is not null, p.prosrc, \
+                    c.j ->> 'table', c.j ->> 'event', \
+                    case when c.j is not null then array( \
+                        select pg_catalog.jsonb_array_elements_text(c.j -> 'key')) end, \
+                    case when c.j is not null then array( \
+                        select pg_catalog.jsonb_array_elements_text(c.j -> 'columns')) end, \
+                    case when c.j is not null then array( \
+                        select pg_catalog.jsonb_array_elements_text(c.j -> 'group_key')) end, \
+                    t.oid is not null, t.tgenabled::text, t.tgfoid = p.oid \
+             from unnest($2::text[], $4::text[]) with ordinality as e(function, trigger, ord) \
+             left join pg_catalog.pg_proc p \
+               on p.proname = e.function and p.pronargs = 0 \
+              and p.pronamespace = ( \
+                  select oid from pg_catalog.pg_namespace where nspname = $1) \
+             left join lateral ( \
+                 select case when d.description like '{\"trellis_capture\":1,%' \
+                             then d.description::jsonb end as j \
+                 from pg_catalog.pg_description d \
+                 where d.objoid = p.oid \
+                   and d.classoid = 'pg_catalog.pg_proc'::pg_catalog.regclass \
+                   and d.objsubid = 0) c on true \
+             left join pg_catalog.pg_trigger t \
+               on t.tgrelid = pg_catalog.to_regclass($3) and t.tgname = e.trigger \
+              and not t.tgisinternal \
+             order by e.ord",
+            &[&schema, &functions, &regclass, &triggers],
+        )
+        .await?;
     let mut present = false;
     let mut current = true;
     let mut faults = Vec::new();
     let mut specs = Vec::new();
-    for event in CaptureEvent::ALL {
-        let function = sql::function_name(table, event)?;
-        let trigger = sql::trigger_name(schema, event);
-        // A comment this generator didn't write reads as no spec, rather
-        // than failing the cast.
-        let row = client
-            .query_one(
-                "select p.oid is not null, p.prosrc, \
-                        c.j ->> 'table', c.j ->> 'event', \
-                        case when c.j is not null then array( \
-                            select pg_catalog.jsonb_array_elements_text(c.j -> 'key')) end, \
-                        case when c.j is not null then array( \
-                            select pg_catalog.jsonb_array_elements_text(c.j -> 'columns')) end, \
-                        case when c.j is not null then array( \
-                            select pg_catalog.jsonb_array_elements_text(c.j -> 'group_key')) end, \
-                        t.oid is not null, t.tgenabled::text, t.tgfoid = p.oid \
-                 from (select 1) one \
-                 left join pg_catalog.pg_proc p \
-                   on p.proname = $2 and p.pronargs = 0 \
-                  and p.pronamespace = ( \
-                      select oid from pg_catalog.pg_namespace where nspname = $1) \
-                 left join lateral ( \
-                     select case when d.description like '{\"trellis_capture\":1,%' \
-                                 then d.description::jsonb end as j \
-                     from pg_catalog.pg_description d \
-                     where d.objoid = p.oid \
-                       and d.classoid = 'pg_catalog.pg_proc'::pg_catalog.regclass \
-                       and d.objsubid = 0) c on true \
-                 left join pg_catalog.pg_trigger t \
-                   on t.tgrelid = pg_catalog.to_regclass($3) and t.tgname = $4 \
-                  and not t.tgisinternal",
-                &[&schema, &function, &regclass, &trigger],
-            )
-            .await?;
+    for (((event, function), trigger), row) in CaptureEvent::ALL
+        .into_iter()
+        .zip(&functions)
+        .zip(&triggers)
+        .zip(&rows)
+    {
         let has_function: bool = row.get(0);
         let has_trigger: bool = row.get(7);
         present |= has_function || has_trigger;
@@ -656,7 +671,7 @@ async fn attempt(
         Op::Install(_) => {
             crate::intake::publication::park_table_catch_ups(&txn, &[table.to_string()]).await?
         }
-        Op::Widen(_) => crate::intake::publication::park_marker(&txn, table).await?,
+        Op::Widen(_) => crate::intake::publication::park_widen_marker(&txn, table).await?,
         Op::Uninstall(_) => {}
     }
     let statements = match op {
@@ -947,7 +962,8 @@ async fn lock_wait(
 
 /// Logs what keeps a capture operation from its table lock, at most once
 /// per [`BLOCKER_LOG_INTERVAL`] of one call. (A caller that runs passes with
-/// short deadlines gets a line per pass; C5 rate-limits those.)
+/// short deadlines gets `debug` lines only at its deadlines; the reconcile
+/// pass rate-limits its own `info` report of a wait across passes.)
 struct BlockerLog {
     operation: LockingOperation,
     last_logged: Option<Instant>,
@@ -998,9 +1014,13 @@ impl BlockerLog {
 
     /// Once the deadline stops the retries: logs `wait` if a line is due.
     fn at_deadline(&mut self, wait: &LockWait) {
-        if self.due() {
-            self.log(wait, "leaving it for the next pass");
-        }
+        // The reconcile pass reports a wait that outlasts its passes at
+        // `info`, rate-limited across passes (`super::reconcile`).
+        tracing::debug!(
+            what = self.operation.what(),
+            table = %wait.table,
+            "{wait}; leaving it for the next pass"
+        );
     }
 
     fn log(&self, wait: &LockWait, next: &str) {
