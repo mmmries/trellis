@@ -867,15 +867,27 @@ async fn write_one_to_one_range(
         format!("on conflict ({pk_col_list}) do update set {update_sets}{unchanged_guard}")
     };
 
-    let where_clause = pk_range_where(&pk_idents, pk, lo);
-    let params = range_params(lo, hi);
+    let mut params = range_params(lo, hi);
+    // A quarantined key is left out (#616): it stays out of the target until
+    // `release_key` re-derives it, exactly as the drain leaves it out of every
+    // batch. The build's own narrowing quarantines the key a chunk fails on
+    // (`chunk_queue::fail_chunk`), and the chunk then runs without it. So is a
+    // key with a `NULL` part, which no target row can represent
+    // ([`key_not_null`]).
+    let where_clause = format!(
+        "{} and {} and {}",
+        pk_range_where(&pk_idents, pk, lo),
+        key_not_null(&pk_idents),
+        not_quarantined(pk, params.len() + 1),
+    );
+    params.push(&source_table);
     // Only `ALTER TRANSFORM`'s rewrite (`restrict_to`) reports the keys it
     // changed, for the target-mutation seam: a first build's target has no
     // reader yet (`catalog::reject_non_live_upstream`).
     if restrict_to.is_some() {
         let insert_sql = format!(
             "insert into {target} ({insert_cols}) \
-             select {select_exprs} from {source} where {where_clause} \
+             select {select_exprs} from {source} as {SOURCE_ALIAS} where {where_clause} \
              {on_conflict} returning {}",
             ddl::pk_key_sql_expr(pk, None),
         );
@@ -884,7 +896,7 @@ async fn write_one_to_one_range(
     }
     let insert_sql = format!(
         "insert into {target} ({insert_cols}) \
-         select {select_exprs} from {source} where {where_clause} \
+         select {select_exprs} from {source} as {SOURCE_ALIAS} where {where_clause} \
          {on_conflict}"
     );
     client.execute(&insert_sql, &params).await?;
@@ -977,6 +989,140 @@ pub(crate) async fn execute_one_to_one_chunk(
         .map(drop)
     })
     .await
+}
+
+/// The alias a 1-1 range write and [`narrow_one_to_one_chunk`] give the
+/// source, so [`not_quarantined`]'s key expression names the source's columns
+/// even when one of them shares a name with a column of `poison`.
+const SOURCE_ALIAS: &str = "__trellis_src";
+
+/// SQL predicate over a source row aliased [`SOURCE_ALIAS`]: its key isn't
+/// quarantined (`poison`) for the source table bound as `$param`, the
+/// canonical (qualified) identity quarantine keys on.
+fn not_quarantined(pk: &[PrimaryKeyColumn], param: usize) -> String {
+    format!(
+        "not exists (select 1 from poison p where p.src_table = ${param} and p.key = {})",
+        ddl::pk_key_sql_expr(pk, Some(SOURCE_ALIAS))
+    )
+}
+
+/// SQL predicate: no part of the key `pk_idents` is `NULL`. A genuine
+/// `PRIMARY KEY` never has one, but a source keyed by a nullable `UNIQUE
+/// NULLS NOT DISTINCT` index (an aggregate target's grouping columns, issue
+/// #128) can, and a `(lo, hi]` row comparison still admits such a row
+/// whenever an earlier part decides it (`(2, NULL) <= (3, 'a')`). No target
+/// row can represent it (the target's own primary key is `NOT NULL`), so a
+/// 1-1 range write leaves it out, as [`discover_pk_ranges`] does and as the
+/// drain skips the key (issue #205). Writing it would fail the chunk with a
+/// not-null violation that [`narrow_one_to_one_chunk`], which never counts
+/// such a row, would pin on an innocent key beside it.
+fn key_not_null(pk_idents: &[String]) -> String {
+    pk_idents
+        .iter()
+        .map(|c| format!("{c} is not null"))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// What [`narrow_one_to_one_chunk`] found in a failed chunk's range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChunkNarrowing {
+    /// The range holds two or more keys that aren't quarantined. `mid` is the
+    /// encoded key ([`ddl::join_pk_key`], as a chunk's bounds are) that splits
+    /// them in half: `(lo, mid]` and `(mid, hi]` each hold at least one.
+    Split { mid: String },
+    /// The range holds exactly one key that isn't quarantined, in the
+    /// encoding the ring and `poison` use ([`ddl::pk_key_sql_expr`]).
+    Key(String),
+    /// The range holds no key that isn't quarantined.
+    Empty,
+}
+
+/// Narrows a failed [`execute_one_to_one_chunk`] range `(lo, hi]` of
+/// `source_table` (#616): counts the keys it would write, leaving out the
+/// quarantined ones as the write does, and either names the one key or the
+/// key that splits them in half. The split point is found the way
+/// [`discover_pk_ranges`] finds a chunk's upper bound: the largest key of the
+/// first half, in the primary key's own order.
+pub(crate) async fn narrow_one_to_one_chunk(
+    client: &impl GenericClient,
+    source_table: &str,
+    lo: Option<&str>,
+    hi: &str,
+) -> Result<ChunkNarrowing, BackfillError> {
+    let pk = ddl::source_primary_key_in_txn(client, source_table).await?;
+    let decode = |text: &str| -> Result<Vec<String>, BackfillError> {
+        Ok(ddl::split_pk_key(&pk, source_table, text)?
+            .into_iter()
+            .map(|part| part.map(|c| c.into_owned()).unwrap_or_default())
+            .collect())
+    };
+    let lo = lo.map(decode).transpose()?;
+    let hi = decode(hi)?;
+    let source = ddl::qualified_source_table(source_table);
+    let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
+    let mut params = range_params(&lo, &hi);
+    // The keys [`write_one_to_one_range`] writes, by the same predicate.
+    let where_clause = format!(
+        "{} and {} and {}",
+        pk_range_where(&pk_idents, &pk, &lo),
+        key_not_null(&pk_idents),
+        not_quarantined(&pk, params.len() + 1),
+    );
+    params.push(&source_table);
+
+    let keys: i64 = client
+        .query_one(
+            &format!("select count(*) from {source} as {SOURCE_ALIAS} where {where_clause}"),
+            &params,
+        )
+        .await?
+        .get(0);
+    match keys {
+        0 => Ok(ChunkNarrowing::Empty),
+        1 => {
+            let key: String = client
+                .query_one(
+                    &format!(
+                        "select {} from {source} as {SOURCE_ALIAS} where {where_clause}",
+                        ddl::pk_key_sql_expr(&pk, Some(SOURCE_ALIAS))
+                    ),
+                    &params,
+                )
+                .await?
+                .get(0);
+            Ok(ChunkNarrowing::Key(key))
+        }
+        keys => {
+            let col_list = pk_idents.join(", ");
+            let order_desc = pk_idents
+                .iter()
+                .map(|c| format!("s.{c} desc"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mid_select = pk_idents
+                .iter()
+                .map(|c| format!("s.{c}::text"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let row = client
+                .query_one(
+                    &format!(
+                        "select {mid_select} from \
+                         (select {col_list} from {source} as {SOURCE_ALIAS} \
+                          where {where_clause} order by {col_list} limit {}) s \
+                         order by {order_desc} limit 1",
+                        keys / 2
+                    ),
+                    &params,
+                )
+                .await?;
+            let mid: Vec<String> = (0..pk.len()).map(|i| row.get(i)).collect();
+            Ok(ChunkNarrowing::Split {
+                mid: ddl::join_pk_key(mid),
+            })
+        }
+    }
 }
 
 /// Walks the source primary key in half-open `(lo, hi]` ranges, returning them
