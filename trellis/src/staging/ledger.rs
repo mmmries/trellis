@@ -44,8 +44,9 @@
 //!    for every key of the page that has no entry, then `select … for
 //!    update` every entry, sorted by key, in one statement. A tombstone
 //!    collected between the two (`super::retire::collect_tombstones`, #623
-//!    D7) leaves its key with no entry to lock, so the lock is retaken until
-//!    it holds every key.
+//!    D7) leaves its key with no entry to lock, which fails the page with a
+//!    transient error: it rolls back and retries, inserting that key's
+//!    placeholder afresh (#712).
 //! 2. **Re-derive read**: a record staged as a `recompute` (or folded with
 //!    one) is a Re-derive, and so is one with no change identity. One
 //!    statement reads those keys' source rows *and* `pg_current_snapshot()`,
@@ -1233,10 +1234,20 @@ pub(super) async fn finish_groups(
 
 /// Locks the ledger entries of `keys` (I1, I5): inserts a non-member
 /// placeholder for every key with no entry, then `select … for update`
-/// every entry, sorted by key. A tombstone the placeholder insert found can
-/// be collected (`super::retire::collect_tombstones`, #623 D7) before the
-/// lock reaches it, leaving its key with no entry: the lock is then taken
-/// again, placeholders first, until it holds every key.
+/// every entry, sorted by key.
+///
+/// A tombstone the placeholder insert found can be collected
+/// (`super::retire::collect_tombstones`, #623 D7) before the lock reaches
+/// it, leaving its key with no entry. That fails the call with
+/// [`ApplyError::LedgerEntryCollected`], which the caller's transaction
+/// rolls back on and retries as a transient error (#712); the retry inserts
+/// the key's placeholder afresh. Taking the lock again in the same
+/// transaction would insert that placeholder while holding the other keys'
+/// locks, out of I5's one order, and deadlock with a transaction that
+/// inserted the same placeholder first and then queued on one of them. A
+/// savepoint to give those locks back first would cost every call two round
+/// trips, a subtransaction and a multixact on the entries it then updates,
+/// for a race that needs the GC inside a window of one round trip.
 ///
 /// Shared by a page ([`apply_ledger_target`]) and a build chunk
 /// ([`super::build`], #625 F1). `skip_lock` is the `skip_ledger_lock`
@@ -1252,28 +1263,25 @@ pub(super) async fn lock_entries(
     let mut distinct = keys.to_vec();
     distinct.sort_unstable();
     distinct.dedup();
-    loop {
-        txn.execute(
-            &format!(
-                "insert into {ledger} ({key_col}, {}) \
-                 select k, false from unnest($1::text[]) as k order by k \
-                 on conflict do nothing",
-                quote_ident(schema::MEMBER_COLUMN)
-            ),
-            &[&distinct],
-        )
-        .await?;
-        // Test-only pause point (#623 D7). See `super::interleave`.
-        #[cfg(any(test, feature = "test-util"))]
-        super::interleave::pause_at(
-            txn,
-            super::interleave::PausePoint::AfterPlaceholders,
-            &plan.target,
-        )
-        .await?;
-        if skip_lock {
-            break;
-        }
+    txn.execute(
+        &format!(
+            "insert into {ledger} ({key_col}, {}) \
+             select k, false from unnest($1::text[]) as k order by k \
+             on conflict do nothing",
+            quote_ident(schema::MEMBER_COLUMN)
+        ),
+        &[&distinct],
+    )
+    .await?;
+    // Test-only pause point (#623 D7). See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        txn,
+        super::interleave::PausePoint::AfterPlaceholders,
+        &plan.target,
+    )
+    .await?;
+    if !skip_lock {
         let locked = txn
             .execute(
                 &format!(
@@ -1283,8 +1291,10 @@ pub(super) async fn lock_entries(
                 &[&distinct],
             )
             .await?;
-        if locked as usize == distinct.len() {
-            break;
+        if (locked as usize) < distinct.len() {
+            return Err(ApplyError::LedgerEntryCollected {
+                target: plan.target.clone(),
+            });
         }
     }
     // Test-only pause point (#623 D1). See `super::interleave`.

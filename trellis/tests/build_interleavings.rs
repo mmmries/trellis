@@ -21,8 +21,10 @@ use std::sync::{Arc, Mutex};
 
 use drain_driver::Driver;
 use trellis::defs::ValueType;
+use trellis::staging::apply::ApplyError;
 use trellis::staging::build::{BuildPlan, ChunkOutcome};
 use trellis::staging::interleave::PausePoint;
+use trellis::staging::quarantine::{FailureClass, classify};
 
 const TARGET: &str = "public.agg";
 
@@ -762,6 +764,91 @@ async fn key_3_entry(d: &Driver) -> Option<(bool, Option<i64>)> {
         .await
         .expect("read key 3's entry")
         .map(|r| (r.get(0), r.get(1)))
+}
+
+// ------------------------------- an entry the GC collects mid-lock (#712)
+
+/// A build whose ledger holds key 2's tombstone, already collectible, and
+/// whose source has key 2 back: every key chunked, key 2 deleted and
+/// drained, then key 1 updated and key 2 re-inserted, captured into the
+/// returned batch, which is left undrained.
+async fn start_retake(flavour: Flavour) -> (Driver, BuildPlan, i64) {
+    let (mut d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+    d.chunk(&plan, None, "3").await;
+    let user = d.user().await;
+    user.batch_execute("delete from public.src where id = 2")
+        .await
+        .expect("delete key 2");
+    let deleted = d.seal().await;
+    d.drain(deleted, "apply").await;
+    user.batch_execute(
+        "update public.src set v = 11 where id = 1; insert into public.src values (2, 1, 25)",
+    )
+    .await
+    .expect("update key 1, re-insert key 2");
+    let batch = d.seal().await;
+    (d, plan, batch)
+}
+
+/// A page whose entry lock loses a key to the GC gives up every lock it
+/// holds before inserting that key's placeholder again, so a chunk that
+/// took the placeholder in the meantime gets every lock it asks for. The
+/// page (keys 1 and 2) is frozen after its placeholder insert, which found
+/// key 2's tombstone. The GC collects it, and the chunk (keys 1 to 3)
+/// inserts key 2's placeholder and is frozen there. The page locks key 1,
+/// finds no entry for key 2, rolls back and retries, and its retry queues on
+/// the chunk's placeholder; then the chunk locks its keys. Had the page kept
+/// key 1's lock, the chunk would queue on it: a deadlock, or the chunk giving
+/// up at its lock timeout.
+#[tokio::test]
+async fn a_page_losing_an_entry_to_the_gc_never_deadlocks_with_a_chunk() {
+    let flavour = Flavour::Sum;
+    let (mut d, plan, batch) = start_retake(flavour).await;
+    let mut page = d
+        .drain_frozen(batch, "page", &[(PausePoint::AfterPlaceholders, TARGET)])
+        .await;
+    page.reached(PausePoint::AfterPlaceholders).await;
+    assert_eq!(d.collect_tombstones().await, 1, "key 2's tombstone goes");
+    let mut chunk = d
+        .chunk_frozen(&plan, None, "3", &[(PausePoint::AfterPlaceholders, TARGET)])
+        .await;
+    let frozen = chunk.reached(PausePoint::AfterPlaceholders).await;
+    d.release(&mut page, PausePoint::AfterPlaceholders).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    d.release(&mut chunk, PausePoint::AfterPlaceholders).await;
+    let chunked = chunk.finish_result().await;
+    let paged = page.finish_result().await;
+
+    assert_eq!(d.deadlocks_logged(), Vec::<String>::new());
+    assert_eq!(chunked.expect("the chunk takes every lock").keys, 3);
+    paged.expect("the page");
+    assert_oracle(&mut d, &plan, flavour).await;
+}
+
+/// A chunk whose entry lock loses a key to the GC gives up with a transient
+/// error, to be retried, rather than re-derive its range with that key
+/// unlocked. The chunk (keys 1 to 3) is frozen after its placeholder
+/// insert, which found key 2's tombstone, and the GC collects it.
+#[tokio::test]
+async fn a_chunk_losing_an_entry_to_the_gc_gives_up_transiently() {
+    let flavour = Flavour::Sum;
+    let (mut d, plan, batch) = start_retake(flavour).await;
+    let mut chunk = d
+        .chunk_frozen(&plan, None, "3", &[(PausePoint::AfterPlaceholders, TARGET)])
+        .await;
+    chunk.reached(PausePoint::AfterPlaceholders).await;
+    assert_eq!(d.collect_tombstones().await, 1, "key 2's tombstone goes");
+    d.release(&mut chunk, PausePoint::AfterPlaceholders).await;
+    let err = chunk.finish_result().await.expect_err("key 2 has no entry");
+    assert!(
+        matches!(err, ApplyError::LedgerEntryCollected { .. }),
+        "the entry was collected, not {err}"
+    );
+    assert_eq!(classify(&err), FailureClass::Transient);
+    d.drain(batch, "page").await;
+    assert_eq!(d.chunk(&plan, None, "3").await.keys, 3);
+    assert_eq!(d.deadlocks_logged(), Vec::<String>::new());
+    assert_oracle(&mut d, &plan, flavour).await;
 }
 
 // ------------------------------------------------ a build under writers
