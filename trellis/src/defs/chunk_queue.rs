@@ -878,27 +878,42 @@ pub async fn fail_chunk(
             };
             (outcome, attempts, location)
         }
-        // A Re-derive build's work isn't narrowed to a key yet (#625 F5): a
-        // data failure is charged like any other, and its
-        // [`MAX_CHARGED_ATTEMPTS`]th charge pauses the definition. A
-        // transient one (the chunk's short entry-lock timeout, mostly) backs
-        // off for at most [`REDERIVE_RETRY_CAP`], so a chunk that keeps
-        // meeting drain pages isn't left out for minutes.
+        // A Re-derive chunk narrows a data failure to a key as a 1-1 range
+        // chunk does (#625 F5, F-A5): its range holds the same keys, and
+        // it leaves a quarantined key out the same way.
+        //
+        // "The same keys" holds only while every source is captured, keyed
+        // by a genuine `PRIMARY KEY`: `narrow_one_to_one_chunk` never counts
+        // a key with a `NULL` part (`key_not_null`), and a Re-derive chunk
+        // does re-derive one. A seam-fed source (another aggregate's target,
+        // keyed by its nullable grouping columns) isn't the Re-derive
+        // build's yet (`staging::build::qualifies`); once #625 F6 takes it,
+        // a failing `NULL`-keyed row would narrow to `Empty` (charged, then
+        // paused) or be pinned on an innocent key beside it. F6 must narrow
+        // by the chunk's own key predicate before it widens `qualifies`.
+        //
+        // A transient failure (the chunk's short entry-lock timeout, mostly)
+        // backs off for at
+        // most [`REDERIVE_RETRY_CAP`], so a chunk that keeps meeting drain
+        // pages isn't left out for minutes.
         ChunkWork::Rederive { lo, hi } => {
             let (outcome, attempts) = fail_range_chunk(
                 pool,
                 chunk,
-                None,
+                Some((lo.as_deref(), hi)),
                 claimed_by,
                 kind,
                 &message,
                 REDERIVE_RETRY_CAP,
             )
             .await?;
-            let location = format!(
-                "re-derive range ({}, {hi}]",
-                lo.as_deref().unwrap_or("-infinity")
-            );
+            let location = match &outcome {
+                ChunkFailure::Quarantined { key, .. } => format!("key {key}"),
+                _ => format!(
+                    "re-derive range ({}, {hi}]",
+                    lo.as_deref().unwrap_or("-infinity")
+                ),
+            };
             (outcome, attempts, location)
         }
         ChunkWork::Plan { .. } => {
@@ -1103,14 +1118,15 @@ async fn fail_range_chunk(
     let outcome = match narrowed {
         Some(backfill::ChunkNarrowing::Split { mid }) => {
             // This row keeps the lower half, and a new one takes the upper
-            // half. Both carry the failure so far, so `status` keeps
-            // reporting it while the build narrows, and the build's
-            // `fuse_rearmed_at`, so a resume supersedes both alike.
+            // half, of the same kind (a 1-1 range or a Re-derive chunk). Both
+            // carry the failure so far, so `status` keeps reporting it while
+            // the build narrows, and the build's `fuse_rearmed_at`, so a
+            // resume supersedes both alike.
             txn.execute(
                 "insert into backfill_chunks \
-                     (definition_id, lo, hi, fuse_rearmed_at, attempts, charged, \
+                     (definition_id, kind, lo, hi, fuse_rearmed_at, attempts, charged, \
                       last_error, next_attempt_at) \
-                 select definition_id, $2, hi, fuse_rearmed_at, $3, charged, $4, now() \
+                 select definition_id, kind, $2, hi, fuse_rearmed_at, $3, charged, $4, now() \
                  from backfill_chunks where id = $1",
                 &[&chunk.id, &mid, &attempts, &error],
             )
