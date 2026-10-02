@@ -164,9 +164,9 @@ const DRAINED_PREFIX_SQL: &str = "\
     from segments";
 
 /// Every ledger table there is, schema-qualified and quoted: a
-/// definition's `<target>__ledger`, where it exists. Only aggregate targets
-/// have one today; a 1-1 target's (#623 D6) is found the same way, with the
-/// same ordering-state columns, so [`collect_tombstones`] collects it as is.
+/// definition's `<target>__ledger`, where it exists. An aggregate target's
+/// and a 1-1 target's (#623 D6) carry the same ordering-state columns, so
+/// [`collect_tombstones`] collects both alike.
 const LEDGER_TABLES_SQL: &str = "\
     select format('%I.%I', n.nspname, c.relname) \
     from transform_definitions d \
@@ -215,7 +215,7 @@ const TOMBSTONE_BATCHES_PER_PASS: usize = 4;
 /// page has just revived is no longer a tombstone. A delete that lands
 /// between a page's placeholder insert and its lock fails the page's entry
 /// lock with a transient error, and the page retries
-/// (`ledger::lock_entries`, #712).
+/// (`ledger::lock_entries` and `one_to_one_ledger::lock_entries`, #712).
 pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError> {
     let row = client.query_one(DRAINED_PREFIX_SQL, &[]).await?;
     let prefix: Option<i64> = row.get(0);
