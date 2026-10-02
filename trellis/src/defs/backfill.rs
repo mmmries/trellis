@@ -1675,8 +1675,8 @@ async fn backfill_aggregate(
     let contributions = super::ledger::contributions(&def.fields, group_by, &substituted);
 
     // The ledger write: one entry per source row. `member`, `tombstone`,
-    // `applied_lsn`, `applied_seg` and `join_key` take their defaults (a
-    // member, live, never applied, no join key until #623 D5).
+    // `applied_lsn` and `applied_seg` take their defaults (a member, live,
+    // never applied).
     let mut ledger_cols = vec![quote_ident(super::ledger::KEY_COLUMN)];
     let mut ledger_exprs = vec![scan.key_sql(&pk)];
     for key in group_by {
@@ -1841,9 +1841,8 @@ async fn backfill_aggregate(
         }
         let horizon = load_emptied_ledger(&txn, &ledger, &ledger_sql).await?;
         // The group deltas recorded moves between the entries just discarded
-        // (#625 F1's B4). Only a ledger-routed target has them: a
-        // relationship-fed one (until #623 D5) builds here too, with none.
-        if crate::staging::ledger::route(def, source_columns).is_some() {
+        // (#625 F1's B4). Only a ledger-routed target has them.
+        if crate::staging::ledger::route(def, source_columns, &relationships).is_some() {
             super::ledger::truncate_deltas(
                 &*txn,
                 &super::ledger::qualified_deltas_table(target_schema, &def.target),
@@ -1864,11 +1863,7 @@ async fn backfill_aggregate(
     let rebuild = format!(
         "alter table {ledger} add primary key ({}){}",
         quote_ident(super::ledger::KEY_COLUMN),
-        super::ledger::aggregate_ledger_index_ddl(
-            &ledger,
-            &group_idents,
-            !super::eval::relationship_references(def).is_empty(),
-        ),
+        super::ledger::aggregate_ledger_index_ddl(&ledger, &group_idents),
     );
     {
         let txn = client.transaction().await?;
