@@ -38,6 +38,9 @@
 //!
 //! Harness conventions follow `defs_exact_integers.rs`.
 
+#[path = "support/wait_live.rs"]
+mod wait_live;
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -1170,19 +1173,20 @@ fn the_two_word_double_precision_keyword_parses_in_both_spellings() {
 ///
 /// This is the claim the backfill test above cannot make, and it is the one
 /// the recompute-vs-delta decision is *about*: `defs::invertibility`
-/// classifies a float `SUM`/`AVG` as recompute-only, so both
-/// `defs::backfill::classify_field` and
-/// `staging::apply_aggregate::classify_fields` must route these fields to
-/// the probe-assisted recompute path rather than the delta path. If either
-/// still passed a hardcoded `ValueType::Numeric` to the gate — as both did
-/// before #112 — the workload below would leave a group whose running sum
-/// had drifted, or one poisoned by a deleted `NaN` row that subtraction
-/// cannot undo.
+/// classifies a float `SUM`/`AVG` as recompute-only, so
+/// `defs::backfill::classify_field`, which shapes a ledger target
+/// (`staging::ledger::route`), must make these fields recomputed from each
+/// written group's live ledger entries rather than maintained by increments.
+/// If it still passed a hardcoded `ValueType::Numeric` to the gate, as it did
+/// before #112, the workload below would leave a group whose running sum had
+/// drifted, or one poisoned by a deleted `NaN` row that subtraction cannot
+/// undo.
 ///
-/// Run through the public `Trellis` facade against the full live pipeline,
-/// with convergence awaited via `watermark_token`/`await_converged`. The
-/// comparison is a symmetric difference against independently-written SQL,
-/// per ADR-0013.
+/// Run through the public `Trellis` facade against the full live pipeline.
+/// The workload starts once the target reports `live`, so every statement
+/// goes through Apply rather than the build, and convergence is awaited via
+/// `watermark_token`/`await_converged`. The comparison is a symmetric
+/// difference against independently-written SQL, per ADR-0013.
 #[tokio::test]
 async fn an_incremental_float_aggregate_stays_equal_to_a_hand_written_group_by() {
     let cluster = TestCluster::start();
@@ -1222,6 +1226,11 @@ async fn an_incremental_float_aggregate_stays_equal_to_a_hand_written_group_by()
     )
     .await
     .expect("connect running trellis");
+
+    // Wait out the build first (#728): `await_converged` covers a definition
+    // only once it is `live`, and from then on every statement below goes
+    // through Apply, the incremental path this test is about.
+    wait_live::wait_for_live(&trellis, "t").await;
 
     // A workload built specifically to break a delta-maintained float sum:
     // a group whose magnitudes differ by 16 orders of magnitude (so

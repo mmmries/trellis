@@ -29,6 +29,9 @@
 //! Harness conventions (`install_definition` + drain the chunk queue, then
 //! introspect `information_schema`) follow `defs_typed_literals.rs`.
 
+#[path = "support/wait_live.rs"]
+mod wait_live;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -718,19 +721,22 @@ async fn integer_text_rendering_is_byte_identical_to_postgres() {
 /// across inserts, updates and deletes.
 ///
 /// This is the one claim the backfill test above cannot make, and it is
-/// where a `SUM(integer) -> bigint` column is genuinely load-bearing:
-/// `staging::apply_aggregate` maintains a group's running sum as a hidden
-/// `numeric` partial and folds it into the visible column, so the visible
-/// column's type change from `numeric` to `bigint` puts a Postgres
-/// assignment cast on the hot path of every delta. Nothing else in the test
-/// suite exercises that — the generative suite's own value columns are
-/// `numeric`, so its `SUM` targets stay `numeric` too.
+/// where a `SUM(integer) -> bigint` column is genuinely load-bearing: a
+/// ledger target (`staging::ledger`, #623 D3) keeps a group's `SUM` in the
+/// visible column itself, and every Apply adds the group's increment to it,
+/// a `sum` over the ledger's `integer` contributions that Postgres widens to
+/// `bigint`. An increment computed in `int4`, or a visible column left
+/// `integer`, overflows on the workload below, whose sums pass `int4`.
+/// Nothing else in the test suite exercises that: the generative suite's
+/// own value columns are `numeric`, so its `SUM` targets stay `numeric` too.
 ///
 /// Run through the public `Trellis` facade against the full live pipeline
-/// (real capture triggers, real ring, real drain workers), with
-/// convergence awaited via `watermark_token`/`await_converged` rather than
-/// slept for. The comparison at the end is a symmetric difference against a
-/// hand-written `GROUP BY`, per ADR-0013.
+/// (real capture triggers, real ring, real drain workers). The workload
+/// starts once the target reports `live`, so every statement goes through
+/// Apply rather than the build, and convergence is awaited via
+/// `watermark_token`/`await_converged` rather than slept for. The
+/// comparison at the end is a symmetric difference against a hand-written
+/// `GROUP BY`, per ADR-0013.
 #[tokio::test]
 async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
     let cluster = TestCluster::start();
@@ -770,6 +776,11 @@ async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
     )
     .await
     .expect("connect running trellis");
+
+    // Wait out the build first (#728): `await_converged` covers a definition
+    // only once it is `live`, and from then on every statement below goes
+    // through Apply, the incremental path this test is about.
+    wait_live::wait_for_live(&trellis, "t").await;
 
     // A workload that moves rows *between* groups, empties a group, and
     // pushes a running sum well past `int4` — so a delta that silently
