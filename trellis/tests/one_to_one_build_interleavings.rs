@@ -603,3 +603,516 @@ async fn a_chunk_feeds_a_reader_of_its_target_through_the_seam() {
     );
     assert_oracle(&mut d).await;
 }
+
+// ------------------------------------------- a field build's chunk (F8b)
+//
+// `ALTER TRANSFORM one ADD v + 1 AS w` registers a field build (#625 F8b):
+// `w` applies from the edit's commit, and each chunk of the build rewrites
+// just `w` of its keys' existing rows from one snapshot, under their entry
+// lock, leaving the entries alone. Each test makes that state from a live
+// `one` and runs the build's chunks by hand.
+
+const W_ACTUAL: &str = "select id, g, dbl, w from public.one order by id";
+const W_EXPECTED: &str = "select id, g, v + v, v + 1 from public.src order by id";
+
+/// `public.src` seeded with `rows`, [`ONE`] live over it, and then
+/// `ALTER TRANSFORM one ADD v + 1 AS w`, with none of its field build run.
+async fn start_field_build(rows: &[(i32, i32, i32)]) -> (Driver, OneToOnePlan) {
+    let d = Driver::start(
+        &format!("{CREATE} {}", seed(rows)),
+        &columns(),
+        &[ONE],
+        &["public.src"],
+    )
+    .await;
+    let trellis::defs::Statement::AlterTransform(alter) =
+        trellis::defs::parse_statement("ALTER TRANSFORM one ADD v + 1 AS w").expect("parse")
+    else {
+        panic!("not an ALTER");
+    };
+    trellis::defs::alter_transform(d.pool(), &alter)
+        .await
+        .expect("alter one");
+    let plan = OneToOnePlan::load(d.pool(), "one")
+        .await
+        .expect("load the 1-1 plan")
+        .expect("a plain 1-1 target takes the re-derive build");
+    (d, plan)
+}
+
+/// Starts one field chunk of `w`, `(lo, hi]`, in its own task and
+/// transaction, frozen at each of `points` once reached.
+async fn field_chunk_frozen(
+    d: &Driver,
+    plan: &OneToOnePlan,
+    lo: Option<&str>,
+    hi: &str,
+    points: &[(PausePoint, &str)],
+) -> Running<OneToOneOutcome> {
+    let plan = plan.clone();
+    let (lo, hi) = (lo.map(str::to_string), hi.to_string());
+    d.run_frozen(points, move |pool| async move {
+        let mut client = pool.get().await?;
+        let txn = client.transaction().await?;
+        let outcome =
+            one_to_one::run_field_chunk(&txn, &plan, &["w".to_string()], lo.as_deref(), &hi)
+                .await?;
+        txn.commit().await?;
+        Ok(outcome)
+    })
+    .await
+}
+
+/// Runs and commits one field chunk of `w`.
+async fn field_chunk(
+    d: &Driver,
+    plan: &OneToOnePlan,
+    lo: Option<&str>,
+    hi: &str,
+) -> OneToOneOutcome {
+    field_chunk_frozen(d, plan, lo, hi, &[])
+        .await
+        .finish()
+        .await
+}
+
+/// Settles the pipeline and asserts the target, `w` included, equals the
+/// source.
+async fn assert_field_oracle(d: &mut Driver) {
+    d.settle().await;
+    assert_eq!(
+        d.rows(W_ACTUAL).await,
+        d.rows(W_EXPECTED).await,
+        "the 1-1 target, its built field included, against the source"
+    );
+}
+
+/// The edit itself writes no row, and a field chunk writes only `w`.
+#[tokio::test]
+async fn a_field_chunk_writes_only_its_field() {
+    let (mut d, plan) = start_field_build(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+    assert_eq!(
+        d.rows(W_ACTUAL).await,
+        ["(1,1,2,)", "(2,1,4,)", "(3,2,6,)"],
+        "the edit only registers its build"
+    );
+    // A change no entry hears about: a field chunk doesn't bring `g` or
+    // `dbl` up to date, only a whole build or Apply does.
+    write_uncaptured(&d, "update public.src set g = 9, v = 5 where id = 1").await;
+    const ENTRIES: &str = "select __from_key, __basis::text, __tombstone, __applied_seg \
+                           from public.one__ledger order by __from_key";
+    let entries = d.rows(ENTRIES).await;
+    let outcome = field_chunk(&d, &plan, None, "3").await;
+    assert_eq!(
+        outcome,
+        OneToOneOutcome {
+            keys: 3,
+            written: 3,
+            deleted: 0,
+        }
+    );
+    assert_eq!(
+        d.rows(W_ACTUAL).await,
+        ["(1,1,2,6)", "(2,1,4,3)", "(3,2,6,4)"],
+        "w from the source as the chunk read it; g and dbl untouched"
+    );
+    // Run again, it finds `w` right everywhere and writes nothing.
+    assert_eq!(field_chunk(&d, &plan, None, "3").await.written, 0);
+    assert_eq!(
+        d.rows(ENTRIES).await,
+        entries,
+        "a field chunk leaves every entry as it was"
+    );
+    // Put the source back as the target's `g` and `dbl` have it, and the
+    // field chunk brings `w` along.
+    write_uncaptured(&d, "update public.src set g = 1, v = 1 where id = 1").await;
+    field_chunk(&d, &plan, None, "3").await;
+    assert_field_oracle(&mut d).await;
+}
+
+/// A field chunk over keys 1–10 and an Apply of `op` (on key 2, or key 7 for
+/// the insert), in every order: the field applies from the edit's commit, so
+/// Apply writes `w` from its image whichever comes first.
+async fn field_chunk_against_apply(op: Op) {
+    for order in [
+        Order::ChunkWriteApply,
+        Order::WriteChunkApply,
+        Order::WriteApplyChunk,
+    ] {
+        let (mut d, plan) = start_field_build(&[(1, 1, 1), (2, 1, 2), (3, 2, 3), (4, 2, 4)]).await;
+        let user = d.user().await;
+        if matches!(order, Order::ChunkWriteApply) {
+            assert_eq!(field_chunk(&d, &plan, None, "10").await.keys, 4);
+        }
+        user.batch_execute(op.sql()).await.expect("the write");
+        if matches!(order, Order::WriteChunkApply) {
+            field_chunk(&d, &plan, None, "10").await;
+        }
+        let batch = d.seal().await;
+        d.drain(batch, "apply").await;
+        if matches!(order, Order::WriteApplyChunk) {
+            field_chunk(&d, &plan, None, "10").await;
+        }
+        assert_eq!(
+            d.rows(W_ACTUAL).await,
+            d.rows(W_EXPECTED).await,
+            "{op:?} {order:?}"
+        );
+        assert_field_oracle(&mut d).await;
+    }
+}
+
+#[tokio::test]
+async fn a_field_chunk_and_an_apply_agree_on_an_insert() {
+    field_chunk_against_apply(Op::Insert).await;
+}
+
+#[tokio::test]
+async fn a_field_chunk_and_an_apply_agree_on_an_update() {
+    field_chunk_against_apply(Op::Update).await;
+}
+
+#[tokio::test]
+async fn a_field_chunk_and_an_apply_agree_on_a_delete() {
+    field_chunk_against_apply(Op::Delete).await;
+}
+
+/// Why a field chunk leaves the entries alone: a write to key 2 commits,
+/// the chunk's snapshot sees it, and only then does the write's Apply run.
+/// Had the chunk moved key 2's `basis` to its snapshot, ADR-0002's I2 would
+/// refuse that Apply as already seen, and `g` and `dbl`, which the chunk
+/// doesn't write, would keep their old values for good.
+#[tokio::test]
+async fn a_change_the_field_chunk_saw_still_applies_its_other_columns() {
+    let (mut d, plan) = start_field_build(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+    let user = d.user().await;
+    user.batch_execute("update public.src set g = 5, v = 20 where id = 2")
+        .await
+        .expect("update key 2");
+    field_chunk(&d, &plan, None, "3").await;
+    assert_eq!(
+        d.rows("select id, g, w from public.one where id = 2").await,
+        ["(2,1,21)"],
+        "the chunk wrote w from the change it saw, and nothing else"
+    );
+    let batch = d.seal().await;
+    d.drain(batch, "apply").await;
+    assert_eq!(
+        d.rows("select id, g, dbl, w from public.one where id = 2")
+            .await,
+        ["(2,5,40,21)"],
+        "the change's Apply still writes its other columns"
+    );
+    assert_field_oracle(&mut d).await;
+}
+
+/// A field chunk frozen after its entry lock holds key 1's entry (the
+/// `chunk_without_entry_lock` plant fails here), so a page applying a later
+/// change to key 1 queues behind it and writes `w` after it: the chunk's
+/// older read can't land over the page's newer `w`. (Without the lock the
+/// two would race inside the chunk's one statement: its update, finding the
+/// page's committed row, would put its snapshot's `w` over the page's.)
+#[tokio::test]
+async fn a_page_queues_behind_a_field_chunk_holding_its_key() {
+    let (mut d, plan) = start_field_build(&[(1, 1, 10), (2, 1, 20)]).await;
+    let mut running = field_chunk_frozen(
+        &d,
+        &plan,
+        None,
+        "2",
+        &[(PausePoint::AfterEntryLock, TARGET)],
+    )
+    .await;
+    let frozen = running.reached(PausePoint::AfterEntryLock).await;
+    let probe = d
+        .ctl
+        .execute(
+            "select 1 from public.one__ledger where __from_key = '1' for update nowait",
+            &[],
+        )
+        .await
+        .expect_err("the field chunk holds key 1's entry");
+    assert_eq!(
+        probe.code(),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "{probe}"
+    );
+    let user = d.user().await;
+    user.batch_execute("update public.src set g = 3, v = 30 where id = 1")
+        .await
+        .expect("update key 1");
+    let batch = d.seal().await;
+    let page = d.drain_frozen(batch, "page", &[]).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    d.release(&mut running, PausePoint::AfterEntryLock).await;
+    assert_eq!(running.finish().await.keys, 2);
+    page.finish().await;
+    assert_eq!(
+        d.rows(W_ACTUAL).await,
+        d.rows(W_EXPECTED).await,
+        "the page's later change wins, with no catch-up"
+    );
+    assert_field_oracle(&mut d).await;
+}
+
+/// A page frozen after its entry lock holds key 2, so a field chunk over it
+/// gives up at its short lock timeout with `55P03` (transient), writing
+/// nothing. Once the page commits, the chunk runs again.
+#[tokio::test]
+async fn a_field_chunk_gives_up_on_a_key_a_page_holds() {
+    let (mut d, plan) = start_field_build(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+    let user = d.user().await;
+    user.batch_execute("update public.src set v = v + 10 where id = 2")
+        .await
+        .expect("update key 2");
+    let batch = d.seal().await;
+    let mut page = d
+        .drain_frozen(batch, "page", &[(PausePoint::AfterEntryLock, TARGET)])
+        .await;
+    page.reached(PausePoint::AfterEntryLock).await;
+    let err = field_chunk_frozen(&d, &plan, None, "3", &[])
+        .await
+        .finish_result()
+        .await
+        .expect_err("the chunk gives up on key 2");
+    assert!(
+        trellis::locks::is_lock_not_available(&err),
+        "a lock timeout, not {err}"
+    );
+    assert_eq!(classify(&err), FailureClass::Transient);
+    assert_eq!(
+        d.rows("select count(*) from public.one where w is not null")
+            .await,
+        ["(0)"],
+        "the chunk rolled back"
+    );
+    d.release(&mut page, PausePoint::AfterEntryLock).await;
+    page.finish().await;
+    assert_eq!(field_chunk(&d, &plan, None, "3").await.keys, 3);
+    assert_field_oracle(&mut d).await;
+}
+
+/// A field paused while its build runs (an operator pause, say) is left out
+/// of the build's chunks, as Apply leaves it out: it keeps the value it had.
+#[tokio::test]
+async fn a_field_chunk_leaves_a_paused_field_alone() {
+    let (mut d, plan) = start_field_build(&[(1, 1, 1), (2, 1, 2)]).await;
+    d.ctl
+        .execute(
+            "insert into column_status (transform_table, column_name, last_error, local_fuse) \
+             values ('one', 'w', 'paused by the test', true)",
+            &[],
+        )
+        .await
+        .expect("pause one.w");
+    let outcome = field_chunk(&d, &plan, None, "2").await;
+    assert_eq!((outcome.keys, outcome.written), (2, 0));
+    assert_eq!(
+        d.rows("select count(*) from public.one where w is not null")
+            .await,
+        ["(0)"]
+    );
+    d.ctl
+        .execute("delete from column_status", &[])
+        .await
+        .expect("unpause one.w");
+    field_chunk(&d, &plan, None, "2").await;
+    assert_field_oracle(&mut d).await;
+}
+
+/// The field chunk's statement reads the source and the target by their
+/// keys, as the whole build's does
+/// (`the_chunk_statement_reads_every_table_by_its_key`), and never the
+/// ledger, which it doesn't write.
+#[tokio::test]
+async fn the_field_chunk_statement_reads_every_table_by_its_key() {
+    let rows: Vec<(i32, i32, i32)> = (1..=50).map(|i| (i, i % 5, i)).collect();
+    let (mut d, plan) = start_field_build(&rows).await;
+    d.ctl
+        .batch_execute("analyze public.src, public.one, public.one__ledger")
+        .await
+        .expect("analyze the tables");
+    let keys: Vec<String> = (11..=20).map(|i| i.to_string()).collect();
+    let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let mut client = d.pool().get().await.expect("a connection");
+    let txn = client.transaction().await.expect("begin");
+    let explained = one_to_one::explain_field_chunk(
+        &txn,
+        &plan,
+        &["w".to_string()],
+        Some("10"),
+        "20",
+        &key_refs,
+    )
+    .await
+    .expect("explain the field chunk statement");
+    txn.rollback().await.expect("roll back");
+    drop(client);
+    let scans: Vec<&str> = explained
+        .lines()
+        .filter(|line| line.contains("Seq Scan"))
+        .collect();
+    assert_eq!(
+        scans,
+        Vec::<&str>::new(),
+        "no sequential scan:\n{explained}"
+    );
+    assert!(
+        !explained.contains("one__ledger"),
+        "the field chunk's statement doesn't touch the ledger:\n{explained}"
+    );
+    field_chunk(&d, &plan, None, "50").await;
+    assert_field_oracle(&mut d).await;
+}
+
+// ------------------------------- a column resume against a page before it
+
+/// A column resume releases its pause and registers the field build in one
+/// commit (#625 F8b), and the column applies from there. A page that read
+/// the paused columns before that commit leaves the column out of its
+/// writes, so it must not apply after it. Otherwise this happens: the build
+/// writes `dbl` of key 1; the page of an older change to key 1, computed
+/// after the resume and drained out of order, writes `dbl` from its image;
+/// and the frozen page, whose change is newer, passes I2 and writes key 1's
+/// other columns, leaving `dbl` at the older change's value for good.
+/// The resume bumps the source's version fence, as `ALTER TRANSFORM` does,
+/// so it waits for that page, and a page that reaches the fence after it
+/// misses and computes again, with the column.
+#[tokio::test]
+async fn a_page_computed_before_a_column_resume_does_not_apply_after_it() {
+    let mut d = Driver::start(
+        &format!("{CREATE} {}", seed(&[(1, 1, 1), (2, 1, 2)])),
+        &columns(),
+        &[ONE],
+        &["public.src"],
+    )
+    .await;
+    trellis::staging::quarantine::pause_column(d.pool(), "one", "dbl")
+        .await
+        .expect("pause one.dbl");
+    let user = d.user().await;
+    user.batch_execute("update public.src set v = 10 where id = 1")
+        .await
+        .expect("the older write");
+    let older = d.seal().await;
+    user.batch_execute("update public.src set v = 20, g = 2 where id = 1")
+        .await
+        .expect("the newer write");
+    let newer = d.seal().await;
+    // The newer batch's page computes with `dbl` paused, takes the version
+    // fence, and stops before its entry lock.
+    let mut page = d
+        .drain_frozen(newer, "page", &[(PausePoint::AfterPlaceholders, TARGET)])
+        .await;
+    let frozen = page.reached(PausePoint::AfterPlaceholders).await;
+    let mut resume = tokio::spawn({
+        let pool = d.pool().clone();
+        async move { trellis::staging::quarantine::resume_column(&pool, "one", "dbl").await }
+    });
+    let waited = tokio::select! {
+        resumed = &mut resume => {
+            resumed.expect("the resume's task").expect("resume one.dbl");
+            false
+        }
+        () = d.wait_blocked_behind(frozen.backend_pid) => true,
+    };
+    if waited {
+        d.release(&mut page, PausePoint::AfterPlaceholders).await;
+        page.finish().await;
+        resume
+            .await
+            .expect("the resume's task")
+            .expect("resume one.dbl");
+        trellis::staging::build::settle_builds(d.pool()).await;
+        d.drain(older, "older").await;
+    } else {
+        // The race above, which the fence closes.
+        trellis::staging::build::settle_builds(d.pool()).await;
+        d.drain(older, "older").await;
+        d.release(&mut page, PausePoint::AfterPlaceholders).await;
+        page.finish().await;
+    }
+    assert!(
+        waited,
+        "the resume committed while a page computed with the column paused was in flight; \
+         the target is now {:?} against the source's {:?}",
+        d.rows(ACTUAL).await,
+        d.rows(EXPECTED).await,
+    );
+    assert_oracle(&mut d).await;
+}
+
+// --------------------------- a chunk planned before an edit, run after it
+
+/// One drain worker's build step, as `work_once` takes it.
+async fn build_step(pool: &trellis::Pool, worker: &str) -> trellis::staging::build::Step {
+    let options = trellis::staging::build::WorkerOptions {
+        chunk_rows: 10_000,
+        drain_batch_cap: 10_000,
+        heartbeat_interval: std::time::Duration::from_secs(1),
+        reclaim_ttl: std::time::Duration::from_secs(60),
+    };
+    trellis::staging::build::work_once(pool, worker, &options)
+        .await
+        .expect("a build step")
+}
+
+/// A chunk plans from the definition before its transaction, so an edit can
+/// commit between the two. Here the first field build's chunk has read `w`
+/// as `v + 1` and stops before its entry lock; `ALTER ... ALTER w AS v + 2`
+/// commits, and its own field build runs over every key and writes `v + 2`.
+/// Had the first chunk then gone on, it would have put `v + 1` back over
+/// every row, and with both builds done nothing would have rewritten it. It
+/// checks the source's version fence before it commits, finds the edit's
+/// bump, and gives its claim back to plan again.
+#[tokio::test]
+async fn a_chunk_planned_before_an_edit_doesnt_write_after_it() {
+    let (mut d, _plan) = start_field_build(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+    // The first field build's plan job enqueues its one chunk.
+    assert_eq!(
+        build_step(d.pool(), "planner").await,
+        trellis::staging::build::Step::Planned
+    );
+    let mut stale = d
+        .run_frozen(
+            &[(PausePoint::AfterPlaceholders, TARGET)],
+            |pool| async move { Ok(build_step(&pool, "stale").await) },
+        )
+        .await;
+    stale.reached(PausePoint::AfterPlaceholders).await;
+    let trellis::defs::Statement::AlterTransform(alter) =
+        trellis::defs::parse_statement("ALTER TRANSFORM one ALTER w AS v + 2").expect("parse")
+    else {
+        panic!("not an ALTER");
+    };
+    trellis::defs::alter_transform(d.pool(), &alter)
+        .await
+        .expect("alter one.w");
+    // The edit's field build: its plan job, then its chunk.
+    assert_eq!(
+        build_step(d.pool(), "second").await,
+        trellis::staging::build::Step::Planned
+    );
+    assert_eq!(
+        build_step(d.pool(), "second").await,
+        trellis::staging::build::Step::Chunk
+    );
+    assert_eq!(
+        d.rows("select id, w from public.one order by id").await,
+        ["(1,3)", "(2,4)", "(3,5)"],
+        "the edit's build wrote v + 2"
+    );
+    d.release(&mut stale, PausePoint::AfterPlaceholders).await;
+    stale.finish().await;
+    trellis::staging::build::settle_builds(d.pool()).await;
+    assert_eq!(
+        d.rows("select id, w from public.one order by id").await,
+        ["(1,3)", "(2,4)", "(3,5)"],
+        "the chunk planned before the edit wrote nothing after it"
+    );
+    d.settle().await;
+    assert_eq!(
+        d.rows("select id, w from public.one order by id").await,
+        d.rows("select id, v + 2 from public.src order by id").await,
+    );
+}
