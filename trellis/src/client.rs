@@ -533,7 +533,8 @@ async fn run(
         )));
     }
 
-    let client_id = format!("trellis-client-{}", uniqueish_id());
+    // Unique across processes and restarts (issue #756): see `new_worker_id`.
+    let client_id = new_worker_id();
 
     // Issue #144, ADR-0010 decision 3: register this process in the
     // worker registry the moment it starts running drain workers — before
@@ -610,15 +611,108 @@ async fn run(
     }
 }
 
-/// A cheap, process-local uniqueness token for `claimed_by` prefixes — not a
-/// UUID (no such dependency here), just enough entropy that two clients in
-/// the same process (as in a test) don't collide. `thread::current().id()`
-/// is unique within a process and available with no extra dependency.
-fn uniqueish_id() -> String {
-    format!("{:?}", std::thread::current().id())
+/// This `Client`'s worker id: its worker-registry key, and the prefix of
+/// every app-worker task's `claimed_by` (`{id}-app-{i}`). Shaped
+/// `trellis-[{host}-]{pid}-{random}`, with 64 random bits as 16 hex digits.
+///
+/// It must be unique across every process sharing the database, and across
+/// restarts of one process (issue #756). A claim is "mine" by `claimed_by`
+/// alone: `held_share` hands a drain every `seg_claims` row carrying its
+/// `claimed_by`, and each page's claim check and completion `delete` match on
+/// it, as do the chunk queue's `ClaimFence` and `finish_chunk`. Two workers
+/// sharing an id both drain the same buckets and both pass every check, so a
+/// stale page (a truncate's clear, say) can commit over a newer one. The id
+/// used to be the calling thread's `ThreadId`, which only numbers threads
+/// within one process: every replica's first `Client` came out the same.
+///
+/// The host and pid only make the id readable in logs and in the claim
+/// tables; the random part alone carries the uniqueness.
+fn new_worker_id() -> String {
+    let mut bytes = [0u8; 8];
+    let random = match getrandom::fill(&mut bytes) {
+        Ok(()) => u64::from_le_bytes(bytes),
+        // No OS randomness (practically unheard of): std's `RandomState`
+        // seeds its own keys per process, so a hash of the clock under it
+        // still differs between processes.
+        Err(_) => {
+            use std::hash::{BuildHasher, Hash, Hasher};
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            std::time::SystemTime::now().hash(&mut hasher);
+            std::process::id().hash(&mut hasher);
+            hasher.finish()
+        }
+    };
+    worker_id(host_name().as_deref(), std::process::id(), random)
+}
+
+/// The machine's host name (a pod name, under Kubernetes), if it's cheap to
+/// find: Linux's `/proc`, else `$HOSTNAME`.
+fn host_name() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+}
+
+/// [`new_worker_id`]'s format. The host is cut to at most 24 of the
+/// characters a host name may use, and dropped if none are left.
+fn worker_id(host: Option<&str>, pid: u32, random: u64) -> String {
+    let host: String = host
+        .unwrap_or_default()
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.')
+        .take(24)
+        .collect();
+    if host.is_empty() {
+        format!("trellis-{pid}-{random:016x}")
+    } else {
+        format!("trellis-{host}-{pid}-{random:016x}")
+    }
+}
+
+#[cfg(test)]
+mod worker_id_tests {
+    use super::*;
+
+    /// Issue #756: the old id was a function of the calling thread alone, so
+    /// two processes starting a `Client` from the same-numbered thread got
+    /// the same one. Two ids minted on one thread stand in for them: they
+    /// must differ, and so must every `claimed_by` derived from them.
+    #[test]
+    fn ids_minted_on_the_same_thread_differ() {
+        let a = new_worker_id();
+        let b = new_worker_id();
+        assert_ne!(a, b);
+        assert_ne!(format!("{a}-app-0"), format!("{b}-app-0"));
+    }
+
+    /// The same host and pid (a restarted process that got its old pid back,
+    /// or pid 1 in two containers) still differ by the random part.
+    #[test]
+    fn the_same_host_and_pid_differ_by_the_random_part() {
+        assert_ne!(
+            worker_id(Some("web-1"), 1, 1),
+            worker_id(Some("web-1"), 1, 2)
+        );
+    }
+
+    #[test]
+    fn the_id_is_scannable_and_bounded() {
+        assert_eq!(
+            worker_id(Some("web-7f9c\n"), 42, 0xab),
+            "trellis-web-7f9c-42-00000000000000ab"
+        );
+        assert_eq!(worker_id(None, 42, 0xab), "trellis-42-00000000000000ab");
+        assert_eq!(
+            worker_id(Some(" \n"), 42, 0xab),
+            "trellis-42-00000000000000ab"
+        );
+        let long = "a".repeat(200);
+        let id = worker_id(Some(&long), u32::MAX, u64::MAX);
+        assert_eq!(
+            id,
+            format!("trellis-{}-4294967295-ffffffffffffffff", "a".repeat(24))
+        );
+    }
 }
 
 // ---------------------------------------------------------------------

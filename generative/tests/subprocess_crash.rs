@@ -156,6 +156,25 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
         );
     }
 
+    // The killed process's claims on the batch outlive it: the fresh
+    // subprocess has an id of its own (issue #756), so it takes them back
+    // only once the reclaim sweep finds them past `reclaim_ttl` (30 s, as
+    // long as `quiesce` waits). Age them past it instead of waiting it out;
+    // the fresh subprocess's next maintenance tick reclaims them. Nothing
+    // else holds a claim here: the killed process was the only engine.
+    pool.get()
+        .await
+        .expect("pool connection")
+        .execute(
+            &format!(
+                "update {}.seg_claims set claimed_at = now() - interval '1 hour'",
+                trellis::config::DEFAULT_SCHEMA
+            ),
+            &[],
+        )
+        .await
+        .expect("age the killed process's claims");
+
     // The scenario's critical pair is always its program's last two ops
     // (`RelInterleavingScenario`'s own doc comment), so there is nothing
     // left to apply — just wait for the fresh subprocess to finish

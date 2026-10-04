@@ -394,6 +394,110 @@ async fn clean_shutdown_removes_the_one_row_a_multi_thread_client_registered() {
     );
 }
 
+/// Env var naming the database [`worker_process`] starts its `Client` on;
+/// unset, that test does nothing.
+const WORKER_PROCESS_DSN: &str = "TRELLIS_TEST_756_WORKER_DSN";
+
+/// One worker process for
+/// [`two_processes_register_distinct_rows_and_shutdown_removes_only_its_own`],
+/// which runs this test binary filtered to this test: start a drain `Client`,
+/// print `ready`, and shut it down cleanly once stdin closes. Ignored, so it
+/// only ever runs that way.
+#[test]
+#[ignore = "a child process of two_processes_register_distinct_rows_and_shutdown_removes_only_its_own"]
+fn worker_process() {
+    use std::io::Read;
+    let Ok(dsn) = std::env::var(WORKER_PROCESS_DSN) else {
+        return;
+    };
+    let options = ClientOptions {
+        staging_worker: false,
+        application_threads: 1,
+        ..Default::default()
+    };
+    let client = TrellisClient::start(&dsn, options).expect("client start");
+    println!("ready");
+    let mut sink = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut sink)
+        .expect("wait for stdin to close");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(client.shutdown())
+        .expect("clean shutdown");
+}
+
+/// Issue #756: two processes, each starting the same drain `Client` from the
+/// same code path, register two rows under distinct ids, and one's clean
+/// shutdown removes only its own row. The id used to be the starting thread's
+/// `ThreadId`, which numbers threads within one process only, so both came
+/// out the same: one shared row, which the first shutdown deleted for both.
+#[tokio::test]
+async fn two_processes_register_distinct_rows_and_shutdown_removes_only_its_own() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    let ids = async || -> Vec<String> {
+        raw.query(
+            "select worker_id from worker_registry order by worker_id",
+            &[],
+        )
+        .await
+        .expect("read worker ids")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
+    };
+
+    // Each child starts its `Client` before printing `ready`, and
+    // `Client::start` registers before it returns, so no waiting is needed.
+    let spawn = || {
+        let mut child = Command::new(std::env::current_exe().expect("test binary"))
+            .args(["worker_process", "--exact", "--ignored", "--nocapture"])
+            .env(WORKER_PROCESS_DSN, db.dsn())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn worker process");
+        let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+        lines
+            .find(|line| line.as_deref().is_ok_and(|l| l == "ready"))
+            .expect("worker process reports ready")
+            .expect("read worker output");
+        // Keep reading what libtest prints after `ready`: a closed pipe
+        // would fail the child's last writes.
+        std::thread::spawn(move || lines.for_each(drop));
+        child
+    };
+    let mut first = spawn();
+    let first_ids = ids().await;
+    let mut second = spawn();
+    let both = ids().await;
+    assert_eq!(both.len(), 2, "two processes, two rows: {both:?}");
+
+    drop(first.stdin.take());
+    assert!(first.wait().expect("first worker exits").success());
+    let left = ids().await;
+    assert_eq!(
+        left.len(),
+        1,
+        "the first process's shutdown removes one row: {left:?}"
+    );
+    assert!(
+        !first_ids.contains(&left[0]),
+        "the row left is the second process's: {first_ids:?} vs {left:?}"
+    );
+
+    drop(second.stdin.take());
+    assert!(second.wait().expect("second worker exits").success());
+    assert_eq!(worker_registry_row_count(&raw).await, 0);
+}
+
 /// A staging-only `Client` (`application_threads: 0`) must never register at
 /// all — the lower-level mirror of `has_live_drain_workers_is_false_for_a_staging_only_connection`.
 #[tokio::test]
