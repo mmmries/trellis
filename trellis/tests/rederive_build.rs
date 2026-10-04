@@ -1167,9 +1167,10 @@ async fn the_start_waits_for_the_widens_capture_gate() {
     assert_eq!(f.status("cnt").await.as_deref(), Some("live"));
 
     // Staged by the capture function `cnt` needs, which doesn't image `v`,
-    // and left in the ring.
+    // and left in the ring. It moves `g` too: an update of only `v`, which
+    // nothing reads yet, stages nothing (#623 D8a).
     f.raw
-        .batch_execute("update public.src set v = v + 1000 where id = 3")
+        .batch_execute("update public.src set v = v + 1000, g = g + 1 where id = 3")
         .await
         .expect("write before the widen");
     let columns = [
@@ -1443,9 +1444,10 @@ async fn a_rebuild_sweeps_a_deleted_key_only_apply_had_counted() {
     // Nothing has sealed since the start, so the start's segment is still
     // active, and a page re-derives its batch's keys (#733). A write sealed
     // into that batch moves the inserts below to the next, which Apply
-    // applies.
+    // applies. It changes `v`: an update that changes nothing imaged stages
+    // nothing (#623 D8a's skip-no-op).
     f.raw
-        .batch_execute("update public.src set v = v where id = 1")
+        .batch_execute("update public.src set v = v + 1 where id = 1")
         .await
         .expect("a write in the start's segment");
     f.drain().await;

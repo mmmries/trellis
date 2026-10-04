@@ -1,7 +1,9 @@
 //! Generates one table's capture functions and triggers (#622 C2).
 //!
 //! Each captured table gets one function per event (insert, update, delete,
-//! truncate) and one `AFTER … FOR EACH STATEMENT` trigger per function. The
+//! truncate) and one `AFTER … FOR EACH STATEMENT` trigger per function, plus
+//! a `BEFORE INSERT OR UPDATE OR DELETE … FOR EACH STATEMENT` begin trigger
+//! and function that only mark where a statement's span starts (#623 D8a). The
 //! statement shape follows the #565 spike's `capture_sql.py`: one `INSERT …
 //! SELECT` from the transition table into the active ring slot, chosen by a
 //! `CASE` over the four static `seg_N` inserts so every arm keeps a cached
@@ -33,6 +35,14 @@
 //!   `ring_slot_mirror` with `pg_sequence_last_value`, in the same expression
 //!   that assigns the writer's xid. See `staging::append::active_ring_slot`
 //!   for why both halves matter at every isolation level.
+//! - **It images the live row** (#623 D8a): when another write to the table
+//!   ran in the statement's span, every row the statement wrote is re-read
+//!   by primary key, so a nested write to the same key leaves the later ring
+//!   row carrying the final values (see [`ring_select`]). Otherwise the
+//!   transition row is the live row, and it reads no relation, so a
+//!   `SERIALIZABLE` writer takes no predicate lock on the table (see
+//!   [`function_body`]). An update row whose imaged columns didn't change is
+//!   dropped either way.
 //! - **It skips a statement that changed nothing.** An `UPDATE … WHERE false`
 //!   still fires a statement trigger. Returning early keeps it from
 //!   assigning an xid it doesn't need.
@@ -161,17 +171,32 @@ impl CaptureSpec {
     }
 }
 
-/// One of the four statement events a table is captured on.
+/// One of the five statement triggers capture installs on a table, each with
+/// its own function: the four events it images into the ring, and
+/// [`CaptureEvent::Begin`], the `BEFORE` statement trigger that marks where a
+/// statement's span starts (see "The live re-read is conditional" on
+/// [`function_body`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CaptureEvent {
     Insert,
     Update,
     Delete,
     Truncate,
+    Begin,
 }
 
 impl CaptureEvent {
-    pub const ALL: [CaptureEvent; 4] = [
+    /// Every trigger and function capture installs, checks and removes.
+    pub const ALL: [CaptureEvent; 5] = [
+        CaptureEvent::Insert,
+        CaptureEvent::Update,
+        CaptureEvent::Delete,
+        CaptureEvent::Truncate,
+        CaptureEvent::Begin,
+    ];
+
+    /// The events whose functions write ring rows.
+    pub const CAPTURED: [CaptureEvent; 4] = [
         CaptureEvent::Insert,
         CaptureEvent::Update,
         CaptureEvent::Delete,
@@ -184,11 +209,12 @@ impl CaptureEvent {
             CaptureEvent::Update => "update",
             CaptureEvent::Delete => "delete",
             CaptureEvent::Truncate => "truncate",
+            CaptureEvent::Begin => "begin",
         }
     }
 
-    /// The trigger's `REFERENCING` clause. A truncate trigger can't have
-    /// transition tables.
+    /// The trigger's `REFERENCING` clause. A truncate or `BEFORE` trigger
+    /// can't have transition tables.
     fn referencing(self) -> String {
         match self {
             CaptureEvent::Insert => format!(" referencing new table as {NEW_ROWS}"),
@@ -196,7 +222,7 @@ impl CaptureEvent {
                 format!(" referencing old table as {OLD_ROWS} new table as {NEW_ROWS}")
             }
             CaptureEvent::Delete => format!(" referencing old table as {OLD_ROWS}"),
-            CaptureEvent::Truncate => String::new(),
+            CaptureEvent::Truncate | CaptureEvent::Begin => String::new(),
         }
     }
 }
@@ -219,6 +245,19 @@ pub fn pinned_output_settings() -> Vec<&'static str> {
         })
         .collect()
 }
+
+/// Planner settings every capture function runs (and so plans) under, as
+/// `SET` clauses (#623 D8a).
+///
+/// PL/pgSQL plans each statement once per session, often on the first
+/// write to a table that is still empty or that a `VACUUM` last saw empty.
+/// Costed against an empty table, a sequential scan beats the primary-key
+/// index for the live re-read, and the cached plan would then scan the whole
+/// table for every captured row once it has grown. With sequential scans
+/// off, the probe is an index scan from the first plan on. The function's
+/// other reads are transition tables (not sequential scans) and catalog
+/// probes that use their indexes anyway.
+pub const PLANNER_SETTINGS: &[&str] = &["set enable_seqscan to 'off'"];
 
 /// The unquoted name of `table`'s capture function for `event`, in the
 /// instance schema: `cap_<event>_<table>_<hash>`, where `<table>` is the
@@ -362,10 +401,16 @@ pub fn function_ddl(
     let function = qualified_function(schema, spec, event)?;
     let body = function_body(schema, spec, event);
     let tag = dollar_tag(&body);
-    let settings: String = pinned_output_settings()
-        .iter()
-        .map(|clause| format!("\n    {clause}"))
-        .collect();
+    // The begin function renders and reads nothing, so it skips the
+    // settings' save and restore on every statement.
+    let settings: String = match event {
+        CaptureEvent::Begin => String::new(),
+        _ => pinned_output_settings()
+            .iter()
+            .chain(PLANNER_SETTINGS)
+            .map(|clause| format!("\n    {clause}"))
+            .collect(),
+    };
     Ok(format!(
         "create or replace function {function}()\n    returns trigger\n    language plpgsql\n    \
          security definer\n    set search_path = pg_catalog, pg_temp{settings}\nas {tag}\n{body}{tag}"
@@ -417,11 +462,14 @@ pub fn trigger_ddl(
     let table = quoted_table(&spec.table)?;
     let trigger = quote_ident(&trigger_name(schema, event));
     let function = qualified_function(schema, spec, event)?;
+    let timing = match event {
+        CaptureEvent::Begin => "before insert or update or delete".to_string(),
+        _ => format!("after {}", event.as_str()),
+    };
     Ok(vec![
         format!(
-            "create or replace trigger {trigger} after {} on {table}{} \
+            "create or replace trigger {trigger} {timing} on {table}{} \
              for each statement execute function {function}()",
-            event.as_str(),
             event.referencing(),
         ),
         format!("alter table {table} enable always trigger {trigger}"),
@@ -485,7 +533,85 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// COLUMN` take `ACCESS EXCLUSIVE`: no captured statement runs across one,
 /// and a statement after one in the same transaction probes the new catalog.
 /// The truncate function images nothing, so it has no probe.
+///
+/// # The live re-read is conditional (#623 D8a)
+///
+/// The live re-read ([`ring_select`]) is an index probe of the source table
+/// inside the application's write, and under `SERIALIZABLE` every probe takes
+/// a SIREAD lock on the key's btree leaf page. Concurrent serializable
+/// writers on neighbouring keys (every insert of an auto-increment id lands
+/// on the rightmost leaf) then form the rw-conflict chains SSI cancels with
+/// `40001`, writes that would commit without capture. So a function re-reads
+/// only when the live row can differ from the transition row, and otherwise
+/// images the transition tables, reading no relation at all.
+///
+/// The live version of a key this statement wrote can differ from its
+/// transition row only if some other write to the same table changed it
+/// after this statement's row change and before this capture runs: a nested
+/// statement (an application trigger, an FK cascade, a function the
+/// statement calls) or a sibling event of the same statement (a writable
+/// CTE, `MERGE`, `INSERT … ON CONFLICT DO UPDATE`). Every such write is a
+/// statement on this table, so its own capture function runs before this one
+/// returns. The table's plain-table check (`defs::catalog::change_keyed`)
+/// rules out partitions and inheritance children, whose writes would fire
+/// another table's triggers.
+///
+/// So each instance keeps, per table, a transaction-local setting
+/// ([`span_setting`]) holding `{seq, open, start}`:
+///
+/// - `seq` counts this transaction's capture calls that staged rows;
+/// - the [`CaptureEvent::Begin`] function, a `BEFORE` statement trigger,
+///   increments `open`, and when `open` was 0 sets `start` to `seq`;
+/// - each capture call decrements `open`, re-reads if `seq <> start`, and
+///   then increments `seq` if its statement changed any row.
+///
+/// While any statement on the table is between its `BEFORE` and its capture
+/// `open` stays above 0, so `start` was set no later than the start of the
+/// statement now capturing, and any capture call that staged rows since then
+/// has moved `seq`. Every inexact case errs towards re-reading: a `start`
+/// older than the statement (a nested or sibling statement's), a `BEFORE`
+/// with no matching capture (several `ModifyTable` nodes share one `AFTER`
+/// call), or no `start` at all (`-1`: the begin trigger was disabled or
+/// missing, which the C9 audit reports). A subtransaction that rolls back
+/// restores the setting with the writes it undid. The setting is the
+/// application's to overwrite, as it could disable the triggers; doing so
+/// can only cost it its own derived data, and the re-read itself never reads
+/// another transaction's row either way.
+///
+/// One write reaches the table without a capture call of its own: the
+/// update a foreign key's action makes on it (`ON UPDATE CASCADE`, `SET
+/// NULL` or `SET DEFAULT`, or `ON DELETE SET NULL` or `SET DEFAULT`).
+/// Postgres runs it in the trigger query level of the statement whose row
+/// fired the action, not in one of its own. So if that level already fired
+/// the table's `BEFORE UPDATE` statement trigger, it fires none, and its rows
+/// join the transition tables of the table's update queued there that hasn't
+/// fired yet: one capture call for both. A row both updates changed (a
+/// self-referencing key that cascades, or two cascading keys on one row) is
+/// then in the transition tables twice, and the join can pair an old version
+/// with an intermediate new one and emit that pair last. Such a pairing
+/// needs a key that occurs twice among the old rows, since the intermediate
+/// version is an old row too, so the update function also re-reads whenever
+/// a key does (`capture_ssi.rs` pins it). An `ON DELETE CASCADE` merges the
+/// same way, harmlessly: a row is deleted once, and no action inserts.
+///
+/// The schema-changed branch ([`schema_changed_branch`]) always re-reads:
+/// it is rare, and its `EXECUTE` builds one statement shape.
 fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> String {
+    let span = text_expr(&span_setting(schema, &spec.table));
+    let span_state = format!(
+        "coalesce(nullif(pg_catalog.current_setting({span}, true), ''), '{{0,0,-1}}')::bigint[]"
+    );
+    if event == CaptureEvent::Begin {
+        return format!(
+            "declare\n    st bigint[];\nbegin\n    \
+             -- #623 D8a: the statement-span state (see capture::sql's function_body).\n    \
+             st := {span_state};\n    \
+             if st[2] > 0 then\n        st[2] := st[2] + 1;\n    \
+             else\n        st := array[st[1], 1, st[1]];\n    end if;\n    \
+             perform pg_catalog.set_config({span}, cast(st as text), true);\n    \
+             return null;\nend;\n"
+        );
+    }
     let mirror = text_expr(&format!(
         "{}.{}",
         quote_ident(schema),
@@ -494,14 +620,16 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
     let rows = match event {
         CaptureEvent::Insert | CaptureEvent::Update => Some(NEW_ROWS),
         CaptureEvent::Delete => Some(OLD_ROWS),
-        CaptureEvent::Truncate => None,
+        CaptureEvent::Truncate | CaptureEvent::Begin => None,
     };
     let mut body = String::from(
         "#variable_conflict use_variable\n\
          declare\n    slot smallint;\n    l pg_lsn;\n    ts timestamptz;\n",
     );
     if rows.is_some() {
-        body.push_str("    present bigint;\n    have text[];\n");
+        body.push_str(
+            "    present bigint;\n    have text[];\n    st bigint[];\n    reread boolean;\n",
+        );
     }
     body.push_str("begin\n");
     if let Some(rows) = rows {
@@ -510,6 +638,13 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
              -- statement that changed nothing.\n    \
              present := case when exists (select 1 from {rows})\n        \
              then {} else -1 end;\n    \
+             -- #623 D8a: re-read only if another capture of this table staged rows\n    \
+             -- since this statement's span started.\n    \
+             st := {span_state};\n    \
+             reread := st[3] <> st[1];\n    \
+             st[2] := case when st[2] > 0 then st[2] - 1 else 0 end;\n    \
+             if present >= 0 then\n        st[1] := st[1] + 1;\n    end if;\n    \
+             perform pg_catalog.set_config({span}, cast(st as text), true);\n    \
              if present < 0 then\n        return null;\n    end if;\n",
             column_probe("count(*)", &spec.columns),
         ));
@@ -524,6 +659,18 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
     if rows.is_some() {
         body.push_str(&schema_changed_branch(schema, spec, event));
     }
+    if event == CaptureEvent::Update {
+        // After the schema-changed branch, which handles a renamed key.
+        body.push_str(&format!(
+            "    -- #623 D8a: an FK action's update shares these transition tables, and\n    \
+             -- a row updated twice leaves two old versions of one key.\n    \
+             if not reread then\n        \
+             reread := exists (select 1 from {OLD_ROWS} o\n            \
+             group by {} collate \"C\" having count(*) > 1);\n    \
+             end if;\n",
+            key_expr(spec, "o")
+        ));
+    }
     body.push_str("    case slot\n");
     for slot in 0..RING_SIZE {
         let ring = format!(
@@ -531,16 +678,43 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
             quote_ident(schema),
             quote_ident(&format!("seg_{slot}"))
         );
-        body.push_str(&format!(
-            "    when {slot} then\n        insert into {ring} ({RING_COLUMNS})\n{};\n",
-            ring_select(spec, event, Render::Static)
-        ));
+        let insert = |live: bool| {
+            format!(
+                "insert into {ring} ({RING_COLUMNS})\n{}",
+                ring_select(spec, event, Render::Static, live)
+            )
+        };
+        if rows.is_some() {
+            body.push_str(&format!(
+                "    when {slot} then\n        if reread then\n        {};\n        \
+                 else\n        {};\n        end if;\n",
+                insert(true),
+                insert(false)
+            ));
+        } else {
+            body.push_str(&format!(
+                "    when {slot} then\n        {};\n",
+                insert(false)
+            ));
+        }
     }
     body.push_str(
         "    else\n        raise exception 'trellis capture: ring_slot_mirror returned %', slot;\n    \
          end case;\n    return null;\nend;\n",
     );
     body
+}
+
+/// The transaction-local setting holding instance `schema`'s statement-span
+/// state for `table` (see "The live re-read is conditional" on
+/// [`function_body`]): `trellis_capture.s_<hash>`, a custom setting any
+/// session may set. Two tables whose hashes collide share one state, which
+/// only makes both re-read more often.
+pub(crate) fn span_setting(schema: &str, table: &str) -> String {
+    let mut bytes = schema.as_bytes().to_vec();
+    bytes.push(0);
+    bytes.extend_from_slice(table.as_bytes());
+    format!("trellis_capture.s_{:016x}", fnv1a64(&bytes))
 }
 
 /// A subquery over the table's live columns (`tg_relid`) named in `columns`,
@@ -597,11 +771,11 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
     let template = format!(
         "insert into {} ({RING_COLUMNS}) {}",
         placeholder(1),
-        ring_select(spec, event, Render::Dynamic)
+        ring_select(spec, event, Render::Dynamic, true)
     )
     .replace('\n', " ")
     .replace('%', "%%");
-    let template = (1..=5).fold(template, |t, n| {
+    let template = (1..=7).fold(template, |t, n| {
         t.replace(&placeholder(n), &format!("%{n}$s"))
     });
 
@@ -621,13 +795,14 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
                 rows.join(", ")
             )
         };
-    // Only the event's own transition tables have arguments; the others are
-    // `null`, which `format()` never reads.
+    // Only the aliases the event reads (its transition tables and the live
+    // table `t`) have arguments; the others are `null`, which `format()`
+    // never reads.
     let reads = |alias: &str| match event {
-        CaptureEvent::Insert => alias == "n",
-        CaptureEvent::Delete => alias == "o",
+        CaptureEvent::Insert => alias != "o",
+        CaptureEvent::Delete => alias != "n",
         CaptureEvent::Update => true,
-        CaptureEvent::Truncate => false,
+        CaptureEvent::Truncate | CaptureEvent::Begin => false,
     };
     let image_arg = |alias: &str| {
         if !reads(alias) {
@@ -652,7 +827,8 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
          using {src}, {marker_key}, l, {marker}, ts;\n        \
          if not ({key_present}) then\n            return null;\n        end if;\n        \
          execute pg_catalog.format({template},\n                {ring},\n                \
-         {img_o},\n                {img_n},\n                {gk_o},\n                {gk_n})\n            \
+         {img_o},\n                {img_n},\n                {img_t},\n                \
+         {gk_o},\n                {gk_n},\n                {gk_t})\n            \
          using l, ts;\n        \
          return null;\n    end if;\n",
         count = spec.columns.len(),
@@ -663,8 +839,10 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
         template = text_expr(&template),
         img_o = image_arg("o"),
         img_n = image_arg("n"),
+        img_t = image_arg("t"),
         gk_o = group_arg("o"),
         gk_n = group_arg("n"),
+        gk_t = group_arg("t"),
     )
 }
 
@@ -691,10 +869,22 @@ enum Render {
     /// The static inserts: every spec column named, and `l` and `ts` the
     /// function's variables.
     Static,
-    /// [`schema_changed_branch`]'s template: [`placeholder`]s for the old
-    /// image (2), new image (3), old group-key array (4) and new group-key
-    /// array (5), and `$1`/`$2` for `l` and `ts`.
+    /// [`schema_changed_branch`]'s template: [`placeholder`]s for the images
+    /// of `o`, `n` and `t` (2, 3, 4) and their group-key arrays (5, 6, 7),
+    /// and `$1`/`$2` for `l` and `ts`. It has no skip-no-op filter, so an
+    /// update in the branch stages every row it changed.
     Dynamic,
+}
+
+/// The aliases [`ring_select`] reads: the old transition table, the new one,
+/// and the live table re-read by primary key.
+const ALIASES: [&str; 3] = ["o", "n", "t"];
+
+fn alias_index(alias: &str) -> usize {
+    ALIASES
+        .iter()
+        .position(|a| *a == alias)
+        .expect("ring_select reads only o, n and t")
 }
 
 impl Render {
@@ -715,24 +905,180 @@ impl Render {
     fn image(self, spec: &CaptureSpec, alias: &str) -> String {
         match self {
             Render::Static => image_expr(spec, alias),
-            Render::Dynamic => placeholder(if alias == "o" { 2 } else { 3 }),
+            Render::Dynamic => placeholder(2 + alias_index(alias)),
         }
     }
 
     fn group_array(self, spec: &CaptureSpec, alias: &str) -> String {
         match self {
             Render::Static => group_key_array(spec, alias),
-            Render::Dynamic => placeholder(if alias == "o" { 4 } else { 5 }),
+            Render::Dynamic => placeholder(5 + alias_index(alias)),
         }
     }
 }
 
 /// The rows a capture insert writes: a `SELECT` over the event's transition
 /// tables (a `VALUES` row for truncate), in [`RING_COLUMNS`] order.
-fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) -> String {
+///
+/// # The image is the live row (#623 D8a, D's Q8)
+///
+/// With `live` (see "The live re-read is conditional" on [`function_body`]
+/// for when), every row a statement wrote is re-read from the live table `t`
+/// by primary key, and its `new_image` is that row, not the transition
+/// table's. Without it, [`transition_select`] images the transition tables. An
+/// application `AFTER ROW` trigger that rewrites the row its own statement
+/// wrote runs its nested statement, and that statement's capture, before
+/// this statement's capture; the transition table still holds the outer
+/// statement's version, so imaging it would put the older values at the
+/// higher `lsn` (#680). The live row is the one the transaction ends the
+/// statement with. If it is gone, a nested write deleted or re-keyed it, and
+/// the row staged is a delete of the key, imaging the transition row as its
+/// `old_image`. A delete's key is re-read too: a nested write that put the
+/// key back stages it as an update to the live row.
+///
+/// The re-read never sees another transaction's change. Each row it joins
+/// was written (or deleted) by this statement, so this transaction holds its
+/// row lock, or for a new key its unique-index entry, until it commits, and
+/// the key's live version, if any, is one this transaction wrote. Two more
+/// conditions keep the probe on that version:
+///
+/// - **It was written by this transaction**: `age(t.xmin) <= 0`. Under
+///   `REPEATABLE READ` and `SERIALIZABLE` the snapshot predates the
+///   statement, so a version of the key that another transaction deleted or
+///   re-keyed after the snapshot, and that this statement then re-created,
+///   is still visible beside this transaction's own (#623 D8a review). `age`
+///   measures against the transaction's own xid, or the next xid as of its
+///   first call in the transaction, so it is `<= 0` for every version this
+///   transaction or its subtransactions wrote, and positive for one
+///   committed before the snapshot.
+/// - **Its key renders the same**: the typed `=` finds the version through
+///   the index, but the ring keys by the key's text, and a type's `=` can be
+///   looser (`numeric` `1.0 = 1.00`). Without the text check, a key move
+///   from `1.0` to `1.00` would find the new row for the old key and never
+///   stage the old key's delete.
+///
+/// `tests/capture_reread.rs` checks this at every isolation level.
+///
+/// The old image and the `group_key` are unchanged (old ∪ new, plus the live
+/// row's): the relationship readers still need the old join keys until E
+/// (#624).
+///
+/// # An update that changed nothing read stages nothing
+///
+/// A paired update row is dropped when every imaged column is the same
+/// before and after, compared by `record_image_ne` over the typed values: a
+/// binary comparison that works for every type, including those with no
+/// equality operator (`json`, `point`, `xml`), and that is never looser than
+/// the images' text, since a value's output text is a function of its
+/// binary form under the pinned settings. A statement trigger can't take a
+/// `WHEN` clause when it has transition tables, so the filter is here.
+fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render, live: bool) -> String {
     let src = text_expr(&spec.table);
     let (l, ts) = (render.lsn(), render.ts());
     let indent = "        ";
+    if !live {
+        return transition_select(spec, event, render);
+    }
+    let table = quoted_table(&spec.table).expect("CaptureSpec::new checked the table name");
+    let first_key = quote_ident(&spec.key[0]);
+    let live = format!("t.{first_key} is not null");
+    // `t`, read by the primary key's typed equality. The `limit 1` keeps the
+    // lateral subquery from being flattened into a join, so the plan is a
+    // probe per captured row whatever the table's size was when PL/pgSQL
+    // planned the statement (it plans once per session); see
+    // [`PLANNER_SETTINGS`] for the probe's index scan. `of` is the typed
+    // key's source per key column.
+    // `key` is the row's own ring key, which the live version's must match
+    // as text; `age(t.xmin) <= 0` keeps the probe on a version this
+    // transaction wrote (see "The image is the live row" above).
+    let live_join = |of: &dyn Fn(&str) -> String, key: &str| {
+        let on: Vec<String> = spec
+            .key
+            .iter()
+            .map(|c| format!("t.{} = {}", quote_ident(c), of(&quote_ident(c))))
+            .collect();
+        format!(
+            "{indent}left join lateral (select * from {table} t where {}\n{indent}    \
+             and {} = {key} collate \"C\" and pg_catalog.age(t.xmin) <= 0 limit 1) t on true",
+            on.join(" and "),
+            key_expr(spec, "t"),
+        )
+    };
+    match event {
+        CaptureEvent::Insert => format!(
+            "{indent}select {src}, case when {live} then {} else {} end,\n{indent}    \
+             case when {live} then 'insert' else 'delete' end,\n{indent}    \
+             {l}, case when not ({live}) then {} end, case when {live} then {} end, \
+             {l}, {ts}, {}\n{indent}from {NEW_ROWS} n\n{}",
+            key_expr(spec, "t"),
+            key_expr(spec, "n"),
+            render.image(spec, "n"),
+            render.image(spec, "t"),
+            group_key_expr(spec, &["n", "t"], render),
+            live_join(&|c| format!("n.{c}"), &key_expr(spec, "n")),
+        ),
+        CaptureEvent::Delete => format!(
+            "{indent}select {src}, case when {live} then {} else {} end,\n{indent}    \
+             case when {live} then 'update' else 'delete' end,\n{indent}    \
+             {l}, {}, case when {live} then {} end, {l}, {ts}, {}\n{indent}from {OLD_ROWS} o\n{}",
+            key_expr(spec, "t"),
+            key_expr(spec, "o"),
+            render.image(spec, "o"),
+            render.image(spec, "t"),
+            group_key_expr(spec, &["o", "t"], render),
+            live_join(&|c| format!("o.{c}"), &key_expr(spec, "o")),
+        ),
+        // A statement trigger sees the update's old and new rows as two sets
+        // with no pairing, so they are paired on the key text. A row whose
+        // key changed has no partner: it becomes a delete of its old key and
+        // an insert of its new one. Pairing on the rendered key rather than
+        // the key columns' `=` keeps the pairing on the same identity the
+        // ring keys by, and `collate "C"` makes that a byte comparison.
+        CaptureEvent::Update => {
+            let old = format!("o.{first_key} is not null");
+            let new = format!("n.{first_key} is not null");
+            let changed = update_changed_filter(spec, render);
+            format!(
+                "{indent}select {src},\n{indent}    \
+                 case when {live} then {} when {new} then {} else {} end,\n{indent}    \
+                 case when not ({live}) then 'delete' when not ({old}) then 'insert' \
+                 else 'update' end,\n{indent}    \
+                 {l}, case when {old} then {} when not ({live}) then {} end,\n{indent}    \
+                 case when {live} then {} end, {l}, {ts}, {}\n{indent}from {OLD_ROWS} o\n\
+                 {indent}full join {NEW_ROWS} n on {} = {} collate \"C\"\n{}{changed}",
+                key_expr(spec, "t"),
+                key_expr(spec, "n"),
+                key_expr(spec, "o"),
+                render.image(spec, "o"),
+                render.image(spec, "n"),
+                render.image(spec, "t"),
+                group_key_expr(spec, &["o", "n", "t"], render),
+                key_expr(spec, "o"),
+                key_expr(spec, "n"),
+                live_join(
+                    &|c| format!("coalesce(n.{c}, o.{c})"),
+                    &format!(
+                        "case when {new} then {} else {} end",
+                        key_expr(spec, "n"),
+                        key_expr(spec, "o")
+                    ),
+                ),
+            )
+        }
+        CaptureEvent::Truncate | CaptureEvent::Begin => transition_select(spec, event, render),
+    }
+}
+
+/// [`ring_select`] without the live re-read: every row imaged from its
+/// transition table, which is the live row when no other write to the table
+/// ran in the statement's span (see "The live re-read is conditional" on
+/// [`function_body`]). The update's pairing and skip-no-op filter are the
+/// same as the re-read's.
+fn transition_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) -> String {
+    let src = text_expr(&spec.table);
+    let (l, ts) = (render.lsn(), render.ts());
+    let indent = "        ";
+    let first_key = quote_ident(&spec.key[0]);
     match event {
         CaptureEvent::Insert => format!(
             "{indent}select {src}, {}, 'insert', {l}, null, {}, {l}, {ts}, {}\n{indent}from {NEW_ROWS} n",
@@ -746,44 +1092,58 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) -> Strin
             render.image(spec, "o"),
             group_key_expr(spec, &["o"], render),
         ),
-        // A statement trigger sees the update's old and new rows as two sets
-        // with no pairing, so they are paired on the key text. A row whose
-        // key changed has no partner: it becomes a delete of its old key and
-        // an insert of its new one. Pairing on the rendered key rather than
-        // the key columns' `=` keeps the pairing on the same identity the
-        // ring keys by, and `collate "C"` makes that a byte comparison.
         CaptureEvent::Update => {
-            let side = |alias: &str, rows: &str| {
-                let group = if spec.group_key.is_empty() {
-                    String::new()
-                } else {
-                    format!(", {} as gk", render.group_array(spec, alias))
-                };
-                format!(
-                    "(select {} as k, {} as img{group} from {rows} {alias})",
-                    key_expr(spec, alias),
-                    render.image(spec, alias),
-                )
-            };
-            let group = if spec.group_key.is_empty() {
-                "null::text[]".to_string()
-            } else {
-                distinct_non_null("o.gk || n.gk")
-            };
+            let old = format!("o.{first_key} is not null");
+            let new = format!("n.{first_key} is not null");
             format!(
-                "{indent}select {src}, coalesce(n.k, o.k),\n{indent}    \
-                 case when n.k is null then 'delete' when o.k is null then 'insert' \
+                "{indent}select {src}, case when {new} then {} else {} end,\n{indent}    \
+                 case when not ({new}) then 'delete' when not ({old}) then 'insert' \
                  else 'update' end,\n{indent}    \
-                 {l}, o.img, n.img, {l}, {ts}, {group}\n{indent}from {} o\n{indent}full join {} n \
-                 on o.k = n.k collate \"C\"",
-                side("o", OLD_ROWS),
-                side("n", NEW_ROWS),
+                 {l}, case when {old} then {} end, case when {new} then {} end, {l}, {ts}, {}\n\
+                 {indent}from {OLD_ROWS} o\n\
+                 {indent}full join {NEW_ROWS} n on {} = {} collate \"C\"{}",
+                key_expr(spec, "n"),
+                key_expr(spec, "o"),
+                render.image(spec, "o"),
+                render.image(spec, "n"),
+                group_key_expr(spec, &["o", "n"], render),
+                key_expr(spec, "o"),
+                key_expr(spec, "n"),
+                update_changed_filter(spec, render),
             )
         }
         CaptureEvent::Truncate => format!(
             "{indent}values ({src}, {}, 'truncate', {l}, null, null, {l}, {ts}, null)",
             text_expr(TRUNCATE_SENTINEL_KEY)
         ),
+        CaptureEvent::Begin => unreachable!("the begin function writes no ring row"),
+    }
+}
+
+/// The update's skip-no-op filter (see "An update that changed nothing read
+/// stages nothing" on [`ring_select`]): keep a row that is unpaired or whose
+/// imaged columns' binary images differ. [`Render::Dynamic`] has none.
+fn update_changed_filter(spec: &CaptureSpec, render: Render) -> String {
+    let indent = "        ";
+    let first_key = quote_ident(&spec.key[0]);
+    match render {
+        Render::Static => {
+            let row = |alias: &str| {
+                let cols: Vec<String> = spec
+                    .columns
+                    .iter()
+                    .map(|c| format!("{alias}.{}", quote_ident(c)))
+                    .collect();
+                format!("row({})", cols.join(", "))
+            };
+            format!(
+                "\n{indent}where not (o.{first_key} is not null) or not (n.{first_key} is not null)\n{indent}    \
+                 or pg_catalog.record_image_ne({}, {})",
+                row("o"),
+                row("n")
+            )
+        }
+        Render::Dynamic => String::new(),
     }
 }
 
@@ -848,7 +1208,7 @@ fn group_key_array(spec: &CaptureSpec, alias: &str) -> String {
     format!("array[{}]::text[]", values.join(", "))
 }
 
-/// The ring's `group_key` for rows drawn from `aliases` (old before new):
+/// The ring's `group_key` for rows drawn from `aliases` (old, new, live):
 /// the union of every non-null group-key value, in first-seen order, or
 /// `NULL` when there are none.
 fn group_key_expr(spec: &CaptureSpec, aliases: &[&str], render: Render) -> String {
@@ -995,7 +1355,7 @@ mod tests {
     #[test]
     fn replacing_the_functions_touches_no_trigger_and_keeps_the_revoke() {
         let statements = function_statements("trellis", &spec()).unwrap();
-        assert_eq!(statements.len(), 12);
+        assert_eq!(statements.len(), 15);
         assert!(
             statements
                 .iter()
@@ -1027,24 +1387,24 @@ mod tests {
     #[test]
     fn an_uninstall_drops_triggers_before_functions_and_skips_them_for_a_dropped_table() {
         let statements = uninstall_statements("trellis", "public.orders", true).unwrap();
-        assert_eq!(statements.len(), 8);
-        assert!(statements[..4].iter().all(|s| {
+        assert_eq!(statements.len(), 10);
+        assert!(statements[..5].iter().all(|s| {
             s.starts_with("drop trigger if exists \"trellis_capture_")
                 && s.ends_with(" on \"public\".\"orders\"")
         }));
         assert!(
-            statements[4..]
+            statements[5..]
                 .iter()
                 .all(|s| s.starts_with("drop function if exists \"trellis\".\"cap_"))
         );
         let gone = uninstall_statements("trellis", "public.orders", false).unwrap();
-        assert_eq!(gone, statements[4..]);
+        assert_eq!(gone, statements[5..]);
     }
 
     #[test]
     fn ownership_goes_to_the_named_role_quoted() {
         let statements = owner_statements("trellis", "public.orders", "Migrator").unwrap();
-        assert_eq!(statements.len(), 4);
+        assert_eq!(statements.len(), 5);
         assert!(
             statements
                 .iter()
@@ -1062,6 +1422,11 @@ mod tests {
                 sql.contains("set search_path = pg_catalog, pg_temp"),
                 "{sql}"
             );
+            if event == CaptureEvent::Begin {
+                // It renders nothing, so it saves no output settings.
+                assert!(!sql.contains("set datestyle"), "{sql}");
+                continue;
+            }
             for clause in [
                 "set datestyle to 'ISO, YMD'",
                 "set bytea_output to 'hex'",
@@ -1071,6 +1436,16 @@ mod tests {
             ] {
                 assert!(sql.contains(clause), "missing {clause:?} in\n{sql}");
             }
+        }
+    }
+
+    #[test]
+    fn the_live_reread_plans_as_an_index_probe_from_the_first_call() {
+        for event in CaptureEvent::CAPTURED {
+            assert!(
+                ddl(&spec(), event).contains("\n    set enable_seqscan to 'off'\nas "),
+                "{event:?}"
+            );
         }
     }
 
@@ -1088,7 +1463,7 @@ mod tests {
 
     #[test]
     fn every_ring_and_mirror_reference_is_schema_qualified() {
-        for event in CaptureEvent::ALL {
+        for event in CaptureEvent::CAPTURED {
             let sql = ddl(&spec(), event);
             for slot in 0..RING_SIZE {
                 assert!(
@@ -1103,10 +1478,16 @@ mod tests {
             } else {
                 2
             };
+            // A re-read and a transition-only insert per slot (#623 D8a).
+            let per_slot = if event == CaptureEvent::Truncate {
+                1
+            } else {
+                2
+            };
             assert_eq!(
                 sql.matches("insert into ").count(),
-                RING_SIZE as usize + dynamic,
-                "one insert per ring slot, all qualified:\n{sql}"
+                per_slot * RING_SIZE as usize + dynamic,
+                "every ring insert qualified:\n{sql}"
             );
             if dynamic > 0 {
                 assert_eq!(
@@ -1208,9 +1589,79 @@ mod tests {
         }
     }
 
+    /// #623 D8a: each slot has a re-read insert and a transition-only one,
+    /// chosen by `reread`, which is read from the span state before this
+    /// call counts itself; the transition insert reads no relation.
+    #[test]
+    fn the_reread_is_gated_on_the_span_state() {
+        let span = span_setting("trellis", "public.orders");
+        assert!(span.starts_with("trellis_capture.s_"), "{span}");
+        assert_ne!(span, span_setting("other", "public.orders"));
+        assert_ne!(span, span_setting("trellis", "public.order"));
+        for event in [
+            CaptureEvent::Insert,
+            CaptureEvent::Update,
+            CaptureEvent::Delete,
+        ] {
+            let sql = ddl(&spec(), event);
+            let at = |needle: &str| {
+                sql.find(needle)
+                    .unwrap_or_else(|| panic!("no {needle:?} in\n{sql}"))
+            };
+            let read = at("reread := st[3] <> st[1];");
+            let counted = at("st[1] := st[1] + 1;");
+            let saved = at(&format!(
+                "perform pg_catalog.set_config('{span}', cast(st as text), true);"
+            ));
+            assert!(read < counted && counted < saved && saved < at("if present < 0 then"));
+            for slot in 0..RING_SIZE {
+                let arm = &sql[at(&format!("    when {slot} then\n"))..];
+                let reread = arm.find("        if reread then\n").expect("the gate");
+                let otherwise = arm.find("        else\n").expect("the transition insert");
+                let end = arm.find("        end if;\n").expect("end if");
+                assert!(
+                    arm[reread..otherwise].contains("left join lateral"),
+                    "{sql}"
+                );
+                assert!(!arm[otherwise..end].contains("lateral"), "{sql}");
+                assert!(
+                    !arm[otherwise..end].contains("\"public\".\"orders\""),
+                    "{sql}"
+                );
+            }
+        }
+        let begin = ddl(&spec(), CaptureEvent::Begin);
+        assert!(
+            begin.contains(&format!("pg_catalog.current_setting('{span}', true)")),
+            "{begin}"
+        );
+        assert!(begin.contains("st := array[st[1], 1, st[1]];"), "{begin}");
+        assert!(!begin.contains("insert into"), "{begin}");
+        assert!(!ddl(&spec(), CaptureEvent::Truncate).contains("reread"));
+
+        // An update also re-reads when a key repeats among its old rows (an
+        // FK action's merged update), checked after the schema-changed branch.
+        let update = ddl(&spec(), CaptureEvent::Update);
+        let repeated = update
+            .find("reread := exists (select 1 from trellis_old o")
+            .expect("the repeated-key check");
+        assert!(update.find("-- #622 C6: an imaged column").expect("branch") < repeated);
+        assert!(repeated < update.find("    case slot\n").expect("case"));
+        assert!(
+            update[repeated..].contains("having count(*) > 1"),
+            "{update}"
+        );
+        for event in [CaptureEvent::Insert, CaptureEvent::Delete] {
+            assert!(
+                !ddl(&spec(), event).contains("having count(*)"),
+                "{event:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_body_resolves_a_name_clash_with_a_column_to_the_variable() {
-        for event in CaptureEvent::ALL {
+        for event in CaptureEvent::CAPTURED {
             let sql = ddl(&spec(), event);
             let directive = sql
                 .find("\n#variable_conflict use_variable\ndeclare\n")
@@ -1231,7 +1682,7 @@ mod tests {
             "{sql}"
         );
         assert!(
-            sql.contains("'insert', l, null, jsonb_build_object("),
+            sql.contains("then 'insert' else 'delete' end,\n            l, case when "),
             "{sql}"
         );
         assert!(sql.contains(", l, ts, "), "{sql}");
@@ -1261,7 +1712,10 @@ mod tests {
     fn a_single_column_key_is_the_columns_text_verbatim() {
         let sql = ddl(&spec(), CaptureEvent::Insert);
         assert!(
-            sql.contains("select 'public.orders', format('%s', n.\"id\"), 'insert'"),
+            sql.contains(
+                "select 'public.orders', case when t.\"id\" is not null \
+                 then format('%s', t.\"id\") else format('%s', n.\"id\") end,"
+            ),
             "{sql}"
         );
     }
@@ -1280,33 +1734,104 @@ mod tests {
     #[test]
     fn an_update_full_joins_old_and_new_on_the_key() {
         let sql = ddl(&spec(), CaptureEvent::Update);
-        assert!(
-            sql.contains("(select format('%s', o.\"id\") as k, jsonb_build_object("),
-            "{sql}"
-        );
-        assert!(sql.contains("from trellis_old o) o"), "{sql}");
-        assert!(sql.contains("from trellis_new n) n"), "{sql}");
-        assert!(sql.contains("full join"), "{sql}");
-        assert!(sql.contains("on o.k = n.k collate \"C\""), "{sql}");
+        assert!(sql.contains("from trellis_old o\n"), "{sql}");
         assert!(
             sql.contains(
-                "case when n.k is null then 'delete' when o.k is null then 'insert' \
-                 else 'update' end"
+                "full join trellis_new n on format('%s', o.\"id\") = format('%s', n.\"id\") \
+                 collate \"C\""
             ),
-            "a key move is a delete plus an insert:\n{sql}"
+            "{sql}"
         );
-        assert!(sql.contains("coalesce(n.k, o.k)"), "{sql}");
+        assert!(
+            sql.contains(
+                "case when not (t.\"id\" is not null) then 'delete' \
+                 when not (o.\"id\" is not null) then 'insert' else 'update' end"
+            ),
+            "a key move is a delete plus an insert, and a key gone from the live \
+             table is a delete:\n{sql}"
+        );
+    }
+
+    /// #623 D8a: every event re-reads the rows it wrote from the live table
+    /// by the primary key's typed equality, keeps only a version this
+    /// transaction wrote whose key renders as the row's own, and images the
+    /// live row.
+    #[test]
+    fn every_event_images_the_live_row_read_by_primary_key() {
+        for (event, on, key) in [
+            (
+                CaptureEvent::Insert,
+                "t.\"id\" = n.\"id\"",
+                "format('%s', n.\"id\")",
+            ),
+            (
+                CaptureEvent::Delete,
+                "t.\"id\" = o.\"id\"",
+                "format('%s', o.\"id\")",
+            ),
+            (
+                CaptureEvent::Update,
+                "t.\"id\" = coalesce(n.\"id\", o.\"id\")",
+                "case when n.\"id\" is not null then format('%s', n.\"id\") \
+                 else format('%s', o.\"id\") end",
+            ),
+        ] {
+            let sql = ddl(&spec(), event);
+            assert!(
+                sql.contains(&format!(
+                    "left join lateral (select * from \"public\".\"orders\" t \
+                     where {on}\n            and format('%s', t.\"id\") = {key} collate \"C\" \
+                     and pg_catalog.age(t.xmin) <= 0 limit 1) t on true"
+                )),
+                "a probe per row, never a join the planner could hash:\n{sql}"
+            );
+            assert!(
+                sql.contains(
+                    "case when t.\"id\" is not null then jsonb_build_object('amount', \
+                     case when num_nulls(t.\"amount\") = 1"
+                ),
+                "the new image is the live row's:\n{sql}"
+            );
+        }
+        let composite = ddl(&composite(), CaptureEvent::Insert);
+        assert!(
+            composite.contains("where t.\"post\" = n.\"post\" and t.\"tag\" = n.\"tag\"\n"),
+            "{composite}"
+        );
+    }
+
+    /// #623 D8a: an update row whose imaged columns are all unchanged,
+    /// compared by binary image over the typed values, stages nothing. A key
+    /// move always stages.
+    #[test]
+    fn an_update_that_changed_no_imaged_column_stages_nothing() {
+        let sql = ddl(&spec(), CaptureEvent::Update);
+        assert!(
+            sql.contains(
+                "where not (o.\"id\" is not null) or not (n.\"id\" is not null)\n            \
+                 or pg_catalog.record_image_ne(row(o.\"amount\", o.\"customer_id\", o.\"id\"), \
+                 row(n.\"amount\", n.\"customer_id\", n.\"id\"));"
+            ),
+            "{sql}"
+        );
+        assert!(!sql.contains(" is distinct from "), "{sql}");
     }
 
     #[test]
-    fn the_group_key_is_the_distinct_union_of_old_then_new() {
+    fn the_group_key_is_the_distinct_union_of_old_new_and_live() {
         let update = ddl(&spec(), CaptureEvent::Update);
         assert!(
-            update.contains(", array[case when num_nulls(o.\"customer_id\") = 1"),
+            update.contains(
+                "unnest(array[case when num_nulls(o.\"customer_id\") = 1 then null \
+                 else format('%s', o.\"customer_id\") end]::text[] || \
+                 array[case when num_nulls(n.\"customer_id\") = 1"
+            ),
             "{update}"
         );
         assert!(
-            update.contains("unnest(o.gk || n.gk) with ordinality"),
+            update.contains(
+                "]::text[] || array[case when num_nulls(t.\"customer_id\") = 1 then null"
+            ),
             "{update}"
         );
         assert!(
@@ -1319,11 +1844,7 @@ mod tests {
             "{insert}"
         );
         let plain = ddl(&composite(), CaptureEvent::Update);
-        assert!(
-            plain.contains("l, o.img, n.img, l, ts, null::text[]"),
-            "{plain}"
-        );
-        assert!(!plain.contains(" as gk"), "{plain}");
+        assert!(plain.contains(", l, ts, null::text[]\n"), "{plain}");
     }
 
     #[test]
@@ -1414,7 +1935,13 @@ mod tests {
         assert!(delete[0].contains("referencing old table as trellis_old for each statement"));
         let truncate = trigger_ddl("trellis", &spec, CaptureEvent::Truncate).unwrap();
         assert!(truncate[0].contains("after truncate on \"public\".\"orders\" for each statement"));
-        assert_eq!(install_statements("trellis", &spec).unwrap().len(), 20);
+        let begin = trigger_ddl("trellis", &spec, CaptureEvent::Begin).unwrap();
+        assert!(begin[0].contains(
+            "\"trellis_capture_begin\" before insert or update or delete on \"public\".\"orders\" \
+             for each statement"
+        ));
+        assert!(begin[1].ends_with("enable always trigger \"trellis_capture_begin\""));
+        assert_eq!(install_statements("trellis", &spec).unwrap().len(), 25);
     }
 
     #[test]

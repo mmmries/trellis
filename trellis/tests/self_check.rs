@@ -913,6 +913,7 @@ async fn a_disabled_capture_trigger_is_reported_before_any_comparison() {
     raw.batch_execute(
         "alter table widgets disable trigger trellis_capture_update; \
          alter table widgets enable trigger trellis_capture_delete; \
+         alter table widgets disable trigger trellis_capture_begin; \
          update widget_totals set total = 0",
     )
     .await
@@ -931,6 +932,12 @@ async fn a_disabled_capture_trigger_is_reported_before_any_comparison() {
                 table: WIDGETS.to_string(),
                 trigger: "trellis_capture_delete".to_string(),
                 enabled: "O".to_string(),
+            },
+            // #623 D8a: without it every capture re-reads.
+            CaptureFault::TriggerNotAlways {
+                table: WIDGETS.to_string(),
+                trigger: "trellis_capture_begin".to_string(),
+                enabled: "D".to_string(),
             },
         ]
     );
@@ -969,7 +976,8 @@ async fn a_dropped_capture_trigger_is_reported() {
 /// reported as mis-owned: they belong to the ring's owner (issue #701), and
 /// the schema's owner doesn't count. Once they belong to the new role too,
 /// and it holds exactly the grants the audit expects, the target converges;
-/// revoking `INSERT` on one ring segment is then reported.
+/// revoking `INSERT` on one ring segment, or `SELECT` on the source, which
+/// the functions re-read (#623 D8a), is then reported.
 #[tokio::test]
 async fn a_revoked_capture_privilege_and_a_mis_owned_function_are_reported() {
     let cluster = TestCluster::start();
@@ -1016,9 +1024,11 @@ async fn a_revoked_capture_privilege_and_a_mis_owned_function_are_reported() {
             .await
             .expect("hand a capture function to the role");
     }
-    raw.batch_execute(&format!("grant usage on schema trellis to {role}"))
-        .await
-        .expect("grant the role the schema, the one thing it doesn't own");
+    raw.batch_execute(&format!(
+        "grant usage on schema trellis to {role}; grant select on {WIDGETS} to {role}"
+    ))
+    .await
+    .expect("grant the role the schema and the source, the things it doesn't own");
     let report = audit_widgets(&trellis).await;
     assert!(
         matches!(report.outcome, SelfCheckOutcome::Converged),
@@ -1035,6 +1045,20 @@ async fn a_revoked_capture_privilege_and_a_mis_owned_function_are_reported() {
             role: role.to_string(),
             privilege: "INSERT".to_string(),
             object: "trellis.seg_0".to_string(),
+        }]
+    );
+
+    raw.batch_execute(&format!(
+        "grant insert on trellis.seg_0 to {role}; revoke select on {WIDGETS} from {role}"
+    ))
+    .await
+    .expect("revoke select on the source");
+    assert_eq!(
+        capture_faults(&audit_widgets(&trellis).await),
+        vec![CaptureFault::MissingPrivilege {
+            role: role.to_string(),
+            privilege: "SELECT".to_string(),
+            object: WIDGETS.to_string(),
         }]
     );
 

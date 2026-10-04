@@ -35,13 +35,51 @@ segment with one `INSERT … SELECT`:
   `format('%s', col)` under the same five pinned output settings as every
   Trellis session (`DateStyle`, `TimeZone`, `IntervalStyle`, `bytea_output`,
   `extra_float_digits`), set as the function's own `SET` clauses. So an image
-  doesn't depend on the writing session's settings. A transition table
-  carries the whole row, detoasted, so an image never lacks a column it names.
+  doesn't depend on the writing session's settings. `old_image` comes from
+  the OLD transition table, which carries the whole row, detoasted.
+- **`new_image` is the live row** (#623 D8a). When another write to the
+  table ran during the statement (see "When capture re-reads" below), each
+  row the statement wrote is
+  re-read from the table by primary key, and `new_image` images that row,
+  the one the transaction holds once the statement and its own `AFTER ROW`
+  triggers are done, not the transition table's version (see "Nested writes
+  to the same key" below). If the key is gone from the table, a nested
+  write deleted or re-keyed it, and the row staged is a delete. A delete's
+  key is re-read too: a nested write that put the key back stages an update
+  to the live row. The re-read never sees another transaction's change: each
+  row it joins was written or deleted by this statement, so this transaction
+  holds its row lock, or for a new key its unique-index entry, until commit,
+  and the key's live version is one this transaction wrote. The probe keeps
+  only such a version (`age(xmin) <= 0`): under `REPEATABLE READ` and
+  `SERIALIZABLE` a version another transaction deleted after the snapshot
+  stays visible beside the one this statement re-created. It also requires
+  the version's key to render as the row's own, because the ring keys by
+  text and a type's `=` can be looser (`numeric` `1.0 = 1.00`). The re-read
+  is a `LATERAL … LIMIT 1` probe per row, and the function runs with
+  `enable_seqscan` off: PL/pgSQL plans once per session, often against a
+  table that was empty then, and a cached sequential scan would read the
+  whole table for every captured row once it grows
+  (`tests/capture_reread.rs`, at every isolation level).
+- **The re-read needs `SELECT` on the table**, which the Trellis role holds
+  as the table's owner; the capture audit reports it missing. On a table
+  with `FORCE ROW LEVEL SECURITY` whose policies hide a row from the
+  Trellis role, the re-read can't find it and stages a delete.
 - **Updates** pair the OLD and NEW transition tables by primary key. A row
   whose key changed has no partner, so it becomes a delete of the old key and
   an insert of the new one.
+- **An update that changed nothing imaged stages nothing.** A paired row
+  whose imaged columns all hold the values they had, compared with
+  `record_image_ne` over the typed values, is dropped. That covers an update
+  of only columns no reader reads, and one that sets a column to its own
+  value. A binary comparison works for every type, including those with no
+  equality operator (`json`, `point`, `xml`), and is never looser than the
+  images: an equal value that renders differently (`numeric` `1.5` to `1.50`)
+  still stages. Every relationship join column (`from_col`, `to_col`) is
+  imaged, so a join move alone always stages. A statement trigger can't take
+  a `WHEN` clause when it has transition tables, so the filter is in the
+  function.
 - **`group_key`** is the union of every outbound relationship's `from_col`
-  across OLD and NEW (#133).
+  across OLD, NEW and the live row (#133).
 - **`row_txid`** is the ring's default, `pg_current_xact_id()`: the source
   commit's own `xid8` (exact identity, invariant I0).
 - **`lsn` and `origin_lsn`** are `pg_current_wal_insert_lsn()` when the
@@ -211,24 +249,69 @@ every pass and nothing on its status; instead it pauses again with its
 Regenerating from an event trigger, inside the DDL's own transaction, is not
 built (#622 plan Q2(b)).
 
-## Known limitation: nested writes to the same key (#680)
+## Nested writes to the same key (#680)
 
 Suppose an application `AFTER ROW` trigger, or a self-referencing cascade,
 rewrites a row its own statement wrote. The nested statement's capture runs
-first, so the ring holds the newer image at the lower `lsn`, and the outer
-statement's older image after it. A `GROUP BY` target then subtracts and adds
-the wrong images and can leave the row in the wrong group. A 1-1 target is
-unaffected, because its drain compares the image with the live row. Under
-today's OLD+NEW images no image shape fixes this; D's NEW-only apply with a
-re-read image (#623) does. `tests/capture_join.rs` pins the case as an
-ignored test.
+first, so the outer statement's ring row has the higher `lsn`. Its OLD and
+NEW transition tables still hold the outer statement's own versions, so
+before #623 D8a it staged the older values last, and a `GROUP BY` or 1-1
+target kept them. The outer row's `new_image` is now the live row, the final
+one (`tests/capture_join.rs`, `tests/ledger_interleavings.rs`). Its
+`old_image` is still the outer statement's OLD row: the fold keeps the
+earliest old image anyway, and only the relationship readers read it (until
+#624).
+
+## When capture re-reads (#623 D8a)
+
+Under `SERIALIZABLE` the re-read's index probe takes a predicate (SIREAD)
+lock on the key's btree leaf page, and concurrent serializable writers on
+neighbouring keys then form the read-write conflict chains Postgres cancels
+with `40001`. Every insert of an auto-increment id lands on the rightmost
+leaf, so with an unconditional re-read 50% of single-row serializable
+inserts failed at 4 writers and 87% at 8 and 16, where none fail without
+capture (`benchmark` scenario `ssi-tax`; `local_docs/pr/623-d8a.md`).
+
+So capture re-reads only when the live row can differ from the transition
+row: when some other write to the same table changed it after the
+statement's row change and before its capture. Each such write is itself a
+statement on the table (a nested statement from an application trigger, an
+FK cascade or a function the statement calls, or a sibling event of the
+same statement: a writable CTE, `MERGE`, `INSERT … ON CONFLICT DO UPDATE`),
+so its own capture runs first. A fifth trigger, `<schema>_capture_begin`
+(`BEFORE INSERT OR UPDATE OR DELETE … FOR EACH STATEMENT`), marks where each
+statement's span starts in a transaction-local setting, and a capture
+re-reads only if another capture of the table staged rows since then.
+Otherwise it images the transition tables and reads no relation, so a
+statement nothing else touched takes no predicate lock on the table. The
+inexact cases all err towards re-reading: a disabled or missing begin
+trigger makes every capture re-read (and the capture audit reports it).
+
+One write isn't a statement of its own: the update a foreign key's action
+makes (`ON UPDATE CASCADE`, `SET NULL` or `SET DEFAULT`, or `ON DELETE SET
+NULL` or `SET DEFAULT`). Postgres runs it inside the trigger query level of
+the statement that fired it, where it fires no `BEFORE` statement trigger
+once one has fired, and its rows join the transition tables of the table's
+update already queued there: one capture call covers both. A row both
+updated (a self-referencing key that cascades, or two cascading keys on one
+row) is in the transition tables twice, and pairing by key can image the
+intermediate version last. So an update capture also re-reads when a key
+occurs twice among its old rows (found in review).
+`tests/capture_ssi.rs` pins the gate, and `capture::sql`'s `function_body`
+has the argument.
 
 ## What it costs the writer
 
 The capture runs inside the application's transaction, so the writer pays for
 it: about 16 µs per single-row statement on tmpfs, and 1.3–1.7× one
 expression index's CPU per row for batched writes, with about 300 bytes of
-WAL per row (#622 C4, `local_docs/bench/622-baseline.md`).
+WAL per row (#622 C4, `local_docs/bench/622-baseline.md`). The begin
+trigger and the span bookkeeping (#623 D8a) add about 4.4 µs per statement,
+and nothing per row. An update's repeated-key check adds about 2.7 µs per
+statement and 0.3 µs per row (a rough in-transaction measurement, not
+`write-tax`, which only inserts). When a statement does re-read, the probe
+adds about 0.65–1.0 µs per row in batched writes and 3–10 µs per single-row
+statement.
 
 ## Trellis migrations and the write path
 
