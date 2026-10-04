@@ -134,6 +134,31 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
     // the very batch the killed process never got to commit.
     backend.disarm_pause_before_commit();
 
+    // The claims the paused primary holds, read before the restart: the
+    // fresh subprocess is already draining when `restart` returns, so its
+    // own claims must not be aged below (issue #756). A plain `SELECT`
+    // doesn't block on the paused transaction, as above.
+    let killed_claimants: Vec<String> = pool
+        .get()
+        .await
+        .expect("pool connection")
+        .query(
+            &format!(
+                "select distinct claimed_by from {}.seg_claims",
+                trellis::config::DEFAULT_SCHEMA
+            ),
+            &[],
+        )
+        .await
+        .expect("read the paused primary's claimants")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(
+        !killed_claimants.is_empty(),
+        "the primary, paused mid-Phase-3, must hold the claims of the batch it is draining"
+    );
+
     backend
         .restart()
         .await
@@ -155,6 +180,26 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
              exited on its own: {status:?}"
         );
     }
+
+    // The killed process's claims on the batch outlive it: the fresh
+    // subprocess has an id of its own (issue #756), so it takes them back
+    // only once the reclaim sweep finds them past `reclaim_ttl` (30 s, as
+    // long as `quiesce` waits). Age them past it instead of waiting it out;
+    // the fresh subprocess's next maintenance tick reclaims them. Only the
+    // killed process's: any claim the fresh one has taken since stays live.
+    pool.get()
+        .await
+        .expect("pool connection")
+        .execute(
+            &format!(
+                "update {}.seg_claims set claimed_at = now() - interval '1 hour' \
+                 where claimed_by = any($1)",
+                trellis::config::DEFAULT_SCHEMA
+            ),
+            &[&killed_claimants],
+        )
+        .await
+        .expect("age the killed process's claims");
 
     // The scenario's critical pair is always its program's last two ops
     // (`RelInterleavingScenario`'s own doc comment), so there is nothing

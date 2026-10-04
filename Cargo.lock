@@ -2194,6 +2194,7 @@ name = "trellis"
 version = "0.1.0"
 dependencies = [
  "deadpool-postgres",
+ "getrandom 0.4.3",
  "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",

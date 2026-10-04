@@ -473,6 +473,44 @@ async fn drainer_registration_is_the_share_denominator_floored_at_one() {
     assert_eq!(count, 2);
 }
 
+/// Issue #756: every process start registers drainers under a fresh worker
+/// id, so the maintenance loop's sweep is all that bounds the table. It
+/// removes a row last seen before its horizon and keeps a live one.
+#[tokio::test]
+async fn the_drainer_sweep_deletes_only_rows_older_than_its_horizon() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    claim::register_drainer(&client, "dead")
+        .await
+        .expect("register dead");
+    claim::register_drainer(&client, "live")
+        .await
+        .expect("register live");
+    client
+        .execute(
+            "update drainers set last_seen = now() - interval '1 hour' \
+             where drainer_id = 'dead'",
+            &[],
+        )
+        .await
+        .expect("age the dead drainer");
+
+    let swept = claim::reclaim_stale_drainers(&client, Duration::from_secs(30))
+        .await
+        .expect("sweep drainers");
+    assert_eq!(swept, 1);
+    let left: Vec<String> = client
+        .query("select drainer_id from drainers", &[])
+        .await
+        .expect("read drainers")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(left, ["live"]);
+}
+
 #[tokio::test]
 async fn held_share_reads_the_claims_table_rather_than_recomputing() {
     let cluster = TestCluster::start();

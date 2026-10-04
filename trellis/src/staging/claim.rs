@@ -71,6 +71,33 @@ pub async fn register_drainer(client: &impl GenericClient, id: &str) -> Result<(
     Ok(())
 }
 
+/// Deletes every drainer row last seen more than `older_than` ago, returning
+/// how many it removed. Table hygiene, run by `trellis::client`'s maintenance
+/// loop: each `Client` registers drainers under a worker id of its own
+/// (issue #756), so every process start adds rows that nothing else ever
+/// deletes. A row this old no longer counts toward [`count_live_drainers`]
+/// as long as `older_than` is at least that call's window, and a drainer that
+/// comes back re-registers. `skip locked`, so the sweep never waits behind a
+/// heartbeat's upsert of a live row.
+pub async fn reclaim_stale_drainers(
+    client: &impl GenericClient,
+    older_than: Duration,
+) -> Result<u64, StagingError> {
+    let older_than_secs = older_than.as_secs_f64();
+    let n = client
+        .execute(
+            "with dead as ( \
+                 select drainer_id from drainers \
+                 where last_seen < now() - (interval '1 second' * $1) \
+                 for update skip locked \
+             ) \
+             delete from drainers where drainer_id in (select drainer_id from dead)",
+            &[&older_than_secs],
+        )
+        .await?;
+    Ok(n)
+}
+
 /// Counts drainers seen within `window` of now — the share denominator
 /// [`claim`] divides a batch's free buckets by. Floored at 1 so a claim
 /// never divides by zero, e.g. the very first worker, claiming before any

@@ -39,6 +39,10 @@ tracing-opentelemetry = { version = "0.33", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = [
     "registry",
 ] }
+# Issue #756: the random part of each `Client`'s worker id
+# (`client::new_worker_id`). Already in the tree, through `tokio-postgres`'s
+# SCRAM auth, so this adds no crate.
+getrandom = "0.4"
 refinery = { version = "0.9.2", default-features = false, features = ["tokio-postgres"] }
 regex = "1.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
