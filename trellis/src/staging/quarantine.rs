@@ -2595,8 +2595,12 @@ async fn reads_paused_sibling(
 /// sweep drops the keys deleted while it was frozen. Any other definition
 /// gets a fresh `pending_backfill` marker for its source table
 /// ([`crate::intake::markers::park_marker`], which every marker goes
-/// through). The target is left exactly as
-/// the freeze left it until that marker's discharge
+/// through). The settled projections of the to-one relationships the
+/// definition reads are refreshed from their to-sides in the same
+/// transaction, unless another reader that isn't frozen reads them (issue
+/// #768: the drain may have skipped changes to a to-side while every reader
+/// was frozen). The target is left exactly as the freeze left it until that
+/// marker's discharge
 /// ([`crate::intake::markers::run_pending_backfills`]) runs, which in one
 /// transaction deletes every target row no current source row backs (issue
 /// #330, `intake::resume_orphans`) and dispatches the rebuild by shape
@@ -2648,6 +2652,27 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     // the same `split_part(target_table, '.', 2)` pattern
     // `TargetTableSuffixCollision`'s own check already uses, rather than
     // requiring every caller to know and pass the qualified identity.
+    let not_found = || ApplyError::TransformNotFound {
+        transform: target.to_string(),
+    };
+    let fenced_source: String = txn
+        .query_opt(
+            "select source_table from transform_definitions \
+             where split_part(target_table, '.', 2) = $1",
+            &[&target],
+        )
+        .await?
+        .ok_or_else(not_found)?
+        .get(0);
+    // Issue #768: the drain skips a table whose key can't be used while
+    // every definition reading it is frozen, judged under the fence of each
+    // reader's source (`staging::apply::source_key_for_apply`). The bump
+    // makes a page that judged this definition frozen miss its fence if it
+    // reaches it after this commit, so it can't skip rows the rebuild needs.
+    // It is this transaction's first lock (issue #744): it waits for the
+    // pages holding the fence, and holding the definition row meanwhile
+    // could close a cycle through one queued on a transaction that wants it.
+    super::build::bump_version_fence(&*txn, &fenced_source).await?;
     let row = txn
         .query_opt(
             "select id, source_table, status from transform_definitions \
@@ -2656,12 +2681,15 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
         )
         .await?;
     let Some(row) = row else {
-        return Err(ApplyError::TransformNotFound {
-            transform: target.to_string(),
-        });
+        return Err(not_found());
     };
     let id: i64 = row.get(0);
     let source_table: String = row.get(1);
+    if source_table != fenced_source {
+        // Dropped and defined again on another source between the two
+        // reads: not the definition the caller resumed.
+        return Err(not_found());
+    }
     let status_text: String = row.get(2);
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
@@ -2745,12 +2773,32 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     // `"schema.table"` form (issue #72) — re-resolving it via
     // `resolve_source_schema_in_txn` (bare names only) or re-`qualify`-ing it
     // would reject it outright (`DottedIdentifierComponent`).
-    let rederive_built = match catalog::definition_by_id_in(&*txn, id).await? {
-        Some(definition) => super::build::qualifies(&*txn, &definition).await?,
+    let definition = catalog::definition_by_id_in(&*txn, id).await?;
+    let rederive_built = match &definition {
+        Some(definition) => super::build::qualifies(&*txn, definition).await?,
         None => false,
     };
     if !rederive_built {
         crate::intake::markers::park_marker(&*txn, &source_table).await?;
+    }
+    // Issue #768: the drain skips a to-side whose key can't be used while
+    // every definition reading it is frozen
+    // (`staging::apply::source_key_for_apply`), so changes to a to-side this
+    // definition reads may never have reached the relationship's settled
+    // projection, which its rebuild's go-live catch-up and every later apply
+    // read. Refreshed from the table here, in the resume, so the rebuild
+    // never reads it stale. The bump above holds the fence the skip is
+    // judged under: a page that skipped while this definition was frozen has
+    // committed, its changes no longer pending to be left to it, and a later
+    // one misses the fence and halts. Only the to-one relationships no other
+    // reader that isn't frozen reads ([`catalog::relationships_to_refresh`]),
+    // all their rows locked in one statement, in `relationship_id` order,
+    // the order a page takes them in.
+    if let Some(definition) = &definition {
+        let refresh =
+            catalog::relationships_to_refresh(&*txn, &definition.def, &source_table, Some(id))
+                .await?;
+        catalog::refresh_relationship_projections_by_id_in_txn(&*txn, &refresh).await?;
     }
     // #622 C6: a transform paused by a schema change stops being reported as
     // such the moment it is resumed. Its columns count for capture again from

@@ -1105,7 +1105,9 @@ async fn accumulate_from_side_recomputes(
     // land on a same-named table in another schema — and the from-side
     // reads below use it for the same reason.
     let qualified_from_table = rel.qualified_from_table();
-    let from_pk = ddl::source_primary_key(pool, &qualified_from_table).await?;
+    let Some(from_pk) = from_side_key(pool, &qualified_from_table).await? else {
+        return Ok(());
+    };
     let matches = from_side_keys(
         pool,
         &qualified_from_table,
@@ -1462,8 +1464,10 @@ pub(crate) struct ReverseRelationshipShape {
     from_col: String,
     /// The from-table's primary key, possibly composite (issue #126) — see
     /// [`from_side_rows_for_trigger_txn`]'s doc comment for how a
-    /// multi-column key's row identity is encoded/decoded.
-    from_pk: Vec<PrimaryKeyColumn>,
+    /// multi-column key's row identity is encoded/decoded. `None` when it
+    /// can't be used and every definition reading the from-table is frozen
+    /// ([`from_side_key`], issue #768): no recompute of its rows is staged.
+    from_pk: Option<Vec<PrimaryKeyColumn>>,
     /// Whether some definition on `from_table` reads this relationship. Each
     /// then re-derives every from-side row a parent change reaches: a 1-1
     /// target re-reads the row, and an aggregate on the ledger reads the
@@ -1683,7 +1687,7 @@ async fn build_reverse_relationship_shape(
     // relationship's own recorded one (issue #288), never `rel.def.from_table`
     // re-resolved through this session's `search_path`.
     let qualified_from_table = rel.qualified_from_table();
-    let from_pk = ddl::source_primary_key(pool, &qualified_from_table).await?;
+    let from_pk = from_side_key(pool, &qualified_from_table).await?;
     let defs = catalog::transforms_for_source(pool, &qualified_from_table).await?;
 
     let needs_recompute_fallback = defs.iter().any(|def| {
@@ -2472,13 +2476,16 @@ async fn stage_reverse_recompute_fallback(
     row_columns: &[String],
 ) -> Result<(), ApplyError> {
     let shape = &record.shape;
+    let Some(from_pk) = &shape.from_pk else {
+        return Ok(());
+    };
     for key in [old_key.clone(), new_key.clone()].into_iter().flatten() {
         let trigger = ReverseTrigger::Keys(std::slice::from_ref(&key));
         let from_rows = from_side_rows_for_trigger_txn(
             txn,
             &shape.from_table,
             &shape.from_col,
-            &shape.from_pk,
+            from_pk,
             &trigger,
             row_columns,
         )
@@ -4852,6 +4859,139 @@ fn old_side_image(change: &FoldedChange) -> Option<&String> {
     }
 }
 
+/// The primary key [`compute`] keys `qualified_source`'s changes by
+/// ([`ddl::source_primary_key`]), or `None` when the key can't be used and
+/// no definition that isn't frozen reads the table, so `compute` skips them.
+///
+/// A dropped source is [`ApplyError::SourceTableDropped`], reported under
+/// `qualified_source`, the ring's own spelling (issue #267): its consumers
+/// (`quarantine::purge_dropped_table` and `drain_once`/`drain_many`'s
+/// `folded.retain`) match it against a ring row's `src_table` as an exact
+/// string.
+///
+/// Issue #768: a key that no longer passes the key gate (a type off the
+/// allowlist, or no key at all) halts the drain while any definition that
+/// isn't frozen reads the table ([`catalog::has_unfrozen_reader`], under the
+/// canonical `source_key`), directly or through a relationship: one that
+/// applies would key its rows wrongly or not at all, and one still waiting
+/// for its build, or under a chunked or direct one, re-derives from the
+/// relationship's settled projection its rows keep current. A table whose
+/// readers are all frozen (paused, capture-failed or quarantined) is skipped
+/// instead. Its changes drain with the page, which marks its claim drained
+/// whatever the plan holds, exactly as a paused definition's share is
+/// dropped when `catalog::transforms_for_source` leaves it out, and a resume
+/// rebuilds from the source. A relationship's settled projection on it gets
+/// none of them either, so a resume refreshes the projections on every
+/// to-side the resumed definition reads (`quarantine::resume_transform`).
+/// Asked only on the error, so a drain over usable keys reads nothing more.
+/// The answer is fenced: the version of each relationship from-side reading
+/// the table is read into `versions` first, and a definition, its resume and
+/// its edit each bump their source's, so a page can't commit a skip after a
+/// reader it didn't see.
+///
+/// The halt is the stance while a reader isn't frozen (#703 R2 would pause
+/// that reader in the drain): the capture pass that pauses every reader of a
+/// retyped key (#760) ends it, since the next attempt finds none.
+async fn source_key_for_apply(
+    pool: &Pool,
+    qualified_source: &str,
+    source_key: &str,
+    versions: &mut HashMap<String, Option<i64>>,
+) -> Result<Option<Vec<PrimaryKeyColumn>>, ApplyError> {
+    let err = match ddl::source_primary_key(pool, qualified_source).await {
+        Ok(pk) => return Ok(Some(pk)),
+        Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
+            return Err(ApplyError::SourceTableDropped {
+                source_table: qualified_source.to_string(),
+            });
+        }
+        Err(DdlError::NoPrimaryKey { source_table })
+            if quarantine::source_table_missing(pool, &source_table).await? =>
+        {
+            return Err(ApplyError::SourceTableDropped { source_table });
+        }
+        Err(err) => err,
+    };
+    if !is_key_gate(&err) {
+        return Err(err.into());
+    }
+    // The fence the skip is judged under, read before the readers are: a
+    // reader of `source_key` through a relationship is a definition on the
+    // relationship's from-side, and a definition, its resume or its edit
+    // commits with a bump of its source's fence. `compute`'s caller already
+    // holds `source_key`'s own entry, for a direct reader. So a page that
+    // skips the table can't commit after a reader it didn't see.
+    for rel in catalog::relationships_to_table(pool, source_key).await? {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            versions.entry(rel.qualified_from_table())
+        {
+            let version = catalog::source_table_version(pool, entry.key()).await?;
+            entry.insert(version);
+        }
+    }
+    if has_unfrozen_reader(pool, source_key).await? {
+        return Err(err.into());
+    }
+    tracing::warn!(
+        src_table = %qualified_source,
+        error = %err,
+        "every definition reading this table is frozen and its key can't be used; \
+         skipping its changes"
+    );
+    Ok(None)
+}
+
+/// Whether `err`, from [`ddl::source_primary_key`], is its key gate: the
+/// table has no usable key (none, or one of a type off the allowlist).
+fn is_key_gate(err: &DdlError) -> bool {
+    matches!(
+        err,
+        DdlError::NoPrimaryKey { .. } | DdlError::UnsupportedPrimaryKeyType { .. }
+    )
+}
+
+/// [`catalog::has_unfrozen_reader`] on a pooled connection.
+async fn has_unfrozen_reader(pool: &Pool, table: &str) -> Result<bool, ApplyError> {
+    let client = pool.get().await?;
+    Ok(catalog::has_unfrozen_reader(&**client, table).await?)
+}
+
+/// A relationship from-side's primary key, which a reverse recompute keys
+/// the from-side rows a to-side change reaches by, or `None` when the key
+/// can't be used and every definition reading the from-side is frozen.
+///
+/// Issue #768, the from-side's half of [`source_key_for_apply`]: the
+/// recomputes re-derive the from-side's rows for the definitions reading
+/// it, and a frozen one's resume rebuilds it from the source, so with no
+/// other reader the caller stages none, as `compute` skips the from-side's
+/// own changes. Without this a write to the to-side halted the drain on the
+/// from-side's key though no reader would apply what it staged. A reader
+/// that isn't frozen halts it as before, and so does a from-side that is
+/// gone. A new reader rebuilds from the source too, so the skip needs no
+/// fence.
+async fn from_side_key(
+    pool: &Pool,
+    qualified_from_table: &str,
+) -> Result<Option<Vec<PrimaryKeyColumn>>, ApplyError> {
+    let err = match ddl::source_primary_key(pool, qualified_from_table).await {
+        Ok(pk) => return Ok(Some(pk)),
+        Err(err) => err,
+    };
+    if !is_key_gate(&err)
+        || quarantine::source_table_missing(pool, qualified_from_table).await?
+        || has_unfrozen_reader(pool, qualified_from_table).await?
+    {
+        return Err(err.into());
+    }
+    tracing::warn!(
+        from_table = %qualified_from_table,
+        error = %err,
+        "every definition reading this relationship from-side is frozen and its key \
+         can't be used; staging no recompute of its rows"
+    );
+    Ok(None)
+}
+
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
 /// folded change's `f()` against the transform currently reading its
 /// source table, grouped by (unqualified) `src_table` so each source's
@@ -5052,7 +5192,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             "evaluating a source table's folded changes"
         );
         let version = catalog::source_table_version(pool, &source_key).await?;
-        versions.insert(source_key.clone(), version);
+        // The first read of a table's fence is kept: a skipped table's may
+        // have read this source's already, to fence the readers it judged
+        // under (`source_key_for_apply`), and a bump since then must miss.
+        versions.entry(source_key.clone()).or_insert(version);
 
         // The source identity this batch's own CDC producer staged (issue
         // #76, ADR-0007) — the ring's own spelling of `change.src_table`,
@@ -5066,35 +5209,15 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // the individual definition (issue #69) — introspected once per
         // source here and reused both below (every definition subscribed to
         // this source) and by the row decode below (every change, whichever
-        // definition it's evaluated against). A live `42P01` here means
-        // `source_key` no longer exists (issue #16's dropped-table purge,
-        // not an ordinary DDL error) — see [`ApplyError::SourceTableDropped`].
-        //
-        // Issue #267: reported as `qualified_source` (the ring's own spelling)
-        // rather than the canonical `source_key`. This error's two consumers —
-        // `quarantine::purge_dropped_table` and `drain_once`/`drain_many`'s
-        // `folded.retain(|c| c.src_table != source_table)` — both compare it
-        // to a ring row's `src_table` as an exact string, so a bare name
-        // purges and filters *nothing* and the retry loop re-fails forever on
-        // the same input. The `NoPrimaryKey` arm just below always did report
-        // the qualified form (`source_primary_key` echoes back the name it was
-        // given, which is `qualified_source` here); this arm's bare spelling
-        // happened to match only for a propagated downstream trigger, the one
-        // producer of bare `src_table` rows — which is exactly what #267
-        // stopped producing, so the two arms are made consistent instead.
-        let pk = match ddl::source_primary_key(pool, qualified_source).await {
-            Ok(pk) => pk,
-            Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
-                return Err(ApplyError::SourceTableDropped {
-                    source_table: qualified_source.to_string(),
-                });
-            }
-            Err(DdlError::NoPrimaryKey { source_table })
-                if quarantine::source_table_missing(pool, &source_table).await? =>
-            {
-                return Err(ApplyError::SourceTableDropped { source_table });
-            }
-            Err(err) => return Err(err.into()),
+        // definition it's evaluated against). A dropped source is
+        // [`ApplyError::SourceTableDropped`] (issue #16's purge, #267's
+        // spelling); `None` is a key that can't be used on a table no
+        // definition applies (issue #768), whose changes are dropped with
+        // the page. See [`source_key_for_apply`].
+        let Some(pk) =
+            source_key_for_apply(pool, qualified_source, &source_key, &mut versions).await?
+        else {
+            continue;
         };
 
         // Issue #344: the source column list a 1-1 target's Phase 3 check
@@ -5722,22 +5845,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         let version = catalog::source_table_version(pool, &source_key).await?;
         versions.entry(source_key.clone()).or_insert(version);
 
-        let pk = match ddl::source_primary_key(pool, &change.src_table).await {
-            Ok(pk) => pk,
-            Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
-                // Issue #267: the ring's own spelling, not the canonical
-                // `source_key` — see the by-source loop above's identical
-                // comment on this same arm.
-                return Err(ApplyError::SourceTableDropped {
-                    source_table: change.src_table.clone(),
-                });
-            }
-            Err(DdlError::NoPrimaryKey { source_table })
-                if quarantine::source_table_missing(pool, &source_table).await? =>
-            {
-                return Err(ApplyError::SourceTableDropped { source_table });
-            }
-            Err(err) => return Err(err.into()),
+        // The same key read, and skip, as the by-source loop's above.
+        let Some(pk) =
+            source_key_for_apply(pool, &change.src_table, &source_key, &mut versions).await?
+        else {
+            continue;
         };
         // `&change.src_table` (qualified), not `source_key` — see
         // the by-source loop above's identical comment on its own
@@ -5892,7 +6004,9 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // that function's accumulator, and its entries are staged as
             // `src_table` verbatim.
             let qualified_from_table = rel.qualified_from_table();
-            let from_pk = ddl::source_primary_key(pool, &qualified_from_table).await?;
+            let Some(from_pk) = from_side_key(pool, &qualified_from_table).await? else {
+                continue;
+            };
             // #623 D5: an aggregate on the from-table keeps each row's group
             // on its ledger entry, so the recompute needs no prior image.
             let from_keys = from_side_keys(
