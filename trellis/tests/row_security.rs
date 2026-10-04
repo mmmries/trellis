@@ -18,6 +18,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::defs::TransformStatus;
 use trellis::defs::row_security::{Readers, RowSecurity, applying};
 use trellis::intake::markers;
+use trellis::staging::{StagedWatermark, apply, seal};
 use trellis::{CaptureFault, CatalogError, Divergence, SelfCheckOutcome, TrellisError};
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
@@ -111,6 +112,26 @@ async fn the_check_matches_postgres_for_every_role_and_table_setting() {
             let found = applying(&client, SCHEMA, "public.t", Readers::RingAndSession)
                 .await
                 .expect("check RLS");
+            // No ring here, so all three check the session's role alone
+            // (#765).
+            assert_eq!(
+                applying(&client, SCHEMA, "public.t", Readers::Session)
+                    .await
+                    .expect("check RLS as a seam-fed table"),
+                found,
+                "{role:?} with {setting:?}: as a seam-fed table"
+            );
+            let as_target = applying(&client, SCHEMA, "public.t", Readers::Target)
+                .await
+                .expect("check RLS as a target");
+            assert_eq!(
+                as_target,
+                found.clone().map(|rls| RowSecurity {
+                    target: true,
+                    ..rls
+                }),
+                "{role:?} with {setting:?}: as a target"
+            );
             let active: bool = client
                 .query_one("select row_security_active('public.t')", &[])
                 .await
@@ -132,6 +153,7 @@ async fn the_check_matches_postgres_for_every_role_and_table_setting() {
                         table: "public.t".to_string(),
                         role: role.expect("a superuser is exempt").to_string(),
                         owner_forced: owns,
+                        target: false,
                     },
                     "{case}"
                 );
@@ -150,6 +172,8 @@ async fn the_check_matches_postgres_for_every_role_and_table_setting() {
 /// session's role is the one reported. [`Readers::Ring`], define's check,
 /// asks about the ring's owner alone: the session's role may be a process's
 /// that only defines transforms and never reads the table.
+/// [`Readers::Session`] and [`Readers::Target`] ask about the session's role
+/// alone, which reads a seam-fed table and writes a target (#765).
 #[tokio::test]
 async fn the_ring_owner_is_checked_as_well_as_the_session_role() {
     let cluster = TestCluster::start();
@@ -198,6 +222,16 @@ async fn the_ring_owner_is_checked_as_well_as_the_session_role() {
             .expect("check RLS")
             .expect("the ring's owner is subject to the policies");
         assert_eq!(found.role, "rls_ring", "{readers:?}");
+    }
+    for readers in [Readers::Session, Readers::Target] {
+        assert!(
+            applying(&client, "rls_instance", "public.t", readers)
+                .await
+                .expect("check RLS")
+                .is_none(),
+            "{readers:?} asks about the session's role alone: a seam-fed table's \
+             reader, or a target's writer (#765)"
+        );
     }
     assert!(
         applying(
@@ -352,6 +386,7 @@ async fn defining_refuses_a_table_whose_policies_apply_to_the_trellis_role() {
             table: "public.c".to_string(),
             role: "rls_trellis".to_string(),
             owner_forced: true,
+            target: false,
         }
     );
     let err = it
@@ -384,6 +419,7 @@ async fn defining_refuses_a_table_whose_policies_apply_to_the_trellis_role() {
             table: "public.p".to_string(),
             role: "rls_trellis".to_string(),
             owner_forced: false,
+            target: false,
         }
     );
     it.trellis
@@ -493,6 +529,7 @@ async fn the_capture_pass_pauses_a_reader_once_the_policies_apply_and_self_check
         table: "public.c".to_string(),
         role: "rls_trellis".to_string(),
         owner_forced: true,
+        target: false,
     };
     match self_check(&it.trellis, "c_copy").await {
         SelfCheckOutcome::Diverged(divergences) => assert_eq!(
@@ -582,6 +619,7 @@ async fn defining_refuses_a_to_one_to_side_whose_policies_apply_to_the_session_r
             table: "public.p".to_string(),
             role: "rls_definer".to_string(),
             owner_forced: true,
+            target: false,
         }
     );
     definer
@@ -631,8 +669,8 @@ async fn defining_refuses_a_to_one_to_side_whose_policies_apply_to_the_session_r
 /// A table another definition targets isn't captured (the target-mutation
 /// seam feeds it), but its readers read it as the Trellis role all the same,
 /// so the capture pass checks it too: RLS forced on an upstream target pauses
-/// the definition sourced from it, and not the upstream, which doesn't read
-/// its own target.
+/// the definition sourced from it, for its reads. It pauses the upstream as
+/// well, for its writes to the target (#765).
 #[tokio::test]
 async fn the_capture_pass_pauses_a_reader_of_a_seam_fed_table() {
     let cluster = TestCluster::start();
@@ -672,8 +710,535 @@ async fn the_capture_pass_pauses_a_reader_of_a_seam_fed_table() {
         failure.error.contains("FORCE ROW LEVEL SECURITY"),
         "{failure:?}"
     );
+    assert!(
+        failure.error.contains("Trellis's reads of it"),
+        "{failure:?}"
+    );
+    // #765: the upstream writes the forced target as the same role, so it
+    // pauses too, for its writes.
     let upstream = status(&it.trellis, "c_copy").await;
-    assert_eq!(upstream.status, TransformStatus::Live);
-    assert_eq!(upstream.capture_failure, None);
+    assert_eq!(upstream.status, TransformStatus::Paused);
+    let failure = upstream.capture_failure.expect("the reason is reported");
+    assert_eq!(failure.source_table, "public.c_copy");
+    assert!(
+        failure.error.contains("writes to it are filtered"),
+        "{failure:?}"
+    );
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// Seals the ring and drains what it sealed through `pool`, as `pool`'s
+/// role: a bounded stand-in for one drain thread's turn. Returns the drain's
+/// error, if it failed.
+async fn seal_and_drain(raw: &mut Client, pool: &trellis::Pool) -> Result<(), String> {
+    let sealed = seal::seal_phase1(raw).await.expect("seal phase 1");
+    seal::seal_phase2(raw, sealed.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+    let watermark = StagedWatermark::saturated();
+    for _ in 0..16 {
+        match apply::drain_once(
+            pool,
+            sealed.sealed_seg_seq,
+            "row_security_test",
+            1,
+            "trellis_row_security_test",
+            &watermark,
+        )
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(()),
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+    panic!("the drain didn't finish in 16 turns");
+}
+
+async fn amount_of(admin: &Client, table: &str, id: i32) -> Option<String> {
+    admin
+        .query_one(
+            &format!("select amount::text from {table} where id = $1"),
+            &[&id],
+        )
+        .await
+        .expect("read the target as the superuser")
+        .get(0)
+}
+
+/// Which role writes a target (#765): apply's writes are plain SQL on the
+/// draining connection, so they run as that connection's login role, not as
+/// the ring's owner (no `SECURITY DEFINER` function is involved). A policy
+/// that admits only the ring's owner lets a drain logged in as it update
+/// the target, and fails the same drain logged in as a member of it, even
+/// though the member inherits the owner's privileges and ownership: apply's
+/// upsert fails the policy's `WITH CHECK`.
+#[tokio::test]
+async fn apply_writes_a_target_as_the_draining_connections_role() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.trellis
+        .apply("TRANSFORM c_copy FROM public.c SELECT amount AS amount")
+        .await
+        .expect("define");
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    assert_eq!(
+        status(&it.trellis, "c_copy").await.status,
+        TransformStatus::Live
+    );
+    it.admin
+        .batch_execute(
+            "create role rls_worker login in role rls_trellis; \
+             alter table public.c_copy enable row level security, force row level security; \
+             create policy ring_owner_only on public.c_copy \
+               using (current_user = 'rls_trellis') \
+               with check (current_user = 'rls_trellis');",
+        )
+        .await
+        .expect("a member login role, and a policy only the ring's owner passes");
+    let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
+    let config = trellis::Config::with_schema(dsn, SCHEMA).expect("valid config");
+    let worker = trellis::Pool::new(&config).expect("pool");
+
+    it.admin
+        .batch_execute("update public.c set amount = 100 where id = 1")
+        .await
+        .expect("write the source");
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("a drain as the ring's owner passes the policy");
+    assert_eq!(
+        amount_of(&it.admin, "public.c_copy", 1).await,
+        Some("100".to_string())
+    );
+
+    it.admin
+        .batch_execute("update public.c set amount = 200 where id = 1")
+        .await
+        .expect("write the source");
+    let drained = seal_and_drain(&mut it.raw, &worker).await;
+    assert!(
+        drained
+            .as_ref()
+            .is_err_and(|err| err.contains("violates row-level security policy")),
+        "the member's upsert fails the policy: {drained:?}"
+    );
+    assert_eq!(
+        amount_of(&it.admin, "public.c_copy", 1).await,
+        Some("100".to_string()),
+        "the member's write didn't land"
+    );
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// Registration creates the target as the session's role, with RLS off, so
+/// defining refuses a target only when DDL around its creation makes the
+/// policies apply to that role: here an event trigger that enables and
+/// forces RLS on each new table (#765). One that only enables it, a common
+/// "RLS on every table" setup, leaves the owner exempt and refuses nothing.
+#[tokio::test]
+async fn defining_refuses_a_target_whose_policies_apply_to_the_session_once_created() {
+    let cluster = TestCluster::start();
+    let it = instance(&cluster).await;
+    let event_trigger = |force: &str| {
+        format!(
+            "create or replace function public.rls_on_new_tables() returns event_trigger \
+               language plpgsql as $$ \
+             declare cmd record; \
+             begin \
+               for cmd in select * from pg_event_trigger_ddl_commands() \
+                          where command_tag = 'CREATE TABLE' and schema_name = 'public' loop \
+                 execute format('alter table %s enable row level security{force}', \
+                                cmd.object_identity); \
+               end loop; \
+             end $$;"
+        )
+    };
+    it.admin
+        .batch_execute(&format!(
+            "{} create event trigger rls_on_new_tables on ddl_command_end \
+               when tag in ('CREATE TABLE') execute function public.rls_on_new_tables();",
+            event_trigger("")
+        ))
+        .await
+        .expect("an event trigger enabling RLS on new tables");
+    it.trellis
+        .apply("TRANSFORM c_copy FROM public.c SELECT amount AS amount")
+        .await
+        .expect("the target's owner is exempt without FORCE");
+    let enabled: bool = it
+        .admin
+        .query_one(
+            "select relrowsecurity from pg_class where oid = 'public.c_copy'::regclass",
+            &[],
+        )
+        .await
+        .expect("read the target's RLS")
+        .get(0);
+    assert!(enabled, "the event trigger ran on the target");
+
+    it.admin
+        .batch_execute(&event_trigger(", force row level security"))
+        .await
+        .expect("force RLS on new tables too");
+    let rls = refused_for_row_security(
+        it.trellis
+            .apply("TRANSFORM c_more FROM public.c SELECT amount AS amount")
+            .await,
+    );
+    assert_eq!(
+        rls,
+        RowSecurity {
+            table: "public.c_more".to_string(),
+            role: "rls_trellis".to_string(),
+            owner_forced: true,
+            target: true,
+        }
+    );
+    let left: Option<String> = it
+        .admin
+        .query_one("select to_regclass('public.c_more')::text", &[])
+        .await
+        .expect("look for the target")
+        .get(0);
+    assert_eq!(left, None, "the refusal rolled the target back");
+
+    it.admin
+        .batch_execute("alter role rls_trellis bypassrls")
+        .await
+        .expect("exempt the role");
+    it.trellis
+        .apply("TRANSFORM c_more FROM public.c SELECT amount AS amount")
+        .await
+        .expect("a role with BYPASSRLS is exempt");
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// RLS on a live definition's target after define (#765). Enabling it on a
+/// target the worker's role owns, for the application's readers, changes
+/// nothing. Forcing it makes `self_check` report it, and so does handing the
+/// table to another owner; the next capture pass pauses the definition that
+/// writes it, with the reason as its `capture_failure`. Once the table is
+/// the role's again, resuming rebuilds the definition to `live`.
+#[tokio::test]
+async fn the_capture_pass_pauses_the_writer_of_a_target_its_policies_apply_to() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.trellis
+        .apply("TRANSFORM c_copy FROM public.c SELECT amount AS amount")
+        .await
+        .expect("define");
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    assert_eq!(
+        status(&it.trellis, "c_copy").await.status,
+        TransformStatus::Live
+    );
+
+    it.admin
+        .batch_execute(
+            "alter table public.c_copy enable row level security; \
+             create policy app_only on public.c_copy to public using (false);",
+        )
+        .await
+        .expect("enable RLS on a target the Trellis role owns");
+    capture_pass(&mut it.raw, &it.pool).await;
+    let reported = status(&it.trellis, "c_copy").await;
+    assert_eq!(
+        reported.status,
+        TransformStatus::Live,
+        "routine: nothing fires"
+    );
+    assert_eq!(reported.capture_failure, None);
+    assert!(
+        matches!(
+            self_check(&it.trellis, "c_copy").await,
+            SelfCheckOutcome::Converged
+        ),
+        "the owner's writes and reads aren't filtered"
+    );
+
+    let mut expected = RowSecurity {
+        table: "public.c_copy".to_string(),
+        role: "rls_trellis".to_string(),
+        owner_forced: true,
+        target: true,
+    };
+    it.admin
+        .batch_execute("alter table public.c_copy force row level security")
+        .await
+        .expect("force RLS");
+    match self_check(&it.trellis, "c_copy").await {
+        SelfCheckOutcome::Diverged(divergences) => assert_eq!(
+            divergences,
+            vec![Divergence::Capture(CaptureFault::RowSecurity(
+                expected.clone()
+            ))]
+        ),
+        other => panic!("expected the capture audit's fault, got {other:?}"),
+    }
+
+    it.admin
+        .batch_execute(
+            "alter table public.c_copy no force row level security; \
+             alter table public.c_copy owner to postgres; \
+             grant select, insert, update, delete on public.c_copy to rls_trellis;",
+        )
+        .await
+        .expect("hand the target to another owner");
+    expected.owner_forced = false;
+    match self_check(&it.trellis, "c_copy").await {
+        SelfCheckOutcome::Diverged(divergences) => assert_eq!(
+            divergences,
+            vec![Divergence::Capture(CaptureFault::RowSecurity(
+                expected.clone()
+            ))]
+        ),
+        other => panic!("expected the capture audit's fault, got {other:?}"),
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    let reported = status(&it.trellis, "c_copy").await;
+    assert_eq!(reported.status, TransformStatus::Paused);
+    let failure = reported.capture_failure.expect("the reason is reported");
+    assert_eq!(failure.source_table, "public.c_copy");
+    assert!(failure.columns.is_empty(), "{failure:?}");
+    assert!(
+        failure.error.starts_with(&expected.to_string()) && failure.error.contains("resume"),
+        "{failure:?}"
+    );
+    capture_pass(&mut it.raw, &it.pool).await;
+    assert_eq!(
+        status(&it.trellis, "c_copy").await.status,
+        TransformStatus::Paused,
+        "a later pass leaves it paused"
+    );
+
+    it.admin
+        .batch_execute("alter table public.c_copy owner to rls_trellis")
+        .await
+        .expect("give the target back");
+    it.trellis
+        .apply("RESUME TRANSFORM c_copy")
+        .await
+        .expect("resume");
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    let reported = status(&it.trellis, "c_copy").await;
+    assert_eq!(reported.status, TransformStatus::Live);
+    assert_eq!(reported.capture_failure, None);
+    let copied: i64 = it
+        .admin
+        .query_one("select count(*) from public.c_copy", &[])
+        .await
+        .expect("read the target")
+        .get(0);
+    assert_eq!(copied, 6, "the rebuild wrote every row");
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// A target belongs to the role that defined it. When the workers log in as
+/// a member of the ring's owner and define as that member too, the ring's
+/// owner owns nothing of the target, so enabling RLS on it (for the
+/// application's readers) applies the policies to the ring's owner. That
+/// isn't a writer, so nothing fires (#765): the capture pass, run as the
+/// member, leaves the definition `live`, and `self_check` converges.
+#[tokio::test]
+async fn a_target_its_writer_owns_is_not_checked_for_the_ring_owner() {
+    let cluster = TestCluster::start();
+    let it = instance(&cluster).await;
+    it.admin
+        .batch_execute("create role rls_worker login in role rls_trellis")
+        .await
+        .expect("a login role that is a member of the ring's owner");
+    let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
+    let config = trellis::Config::with_schema(dsn.clone(), SCHEMA).expect("valid config");
+    let pool = trellis::Pool::new(&config).expect("pool");
+    let mut raw = connect(&dsn).await;
+    raw.batch_execute(&format!("set search_path to {SCHEMA}, public"))
+        .await
+        .expect("set search_path");
+    let worker = trellis::Trellis::connect(config, trellis::TrellisOptions::default())
+        .await
+        .expect("connect as the member");
+    worker
+        .apply("TRANSFORM c_copy FROM public.c SELECT amount AS amount")
+        .await
+        .expect("define as the member");
+    capture_pass(&mut raw, &pool).await;
+    markers::settle_registrations(&pool).await;
+    assert_eq!(
+        status(&worker, "c_copy").await.status,
+        TransformStatus::Live
+    );
+    let owner: String = it
+        .admin
+        .query_one(
+            "select pg_get_userbyid(relowner)::text from pg_class \
+             where oid = 'public.c_copy'::regclass",
+            &[],
+        )
+        .await
+        .expect("the target's owner")
+        .get(0);
+    assert_eq!(owner, "rls_worker");
+
+    it.admin
+        .batch_execute(
+            "alter table public.c_copy enable row level security; \
+             create policy app_only on public.c_copy to public using (false);",
+        )
+        .await
+        .expect("enable RLS on the target");
+    let as_reader = applying(&raw, SCHEMA, "public.c_copy", Readers::RingAndSession)
+        .await
+        .expect("check RLS")
+        .expect("the ring's owner doesn't own the target");
+    assert_eq!(as_reader.role, "rls_trellis");
+    assert_eq!(
+        applying(&raw, SCHEMA, "public.c_copy", Readers::Target)
+            .await
+            .expect("check RLS"),
+        None,
+        "its writer owns it"
+    );
+    capture_pass(&mut raw, &pool).await;
+    let reported = status(&worker, "c_copy").await;
+    assert_eq!(reported.status, TransformStatus::Live);
+    assert_eq!(reported.capture_failure, None);
+    assert!(
+        matches!(
+            self_check(&worker, "c_copy").await,
+            SelfCheckOutcome::Converged
+        ),
+        "nothing to report"
+    );
+    worker.shutdown().await.expect("shutdown");
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// A table the target-mutation seam feeds (another definition's target) is
+/// read only by plain SQL on worker connections, as their login role: no
+/// capture function is installed on it, so the ring's owner never reads it.
+/// When the workers log in as a member of the ring's owner and define as
+/// that member, the member owns the upstream's target and the ring's owner
+/// owns nothing of it, so enabling RLS on it for the application's readers
+/// applies the policies to the ring's owner alone. That isn't a reader, so
+/// nothing fires, for a definition sourced from the target or one reading it
+/// as a relationship's to-side: defining either is accepted, the capture
+/// pass leaves them `live`, and `self_check`'s capture audit reports
+/// nothing. Forcing RLS, which applies to the member too, still pauses them.
+#[tokio::test]
+async fn a_seam_fed_table_its_readers_own_is_not_checked_for_the_ring_owner() {
+    let cluster = TestCluster::start();
+    let it = instance(&cluster).await;
+    it.admin
+        .batch_execute("create role rls_worker login in role rls_trellis")
+        .await
+        .expect("a login role that is a member of the ring's owner");
+    let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
+    let config = trellis::Config::with_schema(dsn.clone(), SCHEMA).expect("valid config");
+    let pool = trellis::Pool::new(&config).expect("pool");
+    let mut raw = connect(&dsn).await;
+    raw.batch_execute(&format!("set search_path to {SCHEMA}, public"))
+        .await
+        .expect("set search_path");
+    let worker = trellis::Trellis::connect(config, trellis::TrellisOptions::default())
+        .await
+        .expect("connect as the member");
+    worker
+        .apply("TRANSFORM c_copy FROM public.c SELECT amount AS amount")
+        .await
+        .expect("define the upstream as the member");
+    capture_pass(&mut raw, &pool).await;
+    markers::settle_registrations(&pool).await;
+    worker
+        .apply("RELATIONSHIP mirror FROM p.id TO c_copy.id")
+        .await
+        .expect("declare a relationship to the upstream's target");
+    worker
+        .apply("TRANSFORM c_again FROM public.c_copy SELECT amount AS amount")
+        .await
+        .expect("define one sourced from the target");
+    worker
+        .apply("TRANSFORM c_mirror FROM public.p SELECT mirror.amount AS mirrored")
+        .await
+        .expect("define one reading the target as a to-side");
+    capture_pass(&mut raw, &pool).await;
+    markers::settle_registrations(&pool).await;
+    for target in ["c_copy", "c_again", "c_mirror"] {
+        assert_eq!(
+            status(&worker, target).await.status,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+
+    it.admin
+        .batch_execute(
+            "alter table public.c_copy enable row level security; \
+             create policy app_only on public.c_copy to public using (false);",
+        )
+        .await
+        .expect("enable RLS on the upstream's target");
+    assert_eq!(
+        applying(&raw, SCHEMA, "public.c_copy", Readers::Ring)
+            .await
+            .expect("check RLS")
+            .map(|rls| rls.role),
+        Some("rls_trellis".to_string()),
+        "the ring's owner doesn't own the target"
+    );
+    assert_eq!(
+        applying(&raw, SCHEMA, "public.c_copy", Readers::Session)
+            .await
+            .expect("check RLS"),
+        None,
+        "its readers own it"
+    );
+    worker
+        .apply("TRANSFORM c_more FROM public.c_copy SELECT amount AS amount")
+        .await
+        .expect("a source the seam feeds isn't checked for the ring's owner");
+    worker
+        .apply("TRANSFORM c_mirror2 FROM public.p SELECT mirror.amount AS mirrored")
+        .await
+        .expect("nor is a to-side the seam feeds");
+    capture_pass(&mut raw, &pool).await;
+    markers::settle_registrations(&pool).await;
+    for target in ["c_copy", "c_again", "c_mirror", "c_more", "c_mirror2"] {
+        let reported = status(&worker, target).await;
+        assert_eq!(reported.status, TransformStatus::Live, "{target}");
+        assert_eq!(reported.capture_failure, None, "{target}");
+    }
+    // `self_check`'s capture audit, as the member: nothing to report.
+    for target in ["c_again", "c_mirror"] {
+        let def = trellis::defs::catalog::definition_by_target(&pool, target)
+            .await
+            .expect("read the definition")
+            .expect("registered");
+        let faults = trellis::staging::capture_audit::audit(&raw, SCHEMA, &def)
+            .await
+            .expect("audit");
+        assert_eq!(faults, [], "{target}");
+    }
+
+    it.admin
+        .batch_execute("alter table public.c_copy force row level security")
+        .await
+        .expect("force RLS on the upstream's target");
+    capture_pass(&mut raw, &pool).await;
+    for target in ["c_again", "c_mirror"] {
+        let reported = status(&worker, target).await;
+        assert_eq!(reported.status, TransformStatus::Paused, "{target}");
+        let failure = reported.capture_failure.expect("the reason is reported");
+        assert_eq!(failure.source_table, "public.c_copy", "{target}");
+        assert!(failure.error.contains("rls_worker"), "{failure:?}");
+        assert!(
+            failure.error.contains("Trellis's reads of it"),
+            "{failure:?}"
+        );
+    }
+    worker.shutdown().await.expect("shutdown");
     it.trellis.shutdown().await.expect("shutdown");
 }

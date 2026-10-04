@@ -281,17 +281,29 @@ pub(crate) async fn pause_readers_of_missing(
 }
 
 /// The staging worker's capture pass's check for a table Trellis can't read
-/// correctly: pauses every definition that reads `table` and isn't paused
-/// for a capture failure yet, recording why in `capture_failures`, when
+/// or write correctly. It pauses every definition that reads `table` and
+/// isn't paused for a capture failure yet, recording why in
+/// `capture_failures`, when
 ///
 /// - the table's row-level security policies now apply to the ring's owner
 ///   or to this worker's own role, which read it (issue #745,
-///   [`crate::defs::row_security`]). RLS can be enabled or forced, or the
-///   table handed to another owner, after the definitions were accepted; or
+///   [`crate::defs::row_security`]); only to this worker's own role for a
+///   table another definition targets, which no capture function reads
+///   ([`crate::defs::row_security::Readers::Session`]). RLS can be enabled
+///   or forced, or the table handed to another owner, after the definitions
+///   were accepted; or
 /// - a logical-replication subscription now replicates into it, whose
 ///   changes capture never sees (issue #751, [`crate::defs::subscription`]).
 ///   A subscription can be created, or refreshed to include the table,
 ///   after define.
+///
+/// And (issue #765) it pauses the definition whose target `table` is, when
+/// its policies now apply to this worker's own role, which writes it
+/// ([`crate::defs::row_security::Readers::Target`]): its applies' updates
+/// and deletes would skip the rows they hide, and its inserts would fail.
+/// The ring's owner isn't checked for that: it writes no target. One query
+/// answers for the target's writer and its readers, which are the same
+/// role.
 ///
 /// Returns whether it paused any, in which case the caller leaves the table
 /// for the next pass, whose catalog no longer counts them.
@@ -301,33 +313,54 @@ pub(crate) async fn pause_readers_of_missing(
 /// way, and the next pass pauses it again while the table is still
 /// unsupported.
 ///
-/// Costs no query for a table no unpaused definition reads.
+/// Costs no query for a table no unpaused definition reads or writes.
 pub(crate) async fn pause_readers_of_unsupported(
     client: &mut Client,
     schema: &str,
     catalog: &CaptureCatalog,
     table: &str,
 ) -> Result<bool, CaptureError> {
+    use crate::defs::row_security::{Readers, RowSecurity, applying};
+    let writers = unpaused_writers(catalog, table);
     let readers = unpaused_readers(catalog, table);
-    if readers.is_empty() {
+    if writers.is_empty() && readers.is_empty() {
         return Ok(false);
     }
-    let error = if let Some(rls) = crate::defs::row_security::applying(
-        &*client,
-        schema,
-        table,
-        crate::defs::row_security::Readers::RingAndSession,
-    )
-    .await?
-    {
-        row_security_error(&rls)
-    } else if let Some(sub) = crate::defs::subscription::subscribed(&*client, table).await? {
-        subscribed_error(&sub)
+    // A table another definition targets is fed by the seam, with no
+    // capture function to read it as the ring's owner: only the workers
+    // read and write it, as their own role, so one check of this worker's
+    // role answers for its writer and its readers alike.
+    let seam_fed = catalog.definitions.iter().any(|d| d.target == table);
+    let roles = if seam_fed {
+        Readers::Session
     } else {
-        return Ok(false);
+        Readers::RingAndSession
     };
+    let rls = applying(&*client, schema, table, roles).await?;
+    let mut pauses: Vec<(i64, String)> = Vec::new();
+    if let Some(rls) = &rls {
+        let error = row_security_error(&RowSecurity {
+            target: true,
+            ..rls.clone()
+        });
+        pauses.extend(writers.into_iter().map(|id| (id, error.clone())));
+    }
+    if !readers.is_empty() {
+        let error = match &rls {
+            Some(rls) => Some(row_security_error(rls)),
+            None => crate::defs::subscription::subscribed(&*client, table)
+                .await?
+                .map(|sub| subscribed_error(&sub)),
+        };
+        if let Some(error) = error {
+            pauses.extend(readers.into_iter().map(|id| (id, error.clone())));
+        }
+    }
+    if pauses.is_empty() {
+        return Ok(false);
+    }
     let txn = client.transaction().await?;
-    for id in readers {
+    for (id, error) in pauses {
         if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error).await? {
             tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
         }
@@ -346,6 +379,17 @@ fn subscribed_error(sub: &crate::defs::subscription::Subscribed) -> String {
 /// applies to a table it reads.
 fn row_security_error(rls: &crate::defs::row_security::RowSecurity) -> String {
     format!("{rls}; then resume the definition to rebuild it, or drop the definition")
+}
+
+/// Every definition whose target is `table` (at most one) and that isn't
+/// paused for a capture failure yet.
+fn unpaused_writers(catalog: &CaptureCatalog, table: &str) -> Vec<i64> {
+    catalog
+        .definitions
+        .iter()
+        .filter(|r| r.target == table && !r.capture_failed)
+        .map(|r| r.id)
+        .collect()
 }
 
 /// Every definition that reads `table` at all, as its source or a

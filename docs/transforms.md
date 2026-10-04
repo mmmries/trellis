@@ -62,6 +62,9 @@ error naming the table, the role and the fix. So is one whose policies on a
 to-one relationship's to-side apply to the role that defines it: defining
 reads that table, as that role, to fill the relationship's projection
 ([embedding](embedding.md#what-the-staging-worker-needs-from-the-database)).
+For a table that is another transform's target, only the defining role is
+checked, standing in for the workers: no capture function reads that table,
+so the role that owns the ring never does.
 Row-level security can also be enabled or forced, a table handed to another
 owner, or `BYPASSRLS` taken away, after a transform is defined. The staging
 worker then pauses every transform that reads the table (another transform's
@@ -345,6 +348,25 @@ undefined. Treat a target as read-only, and specifically:
   the table and its definition together, and refuses while another definition
   still chains off it. A hand `TRUNCATE` leaves the table empty until the
   transform is paused and resumed.
+* **Don't let row-level security apply to the role that writes it** (#765).
+  Trellis writes a target as the role each worker connects as, and policies
+  that apply to that role filter those writes: an update or delete skips the
+  rows they hide, leaving them stale, and an insert fails their `WITH CHECK`.
+  The rule is the one for [source tables](#source-tables). Trellis creates
+  the target as the role that defines it, so that role owns it and is exempt
+  unless the table has `FORCE ROW LEVEL SECURITY`. Enabling row-level security
+  on a target for your application's readers is fine as long as the workers
+  run as the table's owner (or a member of it) or have `BYPASSRLS`. It isn't
+  supported once the table is forced, handed to an owner the workers don't
+  belong to, or the workers' `BYPASSRLS` is taken away. The staging worker
+  then pauses the transform that writes the target, with the reason on
+  `status()`'s `capture_failure` (whose `source_table` names the target), and
+  `self_check` reports it as a `capture` divergence. Readers of the target are
+  paused too when the policies apply to the role that reads it. Exempt the
+  role, then resume the transform, which rebuilds it. Defining a transform is
+  refused if DDL around its target's creation, such as an event trigger that
+  forces row-level security on every new table, makes the policies apply to
+  the defining role.
 * **Expect a partial table while `backfilling`, and after `RESUME`.** The
   [status](#status) says when the table is complete; a reader that needs
   completeness checks it.

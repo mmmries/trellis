@@ -248,7 +248,10 @@ pub enum CatalogError {
     /// Issue #745: row-level security on the definition's source, or on the
     /// to-side of a relationship it reads through, applies to a role Trellis
     /// reads the table as, so its policies would filter Trellis's reads
-    /// (see [`super::row_security`]). Not supported.
+    /// (see [`super::row_security`]). Or (issue #765) row-level security on
+    /// its newly created target applies to the session's role, which would
+    /// filter Trellis's writes ([`super::row_security::RowSecurity::target`]).
+    /// Not supported.
     RowSecurityApplies(super::row_security::RowSecurity),
     /// Issue #751: a logical-replication subscription replicates into the
     /// definition's source, or into the to-side of a relationship it reads
@@ -2537,7 +2540,10 @@ async fn create_definition_inner(
     // to-side as the session's role
     // ([`widen_relationship_projections_for_definition_in_txn`], above), and
     // a build reads the projection, so a to-one to-side is checked for the
-    // session's role too.
+    // session's role too. A table another definition targets is checked for
+    // the session's role alone: the target-mutation seam feeds it, no
+    // capture function reads it, so the ring's owner never does (see
+    // [`super::row_security::Readers::Session`]).
     let mut to_sides: Vec<(String, super::row_security::Readers)> = relationships
         .values()
         .map(|r| {
@@ -2550,10 +2556,15 @@ async fn create_definition_inner(
         })
         .collect();
     to_sides.sort_by(|a, b| a.0.cmp(&b.0));
-    let read_tables: Vec<(String, super::row_security::Readers)> =
+    let mut read_tables: Vec<(String, super::row_security::Readers)> =
         std::iter::once((qualified_source.clone(), super::row_security::Readers::Ring))
             .chain(to_sides)
             .collect();
+    for (table, readers) in &mut read_tables {
+        if is_definition_target(&*txn, table).await? {
+            *readers = super::row_security::Readers::Session;
+        }
+    }
     reject_row_security(&*txn, pool.schema(), &read_tables).await?;
     // Issue #751: and a table a logical-replication subscription writes is
     // one whose changes capture never sees, for the same tables.
@@ -2580,6 +2591,21 @@ async fn create_definition_inner(
         )
         .await?;
     }
+    // Issue #765: Trellis writes the target as the role each worker connects
+    // as, and policies that apply to it would filter those writes. The table
+    // was just created, as the session's role with RLS off, so this only
+    // fires when DDL around the creation (an event trigger) forced RLS on it
+    // or handed it to another owner. The session's role stands in for the
+    // workers' (see [`super::row_security`]).
+    reject_row_security(
+        &*txn,
+        pool.schema(),
+        &[(
+            qualified_target.clone(),
+            super::row_security::Readers::Target,
+        )],
+    )
+    .await?;
 
     // Issue #768: the drain skips a to-side whose key can't be used while
     // every definition reading it is frozen, so changes to it may never have
@@ -3345,9 +3371,9 @@ pub(crate) async fn relationships_from_table_in(
 
 /// Issue #622 (C2): every registered definition, as its id, qualified
 /// `source_table`, parsed text and whether a `schema_changed` marker paused
-/// it (C6, `capture_failures`), plus every relationship. This is the whole
-/// input `crate::capture::columns` needs to decide which columns a table's
-/// capture trigger images.
+/// it (C6, `capture_failures`) and its qualified `target_table` (#765),
+/// plus every relationship. This is the whole input `crate::capture::columns`
+/// needs to decide which columns a table's capture trigger images.
 ///
 /// Definitions in every status count. A table is captured from the moment
 /// something registers a reader of it, before that reader builds, and a
@@ -3357,7 +3383,7 @@ pub(crate) async fn capture_readers(
     client: &impl GenericClient,
 ) -> Result<
     (
-        Vec<(i64, String, TransformDef, bool)>,
+        Vec<(i64, String, TransformDef, bool, String)>,
         Vec<RelationshipDefinition>,
     ),
     CatalogError,
@@ -3365,13 +3391,22 @@ pub(crate) async fn capture_readers(
     let definitions = client
         .query(
             "select d.id, d.source_table, d.definition_text, \
-                    exists (select 1 from capture_failures f where f.transform_id = d.id) \
+                    exists (select 1 from capture_failures f where f.transform_id = d.id), \
+                    d.target_table \
              from transform_definitions d order by d.id",
             &[],
         )
         .await?
         .into_iter()
-        .map(|row| Ok((row.get(0), row.get(1), parse(row.get(2))?, row.get(3))))
+        .map(|row| {
+            Ok((
+                row.get(0),
+                row.get(1),
+                parse(row.get(2))?,
+                row.get(3),
+                row.get(4),
+            ))
+        })
         .collect::<Result<Vec<_>, CatalogError>>()?;
     let relationships = client
         .query(
@@ -4860,7 +4895,9 @@ async fn reject_unkeyed_source(
 /// ([`super::row_security::applying`]): the ring's owner, and the session's
 /// role for a table registration itself reads ([`super::row_security::Readers`];
 /// not otherwise, since the session may belong to a process that never reads
-/// the table) — [`CatalogError::RowSecurityApplies`]. A table that doesn't
+/// the table), or only the session's role for a table another definition
+/// targets, which no capture function reads, and for the target it creates
+/// (#765) — [`CatalogError::RowSecurityApplies`]. A table that doesn't
 /// exist passes: the checks that need it report that.
 async fn reject_row_security(
     client: &impl GenericClient,
