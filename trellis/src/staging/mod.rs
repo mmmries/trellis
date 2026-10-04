@@ -93,7 +93,9 @@ pub use apply::drain_many;
 pub use apply::{
     ApplyError, DEFAULT_DRAIN_BATCH_CAP, drain_many_with_cap, next_claimable_segments,
 };
-pub use claim::{DEFAULT_DRAINER_WINDOW, claim, count_live_drainers, register_drainer};
+pub use claim::{
+    DEFAULT_DRAINER_WINDOW, claim, count_live_drainers, reclaim_stale_drainers, register_drainer,
+};
 pub use error::StagingError;
 pub use liveness::{
     DEFAULT_RECLAIM_TTL, HeartbeatDaemon, HeartbeatDaemonConfig, reclaim_stale, release_segments,

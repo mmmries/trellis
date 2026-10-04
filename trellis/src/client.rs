@@ -523,6 +523,7 @@ async fn run(
             wake_channel: options.wake_channel.clone(),
             interval: options.maintenance_interval,
             reclaim_ttl: options.reclaim_ttl,
+            drainer_window: options.drainer_window,
             reconcile_interval: options.reconcile_interval,
             watermark: watermark.clone(),
             backfill_catch_up_timeout: BACKFILL_CATCH_UP_TIMEOUT,
@@ -802,6 +803,10 @@ struct MaintenanceConfig {
     wake_channel: String,
     interval: Duration,
     reclaim_ttl: Duration,
+    /// The window a drainer counts as live within
+    /// ([`ClientOptions::drainer_window`]): the drainer sweep keeps a row at
+    /// least this long.
+    drainer_window: Duration,
     reconcile_interval: Duration,
     /// The staged-through watermark a backfill enumeration waits on before
     /// staging (issue #312). Always caught up under trigger capture (issue
@@ -835,6 +840,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         wake_channel,
         interval,
         reclaim_ttl,
+        drainer_window,
         reconcile_interval,
         watermark,
         backfill_catch_up_timeout,
@@ -906,6 +912,15 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 // is purely about bounding the table's size over time.
                 let reclaimed = staging::reclaim_stale_workers(c, reclaim_ttl).await;
                 failed = failures.check("reclaim_stale_workers", reclaimed).is_err();
+            }
+            if !failed {
+                // Issue #756: the same hygiene for `drainers`. Worker ids are
+                // unique per process start, so a restarted or crashed
+                // process's drainer rows would otherwise sit forever. Kept at
+                // least a drainer window, so no row a claim still counts goes.
+                let reclaimed =
+                    staging::reclaim_stale_drainers(c, reclaim_ttl.max(drainer_window)).await;
+                failed = failures.check("reclaim_stale_drainers", reclaimed).is_err();
             }
             if !failed {
                 let retired = staging::retire_drained_segments(c).await;
@@ -2353,6 +2368,7 @@ mod maintenance_failure_tests {
             wake_channel: "wake".to_string(),
             interval: Duration::from_millis(20),
             reclaim_ttl: Duration::from_secs(30),
+            drainer_window: staging::DEFAULT_DRAINER_WINDOW,
             reconcile_interval: Duration::from_secs(3600),
             watermark: staging::StagedWatermark::new(),
             backfill_catch_up_timeout: Duration::from_secs(1),
@@ -3441,6 +3457,7 @@ mod backfill_shutdown_tests {
             wake_channel: "wake".to_string(),
             interval: Duration::from_millis(50),
             reclaim_ttl: Duration::from_secs(30),
+            drainer_window: staging::DEFAULT_DRAINER_WINDOW,
             reconcile_interval: Duration::from_secs(3600),
             watermark: staging::StagedWatermark::saturated(),
             backfill_catch_up_timeout: Duration::from_secs(600),
