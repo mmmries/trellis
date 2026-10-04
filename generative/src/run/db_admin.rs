@@ -16,7 +16,9 @@
 
 use trellis::Pool;
 
-use crate::backend::{Backend, ClusterControl, ManualBackend, await_pool_usable};
+use crate::backend::{
+    Backend, ClusterControl, ManualBackend, SERVER_STOP_RECLAIM_TTL, await_pool_usable,
+};
 use crate::model::{DbAdminAction, DbAdminPlan, Program};
 
 use super::{Outcome, RunError, apply_and_check_outcome, quiesce_snapshot_and_check};
@@ -40,6 +42,9 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
         );
     }
 
+    // A restart can strand a claim the engine then waits a reclaim TTL to
+    // free (issue #752; see `SERVER_STOP_RECLAIM_TTL`).
+    backend.set_reclaim_ttl(SERVER_STOP_RECLAIM_TTL);
     backend
         .install(program)
         .await

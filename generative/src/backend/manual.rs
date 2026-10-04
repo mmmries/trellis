@@ -66,6 +66,25 @@ use crate::model::{
 /// than hang the test suite forever.
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The reclaim TTL a run that stops Postgres under a running engine gives
+/// its engine clients ([`ManualBackend::set_reclaim_ttl`]).
+///
+/// A server stop can strand a claim (issue #752). A worker that claimed a
+/// build job or a segment just before the stop loses its connection before
+/// it can run the work or give the claim back, so the claim stays in the
+/// catalog under a worker that isn't running it. The engine's stale-claim
+/// sweep frees it once it is a reclaim TTL old. A cold copy carries the same
+/// claim into the restored cluster, where its worker doesn't exist at all.
+/// At the engine's default TTL (30 s, the same as [`QUIESCE_TIMEOUT`]),
+/// the quiesce after the stop timed out on that recovery about half the time.
+/// This TTL keeps the recovery well inside the quiesce's budget.
+pub const SERVER_STOP_RECLAIM_TTL: Duration = Duration::from_secs(10);
+
+// The sweep frees a stranded claim within a TTL plus one maintenance tick
+// (300 ms by default), and the quiesce needs time left after that to
+// finish the work. A third of the budget leaves twenty seconds.
+const _: () = assert!(SERVER_STOP_RECLAIM_TTL.as_secs() * 3 <= QUIESCE_TIMEOUT.as_secs());
+
 /// [`ManualBackend::restart`]'s bounded retry budget (issue #251) for the
 /// residual `ProducerAlreadyRunning` window `trellis::Client::shutdown`
 /// alone doesn't close: up to this many *retries* (so up to
@@ -358,6 +377,10 @@ pub struct ManualBackend {
     /// with [`ManualBackend::set_reconcile_interval`]; the engine's default
     /// otherwise.
     reconcile_interval: Option<Duration>,
+    /// The reclaim TTL the engine client is started with
+    /// ([`ClientOptions::reclaim_ttl`]), when a caller sets one with
+    /// [`ManualBackend::set_reclaim_ttl`]; the engine's default otherwise.
+    reclaim_ttl: Option<Duration>,
     /// The schema this backend's transform *target* tables are created
     /// under (`trellis::Config::target_schema`; issue #234,
     /// `docs/instance-identity.md`): two instances sharing one
@@ -505,6 +528,7 @@ impl ManualBackend {
                 .unwrap_or_else(|| ClientOptions::default().maintenance_interval),
             build_chunk_rows: None,
             reconcile_interval: None,
+            reclaim_ttl: None,
             target_schema,
             config,
             operator: None,
@@ -527,6 +551,17 @@ impl ManualBackend {
     /// effect at the first [`Backend::install`](super::Backend::install).
     pub fn set_reconcile_interval(&mut self, interval: Duration) {
         self.reconcile_interval = Some(interval);
+    }
+
+    /// Sets how long a claim may sit unrefreshed before the engine takes it
+    /// back ([`ClientOptions::reclaim_ttl`]), with claims refreshed every
+    /// third of it ([`ClientOptions::heartbeat`]). A run that stops Postgres
+    /// under the engine sets [`SERVER_STOP_RECLAIM_TTL`]. Like
+    /// [`ManualBackend::set_build_chunk_rows`], it takes effect at the first
+    /// [`Backend::install`](super::Backend::install), and
+    /// [`ManualBackend::connect_to_restore`] carries it over.
+    pub fn set_reclaim_ttl(&mut self, ttl: Duration) {
+        self.reclaim_ttl = Some(ttl);
     }
 
     /// Diagnostic-only (improvement-plan task D4): the largest `bucket_count`
@@ -900,7 +935,7 @@ impl super::Backend for ManualBackend {
         // The staging worker captures whatever the definitions just
         // registered read, straight from the catalog (issue #427).
         if !program.tables.is_empty() && self.engine_client.is_none() {
-            let options = ClientOptions {
+            let mut options = ClientOptions {
                 staging_worker: true,
                 application_threads: self.application_threads,
                 maintenance_interval: self.maintenance_interval,
@@ -912,6 +947,10 @@ impl super::Backend for ManualBackend {
                     .unwrap_or_else(|| ClientOptions::default().reconcile_interval),
                 ..Default::default()
             };
+            if let Some(ttl) = self.reclaim_ttl {
+                options.reclaim_ttl = ttl;
+                options.heartbeat.interval = ttl / 3;
+            }
             let client = EngineClient::start_with_config(self.config.clone(), options.clone())?;
             self.engine_client = Some(client);
             // Remembered so `restart` (improvement-plan task E3) can start an

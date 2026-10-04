@@ -22,7 +22,7 @@
 //! so these runs can go in parallel without four of them each holding one
 //! cluster and waiting forever for another.
 
-use generative::backend::ManualBackend;
+use generative::backend::{Backend, ManualBackend, SERVER_STOP_RECLAIM_TTL};
 use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec, build_program_multi_with_shapes,
     restore_plan_for, trivial_program,
@@ -206,4 +206,68 @@ fn a_restore_from_the_first_op_replays_the_whole_program() {
 #[test]
 fn a_restore_from_the_last_op_converges_with_nothing_to_replay() {
     pin(5);
+}
+
+/// Issue #752: a server stop can strand a claim, and the backend's quiesce
+/// has to outlast the engine freeing it. A worker that claims a build job
+/// just before a backup stops Postgres loses its connection before it can
+/// run the job or give the claim back, and a cold copy carries that claim
+/// into the restore. Only the engine's stale-claim sweep frees it, once it
+/// is a reclaim TTL old. At the default TTL, which equals the quiesce's
+/// budget, the restore runs above timed out on it about half the time.
+///
+/// This strands one deterministically: a field build's plan job claimed by
+/// a worker that doesn't exist, as if the stop had killed it. At
+/// [`SERVER_STOP_RECLAIM_TTL`], which the restore and db-admin runs set,
+/// the sweep frees it and the build finishes inside the budget.
+#[test]
+fn a_claim_stranded_by_a_server_stop_is_freed_inside_the_quiesce_budget() {
+    let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
+    let cluster = TestCluster::start();
+    runtime.block_on(async {
+        let db = cluster.create_isolated_database().await;
+        let mut backend = ManualBackend::connect(db.dsn())
+            .await
+            .expect("connect manual backend");
+        backend.set_reclaim_ttl(SERVER_STOP_RECLAIM_TTL);
+        backend
+            .install(&one_to_one_and_aggregate_program())
+            .await
+            .expect("install");
+        backend
+            .quiesce()
+            .await
+            .expect("the install's builds settle");
+
+        // With no engine running, the field build `ALTER TRANSFORM`
+        // registers stays unclaimed until the claim below takes it.
+        backend.stop_engine().await.expect("stop the engine");
+        let operator = trellis::Trellis::connect(
+            Config::from_dsn(db.dsn().to_string()).expect("config"),
+            trellis::TrellisOptions::default(),
+        )
+        .await
+        .expect("connect the operator");
+        operator
+            .apply("ALTER TRANSFORM t1 ADD c1 AS c1_again")
+            .await
+            .expect("add a field");
+        operator.shutdown().await.expect("shut the operator down");
+        let stranded = backend
+            .execute_raw(
+                "update backfill_chunks \
+                 set claimed_by = 'a-worker-the-stop-killed', claimed_at = now() \
+                 where not done",
+            )
+            .await
+            .expect("strand the build's claim");
+        assert_eq!(stranded, 1, "the field build has one plan job");
+
+        backend.start_engine().await.expect("start the engine");
+        backend
+            .quiesce()
+            .await
+            .expect("the sweep frees the stranded claim and the build finishes");
+        backend.stop_engine().await.expect("stop the engine");
+    });
 }
