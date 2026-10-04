@@ -148,6 +148,21 @@ Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
   a frozen value. Aggregate transforms are *not* cascaded into — aggregate
   accumulation has no per-column pause concept (`staging::apply_aggregate`), a
   deliberate gap.
+* **Sibling readers** (issue #748) — a field of the same 1-1 definition that
+  reads a paused field by alias, directly or through other fields, is paused
+  too: the cascade gives it a `column_status` row and an edge, Apply leaves it
+  out with the paused field (so it freezes rather than evaluating over the
+  paused field's absence and going NULL), and a resume releases it once no
+  field it reads is still paused, rebuilding it in the same field build. Apply's
+  read of the paused set closes over these readers itself
+  (`defs::eval::AliasReaders`), so a reader is held out even before its row
+  exists. An `ALTER TRANSFORM` field build covers the readers of each field it
+  edits, and a capture wait holds them out (and lists them) with it. An edit
+  that makes a field read a paused field pauses it with that field (a row and
+  an edge, as if the pause had come after the edit). A field build's chunks
+  take in the readers of its fields from the definition as it stands when
+  each chunk is planned, so the build that releases a field awaiting its
+  capture also writes a reader an edit added after that build was registered.
 
 ## Resume re-arms the fuse
 

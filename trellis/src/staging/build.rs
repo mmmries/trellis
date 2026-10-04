@@ -150,7 +150,14 @@
 //!
 //! **Field builds (F8b).** `ALTER TRANSFORM ... ADD`/`ALTER` and a column
 //! resume rebuild only the fields they change, in the background
-//! ([`start_field_build`]). The call's own transaction (#666: `apply` only
+//! ([`start_field_build`]). The fields they change take in every field that
+//! reads one of them by alias, directly or through others (issue #748,
+//! `defs::eval::AliasReaders`), since its value moves with theirs; a column
+//! pause holds such a reader out of Apply with the field it reads, so the
+//! resume rebuilds both. Each chunk takes the readers in again from the
+//! definition as it stands when the chunk is planned, so a reader an edit
+//! added after the build was registered (of a field awaiting its capture,
+//! which this build releases) is written too. The call's own transaction (#666: `apply` only
 //! registers) moves the definition `live -> backfilling` with `build =
 //! 'rederive'`, or leaves it `backfilling` when a build is already running,
 //! and enqueues a plan job whose `backfill_chunks.fields` names the fields.
@@ -1809,7 +1816,22 @@ impl FieldPlan {
             .await
             .map_err(build_error)?
         {
-            return Ok(ChunkPlan::Field(FieldPlan::OneToOne(plan, fields.to_vec())));
+            // With every field that reads one of `fields` by alias in the
+            // definition as it is now (issue #748): a later edit can add a
+            // reader of a field this build releases (one awaiting its
+            // capture), which Apply holds out with that field and which no
+            // other build writes once it is released. A chunk planned
+            // before such an edit is planned again ([`plan_epoch`]).
+            let mut fields: std::collections::HashSet<String> = fields.iter().cloned().collect();
+            crate::defs::eval::AliasReaders::of(&definition.def).close(&mut fields);
+            let fields: Vec<String> = definition
+                .def
+                .fields
+                .iter()
+                .filter(|f| fields.contains(&f.name))
+                .map(|f| f.name.clone())
+                .collect();
+            return Ok(ChunkPlan::Field(FieldPlan::OneToOne(plan, fields)));
         }
         if !matches!(
             definition.def.key_space,
@@ -1840,7 +1862,7 @@ impl FieldPlan {
         if keys.is_empty() {
             return Ok(ChunkPlan::Field(FieldPlan::Empty));
         }
-        let excluded = super::quarantine::paused_columns_for(pool, &definition.def.target)
+        let excluded = super::quarantine::paused_columns_for(pool, &definition.def)
             .await
             .map_err(build_error)?;
         let rederive = super::apply::DirectRederive::new(
