@@ -9,6 +9,12 @@
 //! back to the same point and what comes back is consistent with
 //! itself. Trellis has no restore-specific handling, and needs none.
 //!
+//! The one thing a stop carries over is a claim a worker took just before
+//! it, whose worker is gone after the restore. The stale-claim sweep frees
+//! it once it is a reclaim TTL old, so this run gives the engine
+//! [`SERVER_STOP_RECLAIM_TTL`] to keep that inside the quiesce's budget
+//! (issue #752).
+//!
 //! The oracle is "cloned" at *k* for free: it recomputes from the source
 //! tables, and those are in the backup. So the restored database is held to
 //! two things before anything is replayed on it. Its source tables must be
@@ -32,7 +38,9 @@
 
 use trellis::{Config, Pool};
 
-use crate::backend::{Backend, BackupRestore, ManualBackend, Snapshot, await_pool_usable};
+use crate::backend::{
+    Backend, BackupRestore, ManualBackend, SERVER_STOP_RECLAIM_TTL, Snapshot, await_pool_usable,
+};
 use crate::model::{BackupKind, Program, RestorePlan};
 
 use super::{
@@ -108,6 +116,11 @@ pub async fn run_convergence_with_restore<C: BackupRestore>(
     match plan.kind {
         BackupKind::ColdCopy => {}
     }
+
+    // The backup stops the server under the running engine, which can
+    // strand a claim on both sides of the restore (issue #752; see
+    // `SERVER_STOP_RECLAIM_TTL`). `connect_to_restore` carries the TTL over.
+    backend.set_reclaim_ttl(SERVER_STOP_RECLAIM_TTL);
 
     backend
         .install(program)

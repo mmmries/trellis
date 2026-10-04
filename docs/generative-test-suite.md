@@ -334,7 +334,11 @@ Two structural notes for when faults enter the stream:
   point and what comes back is consistent with itself. Layer 3's
   backup/restore action checks that assumption: today the cold-copy case
   (restore, replay, converge, no pause); the `pg_basebackup` case waits on
-  #558.
+  #558. One thing a server stop does carry over is a claim a worker took just
+  before it: the claim's worker can't run the job or give it back, so only
+  the stale-claim sweep frees it, a reclaim TTL later (#752). The restore and
+  restart runs give the engine a 10 s TTL so that recovery fits well inside
+  the 30 s quiesce.
 
 ## 9. Operational shape
 

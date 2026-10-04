@@ -16,7 +16,9 @@ mod manual;
 mod sql;
 mod subprocess;
 
-pub use manual::{ManualApplier, ManualBackend, ManualBackendError, await_pool_usable};
+pub use manual::{
+    ManualApplier, ManualBackend, ManualBackendError, SERVER_STOP_RECLAIM_TTL, await_pool_usable,
+};
 pub use subprocess::{SubprocessBackend, SubprocessBackendError};
 
 use std::collections::BTreeMap;
