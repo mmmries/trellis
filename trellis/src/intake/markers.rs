@@ -909,9 +909,11 @@ pub(super) async fn fetch_read(
 /// every applying reader of the table to re-derive. It runs when a
 /// ring-built definition needs it, or when anything other than this pass's
 /// background-built definitions (chunks or a direct-build job, which read the
-/// table themselves) reads the table (a catch-up for applying readers). A
-/// marker on a table only background-built definitions read, or nothing
-/// reads at all (issue #417), is discharged without enumerating.
+/// table themselves) and the waiting definitions the Re-derive build will
+/// start, which do too ([`waiting_rederive_builds`], issue #732), reads the
+/// table (a catch-up for applying readers). A marker on a table only those
+/// read, or nothing reads at all (issue #417), is discharged without
+/// enumerating.
 ///
 /// A go-live catch-up always enumerates. An earlier optimization let a
 /// direct build's catch-up skip a table that looked unchanged since the
@@ -1085,6 +1087,9 @@ pub(crate) async fn run_pending_backfills_for(
 
     let mut settled = 0usize;
     let mut failures = Vec::new();
+    // Read by the pass's first discharge, and shared by the rest: no
+    // discharge changes which definitions are in it.
+    let mut rederive = None;
     for marker in pending {
         if !marker.due {
             tracing::debug!(
@@ -1143,6 +1148,7 @@ pub(crate) async fn run_pending_backfills_for(
             intake_timeout,
             stop,
             ready,
+            &mut rederive,
         )
         .await
         {
@@ -1260,14 +1266,15 @@ enum Build {
 /// transaction opens, so planning chunk boundaries (a walk of the source's
 /// primary-key index) doesn't hold that transaction open.
 ///
-/// A definition the Re-derive build takes (`staging::build::qualifies`,
-/// #625 F3) is left out, whatever `ready` says: the staging worker's start
-/// builds it (`staging::build::start_ready_builds`), and nothing here
-/// touches it, its orphan sweep included.
+/// A definition in `rederive` ([`waiting_rederive_builds`]) is left out,
+/// whatever `ready` says: the staging worker's start builds it
+/// (`staging::build::start_ready_builds`), and nothing here touches it, its
+/// orphan sweep included.
 async fn plan_waiting_builds(
     client: &tokio_postgres::Client,
     table: &str,
     ready: Option<&[i64]>,
+    rederive: &[i64],
 ) -> Result<Vec<(i64, Build)>, IntakeError> {
     use crate::defs::ast::KeySpace;
     use crate::defs::backfill::{self, BackfillError};
@@ -1287,7 +1294,7 @@ async fn plan_waiting_builds(
         let id: i64 = row.get(0);
         let text: String = row.get(1);
         let def = crate::defs::parse(&text).map_err(CatalogError::from)?;
-        if rederive_built(client, id).await? {
+        if rederive.contains(&id) {
             continue;
         }
         let chunked =
@@ -1319,13 +1326,50 @@ async fn plan_waiting_builds(
     Ok(builds)
 }
 
-/// Whether definition `id` is the Re-derive build's (#625 F3), so no old
-/// build dispatches it.
-async fn rederive_built(client: &tokio_postgres::Client, id: i64) -> Result<bool, IntakeError> {
-    let Some(definition) = crate::defs::catalog::definition_by_id_in(client, id).await? else {
-        return Ok(false);
-    };
-    Ok(crate::staging::build::qualifies(client, &definition).await?)
+/// Every `waiting_to_backfill` definition, on any source, that the Re-derive
+/// build takes (`staging::build::qualifies`, #625 F3), in id order. The
+/// discharge neither dispatches one ([`plan_waiting_builds`]) nor counts it
+/// as a reader of the marker's table (issue #732): the build's start reads
+/// the source itself, from chunks planned after it commits, and every change
+/// committed before then is re-derived by the page that drains it
+/// (`staging::build::start`'s "The start's segment").
+///
+/// Leaving one out can't strand it, whether or not it still qualifies when
+/// the start runs. It isn't applying, so it wouldn't fold the enumeration's
+/// `Recompute` rows anyway. If it stops qualifying first, the start passes it
+/// over (`start_ready_builds` asks [`crate::staging::build::qualifies`]
+/// again), the capture pass parks it a marker of its own
+/// ([`park_ready_registration_markers`]), and that marker's discharge plans
+/// its build like any other, enumerating for it if it is ring-built.
+///
+/// Read on `client` once per pass, before its first discharge's transaction
+/// opens ([`discharge_marker`]). A definition registered after this read is
+/// counted as a reader, which at worst enumerates for nothing, as before
+/// #732. So is one whose text doesn't parse: its own table's discharge meets
+/// the error in [`plan_waiting_builds`] and backs off (issues #407, #518),
+/// and every other table's discharge goes on without it.
+async fn waiting_rederive_builds(client: &tokio_postgres::Client) -> Result<Vec<i64>, IntakeError> {
+    let ids: Vec<i64> = client
+        .query(
+            "select id from transform_definitions where status = $1 order by id",
+            &[&TransformStatus::WaitingToBackfill.as_str()],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    let mut rederive = Vec::new();
+    for id in ids {
+        let definition = match crate::defs::catalog::definition_by_id_in(client, id).await {
+            Ok(Some(definition)) => definition,
+            Ok(None) | Err(crate::defs::catalog::CatalogError::Parse(_)) => continue,
+            Err(err) => return Err(err.into()),
+        };
+        if crate::staging::build::qualifies(client, &definition).await? {
+            rederive.push(id);
+        }
+    }
+    Ok(rederive)
 }
 
 /// Runs `marker`'s discharge in one transaction: the read (the enumeration,
@@ -1336,6 +1380,10 @@ async fn rederive_built(client: &tokio_postgres::Client, id: i64) -> Result<bool
 /// ([`go_live_caught_up`]). An error drops the
 /// transaction, which rolls it back, so the marker survives either way the
 /// discharge falls short.
+///
+/// `rederive` is the pass's [`waiting_rederive_builds`], read here if no
+/// discharge before this one in the pass has read it.
+#[allow(clippy::too_many_arguments)]
 async fn discharge_marker(
     client: &mut tokio_postgres::Client,
     marker: &PendingBackfill,
@@ -1344,14 +1392,22 @@ async fn discharge_marker(
     catch_up_timeout: Duration,
     stop: &(dyn Fn() -> bool + Sync),
     ready: Option<&[i64]>,
+    rederive: &mut Option<Vec<i64>>,
 ) -> Result<Discharge, IntakeError> {
-    let builds = plan_waiting_builds(client, &marker.table, ready).await?;
+    if rederive.is_none() {
+        *rederive = Some(waiting_rederive_builds(client).await?);
+    }
+    let rederive = rederive.as_deref().unwrap_or_default();
+    let builds = plan_waiting_builds(client, &marker.table, ready, rederive).await?;
     let waiting: Vec<i64> = builds.iter().map(|(id, _)| *id).collect();
-    // Definitions whose build reads the table itself, in the background.
+    // Definitions whose build reads the table itself, in the background:
+    // those this discharge dispatches to chunks or a direct-build job, and
+    // those the Re-derive build will start (issue #732).
     let background: Vec<i64> = builds
         .iter()
         .filter(|(_, build)| !matches!(build, Build::Ring))
         .map(|(id, _)| *id)
+        .chain(rederive.iter().copied())
         .collect();
     let ring: Vec<i64> = builds
         .iter()
@@ -2504,9 +2560,12 @@ mod catch_up_tests {
     /// before its next-attempt time, each retry that fails again backs off
     /// further, and a new park of the table resets the state.
     ///
-    /// `public.nokey` has no identity key, so planning its plain 1-1
-    /// definition's chunks fails on every attempt. Its marker is parked first
-    /// so an unordered read meets it first too.
+    /// `public.nokey` has no identity key, so enumerating it for its `live`
+    /// reader fails on every attempt. Its marker is parked first so an
+    /// unordered read meets it first too. (The reader used to be a waiting
+    /// plain 1-1 definition whose chunk planning failed, but the Re-derive
+    /// build takes that shape now (#625 F8a), and the discharge leaves it
+    /// alone, enumeration included (issue #732).)
     #[tokio::test]
     async fn a_failing_marker_backs_off_without_starving_the_marker_behind_it() {
         let cluster = testkit::TestCluster::start();
@@ -2528,11 +2587,11 @@ mod catch_up_tests {
             .execute(
                 "insert into transform_definitions \
                  (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.d', 'public.nokey', 1, $1, 'waiting_to_backfill')",
+                 values ('public.d', 'public.nokey', 1, $1, 'live')",
                 &[&"TRANSFORM d FROM nokey SELECT id AS x"],
             )
             .await
-            .expect("seed the broken table's deferred definition");
+            .expect("seed the broken table's live reader");
         register_reader(&db, "public.t", "t_reader").await;
         capture_for_test(&mut client, &["public.nokey", "public.t"]).await;
         client
@@ -2679,6 +2738,57 @@ mod catch_up_tests {
             retry_in.is_some(),
             "a failed marker has a next-attempt time"
         );
+    }
+
+    /// Issue #732: the discharge reads every waiting definition in the
+    /// catalog to find the Re-derive build's ([`waiting_rederive_builds`]),
+    /// but one whose text doesn't parse fails only its own table's discharge,
+    /// as before. Another table's marker still discharges.
+    #[tokio::test]
+    async fn an_unparseable_waiting_definition_fails_only_its_own_tables_discharge() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        client
+            .batch_execute(
+                "create table public.t (id bigint primary key); \
+                 insert into public.t values (1); \
+                 create table public.other (id bigint primary key); \
+                 insert into source_table_versions (source_table, version) \
+                 values ('public.other', 1);",
+            )
+            .await
+            .expect("seed the source tables");
+        register_reader(&db, "public.t", "t_reader").await;
+        capture_for_test(&mut client, &["public.t"]).await;
+        client
+            .execute(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.d', 'public.other', 1, 'not a transform', 'waiting_to_backfill')",
+                &[],
+            )
+            .await
+            .expect("seed an unparseable definition on another table");
+
+        let failures = run_pending_backfills_until(
+            &mut client,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::from_secs(600),
+            &|| false,
+        )
+        .await
+        .expect("a failing marker must not fail the pass");
+        assert!(
+            failures.is_empty(),
+            "another table's broken definition doesn't fail this discharge, got {:?}",
+            failures
+                .iter()
+                .map(|failure| failure.error.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(retry_state(&client, "public.t").await, None);
     }
 
     /// Issue #407: a park that lands while a discharge of the same table is
