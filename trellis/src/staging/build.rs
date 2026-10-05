@@ -60,7 +60,7 @@
 //! 3. one statement ([`super::ledger::chunk_statement`]) reads
 //!    `pg_current_snapshot()`, the active segment and the locked keys' source
 //!    rows, rewrites their entries from them (`basis` := the snapshot,
-//!    `applied_seg` raised to the segment, `applied_lsn` left alone, a key
+//!    a tombstone's `applied_seg` raised to the segment, `applied_lsn` left alone, a key
 //!    with no row a tombstone), and appends the moves' per-group increments
 //!    to `<target>__deltas`.
 //!
@@ -407,7 +407,14 @@ async fn lock_chunk_entries(
             .await?
             .get(0);
         crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
-        ledger::lock_entries(txn, ledger, keys, skip_lock).await?;
+        ledger::lock_entries(
+            txn,
+            ledger,
+            keys,
+            ledger::NewEntries::Placeholders,
+            skip_lock,
+        )
+        .await?;
         txn.execute("select set_config('lock_timeout', $1, true)", &[&previous])
             .await?;
         Ok::<_, ApplyError>(())

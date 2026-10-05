@@ -587,14 +587,14 @@ async fn a_rederive_absorbed_update_leaves_an_older_capture_skippable_only_by_vi
     assert_oracle(&mut d, flavour).await;
 }
 
-/// A source `TRUNCATE` empties a 1-1 target's ledger, so a change from before
+/// A source `TRUNCATE` empties a target's ledger, so a change from before
 /// it that still reaches a page afterward meets no entry, no basis and no
 /// `applied_lsn`: only the truncate floor (the D split's Q6) tells it is
 /// older than the truncate. Here one is staged by hand at an `lsn` below the
 /// truncate's; applied, it would bring back a row the source no longer has.
-#[tokio::test]
-async fn a_change_from_before_a_truncate_does_not_bring_back_a_one_to_one_row() {
-    let flavour = Flavour::OneToOne;
+/// On either ledger the key's Apply would write its entry in the lock's
+/// insert (#623 D6, #775), so that insert must check the floor itself.
+async fn a_change_from_before_a_truncate_does_not_come_back(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
     write(&d, "truncate public.src").await;
     d.settle().await;
@@ -622,6 +622,21 @@ async fn a_change_from_before_a_truncate_does_not_bring_back_a_one_to_one_row() 
     txn.commit().await.expect("commit");
     drop(client);
     assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_change_from_before_a_truncate_does_not_bring_back_a_one_to_one_row() {
+    a_change_from_before_a_truncate_does_not_come_back(Flavour::OneToOne).await;
+}
+
+#[tokio::test]
+async fn a_change_from_before_a_truncate_does_not_bring_back_an_aggregate_entry() {
+    a_change_from_before_a_truncate_does_not_come_back(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_change_from_before_a_truncate_does_not_bring_back_a_min_max_entry() {
+    a_change_from_before_a_truncate_does_not_come_back(Flavour::AggregateMinMax).await;
 }
 
 // ----------------------------------------------------------------- exp 2, 10
@@ -1839,6 +1854,205 @@ async fn exp2_9_gc_waits_for_the_older_update_one_to_one() {
     exp2_9_gc_waits_for_the_older_update(Flavour::OneToOne).await;
 }
 
+/// [`exp2_9_gc_waits_for_the_older_update`] for a key the ledger has never
+/// had: key 3's insert lags in batch 1 while its delete drains from batch
+/// 2. The delete's Apply writes key 3's tombstone in the lock's insert
+/// (#623 D6, #775), and that insert's segment stamp must keep it past the
+/// GC until the insert drains, or the insert applies to no entry and brings
+/// key 3 back.
+async fn a_new_keys_tombstone_waits_for_its_older_insert(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
+    write(&d, "insert into public.src values (3, 2, 5)").await;
+    let b1 = d.seal().await;
+    write(&d, "delete from public.src where id = 3").await;
+    let b2 = d.seal().await;
+    d.drain(b2, "a").await;
+    assert_eq!(tombstones(&d, flavour).await, ["(3)"]);
+    assert_eq!(d.collect_tombstones().await, 0, "the insert's batch lags");
+    d.drain(b1, "b").await;
+    assert_eq!(d.collect_tombstones().await, 1, "nothing lags any more");
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_new_keys_tombstone_waits_for_its_older_insert_aggregate() {
+    a_new_keys_tombstone_waits_for_its_older_insert(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_new_keys_tombstone_waits_for_its_older_insert_min_max() {
+    a_new_keys_tombstone_waits_for_its_older_insert(Flavour::AggregateMinMax).await;
+}
+
+#[tokio::test]
+async fn a_new_keys_tombstone_waits_for_its_older_insert_one_to_one() {
+    a_new_keys_tombstone_waits_for_its_older_insert(Flavour::OneToOne).await;
+}
+
+/// Key `id`'s entry on `flavour`'s ledger: whether it is a tombstone, and
+/// its `applied_seg`.
+async fn entry_stamp(d: &Driver, flavour: Flavour, id: i32) -> (bool, Option<i64>) {
+    let row = d
+        .ctl
+        .query_one(
+            &format!(
+                "select __tombstone, __applied_seg from {} where __from_key = $1",
+                flavour.ledger()
+            ),
+            &[&id.to_string()],
+        )
+        .await
+        .expect("the key's entry");
+    (row.get(0), row.get(1))
+}
+
+/// Only a tombstone carries `applied_seg` (#775): a write that leaves an
+/// entry live leaves its stamp alone, so an Apply to a live entry changes no
+/// indexed column, and the GC's partial index can still key on the stamp.
+/// The stamp a live entry keeps is stale, here an earlier tombstone's, kept
+/// through the key's revival. Key 1 is deleted (batch 1) and stamped,
+/// revived (2), updated (3) and deleted again (4). Batch 3 lags while 4
+/// drains: the second delete must raise the stale stamp to its own batch,
+/// or the GC, whose prefix is batch 2, collects the tombstone and the
+/// update applies to a fresh entry, bringing key 1 back.
+async fn a_revived_keys_tombstone_is_stamped_afresh(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
+    assert_eq!(
+        entry_stamp(&d, flavour, 1).await,
+        (false, None),
+        "a live entry no write made a tombstone has no stamp"
+    );
+    write(&d, "delete from public.src where id = 1").await;
+    let b1 = d.seal().await;
+    d.drain(b1, "a").await;
+    assert_eq!(entry_stamp(&d, flavour, 1).await, (true, Some(b1)));
+    write(&d, "insert into public.src values (1, 2, 11)").await;
+    let b2 = d.seal().await;
+    d.drain(b2, "a").await;
+    assert_eq!(
+        entry_stamp(&d, flavour, 1).await,
+        (false, Some(b1)),
+        "the revival keeps the old stamp"
+    );
+    write(&d, "update public.src set v = 12 where id = 1").await;
+    let b3 = d.seal().await;
+    write(&d, "delete from public.src where id = 1").await;
+    let b4 = d.seal().await;
+    d.drain(b4, "a").await;
+    assert_eq!(entry_stamp(&d, flavour, 1).await, (true, Some(b4)));
+    assert_eq!(d.collect_tombstones().await, 0, "the update's batch lags");
+    d.drain(b3, "b").await;
+    assert_eq!(d.collect_tombstones().await, 1, "nothing lags any more");
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_revived_keys_tombstone_is_stamped_afresh_aggregate() {
+    a_revived_keys_tombstone_is_stamped_afresh(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_revived_keys_tombstone_is_stamped_afresh_min_max() {
+    a_revived_keys_tombstone_is_stamped_afresh(Flavour::AggregateMinMax).await;
+}
+
+#[tokio::test]
+async fn a_revived_keys_tombstone_is_stamped_afresh_one_to_one() {
+    a_revived_keys_tombstone_is_stamped_afresh(Flavour::OneToOne).await;
+}
+
+/// A Re-derive that leaves an entry live stamps nothing (#775), and an Apply
+/// that then deletes the key stamps only its own batch, though the entry's
+/// `basis` saw a change in a later one. That is enough: the delete was
+/// applied because the `basis` doesn't see it, so every change the `basis`
+/// sees completed before the delete, in its batch or an earlier one.
+///
+/// Key 1's Re-derive (batch 1) drains after its update (batch 2) commits:
+/// the entry stays live, unstamped, with a `basis` that sees the update. The
+/// delete (batch 3) drains, applies and stamps 3. While batch 2 lags the GC
+/// must keep the tombstone, or the update, which the entry refuses, applies
+/// to a fresh entry.
+async fn a_live_rederive_then_a_delete_stamps_the_deletes_batch(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
+    d.stage_recomputes(SRC, &["1"]).await;
+    let b1 = d.seal().await;
+    write(&d, "update public.src set v = 15 where id = 1").await;
+    let b2 = d.seal().await;
+    d.drain(b1, "r").await;
+    assert_eq!(
+        entry_stamp(&d, flavour, 1).await,
+        (false, None),
+        "a Re-derive that leaves the entry live stamps nothing"
+    );
+    write(&d, "delete from public.src where id = 1").await;
+    let b3 = d.seal().await;
+    d.drain(b3, "a").await;
+    assert_eq!(entry_stamp(&d, flavour, 1).await, (true, Some(b3)));
+    assert_eq!(d.collect_tombstones().await, 0, "the update's batch lags");
+    d.drain(b2, "b").await;
+    assert_eq!(d.collect_tombstones().await, 1, "nothing lags any more");
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_live_rederive_then_a_delete_stamps_the_deletes_batch_aggregate() {
+    a_live_rederive_then_a_delete_stamps_the_deletes_batch(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_live_rederive_then_a_delete_stamps_the_deletes_batch_min_max() {
+    a_live_rederive_then_a_delete_stamps_the_deletes_batch(Flavour::AggregateMinMax).await;
+}
+
+#[tokio::test]
+async fn a_live_rederive_then_a_delete_stamps_the_deletes_batch_one_to_one() {
+    a_live_rederive_then_a_delete_stamps_the_deletes_batch(Flavour::OneToOne).await;
+}
+
+/// A Re-derive that leaves a tombstone stamps the newest segment its read
+/// sees (#742), not its page's, also on an entry that was live and
+/// unstamped (#775). Key 1's Re-derive (batch 1) drains after the key's
+/// update (2) and delete (3, still the active segment) commit: it reads no
+/// row, so it writes a tombstone whose `basis` sees both. The delete is then refused. While
+/// batch 2 lags, the GC, whose prefix is batch 1, must keep the tombstone,
+/// or the update applies to a fresh entry and brings key 1 back.
+async fn a_rederives_tombstone_outlives_the_changes_its_read_saw(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
+    d.stage_recomputes(SRC, &["1"]).await;
+    let b1 = d.seal().await;
+    write(&d, "update public.src set v = 15 where id = 1").await;
+    let b2 = d.seal().await;
+    write(&d, "delete from public.src where id = 1").await;
+    d.drain(b1, "r").await;
+    let b3 = d.seal().await;
+    let (tombstone, stamp) = entry_stamp(&d, flavour, 1).await;
+    assert!(tombstone);
+    assert!(
+        stamp >= Some(b3),
+        "stamped {stamp:?}, below the delete's batch {b3}"
+    );
+    d.drain(b3, "a").await;
+    assert_eq!(d.collect_tombstones().await, 0, "the update's batch lags");
+    d.drain(b2, "b").await;
+    assert_eq!(d.collect_tombstones().await, 1, "nothing lags any more");
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_rederives_tombstone_outlives_the_changes_its_read_saw_aggregate() {
+    a_rederives_tombstone_outlives_the_changes_its_read_saw(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_rederives_tombstone_outlives_the_changes_its_read_saw_min_max() {
+    a_rederives_tombstone_outlives_the_changes_its_read_saw(Flavour::AggregateMinMax).await;
+}
+
+#[tokio::test]
+async fn a_rederives_tombstone_outlives_the_changes_its_read_saw_one_to_one() {
+    a_rederives_tombstone_outlives_the_changes_its_read_saw(Flavour::OneToOne).await;
+}
+
 /// A batch drained out of order holds GC back at the batch below it: the
 /// tombstone of the first batch goes, the one above the lagging batch
 /// stays until the lagging batch has drained.
@@ -2005,7 +2219,9 @@ async fn an_entry_lost_to_the_gc_never_deadlocks_one_to_one() {
 
 /// A GC batch reads the ledger through its tombstone index, never by a
 /// sequential or bitmap scan (#738), so its cost is the tombstones it
-/// walks, not the ledger's size (#722). Each load is analyzed to tempt the
+/// collects, not the ledger's size (#722), and the index keys on
+/// `__applied_seg`, so it isn't the tombstones not yet collectable either
+/// (#775). Each load is analyzed to tempt the
 /// planner away from the index:
 ///
 /// - tombstone-heavy (a quarter of the entries, all at or below the
@@ -2059,6 +2275,14 @@ async fn the_gc_statement_reads_the_ledger_by_its_tombstone_index(flavour: Flavo
             explained.contains(&format!("Index Scan using {index}")),
             "{load}: the batch walks {index}:\n{explained}"
         );
+        // It seeks the collectable tombstones by their stamp, so its cost
+        // doesn't grow with the tombstones above the drained prefix (#775).
+        assert!(
+            explained
+                .lines()
+                .any(|line| line.contains("Index Cond:") && line.contains("__applied_seg")),
+            "{load}: the batch seeks __applied_seg:\n{explained}"
+        );
         // The inner select locks its rows, so the index's predicate stays a
         // filter: read committed re-checks it on a row updated under the
         // batch, which a page reviving the entry does.
@@ -2079,6 +2303,220 @@ async fn the_gc_statement_reads_the_ledger_by_its_tombstone_index_aggregate() {
 #[tokio::test]
 async fn the_gc_statement_reads_the_ledger_by_its_tombstone_index_one_to_one() {
     the_gc_statement_reads_the_ledger_by_its_tombstone_index(Flavour::OneToOne).await;
+}
+
+/// Whether key `id`'s entry on `flavour`'s ledger is a heap-only tuple: the
+/// new version of a HOT update, which wrote no index entry.
+async fn heap_only(d: &Driver, flavour: Flavour, id: i32) -> bool {
+    let ledger = flavour.ledger();
+    d.ctl
+        .batch_execute("create extension if not exists pageinspect")
+        .await
+        .expect("pageinspect");
+    d.ctl
+        .query_one(
+            &format!(
+                "select (i.t_infomask2 & 32768) <> 0 \
+                 from {ledger} l, \
+                      heap_page_items(get_raw_page('{ledger}', (l.ctid::text::point)[0]::int)) i \
+                 where l.__from_key = $1 and i.lp = (l.ctid::text::point)[1]::int"
+            ),
+            &[&id.to_string()],
+        )
+        .await
+        .expect("the entry's tuple")
+        .get(0)
+}
+
+/// An Apply or a Re-derive that leaves an entry live, in its group, changes
+/// no column a ledger index reads, so it can be a HOT update and write no
+/// index entry (#775). It moves `applied_lsn` or `basis` and the entry's
+/// contributions, which no index reads, and leaves `applied_seg`, which the
+/// GC's partial index keys on, alone: only a tombstone carries it
+/// (`defs::ledger::tombstone_seg_sql`). Key 1 is updated (an Apply) and
+/// then re-derived, each in a page of its own, and both times its entry's
+/// new version is heap-only. Its stamp, stale from an earlier tombstone, is
+/// left as it was.
+async fn a_live_entrys_apply_and_rederive_are_hot(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
+    write(&d, "delete from public.src where id = 1").await;
+    let b1 = d.seal().await;
+    d.drain(b1, "a").await;
+    write(&d, "insert into public.src values (1, 1, 11)").await;
+    let b2 = d.seal().await;
+    d.drain(b2, "a").await;
+    assert_eq!(entry_stamp(&d, flavour, 1).await, (false, Some(b1)));
+
+    write(&d, "update public.src set v = 12 where id = 1").await;
+    let b3 = d.seal().await;
+    d.drain(b3, "a").await;
+    assert!(heap_only(&d, flavour, 1).await, "the Apply is HOT");
+    d.stage_recomputes(SRC, &["1"]).await;
+    let b4 = d.seal().await;
+    d.drain(b4, "a").await;
+    assert!(heap_only(&d, flavour, 1).await, "the Re-derive is HOT");
+    assert_eq!(entry_stamp(&d, flavour, 1).await, (false, Some(b1)));
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_live_entrys_apply_and_rederive_are_hot_aggregate() {
+    a_live_entrys_apply_and_rederive_are_hot(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_live_entrys_apply_and_rederive_are_hot_min_max() {
+    a_live_entrys_apply_and_rederive_are_hot(Flavour::AggregateMinMax).await;
+}
+
+#[tokio::test]
+async fn a_live_entrys_apply_and_rederive_are_hot_one_to_one() {
+    a_live_entrys_apply_and_rederive_are_hot(Flavour::OneToOne).await;
+}
+
+/// A page's Apply of a key with no entry writes the entry in the insert that
+/// locks it, in one version (#775), rather than a placeholder its statement
+/// then rewrites, which left a dead version, a lock and a new index entry
+/// behind for every source row an insert-only load wrote. Key 4's insert
+/// and delete fold into a delete of a key the ledger never had: a
+/// tombstone (the third version), which counts in no group.
+async fn a_new_keys_apply_writes_its_entry_once(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10)]).await;
+    write(
+        &d,
+        "insert into public.src values (2, 1, 5), (3, 2, 7), (4, 2, 1)",
+    )
+    .await;
+    write(&d, "delete from public.src where id = 4").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    assert_oracle(&mut d, flavour).await;
+
+    let ledger = flavour.ledger();
+    d.ctl
+        .batch_execute("create extension if not exists pageinspect")
+        .await
+        .expect("pageinspect");
+    // Every heap tuple the page's transaction (the newest writer) wrote,
+    // live or dead.
+    let written: i64 = d
+        .ctl
+        .query_one(
+            &format!(
+                "select count(*) from generate_series(0, \
+                     pg_relation_size('{ledger}') / current_setting('block_size')::int - 1) b, \
+                     heap_page_items(get_raw_page('{ledger}', b::int)) i \
+                 where i.t_xmin::text::bigint = (select max(xmin::text::bigint) from {ledger})"
+            ),
+            &[],
+        )
+        .await
+        .expect("count the page's tuples")
+        .get(0);
+    assert_eq!(written, 3, "one version per new key");
+}
+
+#[tokio::test]
+async fn a_new_keys_apply_writes_its_entry_once_aggregate() {
+    a_new_keys_apply_writes_its_entry_once(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_new_keys_apply_writes_its_entry_once_min_max() {
+    a_new_keys_apply_writes_its_entry_once(Flavour::AggregateMinMax).await;
+}
+
+/// A page's Apply of a key with no entry writes the entry in its lock's
+/// insert (#775), and the insert is the lock (I1): a Re-derive of the same
+/// key queues on that uncommitted entry and reads only once it commits.
+/// Page A (key 2's insert) is frozen holding the entry it wrote; key 2 is
+/// then moved to group 2, and page R, the move folded with a Re-derive of
+/// key 2, queues behind A. Released, R reads the moved row and moves key 2
+/// out of the group A counted it in. Had R not waited, it would find no
+/// entry and count key 2 a second time beside A's.
+async fn a_rederive_queues_on_a_new_keys_applied_entry(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10)]).await;
+    write(&d, "insert into public.src values (2, 1, 5)").await;
+    let insert = d.seal().await;
+    let mut a = d
+        .drain_frozen(
+            insert,
+            "a",
+            &[(PausePoint::AfterEntryLock, flavour.target())],
+        )
+        .await;
+    let frozen = a.reached(PausePoint::AfterEntryLock).await;
+    write(&d, "update public.src set g = 2, v = 50 where id = 2").await;
+    d.stage_recomputes(SRC, &["2"]).await;
+    let rederive = d.seal().await;
+    let r = d.drain_frozen(rederive, "r", &[]).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    d.release(&mut a, PausePoint::AfterEntryLock).await;
+    a.finish().await;
+    r.finish().await;
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_rederive_queues_on_a_new_keys_applied_entry_aggregate() {
+    a_rederive_queues_on_a_new_keys_applied_entry(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_rederive_queues_on_a_new_keys_applied_entry_min_max() {
+    a_rederive_queues_on_a_new_keys_applied_entry(Flavour::AggregateMinMax).await;
+}
+
+#[tokio::test]
+async fn a_rederive_queues_on_a_new_keys_applied_entry_one_to_one() {
+    a_rederive_queues_on_a_new_keys_applied_entry(Flavour::OneToOne).await;
+}
+
+/// The other order: a Re-derive's placeholder for a key with no entry holds
+/// off a page whose Apply would write that entry in its insert (#775). Page
+/// R, a Re-derive of key 2, is frozen after its placeholder insert, before
+/// its read; key 2's insert and then an update commit; page A, draining
+/// both (folded into an Apply of the update), queues on R's placeholder.
+/// Released, R reads the updated row. A's insert then finds R's entry, so
+/// A writes nothing in it and goes through the lock and I2 like any other
+/// key: the update is visible in R's basis and skipped. Had A taken key 2
+/// for one its insert wrote, it would count R's entry in again.
+async fn a_new_keys_apply_queues_on_a_rederives_placeholder(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10)]).await;
+    d.stage_recomputes(SRC, &["2"]).await;
+    let rederive = d.seal().await;
+    let mut r = d
+        .drain_frozen(
+            rederive,
+            "r",
+            &[(PausePoint::AfterPlaceholders, flavour.target())],
+        )
+        .await;
+    let frozen = r.reached(PausePoint::AfterPlaceholders).await;
+    write(&d, "insert into public.src values (2, 1, 5)").await;
+    write(&d, "update public.src set v = 50 where id = 2").await;
+    let writes = d.seal().await;
+    let a = d.drain_frozen(writes, "a", &[]).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    d.release(&mut r, PausePoint::AfterPlaceholders).await;
+    r.finish().await;
+    a.finish().await;
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_new_keys_apply_queues_on_a_rederives_placeholder_aggregate() {
+    a_new_keys_apply_queues_on_a_rederives_placeholder(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_new_keys_apply_queues_on_a_rederives_placeholder_min_max() {
+    a_new_keys_apply_queues_on_a_rederives_placeholder(Flavour::AggregateMinMax).await;
+}
+
+#[tokio::test]
+async fn a_new_keys_apply_queues_on_a_rederives_placeholder_one_to_one() {
+    a_new_keys_apply_queues_on_a_rederives_placeholder(Flavour::OneToOne).await;
 }
 
 // ------------------------------------- a 1-1 and an aggregate in one page
@@ -2360,4 +2798,100 @@ async fn a_to_side_truncate_racing_a_child_field() {
 #[tokio::test]
 async fn a_to_side_truncate_racing_a_child_group_key() {
     a_to_side_truncate_racing_a_child(RelFlavour::GroupKey).await;
+}
+
+/// One page that holds every kind of record step 3 tells apart (#775):
+/// Applies its lock's insert wrote (`$10`'s fresh records, moved into their
+/// groups from their images: a new key in an existing group, one with a
+/// NULL argument, one with a NULL group key, and an insert and delete that
+/// fold into a tombstone), beside the keys it reads and updates (`$9`): an
+/// existing key moving groups, an existing key deleted, a new key's
+/// Re-derive on its placeholder, and a change from before a truncate that
+/// gets a placeholder at the floor and is refused. The target must equal
+/// the oracle, so each fresh record's move equals the entry its insert
+/// wrote, and the two key lists stay aligned with the records.
+async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10)]).await;
+    write(&d, "truncate public.src").await;
+    d.settle().await;
+    write(
+        &d,
+        "insert into public.src values (1, 1, 10), (2, 1, 20), (3, 2, 30)",
+    )
+    .await;
+    d.settle().await;
+    assert_oracle(&mut d, flavour).await;
+
+    write(
+        &d,
+        "update public.src set g = 2, v = 11 where id = 1; \
+         delete from public.src where id = 2; \
+         insert into public.src values (4, 1, 40), (5, 2, null), (6, null, 60), (7, 1, 70), \
+                                       (8, 3, 80); \
+         delete from public.src where id = 7",
+    )
+    .await;
+    d.stage_recomputes(SRC, &["8"]).await;
+    let mut client = d.pool().get().await.expect("pool");
+    let txn = client.transaction().await.expect("begin");
+    trellis::staging::append(
+        &txn,
+        &[StagedChange::Cdc {
+            src_table: SRC.to_string(),
+            key: "9".to_string(),
+            op: CdcOp::Insert,
+            lsn: Some(PgLsn::from(1)),
+            old_image: None,
+            new_image: Some(r#"{"id":"9","g":"1","v":"90"}"#.to_string()),
+            origin_lsn: None,
+            src_changed: None,
+            hop_gen: 0,
+            group_key: None,
+        }],
+    )
+    .await
+    .expect("stage the pre-truncate change");
+    txn.commit().await.expect("commit");
+    drop(client);
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    let entries: Vec<String> = d
+        .rows(&format!(
+            "select __from_key || ':' || (__applied_lsn is not null)::text || ':' || \
+                    __member::text || ':' || __tombstone::text \
+             from {} order by __from_key",
+            flavour.ledger()
+        ))
+        .await;
+    assert_eq!(
+        entries,
+        [
+            "(1:true:true:false)",
+            "(2:true:false:true)",
+            "(3:true:true:false)",
+            "(4:true:true:false)",
+            "(5:true:true:false)",
+            "(6:true:true:false)",
+            "(7:true:false:true)",
+            "(8:false:true:false)",
+            "(9:false:false:false)",
+        ],
+        "each key's entry: applied, member, tombstone"
+    );
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle_aggregate() {
+    a_page_mixing_fresh_and_read_entries_equals_the_oracle(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle_avg() {
+    a_page_mixing_fresh_and_read_entries_equals_the_oracle(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle_min_max() {
+    a_page_mixing_fresh_and_read_entries_equals_the_oracle(Flavour::AggregateMinMax).await;
 }

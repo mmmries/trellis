@@ -337,7 +337,9 @@ state that orders its writes.
     Otherwise `delta = f(NEW) − entry.contrib`, group += delta, entry :=
     (new group, new contribution, C's position, basis unchanged). A delete
     is `f(NEW) = 0` and the entry becomes a tombstone. A row with no entry
-    is an insert of NEW.
+    is an insert of NEW, which the lock's own insert writes as the entry
+    (1-1 since #724, an aggregate ledger since #775, except one that reads a
+    relationship, whose parents are read after the lock).
 
   | Producer | Operation |
   |---|---|
@@ -593,7 +595,17 @@ applying.
   batch can see a later batch's delete. A Re-derive therefore stamps at
   least the newest segment its snapshot sees. Every change the snapshot saw
   is in that segment or an earlier one, so the tombstone outlives every
-  change its `basis` would refuse.
+  change its `basis` would refuse. *Amended by #775:* only a tombstone
+  carries the stamp. A write that leaves an entry a tombstone raises
+  `applied_seg` as above, and one that leaves it live leaves it alone, so
+  that the GC's partial index can key on it and an Apply to a live entry
+  still changes no indexed column (HOT). A live entry's stale stamp, or
+  none, is never what protects a tombstone: an Apply that deletes the key
+  applies only a change D its `basis` doesn't see, so every change the
+  `basis` does see completed before D and is in D's batch or an earlier
+  one, which D's page's stamp covers; a Re-derive that deletes it stamps
+  its own read's segment. A revival keeps the old stamp, which can only
+  delay the GC (`defs::ledger::tombstone_seg_sql`).
 - Every repair that used to be a re-read (an explicit `request_backfill`, a
   resume, a quarantine release) is a rebuild: Re-derive over the key space,
   which I2 makes safe against any pending change.
@@ -870,7 +882,29 @@ For the debate on #618; each has a recommendation where one exists.
    index keys on (0 of 1.2M updates were HOT, the build's included; the two
    indexes an update writes are 285 of the 682 B), and a ledger is built
    full (`fillfactor` 100), which keeps even the 1-1 ledger, whose indexes
-   allow HOT, at 13–16% HOT updates. **No separate tablespace is
+   allow HOT, at 13–16% HOT updates. *#775:* only a tombstone now carries
+   `__applied_seg` (I4's amendment), so an Apply or Re-derive that leaves
+   an entry live in its group changes no indexed column, while the GC
+   keeps its seek: on contiguous 1,000-row `amt` updates of a 1M-entry
+   `SUM` ledger, 16% of the updates were HOT (0% before) and WAL per row
+   fell 4%. The rest is page room. `fillfactor` 80 lifted HOT to 45% on
+   that load but gained nothing on the round's loads, and cost a 10–16%
+   larger ledger and a 4–9% slower 10M build, so ledgers stay at 100. The
+   larger win was elsewhere: a page's Apply of a key with no entry now
+   writes the entry in the insert that locks it, as the 1-1 ledger
+   already did, rather than a placeholder its statement rewrites. That
+   rewrite set the entry's group and membership, which the `GROUP BY`
+   index reads, so no fillfactor could make it HOT, and under an
+   insert-only load it was most of the ledger's WAL. On disk at 8 workers,
+   WAL per folded row fell from 1,134/1,168/1,497 B to 749/802/970 B at
+   400/4,000/40,000 groups (1.68x and 1.72x the pre-D control's at 400
+   and 4,000, under the 2x bar), Postgres CPU per row from 51–60 µs to
+   37–42 µs, and the in-window rate rose from 146k/108k/87k to
+   163k/146k/105k rows/s. With 5,000-row pages the cheaper page moves the
+   ceiling to the group rows: 8 workers queue on the groups every page
+   shares, and fold about 5% slower in the window and 25–30% slower end to
+   end than D9, whose pages spent that time in a whole-ledger scan; 4
+   workers fold faster than 8 (109k against 59k for D9 at 4). **No separate tablespace is
    documented:** at ~3x a narrow source the ledger is sized like any other
    derived table, and nothing measured so far shows its I/O needs a device
    of its own.
