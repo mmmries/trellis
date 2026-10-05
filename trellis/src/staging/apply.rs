@@ -1035,15 +1035,46 @@ async fn from_side_keys(
             let client = pool.get().await?;
             let col_ident = quote_ident(from_col);
             let pg_type = key_column_pg_type(pool, from_table, from_col).await?;
-            let filter = key_array_filter(&col_ident, pg_type.as_deref());
-            let sql = format!(
-                "select {pk}, {col_ident}::text \
-                 from {tbl} \
-                 where {filter}",
-                pk = ddl::pk_key_sql_expr(from_pk, None),
-                tbl = ddl::qualified_source_table(from_table),
-            );
-            let rows = client.query(&sql, &[join_keys]).await?;
+            let sql = |pg_type: Option<&str>| {
+                format!(
+                    "select {pk}, {col_ident}::text \
+                     from {tbl} \
+                     where {filter}",
+                    pk = ddl::pk_key_sql_expr(from_pk, None),
+                    tbl = ddl::qualified_source_table(from_table),
+                    filter = key_array_filter(&col_ident, pg_type),
+                )
+            };
+            let rows = match client.query(&sql(pg_type.as_deref()), &[join_keys]).await {
+                Ok(rows) => rows,
+                // #784 review: a key that isn't `from_col`'s type can't match
+                // a row, but the typed cast rejects it, failing the batch
+                // for good. A to-side's ring `group_key` written by capture
+                // functions older than the catalog can name another column's
+                // values: a row written before a relationship was dropped
+                // from the table (or before the reconcile pass regenerated
+                // its functions) still holds them when it drains, and
+                // regenerating the functions doesn't rewrite it, so every
+                // retry would fail the same way. Match by text instead. A
+                // join column's own values match the same rows as typed
+                // (a relationship's columns share one text-stable type); any
+                // other value matches none, or a row whose text happens to
+                // equal it, which costs only an idempotent Re-derive.
+                Err(e)
+                    if pg_type.is_some()
+                        && e.code().is_some_and(|c| c.code().starts_with("22")) =>
+                {
+                    tracing::warn!(
+                        from_table,
+                        from_col,
+                        error = %e,
+                        "a reverse lookup's keys don't all cast to the join column's type; \
+                         matching them by text"
+                    );
+                    client.query(&sql(None), &[join_keys]).await?
+                }
+                Err(e) => return Err(e.into()),
+            };
             Ok(rows
                 .into_iter()
                 .map(|r| (r.get::<_, String>(0), Some(r.get::<_, String>(1))))
@@ -1086,10 +1117,6 @@ async fn accumulate_from_side_recomputes(
     key_src_changed: &HashMap<String, Provenance>,
     reverse_recomputes: &mut HashMap<(String, String), (i32, Provenance)>,
 ) -> Result<(), ApplyError> {
-    if key_hops.is_empty() {
-        return Ok(());
-    }
-    let join_keys: Vec<String> = key_hops.keys().cloned().collect();
     // Issue #267: this accumulator's entries become staged `src_table`s
     // verbatim ([`apply_and_mark_drained_many`]'s step 4), so they carry the
     // from-table's qualified identity — the spelling capture stages for this
@@ -1104,15 +1131,40 @@ async fn accumulate_from_side_recomputes(
     // bare `from_table` through this session's `search_path`, which could
     // land on a same-named table in another schema — and the from-side
     // reads below use it for the same reason.
-    let qualified_from_table = rel.qualified_from_table();
-    let Some(from_pk) = from_side_key(pool, &qualified_from_table).await? else {
+    accumulate_from_side_recomputes_on(
+        pool,
+        &rel.qualified_from_table(),
+        &rel.def.from_col,
+        key_hops,
+        key_src_changed,
+        reverse_recomputes,
+    )
+    .await
+}
+
+/// [`accumulate_from_side_recomputes`] for a relationship given by its
+/// qualified from-table and `from_col`, as a deferred reverse's
+/// [`ReverseRelationshipShape`] holds them (#784).
+async fn accumulate_from_side_recomputes_on(
+    pool: &Pool,
+    qualified_from_table: &str,
+    from_col: &str,
+    key_hops: &HashMap<String, i32>,
+    key_src_changed: &HashMap<String, Provenance>,
+    reverse_recomputes: &mut HashMap<(String, String), (i32, Provenance)>,
+) -> Result<(), ApplyError> {
+    if key_hops.is_empty() {
+        return Ok(());
+    }
+    let join_keys: Vec<String> = key_hops.keys().cloned().collect();
+    let Some(from_pk) = from_side_key(pool, qualified_from_table).await? else {
         return Ok(());
     };
     let matches = from_side_keys(
         pool,
-        &qualified_from_table,
+        qualified_from_table,
         &from_pk,
-        &rel.def.from_col,
+        from_col,
         &ReverseTrigger::Keys(&join_keys),
     )
     .await?;
@@ -1127,7 +1179,7 @@ async fn accumulate_from_side_recomputes(
             .copied()
             .unwrap_or((None, None));
         reverse_recomputes
-            .entry((qualified_from_table.clone(), from_key))
+            .entry((qualified_from_table.to_string(), from_key))
             .and_modify(|(h, (sc, origin))| {
                 *h = (*h).max(hop);
                 *sc = earliest_src_changed(*sc, src_changed);
@@ -4847,6 +4899,45 @@ struct RelationshipProjectionClear {
     lsn: Option<PgLsn>,
 }
 
+/// Where `compute` finds the join values a to-side change's raw ring rows
+/// gave one inbound relationship's `to_col`, including any the fold erased
+/// from both folded images (#784): a parent born and deleted inside the
+/// batch, or one re-keyed through a value and on. A child may have read the
+/// parent live under such a value (an aggregate's ledger write does, #623
+/// D5), and no reverse record names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TouchedJoinValues {
+    /// The `to_col` is the to-side's whole, non-nullable primary key, so
+    /// the ring key is its only value.
+    RingKey,
+    /// The ring's `group_key` carries the `to_col`'s values and nothing
+    /// else's ([`crate::capture::columns::to_side_group_key_column`]).
+    GroupKey,
+    /// Neither: a value the fold erased goes untracked (#784's known gap).
+    Untracked,
+}
+
+impl TouchedJoinValues {
+    fn of(to_col: &str, key_col: Option<&str>, group_key_col: Option<&str>) -> Self {
+        if key_col == Some(to_col) {
+            TouchedJoinValues::RingKey
+        } else if group_key_col == Some(to_col) {
+            TouchedJoinValues::GroupKey
+        } else {
+            TouchedJoinValues::Untracked
+        }
+    }
+
+    /// The values `change` touched.
+    fn of_change(self, change: &FoldedChange) -> Vec<&String> {
+        match self {
+            TouchedJoinValues::RingKey => vec![&change.key],
+            TouchedJoinValues::GroupKey => change.group_key.iter().flatten().collect(),
+            TouchedJoinValues::Untracked => Vec::new(),
+        }
+    }
+}
+
 /// The image [`compute`] decodes as a change's *old side*: its folded
 /// `old_image` when it carries real images, or, for an image-less recompute,
 /// its prior-image hint (issue #315, `FoldedChange::prior_image`) — the row
@@ -5259,6 +5350,23 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // `from_col` matches, and stage each as an image-less recompute at the
         // triggering change's `hop_gen + 1`.
         let inbound_rels = catalog::relationships_to_table(pool, &source_key).await?;
+        // Issue #784: which column's values this to-side's ring rows carry
+        // beyond their images, decided as capture and the seam decide it.
+        let key_col = super::target_mutations::sole_key_column(&pk);
+        let group_key_col: Option<String> = match source_key.split_once('.') {
+            Some((schema, table)) if !inbound_rels.is_empty() => {
+                let client = pool.get().await?;
+                let outbound =
+                    catalog::relationships_from_table_in(&**client, schema, table).await?;
+                crate::capture::columns::to_side_group_key_column(
+                    outbound.iter().map(|r| r.def.from_col.as_str()),
+                    inbound_rels.iter().map(|r| r.def.to_col.as_str()),
+                    key_col,
+                )
+                .map(str::to_string)
+            }
+            _ => None,
+        };
 
         // Decoded/re-read once per change here — not once per (definition,
         // change) — since every definition subscribed to this source
@@ -5353,6 +5461,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 // `src_changed` among those same changes — see
                 // `earliest_src_changed`'s doc comment for why the two use
                 // opposite merge directions.
+                let touched =
+                    TouchedJoinValues::of(&rel.def.to_col, key_col, group_key_col.as_deref());
                 let mut key_hops: HashMap<String, i32> = HashMap::new();
                 let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
                 for (i, change) in changes.iter().enumerate() {
@@ -5377,6 +5487,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     for row in [&rows[i], &old_rows[i]] {
                         let key = relationship_key_text(row, &rel.def.to_col, &rel.def.name)?;
                         note(&key, change.hop_gen);
+                    }
+                    // Issue #784: every key the fold erased from both
+                    // images, as `TouchedJoinValues` says.
+                    for key in touched.of_change(change) {
+                        note(&Some(key.clone()), change.hop_gen);
                     }
                 }
                 accumulate_from_side_recomputes(
@@ -5433,17 +5548,34 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // record below as usual (it also advances the projection). The
             // recompute still asked for the from-side rows to be re-derived,
             // so they are, from both of the record's images.
-            let has_image_less = changes.iter().any(|change| {
-                (change.old_image.is_none() && change.new_image.is_none()) || change.has_recompute
-            });
-            if has_image_less {
-                let mut key_hops: HashMap<String, i32> = HashMap::new();
-                let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
-                for (i, change) in changes.iter().enumerate() {
-                    let image_less = change.old_image.is_none() && change.new_image.is_none();
-                    if !image_less && !change.has_recompute {
-                        continue;
-                    }
+            //
+            // Issue #784: an aggregate's ledger write reads the parent live
+            // (#623 D5), so a child may have read the parent under a join
+            // key the fold erased from both of this record's images: a
+            // parent born and deleted inside the batch (no image on either
+            // side), or one re-keyed through a value and on. Those keys come
+            // from the ring key or `group_key` (`TouchedJoinValues`), and
+            // their from-side rows are re-derived here like an image-less
+            // record's, since no reverse record names them.
+            let touched = TouchedJoinValues::of(&rel.def.to_col, key_col, group_key_col.as_deref());
+            let mut key_hops: HashMap<String, i32> = HashMap::new();
+            let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
+            let mut note_key = |key: String, change: &FoldedChange| {
+                key_hops
+                    .entry(key.clone())
+                    .and_modify(|h| *h = (*h).max(change.hop_gen))
+                    .or_insert(change.hop_gen);
+                key_src_changed
+                    .entry(key)
+                    .and_modify(|(sc, origin)| {
+                        *sc = earliest_src_changed(*sc, change.src_changed);
+                        *origin = earliest_origin(*origin, change.origin_lsn);
+                    })
+                    .or_insert((change.src_changed, change.origin_lsn));
+            };
+            for (i, change) in changes.iter().enumerate() {
+                let image_less = change.old_image.is_none() && change.new_image.is_none();
+                if image_less || change.has_recompute {
                     // An image-less change carries no image of its own:
                     // its new side is the live re-read, and its old side
                     // (`old_side_image`) is its prior-image hint, the row as
@@ -5458,32 +5590,37 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     {
                         // Issue #677: absent `to_col` is `MissingColumn`,
                         // only a `NULL` one is "no key".
-                        let Some(join_text) = required_column(row, &rel.def.to_col, &rel.def.name)?
-                        else {
-                            continue;
-                        };
-                        key_hops
-                            .entry(join_text.clone())
-                            .and_modify(|h| *h = (*h).max(change.hop_gen))
-                            .or_insert(change.hop_gen);
-                        key_src_changed
-                            .entry(join_text.clone())
-                            .and_modify(|(sc, origin)| {
-                                *sc = earliest_src_changed(*sc, change.src_changed);
-                                *origin = earliest_origin(*origin, change.origin_lsn);
-                            })
-                            .or_insert((change.src_changed, change.origin_lsn));
+                        if let Some(join_text) =
+                            required_column(row, &rel.def.to_col, &rel.def.name)?
+                        {
+                            note_key(join_text.clone(), change);
+                        }
+                    }
+                    for key in touched.of_change(change) {
+                        note_key(key.clone(), change);
+                    }
+                } else {
+                    // The reverse record below re-derives the from-side rows
+                    // of its two images' keys; only the keys between them
+                    // are left.
+                    let old_key =
+                        relationship_key_text(&old_rows[i], &rel.def.to_col, &rel.def.name)?;
+                    let new_key = relationship_key_text(&rows[i], &rel.def.to_col, &rel.def.name)?;
+                    for key in touched.of_change(change) {
+                        if Some(key) != old_key.as_ref() && Some(key) != new_key.as_ref() {
+                            note_key(key.clone(), change);
+                        }
                     }
                 }
-                accumulate_from_side_recomputes(
-                    pool,
-                    rel,
-                    &key_hops,
-                    &key_src_changed,
-                    &mut reverse_recomputes,
-                )
-                .await?;
             }
+            accumulate_from_side_recomputes(
+                pool,
+                rel,
+                &key_hops,
+                &key_src_changed,
+                &mut reverse_recomputes,
+            )
+            .await?;
 
             // Issue #131: to-one. One `ReverseRelationshipShape` per
             // relationship per `compute()` call, shared (via `Arc`) by every
@@ -5792,14 +5929,41 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         };
         let old_row = deferred_decoded.take_opt(old_slot);
         let new_row = deferred_decoded.take_opt(new_slot);
+        // Issue #784: the join keys the folded retries named that neither
+        // folded image does. A child may have read the parent live under
+        // one of them (an aggregate's ledger write does, #623 D5), and no
+        // reverse record is left to re-derive it, so its children are
+        // re-derived here, as `compute`'s by-source loop does for the
+        // parent's own rows (`TouchedJoinValues`). A deferred row's
+        // `group_key` holds only this relationship's keys, since its
+        // `src_table` is the relationship's own.
+        if shape.needs_recompute_fallback {
+            let old_key = relationship_key_text(&old_row, &shape.to_col, &shape.name)?;
+            let new_key = relationship_key_text(&new_row, &shape.to_col, &shape.name)?;
+            let mut key_hops: HashMap<String, i32> = HashMap::new();
+            let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
+            for key in change.group_key.iter().flatten() {
+                if Some(key) != old_key.as_ref() && Some(key) != new_key.as_ref() {
+                    key_hops.insert(key.clone(), 0);
+                    key_src_changed.insert(key.clone(), (change.src_changed, change.origin_lsn));
+                }
+            }
+            accumulate_from_side_recomputes_on(
+                pool,
+                &shape.from_table,
+                &shape.from_col,
+                &key_hops,
+                &key_src_changed,
+                &mut reverse_recomputes,
+            )
+            .await?;
+        }
         if old_row.is_none() && new_row.is_none() {
-            // Should be unreachable: a deferred row is only ever staged
-            // from a `RelationshipReverseRecord` that already had at least
-            // one image (Phase 3's own staging site can only reach the
-            // guard-rejection branch for a record that had one — see
-            // `check_reverse_guards`'s "both keys `None`" short-circuit,
-            // which always passes and never reaches that branch at all).
-            // Defensively skip rather than build a meaningless record.
+            // The retries folded to no image on either side: the parent was
+            // born and deleted across them (#784), and its children were
+            // re-derived above. A single deferred row always has an image
+            // (`check_reverse_guards` passes a record with neither key), so
+            // nothing else folds to this.
             continue;
         }
         let read_key = relationship_read_key(&old_row, &new_row, &shape.to_col, &shape.name)?;
@@ -7726,6 +7890,13 @@ pub(crate) async fn apply_page(
                 origin_lsn: record.origin_lsn,
                 relationship_id: shape.id,
                 retry_count: record.retry_count + 1,
+                group_key: Some(
+                    old_key
+                        .iter()
+                        .chain(new_key.iter().filter(|k| Some(*k) != old_key.as_ref()))
+                        .cloned()
+                        .collect(),
+                ),
             });
             continue;
         }

@@ -35,6 +35,7 @@ mod drain_driver;
 
 use drain_driver::Driver;
 use tokio_postgres::types::PgLsn;
+use trellis::capture::install::Progress;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::staging::interleave::PausePoint;
@@ -2598,6 +2599,8 @@ enum RelFlavour {
     Field,
     /// The parent's value as the group key: `GROUP BY parent.w`.
     GroupKey,
+    /// Whether a child has a parent with a value: `COUNT(parent.w)` (#784).
+    Count,
 }
 
 impl RelFlavour {
@@ -2611,12 +2614,18 @@ impl RelFlavour {
                 "TRANSFORM agg FROM public.src GROUP BY parent.w \
                  SELECT SUM(g) AS total, COUNT(*) AS n"
             }
+            RelFlavour::Count => {
+                "TRANSFORM agg FROM public.src GROUP BY g \
+                 SELECT COUNT(parent.w) AS total, COUNT(*) AS n"
+            }
         }
     }
 
     fn actual(self) -> &'static str {
         match self {
-            RelFlavour::Field => "select g, total, n from public.agg order by g",
+            RelFlavour::Field | RelFlavour::Count => {
+                "select g, total, n from public.agg order by g"
+            }
             RelFlavour::GroupKey => "select w, total, n from public.agg order by w",
         }
     }
@@ -2630,6 +2639,10 @@ impl RelFlavour {
             RelFlavour::GroupKey => {
                 "select p.w, sum(s.g), count(*) from public.src s \
                  left join public.par p on p.id = s.p group by p.w order by p.w"
+            }
+            RelFlavour::Count => {
+                "select s.g, count(p.w), count(*) from public.src s \
+                 left join public.par p on p.id = s.p group by s.g order by s.g"
             }
         }
     }
@@ -2800,6 +2813,137 @@ async fn a_to_side_truncate_racing_a_child_group_key() {
     a_to_side_truncate_racing_a_child(RelFlavour::GroupKey).await;
 }
 
+/// #784: a parent born and deleted inside one batch, which a child read
+/// while it lived. Child 1 moves to group 3 and onto parent 5, which doesn't
+/// exist yet, and its batch drains after parent 5 is inserted, so its Apply
+/// reads parent 5 live (57). Parent 5 is then deleted, and its insert and
+/// delete seal into one batch, which folds to no image on either side: the
+/// key had no row before the batch and has none after. The child's entry
+/// still holds parent 5's value, so the parent's batch must re-derive the
+/// children of every key its rows touched, not only those of its folded
+/// images. Without that, group 3 keeps `w = 57` (`SUM` 57, `COUNT` 1, or a
+/// `GROUP BY` row for 57) where the oracle has none.
+async fn a_parent_born_and_deleted_in_one_batch_after_a_child_read_it(flavour: RelFlavour) {
+    let mut d = start_rel(flavour).await;
+    write(&d, "update public.src set g = 3, p = 5 where id = 1").await;
+    let c_batch = d.seal().await;
+    write(&d, "insert into public.par values (5, 57)").await;
+    d.drain(c_batch, "a").await;
+    write(&d, "delete from public.par where id = 5").await;
+    let p_batch = d.seal().await;
+    d.drain(p_batch, "b").await;
+    assert_rel_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_parent_born_and_deleted_in_one_batch_after_a_child_read_it_field() {
+    a_parent_born_and_deleted_in_one_batch_after_a_child_read_it(RelFlavour::Field).await;
+}
+
+#[tokio::test]
+async fn a_parent_born_and_deleted_in_one_batch_after_a_child_read_it_group_key() {
+    a_parent_born_and_deleted_in_one_batch_after_a_child_read_it(RelFlavour::GroupKey).await;
+}
+
+#[tokio::test]
+async fn a_parent_born_and_deleted_in_one_batch_after_a_child_read_it_count() {
+    a_parent_born_and_deleted_in_one_batch_after_a_child_read_it(RelFlavour::Count).await;
+}
+
+/// #784 as the generative tier hit it: the same parent born and deleted
+/// while a child read it, but with both of the parent's changes deferred
+/// by the reverse guard's in-flight check (#132's guard (c)), since a
+/// child's change to the same join key is undrained each time. A deferred
+/// reverse is re-staged under the join key, so the two deferrals fold
+/// together like the parent's own rows would, to no image on either side.
+///
+/// Child 1 points at parent 5 before it exists. Parent 5's insert drains
+/// first and is deferred (child 1's change is pending); child 1's batch
+/// then drains and reads parent 5 live (57). Parent 5's delete drains next,
+/// deferred along with the insert's retry, because child 2's move onto
+/// parent 5 is pending. Both retries land in child 2's batch and fold.
+/// Without the fix the folded retry is dropped, and child 1 keeps 57.
+async fn a_parent_born_and_deleted_across_deferred_reverses(flavour: RelFlavour) {
+    let mut d = start_rel(flavour).await;
+    write(&d, "update public.src set g = 3, p = 5 where id = 1").await;
+    let c1_batch = d.seal().await;
+    write(&d, "insert into public.par values (5, 57)").await;
+    let insert_batch = d.seal().await;
+    d.drain(insert_batch, "a").await;
+    d.drain(c1_batch, "a").await;
+    write(&d, "delete from public.par where id = 5").await;
+    let delete_batch = d.seal().await;
+    write(&d, "update public.src set p = 5 where id = 2").await;
+    d.drain(delete_batch, "a").await;
+    let retry_batch = d.seal().await;
+    d.drain(retry_batch, "a").await;
+    assert_rel_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_parent_born_and_deleted_across_deferred_reverses_field() {
+    a_parent_born_and_deleted_across_deferred_reverses(RelFlavour::Field).await;
+}
+
+#[tokio::test]
+async fn a_parent_born_and_deleted_across_deferred_reverses_group_key() {
+    a_parent_born_and_deleted_across_deferred_reverses(RelFlavour::GroupKey).await;
+}
+
+#[tokio::test]
+async fn a_parent_born_and_deleted_across_deferred_reverses_count() {
+    a_parent_born_and_deleted_across_deferred_reverses(RelFlavour::Count).await;
+}
+
+/// #784's other shape: a parent's join value passes through a key inside
+/// one batch, and a child read it under that key. The relationship joins on
+/// `par.code`, a unique column that isn't the primary key, so re-keying it
+/// is an update of one ring key. Child 1 points at code 900 before any
+/// parent has it; parent 1 moves to code 900, the child's batch drains and
+/// reads parent 1 live (10), and parent 1 moves on to code 500. Parent 1's
+/// batch folds to old code 100 and new code 500, and code 900 appears in
+/// neither image, so re-deriving the children of the folded images alone
+/// leaves child 1 counting parent 1's value under a code no parent has.
+#[tokio::test]
+async fn a_parent_rekeyed_through_a_childs_key_inside_one_batch() {
+    let actual = "select g, total, n from public.agg order by g";
+    let expected = "select s.g, sum(p.w), count(*) from public.src s \
+                    left join public.par p on p.code = s.p group by s.g order by s.g";
+    let mut d = Driver::start_with_relationships(
+        "create table public.par (id integer primary key, code integer unique, w numeric); \
+         create table public.src (id integer primary key, g integer, p integer); \
+         insert into public.par values (1, 100, 10), (2, 200, 20); \
+         insert into public.src values (1, 1, 100), (2, 1, 200);",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("p", ValueType::Numeric),
+        ],
+        &["RELATIONSHIP parent FROM src.p TO par.code"],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
+        &[PAR, SRC],
+    )
+    .await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "before the scenario"
+    );
+    write(&d, "update public.src set g = 2, p = 900 where id = 1").await;
+    let c_batch = d.seal().await;
+    write(&d, "update public.par set code = 900 where id = 1").await;
+    d.drain(c_batch, "a").await;
+    write(&d, "update public.par set code = 500 where id = 1").await;
+    let p_batch = d.seal().await;
+    d.drain(p_batch, "b").await;
+    d.settle().await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "target (left) differs from the oracle (right)"
+    );
+}
+
 /// One page that holds every kind of record step 3 tells apart (#775):
 /// Applies its lock's insert wrote (`$10`'s fresh records, moved into their
 /// groups from their images: a new key in an existing group, one with a
@@ -2894,4 +3038,263 @@ async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle_avg() {
 #[tokio::test]
 async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle_min_max() {
     a_page_mixing_fresh_and_read_entries_equals_the_oracle(Flavour::AggregateMinMax).await;
+}
+
+/// #784 review: a parent table that is also a from-side, `par.owner` to
+/// `usr.handle`, a `text` column, while `src.p` joins `par.id`, an
+/// `integer`. Its ring `group_key` holds `owner`'s values, which aren't
+/// `par.id`'s, so the reverse path mustn't read them as `parent`'s join
+/// values: cast to `integer` for the lookup, `'alice'` failed the batch on
+/// every drain.
+#[tokio::test]
+async fn a_parent_that_is_also_a_from_side_of_another_type_drains_a_plain_update() {
+    let actual = "select g, total, n from public.agg order by g";
+    let expected = "select s.g, sum(p.w), count(*) from public.src s \
+                    left join public.par p on p.id = s.p group by s.g order by s.g";
+    let mut d = Driver::start_with_relationships(
+        "create table public.usr (handle text primary key, z integer); \
+         create table public.par (id integer primary key, owner text, w numeric); \
+         create table public.src (id integer primary key, g integer, p integer); \
+         insert into public.usr values ('alice', 1); \
+         insert into public.par values (1, 'alice', 10), (2, 'alice', 20); \
+         insert into public.src values (1, 1, 1), (2, 1, 2);",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("p", ValueType::Numeric),
+        ],
+        &[
+            "RELATIONSHIP owner FROM par.owner TO usr.handle",
+            "RELATIONSHIP parent FROM src.p TO par.id",
+        ],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
+        &["public.usr", PAR, SRC],
+    )
+    .await;
+    write(&d, "update public.par set w = 11 where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    d.settle().await;
+    assert_eq!(d.rows(actual).await, d.rows(expected).await);
+}
+
+/// #784 review: the same shape with `owner` an `integer` that names
+/// another parent's id. A plain update of parent 1, whose owner is 2,
+/// re-derives parent 1's children and no others: reading `group_key`'s
+/// `owner` value as one of `parent`'s keys would re-derive parent 2's on
+/// every write. Then parent 5 is born and deleted in one batch after child 1
+/// read it, which the ring key still catches with `group_key` out of play.
+#[tokio::test]
+async fn a_parent_that_is_also_a_from_side_re_derives_only_its_own_children() {
+    let actual = "select g, total, n from public.agg order by g";
+    let expected = "select s.g, count(p.w), count(*) from public.src s \
+                    left join public.par p on p.id = s.p group by s.g order by s.g";
+    let mut d = Driver::start_with_relationships(
+        "create table public.usr (id integer primary key, z integer); \
+         create table public.par (id integer primary key, owner integer, w numeric); \
+         create table public.src (id integer primary key, g integer, p integer); \
+         insert into public.usr values (2, 1); \
+         insert into public.par values (1, 2, 10), (2, 2, 20); \
+         insert into public.src values (1, 1, 1), (2, 1, 2);",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("p", ValueType::Numeric),
+        ],
+        &[
+            "RELATIONSHIP owner FROM par.owner TO usr.id",
+            "RELATIONSHIP parent FROM src.p TO par.id",
+        ],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
+        &["public.usr", PAR, SRC],
+    )
+    .await;
+    let ring = "(select * from seg_0 union all select * from seg_1 \
+                union all select * from seg_2 union all select * from seg_3) r";
+    let before = d
+        .rows(&format!("select coalesce(max(change_id), 0) from {ring}"))
+        .await;
+    let before = before[0].trim_matches(|c| c == '(' || c == ')').to_string();
+    write(&d, "update public.par set w = 11 where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    let staged = d
+        .rows(&format!(
+            "select key from {ring} \
+             where src_table = 'public.src' and change_id > {before} \
+             group by key order by key"
+        ))
+        .await;
+    assert_eq!(staged, vec!["(1)".to_string()], "only parent 1's child");
+    d.settle().await;
+
+    write(&d, "update public.src set g = 3, p = 5 where id = 1").await;
+    let c_batch = d.seal().await;
+    write(&d, "insert into public.par values (5, 2, 57)").await;
+    d.drain(c_batch, "a").await;
+    write(&d, "delete from public.par where id = 5").await;
+    let p_batch = d.seal().await;
+    d.drain(p_batch, "b").await;
+    d.settle().await;
+    assert_eq!(d.rows(actual).await, d.rows(expected).await);
+}
+
+/// #784 review: a to-side's capture functions older than the catalog. They
+/// were installed while `par` was also a from-side, so its ring `group_key`
+/// holds `owner`'s values. With that relationship gone, `group_key` is
+/// where `parent`'s erased `code` values live (no other column shares it
+/// now), so the reverse path reads the stale `'alice'` as one, until the
+/// reconcile pass regenerates the functions. Its lookup by `src.p`, an
+/// `integer`, must still drain: `'alice'` matches no row.
+#[tokio::test]
+async fn a_to_sides_stale_group_key_of_another_type_still_drains() {
+    let actual = "select g, total, n from public.agg order by g";
+    let expected = "select s.g, sum(p.w), count(*) from public.src s \
+                    left join public.par p on p.code = s.p group by s.g order by s.g";
+    let mut d = Driver::start_with_relationships(
+        "create table public.usr (handle text primary key, z integer); \
+         create table public.par (id integer primary key, code integer unique, \
+                                  owner text, w numeric); \
+         create table public.src (id integer primary key, g integer, p integer); \
+         insert into public.usr values ('alice', 1); \
+         insert into public.par values (1, 100, 'alice', 10), (2, 200, 'alice', 20); \
+         insert into public.src values (1, 1, 100), (2, 1, 200);",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("p", ValueType::Numeric),
+        ],
+        &[
+            "RELATIONSHIP owner FROM par.owner TO usr.handle",
+            "RELATIONSHIP parent FROM src.p TO par.code",
+        ],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
+        &["public.usr", PAR, SRC],
+    )
+    .await;
+    write(
+        &d,
+        &format!("delete from {DEFAULT_SCHEMA}.relationship_definitions where name = 'owner'"),
+    )
+    .await;
+    write(&d, "update public.par set w = 11 where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    d.settle().await;
+    assert_eq!(d.rows(actual).await, d.rows(expected).await);
+}
+
+/// #784 review: a relationship declared onto a to-side that is already
+/// captured. `par` is captured for `parent`, which joins its primary key, so
+/// its ring `group_key` is empty. Declaring `by_code`, which joins
+/// `par.code`, puts `code` there, and the capture reconcile widens `par`'s
+/// functions to write it: without that, a `code` value the fold erases
+/// would go untracked.
+#[tokio::test]
+async fn a_relationship_onto_a_captured_to_side_widens_its_group_key() {
+    let mut d = Driver::start_with_relationships(
+        "create table public.par (id integer primary key, code integer unique, w numeric); \
+         create table public.src (id integer primary key, g integer, p integer, q integer); \
+         insert into public.par values (1, 100, 10); \
+         insert into public.src values (1, 1, 1, 100);",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("p", ValueType::Numeric),
+        ],
+        &["RELATIONSHIP parent FROM src.p TO par.id"],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
+        &[PAR, SRC],
+    )
+    .await;
+    let ring = "(select * from seg_0 union all select * from seg_1 \
+                union all select * from seg_2 union all select * from seg_3) r";
+    let last_group_key = format!(
+        "select group_key from {ring} where src_table = 'public.par' \
+         order by change_id desc limit 1"
+    );
+    write(&d, "update public.par set code = 101, w = 11 where id = 1").await;
+    assert_eq!(d.rows(&last_group_key).await, vec!["()".to_string()]);
+
+    trellis::defs::create_relationship(d.pool(), "RELATIONSHIP by_code FROM src.q TO par.code")
+        .await
+        .expect("declare by_code");
+    let catalog = trellis::capture::columns::load_catalog(&d.ctl, DEFAULT_SCHEMA)
+        .await
+        .expect("load the catalog");
+    let spec = trellis::capture::columns::capture_spec(&d.ctl, &catalog, PAR)
+        .await
+        .expect("capture spec");
+    assert_eq!(spec.group_key(), ["code".to_string()]);
+    let action = trellis::capture::install::plan(
+        &trellis::capture::install::installed(&d.ctl, DEFAULT_SCHEMA, PAR)
+            .await
+            .expect("read the installed capture"),
+        &spec,
+    );
+    assert_eq!(action, trellis::capture::install::CaptureAction::Widen);
+    let widened = trellis::capture::install::reconcile(&mut d.ctl, DEFAULT_SCHEMA, &spec, None)
+        .await
+        .expect("widen par's capture");
+    assert!(
+        matches!(widened, Progress::Done(_)),
+        "an unbounded widen lands"
+    );
+    write(&d, "update public.par set code = 102 where id = 1").await;
+    assert_eq!(
+        d.rows(&last_group_key).await,
+        vec![r#"("{101,102}")"#.to_string()]
+    );
+}
+
+/// #784's known gap, pinned: a to-side two relationships join on different
+/// non-key columns, `par.code` (a to-one) and `par.fk` (a to-many), the
+/// shape the generative suite draws when one definition reads its second
+/// table through a to-one and another through a to-many. Neither `to_col`
+/// is `par`'s primary key, and they can't share the ring's unlabelled
+/// `group_key` (`capture::columns::to_side_group_key_column`), so neither is
+/// tracked. Parent 5 is born and deleted in one batch after child 1 read
+/// it live under code `'e'`, as in
+/// `a_parent_born_and_deleted_in_one_batch_after_a_child_read_it`, and
+/// nothing names `'e'` to re-derive: group 3 keeps `COUNT` 1 where the
+/// oracle has 0. With `kids` dropped, `code` is tracked and this passes.
+/// Closing it needs `group_key`'s values labelled per column.
+#[tokio::test]
+#[ignore = "#784 known gap: a to-side two relationships join on different non-key columns"]
+async fn a_parent_born_and_deleted_on_a_to_side_joined_by_two_non_key_columns() {
+    let actual = "select g, total, n from public.agg order by g";
+    let expected = "select s.g, count(p.w), count(*) from public.src s \
+                    left join public.par p on p.code = s.p group by s.g order by s.g";
+    let mut d = Driver::start_with_relationships(
+        "create table public.par (id integer primary key, code text unique, fk text, w numeric); \
+         create table public.src (id integer primary key, g integer, p text, k text); \
+         insert into public.par values (1, 'a', 'x', 10), (2, 'b', 'y', 20); \
+         insert into public.src values (1, 1, 'a', 'k1'), (2, 1, 'b', 'k2');",
+        &[("id", ValueType::Numeric), ("g", ValueType::Numeric)],
+        &[
+            "RELATIONSHIP parent FROM src.p TO par.code",
+            "RELATIONSHIP kids FROM src.k TO par.fk",
+        ],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
+        &[PAR, SRC],
+    )
+    .await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "before the scenario"
+    );
+    write(&d, "update public.src set g = 3, p = 'e' where id = 1").await;
+    let c_batch = d.seal().await;
+    write(&d, "insert into public.par values (5, 'e', 'z', 57)").await;
+    d.drain(c_batch, "a").await;
+    write(&d, "delete from public.par where id = 5").await;
+    let p_batch = d.seal().await;
+    d.drain(p_batch, "b").await;
+    d.settle().await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "target (left) differs from the oracle (right)"
+    );
 }
