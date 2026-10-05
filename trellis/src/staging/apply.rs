@@ -736,11 +736,9 @@ impl LiveRowsQuery<'_> {
 /// - No sequential scan alone: a scan of the key's whole index, 31 ms.
 /// - Both: 15–19 ms on PostgreSQL 16, 10–15 ms on 17.
 ///
-/// A composite key is never restricted this way. One `= any` per column
-/// makes the planner multiply the columns' selectivities, expect a row or
-/// two from the source, and compare every bounded row with every key,
-/// quadratic in the batch even with fresh statistics: 1,474 ms against 13
-/// ms for 5,000 keys of a four-column key at 1M rows, and 946 ms on a
+/// A composite key is never restricted this way ([`bounds_keyset_by_array`]):
+/// one `= any` per column took 1,474 ms against 13 ms for 5,000 keys of a
+/// four-column key at 1M rows with fresh statistics, and 946 ms on a
 /// two-column key at 20M rows. Without a sequential scan to hash, it probes
 /// the key's index once per key whether or not its statistics lag (18 ms on
 /// PostgreSQL 16 for 5,000 keys at 400k rows analyzed at 100, against 70 ms
@@ -782,7 +780,7 @@ pub(super) fn live_rows_query<'a>(
                 if !null {
                     next_param += 1;
                     let array = format!("${next_param}::text[]::{}[]", column.data_type);
-                    if pk.len() == 1 {
+                    if bounds_keyset_by_array(pk) {
                         bounds.push(format!("t.{} = any({array})", quote_ident(&column.name)));
                     }
                     arrays.push(array);
@@ -4407,6 +4405,130 @@ mod tests {
         }
     }
 
+    /// Issue #790's review: a composite-key 1-1 target's pre-lock
+    /// ([`lock_composite_keys`]) is matched to its keys without comparing
+    /// every target row with every key, and without scanning the target.
+    ///
+    /// - `fresh`: a four-column key at 1M rows with fresh statistics.
+    ///   Bounding each key column by its own `= any` array made the planner
+    ///   expect one row from the target and loop over all 5,000 keys for
+    ///   each of the 5,000 rows it read: 25M comparisons, 2.3 s against
+    ///   25 ms.
+    /// - `stale`: a two-column key analyzed at 100 rows, then grown to 1M
+    ///   with autovacuum off. With sequential scans on, PostgreSQL 16 and 17
+    ///   both hashed the keys against a sequential scan of the target.
+    ///
+    /// The plan is explained under the settings the pre-lock runs with, and
+    /// the pre-lock itself must start no sequential scan of the target. It
+    /// must still lock every key.
+    #[tokio::test]
+    async fn the_composite_pre_lock_never_compares_every_row_with_every_key() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table fresh (a int, b text, c int, d text, total int, \
+                                     primary key (a, b, c, d)) \
+                     with (autovacuum_enabled = false); \
+                 insert into fresh select i, 'k' || i, i, 'd' || i, i \
+                     from generate_series(1, 1000000) i; \
+                 analyze fresh; \
+                 create table stale (a int, b text, total int, primary key (a, b)) \
+                     with (autovacuum_enabled = false); \
+                 insert into stale select i, 'k' || i, i from generate_series(1, 100) i; \
+                 analyze stale; \
+                 insert into stale select i, 'k' || i, i from generate_series(101, 1000000) i;",
+            )
+            .await
+            .expect("seed the targets");
+        for table in ["public.fresh", "public.stale"] {
+            let pk = ddl::identity_key_columns(&client, table)
+                .await
+                .expect("identity");
+            let key_sql = ddl::pk_key_sql_expr(&pk, Some("t"));
+            let part_sql: Vec<String> = pk
+                .iter()
+                .map(|c| format!("t.{}::text", quote_ident(&c.name)))
+                .collect();
+            let rows: Vec<(String, Vec<String>)> = client
+                .query(
+                    &format!(
+                        "select {key_sql}, {} from {table} t \
+                         where t.total % 79 = 0 limit 5000",
+                        part_sql.join(", ")
+                    ),
+                    &[],
+                )
+                .await
+                .expect("keys")
+                .into_iter()
+                .map(|row| (row.get(0), (1..=pk.len()).map(|i| row.get(i)).collect()))
+                .collect();
+            assert_eq!(rows.len(), 5000);
+            let parts: Vec<&Vec<String>> = rows.iter().map(|(_, parts)| parts).collect();
+            let arrays = transpose_pk_parts(pk.len(), &parts);
+            let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
+            let sql = composite_lock_statement(table, &pk, &key_sql);
+            let txn = client.transaction().await.expect("begin");
+            let plan: String = crate::staging::ledger::query_by_entry_key(
+                &txn,
+                &format!("explain (analyze, timing off) {sql}"),
+                &params,
+            )
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+            let filtered: u64 = plan
+                .lines()
+                .filter_map(|line| line.split("Rows Removed by Join Filter: ").nth(1))
+                .map(|n| n.trim().parse::<u64>().expect("a row count"))
+                .sum();
+            assert!(
+                !plan.contains("Seq Scan") && filtered < rows.len() as u64,
+                "{table}: the target must be matched to the keys without comparing \
+                 every row with every key, got:\n{plan}"
+            );
+            let seq_scans = "select seq_scan from pg_stat_xact_user_tables \
+                             where relid = $1::text::regclass";
+            let before: i64 = txn
+                .query_one(seq_scans, &[&table])
+                .await
+                .expect("scans")
+                .get(0);
+            let locked: std::collections::HashSet<String> =
+                lock_composite_keys(&txn, table, &pk, &key_sql, &arrays)
+                    .await
+                    .expect("lock")
+                    .into_iter()
+                    .map(|row| row.get(0))
+                    .collect();
+            let after: i64 = txn
+                .query_one(seq_scans, &[&table])
+                .await
+                .expect("scans")
+                .get(0);
+            assert_eq!(
+                after, before,
+                "{table}: the pre-lock must not scan the target, as its plan above doesn't"
+            );
+            txn.rollback().await.expect("rollback");
+            assert_eq!(
+                locked,
+                rows.into_iter().map(|(key, _)| key).collect(),
+                "{table}: every key is locked"
+            );
+        }
+    }
+
     /// Issue #531: only a record at or below its relationship's refresh
     /// stamp takes the live-row check. A relationship never refreshed, or a
     /// record above the stamp (every change after the refresh), reads
@@ -6619,6 +6741,91 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
         .join(" and ")
 }
 
+/// Whether a join of a keyset to a table keyed by `key` should also restrict
+/// the key's column to the keyset's own array (`t.<col> = any(<array>)`),
+/// which the join already implies: only when `key` is a single column. Every
+/// keyset join that takes such a bound asks here (#778, #790).
+///
+/// The bound caps the table's side of whatever join the planner picks at the
+/// keyset. Without it, a table analyzed while small and grown since is read
+/// in full: at 1M rows analyzed at 100, a 5,000-key batch hashed a
+/// sequential scan of the table, 3 to 13 times slower than through its key's
+/// index.
+///
+/// A composite key isn't bounded. The planner multiplies one bound per
+/// column's selectivities as if they were independent, but a composite key's
+/// columns are each nearly as selective as the whole key, so it expects the
+/// bounded table to yield a row or two. It then loops over that scan and
+/// compares every bounded row with every key, quadratic in the batch,
+/// statistics fresh or not: 5,000 keys took 2.3 s to lock on a 1M-row target
+/// with a four-column key (25 ms unbounded), and 1.8 s on a 20M-row target
+/// with a two-column key (19 ms). A leading-column bound alone avoids that,
+/// but reads a whole tenant when the leading column is a low-cardinality one
+/// (84 ms against 4 ms for 500 keys over 1,000 tenants). Unbounded, a
+/// composite key is probed per key while its statistics are fresh, and can
+/// still be hashed against a sequential scan while they lag (139 ms against
+/// 27 ms bounded, two columns at 1M rows), unless the statement also runs
+/// under `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan), as the
+/// source read, the endpoint feed's re-read, the sweep delete and the
+/// composite pre-lock ([`lock_composite_keys`]) do.
+///
+/// The bound alone isn't enough on PostgreSQL 16, which prices an index scan
+/// for thousands of `= any` values far above 17's estimate: it scanned a
+/// 400k-row table analyzed at 100 and filtered it by the bound, where 17
+/// read the index. So each statement that takes the bound also runs under
+/// those settings.
+pub(crate) fn bounds_keyset_by_array(key: &[PrimaryKeyColumn]) -> bool {
+    key.len() == 1
+}
+
+/// [`apply_target`]'s pre-lock for a composite key (issue #121): the target
+/// rows of a bound keyset relation ([`pk_keyset_unnest`] at `$1`), `select`ing
+/// `columns`, locked `for update of t` in key order. No one column's `=
+/// any(...)` test identifies a row of a composite key, so the pre-lock joins
+/// the target to the keyset and locks only the real table's rows
+/// (`unnest(...)`'s derived rows aren't real table rows Postgres could lock).
+///
+/// The join is deliberately not also restricted by one `t.<col> = any(<its
+/// array>)` per key column: see [`bounds_keyset_by_array`]. It runs under
+/// `ENTRY_PLAN_SETTINGS` instead ([`lock_composite_keys`]).
+fn composite_lock_statement(target_ident: &str, pk: &[PrimaryKeyColumn], columns: &str) -> String {
+    format!(
+        "select {columns} from {target_ident} as t join {} on ({}) \
+         order by {} for update of t",
+        pk_keyset_unnest(pk, 1),
+        pk_keyset_match(pk, "t"),
+        pk.iter()
+            .map(|c| format!("t.{}", quote_ident(&c.name)))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+/// Runs [`composite_lock_statement`] over the keys in `arrays` (column `j`'s
+/// parts in `arrays[j]`, as [`transpose_pk_parts`] gives them) under
+/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan), and returns
+/// the locked rows. While a target's statistics lag its size, the join
+/// alone hashed the keys against a sequential scan of the target: a
+/// two-column key at 1M rows analyzed at 100 took 133–167 ms on
+/// PostgreSQL 16 and 17, against 12–16 ms probing the key's index per key
+/// with the settings (#790). With fresh statistics the planner already
+/// probes per key, and the settings leave that plan alone.
+async fn lock_composite_keys(
+    txn: &Transaction<'_>,
+    target_ident: &str,
+    pk: &[PrimaryKeyColumn],
+    columns: &str,
+    arrays: &[Vec<&str>],
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
+    super::ledger::query_by_entry_key(
+        txn,
+        &composite_lock_statement(target_ident, pk, columns),
+        &params,
+    )
+    .await
+}
+
 /// The per-column bind arrays [`pk_keyset_unnest`] needs, transposed from
 /// `rows` (each an already-[`decode_target_pk_parts`]-decoded key, in `pk`'s
 /// own declared column order) so column `j`'s array is every row's `j`th
@@ -7179,26 +7386,15 @@ async fn apply_target(
         )
         .await?
     } else {
-        // Issue #121: a composite key has no single column an `= any(...)`
-        // array test could name, so the pre-lock instead joins the target to
-        // a bound keyset relation and locks only the real table's rows
-        // (`for update of t` — `unnest(...)`'s derived rows aren't real table
-        // rows Postgres could lock).
+        // Issue #121: a composite key is matched against a bound keyset
+        // relation instead; see `composite_lock_statement`.
         let arrays = transpose_pk_parts(arity, &lock_key_parts);
-        let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
-        txn.query(
-            &format!(
-                "select {lock_key_expr}{prior_select} from {target_ident} as t join {} on ({}) \
-                 order by {} for update of t",
-                pk_keyset_unnest(&plan.pk, 1),
-                pk_keyset_match(&plan.pk, "t"),
-                plan.pk
-                    .iter()
-                    .map(|c| format!("t.{}", quote_ident(&c.name)))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ),
-            &params,
+        lock_composite_keys(
+            txn,
+            &target_ident,
+            &plan.pk,
+            &format!("{lock_key_expr}{prior_select}"),
+            &arrays,
         )
         .await?
     };

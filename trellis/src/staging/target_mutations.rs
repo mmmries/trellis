@@ -186,8 +186,8 @@ use tokio_postgres::types::{PgLsn, ToSql};
 
 use super::append::{self, CdcOp, StagedChange};
 use super::apply::{
-    ApplyError, MAX_HOP_GEN, earliest_src_changed, live_row_columns, pk_keyset_col,
-    row_as_text_jsonb_sql,
+    ApplyError, MAX_HOP_GEN, bounds_keyset_by_array, earliest_src_changed, live_row_columns,
+    pk_keyset_col, row_as_text_jsonb_sql,
 };
 use super::fold::earliest_origin;
 use crate::defs::catalog;
@@ -586,7 +586,7 @@ async fn read_new_images(
         return Ok(HashMap::new());
     }
     let query = new_images_query(target, image_columns, feed, keys)?;
-    let rows = txn.query(&query.sql, &query.params()).await?;
+    let rows = super::ledger::query_by_entry_key(txn, &query.sql, &query.params()).await?;
     Ok(rows
         .into_iter()
         .map(|row| {
@@ -645,6 +645,21 @@ impl NewImagesQuery<'_> {
 /// indexable: on a 500k-group aggregate target, a 500-key batch with one
 /// NULL group took 8.5s against 0.4ms without it. This is the same split
 /// `intake::resume_orphans` makes per NULL pattern.
+///
+/// A single-column identity's non-`NULL` arm also restricts the column to
+/// its array (`t.<col> = any(<array>)`), which the match already implies,
+/// so the target's side of whatever join the planner picks is bounded by
+/// the batch (#790). A condition in a left join's `on` that names only the
+/// target filters the target's scan. Without it, a target analyzed while
+/// small and grown since was read in full: at 1M rows, a 5,000-key batch
+/// hashed a sequential scan of the target, 102 ms against 31 ms through the
+/// index. [`read_new_images`] also runs it under `ENTRY_PLAN_SETTINGS` (no
+/// sequential scan): PostgreSQL 16, unlike 17, still scanned a 400k-row
+/// target and filtered it by the bound.
+///
+/// A composite identity is never restricted this way: see
+/// [`bounds_keyset_by_array`] for why one `= any` per column is worse
+/// than the scan it avoids.
 fn new_images_query<'a>(
     target: &str,
     image_columns: &[String],
@@ -706,16 +721,22 @@ fn new_images_query<'a>(
             ];
             let mut aliases = vec!["key".to_string(), "prior".to_string()];
             let mut matched = Vec::with_capacity(pk.len());
+            let mut bounds = Vec::new();
             for (i, (column, &null)) in pk.iter().zip(pattern).enumerate() {
                 let col = quote_ident(&column.name);
                 if null {
                     matched.push(format!("t.{col} is null"));
                 } else {
-                    arrays.push(format!("{}::text[]::{}[]", param(), column.data_type));
+                    let array = format!("{}::text[]::{}[]", param(), column.data_type);
+                    if bounds_keyset_by_array(pk) {
+                        bounds.push(format!("t.{col} = any({array})"));
+                    }
+                    arrays.push(array);
                     aliases.push(pk_keyset_col(i));
                     matched.push(format!("t.{col} = k.{}", pk_keyset_col(i)));
                 }
             }
+            matched.extend(bounds);
             format!(
                 "select k.key, \
                         case when t.ctid is null then null \
@@ -1224,5 +1245,178 @@ mod tests {
             plan.contains("Seq Scan"),
             "the pre-#433 shape should not be able to probe the index, got:\n{plan}"
         );
+    }
+
+    /// Issue #790: `read_new_images` reads only its batch's rows of a
+    /// single-column key's target whose statistics lag its size (analyzed at
+    /// 100 rows, then grown to 400k with autovacuum off). Left to the join
+    /// alone, the planner hashed a 5,000-key batch against a sequential scan
+    /// of the target; the arm's `= any` restriction caps the target's side
+    /// at the batch. The statement is explained the way [`read_new_images`]
+    /// runs it, under `ENTRY_PLAN_SETTINGS`: with the bound alone,
+    /// PostgreSQL 16 still scanned the target and filtered it (CI).
+    ///
+    /// A composite identity is left unrestricted, and with fresh statistics
+    /// it must not be matched by comparing every row with every key: here an
+    /// aggregate's nullable four-column identity at 1M rows, with
+    /// `NULL`-bearing keys (so one arm per pattern). One `= any` per column
+    /// made the planner expect a row from the target and loop over every key
+    /// for each bounded row, 12.5M comparisons for 5,000 keys (316 ms against
+    /// 16 ms).
+    ///
+    /// Either way every key must come back with its row.
+    #[tokio::test]
+    async fn read_new_images_reads_only_the_batch_while_target_statistics_lag() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(db.dsn()).await;
+        client
+            .batch_execute(
+                "create table single (id int primary key, total int) \
+                     with (autovacuum_enabled = false); \
+                 create table composite (g int, h text, i int, j text, total int, \
+                                         unique nulls not distinct (g, h, i, j)) \
+                     with (autovacuum_enabled = false); \
+                 insert into single select i, i from generate_series(1, 100) i; \
+                 analyze single; \
+                 insert into single select i, i from generate_series(101, 400000) i; \
+                 insert into composite select i, 'k' || i, i, 'j' || i, i \
+                     from generate_series(1, 1000000) i; \
+                 insert into composite values (null, 'k1', 1, 'j1', 0), (5, null, 5, 'j5', 0); \
+                 analyze composite;",
+            )
+            .await
+            .expect("seed the targets");
+        let txn = client.transaction().await.expect("begin");
+        let cases = [
+            ("public.single", "t.total % 79 = 0", 1, true),
+            (
+                "public.composite",
+                "t.g is null or t.h is null or t.total % 79 = 0",
+                3,
+                false,
+            ),
+        ];
+        for (table, batch, patterns, bounded) in cases {
+            let key_columns = ddl::identity_key_columns(&txn, table)
+                .await
+                .expect("identity");
+            let columns = live_row_columns(&txn, table).await.expect("columns");
+            let key_sql = ddl::pk_key_sql_expr(&key_columns, Some("t"));
+            let keys: BTreeMap<String, KeyMutation> = txn
+                .query(
+                    &format!(
+                        "select {key_sql} from {table} t where {batch} \
+                         order by t.total limit 5000"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("keys")
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.get(0),
+                        KeyMutation {
+                            prior_image: None,
+                            hop_gen: 0,
+                            src_changed: None,
+                            origin_lsn: None,
+                        },
+                    )
+                })
+                .collect();
+            assert_eq!(keys.len(), 5000);
+            let feed = EndpointFeed {
+                key_columns,
+                group_key_columns: Vec::new(),
+            };
+            let query = new_images_query(table, &columns, &feed, &keys).expect("query");
+            assert_eq!(
+                query.arms.len(),
+                patterns,
+                "{table}: one arm per NULL pattern"
+            );
+            assert_eq!(
+                query.sql.contains("= any("),
+                bounded,
+                "{table}: only a single-column key is bounded:\n{}",
+                query.sql
+            );
+            let plan: String = crate::staging::ledger::query_by_entry_key(
+                &txn,
+                &format!("explain (analyze, timing off) {}", query.sql),
+                &query.params(),
+            )
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+            let target = &table["public.".len()..];
+            let scans: Vec<&str> = plan
+                .lines()
+                .filter(|line| line.contains(&format!(" on {target} ")))
+                .collect();
+            assert!(
+                !scans.is_empty(),
+                "{table}: no scan of the target in:\n{plan}"
+            );
+            for scan in scans {
+                let rows: f64 = scan
+                    .split("rows=")
+                    .nth(1)
+                    .and_then(|rest| rest.split(' ').next())
+                    .and_then(|rows| rows.parse().ok())
+                    .expect("a row estimate");
+                assert!(
+                    !scan.contains("Seq Scan") && rows <= keys.len() as f64,
+                    "{table}: the target must be read through the batch's keys, got:\n{plan}"
+                );
+            }
+            let filtered: u64 = plan
+                .lines()
+                .filter_map(|line| line.split("Rows Removed by Join Filter: ").nth(1))
+                .map(|n| n.trim().parse::<u64>().expect("a row count"))
+                .sum();
+            assert!(
+                filtered < keys.len() as u64,
+                "{table}: the target must be matched to the keys without comparing \
+                 every row with every key, got:\n{plan}"
+            );
+            let before = seq_scans_in_txn(&txn, table).await;
+            let got = read_new_images(&txn, table, &columns, &feed, &keys)
+                .await
+                .expect("re-read");
+            assert_eq!(
+                seq_scans_in_txn(&txn, table).await,
+                before,
+                "{table}: read_new_images must not scan the target, as its plan above doesn't"
+            );
+            let missing: Vec<&String> = keys
+                .keys()
+                .filter(|key| got.get(*key).is_none_or(|new| new.image.is_none()))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{table}: every key finds its own row, missing {missing:?}"
+            );
+        }
+    }
+
+    /// How many sequential scans of `table` this transaction has started so
+    /// far (`pg_stat_xact_user_tables` counts the open transaction's own).
+    /// The plan test explains its statement through `query_by_entry_key`;
+    /// this checks that [`read_new_images`] runs it that way too, which
+    /// PostgreSQL 16 would otherwise plan as a scan of a stale target (#790).
+    async fn seq_scans_in_txn(txn: &Transaction<'_>, table: &str) -> i64 {
+        txn.query_one(
+            "select seq_scan from pg_stat_xact_user_tables where relid = $1::text::regclass",
+            &[&table],
+        )
+        .await
+        .expect("the transaction's scan count")
+        .get(0)
     }
 }

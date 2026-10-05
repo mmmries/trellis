@@ -185,6 +185,7 @@ use crate::defs::model::RelationshipCardinality;
 use crate::defs::oracle::{render_to_one_rel_expr_sql, to_one_join_clauses};
 use crate::defs::{TransformStatus, parse};
 use crate::pool::quote_ident;
+use crate::staging::apply::bounds_keyset_by_array;
 use crate::staging::target_mutations::TargetMutations;
 
 use super::IntakeError;
@@ -465,66 +466,7 @@ impl Sweep {
         let arrays: Vec<Vec<Option<String>>> = (0..arity)
             .map(|j| keys.iter().map(|key| key[j].clone()).collect())
             .collect();
-        let cols: Vec<String> = (0..arity).map(keyset_col).collect();
-        // Each value is cast back from its text on its own (rather than the
-        // array as a whole), so any key type with a text input works, an
-        // array-typed one included.
-        let typed: Vec<String> = target
-            .key_cols
-            .iter()
-            .zip(&cols)
-            .map(|(c, k)| format!("{k}::{} as {k}", c.data_type))
-            .collect();
-        let arrays_sql: Vec<String> = (1..=arity).map(|i| format!("${i}::text[]")).collect();
-        let target_cols: Vec<String> = target
-            .key_cols
-            .iter()
-            .map(|c| format!("t.{}", quote_ident(&c.name)))
-            .collect();
-        let guard = match &target.ledger_guard {
-            Some(ledger) => {
-                use crate::defs::ledger::{MEMBER_COLUMN, TOMBSTONE_COLUMN};
-                let matches: Vec<String> = target
-                    .key_cols
-                    .iter()
-                    // Not `is not distinct from`, which no index serves.
-                    .map(|c| {
-                        format!(
-                            "(l.{0} = t.{0} or (l.{0} is null and t.{0} is null))",
-                            quote_ident(&c.name)
-                        )
-                    })
-                    .collect();
-                format!(
-                    " and not exists (select 1 from {ledger} as l where l.{} and not l.{} and {})",
-                    quote_ident(MEMBER_COLUMN),
-                    quote_ident(TOMBSTONE_COLUMN),
-                    matches.join(" and "),
-                )
-            }
-            None => String::new(),
-        };
-        let sql = format!(
-            "delete from {} as t using (select {} from unnest({}) as u({})) as k \
-             where {}{guard} and exists ( \
-                 select 1 from transform_definitions where id = ${} and status = ${} \
-             ) \
-             returning {}",
-            target.target_ident,
-            typed.join(", "),
-            arrays_sql.join(", "),
-            cols.join(", "),
-            keyset_match_cols(&target_cols, &null_patterns(&arrays)),
-            arity + 1,
-            arity + 2,
-            target.returning,
-        );
-        let status = target.status.as_str();
-        let mut params: Vec<&(dyn ToSql + Sync)> =
-            arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-        params.push(&target.id);
-        params.push(&status);
-        let rows = txn.query(&sql, &params).await?;
+        let rows = delete_keys(txn, target, &arrays).await?;
         if rows.is_empty() {
             return Ok(());
         }
@@ -858,6 +800,87 @@ fn ledger_orphan_branch_sql(
     )
 }
 
+/// Runs [`delete_statement`] for `arrays` under `ENTRY_PLAN_SETTINGS`
+/// (through `ledger::query_by_entry_key`), and returns the deleted rows:
+/// [`Sweep::delete`]'s statement as it runs, which its plan test runs too.
+async fn delete_keys(
+    txn: &Transaction<'_>,
+    target: &SweptTarget,
+    arrays: &[Vec<Option<String>>],
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    let sql = delete_statement(target, arrays);
+    let status = target.status.as_str();
+    let mut params: Vec<&(dyn ToSql + Sync)> =
+        arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+    params.push(&target.id);
+    params.push(&status);
+    crate::staging::ledger::query_by_entry_key(txn, &sql, &params).await
+}
+
+/// [`Sweep::delete`]'s statement: deletes `target`'s rows whose key is one
+/// of `arrays`' (column `j`'s values in `arrays[j]`, bound as `$j+1`), if
+/// the definition is still in the status the sweep read it in (`$arity+1`,
+/// `$arity+2`), and returns each deleted row's key (and prior image).
+fn delete_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> String {
+    let arity = target.key_cols.len();
+    let cols: Vec<String> = (0..arity).map(keyset_col).collect();
+    // Each value is cast back from its text on its own (rather than the
+    // array as a whole), so any key type with a text input works, an
+    // array-typed one included.
+    let typed: Vec<String> = target
+        .key_cols
+        .iter()
+        .zip(&cols)
+        .map(|(c, k)| format!("{k}::{} as {k}", c.data_type))
+        .collect();
+    let arrays_sql: Vec<String> = (1..=arity).map(|i| format!("${i}::text[]")).collect();
+    let target_cols: Vec<String> = target
+        .key_cols
+        .iter()
+        .map(|c| format!("t.{}", quote_ident(&c.name)))
+        .collect();
+    let patterns = null_patterns(arrays);
+    let bound = keyset_bound(&target_cols, &target.key_cols, &patterns);
+    let guard = match &target.ledger_guard {
+        Some(ledger) => {
+            use crate::defs::ledger::{MEMBER_COLUMN, TOMBSTONE_COLUMN};
+            let matches: Vec<String> = target
+                .key_cols
+                .iter()
+                // Not `is not distinct from`, which no index serves.
+                .map(|c| {
+                    format!(
+                        "(l.{0} = t.{0} or (l.{0} is null and t.{0} is null))",
+                        quote_ident(&c.name)
+                    )
+                })
+                .collect();
+            format!(
+                " and not exists (select 1 from {ledger} as l where l.{} and not l.{} and {})",
+                quote_ident(MEMBER_COLUMN),
+                quote_ident(TOMBSTONE_COLUMN),
+                matches.join(" and "),
+            )
+        }
+        None => String::new(),
+    };
+    format!(
+        "delete from {} as t using (select {} from unnest({}) as u({})) as k \
+         where {}{bound}{guard} and exists ( \
+             select 1 from transform_definitions where id = ${} and status = ${} \
+         ) \
+         returning {}",
+        target.target_ident,
+        typed.join(", "),
+        arrays_sql.join(", "),
+        cols.join(", "),
+        keyset_match_cols(&target_cols, &patterns),
+        arity + 1,
+        arity + 2,
+        target.returning,
+    )
+}
+
 /// The `k`-alias column name for the `i`th `GROUP BY` column in a keyset
 /// `unnest(...)`. Named `c0`, `c1`, … so they never
 /// collide with the source/target's own (arbitrarily-named) grouping columns
@@ -916,6 +939,44 @@ fn keyset_match_cols(cols: &[String], patterns: &[Vec<bool>]) -> String {
                 .join(" or ")
         ),
     }
+}
+
+/// Restricts a single-column key to the keyset's own array (` and <col> =
+/// any($1::text[]::<type>[])`), which [`keyset_match_cols`] already implies,
+/// so the target's side of whatever join the planner picks is bounded by the
+/// keys (#790). At 1M rows analyzed at 100, a 5,000-key delete hashed a
+/// sequential scan of the target, 128 ms against 32 ms through its index.
+/// The delete also runs under `ENTRY_PLAN_SETTINGS` (no sequential scan):
+/// PostgreSQL 16, unlike 17, still scanned a 400k-row target and filtered it
+/// by the bound.
+///
+/// Empty otherwise:
+/// - **A composite key** ([`bounds_keyset_by_array`]). One bound per column
+///   makes the planner expect a row or two from the target and compare every
+///   bounded row with every key, quadratic in the batch even with fresh
+///   statistics: 2.6 s against 33 ms for 5,000 keys of a four-column key at
+///   3M rows.
+/// - **A keyset with a `NULL` key**, which has two [`null_patterns`]. The
+///   match is then an `or` of the patterns, which no hash or merge join can
+///   take, so the planner already probes the index once per key.
+/// - **An array-typed column.** Its keyset values are cast one by one (see
+///   [`delete_statement`]), and a bound casts the array whole.
+fn keyset_bound(cols: &[String], key_cols: &[PrimaryKeyColumn], patterns: &[Vec<bool>]) -> String {
+    let [pattern] = patterns else {
+        return String::new();
+    };
+    if !bounds_keyset_by_array(key_cols) {
+        return String::new();
+    }
+    cols.iter()
+        .zip(key_cols)
+        .zip(pattern)
+        .enumerate()
+        .filter(|(_, ((_, c), null))| !**null && !c.data_type.ends_with(']'))
+        .map(|(i, ((col, c), _))| {
+            format!(" and {col} = any(${}::text[]::{}[])", i + 1, c.data_type)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1353,6 +1414,208 @@ mod db_tests {
                 "after {edit:?}, got {err:?}"
             );
         }
+    }
+
+    /// Issue #790: [`delete_statement`] reads only its keys' rows of a
+    /// single-column key's target whose statistics lag its size: analyzed at
+    /// 100 rows, then grown to 400k with autovacuum off. Left to the keyset
+    /// join alone, the planner hashed 5,000 keys against a sequential scan of
+    /// the target; [`keyset_bound`] caps the target's side at the keys. The
+    /// delete is explained the way [`Sweep::delete`] runs it, under
+    /// `ENTRY_PLAN_SETTINGS`: with the bound alone, PostgreSQL 16 still
+    /// scanned the target and filtered it (CI).
+    ///
+    /// A composite key isn't bounded. With fresh statistics, a four-column
+    /// key at 2M rows must not be matched by comparing every target row with
+    /// every key, which one bound per column made the planner do (2.6 s
+    /// against 33 ms at 3M rows). A batch with `NULL`-bearing keys in more
+    /// than one pattern isn't bounded either, and still probes the index per
+    /// key while statistics lag. Every key must still be deleted.
+    #[tokio::test]
+    async fn the_sweep_delete_reads_only_its_keys_while_target_statistics_lag() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (_pool, mut raw) = connect(&db).await;
+        raw.batch_execute(
+            "create table public.single (id int primary key, total int) \
+                 with (autovacuum_enabled = false); \
+             create table public.composite (g int, h text, total int, \
+                                            unique nulls not distinct (g, h)) \
+                 with (autovacuum_enabled = false); \
+             create table public.wide (a int, b text, c int, d text, total int, \
+                                       unique nulls not distinct (a, b, c, d)) \
+                 with (autovacuum_enabled = false); \
+             insert into public.wide select i, 'k' || i, i, 'd' || i, i \
+                 from generate_series(1, 2000000) i; \
+             analyze public.wide; \
+             insert into public.single select i, i from generate_series(1, 100) i; \
+             insert into public.composite select i, 'k' || i, i from generate_series(1, 100) i; \
+             analyze public.single; analyze public.composite; \
+             insert into public.single select i, i from generate_series(101, 400000) i; \
+             insert into public.composite select i, 'k' || i, i \
+                 from generate_series(101, 400000) i; \
+             insert into public.composite values (null, 'k1', 0), (5, null, 0); \
+             insert into source_table_versions (source_table, version) values ('public.t', 1)",
+        )
+        .await
+        .expect("seed targets whose statistics lag");
+        let cases = [
+            ("public.single", "t.total % 79 = 0", true),
+            ("public.wide", "t.total % 79 = 0", false),
+            (
+                "public.composite",
+                "t.g is null or t.h is null or t.total % 79 = 0",
+                false,
+            ),
+        ];
+        for (table, batch, bounded) in cases {
+            let id: i64 = raw
+                .query_one(
+                    "insert into transform_definitions \
+                     (target_table, source_table, source_version, definition_text, status) \
+                     values ($1, 'public.t', 1, 'unused', 'catching_up') \
+                     on conflict (target_table) do update set status = excluded.status \
+                     returning id",
+                    &[&table],
+                )
+                .await
+                .expect("seed the definition")
+                .get(0);
+            let key_cols = ddl::identity_key_columns(&raw, table)
+                .await
+                .expect("identity");
+            let target = SweptTarget {
+                id,
+                status: TransformStatus::CatchingUp,
+                target: table.to_string(),
+                target_ident: ddl::qualified_target_table_ident(table),
+                returning: ddl::pk_key_sql_expr(&key_cols, Some("t")),
+                key_cols,
+                branches: Vec::new(),
+                has_image: false,
+                ledger_guard: None,
+                ledger_rederive: None,
+            };
+            let columns: Vec<String> = target
+                .key_cols
+                .iter()
+                .map(|c| format!("t.{}::text", quote_ident(&c.name)))
+                .collect();
+            let key_sql = ddl::pk_key_sql_expr(&target.key_cols, Some("t"));
+            let rows: Vec<(String, Vec<Option<String>>)> = raw
+                .query(
+                    &format!(
+                        "select {key_sql}, {} from {table} t where {batch} \
+                         order by t.total limit 5000",
+                        columns.join(", ")
+                    ),
+                    &[],
+                )
+                .await
+                .expect("keys")
+                .into_iter()
+                .map(|row| {
+                    let parts = (1..=columns.len()).map(|i| row.get(i)).collect();
+                    (row.get(0), parts)
+                })
+                .collect();
+            assert_eq!(rows.len(), 5000);
+            let arrays: Vec<Vec<Option<String>>> = (0..columns.len())
+                .map(|j| rows.iter().map(|(_, parts)| parts[j].clone()).collect())
+                .collect();
+            let sql = delete_statement(&target, &arrays);
+            assert_eq!(
+                sql.contains("= any("),
+                bounded,
+                "{table}: bounded only for a single-column key with one NULL pattern:\n{sql}"
+            );
+            let status = target.status.as_str();
+            let mut params: Vec<&(dyn ToSql + Sync)> =
+                arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+            params.push(&target.id);
+            params.push(&status);
+            let mut txn = raw.transaction().await.expect("begin");
+            let explain = txn.savepoint("explain").await.expect("savepoint");
+            let plan: String = crate::staging::ledger::query_by_entry_key(
+                &explain,
+                &format!("explain (analyze, timing off) {sql}"),
+                &params,
+            )
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+            explain
+                .rollback()
+                .await
+                .expect("roll back the explain's delete");
+            let name = &table["public.".len()..];
+            let scans: Vec<&str> = plan
+                .lines()
+                .filter(|line| line.contains(&format!(" on {name} ")))
+                .collect();
+            assert!(
+                !scans.is_empty(),
+                "{table}: no scan of the target in:\n{plan}"
+            );
+            for scan in scans {
+                let estimate: f64 = scan
+                    .split("rows=")
+                    .nth(1)
+                    .and_then(|rest| rest.split(' ').next())
+                    .and_then(|rows| rows.parse().ok())
+                    .expect("a row estimate");
+                assert!(
+                    !scan.contains("Seq Scan") && estimate <= rows.len() as f64,
+                    "{table}: the target must be read through the keys, got:\n{plan}"
+                );
+            }
+            let filtered: u64 = plan
+                .lines()
+                .filter_map(|line| line.split("Rows Removed by Join Filter: ").nth(1))
+                .map(|n| n.trim().parse::<u64>().expect("a row count"))
+                .sum();
+            assert!(
+                filtered < rows.len() as u64,
+                "{table}: the target must be matched to the keys without comparing \
+                 every row with every key, got:\n{plan}"
+            );
+            let before = seq_scans_in_txn(&txn, table).await;
+            let deleted: std::collections::HashSet<String> = delete_keys(&txn, &target, &arrays)
+                .await
+                .expect("delete")
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert_eq!(
+                seq_scans_in_txn(&txn, table).await,
+                before,
+                "{table}: the sweep's delete must not scan the target, as its plan above doesn't"
+            );
+            txn.rollback().await.expect("roll back");
+            assert_eq!(
+                deleted,
+                rows.into_iter().map(|(key, _)| key).collect(),
+                "{table}: every key is deleted"
+            );
+        }
+    }
+
+    /// How many sequential scans of `table` this transaction has started so
+    /// far (`pg_stat_xact_user_tables` counts the open transaction's own).
+    /// The plan above is explained through `query_by_entry_key`; this checks
+    /// that [`delete_keys`] runs it that way too, which PostgreSQL 16 would
+    /// otherwise plan as a scan of a stale target (#790).
+    async fn seq_scans_in_txn(txn: &Transaction<'_>, table: &str) -> i64 {
+        txn.query_one(
+            "select seq_scan from pg_stat_xact_user_tables where relid = $1::text::regclass",
+            &[&table],
+        )
+        .await
+        .expect("the transaction's scan count")
+        .get(0)
     }
 }
 
