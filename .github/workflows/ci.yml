@@ -126,6 +126,14 @@ jobs:
         # `--no-fail-fast` so one failing test binary doesn't stop the rest
         # from running, and one run shows every failure, as `verify` does
         # locally (issue #665).
+        #
+        # The throwaway clusters run with `jit=off`. The runner's Postgres
+        # (pgdg 16, built --with-llvm) may JIT-compile the large generate_series
+        # and aggregate statements the data-heavy tests run; those ran ~17x
+        # slower here than on a machine whose Postgres has no JIT. JIT is
+        # chosen after planning, so it changes no results or plans.
+        env:
+          TRELLIS_TESTKIT_PG_OPTIONS: jit=off
         run: cargo test --workspace --features benchmark/engine-access --no-fail-fast
 
       - name: Prune target/ to third-party dependencies
