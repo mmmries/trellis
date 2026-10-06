@@ -586,6 +586,10 @@ async fn the_capture_pass_pauses_a_reader_once_the_policies_apply_and_self_check
 /// to-one to-side whose policies apply to the session's role, even when the
 /// ring's owner is exempt. Here the ring's owner has `BYPASSRLS`, which a
 /// login role that is a member of it doesn't inherit.
+///
+/// Declaring the to-one relationship seeds that projection too, so it is
+/// refused the same way: the session runs with `row_security = off` (issue
+/// #766), and the seed would otherwise fail on Postgres's bare error.
 #[tokio::test]
 async fn defining_refuses_a_to_one_to_side_whose_policies_apply_to_the_session_role() {
     let cluster = TestCluster::start();
@@ -604,10 +608,24 @@ async fn defining_refuses_a_to_one_to_side_whose_policies_apply_to_the_session_r
     let definer = trellis::Trellis::connect(config, trellis::TrellisOptions::default())
         .await
         .expect("connect as the definer");
-    definer
+    let rls = refused_for_row_security(
+        definer
+            .apply("RELATIONSHIP parent FROM c.pid TO p.id")
+            .await,
+    );
+    assert_eq!(
+        rls,
+        RowSecurity {
+            table: "public.p".to_string(),
+            role: "rls_definer".to_string(),
+            owner_forced: true,
+            target: false,
+        }
+    );
+    it.trellis
         .apply("RELATIONSHIP parent FROM c.pid TO p.id")
         .await
-        .expect("declaring a relationship isn't checked");
+        .expect("the ring's owner, with BYPASSRLS, declares it");
     let rls = refused_for_row_security(
         definer
             .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
@@ -660,7 +678,7 @@ async fn defining_refuses_a_to_one_to_side_whose_policies_apply_to_the_session_r
         (1..=3)
             .map(|i| (i, Some(format!("n{i}"))))
             .collect::<Vec<_>>(),
-        "every to-side row seeds the projection, the relationship's hidden one included"
+        "every to-side row seeds the projection, the definer's hidden one included"
     );
     definer.shutdown().await.expect("shutdown");
     it.trellis.shutdown().await.expect("shutdown");
@@ -766,15 +784,35 @@ async fn amount_of(admin: &Client, table: &str, id: i32) -> Option<String> {
         .get(0)
 }
 
-/// Which role writes a target (#765): apply's writes are plain SQL on the
-/// draining connection, so they run as that connection's login role, not as
-/// the ring's owner (no `SECURITY DEFINER` function is involved). A policy
-/// that admits only the ring's owner lets a drain logged in as it update
-/// the target, and fails the same drain logged in as a member of it, even
-/// though the member inherits the owner's privileges and ownership: apply's
-/// upsert fails the policy's `WITH CHECK`.
+/// The quarantine's record of every key it has charged or evicted.
+async fn poison_rows(admin: &Client) -> i64 {
+    admin
+        .query_one(&format!("select count(*) from {SCHEMA}.poison"), &[])
+        .await
+        .expect("count poison rows")
+        .get(0)
+}
+
+/// Which role writes a target (#765), and what happens when row-level
+/// security applies to a role the catalog checks never look at (#766).
+///
+/// Apply's writes are plain SQL on the draining connection, so they run as
+/// that connection's login role, not as the ring's owner (no `SECURITY
+/// DEFINER` function is involved). Here the ring's owner has `BYPASSRLS` and
+/// a drain logged in as it updates the target. A login role that is a member
+/// of it doesn't inherit `BYPASSRLS`, so the target's forced policies apply
+/// to it. Neither define, nor the capture pass, nor `self_check` checks that
+/// role: they run as the ring's owner, which is exempt.
+///
+/// The policy hides row 1, so with row-level security on, the member's
+/// update of it would silently match nothing and leave the target stale.
+/// Every Trellis connection runs with `row_security = off`, so the write
+/// raises instead, and the drain pauses the definition that writes the
+/// target as a halt, with the reason naming the table and the role, rather
+/// than charging the page's keys to the quarantine. The rest of the page
+/// commits.
 #[tokio::test]
-async fn apply_writes_a_target_as_the_draining_connections_role() {
+async fn a_drain_as_an_unchecked_role_pauses_the_writer_instead_of_skipping_rows() {
     let cluster = TestCluster::start();
     let mut it = instance(&cluster).await;
     it.trellis
@@ -789,17 +827,24 @@ async fn apply_writes_a_target_as_the_draining_connections_role() {
     );
     it.admin
         .batch_execute(
-            "create role rls_worker login in role rls_trellis; \
+            "alter role rls_trellis bypassrls; \
+             create role rls_worker login in role rls_trellis; \
              alter table public.c_copy enable row level security, force row level security; \
-             create policy ring_owner_only on public.c_copy \
-               using (current_user = 'rls_trellis') \
-               with check (current_user = 'rls_trellis');",
+             create policy hide_one on public.c_copy using (id <> 1) with check (true);",
         )
         .await
-        .expect("a member login role, and a policy only the ring's owner passes");
+        .expect("a member login role the target's policies apply to");
     let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
     let config = trellis::Config::with_schema(dsn, SCHEMA).expect("valid config");
     let worker = trellis::Pool::new(&config).expect("pool");
+
+    // The catalog checks run as the ring's owner, which is exempt.
+    capture_pass(&mut it.raw, &it.pool).await;
+    assert_eq!(
+        status(&it.trellis, "c_copy").await.status,
+        TransformStatus::Live,
+        "the capture pass, as the ring's owner, sees nothing to pause"
+    );
 
     it.admin
         .batch_execute("update public.c set amount = 100 where id = 1")
@@ -807,7 +852,7 @@ async fn apply_writes_a_target_as_the_draining_connections_role() {
         .expect("write the source");
     seal_and_drain(&mut it.raw, &it.pool)
         .await
-        .expect("a drain as the ring's owner passes the policy");
+        .expect("a drain as the ring's owner, which has BYPASSRLS, passes");
     assert_eq!(
         amount_of(&it.admin, "public.c_copy", 1).await,
         Some("100".to_string())
@@ -817,22 +862,238 @@ async fn apply_writes_a_target_as_the_draining_connections_role() {
         .batch_execute("update public.c set amount = 200 where id = 1")
         .await
         .expect("write the source");
-    let drained = seal_and_drain(&mut it.raw, &worker).await;
-    assert!(
-        drained
-            .as_ref()
-            .is_err_and(|err| err.contains("violates row-level security policy")),
-        "the member's upsert fails the policy: {drained:?}"
-    );
+    seal_and_drain(&mut it.raw, &worker)
+        .await
+        .expect("the member's drain pauses the writer and commits the rest of the page");
     assert_eq!(
         amount_of(&it.admin, "public.c_copy", 1).await,
         Some("100".to_string()),
         "the member's write didn't land"
     );
+    let paused = status(&it.trellis, "c_copy").await;
+    assert_eq!(paused.status, TransformStatus::Paused);
+    let failure = paused.capture_failure.expect("the halt's record");
+    assert_eq!(failure.kind, trellis::CaptureFailureKind::Halt);
+    assert!(
+        failure
+            .error
+            .contains("row-level security on target public.c_copy applies to role rls_worker"),
+        "{}",
+        failure.error
+    );
+    assert!(
+        failure
+            .error
+            .contains("query would be affected by row-level security policy"),
+        "carries Postgres's own message: {}",
+        failure.error
+    );
+    assert!(
+        failure.error.contains("docs/transforms.md"),
+        "points to the docs: {}",
+        failure.error
+    );
+    assert_eq!(
+        poison_rows(&it.admin).await,
+        0,
+        "no key was charged for a failure that isn't any key's"
+    );
     it.trellis.shutdown().await.expect("shutdown");
 }
 
-/// Registration creates the target as the session's role, with RLS off, so
+/// The read half of the drain test above (#766): a relationship's to-side
+/// whose policies apply to the drain's login role, but not to the ring's
+/// owner the catalog checks look at. The drain's read of it raises, and the
+/// drain pauses the definition that reads through the relationship, naming
+/// the to-side, instead of reading the hidden parent as absent.
+#[tokio::test]
+async fn a_drain_as_an_unchecked_role_pauses_the_reader_of_a_hidden_to_side() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.trellis
+        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
+        .await
+        .expect("declare a relationship");
+    it.trellis
+        .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
+        .await
+        .expect("define");
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    assert_eq!(
+        status(&it.trellis, "c_named").await.status,
+        TransformStatus::Live
+    );
+    it.admin
+        .batch_execute(
+            "alter role rls_trellis bypassrls; \
+             create role rls_worker login in role rls_trellis; \
+             alter table public.p enable row level security, force row level security; \
+             create policy hide_two on public.p using (id <> 2);",
+        )
+        .await
+        .expect("a member login role the to-side's policies apply to");
+    let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
+    let config = trellis::Config::with_schema(dsn, SCHEMA).expect("valid config");
+    let worker = trellis::Pool::new(&config).expect("pool");
+    capture_pass(&mut it.raw, &it.pool).await;
+    assert_eq!(
+        status(&it.trellis, "c_named").await.status,
+        TransformStatus::Live,
+        "the capture pass, as the ring's owner, sees nothing to pause"
+    );
+
+    it.admin
+        .batch_execute("update public.p set name = 'renamed' where id = 2")
+        .await
+        .expect("write the to-side");
+    seal_and_drain(&mut it.raw, &worker)
+        .await
+        .expect("the member's drain pauses the reader and commits the rest of the page");
+    let paused = status(&it.trellis, "c_named").await;
+    assert_eq!(paused.status, TransformStatus::Paused);
+    let failure = paused.capture_failure.expect("the halt's record");
+    assert_eq!(failure.kind, trellis::CaptureFailureKind::Halt);
+    assert_eq!(failure.source_table, "public.p");
+    assert!(
+        failure
+            .error
+            .contains("row-level security on public.p applies to role rls_worker"),
+        "{}",
+        failure.error
+    );
+    assert_eq!(poison_rows(&it.admin).await, 0);
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// A refused read beside a key failure (#766 with #799). The page holds a
+/// change to a to-side whose policies apply to the drain's role, and a change
+/// to key 1 of `c` that one of `c`'s three readers, `c_cheap`, fails to write
+/// (its target refuses the amount). The refusal halts the definition reading
+/// through the relationship, charging no key, and the page's retries skip the
+/// refused table. So do isolation's probes: a bisection probe holding the
+/// to-side's change would otherwise read the refused table again, halt on its
+/// `42501` and leave key 1 uncharged on every drain. (Attribution's probes
+/// skip the same way, but hold only key 1's record, which reads nothing
+/// refused.) Key 1 is charged to `c_cheap` alone and, at the death threshold,
+/// held for it, while `c_copy` applies it.
+#[tokio::test]
+async fn a_refused_read_halts_while_a_key_failure_beside_it_is_held_for_its_definition() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.trellis
+        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
+        .await
+        .expect("declare a relationship");
+    for ddl in [
+        "TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name",
+        "TRANSFORM c_cheap FROM public.c SELECT amount AS amount",
+        "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
+    ] {
+        it.trellis.apply(ddl).await.expect(ddl);
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    for target in ["c_named", "c_cheap", "c_copy"] {
+        assert_eq!(
+            status(&it.trellis, target).await.status,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    it.admin
+        .batch_execute(
+            "alter role rls_trellis bypassrls; \
+             create role rls_worker login in role rls_trellis; \
+             alter table public.p enable row level security, force row level security; \
+             create policy hide_two on public.p using (id <> 2); \
+             alter table public.c_cheap add constraint cheap check (amount < 100);",
+        )
+        .await
+        .expect("a member login role the to-side's policies apply to, and a narrow target");
+    let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
+    let config = trellis::Config::with_schema(dsn, SCHEMA).expect("valid config");
+    let worker = trellis::Pool::new(&config).expect("pool");
+
+    it.admin
+        .batch_execute(
+            "update public.p set name = 'renamed' where id = 2; \
+             update public.c set amount = 500 where id = 1;",
+        )
+        .await
+        .expect("write the to-side and the source");
+    let sealed = seal::seal_phase1(&mut it.raw).await.expect("seal phase 1");
+    seal::seal_phase2(&it.raw, sealed.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+    let mut failures = 0;
+    loop {
+        match apply::drain_once(
+            &worker,
+            sealed.sealed_seg_seq,
+            "row_security_test",
+            1,
+            "trellis_row_security_test",
+            &StagedWatermark::saturated(),
+        )
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(err) => {
+                failures += 1;
+                assert!(failures <= 20, "the page never committed: {err}");
+            }
+        }
+    }
+    assert_eq!(
+        failures,
+        trellis::staging::DEFAULT_DEATH_THRESHOLD as usize - 1,
+        "each drain below the threshold charges key 1 once, and the one that crosses it \
+         holds the key and commits the page"
+    );
+
+    let halted = status(&it.trellis, "c_named").await;
+    assert_eq!(halted.status, TransformStatus::Paused);
+    let failure = halted.capture_failure.expect("the halt's record");
+    assert_eq!(failure.kind, trellis::CaptureFailureKind::Halt);
+    assert_eq!(failure.source_table, "public.p");
+    let poisoned: Vec<(String, String)> = it
+        .admin
+        .query(
+            &format!(
+                "select split_part(d.target_table, '.', 2), p.key from {SCHEMA}.poison p \
+                 join {SCHEMA}.transform_definitions d on d.id = p.transform_id order by 1, 2"
+            ),
+            &[],
+        )
+        .await
+        .expect("read poison")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        poisoned,
+        vec![("c_cheap".to_string(), "1".to_string())],
+        "key 1 is held for the definition whose write failed, and the refusal charged nothing"
+    );
+    assert_eq!(
+        status(&it.trellis, "c_cheap").await.status,
+        TransformStatus::Live
+    );
+    assert_eq!(
+        amount_of(&it.admin, "public.c_copy", 1).await,
+        Some("500".to_string()),
+        "c_copy applied the change c_cheap failed on"
+    );
+    assert_eq!(
+        amount_of(&it.admin, "public.c_cheap", 1).await,
+        Some("1".to_string()),
+        "c_cheap holds key 1"
+    );
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
 /// defining refuses a target only when DDL around its creation makes the
 /// policies apply to that role: here an event trigger that enables and
 /// forces RLS on each new table (#765). One that only enables it, a common
@@ -1240,5 +1501,288 @@ async fn a_seam_fed_table_its_readers_own_is_not_checked_for_the_ring_owner() {
         );
     }
     worker.shutdown().await.expect("shutdown");
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// Once every definition reading a to-side through a relationship is paused
+/// for row-level security that applies to the drain's role, the drain still
+/// keeps the relationship's settled projection current from the to-side's
+/// changes, and every Trellis session runs with `row_security = off` (#766),
+/// so that read is refused. The drain skips the table instead, as it does a
+/// table whose key can't be used (#768), so the page commits rather than
+/// failing forever, and nothing is charged to the quarantine. A resume
+/// refreshes the projection, so the rebuilt target reads the change the
+/// skip left out.
+#[tokio::test]
+async fn a_to_side_whose_readers_are_paused_for_row_security_drains_past_the_refusal() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.trellis
+        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
+        .await
+        .expect("declare a relationship");
+    it.trellis
+        .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
+        .await
+        .expect("define");
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    it.admin
+        .batch_execute(
+            "alter table public.p enable row level security, force row level security; \
+             create policy hide_two on public.p using (id <> 2);",
+        )
+        .await
+        .expect("force RLS on the to-side");
+    capture_pass(&mut it.raw, &it.pool).await;
+    let paused = status(&it.trellis, "c_named").await;
+    assert_eq!(paused.status, TransformStatus::Paused);
+    assert_eq!(
+        paused.capture_failure.expect("the pass's record").kind,
+        trellis::CaptureFailureKind::Capture
+    );
+
+    it.admin
+        .batch_execute("update public.p set name = 'renamed' where id = 2")
+        .await
+        .expect("write the to-side");
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("the drain skips the refused to-side and commits the page");
+    assert_eq!(poison_rows(&it.admin).await, 0);
+
+    it.admin
+        .batch_execute("alter role rls_trellis bypassrls")
+        .await
+        .expect("exempt the role");
+    it.trellis
+        .apply("RESUME TRANSFORM c_named")
+        .await
+        .expect("resume");
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    assert_eq!(
+        status(&it.trellis, "c_named").await.status,
+        TransformStatus::Live
+    );
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("the drain applies the rebuild");
+    let name: Option<String> = it
+        .admin
+        .query_one("select name from public.c_named where id = 1", &[])
+        .await
+        .expect("read the target")
+        .get(0);
+    assert_eq!(
+        name.as_deref(),
+        Some("renamed"),
+        "the rebuild read the change"
+    );
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// The relationship's settled projection on `to_table`'s `label` for `id`,
+/// read as the superuser.
+async fn projected_label(admin: &Client, relationship: &str, id: i32) -> Option<String> {
+    let projection: String = admin
+        .query_one(
+            &format!(
+                "select rp.projection_table from {SCHEMA}.relationship_projections rp \
+                 join {SCHEMA}.relationship_definitions rd on rd.id = rp.relationship_id \
+                 where rd.name = $1"
+            ),
+            &[&relationship],
+        )
+        .await
+        .expect("the relationship has a projection")
+        .get(0);
+    admin
+        .query_opt(
+            &format!("select label from {SCHEMA}.{projection} where id = $1"),
+            &[&id],
+        )
+        .await
+        .expect("read the projection")
+        .and_then(|row| row.get(0))
+}
+
+/// The refused page's retry (#766) skips every table no unfrozen definition
+/// reads, not just the refused one: here a healthy to-side, `q`, sharing the
+/// page, whose only reader is paused. Its change never reaches its
+/// relationship's projection, as for a table skipped for its key (#768), so
+/// the next definition to read through the relationship must refresh the
+/// projection from the table, or it would go live on the stale label.
+#[tokio::test]
+async fn a_healthy_to_side_skipped_beside_a_refused_one_is_refreshed_by_the_next_reader() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.admin
+        .batch_execute(
+            "create table public.q (id int primary key, label text); \
+             create table public.d (id int primary key, qid int); \
+             insert into public.q values (1, 'old'); \
+             insert into public.d values (1, 1); \
+             alter table public.q owner to rls_trellis; \
+             alter table public.d owner to rls_trellis;",
+        )
+        .await
+        .expect("a second relationship's tables");
+    for statement in [
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+        "TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name",
+        "RELATIONSHIP tag FROM d.qid TO q.id",
+        "TRANSFORM d_tagged FROM public.d SELECT tag.label AS label",
+    ] {
+        it.trellis.apply(statement).await.expect(statement);
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    it.trellis
+        .apply("PAUSE TRANSFORM d_tagged")
+        .await
+        .expect("pause q's only reader");
+    it.admin
+        .batch_execute(
+            "alter table public.p enable row level security, force row level security; \
+             create policy hide_two on public.p using (id <> 2);",
+        )
+        .await
+        .expect("force RLS on the to-side");
+    capture_pass(&mut it.raw, &it.pool).await;
+    assert_eq!(
+        status(&it.trellis, "c_named").await.status,
+        TransformStatus::Paused
+    );
+
+    it.admin
+        .batch_execute(
+            "update public.p set name = 'renamed' where id = 2; \
+             update public.q set label = 'new' where id = 1;",
+        )
+        .await
+        .expect("write both to-sides into one page");
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("the retry skips both to-sides and commits the page");
+    assert_eq!(
+        projected_label(&it.admin, "tag", 1).await.as_deref(),
+        Some("old"),
+        "q's change was skipped with the refused table"
+    );
+
+    it.trellis
+        .apply("TRANSFORM d_relabelled FROM public.d SELECT tag.label AS label")
+        .await
+        .expect("a new reader of the relationship");
+    assert_eq!(
+        projected_label(&it.admin, "tag", 1).await.as_deref(),
+        Some("new"),
+        "the define refreshed the projection the skip left stale"
+    );
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("drain after the define");
+    let label: Option<String> = it
+        .admin
+        .query_one("select label from public.d_relabelled where id = 1", &[])
+        .await
+        .expect("read the new reader's target")
+        .get(0);
+    assert_eq!(label.as_deref(), Some("new"));
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// The from-side half of the skip (#766). A relationship's from-side, `c`,
+/// has policies that apply to the drain's role, and its to-side, `p`, has a
+/// live reader of its own, `p_copy`. An image-less change to `p` (a
+/// `recompute`, as a backfill, a release or a propagation hop stages)
+/// re-derives the `c` rows that read it, so the drain looks those rows up in
+/// `c`, and that read is refused. The refusal halts `c_named`, the only
+/// definition reading `c`, and the retry skips the lookup as it skips `c`'s
+/// own changes, so the page commits and `p_copy` applies its share. Without
+/// the skip the retry is refused again on every pass, and the ring stalls
+/// behind the page.
+#[tokio::test]
+async fn a_to_side_recompute_skips_a_from_side_whose_readers_are_halted_for_row_security() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.trellis
+        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
+        .await
+        .expect("declare a relationship");
+    for ddl in [
+        "TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name",
+        "TRANSFORM p_copy FROM public.p SELECT name AS name",
+    ] {
+        it.trellis.apply(ddl).await.expect(ddl);
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("the registrations drain before any policy applies");
+    for target in ["c_named", "p_copy"] {
+        assert_eq!(
+            status(&it.trellis, target).await.status,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    it.admin
+        .batch_execute(
+            "alter role rls_trellis bypassrls; \
+             create role rls_worker login in role rls_trellis; \
+             alter table public.c enable row level security, force row level security; \
+             create policy hide_two on public.c using (id <> 2); \
+             set session_replication_role = replica; \
+             update public.p set name = 'renamed' where id = 2; \
+             reset session_replication_role;",
+        )
+        .await
+        .expect("a member login role the from-side's policies apply to, and an uncaptured write");
+    let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
+    let config = trellis::Config::with_schema(dsn, SCHEMA).expect("valid config");
+    let worker = trellis::Pool::new(&config).expect("pool");
+
+    let ring_slot: i16 = it
+        .raw
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment_pointer")
+        .get(0);
+    it.raw
+        .execute(
+            &format!(
+                "insert into seg_{ring_slot} (src_table, key, op, lsn, old_image, new_image, \
+                 hop_gen) values ('public.p', '2', 'recompute', null, null, null, 0)"
+            ),
+            &[],
+        )
+        .await
+        .expect("stage an image-less change to the to-side");
+    seal_and_drain(&mut it.raw, &worker)
+        .await
+        .expect("the drain halts the from-side's reader, skips the lookup and commits");
+
+    let halted = status(&it.trellis, "c_named").await;
+    assert_eq!(halted.status, TransformStatus::Paused);
+    let failure = halted.capture_failure.expect("the halt's record");
+    assert_eq!(failure.kind, trellis::CaptureFailureKind::Halt);
+    assert_eq!(failure.source_table, "public.c");
+    assert_eq!(
+        status(&it.trellis, "p_copy").await.status,
+        TransformStatus::Live
+    );
+    let name: Option<String> = it
+        .admin
+        .query_one("select name from public.p_copy where id = 2", &[])
+        .await
+        .expect("read the target")
+        .get(0);
+    assert_eq!(name.as_deref(), Some("renamed"), "p_copy applied the page");
+    assert_eq!(poison_rows(&it.admin).await, 0);
     it.trellis.shutdown().await.expect("shutdown");
 }
