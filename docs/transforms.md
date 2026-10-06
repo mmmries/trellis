@@ -33,6 +33,7 @@ a key, index or policy itself.
 | A column Trellis keeps a typed copy of, widened: a 1-1 target's key or passthrough column, an aggregate's `GROUP BY` key (copied into its target, ledger and group-delta table, and, for one read through a relationship, the relationship projection's column for it), a relationship projection's key. Widenings are `integer` → `bigint` (and `smallint` up), `varchar(n)` → longer or `text`, and a wider `numeric`, temporal, `interval` or `bit varying` precision (#767) | n/a: each copy takes the source column's type at define. | The copy keeps its type, so a value it can't hold would fail its write. The staging worker pauses every transform that owns such a copy, naming the column, its new type and each copy. A narrowing pauses nothing (every value still fits), except a `varchar(n)` key's (the row above). | `RESUME`: the staging worker `ALTER`s each copy to the source's live type, under `ACCESS EXCLUSIVE` (a table rewrite for `integer` → `bigint`; reads of the target wait), then rebuilds. Or drop and define again. |
 | Two `GROUP BY` keys that share a target column name (`buyer.name` and `seller.name`, or `name` beside `buyer.name`); keys can't be aliased | Yes. | n/a | Group over a 1-1 transform that selects them under distinct names (`buyer.name AS buyer_name`). |
 | A field named after a 1-1 source key column (`id AS id`), or any field or `GROUP BY` column whose name starts with `__` (#566) | Yes. The target already carries the key columns, and `__` names are Trellis's hidden columns (such as an `AVG`'s running sum). `id AS order_id` is an ordinary column. | n/a | Rename the field. |
+| An aggregate whose argument names another aggregate field when no source column has that name (`SUM(val) AS total, MAX(total)`), directly or through a field that reads one | Yes (`AggregateOfAggregateField`). The argument would nest one aggregate in another, which no build can run. | n/a | Aggregate the source column instead (`MAX(val)`). |
 | `JOIN` | Yes (parse error). Cross-join is not supported. | n/a | Use a [relationship](#relationships). |
 | A `WHERE` other than `TRUE` | Yes (parse error). Partial data is not supported ([#804](https://github.com/salesforce-misc/trellis/issues/804)). | n/a | None. |
 | Chaining off a transform that is not `live` (`TransformNotLive`) | Yes. | n/a | Wait for the upstream to go `live`, then define. |
@@ -189,7 +190,11 @@ by a formula rather than copied from a source column. A formula may reference:
   requires (see [Granularity](#granularity)).
 * Related-table columns through a declared relationship — a bare path for to-one,
   wrapped in an aggregate for to-many (see [Relationships](#relationships)).
-* Other calculated columns on the same target table.
+* Other calculated columns on the same target table. In an aggregate target, an
+  aggregate's argument never reads a column that is itself an aggregate: a name
+  there means the source column, as in SQL. `SUM(val) AS val, MIN(val) AS lo`
+  takes the minimum of the source column `val`, not of the sum. A column that
+  isn't an aggregate (`(id + 1) AS adj, SUM(adj)`) is still read by name.
 
 Formulas may only use **immutable** functions and operators — those whose output
 depends solely on their inputs. Anything depending on database state outside the
