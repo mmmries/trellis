@@ -46,6 +46,9 @@ use crate::capture::CaptureError;
 use crate::capture::columns::{CaptureCatalog, load_catalog, read_columns, readers_of};
 use crate::capture::install::{Installed, installed};
 use crate::defs::catalog::CatalogError;
+use crate::defs::model::RelationshipDefinition;
+use crate::defs::validate::ValidationError;
+use crate::defs::{copies, key_types};
 use crate::pool::Pool;
 
 /// What one table's markers in a drain's segments say is missing, or what
@@ -362,6 +365,277 @@ pub(crate) async fn pause_readers_of_unsupported(
     let txn = client.transaction().await?;
     for (id, error) in pauses {
         if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error).await? {
+            tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
+        }
+    }
+    txn.commit().await?;
+    Ok(true)
+}
+
+/// The staging worker's capture pass's check of the types and collations
+/// of `table`'s columns that a definition keys by or keeps a typed copy of
+/// (issues #760 and #767, [`crate::defs::key_types`],
+/// [`crate::defs::copies`]). It pauses every definition that reads `table`
+/// and isn't paused for a capture failure yet when, on `table`,
+///
+/// 1. one of its key columns has a type or collation define would refuse
+///    for that use now ([`key_types::refusal`]): an `ALTER COLUMN ... TYPE
+///    character(n)` on a join column, a nondeterministic `COLLATE` on a
+///    `GROUP BY` column;
+/// 2. a relationship it reads through no longer joins two columns of the
+///    same type, modifier and collation (#590,
+///    [`crate::defs::catalog::validate_join_pair`]): one join column widened
+///    and the other not (yet);
+/// 3. one of its key columns changed type, since the definition was
+///    accepted or last resumed, in a way that renders the values Trellis
+///    already stored differently ([`key_types::renders_differently`]):
+///    `timestamp` to `timestamptz`, `text` to `uuid`, a narrower
+///    `varchar(n)`; or
+/// 4. a column it keeps a typed copy of widened past the copy
+///    ([`crate::defs::copies::CopyState::outgrown`]): `integer` to `bigint`
+///    under a 1-1 target's key, `varchar(50)` to `text` under a passthrough.
+///
+/// The types the third check compares against are those recorded in
+/// `definition_key_types`; a key column with none recorded (one that joined
+/// the table's row-identity key after define, #687) gets the live one
+/// recorded here instead.
+///
+/// The pause's `capture_failure` names every reason and what to do. Only a
+/// deliberate resume clears it (or a drop): Trellis re-types nothing on its
+/// own. A resume re-validates the definition as define would, and refuses
+/// while the first two hold; otherwise it re-records the key types, brings
+/// the copies to their live types and rebuilds
+/// (`staging::quarantine::resume_transform`).
+///
+/// A key column the table no longer has is
+/// [`pause_readers_of_missing`]'s, which the pass runs first. Returns whether
+/// it paused any. Costs no query for a table no unpaused definition reads.
+pub(crate) async fn pause_readers_of_retyped(
+    client: &mut Client,
+    schema: &str,
+    catalog: &CaptureCatalog,
+    table: &str,
+) -> Result<bool, CaptureError> {
+    let readers = unpaused_readers(catalog, table);
+    if readers.is_empty() {
+        return Ok(false);
+    }
+    let (live, key) = key_types::live_columns(&*client, table).await?;
+    if live.is_empty() {
+        // No such table: `capture_spec` reports it.
+        return Ok(false);
+    }
+    // Each recorded type, with its `format_type` rendering for the reason.
+    let mut recorded: BTreeMap<(i64, String), (key_types::ColumnType, String)> = BTreeMap::new();
+    for row in client
+        .query(
+            "select transform_id, column_name, type_name, typmod, \
+                    coalesce(pg_catalog.format_type(pg_catalog.to_regtype(type_name), typmod), \
+                             type_name) \
+             from definition_key_types \
+             where transform_id = any($1) and table_name = $2",
+            &[&readers, &table],
+        )
+        .await?
+    {
+        recorded.insert(
+            (row.get(0), row.get(1)),
+            (
+                key_types::ColumnType {
+                    type_name: row.get(2),
+                    typmod: row.get(3),
+                },
+                row.get(4),
+            ),
+        );
+    }
+
+    let mut pauses: Vec<(i64, Vec<String>, String)> = Vec::new();
+    let mut unrecorded: Vec<(i64, String)> = Vec::new();
+    for reader in catalog
+        .definitions
+        .iter()
+        .filter(|r| readers.contains(&r.id))
+    {
+        let declared: Vec<&RelationshipDefinition> = catalog
+            .relationships
+            .iter()
+            .filter(|r| r.qualified_from_table() == reader.source)
+            .collect();
+        let to_tables: Vec<String> = declared.iter().map(|r| r.qualified_to_table()).collect();
+        let rels: Vec<key_types::RelRef<'_>> = declared
+            .iter()
+            .zip(&to_tables)
+            .map(|(r, to_table)| key_types::RelRef {
+                name: &r.def.name,
+                from_col: &r.def.from_col,
+                to_col: &r.def.to_col,
+                to_table,
+            })
+            .collect();
+        let mut columns: Vec<String> = Vec::new();
+        let mut reasons: Vec<String> = Vec::new();
+        // Whether a resume would refuse: define refuses what it found.
+        let mut refused = false;
+        let mut flag = |column: &str, reason: String, columns: &mut Vec<String>| {
+            if !columns.iter().any(|c| c == column) {
+                columns.push(column.to_string());
+            }
+            reasons.push(reason);
+        };
+
+        let mut seen: Vec<String> = Vec::new();
+        for (column, key_use) in
+            key_types::key_uses(&reader.def, &reader.source, &rels, table, &key)
+        {
+            if seen.contains(&column) {
+                continue;
+            }
+            seen.push(column.clone());
+            let Some(now) = live.get(&column) else {
+                continue;
+            };
+            if let Some(reason) =
+                key_types::refusal(&*client, table, &column, &key_use, now).await?
+            {
+                refused = true;
+                flag(&column, reason, &mut columns);
+                continue;
+            }
+            match recorded.get(&(reader.id, column.clone())) {
+                Some((old, was)) if key_types::renders_differently(old, &now.ty) => {
+                    flag(
+                        &column,
+                        key_types::retyped_error(table, &column, &key_use, was, now),
+                        &mut columns,
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    if !unrecorded.contains(&(reader.id, column.clone())) {
+                        unrecorded.push((reader.id, column.clone()));
+                    }
+                }
+            }
+        }
+
+        // #590's pairing, for each relationship it reads through with a
+        // join column on this table. A join column refused on its own is
+        // reported above; only the pairing is this check's.
+        let read: BTreeSet<String> = crate::defs::eval::relationship_references(&reader.def)
+            .into_iter()
+            .map(|(rel, _)| rel)
+            .collect();
+        for (rel, to_table) in declared.iter().zip(&to_tables) {
+            if !read.contains(&rel.def.name) {
+                continue;
+            }
+            let column = if rel.qualified_from_table() == table {
+                &rel.def.from_col
+            } else if to_table == table {
+                &rel.def.to_col
+            } else {
+                continue;
+            };
+            if columns.contains(column) || !live.contains_key(column) {
+                continue;
+            }
+            match crate::defs::catalog::validate_join_pair(
+                &*client,
+                &rel.def,
+                &rel.qualified_from_table(),
+                to_table,
+                false,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(CatalogError::Db(err)) => return Err(err.into()),
+                Err(CatalogError::Pool(err)) => return Err(CatalogError::Pool(err).into()),
+                Err(err @ CatalogError::Validate(ValidationError::RelationshipTypeMismatch(_))) => {
+                    refused = true;
+                    flag(column, err.to_string(), &mut columns);
+                }
+                // A refused type or collation on the other side is that
+                // table's check's; a missing column is the missing-column
+                // check's.
+                Err(_) => {}
+            }
+        }
+
+        // #767: a copy whose source column on this table outgrew it.
+        let copies: Vec<copies::TypedCopy> = copies::typed_copies(
+            &*client,
+            schema,
+            &reader.def,
+            &reader.source,
+            &reader.target,
+            &declared,
+        )
+        .await?
+        .into_iter()
+        .filter(|c| c.source_table == table)
+        .collect();
+        let mut outgrown: BTreeMap<String, Vec<copies::CopyState>> = BTreeMap::new();
+        for state in copies::inspect(&*client, copies).await? {
+            if state.outgrown() && !columns.contains(&state.copy.source_column) {
+                outgrown
+                    .entry(state.copy.source_column.clone())
+                    .or_default()
+                    .push(state);
+            }
+        }
+        for (column, states) in outgrown {
+            let held: Vec<String> = states
+                .iter()
+                .map(|s| format!("{} ({})", s.copy.label(), s.copy_type.display))
+                .collect();
+            flag(
+                &column,
+                format!(
+                    "column {column:?} of {table} widened to {}, and Trellis keeps a copy of it \
+                     that can't hold every value of that type: {}",
+                    states[0].live_type.display,
+                    held.join(", ")
+                ),
+                &mut columns,
+            );
+        }
+
+        if !reasons.is_empty() {
+            let remedy = if refused {
+                "A resume re-validates the definition as define would, and refuses until that \
+                 is fixed. Fix it, then resume the definition to rebuild it, or drop the \
+                 definition and define it again"
+            } else {
+                "Resume the definition: the resume brings Trellis's copies to the new types and \
+                 rebuilds it. Or drop the definition and define it again"
+            };
+            let error = format!("{}. {remedy}", reasons.join("; "));
+            pauses.push((reader.id, columns, error));
+        }
+    }
+
+    // Recorded on its own: the next pass compares against it whether or not
+    // this one pauses anything.
+    let mut by_reader: BTreeMap<i64, Vec<(String, String)>> = BTreeMap::new();
+    for (id, column) in unrecorded {
+        by_reader
+            .entry(id)
+            .or_default()
+            .push((table.to_string(), column));
+    }
+    for (id, columns) in &by_reader {
+        key_types::record(&*client, *id, columns).await?;
+    }
+    if pauses.is_empty() {
+        return Ok(false);
+    }
+    let txn = client.transaction().await?;
+    for (id, columns, error) in pauses {
+        if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &columns, &error)
+            .await?
+        {
             tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
         }
     }
