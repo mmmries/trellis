@@ -264,6 +264,57 @@ generator refactors. Three artifact kinds:
 - **A control test beside each finding** — a case that must *converge* — proving the
   harness can tell green from red.
 
+### The baseline bar: no unknown failures
+
+The concurrent runtime's planted-bug sweep (`planted_bugs_are_caught` in
+`generative/tests/concurrent_convergence.rs`) runs a tier's seeded cases once
+unplanted, as the baseline, then once per planted bug, and judges each plant
+only on cases the baseline passed. **No unknown failure is accepted in a
+generative case**: the baseline passes only with **zero failures outside
+the quarantine list**, `generative/baseline-quarantine.txt`. The rule is the same
+for every tier (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`).
+
+- **Each list entry** is one line, `<tier> <seed>:<case> #<issue> <what fails>`.
+  The case numbering is the sweep's, as `GENERATIVE_PLANT_ONLY=<seed>:<case>` takes
+  it, and the issue is an **open** issue that pins that case's failure. An
+  entry covers the whole case: while it's listed, any failure in that case is
+  left out, not only the one its issue pins.
+- **A failure that isn't listed fails the baseline.** Triage it before the
+  baseline counts: either file it as a bug with its pinned case (check first
+  whether it also fails without your change, and whether an issue already
+  covers it) and list it, or fix the harness defect behind it. A failure is
+  never waved away as a flake. A listed case is left out of every plant's
+  count, whether it failed this run or not.
+- **The list can't go stale.** The sweep looks up every listed issue before it
+  runs anything, and fails if one is closed: the fix has landed, so the entry
+  goes (or the issue was closed early and the case still fails, so it reopens).
+  The lookup goes through `gh api` and is tried again after a network blip; a
+  sweep that still can't make it doesn't run, and neither does one whose entry
+  names a pull request or an issue that doesn't exist. After the baseline, the
+  sweep reports a listed case that passed every time it ran. A race can pass
+  now and then, so that is a prompt to look, not a failure.
+- **A tier's strategy change redraws its cases**, so the same `<seed>:<case>`
+  names a different program. The list isn't a regression pin (those are
+  hand-built, above), so re-sweep the tier and redo its entries.
+
+The bar is a zero with a list, not a failure share: a share lets a real bug fail
+a fixed fraction of cases through routine sweeps, while a strict zero with no
+list would let a known, filed failure block every unrelated change's sweep.
+
+To run the baseline alone, against the bar:
+
+```text
+TMPDIR=/dev/shm GENERATIVE_PLANTS=none GENERATIVE_PLANT_TIER=steady_load \
+GENERATIVE_PLANT_SEEDS=8 cargo test -p generative --test concurrent_convergence \
+    planted_bugs_are_caught -- --ignored --nocapture
+```
+
+`GENERATIVE_PLANTS=all` runs the baseline and then the tier's plant gate. The
+tiers are calibrated for a tmpfs cluster, so run sweeps there. A process run
+directly with `GENERATIVE_PLANT_CHILD=1` (as a repro loop does) is one of the
+sweep's workers, not a gate: it prints a `plant-sweep` row per case and exits
+0 even when a case fails, with no list or bar applied, so read its rows.
+
 ## 7. The action space, and how it grows
 
 Every candidate action falls in one of three buckets by its effect on the oracle:
@@ -348,20 +399,18 @@ Two structural notes for when faults enter the stream:
 - Persist failing seeds locally, replayed first on the next run, but never check
   them in: a seed only names the same program while the strategy keeps its shape,
   so a checked-in seed goes stale on the next generator change (#505). A failure
-  worth keeping becomes a hand-built pin.
+  worth keeping becomes a hand-built pin. (The baseline quarantine list in §6
+  does name cases by seed, but only to exclude known, filed failures from a
+  sweep's baseline. The sweep fails on an entry whose issue is closed and
+  reports one whose case passed, but it can't tell that a generator change
+  has redrawn a listed case, so that change redoes the tier's entries.)
 - **Planted-bug sweeps and their baseline.** The concurrent sweep
   (`planted_bugs_are_caught` in `generative/tests/concurrent_convergence.rs`)
   re-runs generated cases with a deliberate bug planted and checks the tier
-  catches it, against an unplanted baseline. Each tier (`SweepTier`) sets
-  `max_baseline_failure_share`: the sweep fails if the baseline fails more than
-  one case in that many (8 for the cooling-key tier, 20 for the others), because
-  the run is then on the wrong storage and no catch rate means anything. A plant
-  in the tier's `known_misses` is run and reported but doesn't fail the sweep
-  when uncaught, and one in `not_gated` (with its reason) is left out of
-  `GENERATIVE_PLANTS=all`. Today the baseline tolerates that failure share.
-  The target ([#786](https://github.com/salesforce-misc/trellis/issues/786)) is
-  to require 0 baseline failures except a checked-in, issue-linked quarantine
-  list.
+  catches it, against an unplanted baseline that must have zero failures outside
+  the quarantine list (§6). A plant in the tier's `known_misses` is run and
+  reported but doesn't fail the sweep when uncaught, and one in `not_gated` (with
+  its reason) is left out of `GENERATIVE_PLANTS=all`.
 - Document how to run one property alone on a clean database; every property
   bootstraps what it reads, so it never depends on run order.
 
