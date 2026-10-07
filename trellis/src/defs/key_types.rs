@@ -262,7 +262,11 @@ pub(crate) fn renders_differently(old: &ColumnType, new: &ColumnType) -> bool {
 /// Whether a typed copy of type `copy` can't hold every value of its source
 /// column's live type `live`, because `live` is a widening of it (#767):
 ///
-/// - a wider integer (`smallint` → `integer` → `bigint`);
+/// - a wider integer (`smallint` → `integer` → `bigint`), or `real` →
+///   `double precision`;
+/// - an integer to a `numeric` with fractional digits, or with more integer
+///   digits than the integer holds, or with no limit at all
+///   ([`integer_outgrown_by_numeric`]): `bigint` → `numeric`;
 /// - a longer string bound (`varchar(n)` → `varchar(m>n)`, `text`, or an
 ///   unbounded `varchar`);
 /// - a `numeric` with room for more integer or fractional digits, or none
@@ -281,6 +285,15 @@ pub(crate) fn widens(copy: &ColumnType, live: &ColumnType) -> bool {
     }
     if let (Some(was), Some(is)) = (copy.string_bound(), live.string_bound()) {
         return narrower_bound(was, is);
+    }
+    if copy.builtin() && live.builtin() && copy.base() == "float4" && live.base() == "float8" {
+        return true;
+    }
+    if let Some(width) = copy.int_width()
+        && live.builtin()
+        && live.base() == "numeric"
+    {
+        return integer_outgrown_by_numeric(width, live.typmod);
     }
     if copy.type_name != live.type_name || !copy.builtin() {
         return false;
@@ -314,6 +327,22 @@ fn numeric_rounds(old: i32, new: i32) -> bool {
         (_, None) => false,
         (None, Some(_)) => true,
         (Some((_, was)), Some((_, is))) => is < was,
+    }
+}
+
+/// Whether a `numeric` of modifier `live` holds a value an integer of
+/// `width` bytes can't: it has no limit, or a fractional digit, or more
+/// integer digits (`p - s`) than every value of the integer's range has (4,
+/// 9 and 18 for 2, 4 and 8 bytes).
+fn integer_outgrown_by_numeric(width: u8, live: i32) -> bool {
+    let digits = match width {
+        2 => 4,
+        4 => 9,
+        _ => 18,
+    };
+    match numeric_modifier(live) {
+        None => true,
+        Some((precision, scale)) => scale > 0 || precision - scale > digits,
     }
 }
 
@@ -667,6 +696,14 @@ mod tests {
             (ty("int2", -1), ty("int4", -1)),
             (ty("int4", -1), ty("int8", -1)),
             (ty("int2", -1), ty("int8", -1)),
+            (ty("float4", -1), ty("float8", -1)),
+            (ty("int4", -1), ty("numeric", -1)),
+            (ty("int8", -1), ty("numeric", -1)),
+            (ty("int8", -1), numeric(19, 0)),
+            (ty("int4", -1), numeric(10, 0)),
+            (ty("int4", -1), numeric(5, 2)),
+            (ty("int2", -1), numeric(5, 0)),
+            (ty("int2", -1), numeric(2, -3)),
             (varchar(50), varchar(100)),
             (varchar(50), ty("text", -1)),
             (varchar(50), ty("varchar", -1)),
@@ -699,8 +736,15 @@ mod tests {
             (ty("timestamp", 6), ty("timestamp", 3)),
             (ty("timestamp", 6), ty("timestamp", -1)),
             (ty("timestamp", -1), ty("timestamptz", -1)),
-            (ty("int4", -1), ty("numeric", -1)),
-            (ty("float4", -1), ty("float8", -1)),
+            (ty("int4", -1), numeric(9, 0)),
+            (ty("int8", -1), numeric(18, 0)),
+            (ty("int2", -1), numeric(4, 0)),
+            (ty("int4", -1), numeric(3, -2)),
+            (ty("numeric", -1), ty("int8", -1)),
+            (ty("int4", -1), ty("float8", -1)),
+            (ty("public.int4", -1), ty("pg_catalog.numeric", -1)),
+            (ty("float8", -1), ty("float4", -1)),
+            (ty("public.float4", -1), ty("pg_catalog.float8", -1)),
             (ty("text", -1), ty("uuid", -1)),
             (ty("bpchar", 9), ty("bpchar", 12)),
             (ty("varbit", 16), ty("varbit", 8)),

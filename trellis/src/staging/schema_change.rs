@@ -373,9 +373,10 @@ pub(crate) async fn pause_readers_of_unsupported(
 }
 
 /// The staging worker's capture pass's check of the types and collations
-/// of `table`'s columns that a definition keys by or keeps a typed copy of
-/// (issues #760 and #767, [`crate::defs::key_types`],
-/// [`crate::defs::copies`]). It pauses every definition that reads `table`
+/// of `table`'s columns that a definition keys by, or that a column it
+/// created takes its type from (issues #760, #767 and #824,
+/// [`crate::defs::key_types`], [`crate::defs::copies`]). It pauses every
+/// definition that reads `table`
 /// and isn't paused for a capture failure yet when, on `table`,
 ///
 /// 1. one of its key columns has a type or collation define would refuse
@@ -391,9 +392,12 @@ pub(crate) async fn pause_readers_of_unsupported(
 ///    already stored differently ([`key_types::renders_differently`]):
 ///    `timestamp` to `timestamptz`, `text` to `uuid`, a narrower
 ///    `varchar(n)`; or
-/// 4. a column it keeps a typed copy of widened past the copy
+/// 4. a column Trellis created for it, typed from columns of `table`, can't
+///    hold every value of the type define would give it now
 ///    ([`crate::defs::copies::CopyState::outgrown`]): `integer` to `bigint`
-///    under a 1-1 target's key, `varchar(50)` to `text` under a passthrough.
+///    under a 1-1 target's key, a `SUM`, a `MIN` or a calculated field,
+///    `varchar(50)` to `text` under a passthrough or a to-one projection's
+///    column.
 ///
 /// The types the third check compares against are those recorded in
 /// `definition_key_types`; a key column with none recorded (one that joined
@@ -404,7 +408,8 @@ pub(crate) async fn pause_readers_of_unsupported(
 /// deliberate resume clears it (or a drop): Trellis re-types nothing on its
 /// own. A resume re-validates the definition as define would, and refuses
 /// while the first two hold; otherwise it re-records the key types, brings
-/// the copies to their live types and rebuilds
+/// every column it created to the type define would give it now, and
+/// rebuilds
 /// (`staging::quarantine::resume_transform`).
 ///
 /// A key column the table no longer has is
@@ -563,7 +568,8 @@ pub(crate) async fn pause_readers_of_retyped(
             }
         }
 
-        // #767: a copy whose source column on this table outgrew it.
+        // #767, #824: a column Trellis created, typed from columns of this
+        // table, that the type define would give it now outgrew.
         let copies: Vec<copies::TypedCopy> = copies::typed_copies(
             &*client,
             schema,
@@ -574,32 +580,33 @@ pub(crate) async fn pause_readers_of_retyped(
         )
         .await?
         .into_iter()
-        .filter(|c| c.source_table == table)
+        .filter(|c| c.columns_of(table).next().is_some())
         .collect();
-        let mut outgrown: BTreeMap<String, Vec<copies::CopyState>> = BTreeMap::new();
+        // By the columns of this table each is typed from.
+        let mut outgrown: BTreeMap<Vec<String>, Vec<copies::CopyState>> = BTreeMap::new();
         for state in copies::inspect(&*client, copies).await? {
-            if state.outgrown() && !columns.contains(&state.copy.source_column) {
-                outgrown
-                    .entry(state.copy.source_column.clone())
-                    .or_default()
-                    .push(state);
+            if !state.outgrown() {
+                continue;
             }
+            let from: Vec<String> = state.copy.columns_of(table).map(str::to_string).collect();
+            // A copy of a key column flagged above is reported once, there.
+            if state.copy.inferred.is_none() && columns.contains(&from[0]) {
+                continue;
+            }
+            outgrown.entry(from).or_default().push(state);
         }
-        for (column, states) in outgrown {
-            let held: Vec<String> = states
-                .iter()
-                .map(|s| format!("{} ({})", s.copy.label(), s.copy_type.display))
-                .collect();
+        for (from, states) in outgrown {
+            let inputs = input_types(&*client, table, &live, &states).await?;
             flag(
-                &column,
-                format!(
-                    "column {column:?} of {table} widened to {}, and Trellis keeps a copy of it \
-                     that can't hold every value of that type: {}",
-                    states[0].live_type.display,
-                    held.join(", ")
-                ),
+                &from[0],
+                outgrown_reason(table, &from, &inputs, &states),
                 &mut columns,
             );
+            for column in &from[1..] {
+                if !columns.contains(column) {
+                    columns.push(column.clone());
+                }
+            }
         }
 
         if !reasons.is_empty() {
@@ -643,6 +650,129 @@ pub(crate) async fn pause_readers_of_retyped(
     Ok(true)
 }
 
+/// Every source column `states` are typed from, once each, as
+/// `schema.table.column` with its live type (`format_type`). `live` is
+/// `table`'s columns; the others are read from the catalog. Queries only
+/// when some state reads another table.
+async fn input_types(
+    client: &impl tokio_postgres::GenericClient,
+    table: &str,
+    live: &std::collections::HashMap<String, key_types::LiveColumn>,
+    states: &[copies::CopyState],
+) -> Result<Vec<(String, String)>, tokio_postgres::Error> {
+    let mut reads: Vec<&(String, String)> = Vec::new();
+    for read in states.iter().flat_map(|s| &s.copy.reads) {
+        if !reads.contains(&read) {
+            reads.push(read);
+        }
+    }
+    let elsewhere: Vec<&&(String, String)> = reads.iter().filter(|(t, _)| t != table).collect();
+    let mut other: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    if !elsewhere.is_empty() {
+        let tables: Vec<String> = elsewhere
+            .iter()
+            .map(|(t, _)| crate::defs::ddl::regclass_arg(t))
+            .collect();
+        let names: Vec<&str> = elsewhere.iter().map(|(_, c)| c.as_str()).collect();
+        for row in client
+            .query(
+                "select k.i, pg_catalog.format_type(a.atttypid, a.atttypmod) \
+                 from unnest($1::text[], $2::text[]) with ordinality as k(t, c, i) \
+                 join pg_catalog.pg_attribute a \
+                   on a.attrelid = pg_catalog.to_regclass(k.t) and a.attname = k.c \
+                  and a.attnum > 0 and not a.attisdropped",
+                &[&tables, &names],
+            )
+            .await?
+        {
+            other.insert(row.get::<_, i64>(0) as usize - 1, row.get(1));
+        }
+    }
+    let mut next = 0;
+    Ok(reads
+        .into_iter()
+        .map(|(t, c)| {
+            let display = if t == table {
+                live.get(c).map(|now| now.display.clone())
+            } else {
+                next += 1;
+                other.get(&(next - 1)).cloned()
+            };
+            (
+                format!("{t}.{c}"),
+                display.unwrap_or_else(|| "no longer there".to_string()),
+            )
+        })
+        .collect())
+}
+
+/// The reason a definition is paused for `states`, the columns it created
+/// typed from `columns` of `table` whose types define would now give a
+/// wider type ([`copies::CopyState::outgrown`]). `inputs` are every source
+/// column `states` are typed from, with its live type ([`input_types`]).
+///
+/// It names a column as the one that widened only when it is the only
+/// column they're typed from. Otherwise it names each one with its type:
+/// nothing records an expression's input types, so the pass can't tell
+/// which of them changed, and it may be a column of another table.
+fn outgrown_reason(
+    table: &str,
+    columns: &[String],
+    inputs: &[(String, String)],
+    states: &[copies::CopyState],
+) -> String {
+    let only_input = match (columns, inputs) {
+        ([column], [(_, now)]) => Some((column, now)),
+        _ => None,
+    };
+    if let Some((column, now)) = only_input {
+        if states.iter().all(|s| s.copy.inferred.is_none()) {
+            let held: Vec<String> = states
+                .iter()
+                .map(|s| format!("{} ({})", s.copy.label(), s.copy_type.display))
+                .collect();
+            return format!(
+                "column {column:?} of {table} widened to {}, and Trellis keeps a copy of it \
+                 that can't hold every value of that type: {}",
+                states[0].live_type.display,
+                held.join(", ")
+            );
+        }
+        return format!(
+            "column {column:?} of {table} widened to {now}, and Trellis keeps columns typed \
+             from it that can't hold every value of the types define would give them now: {}",
+            outgrown_columns(states)
+        );
+    }
+    let named: Vec<String> = inputs
+        .iter()
+        .map(|(label, now)| format!("{label} ({now})"))
+        .collect();
+    format!(
+        "Trellis keeps columns typed from {} that can't hold every value of the types define \
+         would give them now: {}",
+        named.join(", "),
+        outgrown_columns(states)
+    )
+}
+
+/// `states` as a reason lists them: each column, its type, and the type
+/// define would give it now.
+fn outgrown_columns(states: &[copies::CopyState]) -> String {
+    states
+        .iter()
+        .map(|s| {
+            format!(
+                "{} ({}, now {})",
+                s.copy.label(),
+                s.copy_type.display,
+                s.live_type.display
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The `capture_failure` sentence for a definition paused because `sub`
 /// replicates into a table it reads.
 fn subscribed_error(sub: &crate::defs::subscription::Subscribed) -> String {
@@ -678,4 +808,101 @@ fn unpaused_readers(catalog: &CaptureCatalog, table: &str) -> Vec<i64> {
                 .any(|r| r.id == *id && !r.capture_failed)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::defs::copies::{CopyKind, CopyState, CopyType, TypedCopy};
+    use crate::defs::key_types::ColumnType;
+
+    fn ty(display: &str) -> CopyType {
+        CopyType {
+            oid: 0,
+            typmod: -1,
+            ty: ColumnType {
+                type_name: format!("pg_catalog.{display}"),
+                typmod: -1,
+            },
+            display: display.to_string(),
+        }
+    }
+
+    fn state(column: &str, reads: &[(&str, &str)], inferred: bool) -> CopyState {
+        CopyState {
+            copy: TypedCopy {
+                kind: if inferred {
+                    CopyKind::Field
+                } else {
+                    CopyKind::Passthrough
+                },
+                table: "\"public\".\"mix\"".to_string(),
+                table_name: "public.mix".to_string(),
+                column: column.to_string(),
+                reads: reads
+                    .iter()
+                    .map(|(t, c)| (t.to_string(), c.to_string()))
+                    .collect(),
+                inferred: inferred.then(|| "bigint".to_string()),
+            },
+            copy_type: ty("integer"),
+            live_type: ty("bigint"),
+        }
+    }
+
+    fn input(label: &str, now: &str) -> (String, String) {
+        (label.to_string(), now.to_string())
+    }
+
+    /// A column is named as the one that widened only when it is the only
+    /// input. `qty + author.score`, after `score` widens, is checked on the
+    /// source table too, where `qty` is its only column and hasn't changed.
+    #[test]
+    fn an_outgrown_reason_names_a_widened_column_only_when_it_is_the_only_input() {
+        let qty = ["qty".to_string()];
+        let only = [state("next", &[("public.posts", "qty")], true)];
+        assert_eq!(
+            outgrown_reason(
+                "public.posts",
+                &qty,
+                &[input("public.posts.qty", "bigint")],
+                &only
+            ),
+            "column \"qty\" of public.posts widened to bigint, and Trellis keeps columns typed \
+             from it that can't hold every value of the types define would give them now: \
+             public.mix.next (integer, now bigint)"
+        );
+        let copy = [state("qty", &[("public.posts", "qty")], false)];
+        assert_eq!(
+            outgrown_reason(
+                "public.posts",
+                &qty,
+                &[input("public.posts.qty", "bigint")],
+                &copy
+            ),
+            "column \"qty\" of public.posts widened to bigint, and Trellis keeps a copy of it \
+             that can't hold every value of that type: public.mix.qty (integer)"
+        );
+        let mixed = [state(
+            "z",
+            &[("public.posts", "qty"), ("public.authors", "score")],
+            true,
+        )];
+        let reason = outgrown_reason(
+            "public.posts",
+            &qty,
+            &[
+                input("public.posts.qty", "integer"),
+                input("public.authors.score", "bigint"),
+            ],
+            &mixed,
+        );
+        assert_eq!(
+            reason,
+            "Trellis keeps columns typed from public.posts.qty (integer), \
+             public.authors.score (bigint) that can't hold every value of the types define \
+             would give them now: public.mix.z (integer, now bigint)"
+        );
+        assert!(!reason.contains("widened"), "{reason}");
+    }
 }
