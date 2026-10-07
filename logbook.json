@@ -1,0 +1,38 @@
+[
+  {
+    "date": "2026-10-02",
+    "runs": 9,
+    "hours": 4.58,
+    "rows_validated": 328187304
+  },
+  {
+    "date": "2026-10-03",
+    "runs": 38,
+    "hours": 16.84,
+    "rows_validated": 1709108578
+  },
+  {
+    "date": "2026-10-04",
+    "runs": 29,
+    "hours": 13.17,
+    "rows_validated": 1008140920
+  },
+  {
+    "date": "2026-10-05",
+    "runs": 46,
+    "hours": 7.27,
+    "rows_validated": 1089533952
+  },
+  {
+    "date": "2026-10-06",
+    "runs": 17,
+    "hours": 5.31,
+    "rows_validated": 39630300
+  },
+  {
+    "date": "2026-10-07",
+    "runs": 6,
+    "hours": 0.56,
+    "rows_validated": 206
+  }
+]
