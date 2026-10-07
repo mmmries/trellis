@@ -20,8 +20,9 @@
 //! 1. **define would refuse it now** ([`refusal`]); or
 //! 2. **its new type renders the values already stored differently**
 //!    ([`renders_differently`]), against the type recorded when the
-//!    definition was accepted or last resumed (`definition_key_types`,
-//!    [`record`]). The target, ledger and projection rows built from the old
+//!    definition was accepted or last resumed, or when a pass last accepted
+//!    a change to the column without a pause (`definition_key_types`,
+//!    [`record`], [`rerecord`]). The target, ledger and projection rows built from the old
 //!    rendering would never match the new one: a `timestamp` key becomes
 //!    `timestamptz` (`'… 10:00:00'` reads back as `'… 15:00:00+00'` after an
 //!    `ALTER` in a New York session), `date` becomes `timestamp`, `text`
@@ -33,7 +34,9 @@
 //! The same pass also pauses on a relationship whose two join columns no
 //! longer have the same type, modifier and collation (#590, through
 //! `catalog::validate_join_pair`), and on a widening of a column Trellis
-//! keeps a typed copy of ([`super::copies`], [`widens`]).
+//! keeps a typed copy of ([`super::copies`], [`widens`]). A widening that
+//! changes only the catalog ([`catalog_only`]) re-types the copy in place
+//! instead.
 //!
 //! Routine changes that need neither: widening an integer or string key
 //! that no copy holds (an aggregate's source key, a to-many join's to-side),
@@ -43,8 +46,15 @@
 //! change between deterministic collations. None of them changes an existing
 //! value's identity, and every copy still holds every value.
 //!
-//! A resume re-records these types ([`rerecord`]), after it has re-validated
-//! the definition and brought its copies to their live types.
+//! A resume re-records these types ([`record_definition`]), after it has
+//! re-validated the definition and brought its copies to their live types.
+//! So does the capture pass, for each key column whose type changed in one
+//! of these routine ways or by a widening it re-typed in place, unless it
+//! pauses the definition ([`rerecord`]). The definition stores keys of the
+//! new type from then on, so the next change is measured from it: a
+//! `GROUP BY` key widened from `numeric(10,2)` to `numeric(10,3)` and then
+//! narrowed back to `numeric(10,2)` rounds the keys stored in between, and
+//! pauses.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -307,6 +317,39 @@ pub(crate) fn widens(copy: &ColumnType, live: &ColumnType) -> bool {
     }
 }
 
+/// Whether a column of type `copy` can be re-typed to `live` by changing
+/// only the catalog: Postgres neither rewrites the table nor changes a value
+/// it holds, and each index on the column is kept. Exactly these widenings
+/// (#824):
+///
+/// - `varchar(n)` to `varchar(m)` with `m > n`;
+/// - `varchar(n)`, or an unbounded `varchar`, to `text`;
+/// - `varchar(n)` to an unbounded `varchar`;
+/// - `numeric(p,s)` to `numeric(q,s)` with `q > p`: the same scale.
+///
+/// Nothing else, though `pg_cast` calls more casts binary-coercible:
+/// `text` to `varchar(n)` is one, and it narrows. A `character(n)` length
+/// change isn't one either, since its values are blank-padded to the
+/// length.
+pub(crate) fn catalog_only(copy: &ColumnType, live: &ColumnType) -> bool {
+    if copy == live || !copy.builtin() || !live.builtin() {
+        return false;
+    }
+    match (copy.base(), live.base()) {
+        ("varchar", "text") => true,
+        ("varchar", "varchar") => {
+            copy.typmod >= 4 && (live.typmod < 0 || live.typmod > copy.typmod)
+        }
+        ("numeric", "numeric") => {
+            match (numeric_modifier(copy.typmod), numeric_modifier(live.typmod)) {
+                (Some((p, s)), Some((q, t))) => t == s && q > p,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// A `numeric(p,s)` modifier's precision and scale. A modifier is
 /// `((p << 16) | (s & 0x7ff)) + 4`, with `s` an 11-bit two's complement,
 /// since Postgres 15 allows a negative scale. `None` for an unconstrained
@@ -507,6 +550,33 @@ pub(crate) async fn record(
     id: i64,
     columns: &[(String, String)],
 ) -> Result<(), tokio_postgres::Error> {
+    upsert(client, id, columns, "nothing").await
+}
+
+/// [`record`], replacing the type recorded for each column: for a key
+/// column whose type changed without re-rendering the keys stored, so the
+/// next change is measured from the type keys are stored under now.
+pub(crate) async fn rerecord(
+    client: &impl GenericClient,
+    id: i64,
+    columns: &[(String, String)],
+) -> Result<(), tokio_postgres::Error> {
+    upsert(
+        client,
+        id,
+        columns,
+        "update set type_name = excluded.type_name, typmod = excluded.typmod",
+    )
+    .await
+}
+
+/// [`record`] and [`rerecord`]: `on conflict do {on_conflict}`.
+async fn upsert(
+    client: &impl GenericClient,
+    id: i64,
+    columns: &[(String, String)],
+    on_conflict: &str,
+) -> Result<(), tokio_postgres::Error> {
     if columns.is_empty() {
         return Ok(());
     }
@@ -518,7 +588,8 @@ pub(crate) async fn record(
     let names: Vec<&str> = columns.iter().map(|(_, c)| c.as_str()).collect();
     client
         .execute(
-            "insert into definition_key_types \
+            &format!(
+                "insert into definition_key_types \
                  (transform_id, table_name, column_name, type_name, typmod) \
              select $1, k.t, k.c, n.nspname::text || '.' || ty.typname::text, a.atttypmod \
              from unnest($2::text[], $3::text[], $4::text[]) as k(t, r, c) \
@@ -527,7 +598,8 @@ pub(crate) async fn record(
               and a.attnum > 0 and not a.attisdropped \
              join pg_catalog.pg_type ty on ty.oid = a.atttypid \
              join pg_catalog.pg_namespace n on n.oid = ty.typnamespace \
-             on conflict do nothing",
+             on conflict (transform_id, table_name, column_name) do {on_conflict}"
+            ),
             &[&id, &tables, &regclasses, &names],
         )
         .await?;
@@ -825,5 +897,51 @@ mod tests {
                 rel: "author".to_string()
             }
         )));
+    }
+    /// The four catalog-only widenings #824 names, and none of their
+    /// neighbours: each of those either rewrites the table or changes a
+    /// value, or narrows.
+    #[test]
+    fn only_the_named_widenings_are_catalog_only() {
+        for (copy, live) in [
+            (varchar(10), varchar(40)),
+            (varchar(10), ty("text", -1)),
+            (ty("varchar", -1), ty("text", -1)),
+            (varchar(10), ty("varchar", -1)),
+            (numeric(10, 2), numeric(12, 2)),
+            (numeric(5, 0), numeric(18, 0)),
+        ] {
+            assert!(catalog_only(&copy, &live), "{copy:?} -> {live:?}");
+        }
+        for (copy, live) in [
+            (varchar(10), varchar(10)),
+            (varchar(40), varchar(10)),
+            // Binary-coercible in `pg_cast`, but it narrows.
+            (ty("text", -1), varchar(10)),
+            (ty("text", -1), ty("varchar", -1)),
+            (ty("varchar", -1), varchar(10)),
+            // Blank-padded: a length change changes the values.
+            (ty("bpchar", 5), ty("bpchar", 9)),
+            (ty("bpchar", 5), ty("text", -1)),
+            (varchar(10), ty("bpchar", 14)),
+            // A scale change, an unbounded `numeric`, a narrower precision.
+            (numeric(10, 2), numeric(12, 3)),
+            (numeric(10, 2), numeric(10, 3)),
+            (numeric(10, 2), ty("numeric", -1)),
+            (numeric(12, 2), numeric(10, 2)),
+            (ty("numeric", -1), numeric(12, 2)),
+            // Rewrites.
+            (ty("int4", -1), ty("int8", -1)),
+            (ty("float4", -1), ty("float8", -1)),
+            (ty("int4", -1), ty("numeric", -1)),
+            // Outside the named set, though Postgres changes only the
+            // catalog for them too.
+            (ty("timestamp", 3), ty("timestamp", 6)),
+            (ty("varbit", 8), ty("varbit", 16)),
+            // Not builtin.
+            (ty("public.varchar", 14), ty("public.varchar", 44)),
+        ] {
+            assert!(!catalog_only(&copy, &live), "{copy:?} -> {live:?}");
+        }
     }
 }

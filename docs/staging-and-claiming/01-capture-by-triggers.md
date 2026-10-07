@@ -259,19 +259,56 @@ it regenerates anything, it pauses the definition, with its
    `text` to `uuid`, a narrower `numeric` scale or temporal precision (the
    rewrite rounds), or a narrower `varchar(n)` (the rewrite strips trailing
    spaces past the new length). It compares against the type recorded in
-   `definition_key_types` when the definition was accepted or last resumed;
-   or
+   `definition_key_types` when the definition was accepted or last resumed,
+   or when a pass last accepted a change to the column without a pause; or
 4. a column Trellis created can't hold every value of the type define would
    give it now: `integer` to `bigint` under a 1-1 target's key, a `GROUP BY`
    key, a calculated field (`qty + 1`) or a `SUM` or `MIN` (whose ledger
    contribution is typed as the argument), `integer` or `bigint` to
-   `numeric` under the same, `varchar(50)` to `text` under a passthrough or
-   a projection's column for `author.name`. The column's next value that
-   doesn't fit would fail its write.
+   `numeric` under the same, `real` to `double precision` under a
+   passthrough. The column's next value that doesn't fit would fail its
+   write.
 
 The reason names each column, its old and new type, and each copy, and says
-what to do. Nothing clears it but a deliberate `RESUME`, or a drop: Trellis
-re-types nothing on its own.
+what to do. Nothing clears it but a deliberate `RESUME`, or a drop.
+
+The fourth check has one exception, which pauses nothing (#824). When every
+widened column of a table Trellis created widened by changing only the
+catalog, the pass re-types that table's columns itself. Only a 1-1 target's
+copies and a relationship projection's can: Trellis types every other
+column by value family or by an expression, with no length or precision. The widenings that qualify
+are exactly `varchar(n)` to a longer `varchar(m)`, `varchar(n)` or
+`varchar` to `text`, `varchar(n)` to `varchar`, and `numeric(p,s)` to a
+larger precision at the same scale. `character(n)` changes and `text` to
+`varchar(n)` don't. Postgres then rewrites nothing, changes no value and
+keeps each index, so no definition pauses or rebuilds. A `varchar` key's
+widening is one of them: the key's copy is re-typed and its new type
+recorded. It runs one table per transaction, under the same lock timeout
+as a resume's re-type. A table whose re-type fails transiently (its lock
+not got in time, a deadlock, a statement timeout) is left as it is,
+nothing pauses, and the next pass tries again. A table where some column
+also needs a rewrite (`integer` to `bigint`) pauses as above. A table
+whose re-type fails for another reason (a view on the column) pauses too
+when some column there outgrew its type. When none did (`varchar` to
+`text`), its writes still succeed, so it pauses nothing and keeps its old
+types. Either way the worker doesn't try that re-type again, and so
+doesn't take the table's lock for it every pass, until the source's type
+changes again, a definition with a column there is defined or dropped, or
+the worker restarts.
+
+A value written after the source widened and before the pass re-typed the
+column failed its write with `22001` (too long) or `22003` (numeric
+overflow), and its key may be held. One whose excess characters are all
+spaces was stored truncated instead, which nothing repairs ([known
+correctness gaps, entry
+23](../known-correctness-gaps.md#23-a-value-padded-with-spaces-past-a-widened-varchars-old-length-drained-before-trellis-re-types-its-copy)).
+The re-type's transaction records a release request (`retype_releases`) for
+each definition with a column on the table. After the pass, the staging
+worker releases every key such a definition holds whose failure had that
+SQLSTATE (`poison.sqlstate`), through the same per-key release as
+`Trellis::release_key`, so the key's parked work is applied again, and does
+so after each pass for a minute more, for a key whose eviction was still
+committing. A key held for any other failure stays held.
 
 Changes that need neither pause nothing: widening a key no copy holds (an
 aggregate's source key, which its ledger keys by text), a `GROUP BY` key's

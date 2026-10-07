@@ -886,6 +886,7 @@ pub async fn fail_chunk(
 ) -> Result<ChunkFailure, ChunkQueueError> {
     let kind = FailureKind::of(error);
     let message = error.to_string();
+    let sqlstate = crate::staging::quarantine::sqlstate_of(error);
     let (outcome, attempts, location) = match &chunk.work {
         ChunkWork::Range { lo, hi } => {
             let (outcome, attempts) = fail_range_chunk(
@@ -895,6 +896,7 @@ pub async fn fail_chunk(
                 claimed_by,
                 kind,
                 &message,
+                sqlstate.as_deref(),
                 RETRY_CAP,
             )
             .await?;
@@ -930,6 +932,7 @@ pub async fn fail_chunk(
                 claimed_by,
                 kind,
                 &message,
+                sqlstate.as_deref(),
                 REDERIVE_RETRY_CAP,
             )
             .await?;
@@ -950,6 +953,7 @@ pub async fn fail_chunk(
                 claimed_by,
                 kind,
                 &message,
+                sqlstate.as_deref(),
                 REDERIVE_RETRY_CAP,
             )
             .await?;
@@ -963,6 +967,7 @@ pub async fn fail_chunk(
                 claimed_by,
                 kind,
                 &message,
+                sqlstate.as_deref(),
                 REDERIVE_RETRY_CAP,
             )
             .await?;
@@ -1091,7 +1096,9 @@ async fn pause_for_build_failure(
 ///
 /// `narrow` is the range a data failure is narrowed within, or `None` when
 /// the chunk isn't narrowed: its data failures are charged like any other.
+/// `sqlstate` is the failure's, which a key it quarantines keeps (#824).
 /// `retry_cap` caps the backoff.
+#[allow(clippy::too_many_arguments)]
 async fn fail_range_chunk(
     pool: &Pool,
     chunk: &ClaimedChunk,
@@ -1099,6 +1106,7 @@ async fn fail_range_chunk(
     claimed_by: &str,
     kind: FailureKind,
     error: &str,
+    sqlstate: Option<&str>,
     retry_cap: Duration,
 ) -> Result<(ChunkFailure, i32), ChunkQueueError> {
     let mut client = pool.get().await?;
@@ -1186,6 +1194,7 @@ async fn fail_range_chunk(
                 &source_table,
                 &key,
                 error,
+                sqlstate,
             )
             .await
             .map_err(|err| ChunkQueueError::Quarantine(Box::new(err)))?;
@@ -2187,6 +2196,81 @@ mod tests {
                 (3, "a".to_string(), 10)
             ]
         );
+    }
+
+    /// #824: a chunk narrowed to the key whose write fails quarantines it
+    /// with the failure's SQLSTATE, which a release after an in-place
+    /// re-type (`staging::quarantine::release_retyped_keys`) matches on:
+    /// here `22003`, a value out of range for the target's `smallint`.
+    #[tokio::test]
+    async fn a_chunk_quarantines_its_failing_key_with_the_failure_s_sqlstate() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        let text = "TRANSFORM small_copies FROM smalls SELECT x AS y";
+        raw.batch_execute(
+            "create table public.smalls (id int primary key, x int); \
+             insert into public.smalls values (1, 1), (2, 40000), (3, 3), (4, 4); \
+             create table public.small_copies (id int primary key, y smallint); \
+             insert into source_table_versions (source_table, version) \
+             values ('public.smalls', 1)",
+        )
+        .await
+        .expect("seed source");
+        let id: i64 = raw
+            .query_one(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.small_copies', 'public.smalls', 1, $1, 'waiting_to_backfill') \
+                 returning id",
+                &[&text],
+            )
+            .await
+            .expect("seed definition")
+            .get(0);
+        let def = parse(text).expect("parse definition");
+        assert_eq!(
+            dispatch(&pool, id, &def, "public.smalls").await,
+            Some(TransformStatus::Backfilling)
+        );
+
+        let mut outcomes = Vec::new();
+        for _ in 0..20 {
+            let Some(chunk) = claim_chunks(&raw, WORKER, 1).await.expect("claim").pop() else {
+                break;
+            };
+            match run_claimed_chunk(
+                &pool,
+                &chunk,
+                WORKER,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .await
+            {
+                Ok(()) => finish_chunk(&pool, &chunk, WORKER).await.expect("finish"),
+                Err(err) => outcomes.push(
+                    fail_chunk(&pool, &chunk, WORKER, &err)
+                        .await
+                        .expect("fail the chunk"),
+                ),
+            }
+        }
+        assert!(
+            matches!(outcomes.last(), Some(ChunkFailure::Quarantined { .. })),
+            "{outcomes:?}"
+        );
+        let poisoned: Vec<(String, Option<String>)> = raw
+            .query(
+                "select key, sqlstate from poison where transform_id = $1",
+                &[&id],
+            )
+            .await
+            .expect("read poison")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(poisoned, vec![(ddl_key(&["2"]), Some("22003".to_string()))]);
     }
 
     /// Issue #766: a build worker logged in as a role the source's row-level
