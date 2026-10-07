@@ -1356,7 +1356,8 @@ async fn accumulate_from_side_recomputes_on(
 #[derive(Debug, Clone)]
 pub(crate) struct RelationshipGenBump {
     /// [`projection_lock_statement`]'s statement for the projection, which
-    /// locks the rows in key order before the bump writes them.
+    /// the page's pre-lock ([`lock_page_projection_rows`]) runs to lock the
+    /// rows in key order before the bump writes them.
     lock_sql: String,
     /// [`generation_bump_statement`]'s statement for the projection.
     sql: String,
@@ -2488,6 +2489,13 @@ async fn from_side_change_in_flight(
 /// apply's `UPDATE` to commit and then observed its bumped `gen` (guard (b)
 /// correctly fails). There is no third interleaving.
 ///
+/// The page has already taken this lock, with every other projection row
+/// lock it needs, in key order before its first record
+/// ([`lock_page_projection_rows`], ADR-0002 I5, issue #848): taken here one
+/// record at a time, in fold order, two pages touching the same parents in
+/// different orders deadlocked. Re-locking a row this transaction holds is
+/// a no-op, so this read waits only on a row inserted since then.
+///
 /// Returns `Ok(None)` when every guard passes. Returns `Ok(Some(failure))`
 /// naming the *first* guard that didn't — never more than one, since guard
 /// evaluation stops at the first failure (there is nothing further to learn
@@ -2743,7 +2751,8 @@ async fn check_reverse_guards(
 /// carries no information about whether guard (d) also holds).
 ///
 /// Takes the same `FOR UPDATE` lock [`check_reverse_guards`] already took
-/// (or would take) on this row, inside the same transaction — Postgres
+/// on this row, as the page's pre-lock did before it
+/// ([`lock_page_projection_rows`]), inside the same transaction — Postgres
 /// re-locking a row this transaction already holds is a no-op, not a second
 /// wait.
 async fn reverse_ordering_still_holds(
@@ -3198,9 +3207,10 @@ async fn relationship_refresh_stamps(
 /// live read share one snapshot (ADR-0002 I1), and the delete and the upsert
 /// never both act on the row: the delete acts only where the to-side has no
 /// row, or where the upsert is withheld. A drain applying a pending change
-/// concurrently commits its row write with its drain state. Guard (b)/(d)
-/// locked one key's row `for update` in an earlier statement, and the
-/// release locks every key's, so on such a row that drain has committed
+/// concurrently commits its row write with its drain state. A page locks
+/// both keys' rows `for update` before its first record
+/// ([`lock_page_projection_rows`]), and the release locks every key's, so on
+/// such a row that drain has committed
 /// before this snapshot or waits for this transaction. For any other row,
 /// the withheld-upsert delete requires the row's `lsn` to be the one this
 /// snapshot read: a to-side write committed while this statement waited on
@@ -3561,16 +3571,13 @@ fn generation_bump_statement(
 /// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan, issue #835), as
 /// the page's other statements keyed by entry run.
 ///
-/// The rows are locked in key order first ([`projection_lock_statement`]),
-/// the order the reverse release locks them in and the order of every other
-/// page's bump (ADR-0002 I5). The bump alone locks in whatever order its
-/// plan reads the rows. With the key compared at its type, the planner
+/// The caller has locked the rows in key order first
+/// ([`lock_page_projection_rows`]): the bump alone locks in whatever order
+/// its plan reads the rows. With the key compared at its type, the planner
 /// reads the key index into a bitmap and the rows in physical order
 /// whenever the keys' rows are scattered through the table, as rewriting a
 /// projection's rows scatters them: on a 100k-row projection it read even
-/// two keys that way, on PostgreSQL 16 and 17. Two pages, or a page and a
-/// release, locking an overlapping set of keys would then take them in
-/// opposite orders and deadlock.
+/// two keys that way, on PostgreSQL 16 and 17.
 async fn bump_generations(
     txn: &Transaction<'_>,
     bump: &RelationshipGenBump,
@@ -3578,8 +3585,75 @@ async fn bump_generations(
     let keys: Vec<&str> = bump.touched_keys.iter().map(String::as_str).collect();
     txn.batch_execute(super::ledger::ENTRY_PLAN_SETTINGS)
         .await?;
-    txn.query(&bump.lock_sql, &[&keys]).await?;
     txn.execute(&bump.sql, &[&keys]).await?;
+    txn.batch_execute(super::ledger::ENTRY_PLAN_RESET).await?;
+    Ok(())
+}
+
+/// Locks, `for update`, every to-one relationship projection row a page
+/// writes: the rows of `gen_bumps`' touched keys, which its generation bump
+/// writes ([`bump_generations`]), and of each reverse record's old and new
+/// key, which its guards read and its projection advance writes
+/// (`reverses`, each record with its keys). One statement per relationship
+/// ([`projection_lock_statement`]), in `relationship_id` order, each in key
+/// order, under `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan),
+/// so every page takes these rows in the order the reverse release does
+/// (ADR-0002 I5, issue #848).
+///
+/// Left to themselves, the bump would lock its rows in plan order and the
+/// reverse records theirs one record at a time, in fold order, so two pages,
+/// or a page and the release, touching an overlapping set of keys in
+/// different orders would deadlock. A key with no row yet has nothing to
+/// lock here: a row committed after this statement is locked by the record
+/// that reads it (its guards), and a record that inserts a row takes its
+/// lock when it writes it, both in record order. Two pages can still
+/// deadlock through such a row, but only while it is being created.
+async fn lock_page_projection_rows<'a>(
+    txn: &Transaction<'_>,
+    gen_bumps: &HashMap<i64, RelationshipGenBump>,
+    reverses: impl IntoIterator<
+        Item = (
+            &'a RelationshipReverseRecord,
+            &'a (Option<String>, Option<String>),
+        ),
+    >,
+) -> Result<(), ApplyError> {
+    let mut locks: BTreeMap<i64, (String, Vec<&str>)> = BTreeMap::new();
+    for (relationship_id, bump) in gen_bumps {
+        locks
+            .entry(*relationship_id)
+            .or_insert_with(|| (bump.lock_sql.clone(), Vec::new()))
+            .1
+            .extend(bump.touched_keys.iter().map(String::as_str));
+    }
+    for (record, (old_key, new_key)) in reverses {
+        let shape = &record.shape;
+        if shape.qualified_projection.is_empty() || (old_key.is_none() && new_key.is_none()) {
+            continue;
+        }
+        let keys = match locks.entry(shape.id) {
+            std::collections::btree_map::Entry::Occupied(entry) => &mut entry.into_mut().1,
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let key_pg_type = shape.to_side.key_pg_type(txn, &shape.to_col).await?;
+                let sql = projection_lock_statement(
+                    &shape.qualified_projection,
+                    &shape.to_col,
+                    key_pg_type,
+                );
+                &mut entry.insert((sql, Vec::new())).1
+            }
+        };
+        keys.extend(old_key.iter().chain(new_key).map(String::as_str));
+    }
+    locks.retain(|_, (_, keys)| !keys.is_empty());
+    if locks.is_empty() {
+        return Ok(());
+    }
+    txn.batch_execute(super::ledger::ENTRY_PLAN_SETTINGS)
+        .await?;
+    for (sql, keys) in locks.values() {
+        txn.query(sql, &[keys]).await?;
+    }
     txn.batch_execute(super::ledger::ENTRY_PLAN_RESET).await?;
     Ok(())
 }
@@ -5254,6 +5328,19 @@ mod tests {
         .get(0)
     }
 
+    /// The rows `txn` has fetched from `public.stale_projection` through an
+    /// index.
+    async fn projection_index_fetches(txn: &Transaction<'_>) -> i64 {
+        txn.query_one(
+            "select idx_tup_fetch from pg_stat_xact_user_tables \
+             where relid = 'public.stale_projection'::regclass",
+            &[],
+        )
+        .await
+        .expect("fetches")
+        .get(0)
+    }
+
     /// Asserts that `plan` reads the projection only through its primary key
     /// index, by the keys: no sequential scan, and no filter, which a scan
     /// of the whole index (the order the release's lock asks for) applies
@@ -5330,15 +5417,16 @@ mod tests {
         assert_eq!(others, 0, "each row is bumped at most once");
     }
 
-    /// Issue #835: the generation bump ([`bump_generations`]) locks its rows
-    /// in key order, the order the reverse release's lock and every other
-    /// page's bump take them in (ADR-0002 I5). The bare `update` reads the
-    /// key index into a bitmap and locks the rows in physical order, so on a
-    /// projection whose keys are scattered through the table, with key 2's
-    /// row before key 1's, it locked 2 first.
+    /// Issues #835 and #848: a page locks the rows its generation bump
+    /// ([`bump_generations`]) writes in key order
+    /// ([`lock_page_projection_rows`]), the order the reverse release's lock
+    /// and every other page take them in (ADR-0002 I5). The bare `update`
+    /// reads the key index into a bitmap and locks the rows in physical
+    /// order, so on a projection whose keys are scattered through the table,
+    /// with key 2's row before key 1's, it locked 2 first.
     ///
-    /// Another transaction holds key 2's row; the bump of keys 1 and 2 must
-    /// then wait on key 2 holding key 1's lock, not hold nothing.
+    /// Another transaction holds key 2's row; the page's lock of keys 1 and 2
+    /// must then wait on key 2 holding key 1's lock, not hold nothing.
     #[tokio::test]
     async fn the_generation_bump_locks_its_rows_in_key_order() {
         let cluster = testkit::TestCluster::start();
@@ -5399,7 +5487,11 @@ mod tests {
             .get(0);
         let bumping = tokio::spawn(async move {
             let txn = bumper.transaction().await.expect("begin");
-            bump_generations(&txn, &bump).await.expect("bump");
+            let bumps = HashMap::from([(1, bump)]);
+            lock_page_projection_rows(&txn, &bumps, std::iter::empty())
+                .await
+                .expect("lock");
+            bump_generations(&txn, &bumps[&1]).await.expect("bump");
             txn.commit().await.expect("commit");
         });
         // The bump waits on the lock this test holds: a precondition the
@@ -5421,7 +5513,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(blocked, "the bump never waited on key 2's held lock");
+        assert!(blocked, "the lock never waited on key 2's held lock");
         let free: Vec<i32> = observer
             .query(
                 "select id from reversed_projection where id = 1 for update skip locked",
@@ -5436,7 +5528,7 @@ mod tests {
         bumping.await.expect("the bump finishes");
         assert!(
             free.is_empty(),
-            "the bump holds key 1 while it waits on key 2: it locks in key order"
+            "the lock holds key 1 while it waits on key 2: it locks in key order"
         );
         let gens: Vec<(i32, i64)> = observer
             .query(
@@ -5450,6 +5542,124 @@ mod tests {
             .map(|row| (row.get(0), row.get(1)))
             .collect();
         assert_eq!(gens, vec![(1, 1), (2, 1)], "each key's row is bumped once");
+    }
+
+    /// Issue #848: a page's projection lock ([`lock_page_projection_rows`])
+    /// locks the rows of its generation bumps' keys and of each reverse
+    /// record's old and new key, and no other, reading a projection whose
+    /// statistics lag its size by its primary key, as the release's lock
+    /// does. The reverse records' statement is built from the shape's key
+    /// type, and the settings are put back afterwards. Under 4,900 keys
+    /// compared at the key's type, PostgreSQL 16 scans the projection unless
+    /// the statement runs under the entry plan settings; with the key cast to
+    /// `text`, it walks the whole key index.
+    #[tokio::test]
+    async fn a_page_locks_every_projection_row_it_writes_by_the_key() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, projection, key_pg_type, keys) = stale_projection(&db).await;
+        let bump = RelationshipGenBump {
+            lock_sql: projection_lock_statement(&projection, "id", key_pg_type.as_deref()),
+            sql: generation_bump_statement(&projection, "id", key_pg_type.as_deref()),
+            touched_keys: keys[..4900].iter().cloned().collect(),
+        };
+        let shape = Arc::new(ReverseRelationshipShape {
+            id: 2,
+            name: "parent".to_string(),
+            qualified_projection: projection.clone(),
+            projection_table_bare: "stale_projection".to_string(),
+            projection_schema: "public".to_string(),
+            to_col: "id".to_string(),
+            from_table: "public.src".to_string(),
+            from_col: "p".to_string(),
+            from_key_pg_type: std::sync::OnceLock::new(),
+            from_pk: None,
+            needs_recompute_fallback: false,
+            to_side: ToSide {
+                table: projection.clone(),
+                identity: "public.stale_projection".to_string(),
+                seam_fed: false,
+                key_pg_type: std::sync::OnceLock::new(),
+            },
+        });
+        let record = RelationshipReverseRecord {
+            shape,
+            old_row: None,
+            new_row: None,
+            old_image: None,
+            new_image: None,
+            lsn: None,
+            prev_lsn: None,
+            prev_gen: None,
+            watermark: PgLsn::from(0),
+            hop_gen: 0,
+            src_changed: None,
+            origin_lsn: None,
+            retry_count: 0,
+        };
+        // A key change, a key with no row yet, and a record with no key.
+        let reverse_keys = [
+            (Some(keys[4960].clone()), Some(keys[4950].clone())),
+            (None, Some("400001".to_string())),
+            (None, None),
+        ];
+        let bumps = HashMap::from([(1, bump)]);
+        let txn = client.transaction().await.expect("begin");
+        let before = projection_seq_scans(&txn).await;
+        let fetched_before = projection_index_fetches(&txn).await;
+        lock_page_projection_rows(
+            &txn,
+            &bumps,
+            reverse_keys.iter().map(|keys| (&record, keys)),
+        )
+        .await
+        .expect("lock");
+        assert_eq!(
+            projection_seq_scans(&txn).await,
+            before,
+            "the lock must not scan the projection"
+        );
+        let fetched = projection_index_fetches(&txn).await - fetched_before;
+        assert!(
+            fetched <= 4902,
+            "the lock fetches only the keys' rows, not the whole key index: {fetched}"
+        );
+        let setting: String = txn
+            .query_one("select current_setting('enable_seqscan')", &[])
+            .await
+            .expect("setting")
+            .get(0);
+        assert_eq!(setting, "on", "the settings are put back afterwards");
+        let (other, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let candidates: Vec<i32> = [0, 4899, 4900, 4950, 4960, 4999]
+            .iter()
+            .map(|&i| keys[i].parse().expect("an integer key"))
+            .collect();
+        let free: Vec<i32> = other
+            .query(
+                "select id from stale_projection where id = any($1) \
+                 order by stale_projection.id for update skip locked",
+                &[&candidates],
+            )
+            .await
+            .expect("free rows")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        txn.rollback().await.expect("rollback");
+        let expected_free: Vec<i32> = [4900, 4999]
+            .iter()
+            .map(|&i| keys[i].parse().expect("an integer key"))
+            .collect();
+        assert_eq!(
+            free, expected_free,
+            "the bump's keys and the reverse records' keys are locked, and no other"
+        );
     }
 
     /// Issue #835: Phase 3's single-key projection statements (the reverse
@@ -9285,7 +9495,9 @@ async fn clear_target(
 /// 3. **The 1-1 targets on their ledgers** ([`settle_one_to_one_target`],
 ///    #623 D6): the sorted entry lock, the Re-derive read, the entries'
 ///    ADR-0002 I2 test, then the ordered pre-lock + upsert/delete of only
-///    the keys it changed ([`apply_target`]), immediately followed by the **relationship
+///    the keys it changed ([`apply_target`]), followed by a key-ordered lock
+///    of every projection row the page writes ([`lock_page_projection_rows`],
+///    issue #848) and the **relationship
 ///    settled-parent projection gen bump** (issue #130, epic #127): every
 ///    to-one relationship parent this batch's relationship resolution
 ///    touched (`plan.relationship_gen_bumps`) gets its projection's
@@ -9611,6 +9823,30 @@ pub(crate) async fn apply_page(
             .await?;
     }
 
+    // Before 3c and 3d, issue #848: every projection row the generation
+    // bumps (3c) and the reverse records (3d) write, locked `for update` in
+    // one statement per relationship, in `relationship_id` order and each in
+    // key order (ADR-0002 I5): see `lock_page_projection_rows`. The bump and
+    // the reverse records' guards and writes then take no lock on a row that
+    // existed here.
+    let reverse_keys: Vec<(Option<String>, Option<String>)> = plan
+        .relationship_reverses
+        .iter()
+        .map(|record| {
+            let shape = &record.shape;
+            Ok((
+                relationship_key_text(&record.old_row, &shape.to_col, &shape.name)?,
+                relationship_key_text(&record.new_row, &shape.to_col, &shape.name)?,
+            ))
+        })
+        .collect::<Result<_, ApplyError>>()?;
+    lock_page_projection_rows(
+        txn,
+        &plan.relationship_gen_bumps,
+        plan.relationship_reverses.iter().zip(&reverse_keys),
+    )
+    .await?;
+
     // 3c. Relationship settled-parent projection gen bump (issue #130, epic
     // #127; plan doc §2 guard (b)'s precondition): every to-one relationship
     // parent this batch's relationship resolution touched
@@ -9630,25 +9866,15 @@ pub(crate) async fn apply_page(
     // on the widen-only catch-up gap #131 closes) simply bumps nothing — no
     // error, same as any `UPDATE ... WHERE` matching zero rows. The key is
     // compared at its own type under the entry plan settings, so the
-    // projection's primary key index serves it, after a statement that
-    // locks the same rows in key order ([`bump_generations`], issue #835).
+    // projection's primary key index serves it ([`bump_generations`], issue
+    // #835). The rows are already locked in key order, just above: the bare
+    // `UPDATE` locks in whatever order its plan reads the rows (physical
+    // order under a bitmap scan), so two pages bumping an overlapping set of
+    // hot parents would otherwise deadlock (review follow-up to #132).
     for bump in plan.relationship_gen_bumps.values() {
         if bump.touched_keys.is_empty() {
             continue;
         }
-        // Ascending-key lock order (review follow-up to #132, ADR-0002 I5):
-        // two concurrent pages whose batches both touch an overlapping set of
-        // relationship-projection parent keys (plausible whenever two
-        // segments both contain from-side rows re-pointing among the same
-        // hot parents) must lock those rows in one order, or they deadlock.
-        // Postgres detects and aborts one side rather than corrupting
-        // anything, but it's a needless liveness hazard. The bare `UPDATE`
-        // locks in whatever order its plan reads the rows (physical order
-        // under a bitmap scan), so `bump_generations` locks them `order by`
-        // key first, as the target-write pre-lock above does, with
-        // `two_overlapping_group_writers_serialize_via_ascending_lock_order_not_deadlock`
-        // as that pre-lock's regression pin and
-        // `the_generation_bump_locks_its_rows_in_key_order` as this one's.
         bump_generations(txn, bump).await?;
     }
 
@@ -9675,10 +9901,8 @@ pub(crate) async fn apply_page(
     // Issue #762: the ring rows this transaction applies, which a live
     // write's pending read counts as applied.
     let claim = super::page::ClaimScope { steps, claimed_by };
-    for record in &plan.relationship_reverses {
+    for (record, (old_key, new_key)) in plan.relationship_reverses.iter().zip(reverse_keys) {
         let shape = &record.shape;
-        let old_key = relationship_key_text(&record.old_row, &shape.to_col, &shape.name)?;
-        let new_key = relationship_key_text(&record.new_row, &shape.to_col, &shape.name)?;
         // Resolved once per record from the batch-wide cache above — every
         // `from_side_rows_for_trigger_txn` call this record makes (via
         // `stage_reverse_recompute_fallback`) reuses this same slice.
@@ -9690,9 +9914,17 @@ pub(crate) async fn apply_page(
         // `check_reverse_guards`'s own doc comment for the mechanism, the
         // locking discipline, and why they're combined into one Phase 3
         // step instead of four independent ones.
-        if let Some(failure) =
-            check_reverse_guards(txn, shape, record, &old_key, &new_key, watermark).await?
-        {
+        let guards =
+            check_reverse_guards(txn, shape, record, &old_key, &new_key, watermark).await?;
+        // Test-only pause point (#848). See `super::interleave`.
+        #[cfg(any(test, feature = "test-util"))]
+        super::interleave::pause_at(
+            txn,
+            super::interleave::PausePoint::AfterReverseGuards,
+            &shape.qualified_projection,
+        )
+        .await?;
+        if let Some(failure) = guards {
             // Issue #135: fairness escalation — see this module's own
             // "Issue #135, epic #127: fairness escalation" design section
             // (right after `check_reverse_guards`) for the full mechanism

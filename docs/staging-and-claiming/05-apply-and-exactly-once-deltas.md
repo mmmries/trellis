@@ -582,10 +582,21 @@ statement**. The entry lock is ordered by key
 ([the 1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger),
 [the aggregate ledger](#aggregate-groups-the-ledger)); a 1-1 target's rows are
 then pre-locked in key order, and an aggregate's group upsert writes its
-groups in group order. A page's to-one relationship projection rows, whose
-generation it bumps, are locked in key order before the bump writes them,
-the order the reverse release locks them in: the bump alone writes them in
-whatever order its plan reads them, physical order under a bitmap scan.
+groups in group order. After its targets, a page locks every to-one
+relationship projection row it writes, in one sorted statement per
+relationship, in relationship order. Those are the rows whose generation it
+bumps and the rows its reverse records guard and advance, and the order is
+the one the reverse release uses. Left to themselves, the bump would write
+its rows in whatever order its plan reads them (physical order under a
+bitmap scan), and the reverse records would lock theirs one at a time in
+fold order. Either one deadlocks against a page or a release that reaches
+the same parents in another order. The sorted lock finds only the rows
+that exist when it runs. A row it didn't find, because it doesn't exist yet
+or was committed after the lock, is locked when a reverse record reads or
+writes it, in record order, and a record inserting a key another page is
+inserting waits on that page's insert. Two pages can still deadlock through
+such a row, but only while a projection row both of them reach is being
+created; Postgres aborts one of them, which retries.
 
 A consistent total lock order has no cycle, so overlapping workers serialize on a
 shared hot group instead of deadlocking. That plus a bounded, idempotent retry on
