@@ -2317,3 +2317,235 @@ async fn a_page_that_skipped_a_from_side_key_misses_its_fence_after_a_reader_res
         other => panic!("expected VersionFenceMiss, got {other:?}"),
     }
 }
+
+/// Issue #831: a release of a to-side key and a resume of a from-side's
+/// reader bump different fences (the to-side's and the from-side's), so the
+/// relationship's refresh stamp is what serializes them. The resume, the
+/// relationship's first reader to go unfrozen, refreshes its projection with
+/// the stamp locked `for update`, and the release holds it `for share` from
+/// before its projection writes to its commit. So the resume waits for the
+/// release, and reads what it wrote.
+///
+/// `users` key `ann` is held for `users_copy` while every reader of `posts`
+/// is paused and its key is off the allowlist, which the release doesn't
+/// resolve. The release is frozen after its last write, the key is made
+/// usable again and `posts_named` resumed: the resume queues behind the
+/// release, on the refresh stamp, and the rebuilt `posts_named` holds the
+/// change the release carried.
+#[tokio::test]
+async fn a_resume_of_a_from_side_reader_waits_for_a_key_release() {
+    use trellis::staging::interleave::{PausePoint, PauseScope, with_scope};
+    use trellis::staging::{StagedWatermark, apply, seal};
+    const PAUSE_LOCK: i64 = 831;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = retyped_to_side_setup(db.dsn(), &mut raw, &db.pool).await;
+    trellis
+        .apply("TRANSFORM users_copy FROM public.users SELECT name AS name")
+        .await
+        .expect("define users_copy");
+    bring_live(&mut raw, &db.pool, &["users_copy"]).await;
+    let app = connect(db.dsn()).await;
+
+    for target in ["posts_named", "posts_plain"] {
+        trellis
+            .apply(&format!("PAUSE TRANSFORM {target}"))
+            .await
+            .expect("pause a reader of posts");
+    }
+    app.batch_execute("alter table public.posts alter column id type numeric")
+        .await
+        .expect("retype the from-side key");
+    let outcome = capture_pass(&mut raw, &db.pool).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    raw.batch_execute(
+        "insert into poison (transform_id, src_table, key, last_error) \
+         select id, 'public.users', 'ann', 'planted by the test' from transform_definitions \
+         where target_table = 'public.users_copy'",
+    )
+    .await
+    .expect("hold users key ann for users_copy");
+    app.batch_execute("update public.users set name = 'Annie' where handle = 'ann'")
+        .await
+        .expect("write the to-side");
+    // One batch, not `drain_to_quiescence`: the parked write keeps the ring
+    // pending until the release.
+    let sealed = seal::seal_phase1(&mut raw).await.expect("seal phase 1");
+    seal::seal_phase2(&raw, sealed.sealed_seg_seq, "capture_schema_change_wake")
+        .await
+        .expect("seal phase 2");
+    while apply::drain_once(
+        &db.pool,
+        sealed.sealed_seg_seq,
+        "worker",
+        1,
+        "capture_schema_change_wake",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("drain the to-side's write")
+    .is_some()
+    {}
+    assert_eq!(
+        rows(&raw, "select count(*)::text from poison_held").await,
+        vec![vec![Some("1".to_string())]],
+        "the page parked the write for users_copy"
+    );
+    assert_eq!(
+        rows(&raw, "select name from public.posts_named where id = 1").await,
+        vec![vec![Some("Ann".to_string())]],
+        "posts_named is paused"
+    );
+
+    let gate = connect(db.dsn()).await;
+    gate.execute("select pg_advisory_lock($1)", &[&PAUSE_LOCK])
+        .await
+        .expect("take the pause lock");
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::BeforeReleaseCommit, "public.users", PAUSE_LOCK);
+    let pool = db.pool.clone();
+    let mut release = tokio::spawn(with_scope(scope, async move {
+        trellis::staging::release_key(&pool, "users_copy", "public.users", "ann").await
+    }));
+    let releaser = tokio::select! {
+        reached = reached => reached.expect("pause scope dropped").backend_pid,
+        finished = &mut release => panic!("the release finished without pausing: {finished:?}"),
+    };
+
+    app.batch_execute("alter table public.posts alter column id type int")
+        .await
+        .expect("make the from-side key usable again");
+    let resume = tokio::spawn({
+        let dsn = db.dsn().to_string();
+        async move {
+            definer(&dsn)
+                .await
+                .apply("RESUME TRANSFORM posts_named")
+                .await
+        }
+    });
+    let blocked = blocked_behind(&raw, releaser).await;
+    // A backend queued on a row lock holds the row's tuple lock while it
+    // waits for the holder: here the stamp's row, not a projection row.
+    assert_eq!(
+        rows(
+            &raw,
+            &format!(
+                "select c.relname::text from pg_locks l join pg_class c on c.oid = l.relation \
+                 where l.pid = {blocked} and l.locktype = 'tuple' and l.granted"
+            ),
+        )
+        .await,
+        vec![vec![Some("relationship_projections".to_string())]],
+        "the resume waits on author's refresh stamp"
+    );
+    assert!(!resume.is_finished(), "the resume waits for the release");
+
+    gate.execute("select pg_advisory_unlock($1)", &[&PAUSE_LOCK])
+        .await
+        .expect("release the pause lock");
+    let discarded = release
+        .await
+        .expect("release task")
+        .expect("release users key ann");
+    assert_eq!(discarded, 1, "the parked write is discarded");
+    resume
+        .await
+        .expect("resume task")
+        .expect("resume posts_named");
+
+    bring_live(&mut raw, &db.pool, &["posts_named", "users_copy"]).await;
+    assert_eq!(
+        rows(&raw, "select name from public.posts_named where id = 1").await,
+        vec![vec![Some("Annie".to_string())]],
+        "the resumed reader holds the change the release carried"
+    );
+    assert_eq!(
+        rows(&raw, "select name from public.users_copy order by name").await,
+        rows(&raw, "select name from public.users order by name").await,
+        "the release re-derived users_copy's key"
+    );
+}
+
+/// The pid of the one backend queued on a lock `pid` holds, once one is:
+/// the wait is one the test forced, so this is no wait for convergence.
+async fn blocked_behind(raw: &Client, pid: i32) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let waiters: Vec<i32> = raw
+            .query(
+                "select pid from pg_stat_activity where $1 = any(pg_blocking_pids(pid))",
+                &[&pid],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        if let [waiter] = waiters[..] {
+            return waiter;
+        }
+        assert!(
+            waiters.is_empty(),
+            "one backend waits on the release: {waiters:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "no backend queued behind the release (pid {pid}) within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Issue #831: a key release resolves no relationship from-side's key. It
+/// stages no recompute of a from-side's rows (its `Recompute` re-derives
+/// them on a later page), so a from-side whose key can't be used, read by a
+/// definition that isn't frozen, is no reason to refuse it.
+///
+/// `users` key `ann` is held for `users_copy`, then `posts.id` is retyped
+/// off the allowlist with `posts_named` and `posts_plain` still live (no
+/// capture pass runs, so nothing pauses them). The release of `ann` goes
+/// through and stages its `Recompute`.
+#[tokio::test]
+async fn a_release_ignores_an_unusable_from_side_key() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = retyped_to_side_setup(db.dsn(), &mut raw, &db.pool).await;
+    trellis
+        .apply("TRANSFORM users_copy FROM public.users SELECT name AS name")
+        .await
+        .expect("define users_copy");
+    bring_live(&mut raw, &db.pool, &["users_copy"]).await;
+    raw.batch_execute(
+        "insert into poison (transform_id, src_table, key, last_error) \
+         select id, 'public.users', 'ann', 'planted by the test' from transform_definitions \
+         where target_table = 'public.users_copy'",
+    )
+    .await
+    .expect("hold users key ann for users_copy");
+    raw.batch_execute("alter table public.posts alter column id type numeric")
+        .await
+        .expect("retype the from-side key");
+    assert_eq!(
+        rows(
+            &raw,
+            "select status from transform_definitions \
+             where target_table = 'public.posts_named'"
+        )
+        .await,
+        vec![vec![Some("live".to_string())]],
+        "a reader of posts isn't frozen"
+    );
+
+    let discarded = trellis::staging::release_key(&db.pool, "users_copy", "public.users", "ann")
+        .await
+        .expect("a release needs no from-side's key");
+    assert_eq!(discarded, 0, "nothing was parked");
+    assert_eq!(
+        rows(&raw, "select count(*)::text from poison").await,
+        vec![vec![Some("0".to_string())]],
+        "the key is released"
+    );
+}
