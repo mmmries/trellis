@@ -322,6 +322,15 @@ A transient failure (a lost connection, a lock or serialization conflict) is ret
 A failure that reproduces is isolated to the source key that causes it and the transform
 whose apply it fails in, and the key is evicted to `poison` for that transform once its
 `key_deaths` count reaches `DEFAULT_DEATH_THRESHOLD`.
+A page's `COMMIT` is classified like any of its statements, since a deferred constraint
+or constraint trigger an application puts on a target fails there, and a connection can
+drop there. A connection that drops after the `COMMIT` lands retries a page that
+committed: a final page's retry finds the claim that commit released gone and rolls
+back as a lost claim, and a non-final page's retry applies again and writes nothing
+new, since each key's ledger entry already holds its change.
+Isolation's probes roll back rather than commit, so each runs
+`SET CONSTRAINTS ALL IMMEDIATE` before its rollback, and a deferred check fails in the
+probe of the key that breaks it. Trellis's own tables declare no deferrable constraint.
 A failure that is structural rather than one key's fault, so that every key reproduces
 it, is not charged to any key: it pauses the definitions it reaches
 ([ADR-0014](0014-pause-and-drop-a-transform.md)).
