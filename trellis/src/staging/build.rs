@@ -1112,8 +1112,9 @@ pub async fn qualifies(
 /// [`qualifies`] (#625 F2). `ready` is what the staging worker's capture pass
 /// found dispatchable (`capture::reconcile`): the definitions it would
 /// otherwise park a registration marker for. Returns the ones the old build
-/// path must leave alone: those started, and those waiting on their source's
-/// capture gate.
+/// path must leave alone: those started, those waiting on their source's
+/// capture gate, and those whose start timed out waiting for the
+/// column-pause lock (#922), which the next pass starts.
 ///
 /// The gate is the discharge's (`intake::markers`, Q2(a)): while any change
 /// to the source at or below the gate its capture install or widen recorded
@@ -1155,8 +1156,23 @@ pub async fn start_ready_builds(
             taken.push(id);
             continue;
         }
-        if start(client, &definition).await? {
-            taken.push(id);
+        match start(client, &definition).await {
+            Ok(true) => taken.push(id),
+            Ok(false) => {}
+            // A start waits for the column-pause lock (#922). One that
+            // times out wrote nothing; it stays `waiting_to_backfill` for
+            // the next pass, and gets no registration marker meanwhile,
+            // as one held by its capture gate does. The rest of the pass
+            // goes on.
+            Err(ApplyError::ColumnPauseLockTimeout(err)) => {
+                tracing::warn!(
+                    definition_id = id,
+                    error = %err,
+                    "re-derive build start waited out the column-pause lock; retrying next pass"
+                );
+                taken.push(id);
+            }
+            Err(err) => return Err(err),
         }
     }
     Ok(taken)
@@ -1277,6 +1293,18 @@ async fn start(
     definition: &Definition,
 ) -> Result<bool, ApplyError> {
     let txn = client.transaction().await?;
+    // The column-pause lock, exclusive (#922): this start releases the
+    // definition's `awaiting_capture` pauses ([`release_awaiting_capture`]),
+    // which a pause, a resume and a define read and write. Before the
+    // definition row, where every taker of the lock orders it
+    // (`crate::locks::lock_column_pauses`); this start has no fence. A wait
+    // that times out fails the start, and the capture pass takes it again.
+    crate::locks::lock_column_pauses(
+        &txn,
+        crate::locks::ColumnPauseLock::Exclusive,
+        crate::locks::ColumnPauseOp::Capture,
+    )
+    .await?;
     let status: Option<String> = txn
         .query_opt(
             "select status from transform_definitions where id = $1 for update",
@@ -1463,6 +1491,16 @@ async fn field_build_ready(
     // stalled worker holds up every page of the source, not just its chunk.
     fence.arm(&*txn).await?;
     bump_version_fence(&*txn, &definition.source_table).await?;
+    // The column-pause lock, exclusive (#922), after the fence wait and
+    // before the claim and the rows: the release below writes pause state
+    // (`release_awaiting_capture`). See `crate::locks::lock_column_pauses`.
+    // A wait that times out fails this job's attempt, which retries.
+    crate::locks::lock_column_pauses(
+        &*txn,
+        crate::locks::ColumnPauseLock::Exclusive,
+        crate::locks::ColumnPauseOp::Capture,
+    )
+    .await?;
     if !fence.hold(&*txn).await? {
         txn.rollback().await?;
         return Ok(FieldStart::Superseded);
