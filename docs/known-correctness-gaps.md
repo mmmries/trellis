@@ -806,5 +806,10 @@ refusing them up front:
   connections also run with `row_security = off`, so a read or write that
   row-level security would filter fails instead of silently missing rows
   (entry 11).
+* **A `default_transaction_isolation` of `repeatable read` or
+  `serializable`** on the server, the database or a role. Trellis's
+  connections default to `read committed`, which its reads after a lock
+  depend on, whatever the setting. The application's own sessions keep
+  their level: capture works at every level.
 * **A whole-database backup and restore, or PITR.** Sources and Trellis state
   roll back together.
