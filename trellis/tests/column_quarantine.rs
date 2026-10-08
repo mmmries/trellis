@@ -25,6 +25,7 @@ use trellis::defs::{
     create_relationship, create_target_table, install_definition, relationship_projection,
     source_primary_key,
 };
+use trellis::dev::interleave::{PausePoint, PauseScope, with_scope};
 use trellis::staging::StagedWatermark;
 use trellis::staging::apply::{self, ApplyError};
 use trellis::staging::quarantine::{self, DEFAULT_COLUMN_DEATH_THRESHOLD};
@@ -602,6 +603,425 @@ async fn a_dependent_transforms_column_cascades_to_paused_when_its_upstream_colu
         )
         .await,
         "the cascade edge must be recorded so resume can later un-cascade it correctly"
+    );
+}
+
+/// Adds a third 1-1 transform (`order_reports`, reading `order_summaries`'s
+/// `grand_total`), so a cascade from `order_totals.total` reaches a child
+/// and a grandchild, each fenced on its own source.
+async fn seed_order_reports(db: &TestDatabase, orders_def: &TransformDef) {
+    let order_summaries_columns = numeric_columns(&["id", "grand_total"]);
+    let reports_def = create_definition(
+        &db.pool,
+        "TRANSFORM order_reports FROM order_summaries SELECT grand_total + 1 AS report_total",
+        &order_summaries_columns,
+    )
+    .await
+    .expect("create order_reports definition");
+    let pk = source_primary_key(&db.pool, &orders_def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(
+        &db.pool,
+        &reports_def.def,
+        "public",
+        &pk,
+        &order_summaries_columns,
+        &reports_def.def.source,
+    )
+    .await
+    .expect("create order_reports table");
+}
+
+/// Holds the version fence of the source `target`'s definition reads `for
+/// share`, as a page in flight does, until the returned transaction ends.
+async fn hold_fence_of<'a>(raw: &'a mut Client, target: &str) -> tokio_postgres::Transaction<'a> {
+    raw.execute(
+        "insert into source_table_versions (source_table, version) \
+         select d.source_table, 1 from transform_definitions d \
+         where split_part(d.target_table, '.', 2) = $1 \
+         on conflict (source_table) do nothing",
+        &[&target],
+    )
+    .await
+    .expect("seed the fence");
+    let holder = raw.transaction().await.expect("begin the fence holder");
+    let held = holder
+        .execute(
+            "select v.version from source_table_versions v \
+             join transform_definitions d on d.source_table = v.source_table \
+             where split_part(d.target_table, '.', 2) = $1 for share of v",
+            &[&target],
+        )
+        .await
+        .expect("hold the fence");
+    assert_eq!(held, 1, "{target}'s fence is held");
+    holder
+}
+
+/// A pool whose sessions give up on a lock after 100 ms (a setting shorter
+/// than Trellis's 30 s cap is kept), so a pause's fence bump behind a held
+/// fence fails fast.
+fn impatient_pool(db: &TestDatabase) -> trellis::Pool {
+    trellis::Pool::new(
+        &Config::from_dsn(format!("{} options='-c lock_timeout=100'", db.dsn()))
+            .expect("valid dsn"),
+    )
+    .expect("pool")
+}
+
+async fn cascade_pending(client: &Client, transform: &str, column: &str) -> Option<bool> {
+    client
+        .query_opt(
+            "select cascade_pending from column_status \
+             where transform_table = $1 and column_name = $2",
+            &[&transform, &column],
+        )
+        .await
+        .expect("read column_status")
+        .map(|row| row.get(0))
+}
+
+/// Issue #912: each pair of a column pause's cascade bumps its own source's
+/// fence in its own transaction, so a writer holding a grandchild's fence
+/// fails the walk after the child has paused. The child was paused by the
+/// first attempt, and a retried `PAUSE` still walks on through it to the
+/// grandchild.
+#[tokio::test]
+async fn a_retried_pause_completes_a_cascade_that_failed_at_a_grandchild() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    let orders_def = seed_order_totals(&db, &client).await;
+    seed_order_summaries(&db, &orders_def).await;
+    seed_order_reports(&db, &orders_def).await;
+
+    let mut page = connect_raw(db.dsn()).await;
+    let holder = hold_fence_of(&mut page, "order_reports").await;
+    let result = quarantine::pause_column(&impatient_pool(&db), "order_totals", "total").await;
+    assert!(
+        result.is_err(),
+        "the grandchild's fence bump must wait out the lock timeout, got {result:?}"
+    );
+    assert_eq!(
+        column_status_row(&client, "order_totals", "total").await,
+        Some((true, None)),
+        "the pause's own row commits before its cascade"
+    );
+    assert!(
+        column_status_row(&client, "order_summaries", "grand_total")
+            .await
+            .is_some(),
+        "the child paused before the walk failed"
+    );
+    assert_eq!(
+        column_status_row(&client, "order_reports", "report_total").await,
+        None,
+        "the walk failed at the grandchild"
+    );
+    assert_eq!(
+        cascade_pending(&client, "order_totals", "total").await,
+        Some(true),
+        "the pause still owes its cascade"
+    );
+    holder.rollback().await.expect("end the fence holder");
+
+    quarantine::pause_column(&db.pool, "order_totals", "total")
+        .await
+        .expect("retry the pause");
+    let grandchild = column_status_row(&client, "order_reports", "report_total")
+        .await
+        .expect("the retry walks through the child it paused already to the grandchild");
+    assert!(!grandchild.0, "the grandchild's pause is a cascade's");
+    assert!(
+        cascade_edge_exists(
+            &client,
+            "order_reports",
+            "report_total",
+            "order_summaries",
+            "grand_total"
+        )
+        .await,
+        "the grandchild's edge is recorded so the resume releases it"
+    );
+    assert_eq!(
+        cascade_pending(&client, "order_totals", "total").await,
+        Some(false),
+        "the finished walk clears the mark"
+    );
+
+    // The resume releases the whole chain the two attempts paused.
+    let resumed = quarantine::resume_column(&db.pool, "order_totals", "total")
+        .await
+        .expect("resume the head");
+    assert_eq!(resumed.len(), 3, "resumed {resumed:?}");
+}
+
+/// Issue #912: a column fuse trip commits its pause and then cascades. A
+/// cascade that fails at the grandchild has no caller to retry it, and the
+/// paused column stops failing, so nothing trips the fuse again. The trip
+/// leaves its pause marked as owing the cascade, and the capture pass's
+/// [`quarantine::complete_pause_cascades`] finishes the walk.
+#[tokio::test]
+async fn a_fuse_trip_whose_cascade_failed_at_a_grandchild_is_completed_by_the_capture_pass() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let orders_def = seed_order_totals(&db, &client).await;
+    seed_order_summaries(&db, &orders_def).await;
+    seed_order_reports(&db, &orders_def).await;
+    let below_threshold: Vec<i64> = (1..DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    stage_bad_orders(&mut client, &db.pool, &below_threshold).await;
+
+    let mut page = connect_raw(db.dsn()).await;
+    let holder = hold_fence_of(&mut page, "order_reports").await;
+    let table = active_segment_table(&client).await;
+    insert_cdc_row(
+        &client,
+        &table,
+        "orders",
+        &DEFAULT_COLUMN_DEATH_THRESHOLD.to_string(),
+        "insert",
+        None,
+        Some(r#"{"price":"not-a-number","tax":"1.50"}"#),
+    )
+    .await;
+    let seg_seq = seal_active_segment(&mut client).await;
+    let result = apply::drain_once(
+        &impatient_pool(&db),
+        seg_seq,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
+    assert!(result.is_err(), "the drain fails, got {result:?}");
+    let root = column_status_row(&client, "order_totals", "total")
+        .await
+        .expect("the fuse tripped");
+    assert!(root.0, "a threshold trip is a local fuse");
+    assert!(
+        column_status_row(&client, "order_summaries", "grand_total")
+            .await
+            .is_some(),
+        "the child paused before the walk failed"
+    );
+    assert_eq!(
+        column_status_row(&client, "order_reports", "report_total").await,
+        None,
+        "the walk failed at the grandchild"
+    );
+
+    // While the writer still holds the grandchild's fence, the capture
+    // pass's completion gives up after its own short lock timeout, not the
+    // session's 30 s: the maintenance loop that runs it is the only sealer.
+    let started = std::time::Instant::now();
+    assert_eq!(
+        quarantine::complete_pause_cascades(&db.pool)
+            .await
+            .expect("a walk's failure is logged, not returned"),
+        0,
+        "no walk finishes while the fence is held"
+    );
+    let took = started.elapsed();
+    assert!(
+        took < quarantine::CASCADE_COMPLETION_LOCK_TIMEOUT + Duration::from_secs(5),
+        "the completion waited {took:?} behind the held fence"
+    );
+    assert_eq!(
+        cascade_pending(&client, "order_totals", "total").await,
+        Some(true),
+        "the pause still owes its cascade"
+    );
+    holder.rollback().await.expect("end the fence holder");
+
+    // The staging worker's capture pass, as the maintenance loop runs it.
+    trellis::client::reconcile_pass(
+        &mut client,
+        &db.pool,
+        DEFAULT_SCHEMA,
+        "wake",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("reconcile pass");
+    assert!(
+        column_status_row(&client, "order_reports", "report_total")
+            .await
+            .is_some(),
+        "the capture pass's completion reaches the grandchild"
+    );
+    assert!(
+        cascade_edge_exists(
+            &client,
+            "order_reports",
+            "report_total",
+            "order_summaries",
+            "grand_total"
+        )
+        .await
+    );
+    assert_eq!(
+        cascade_pending(&client, "order_totals", "total").await,
+        Some(false)
+    );
+    assert_eq!(
+        quarantine::complete_pause_cascades(&db.pool)
+            .await
+            .expect("nothing left to finish"),
+        0,
+        "a finished walk isn't walked again"
+    );
+}
+
+/// Holds a session advisory lock on a connection of its own, for a
+/// [`PauseScope`] arming to block on until [`release_gate`].
+async fn take_gate(db: &TestDatabase, key: i64) -> Client {
+    let gate = connect_raw(db.dsn()).await;
+    gate.execute("select pg_advisory_lock($1)", &[&key])
+        .await
+        .expect("take the pause lock");
+    gate
+}
+
+async fn release_gate(gate: &Client, key: i64) {
+    gate.execute("select pg_advisory_unlock($1)", &[&key])
+        .await
+        .expect("release the pause lock");
+}
+
+/// Issue #912: a cascade pair checks, after its fence bump, that its
+/// upstream column is still paused. A walk frozen between the bump and that
+/// check while the upstream column's `RESUME` commits (the two bump
+/// different fences: the reader's definition reads the paused column's
+/// target) writes nothing, rather than pausing a reader the resume never
+/// saw, with an edge from a live column that no later resume would delete.
+#[tokio::test]
+async fn a_cascade_pair_that_loses_the_race_to_its_upstreams_resume_pauses_nothing() {
+    const PAUSE_LOCK: i64 = 912;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    let orders_def = seed_order_totals(&db, &client).await;
+    seed_order_summaries(&db, &orders_def).await;
+
+    let gate = take_gate(&db, PAUSE_LOCK).await;
+    let scope = PauseScope::new();
+    let reached = scope.arm(
+        PausePoint::AfterCascadeFenceBump,
+        "order_summaries",
+        PAUSE_LOCK,
+    );
+    let pool = db.pool.clone();
+    let mut pause = tokio::spawn(with_scope(scope, async move {
+        quarantine::pause_column(&pool, "order_totals", "total").await
+    }));
+    tokio::select! {
+        reached = reached => { reached.expect("pause scope dropped"); }
+        finished = &mut pause => panic!("the pause finished without reaching the pair: {finished:?}"),
+    }
+
+    let resumed = quarantine::resume_column(&db.pool, "order_totals", "total")
+        .await
+        .expect("the resume doesn't wait on the frozen pair");
+    assert_eq!(
+        resumed,
+        vec![("order_totals".to_string(), "total".to_string())],
+        "the pair hadn't reached the reader when the resume ran"
+    );
+
+    release_gate(&gate, PAUSE_LOCK).await;
+    pause
+        .await
+        .expect("pause task")
+        .expect("the walk stops at a resumed upstream");
+    assert_eq!(
+        column_status_row(&client, "order_summaries", "grand_total").await,
+        None,
+        "the reader of a resumed column isn't paused"
+    );
+    assert!(
+        !cascade_edge_exists(
+            &client,
+            "order_summaries",
+            "grand_total",
+            "order_totals",
+            "total"
+        )
+        .await,
+        "no edge from a live column"
+    );
+}
+
+/// Issue #912: a walk clears its pause's `cascade_pending` mark only if the
+/// row is as the walk found it. Here a second `PAUSE` of the same column
+/// commits while the first walk is frozen at the grandchild, and its own
+/// walk fails there. The first walk then finishes, and leaves the second
+/// pause's mark for the capture pass's completion.
+#[tokio::test]
+async fn a_walk_leaves_the_mark_of_a_pause_that_committed_after_it_started() {
+    const PAUSE_LOCK: i64 = 9120;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    let orders_def = seed_order_totals(&db, &client).await;
+    seed_order_summaries(&db, &orders_def).await;
+    seed_order_reports(&db, &orders_def).await;
+
+    let gate = take_gate(&db, PAUSE_LOCK).await;
+    let scope = PauseScope::new();
+    let reached = scope.arm(
+        PausePoint::AfterCascadeFenceBump,
+        "order_reports",
+        PAUSE_LOCK,
+    );
+    let pool = db.pool.clone();
+    let mut first = tokio::spawn(with_scope(scope, async move {
+        quarantine::pause_column(&pool, "order_totals", "total").await
+    }));
+    tokio::select! {
+        reached = reached => { reached.expect("pause scope dropped"); }
+        finished = &mut first => panic!("the pause finished without reaching the grandchild: {finished:?}"),
+    }
+
+    let second = quarantine::pause_column(&impatient_pool(&db), "order_totals", "total").await;
+    assert!(
+        second.is_err(),
+        "the second walk waits out its lock timeout behind the first at the grandchild, got {second:?}"
+    );
+    assert_eq!(
+        cascade_pending(&client, "order_totals", "total").await,
+        Some(true)
+    );
+
+    release_gate(&gate, PAUSE_LOCK).await;
+    first
+        .await
+        .expect("pause task")
+        .expect("the first walk finishes");
+    assert!(
+        column_status_row(&client, "order_reports", "report_total")
+            .await
+            .is_some(),
+        "the first walk reached the grandchild"
+    );
+    assert_eq!(
+        cascade_pending(&client, "order_totals", "total").await,
+        Some(true),
+        "the first walk leaves the mark the second pause wrote"
+    );
+
+    assert_eq!(
+        quarantine::complete_pause_cascades(&db.pool)
+            .await
+            .expect("finish the owed cascade"),
+        1
+    );
+    assert_eq!(
+        cascade_pending(&client, "order_totals", "total").await,
+        Some(false),
+        "a walk started after the last pause clears it"
     );
 }
 

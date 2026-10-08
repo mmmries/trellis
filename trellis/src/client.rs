@@ -768,6 +768,7 @@ async fn first_capture_pass(
             .await
             .map_err(capture_pass_error)?;
     release_retyped_keys(pool).await;
+    complete_pause_cascades(pool).await;
     let taken =
         staging::build::start_ready_builds(session.client_mut(), pool, &outcome.ready).await?;
     outcome.ready.retain(|id| !taken.contains(id));
@@ -784,6 +785,20 @@ async fn release_retyped_keys(pool: &Pool) {
         tracing::warn!(
             error = %err,
             "couldn't release the keys held before an in-place re-type; retrying next pass"
+        );
+    }
+}
+
+/// Finishes any column pause's cascade that didn't complete (#912,
+/// [`staging::quarantine::complete_pause_cascades`]). A walk that fails is
+/// logged there, and the next pass tries again: a pause stays marked until
+/// its cascade reaches every dependent. Only a failure to read the marks
+/// reaches here.
+async fn complete_pause_cascades(pool: &Pool) {
+    if let Err(err) = staging::quarantine::complete_pause_cascades(pool).await {
+        tracing::warn!(
+            error = %err,
+            "couldn't read the column pauses owing a cascade; retrying next pass"
         );
     }
 }
@@ -1369,6 +1384,7 @@ async fn reconcile_source_tables(
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
     let mut outcome = capture::reconcile::reconcile(client, schema, &desired, deadline).await?;
     release_retyped_keys(pool).await;
+    complete_pause_cascades(pool).await;
     // #625 F2/F3: a ready definition the Re-derive build takes gets no
     // registration marker, and the discharge below doesn't dispatch it.
     let taken = staging::build::start_ready_builds(client, pool, &outcome.ready).await?;
