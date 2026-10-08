@@ -1170,14 +1170,10 @@ async fn a_superseded_delete_writes_back_a_key_a_lost_reinsert_restored() {
 /// is in `poison_held`, not the ring, and the key is marked poisoned for
 /// `order_names`, the definition reading customers through the relationship
 /// (#799: whole-key poison is per transform). It is the relationship's only
-/// reader, so its reverse work leaves the key out.
-async fn park_customer_change(
-    client: &Client,
-    id: i32,
-    op: &str,
-    old_image: Option<&str>,
-    new_image: Option<&str>,
-) {
+/// reader, so its reverse work leaves the key out. The held row keeps the
+/// change's pre-image and no join values: the relationship's `to_col` is the
+/// customers' key, whose only value is the ring key (#803).
+async fn park_customer_change(client: &Client, id: i32, old_image: Option<&str>) {
     let key = id.to_string();
     client
         .execute(
@@ -1191,11 +1187,11 @@ async fn park_customer_change(
     client
         .execute(
             "insert into poison_held \
-                 (transform_id, src_table, key, seg_seq, op, lsn, old_image, new_image, hop_gen) \
-             select id, 'public.customers', $1, 1, $2, pg_current_wal_insert_lsn(), \
-                    $3::text::jsonb, $4::text::jsonb, 0 \
+                 (transform_id, src_table, key, seg_seq, lsn, old_image, hop_gen) \
+             select id, 'public.customers', $1, 1, pg_current_wal_insert_lsn(), \
+                    $2::text::jsonb, 0 \
              from transform_definitions where target_table like '%.order_names'",
-            &[&key, &op, &old_image, &new_image],
+            &[&key, &old_image],
         )
         .await
         .expect("park the customer's change");
@@ -1217,14 +1213,7 @@ async fn releasing_a_parked_to_side_rename_advances_the_projection() {
         .batch_execute("update public.customers set name = 'ann2' where id = 1")
         .await
         .expect("rename customer 1");
-    park_customer_change(
-        &client,
-        1,
-        "update",
-        Some(r#"{"id":"1","name":"ann"}"#),
-        Some(r#"{"id":"1","name":"ann2"}"#),
-    )
-    .await;
+    park_customer_change(&client, 1, Some(r#"{"id":"1","name":"ann"}"#)).await;
     trellis::staging::release_key(&db.pool, "order_names", "public.customers", "1")
         .await
         .expect("release the parked customer");
@@ -1251,14 +1240,7 @@ async fn releasing_a_parked_to_side_delete_removes_the_projection_row() {
         .batch_execute("delete from public.customers where id = 1")
         .await
         .expect("delete customer 1");
-    park_customer_change(
-        &client,
-        1,
-        "delete",
-        Some(r#"{"id":"1","name":"ann"}"#),
-        None,
-    )
-    .await;
+    park_customer_change(&client, 1, Some(r#"{"id":"1","name":"ann"}"#)).await;
     trellis::staging::release_key(&db.pool, "order_names", "public.customers", "1")
         .await
         .expect("release the parked customer");
@@ -1298,14 +1280,7 @@ async fn releasing_a_parked_rename_whose_segment_is_still_draining_advances_the_
         )
         .await
         .expect("mark the segment draining");
-    park_customer_change(
-        &client,
-        1,
-        "update",
-        Some(r#"{"id":"1","name":"ann"}"#),
-        Some(r#"{"id":"1","name":"ann2"}"#),
-    )
-    .await;
+    park_customer_change(&client, 1, Some(r#"{"id":"1","name":"ann"}"#)).await;
     trellis::staging::release_key(&db.pool, "order_names", "public.customers", "1")
         .await
         .expect("release the parked customer");
@@ -1324,6 +1299,172 @@ async fn releasing_a_parked_rename_whose_segment_is_still_draining_advances_the_
         Some(Some("ann2".to_string()))
     );
     assert_eq!(order_names(&client).await, renamed());
+}
+
+/// The name the `customer` projection holds for `code`: `None` for no row.
+async fn projected_by_code(
+    client: &Client,
+    projection: &str,
+    code: &str,
+) -> Option<Option<String>> {
+    client
+        .query_opt(
+            &format!("select name from \"{projection}\" where code = $1"),
+            &[&code],
+        )
+        .await
+        .expect("read the customer projection")
+        .map(|r| r.get(0))
+}
+
+/// Customer 1 (`ann`) moving from join value `old` to `new`, as its capture
+/// stages it.
+fn customer_recode(lsn: PgLsn, old: &str, new: &str) -> StagedChange {
+    let image = |code: &str| format!(r#"{{"id":"1","code":"{code}","name":"ann"}}"#);
+    StagedChange::Cdc {
+        src_table: "public.customers".to_string(),
+        key: "1".to_string(),
+        op: CdcOp::Update,
+        lsn: Some(lsn),
+        old_image: Some(image(old)),
+        new_image: Some(image(new)),
+        origin_lsn: None,
+        src_changed: None,
+        hop_gen: 0,
+        group_key: None,
+    }
+}
+
+/// #803 review: batches drain out of order, so a held key's parked changes
+/// need not follow one another. Here the customer's to-one join value moved
+/// `a` -> `b` -> `c` -> `d`: the `b` -> `c` batch drained first, unheld, and
+/// wrote the projection row `c` from the live row; the `a` -> `b` batch drained
+/// next and parked the key (the hand-parked earliest row); and the `c` -> `d`
+/// batch parked it too. Only that last park's pre-image names `c`, and the
+/// one held row keeps the earliest park's pre-image (`a`), so the park folds
+/// each pre-image's join values into `join_values`. Without it the release
+/// rewrites `a`, `b` and `d` from live but never `c`, which keeps the
+/// customer's name with no customer behind it.
+#[tokio::test]
+async fn releasing_a_key_parked_around_an_out_of_order_drain_removes_its_stale_projection_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.customers (id integer primary key, code text unique, name text); \
+             create table public.orders (id integer primary key, customer_code text); \
+             insert into public.customers values (1, 'b', 'ann'); \
+             insert into public.orders values (10, 'c'), (11, 'd')",
+        )
+        .await
+        .expect("create and seed customers and orders");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP customer FROM orders.customer_code TO customers.code",
+    )
+    .await
+    .expect("declare the relationship");
+    let trellis = connect_trellis(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM order_names FROM orders SELECT customer.name AS customer_name")
+        .await
+        .expect("register the consumer");
+    bring_live(&db.pool, &mut client).await;
+    let projection: String = client
+        .query_one(
+            "select rp.projection_table from relationship_projections rp \
+             join relationship_definitions rd on rd.id = rp.relationship_id \
+             where rd.name = 'customer'",
+            &[],
+        )
+        .await
+        .expect("find the customer projection")
+        .get(0);
+
+    // The `b` -> `c` batch, drained before the key was held.
+    commit_and_stage(
+        &mut client,
+        "update public.customers set code = 'c' where id = 1",
+        |lsn| customer_recode(lsn, "b", "c"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        projected_by_code(&client, &projection, "c").await,
+        Some(Some("ann".to_string()))
+    );
+
+    // The `a` -> `b` batch, drained after it, held the key and parked its
+    // change: the earliest park, whose pre-image is `a`.
+    client
+        .execute(
+            "insert into poison (transform_id, src_table, key, last_error) \
+             select id, 'public.customers', '1', 'test' from transform_definitions \
+             where target_table like '%.order_names'",
+            &[],
+        )
+        .await
+        .expect("mark the customer poisoned");
+    client
+        .execute(
+            "insert into poison_held \
+                 (transform_id, src_table, key, seg_seq, lsn, old_image, join_values) \
+             select id, 'public.customers', '1', 0, pg_current_wal_insert_lsn(), \
+                    '{\"id\": 1, \"code\": \"a\", \"name\": \"ann\"}', \
+                    array['{\"code\": \"b\"}'::jsonb] \
+             from transform_definitions where target_table like '%.order_names'",
+            &[],
+        )
+        .await
+        .expect("park the a -> b change");
+
+    // The `c` -> `d` batch parks the key through the real page path.
+    commit_and_stage(
+        &mut client,
+        "update public.customers set code = 'd' where id = 1",
+        |lsn| customer_recode(lsn, "c", "d"),
+    )
+    .await;
+    let parked = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+    seal::seal_phase2(&client, parked.sealed_seg_seq, WAKE)
+        .await
+        .expect("seal phase 2");
+    drain_sealed(&db.pool, parked.sealed_seg_seq).await;
+    let held: Vec<String> = client
+        .query(
+            "select j::text from poison_held, unnest(join_values) j order by 1",
+            &[],
+        )
+        .await
+        .expect("read the held row's join values")
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert!(
+        held.contains(&r#"{"code": "d"}"#.to_string()),
+        "the page parked the c -> d change into the held row: {held:?}"
+    );
+    assert_eq!(
+        projected_by_code(&client, &projection, "c").await,
+        Some(Some("ann".to_string())),
+        "the parked c -> d change left the projection alone"
+    );
+
+    trellis::staging::release_key(&db.pool, "order_names", "public.customers", "1")
+        .await
+        .expect("release the parked customer");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        projected_by_code(&client, &projection, "c").await,
+        None,
+        "no customer has code c"
+    );
+    assert_eq!(
+        projected_by_code(&client, &projection, "d").await,
+        Some(Some("ann".to_string()))
+    );
 }
 
 /// Issue #754 review: a change whose bucket already applied it, while
