@@ -102,6 +102,7 @@ These are the tools the entries refer to:
 | 22 | A column read only as a field moved to another type family (`integer` → `double precision`, `numeric` ↔ `double precision`) | a value rounded into the old type is silent; other writes fail | at failure; `self_check` (1-1 targets only) | none filed |
 | 23 | A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy | yes | `self_check` (1-1 targets only) | none filed |
 | 24 | A trigger or constraint refusing a change only when two separate pairs of definitions apply it | no (the drain fails) | `drain_failure` and `self_check` | none |
+| 25 | A `MERGE` moving a row to another partition, once partitioned sources are supported (#897) | yes | `self_check` (1-1 targets only) | none; reported to Postgres (#942) |
 
 ## 1. A rewriting `ALTER COLUMN TYPE … USING`
 
@@ -673,6 +674,52 @@ Or pause a definition in a failing combination (one of either pair): once
 some definition is in every combination left, isolation charges the ones it
 pins, which hold the key until it's released or they're resumed.
 
+## 25. A `MERGE` that moves a row to another partition
+
+**Trigger:** a `MERGE` on a partitioned source whose `UPDATE` action
+(including `WHEN NOT MATCHED BY SOURCE … UPDATE`) changes a row's partition,
+wherever Trellis installs capture in the partition tree. A `MERGE` that keeps
+every row in its partition, and a plain `UPDATE` that moves one, are
+unaffected. Trellis refuses a partitioned table or a partition as a source
+today, so nobody can hit this yet: it applies once partitioned sources are
+supported (epic #897).
+
+**Effect:** silent. The cause is in Postgres, not Trellis: the transition
+tables Trellis's capture reads mishandle the moved row. It came in with
+Postgres commits `c0bfdaf2b` (15.6) and `06a546382` (16.2), which fixed an
+unrelated row-trigger failure. It's reported upstream as a bug, and Trellis
+is waiting to hear whether Postgres accepts and fixes it.
+
+* **15.6+, 16.2+, 17 and 18:** the row's images never reach the `UPDATE`
+  tables. Its old image goes to the `DELETE` table only if the `MERGE` has a
+  `DELETE` action, and its new image to the `INSERT` table only if it has
+  an `INSERT` action. With only an `UPDATE` action, the row's change is
+  lost and the target keeps it as it was. With an `INSERT` action but no
+  `DELETE` action, the target has it in both its old and new place (an
+  aggregate's count is one too high). With a `DELETE` action but no
+  `INSERT` action, the target loses it (one too low). Only a `MERGE` with
+  both is exact.
+* **15.0–15.5 and 16.0–16.1:** a `MERGE` with only an `UPDATE` action is
+  exact. An `INSERT` or `DELETE` action also puts the row's new or old
+  image in its own table, so that image is applied twice: an `INSERT`
+  action adds the row to its new place twice, and a `DELETE` action takes
+  it out of its old place twice. Observed on 15.5, and on 16 just before
+  `06a546382`; the other minors are inferred.
+
+**Detected?** Not when it happens: the capture triggers receive empty or
+partial transition tables, and can't tell a `MERGE` from an `UPDATE`.
+`self_check` shows the drift on a 1-1 target.
+
+**Planned work:** none. Epic #897 doesn't design around it, and #942 has the
+findings and the upstream report.
+
+**Workaround:** change the partition key with `UPDATE`, or with `DELETE` and
+`INSERT`, not with a `MERGE`. A `MERGE` with both `DELETE` and `INSERT`
+actions isn't a safe form: it's wrong before 15.6 and 16.2.
+
+**Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
+`request_backfill` it.
+
 ## Repair caveats
 
 * **A resume that re-types copies holds `ACCESS EXCLUSIVE` on them.** After a
@@ -792,7 +839,9 @@ refusing them up front:
   it are missed, or, on an inheritance parent, a child's rows are staged as
   the parent's own; the resume's rebuild re-reads the table and repairs
   both. Capture's
-  window before the pass sees row-level security is entry 11.
+  window before the pass sees row-level security is entry 11. Once
+  partitioned sources are supported (#897), a `MERGE` that moves a row
+  between partitions is entry 25.
 * **A capture function's privilege revoked, or the function made
   `SECURITY INVOKER`.** This is loud rather than silent: every write to the
   captured table fails, naming the capture function, so no change is lost.
