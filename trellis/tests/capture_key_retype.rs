@@ -1622,6 +1622,236 @@ async fn widening_a_summed_column_pauses_and_resume_re_types_its_contribution_an
     assert_eq!(status(&raw, "per_shop").await, TransformStatus::Live);
 }
 
+/// #857: a `SUM` whose argument moved from `numeric` to a float type is
+/// recompute-only now, but its group-delta table keeps the running-sum column
+/// define gave the old `SUM`. A resume refuses rather than rebuild into it,
+/// names `DROP TRANSFORM`, and leaves the definition paused and the table as
+/// it was.
+#[tokio::test]
+async fn a_resume_refuses_an_aggregate_whose_sum_argument_moved_between_numeric_and_float() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop varchar(10), amount numeric); \
+         insert into public.orders values (1, 'a', 10.5), (2, 'a', 20), (3, 'b', 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM per_shop FROM public.orders GROUP BY shop \
+             SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+        )
+        .await
+        .expect("define per_shop");
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+    let delta_columns = async |raw: &Client| -> Vec<String> {
+        raw.query(
+            "select attname::text from pg_attribute \
+             where attrelid = 'public.per_shop__deltas'::regclass \
+               and attnum > 0 and not attisdropped and attname like '\\_\\_d%' \
+             order by attnum",
+            &[],
+        )
+        .await
+        .expect("read the delta columns")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
+    };
+    let before = delta_columns(&raw).await;
+    assert!(before.iter().any(|c| c == "__ds0"), "{before:?}");
+
+    trellis
+        .apply("PAUSE TRANSFORM per_shop")
+        .await
+        .expect("pause per_shop");
+    raw.batch_execute("alter table public.orders alter column amount type double precision")
+        .await
+        .expect("move the summed column to a float");
+    let message = resume_refused(&trellis, "per_shop").await;
+    assert!(
+        message.contains("DROP TRANSFORM") && message.contains("__ds0"),
+        "{message}"
+    );
+    // Define would accept this definition, so the message doesn't say it
+    // would refuse it.
+    assert!(!message.contains("define would refuse"), "{message}");
+    assert_eq!(status(&raw, "per_shop").await, TransformStatus::Paused);
+    assert_eq!(delta_columns(&raw).await, before);
+}
+
+/// #857, the other direction: a `SUM` argument that moved from a float type
+/// to `numeric` gains the running-sum column define would give it now, and
+/// loses the recompute flag. The resume refuses that too.
+#[tokio::test]
+async fn a_resume_refuses_an_aggregate_whose_sum_argument_moved_from_float_to_numeric() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop varchar(10), amount double precision); \
+         insert into public.orders values (1, 'a', 10.5), (2, 'a', 20), (3, 'b', 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM per_shop FROM public.orders GROUP BY shop \
+             SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+        )
+        .await
+        .expect("define per_shop");
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+
+    trellis
+        .apply("PAUSE TRANSFORM per_shop")
+        .await
+        .expect("pause per_shop");
+    raw.batch_execute("alter table public.orders alter column amount type numeric")
+        .await
+        .expect("move the summed column to numeric");
+    let message = resume_refused(&trellis, "per_shop").await;
+    assert!(
+        message.contains("DROP TRANSFORM")
+            && message.contains("__out")
+            && message.contains("__ds0"),
+        "{message}"
+    );
+    assert_eq!(status(&raw, "per_shop").await, TransformStatus::Paused);
+}
+
+/// #857: the staging worker makes the same check before it re-types
+/// anything. The operator's resume is accepted (a widened `GROUP BY` key is
+/// waiting to be re-typed), then the summed column moves to a float: the
+/// worker's pass refuses the resume, leaves the key's column as it was, and
+/// reports `DROP TRANSFORM`.
+#[tokio::test]
+async fn the_worker_refuses_a_requested_resume_whose_delta_table_s_shape_changed_first() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop int, amount numeric); \
+         insert into public.orders values (1, 1, 10.5), (2, 1, 20), (3, 2, 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM per_shop FROM public.orders GROUP BY shop \
+             SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+        )
+        .await
+        .expect("define per_shop");
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+
+    raw.batch_execute("alter table public.orders alter column shop type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(&mut raw, &db.pool).await;
+    resume(&trellis, "per_shop").await;
+    assert_retyping(&trellis, &raw, "per_shop").await;
+    raw.batch_execute("alter table public.orders alter column amount type double precision")
+        .await
+        .expect("move the summed column to a float");
+    capture_pass(&mut raw, &db.pool).await;
+
+    let reported = trellis
+        .status("per_shop")
+        .await
+        .expect("status")
+        .expect("per_shop");
+    assert_eq!(reported.status, TransformStatus::Paused);
+    let error = reported.capture_failure.expect("reason").error;
+    assert!(
+        error.starts_with("the resume was refused:") && error.contains("DROP TRANSFORM"),
+        "{error}"
+    );
+    assert!(!error.contains("define would refuse"), "{error}");
+    assert_eq!(
+        column_type(&raw, "public.per_shop", "shop").await,
+        "integer"
+    );
+}
+
+/// #857 negative control: a retype that keeps every field's classification
+/// (`SUM` over `integer` moved to `bigint`) leaves the group-delta table's
+/// shape as define would create it, so the resume goes ahead.
+#[tokio::test]
+async fn a_resume_goes_ahead_when_a_sum_argument_retype_keeps_the_delta_table_s_shape() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop varchar(10), amount int); \
+         insert into public.orders values (1, 'a', 10), (2, 'a', 20), (3, 'b', 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM per_shop FROM public.orders GROUP BY shop \
+             SELECT shop AS shop, SUM(amount) AS total, MIN(amount) AS least, COUNT(*) AS n",
+        )
+        .await
+        .expect("define per_shop");
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+
+    trellis
+        .apply("PAUSE TRANSFORM per_shop")
+        .await
+        .expect("pause per_shop");
+    raw.batch_execute("alter table public.orders alter column amount type bigint")
+        .await
+        .expect("widen the summed column");
+    trellis
+        .apply("RESUME TRANSFORM per_shop")
+        .await
+        .expect("the resume isn't refused");
+}
+
+/// #857: a column resume of an aggregate field builds nothing and never
+/// reads the group-delta table, so it isn't refused for the table's shape.
+#[tokio::test]
+async fn a_column_resume_of_an_aggregate_field_ignores_the_delta_table_s_shape() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop varchar(10), amount numeric); \
+         insert into public.orders values (1, 'a', 10.5), (2, 'a', 20), (3, 'b', 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM per_shop FROM public.orders GROUP BY shop \
+             SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+        )
+        .await
+        .expect("define per_shop");
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+
+    trellis
+        .apply("PAUSE TRANSFORM per_shop.total")
+        .await
+        .expect("pause the field");
+    raw.batch_execute("alter table public.orders alter column amount type double precision")
+        .await
+        .expect("move the summed column to a float");
+    trellis
+        .apply("RESUME TRANSFORM per_shop.total")
+        .await
+        .expect("the column resume isn't refused for the delta table's shape");
+}
+
 /// #824: widening a column a 1-1 calculated field reads (`qty + 1`, with
 /// `qty` `integer` to `bigint`) outgrows the field's column: the pass
 /// pauses the definition, and a resume re-types that column, leaving the
