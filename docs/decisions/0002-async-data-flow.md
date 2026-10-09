@@ -527,11 +527,34 @@ applying.
   [#617 step 2](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5852918496):
   oracle matched on four 10M runs under 2,000 writes/s, with 196–361k changes
   correctly skipped by chunk bases and 0 in-progress ids.
+- **A source that is another definition's target takes a per-build fence.**
+  Such a source is fed by the mutation seam ([Multi-hop](#multi-hop-a-targets-writes-reach-its-readers-through-the-mutation-seam)),
+  not by capture. A seam writer decides inside its own apply transaction
+  whether a definition applies, so one that decided before the build's start
+  committed can commit after a chunk's snapshot, and neither the chunk nor
+  the ring carries its write. The plan job's first act is a fence, the id of
+  a transaction begun after the start commit (the marker fence's rule,
+  #431), and it plans no chunk until the oldest running transaction began
+  after it. That covers a writer only if it held its transaction id when it
+  checked, so the seam's check takes the id first, in a statement of its
+  own. Only a seam-fed build waits, and only on older transactions;
+  `status` names the fence (`BuildWait::Fence`). The seam stays
+  ([#807](https://github.com/salesforce-misc/trellis/issues/807)), so this
+  fence stays. *Evidence:* `tests/target_mutation_seam.rs` freezes an upstream
+  writer after its reader check and starts the downstream: without the fence
+  the downstream misses the writer's row.
+  A source that is another aggregate's target is keyed by its nullable
+  `GROUP BY` columns, and a key with a `NULL` part is in no chunk's range
+  (the range is a row comparison). An aggregate's plan job stages an
+  image-less `Recompute` for each such key when its walk ends, which a page
+  re-derives under the entry lock. Those rows can still be in the ring when
+  the build flips `live`; their origin is unknown, so a token taken after the
+  flip waits for them, as for any seam row.
 - **Builds that keep the one-pass path.** The Re-derive build serves an
-  aggregate or 1-1 definition on a captured source. Three kinds keep the
-  one-pass build: a definition with a relationship path in any field (1-1 or
-  aggregate), a definition whose source is another definition's target, and a
-  1-1 definition whose alias chain is cyclic (`build::qualifies`). They build in one pass, with a fence wait and a go-live catch-up that
+  aggregate or 1-1 definition on a captured source or on another
+  definition's target. Two kinds keep the one-pass build: a definition with a
+  relationship path in any field (1-1 or aggregate), and a 1-1 definition
+  whose alias chain is cyclic (`build::qualifies`). They build in one pass, with a fence wait and a go-live catch-up that
   re-reads every table the build read and sweeps the target for unbacked
   rows (`intake::markers`, `intake::resume_orphans`; the definition reports
   `catching_up` meanwhile). Moving them to Re-derive would remove that path
