@@ -2481,12 +2481,37 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
         None,
         "the resumed upstream column itself must no longer be paused"
     );
+    // Issue #916: the walk deleted its edge into the reader, and the reader's
+    // build has already run chunks with the column held out, so it can't be
+    // released. It stays paused as a pause of its own, with a reason that
+    // is true and the way out, not as a row with no edge that says it waits
+    // on an upstream that has resumed.
+    let (local_fuse, last_error) = column_status_row(&client, "order_summaries", "grand_total")
+        .await
+        .expect(
+            "the cascaded-onto column must remain paused: its definition is mid-build, so \
+             resume_column must not release it",
+        );
     assert!(
-        column_status_row(&client, "order_summaries", "grand_total")
-            .await
-            .is_some(),
-        "the cascaded-onto column must remain paused: its definition still isn't live, so \
-         resume_column must have left it exactly as it was rather than stranding or dropping it"
+        local_fuse,
+        "with its edge gone, the column is held by a pause of its own"
+    );
+    let last_error = last_error.expect("the held column says why");
+    assert!(
+        last_error.contains("backfilling")
+            && last_error.contains("RESUME it once the definition is live"),
+        "the reason names the definition's state and the way out, got {last_error:?}"
+    );
+    assert!(
+        !cascade_edge_exists(
+            &client,
+            "order_summaries",
+            "grand_total",
+            "order_totals",
+            "total"
+        )
+        .await,
+        "the upstream resumed, so no edge into the reader remains"
     );
 }
 
@@ -3630,6 +3655,176 @@ async fn a_definition_reading_a_paused_column_is_paused_at_birth_until_that_colu
         sib_sum_row(&client, 1, &["t1", "t2", "c1"]).await,
         some(&["26", "27", "21"]),
         "the resume builds the readers from the resumed value"
+    );
+}
+
+/// Issue #916: the column's resume that comes before the new definition's
+/// registration settles. `sib_sum` is `waiting_to_backfill`, so it can't
+/// take a field build, but it has built nothing either: the resume releases
+/// its born-paused fields by deleting their rows, and its own build, which
+/// reads the paused set when it runs, writes them from the resumed value.
+/// Before the fix the resume deleted the edge and skipped the pair,
+/// leaving `t1` paused with no edge and a reason that no longer held.
+#[tokio::test]
+async fn a_resume_before_the_readers_registration_settles_releases_its_born_paused_fields() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total, price + 0 AS cost").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+    change_item(&mut client, &db.pool, 1, Some((10, 5, 0)), (20, 5, 0)).await;
+
+    let trellis = trellis_on(&db).await;
+    trellis
+        .apply("TRANSFORM sib_sum FROM sib SELECT total + 1 AS t1, t1 + 1 AS t2, cost + 1 AS c1")
+        .await
+        .expect("define a reader of the paused column");
+    assert_eq!(
+        status_named(&client, "sib_sum").await,
+        "waiting_to_backfill"
+    );
+    assert!(column_status_row(&client, "sib_sum", "t1").await.is_some());
+
+    let resumed = quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total before sib_sum's registration settles");
+    assert_eq!(
+        resumed,
+        vec![
+            ("sib".to_string(), "total".to_string()),
+            ("sib_sum".to_string(), "t1".to_string()),
+            ("sib_sum".to_string(), "t2".to_string()),
+        ],
+        "a definition that hasn't started building has nothing to rebuild, so its fields are released"
+    );
+    for column in ["t1", "t2"] {
+        assert_eq!(
+            column_status_row(&client, "sib_sum", column).await,
+            None,
+            "{column} must not be left paused with no edge and a reason that no longer holds"
+        );
+    }
+    assert!(!cascade_edge_exists(&client, "sib_sum", "t1", "sib", "total").await);
+
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::staging::build::settle_builds(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+    trellis::staging::build::settle_builds(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+    assert_eq!(status_named(&client, "sib_sum").await, "live");
+    assert_eq!(sib_row(&client, 1, &["total"]).await, some(&["25"]));
+    assert_eq!(
+        sib_sum_row(&client, 1, &["t1", "t2", "c1"]).await,
+        some(&["26", "27", "21"]),
+        "the definition's build writes the released fields from the resumed value"
+    );
+}
+
+/// Issue #916, the other pair a column's resume can't release: a reader
+/// whose definition no longer validates (#708). The walk deleted its edge,
+/// so the reader is held as a pause of its own, with a reason that says
+/// why, and its sibling keeps the edge from it. An operator `RESUME` of the
+/// held field is refused while define would refuse the definition, and
+/// once the schema is fixed it releases and rebuilds the field and its
+/// sibling.
+#[tokio::test]
+async fn a_resume_holds_a_reader_whose_definition_no_longer_validates_until_its_own_resume() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total, price + 0 AS cost").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    let trellis = trellis_on(&db).await;
+    trellis
+        .apply("TRANSFORM sib_sum FROM sib SELECT total + 1 AS t1, t1 + 1 AS t2, cost + 1 AS c1")
+        .await
+        .expect("define a reader of total");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+    assert_eq!(status_named(&client, "sib_sum").await, "live");
+    assert_eq!(
+        sib_sum_row(&client, 1, &["t1", "t2", "c1"]).await,
+        some(&["16", "17", "11"])
+    );
+
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+    assert!(cascade_edge_exists(&client, "sib_sum", "t1", "sib", "total").await);
+    assert!(cascade_edge_exists(&client, "sib_sum", "t2", "sib_sum", "t1").await);
+    change_item(&mut client, &db.pool, 1, Some((10, 5, 0)), (20, 5, 0)).await;
+    // A column of `sib_sum`'s source named like its calculated field `t1`
+    // would shadow it, so define would refuse `sib_sum` now.
+    client
+        .batch_execute("alter table public.sib add column t1 numeric")
+        .await
+        .expect("add a column named like the reader's field");
+
+    let resumed = quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total");
+    assert_eq!(
+        resumed,
+        vec![("sib".to_string(), "total".to_string())],
+        "the reader whose definition no longer validates is not resumed"
+    );
+    let (local_fuse, last_error) = column_status_row(&client, "sib_sum", "t1")
+        .await
+        .expect("t1 stays paused");
+    assert!(
+        local_fuse,
+        "with its edge gone, t1 is held by a pause of its own"
+    );
+    let last_error = last_error.expect("the held column says why");
+    assert!(
+        last_error.contains("no longer validates")
+            && last_error.contains("shares its name with a source column")
+            && last_error.contains("RESUME it once the definition validates again"),
+        "the reason names the refusal and the way out, got {last_error:?}"
+    );
+    assert!(!cascade_edge_exists(&client, "sib_sum", "t1", "sib", "total").await);
+    assert_eq!(
+        column_status_row(&client, "sib_sum", "t2").await,
+        Some((
+            false,
+            Some("paused because upstream column 'sib_sum.t1' is paused".to_string())
+        )),
+        "the held field's reader keeps its edge from it, and its reason"
+    );
+    assert!(cascade_edge_exists(&client, "sib_sum", "t2", "sib_sum", "t1").await);
+
+    match trellis.apply("RESUME TRANSFORM sib_sum.t1").await {
+        Err(trellis::TrellisError::Apply(ApplyError::ResumeRefused { .. })) => {}
+        other => panic!("expected the field resume to be refused, got {other:?}"),
+    }
+    client
+        .batch_execute("alter table public.sib drop column t1")
+        .await
+        .expect("drop the ambiguous column");
+    trellis::staging::build::settle_builds(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+    assert_eq!(sib_row(&client, 1, &["total"]).await, some(&["25"]));
+    assert_eq!(
+        sib_sum_row(&client, 1, &["t1", "t2", "c1"]).await,
+        some(&["16", "17", "21"]),
+        "the held fields stay frozen; the live field applies"
+    );
+
+    trellis
+        .apply("RESUME TRANSFORM sib_sum.t1")
+        .await
+        .expect("resume the held field once its definition validates");
+    assert_eq!(column_status_row(&client, "sib_sum", "t1").await, None);
+    assert_eq!(column_status_row(&client, "sib_sum", "t2").await, None);
+    trellis::staging::build::settle_builds(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+    assert_eq!(
+        sib_sum_row(&client, 1, &["t1", "t2", "c1"]).await,
+        some(&["26", "27", "21"]),
+        "the held field's resume rebuilds it and its sibling from the resumed value"
     );
 }
 
