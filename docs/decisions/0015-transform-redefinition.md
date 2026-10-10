@@ -113,6 +113,20 @@ column is a graph-edge change, validated by the same whole-graph cycle detection
 runs. An edit that would introduce a cycle, directly or transitively, is rejected before
 it runs.
 
+An edit validates the definition it leaves against the source's live columns, read in the
+edit's own transaction after the version fence and the definition's row lock, with the
+checks a define makes. The columns recorded when the definition was defined are not the
+reference: a column the host has added since is readable, one named like a new field
+refuses it, and one dropped, or retyped so that a field reading it no longer validates,
+refuses an edit that leaves that field. So an edit never commits a definition define would
+refuse. A field's builds compute it over the live types and its applies over the recorded
+ones, so an edit records the type of each column it reads that the host added since, and
+refuses to build a field reading a column whose type the host changed: `x` moved from
+`integer` to `double precision` refuses `ADD x + y AS xy` until a resume re-types the
+definition. Recording the new type instead would move every unedited field reading `x`
+onto it, under columns created for the old type, so a `3.5` that fails to parse as the
+recorded `integer`, and holds its key, would round silently into an `integer` column.
+
 Dropping a column follows the drop rule already in force: **refuse, do not cascade.** If
 any definition still references the column being dropped, the drop is refused and names
 the referencing definitions; the operator retires them first, in dependency order. Trellis
