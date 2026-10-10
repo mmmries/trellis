@@ -3705,16 +3705,18 @@ pub(crate) async fn resume_pairs(
                         error = %reason,
                         "dependent column stays paused: its definition no longer validates"
                     );
-                    hold_orphaned_pause(
-                        pool,
-                        &t,
-                        &c,
-                        &format!(
+                    // A refusal define doesn't make (a redefined source
+                    // key) never validates "again" by itself: its own text
+                    // names the repair.
+                    let why = if reason.is_define_refusal() {
+                        format!(
                             "its definition no longer validates ({reason}); \
                              RESUME it once the definition validates again"
-                        ),
-                    )
-                    .await?;
+                        )
+                    } else {
+                        format!("its definition can't be resumed: {reason}")
+                    };
+                    hold_orphaned_pause(pool, &t, &c, &why).await?;
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -4086,9 +4088,10 @@ enum ResumeStep {
 ///    it: a key, join or `GROUP BY` column of a type or collation define
 ///    refuses, a relationship whose join columns no longer match (#590), a
 ///    redefined source key. A whole-transform resume also refuses an
-///    aggregate whose group-delta table lacks columns define would create now
-///    ([`catalog::check_deltas_shape`], #857); a column resume doesn't make
-///    that check.
+///    aggregate whose group-delta table has different running-sum or
+///    recompute columns from the ones define would create now, or doesn't
+///    exist ([`catalog::check_deltas_shape`], #857, #967); a column resume
+///    doesn't make that check.
 /// 2. **It compares each column Trellis created with a type from the
 ///    source (typed copies, and calculated, aggregate and contribution
 ///    columns) with the type define would give it now**

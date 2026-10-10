@@ -28,7 +28,9 @@ them gets broken without Trellis noticing.
 * No row-level security policy applies to a role Trellis logs in as, or to
   the role that owns its ring (entry 11).
 * No application trigger re-keys a relationship's join column within the
-  statement that wrote it (entry 9).
+  statement that wrote it ([an application trigger re-keying a parent's
+  join column within the
+  statement](#9-an-application-trigger-re-keying-a-parents-join-column-within-the-statement)).
 * No trigger or constraint refuses a change only when several of the
   definitions reading it apply it together, in combinations no one of them is
   in every one of, such as two separate pairs (entry 24).
@@ -51,13 +53,15 @@ These are the tools the entries refer to:
   target from the source. Run it through `Trellis::apply` or
   `trellis apply '<statement>'`. A resume first re-runs define's validation
   against the live schema, and refuses, leaving the definition paused, while
-  define would refuse it, or while an aggregate's group-delta table lacks
-  columns define would create now (entry 22). It then brings every column Trellis created for
-  the definition with a type from the source (its key, passthrough and GROUP
-  BY copies, its calculated, aggregate and ledger contribution columns, and
-  its relationship projections' columns) to the type define would give it
-  now, re-reads every current source row and deletes target rows the source
-  no longer backs
+  define would refuse it. It also refuses in three cases define doesn't: a
+  1-1 target's source key was redefined, or an aggregate's group-delta table
+  is missing (entry 8) or has different running-sum or recompute columns from
+  the ones define would create now (entry 22). It then brings every column
+  Trellis created for the definition with a type from the source (its key,
+  passthrough and GROUP BY copies, its calculated, aggregate and ledger
+  contribution columns, and its relationship projections' columns) to the
+  type define would give it now, re-reads every current source row and
+  deletes target rows the source no longer backs
   ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)). It doesn't replay
   buffered changes, so it repairs anything that's wrong because a change was
   missed. It also releases every key the definition holds in quarantine, and
@@ -68,13 +72,14 @@ These are the tools the entries refer to:
 * **`DROP TRANSFORM <target>`, then define it again** is the repair when you
   keep a schema change the definition can't be rebuilt over: a resume refuses
   while define would, naming the column and what to change, and a 1-1
-  definition whose source key was redefined, or an aggregate whose `SUM` or
+  definition whose source key was redefined, an aggregate whose `SUM` or
   `AVG` argument moved between an exact type and floating point (entry 22),
-  can only be defined again. It's
-  also the repair when a resume can't convert the values of a column Trellis
-  created to its new type (a key moved from `text` to `uuid` by a `USING`
-  that isn't a cast). The definition stays paused and its target keeps its
-  rows: Trellis doesn't empty a target the application reads on its own.
+  or whose group-delta table was dropped (entry 8), can only be defined again.
+  It's also the repair when a resume can't convert the values of a column
+  Trellis created to its new type (a key moved from `text` to `uuid` by a
+  `USING` that isn't a cast). The definition stays paused and its target
+  keeps its rows: Trellis doesn't empty a target the application reads on its
+  own.
 * **`self_check(target, …)`** detects divergence but never repairs it. It
   audits the target's capture triggers, then compares the target with a
   recompute of it in Postgres
@@ -87,16 +92,16 @@ These are the tools the entries refer to:
 |---|---|---|---|---|
 | 1 | `ALTER COLUMN … TYPE … USING` that rewrites values | yes | `self_check` (1-1 targets only) | #703, study pending |
 | 2 | A column dropped and re-added under the same name | yes | `self_check` (1-1 targets only) | #703, study pending |
-| 3 | A source key re-collated while a `self_check` sweep runs | the sweep can skip or repeat keys | no | #782 |
+| 3 | A source key re-collated while a `self_check` sweep runs | the sweep can skip or repeat keys | no | none filed |
 | 5 | Capture switched off and back on, or the table attached to a hierarchy and detached, between two reconcile passes | yes | no | #707, study pending |
 | 6 | A capture function body replaced by hand | yes | not by the audit | #707, study pending |
-| 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
+| 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented (#986 for a dropped ledger) |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #788, decision pending |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
 | 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge, catch-up and build merge: pause what they reach; one the catalog can't pin shows on `drain_failure` (drain) or `backfill_failure` (discharge, catch-up), or, for a build merge, pauses on its fifth charge with the error on `capture_failure`; build chunk: `backfill_failure` | none |
 | 12 | A crash empties an unlogged source table | yes | no | none filed |
 | 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load: on define | #644 |
-| 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | #528, test ignored |
+| 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | #624, test ignored |
 | 16 | `self_check` audits 1-1 targets only | yes | n/a | none filed |
 | 17 | `DROP TYPE` of an enum a live definition references | no (later introspection fails) | at failure only | none filed |
 | 18 | `jsonb_agg` element order differs between recomputes | yes | no | none filed |
@@ -177,7 +182,7 @@ build that straddles the change is pinned to the collation it planned under
 
 **Detected?** No.
 
-**Planned work:** #782.
+**Planned work:** none filed.
 
 **Repair:** start a new sweep after the change.
 
@@ -251,20 +256,28 @@ re-read the table the way a reinstall does.
 ## 8. Hand edits to a target table
 
 **Trigger:** any `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` on a target
-table, or changing its columns or key constraints.
+table, changing its columns or key constraints, or dropping a table Trellis
+keeps beside it (`<target>__ledger`, or an aggregate's `<target>__deltas`).
 
 **Effect:** Trellis assumes it's the only writer and doesn't correct the
 change. An edited row stays wrong until its key is recomputed for another
-reason, and a truncated target stays empty.
+reason, and a truncated target stays empty. An aggregate's resume refuses
+while its group-delta table is missing, naming the table, and the definition
+stays paused. A missing ledger isn't noticed by a resume: the rebuild's start
+then fails every staging-worker pass, and no other definition's build starts
+until the definition is paused or dropped (#986).
 
 **Detected?** `self_check` reports it on 1-1 targets. Nothing reports it on
 aggregate or relationship-enriched targets.
 
-**Planned work:** none. This is a documented rule
+**Planned work:** none for the edits. This is a documented rule
 ([transforms — Target tables are Trellis-owned](transforms.md#target-tables-are-trellis-owned)).
+#986 would have a resume refuse a missing ledger too, and keep one
+definition's failed build start from holding up the others'.
 
 **Repair:** `PAUSE`/`RESUME` the transform. If its columns or constraints
-were changed, `DROP TRANSFORM` and define it again.
+were changed, or a table Trellis keeps beside it was dropped,
+`DROP TRANSFORM` and define it again.
 
 ## 9. An application trigger re-keying a parent's join column within the statement
 
@@ -465,7 +478,8 @@ value. This is silent.
 `a_from_side_change_pending_across_a_to_side_truncate_leaves_no_stale_group`
 (`trellis/tests/apply_relationships.rs`).
 
-**Planned work:** #528.
+**Planned work:** milestone E (#624), whose interleaving tests include this
+shape (#528).
 
 **Repair:** `PAUSE`/`RESUME` the aggregate.
 
@@ -629,10 +643,10 @@ to another type family as it was.
 every column the definition created to the type define would give it now,
 releases its held keys and rebuilds the target. An aggregate with a `SUM` or
 `AVG` whose argument moved between an exact type (`integer`, `numeric`) and
-floating point is the exception: its group-delta table doesn't have the
-running-sum columns define would create now. The resume refuses, naming
-`DROP TRANSFORM`, and the definition stays paused. Drop it and define it again
-(#857).
+floating point is the exception: its group-delta table has different
+running-sum or recompute columns from the ones define would create now. The
+resume refuses, naming `DROP TRANSFORM`, and the definition stays paused.
+Drop it and define it again (#857).
 
 ## 23. A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy
 
@@ -840,13 +854,15 @@ refusing them up front:
   passthrough or calculated field, a GROUP BY key, a `SUM` or `MIN` and its
   ledger contribution, or a relationship projection's key or column;
   `bigint` to `numeric` under a `MIN`). A resume refuses until define would
-  accept the definition again (entry 22 has the one other refusal); otherwise it re-types those columns and
-  rebuilds
+  accept the definition again (and for the refusals only a resume makes, see
+  [The repair tools](#the-repair-tools)); otherwise it re-types those
+  columns and rebuilds
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
   A value a copy can't hold that drains before the pass is quarantined, and
   the resume releases it. A change between deterministic collations needs
-  nothing (but see entry 3). A field's move to another type family pauses
-  nothing (entry 22).
+  nothing (but see [a source key re-collated while a `self_check` sweep
+  runs](#3-a-source-key-re-collated-while-a-self_check-sweep-runs)). A
+  field's move to another type family pauses nothing (entry 22).
 * **A widening that changes only the catalog of a column Trellis copies with
   its type.** `varchar(n)` to a longer `varchar`, to `text` or to
   `varchar`, and `numeric(p,s)` to a larger precision at the same scale,

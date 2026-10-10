@@ -2846,6 +2846,38 @@ mod tests {
 
     const INT: ValueType = ValueType::Integer(crate::integer::IntWidth::Int4);
 
+    /// #967: `route` declines a definition [`crate::defs::validate::validate`]
+    /// accepts when its calculated fields' alias expansion is past the
+    /// substitution's node budget. It's the same substitution define's DDL
+    /// makes (`ddl::aggregate_target_table_ddl`), on the definition's text
+    /// alone, so define refuses such a definition and none is ever
+    /// persisted: `catalog::check_deltas_shape`'s `None` arm is defensive.
+    #[test]
+    fn route_declines_a_valid_aggregate_whose_alias_expansion_is_past_the_node_budget() {
+        let levels = 20;
+        let mut fields: Vec<String> = (0..levels)
+            .map(|k| format!("f{} + f{} AS f{k}", k + 1, k + 1))
+            .collect();
+        fields.push(format!("SUM(v) + SUM(v) AS f{levels}"));
+        let text = format!(
+            "TRANSFORM t FROM s GROUP BY g SELECT g AS g, {}",
+            fields.join(", ")
+        );
+        let def = parse(&text).expect("parse");
+        let source_columns: HashMap<String, ValueType> = [
+            ("g".to_string(), ValueType::Text),
+            ("v".to_string(), ValueType::Numeric),
+        ]
+        .into();
+        crate::defs::validate::validate(&def, &source_columns, &HashMap::new())
+            .expect("validate accepts it");
+        assert!(route(&def, &source_columns, &HashMap::new()).is_none());
+        assert!(
+            crate::defs::backfill::substituted_field_exprs(&def).is_err(),
+            "define's DDL makes the same substitution, and refuses it"
+        );
+    }
+
     #[test]
     fn plain_sum_and_count_targets_route_to_the_ledger() {
         let s = shape(
