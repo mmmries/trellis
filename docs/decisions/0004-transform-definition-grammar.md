@@ -2,8 +2,6 @@
 status: accepted
 date: 2026-08-20
 deciders: Michael Ries
-consulted: 
-informed:
 ---
 
 # Transform-Definition Grammar
@@ -11,7 +9,7 @@ informed:
 [transforms](../transforms.md) describes the logical model but not how a user
 writes a transform down. This ADR settles the surface syntax.
 
-## Decision
+## Definitions use a minimal, purpose-built grammar
 
 Transform definitions use a **minimal, purpose-built grammar**, parsed at
 definition time into an AST the validator and execution layer consume. It
@@ -22,8 +20,10 @@ starting from stable operations common to **PostgreSQL 15+**.
 The *statement* shape (`TRANSFORM / FROM / SELECT / WHERE`, later `GROUP BY` /
 `JOIN`) is ours; the *expression semantics* are an **immutable subset of
 Postgres's**. That subset lets Postgres serve as the primary correctness oracle,
-with our re-implemented evaluator as a secondary cross-check (see
-`docs/generative-test-suite.md`).
+with our re-implemented evaluator as a secondary cross-check (see the
+[generative test suite](../generative-test-suite.md)).
+
+## The grammar is split by concern
 
 The grammar is **split by concern**, mirroring the pieces
 [transforms](../transforms.md) already chooses separately, so granularity rules
@@ -41,8 +41,8 @@ context:
 
 ## Why our own grammar, not the Postgres parser
 
-The obvious alternative is Postgres's real grammar (`libpg_query` via
-`pg_query.rs`, or the pure-Rust `sqlparser-rs`). We reject both because we
+The obvious alternative is Postgres's real grammar (`libpg_query`
+through its Rust bindings, or the pure-Rust `sqlparser-rs`). We reject both because we
 execute formulas ourselves rather than issuing SQL to Postgres per batch: we
 re-implement evaluation in our own layer so we can do things Postgres-as-executor
 can't — notably small **atomic delta adjustments** to aggregated `numeric`
@@ -54,9 +54,9 @@ grammar-plus-evaluator change. Adopting a full SQL parser would invert this —
 we'd inherit its entire surface and forbid it piece by piece — and we parse
 fragments, not whole statements. We want the accepted language to *be* the spec.
 
-## Concrete syntax (1-1 slice, issues #22, #62)
+## A 1-1 definition is `TRANSFORM`, `FROM`, `SELECT` and an optional `WHERE`
 
-The 1-1 slice (`trellis/src/defs`) uses:
+The 1-1 statement is:
 
 ```text
 TRANSFORM <target>
@@ -72,12 +72,12 @@ carry one of four types — `Numeric`, `Text`, `Boolean`, `Uuid` — and every o
 return types are type-checked at definition time. `<predicate>` accepts only the
 literal `TRUE`; any other `WHERE` is refused at definition time.
 
-### Typed literals (issue #109)
+### Typed literals spell constants in canonical Postgres form
 
 A calculated field can also *spell* a constant of a type that has no literal
 syntax of its own, which is what lets it **produce** — rather than merely pass
-through — a value of that type (`docs/type-support.md`'s "computed 1-1 target"
-role). Two spellings, one AST node:
+through — a value of that type (the "computed 1-1 target" role in
+[type support](../type-support.md)). Two spellings, one AST node:
 
 ```text
 DATE '2024-01-01'
@@ -87,9 +87,8 @@ CAST('2024-01-01' AS date)
 Both are valid, unambiguous Postgres, and Postgres folds them to the *same*
 constant (`EXPLAIN (VERBOSE)` prints `'2024-01-01'::date` for each), so the
 SQL-rendering oracle can render our node back to text that means exactly what
-we evaluated. Accepted types are an allowlist — today `date`, `timestamp`,
-`bytea` — in `trellis/src/defs/typed_literal.rs`, which is also where each
-family's reasoning lives.
+we evaluated. Accepted types are an allowlist of type families (`date`,
+`timestamp`, `bytea` and `jsonb` among them), each admitted by the rules below.
 
 Deliberately out:
 
@@ -117,12 +116,11 @@ of the ADR's bar drive it:
   rendering byte-for-byte. Requiring canonical form makes the two renderers
   agree by construction instead of needing a per-family normalizer.
 
-`jsonb` is the family this second rule holds back: `jsonb_out` re-sorts object
+`jsonb` is the family this second rule costs most: `jsonb_out` re-sorts object
 keys by length then bytes, collapses duplicates, and renormalizes numbers, so
-checking a literal is canonical means implementing a real `jsonb` value model
-— #115's job, which needs one anyway for `jsonb_agg`.
+checking a literal is canonical takes a real `jsonb` value model.
 
-`COALESCE(<expr>, ...)` is accepted (issue #64) — first non-`NULL` argument, or
+`COALESCE(<expr>, ...)` is accepted — first non-`NULL` argument, or
 `NULL` if all are. It's immutable, but *variadic*, so it isn't a registry
 function: the parser special-cases it (at least one argument, as Postgres does)
 and the evaluator short-circuits. It is a **safe subset** of Postgres's
@@ -136,8 +134,7 @@ and the evaluator short-circuits. It is a **safe subset** of Postgres's
 * No `NULL` literal at all, so `COALESCE(x, NULL)` isn't expressible; bare `NULL`
   parses as a column reference and is rejected as unresolved.
 
-Each gap is pinned by a divergence test in `trellis/src/defs` and tracked toward
-full compatibility.
+Each gap is pinned by a divergence test.
 
 `FROM <source>` is where a key-space clause slots in without changing the outer
 shape:
@@ -166,3 +163,15 @@ Anything volatile, session- or collation-dependent stays out.
 Binary operators parse by precedence climbing over a per-operator precedence table
 in the operator registry; all are left-associative. A new operator declares its
 tier there.
+
+## Consequences
+
+* Every operator or function a user can write is one we re-implemented: each
+  addition is a paired grammar-plus-evaluator change, and a Postgres function
+  outside the list is refused until then.
+* The accepted language is narrower than Postgres's in places a SQL user will
+  notice: a typed literal must use its type's canonical spelling, `::` casts and
+  general `CAST` are refused, and `COALESCE` requires arguments of one type and
+  has no `NULL` literal.
+* Precedence lives in our own operator table, so each new operator has to
+  declare its tier there correctly.
