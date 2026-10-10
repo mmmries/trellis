@@ -1124,6 +1124,228 @@ async fn two_definitions_on_one_source_take_one_build_path_each() {
     );
 }
 
+/// #986: a build's start that fails for good (here, the definition's ledger
+/// table was dropped, so the start's read of it errors) pauses that
+/// definition with the error as its `capture_failure`, instead of failing
+/// the reconcile pass on every pass after. The definition registered after
+/// it, whose start comes later in the same pass, still starts and goes live.
+/// Resuming the paused definition refuses and names the repair.
+#[tokio::test]
+async fn a_start_that_fails_pauses_its_definition_and_the_pass_starts_the_others() {
+    let mut f = Fixture::new(150, &[ONE, AGG]).await;
+    f.raw
+        .batch_execute("drop table public.one__ledger")
+        .await
+        .expect("drop the ledger of the first definition");
+
+    // The first definition's start fails; the pass goes on to the second's.
+    f.pass().await;
+    assert_eq!(f.status("one").await.as_deref(), Some("paused"));
+    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
+    assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
+
+    let trellis = f.trellis().await;
+    let failure = trellis
+        .status("one")
+        .await
+        .expect("status")
+        .expect("one is registered")
+        .capture_failure
+        .expect("the pause carries the error");
+    assert_eq!(failure.kind, trellis::CaptureFailureKind::Halt);
+    assert!(
+        failure.error.contains("one__ledger") && failure.error.contains("couldn't start"),
+        "{}",
+        failure.error
+    );
+
+    // The next pass doesn't meet it again, and the healthy build finishes.
+    f.pass().await;
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.assert_agg_oracle().await;
+    assert_eq!(f.status("one").await.as_deref(), Some("paused"));
+
+    // The resume refuses (the ledger is gone) and says what to do.
+    let refusal = trellis
+        .apply("RESUME TRANSFORM one")
+        .await
+        .expect_err("a resume of a definition without its ledger is refused")
+        .to_string();
+    assert!(
+        refusal.contains("DROP TRANSFORM") && refusal.contains("one__ledger"),
+        "{refusal}"
+    );
+    assert_eq!(f.status("one").await.as_deref(), Some("paused"));
+}
+
+/// #986: the rest of the pass runs after a start fails, not only the other
+/// starts: the registration marker of a definition the Re-derive build
+/// doesn't take (it reads a relationship) is parked and discharged, so that
+/// definition's build is dispatched in the same pass.
+#[tokio::test]
+async fn a_start_that_fails_doesn_t_stop_the_pass_discharging_other_markers() {
+    const MAXES: &str = "TRANSFORM agg_max FROM public.src GROUP BY g \
+         SELECT MAX(v) AS top, MAX(grp.w) AS w";
+    let mut f = Fixture::new(150, &[ONE]).await;
+    f.raw
+        .batch_execute(
+            "create table public.grps (id integer primary key, w integer); \
+             insert into public.grps select i, i * 10 from generate_series(0, 6) i",
+        )
+        .await
+        .expect("seed the relationship's to-side");
+    trellis::defs::create_relationship(&f.db.pool, "RELATIONSHIP grp FROM src.g TO grps.id")
+        .await
+        .expect("create the to-one relationship");
+    let columns = [
+        (
+            "id".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int8),
+        ),
+        (
+            "g".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int4),
+        ),
+        (
+            "v".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int8),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    trellis::defs::install_definition(&f.db.pool, MAXES, &columns, "public")
+        .await
+        .expect("register the relationship-fed definition");
+    f.raw
+        .batch_execute("drop table public.one__ledger")
+        .await
+        .expect("drop the ledger of the first definition");
+
+    // The first pass installs `grps`'s capture, which keeps `agg_max`
+    // waiting until its own discharge; the second dispatches it.
+    f.pass().await;
+    f.pass().await;
+    assert_eq!(f.status("one").await.as_deref(), Some("paused"));
+    assert_eq!(
+        f.status("agg_max").await.as_deref(),
+        Some("backfilling"),
+        "the discharge dispatched the old build's job"
+    );
+}
+
+/// #986: a start that fails transiently (here its read of the ledger waits
+/// out `lock_timeout` behind another session's lock, `55P03`) is retried on
+/// the next pass, not paused, and the pass still starts the other
+/// definitions' builds.
+#[tokio::test]
+async fn a_start_that_fails_transiently_is_retried_next_pass_and_not_paused() {
+    let mut f = Fixture::new(150, &[ONE, AGG]).await;
+    let holder = connect(f.db.dsn()).await;
+    holder
+        .batch_execute("begin; lock table public.one__ledger in access exclusive mode")
+        .await
+        .expect("hold the first definition's ledger");
+    f.raw
+        .batch_execute("set lock_timeout = '200ms'")
+        .await
+        .expect("make the pass's lock waits short");
+
+    // The holder's open transaction is one the discharge's fence wait waits
+    // out, so this pass gives it only a moment.
+    trellis::client::reconcile_pass(
+        &mut f.raw,
+        &f.db.pool,
+        DEFAULT_SCHEMA,
+        WAKE,
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("reconcile pass");
+    assert_eq!(
+        f.status("one").await.as_deref(),
+        Some("waiting_to_backfill")
+    );
+    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
+    assert_eq!(
+        f.count("select count(*) from capture_failures").await,
+        0,
+        "a transient failure records nothing"
+    );
+
+    holder
+        .batch_execute("rollback")
+        .await
+        .expect("release the ledger");
+    f.raw
+        .batch_execute("reset lock_timeout")
+        .await
+        .expect("reset lock_timeout");
+    f.pass().await;
+    assert_eq!(f.status("one").await.as_deref(), Some("backfilling"));
+    assert_eq!(f.build("one").await.as_deref(), Some("rederive"));
+}
+
+/// Known-gaps entry 8: a live definition whose ledger is dropped fails each
+/// drain page that applies a change for it, until the keys it touches are
+/// held and the definition is quarantined. The other definition on the
+/// source stays live, and the quarantined one's resume refuses with the
+/// repair.
+#[tokio::test]
+async fn a_live_definition_whose_ledger_is_dropped_is_quarantined_alone() {
+    let mut f = Fixture::new(50, &[ONE, AGG]).await;
+    f.pass().await;
+    f.run("one").await;
+    f.run("agg").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.raw
+        .batch_execute(
+            "drop table public.one__ledger; \
+             update public.src set v = v + 1 where id <= 6",
+        )
+        .await
+        .expect("drop the ledger and change some rows");
+
+    // Each page fails until its keys' retries run out: a bounded number of
+    // explicit drains, not a timed wait.
+    let watermark = StagedWatermark::saturated();
+    for _ in 0..16 {
+        trellis::staging::seal_if_active_nonempty(&mut f.raw, WAKE)
+            .await
+            .expect("seal");
+        while let Some(seg) = apply::next_claimable_segment(&f.raw)
+            .await
+            .expect("next claimable segment")
+        {
+            if apply::drain_once(&f.db.pool, seg, "drainer", 1, WAKE, &watermark)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        if f.status("one").await.as_deref() == Some("quarantined") {
+            break;
+        }
+    }
+    assert_eq!(f.status("one").await.as_deref(), Some("quarantined"));
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.assert_agg_oracle().await;
+
+    let refusal = f
+        .trellis()
+        .await
+        .apply("RESUME TRANSFORM one")
+        .await
+        .expect_err("a resume of a definition without its ledger is refused")
+        .to_string();
+    assert!(
+        refusal.contains("DROP TRANSFORM") && refusal.contains("one__ledger"),
+        "{refusal}"
+    );
+}
+
 /// A worker that dies after a chunk's or a merge's commit, before its own
 /// flip check, leaves a finished build `backfilling`; the next worker step
 /// that finds nothing to claim makes the flip (`work_once`'s idle check).
