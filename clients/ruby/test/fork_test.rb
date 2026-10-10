@@ -69,7 +69,7 @@ class ForkTest < Minitest::Test
       assert_includes lines,
                       "#{name}: Trellis::ForkedHandleError: this Trellis handle was connected by " \
                       "process #{parent}, and this is process #{child}: a handle does not survive " \
-                      "fork, so call Trellis.connect in this process (after forking: Puma's " \
+                      "fork, so connect a new one in this process (after forking: Puma's " \
                       "before_worker_boot, Unicorn's after_fork, Passenger's " \
                       "starting_worker_process; \"Forking servers\" in clients/ruby/README.md " \
                       "covers preload_app! and fork_worker)",
@@ -138,9 +138,9 @@ class ForkTest < Minitest::Test
     assert_equal "Trellis::ForkedHandleError: this process (#{child}) was forked from process " \
                  "#{parent} while that process had a Trellis engine running, so it may have " \
                  "inherited a lock one of the engine's threads held, which nothing in this " \
-                 "process can release: it can't connect. Call Trellis.shutdown before forking " \
-                 "and Trellis.connect after: Puma's before_fork and before_worker_boot, and " \
-                 "with fork_worker, before_worker_fork and after_worker_fork too " \
+                 "process can release: it can't connect. Call Trellis::Instance.shutdown_all " \
+                 "before forking and connect after: Puma's before_fork and before_worker_boot, " \
+                 "and with fork_worker, before_worker_fork and after_worker_fork too " \
                  "(\"Forking servers\" in clients/ruby/README.md)\n", output
 
     # The server hangs up, so the connect fails, and its threads are gone.
@@ -155,11 +155,12 @@ class ForkTest < Minitest::Test
     server&.close
   end
 
-  # Every public method but connect and connected? goes through the handle,
+  # Every public method but connect, connected? and default_instance (which
+  # only returns the instance) goes through the handle,
   # so a method added to the module without a line in SURFACE (or, for
   # shutdown, its own case above) fails here rather than going unchecked.
   def test_the_surface_names_every_public_method_that_uses_the_handle
-    uses_handle = Trellis.singleton_methods.map(&:to_s) - %w[connect connected?]
+    uses_handle = Trellis.singleton_methods.map(&:to_s) - %w[connect connected? default_instance]
     assert_equal uses_handle.sort, [*SURFACE.keys, "shutdown"].sort
   end
 
