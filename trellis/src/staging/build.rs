@@ -1237,7 +1237,7 @@ pub async fn start_ready_builds(
             taken.push(id);
             continue;
         }
-        match start(client, &definition).await {
+        match start(client, pool.schema(), &definition).await {
             Ok(Some(dependents)) => {
                 taken.push(id);
                 // The build has started; readers elsewhere that the release
@@ -1499,6 +1499,7 @@ async fn capture_gate_holds(client: &impl GenericClient, table: &str) -> Result<
 /// committed.
 async fn start(
     client: &mut tokio_postgres::Client,
+    schema: &str,
     definition: &Definition,
 ) -> Result<Option<Vec<(String, String)>>, ApplyError> {
     let txn = client.transaction().await?;
@@ -1510,6 +1511,7 @@ async fn start(
     // that times out fails the start, and the capture pass takes it again.
     crate::locks::lock_column_pauses(
         &txn,
+        schema,
         crate::locks::ColumnPauseLock::Exclusive,
         crate::locks::ColumnPauseOp::Capture,
     )
@@ -1868,6 +1870,7 @@ async fn field_build_ready(
     // A wait that times out fails this job's attempt, which retries.
     crate::locks::lock_column_pauses(
         &*txn,
+        pool.schema(),
         crate::locks::ColumnPauseLock::Exclusive,
         crate::locks::ColumnPauseOp::Capture,
     )
