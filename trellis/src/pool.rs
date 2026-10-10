@@ -34,7 +34,173 @@ use std::time::Duration;
 use tokio_postgres::NoTls;
 
 /// A pooled connection, handed out by [`Pool::get`].
-pub type Client = deadpool_postgres::Client;
+///
+/// Derefs to the pooled connection exactly as `deadpool_postgres::Client`
+/// does, and behaves the same, with one difference for a checkout made inside
+/// a public call (issue #599, `crate::deadline`): it was handed out with a
+/// session `statement_timeout` of the call's remaining budget, and
+/// [`Client::transaction`]/[`Client::build_transaction`] set the budget then
+/// remaining for each transaction. When it drops, the setting is reset
+/// *before* the connection goes back to the pool, on a task of its own, so a
+/// later borrower (a background worker) never inherits a call's timeout. That
+/// reset queues behind whatever the connection is still doing, so a statement
+/// an abandoned call left running keeps its connection out of the pool until
+/// the server has finished with it.
+pub struct Client {
+    inner: Option<deadpool_postgres::Client>,
+    /// `Some` when this checkout ran under a call's deadline: how long to
+    /// wait for the connection to settle before giving up on it.
+    settle: Option<Duration>,
+}
+
+impl Client {
+    fn plain(inner: deadpool_postgres::Client) -> Self {
+        Self {
+            inner: Some(inner),
+            settle: None,
+        }
+    }
+
+    fn wrapper_mut(&mut self) -> &mut deadpool_postgres::ClientWrapper {
+        self.inner.as_mut().expect("present until dropped")
+    }
+
+    /// `deadpool_postgres::ClientWrapper::transaction`, bounded by the
+    /// running call's remaining budget if there is one.
+    pub async fn transaction(
+        &mut self,
+    ) -> Result<deadpool_postgres::Transaction<'_>, tokio_postgres::Error> {
+        let txn = self.wrapper_mut().transaction().await?;
+        bound_transaction(&txn).await?;
+        Ok(txn)
+    }
+
+    /// `deadpool_postgres::ClientWrapper::build_transaction`; its
+    /// [`TransactionBuilder::start`] bounds the transaction like
+    /// [`Client::transaction`].
+    pub fn build_transaction(&mut self) -> TransactionBuilder<'_> {
+        TransactionBuilder {
+            inner: self.wrapper_mut().build_transaction(),
+        }
+    }
+}
+
+/// `SET LOCAL statement_timeout` for the running call's remaining budget, as
+/// a transaction's first statement. Nothing outside a call.
+async fn bound_transaction(
+    txn: &deadpool_postgres::Transaction<'_>,
+) -> Result<(), tokio_postgres::Error> {
+    if let Some(deadline) = crate::deadline::current() {
+        txn.simple_query(&deadline.set_statement_timeout_sql(true))
+            .await?;
+    }
+    Ok(())
+}
+
+/// [`Client::build_transaction`]'s builder: `deadpool_postgres`'s, whose
+/// `start` also bounds the transaction by the running call's budget.
+pub struct TransactionBuilder<'a> {
+    inner: deadpool_postgres::TransactionBuilder<'a>,
+}
+
+impl<'a> TransactionBuilder<'a> {
+    pub fn isolation_level(mut self, isolation_level: tokio_postgres::IsolationLevel) -> Self {
+        self.inner = self.inner.isolation_level(isolation_level);
+        self
+    }
+
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.inner = self.inner.read_only(read_only);
+        self
+    }
+
+    pub fn deferrable(mut self, deferrable: bool) -> Self {
+        self.inner = self.inner.deferrable(deferrable);
+        self
+    }
+
+    pub async fn start(self) -> Result<deadpool_postgres::Transaction<'a>, tokio_postgres::Error> {
+        let txn = self.inner.start().await?;
+        bound_transaction(&txn).await?;
+        Ok(txn)
+    }
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client").finish_non_exhaustive()
+    }
+}
+
+impl std::ops::Deref for Client {
+    type Target = deadpool_postgres::ClientWrapper;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref().expect("present until dropped")
+    }
+}
+
+impl std::ops::DerefMut for Client {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.wrapper_mut()
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let Some(settle) = self.settle else {
+            return;
+        };
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(reset_session(Unreset(Some(inner)), settle));
+            }
+            // Nothing to reset it on: close it rather than pool it still
+            // carrying a call's timeout.
+            Err(_) => drop(deadpool_postgres::Object::take(inner)),
+        }
+    }
+}
+
+/// How long past its settle time a released call connection gets to answer
+/// the reset before it is closed instead of pooled.
+const RESET_GRACE: Duration = Duration::from_secs(5);
+
+/// Clears the call's `statement_timeout` and returns the connection to the
+/// pool, or closes it if it won't answer. The connection is closed too if
+/// this task is dropped before the reset lands, even before its first poll
+/// (its runtime shutting down): only a connection the reset reached goes
+/// back to the pool.
+async fn reset_session(mut unreset: Unreset, settle: Duration) {
+    let reset = tokio::time::timeout(
+        settle + RESET_GRACE,
+        unreset
+            .0
+            .as_ref()
+            .expect("held until reset")
+            .simple_query("reset statement_timeout"),
+    )
+    .await;
+    if let Ok(Ok(_)) = reset {
+        drop(unreset.0.take());
+    }
+}
+
+/// A released call connection that still carries the call's
+/// `statement_timeout`: closed when dropped, unless [`reset_session`] took
+/// it back out once its reset landed.
+struct Unreset(Option<deadpool_postgres::Client>);
+
+impl Drop for Unreset {
+    fn drop(&mut self) {
+        if let Some(client) = self.0.take() {
+            drop(deadpool_postgres::Object::take(client));
+        }
+    }
+}
 
 /// Trellis's connection pool.
 ///
@@ -65,6 +231,9 @@ pub struct Pool {
     /// The name this pool's instance logs under ([`crate::instance_log`]),
     /// for the drivers [`Pool::connect_unpooled`] spawns.
     instance: std::sync::Arc<str>,
+    /// `Config::pool_wait_timeout`, which a call's remaining budget can
+    /// shorten for one checkout ([`Pool::get`]).
+    wait_timeout: Duration,
 }
 
 impl Pool {
@@ -123,6 +292,7 @@ impl Pool {
             schema: config.schema().to_string(),
             target_schema: config.target_schema().to_string(),
             instance: crate::instance_log::name_of(config),
+            wait_timeout: config.pool_wait_timeout(),
         })
     }
 
@@ -132,8 +302,32 @@ impl Pool {
     /// `Err(Error::Pool(deadpool_postgres::PoolError::Timeout(_)))` — a
     /// clear, typed, loggable failure (categorized [`crate::ErrorCode::Connectivity`]
     /// via [`Error::code`]) instead of hanging indefinitely (issue #182).
+    ///
+    /// Inside a public call (issue #599, `crate::deadline`) it waits no
+    /// longer than the call has left, and hands the connection out with its
+    /// `statement_timeout` set to that, so the server abandons a statement
+    /// the call can no longer wait for.
     pub async fn get(&self) -> Result<Client, Error> {
-        Ok(self.inner.get().await?)
+        let Some(deadline) = crate::deadline::current() else {
+            return Ok(Client::plain(self.inner.get().await?));
+        };
+        let remaining = deadline.remaining();
+        if remaining.is_zero() {
+            return Err(Error::Pool(deadpool_postgres::PoolError::Timeout(
+                deadpool_postgres::TimeoutType::Wait,
+            )));
+        }
+        let timeouts = deadpool_postgres::Timeouts {
+            wait: Some(self.wait_timeout.min(remaining)),
+            create: Some(remaining),
+            recycle: Some(remaining),
+        };
+        let mut client = Client::plain(self.inner.timeout_get(&timeouts).await?);
+        client.settle = Some(deadline.settle_time());
+        client
+            .simple_query(&deadline.set_statement_timeout_sql(false))
+            .await?;
+        Ok(client)
     }
 
     /// Opens one connection outside the pool, set up exactly like a pooled
@@ -162,6 +356,13 @@ impl Pool {
             },
         ));
         session_bootstrap(&mut client, &self.schema, &self.target_schema).await?;
+        // Closed when dropped, so nothing to reset: a call's deadline simply
+        // ends with the connection.
+        if let Some(deadline) = crate::deadline::current() {
+            client
+                .simple_query(&deadline.set_statement_timeout_sql(false))
+                .await?;
+        }
         Ok(client)
     }
 
@@ -1133,6 +1334,85 @@ mod tests {
 
     /// Issue #591: `Pool`'s derived `Debug` reaches the DSN only through
     /// `deadpool_postgres::Manager`'s `tokio_postgres::Config`, whose own
+    /// Issue #599: a call connection whose reset never ran (its runtime shut
+    /// down with the reset task still queued) is closed, not pooled with the
+    /// call's `statement_timeout` still set. The connection's driver runs on
+    /// a runtime that stays up, and the call runs on a current-thread runtime
+    /// that never polls the queued reset before it is dropped. With one
+    /// connection in the pool, the next checkout would be that session.
+    #[test]
+    fn a_call_connection_whose_reset_never_ran_is_not_pooled() {
+        let setup = tokio::runtime::Runtime::new().expect("setup runtime");
+        let cluster = testkit::TestCluster::start();
+        let db = setup.block_on(cluster.create_isolated_database());
+        let config = Config::from_dsn(db.dsn().to_string())
+            .expect("dsn")
+            .with_pool_max_size(1)
+            .expect("pool size");
+        let pool = Pool::new(&config).expect("pool");
+        // Opened here, so its driver lives on `setup`.
+        setup.block_on(async {
+            drop(pool.get().await.expect("open the connection"));
+        });
+
+        let call = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("call runtime");
+        call.block_on(crate::deadline::bounded(
+            std::time::Instant::now(),
+            Duration::from_secs(30),
+            async {
+                let client = pool.get().await.map_err(crate::TrellisError::Engine)?;
+                // Released at the end of the call: its reset is queued on
+                // `call`, which returns without running it.
+                drop(client);
+                Ok(())
+            },
+        ))
+        .expect("the call");
+        drop(call);
+
+        let timeout: String = setup.block_on(async {
+            pool.get()
+                .await
+                .expect("check out again")
+                .query_one("show statement_timeout", &[])
+                .await
+                .expect("show")
+                .get(0)
+        });
+        assert_eq!(
+            timeout, "0",
+            "the call's statement_timeout came back to the pool"
+        );
+    }
+
+    /// Issue #599: a transaction opened inside a call gets the budget left
+    /// when it begins, not the one its connection was checked out with.
+    #[tokio::test]
+    async fn a_calls_transaction_gets_the_budget_left_when_it_begins() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("dsn")).expect("pool");
+        let (session, local) =
+            crate::deadline::bounded(std::time::Instant::now(), Duration::from_secs(3), async {
+                let mut client = pool.get().await.map_err(crate::TrellisError::Engine)?;
+                let setting = "select setting::bigint from pg_settings \
+                               where name = 'statement_timeout'";
+                let session: i64 = client.query_one(setting, &[]).await.expect("read").get(0);
+                // Stands for the call's earlier work.
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let txn = client.transaction().await.expect("begin");
+                let local: i64 = txn.query_one(setting, &[]).await.expect("read").get(0);
+                Ok((session, local))
+            })
+            .await
+            .expect("the call");
+        assert!((2500..=3000).contains(&session), "at checkout: {session}");
+        assert!((1..=1500).contains(&local), "at begin: {local}");
+    }
+
     /// `Debug` masks the password. This pins that, so a dependency bump
     /// that changes it fails here rather than in someone's logs.
     #[test]

@@ -336,8 +336,8 @@ impl Handle {
     }
 
     /// Waits up to `timeout_ms` for every change committed at or before
-    /// `token` to reach its targets. The handle runs one call at a time, so
-    /// every other call on it queues behind this one.
+    /// `token` to reach its targets, and at most the call's 30-second
+    /// deadline. Other calls on the handle don't queue behind it.
     fn await_converged(
         ruby: &Ruby,
         rb_self: &Self,
@@ -433,6 +433,7 @@ fn connect(
             staging,
             drain_threads,
             worker_threads: Some(worker_threads),
+            ..Default::default()
         };
         // Can't fail after `check` passed (a process's answer never
         // changes), but if it did, it's still an error rather than a hang.
