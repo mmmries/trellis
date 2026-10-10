@@ -45,6 +45,7 @@
 //! has its own default channel, so it never wakes another instance's workers.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
@@ -448,6 +449,9 @@ impl From<ApplyError> for ClientError {
 pub struct Client {
     shutdown_tx: watch::Sender<bool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Keeps `trellis_instance_up` at 1 for this client's instance until the
+    /// client is dropped or shut down.
+    _running: crate::metrics::RunningInstance,
 }
 
 impl Client {
@@ -509,6 +513,7 @@ impl Client {
         // logs under this instance (`crate::instance_log`), so each task
         // spawned onto the runtime does too.
         let instance = crate::instance_log::name_of(&config);
+        let instance_name = Arc::clone(&instance);
         let thread = std::thread::Builder::new()
             .name("trellis-client".to_string())
             .spawn(move || {
@@ -528,6 +533,7 @@ impl Client {
             Ok(Ok(())) => Ok(Client {
                 shutdown_tx,
                 thread: Some(thread),
+                _running: crate::metrics::RunningInstance::new(&instance_name),
             }),
             Ok(Err(err)) => {
                 // Setup failed; the thread is already exiting (or exited)
@@ -600,6 +606,48 @@ mod client_runtime_tests {
         });
         assert_eq!(worker, "app/tenant_a");
         assert_eq!(blocking, "app/tenant_a");
+    }
+
+    /// Issue #873: a running client sets its instance's gauges again on a
+    /// timer, so the recorder's idle timeout drops only a stopped instance's.
+    /// A client with no staging worker and no drain workers never touches the
+    /// database, so this needs none. The timeout only bounds a failure.
+    #[test]
+    fn a_running_client_refreshes_its_instances_gauges_every_interval() {
+        use std::time::Duration;
+
+        use super::{Client, ClientOptions};
+
+        let config = crate::config::Config::with_schema(
+            "postgres://app@127.0.0.1:1/gauge_refresh",
+            "gauge_refresh",
+        )
+        .expect("config");
+        let instance = crate::instance_log::name_of(&config);
+        let client = Client::start_with_config(
+            config,
+            ClientOptions {
+                maintenance_interval: Duration::from_millis(10),
+                ..ClientOptions::default()
+            },
+        )
+        .expect("start a client with no workers");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // Two refreshes: the task runs, and runs again.
+            for _ in 0..2 {
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    crate::metrics::refreshed(&instance),
+                )
+                .await
+                .expect("the running client refreshed its gauges");
+            }
+            client.shutdown().await.expect("shutdown");
+        });
     }
 }
 
@@ -714,6 +762,14 @@ async fn run(
         )));
     }
 
+    // Keeps this instance's gauges set for as long as the client runs, so the
+    // recorder's idle timeout drops only a stopped instance's
+    // (`crate::metrics::refresh_instance_gauges`).
+    let gauge_task = tokio::spawn(gauge_refresh_loop(
+        options.maintenance_interval,
+        shutdown_rx.clone(),
+    ));
+
     if ready_tx.send(Ok(())).is_err() {
         // The calling thread gave up waiting (e.g. it never actually reads
         // the channel because `Client::start` itself was dropped mid-call,
@@ -726,6 +782,7 @@ async fn run(
     // signal here too, then join everything.
     let _ = shutdown_rx.changed().await;
 
+    let _ = gauge_task.await;
     if let Some(task) = maintenance_task {
         let _ = task.await;
     }
@@ -745,6 +802,19 @@ async fn run(
         && let Ok(conn) = pool.get().await
     {
         let _ = staging::deregister_worker(&**conn, &client_id).await;
+    }
+}
+
+/// Sets the instance's gauges again every `interval` until shutdown
+/// (issue #873). Spawned onto the client's runtime, whose threads carry the
+/// instance name the gauges are labeled with.
+async fn gauge_refresh_loop(interval: Duration, mut shutdown_rx: watch::Receiver<bool>) {
+    loop {
+        crate::metrics::refresh_instance_gauges();
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
     }
 }
 
