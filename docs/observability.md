@@ -62,7 +62,9 @@ follow:
   apply, keyed by the **terminal transform** (not source→sink pair) to keep
   cardinality low.
 
-Supporting counters/gauges keep the histograms interpretable:
+Supporting counters/gauges keep the histograms interpretable. Every series
+below, and the histograms above, also carries the `trellis_instance` label
+([below](#several-instances-in-one-process)):
 
 * `changes_applied_total{transform}` — staged changes each transform folded
   and applied. One change is one row in the staging ring: a source row change
@@ -113,10 +115,12 @@ registry:
 * **Counters and histograms** stay at their last value. Their rate is 0, which
   is true.
 * **Gauges** (`staging_segments`, `build_chunk_seconds_max`) disappear once
-  nothing has set them for 60 seconds. A running handle sets each of its gauges
-  again every 300 ms (`maintenance_interval`), to its last known value, so only a
-  stopped instance's expire. A running instance whose staging worker cannot read
-  the ring keeps reporting the last segment counts it read.
+  nothing has set them for 60 seconds. A handle's background client (`staging`
+  or `drain_threads`) sets each of its instance's gauges again every 300 ms
+  (`maintenance_interval`), to its last known value, so a gauge expires only
+  once no client of its instance runs in the process. A running instance whose
+  staging worker cannot read the ring keeps reporting the last segment counts
+  it read.
 * **`trellis_instance_up{trellis_instance}`** is 1 while at least one handle of
   the instance runs in this process, and 0 once the last one has shut down or been
   dropped. It never expires, so it keeps reporting 0. Alert on

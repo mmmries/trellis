@@ -13,7 +13,11 @@ Trellis owns lives in `public` or under unqualified names.
   touching the application tables sharing the database.
 * **Multiple instances per cluster.** The schema name is configurable, so
   several Trellis instances can coexist in one cluster — even one database —
-  each isolated within its own schema.
+  each isolated within its own schema. A process holds one handle for each
+  instance it uses, with its own runtimes and connections and nothing shared
+  between handles
+  ([ADR-0010](decisions/0010-embeddable-clients.md#decision-3-the-binding-owns-one-handle-per-instance-rust-owns-its-threads),
+  decision 3).
 
 ## Default and configuration
 
@@ -164,19 +168,61 @@ trigger names do. `ClientOptions::wake_channel` overrides the default; every
 
 One thing remains the operator's responsibility, not the engine's:
 
-* **Distinct transform target schemas** (`Config::target_schema`) if the two
-  instances materialize similarly-named targets. Target tables are
-  application data, deliberately outside the instance schema (see
-  `DEFAULT_TARGET_SCHEMA`), so nothing keeps two instances' targets apart
-  automatically. Only the targets you name need this. The tables Trellis
-  generates for itself, such as a to-one relationship's projection
+* **Target names that don't clash.** Target tables are application data,
+  deliberately outside the instance schema (see `DEFAULT_TARGET_SCHEMA`), and
+  two instances may share a target schema (`public` by default). A define
+  never takes over a relation it didn't create, so a target whose name, or
+  whose `<target>__ledger` or `<target>__deltas`, is already taken in the
+  target schema, by the other instance's target or anything else, is refused
+  ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
+  Whichever instance defines a name second is the one refused. Give the
+  instances distinct target names, or distinct target schemas
+  (`Config::target_schema`). Only the targets you name need this. The tables
+  Trellis generates for itself, such as a to-one relationship's projection
   (`_trellis_rel_projection_<id>`, numbered per instance), live in the instance
   schema, so two instances sharing a target schema can't collide on them
   (issue #435).
 
+## What two instances in one database share
+
+Instances in one database keep separate rings, triggers and workers, but they
+share the tables of the application, and Postgres coordinates access to a table
+by its locks, whatever instance asks. So two instances that both read one
+source share these:
+
+* **Two sets of triggers per write.** Each instance installs capture triggers of
+  its own on the table, named for its schema, with their functions in its
+  schema. A write to the table fires both sets, and each appends the change to
+  its own instance's ring in the writer's transaction. A writer pays for every
+  instance that captures the table. Each instance's capture pass installs,
+  widens and uninstalls only its own triggers, so one instance leaving the table
+  leaves the other's capture running.
+* **Capture DDL that can wait on the other's.** Installing or widening capture
+  takes `SHARE ROW EXCLUSIVE` on the source, which conflicts with itself, and
+  removing it takes `ACCESS EXCLUSIVE`. While one instance's attempt holds or
+  waits for the table lock, the other instance's attempt waits behind it. An
+  attempt gives up after 50 ms and retries, which keeps short the queue of
+  application writers behind it, and a table both instances want to change
+  settles one after the other. When a capture pass can't get in, the
+  definition's `capture_wait` lists the sessions that hold or queue for the
+  lock, the other instance's among them.
+
+Every two instances in one database also share the attach lock, whatever they
+read, because Postgres keys an advisory lock by database, not by schema (see
+[above](#a-catalog-schema-that-belongs-to-another-instance)).
+
+What stays separate is the rest: each instance's ring, claims, catalog,
+generated tables and wake channel, its one staging worker, and its
+column-pause lock, whose key follows the schema, so a pause, resume or define
+in one instance never waits on another's.
+
+## One instance reading another's target
+
 An instance can read another instance's 1-1 target as a source, exactly as it
-would any other table with a primary key. It cannot read another instance's
-aggregate target. Trellis requires a source table to have a primary key
+would any other table with a primary key. Its capture triggers sit on the
+owner's target table, so every row the owner's drain writes there fires them,
+as an application's write would, and the owner needs no change. It cannot read
+another instance's aggregate target. Trellis requires a source table to have a primary key
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)), and an aggregate
 target has none: its grouping columns may be `NULL`, so its identity is a
 `UNIQUE NULLS NOT DISTINCT` constraint. Inside the owning instance that never
@@ -190,6 +236,8 @@ the downstream transform in the instance that owns it. The same goes for a relat
 RELATIONSHIP` rejects an endpoint that is another instance's aggregate target
 with `RelationshipEndpointNotChangeKeyed` (issue #375), since the relationship
 would capture it just the same.
+
+## Convergence waits
 
 Co-tenant instances don't slow each other's convergence waits.
 `staging::watermark_token` is `pg_current_wal_insert_lsn()`, a cluster-wide LSN, but

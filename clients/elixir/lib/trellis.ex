@@ -57,17 +57,30 @@ defmodule Trellis do
   - Every atom in a result comes from a closed set allocated when the NIF
     loads; none is ever built from a string the database returned.
 
-  ## One handle per OS process
+  ## One handle per instance
 
-  A handle owns a connection pool and a small Rust runtime, and optionally
-  the background workers. Connect once, at boot, and share the handle; don't
-  connect per request. The handle is shut down when `shutdown/1` is called,
-  or, as a backstop, when it is garbage collected.
+  An instance is one catalog schema in one database (the `:schema` option). A
+  handle belongs to one instance, and a VM holds a handle for each instance it
+  uses: against different databases, or against different catalog schemas in
+  one database. Connect each handle once, at boot, and share it; don't connect
+  per request. The handle is shut down when `shutdown/1` is called, or, as a
+  backstop, when it is garbage collected.
 
-  In an application, let a supervisor own it: `{Trellis, options}` in the
-  supervision tree starts a process that connects the handle as it starts
-  and shuts it down when the supervisor stops it (see `start_link/1`).
-  Every function here that takes a handle takes that process's name too:
+  Each handle pays for itself. It owns a connection pool of up to 20
+  connections and a small Rust runtime (`:worker_threads` threads). A handle
+  with `staging: true` or `drain_threads` above `0` also owns a second runtime
+  and pool of the same size, plus connections outside both pools: one for the
+  staging worker, and for each drain thread a `LISTEN` connection and up to two
+  more while it drains.
+  Handles share no budget, so size all of them together against the server's
+  `max_connections`. Each instance has its own staging worker, so set
+  `staging: true` in one process of the fleet per instance.
+
+  In an application, let a supervisor own each handle: `{Trellis, options}` in
+  the supervision tree starts a process that connects the handle as it starts
+  and shuts it down when the supervisor stops it (see `start_link/1`). Every
+  function here that takes a handle takes that process's name too, and the
+  names tell the handles apart:
 
       # config/runtime.exs
       config :my_app, MyApp.Trellis,
@@ -83,6 +96,14 @@ defmodule Trellis do
 
       # Anywhere in the app.
       {:ok, status} = Trellis.status(MyApp.Trellis, "widget_prices")
+
+  A second instance in the same database is a second child with its own `:name`
+  and `:schema`:
+
+      {Trellis, name: MyApp.Billing, url: url, schema: "billing"}
+
+  `Trellis.Metrics.render_prometheus/0` covers every handle in the VM at once,
+  each instance's series labeled `trellis_instance`.
 
   For the migrations that define transforms, see `Trellis.Migration`.
   """
@@ -134,8 +155,8 @@ defmodule Trellis do
     Default `"public"`.
   - `:staging`: whether this connection runs the staging worker, which
     installs change capture on the source tables and starts each new
-    transform's backfill. Exactly one connection in a fleet should.
-    Default `false`.
+    transform's backfill. Exactly one connection of each instance in a fleet
+    should. Default `false`.
   - `:drain_threads`: how many threads apply staged changes to the targets.
     Default `0`.
   - `:worker_threads`: the worker threads of each Rust runtime a handle owns
@@ -201,8 +222,8 @@ defmodule Trellis do
 
   Returns `{:error, %Trellis.Error{}}` if the connect fails, so the
   supervisor's start fails with the reason. A second `staging: true`
-  process fails that way (`:conflict`) while the first is alive: in a
-  rolling deploy, stop the old one before the new one starts.
+  process for the same instance fails that way (`:conflict`) while the first
+  is alive: in a rolling deploy, stop the old one before the new one starts.
 
   Every call made through the process's name runs in the process, one at a
   time, as it would on the handle, which runs one call at a time anyway.
