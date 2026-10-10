@@ -144,12 +144,24 @@ pub struct TrellisOptions {
     /// How many drain (application) worker threads this connection runs. Zero
     /// (the default) runs none.
     pub drain_threads: usize,
-    /// Caps the worker-thread count of the `tokio` runtime
-    /// [`BlockingTrellis::connect`](crate::BlockingTrellis::connect) builds
-    /// to own this connection (see its module doc comment) — irrelevant to
-    /// [`Trellis::connect`] itself, which never builds a runtime of its own.
-    /// `None` (the default) preserves today's behavior: `tokio`'s own
-    /// default of one worker thread per core.
+    /// Caps the worker-thread count of each `tokio` runtime this connection
+    /// owns: the background [`Client`]'s (built when `staging` or
+    /// `drain_threads` starts one) and, for
+    /// [`BlockingTrellis::connect`](crate::BlockingTrellis::connect), the
+    /// runtime that services the handle's calls (see its module doc
+    /// comment). [`Trellis::connect`] itself never builds a runtime of its
+    /// own, so a connection that starts no client is unaffected. `None` (the
+    /// default) leaves `tokio`'s own default of one worker thread per core.
+    ///
+    /// The cap is per runtime and per handle, with no budget shared between
+    /// handles. A [`BlockingTrellis`](crate::BlockingTrellis) that runs a
+    /// client holds up to two runtimes, so up to `2 * n` worker threads; a
+    /// process with H such handles holds up to `2 * n * H`. Size `n` for the
+    /// handle count you open. The cap counts worker threads only: the thread
+    /// driving each runtime and each runtime's on-demand blocking pool are
+    /// outside it. The client's staging and drain workers are tasks on its
+    /// runtime, so `n` also bounds how many of them compute at once, however
+    /// large `drain_threads` is.
     ///
     /// Matters chiefly when Trellis is embedded inside a host VM that
     /// already sized its own scheduler pool to core count — a BEAM node, or
@@ -159,9 +171,12 @@ pub struct TrellisOptions {
     /// own work is I/O, not compute-bound, a small explicit count (2, say)
     /// is enough; see issue #141.
     ///
-    /// Must be at least 1 when set: `Some(0)` fails the connect with
-    /// [`TrellisError::BlockingSpawn`], since a runtime with no worker
-    /// threads couldn't run anything anyway.
+    /// Must be at least 1 when set, since a runtime with no worker threads
+    /// couldn't run anything: `Some(0)` fails a connect that builds a runtime,
+    /// with [`TrellisError::BlockingSpawn`] from `BlockingTrellis::connect` or
+    /// [`TrellisError::Client`] from a [`Trellis::connect`] that starts a
+    /// client. A `Trellis::connect` that starts no client builds no runtime,
+    /// so it never reads the cap.
     pub worker_threads: Option<usize>,
 }
 
@@ -1377,15 +1392,22 @@ impl Trellis {
             .map_err(TrellisError::SelfCheck)
     }
 
+    /// The [`ClientOptions`] a connection's background [`Client`] runs with:
+    /// the role flags and the runtime's thread cap, everything else default.
+    fn client_options(options: &TrellisOptions) -> ClientOptions {
+        ClientOptions {
+            staging_worker: options.staging,
+            application_threads: options.drain_threads,
+            worker_threads: options.worker_threads,
+            ..Default::default()
+        }
+    }
+
     /// Starts the background [`Client`] for a `staging`/`drain_threads`
     /// connection. The staging worker reads the tables to publish from the
     /// catalog itself (issue #427), so an empty catalog is fine.
     fn start_client(config: &Config, options: &TrellisOptions) -> Result<Client, TrellisError> {
-        let client_options = ClientOptions {
-            staging_worker: options.staging,
-            application_threads: options.drain_threads,
-            ..Default::default()
-        };
+        let client_options = Self::client_options(options);
         // Issue #234: `start_with_config`, not `start(config.dsn(), ..)` —
         // the latter threw this `Config`'s schema away and re-resolved one
         // from the process environment, so a `Trellis` explicitly configured
@@ -2334,6 +2356,54 @@ impl From<StagingError> for TrellisError {
 impl From<SelfCheckError> for TrellisError {
     fn from(err: SelfCheckError) -> Self {
         TrellisError::SelfCheck(err)
+    }
+}
+
+#[cfg(test)]
+mod client_options_tests {
+    use super::*;
+
+    /// Issue #876: a connection's `worker_threads` reaches the background
+    /// client's runtime. It used to stop at the blocking wrapper, so the
+    /// client thread built its own per-core runtime whatever the caller set.
+    #[test]
+    fn worker_threads_reaches_the_client_options() {
+        let options = TrellisOptions {
+            staging: true,
+            drain_threads: 3,
+            worker_threads: Some(2),
+        };
+        let client = Trellis::client_options(&options);
+        assert_eq!(client.worker_threads, Some(2));
+        assert!(client.staging_worker);
+        assert_eq!(client.application_threads, 3);
+        assert_eq!(
+            Trellis::client_options(&TrellisOptions::default()).worker_threads,
+            None
+        );
+    }
+
+    /// Issue #876: the cap reaches the runtime the client thread actually
+    /// builds, not just the options struct. A zero cap fails that build
+    /// before the client opens any connection, so this needs no database;
+    /// a client thread that built its runtime any other way would get past
+    /// it and fail on the unreachable DSN instead.
+    #[tokio::test]
+    async fn connect_builds_the_client_runtime_with_worker_threads() {
+        let config =
+            Config::with_schema("postgres://trellis@127.0.0.1:1/none", "trellis").expect("config");
+        let options = TrellisOptions {
+            staging: true,
+            drain_threads: 0,
+            worker_threads: Some(0),
+        };
+        match Trellis::connect(config, options).await {
+            Err(TrellisError::Client(ClientError::Spawn(err))) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            Err(err) => panic!("expected the client runtime build to fail, got: {err}"),
+            Ok(_) => panic!("a zero worker_threads cap must not start a client"),
+        }
     }
 }
 
