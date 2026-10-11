@@ -33,7 +33,9 @@ reference's identity. It never persists or re-resolves the bare spelling.**
 2. **The dependency graph keys on qualified identity.** `public.posts` and
    `archive.posts` are distinct nodes with independent edges, versions, and
    quarantine state, walked and diffed on qualified strings, never re-resolved.
-   The catalog's uniqueness constraints key on qualified identity too.
+   The catalog's uniqueness constraints key on qualified identity too; a
+   transform's target is also unique by its bare table name, since a
+   transform is addressed by it.
 
 3. **Every generated statement emits qualified names,** schema and table quoted
    independently — for capture triggers and functions, backfill enumeration, and

@@ -68,8 +68,9 @@ SELECT <expr> AS <field> [, <expr> AS <field> ...]
 `<expr>` is a column reference, a numeric or single-quoted string literal,
 `<expr> + <expr>`, `<expr> > <expr>`, or a function call (`strpos`,
 `octet_length`, `char_length`, `regexp_count`; general `func(args)` syntax). Values
-carry one of four types — `Numeric`, `Text`, `Boolean`, `Uuid` — and every operator/function's argument and
-return types are type-checked at definition time. `<predicate>` accepts only the
+carry a Postgres type (the ones [type support](../type-support.md) lists), and
+every operator/function's argument and return types are type-checked at
+definition time. `<predicate>` accepts only the
 literal `TRUE`; any other `WHERE` is refused at definition time.
 
 ### Typed literals spell constants in canonical Postgres form
@@ -98,8 +99,8 @@ Deliberately out:
 * **General `CAST(<expr> AS <type>)`** — a coercion lattice, not a literal.
   Every (source, target) pair needs its own volatility verdict and evaluator
   arm, and most interesting pairs aren't immutable (`timestamptz` → `date`
-  reads `TimeZone`). Each type family's own issue decides its own pairs;
-  rejected here by name.
+  reads `TimeZone`). Each type family decides its own pairs when it is
+  admitted; rejected here by name.
 
 The literal's text must be in that family's **canonical Postgres output
 spelling** — `DATE '2024-1-5'` is refused even though Postgres parses it. This
@@ -117,8 +118,10 @@ of the ADR's bar drive it:
   agree by construction instead of needing a per-family normalizer.
 
 `jsonb` is the family this second rule costs most: `jsonb_out` re-sorts object
-keys by length then bytes, collapses duplicates, and renormalizes numbers, so
-checking a literal is canonical takes a real `jsonb` value model.
+keys by length then bytes, collapses duplicates, and renormalizes numbers. The
+literal is checked, not normalized: one with exponent notation, an
+out-of-order or duplicate object key, or a non-canonical string escape is
+refused, so no `jsonb` value model is needed.
 
 `COALESCE(<expr>, ...)` is accepted — first non-`NULL` argument, or
 `NULL` if all are. It's immutable, but *variadic*, so it isn't a registry
@@ -126,9 +129,10 @@ function: the parser special-cases it (at least one argument, as Postgres does)
 and the evaluator short-circuits. It is a **safe subset** of Postgres's
 `COALESCE`; the accepted-language-is-the-spec goal makes the gaps worth naming:
 
-* All arguments must resolve to the *same* type (exact match), where Postgres
-  resolves to a common type. Because this type lattice is coarser (one `Numeric`,
-  no distinct `int`/`bigint`), no *expressible* mismatch behaves differently.
+* Numeric arguments resolve to a common type as Postgres's `COALESCE` does
+  (`integer` and `numeric` give `numeric`; a float wins over every exact type).
+  Any other mix of types is refused, where Postgres resolves some mixes (`date`
+  and `timestamp`, say) to a common type.
 * No `unknown`-typed literal: a quoted literal is always `Text`, so
   `COALESCE(<numeric>, '0')` is a type mismatch here. Write `COALESCE(<numeric>, 0)`.
 * No `NULL` literal at all, so `COALESCE(x, NULL)` isn't expressible; bare `NULL`
@@ -171,7 +175,7 @@ tier there.
   outside the list is refused until then.
 * The accepted language is narrower than Postgres's in places a SQL user will
   notice: a typed literal must use its type's canonical spelling, `::` casts and
-  general `CAST` are refused, and `COALESCE` requires arguments of one type and
-  has no `NULL` literal.
+  general `CAST` are refused, and `COALESCE` refuses mixed non-numeric argument
+  types and has no `NULL` literal.
 * Precedence lives in our own operator table, so each new operator has to
   declare its tier there correctly.

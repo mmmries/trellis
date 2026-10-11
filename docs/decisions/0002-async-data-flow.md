@@ -116,9 +116,9 @@ refined them; I6 to I8 are the rules the capture and build experiments forced.
 | | Invariant | Evidence and refinements |
 |---|---|---|
 | **I0** | **One database.** Sources, the ring, every ledger and every target live in one Postgres database, so one snapshot orders every commit Trellis will see. | Design premise; made exact by trigger capture, which makes a ring row's transaction the source commit's. Nothing here works across databases. |
-| **I1** | **Read after lock.** Every live read that feeds an absolute write happens after the writer holds the lock on the ledger state it will write, and the snapshot it stores is taken **in the same statement** as the read. One write reads first: a build chunk's insert of the entry of a key that has none, from a read in the same statement. Its uniqueness check comes after the read, and finding no entry there means no Apply has written the key since the read's snapshot, because the tombstone GC, the one thing that removes an entry an Apply wrote, skips a ledger under a build (I4). A page deletes only a placeholder it wrote no change to, which holds no applied change, and a source truncate commits before the chunk's first read, which holds the source's lock, so it empties no change the snapshot doesn't see. A key that has an entry by then is locked and read afresh. The rule needs `READ COMMITTED`, where each statement reads from a snapshot of its own, so a read after the lock sees what the lock waited for; at `REPEATABLE READ` or `SERIALIZABLE` it would read from the transaction's first snapshot, taken before the lock. Every session Trellis opens sets `default_transaction_isolation` to `read committed`, whatever the server's, database's or role's default, and a transaction that needs one snapshot for several reads asks for its level explicitly. | In my interleaving experiment (seventeen hand-driven scenarios of Apply racing a Re-derive and other producers), the scenarios where Apply meets a held entry lock hold, and Apply demonstrably blocks on it. In a snapshot-timing experiment I measured a snapshot taken in a separate statement differing from the read's in 99.7% of samples under load; the stored basis is the full `pg_snapshot`, not `xmin`/`xmax`. |
+| **I1** | **Read after lock.** Every live read that feeds an absolute write happens after the writer holds the lock on the ledger state it will write, and the snapshot it stores is taken **in the same statement** as the read. One write reads first: a build chunk's insert of the entry of a key that has none, from a read in the same statement. Its uniqueness check comes after the read, and finding no entry there means no Apply has written the key since the read's snapshot, because the tombstone GC, the one thing that removes an entry an Apply wrote, skips a ledger under a build (I4). A page deletes only a placeholder it wrote no change to, which holds no applied change, and a source truncate commits before the chunk's first read, which holds the source's lock, so it empties no change the snapshot doesn't see. A key that has an entry by then is locked and read afresh. The rule needs `READ COMMITTED`, where each statement reads from a snapshot of its own, so a read after the lock sees what the lock waited for; at `REPEATABLE READ` or `SERIALIZABLE` it would read from the transaction's first snapshot, taken before the lock. Every session Trellis opens sets `default_transaction_isolation` to `read committed`, whatever the server's, database's or role's default, and a transaction that needs one snapshot for several reads asks for its level explicitly. | In my interleaving experiment (seventeen hand-driven scenarios of Apply racing a Re-derive and other producers), the scenarios where a stalled Re-derive meets a change to the same key, committed before or after its snapshot, hold, and Apply demonstrably blocks on the entry lock. In a snapshot-timing experiment I measured a snapshot taken in a separate statement differing from the read's in 99.7% of samples under load; the stored basis is the full `pg_snapshot`, not `xmin`/`xmax`. |
 | **I2** | **Visibility-checked application.** A change C for row r is applied iff C's transaction is **not** visible in r's basis snapshot **and** C's ring position is above r's `applied_lsn` (and above the target's truncate floor, [Truncate](#truncate-ddl-drop)). Skipping is exact, never "maybe counted, re-derive". | In the interleaving experiment, skip-iff-visible alone fails three scenarios (same-key order across batches is not decidable from visibility); stamping Apply's own snapshot fails two more; visible-or-`applied_lsn` passes all seventeen. An in-flight id is decidable from the stored list (0 disagreements over ~1.1M pairs in the snapshot-timing experiment); my 10M chunked-build runs saw 0 in-progress cases. |
-| **I3** | **Per-row ordering state; groups are pure sums.** The ledger entry is the only place a row's applied contribution and group live. A group value is the sum of its entries' contributions, so group updates commute and a group row is only ever incremented. A relationship's parent is read under the child's entry lock ([Relationships](#relationships-the-parent-is-read-under-the-childs-entry-lock)). | The interleaving experiment's concurrent-group-increment and same-key-ordering scenarios hold. |
+| **I3** | **Per-row ordering state; groups are pure sums.** The ledger entry is the only place a row's applied contribution and group live. A group value is the sum of its entries' contributions, so group updates commute and a group row is only ever incremented. A relationship's parent is read under the child's entry lock ([Relationships](#relationships-the-parent-is-read-under-the-childs-entry-lock)). | In the interleaving experiment, eight workers creating the same groups at once, and a row passing through a group within one folded batch while that group rebuilds, both hold with groups as sums and no pre-lock or probe. |
 | **I4** | **Tombstones live until the batch watermark passes.** A deleted row's entry stays, with its `applied_lsn` and `applied_seg`, until every batch at or below its `applied_seg` is fully drained ([Convergence and status](#convergence-and-status)). | In the interleaving experiment an older update resurrects a deleted row unless the tombstone is kept. The batch-watermark form is exact under triggers because a same-key predecessor of a delete committed before the delete's trigger ran. |
 | **I5** | **One lock order, taken as one sorted batch.** A page's 1-1 targets, then its aggregate targets, each in target order; per target its ledger entries, then its rows or groups, each locked in key order in one statement per class. Never a per-row loop. | In the interleaving experiment a per-row loop deadlocked 19–22 times in 20 s; the sorted batch never did. The implemented paths held it in my benchmark round (no deadlock in any benchmark, and group moves and the hot-key case converge with none). The unbuilt factored relationship layout is the one variant that deadlocked ([Relationships](#relationships-the-parent-is-read-under-the-childs-entry-lock)). |
 | **I6** | **Never block, and never fail, an application writer.** No Trellis transaction takes a lock an application write can queue behind, except the join and drop fences, which are bounded by `lock_timeout` and retried. A schema change to a read column never fails the application's statement. A missing ring table or a revoked privilege does, loudly ([Consequences](#consequences-and-costs)). | I measured a bare `CREATE TRIGGER` stalling every writer for 25 s; with a 50 ms `lock_timeout` retry the worst wait was 52 ms. I renamed a read column under the capture function and every insert failed until regeneration. The retire path already takes its `TRUNCATE` lock `NOWAIT`. |
@@ -213,8 +213,10 @@ What it does there is one append.
   recompute comparison (five triggers, one Trellis
   role). Replica-mode sessions are covered by
   `ENABLE ALWAYS`; an owner who disables or drops the trigger by name is
-  documented as uncaptured until the audit runs (see also gaps 5 and 6 in
-  [known correctness gaps](../known-correctness-gaps.md)).
+  documented as uncaptured until the audit runs (see also the known
+  correctness gaps
+  [Capture switched off and back on between two reconcile passes](../known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes) and
+  [A capture function body replaced by hand](../known-correctness-gaps.md#6-a-capture-function-body-replaced-by-hand)).
 - **Only the staging worker creates or drops triggers**, from the catalog
   alone, on its reconcile pass: a table gains triggers when something
   registers a reader of it and loses them when its last reader is dropped.
@@ -351,7 +353,8 @@ state that orders its writes.
   fold-in ratio: 400 groups is 33–57% slower in-window (39–51% end to end),
   because the old path wrote one group row per group per page and the
   ledger writes one entry per source row. WAL per folded row is 2.5–2.6x
-  the old path's in that measurement, and Postgres CPU per folded row
+  the old path's in that measurement, taken before Apply's updates were made
+  HOT-eligible, and Postgres CPU per folded row
   1.8–2.6x.
 - **Ledger size and WAL.** The ledger is 2.6–3.1x a narrow source table on
   disk (~100 B per entry) and adds 1.5–1.8x a ledger-less apply's WAL, 40–45%
@@ -539,8 +542,8 @@ applying.
   this needs no new locks, keeps I5, and survives a crash because the delta
   rows are durable. *Evidence:*
   in my 100M chunked-build run, a 100k-row chunk touched ~63% of 100k groups,
-  so chunk transactions that lock groups serialize on them; 10x larger chunks
-  cut define-to-live by only a third.
+  so chunk transactions that lock groups serialize on them; at 10M, 10x larger
+  chunks cut define-to-live by only a third.
 - **Must (I7):** chunk transactions are short (one range, no group locks,
   under `lock_timeout`), and a captured-change batch never waits inside its
   transaction for a chunk's lock.
@@ -593,9 +596,8 @@ applying.
   rows alone is sound; a transaction straddling the token over-reports, the
   safe direction. The token is the insert position because the write
   position, `pg_current_wal_lsn()`, lags a commit made with
-  `synchronous_commit = off` and can sit below its rows' `origin_lsn`, which I
-  found in a `synchronous_commit = off` run. There is no capture watermark to
-  check.
+  `synchronous_commit = off` and can sit below its rows' `origin_lsn`. There
+  is no capture watermark to check.
 - **Must:** three stored statuses: `waiting_to_backfill` (registered, chunk
   plan not yet written; normally momentary), `backfilling` (applying, chunks
   or deltas outstanding), `live`. A one-pass build adds
@@ -771,9 +773,9 @@ Each alternative below is recorded with the number that rejected it.
   function:
   the application sees the fault at once, not after data is lost. One silent-uncapture path is an owner disabling
   the trigger by name, which the audit reports; the others are the
-  disable-and-restore and replaced-function cases in
-  [known correctness gaps](../known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes)
-  (gaps 5 and 6).
+  disable-and-restore and replaced-function cases, the known correctness gaps
+  [Capture switched off and back on between two reconcile passes](../known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes) and
+  [A capture function body replaced by hand](../known-correctness-gaps.md#6-a-capture-function-body-replaced-by-hand).
 - **Hosted compatibility** is core Postgres for everything required
   (statement triggers, transition tables, `SECURITY DEFINER`, the `TRIGGER`
   privilege); no event trigger is needed.
@@ -825,8 +827,8 @@ Nothing below polls for convergence.
 
 1. **One deterministic interleaving test per scenario of the interleaving
    experiment** (all seventeen) on the real engine, hand-driven with advisory
-   locks, plus one per race that a patch in the rejected ordering-by-LSN
-   design each closed.
+   locks, plus one for each of the nine superseded problems in the inventory of
+   producer pairings that motivated this design.
 2. **The generative concurrent tier** with three planted violations (skip
    the lock, compare LSN instead of visibility, delete tombstones early), each
    caught within the nightly budget. **Merge gate.**
