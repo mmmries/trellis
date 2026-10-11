@@ -1168,8 +1168,17 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 // drain-only client's row would otherwise sit forever.
                 // `staging::has_live_workers` never depends on this having
                 // run (see `staging::worker_registry`'s doc comment); this
-                // is purely about bounding the table's size over time.
-                let reclaimed = staging::reclaim_stale_workers(c, reclaim_ttl).await;
+                // is purely about bounding the table's size over time. Kept
+                // at least `DEFAULT_RECLAIM_TTL`, the TTL
+                // `has_live_drain_workers` reads: a peer with the default
+                // `reclaim_ttl` refreshes its row only every third of that
+                // (`upkeep_interval`), so this client's shorter `reclaim_ttl`
+                // would delete a live peer's row between two refreshes.
+                let reclaimed = staging::reclaim_stale_workers(
+                    c,
+                    reclaim_ttl.max(staging::DEFAULT_RECLAIM_TTL),
+                )
+                .await;
                 failed = failures.check("reclaim_stale_workers", reclaimed).is_err();
             }
             if !failed {
@@ -4202,8 +4211,9 @@ mod runtime_tests {
 mod worker_upkeep_tests {
     //! #1013, #273: the process's one worker-registry heartbeat and
     //! chunk-reclaim sweep. The loop is stepped through its `pass` parameter
-    //! rather than a clock, so none of this waits for a tick (#297), except
-    //! the one test that starts a real `Client`.
+    //! rather than a clock, so none of this waits for a tick (#297). The
+    //! tests that start a real `Client` await a trigger's notification of
+    //! the client's own write instead of polling for it.
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4351,61 +4361,124 @@ mod worker_upkeep_tests {
         assert_eq!(upkeep_interval(Duration::ZERO), MIN_UPKEEP_INTERVAL);
     }
 
-    /// `run` wires the loop: a started client's row is refreshed with no
-    /// maintenance loop (`staging_worker: false`) and no help from the test.
-    /// The only wait is for the first pass, bounded at 60 s, on a 20 ms
-    /// interval.
+    /// Connects to `db` and has every `op` (`update` or `delete`) of a
+    /// `worker_registry` row send the row's `worker_id` to the returned
+    /// receiver, so a test awaits a client's write instead of polling for it.
+    /// The trigger's `NOTIFY` is part of the writing transaction, so it
+    /// arrives once that write has committed.
+    async fn registry_writes(
+        db: &testkit::TestDatabase,
+        op: &str,
+    ) -> (
+        tokio_postgres::Client,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (raw, mut connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(Ok(message)) =
+                std::future::poll_fn(|cx| connection.poll_message(cx)).await
+            {
+                if let tokio_postgres::AsyncMessage::Notification(n) = message {
+                    let _ = tx.send(n.payload().to_string());
+                }
+            }
+        });
+        raw.batch_execute(&format!(
+            "set search_path to {schema}, public; \
+             create function registry_{op}() returns trigger language plpgsql as $$ \
+             begin perform pg_notify('registry_{op}', old.worker_id); return null; end $$; \
+             create trigger registry_{op} after {op} on worker_registry \
+             for each row execute function registry_{op}(); \
+             listen registry_{op}",
+            schema = crate::config::DEFAULT_SCHEMA
+        ))
+        .await
+        .expect("notify on registry writes");
+        (raw, rx)
+    }
+
+    /// `run` wires the loop: a started client's upkeep task refreshes its row
+    /// with no maintenance loop (`staging_worker: false`). The startup
+    /// registration inserts the row, so only a pass updates it, and the
+    /// first pass runs as soon as the task starts. The test awaits that
+    /// update; the timeout only bounds a failure.
     #[tokio::test]
     async fn a_started_client_refreshes_its_row_from_the_upkeep_task() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
-        let (raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        raw.batch_execute(&format!(
-            "set search_path to {}, public",
-            crate::config::DEFAULT_SCHEMA
-        ))
-        .await
-        .expect("search_path");
+        let (raw, mut updated) = registry_writes(&db, "update").await;
         let client = Client::start(
             db.dsn(),
             ClientOptions {
                 staging_worker: false,
                 application_threads: 2,
-                reclaim_ttl: Duration::from_millis(60),
+                ..ClientOptions::default()
+            },
+        )
+        .expect("start");
+
+        let refreshed = tokio::time::timeout(Duration::from_secs(60), updated.recv())
+            .await
+            .expect("the upkeep task refreshed the row")
+            .expect("listener");
+        let registered: String = raw
+            .query_one("select worker_id from worker_registry", &[])
+            .await
+            .expect("one registered row")
+            .get(0);
+        assert_eq!(refreshed, registered);
+
+        client.shutdown().await.expect("shutdown");
+    }
+
+    /// A staging worker whose own `reclaim_ttl` is shorter than
+    /// `DEFAULT_RECLAIM_TTL` still leaves a row `has_live_drain_workers`
+    /// counts live: a peer with the default `reclaim_ttl` refreshes its row
+    /// only every third of `DEFAULT_RECLAIM_TTL`, so a sweep at this
+    /// client's TTL would delete it between two refreshes. A row past every
+    /// TTL goes in the same sweep statement, and its deletion says the sweep
+    /// has run.
+    #[tokio::test]
+    async fn the_registry_sweep_keeps_a_row_the_health_check_counts_live() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (raw, mut deleted) = registry_writes(&db, "delete").await;
+        raw.batch_execute(
+            "insert into worker_registry (worker_id, registered_at, last_seen) values \
+             ('crashed', now() - interval '1 hour', now() - interval '1 hour'), \
+             ('between-refreshes', now() - interval '1 second', now() - interval '1 second')",
+        )
+        .await
+        .expect("seed the registry");
+        let client = Client::start(
+            db.dsn(),
+            ClientOptions {
+                staging_worker: true,
+                reclaim_ttl: Duration::from_millis(200),
                 heartbeat: HeartbeatDaemonConfig {
-                    interval: Duration::from_millis(10),
+                    interval: Duration::from_millis(100),
                     ..HeartbeatDaemonConfig::default()
                 },
                 ..ClientOptions::default()
             },
         )
         .expect("start");
-        let worker_id: String = raw
-            .query_one("select worker_id from worker_registry", &[])
-            .await
-            .expect("one registered row")
-            .get(0);
 
-        tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
-                stale_registry_row(&raw, &worker_id).await;
-                // Fresh within a second means a pass ran since the aging.
-                if staging::has_live_workers(&raw, Duration::from_secs(5))
-                    .await
-                    .expect("read")
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the upkeep task refreshed the row");
+        tokio::time::timeout(Duration::from_secs(60), deleted.recv())
+            .await
+            .expect("the maintenance loop swept the registry")
+            .expect("listener");
+        let left: Vec<String> = raw
+            .query("select worker_id from worker_registry", &[])
+            .await
+            .expect("read the registry")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(left, ["between-refreshes"]);
 
         client.shutdown().await.expect("shutdown");
     }

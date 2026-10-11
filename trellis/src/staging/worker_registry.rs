@@ -116,8 +116,10 @@ const RECLAIM_STALE_WORKERS_SQL: &str = "\
 /// `last_seen` is older than `ttl`, returning how many it removed. Purely
 /// table hygiene after an unclean shutdown elsewhere in the fleet (crash,
 /// `kill -9`, a dropped `Client` that never called `shutdown`) — it bounds
-/// the table's growth and nothing more. Uses the same `ttl` value
-/// [`super::liveness::reclaim_stale`] applies to a claim.
+/// the table's growth and nothing more. `maintenance_loop` passes its
+/// `reclaim_ttl`, but never less than [`super::liveness::DEFAULT_RECLAIM_TTL`]
+/// (what `Trellis::has_live_drain_workers` reads), so it never deletes a row
+/// that check still counts as live.
 ///
 /// [`has_live_workers`] never depends on this having run — see the module
 /// doc comment for why requiring a reclaim pass before the read would be
