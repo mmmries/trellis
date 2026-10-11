@@ -2753,16 +2753,17 @@ async fn a_drop_arriving_mid_plan_batch_does_not_deadlock_with_it() {
     );
 }
 
-/// A plan job whose batch starts while a resume holds the definition row
-/// waits for it holding nothing, and once the resume commits its claim is
-/// stale: it stops as superseded and writes nothing.
-#[tokio::test]
-async fn a_plan_batch_behind_a_resume_stops_as_superseded() {
-    let mut f = Fixture::new(60, &[AGG]).await;
-    let (plan, trellis) = paused_with_a_claimed_plan_job(&mut f).await;
+/// Starts a plan job's batch while `action` holds the definition row and
+/// waits on a fenced writer's lock on the plan row, then lets the writer
+/// commit. The batch must wait for `action` at its first statement, the
+/// definition row, holding nothing: a batch that took the plan row first
+/// would wait in its insert instead, behind `action`. Returns the plan job's
+/// id and what `action` returned, once the batch has ended.
+async fn plan_batch_behind(f: &mut Fixture, action: &'static str) -> (i64, Result<(), String>) {
+    let (plan, trellis) = paused_with_a_claimed_plan_job(f).await;
 
     // A fenced writer on the plan row (`ClaimFence::hold`'s lock), which is
-    // what the resume waits out after it takes the definition row.
+    // what `action` waits out after it takes the definition row.
     let holder = connect(f.db.dsn()).await;
     let holder_pid: i32 = holder
         .query_one("select pg_backend_pid()", &[])
@@ -2779,24 +2780,23 @@ async fn a_plan_batch_behind_a_resume_stops_as_superseded() {
         .await
         .expect("hold the plan row");
 
-    let resume = tokio::spawn(async move { trellis.apply("RESUME TRANSFORM agg").await });
+    let acting = tokio::spawn(async move { trellis.apply(action).await });
     wait_for_queue(&f.raw, Some(holder_pid), 1).await;
     let pool = f.db.pool.clone();
     let claimed = plan.clone();
     let batch = tokio::spawn(async move {
         build::run_claimed(&pool, &claimed, "held", &OPTIONS).await;
     });
-    // The resume waits on the holder, and the batch on the resume, at its
-    // first statement: the definition row, before it claims anything. A
-    // batch that took the plan row first would wait in its insert instead
-    // and end as a deadlock victim, so it is not waiting here when it ends.
+    // `action` waits on the holder, and the batch on `action`, at the
+    // batch's definition-row statement.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let waiting: i64 = f
             .raw
             .query_one(
                 "select count(*) from pg_stat_activity \
-                 where wait_event_type = 'Lock' \
-                   and query like 'select 1 from transform_definitions % for key share'",
+                 where datname = current_database() and wait_event_type = 'Lock' \
+                   and query = 'select 1 from transform_definitions where id = $1 for key share'",
                 &[],
             )
             .await
@@ -2809,20 +2809,35 @@ async fn a_plan_batch_behind_a_resume_stops_as_superseded() {
             !batch.is_finished(),
             "the plan batch ended without waiting on the definition row"
         );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the plan batch never waited on the definition row"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     holder.batch_execute("commit").await.expect("commit");
 
-    resume
+    let acted = acting
         .await
-        .expect("the resume task")
-        .expect("the resume is not a deadlock victim");
+        .expect("the action task")
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"));
     batch.await.expect("the plan batch task");
+    (plan.id, acted)
+}
+
+/// A plan job whose batch starts while a resume holds the definition row
+/// waits for it holding nothing, and once the resume commits its claim is
+/// stale: it stops as superseded and writes nothing.
+#[tokio::test]
+async fn a_plan_batch_behind_a_resume_stops_as_superseded() {
+    let mut f = Fixture::new(60, &[AGG]).await;
+    let (plan_id, resumed) = plan_batch_behind(&mut f, "RESUME TRANSFORM agg").await;
+    resumed.expect("the resume is not a deadlock victim");
 
     assert_eq!(
         f.count(&format!(
-            "select count(*) from backfill_chunks where id = {}",
-            plan.id
+            "select count(*) from backfill_chunks where id = {plan_id}"
         ))
         .await,
         0,
@@ -2838,4 +2853,20 @@ async fn a_plan_batch_behind_a_resume_stops_as_superseded() {
     f.run("agg").await;
     assert_eq!(f.status("agg").await.as_deref(), Some("live"));
     f.assert_agg_oracle().await;
+}
+
+/// The same behind a drop: once the drop commits, the batch's definition-row
+/// statement finds no row, its claim is gone with the plan row, and it ends
+/// quietly having written nothing.
+#[tokio::test]
+async fn a_plan_batch_behind_a_drop_writes_nothing() {
+    let mut f = Fixture::new(60, &[AGG]).await;
+    let (_, dropped) = plan_batch_behind(&mut f, "DROP TRANSFORM agg").await;
+    dropped.expect("the drop is not a deadlock victim");
+    assert_eq!(f.status("agg").await, None, "the definition is gone");
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks").await,
+        0,
+        "and the batch planned no chunk"
+    );
 }

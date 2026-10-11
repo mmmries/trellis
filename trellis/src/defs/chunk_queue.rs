@@ -468,7 +468,8 @@ pub(crate) const STALE: &str = "bc.fuse_rearmed_at is distinct from d.fuse_rearm
 /// (a plan job's `insert into backfill_chunks`) takes the definition row
 /// `for key share` before [`hold`], not after: the foreign-key check would
 /// otherwise wait on the definition row while holding the chunk, the reverse
-/// order, and deadlock with them (`staging::build::run_plan`).
+/// order, and deadlock with them (`staging::build::run_plan`). Like any lock
+/// taken ahead of the claim's, it comes after [`arm`](Self::arm).
 ///
 /// [`hold`]: ClaimFence::hold
 #[derive(Debug, Clone, Copy)]

@@ -2881,7 +2881,10 @@ async fn run_plan(
         // this batch locks: taken after the claim, that check closes a cycle.
         // Here a resume or drop in flight makes this batch wait holding
         // nothing, and one that committed first shows in the claim's stale
-        // check, so the batch stops as superseded.
+        // check, so the batch stops as superseded. The claim's idle timeout
+        // goes first, so it bounds a stall that holds the definition row
+        // too.
+        fence.arm(&*txn).await?;
         txn.execute(
             "select 1 from transform_definitions where id = $1 for key share",
             &[&chunk.definition_id],
