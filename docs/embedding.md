@@ -269,7 +269,10 @@ now", not "is *this* connection running one", so call it from any connection,
 including a web process at `drain_threads: 0`, which is where an uptime
 monitor or load balancer polls. A drain worker counts as live until its
 heartbeat is older than the reclaim TTL (30 seconds by default), so a crashed
-one drops out within that window. The staging worker counts as live while
+one drops out within that window. The heartbeat comes from one task per process,
+not from the drain threads, so a fleet that is busy in a long drain or build
+chunk stays live. That task runs only while a drain thread does, so a process
+whose drain threads have all exited drops out within the same window. The staging worker counts as live while
 some connection holds the instance's staging-worker lock, which Postgres frees
 the moment a crashed worker's connection closes. It also reads `false` for the
 tick or so the worker takes to reconnect after a failed step, so page on it
