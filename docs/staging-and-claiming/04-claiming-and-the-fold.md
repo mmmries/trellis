@@ -31,7 +31,7 @@ batch is split into buckets at seal time, and workers claim buckets.
 **How many buckets** is decided **once, by the seal, from configuration and batch
 size only**: at least `MIN_ROWS_TO_SPLIT` (256) rows seals into `SEG_BUCKETS`
 (default 8); anything smaller gets 1. It deliberately **does not** consult the
-live-worker registry — workers register lazily and the count swings run to run, so
+live-worker registry — the count moves as workers start, stop and die, so
 an immutable, safety-critical partition must not be sampled from a registry that
 moves under it.
 
@@ -40,6 +40,15 @@ belongs — being wrong there costs a pass of under-parallelism, not a double ap
 The share is `ceil(free_buckets / live_workers)`. Both extremes are wrong: *every*
 free bucket is the single-worker bulk path again; *one* bucket makes a lone worker
 pay `bucket_count` claims, folds and applies for one batch.
+
+`live_workers` counts the rows of the `drainers` table seen within the drainer
+window (30 s by default): one row per drain thread. A client writes the rows of
+all its running drain threads in one statement when it starts and then once per
+third of the window, from one task of its own, not on each thread's wake. A thread
+busy in a long drain or build chunk keeps its row fresh that way, and a thread
+whose loop has exited or panicked is left out of the statement, so its row ages
+out of the count within the window. Rows nothing has refreshed for the window (or
+the reclaim TTL, if longer) are deleted by the staging worker's maintenance tick.
 
 **Exclusivity is the primary key**, not a lock:
 
