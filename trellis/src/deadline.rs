@@ -135,10 +135,16 @@ pub(crate) async fn bounded<T>(
             let backstop = tokio::time::Instant::from_std(deadline.at + BACKSTOP_GRACE);
             match tokio::time::timeout_at(backstop, call).await {
                 Ok(Err(err)) if deadline.passed() && is_budget_error(&err) => {
-                    Err(TrellisError::CallTimeout { budget })
+                    Err(TrellisError::CallTimeout {
+                        budget,
+                        abandoned: false,
+                    })
                 }
                 Ok(result) => result,
-                Err(_) => Err(TrellisError::CallTimeout { budget }),
+                Err(_) => Err(TrellisError::CallTimeout {
+                    budget,
+                    abandoned: true,
+                }),
             }
         })
         .await
@@ -250,8 +256,41 @@ mod tests {
         })
         .await
         .expect_err("times out");
-        assert!(matches!(err, TrellisError::CallTimeout { .. }), "{err}");
+        assert!(
+            matches!(
+                err,
+                TrellisError::CallTimeout {
+                    abandoned: true,
+                    ..
+                }
+            ),
+            "{err}"
+        );
         assert!(started.elapsed() >= Duration::from_millis(50) + BACKSTOP_GRACE);
+    }
+
+    /// A budget error that arrives once the deadline has passed is the
+    /// server's (or the pool's) answer, so the call was not abandoned.
+    #[tokio::test]
+    async fn a_budget_error_past_the_deadline_is_not_abandoned() {
+        let err = bounded(Instant::now(), Duration::from_millis(20), async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Err::<(), _>(TrellisError::Engine(crate::Error::Pool(
+                deadpool_postgres::PoolError::Timeout(deadpool_postgres::TimeoutType::Wait),
+            )))
+        })
+        .await
+        .expect_err("times out");
+        assert!(
+            matches!(
+                err,
+                TrellisError::CallTimeout {
+                    abandoned: false,
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[tokio::test]
