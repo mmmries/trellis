@@ -302,7 +302,7 @@ pub enum EvalError {
     /// (`22003 numeric_value_out_of_range`, `"integer out of range"`) for
     /// the same expression, which ADR-0004 requires Trellis to reproduce
     /// rather than silently widening to arbitrary precision. Per ADR-0003's
-    /// column-level quarantine amendment it pauses the offending
+    /// column-level quarantine it pauses the offending
     /// `(transform, column)` pair, which is the right outcome: that column's
     /// definition overflows for this data and needs a human, while every
     /// other column on the same target keeps flowing.
@@ -516,7 +516,7 @@ impl EvalError {
     }
 
     /// The calculated-field name this failure is attributed to — every
-    /// variant carries one (see each variant's `field`). ADR-0003's amendment
+    /// variant carries one (see each variant's `field`). ADR-0003
     /// (column-level quarantine) uses this to attribute a failure to a
     /// `(transform, column)` pair: `staging::quarantine`'s isolate-before-
     /// blaming probe knows which [`TransformDef`] it just evaluated, and
@@ -672,7 +672,7 @@ pub fn evaluate(
 }
 
 /// [`evaluate`], skipping every field named in `excluded` — ADR-0003's
-/// amendment (column-level quarantine): a paused column must not be
+/// column-level quarantine: a paused column must not be
 /// re-evaluated (it would just reproduce the same failure that paused it
 /// forever), and its target value freezes at whatever it last held rather
 /// than being overwritten. See [`evaluate_with_relationships_excluding`] for
@@ -731,7 +731,7 @@ pub fn evaluate_with_relationships(
 /// NULL." `excluded` is normally empty (every existing caller stays on this
 /// behavior via [`evaluate_with_relationships`]/[`evaluate`]); it's non-empty
 /// only when the caller has already looked up which of this definition's
-/// columns are currently paused (ADR-0003's amendment).
+/// columns are currently paused (ADR-0003).
 ///
 /// `excluded` must be closed over alias readers ([`AliasReaders::close`],
 /// issue #748): a field left in that reads an excluded one by alias would
