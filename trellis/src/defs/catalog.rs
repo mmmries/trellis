@@ -108,6 +108,7 @@ use super::ast::{
 use super::backfill::{self, BackfillError};
 use super::ddl::{self, DdlError};
 use super::error::ParseError;
+use super::grammar::{self, CURRENT_GRAMMAR_VERSION};
 #[cfg(any(test, feature = "internals"))]
 use super::model::SchemaEdge;
 use super::model::{
@@ -1340,12 +1341,13 @@ pub(crate) async fn definition_tables_read(
 ) -> Result<Vec<String>, CatalogError> {
     let row = txn
         .query_one(
-            "select source_table, definition_text from transform_definitions where id = $1",
+            "select source_table, definition_text, grammar_version \
+             from transform_definitions where id = $1",
             &[&definition_id],
         )
         .await?;
     let qualified: String = row.get(0);
-    let def = parse(row.get::<_, &str>(1))?;
+    let def = grammar::load(row.get::<_, &str>(1), row.get(2))?;
     tables_read_by(txn, &def, &qualified).await
 }
 
@@ -1387,7 +1389,7 @@ pub(crate) async fn catching_up_readers_unlocked(
 ) -> Result<Vec<(i64, Vec<String>)>, CatalogError> {
     let rows = txn
         .query(
-            "select id, source_table, definition_text from transform_definitions \
+            "select id, source_table, definition_text, grammar_version from transform_definitions \
              where status = $1 order by id",
             &[&TransformStatus::CatchingUp.as_str()],
         )
@@ -1395,7 +1397,7 @@ pub(crate) async fn catching_up_readers_unlocked(
     let mut readers = Vec::new();
     for row in rows {
         let qualified: String = row.get(1);
-        let def = parse(row.get::<_, &str>(2))?;
+        let def = grammar::load(row.get::<_, &str>(2), row.get(3))?;
         let tables = tables_read_by(txn, &def, &qualified).await?;
         if tables.iter().any(|t| t == table) {
             readers.push((row.get::<_, i64>(0), tables));
@@ -1418,7 +1420,7 @@ pub(crate) async fn applying_readers(
 ) -> Result<Vec<i64>, CatalogError> {
     let rows = client
         .query(
-            "select id, source_table, definition_text from transform_definitions \
+            "select id, source_table, definition_text, grammar_version from transform_definitions \
              where status = any($1) order by id",
             &[&TransformStatus::applying()],
         )
@@ -1426,7 +1428,7 @@ pub(crate) async fn applying_readers(
     let mut readers = Vec::new();
     for row in rows {
         let qualified: String = row.get(1);
-        let def = parse(row.get::<_, &str>(2))?;
+        let def = grammar::load(row.get::<_, &str>(2), row.get(3))?;
         if tables_read_by(client, &def, &qualified)
             .await?
             .iter()
@@ -1459,7 +1461,7 @@ pub(crate) async fn has_unfrozen_reader(
 ) -> Result<bool, CatalogError> {
     let rows = client
         .query(
-            "select source_table, definition_text from transform_definitions \
+            "select source_table, definition_text, grammar_version from transform_definitions \
              where status = any($1) order by id",
             &[&TransformStatus::dispatchable()],
         )
@@ -1469,7 +1471,7 @@ pub(crate) async fn has_unfrozen_reader(
         if qualified == table {
             return Ok(true);
         }
-        let def = parse(row.get::<_, &str>(1))?;
+        let def = grammar::load(row.get::<_, &str>(1), row.get(2))?;
         if tables_read_by(client, &def, &qualified)
             .await?
             .iter()
@@ -1553,7 +1555,7 @@ pub(crate) async fn reported_statuses(
         .collect();
     let rows = client
         .query(
-            "select id, target_table, source_table, status, definition_text \
+            "select id, target_table, source_table, status, definition_text, grammar_version \
              from transform_definitions order by id",
             &[],
         )
@@ -1571,7 +1573,7 @@ pub(crate) async fn reported_statuses(
         if status == TransformStatus::Live {
             reads.push(source.clone());
             if let Some((schema, table)) = source.split_once('.') {
-                let def = parse(row.get::<_, &str>(4))?;
+                let def = grammar::load(row.get::<_, &str>(4), row.get(5))?;
                 for rel in referenced_relationships(&def) {
                     let key = (schema.to_string(), table.to_string(), rel);
                     if let Some(to_table) = relationships.get(&key) {
@@ -2250,9 +2252,14 @@ pub async fn alter_transform(
     let new_text = render_definition_text(&merged);
     txn.execute(
         "update transform_definitions \
-         set definition_text = $1, definition_version = $2 \
+         set definition_text = $1, definition_version = $2, grammar_version = $4 \
          where id = $3",
-        &[&new_text, &new_version, &current.id],
+        &[
+            &new_text,
+            &new_version,
+            &current.id,
+            &CURRENT_GRAMMAR_VERSION,
+        ],
     )
     .await?;
 
@@ -3604,8 +3611,9 @@ async fn create_definition_inner(
     let id: i64 = match txn
         .query_one(
             "insert into transform_definitions
-                (target_table, source_table, source_version, definition_text, source_columns, status)
-             values ($1, $2, $3, $4, jsonb_object($5::text[], $6::text[]), $7)
+                (target_table, source_table, source_version, definition_text, source_columns, status,
+                 grammar_version)
+             values ($1, $2, $3, $4, jsonb_object($5::text[], $6::text[]), $7, $8)
              returning id",
             &[
                 &qualified_target,
@@ -3615,6 +3623,7 @@ async fn create_definition_inner(
                 &type_keys,
                 &type_vals,
                 &status_text,
+                &CURRENT_GRAMMAR_VERSION,
             ],
         )
         .await
@@ -3879,8 +3888,8 @@ pub async fn create_relationship(
         .query_one(
             "insert into relationship_definitions
                 (name, from_schema, from_table, from_col, to_schema, to_table, to_col,
-                 definition_text, cardinality)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 definition_text, cardinality, grammar_version)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              returning id",
             &[
                 &def.name,
@@ -3892,6 +3901,7 @@ pub async fn create_relationship(
                 &def.to_col,
                 &source_text,
                 &cardinality.as_str(),
+                &CURRENT_GRAMMAR_VERSION,
             ],
         )
         .await?
@@ -4417,6 +4427,10 @@ pub(crate) async fn relationships_from_table_in(
 /// Definitions in every status count. A table is captured from the moment
 /// something registers a reader of it, before that reader builds, and a
 /// paused or quarantined reader still needs its columns when it resumes.
+/// The exception is a definition older than the grammar window (ADR-0018):
+/// attaching paused it, it never resumes, and its fix is a drop and a fresh
+/// define, so it reads nothing and is left out. A definition newer than the
+/// window fails the read, since its columns can't be known.
 #[allow(clippy::type_complexity)]
 pub(crate) async fn capture_readers(
     client: &impl GenericClient,
@@ -4431,20 +4445,16 @@ pub(crate) async fn capture_readers(
         .query(
             "select d.id, d.source_table, d.definition_text, \
                     exists (select 1 from capture_failures f where f.transform_id = d.id), \
-                    d.target_table \
+                    d.target_table, d.grammar_version \
              from transform_definitions d order by d.id",
             &[],
         )
         .await?
         .into_iter()
-        .map(|row| {
-            Ok((
-                row.get(0),
-                row.get(1),
-                parse(row.get(2))?,
-                row.get(3),
-                row.get(4),
-            ))
+        .filter_map(|row| match grammar::load(row.get(2), row.get(5)) {
+            Ok(def) => Some(Ok((row.get(0), row.get(1), def, row.get(3), row.get(4)))),
+            Err(ParseError::GrammarVersionTooOld { .. }) => None,
+            Err(e) => Some(Err(e.into())),
         })
         .collect::<Result<Vec<_>, CatalogError>>()?;
     let relationships = client
@@ -7444,7 +7454,7 @@ pub(crate) async fn relationships_to_refresh(
     }
     let readers = client
         .query(
-            "select id, definition_text from transform_definitions \
+            "select id, definition_text, grammar_version from transform_definitions \
              where source_table = $1 and status = any($2)",
             &[&qualified_source, &TransformStatus::dispatchable()],
         )
@@ -7453,7 +7463,7 @@ pub(crate) async fn relationships_to_refresh(
         if Some(row.get::<_, i64>(0)) == exclude {
             continue;
         }
-        for rel in referenced_relationships(&parse(row.get::<_, &str>(1))?) {
+        for rel in referenced_relationships(&grammar::load(row.get::<_, &str>(1), row.get(2))?) {
             unread.remove(&rel);
         }
     }
@@ -7797,6 +7807,7 @@ fn encode_type_map(source_columns: &HashMap<String, ValueType>) -> (Vec<&str>, V
 struct PendingDefinition {
     source_version: i64,
     text: String,
+    grammar_version: i32,
     status: TransformStatus,
     source_columns: HashMap<String, ValueType>,
     source_table: String,
@@ -7863,7 +7874,7 @@ pub async fn dependents_of(
         .query(
             &format!(
                 "select t.id, t.source_version, t.definition_text, t.status, t.source_table, \
-                        t.target_table, e.key, e.value
+                        t.target_table, e.key, e.value, t.grammar_version
                  from schema_nodes from_node
                  join schema_edges se on se.from_node_id = from_node.id and se.kind = $2
                  join schema_nodes to_node on to_node.id = se.to_node_id
@@ -7896,6 +7907,7 @@ pub async fn dependents_of(
             PendingDefinition {
                 source_version: row.get(1),
                 text: row.get(2),
+                grammar_version: row.get(8),
                 status,
                 source_columns: HashMap::new(),
                 source_table: row.get(4),
@@ -7917,7 +7929,7 @@ pub async fn dependents_of(
     let mut result = Vec::with_capacity(order.len());
     for id in order {
         let pending = by_id.remove(&id).expect("id was just pushed to order");
-        let def = parse(&pending.text)?;
+        let def = grammar::load(&pending.text, pending.grammar_version)?;
         result.push(Definition {
             id,
             source_version: pending.source_version,
@@ -8276,7 +8288,7 @@ pub(crate) async fn definition_by_id_in(
     let rows = client
         .query(
             "select t.source_version, t.definition_text, t.status, t.source_table, \
-                    t.target_table, e.key, e.value \
+                    t.target_table, e.key, e.value, t.grammar_version \
              from transform_definitions t \
              left join lateral jsonb_each_text(t.source_columns) e on true \
              where t.id = $1",
@@ -8295,7 +8307,7 @@ pub(crate) async fn definition_by_id_in(
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
-    let def = parse(&text)?;
+    let def = grammar::load(&text, rows[0].get(7))?;
 
     let mut source_columns = HashMap::new();
     for row in &rows {
@@ -8349,7 +8361,7 @@ pub async fn definition_by_target(
     let rows = client
         .query(
             "select t.id, t.source_version, t.definition_text, t.status, t.source_table, \
-                    t.target_table, e.key, e.value \
+                    t.target_table, e.key, e.value, t.grammar_version \
              from transform_definitions t \
              left join lateral jsonb_each_text(t.source_columns) e on true \
              where split_part(t.target_table, '.', 2) = $1",
@@ -8369,7 +8381,7 @@ pub async fn definition_by_target(
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
-    let def = parse(&text)?;
+    let def = grammar::load(&text, rows[0].get(8))?;
 
     let mut source_columns = HashMap::new();
     for row in &rows {
@@ -8480,16 +8492,16 @@ pub(crate) async fn reads_column(
     (upstream_table, upstream_column): (&str, &str),
 ) -> Result<bool, CatalogError> {
     if reader_transform == upstream_table {
-        let text: Option<String> = client
+        let text: Option<(String, i32)> = client
             .query_opt(
-                "select definition_text from transform_definitions \
+                "select definition_text, grammar_version from transform_definitions \
                  where split_part(target_table, '.', 2) = $1",
                 &[&upstream_table],
             )
             .await?
-            .map(|row| row.get(0));
-        if let Some(text) = text {
-            let def = parse(&text)?;
+            .map(|row| (row.get(0), row.get(1)));
+        if let Some((text, grammar_version)) = text {
+            let def = grammar::load(&text, grammar_version)?;
             if matches!(def.key_space, KeySpace::OneToOne)
                 && super::eval::AliasReaders::of(&def)
                     .direct(upstream_column)
@@ -8564,7 +8576,7 @@ async fn column_dependents_via(
             // the same transform depending on whether a row was reached
             // directly or via cascade.
             "select split_part(target_table, '.', 2), definition_text, source_table, \
-                    target_table \
+                    target_table, grammar_version \
              from transform_definitions",
             &[],
         )
@@ -8615,7 +8627,27 @@ async fn column_dependents_via(
         // skip rather than fail this best-effort lineage scan on the
         // unexpected chance it doesn't, rather than let one bad row prevent
         // cascading a pause to every other, healthy dependent.
-        let Ok(def) = parse(&text) else { continue };
+        //
+        // The exception is a definition written under a newer grammar
+        // (ADR-0018) that could read the upstream table, directly or through
+        // a relationship. For the drop refusal this scan is the whole check,
+        // and whether that definition reads the column can't be known here,
+        // so the drop is refused rather than allowed past it. A definition
+        // older than the window is paused for good and redefined from
+        // scratch, so it doesn't hold a drop up.
+        let def = match grammar::load(&text, row.get(4)) {
+            Ok(def) => def,
+            Err(e @ ParseError::GrammarVersionTooNew { .. })
+                if !only_one_to_one
+                    && (qualified_source == qualified_upstream
+                        || rel_to_table.iter().any(|((from, _), to)| {
+                            *from == qualified_source && *to == qualified_upstream
+                        })) =>
+            {
+                return Err(e.into());
+            }
+            Err(_) => continue,
+        };
         if only_one_to_one && !matches!(def.key_space, KeySpace::OneToOne) {
             continue;
         }
@@ -9877,5 +9909,114 @@ mod table_not_accessible_tests {
             assert!(message.ends_with(doc), "{message}");
         }
         assert_eq!(not_accessible(true, true).code(), ErrorCode::Validation);
+    }
+}
+
+/// ADR-0018: the catalog scans that read every definition handle one outside
+/// this binary's grammar window as that window's rules require.
+#[cfg(test)]
+mod grammar_window_tests {
+    use super::*;
+
+    /// Seeds `public.t` over `public.s`, `public.chained` reading `t.a`,
+    /// and `public.other` over the unrelated `public.u`, then stamps the
+    /// grammar versions given for `chained` and `other`.
+    async fn seed(client: &impl GenericClient, chained: i32, other: i32) {
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.s', 1), ('public.t', 1), ('public.u', 1); \
+                 insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values \
+                 ('public.t', 'public.s', 1, 'TRANSFORM t FROM s SELECT a AS a', 'live'), \
+                 ('public.chained', 'public.t', 1, \
+                  'TRANSFORM chained FROM t SELECT a AS a_copy', 'paused'), \
+                 ('public.other', 'public.u', 1, \
+                  'TRANSFORM other FROM u SELECT a AS a', 'paused')",
+            )
+            .await
+            .expect("seed definitions");
+        for (target, version) in [("public.chained", chained), ("public.other", other)] {
+            client
+                .execute(
+                    "update transform_definitions set grammar_version = $2 \
+                     where target_table = $1",
+                    &[&target, &version],
+                )
+                .await
+                .expect("stamp");
+        }
+    }
+
+    /// A definition older than the window is left out of the capture
+    /// readers, so it can't stop capture for every other one; a newer one
+    /// fails the read.
+    #[tokio::test]
+    async fn capture_readers_leave_out_a_too_old_definition_and_refuse_a_too_new_one() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("acquire connection");
+        let old = grammar::OLDEST_SUPPORTED_GRAMMAR_VERSION - 1;
+        seed(&**client, old, CURRENT_GRAMMAR_VERSION).await;
+
+        let (definitions, _) = capture_readers(&**client).await.expect("capture readers");
+        let targets: Vec<&str> = definitions.iter().map(|d| d.4.as_str()).collect();
+        assert_eq!(targets, ["public.t", "public.other"]);
+
+        client
+            .execute(
+                "update transform_definitions set grammar_version = $1 \
+                 where target_table = 'public.chained'",
+                &[&(CURRENT_GRAMMAR_VERSION + 1)],
+            )
+            .await
+            .expect("stamp newer");
+        match capture_readers(&**client).await {
+            Err(CatalogError::Parse(ParseError::GrammarVersionTooNew { .. })) => {}
+            other => panic!("expected GrammarVersionTooNew, got {other:?}"),
+        }
+    }
+
+    /// Dropping a field is refused while a definition this binary can't read
+    /// could read it; a newer definition over an unrelated table, or a
+    /// too-old one, doesn't hold it up, and the pause cascade skips both.
+    #[tokio::test]
+    async fn a_field_drop_is_refused_past_a_newer_definition_that_could_read_it() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("acquire connection");
+        let newer = CURRENT_GRAMMAR_VERSION + 1;
+        seed(&**client, newer, newer).await;
+
+        match column_dependents_any_keyspace(&**client, "t", "a").await {
+            Err(CatalogError::Parse(ParseError::GrammarVersionTooNew { stored, .. })) => {
+                assert_eq!(stored, newer);
+            }
+            other => panic!("expected GrammarVersionTooNew, got {other:?}"),
+        }
+        let pool = crate::pool::Pool::new(
+            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        )
+        .expect("pool");
+        assert_eq!(
+            column_dependents(&pool, "t", "a").await.expect("cascade"),
+            Vec::<(String, String)>::new()
+        );
+
+        client
+            .execute(
+                "update transform_definitions set grammar_version = $1 \
+                 where target_table = 'public.chained'",
+                &[&(grammar::OLDEST_SUPPORTED_GRAMMAR_VERSION - 1)],
+            )
+            .await
+            .expect("stamp too old");
+        assert_eq!(
+            column_dependents_any_keyspace(&**client, "t", "a")
+                .await
+                .expect("an unrelated newer definition and a too-old one don't refuse"),
+            Vec::<(String, String)>::new()
+        );
     }
 }
