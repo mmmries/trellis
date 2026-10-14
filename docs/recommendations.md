@@ -128,8 +128,8 @@ heavy group contention (4,000 groups taking 400,000 changes per second in
 reclaimed nothing while the drain's overlapping transactions held the dead
 versions. With room
 on every page the updates are HOT and pruned in place, and the same run keeps
-the table at 33-50 MB instead of about 220 MB and folds about 55% more changes
-per second.
+the table at 33-50 MB (tmpfs) or 70-130 MB (NVMe) instead of about 200-220 MB
+and folds about 60% more changes per second.
 
 The cost is disk and build time for every aggregate, contended or not:
 
@@ -138,7 +138,7 @@ The cost is disk and build time for every aggregate, contended or not:
   2.0 GB instead of 545 MB (both including the group index, which fillfactor
   doesn't change).
 * The build writes that many pages: that 6-million-group build took about
-  50% longer on disk (119 s instead of 78 s), the 2-million-group one 10-15%.
+  50% longer on disk (119 s instead of 78 s), the 2-million-group one 10-30%.
 
 Size the disk for five times an aggregate target's rows. `pg_dump` carries the
 setting, so a restored target keeps it.
