@@ -1440,6 +1440,16 @@ pub(crate) const PROJECTION_LSN_COLUMN: &str = "__trellis_lsn";
 /// of the target's ledger entries are live members of the group
 /// ([`super::ledger`]). The build and Apply's group statements write it
 /// from the ledger, and a group whose count reaches 0 is deleted (#623 D3).
+/// `fillfactor` of an aggregate's group table (#779). Every write to it is an
+/// update of a non-indexed column on a row that already exists, so a page with
+/// room beside its rows lets Postgres do the update HOT and prune the old
+/// version in-page. At the default 100 almost none are HOT, and paged drains
+/// (each page rewrites most groups) bloated 4,000 groups to ~215 MB; at 20 the
+/// same run is ~44 MB with ~97% HOT updates. The cost is a live table about 5x
+/// its packed size, the price of an update-only table. 30 was not enough: a
+/// page's versions outgrow its slack and the table bloated to ~160 MB.
+pub(crate) const GROUP_TABLE_FILLFACTOR: u8 = 20;
+
 pub(crate) const MEMBERS_COLUMN: &str = "__trellis_members";
 
 /// The read-side counterpart to [`qualified_target_table`] (issue #76,
@@ -2064,6 +2074,7 @@ pub(crate) async fn aggregate_target_table_ddl(
         pk_columns.join(", ")
     ));
     sql.push(')');
+    sql.push_str(&format!(" with (fillfactor = {GROUP_TABLE_FILLFACTOR})"));
 
     // #623 D2: the target's ledger, created with it. Its `GROUP BY` columns
     // are typed as the target's, and each contribution column as its

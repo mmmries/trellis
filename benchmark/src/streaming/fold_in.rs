@@ -417,6 +417,8 @@ pub async fn run_probe(
     let (oracle_ok, oracle_groups, oracle_mismatched_groups) =
         check_aggregate_oracle(&raw, &terminal, &def.def, drained).await;
 
+    report_table_storage(&raw, &terminal).await;
+
     client.shutdown().await.expect("client shutdown");
 
     let achieved_rows_per_sec = load.achieved_rows_per_sec();
@@ -501,4 +503,34 @@ pub async fn run_sweep(
         results.push(run_probe(groups, "SUM", target_rows_per_sec, offer, tuning).await);
     }
     results
+}
+
+/// Issue #779: how bloated the aggregate's group table is after the run. Prints
+/// size, live and dead tuples and the HOT-update share from `pg_stat_user_tables`
+/// (stats are flushed lazily, so it waits a moment first).
+async fn report_table_storage(raw: &RawClient, terminal: &str) {
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let row = raw
+        .query_one(
+            "select pg_relation_size(c.oid), pg_total_relation_size(c.oid), \
+                    coalesce(s.n_live_tup,0), coalesce(s.n_dead_tup,0), \
+                    coalesce(s.n_tup_upd,0), coalesce(s.n_tup_hot_upd,0), \
+                    coalesce(s.autovacuum_count,0), coalesce(c.reloptions::text,'') \
+               from pg_class c left join pg_stat_user_tables s on s.relid = c.oid \
+              where c.oid = ('public.' || quote_ident($1))::regclass",
+            &[&terminal],
+        )
+        .await
+        .expect("table storage stats");
+    eprintln!(
+        "TABLE-STORAGE {terminal}: heap {} MB, total {} MB, live {}, dead {}, upd {}, hot_upd {}, autovacuums {}, reloptions [{}]",
+        row.get::<_, i64>(0) / 1_048_576,
+        row.get::<_, i64>(1) / 1_048_576,
+        row.get::<_, i64>(2),
+        row.get::<_, i64>(3),
+        row.get::<_, i64>(4),
+        row.get::<_, i64>(5),
+        row.get::<_, i64>(6),
+        row.get::<_, String>(7),
+    );
 }
