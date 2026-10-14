@@ -92,6 +92,122 @@ class SchemaDumpTest < Minitest::Test
     refute_includes File.read(File.join(@dir, "structure.sql")), "Trellis definitions"
   end
 
+  def test_a_connect_at_another_database_is_refused_and_nothing_is_written
+    source = database("mine")
+    other = database("theirs")
+    define_in(source)
+    TrellisTestApp.config.trellis.connect = { url: dsn(other) }
+    error = assert_raises(Trellis::ValidationError) { Tasks.dump_schema(db_config(source), :sql) }
+    assert_includes error.message, "config.trellis.connect points at #{other}"
+    assert_includes error.message, "is #{source}"
+    assert_match(/dump_database/, error.message)
+    refute File.exist?(File.join(@dir, "structure.sql"))
+  end
+
+  def test_a_connect_at_another_host_or_port_is_refused
+    source = database("hostport")
+    config = db_config(source)
+    info = TestCluster.info
+    TrellisTestApp.config.trellis.connect = { url: "host=elsewhere.invalid port=#{info.fetch("port")} dbname=#{source}" }
+    assert_raises(Trellis::ValidationError) { SchemaDump.verify_same_database!(config) }
+    TrellisTestApp.config.trellis.connect = { url: "host=#{info.fetch("host")} port=1 dbname=#{source}" }
+    assert_raises(Trellis::ValidationError) { SchemaDump.verify_same_database!(config) }
+    TrellisTestApp.config.trellis.connect = { url: dsn(source) }
+    SchemaDump.verify_same_database!(config)
+  end
+
+  def test_an_instance_at_another_database_is_refused
+    source = database("inst")
+    TrellisTestApp.config.trellis.connect = { url: dsn(source) }
+    TrellisTestApp.config.trellis.instances = { reports: { url: dsn(database("inst_other")), schema: "reports" } }
+    error = assert_raises(Trellis::ValidationError) { SchemaDump.verify_same_database!(db_config(source)) }
+    assert_includes error.message, "config.trellis.instances[:reports]"
+  end
+
+  def test_url_forms_are_compared_by_host_port_and_database
+    hash = { adapter: "postgresql", url: "postgres://u:p@db.example:6543/app" }
+    config = ActiveRecord::DatabaseConfigurations::HashConfig.new("test", "primary", hash)
+    TrellisTestApp.config.trellis.connect = { url: "postgresql://other@db.example:6543/app?sslmode=disable" }
+    SchemaDump.verify_same_database!(config)
+    TrellisTestApp.config.trellis.connect = { url: "host=db.example port=6543 dbname=app" }
+    SchemaDump.verify_same_database!(config)
+    TrellisTestApp.config.trellis.connect = { url: "postgres://db.example:6543/app2" }
+    assert_raises(Trellis::ValidationError) { SchemaDump.verify_same_database!(config) }
+    TrellisTestApp.config.trellis.connect = { url: "postgres://db.example/app" }
+    assert_raises(Trellis::ValidationError) { SchemaDump.verify_same_database!(config) }
+  end
+
+  # Rails' generated database.yml names no host: libpq connects to its local
+  # socket. Trellis needs a host, and any local one matches.
+  def test_a_rails_config_with_no_host_matches_a_local_trellis_host
+    config = ActiveRecord::DatabaseConfigurations::HashConfig.new("test", "primary",
+                                                                   { adapter: "postgresql", database: "app" })
+    with_env("PGHOST" => nil, "PGPORT" => nil) do
+      ["host=localhost dbname=app", "postgres://127.0.0.1/app", "host=/var/run/postgresql dbname=app"].each do |url|
+        TrellisTestApp.config.trellis.connect = { url: }
+        SchemaDump.verify_same_database!(config)
+      end
+      TrellisTestApp.config.trellis.connect = { url: "host=db.example dbname=app" }
+      assert_raises(Trellis::ValidationError) { SchemaDump.verify_same_database!(config) }
+    end
+  end
+
+  # Trellis reads nothing from the environment: a url with no port is 5432,
+  # one with no dbname is the user's database, whatever PGPORT says.
+  def test_a_trellis_url_is_resolved_without_the_environment
+    config = ActiveRecord::DatabaseConfigurations::HashConfig.new("test", "primary",
+                                                                   { adapter: "postgresql", host: "h", database: "app" })
+    with_env("PGPORT" => "5433") do
+      TrellisTestApp.config.trellis.connect = { url: "host=h dbname=app" }
+      assert_raises(Trellis::ValidationError) { SchemaDump.verify_same_database!(config) }
+    end
+    with_env("PGPORT" => nil) do
+      TrellisTestApp.config.trellis.connect = { url: "host=h user=app" }
+      SchemaDump.verify_same_database!(config)
+    end
+  end
+
+  def test_a_url_that_does_not_parse_is_refused_without_quoting_it
+    config = db_config(TestCluster.info.fetch("dbname"))
+    ["postgres://u:hunter2@h/app?pool=5", "host=h password=hunter2 xyzzy"].each do |url|
+      TrellisTestApp.config.trellis.connect = { url: }
+      error = assert_raises(Trellis::ValidationError) { SchemaDump.verify_same_database!(config) }
+      assert_includes error.message, "config.trellis.connect"
+      refute_includes error.message, "hunter2"
+    end
+  end
+
+  # `db:prepare` in development migrates and dumps the test database too,
+  # with development's config.trellis.connect: that dump is checked against
+  # development's config of the same name.
+  def test_another_environments_dump_is_checked_against_the_current_one
+    saved = { env: Tasks.env, configurations: ActiveRecord::Base.configurations }
+    info = TestCluster.info
+    base = { "adapter" => "postgresql", "host" => info.fetch("host"), "port" => info.fetch("port") }
+    ActiveRecord::Base.configurations = {
+      "development" => { "primary" => base.merge("database" => "app_development") },
+      "test" => { "primary" => base.merge("database" => "app_test") }
+    }
+    Tasks.env = "development"
+    test_config = ActiveRecord::Base.configurations.configs_for(env_name: "test", name: "primary")
+    where = "host=#{info.fetch("host")} port=#{info.fetch("port")}"
+    TrellisTestApp.config.trellis.connect = { url: "#{where} dbname=app_development" }
+    SchemaDump.verify_same_database!(test_config)
+    TrellisTestApp.config.trellis.connect = { url: "#{where} dbname=app_test" }
+    assert_raises(Trellis::ValidationError) { SchemaDump.verify_same_database!(test_config) }
+  ensure
+    Tasks.env = saved.fetch(:env)
+    ActiveRecord::Base.configurations = saved.fetch(:configurations)
+  end
+
+  def test_a_mismatch_against_another_database_of_the_app_is_not_checked
+    source = database("multi")
+    TrellisTestApp.config.trellis.connect = { url: dsn(database("multi_other")) }
+    TrellisTestApp.config.trellis.dump_database = "somewhere_else"
+    Tasks.dump_schema(db_config(source), :sql)
+    assert File.exist?(File.join(@dir, "structure.sql"))
+  end
+
   def test_a_dump_redone_when_the_definitions_changed_under_it
     source = database("race")
     define_in(source)
@@ -156,6 +272,14 @@ class SchemaDumpTest < Minitest::Test
     @admin.exec("create database #{name}")
     @databases << name
     name
+  end
+
+  def with_env(vars)
+    saved = vars.keys.to_h { |key| [key, ENV.fetch(key, nil)] }
+    vars.each { |key, value| ENV[key] = value }
+    yield
+  ensure
+    saved&.each { |key, value| ENV[key] = value }
   end
 
   def dsn(database)

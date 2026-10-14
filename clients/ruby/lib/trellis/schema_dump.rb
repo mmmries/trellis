@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "active_record"
+require "etc"
 require "trellis/pg"
 
 module Trellis
@@ -50,6 +51,10 @@ module Trellis
     # How many times a dump is redone when a define or drop races it.
     ATTEMPTS = 3
 
+    # The hosts a Rails config with no host (libpq's default, the local
+    # socket) matches, besides a socket directory.
+    LOCAL_HOSTS = %w[localhost 127.0.0.1 ::1].freeze
+
     HEADER = <<~SQL
       --
       -- Trellis definitions (Trellis::Instance#dump_definitions_sql)
@@ -71,6 +76,46 @@ module Trellis
         return false unless Railtie.connect_options || !Railtie.instance_options.empty?
 
         db_config.name == dump_database
+      end
+
+      # Raises Trellis::ValidationError unless config.trellis.connect and every
+      # config.trellis.instances entry point at the database db_config
+      # describes: appending the definitions of one database to the dump of
+      # another produces a file that fails to load.
+      #
+      # Databases are compared by host, port and dbname, each resolved the way
+      # its client resolves it: Rails' config as libpq does (PGHOST, PGPORT,
+      # PGDATABASE, then the user name), a Trellis url as Trellis does, from
+      # the url alone (port 5432, dbname the user name). A Rails config with no
+      # host connects to libpq's default, the local socket, which matches a
+      # local Trellis host (`localhost`, `127.0.0.1`, `::1` or a socket
+      # directory). Other spellings are not equated: `localhost` and
+      # `127.0.0.1` differ, so give config.trellis.connect and database.yml the
+      # same host.
+      #
+      # `db:prepare` in development also migrates and dumps the test
+      # environment's databases, while config.trellis.connect is
+      # development's: a db_config of another environment is compared as the
+      # current environment's config of the same name.
+      def verify_same_database!(db_config)
+        require "pg"
+        target = rails_database(current_environment_config(db_config).configuration_hash)
+        configured = {}
+        configured["config.trellis.connect"] = Railtie.connect_options if Railtie.connect_options
+        Railtie.instance_options.each { |name, options| configured["config.trellis.instances[#{name.inspect}]"] = options }
+        configured.each do |what, options|
+          next unless options[:url]
+
+          found = trellis_database(options[:url], what)
+          next if same_database?(found, target)
+
+          raise Trellis::ValidationError,
+                "#{what} points at #{describe(found)}, but config.trellis.dump_database " \
+                "#{db_config.name.inspect} is #{describe(target)}: its definitions don't belong in " \
+                "that database's structure dump. Point #{what} at the same host, port and database " \
+                "(spelled identically, e.g. `localhost` is not `127.0.0.1`), or set " \
+                "config.trellis.dump_database to the config that names it"
+        end
       end
 
       def dump_database
@@ -110,6 +155,70 @@ module Trellis
 
       private
 
+      # The keywords of a libpq connection string or URI. A failure names
+      # what was being read and never the string or libpq's message, which
+      # can quote part of a password (as Trellis's own parse does, #608).
+      def conninfo(url, what)
+        PG::Connection.conninfo_parse(url.to_s).to_h { |entry| [entry[:keyword], entry[:val]] }
+      rescue PG::Error
+        raise Trellis::ValidationError,
+              "#{what}'s url doesn't parse as a libpq connection string or postgres:// URL"
+      end
+
+      # [host, port, dbname] Trellis connects to with url. Trellis reads
+      # nothing from the environment: an unset port is 5432 and an unset
+      # dbname the user's name (the server's default), the user being the
+      # OS user when the url names none. The host is nil only for a url
+      # naming neither host nor hostaddr, which Trellis can't connect with.
+      def trellis_database(url, what)
+        keywords = conninfo(url, what).transform_values { |value| value.to_s.empty? ? nil : value }
+        user = keywords["user"] || Etc.getpwuid(Process.euid)&.name
+        [keywords["host"] || keywords["hostaddr"], keywords["port"] || "5432", keywords["dbname"] || user.to_s]
+      end
+
+      # [host, port, dbname] of a Rails database config hash, as libpq
+      # resolves it: Rails' keys (or a `url`, which a hand-built HashConfig
+      # can carry), then PGHOST/PGPORT/PGDATABASE and libpq's defaults. The
+      # host is nil when nothing names one: libpq's default, the local socket.
+      def rails_database(hash)
+        hash = hash.transform_keys(&:to_sym)
+        url = hash[:url] ? conninfo(hash[:url], "config.trellis.dump_database's url") : {}
+        given = { host: hash[:host] || url["host"], port: hash[:port] || url["port"],
+                  dbname: hash[:database] || url["dbname"], user: hash[:username] || url["user"] }
+        defaults = PG::Connection.conndefaults_hash
+        resolved = given.to_h do |key, value|
+          value = defaults[key] if value.nil? || value.to_s.empty?
+          [key, value.nil? || value.to_s.empty? ? nil : value.to_s]
+        end
+        [resolved[:host], resolved[:port] || "5432", resolved[:dbname] || resolved[:user].to_s]
+      end
+
+      def same_database?(trellis, rails)
+        host, port, dbname = trellis
+        rails_host, rails_port, rails_dbname = rails
+        return false unless port == rails_port && dbname == rails_dbname
+
+        host == rails_host || (rails_host.nil? && local_host?(host))
+      end
+
+      def local_host?(host)
+        LOCAL_HOSTS.include?(host) || host.to_s.start_with?("/", "@")
+      end
+
+      # The config named db_config.name in the environment being run, or
+      # db_config itself when it is that environment's (or there is none).
+      def current_environment_config(db_config)
+        env = ::ActiveRecord::Tasks::DatabaseTasks.env.to_s
+        return db_config if db_config.env_name.to_s == env
+
+        ::ActiveRecord::Base.configurations.configs_for(env_name: env, name: db_config.name) || db_config
+      end
+
+      def describe(database)
+        host, port, dbname = database
+        "#{dbname} on #{host || "the local socket"}:#{port}"
+      end
+
       # Whether the structure dump passes any `--schema` (so a schema not
       # listed is left out), as PostgreSQLDatabaseTasks#structure_dump decides.
       def restricts_schemas?(configuration_hash)
@@ -140,6 +249,8 @@ module Trellis
 
         filename = schema_dump_path(db_config, format)
         return super unless filename
+
+        SchemaDump.verify_same_database!(db_config)
 
         SchemaDump::ATTEMPTS.times do
           before = SchemaDump.appendix
