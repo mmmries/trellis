@@ -1440,17 +1440,19 @@ pub(crate) const PROJECTION_LSN_COLUMN: &str = "__trellis_lsn";
 /// of the target's ledger entries are live members of the group
 /// ([`super::ledger`]). The build and Apply's group statements write it
 /// from the ledger, and a group whose count reaches 0 is deleted (#623 D3).
-/// `fillfactor` of an aggregate's group table (#779). Every write to it is an
-/// update of a non-indexed column on a row that already exists, so a page with
-/// room beside its rows lets Postgres do the update HOT and prune the old
-/// version in-page. At the default 100 almost none are HOT, and paged drains
-/// (each page rewrites most groups) bloated 4,000 groups to ~215 MB; at 20 the
-/// same run is ~44 MB with ~97% HOT updates. The cost is a live table about 5x
-/// its packed size, the price of an update-only table. 30 was not enough: a
-/// page's versions outgrow its slack and the table bloated to ~160 MB.
-pub(crate) const GROUP_TABLE_FILLFACTOR: u8 = 20;
-
 pub(crate) const MEMBERS_COLUMN: &str = "__trellis_members";
+
+/// `fillfactor` of an aggregate's group table (#779). Apart from a new group's
+/// insert and an empty group's delete, every write to it updates columns no
+/// index covers, so a page with room beside its rows lets Postgres do the
+/// update HOT and prune the old version in-page. At the default 100 almost
+/// none are HOT, and paged drains (each page rewrites most groups) bloated
+/// 4,000 groups to ~220 MB; at 20 the same run is 33-50 MB with ~97% HOT
+/// updates. The cost is a group table about 5x its packed size from the
+/// start, and a build that writes that many pages: a 6M-group build on disk
+/// took ~50% longer. 30 was not enough: a page's versions outgrow its slack
+/// and the table bloated to ~130 MB.
+pub(crate) const GROUP_TABLE_FILLFACTOR: u8 = 20;
 
 /// The read-side counterpart to [`qualified_target_table`] (issue #76,
 /// ADR-0011): quotes an already-qualified `"schema.table"` name — as read

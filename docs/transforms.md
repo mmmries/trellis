@@ -107,6 +107,13 @@ aliased. An aggregate target also has hidden columns of Trellis's own, such as
 the running sum behind an `AVG`. Name limits are in
 [Supported sources and targets](#supported-sources-and-targets).
 
+Trellis creates an aggregate target `WITH (fillfactor = 20)`: each page is
+filled to a fifth, so the drain's constant group updates are HOT and reuse
+their page instead of bloating the table. The target is about five times its
+packed size on disk from the start, and its build writes that many pages
+([Recommendations](recommendations.md#aggregate-target-size)). 1-1 targets
+and the tables Trellis keeps beside a target use the default.
+
 ```
 TRANSFORM order_totals FROM order_line_items GROUP BY order_id
 SELECT

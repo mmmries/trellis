@@ -117,6 +117,32 @@ At 10,000 changes per second, a one-hour outage needs about 6.8 GB.
   ([#808](https://github.com/salesforce-misc/trellis/issues/808),
   [ADR-0002 — Consequences](decisions/0002-async-data-flow.md#consequences-and-costs)).
 
+## Aggregate target size
+
+Trellis creates every aggregate target `WITH (fillfactor = 20)`
+([#779](https://github.com/salesforce-misc/trellis/issues/779)). A group row
+is rewritten every time a change reaches its group, and at Postgres's default
+fillfactor of 100 a full page can't keep the new version beside the old: under
+heavy group contention (4,000 groups taking 400,000 changes per second in
+5,000-change pages) the table grew by about 3 MB a second, and autovacuum
+reclaimed nothing while the drain's overlapping transactions held the dead
+versions. With room
+on every page the updates are HOT and pruned in place, and the same run keeps
+the table at 33-50 MB instead of about 220 MB and folds about 55% more changes
+per second.
+
+The cost is disk and build time for every aggregate, contended or not:
+
+* The table is about five times its packed size from the start: a
+  2-million-group target took 670 MB instead of 180 MB, a 6-million-group one
+  2.0 GB instead of 545 MB (both including the group index, which fillfactor
+  doesn't change).
+* The build writes that many pages: that 6-million-group build took about
+  50% longer on disk (119 s instead of 78 s), the 2-million-group one 10-15%.
+
+Size the disk for five times an aggregate target's rows. `pg_dump` carries the
+setting, so a restored target keeps it.
+
 ## `statement_timeout`
 
 Trellis never lifts the `statement_timeout` on its role or database: it
