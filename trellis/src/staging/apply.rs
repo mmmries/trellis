@@ -3243,8 +3243,15 @@ fn required_column<'r>(
 
 /// Whether [`to_side_superseded`] finds `record`'s images stale, checked
 /// only for a record that may be stale: every record on a seam-fed to-side,
-/// and one on a source to-side at or below its relationship's refresh stamp
-/// in `refresh_stamps` ([`overtaken_by_refresh`]).
+/// a deferred record's retry, and one on a source to-side at or below its
+/// relationship's refresh stamp in `refresh_stamps` ([`overtaken_by_refresh`]).
+///
+/// Issue #886: a retry is out of order with its parent's later changes. They
+/// drain while it waits, so by the time it applies the projection may hold a
+/// newer change's image, or none, after a later delete. Guard (d) can't tell:
+/// the retry captures `prev_lsn` afresh, from the projection as the newer
+/// change left it. Applied from its own images, the retry would put an older
+/// value back with nothing after it to correct it.
 async fn superseded_to_side(
     txn: &Transaction<'_>,
     row_columns_cache: &mut HashMap<String, Vec<String>>,
@@ -3254,14 +3261,21 @@ async fn superseded_to_side(
     new_key: &Option<String>,
 ) -> Result<bool, ApplyError> {
     let shape = &record.shape;
-    if !shape.to_side.seam_fed
-        && !overtaken_by_refresh(record.lsn, refresh_stamps.get(&shape.id).copied())
-    {
+    let must_check = shape.to_side.seam_fed
+        || overtaken_by_refresh(record.lsn, refresh_stamps.get(&shape.id).copied());
+    if !must_check && record.retry_count == 0 {
         return Ok(false);
     }
     let columns = cached_row_columns(txn, row_columns_cache, &shape.to_side.identity)
         .await?
         .to_vec();
+    // A retry whose to-side no longer has `to_col` (renamed or dropped, which
+    // pauses the relationship's readers) has no live row to be checked
+    // against: the keyed read would fail its page on every attempt. It
+    // applies its images, as it did before the retry was checked.
+    if !must_check && !columns.contains(&shape.to_col) {
+        return Ok(false);
+    }
     to_side_superseded(
         txn,
         shape,
@@ -3385,6 +3399,10 @@ async fn apply_projection_from_live(
         &shape.to_col,
     )
     .await?;
+    // A projected column the to-side no longer has (renamed or dropped while
+    // the definition reading it is paused) is written `NULL`, as the image
+    // path's `jsonb_populate_record` writes a column the image lacks.
+    let live_columns = live_row_columns(txn, &to_side.identity).await?;
     let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
     let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
     let mut insert_cols = vec![key_ident.clone()];
@@ -3393,7 +3411,11 @@ async fn apply_projection_from_live(
     for col in &data_columns {
         let ident = quote_ident(col);
         insert_cols.push(ident.clone());
-        select_exprs.push(format!("t.{ident}"));
+        if live_columns.contains(col) {
+            select_exprs.push(format!("t.{ident}"));
+        } else {
+            select_exprs.push("null".to_string());
+        }
         update_sets.push(format!("{ident} = excluded.{ident}"));
     }
     insert_cols.push(gen_ident);
