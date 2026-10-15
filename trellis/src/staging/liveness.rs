@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::MissedTickBehavior;
+use tokio_postgres::types::Type;
 use tokio_postgres::{Client, GenericClient};
 
 use super::error::StagingError;
@@ -135,7 +136,9 @@ pub async fn reclaim_stale(
     ttl: Duration,
 ) -> Result<u64, StagingError> {
     let ttl_secs = ttl.as_secs_f64();
-    let n = client.execute(RECLAIM_STALE_SQL, &[&ttl_secs]).await?;
+    let n = client
+        .execute_typed(RECLAIM_STALE_SQL, &[(&ttl_secs, Type::FLOAT8)])
+        .await?;
     Ok(n)
 }
 

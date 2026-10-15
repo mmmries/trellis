@@ -40,6 +40,7 @@
 use std::time::Duration;
 
 use tokio_postgres::GenericClient;
+use tokio_postgres::types::Type;
 
 use super::error::StagingError;
 
@@ -130,7 +131,7 @@ pub async fn reclaim_stale_workers(
 ) -> Result<u64, StagingError> {
     let ttl_secs = ttl.as_secs_f64();
     let n = client
-        .execute(RECLAIM_STALE_WORKERS_SQL, &[&ttl_secs])
+        .execute_typed(RECLAIM_STALE_WORKERS_SQL, &[(&ttl_secs, Type::FLOAT8)])
         .await?;
     Ok(n)
 }
