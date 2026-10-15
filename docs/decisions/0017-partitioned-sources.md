@@ -153,15 +153,17 @@ leaves only.
   alone.
 - A `DEFAULT` whose sibling set changed: treated as new.
 - A dropped or detached subtree: correct its topmost gone node, routing by that
-  node's recorded text. A detach-pending leaf is cleaned up only once its
-  `pg_inherits` row is gone and the ring has been folded.
+  node's recorded text. A detach-pending leaf's correction starts only once its
+  `pg_inherits` row is gone.
 - Then the no-leaf sweep below.
 
 On an aggregate, a node's correction is a Re-derive of a key set through the
 normal page path. The set is the keys of the live ledger entries whose group
 routes to the node by its recorded text, found through the ledger's `GROUP BY`
-index, plus, when the node still exists, the keys of its current rows, read from
-the node in keyset chunks as a build does. Each key takes its entry lock, reads
+index, plus, for a node in the tree, the keys of its current rows, read from
+the node in keyset chunks as a build does. A gone node's rows all satisfied its
+recorded text, so the ledger walk finds their entries; only a gone node without
+a usable text has its detached table's rows read instead. Each key takes its entry lock, reads
 the source row live through the root, and rewrites or tombstones its entry, so
 its group moves by a delta. No target row and no ledger entry is ever deleted
 directly. A group is the sum of its entries, so deleting a group row would leave
@@ -169,7 +171,20 @@ the entries live, and deleting entries would drop the tombstones that refuse a
 ring change staged before the DDL, which would then resurrect the row. A
 partitioned source's aggregate always has the ledger's `GROUP BY` index. The
 pending correction is durable, so a restart resumes it, and the pass records its
-fingerprints once the correction is queued, not once it has drained.
+fingerprints once the correction is queued, not once it has drained. A
+correction works in pages of one build chunk's size, each page one transaction
+that commits its keys' entries and its progress together, so a restart resumes
+after the last committed page: the ledger walk in `(group, key)` order, then the
+node's rows in primary-key order.
+
+A change staged before the DDL can still be in the ring when the correction
+runs. The correction starts by stamping the definition's `build_seg`, as a
+rebuild does: a page with a batch at or below it re-derives its keys from the
+source instead of applying their changes, so an unapplied insert into a dropped
+leaf becomes a tombstone rather than a row. It then waits for the transactions
+open at the stamp to end, so no page that read the old `build_seg` can still
+write a key the walk has no entry for. Waiting for the ring to fold through a
+position would never finish on a busy ring, whose active segment is never empty.
 
 For a to-many target, the correction is "recompute the routed parents" through
 the normal Recompute path: no target row is ever deleted.
@@ -181,11 +196,15 @@ closed the oracle diff in every lifecycle cell I measured on `HASH`, `RANGE` and
 which a "recompute the groups found in the leaf" rule never converged on, and
 every window closed within 5.2 s under load. Those figures show the routing is
 exact, not what a correction costs. On the real path the work scales with the
-node's rows: I extrapolate from a build's throughput (10M rows in 65 s on 8
-workers) and from the primary-key reads of a join on `unnest`: a leaf of 1M rows
-takes about 7 s, and a retention `DROP` of 100M rows about 11 minutes plus
-roughly 10 GB of tombstone WAL, then the garbage collector's deletes of those
-tombstones. These are extrapolations, not measurements. Rows an operation adds
+node's rows. Measured on the engine (one runner, a debug build, the cluster on
+tmpfs), a `DROP` of a leaf of 1M rows over 50,000 groups re-derives its 1M keys
+in about 12 s and writes about 480 MB of WAL, about 480 bytes a key: the entry
+lock, the entry's rewrite as a tombstone (not HOT, so an insert into the key
+index and the tombstone index) and the full-page images those touch. Folding the
+correction's group deltas takes the merger about 0.5 s and 26 MB. At that rate a
+retention `DROP` of 100M rows takes about 20 minutes and about 48 GB of WAL, then
+the garbage collector's deletes of those tombstones; that figure is an
+extrapolation. Rows an operation adds
 are undercounted until its correction drains, rows it removes are overcounted,
 and writes through the parent have no window at all. For a to-many target,
 deleting rows lost them for good in 180 of 189 trials; recomputing the routed
@@ -330,12 +349,12 @@ grouped `BY product_id` is refused at define, naming `order_id`.
   capture costing no more per write than on a plain table.
 - Partition maintenance needs no operator step, but counts can be wrong for
   about one interval plus a correction that costs O(rows in the node), not
-  O(groups): by extrapolation, about 7 s for a leaf of 1M rows, and about 11
-  minutes and 10 GB of tombstone WAL for a retention `DROP` of 100M rows. An
-  operator who needs exact counts throughout moves rows with DML through the
-  parent instead, which I measured at about 4–5 s and 0.5–0.6 GB of WAL per
-  1M-row leaf; creating an empty leaf and writing through the parent costs
-  nothing.
+  O(groups): about 12 s and 480 MB of WAL for a leaf of 1M rows, and by
+  extrapolation about 20 minutes and 48 GB of WAL for a retention `DROP` of
+  100M rows. An operator who needs exact counts throughout moves rows with DML
+  through the parent instead, which I measured at about 4–5 s and 0.5–0.6 GB of
+  WAL per 1M-row leaf; creating an empty leaf and writing through the parent
+  costs nothing.
 - The reconcile pass carries per-source catalog state (recorded nodes and two
   fingerprints), a few milliseconds per pass at 1,000 leaves, and a durable
   queue of pending corrections, and capture gains one catalog call per
