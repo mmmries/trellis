@@ -663,3 +663,174 @@ async fn a_whole_tree_install_waiting_on_a_leaf_writer_reports_that_writer() {
     assert_eq!(plain.len(), 1);
     writer.batch_execute("rollback").await.expect("release");
 }
+
+/// Reading the tree takes no relation lock, so a leaf held under an uncommitted
+/// `ACCESS EXCLUSIVE` stalls neither the installed check nor the walk: a
+/// reconcile of a captured tree sees it unchanged, and one that has to install
+/// reports it waiting on the leaf's holder and installs nothing. The raw test
+/// client has no `lock_timeout`, so a stalled read fails the outer timeout.
+#[tokio::test]
+async fn a_leaf_held_access_exclusive_stalls_no_read_of_the_tree() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    client.batch_execute(&flat(4)).await.expect("tree");
+    let holder = connect(db.dsn()).await;
+    let within = Duration::from_secs(10);
+    let deadline = || Some(Instant::now() + Duration::from_millis(300));
+
+    holder
+        .batch_execute("begin; lock table public.r_1 in access exclusive mode")
+        .await
+        .expect("hold the leaf");
+    let nodes = tokio::time::timeout(within, install::descendants(&client, "public.r"))
+        .await
+        .expect("the walk stalled on the held leaf")
+        .expect("descendants");
+    assert_eq!(nodes.len(), 4);
+    let progress = tokio::time::timeout(
+        within,
+        install::reconcile(&mut client, DEFAULT_SCHEMA, &spec("public.r"), deadline()),
+    )
+    .await
+    .expect("the reconcile stalled on the held leaf")
+    .expect("reconcile");
+    assert!(matches!(progress, Progress::Waiting(_)), "{progress:?}");
+    assert!(trigger_map(&client).await.is_empty(), "nothing installed");
+    holder.batch_execute("rollback").await.expect("release");
+
+    landed(
+        install::reconcile(&mut client, DEFAULT_SCHEMA, &spec("public.r"), None)
+            .await
+            .expect("install"),
+    );
+    holder
+        .batch_execute("begin; lock table public.r_2 in access exclusive mode")
+        .await
+        .expect("hold another leaf");
+    let progress = tokio::time::timeout(
+        within,
+        install::reconcile(&mut client, DEFAULT_SCHEMA, &spec("public.r"), deadline()),
+    )
+    .await
+    .expect("the installed check stalled on the held leaf")
+    .expect("reconcile");
+    assert!(matches!(progress, Progress::Done(_)), "{progress:?}");
+    assert!(!trigger_map(&client).await.is_empty(), "still installed");
+    holder.batch_execute("rollback").await.expect("release");
+}
+
+/// The lock-free walk behind [`install::descendants`] lists exactly what
+/// `pg_partition_tree` does, in the same order, from every table of a varied
+/// tree: three levels, `DEFAULT` partitions at two of them, a middle whose
+/// detach is pending (omitted with its subtree), a middle asked about as a
+/// root, a leaf, a plain table, a plain-inheritance parent and a missing name.
+#[tokio::test]
+async fn the_tree_walk_matches_pg_partition_tree() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.r (id int, region int, v text) partition by list (region); \
+             create table public.m1 partition of public.r for values in (1) \
+                 partition by range (id); \
+             create table public.m1_a partition of public.m1 for values from (0) to (10) \
+                 partition by hash (id); \
+             create table public.m1_a0 partition of public.m1_a \
+                 for values with (modulus 2, remainder 0); \
+             create table public.m1_a1 partition of public.m1_a \
+                 for values with (modulus 2, remainder 1); \
+             create table public.m1_d partition of public.m1 default; \
+             create table public.m2 partition of public.r for values in (2) \
+                 partition by hash (id); \
+             create table public.m2_0 partition of public.m2 \
+                 for values with (modulus 2, remainder 0); \
+             create table public.m2_1 partition of public.m2 \
+                 for values with (modulus 2, remainder 1); \
+             create table public.plain (id int); \
+             create table public.ip (id int); \
+             create table public.ic () inherits (public.ip)",
+        )
+        .await
+        .expect("tree");
+    let holder = connect(db.dsn()).await;
+    holder
+        .batch_execute("begin; lock table public.m2 in access share mode")
+        .await
+        .expect("hold the middle");
+    let detacher = connect(db.dsn()).await;
+    detacher
+        .batch_execute("set statement_timeout = '500ms'")
+        .await
+        .expect("timeout");
+    let interrupted = detacher
+        .batch_execute("alter table public.r detach partition public.m2 concurrently")
+        .await;
+    assert!(interrupted.is_err(), "the second phase waits on the holder");
+    holder.batch_execute("rollback").await.expect("release");
+    let pending: bool = client
+        .query_one(
+            "select inhdetachpending from pg_inherits where inhrelid = 'public.m2'::regclass",
+            &[],
+        )
+        .await
+        .expect("pending")
+        .get(0);
+    assert!(pending, "public.m2 is detach-pending: {interrupted:?}");
+    // After the detach: a pending one can't start while the level has one.
+    client
+        .batch_execute("create table public.rd partition of public.r default")
+        .await
+        .expect("default");
+
+    for table in [
+        "public.r",
+        "public.m1",
+        "public.m1_a",
+        "public.m1_a0",
+        "public.m2",
+        "public.plain",
+        "public.ip",
+        "public.missing",
+    ] {
+        let expected: Vec<String> = client
+            .query(
+                "select n.nspname::text || '.' || c.relname::text \
+                 from pg_catalog.pg_partition_tree(pg_catalog.to_regclass($1)) d \
+                 join pg_catalog.pg_class c on c.oid = d.relid \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 where d.level > 0 order by d.level, 1",
+                &[&table],
+            )
+            .await
+            .expect("pg_partition_tree")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        let walked = install::descendants(&client, table)
+            .await
+            .expect("descendants");
+        assert_eq!(walked, expected, "{table}");
+    }
+    let r = install::descendants(&client, "public.r").await.expect("r");
+    assert_eq!(
+        r,
+        [
+            "public.m1",
+            "public.rd",
+            "public.m1_a",
+            "public.m1_d",
+            "public.m1_a0",
+            "public.m1_a1"
+        ],
+        "the pending middle and its leaves are omitted"
+    );
+    assert_eq!(
+        install::descendants(&client, "public.m2")
+            .await
+            .expect("m2"),
+        ["public.m2_0", "public.m2_1"],
+        "the pending middle's own tree is intact"
+    );
+}
