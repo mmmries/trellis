@@ -120,7 +120,12 @@ struct Column {
     /// for equality only.
     xmin: String,
     /// A hash of the column's whole `pg_attribute` row and its default
-    /// expression.
+    /// expression. The expression's `:location` fields (parse offsets into
+    /// the statement that set it) are left out: PostgreSQL 16 and earlier
+    /// store a column's default again on every `ALTER COLUMN ... TYPE`, with
+    /// each location reset to -1, so the same expression would otherwise
+    /// read as a changed one and a same-type rewrite of a column with a
+    /// default would never be acted on.
     hash: String,
 }
 
@@ -150,7 +155,8 @@ const LIVE_COLUMNS: &str = "\
            a.atttypid, n.nspname::text || '.' || ty.typname::text, a.atttypmod, \
            pg_catalog.format_type(a.atttypid, a.atttypmod), a.xmin::text, \
            pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to( \
-               pg_catalog.to_jsonb(a)::text || coalesce(d.adbin::text, ''), 'UTF8')), 'hex') \
+               pg_catalog.to_jsonb(a)::text || coalesce(pg_catalog.regexp_replace( \
+                   d.adbin::text, ' :location -?[0-9]+', '', 'g'), ''), 'UTF8')), 'hex') \
     from tree t \
     join pg_catalog.pg_attribute a \
       on a.attrelid = t.relid and a.attnum > 0 and not a.attisdropped \
