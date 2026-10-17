@@ -49,7 +49,12 @@
 //! collation shadowing a built-in name and a custom operator in `public`
 //! silently misroute rows. A `DEFAULT` with no siblings has no text (every
 //! group routes to it), and any other node without a usable text routes
-//! nothing: the every-pass sweep (P5) finds those groups.
+//! nothing.
+//!
+//! A `complement` correction, which the every-pass sweep queues when it finds
+//! groups that route to no current leaf ([`crate::capture::complement`],
+//! P7), routes by the complement text it was queued with, as a gone node
+//! does by its recorded one, and has no node phase.
 //!
 //! A `HASH` text embeds its parent's oid, so a dropped middle's leaves are
 //! routed only through the middle's own text. That is why a correction names
@@ -354,9 +359,12 @@ fn qualified_collation(recorded: &str) -> String {
 
 /// The route of `correction`, given the source's recorded tree.
 fn route_of(correction: &PendingCorrection, recorded: Option<&Recorded>) -> Route {
-    // A node in the tree routes by what the record says of it now. A
-    // `truncated` correction, queued by the seal, carries neither.
-    let (text, is_default) = if correction.kind == partitions::Kind::GoneNode.as_str() {
+    // A gone node's and a complement's text is the queued one; a node in
+    // the tree routes by what the record says of it now. A `truncated`
+    // correction, queued by the seal, carries neither.
+    let queued = correction.kind == partitions::Kind::GoneNode.as_str()
+        || correction.kind == partitions::Kind::Complement.as_str();
+    let (text, is_default) = if queued {
         (correction.constraint.clone(), correction.node_default)
     } else {
         let node = recorded.and_then(|r| r.nodes.iter().find(|n| n.oid == correction.node_oid));
@@ -922,6 +930,36 @@ async fn correct(
             });
         }
     }
+    if correction.kind == partitions::Kind::Complement.as_str()
+        && let Some(text) = &correction.constraint
+    {
+        // A complement names each `HASH` node it reads remainders of, and
+        // can't be evaluated once one is dropped. The dropped node's own
+        // correction covers its groups, and the next pass's sweep finds any
+        // others again under the tree as it is then.
+        let mut oids: Vec<i64> = crate::capture::complement::hash_parents(text)
+            .into_iter()
+            .map(i64::from)
+            .collect();
+        oids.sort_unstable();
+        oids.dedup();
+        let client = pool.get().await?;
+        let alive: i64 = client
+            .query_one(
+                "select count(*) from pg_catalog.pg_class \
+                 where oid = any($1::bigint[]::oid[])",
+                &[&oids],
+            )
+            .await?
+            .get(0);
+        if usize::try_from(alive).unwrap_or(0) < oids.len() {
+            return Ok(if mark_done(pool, fence, correction, definition).await? {
+                Step::Done
+            } else {
+                Step::Superseded
+            });
+        }
+    }
     let recorded = {
         let client = pool.get().await?;
         partitions::recorded(&**client, &correction.table).await?
@@ -1411,8 +1449,11 @@ async fn pause_before_commit(
 /// routes no entry. A gone node routed by its text needs no node phase: every
 /// row it held satisfied that text while it was in the tree, so the ledger
 /// phase found every live entry of its rows, and reading a detached table's
-/// rows would only rewrite those tombstones again.
+/// rows would only rewrite those tombstones again. A complement has no node.
 fn reads_node(correction: &PendingCorrection, route: &Route) -> bool {
+    if correction.kind == partitions::Kind::Complement.as_str() {
+        return false;
+    }
     correction.kind != partitions::Kind::GoneNode.as_str() || *route == Route::Unusable
 }
 
@@ -1682,6 +1723,36 @@ mod tests {
             route_of(&correction, None),
             Route::Text("(a = 1)".to_string())
         );
+    }
+
+    #[test]
+    fn each_kind_reads_its_node_or_not() {
+        let correction = |kind: partitions::Kind| PendingCorrection {
+            id: 1,
+            table: "public.t".to_string(),
+            kind: kind.as_str().to_string(),
+            node_oid: 7,
+            node_name: "public.t_7".to_string(),
+            cause: partitions::Cause::Truncated.as_str().to_string(),
+            constraint: Some("(a = 1)".to_string()),
+            node_default: false,
+            parent_oid: None,
+            queued_lsn: "0/1".to_string(),
+        };
+        let text = Route::Text("(a = 1)".to_string());
+        for route in [&text, &Route::Every, &Route::Unusable] {
+            assert!(reads_node(&correction(partitions::Kind::NewLeaf), route));
+            assert!(reads_node(&correction(partitions::Kind::Truncated), route));
+            assert!(!reads_node(
+                &correction(partitions::Kind::Complement),
+                route
+            ));
+        }
+        assert!(!reads_node(&correction(partitions::Kind::GoneNode), &text));
+        assert!(reads_node(
+            &correction(partitions::Kind::GoneNode),
+            &Route::Unusable
+        ));
     }
 
     #[test]
