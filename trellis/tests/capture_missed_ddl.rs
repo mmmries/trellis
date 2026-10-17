@@ -499,6 +499,15 @@ async fn single_migrations_act_only_on_a_changed_column() {
             "alter table public.{t} alter column g type bigint",
             Expect::PausedS,
         ),
+        // R1: a narrower scale that the passthrough's `numeric(10,2)` copy
+        // still holds, but renders with another number of fractional digits
+        // (`1.5` as `1.50`): the copy must be re-typed, so `r` pauses; `s`
+        // doesn't read `n`.
+        (
+            "D24",
+            "alter table public.{t} alter column n type numeric(9,1)",
+            Expect::PausedR,
+        ),
     ])
     .await;
 }

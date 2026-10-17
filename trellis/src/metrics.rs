@@ -206,8 +206,10 @@ const CAPTURE_AUTO_REBUILDS_METRIC: &str = "trellis_capture_auto_rebuilds_total"
 
 /// Why the capture pass rebuilt a table's readers on its own,
 /// [`CAPTURE_AUTO_REBUILDS_METRIC`]'s `cause` label (#703). The decision
-/// that set it up (#703, #707) names two more causes, `trigger_cycled` and
-/// `function_replaced`, for #707's detectors, which aren't built yet.
+/// that set it up (#703, #707) names two more causes, which aren't counted
+/// yet: `function_replaced`, for #707's detector, and `capture_reinstalled`,
+/// for the installs that already repair a trigger left missing, disabled or
+/// not `ALWAYS`, or a table recreated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CaptureRebuildCause {
     /// A read column's values were rewritten in place by an `ALTER COLUMN
