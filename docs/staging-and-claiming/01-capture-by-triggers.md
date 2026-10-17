@@ -280,6 +280,18 @@ registration) and the next pass would otherwise wait to backfill forever,
 with the table's capture failing every pass and nothing on its status;
 instead it pauses again with its `capture_failure`. A pass that pauses leaves the table for the next pass.
 
+A drain page doesn't wait for the pass on a redefined primary key either.
+The installed functions go on imaging the old key until the pass
+regenerates them, so no write marks the change, and a page would read their
+rows by the new key: an arity change (`(id)` to `(id, g)`) fails the page,
+and a same-arity one (`(id)` to `(g)`) reads the wrong rows. So before a
+page computes anything, it compares the key each of its tables' installed
+functions record with the table's primary key now, one catalog read per
+page, and on a mismatch runs the pass's pause for that table
+(`staging::schema_change::pause_readers_of_redefined_keys`). The page's
+compute then applies none of those rows, and nothing is charged to
+quarantine for them.
+
 ## A re-typed key column, or an outgrown copy
 
 `ALTER COLUMN ... TYPE` rewrites the table but keeps its triggers, and the
@@ -372,10 +384,9 @@ holds, a change to a column read only as a field that every column typed
 from it still holds (a `varchar` widening under a calculated field, whose
 column is `text`), and a change between deterministic collations (byte
 equality is unchanged, even across a join pair; define and a resume still
-require a pair's collations to match). A field's move to another type
-family (`integer` to `double precision`) pauses nothing either, though its
-columns may not hold the new values
-([known correctness gaps, entry 22](../known-correctness-gaps.md#22-a-column-read-only-as-a-field-moved-to-another-type-family)).
+require a pair's collations to match). A change to a column read as a field
+that isn't a pure widening, a narrowing included, is the next section's: it
+rebuilds the readers, or pauses the ones it leaves invalid.
 
 A resume re-validates the definition as define would and refuses while the
 first two hold, naming the columns and what to change. Otherwise, if any
@@ -404,6 +415,105 @@ key allowlist: `staging::apply::compute` introspects every staged table's key
 before it asks which definitions apply, and halts on that type (#663). The
 halt and the capture pass's pause both record a `capture_failure`, and the
 first one stands.
+
+## A column changed or rewritten without a trigger
+
+Two more kinds of DDL change what a read column holds while its name stays
+the same, and fire no DML trigger (#703):
+
+- **A column dropped and re-added** (`DROP COLUMN plan; ADD COLUMN plan
+  text`): every row holds the new column's default, under a new `attnum`.
+  **A column retyped** other than by a pure widening: a narrowing, a
+  `numeric` scale change (`1.50` becomes `1.5000`, or rounds), a move to
+  another type family (`integer` to `double precision`). A pure widening (a
+  wider integer, a longer `varchar` or `text`, more `numeric` precision at
+  the same scale, a wider temporal precision) keeps every value's text, and
+  is left to the previous section's checks of the columns Trellis created.
+- **A same-type rewrite**: `ALTER COLUMN b TYPE integer USING b * 10` on an
+  `integer` column changes every value and leaves the name, `attnum`, type
+  and modifier as they were.
+
+So each captured table keeps a baseline in `capture_baselines`: per column
+its capture images, on the table itself or on each leaf of a partitioned
+root (the root has no storage of its own), its `attnum`, type and modifier,
+the `xmin` of its `pg_attribute` row, a hash of the rest of that row with
+its default expression, and the node's file node. An install, widen or
+narrow records it in the transaction that installs the functions, for the
+columns and leaves it newly covers. Each capture pass compares the live
+catalog with it before it regenerates the table's functions, and writes what
+it read back in the transaction of its response, so a change seen once is
+acted on once (`capture::baseline`). It costs two catalog reads per table.
+
+- **A changed `attnum`, or a type change that isn't a pure widening, is a
+  changed column.**
+- **A same-type rewrite is the row's `xmin` and the node's file node both
+  moved, and nothing else about the column changed.** Each moves alone in
+  routine work: `SET DEFAULT`, `SET NOT NULL`, `SET STATISTICS` and column
+  `GRANT`s move the row, and `VACUUM FULL`, `CLUSTER`, pg_repack, `SET
+  LOGGED` and a volatile `ADD COLUMN` rewrite the table. A framework
+  migration often does one of each in a transaction (`add_column ...
+  default: -> { 'gen_random_uuid()' }` beside a `change_column_default`), so
+  the rewrite counts only when the rest of the column's row, its default
+  expression included, is what it was. A catalog freeze leaves the `xmin` a
+  query reads as it was.
+
+The response follows whether the definitions are still valid as written:
+
+- **Rebuilt automatically, pausing nobody.** A same-type rewrite, and a
+  changed column every definition reading it is still valid over. The pass
+  re-reads the table for its applying readers, exactly as
+  `Trellis::request_backfill` does: a reader the Re-derive build takes
+  reports `backfilling`, every other `catching_up`, until the re-read is
+  done. It logs a `WARN` naming the table, the cause and the readers, and
+  counts `capture_auto_rebuilds_total{source_table, cause}`, `cause`
+  `value_rewrite` or `column_changed`
+  ([observability](../observability.md#metrics)).
+- **Paused, with a `capture_failure` naming the column and the change.** A
+  changed column where define would now refuse a definition that reads it,
+  where the definition would evaluate it as another type (`integer` to
+  `double precision`, so the types it recorded no longer hold), or where a
+  `numeric` column Trellis created from it must be re-typed to the new
+  scale. `RESUME` re-validates, re-types and rebuilds, or refuses while
+  define would. A key column's type change is left to the previous
+  section's checks; a key column dropped and re-added rebuilds.
+
+### What rebuilds, what pauses, and what's missed
+
+Changes no capture trigger sees, and what the staging worker does about
+them:
+
+- **Repaired on its own, pausing nobody** (a re-read's readers report
+  `backfilling` or `catching_up` until it's done):
+  - a capture trigger left missing, disabled or not `ALWAYS`, or a table
+    dropped and recreated as a plain table: the install re-reads the table;
+  - a same-type `USING` rewrite of a read column: re-read;
+  - a read column dropped and re-added, or retyped other than by a pure
+    widening, where every definition reading it is still valid: re-read;
+  - a widening that changes only the catalog of a column Trellis created:
+    re-typed in place, with no re-read.
+- **Pauses, until a deliberate `RESUME`:**
+  - a read column renamed or dropped, or the primary key redefined, by a
+    marker, the pass or a drain page;
+  - a key column retyped or re-collated so define would refuse it, or so the
+    stored keys render differently; a relationship's join columns no longer
+    matching; a column Trellis created outgrown by a widening;
+  - a read column changed so define would refuse a definition reading it, so
+    it would evaluate the column as another type, or so a `numeric` column
+    Trellis created must be re-typed;
+  - row-level security applying to Trellis's roles, a subscription into a
+    source, or a source joining a partition or inheritance hierarchy.
+- **Missed, and documented** in
+  [known correctness gaps](../known-correctness-gaps.md): a `USING`
+  rewrite with a metadata change to the same column in the same window, on
+  a column added with a constant default whose table no rewrite has touched
+  since (the rewrite clears the default the column's row keeps for older
+  rows, as `VACUUM FULL` does), or as a pure widening no copy outgrows; capture switched off and on again
+  between two passes; a capture function's body replaced by hand.
+
+A few routine operations rebuild for nothing, at the cost of one re-read: a
+rewrite that leaves the values as they were (`USING b + 0`, or a column
+retyped and back between two passes), and an identical `SET DEFAULT`
+re-applied in the same window as a table rewrite.
 
 ## Nested writes to the same key
 

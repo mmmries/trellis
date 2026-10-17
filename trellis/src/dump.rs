@@ -103,6 +103,7 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     ),
     // Runtime state.
     ("backfill_chunks", Class::Runtime),
+    ("capture_baselines", Class::Runtime),
     ("capture_failures", Class::Runtime),
     ("capture_holdups", Class::Runtime),
     ("column_deaths", Class::Runtime),

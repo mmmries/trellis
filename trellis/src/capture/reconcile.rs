@@ -54,6 +54,13 @@
 //! pass fingerprints those tables' columns once, before any check
 //! ([`crate::staging::drift_memo`], #858).
 //!
+//! Last, it compares the table's read columns with the baseline the last
+//! install, widen, narrow or pass recorded (#703, `capture::baseline`): a
+//! column dropped and re-added, retyped other than by a pure widening, or
+//! whose values a same-type `ALTER ... TYPE ... USING` rewrote. It rebuilds
+//! the table's applying readers as `Trellis::request_backfill` would, or
+//! pauses a definition the change may have left invalid.
+//!
 //! Before any of that, the pass resumes each definition an upstream's resume
 //! paused, once that upstream is `live` (#828, #970,
 //! [`crate::staging::quarantine::resume_caused_definitions`]), and finishes
@@ -287,6 +294,17 @@ pub async fn reconcile(
                 continue;
             }
         }
+        // #703 R1, R3b: a read column dropped and re-added, retyped, or
+        // its values rewritten in place, since the last pass. Its readers
+        // rebuild, or pause where their definition may no longer be valid.
+        match super::baseline::check(client, schema, &snapshot.catalog, table).await {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(err) => {
+                outcome.failed.push((table.clone(), err));
+                continue;
+            }
+        }
         let spec = match capture_spec(&*client, &snapshot.catalog, table).await {
             Ok(spec) => spec,
             Err(err) => {
@@ -462,6 +480,9 @@ pub async fn reconcile(
 
     // A source nothing reads any more has no recorded tree to keep.
     partitions::forget_except(&*client, desired).await?;
+    // Nor a baseline, once nothing captures it.
+    let kept: Vec<&str> = known.iter().map(|t| t.as_str()).collect();
+    super::baseline::forget_except(&*client, &kept).await?;
 
     let gated = gated_marker_tables(&*client).await?;
     outcome.ready = ready_definitions(&snapshot, desired, &outcome.captured, &gated, &seam_held);

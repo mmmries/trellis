@@ -171,6 +171,15 @@ async fn run_backfill_chunks(pool: &trellis::Pool) {
     }
 }
 
+/// Whether `status` is a rebuild's: a go-live catch-up, or a Re-derive
+/// build.
+fn rebuilding(status: TransformStatus) -> bool {
+    matches!(
+        status,
+        TransformStatus::CatchingUp | TransformStatus::Backfilling
+    )
+}
+
 async fn status(raw: &Client, target: &str) -> TransformStatus {
     let text: String = raw
         .query_one(
@@ -574,7 +583,8 @@ async fn widening_a_one_to_one_key_pauses_and_resume_widens_the_target_key() {
 /// `integer` to `bigint`) isn't re-typed in place (#824): the pass pauses
 /// the definition, naming both, and a resume re-types both and rebuilds, so
 /// a longer value lands. A narrowing of a passthrough pauses nothing and
-/// re-types nothing: every value still fits.
+/// re-types nothing: every value still fits. It rebuilds the definition
+/// (#703 R1): the narrowing may have dropped trailing spaces.
 #[tokio::test]
 async fn a_table_that_also_needs_a_rewrite_pauses_and_resume_re_types_all_of_it() {
     let cluster = TestCluster::start();
@@ -586,11 +596,12 @@ async fn a_table_that_also_needs_a_rewrite_pauses_and_resume_re_types_all_of_it(
         .await
         .expect("narrow the passthrough");
     capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert!(rebuilding(status(&raw, "item_names").await));
     assert_eq!(
         column_type(&raw, "public.item_names", "name").await,
         "character varying(10)"
     );
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
 
     raw.batch_execute(
         "alter table public.items alter column name type varchar(40), \
@@ -2787,7 +2798,6 @@ async fn changes_no_created_column_outgrows_pause_nothing() {
         "alter table public.lines alter column name type varchar(40)",
         "alter table public.lines alter column name type text",
         "alter table public.lines alter column price type numeric(12,2)",
-        "alter table public.lines alter column qty type integer",
     ] {
         raw.batch_execute(alter).await.expect(alter);
         capture_pass(&mut raw, &db.pool).await;
@@ -2795,6 +2805,16 @@ async fn changes_no_created_column_outgrows_pause_nothing() {
             assert_eq!(status(&raw, target).await, TransformStatus::Live, "{alter}");
         }
     }
+    // A narrowing isn't a pure widening (#703 R1): it rebuilds the readers,
+    // and still pauses nothing.
+    raw.batch_execute("alter table public.lines alter column qty type integer")
+        .await
+        .expect("narrow qty");
+    capture_pass(&mut raw, &db.pool).await;
+    for target in targets {
+        assert!(rebuilding(status(&raw, target).await), "{target}");
+    }
+    bring_live(&mut raw, &db.pool, &targets).await;
     assert_eq!(snapshot(&raw).await, before);
 
     raw.batch_execute(
@@ -3240,7 +3260,8 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
 /// length change (its values are blank-padded to the length) and a `text`
 /// column made `varchar(n)` (binary-coercible, but a narrowing) are left
 /// as they were, and, as before, pause nothing: every value still fits a
-/// passthrough of either.
+/// passthrough of either. Neither is a pure widening, so the definition
+/// rebuilds (#703 R1).
 #[tokio::test]
 async fn character_and_text_to_varchar_changes_are_not_re_typed_in_place() {
     let cluster = TestCluster::start();
@@ -3265,8 +3286,9 @@ async fn character_and_text_to_varchar_changes_are_not_re_typed_in_place() {
     )
     .await
     .expect("change both columns");
-    full_pass(&mut raw, &db.pool).await;
-    assert_eq!(status(&raw, "tag_codes").await, TransformStatus::Live);
+    capture_pass(&mut raw, &db.pool).await;
+    assert!(rebuilding(status(&raw, "tag_codes").await));
+    bring_live(&mut raw, &db.pool, &["tag_codes"]).await;
     assert_eq!(
         column_type(&raw, "public.tag_codes", "code").await,
         "character(5)"
@@ -4066,7 +4088,10 @@ async fn a_catalog_only_widening_after_clean_passes_is_re_typed_on_the_next_pass
 
 /// A column re-typed and re-typed back between two passes ends where it was,
 /// but is not the column the last comparison saw: the next pass compares
-/// again. The fingerprint carries each row's `xmin` for this.
+/// again. The fingerprint carries each row's `xmin` for this. The two
+/// rewrites read as a same-type rewrite of the column, so the table's
+/// readers rebuild (#703 R3b's documented false positive), and nothing
+/// pauses.
 #[tokio::test]
 async fn a_column_re_typed_and_back_between_passes_is_compared_again() {
     let cluster = TestCluster::start();
@@ -4083,11 +4108,7 @@ async fn a_column_re_typed_and_back_between_passes_is_compared_again() {
     capture_pass(&mut raw, &db.pool).await;
 
     for target in ["post_authors", "post_titles", "per_kind"] {
-        assert_eq!(
-            status(&raw, target).await,
-            TransformStatus::Live,
-            "{target}"
-        );
+        assert!(rebuilding(status(&raw, target).await), "{target}");
     }
     let after = copy_checks(&raw).await;
     assert!(after["per_kind"] > settled["per_kind"], "{after:?}");
@@ -4197,7 +4218,8 @@ async fn a_drifted_copy_is_never_skipped() {
     capture_pass(&mut raw, &db.pool).await;
     let second = copy_checks(&raw).await;
     assert!(second["post_titles"] > first["post_titles"], "{second:?}");
-    assert_eq!(status(&raw, "post_titles").await, TransformStatus::Live);
+    // A narrowing pauses nothing; it rebuilds the readers (#703 R1).
+    assert!(rebuilding(status(&raw, "post_titles").await));
 }
 
 /// `ALTER TRANSFORM` rewrites a definition in place, giving it a column

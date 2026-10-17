@@ -373,6 +373,60 @@ pub(crate) fn catalog_only(copy: &ColumnType, live: &ColumnType) -> bool {
     }
 }
 
+/// Whether a column retyped from `old` to `new` kept every value's text: a
+/// pure widening (#703 R1), which the capture pass's column check never
+/// acts on. Exactly these:
+///
+/// - a wider integer: `smallint` to `integer` to `bigint`;
+/// - a string bound that doesn't narrow: `varchar(n)` to `varchar(m>n)`, an
+///   unbounded `varchar` or `text`, and `varchar` to `text` or back;
+/// - `numeric(p,s)` to `numeric(q,s)` with `q > p`: more precision at the
+///   same scale;
+/// - a wider fractional-second precision of the same temporal type, or a
+///   longer `bit varying`.
+///
+/// Anything else changes the text of some value (`real` to `double
+/// precision`, a `numeric` scale change, which re-renders `1.50` as
+/// `1.5000` or rounds it), narrows, or is another type.
+pub(crate) fn pure_widening(old: &ColumnType, new: &ColumnType) -> bool {
+    if old == new {
+        return true;
+    }
+    if let (Some(was), Some(is)) = (old.int_width(), new.int_width()) {
+        return is > was;
+    }
+    if let (Some(was), Some(is)) = (old.string_bound(), new.string_bound()) {
+        return !narrower_bound(is, was);
+    }
+    if old.type_name != new.type_name || !old.builtin() {
+        return false;
+    }
+    match old.base() {
+        "numeric" => match (numeric_modifier(old.typmod), numeric_modifier(new.typmod)) {
+            (Some((p, s)), Some((q, t))) => t == s && q > p,
+            _ => false,
+        },
+        "varbit" => new.typmod < 0 || (old.typmod >= 0 && new.typmod > old.typmod),
+        "time" | "timetz" | "timestamp" | "timestamptz" => new.precision() >= old.precision(),
+        _ => false,
+    }
+}
+
+/// Whether a `numeric(p,s)` copy of type `copy` renders a value of its
+/// source column's live type `live` with another number of fractional
+/// digits: a scale change pads (`1.5` stored as `1.50`) or rounds. Only a
+/// copy with a scale can; any other type holds a value of a narrower or
+/// equal live type with its text (#703 R1).
+pub(crate) fn rescales(copy: &ColumnType, live: &ColumnType) -> bool {
+    if !(copy.builtin() && live.builtin() && copy.base() == "numeric" && live.base() == "numeric") {
+        return false;
+    }
+    match numeric_modifier(copy.typmod) {
+        Some((_, s)) => numeric_modifier(live.typmod).map(|(_, t)| t) != Some(s),
+        None => false,
+    }
+}
+
 /// A `numeric(p,s)` modifier's precision and scale. A modifier is
 /// `((p << 16) | (s & 0x7ff)) + 4`, with `s` an 11-bit two's complement,
 /// since Postgres 15 allows a negative scale. `None` for an unconstrained
@@ -806,6 +860,55 @@ mod tests {
     /// `numeric(p,s)`'s `atttypmod`.
     fn numeric(precision: i32, scale: i32) -> ColumnType {
         ty("numeric", ((precision << 16) | (scale & 0x7ff)) + 4)
+    }
+
+    /// #703 R1: the study's pure widenings keep every value's text; every
+    /// other change, narrowing or not, is acted on.
+    #[test]
+    fn only_a_widening_that_keeps_the_text_is_pure() {
+        for (old, new) in [
+            (ty("int2", -1), ty("int4", -1)),
+            (ty("int4", -1), ty("int8", -1)),
+            (varchar(50), varchar(255)),
+            (varchar(50), ty("text", -1)),
+            (varchar(50), ty("varchar", -1)),
+            (ty("text", -1), ty("varchar", -1)),
+            (numeric(10, 2), numeric(12, 2)),
+            (ty("timestamp", 3), ty("timestamp", 6)),
+            (ty("timestamp", 6), ty("timestamp", -1)),
+            (ty("varbit", 8), ty("varbit", -1)),
+        ] {
+            assert!(pure_widening(&old, &new), "{old:?} -> {new:?}");
+        }
+        for (old, new) in [
+            (ty("int8", -1), ty("int4", -1)),
+            (varchar(50), varchar(10)),
+            (ty("text", -1), varchar(255)),
+            (numeric(10, 2), numeric(10, 4)),
+            (numeric(10, 2), numeric(10, 1)),
+            (numeric(10, 2), ty("numeric", -1)),
+            (numeric(12, 2), numeric(10, 2)),
+            (ty("timestamp", 6), ty("timestamp", 3)),
+            (ty("float4", -1), ty("float8", -1)),
+            (ty("int4", -1), ty("float8", -1)),
+            (ty("int4", -1), ty("numeric", -1)),
+            (ty("int4", -1), ty("text", -1)),
+            (ty("bpchar", 9), ty("bpchar", 12)),
+            (ty("public.int4", -1), ty("pg_catalog.int8", -1)),
+        ] {
+            assert!(!pure_widening(&old, &new), "{old:?} -> {new:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_numeric_copy_with_another_scale_rescales() {
+        assert!(rescales(&numeric(10, 2), &numeric(10, 1)));
+        assert!(rescales(&numeric(12, 2), &numeric(10, 4)));
+        assert!(rescales(&numeric(10, 2), &ty("numeric", -1)));
+        assert!(!rescales(&numeric(12, 2), &numeric(10, 2)));
+        assert!(!rescales(&ty("numeric", -1), &numeric(10, 1)));
+        assert!(!rescales(&varchar(50), &varchar(10)));
+        assert!(!rescales(&ty("bpchar", 9), &ty("bpchar", 12)));
     }
 
     /// `interval`'s `atttypmod` for a field range and a precision.
