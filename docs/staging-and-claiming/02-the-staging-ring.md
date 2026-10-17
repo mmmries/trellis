@@ -74,7 +74,7 @@ VALUES (...), (...), ...;
 ```
 
 No `ON CONFLICT`, no merge, one row per raw change. Three columns are supplied by
-the *table definition* rather than the producer, which makes them free that makes them free:
+the *table definition* rather than the producer, which makes them free:
 
 | Column | How it is populated | Why not client-side |
 |---|---|---|
@@ -102,7 +102,7 @@ All four append into the active segment:
 
 | Producer | What it appends | Carries images? |
 |---|---|---|
-| Capture triggers | the source change, in the writer's transaction | yes — `old_image` and/or `new_image` |
+| Capture triggers | the source change, in the writer's transaction | yes — `old_image` and/or `new_image`, and `transition_images` where a re-read's images aren't the statement's own ([01](01-capture-by-triggers.md#every-transition-row-counts-once)) |
 | Reverse propagation (a worker staging its dependents) | a bare recompute trigger | **no** |
 | Definition re-derive (a formula changed) | a bare recompute trigger | **no** |
 | Backfill / snapshot enumeration | a bare recompute trigger, server-side | **no** |
