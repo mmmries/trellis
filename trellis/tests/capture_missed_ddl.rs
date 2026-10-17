@@ -726,6 +726,15 @@ async fn real_changes_rebuild_or_pause() {
             "alter table public.{t} alter column x type text using x || '!'",
             Expect::Nothing,
         ),
+        // A column with a compression method set: `ALTER COLUMN ... TYPE`
+        // resets `attcompression` to the default, so the rewrite changed
+        // its row.
+        (
+            "F2",
+            "alter table public.{t} alter column v set compression pglz -- PASS \
+             alter table public.{t} alter column v type varchar(50) using v || '!'",
+            Expect::Nothing,
+        ),
         // A metadata change to the same column in the rewrite's window.
         (
             "Z1",

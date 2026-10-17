@@ -507,8 +507,10 @@ them:
   rewrite with a metadata change to the same column in the same window, on
   a column added with a constant default whose table no rewrite has touched
   since (the rewrite clears the default the column's row keeps for older
-  rows, as `VACUUM FULL` does), or as a pure widening no copy outgrows; capture switched off and on again
-  between two passes; a capture function's body replaced by hand.
+  rows, as `VACUUM FULL` does), on a column with a compression method set
+  (the `ALTER` resets it), or as a pure widening no copy outgrows; capture
+  switched off and on again between two passes; a capture function's body
+  replaced by hand.
 
 A few routine operations rebuild for nothing, at the cost of one re-read: a
 rewrite that leaves the values as they were (`USING b + 0`, or a column

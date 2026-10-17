@@ -96,7 +96,7 @@ These are the tools the entries refer to:
 
 | # | Trigger | Silent? | Detected? | Planned work |
 |---|---|---|---|---|
-| 1 | `ALTER COLUMN … TYPE … USING` that rewrites values, with a metadata change to the same column in the same pass window, on a column added with a constant default whose table hasn't been rewritten since, or as a widening no copy outgrows | yes | `self_check` (1-1 targets only) | none; documented |
+| 1 | `ALTER COLUMN … TYPE … USING` that rewrites values, with a metadata change to the same column in the same pass window, on a column added with a constant default whose table hasn't been rewritten since, on a column with a compression method set, or as a widening no copy outgrows | yes | `self_check` (1-1 targets only) | none; documented |
 | 3 | A source key re-collated while a `self_check` job runs | the job can skip or repeat keys | no | none filed |
 | 5 | Capture switched off and back on, or the table attached to a hierarchy and detached, between two reconcile passes | yes | `self_check` (1-1 targets only) | #707, study pending |
 | 6 | A capture function body replaced by hand | yes | `self_check` (1-1 targets only) | #707, study pending |
@@ -122,7 +122,7 @@ These are the tools the entries refer to:
 ## 1. A rewriting `ALTER COLUMN TYPE … USING` that the capture pass can't tell from routine work
 
 **Trigger:** a `USING` that rewrites a read column's values, in one of
-three shapes:
+four shapes:
 
 ```sql
 -- A metadata change to the same column in the same reconcile window
@@ -134,6 +134,11 @@ ALTER TABLE orders ALTER COLUMN amount TYPE integer USING amount * 10;
 -- (`VACUUM FULL`, `CLUSTER`, a rewriting `ALTER TABLE`) has touched since:
 ALTER TABLE orders ADD COLUMN fee integer DEFAULT 0;
 ALTER TABLE orders ALTER COLUMN fee TYPE integer USING fee + 1;
+
+-- A column with a compression method set, rewritten for the first time
+-- since it was set:
+ALTER TABLE orders ALTER COLUMN note SET COMPRESSION pglz;
+ALTER TABLE orders ALTER COLUMN note TYPE text USING upper(note);
 
 -- A widening that changes values, where no column Trellis created from
 -- `amount` outgrows the new type:
@@ -155,6 +160,8 @@ rewrite, which framework migrations do all the time, so the pass leaves it.
 So does the first rewrite of a column added with a constant default: the
 column's row keeps that default for the rows that predate it until the
 table is rewritten, and any rewrite, `VACUUM FULL` included, clears it.
+So does the first `ALTER COLUMN … TYPE` of a column with a compression
+method set, which resets the method to the default.
 A pure widening (`integer` → `bigint`, a longer `varchar`) never acts on
 its own, since it keeps every value's text; only a column Trellis created
 that it outgrows pauses its readers. `self_check` reports the cell
