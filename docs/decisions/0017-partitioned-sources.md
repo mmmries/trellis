@@ -127,12 +127,15 @@ hosts don't offer one, and I found it fires neither for an interrupted
 ### Target rows route to nodes by each leaf's recorded bound, under pinned settings
 
 The pass records each leaf's `pg_get_partition_constraintdef` text with the key
-columns' types and collations, fetching only for new or changed leaves and for a
-`DEFAULT` whose siblings changed. A correction routes a group to a node by
-evaluating that text over the group key, each group column cast to the source
-key column's type and collation. Every fetch and evaluation runs under
-`search_path = pg_catalog, pg_temp`, `DateStyle ISO, YMD` and `TimeZone UTC`, in
-short transactions under a short `lock_timeout` that retry on a lock timeout.
+columns' types and those types' collations, fetching only for new or changed
+leaves and for a `DEFAULT` whose siblings changed. A correction routes a group to
+a node by evaluating that text over the group key, each group column cast to the
+source key column's type, under the type's own collation. A text names a level's
+collation on a bound only when it differs from the type's, so every comparison
+runs under its own level's collation, even when the levels of one tree differ.
+Every fetch and evaluation runs under `search_path = pg_catalog, pg_temp`,
+`DateStyle ISO, YMD` and `TimeZone UTC`, in short transactions under a short
+`lock_timeout` that retry on a lock timeout.
 
 The catalog loses a leaf's bound when it is dropped or detached, so the pass
 records it while it can. With the cast I found 0 disagreements in about 3.4M
@@ -217,8 +220,12 @@ lock, the entry's rewrite as a tombstone (not HOT, so an insert into the key
 index and the tombstone index) and the full-page images those touch. Folding the
 correction's group deltas takes the merger about 0.5 s and 26 MB. At that rate a
 retention `DROP` of 100M rows takes about 20 minutes and about 48 GB of WAL, then
-the garbage collector's deletes of those tombstones; that figure is an
-extrapolation. Rows an operation adds
+the garbage collector's deletes of those tombstones; that figure is a linear
+extrapolation from a leaf whose ledger stays in cache, and it is a floor. Past
+the cache, finding each key through the ledger's `GROUP BY` index reads a random
+heap page and a random index page: a model of that walk (#1085) ran at
+17.5–21.5k keys a second and 9–12 KB of WAL a key, which projects to 78–95
+minutes and 0.9–1.2 TB of WAL for a leaf of 100M rows. Rows an operation adds
 are undercounted until its correction drains, rows it removes are overcounted,
 and writes through the parent have no window at all. For a to-many target,
 deleting rows lost them for good in 180 of 189 trials; recomputing the routed
@@ -363,9 +370,10 @@ grouped `BY product_id` is refused at define, naming `order_id`.
   capture costing no more per write than on a plain table.
 - Partition maintenance needs no operator step, but counts can be wrong for
   about one interval plus a correction that costs O(rows in the node), not
-  O(groups): about 12 s and 480 MB of WAL for a leaf of 1M rows, and by
-  extrapolation about 20 minutes and 48 GB of WAL for a retention `DROP` of
-  100M rows. An operator who needs exact counts throughout moves rows with DML
+  O(groups): about 12 s and 480 MB of WAL for a leaf of 1M rows, and for a
+  retention `DROP` of 100M rows at least 20 minutes and 48 GB of WAL, and as
+  much as 78–95 minutes and 0.9–1.2 TB once the ledger outgrows the cache
+  (#1085's model). An operator who needs exact counts throughout moves rows with DML
   through the parent instead, which I measured at about 4–5 s and 0.5–0.6 GB of
   WAL per 1M-row leaf; creating an empty leaf and writing through the parent
   costs nothing.

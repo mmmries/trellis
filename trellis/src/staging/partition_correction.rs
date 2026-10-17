@@ -40,8 +40,10 @@
 //! `pg_get_partition_constraintdef` text holds over the group's key columns
 //! ([`route_predicate`]). The text names the source's key columns, so the
 //! group's values are presented under those names, each cast to the key
-//! column's recorded type and collation: a `HASH` text raises on a
-//! differently typed column, and a text column compares under its collation.
+//! column's recorded type, under that type's own collation: a `HASH` text
+//! raises on a differently typed column, and a text names a level's
+//! collation on a bound (`COLLATE`) only when it isn't the type's, so each
+//! comparison is under its own level's collation, whichever levels differ.
 //! The read runs under pinned settings (`search_path = pg_catalog, pg_temp`,
 //! `DateStyle ISO, YMD`, `TimeZone UTC`: [`crate::capture::partitions`]'s
 //! `pinned_settings`), because the text of a bound, and what it means, depends
@@ -386,9 +388,21 @@ fn route_columns(
     recorded: Option<&Recorded>,
     alias: &str,
 ) -> Vec<RouteColumn> {
-    plan.plain_group_cols()
-        .into_iter()
-        .map(|name| RouteColumn {
+    route_columns_named(&plan.plain_group_cols(), recorded, alias)
+}
+
+/// [`route_columns`] for the group columns `names`. A column is presented
+/// under the first recorded key on it: its type, and its type's own
+/// collation ([`Key::collation`]), which every level's text compares under
+/// unless it names its level's on the bound (#1084).
+fn route_columns_named(
+    names: &[&str],
+    recorded: Option<&Recorded>,
+    alias: &str,
+) -> Vec<RouteColumn> {
+    names
+        .iter()
+        .map(|&name| RouteColumn {
             name: name.to_string(),
             value: format!("{alias}.{}", quote_ident(name)),
             key: recorded.and_then(|r| {
@@ -1839,5 +1853,159 @@ mod tests {
             2,
         );
         assert_eq!(seeks, ["l.\"a\" is null"]);
+    }
+
+    /// Each node's route over a probe row, under [`route_columns_named`],
+    /// against the leaf Postgres routes the row to, for `public.items`. The
+    /// probe is presented as a value of `column` (its type, and collation),
+    /// as a group column of the source's type is.
+    async fn route_disagreements(
+        client: &mut tokio_postgres::Client,
+        ddl: &str,
+        column: &str,
+        probes: &[&str],
+    ) -> Vec<String> {
+        client
+            .batch_execute(&format!("drop table if exists public.items cascade; {ddl}"))
+            .await
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+        let (_, _, recorded) = partitions::read_tree_once(client, "public.items")
+            .await
+            .expect("read the tree")
+            .expect("a partitioned root");
+        let columns = route_columns_named(&["t"], Some(&recorded), "p");
+        let txn = client.transaction().await.expect("begin");
+        txn.batch_execute(&partitions::pinned_settings())
+            .await
+            .expect("pinned settings");
+        let nodes: Vec<(String, Option<String>)> = txn
+            .query(
+                "select relid::regclass::text, pg_get_partition_constraintdef(relid) \
+                 from pg_partition_tree('public.items') where level > 0 order by 1",
+                &[],
+            )
+            .await
+            .expect("the nodes' texts")
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        let mut wrong = Vec::new();
+        for probe in probes {
+            // The node chain Postgres routes the probe through, or none.
+            txn.batch_execute("savepoint probe")
+                .await
+                .expect("savepoint");
+            let routed: Vec<String> = match txn
+                .query(
+                    "with ins as (insert into public.items values ($1::text) returning tableoid) \
+                     select a::regclass::text from ins, pg_partition_ancestors(ins.tableoid) a",
+                    &[probe],
+                )
+                .await
+            {
+                Ok(rows) => rows.iter().map(|r| r.get(0)).collect(),
+                Err(e) => {
+                    let message = e.as_db_error().map(|d| d.message().to_string());
+                    assert!(
+                        message
+                            .as_deref()
+                            .is_some_and(|m| m.contains("no partition")),
+                        "{probe:?}: {e}"
+                    );
+                    Vec::new()
+                }
+            };
+            txn.batch_execute("rollback to savepoint probe")
+                .await
+                .expect("rollback to savepoint");
+            for (node, text) in &nodes {
+                let text = text.clone().expect("a non-root node has a text");
+                let predicate = route_predicate(&Route::Text(text.clone()), &columns);
+                let routes: bool = txn
+                    .query_one(
+                        &format!(
+                            "select {predicate} from (select $1::text::{column} as \"t\") as p"
+                        ),
+                        &[probe],
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{predicate}: {e}"))
+                    .get(0);
+                if routes != routed.contains(node) {
+                    wrong.push(format!(
+                        "{probe:?} on {node}: routed {routes}, Postgres {routed:?}, by {predicate}"
+                    ));
+                }
+            }
+        }
+        txn.rollback().await.expect("roll back");
+        wrong
+    }
+
+    /// A column partitioned by two levels of one tree under different
+    /// collations routes as Postgres does, whichever level's key
+    /// [`route_columns_named`] presents it under, the column's own collation
+    /// the same as either level's or as neither's, and a level under the
+    /// type's own collation, whose text names none (#1084).
+    #[tokio::test]
+    async fn a_column_partitioned_under_two_collations_routes_as_postgres_does() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let probes = [
+            "A", "B", "Z", "a", "b", "c", "m", "M", "n", "N", "z", "Z", "_", "0", "\u{e9}", "E",
+            "aa", "AB", "",
+        ];
+        let leaves = "create table public.items_m partition of public.items \
+                          for values from ('B') to ('n') \
+                          partition by range ({middle}); \
+                      create table public.items_m0 partition of public.items_m \
+                          for values from ('B') to ('L'); \
+                      create table public.items_m1 partition of public.items_m \
+                          for values from ('L') to ('m'); \
+                      create table public.items_md partition of public.items_m default; \
+                      create table public.items_lo partition of public.items \
+                          for values from (minvalue) to ('B'); \
+                      create table public.items_hi partition of public.items \
+                          for values from ('n') to (maxvalue);";
+        client
+            .batch_execute("create domain public.c_text as text collate \"C\"")
+            .await
+            .expect("a domain");
+        let c = "t collate \"C\"";
+        let icu = "t collate \"en-US-x-icu\"";
+        let default = "t collate \"default\"";
+        let mut wrong = Vec::new();
+        for column in [
+            "text",
+            "text collate \"C\"",
+            "text collate \"en-US-x-icu\"",
+            "public.c_text",
+        ] {
+            // `t` alone is the column's own collation, and `default` the
+            // database's: a level whose text names none when it is the type's.
+            for (root, middle) in [
+                (c, icu),
+                (icu, c),
+                (c, "t"),
+                ("t", c),
+                (icu, "t"),
+                ("t", icu),
+                (c, default),
+                (default, c),
+            ] {
+                let ddl = format!(
+                    "create table public.items (t {column}) partition by range ({root}); {}",
+                    leaves.replace("{middle}", middle)
+                );
+                wrong.extend(route_disagreements(&mut client, &ddl, column, &probes).await);
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 }
