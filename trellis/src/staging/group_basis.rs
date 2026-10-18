@@ -536,9 +536,9 @@ impl GroupTargetPlan {
     fn sides_sql() -> &'static str {
         "raw as (select x::jsonb as r from unnest($1::text[]) as u(x)), \
          sides as ( \
-             select (r ->> 't')::xid8 as txid, (r ->> 'l')::pg_lsn as lsn, -1 as sgn, \
+             select (r ->> 't')::xid8 as __txid, (r ->> 'l')::pg_lsn as __lsn, -1 as __sgn, \
                     case when jsonb_typeof(r -> 'x') = 'object' then r -> 'x' -> 'old' \
-                         else r -> 'o' end as i \
+                         else r -> 'o' end as __i \
              from raw \
              union all \
              select (r ->> 't')::xid8, (r ->> 'l')::pg_lsn, 1, \
@@ -601,13 +601,13 @@ impl GroupTargetPlan {
             .zip(&self.shape.group_types)
             .map(|(c, t)| format!("{} {t}", quote_ident(c)))
             .collect();
-        columns.push("txid xid8".to_string());
-        columns.push("lsn pg_lsn".to_string());
-        columns.push("n bigint".to_string());
+        columns.push("__txid xid8".to_string());
+        columns.push("__lsn pg_lsn".to_string());
+        columns.push("__n bigint".to_string());
         for (i, arg) in self.shape.args.iter().enumerate() {
-            columns.push(format!("c{} bigint", i + 1));
+            columns.push(format!("__c{} bigint", i + 1));
             if arg.summed {
-                columns.push(format!("s{} numeric", i + 1));
+                columns.push(format!("__s{} numeric", i + 1));
             }
         }
         format!(
@@ -625,22 +625,22 @@ impl GroupTargetPlan {
     fn stage_sql(&self) -> String {
         let cols = quoted(&self.shape.group_cols).join(", ");
         let mut values = self.group_values();
-        values.push("sd.txid".to_string());
-        values.push("sd.lsn".to_string());
-        values.push("sd.sgn".to_string());
-        let mut sums = vec!["sum(sgn)::bigint".to_string()];
+        values.push("sd.__txid".to_string());
+        values.push("sd.__lsn".to_string());
+        values.push("sd.__sgn".to_string());
+        let mut sums = vec!["sum(__sgn)::bigint".to_string()];
         for (i, arg) in self.shape.args.iter().enumerate() {
             let i = i + 1;
-            values.push(format!("{} as a{i}", arg.sql));
-            sums.push(format!("sum(sgn * (a{i} is not null)::int)::bigint"));
+            values.push(format!("{} as __a{i}", arg.sql));
+            sums.push(format!("sum(__sgn * (__a{i} is not null)::int)::bigint"));
             if arg.summed {
-                sums.push(format!("sum(sgn * coalesce(a{i}, 0)::numeric)"));
+                sums.push(format!("sum(__sgn * coalesce(__a{i}, 0)::numeric)"));
             }
         }
         format!(
             "with {sides}, \
              bad as ( \
-                 select count(*) as c from raw \
+                 select count(*) as __bad from raw \
                  where r ->> 'op' = 'recompute' \
                     or (jsonb_typeof(r -> 'x') is distinct from 'object' \
                         and ((r ->> 'op' in ('update', 'delete') \
@@ -650,16 +650,16 @@ impl GroupTargetPlan {
              ), \
              ev as ( \
                  select {values} \
-                 from sides sd cross join lateral jsonb_populate_record(null::{src}, sd.i) as s \
-                 where jsonb_typeof(sd.i) = 'object' \
+                 from sides sd cross join lateral jsonb_populate_record(null::{src}, sd.__i) as s \
+                 where jsonb_typeof(sd.__i) = 'object' \
              ), \
              staged as ( \
                  insert into {staged} \
-                 select {cols}, txid, lsn, {sums} from ev \
-                 where (select c from bad) = 0 \
-                 group by {cols}, txid, lsn \
+                 select {cols}, __txid, __lsn, {sums} from ev \
+                 where (select __bad from bad) = 0 \
+                 group by {cols}, __txid, __lsn \
              ) \
-             select c from bad",
+             select __bad from bad",
             sides = Self::sides_sql(),
             values = values.join(", "),
             src = self.source_row,
@@ -756,24 +756,24 @@ impl GroupTargetPlan {
         let col_list = cols.join(", ");
         let args = &self.shape.args;
         // The per-(group, transaction) sums of each partial.
-        let mut sums = vec!["sum(n)::bigint as n".to_string()];
-        let mut totals = vec!["sum(n)::bigint as n".to_string()];
-        let mut sets = vec!["__n = u.__n + t.n".to_string()];
-        let mut nonzero = vec!["t.n <> 0".to_string()];
-        let mut returning = vec!["t.n as dn".to_string(), "u.__n as nn".to_string()];
+        let mut sums = vec!["sum(__n)::bigint as __n".to_string()];
+        let mut totals = vec!["sum(__n)::bigint as __n".to_string()];
+        let mut sets = vec!["__n = u.__n + t.__n".to_string()];
+        let mut nonzero = vec!["t.__n <> 0".to_string()];
+        let mut returning = vec!["t.__n as __dn".to_string(), "u.__n as __nn".to_string()];
         for (i, arg) in args.iter().enumerate() {
             let i = i + 1;
-            sums.push(format!("sum(c{i})::bigint as c{i}"));
-            totals.push(format!("sum(c{i})::bigint as c{i}"));
-            sets.push(format!("__count_{i} = u.__count_{i} + t.c{i}"));
-            nonzero.push(format!("t.c{i} <> 0"));
-            returning.push(format!("t.c{i} as dc{i}, u.__count_{i} as nc{i}"));
+            sums.push(format!("sum(__c{i})::bigint as __c{i}"));
+            totals.push(format!("sum(__c{i})::bigint as __c{i}"));
+            sets.push(format!("__count_{i} = u.__count_{i} + t.__c{i}"));
+            nonzero.push(format!("t.__c{i} <> 0"));
+            returning.push(format!("t.__c{i} as __dc{i}, u.__count_{i} as __nc{i}"));
             if arg.summed {
-                sums.push(format!("sum(s{i}) as s{i}"));
-                totals.push(format!("sum(s{i}) as s{i}"));
-                sets.push(format!("__sum_{i} = u.__sum_{i} + t.s{i}"));
-                nonzero.push(format!("t.s{i} <> 0"));
-                returning.push(format!("t.s{i} as ds{i}, u.__sum_{i} as ns{i}"));
+                sums.push(format!("sum(__s{i}) as __s{i}"));
+                totals.push(format!("sum(__s{i}) as __s{i}"));
+                sets.push(format!("__sum_{i} = u.__sum_{i} + t.__s{i}"));
+                nonzero.push(format!("t.__s{i} <> 0"));
+                returning.push(format!("t.__s{i} as __ds{i}, u.__sum_{i} as __ns{i}"));
             }
         }
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
@@ -781,25 +781,25 @@ impl GroupTargetPlan {
             .iter()
             .map(|c| format!("array[sg.{c}] = array[b.{c}]"))
             .collect();
-        let new_fields = self.fields_lateral("nf", "up.nn", &|i| format!("up.nc{i}"), &|i| {
-            format!("up.ns{i}")
+        let new_fields = self.fields_lateral("__nf", "up.__nn", &|i| format!("up.__nc{i}"), &|i| {
+            format!("up.__ns{i}")
         });
         let prior_fields = self.fields_lateral(
-            "pf",
-            "(up.nn - up.dn)",
-            &|i| format!("(up.nc{i} - up.dc{i})"),
-            &|i| format!("(up.ns{i} - up.ds{i})"),
+            "__pf",
+            "(up.__nn - up.__dn)",
+            &|i| format!("(up.__nc{i} - up.__dc{i})"),
+            &|i| format!("(up.__ns{i} - up.__ds{i})"),
         );
         let field_count = self.shape.fields.len();
-        let nf: Vec<String> = (0..field_count).map(|j| format!("nf.nf{j}")).collect();
-        let pf: Vec<String> = (0..field_count).map(|j| format!("pf.pf{j}")).collect();
+        let nf: Vec<String> = (0..field_count).map(|j| format!("__nf.__nf{j}")).collect();
+        let pf: Vec<String> = (0..field_count).map(|j| format!("__pf.__pf{j}")).collect();
         let field_names: Vec<String> = self
             .shape
             .fields
             .iter()
             .map(|(name, _, _)| quote_ident(name))
             .collect();
-        let vis_new: Vec<String> = (0..field_count).map(|j| format!("nf{j}")).collect();
+        let vis_new: Vec<String> = (0..field_count).map(|j| format!("__nf{j}")).collect();
         let field_updates: Vec<String> = field_names
             .iter()
             .map(|f| format!("{f} = excluded.{f}"))
@@ -821,7 +821,7 @@ impl GroupTargetPlan {
                         } else if let Some(j) =
                             self.shape.fields.iter().position(|(n, _, _)| n == column)
                         {
-                            format!("vis.pf{j}")
+                            format!("vis.__pf{j}")
                         } else {
                             "null".to_string()
                         };
@@ -829,60 +829,60 @@ impl GroupTargetPlan {
                     })
                     .collect();
                 format!(
-                    "case when vis.nn - vis.dn > 0 then jsonb_build_object({})::text end",
+                    "case when vis.__nn - vis.__dn > 0 then jsonb_build_object({})::text end",
                     pairs.join(", ")
                 )
             }
             None => "null::text".to_string(),
         };
-        let mut applied: Vec<String> = vec!["vis.dn".to_string()];
+        let mut applied: Vec<String> = vec!["vis.__dn".to_string()];
         for (i, arg) in args.iter().enumerate() {
-            applied.push(format!("vis.dc{}", i + 1));
+            applied.push(format!("vis.__dc{}", i + 1));
             if arg.summed {
-                applied.push(format!("vis.ds{}::text", i + 1));
+                applied.push(format!("vis.__ds{}::text", i + 1));
             }
         }
         format!(
             "with sg as ( \
-                 select {col_list}, txid, {sums} from {staged} \
-                 where lsn > coalesce( \
+                 select {col_list}, __txid, {sums} from {staged} \
+                 where __lsn > coalesce( \
                      (select floor from ledger_truncate_floor where target_table = $1), \
                      '0/0'::pg_lsn) \
-                 group by {col_list}, txid \
+                 group by {col_list}, __txid \
              ), \
              pg as (select distinct {col_list} from sg), \
              b as ( \
-                 select pg.*, h.hc, h.basis from pg \
-                 cross join lateral {lookup_hidden} as h(hc, basis) \
+                 select pg.*, h.__hc, h.__basis from pg \
+                 cross join lateral {lookup_hidden} as h(__hc, __basis) \
              ), \
              f as ( \
-                 select sg.*, b.hc from sg join b on {matched} \
-                 where b.basis is null or not pg_visible_in_snapshot(sg.txid, b.basis) \
+                 select sg.*, b.__hc from sg join b on {matched} \
+                 where b.__basis is null or not pg_visible_in_snapshot(sg.__txid, b.__basis) \
              ), \
-             t as (select hc, {totals} from f group by hc), \
+             t as (select __hc, {totals} from f group by __hc), \
              up as ( \
                  update {hidden} u set {sets} from t \
-                 where u.ctid = t.hc and ({nonzero}) \
+                 where u.ctid = t.__hc and ({nonzero}) \
                  returning {up_groups}, {returning} \
              ), \
              vis as ( \
                  select up.*, {nf_pf}, \
-                        (up.nn > 0, {nf_cols}) is distinct from \
-                            (up.nn - up.dn > 0, {pf_cols}) as changed \
+                        (up.__nn > 0, {nf_cols}) is distinct from \
+                            (up.__nn - up.__dn > 0, {pf_cols}) as __changed \
                  from up cross join {new_fields} cross join {prior_fields} \
              ), \
              written as ( \
                  insert into {target} ({col_list}{field_list}) \
-                 select {col_list}{vis_new} from vis where changed and nn > 0 \
+                 select {col_list}{vis_new} from vis where __changed and __nn > 0 \
                  order by {col_list} \
                  on conflict ({col_list}) {upsert_action} \
              ), \
              deleted as ( \
                  delete from {target} where ctid = any(array( \
-                     select h.c from vis cross join lateral {lookup_target} as h(c) \
-                     where vis.changed and vis.nn <= 0 and vis.nn - vis.dn > 0)) \
+                     select h.__c from vis cross join lateral {lookup_target} as h(__c) \
+                     where vis.__changed and vis.__nn <= 0 and vis.__nn - vis.__dn > 0)) \
              ) \
-             select {key}, vis.changed, vis.nn > 0, vis.nn - vis.dn > 0, {prior_image}, \
+             select {key}, vis.__changed, vis.__nn > 0, vis.__nn - vis.__dn > 0, {prior_image}, \
                     {applied} \
              from vis",
             staged = self.staged,

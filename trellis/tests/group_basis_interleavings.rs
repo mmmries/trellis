@@ -207,6 +207,29 @@ async fn a_page_that_changes_nothing_writes_nothing() {
     assert_oracle(&mut d).await;
 }
 
+/// #1096 decision 7: a page that changes a group's partials but no visible
+/// value writes the hidden row and leaves the visible row alone. A `NULL`
+/// `v` changes the row count, which no field shows.
+#[tokio::test]
+async fn a_page_that_changes_only_hidden_partials_leaves_the_visible_row() {
+    let mut d = start_with(
+        "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total",
+        "create table public.src (id integer primary key, g integer, v integer)",
+        &[("id", int4()), ("g", int4()), ("v", int4())],
+        "",
+    )
+    .await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    let before = d.rows("select xmin::text from public.agg").await;
+    step(&mut d, "insert into public.src values (2, 1, null)").await;
+    assert_eq!(partials(&d, 1).await, ["(2,1,10,f)"]);
+    assert_eq!(d.rows("select xmin::text from public.agg").await, before);
+    assert_eq!(
+        d.rows("select g, total from public.agg").await,
+        d.rows("select g, sum(v) from public.src group by g").await
+    );
+}
+
 /// #1096 decision 1: composed fields and expression arguments, without
 /// `MIN`/`MAX` (the ledger's
 /// `composed_fields_and_expression_arguments_equal_postgres`).
@@ -266,6 +289,56 @@ async fn numeric_sums_and_averages_keep_the_declared_scale() {
     ] {
         step(&mut d, sql).await;
         assert_eq!(d.rows(actual).await, d.rows(expected).await, "after {sql}");
+    }
+}
+
+/// `GROUP BY` columns may take any name outside the reserved `__` prefix,
+/// including the names the apply's own statements could use for their
+/// working columns (`n`, `txid`, `lsn`, `hc`, `basis`, `nn`, `c1`, `a1`),
+/// and a field may read a group column beside its aggregates.
+#[tokio::test]
+async fn group_columns_named_like_the_applys_working_columns() {
+    let names = ["n", "txid", "lsn", "hc", "basis", "nn", "c1", "a1"];
+    let columns: Vec<(&str, ValueType)> = std::iter::once(("id", int4()))
+        .chain(names.iter().map(|name| (*name, int4())))
+        .chain(std::iter::once(("v", int4())))
+        .collect();
+    let group = names.join(", ");
+    let mut d = start_with(
+        &format!(
+            "TRANSFORM agg FROM public.src GROUP BY {group} \
+             SELECT SUM(v) AS total, COUNT(v) AS nv, n + COUNT(*) AS np"
+        ),
+        &format!(
+            "create table public.src (id integer primary key, {}, v integer)",
+            names
+                .iter()
+                .map(|name| format!("{name} integer"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        &columns,
+        "",
+    )
+    .await;
+    let actual = format!("select {group}, total, nv, np from public.agg order by {group}");
+    let expected = format!(
+        "select {group}, sum(v), count(v), n + count(*) from public.src \
+         group by {group} order by {group}"
+    );
+    for sql in [
+        "insert into public.src values (1, 1, 2, 3, 4, 5, 6, 7, 8, 10), \
+                                       (2, 1, 2, 3, 4, 5, 6, 7, 8, 5), \
+                                       (3, null, 2, 3, 4, 5, 6, 7, 8, null)",
+        "update public.src set n = 2, v = 1 where id = 1",
+        "delete from public.src where id = 2",
+    ] {
+        step(&mut d, sql).await;
+        assert_eq!(
+            d.rows(&actual).await,
+            d.rows(&expected).await,
+            "after {sql}"
+        );
     }
 }
 
