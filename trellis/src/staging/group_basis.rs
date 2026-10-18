@@ -524,6 +524,43 @@ pub(crate) struct GroupTargetPlan {
     pushed: bool,
 }
 
+/// The columns of a plan's staging table, as DDL.
+fn staged_columns(shape: &GroupShape) -> Vec<String> {
+    let mut columns: Vec<String> = shape
+        .group_cols
+        .iter()
+        .zip(&shape.group_types)
+        .map(|(c, t)| format!("{} {t}", quote_ident(c)))
+        .collect();
+    columns.push("__txid xid8".to_string());
+    columns.push("__lsn pg_lsn".to_string());
+    columns.push("__n bigint".to_string());
+    for (i, arg) in shape.args.iter().enumerate() {
+        columns.push(format!("__c{} bigint", i + 1));
+        if arg.summed {
+            columns.push(format!("__s{} numeric", i + 1));
+        }
+    }
+    columns
+}
+
+/// A short stable hash of the staging table's columns. The table is a
+/// session temp table, and the pool keeps its connections, so a connection
+/// keeps the table it first created under a name. Putting the shape in the
+/// name means a definition whose group column was re-typed (a resume re-reads
+/// the types under the same id) gets a new table; the old one is never
+/// touched again and goes with its session. 64 bits keep two shapes of one
+/// definition from sharing a name, and the name within Postgres's 63 bytes
+/// for any `i64` id.
+fn staged_shape_hash(shape: &GroupShape) -> u64 {
+    // FNV-1a: fixed by definition, unlike `DefaultHasher`.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in staged_columns(shape).join(",").bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 impl GroupTargetPlan {
     pub(crate) fn new(
         catalog_schema: &str,
@@ -540,7 +577,10 @@ impl GroupTargetPlan {
             hidden_ident: hidden_table_ident(catalog_schema, definition_id),
             staged: format!(
                 "pg_temp.{}",
-                quote_ident(&format!("trellis_group_sides_{definition_id}"))
+                quote_ident(&format!(
+                    "trellis_group_sides_{definition_id}_{:016x}",
+                    staged_shape_hash(&shape)
+                ))
             ),
             recomputed: format!(
                 "pg_temp.{}",
@@ -659,26 +699,10 @@ impl GroupTargetPlan {
     /// statement) of the page with each partial's signed sum. Created once a
     /// session; its rows go with each page's transaction.
     fn staged_ddl(&self) -> String {
-        let mut columns: Vec<String> = self
-            .shape
-            .group_cols
-            .iter()
-            .zip(&self.shape.group_types)
-            .map(|(c, t)| format!("{} {t}", quote_ident(c)))
-            .collect();
-        columns.push("__txid xid8".to_string());
-        columns.push("__lsn pg_lsn".to_string());
-        columns.push("__n bigint".to_string());
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            columns.push(format!("__c{} bigint", i + 1));
-            if arg.summed {
-                columns.push(format!("__s{} numeric", i + 1));
-            }
-        }
         format!(
             "create temp table if not exists {} ({}) on commit delete rows",
             self.staged.trim_start_matches("pg_temp."),
-            columns.join(", ")
+            staged_columns(&self.shape).join(", ")
         )
     }
 
@@ -1542,6 +1566,111 @@ mod tests {
         ] {
             assert!(shape(text).is_none(), "{text}");
         }
+    }
+
+    /// A session keeps the temp table it created under a name, and a resume
+    /// keeps the definition id while re-reading the column types: the name
+    /// must change with the shape, or a connection reuses the old table.
+    #[test]
+    fn the_staging_table_name_follows_its_shape() {
+        let text = "TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s";
+        let name = |cols: &HashMap<String, ValueType>| {
+            let def = crate::defs::parse(text).expect("parses");
+            let shape = shape_of(&def, cols).expect("admitted");
+            GroupTargetPlan::new("trellis", 7, "public.t", "public.s", Vec::new(), shape).staged
+        };
+        let int4 = columns();
+        let mut int8 = columns();
+        int8.insert("g".to_string(), ValueType::Integer(IntWidth::Int8));
+        assert_eq!(name(&int4), name(&columns()));
+        assert_ne!(name(&int4), name(&int8));
+        assert!(name(&int4).starts_with("pg_temp.\"trellis_group_sides_7_"));
+        let def = crate::defs::parse(text).expect("parses");
+        let shape = shape_of(&def, &int4).expect("admitted");
+        let longest = GroupTargetPlan::new(
+            "trellis",
+            i64::MIN,
+            "public.t",
+            "public.s",
+            Vec::new(),
+            shape,
+        )
+        .staged;
+        let bare = longest
+            .trim_start_matches("pg_temp.\"")
+            .trim_end_matches('"');
+        assert!(bare.len() <= 63, "{bare} fits a Postgres identifier");
+    }
+
+    /// One page staged and locked on `client` for definition 7 over the
+    /// source columns `cols`, after recreating its hidden table for that
+    /// shape: one insert of group `g`. Returns the hidden table's groups.
+    async fn stage_one_page(
+        client: &mut tokio_postgres::Client,
+        cols: &HashMap<String, ValueType>,
+        g: i64,
+    ) -> Vec<i64> {
+        let schema = crate::config::DEFAULT_SCHEMA;
+        let def =
+            crate::defs::parse("TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s").expect("parses");
+        let shape = shape_of(&def, cols).expect("admitted");
+        let mut plan =
+            GroupTargetPlan::new(schema, 7, "public.t", "public.s", Vec::new(), shape.clone());
+        plan.sides = vec![format!(
+            r#"{{"op":"insert","t":"100","l":"0/10","n":{{"id":1,"g":{g},"a":5}}}}"#
+        )];
+        let txn = client.transaction().await.expect("begin");
+        txn.batch_execute(&format!(
+            "{}; {}",
+            drop_hidden_table_sql(schema, 7),
+            hidden_table_ddl(schema, 7, &shape)
+        ))
+        .await
+        .expect("hidden table");
+        if let Err(error) = lock_groups(&txn, &plan).await {
+            panic!("staging group {g}: {error:?}");
+        }
+        let groups = txn
+            .query(&format!("select g::bigint from {}", plan.hidden_ident), &[])
+            .await
+            .expect("hidden rows")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        txn.commit().await.expect("commit");
+        groups
+    }
+
+    /// The same connection stages a page for one definition id under two
+    /// shapes, as after a resume that re-typed the group column (resume is
+    /// refused on the group basis until #1101, so the hidden table and the
+    /// plan are rebuilt here by hand): the second page's group, out of the
+    /// first shape's range, stages into a table of its own type.
+    #[tokio::test]
+    async fn a_session_stages_a_retyped_group_into_a_table_of_its_shape() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute("create table public.s (id integer primary key, g integer, a integer)")
+            .await
+            .expect("source");
+        assert_eq!(stage_one_page(&mut client, &columns(), 1).await, [1]);
+        client
+            .batch_execute("alter table public.s alter column g type bigint")
+            .await
+            .expect("re-type the group column");
+        let mut int8 = columns();
+        int8.insert("g".to_string(), ValueType::Integer(IntWidth::Int8));
+        assert_eq!(
+            stage_one_page(&mut client, &int8, 5_000_000_000).await,
+            [5_000_000_000]
+        );
     }
 
     #[test]
