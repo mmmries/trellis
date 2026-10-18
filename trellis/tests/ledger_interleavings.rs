@@ -803,6 +803,7 @@ async fn a_truncate_without_an_lsn_halts_instead_of_clearing_without_a_floor() {
         ends_in_delete: false,
         last_change: None,
         to_col_values: Vec::new(),
+        group_sides: Vec::new(),
     };
     let err = apply::compute(d.pool(), &[truncate])
         .await

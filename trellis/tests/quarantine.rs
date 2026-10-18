@@ -1537,6 +1537,7 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
         ends_in_delete: false,
         last_change: None,
         to_col_values: Vec::new(),
+        group_sides: Vec::new(),
     }];
 
     let result = isolate_and_evict(
@@ -1621,6 +1622,7 @@ async fn isolate_and_evict_never_probes_or_poisons_a_deferred_relationship_rever
         ends_in_delete: false,
         last_change: None,
         to_col_values: Vec::new(),
+        group_sides: Vec::new(),
     }];
 
     let result = isolate_and_evict(
@@ -1878,6 +1880,7 @@ fn unevaluable_change(src_table: &str, key: &str) -> FoldedChange {
             row_txid: "1".to_string(),
         }),
         to_col_values: Vec::new(),
+        group_sides: Vec::new(),
     }
 }
 

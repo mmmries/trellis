@@ -89,6 +89,13 @@ pub mod staging {
     /// `await_converged`, for a harness that must re-check the ring once
     /// without starting another wait.
     pub use crate::staging::converge::converged_through;
+    /// The group-basis dev knob (#1100): tests and `benchmark` turn the group
+    /// basis on for admitted aggregates, once, before a client starts. See
+    /// `staging::group_basis`'s module doc for what it supports until the
+    /// ledger is deleted (#1105), which deletes the knob too.
+    pub use crate::staging::group_basis::{
+        KNOB_ENV as GROUP_BASIS_ENV, enabled as group_basis_enabled, set_enabled as set_group_basis,
+    };
     /// One pass of the `self_check` worker task, for a harness that runs no
     /// drain workers (so no such task) and hand-drives the job it started
     /// through `Trellis::self_check` (#1023), the way `ManualBackend` drains

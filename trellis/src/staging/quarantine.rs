@@ -134,9 +134,9 @@ pub enum FailureClass {
 pub fn classify(err: &ApplyError) -> FailureClass {
     match innermost_apply_error(err) {
         ApplyError::VersionFenceMiss { .. } => FailureClass::VersionFenceMiss,
-        ApplyError::HopBoundExceeded { .. } | ApplyError::AggregateOffLedger { .. } => {
-            FailureClass::Halting
-        }
+        ApplyError::HopBoundExceeded { .. }
+        | ApplyError::AggregateOffLedger { .. }
+        | ApplyError::GroupBasisUnsupported { .. } => FailureClass::Halting,
         // A truncate the drain can't raise a floor for (#774) is no key's
         // fault: every page holding it reproduces it.
         ApplyError::TruncateWithoutLsn { .. } => FailureClass::Halting,
@@ -6425,6 +6425,7 @@ mod unit_tests {
             ends_in_delete: false,
             last_change: None,
             to_col_values: Vec::new(),
+            group_sides: Vec::new(),
         }
     }
 

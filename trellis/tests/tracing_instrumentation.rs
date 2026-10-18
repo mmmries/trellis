@@ -461,6 +461,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
             row_txid: "1".to_string(),
         }),
         to_col_values: Vec::new(),
+        group_sides: Vec::new(),
     }];
 
     let result = isolate_and_evict(

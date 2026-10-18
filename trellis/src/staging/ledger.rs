@@ -295,7 +295,8 @@ impl LedgerShape {
 }
 
 /// Whether `def` is a target the ledger path maintains (see the module doc),
-/// and its shape if so. `relationships` are `def`'s, resolved
+/// and its shape if so. An aggregate the group basis takes
+/// ([`super::group_basis::route`], behind its dev knob, #1100) is not. `relationships` are `def`'s, resolved
 /// (`catalog::resolve_relationships`): a definition reading one that isn't
 /// there, or isn't to-one, is refused.
 ///
@@ -314,6 +315,9 @@ pub(crate) fn route(
     let KeySpace::Aggregate { group_by } = &def.key_space else {
         return None;
     };
+    if super::group_basis::route(def, source_columns).is_some() {
+        return None;
+    }
     let mut joined: Vec<&str> = Vec::new();
     for (rel, column) in eval::relationship_references(def) {
         let resolved = relationships.get(&rel)?;

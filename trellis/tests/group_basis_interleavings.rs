@@ -1,0 +1,558 @@
+//! Deterministic interleavings of the drain on a group-basis aggregate
+//! (#1100 G2a, ADR-0002 "Aggregates: a basis per group, kept by deltas").
+//!
+//! Every test in this binary turns the group-basis dev knob on
+//! (`trellis::dev::staging::set_group_basis`) before its driver starts; the
+//! knob is process-wide, and no test here wants the ledger. Each test drives
+//! one interleaving by hand through `support/drain_driver.rs`, and none
+//! sleeps or polls for convergence (#297). Every source starts empty (the
+//! knob's build only accepts an empty source until #1101) and is seeded
+//! through capture.
+//!
+//! The scenarios are #1043 E1's, at group granularity: R1 (a page reads a
+//! group's basis after locking it), R2 (each side is checked against its own
+//! group's basis, per transaction), F2 (sides are never folded per key), R3
+//! (nested writes stage exact transition images, #1099), R7 (pages lock
+//! groups in one sorted statement and never deadlock), and decision 4's
+//! transient states (a group is visible only while its row count is above
+//! 0). An absolute write, which only the build and recompute (#1101, #1102)
+//! make, is planted by [`recompute`]: the model's locked group recompute.
+
+#[path = "support/drain_driver.rs"]
+mod drain_driver;
+
+use drain_driver::Driver;
+use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::ValueType;
+use trellis::integer::IntWidth;
+use trellis::staging::interleave::PausePoint;
+
+const SRC: &str = "public.src";
+const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const ACTUAL: &str = "select g, total, n from public.agg order by g";
+const EXPECTED: &str = "select g, sum(v), count(*) from public.src group by g order by g";
+
+fn int4() -> ValueType {
+    ValueType::Integer(IntWidth::Int4)
+}
+
+/// `public.src (id, g, v)`, empty, with `definition` live over it on the
+/// group basis, captured by triggers. `app` runs after the source's DDL
+/// (an application trigger, say).
+async fn start_with(
+    definition: &str,
+    source_ddl: &str,
+    columns: &[(&str, ValueType)],
+    app: &str,
+) -> Driver {
+    trellis::dev::staging::set_group_basis(true);
+    let d = Driver::start(
+        &format!("{source_ddl}; {app}"),
+        columns,
+        &[definition],
+        &[SRC],
+    )
+    .await;
+    let hidden = scalar(
+        &d,
+        &format!(
+            "select count(*) from pg_tables where schemaname = '{DEFAULT_SCHEMA}' \
+             and tablename like 'agg\\_%'"
+        ),
+    )
+    .await;
+    assert_eq!(hidden, "1", "the definition is on the group basis");
+    d
+}
+
+/// `sql`'s one value, as text.
+async fn scalar(d: &Driver, sql: &str) -> String {
+    let rows = d.rows(sql).await;
+    assert_eq!(rows.len(), 1, "{sql}: {rows:?}");
+    rows[0].trim_matches(|c| c == '(' || c == ')').to_string()
+}
+
+async fn start() -> Driver {
+    start_with(
+        AGG,
+        "create table public.src (id integer primary key, g integer, v integer)",
+        &[("id", int4()), ("g", int4()), ("v", int4())],
+        "",
+    )
+    .await
+}
+
+async fn write(d: &Driver, sql: &str) {
+    d.user().await.batch_execute(sql).await.expect(sql);
+}
+
+/// Writes `sql` and drains it as one sealed page.
+async fn step(d: &mut Driver, sql: &str) {
+    write(d, sql).await;
+    let batch = d.seal().await;
+    d.drain(batch, "step").await;
+}
+
+/// Settles the pipeline and asserts the target equals the oracle.
+async fn assert_oracle(d: &mut Driver) {
+    d.settle().await;
+    assert_eq!(
+        d.rows(ACTUAL).await,
+        d.rows(EXPECTED).await,
+        "the target (left) differs from the oracle (right)"
+    );
+}
+
+/// The hidden table of the one definition, qualified.
+async fn hidden(d: &Driver) -> String {
+    let id = scalar(
+        d,
+        "select id from transform_definitions where target_table = 'public.agg'",
+    )
+    .await;
+    format!("{DEFAULT_SCHEMA}.agg_{id}")
+}
+
+/// The hidden partials of group `g`: `(n, count, sum, has basis)`.
+async fn partials(d: &Driver, g: i32) -> Vec<String> {
+    d.rows(&format!(
+        "select __n, __count_1, __sum_1, __basis is not null from {} where g = {g}",
+        hidden(d).await
+    ))
+    .await
+}
+
+/// A locked group recompute of `groups`, the absolute write #1102 will
+/// make: lock the groups in one sorted statement, then one statement takes
+/// the snapshot, `GROUP BY`s the source and writes the partials, the basis
+/// and the visible rows. Runs on its own connection and is left open; the
+/// caller commits it with [`Recompute::commit`].
+struct Recompute {
+    client: tokio_postgres::Client,
+    pid: i32,
+}
+
+impl Recompute {
+    async fn commit(self) {
+        self.client.batch_execute("commit").await.expect("commit");
+    }
+}
+
+async fn recompute(d: &Driver, groups: &[i32]) -> Recompute {
+    let hidden = hidden(d).await;
+    let client = d.user().await;
+    let pid: i32 = client
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("pid")
+        .get(0);
+    let groups = groups
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    client
+        .batch_execute(&format!(
+            "begin; \
+             insert into {hidden} (g) select g from unnest(array[{groups}]) g order by g \
+                 on conflict (g) do update set __n = excluded.__n where false; \
+             with a as ( \
+                 select x.g, count(s.id) as n, count(s.v) as c, coalesce(sum(s.v), 0) as s \
+                 from unnest(array[{groups}]) x(g) \
+                 left join public.src s on s.g = x.g group by x.g), \
+             h as ( \
+                 update {hidden} h set __n = a.n, __count_1 = a.c, __sum_1 = a.s, \
+                     __basis = pg_current_snapshot() \
+                 from a where h.g = a.g returning h.g) \
+             delete from public.agg where g in (select g from h); \
+             insert into public.agg (g, total, n) \
+             select g, case when __count_1 = 0 then null else __sum_1 end, __n \
+             from {hidden} where g in ({groups}) and __n > 0"
+        ))
+        .await
+        .expect("the recompute");
+    Recompute { client, pid }
+}
+
+// ------------------------------------------------------------------ apply
+
+/// Inserts, updates, group moves, `NULL` arguments and deletes, each its own
+/// page, against Postgres over the source.
+#[tokio::test]
+async fn pages_keep_count_and_sum_exact() {
+    let mut d = start().await;
+    for sql in [
+        "insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, null), (4, null, 7)",
+        "update public.src set v = 20 where id = 1",
+        "update public.src set g = 2 where id = 2",
+        "update public.src set v = null where id = 1; insert into public.src values (5, 3, 1)",
+        "delete from public.src where id in (3, 4)",
+        "update public.src set g = null where id = 5",
+    ] {
+        step(&mut d, sql).await;
+        assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await, "after {sql}");
+    }
+    assert_oracle(&mut d).await;
+}
+
+/// A page whose sides change nothing visible leaves the visible row
+/// unwritten: an update that keeps the group and the value nets to zero.
+#[tokio::test]
+async fn a_page_that_changes_nothing_writes_nothing() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    let before = d.rows("select xmin::text from public.agg").await;
+    step(&mut d, "update public.src set v = v where id = 1").await;
+    assert_eq!(d.rows("select xmin::text from public.agg").await, before);
+    assert_oracle(&mut d).await;
+}
+
+/// #1096 decision 1: composed fields and expression arguments, without
+/// `MIN`/`MAX` (the ledger's
+/// `composed_fields_and_expression_arguments_equal_postgres`).
+#[tokio::test]
+async fn composed_fields_and_expression_arguments_equal_postgres() {
+    let mut d = start_with(
+        "TRANSFORM agg FROM public.src GROUP BY g \
+         SELECT SUM(a) + COUNT(b) AS mixed, SUM(a + b) AS ab, AVG(a) AS mean, \
+                COALESCE(SUM(b), 0) AS sb, SUM(a) > COUNT(b) AS apart, COUNT(a + b) AS nab, \
+                COUNT(*) AS n",
+        "create table public.src (id integer primary key, g integer, a integer, b integer)",
+        &[("id", int4()), ("g", int4()), ("a", int4()), ("b", int4())],
+        "",
+    )
+    .await;
+    let actual = "select g, mixed::text, ab::text, mean::text, sb::text, apart, nab, n \
+                  from public.agg order by g";
+    let expected = "select g, (sum(a) + count(b))::text, sum(a + b)::text, avg(a)::text, \
+                           coalesce(sum(b), 0::numeric)::text, sum(a) > count(b), \
+                           count(a + b), count(*) \
+                    from public.src group by g order by g";
+    for sql in [
+        "insert into public.src values (1, 1, 1, 10), (2, 1, 5, null), (3, 2, null, null), \
+                                       (4, 2, 2, 3)",
+        "update public.src set a = 9 where id = 1; insert into public.src values (5, 2, 7, 1)",
+        "update public.src set b = null where id in (1, 4); \
+         update public.src set g = 1 where id = 5",
+        "delete from public.src where id = 2; update public.src set a = null where id = 5",
+        "update public.src set a = 4, b = 4 where id = 3",
+        "delete from public.src where g = 1",
+    ] {
+        step(&mut d, sql).await;
+        assert_eq!(d.rows(actual).await, d.rows(expected).await, "after {sql}");
+    }
+}
+
+/// `numeric(p,s)` sums and averages carry Postgres's scale (#1096 decision
+/// 2), through values leaving the group.
+#[tokio::test]
+async fn numeric_sums_and_averages_keep_the_declared_scale() {
+    let mut d = start_with(
+        "TRANSFORM agg FROM public.src GROUP BY g \
+         SELECT SUM(m) AS total, AVG(m) AS mean, COUNT(m) AS nm, COUNT(*) AS n",
+        "create table public.src (id integer primary key, g integer, m numeric(10, 2))",
+        &[("id", int4()), ("g", int4()), ("m", ValueType::Numeric)],
+        "",
+    )
+    .await;
+    let actual = "select g, total::text, mean::text, nm, n from public.agg order by g";
+    let expected = "select g, sum(m)::text, avg(m)::text, count(m), count(*) \
+                    from public.src group by g order by g";
+    for sql in [
+        "insert into public.src values (1, 1, 1.5), (2, 1, 0.25), (3, 1, null)",
+        "delete from public.src where id = 2",
+        "update public.src set m = 3 where id = 1",
+        "update public.src set g = 2 where id = 1",
+    ] {
+        step(&mut d, sql).await;
+        assert_eq!(d.rows(actual).await, d.rows(expected).await, "after {sql}");
+    }
+}
+
+// ------------------------------------------------------------------- R1, R2
+
+/// R1: a page reads each group's basis in a statement after its lock. A
+/// recompute holding group 1's lock has counted the page's change C in its
+/// snapshot; the page, already draining, queues on the lock, and once the
+/// recompute commits it reads the new basis and refuses C. A page that read
+/// the basis before its lock would count C twice.
+#[tokio::test]
+async fn r1_a_page_reads_the_basis_after_its_lock() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    write(&d, "insert into public.src values (2, 1, 5)").await;
+    let batch = d.seal().await;
+    let held = recompute(&d, &[1]).await;
+    let page = d.drain_frozen(batch, "a", &[]).await;
+    d.wait_blocked_behind(held.pid).await;
+    held.commit().await;
+    page.finish().await;
+    assert_eq!(partials(&d, 1).await, ["(2,2,15,t)"]);
+    assert_oracle(&mut d).await;
+}
+
+/// R1, the other order: the page locks group 1 first and is frozen there;
+/// a recompute of group 1 queues behind it, and its snapshot, taken after
+/// the page commits, sees the page's change, so it rewrites the group to
+/// the same value.
+#[tokio::test]
+async fn r1_a_recompute_queued_behind_a_page_sees_its_change() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    write(&d, "insert into public.src values (2, 1, 5)").await;
+    let batch = d.seal().await;
+    let mut page = d
+        .drain_frozen(batch, "a", &[(PausePoint::AfterEntryLock, "public.agg")])
+        .await;
+    let frozen = page.reached(PausePoint::AfterEntryLock).await;
+    let d2 = &d;
+    let recomputing = async move { recompute(d2, &[1]).await };
+    let (held, ()) = tokio::join!(recomputing, async {
+        d.wait_blocked_behind(frozen.backend_pid).await;
+        d.release(&mut page, PausePoint::AfterEntryLock).await;
+    });
+    held.commit().await;
+    page.finish().await;
+    assert_eq!(partials(&d, 1).await, ["(2,2,15,t)"]);
+    assert_oracle(&mut d).await;
+}
+
+/// R2: a group move's sides are each checked against their own group's
+/// basis. The move of row 1 from group 1 to 2 is visible in group 2's basis
+/// (a recompute after it), not group 1's: the page applies the old side to
+/// group 1 and refuses the new side for group 2.
+#[tokio::test]
+async fn r2_a_move_is_checked_against_each_groups_basis() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 2, 20)",
+    )
+    .await;
+    write(&d, "update public.src set g = 2 where id = 1").await;
+    let batch = d.seal().await;
+    recompute(&d, &[2]).await.commit().await;
+    d.drain(batch, "a").await;
+    assert_eq!(partials(&d, 1).await, ["(0,0,0,f)"]);
+    assert_eq!(partials(&d, 2).await, ["(2,2,30,t)"]);
+    assert_oracle(&mut d).await;
+}
+
+/// R2 per transaction: two transactions' changes to one group on one page,
+/// one before a recompute of the group and one after. The page applies only
+/// the later one.
+#[tokio::test]
+async fn r2_one_page_applies_only_the_transactions_its_groups_basis_missed() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    write(&d, "insert into public.src values (2, 1, 5)").await;
+    recompute(&d, &[1]).await.commit().await;
+    write(&d, "insert into public.src values (3, 1, 1)").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    assert_eq!(partials(&d, 1).await, ["(3,3,16,t)"]);
+    assert_oracle(&mut d).await;
+}
+
+// ----------------------------------------------------------------------- F2
+
+/// F2: a key's changes on one page are never folded. Row 1 moves from group
+/// 1 to 2 (T1), group 2 is recomputed (its basis sees T1), and row 1 moves on
+/// to group 3 (T2), all before the page. Per (group, transaction): group 1
+/// takes T1's old side, group 2 refuses T1's new side and takes T2's old
+/// side, group 3 takes T2's new side. A fold (T1's old image, T2's new
+/// image) would never take row 1 out of group 2.
+#[tokio::test]
+async fn f2_a_basis_between_two_changes_of_a_key() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    write(&d, "update public.src set g = 2 where id = 1").await;
+    recompute(&d, &[2]).await.commit().await;
+    write(&d, "update public.src set g = 3 where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    assert_eq!(partials(&d, 1).await, ["(0,0,0,f)"]);
+    assert_eq!(partials(&d, 2).await, ["(0,0,0,t)"]);
+    assert_eq!(partials(&d, 3).await, ["(1,1,10,f)"]);
+    assert_oracle(&mut d).await;
+}
+
+/// F2: a key passing through three groups on one page names each of them.
+#[tokio::test]
+async fn f2_a_key_through_three_groups_on_one_page() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 2, 1)",
+    )
+    .await;
+    write(
+        &d,
+        "update public.src set g = 2 where id = 1; update public.src set g = 3 where id = 1",
+    )
+    .await;
+    write(&d, "update public.src set g = 4, v = 11 where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    assert_oracle(&mut d).await;
+}
+
+// ----------------------------------------------------------------------- R3
+
+/// R3 (#1099): nested writes stage exact transition images, so each
+/// statement's sides sum to its rows' net change: an `AFTER ROW` trigger
+/// that rewrites the row it fires on, one that deletes an insert, and one
+/// that updates it.
+#[tokio::test]
+async fn r3_nested_writes_sum_once() {
+    let mut d = start_with(
+        AGG,
+        "create table public.src (id integer primary key, g integer, v integer)",
+        &[("id", int4()), ("g", int4()), ("v", int4())],
+        "create function public.app() returns trigger language plpgsql as $$ \
+         begin \
+             if pg_trigger_depth() = 1 then \
+                 if tg_op = 'INSERT' and new.v < 0 then \
+                     delete from public.src where id = new.id; \
+                 elsif tg_op = 'INSERT' and new.v = 0 then \
+                     update public.src set v = 100, g = 9 where id = new.id; \
+                 elsif tg_op = 'UPDATE' and new.v % 2 = 1 then \
+                     update public.src set v = new.v + 1 where id = new.id; \
+                 end if; \
+             end if; \
+             return null; \
+         end $$; \
+         create trigger app after insert or update on public.src \
+             for each row execute function public.app()",
+    )
+    .await;
+    for sql in [
+        "insert into public.src values (1, 1, 2), (2, 1, -1), (3, 2, 0), (4, 2, 4)",
+        "update public.src set v = 3 where id = 1",
+        "update public.src set v = v + 1",
+        "insert into public.src values (5, 1, -7); update public.src set g = 2 where id = 1",
+    ] {
+        step(&mut d, sql).await;
+        assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await, "after {sql}");
+    }
+}
+
+// ------------------------------------------------------------- decision 4
+
+/// Pages commit out of order, so a group's partials can describe no real
+/// data: a delete's page applied before its insert's leaves group 1 at
+/// `n = -1`. The group is not visible while `n <= 0`, and the converged
+/// state is exact.
+#[tokio::test]
+async fn a_group_is_visible_only_while_its_count_is_above_zero() {
+    let mut d = start().await;
+    write(&d, "insert into public.src values (1, 1, 10)").await;
+    let insert = d.seal().await;
+    write(&d, "delete from public.src where id = 1").await;
+    let delete = d.seal().await;
+    d.drain(delete, "a").await;
+    assert_eq!(partials(&d, 1).await, ["(-1,-1,-10,f)"]);
+    assert!(d.rows(ACTUAL).await.is_empty());
+    d.drain(insert, "b").await;
+    assert_eq!(partials(&d, 1).await, ["(0,0,0,f)"]);
+    assert_oracle(&mut d).await;
+}
+
+// ----------------------------------------------------------------------- R7
+
+/// R7: 8 workers × 20 batches of 320 rows over the same 20 groups, every
+/// batch split across the 8 workers. Every page locks its groups in one
+/// sorted statement, so no worker deadlocks and the groups are right.
+#[tokio::test]
+async fn r7_concurrent_pages_over_shared_groups_never_deadlock() {
+    let mut d = start().await;
+    let before = d.deadlocks_logged().len();
+    let mut seed: u64 = 12345;
+    for round in 0..20 {
+        let mut writers = Vec::new();
+        for writer in 0..8 {
+            let mut rows = Vec::new();
+            for i in 0..40 {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let id = writer * 100_000 + round * 100 + i;
+                rows.push(format!(
+                    "({id}, {}, {})",
+                    (seed >> 33) % 20,
+                    (seed >> 20) % 100
+                ));
+            }
+            let sql = format!(
+                "insert into public.src values {}; \
+                 update public.src set g = (g + 7) % 20 where id % 3 = {}",
+                rows.join(", "),
+                writer % 3
+            );
+            let user = d.user().await;
+            writers.push(tokio::spawn(async move {
+                user.batch_execute(&sql).await.expect("a writer's rows");
+            }));
+        }
+        for writer in writers {
+            writer.await.expect("writer task");
+        }
+        let batch = d.seal().await;
+        let mut workers = Vec::new();
+        for w in 0..8 {
+            workers.push(d.drain_share(batch, &format!("w{w}"), 8).await);
+        }
+        for worker in workers {
+            worker.finish().await;
+        }
+    }
+    assert_eq!(d.deadlocks_logged().split_off(before), Vec::<String>::new());
+    assert_oracle(&mut d).await;
+}
+
+// ------------------------------------------------------------------ refusals
+
+/// What the knob doesn't support yet halts the definition rather than
+/// writing a wrong value: a source `TRUNCATE` (#1102).
+#[tokio::test]
+async fn a_truncate_halts_the_definition() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    write(&d, "truncate public.src").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    assert_eq!(
+        d.rows("select status from transform_definitions").await,
+        ["(paused)"]
+    );
+}
+
+/// Define refuses `SUM` over a `numeric` with no declared scale on the group
+/// basis (#1096 decision 2).
+#[tokio::test]
+async fn define_refuses_an_unconstrained_numeric_sum() {
+    trellis::dev::staging::set_group_basis(true);
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = drain_driver::connect(db.dsn()).await;
+    client
+        .batch_execute("create table public.src (id integer primary key, g integer, m numeric)")
+        .await
+        .expect("source");
+    let columns = [
+        ("id".to_string(), int4()),
+        ("g".to_string(), int4()),
+        ("m".to_string(), ValueType::Numeric),
+    ]
+    .into_iter()
+    .collect();
+    let err = trellis::dev::defs::install_definition(
+        &db.pool,
+        "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(m) AS total",
+        &columns,
+        "public",
+    )
+    .await
+    .expect_err("refused");
+    assert!(err.to_string().contains("no declared scale"), "{err}");
+}

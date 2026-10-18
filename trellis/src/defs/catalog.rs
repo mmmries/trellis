@@ -208,6 +208,10 @@ pub enum CatalogError {
         /// The table, schema-qualified.
         deltas_table: String,
     },
+    /// With the group-basis dev knob on (`staging::group_basis`, #1100),
+    /// define refuses an aggregate the knob routes to the group basis when
+    /// its source or arguments need what that path doesn't have yet.
+    GroupBasisUnsupported { reason: String },
     /// A definition's ledger table doesn't exist, though define creates one
     /// for every definition, 1-1 or aggregate (#986). Only Trellis writes its
     /// tables, so an operator dropped it; the build's `start` reads it and
@@ -514,6 +518,7 @@ impl CatalogError {
             CatalogError::SourceKeyChanged { .. } => ErrorCode::Validation,
             CatalogError::AggregateDeltasShapeChanged { .. } => ErrorCode::Validation,
             CatalogError::AggregateDeltasTableMissing { .. } => ErrorCode::Validation,
+            CatalogError::GroupBasisUnsupported { .. } => ErrorCode::Validation,
             CatalogError::LedgerTableMissing { .. } => ErrorCode::Validation,
             // A target the definition may not have, like a row-security
             // table: the fix is a different schema in the definition.
@@ -662,6 +667,11 @@ impl fmt::Display for CatalogError {
                 "the group-delta table of {target}, {deltas_table}, doesn't exist, but define \
                  would create one. Trellis doesn't re-create it: `DROP TRANSFORM` and define it \
                  again"
+            ),
+            CatalogError::GroupBasisUnsupported { reason } => write!(
+                f,
+                "the group-basis dev knob (TRELLIS_DEV_GROUP_BASIS) can't take this aggregate: \
+                 {reason}"
             ),
             CatalogError::LedgerTableMissing {
                 target,
@@ -861,6 +871,7 @@ impl std::error::Error for CatalogError {
             CatalogError::SourceKeyChanged { .. } => None,
             CatalogError::AggregateDeltasShapeChanged { .. } => None,
             CatalogError::AggregateDeltasTableMissing { .. } => None,
+            CatalogError::GroupBasisUnsupported { .. } => None,
             CatalogError::LedgerTableMissing { .. } => None,
             CatalogError::TargetInCatalogSchema { .. } => None,
             CatalogError::TargetTableSuffixCollision { .. } => None,
@@ -3794,6 +3805,19 @@ async fn create_definition_inner(
             &def,
             &sides.from_columns,
             &sides.joined_columns,
+        ))
+        .await?;
+    }
+    // #1100, #1096 decision 7: an aggregate on the group basis (behind its
+    // dev knob) keeps its partials in a hidden table in the catalog schema,
+    // named by this definition's id, created empty with its row. A JOIN's key
+    // space is never an aggregate's, so it never routes here.
+    if let Some(shape) = crate::staging::group_basis::route(&def, source_columns) {
+        crate::staging::group_basis::check_define(&txn, &shape, &qualified_source).await?;
+        txn.batch_execute(&crate::staging::group_basis::hidden_table_ddl(
+            pool.schema(),
+            id,
+            &shape,
         ))
         .await?;
     }
