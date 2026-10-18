@@ -88,6 +88,18 @@ below, and the histograms above, also carries the `trellis_instance` label
   ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)), so a nonzero rate means a
   holder stayed in it too long, or column pauses became a hot path. Each timeout failed
   one call with a retryable error; nothing is retried in a loop.
+* `capture_auto_rebuilds_total{source_table, cause}` — rebuilds of a source
+  table's readers that the staging worker's capture pass started on its own,
+  pausing nobody, because they missed changes no capture trigger saw while
+  their definitions stayed valid
+  ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-column-changed-or-rewritten-without-a-trigger)).
+  `cause` is `value_rewrite` (a read column's values rewritten in place by an
+  `ALTER COLUMN … TYPE` to the same type with a `USING`) or `column_changed`
+  (a read column dropped and re-added, or retyped other than by a pure
+  widening). Each count is one re-read of the table, the same as a
+  `request_backfill`, and a `WARN` log names the table, the cause and the
+  readers. Watch it to see how often these are detected: a steady rate means
+  routine DDL keeps meeting a detector, which costs a rebuild each time.
 * `held_key_retries_total` and `held_key_retries_succeeded_total` — held keys the
   staging worker released on its own ([the automatic retry](decisions/0003-quarantine-storage-and-api.md#retry-policy),
   off unless `TrellisOptions::held_key_retry` is set), and the retries whose key then applied

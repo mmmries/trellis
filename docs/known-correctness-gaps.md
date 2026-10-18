@@ -18,13 +18,15 @@ them gets broken without Trellis noticing.
 * Trellis is the only writer to its target tables (entry 8).
 * The capture triggers stay installed, enabled and `ENABLE ALWAYS`, and the
   capture functions keep their bodies (entries 5 and 6).
-* No DDL rewrites a column a definition reads, or moves one it reads only as
-  a field to another type family, beyond the changes Trellis detects and
-  pauses for (entries 1, 2 and 22). Retyping or re-collating a key, join or GROUP
-  BY column, and widening any column Trellis creates a column from with its
-  type, pause the definitions concerned, except a widening that changes only
-  the catalog, which Trellis applies to its own columns in place (see
-  [What isn't on this list](#what-isnt-on-this-list), and entry 23).
+* No DDL rewrites the values of a column a definition reads beyond the
+  changes Trellis detects (entry 1). A column dropped and re-added, retyped,
+  or rewritten in place to the same type rebuilds its readers, or pauses the
+  ones define would no longer accept as written. Retyping or re-collating a
+  key, join or GROUP BY column, and widening any column Trellis creates a
+  column from with its type, pause the definitions concerned, except a
+  widening that changes only the catalog, which Trellis applies to its own
+  columns in place (see [What isn't on this list](#what-isnt-on-this-list),
+  and entry 23).
 * No row-level security policy applies to a role Trellis logs in as, or to
   the role that owns its ring (entry 11).
 * No application trigger re-keys a relationship's join column within the
@@ -57,7 +59,8 @@ These are the tools the entries refer to:
   1-1 target's source key was redefined, a definition's ledger table is
   missing (entry 8), or an aggregate's group-delta table is missing (entry 8)
   or has different running-sum or recompute columns from the ones define would
-  create now (entry 22). It then brings every column
+  create now (a `SUM` or `AVG` argument moved between an exact type and
+  floating point). It then brings every column
   Trellis created for the definition with a type from the source (its key,
   passthrough and GROUP BY copies, its calculated, aggregate and ledger
   contribution columns, and its relationship projections' columns) to the
@@ -74,8 +77,8 @@ These are the tools the entries refer to:
   keep a schema change the definition can't be rebuilt over: a resume refuses
   while define would, naming the column and what to change, and a 1-1
   definition whose source key was redefined, an aggregate whose `SUM` or
-  `AVG` argument moved between an exact type and floating point (entry 22),
-  or whose ledger or group-delta table was dropped (entry 8), can only be
+  `AVG` argument moved between an exact type and floating point, or whose
+  ledger or group-delta table was dropped (entry 8), can only be
   defined again.
   It's also the repair when a resume can't convert the values of a column
   Trellis created to its new type (a key moved from `text` to `uuid` by a
@@ -93,8 +96,7 @@ These are the tools the entries refer to:
 
 | # | Trigger | Silent? | Detected? | Planned work |
 |---|---|---|---|---|
-| 1 | `ALTER COLUMN … TYPE … USING` that rewrites values | yes | `self_check` (1-1 targets only) | #703, study pending |
-| 2 | A column dropped and re-added under the same name | yes | `self_check` (1-1 targets only) | #703, study pending |
+| 1 | `ALTER COLUMN … TYPE … USING` that rewrites values, with a metadata change to the same column in the same pass window, on a column added with a constant default whose table hasn't been rewritten since, on a column with a compression method set, or as a widening no copy outgrows | yes | `self_check` (1-1 targets only) | none; documented |
 | 3 | A source key re-collated while a `self_check` job runs | the job can skip or repeat keys | no | none filed |
 | 5 | Capture switched off and back on, or the table attached to a hierarchy and detached, between two reconcile passes | yes | `self_check` (1-1 targets only) | #707, study pending |
 | 6 | A capture function body replaced by hand | yes | `self_check` (1-1 targets only) | #707, study pending |
@@ -110,7 +112,6 @@ These are the tools the entries refer to:
 | 18 | `jsonb_agg`, `array_agg` and `string_agg` element order differs between recomputes | yes | no | none filed |
 | 19 | A paused column doesn't pause the aggregates that read it | yes | on the upstream only | none filed |
 | 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #1115 removes relationships |
-| 22 | A column read only as a field moved to another type family (`integer` → `double precision`, `numeric` ↔ `double precision`) | a value rounded into the old type is silent; other writes fail | at failure; `self_check` (1-1 targets only) | none filed |
 | 23 | A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy | yes | `self_check` (1-1 targets only) | none filed |
 | 24 | A trigger or constraint refusing a change only when two separate pairs of definitions apply it | no (the drain fails) | `drain_failure` and `self_check` | none |
 | 25 | A `MERGE` moving a row to another partition, once partitioned sources are supported (#897) | yes | `self_check` (1-1 targets only) | none; reported to Postgres (#942) |
@@ -118,59 +119,60 @@ These are the tools the entries refer to:
 | 27 | A `DEFAULT` partition beside a leaf created and dropped within one pass, once partitioned sources are supported (#897) | yes | no | none filed |
 | 28 | A leaf detached, written and attached again under the same bound around a `pg_upgrade`, with no pass between, once partitioned sources are supported (#897) | yes | no | none filed |
 
-## 1. A rewriting `ALTER COLUMN TYPE … USING`
+## 1. A rewriting `ALTER COLUMN TYPE … USING` that the capture pass can't tell from routine work
 
-**Trigger:**
+**Trigger:** a `USING` that rewrites a read column's values, in one of
+four shapes:
 
 ```sql
-ALTER TABLE orders ALTER COLUMN amount TYPE bigint USING amount * 10;
--- or the same type, values rewritten in place:
+-- A metadata change to the same column in the same reconcile window
+-- (5 s by default), before or after the rewrite:
+ALTER TABLE orders ALTER COLUMN amount SET DEFAULT 0;
 ALTER TABLE orders ALTER COLUMN amount TYPE integer USING amount * 10;
+
+-- A column added with a constant default, on a table no rewrite
+-- (`VACUUM FULL`, `CLUSTER`, a rewriting `ALTER TABLE`) has touched since:
+ALTER TABLE orders ADD COLUMN fee integer DEFAULT 0;
+ALTER TABLE orders ALTER COLUMN fee TYPE integer USING fee + 1;
+
+-- A column with a compression method set, rewritten for the first time
+-- since it was set:
+ALTER TABLE orders ALTER COLUMN note SET COMPRESSION pglz;
+ALTER TABLE orders ALTER COLUMN note TYPE text USING upper(note);
+
+-- A widening that changes values, where no column Trellis created from
+-- `amount` outgrows the new type:
+ALTER TABLE orders ALTER COLUMN amount TYPE bigint USING amount * 10;
 ```
 
 **Effect:** the statement rewrites the table without firing any DML
-trigger, so capture never sees the new values. Every target that reads `amount` keeps its old values until each
-row is written again. Nothing pauses and status shows nothing.
+trigger, so capture never sees the new values. Every target that reads
+`amount` keeps its old values until each row is written again. Nothing
+pauses or rebuilds, and status shows nothing.
 
-**Detected?** Not automatically. Capture compares column *names*, not types,
-attnums or values. `self_check` reports the cell differences on 1-1 targets.
+**Detected?** Not automatically. The capture pass rebuilds the readers of a
+column rewritten to the same type when the column's `pg_attribute` row and
+the table's file node both moved and nothing else about the column changed
+([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-column-changed-or-rewritten-without-a-trigger)).
+A `SET DEFAULT`, `SET STATISTICS` or other metadata change to the same column
+in the same window looks like routine work that happened to meet a table
+rewrite, which framework migrations do all the time, so the pass leaves it.
+So does the first rewrite of a column added with a constant default: the
+column's row keeps that default for the rows that predate it until the
+table is rewritten, and any rewrite, `VACUUM FULL` included, clears it.
+So does the first `ALTER COLUMN … TYPE` of a column with a compression
+method set, which resets the method to the default.
+A pure widening (`integer` → `bigint`, a longer `varchar`) never acts on
+its own, since it keeps every value's text; only a column Trellis created
+that it outgrows pauses its readers. `self_check` reports the cell
+differences on 1-1 targets.
 
-**Planned work:** #703 proposes recording each read column's identity
-(attnum, type, typmod), plus a filenode/`xmin` baseline that would catch a
-same-type rewrite. Either would pause the readers. Both are gated on a
-false-positive study that hasn't run yet. If a rule is too noisy, this case
-stays documented as a limitation. Event triggers were rejected because they
-need superuser (#699).
+**Planned work:** none; documented. Event triggers, which would see every
+rewrite, need superuser (#699). Logical decoding has the same blind spot:
+`pgoutput` never sends a rewrite's rows.
 
 **Repair:** right after the `ALTER`, run `request_backfill('orders')`, or
-`PAUSE`/`RESUME` every transform that reads the table. A type change to a
-key, join or GROUP BY column pauses its readers on its own (see
-[What isn't on this list](#what-isnt-on-this-list)), and so does a widening
-of one it reads only as a field that needs a rewrite.
-
-## 2. A column dropped and re-added under the same name
-
-**Trigger:**
-
-```sql
-ALTER TABLE users DROP COLUMN plan;
-ALTER TABLE users ADD COLUMN plan text DEFAULT 'free';
-```
-
-Both statements can run before the next reconcile pass sees the drop.
-
-**Effect:** every existing row now has the new column's value. No trigger
-fires, and the name still matches, so there's no schema-change marker and
-no pause. Targets keep values derived from the old column.
-
-**Detected?** Not automatically, because detection is by name. `self_check`
-reports it on 1-1 targets. (A drop that a pass or a captured write sees
-first *is* detected; see [What isn't on this list](#what-isnt-on-this-list).)
-
-**Planned work:** #703 (the same column-identity rule as entry 1).
-
-**Repair:** the same as entry 1: `request_backfill`, or `PAUSE`/`RESUME` the
-readers.
+`PAUSE`/`RESUME` every transform that reads the table.
 
 ## 3. A source key re-collated while a `self_check` job runs
 
@@ -604,45 +606,6 @@ through a relationship (entry 16).
 table also repairs it: its catch-up refreshes the relationship projection
 from the table, then re-derives every child from it.
 
-## 22. A column read only as a field moved to another type family
-
-**Trigger:** an `ALTER COLUMN … TYPE` that moves a column a definition reads
-only as a field (a passthrough, a calculated field's input, an aggregate's
-argument, a to-side column read through a relationship) to another type
-family: `integer` to `double precision`, or `numeric` to `double precision`
-and back. An integer moved to `numeric` isn't this entry: every integer
-column Trellis created from it can no longer hold its values, so its readers
-pause (see [What isn't on this list](#what-isnt-on-this-list)).
-
-**Effect:** the columns Trellis created from it keep the types define gave
-them, and nothing pauses.
-
-* A value the old type can't parse fails its write, and the key is held for
-  that definition (see [Repair caveats](#repair-caveats)). Trellis evaluates
-  a field with the source types it recorded at define or the last resume,
-  so `3.5` fails a field read from what was an `integer`.
-* A value the old type parses but can't hold exactly is rounded into it,
-  silently. A passthrough's `numeric(10,2)` column keeps `1.23` for a
-  `double precision` `1.234`, and an aggregate's `MIN(d)` column keeps
-  `0.12345678901234568` where `d` now holds `0.12345678901234567890123`.
-
-**Detected?** A failed write shows as a held key on the definition's
-`status`. A rounded value shows only in `self_check`, on a 1-1 target. An
-`ALTER TRANSFORM` that adds or changes a field reading the column is refused,
-naming the column, its recorded type and its type now.
-
-**Planned work:** none filed. #824 pauses for a widening, and leaves a move
-to another type family as it was.
-
-**Repair:** `PAUSE TRANSFORM` then `RESUME TRANSFORM`. The resume brings
-every column the definition created to the type define would give it now,
-releases its held keys and rebuilds the target. An aggregate with a `SUM` or
-`AVG` whose argument moved between an exact type (`integer`, `numeric`) and
-floating point is the exception: its group-delta table has different
-running-sum or recompute columns from the ones define would create now. The
-resume refuses, naming `DROP TRANSFORM`, and the definition stays paused.
-Drop it and define it again (#857).
-
 ## 23. A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy
 
 **Trigger:** a source `varchar(n)` column widened by changing only the
@@ -879,8 +842,7 @@ or attach a source's partitions until a pass has run.
   the same source keeps applying the key, so two definitions can disagree on
   it. A widening of a column Trellis copies with its type causes such
   failures when an oversized value drains before the capture pass pauses
-  the definition, and so does a field's move to another type family (entry
-  22). After a widening that changes only the catalog, the capture pass
+  the definition. After a widening that changes only the catalog, the capture pass
   re-types Trellis's column and then releases the definition's keys held
   for `22001` or `22003` itself, after that pass and each pass for a minute
   more. A key whose eviction commits later than that, from a failure
@@ -912,10 +874,24 @@ refusing them up front:
   table dropped and recreated as a plain table.** The next reconcile pass
   reinstalls capture and re-reads the table for its readers.
 * **`TRUNCATE` of a source**, including `CASCADE`.
-* **A read column renamed or dropped, or the primary key redefined (once the
-  pass sees it).** Trellis pauses the readers with a `capture_failure`, and
-  you resume once the schema is right
+* **A read column renamed or dropped, or the primary key redefined.** Trellis
+  pauses the readers with a `capture_failure`, and you resume once the schema
+  is right
   ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md)).
+  A drain page that runs before the capture pass sees a redefined key pauses
+  them itself, before it applies anything, and charges nothing to
+  quarantine.
+* **A read column dropped and re-added under the same name, retyped other
+  than by a pure widening, or rewritten in place to the same type (`ALTER
+  COLUMN b TYPE integer USING b * 10` on an `integer`).** The capture pass
+  rebuilds the table's applying readers, as `request_backfill` would,
+  logging a `WARN` and counting `capture_auto_rebuilds_total`. A definition
+  define would now refuse, one whose evaluated type changed (`integer` to
+  `double precision`), or one whose `numeric` copy must be re-typed pauses
+  instead, with a `capture_failure` naming the column and the change, and
+  its resume re-validates, re-types and rebuilds
+  ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-column-changed-or-rewritten-without-a-trigger)).
+  Entry 1 is what this misses.
 * **A key, join or GROUP BY column retyped or re-collated, or a column
   Trellis creates a column from with its type widened.** The staging
   worker's capture pass pauses the definitions concerned, with a
@@ -936,8 +912,7 @@ refusing them up front:
   A value a copy can't hold that drains before the pass is quarantined, and
   the resume releases it. A change between deterministic collations needs
   nothing (but see [a source key re-collated while a `self_check` job
-  runs](#3-a-source-key-re-collated-while-a-self_check-job-runs)). A
-  field's move to another type family pauses nothing (entry 22).
+  runs](#3-a-source-key-re-collated-while-a-self_check-job-runs)).
 * **A widening that changes only the catalog of a column Trellis copies with
   its type.** `varchar(n)` to a longer `varchar`, to `text` or to
   `varchar`, and `numeric(p,s)` to a larger precision at the same scale,

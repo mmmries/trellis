@@ -12026,6 +12026,12 @@ async fn drain_batch(
     // choice for `poisoned_park`.
     let representative_seg_seq = steps[0].seg_seq;
 
+    // #703 R2: a primary key redefined since capture was installed pauses
+    // the table's readers before this page computes anything for them.
+    let tables: std::collections::BTreeSet<&str> =
+        folded.iter().map(|c| c.src_table.as_str()).collect();
+    super::schema_change::pause_readers_of_redefined_keys(pool, &tables).await?;
+
     let mut backoff = FenceMissBackoff::new();
     let mut transient = TransientRetry::new();
     let mut halt_retry = HaltRetry::default();

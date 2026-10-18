@@ -56,6 +56,7 @@
 // and a build without `internals` would flag them as dead.
 #![cfg_attr(not(feature = "internals"), allow(dead_code))]
 
+pub(crate) mod baseline;
 pub mod columns;
 pub mod complement;
 pub mod install;

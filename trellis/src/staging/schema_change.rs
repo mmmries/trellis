@@ -133,6 +133,102 @@ pub(crate) async fn pause_readers(pool: &Pool, seg_seqs: &[i64]) -> Result<(), A
     Ok(())
 }
 
+/// The drain's side of a redefined primary key (#703 R2): before a page
+/// applies anything, compares the key each of `tables`' installed capture
+/// records with the table's primary key now. On a mismatch it runs the
+/// capture pass's pause for that table ([`pause_readers_of_missing`]), so the
+/// page's compute, which reads only applying definitions, applies none of
+/// the rows the old functions staged keyed by the old key, and nothing is
+/// charged to quarantine for them.
+///
+/// The installed functions keep imaging the old key until the pass
+/// regenerates them, so no write marks the change, and the page would read
+/// those rows by the new key: an arity change fails the page, and a
+/// same-arity change (`(id)` to `(g)`) reads the wrong rows. The pass pauses
+/// the readers too, but only every `reconcile_interval`.
+///
+/// One catalog read per page: a table with no installed capture (another
+/// definition's target, fed by the seam) or no primary key now is skipped.
+/// A key column renamed or dropped is the marker's
+/// ([`pause_readers`]), and [`pause_readers_of_missing`] names it as such.
+pub(crate) async fn pause_readers_of_redefined_keys(
+    pool: &Pool,
+    tables: &BTreeSet<&str>,
+) -> Result<(), ApplyError> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    let schema = pool.schema();
+    let mut names: Vec<&str> = Vec::with_capacity(tables.len());
+    let mut functions: Vec<String> = Vec::with_capacity(tables.len());
+    let mut regclasses: Vec<String> = Vec::with_capacity(tables.len());
+    for &table in tables {
+        // A synthetic `src_table` (a deferred reverse's) isn't a table name.
+        let Ok(function) =
+            crate::capture::sql::function_name(table, crate::capture::sql::CaptureEvent::Insert)
+        else {
+            continue;
+        };
+        names.push(table);
+        functions.push(function);
+        regclasses.push(crate::defs::ddl::regclass_arg(table));
+    }
+    let mut client = pool.get().await?;
+    let changed: Vec<String> = client
+        .query_typed(
+            "select e.t \
+             from unnest($2::text[], $3::text[], $4::text[]) as e(t, f, r) \
+             join pg_catalog.pg_proc p \
+               on p.proname = e.f and p.pronargs = 0 \
+              and p.pronamespace = ( \
+                  select oid from pg_catalog.pg_namespace where nspname = $1) \
+             join pg_catalog.pg_description d \
+               on d.objoid = p.oid \
+              and d.classoid = 'pg_catalog.pg_proc'::pg_catalog.regclass \
+              and d.objsubid = 0 \
+              and d.description like '{\"trellis_capture\":1,%' \
+             cross join lateral ( \
+                 select array( \
+                     select a.attname::text \
+                     from pg_catalog.pg_index i \
+                     cross join unnest(i.indkey) with ordinality as k(n, o) \
+                     join pg_catalog.pg_attribute a \
+                       on a.attrelid = i.indrelid and a.attnum = k.n \
+                     where i.indrelid = pg_catalog.to_regclass(e.r) and i.indisprimary \
+                     order by k.o) as live) l \
+             where pg_catalog.cardinality(l.live) > 0 \
+               and l.live is distinct from array( \
+                   select pg_catalog.jsonb_array_elements_text( \
+                       d.description::jsonb -> 'key'))",
+            &[
+                (&schema, Type::TEXT),
+                (&names, Type::TEXT_ARRAY),
+                (&functions, Type::TEXT_ARRAY),
+                (&regclasses, Type::TEXT_ARRAY),
+            ],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let catalog = load_catalog(&**client, schema).await?;
+    for table in changed {
+        match pause_readers_of_missing(&mut client, schema, &catalog, &table).await {
+            Ok(_) => {}
+            Err(CaptureError::Db(err)) => return Err(err.into()),
+            Err(CaptureError::Catalog(err)) => return Err(err.into()),
+            Err(err) => {
+                // The pass reports what it can't read, and pauses then.
+                crate::instance_log::warn!(table = %table, error = %err, "could not check a redefined primary key before a drain page; the capture pass will");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Pauses each of `readers` of `table` for `missing`, recording why
 /// ([`crate::defs::lifecycle::pause_for_capture_failure`]).
 async fn pause(

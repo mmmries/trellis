@@ -905,10 +905,8 @@ async fn a_key_rename_the_capture_pass_sees_first_pauses_every_reader() {
 /// them keyed by the new one, silently. The pass pauses every reader
 /// instead, with the old and new key on its status, and leaves the functions
 /// for the next pass. A row the old functions staged then drains without
-/// reaching a paused reader, and no write fails.
-///
-/// (A drain that runs before the pass still meets that row while its
-/// readers are live, and fails on its key: #703.)
+/// reaching a paused reader, and no write fails. (A drain page that runs
+/// before the pass pauses them itself: #703 R2, below.)
 #[tokio::test]
 async fn a_primary_key_redefined_without_a_rename_pauses_every_reader() {
     let cluster = TestCluster::start();
@@ -955,6 +953,123 @@ async fn a_primary_key_redefined_without_a_rename_pauses_every_reader() {
         vec!["id".to_string(), "g".to_string()],
         "with every reader paused, the next pass keys capture by the new key"
     );
+}
+
+/// #703 R2: a drain page that runs between a primary key's redefinition and
+/// the capture pass. The old functions still stage rows keyed by the old
+/// key, which the page would read by the new one. The page compares the
+/// installed capture's key with the table's before it applies anything,
+/// pauses every reader of the table as the pass would, and charges nothing to
+/// quarantine. `alter` redefines the key; `new_key` is how the reason names
+/// the key it leaves.
+async fn a_page_before_the_pass_pauses_on_a_redefined_key(alter: &str, new_key: &str) {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    app.batch_execute(&format!(
+        "{alter}; update public.u set b = b + 1 where id = 1;"
+    ))
+    .await
+    .expect("redefine the key, and write");
+
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    for target in ["ta", "tb", "tc", "tsum"] {
+        let reported = trellis.status(target).await.expect("status").expect(target);
+        assert_eq!(reported.status, TransformStatus::Paused, "{target}");
+        let failure = reported.capture_failure.expect("the reason is reported");
+        assert_eq!(failure.source_table, "public.u");
+        assert_eq!(failure.columns, vec!["id".to_string()]);
+        assert!(
+            failure.error.contains("primary key") && failure.error.contains(new_key),
+            "{failure:?}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &raw,
+            "select (select count(*) from poison)::text, \
+                    (select count(*) from poison_held)::text, \
+                    (select count(*) from key_deaths)::text"
+        )
+        .await,
+        vec![vec![
+            Some("0".to_string()),
+            Some("0".to_string()),
+            Some("0".to_string())
+        ]],
+        "nothing is charged to quarantine"
+    );
+
+    let outcome = capture_pass(&mut raw, &db.pool).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    app.batch_execute("update public.u set b = b + 1")
+        .await
+        .expect("no write fails");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+}
+
+#[tokio::test]
+async fn a_drain_page_before_the_pass_pauses_on_a_key_whose_arity_changed() {
+    a_page_before_the_pass_pauses_on_a_redefined_key(
+        "alter table public.u drop constraint u_pkey, add primary key (id, g)",
+        "(\"id\", \"g\")",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_drain_page_before_the_pass_pauses_on_a_key_swapped_for_another_column() {
+    a_page_before_the_pass_pauses_on_a_redefined_key(
+        "alter table public.u drop constraint u_pkey, add primary key (c)",
+        "(\"c\")",
+    )
+    .await;
+}
+
+/// #703 R2's false-positive rows: a key rebuilt on the same columns, by
+/// `ADD PRIMARY KEY USING INDEX`, renamed, or joined by new indexes and
+/// constraints, pauses nothing when a page drains before the pass.
+#[tokio::test]
+async fn a_drain_page_pauses_nothing_for_a_key_rebuilt_on_the_same_columns() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let _trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    for alter in [
+        // X6
+        "alter table public.u drop constraint u_pkey, add constraint u_pkey primary key (id)",
+        // D20
+        "create unique index u_pk2 on public.u (id); \
+         alter table public.u drop constraint u_pkey, \
+             add constraint u_pkey primary key using index u_pk2",
+        // X7
+        "alter table public.u rename constraint u_pkey to u_pk_renamed; \
+         alter table public.u rename constraint u_pk_renamed to u_pkey",
+        // D16, D18, D19
+        "create index u_a_idx on public.u (a); \
+         alter table public.u add constraint ck check (a > 0); \
+         alter table public.u add constraint uq unique (c)",
+    ] {
+        app.batch_execute(&format!(
+            "{alter}; update public.u set b = b + 1 where id = 1;"
+        ))
+        .await
+        .expect(alter);
+        drain_to_quiescence(&db.pool, &mut raw).await;
+        for target in ["ta", "tb", "tc", "tsum"] {
+            assert_eq!(
+                status(&raw, target).await,
+                TransformStatus::Live,
+                "{alter}: {target}"
+            );
+        }
+        b_readers_converged(&raw).await;
+    }
 }
 
 /// Resuming a definition while the column it reads is still missing: the

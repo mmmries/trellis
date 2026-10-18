@@ -804,6 +804,7 @@ pub async fn narrow(
             txn.batch_execute(&statement).await?;
         }
     }
+    super::baseline::record(&txn, spec.table(), spec.columns()).await?;
     txn.commit().await?;
     Ok(())
 }
@@ -1094,6 +1095,18 @@ async fn attempt(
         for statement in sql::owner_statements(schema, table, &owner)? {
             txn.batch_execute(&statement).await?;
         }
+    }
+    // #703: the columns capture images from here on, as they are now.
+    match op {
+        Op::Install {
+            spec, last: true, ..
+        }
+        | Op::Widen(spec) => super::baseline::record(&txn, table, spec.columns()).await?,
+        Op::Uninstall {
+            scope: Scope::All | Scope::Root,
+            ..
+        } => super::baseline::forget(&txn, table).await?,
+        Op::Install { .. } | Op::Uninstall { .. } => {}
     }
     if parks_marker {
         // The marker row is this transaction's own since the park above, so

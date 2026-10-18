@@ -198,6 +198,45 @@ const HELD_KEY_RETRIES_SUCCEEDED_METRIC: &str = "trellis_held_key_retries_succee
 /// holder stayed in the lock longer than the timeout, or the path got hot.
 const COLUMN_PAUSE_LOCK_TIMEOUTS_METRIC: &str = "trellis_column_pause_lock_timeouts_total";
 
+/// #703: rebuilds the capture pass started on its own, without pausing
+/// anyone, because a table's readers missed changes no capture trigger saw
+/// while their definitions stayed valid. Labeled `source_table` and `cause`
+/// ([`CaptureRebuildCause`]).
+const CAPTURE_AUTO_REBUILDS_METRIC: &str = "trellis_capture_auto_rebuilds_total";
+
+/// Why the capture pass rebuilt a table's readers on its own,
+/// [`CAPTURE_AUTO_REBUILDS_METRIC`]'s `cause` label (#703). The decision
+/// that set it up (#703, #707) names two more causes, which aren't counted
+/// yet: `function_replaced`, for #707's detector, and `capture_reinstalled`,
+/// for the installs that already repair a trigger left missing, disabled or
+/// not `ALWAYS`, or a table recreated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CaptureRebuildCause {
+    /// A read column's values were rewritten in place by an `ALTER COLUMN
+    /// ... TYPE` to the same type with a `USING` (#703 R3b).
+    ValueRewrite,
+    /// A read column was dropped and re-added, or changed type or modifier
+    /// in a way that isn't a pure widening, and every definition reading it
+    /// is still valid (#703 R1).
+    ColumnChanged,
+}
+
+impl CaptureRebuildCause {
+    /// Every cause, in label order.
+    pub const ALL: [CaptureRebuildCause; 2] = [
+        CaptureRebuildCause::ValueRewrite,
+        CaptureRebuildCause::ColumnChanged,
+    ];
+
+    /// The `cause` label.
+    pub fn label(self) -> &'static str {
+        match self {
+            CaptureRebuildCause::ValueRewrite => "value_rewrite",
+            CaptureRebuildCause::ColumnChanged => "column_changed",
+        }
+    }
+}
+
 /// [`BUILD_CHUNK_METRIC`]'s buckets: finer than [`LATENCY_BUCKETS`], since a
 /// chunk's percentiles are a profile column (#625 §4). About 25% apart from
 /// 1 ms to 2 minutes.
@@ -333,6 +372,14 @@ pub fn increment_column_pause_lock_timeouts(op: &'static str) {
         .increment(1);
 }
 
+/// Counts one rebuild of `source_table`'s readers that the capture pass
+/// started on its own for `cause` (#703).
+pub fn increment_capture_auto_rebuilds(source_table: &str, cause: CaptureRebuildCause) {
+    ensure_installed();
+    metrics::counter!(CAPTURE_AUTO_REBUILDS_METRIC, INSTANCE_LABEL => instance(), "source_table" => source_table.to_string(), "cause" => cause.label())
+        .increment(1);
+}
+
 /// Counts a seal refused for a full ring (#625 F2).
 pub fn increment_seal_refused() {
     ensure_installed();
@@ -433,6 +480,12 @@ fn describe_metrics() {
         COLUMN_PAUSE_LOCK_TIMEOUTS_METRIC,
         "Count of waits for the column-pause lock that ran out the transaction's lock_timeout, \
          by the operation that waited."
+    );
+    metrics::describe_counter!(
+        CAPTURE_AUTO_REBUILDS_METRIC,
+        "Count of rebuilds of a source table's readers the capture pass started on its own, \
+         without pausing them, because they missed changes no capture trigger saw, labeled by \
+         source_table and cause (value_rewrite/column_changed)."
     );
     metrics::describe_counter!(
         SEAL_REFUSED_METRIC,
@@ -954,6 +1007,7 @@ mod tests {
         increment_build_chunk_lock_timeouts();
         increment_column_pause_lock_timeouts("pause");
         increment_seal_refused();
+        increment_capture_auto_rebuilds("public.t", CaptureRebuildCause::ValueRewrite);
         increment_held_key_retries(1);
         increment_held_key_retries_succeeded(1);
         record_transform_latency("t", Duration::from_millis(1));
@@ -1072,6 +1126,7 @@ mod tests {
                 BUILD_CHUNK_LOCK_TIMEOUTS_METRIC,
                 COLUMN_PAUSE_LOCK_TIMEOUTS_METRIC,
                 SEAL_REFUSED_METRIC,
+                CAPTURE_AUTO_REBUILDS_METRIC,
                 HELD_KEY_RETRIES_METRIC,
                 HELD_KEY_RETRIES_SUCCEEDED_METRIC,
                 TRANSFORM_LATENCY_METRIC,
