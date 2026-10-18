@@ -440,9 +440,15 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     ))
     .await?;
     // #1107, #1096 decision 7: the hidden tables Trellis keeps in its catalog
-    // schema for a definition are named by its id, and go with it.
+    // schema for a definition are named by its id, and go with it: a JOIN's
+    // and a group-basis aggregate's (#1100).
     txn.batch_execute(&super::join::drop_hidden_tables_sql(pool.schema(), id))
         .await?;
+    txn.batch_execute(&crate::staging::group_basis::drop_hidden_table_sql(
+        pool.schema(),
+        id,
+    ))
+    .await?;
     // The target's ledger (#623 D2) and group deltas (#625 F1) went with it
     // just above. Its truncate floor (#623 D3) is keyed by the target's
     // name, so without this a later target of the same name would inherit

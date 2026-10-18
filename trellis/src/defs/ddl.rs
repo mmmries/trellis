@@ -1953,6 +1953,15 @@ pub(crate) async fn aggregate_target_table_ddl(
     let KeySpace::Aggregate { group_by } = &def.key_space else {
         panic!("aggregate_target_table_ddl called on a non-aggregate definition");
     };
+    // #1100: a target on the group basis (behind its dev knob) is a plain
+    // table of its declared columns; its partials live in a hidden table
+    // define creates once the definition has an id.
+    if let Some(shape) = crate::staging::group_basis::route(def, source_columns) {
+        return Ok(crate::staging::group_basis::target_table_ddl(
+            &qualified_target_table(target_schema, def),
+            &shape,
+        ));
+    }
 
     // Substitute cross-field-alias references (e.g. `total2 = total` where
     // `total = SUM(amount)`) before classifying any field as `SUM`/`AVG`

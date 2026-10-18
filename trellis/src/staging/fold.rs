@@ -246,6 +246,18 @@ pub struct FoldedChange {
     ///
     /// Empty when its table is no such to-side.
     pub to_col_values: Vec<(String, String)>,
+    /// #1100: every ring row of the key that is a change (`insert`,
+    /// `update`, `delete`, `recompute`), unfolded, as one JSON object each
+    /// ([`super::group_basis`]'s sides): its `row_txid` (`t`), `lsn` (`l`),
+    /// `op`, `old_image` (`o`), `new_image` (`n`) and, when the capture set
+    /// it, `transition_images` (`x`). A group-basis aggregate sums `f(new) −
+    /// f(old)` per row and never folds per key (#1043 F2), so it needs every
+    /// row, not the fold's endpoints. A union across rows like `group_key`:
+    /// [`merge_folded_changes`] concatenates it.
+    ///
+    /// Filled only while the group-basis knob is on
+    /// ([`super::group_basis::enabled`]), for every key; empty otherwise.
+    pub group_sides: Vec<String>,
 }
 
 /// The change a [`FoldedChange`] applies to a ledger target (#623 D3,
@@ -270,7 +282,8 @@ pub struct LastChange {
 /// on `op` (see the discriminator comment below).
 const FOLD_COLUMNS: &str = "src_table, key, old_image::text as old_image, \
      new_image::text as new_image, lsn, origin_lsn, src_changed, hop_gen, \
-     group_key, appended_at, change_id, route, op, relationship_id, retry_count, row_txid";
+     group_key, appended_at, change_id, route, op, relationship_id, retry_count, row_txid, \
+     transition_images::text as transition_images";
 
 /// The `to_col`s [`fold_sql`] reads out of a to-side key's raw new images
 /// into [`FoldedChange::to_col_values`] (#785): every inbound relationship's
@@ -417,7 +430,7 @@ const PAGE_TABLE: &str = "trellis_drain_page";
 const FOLDED_COLUMNS: &str = "src_table, key, new_image, old_image, src_changed, origin_lsn, \
      lsn, hop_gen, first_seen, group_key, is_truncate, relationship_reverse_deferred, \
      retry_count, prior_image, row_count, has_recompute, ends_in_delete, last_lsn, \
-     last_row_txid, to_col_values";
+     last_row_txid, to_col_values, group_sides";
 
 /// Folds `bucket`'s share of `seg_seq`, from strictly after `after` (the
 /// start when `None`), into this session's [`PAGE_TABLE`], indexed on its
@@ -498,7 +511,7 @@ pub(crate) async fn read_page(
     let sql = read_page_sql(after.is_some());
     let rows = client.query(&sql, &params).await?;
     let next = (rows.len() > cap).then(|| PageKey {
-        route: rows[cap - 1].get(20),
+        route: rows[cap - 1].get(21),
         src_table: rows[cap - 1].get(0),
         key: rows[cap - 1].get(1),
     });
@@ -585,6 +598,7 @@ fn folded_from_row(row: &tokio_postgres::Row) -> FoldedChange {
             .zip(row.get::<_, Option<String>>(18))
             .map(|(lsn, row_txid)| LastChange { lsn, row_txid }),
         to_col_values: to_col_pairs(row.get(19)),
+        group_sides: row.get::<_, Option<Vec<String>>>(20).unwrap_or_default(),
     }
 }
 
@@ -747,6 +761,18 @@ fn fold_sql(
         "array_agg(new_image) filter (where new_image is not null \
                                          and src_table = any(${to_tables_idx}::text[]))"
     );
+    // #1100: a group-basis aggregate's unfolded rows (`FoldedChange::group_sides`).
+    // The knob is read when the statement is rendered, so with it off the
+    // column is a constant and costs the fold nothing.
+    let group_sides = if super::group_basis::enabled() {
+        "array_agg(json_build_object('t', row_txid::text, 'l', lsn::text, 'op', op, \
+                                     'o', old_image::json, 'n', new_image::json, \
+                                     'x', transition_images::json)::text \
+                   order by lsn, change_id) \
+             filter (where op in ('insert', 'update', 'delete', 'recompute'))"
+    } else {
+        "null::text[]"
+    };
     format!(
         "with fenced as ({window_sql}), \
          truncates as materialized ( \
@@ -800,7 +826,8 @@ fn fold_sql(
                        where tc.t = filtered.src_table \
                          and im.i ->> tc.c is not null) p \
                 cross join lateral (values (1, p.c), (2, p.v)) as u(o, x)) \
-             end as to_col_values{extra} \
+             end as to_col_values, \
+             {group_sides} as group_sides{extra} \
          from filtered \
          group by src_table, key{tail}"
     )
@@ -1037,6 +1064,12 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
             values.dedup();
             values
         },
+        // Every row of both segments: a group-basis reader sums them.
+        group_sides: {
+            let mut sides = earlier.group_sides;
+            sides.extend(later.group_sides);
+            sides
+        },
     }
 }
 
@@ -1102,6 +1135,7 @@ mod merge_tests {
             ends_in_delete: false,
             last_change: None,
             to_col_values: Vec::new(),
+            group_sides: Vec::new(),
         }
     }
 

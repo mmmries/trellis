@@ -47,6 +47,11 @@
 //! | [`PausePoint::AfterReverseGuards`] | after a relationship reverse record's guards, named by the projection | the same |
 //! | [`PausePoint::BeforeCommit`] | after the page's last write | after the page's last write |
 //!
+//! An aggregate on the group basis (`super::group_basis`, behind its dev
+//! knob, #1100) fires `AfterEntryLock` after its sorted group lock, before
+//! the statement that reads the groups' bases, `AfterGroupUpsert` after
+//! that statement, and `BeforeCommit`.
+//!
 //! A build chunk (`super::build::run_chunk`, #625 F1) fires the ledger
 //! column's first three points for its target too: `AfterPlaceholders` and
 //! `AfterEntryLock` around the entry lock of the keys that had an entry

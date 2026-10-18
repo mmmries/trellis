@@ -175,6 +175,11 @@ pub enum ApplyError {
     /// can't apply at all, not a bad row: every key of the target would
     /// reproduce it, so it halts rather than charging each key a death.
     AggregateOffLedger { target: String },
+    /// A group-basis aggregate target (`super::group_basis`, #1100) met a
+    /// change its dev knob doesn't support yet (a source `TRUNCATE`, an
+    /// image-less change). Like [`ApplyError::AggregateOffLedger`], every
+    /// page of the target would reproduce it, so it halts the target.
+    GroupBasisUnsupported { target: String, what: &'static str },
     /// A folded record names a source table Postgres no longer has
     /// (`42P01` from a live query against it) — issue #16's "one sanctioned
     /// exception to immutability": no retry or per-key quarantine can
@@ -342,6 +347,7 @@ impl ApplyError {
             | ApplyError::LedgerEntryCollected { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::AggregateOffLedger { .. }
+            | ApplyError::GroupBasisUnsupported { .. }
             | ApplyError::ReverseTriggerNotResolvable { .. }
             | ApplyError::TruncateWithoutLsn { .. }
             | ApplyError::SpilledMutationsNotFlushed => ErrorCode::Internal,
@@ -408,6 +414,10 @@ impl fmt::Display for ApplyError {
             ApplyError::AggregateOffLedger { target } => {
                 write!(f, "aggregate target '{target}' is not on the ledger")
             }
+            ApplyError::GroupBasisUnsupported { target, what } => write!(
+                f,
+                "group-basis aggregate target '{target}' can't apply {what}"
+            ),
             ApplyError::HopBoundExceeded { hop_gen, tables } => write!(
                 f,
                 "downstream propagation exceeded the hop bound (hop_gen {hop_gen} > \
@@ -515,6 +525,7 @@ impl std::error::Error for ApplyError {
             | ApplyError::LedgerEntryCollected { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::AggregateOffLedger { .. }
+            | ApplyError::GroupBasisUnsupported { .. }
             | ApplyError::SourceTableDropped { .. }
             | ApplyError::ColumnNotPaused { .. }
             | ApplyError::DefinitionNotLive { .. }
@@ -7133,6 +7144,10 @@ pub struct ApplyPlan {
     /// D5), each with this page's records for it, keyed by the definition's
     /// bare target name. Ordered, so every page writes them in one order.
     ledger_targets: BTreeMap<String, super::ledger::LedgerTargetPlan>,
+    /// The aggregate targets on the group basis (`super::group_basis`,
+    /// behind its dev knob, #1100), each with this page's ring rows for it,
+    /// keyed by the definition's bare target name, in target order.
+    group_targets: BTreeMap<String, super::group_basis::GroupTargetPlan>,
     /// Targets to clear in full at Phase 3, keyed by target table name —
     /// issue #60's truncate propagation. See [`ClearPlan`].
     clears: HashMap<String, ClearPlan>,
@@ -7908,6 +7923,8 @@ pub(super) async fn compute_page(
     // #623 D3: aggregate targets on the ledger, in target order, so every
     // page takes their locks in one order.
     let mut ledger_targets: BTreeMap<String, super::ledger::LedgerTargetPlan> = BTreeMap::new();
+    // #1100: aggregate targets on the group basis, in target order too.
+    let mut group_targets: BTreeMap<String, super::group_basis::GroupTargetPlan> = BTreeMap::new();
     // Issue #52: every `Some(src_changed)` origin timestamp
     // `buffer_transform_apply_metrics` sees below, buffered per consuming
     // target — filtered into `ApplyPlan::end_to_end_origins` only for
@@ -8170,18 +8187,32 @@ pub(super) async fn compute_page(
         // nothing here.
         let mut ledger_shapes: Vec<Option<super::ledger::LedgerShape>> =
             Vec::with_capacity(defs.len());
+        // #1100: a definition the group basis takes (behind its dev knob)
+        // reads its changes' ring rows in Phase 3 (`super::group_basis`), so
+        // it decodes and re-reads nothing here either.
+        let mut group_shapes: Vec<Option<super::group_basis::GroupShape>> =
+            Vec::with_capacity(defs.len());
         for def in &defs {
             ledger_shapes.push(super::ledger::route_definition(pool, def).await?);
+            group_shapes.push(super::group_basis::route(&def.def, &def.source_columns));
         }
-        let ledger_only = inbound_rels.is_empty() && ledger_shapes.iter().all(Option::is_some);
+        let ledger_only = inbound_rels.is_empty()
+            && ledger_shapes
+                .iter()
+                .zip(&group_shapes)
+                .all(|(ledger, group)| ledger.is_some() || group.is_some());
         // #623 D6: so does a relationship-free 1-1 definition's Re-derive,
         // so a source read only by those re-reads nothing here either.
         let rederives_in_phase3 = inbound_rels.is_empty()
-            && defs.iter().zip(&ledger_shapes).all(|(def, shape)| {
-                shape.is_some()
-                    || (def.def.key_space == KeySpace::OneToOne
-                        && eval::relationship_references(&def.def).is_empty())
-            });
+            && defs
+                .iter()
+                .zip(ledger_shapes.iter().zip(&group_shapes))
+                .all(|(def, (shape, group))| {
+                    shape.is_some()
+                        || group.is_some()
+                        || (def.def.key_space == KeySpace::OneToOne
+                            && eval::relationship_references(&def.def).is_empty())
+                });
         let decode_old_side = needs_old_rows || !inbound_rels.is_empty();
         let mut batch = ImageBatch::default();
         let mut slots: Vec<(Option<usize>, Option<usize>)> = Vec::with_capacity(changes.len());
@@ -8463,12 +8494,44 @@ pub(super) async fn compute_page(
             }
         }
 
-        for (def, ledger_shape) in defs.iter().zip(ledger_shapes) {
+        for ((def, ledger_shape), group_shape) in defs.iter().zip(ledger_shapes).zip(group_shapes) {
             // #799: this definition's share, without the changes whose key
             // is poisoned for it (parked above).
             let (changes, rows, old_rows) =
                 definition_share(def.id, &changes, &rows, &old_rows, &exclusions);
             if changes.is_empty() {
+                continue;
+            }
+            // #1100: an aggregate on the group basis takes each change's
+            // ring rows as they are; Phase 3 sums their sides
+            // (`super::group_basis`).
+            if let Some(shape) = group_shape {
+                let target_plan = match group_targets.entry(def.def.target.clone()) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let identity = {
+                            let client = pool.get().await?;
+                            ddl::identity_key_columns(&**client, &def.target_table).await?
+                        };
+                        entry.insert(super::group_basis::GroupTargetPlan::new(
+                            pool.schema(),
+                            def.id,
+                            &def.target_table,
+                            qualified_source,
+                            identity,
+                            shape,
+                        ))
+                    }
+                };
+                for change in changes.iter() {
+                    target_plan.push(change)?;
+                    buffer_transform_apply_metrics(
+                        &def.def.target,
+                        change,
+                        &mut end_to_end_origins,
+                        &mut transform_observations,
+                    );
+                }
                 continue;
             }
             // #623 D3: a plain aggregate on the ledger takes the records as
@@ -8868,6 +8931,13 @@ pub(super) async fn compute_page(
                             }
                             .into());
                         }
+                        // #1100: a group-basis target's truncate is #1102's.
+                        if super::group_basis::route(&def.def, &def.source_columns).is_some() {
+                            return Err(ApplyError::GroupBasisUnsupported {
+                                target: def.def.target.clone(),
+                                what: "a source TRUNCATE (the group-basis truncate is #1102)",
+                            });
+                        }
                         aggregate_clears.insert(
                             def.def.target.clone(),
                             AggregateClearPlan {
@@ -9048,6 +9118,7 @@ pub(super) async fn compute_page(
     let mut all_targets: std::collections::HashSet<&String> = targets.keys().collect();
     all_targets.extend(clears.keys());
     all_targets.extend(ledger_targets.keys());
+    all_targets.extend(group_targets.keys());
     all_targets.extend(aggregate_clears.keys());
     // Epic #49 cross-cutting review fix (issues #51/#52): only the
     // terminal-filtered subset of `end_to_end_origins` survives into
@@ -9120,6 +9191,7 @@ pub(super) async fn compute_page(
         versions,
         targets,
         ledger_targets,
+        group_targets,
         clears,
         aggregate_clears,
         poisoned_park,
@@ -10635,6 +10707,15 @@ pub(crate) async fn apply_page(
         keys_deleted += deleted;
     }
 
+    // 3b'. Aggregate targets on the group basis (#1100, behind its dev
+    // knob), in target order.
+    for group_plan in plan.group_targets.values() {
+        let (written, deleted) =
+            super::group_basis::apply_group_target(txn, group_plan, &mut mutations).await?;
+        keys_written += written;
+        keys_deleted += deleted;
+    }
+
     // Before 2c and 3c, issue #531: the refresh stamp of every relationship
     // this batch carries a reverse record or a projection clear for, locked
     // `for share` before this transaction touches any projection row (2c,
@@ -11142,6 +11223,7 @@ pub(crate) async fn apply_page(
         .values()
         .map(|t| &t.qualified_target)
         .chain(plan.ledger_targets.values().map(|t| &t.target))
+        .chain(plan.group_targets.values().map(|t| &t.target))
     {
         super::interleave::pause_at(txn, super::interleave::PausePoint::BeforeCommit, target)
             .await?;

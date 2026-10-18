@@ -253,6 +253,15 @@ re-derives such a key rather than applying its last change. A to-one
 relationship's reverse path also re-derives the from-side rows, as it does for
 a bare trigger.
 
+A group-basis aggregate (ADR-0002, "Aggregates: a basis per group, kept by
+deltas") needs what the fold erases altogether: every change row of a key,
+since it sums each row's `f(new) − f(old)` per (group, transaction) and never
+folds per key. While its dev knob is on (`staging::group_basis`, #1100), the
+fold also returns each key's `insert`/`update`/`delete`/`recompute` rows
+unfolded (`group_sides`: transaction, `lsn`, `op`, both images and the
+transition images), and the segment merge concatenates them. With the knob
+off the column is a constant `NULL`.
+
 A key born and died in the batch (an insert then a delete) folds to both images
 NULL, the same as a bare trigger. That needs nothing kept on the side: the
 key's ledger entry, if a read counted it, names its group, and the delete

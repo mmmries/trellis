@@ -98,7 +98,8 @@ fn seed(err: &ApplyError) -> Option<Seed> {
         }
         ApplyError::HopBoundExceeded { tables, .. } => Some(Seed::Tables(tables.clone())),
         ApplyError::TruncateWithoutLsn { src_table } => Some(Seed::Tables(vec![src_table.clone()])),
-        ApplyError::AggregateOffLedger { target } => Some(Seed::Target(target.clone())),
+        ApplyError::AggregateOffLedger { target }
+        | ApplyError::GroupBasisUnsupported { target, .. } => Some(Seed::Target(target.clone())),
         _ => None,
     }
 }

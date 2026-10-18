@@ -1163,6 +1163,13 @@ fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
     shape_of(&definition.def, &definition.source_columns)
 }
 
+/// Whether `definition` is on the group basis (`super::group_basis`, behind
+/// its dev knob, #1100). Its build is #1101's: until then the plan job only
+/// checks that the source is empty ([`run_plan`]), and enqueues no chunk.
+fn takes_group_basis(definition: &Definition) -> bool {
+    super::group_basis::route(&definition.def, &definition.source_columns).is_some()
+}
+
 /// [`buildable_shape`] of a definition's parts.
 fn shape_of(
     def: &TransformDef,
@@ -1233,7 +1240,10 @@ pub async fn qualifies(
     ) {
         return Ok(false);
     }
-    if buildable_shape(definition).is_none() && !one_to_one::buildable(definition) {
+    if buildable_shape(definition).is_none()
+        && !one_to_one::buildable(definition)
+        && !takes_group_basis(definition)
+    {
         return Ok(false);
     }
     #[cfg(any(test, feature = "internals"))]
@@ -1608,10 +1618,12 @@ async fn start(
     let ledger = ddl::qualified_target_table_ident(&crate::defs::ledger::ledger_table_name(
         &definition.target_table,
     ));
-    let empty: bool = txn
-        .query_one(&format!("select not exists (select 1 from {ledger})"), &[])
-        .await?
-        .get(0);
+    // A group-basis definition has no ledger, and nothing to sweep (#1100).
+    let empty: bool = takes_group_basis(definition)
+        || txn
+            .query_one(&format!("select not exists (select 1 from {ledger})"), &[])
+            .await?
+            .get(0);
     txn.execute(
         "update transform_definitions set status = $2, build = $3 where id = $1",
         &[
@@ -3035,6 +3047,27 @@ async fn run_plan(
         }
     }
     let mut client = pool.get().await?;
+    // #1100: the group basis has no build yet (#1101), so its dev knob
+    // takes only a source that is empty when the build plans, which needs
+    // none: the walk below enqueues no chunk.
+    if cursor.is_none() && chunk.fields.is_none() && takes_group_basis(&definition) {
+        let has_rows: bool = client
+            .query_one(
+                &format!(
+                    "select exists (select 1 from {})",
+                    ddl::qualified_source_table(&definition.source_table)
+                ),
+                &[],
+            )
+            .await?
+            .get(0);
+        if has_rows {
+            return Err(build_error(ApplyError::GroupBasisUnsupported {
+                target: definition.target_table.clone(),
+                what: "a build over a source that has rows (the group-basis build is #1101)",
+            }));
+        }
+    }
     loop {
         let started = Instant::now();
         let ranges = crate::defs::backfill::next_pk_ranges(
@@ -3156,6 +3189,12 @@ async fn run_sweep(
         .ok_or(ChunkQueueError::DefinitionNotFound {
             definition_id: chunk.definition_id,
         })?;
+    if takes_group_basis(&definition) {
+        return Err(build_error(ApplyError::GroupBasisUnsupported {
+            target: definition.target_table.clone(),
+            what: "a rebuild's sweep (the group-basis rebuild is #1101)",
+        }));
+    }
     let plan = AnyPlan::for_definition(pool, &definition).await?;
     let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(
         pool.clone(),
