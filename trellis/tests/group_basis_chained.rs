@@ -484,8 +484,79 @@ async fn an_upstream_rebuild_outside_the_seam_rebuilds_the_reader() {
              order by bc.kind"
         )
         .await,
-        ["(plan)", "(sweep)"]
+        ["(sweep)"],
+        "a group-basis rebuild is its sweep job alone (#1101)"
     );
+
+    // The rebuild replaces the reader's groups from the upstream's target
+    // as the upstream's build left it, and the reader stays exact as the
+    // upstream catches up and is written again.
+    trellis::staging::build::settle_builds(d.pool()).await;
+    assert_eq!(d.rows(&status("public.roll")).await, ["(live,)"]);
+    trellis::intake::markers::settle_registrations(d.pool()).await;
+    let roll = "select n, groups from public.roll order by n";
+    let oracle = "select n, count(*) from (select count(*) as n from public.src group by g) s \
+                  group by n order by n";
+    assert_equal(&mut d, roll, oracle).await;
+    step(
+        &mut d,
+        "insert into public.src values (4, 2, null, 1), (5, 3, null, 1)",
+    )
+    .await;
+    assert_equal(&mut d, roll, oracle).await;
+}
+
+/// A rebuild of a group-basis upstream reaches its group-basis reader
+/// through the seam (#1101): each visible row the rebuild changes is staged
+/// with the row the target held as its prior image, so the reader moves
+/// each group between its rollup groups exactly once. Here the rebuild's
+/// snapshot sees an undrained insert and delete, which it folds into
+/// groups 2 and 3, and their own page is then refused upstream.
+#[tokio::test]
+async fn an_upstream_rebuild_reaches_its_reader_through_the_seam() {
+    let mut d = start(
+        AGG_G,
+        "TRANSFORM roll FROM public.agg GROUP BY n SELECT COUNT(*) AS groups, SUM(total) AS t",
+        &agg_g_columns(),
+        2,
+    )
+    .await;
+    const ROLL: &str = "select n, groups, t from public.roll order by n";
+    const ORACLE: &str = "select n, count(*), sum(total) from ( \
+                              select count(*) as n, sum(v) as total from public.src group by g \
+                          ) s group by n order by n";
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2), (4, 3, 0, 11)",
+    )
+    .await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    write(
+        &d,
+        "insert into public.src values (5, 2, 0, 1); delete from public.src where id = 4",
+    )
+    .await;
+    let undrained = d.seal().await;
+    let trellis = trellis::Trellis::connect(
+        trellis::config::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    trellis
+        .request_backfill("src")
+        .await
+        .expect("request a rebuild");
+    trellis::staging::build::settle_builds(d.pool()).await;
+    assert_eq!(
+        d.rows("select status from transform_definitions order by id")
+            .await,
+        ["(live)", "(live)"]
+    );
+    d.drain(undrained, "undrained").await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    step(&mut d, "insert into public.src values (6, 3, 0, 4)").await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
 }
 
 /// A relationship-fed upstream (its totals follow a parent's value, which
