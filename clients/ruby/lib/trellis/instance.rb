@@ -242,8 +242,9 @@ module Trellis
     end
 
     # Registers a transform from a `TRANSFORM` statement, creates its target
-    # table, and returns its Definition, at :waiting_to_backfill. Its
-    # backfill runs in the background: poll #status for :live.
+    # table, and returns the target table (fully qualified, "schema.table"),
+    # at :waiting_to_backfill. Its backfill runs in the background: poll
+    # #status with the bare table name (the part after the schema) for :live.
     #
     # Only a `TRANSFORM` statement: any other form (DROP, PAUSE, ...) raises
     # ValidationError without being applied, and a statement that doesn't
@@ -253,14 +254,14 @@ module Trellis
     # transaction: if an enclosing migration rolls back, the definition stays.
     def define(statement)
       string!("the statement", statement)
-      Definition.new(**handle.define(statement))
+      handle.define(statement)
     end
 
     # Runs one statement of Trellis's grammar, whatever its form, and returns
     # an Applied saying what it did.
     #
     #   trellis.apply("TRANSFORM order_totals FROM orders SELECT price + tax AS total")
-    #   # => #<data Trellis::Applied kind=:transform_defined, definition=#<data Trellis::Definition ...>, ...>
+    #   # => #<data Trellis::Applied kind=:transform_defined, target_table="public.order_totals", ...>
     #   trellis.apply("RESUME TRANSFORM order_totals.total").columns
     #   # => ["order_totals.total"]
     #
@@ -278,7 +279,7 @@ module Trellis
     end
 
     # The Status of the definition writing target_table (a bare table name,
-    # or "schema.table"), or nil when none does.
+    # without its schema), or nil when none does.
     def status(target_table)
       string!("the target table", target_table)
       hash = handle.status(target_table)
