@@ -180,6 +180,17 @@ leaves only.
   `pg_inherits` row is gone.
 - Then the no-leaf sweep below.
 
+Every detected operation queues its own correction, whatever its kind
+(`new_leaf`, `gone_node`, `complement`), unless an entry of the same node, kind
+and text is queued that no reader has started. A reader that has started an
+entry (it has a progress row, in any phase) may already have walked past the
+rows the new operation changed, and one that finished it never reads it again,
+so a started entry never absorbs a later operation; the reader re-derives the
+node once more for it. Every engine commits its progress row before it reads
+the node's keys or rows, so an operation an unstarted entry absorbs is one each of
+its readers reads. Two inserters that race past the test both queue, which
+costs work and never correctness.
+
 On an aggregate, a node's correction is a Re-derive of a key set through the
 normal page path. The set is the keys of the live ledger entries whose group
 routes to the node by its recorded text, found through the ledger's `GROUP BY`
@@ -214,9 +225,9 @@ statement, because a page that applies such a change and has its ring rows
 retired between two reads would be in neither. The correction then locks the
 set in one sorted statement and rewrites each group's partials from a
 `GROUP BY` of its rows, with that statement's snapshot as the group's basis,
-in one transaction with its progress. Every change the DDL removed was
-committed before the pass queued the correction, so the basis sees it and its
-page refuses it: no `build_seg` and no fence. The rows are read through the
+in one transaction that records the correction done. Every change the DDL
+removed was committed before the reader recorded its start, so the basis sees
+it and its page refuses it: no `build_seg` and no fence. The rows are read through the
 root, or, while the whole tree is as recorded (every node under the same
 parent by the same `pg_inherits` row, none detach-pending, none added), by one
 `GROUP BY` of the node under an `ACCESS SHARE` lock; every row of a group that
@@ -384,7 +395,8 @@ decision.
 A node truncate's ring row names the truncated node. Without the name, the
 truncate trigger of a leaf would empty the whole ledger and target and raise the
 truncate floor, losing every other leaf's rows until a rebuild. The row queues
-that node's correction, with no floor and no barrier, so the other nodes' entries
+that node's correction under the same rule as any other operation (an
+unstarted entry of the node absorbs it), with no floor and no barrier, so the other nodes' entries
 and groups are untouched. A root `TRUNCATE` is unchanged: it clears the whole
 target, once.
 
