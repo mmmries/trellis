@@ -107,12 +107,12 @@ These are the tools the entries refer to:
 | 12 | A crash empties an unlogged source table | yes | `self_check` (1-1 targets only) | none filed |
 | 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load of a plain dump: on define; partial restore: `self_check` (1-1 targets only) | none |
 | 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | #1115 removes relationships |
-| 16 | `self_check` audits 1-1 targets only | yes | n/a | #1104 (aggregates); #1115 removes relationships, and #1112 audits the JOIN targets that replace them |
+| 16 | `self_check` audits 1-1 targets only | yes | n/a | #1104 (aggregates); #1115 removes relationships, whose `JOIN` replacements `self_check` already compares |
 | 17 | `DROP TYPE` of an enum a live definition references | no (later introspection fails) | at failure only | none filed |
 | 18 | `jsonb_agg`, `array_agg` and `string_agg` element order differs between recomputes | yes | no | none filed |
 | 19 | A paused column doesn't pause the aggregates that read it | yes | on the upstream only | none filed |
 | 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #1115 removes relationships |
-| 23 | A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy | yes | `self_check` (1-1 targets only) | none filed |
+| 23 | A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy | yes | `self_check` (1-1 and `JOIN` targets) | none filed |
 | 24 | A trigger or constraint refusing a change only when two separate pairs of definitions apply it | no (the drain fails) | `drain_failure` and `self_check` | none |
 | 25 | A `MERGE` moving a row to another partition, once partitioned sources are supported (#897) | yes | `self_check` (1-1 targets only) | none; reported to Postgres (#942) |
 | 26 | A partitioned source renamed away and back within one pass, once partitioned sources are supported (#897) | yes | no | none filed |
@@ -518,8 +518,9 @@ target is compared with a recompute, so a stale value in one is silent.
 only for plain 1-1 targets.
 
 **Planned work:** #1104 adds `self_check` for aggregate targets. #1115
-removes relationships, and with them relationship-enriched 1-1 targets;
-#1112 adds `self_check` for the JOIN targets that replace them.
+removes relationships, and with them relationship-enriched 1-1 targets.
+`self_check` already compares the `JOIN` targets that replace them, and
+their hidden tables, against the two source tables.
 
 **Repair:** compare the target with your own query of the source, or
 `PAUSE`/`RESUME` it when you suspect a divergence.
@@ -614,8 +615,9 @@ whose characters past `n` are all spaces (`'abcdefghij   '` after
 `varchar(10)` became `varchar(40)`) written to it and drained before the
 staging worker's next capture pass re-types the column Trellis copied it
 into, up to one `reconcile_interval` later. The copies are a 1-1 target's
-key and passthrough columns, and a to-one relationship projection's key and
-its column for each to-side column read through it.
+key and passthrough columns, a `JOIN` target's `GROUP BY` columns and its
+hidden tables' `GROUP BY` and `ON` columns, and a to-one relationship
+projection's key and its column for each to-side column read through it.
 
 **Effect:** silent. Postgres stores a value whose excess characters are all
 spaces in a `varchar(n)` column truncated to `n`, rather than failing it, so
@@ -625,9 +627,11 @@ its write, and its key is held and then released after the re-type (see
 value and rebuilds nothing, so the copy keeps the truncated value until its
 row is written again. A 1-1 key truncated this way leaves its target row
 under the truncated key: the source's later changes to the row write the
-full key, and nothing deletes the truncated row.
+full key, and nothing deletes the truncated row. A `JOIN` counts the row in
+a group under the truncated value the same way: its later changes are counted
+under the full value, and nothing takes it out of the truncated one.
 
-**Detected?** Only by `self_check`, on a 1-1 target.
+**Detected?** Only by `self_check`, on a 1-1 or a `JOIN` target.
 
 **Planned work:** none filed.
 
