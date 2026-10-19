@@ -99,6 +99,21 @@ use super::fold::{FoldedChange, earliest_origin};
 use super::group_basis::{self, Arg, GroupShape, GroupTargetPlan, Writer};
 use super::target_mutations::TargetMutations;
 
+/// #1155 scratch prototypes (experiment branch only, never shipped): 0 =
+/// main; 1 = E2, a sealed segment holding ring rows of a table any `JOIN`
+/// definition reads gets one bucket; 2 = E3, a page with only `FROM`-side
+/// changes locks its `J` rows `FOR SHARE`.
+static PROTO_1155: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Sets the #1155 prototype mode (see [`PROTO_1155`]); only while no client runs.
+pub fn set_proto_1155(mode: u8) {
+    PROTO_1155.store(mode, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn proto_1155() -> u8 {
+    PROTO_1155.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether `def` is a `JOIN` that applies: only behind the group-basis knob
 /// (see the module doc).
 pub(crate) fn applies(def: &TransformDef) -> bool {
@@ -563,11 +578,20 @@ impl JoinTargetPlan {
 
     /// Step 2's `J` lock: the same keys, sorted, `FOR UPDATE`.
     fn j_lock_sql(&self) -> String {
+        let mode = if proto_1155() == 2
+            && self.joined.plan.sides.is_empty()
+            && !self.joined.recompute
+            && self.truncate.is_none()
+        {
+            "share"
+        } else {
+            "update"
+        };
         let cols = quoted(&self.j_cols);
         let j_cols: Vec<String> = cols.iter().map(|c| format!("j.{c}")).collect();
         format!(
             "select 1 from {j} j where ({jc}) in (select {cols} from ({keys}) k) \
-             order by {jc} for update of j",
+             order by {jc} for {mode} of j",
             j = self.j_ident,
             jc = j_cols.join(", "),
             cols = cols.join(", "),

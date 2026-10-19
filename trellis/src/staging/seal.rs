@@ -368,6 +368,16 @@ pub async fn seal_phase2(
         partitions::Kind::Truncated.as_str(),
         partitions::Cause::Truncated.as_str(),
     );
+    // #1155 E2 scratch prototype: a segment carrying ring rows of a table a
+    // `JOIN` definition reads seals with one bucket.
+    let proto_e2 = if super::join::proto_1155() == 1 {
+        "when exists (select 1 from batch b where b.src_table in ( \
+             select source_table from transform_definitions where join_table is not null \
+             union all select join_table from transform_definitions \
+             where join_table is not null)) then 1"
+    } else {
+        ""
+    };
     let sql = format!(
         "with batch as ({window}), \
          decided as ( \
@@ -386,6 +396,7 @@ pub async fn seal_phase2(
                     has_schema_change = d.has_schema_change, \
                     bucket_count = (case \
                         when d.has_truncate then 1 \
+                        {proto_e2} \
                         when d.row_count >= {MIN_ROWS_TO_SPLIT} then {SEG_BUCKETS} \
                         else 1 end)::smallint \
                from decided d \
