@@ -164,6 +164,7 @@ const RELATIONSHIP_REVERSE_FAIRNESS_ESCALATED_METRIC: &str =
 /// classes, labeled `class` ([`BuildStatement`]). The `_sum` per class is
 /// worker-seconds; the profile divides it by the rows built.
 const BUILD_STATEMENT_METRIC: &str = "trellis_build_statement_seconds";
+const JOIN_LOCK_WAIT_METRIC: &str = "trellis_join_lock_wait_seconds";
 
 /// #625 F2: one Re-derive build chunk's transaction, from its begin to its
 /// commit (the span its entry locks and snapshot are held).
@@ -331,6 +332,16 @@ pub fn record_build_statement(class: BuildStatement, elapsed: Duration) {
         .record(elapsed.as_secs_f64());
 }
 
+/// Records how long a `JOIN` transform's page spent in the one sorted
+/// `select … for update` of the `J` rows of the join keys it names (#1112):
+/// the wait for those rows' locks plus the statement's own read. A wait is
+/// another page, or a writer, holding a key.
+pub fn record_join_lock_wait(transform: &str, elapsed: Duration) {
+    ensure_installed();
+    metrics::histogram!(JOIN_LOCK_WAIT_METRIC, INSTANCE_LABEL => instance(), "transform" => transform.to_string())
+        .record(elapsed.as_secs_f64());
+}
+
 /// Records one committed Re-derive build chunk (#625 F2): its transaction's
 /// duration, the keys it re-derived and the delta rows it appended.
 pub fn record_build_chunk(elapsed: Duration, keys: u64, delta_rows: u64) {
@@ -447,6 +458,11 @@ fn described_recorder(
 /// put there; issue #53's exposition is meant to be self-documenting for an
 /// operator reading a raw scrape, so every series gets one.
 fn describe_metrics() {
+    metrics::describe_histogram!(
+        JOIN_LOCK_WAIT_METRIC,
+        metrics::Unit::Seconds,
+        "Time a JOIN transform's page spent locking its J rows (the lock wait plus the read), labeled by transform."
+    );
     metrics::describe_histogram!(
         BUILD_STATEMENT_METRIC,
         metrics::Unit::Seconds,
@@ -1002,6 +1018,7 @@ mod tests {
     /// instance.
     fn record_everything() {
         record_build_statement(BuildStatement::Plan, Duration::from_millis(1));
+        record_join_lock_wait("t", Duration::from_millis(1));
         record_build_chunk(Duration::from_millis(1), 1, 1);
         record_build_merge(1);
         increment_build_chunk_lock_timeouts();
@@ -1119,6 +1136,7 @@ mod tests {
             }
             for metric in [
                 BUILD_STATEMENT_METRIC,
+                JOIN_LOCK_WAIT_METRIC,
                 BUILD_CHUNK_METRIC,
                 BUILD_CHUNK_MAX_METRIC,
                 BUILD_ROWS_METRIC,
