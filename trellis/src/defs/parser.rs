@@ -467,25 +467,20 @@ impl Parser {
     /// definition, since a relationship *is* a definition and definitions can
     /// be retired.
     ///
-    /// A `<transform>.<column>` address is refused here rather than silently
-    /// ignoring the column half: `DROP` is whole-definition only (issue #228,
-    /// decision 2), and dropping a single calculated field is an
-    /// `ALTER TRANSFORM ... DROP <field>` (issues #241/#242).
+    /// `DROP` is whole-definition only (issue #228, decision 2), so a dotted
+    /// transform address is its qualified name; dropping a single calculated
+    /// field is an `ALTER TRANSFORM ... DROP <field>` (issues #241/#242).
     fn parse_drop_ref(&mut self) -> Result<DefinitionRef, ParseError> {
         if self.peek_is_keyword("TRANSFORM") {
             self.advance();
-            let (target, column) = self.parse_transform_address(Verb::Drop)?;
-            if let Some(column) = column {
-                return Err(ParseError::MalformedDefinitionAddress {
-                    statement: "DROP TRANSFORM".to_string(),
-                    address: format!("{target}.{column}"),
-                    detail: "DROP removes a whole definition, so it takes a bare <target>; \
-                             dropping one calculated field is an ALTER TRANSFORM operation \
-                             (issues #241/#242), not a DROP"
-                        .to_string(),
-                });
-            }
-            return Ok(DefinitionRef::Transform(target));
+            let (target, qualified_table) = self.parse_transform_address(Verb::Drop)?;
+            // `DROP` is whole-definition only, so a dotted address is the
+            // transform's qualified name, `<schema>.<table>` (dropping one
+            // calculated field is an `ALTER TRANSFORM ... DROP <field>`).
+            return Ok(DefinitionRef::Transform(match qualified_table {
+                Some(table) => format!("{target}.{table}"),
+                None => target,
+            }));
         }
 
         if self.peek_is_keyword("RELATIONSHIP") {
@@ -510,19 +505,12 @@ impl Parser {
         })
     }
 
-    /// Parses a `PAUSE`/`RESUME`/`DROP TRANSFORM` address:
-    /// `<target>` (whole definition) or `<target>.<column>` (one calculated
-    /// field, issue #228 decision 2).
-    ///
-    /// **Deliberately not [`Self::parse_table_ref`].** That helper reads
-    /// `a.b` as `<schema>.<table>`, which is right in `TRANSFORM`/`FROM`
-    /// position and wrong here: a transform's operator-facing identity is its
-    /// *bare* target-table name everywhere below the facade (see
-    /// [`DefinitionRef::Transform`]'s doc comment), and the same `ident '.'
-    /// ident` shape has to mean `<transform>.<column>` in this position for
-    /// decision 2's column addressing to exist at all. A third part is
-    /// refused naming the whole address, the way `parse_table_ref` does for
-    /// its own over-qualified case.
+    /// Parses a `PAUSE`/`RESUME`/`DROP TRANSFORM` address: `<target>` or a
+    /// two-part `a.b`, returned as its two halves. `PAUSE`/`RESUME` read the
+    /// halves as `<transform>.<column>` (issue #228 decision 2; the facade
+    /// may resolve them to a qualified name, see [`TransformRef`]), `DROP` as
+    /// `<schema>.<table>`. A third part is refused naming the whole address,
+    /// the way [`Self::parse_table_ref`] does for its own over-qualified case.
     fn parse_transform_address(
         &mut self,
         verb: Verb,
@@ -547,9 +535,9 @@ impl Parser {
         Err(ParseError::MalformedDefinitionAddress {
             statement: format!("{} TRANSFORM", verb.keyword()),
             address,
-            detail: "a transform is addressed by its bare target table, optionally with one \
-                     '.<column>' suffix — there is no schema-qualified spelling here, since a \
-                     dotted address already means <transform>.<column>"
+            detail: "a transform is addressed by its target table, bare or \
+                     '<schema>.<table>', or by '<transform>.<column>'; there is no \
+                     '<schema>.<transform>.<column>' spelling"
                 .to_string(),
         })
     }
@@ -677,7 +665,12 @@ impl Parser {
     fn parse_alter_transform(&mut self) -> Result<AlterTransform, ParseError> {
         self.expect_keyword("ALTER")?;
         self.expect_keyword("TRANSFORM")?;
-        let target = self.expect_ident()?;
+        let mut target = self.expect_ident()?;
+        if self.peek_is_symbol('.') {
+            // `<schema>.<table>`, the qualified name `apply` returns.
+            self.advance();
+            target = format!("{target}.{}", self.expect_ident()?);
+        }
 
         let mut clauses = vec![self.parse_alter_clause()?];
         while self.peek_is_symbol(',') {

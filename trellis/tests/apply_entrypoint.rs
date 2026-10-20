@@ -383,6 +383,8 @@ async fn statements_outside_the_grammar_are_parse_errors_that_change_nothing() {
     for statement in [
         "PAUSE RELATIONSHIP authors.posts",
         "RESUME RELATIONSHIP authors.posts",
+        "DROP TRANSFORM public.order_rollup.total",
+        // A transform's `<transform>.<column>`: DROP takes no column.
         "DROP TRANSFORM order_rollup.total",
     ] {
         let err = trellis

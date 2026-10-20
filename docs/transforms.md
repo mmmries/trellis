@@ -451,9 +451,19 @@ DROP   TRANSFORM <target>
 DROP   RELATIONSHIP [<schema>.]<from_table>.<relationship_name>
 ```
 
-**Addressing.** A transform is named by its bare target table, and a dotted
-address means `<transform>.<column>` — pausing or resuming a single calculated
-field rather than the whole definition. A relationship, which only `DROP` names,
+**Addressing.** A transform is named by its target table, bare (`widget_prices`)
+or schema-qualified as `define` returns it (`public.widget_prices`); `ALTER
+TRANSFORM` and `DROP TRANSFORM` take either form, and so do the `Trellis` methods
+that name a transform (`status`, `quarantine_status`, `sample_quarantined`,
+`release_key`, `self_check`). A qualified name must match exactly, so a wrong
+schema names nothing. `PAUSE` and `RESUME` also take `<transform>.<column>`,
+pausing or resuming a single calculated field rather than the whole definition.
+The column form always takes the bare transform name, and it wins when an
+address reads both ways: `a.b` is column `b` of transform `a` when `a` declares
+a field `b`, and otherwise the transform registered as `a.b` (name that
+transform bare when it collides). `DROP TRANSFORM a.b` refuses an address
+whose `a` is a transform and that names no transform itself, since dropping a
+field is `ALTER TRANSFORM a DROP b`. A relationship, which only `DROP` names,
 is always scoped to its from-table (`posts.author`, or `blog.posts.author`),
 because a relationship name is unique only there. Two same-named tables in
 different schemas are different from-tables, so `blog.posts` and `shop.posts`
