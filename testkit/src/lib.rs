@@ -33,5 +33,6 @@ pub mod lsn;
 pub mod plan;
 
 pub use blocking::{BlockedWatch, Blocker, watch_blocked};
+pub use cluster::prototype_1226::ProtoCluster;
 pub use cluster::{ClusterBackup, StopMode, TestCluster, TestDatabase};
 pub use lsn::wal_insert_lsn;

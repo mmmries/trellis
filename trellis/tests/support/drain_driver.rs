@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
-use testkit::{TestCluster, TestDatabase};
+use testkit::{ProtoCluster, TestCluster, TestDatabase};
 use tokio::task::JoinHandle;
 use tokio_postgres::{Client, NoTls};
 use trellis::capture::columns::{capture_spec, load_catalog};
@@ -62,7 +62,7 @@ pub struct Driver {
     /// install, and the settle to quiescence. For measurements.
     pub phases: Vec<(&'static str, Duration)>,
     pub db: TestDatabase,
-    pub cluster: TestCluster,
+    pub cluster: ProtoCluster,
 }
 
 impl Driver {
@@ -113,7 +113,7 @@ impl Driver {
         definitions: &[&str],
         captured: &[&str],
     ) -> Self {
-        let cluster = TestCluster::start();
+        let cluster = ProtoCluster::start();
         let mut db = cluster.create_isolated_database().await;
         let mut ctl = connect(db.dsn()).await;
         let gate = connect(db.dsn()).await;

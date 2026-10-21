@@ -45,7 +45,39 @@ use std::sync::{Condvar, Mutex, MutexGuard, Once, PoisonError};
 use std::time::{Duration, Instant};
 use trellis::{Config, Pool, migrate};
 
+// PROTOTYPE (#1226), not for merge.
+pub mod prototype_1226;
+
 static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// PROTOTYPE (#1226 measurement): when `TRELLIS_TESTKIT_TIMING_FILE` names a
+/// file, append one `phase<TAB>millis` line per timed fixture phase.
+fn proto_max_clusters() -> Option<usize> {
+    std::env::var("TRELLIS_PROTO_MAX_CLUSTERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
+fn proto_fast() -> bool {
+    std::env::var("TRELLIS_PROTO_FAST").is_ok()
+}
+
+fn timing(phase: &str, since: Instant) {
+    if let Ok(path) = std::env::var("TRELLIS_TESTKIT_TIMING_FILE") {
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(
+                format!("{phase}\t{:.1}\n", since.elapsed().as_secs_f64() * 1000.0).as_bytes(),
+            );
+        }
+    }
+}
+
+struct TimingGuard(&'static str, Instant);
+impl Drop for TimingGuard {
+    fn drop(&mut self) {
+        timing(self.0, self.1);
+    }
+}
 
 fn unique_suffix() -> String {
     format!(
@@ -134,7 +166,12 @@ impl PermitPool {
     fn acquire(&'static self) -> ClusterPermit {
         let mut state = self.lock();
         let mut stall = StallClock::start(self.stall_timeout, state.releases, Instant::now());
-        while state.live >= self.max {
+        let max = if self.name == "cluster" {
+            proto_max_clusters().unwrap_or(self.max)
+        } else {
+            self.max
+        };
+        while state.live >= max {
             let remaining = stall.remaining(state.releases, Instant::now());
             if remaining.is_zero() {
                 let held = state.live;
@@ -277,7 +314,10 @@ impl TestCluster {
     fn start_listening_in(parent: &Path, tcp: bool) -> Self {
         // Gate concurrent clusters before any `initdb`; a local so setup
         // panics release it, then moved into the returned cluster.
+        let t_permit = Instant::now();
         let permit = CLUSTERS.acquire();
+        timing("permit_wait", t_permit);
+        let t_start = Instant::now();
 
         let root = parent.join(format!("trellis-testkit-{}", unique_suffix()));
         let data_dir = root.join("data");
@@ -289,6 +329,7 @@ impl TestCluster {
         // defaults to 32) is under pressure from other Postgres instances it
         // can fail spuriously. Retry a few times with backoff before giving
         // up — the pressure is transient as other segments are freed.
+        let t_initdb = Instant::now();
         run_with_retries(
             || {
                 // A failed `initdb` can leave a partial data dir it would then
@@ -298,6 +339,7 @@ impl TestCluster {
             },
             "initdb",
         );
+        timing("initdb", t_initdb);
 
         // Unix-socket-only clusters all share 5432: the port only names the
         // socket file, which lives in each cluster's own directory. A TCP
@@ -307,6 +349,7 @@ impl TestCluster {
         let port: u16 = if tcp { free_loopback_port() } else { 5432 };
 
         let log_path = root.join("postgres.log");
+        let t_pm = Instant::now();
         let server = spawn_server(&data_dir, &socket_dir, port, tcp, &log_path);
 
         let cluster = Self {
@@ -319,6 +362,8 @@ impl TestCluster {
             _permit: permit,
         };
         cluster.wait_ready(&log_path);
+        timing("postmaster_ready", t_pm);
+        timing("cluster_start_total", t_start);
         cluster
     }
 
@@ -345,7 +390,7 @@ impl TestCluster {
                 panic!("postgres did not become ready in time; log:\n{log}");
             }
 
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(if proto_fast() { 5 } else { 100 }));
         }
     }
 
@@ -524,6 +569,7 @@ impl TestCluster {
     /// database lives until the cluster is torn down. That suits the
     /// `trellis-testkit` binary, whose database goes with its cluster.
     pub fn create_database(&self, name: &str) -> String {
+        let t = Instant::now();
         run_to_completion(
             Command::new("createdb")
                 .arg("-h")
@@ -535,6 +581,7 @@ impl TestCluster {
                 .arg(name),
             "createdb",
         );
+        timing("createdb", t);
         self.database_dsn(name)
     }
 
@@ -555,7 +602,9 @@ impl TestCluster {
     /// [`TestCluster`] never see each other's tables or data.
     pub async fn create_isolated_database(&self) -> TestDatabase {
         let db = self.create_empty_database().await;
+        let t = Instant::now();
         Self::migrate(&db).await;
+        timing("migrate", t);
         db
     }
 
@@ -584,6 +633,7 @@ impl TestCluster {
 
 impl Drop for TestCluster {
     fn drop(&mut self) {
+        let _g = TimingGuard("cluster_drop", Instant::now());
         // Postgres can't trap SIGKILL, so a straight `Child::kill()` would
         // skip shutdown and leak the SysV shared memory segment it allocates
         // as a startup interlock — one per teardown, quickly exhausting the
@@ -596,6 +646,18 @@ impl Drop for TestCluster {
         // this, so the shutdown checkpoint `fast` writes buys nothing.
         // `immediate` still goes through the postmaster, which releases the
         // SysV segment before it exits.
+        if proto_fast() {
+            // PROTOTYPE: pg_ctl's -w polls every 100ms; SIGQUIT is what
+            // `pg_ctl stop -m immediate` sends.
+            let server = self.server.get_mut().unwrap_or_else(|e| e.into_inner());
+            let _ = Command::new("kill")
+                .arg("-QUIT")
+                .arg(server.id().to_string())
+                .status();
+            let _ = server.wait();
+            let _ = fs::remove_dir_all(&self.root);
+            return;
+        }
         let stopped_via_pg_ctl = Command::new("pg_ctl")
             .arg("stop")
             .arg("-D")
@@ -703,6 +765,12 @@ const DROP_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 impl Drop for TestDatabase {
     fn drop(&mut self) {
+        let _g = TimingGuard("dropdb", Instant::now());
+        if proto_fast() && prototype_1226::mode() != prototype_1226::Mode::B {
+            // PROTOTYPE: DROP DATABASE forces a checkpoint (~110ms); almost
+            // every cluster has exactly one database and dies right after.
+            return;
+        }
         // `--force` (PG 13+) disconnects any backends still attached before
         // dropping, so teardown doesn't race connections just released to
         // `pool`. Retried in case a backend is still being torn down.
