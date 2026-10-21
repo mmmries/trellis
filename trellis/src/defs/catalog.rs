@@ -2407,6 +2407,39 @@ pub async fn alter_transform(
         }
     }
 
+    // #1188: the re-types above are in this transaction, so define's own
+    // validation of each definition reading a re-typed column sees them. A
+    // reader define would now refuse (a group-basis `SUM` over a column that
+    // is no longer `numeric(p,s)`, say) refuses the whole edit, which rolls
+    // back: nothing changes and nothing pauses.
+    if !retypes.is_empty() {
+        let columns: Vec<String> = retypes.iter().map(|r| r.column.clone()).collect();
+        let refused = refused_readers(&txn, pool.schema(), &alter.target, &columns).await?;
+        if !refused.is_empty() {
+            return Err(CatalogError::UnsupportedAlter(format!(
+                "ALTER on '{target}' re-types {columns}, which {readers} would now refuse; \
+                 change or drop {them} first (Trellis refuses rather than pausing a reader): {detail}",
+                target = alter.target,
+                columns = columns
+                    .iter()
+                    .map(|c| format!("'{c}'"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                readers = refused
+                    .iter()
+                    .map(|r| format!("'{}'", r.target))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                them = if refused.len() == 1 { "it" } else { "them" },
+                detail = refused
+                    .iter()
+                    .map(|r| format!("'{}': {}", r.target, r.reason))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )));
+        }
+    }
+
     // Issue #915: an edit that builds fields can pause one at birth that
     // already has readers (see `pause_readers_of_paused_columns` below). The
     // column-pause lock it holds since its fence covers that and its
@@ -6186,6 +6219,11 @@ pub(crate) async fn revalidate(
             });
         }
     }
+    // #1188: the group basis's own refusals (a `SUM`/`AVG` over a numeric
+    // with no declared scale), which define makes once the table exists.
+    if let Some(shape) = crate::staging::group_basis::route(&definition.def, &source_columns) {
+        crate::staging::group_basis::check_define(txn, &shape, source).await?;
+    }
     reject_row_security(
         txn,
         schema,
@@ -9552,6 +9590,79 @@ pub(crate) async fn column_dependents_any_keyspace(
     upstream_column: &str,
 ) -> Result<Vec<(String, String)>, CatalogError> {
     column_dependents_via(client, upstream_table, upstream_column, false).await
+}
+
+/// A definition that reads a re-typed column of another's target and that
+/// define would now refuse ([`refused_readers`]).
+#[derive(Debug)]
+pub(crate) struct RefusedReader {
+    pub id: i64,
+    /// The reader's bare target name.
+    pub target: String,
+    /// What define's validation of it refuses.
+    pub reason: CatalogError,
+}
+
+/// Every definition that reads one of `columns` of the target `upstream`
+/// (bare name) and that define's whole validation ([`revalidate`]) now
+/// refuses, as the schema stands in `txn` (#1188). The caller has re-typed
+/// the columns in `txn`, so the validation sees the new types. A reader
+/// that stays valid isn't returned; a database error propagates.
+pub(crate) async fn refused_readers(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    upstream: &str,
+    columns: &[String],
+) -> Result<Vec<RefusedReader>, tokio_postgres::Error> {
+    let mut refused = Vec::new();
+    for (id, target) in column_readers(txn, upstream, columns).await? {
+        let checked = match definition_by_id_in(txn, id).await {
+            Ok(Some(definition)) => revalidate(txn, schema, &definition).await.map(|_| ()),
+            Ok(None) => continue,
+            Err(err) => Err(err),
+        };
+        match checked {
+            Ok(()) => {}
+            Err(CatalogError::Db(err)) => return Err(err),
+            Err(reason) => refused.push(RefusedReader { id, target, reason }),
+        }
+    }
+    Ok(refused)
+}
+
+/// The id and bare target of every definition that reads one of `columns`
+/// of the target `upstream` (bare name), in id order: the definitions
+/// [`refused_readers`] validates. Which definitions read a column doesn't
+/// depend on its type, so a caller can read them before it re-types it.
+pub(crate) async fn column_readers(
+    client: &impl GenericClient,
+    upstream: &str,
+    columns: &[String],
+) -> Result<Vec<(i64, String)>, tokio_postgres::Error> {
+    let mut targets: Vec<String> = Vec::new();
+    for column in columns {
+        match column_dependents_any_keyspace(client, upstream, column).await {
+            Ok(deps) => targets.extend(deps.into_iter().map(|(target, _)| target)),
+            Err(CatalogError::Db(err)) => return Err(err),
+            Err(_) => {}
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    let mut readers = Vec::new();
+    for target in targets {
+        if let Some(row) = client
+            .query_opt(
+                "select id from transform_definitions where split_part(target_table, '.', 2) = $1",
+                &[&target],
+            )
+            .await?
+        {
+            readers.push((row.get(0), target));
+        }
+    }
+    readers.sort();
+    Ok(readers)
 }
 
 async fn column_dependents_via(
