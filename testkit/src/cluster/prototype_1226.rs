@@ -107,7 +107,8 @@ fn cp_data_dir(from: &Path, to: &Path) {
 
 fn a_template() -> &'static ClusterBackup {
     A_TEMPLATE.get_or_init(|| {
-        let tmp = TestCluster::start();
+        reap_orphans_once();
+        let tmp = TestCluster::start_listening_in(&std::env::temp_dir(), false);
         migrate_template(&tmp);
         let backup = tmp.cold_backup();
         register_exit_hook();
@@ -115,7 +116,7 @@ fn a_template() -> &'static ClusterBackup {
     })
 }
 
-fn start_from_template() -> TestCluster {
+pub(super) fn start_from_template() -> TestCluster {
     reap_orphans_once();
     let template = a_template();
     let permit = CLUSTERS.acquire();
@@ -126,6 +127,7 @@ fn start_from_template() -> TestCluster {
     let t = Instant::now();
     cp_data_dir(&template.data_dir(), &data_dir);
     timing("a_copy", t);
+    fs::write(root.join("from_template"), b"").expect("marker");
     let log_path = root.join("postgres.log");
     let t = Instant::now();
     let server = spawn_server(&data_dir, &socket_dir, 5432, false, &log_path);
@@ -259,10 +261,15 @@ impl ProtoCluster {
     }
 }
 
-fn clone_db(c: &TestCluster) -> TestDatabase {
+pub(super) fn clone_db(c: &TestCluster) -> TestDatabase {
     let name = format!("trellis_test_{}", unique_suffix());
     let t = Instant::now();
     clone_template(c, &name);
     timing("clone_template", t);
     c.test_database(name)
+}
+
+/// Clusters started from the template carry the `trellis_template` database.
+pub(super) fn is_template_cluster(c: &TestCluster) -> bool {
+    c.root.join("from_template").exists()
 }

@@ -302,6 +302,9 @@ impl TestCluster {
     }
 
     fn start_listening(tcp: bool) -> Self {
+        if !tcp && prototype_1226::mode() == prototype_1226::Mode::A {
+            return prototype_1226::start_from_template();
+        }
         // Reclaim segments/dirs leaked by prior runs that were killed before
         // `Drop` could stop their server. Once per process is enough: our own
         // live clusters are protected by the liveness check, and `Drop` frees
@@ -601,11 +604,18 @@ impl TestCluster {
     /// [`TestDatabase`] is dropped, so concurrent callers against the same
     /// [`TestCluster`] never see each other's tables or data.
     pub async fn create_isolated_database(&self) -> TestDatabase {
+        if prototype_1226::mode() == prototype_1226::Mode::A && self.has_template() {
+            return prototype_1226::clone_db(self);
+        }
         let db = self.create_empty_database().await;
         let t = Instant::now();
         Self::migrate(&db).await;
         timing("migrate", t);
         db
+    }
+
+    fn has_template(&self) -> bool {
+        prototype_1226::is_template_cluster(self)
     }
 
     /// A handle, with its own pool, on the already-created database `name`,
