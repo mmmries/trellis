@@ -127,6 +127,18 @@ impl EngineTuning {
             reconcile_interval: self.reconcile_interval,
             drain_batch_cap: self.drain_batch_cap,
             build_chunk_rows: self.build_chunk_rows,
+            // A hot run's convergence tail is quantised by the stock 5 s
+            // housekeeping interval (segment retirement frees a full ring),
+            // which biases its changes/s; `TRELLIS_BENCH_HOUSEKEEPING_MS`
+            // shortens it for the run.
+            // An unparsable value fails the run rather than silently
+            // measuring the stock interval under a label that says otherwise.
+            housekeeping_interval: match std::env::var("TRELLIS_BENCH_HOUSEKEEPING_MS") {
+                Ok(v) => Duration::from_millis(v.trim().parse().unwrap_or_else(|_| {
+                    panic!("TRELLIS_BENCH_HOUSEKEEPING_MS={v:?} is not a whole number of ms")
+                })),
+                Err(_) => ClientOptions::default().housekeeping_interval,
+            },
             ..Default::default()
         }
     }

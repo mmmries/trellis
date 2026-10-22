@@ -121,6 +121,11 @@
 //! but **not** on a missed latency target or a rate the engine couldn't
 //! keep, which are measurements rather than errors.
 //!
+//! `TRELLIS_BENCH_HOUSEKEEPING_MS=<ms>` sets the housekeeping interval (stock
+//! 5 s) for a run: a hot run's convergence tail is quantised by that
+//! interval, which biases its changes/s. A value that is not a whole number
+//! of milliseconds fails the run.
+//!
 //! `--release` matters: this pushes 1M rows through a real Postgres
 //! instance and a real CDC pipeline, and the debug-build overhead is large
 //! enough to distort the numbers. Each scenario prints one line of JSON to
