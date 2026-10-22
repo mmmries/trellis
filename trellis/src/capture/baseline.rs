@@ -12,9 +12,11 @@
 //!   narrower `varchar` drops trailing spaces, `integer` to `double
 //!   precision` changes what a definition can do with it. A pure widening
 //!   ([`key_types::pure_widening`]: a wider integer, a longer string bound,
-//!   more `numeric` precision at the same scale, a wider temporal precision)
-//!   keeps every value's text, and is never acted on here; a copy Trellis
-//!   made that it outgrows is `pause_readers_of_retyped`'s.
+//!   more `numeric` precision at the same scale or none, a wider temporal or
+//!   `interval` precision) keeps every value's text, and is acted on here
+//!   only when it takes a `numeric`'s declared scale away, which a reader
+//!   may need; a copy Trellis made that it outgrows is
+//!   `pause_readers_of_retyped`'s.
 //! - **R3b, a same-type value rewrite.** `ALTER COLUMN b TYPE integer USING
 //!   b * 10` on an `integer` column rewrites the table with no DML trigger,
 //!   and leaves the column's name, `attnum`, type and modifier as they were.
@@ -62,14 +64,15 @@
 //!   and counts `capture_auto_rebuilds_total{source_table, cause}`
 //!   ([`CaptureRebuildCause`]).
 //! - **R1 where a definition reading the column may no longer be valid:**
-//!   define would now refuse it (`defs::catalog::revalidate`), a column
-//!   Trellis created for it from the column must be re-typed to hold the
-//!   new values with their text (it was outgrown, or it's a `numeric` whose
-//!   scale is no longer the column's, [`key_types::rescales`]; a narrowing
-//!   needs no re-type, as #824 has it), or the value type it evaluates the
-//!   column as changed (`integer` to `double precision`). The pass pauses
-//!   that definition with a `capture_failure` naming the change; `RESUME`
-//!   re-validates, re-types and rebuilds.
+//!   define would now refuse it (`defs::catalog::revalidate`: a `SUM` over
+//!   a `numeric` that lost its declared scale), a column Trellis created for
+//!   it from the column was outgrown by an integer or float width (a copy
+//!   has no type modifier, ADR-0020, so no modifier change outgrows one), or
+//!   the value type it evaluates the column as changed (`integer` to
+//!   `double precision`). The pass pauses that definition with a
+//!   `capture_failure` naming the change; `RESUME` re-validates, re-types
+//!   and rebuilds. A widening that only took a declared scale away, and
+//!   left every reader valid, changed no value: nothing rebuilds.
 //!
 //! R1's type check leaves alone a definition that uses the column as a
 //! key: `pause_readers_of_retyped` owns a key column's type (#760). A key
@@ -560,6 +563,11 @@ pub(crate) async fn follow_renamed_types(
 enum Change {
     /// R3b: its values were rewritten in place.
     Rewritten,
+    /// R1: a pure widening that takes away the declared scale of a `numeric`
+    /// (`numeric(10,2)` to `numeric`): every value keeps its text, so nothing
+    /// rebuilds, but a reader that needs the scale (a `SUM`) may no longer be
+    /// valid, which only its re-validation tells.
+    Widened { from: String, to: String },
     /// R1: its type or modifier changed, not by a pure widening, from the
     /// first rendering to the second.
     Retyped { from: String, to: String },
@@ -572,7 +580,7 @@ impl Change {
     fn retyped(&self) -> bool {
         match self {
             Change::Rewritten => false,
-            Change::Retyped { .. } => true,
+            Change::Widened { .. } | Change::Retyped { .. } => true,
             Change::Readded { from, to } => from != to,
         }
     }
@@ -581,8 +589,9 @@ impl Change {
     fn rank(&self) -> u8 {
         match self {
             Change::Rewritten => 0,
-            Change::Retyped { .. } => 1,
-            Change::Readded { .. } => 2,
+            Change::Widened { .. } => 1,
+            Change::Retyped { .. } => 2,
+            Change::Readded { .. } => 3,
         }
     }
 }
@@ -598,7 +607,10 @@ fn compare(was: &Column, now: &Column) -> Option<Change> {
     }
     if was.retyped(now) {
         if key_types::pure_widening(&was.ty, &now.ty) {
-            return None;
+            return key_types::loses_declared_scale(&was.ty, &now.ty).then(|| Change::Widened {
+                from: was.display.clone(),
+                to: now.display.clone(),
+            });
         }
         return Some(Change::Retyped {
             from: was.display.clone(),
@@ -794,7 +806,7 @@ async fn respond(
 ) -> Result<Option<Response>, CaptureError> {
     let (from, to, readded) = match change {
         Change::Rewritten => return Ok(Some(Response::Rebuild)),
-        Change::Retyped { from, to } => (from, to, false),
+        Change::Widened { from, to } | Change::Retyped { from, to } => (from, to, false),
         Change::Readded { from, to } => (from, to, true),
     };
     if !change.retyped() {
@@ -887,15 +899,13 @@ async fn respond(
     .into_iter()
     .filter(|c| c.columns_of(table).any(|c| c == column))
     .collect();
-    // A copy that still holds every value with its text (a narrowing, a
-    // `character(n)` length) needs no re-type (#824); one the source
-    // outgrew is `pause_readers_of_retyped`'s, which ran first.
+    // A copy has no type modifier (ADR-0020), so it holds every value of
+    // the source column's type whatever its modifier; one an integer or
+    // float width outgrew is `pause_readers_of_retyped`'s, which ran first.
     let drifted: Vec<String> = crate::defs::copies::inspect(txn, copies)
         .await?
         .into_iter()
-        .filter(|s| {
-            s.drifted() && (s.outgrown() || key_types::rescales(&s.copy_type.ty, &s.live_type.ty))
-        })
+        .filter(|s| s.drifted() && s.outgrown())
         .map(|s| {
             format!(
                 "{} ({} now, {} for the new type)",
@@ -910,6 +920,10 @@ async fn respond(
             "{what}, so columns Trellis created from it must be re-typed: {}",
             drifted.join(", ")
         ))));
+    }
+    // A widening that only took away a declared scale changed no value.
+    if matches!(change, Change::Widened { .. }) {
+        return Ok(None);
     }
     Ok(Some(Response::Rebuild))
 }

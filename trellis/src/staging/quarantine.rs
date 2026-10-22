@@ -3103,7 +3103,7 @@ async fn pause_dependent(
 /// to this.
 ///
 /// The staging worker's capture pass calls this each pass, as it releases
-/// the keys an in-place re-type held. That pass runs on the maintenance
+/// the keys a followed type rename held. That pass runs on the maintenance
 /// loop, which nothing else seals for, so each pair's lock waits here are
 /// capped at [`CASCADE_COMPLETION_LOCK_TIMEOUT`] rather than the session's
 /// 30 s: a writer that still holds a reader's fence fails that pause's walk
@@ -5121,6 +5121,7 @@ async fn finish_requested_resume(
                     column: s.copy.column.clone(),
                     old_type: s.copy_type.display.clone(),
                     new_type: s.live_type.display.clone(),
+                    new_type_oid: s.live_type.oid,
                 })
                 .collect();
             for (sql, labels) in crate::defs::copies::retype_statements(&states) {
@@ -5254,6 +5255,9 @@ struct RetypedColumn {
     column: String,
     old_type: String,
     new_type: String,
+    /// `new_type`'s OID, which the capture pass compares the column's type
+    /// with.
+    new_type_oid: u32,
 }
 
 /// Records, in the re-type's own transaction, that definition `id`'s resume
@@ -5281,12 +5285,21 @@ async fn record_retype_causes(
     .await?;
     for c in columns {
         txn.execute(
-            "insert into retype_causes (table_name, column_name, transform_id, old_type, new_type) \
-             values ($1, $2, $3, $4, $5) \
+            "insert into retype_causes \
+                 (table_name, column_name, transform_id, old_type, new_type, new_type_oid) \
+             values ($1, $2, $3, $4, $5, $6::int8) \
              on conflict (table_name, column_name) do update \
              set transform_id = excluded.transform_id, old_type = excluded.old_type, \
-                 new_type = excluded.new_type, retyped_at = now()",
-            &[&c.table, &c.column, &id, &c.old_type, &c.new_type],
+                 new_type = excluded.new_type, new_type_oid = excluded.new_type_oid, \
+                 retyped_at = now()",
+            &[
+                &c.table,
+                &c.column,
+                &id,
+                &c.old_type,
+                &c.new_type,
+                &i64::from(c.new_type_oid),
+            ],
         )
         .await?;
     }
@@ -5972,22 +5985,22 @@ async fn release_key_as(
     Ok(held.len())
 }
 
-/// Releases the keys the staging worker's in-place re-types asked for
-/// (#824, `staging::schema_change`): for each `retype_releases` row, every
-/// key its definition holds whose failure had the row's SQLSTATE (`22003`,
-/// after a `numeric` was re-typed), each
+/// Releases the keys the capture pass asked for when it followed a renamed
+/// type (`capture::baseline::follow_renamed_types`, #1204): for each
+/// `retype_releases` row, every key its definition holds whose failure had
+/// the row's SQLSTATE (`42704`, a cast by the type's old name), each
 /// through [`release_key`], so its parked work is applied again. A key held
 /// for any other failure stays held, and so does one whose failure Trellis
 /// recorded no SQLSTATE for.
 ///
 /// The staging worker runs it after each capture pass, so a release the
-/// re-type's transaction asked for is made even if the worker stopped in
+/// pass's transaction asked for is made even if the worker stopped in
 /// between. A row is kept, and its release run again after each pass, for
-/// [`RETYPE_RELEASE_WINDOW`] after the re-type asked for it: a drain that
-/// reproduced a key's failure before the re-type can commit the key's
+/// [`RETYPE_RELEASE_WINDOW`] after the pass asked for it: a drain that
+/// reproduced a key's failure before the rename was followed can commit the key's
 /// eviction after this read the keys held, and the next pass's release
 /// finds it. A row is deleted once all its keys are released and the window
-/// has passed, and only if no re-type asked again since it was read
+/// has passed, and only if no pass asked again since it was read
 /// (`requested_at`). A release that waits out its lock timeout
 /// ([`ApplyError::ReleaseLockTimeout`]), or fails otherwise, keeps the row
 /// for the next pass. A row whose definition was dropped is deleted. Errs
@@ -6077,9 +6090,9 @@ pub(crate) async fn release_retyped_keys(pool: &Pool) -> Result<(), ApplyError> 
     Ok(())
 }
 
-/// How long [`release_retyped_keys`] keeps releasing the keys an in-place
-/// re-type asked for: twice the session lock timeout. An eviction that
-/// reproduced a failure from before the re-type commits within it unless
+/// How long [`release_retyped_keys`] keeps releasing the keys a followed
+/// rename asked for: twice the session lock timeout. An eviction that
+/// reproduced a failure from before the rename was followed commits within it unless
 /// its own lock waits, each short of the timeout (one that reaches it rolls
 /// the eviction back), add up to more. A key evicted later than that stays
 /// held until it is released by hand.

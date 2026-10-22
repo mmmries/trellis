@@ -28,38 +28,30 @@
 //! - an aggregate ledger's contribution column, typed as the aggregate's
 //!   argument ([`super::ledger::contribution_pg_type`]).
 //!
-//! A copy of a `varchar(n)` column is an unbounded `varchar` (#1207), with the
-//! column's collation: `varchar(n)`, `varchar` and `text` are one type to
-//! Postgres, which checks a length only when a value is assigned, so the
-//! copy holds whatever the source column holds after any change of its
-//! bound, and a `text` and `varchar(n)` source column are one family
-//! ([`CopyState::drifted`]). The other copies keep their source column's
-//! type.
+//! A copy has its source column's type with no type modifier, and the
+//! column's collation (ADR-0020, [`super::copy_type`]): a `numeric(10,2)` is
+//! copied as `numeric`, a `varchar(n)` as `varchar`, a `char(n)` as
+//! `bpchar`. A modifier constrains what the source can hold and plays no
+//! part in a comparison, so the copy holds whatever the source column holds
+//! after any change of its modifier, and a `text` and `varchar(n)` source
+//! column are one family ([`CopyState::drifted`]).
 //!
 //! None of them changes type when the source column does. After the source
-//! column widens (`integer` to `bigint`, `numeric(10,2)` to `numeric(12,2)`),
-//! the first value the column can't hold fails its write (`22003`). So
-//! the staging worker's capture pass compares each column with the type
-//! define would give it from the live schema ([`inspect`]), and acts on
-//! each table holding a column the source widened
-//! (`staging::schema_change::pause_readers_of_retyped`):
+//! column widens to a wider type (`integer` to `bigint`, `real` to `double
+//! precision`, `bigint` to `numeric`), the first value the column can't hold
+//! fails its write (`22003`). So the staging worker's capture pass compares
+//! each column with the type define would give it from the live schema
+//! ([`inspect`]), and pauses every definition that owns a column the source
+//! has outgrown ([`super::key_types::widens`],
+//! `staging::schema_change::pause_readers_of_retyped`). A resume brings
+//! every column whose type differs from define's to it
+//! ([`retype_statements`]), keeping its collation, before it rebuilds,
+//! except a `JOIN`'s hidden tables, which it drops and creates again at the
+//! live types ([`CopyKind::recreated_by_resume`]).
 //!
-//! - When every widened column of the table widened by changing only the
-//!   catalog ([`CopyState::catalog_only`]: a `numeric` with more precision at
-//!   the same scale), the pass re-types those columns itself, in place. No value
-//!   changes, nothing is rewritten, and no definition pauses or rebuilds.
-//!   Then the keys its definitions held for a value the old type couldn't
-//!   hold are released (`staging::quarantine::release_retyped_keys`).
-//! - Otherwise it pauses every definition that owns a column the source has
-//!   outgrown ([`super::key_types::widens`]). A resume brings every column
-//!   whose type differs from define's to it ([`retype_statements`]) before
-//!   it rebuilds, except a `JOIN`'s hidden tables, which it drops and
-//!   creates again at the live types ([`CopyKind::recreated_by_resume`]).
-//!
-//! Trellis re-types a column on its own only in the first case. Either
-//! re-type keeps the column's collation. A narrowing, or a change to another
-//! type family, pauses nothing here and is re-typed only by a resume: every
-//! value still fits, or define's own checks own it.
+//! Trellis never re-types a column on its own. A narrowing, or a change to
+//! another type family, pauses nothing here and is re-typed only by a
+//! resume: every value still fits, or define's own checks own it.
 //!
 //! The comparison costs a few queries per definition, so the capture pass
 //! runs it for a definition only when a table it reads has changed since a
@@ -702,9 +694,6 @@ fn expr_reads(
     }
 }
 
-/// `pg_type.oid` of `varchar`.
-const VARCHAR_OID: u32 = 1043;
-
 /// A column type: its OID and modifier, its `schema.typname` and modifier
 /// ([`ColumnType`]), and `format_type`'s rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -712,7 +701,11 @@ pub(crate) struct CopyType {
     pub oid: u32,
     pub typmod: i32,
     pub ty: ColumnType,
+    /// `format_type`'s rendering, with the modifier: for messages only.
     pub display: String,
+    /// The type as a copy declares and casts to it: no modifier, qualified
+    /// ([`super::copy_type::type_sql`]).
+    pub sql: String,
     /// Whether the type takes a collation.
     pub collatable: bool,
 }
@@ -724,6 +717,10 @@ pub(crate) struct CopyState {
     pub copy: TypedCopy,
     pub copy_type: CopyType,
     pub live_type: CopyType,
+    /// The modifier of the source column the copy is of, when it is a copy of
+    /// one: what `live_type` leaves out (a copy has none, ADR-0020), and what
+    /// tells an integer outgrown by a bounded `numeric` from one that isn't.
+    pub source_typmod: i32,
     /// The copy's collation, quoted and qualified, when it isn't its type's
     /// default: a 1-1 target's key keeps its source key's (#769). A re-type
     /// keeps it.
@@ -748,16 +745,11 @@ impl CopyState {
     /// define would give it now holds values its type can't
     /// ([`super::key_types::widens`]).
     pub(crate) fn outgrown(&self) -> bool {
-        super::key_types::widens(&self.copy_type.ty, &self.live_type.ty)
-    }
-
-    /// Whether the copy drifted by a widening its table takes by changing
-    /// only the catalog ([`super::key_types::catalog_only`]): no rewrite, no
-    /// value changed, every index kept. A group-delta table's column never
-    /// is one: its re-type generates the partition column again.
-    pub(crate) fn catalog_only(&self) -> bool {
-        self.copy.kind != CopyKind::DeltasGroup
-            && super::key_types::catalog_only(&self.copy_type.ty, &self.live_type.ty)
+        let source = ColumnType {
+            type_name: self.live_type.ty.type_name.clone(),
+            typmod: self.source_typmod,
+        };
+        super::key_types::widens(&self.copy_type.ty, &source)
     }
 }
 
@@ -838,15 +830,17 @@ pub(crate) async fn inspect(
         let Some((copy_type, collation)) = copied.get(&i).cloned() else {
             continue;
         };
+        let mut source_typmod = -1;
         let live_type = match &copy.inferred {
             Some(name) => match regtype(client, &mut named, name).await? {
                 Some(oid) => (oid, -1),
                 None => continue,
             },
             None => {
-                let Some(&((source_oid, source_typmod), _)) = sources.get(&i) else {
+                let Some(&((source_oid, typmod), _)) = sources.get(&i) else {
                     continue;
                 };
+                source_typmod = typmod;
                 if copy.kind.by_family() {
                     let value_type = super::pg_type::value_type_for_oid(client, source_oid).await?;
                     let name = super::ddl::pg_type_name(value_type);
@@ -854,11 +848,11 @@ pub(crate) async fn inspect(
                         Some(oid) => (oid, -1),
                         None => continue,
                     }
-                } else if source_oid == VARCHAR_OID {
-                    // A copy of a `varchar(n)` column is unbounded (#1207).
-                    (source_oid, -1)
                 } else {
-                    (source_oid, source_typmod)
+                    // A copy has the source column's type and no modifier
+                    // (ADR-0020), so a source that only changes its modifier
+                    // leaves every copy as it should be.
+                    (source_oid, -1)
                 }
             }
         };
@@ -868,6 +862,7 @@ pub(crate) async fn inspect(
             copy,
             copy_type,
             live_type,
+            source_typmod,
             collation,
         });
     }
@@ -902,11 +897,14 @@ pub(crate) async fn describe(
     }
     let row = client
         .query_one(
-            "select n.nspname::text || '.' || t.typname::text, \
-                    pg_catalog.format_type(t.oid, $2), t.typcollation <> 0 \
-             from pg_catalog.pg_type t \
-             join pg_catalog.pg_namespace n on n.oid = t.typnamespace \
-             where t.oid = $1",
+            &format!(
+                "select n.nspname::text || '.' || t.typname::text, \
+                        pg_catalog.format_type(t.oid, $2), t.typcollation <> 0, {} \
+                 from pg_catalog.pg_type t \
+                 join pg_catalog.pg_namespace n on n.oid = t.typnamespace \
+                 where t.oid = $1",
+                super::copy_type::type_sql("t.oid")
+            ),
             &[&oid, &typmod],
         )
         .await?;
@@ -919,6 +917,7 @@ pub(crate) async fn describe(
         },
         display: row.get(1),
         collatable: row.get(2),
+        sql: row.get(3),
     };
     described.insert((oid, typmod), ty.clone());
     Ok(ty)
@@ -953,7 +952,7 @@ pub(crate) fn retype_statements(states: &[CopyState]) -> Vec<(String, Vec<String
                     };
                     format!(
                         "alter column {column} type {ty}{collate} using {column}::{ty}",
-                        ty = s.live_type.display
+                        ty = s.live_type.sql
                     )
                 })
                 .collect::<Vec<_>>()
@@ -964,7 +963,7 @@ pub(crate) fn retype_statements(states: &[CopyState]) -> Vec<(String, Vec<String
                     .filter(|s| s.copy.table == table)
                     .map(|s| super::ledger::LedgerColumn {
                         name: s.copy.column.clone(),
-                        pg_type: s.live_type.display.clone(),
+                        pg_type: s.live_type.sql.clone(),
                         collation: None,
                     })
                     .collect();
@@ -990,6 +989,7 @@ mod tests {
                 typmod: -1,
             },
             display: display.to_string(),
+            sql: display.to_string(),
             collatable: false,
         };
         CopyState {
@@ -1003,6 +1003,7 @@ mod tests {
             },
             copy_type: ty(from, if from == "integer" { 23 } else { 20 }),
             live_type: ty(to, if to == "integer" { 23 } else { 20 }),
+            source_typmod: -1,
             collation: None,
         }
     }
@@ -1160,23 +1161,21 @@ mod tests {
             CopyKind::TargetKey,
             "\"public\".\"t\"",
             "code",
-            "varchar(10)",
-            "varchar(40)",
+            "integer",
+            "bigint",
         );
-        key.copy_type.typmod = 14;
-        key.live_type.typmod = 44;
         key.collation = Some("pg_catalog.\"C\"".to_string());
         key.live_type.collatable = true;
         assert_eq!(
             retype_statements(std::slice::from_ref(&key))[0].0,
-            "alter table \"public\".\"t\" alter column \"code\" type varchar(40) \
-             collate pg_catalog.\"C\" using \"code\"::varchar(40)"
+            "alter table \"public\".\"t\" alter column \"code\" type bigint \
+             collate pg_catalog.\"C\" using \"code\"::bigint"
         );
         key.live_type.collatable = false;
         assert_eq!(
             retype_statements(std::slice::from_ref(&key))[0].0,
-            "alter table \"public\".\"t\" alter column \"code\" type varchar(40) \
-             using \"code\"::varchar(40)"
+            "alter table \"public\".\"t\" alter column \"code\" type bigint \
+             using \"code\"::bigint"
         );
     }
 
@@ -1193,6 +1192,7 @@ mod tests {
                 typmod,
             },
             display: name.to_string(),
+            sql: name.to_string(),
             collatable: true,
         };
         let mut s = state(CopyKind::Passthrough, "\"public\".\"t\"", "c", "x", "y");
@@ -1204,7 +1204,7 @@ mod tests {
         ] {
             s.copy_type = copy;
             s.live_type = live;
-            assert!(!s.drifted() && !s.outgrown() && !s.catalog_only());
+            assert!(!s.drifted() && !s.outgrown());
             assert!(retype_statements(std::slice::from_ref(&s)).is_empty());
         }
         s.live_type = CopyType {
@@ -1215,6 +1215,7 @@ mod tests {
                 typmod: -1,
             },
             display: "integer".to_string(),
+            sql: "integer".to_string(),
             collatable: false,
         };
         assert!(s.drifted(), "another family still drifts");
