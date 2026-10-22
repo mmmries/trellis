@@ -82,8 +82,9 @@
 //!
 //! # A build ([`build`])
 //!
-//! A fresh build, a `RESUME` (which recreates the hidden tables and keeps the
-//! visible target) and a rebuild in place of a live `JOIN` (a
+//! With both sides unpartitioned (or empty), a fresh build, a `RESUME`
+//! (which recreates the hidden tables and keeps the visible target) and a
+//! rebuild in place of a live `JOIN` (a
 //! `request_backfill` of either table, a re-installed capture) are one
 //! `READ COMMITTED` transaction over both structures, #1097's S1T: a page
 //! whose two sides both recompute every cell they enumerate from one `GROUP
@@ -117,10 +118,22 @@
 //! tables, and visible rows that disagree with `T`. Not a hand edit of `T` or
 //! of `J.matches`, which change only by delta; a `RESUME` recreates them.
 //!
-//! Not built yet, each halting the definition with the reason: a side that is
-//! partitioned and has rows (its per-side, per-leaf build, #1286), and a
-//! `RESUME` that keeps a target with rows while a reader of it isn't paused
-//! (the readers' rebuild at the build's commit, #1287).
+//! # A build with a partitioned side
+//!
+//! A side that is a partitioned root with rows (#1286) is built per side and
+//! per leaf, in transactions of their own ([`BuildWork`]): every unpartitioned
+//! side whole, then each partitioned side's leaves in oid order and its
+//! remainder, each step the shape of [`recompute_routed`] (steps 1 to 4 above
+//! over the region's cells, `T` written as a delta from the partials), then a
+//! final step that locks every group of the visible target and of `T` and
+//! compares each visible row with the row the target holds. The job's cursor
+//! names the last step committed (`super::build::run_join_steps`). Readers
+//! see progressive values until the final step commits.
+//!
+//! A `RESUME` build parks its readers' catch-up when it commits (#1287): its
+//! pages computed prior images from empty partials while the target kept the
+//! earlier rows, so a reader holds rows those images don't match, and its
+//! rebuild overwrites them. The park is in the last transaction, once.
 //!
 //! # Release ([`release`])
 //!
@@ -1176,10 +1189,13 @@ pub(crate) async fn recompute_routed(
     Ok(())
 }
 
-/// A `JOIN`'s fresh build, `RESUME` and rebuild in place (#1109, #1097's
-/// decision): both structures, `P` and `M`, and `T` in the caller's one
-/// `READ COMMITTED` transaction, which commits it. Readers see the old `T`
-/// and the old visible target until that commit.
+/// One transaction of a `JOIN`'s fresh build, `RESUME` or rebuild in place
+/// (#1109, #1097's decision), in the caller's `READ COMMITTED` transaction,
+/// which commits it. `work` is what it covers ([`BuildWork`]).
+///
+/// [`BuildWork::Single`], both sides unpartitioned (or empty): both
+/// structures, `P` and `M`, and `T`, so readers see the old `T` and the old
+/// visible target until the commit.
 ///
 /// 1. The lock row `FOR SHARE`, before the enumeration, so a `TRUNCATE` page
 ///    (the row `FOR UPDATE`) waits for the commit and clears what it empties
@@ -1203,6 +1219,13 @@ pub(crate) async fn recompute_routed(
 ///    group no source row backs and repairs a row that disagrees with `T`'s
 ///    partials.
 ///
+/// [`BuildWork::Side`], one step of a build with a partitioned side: steps 1
+/// to 3 over that side's cells in the region alone, `J` on their keys, `T`
+/// locked and written as a page writes it (only the product's groups, as a
+/// delta from the partials). [`BuildWork::Final`]: the lock row, then step 4's
+/// lock of every group of the visible target and of `T`'s hidden table, and
+/// its compare, with no product.
+///
 /// A hand edit of `T` or of `J.matches` is not repaired: they change only by
 /// delta (a `RESUME` recreates them). Returns the visible rows written and
 /// deleted.
@@ -1210,24 +1233,75 @@ pub(crate) async fn build(
     txn: &Transaction<'_>,
     catalog_schema: &str,
     definition: &Definition,
+    work: &BuildWork<'_>,
 ) -> Result<(usize, usize), ApplyError> {
     let mut plan = plan_for(txn, catalog_schema, definition).await?;
     pause!(txn, BeforeJoinBuild, &plan.target);
-    for side in [&mut plan.from, &mut plan.joined] {
-        side.recompute = true;
-        side.node = Some(side.plan.source_row().to_string());
-    }
     create_working_tables(txn, &plan).await?;
-    txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
-        .await?;
-    for side in [&plan.from, &plan.joined] {
-        group_basis::enumerate_cells(txn, &side.plan).await?;
-    }
     let mut mutations = TargetMutations::new();
-    let (written, deleted) = write_locked(txn, &plan, &mut mutations, true).await?;
+    let counts = match work {
+        BuildWork::Single => {
+            for side in [&mut plan.from, &mut plan.joined] {
+                side.recompute = true;
+                side.node = Some(side.plan.source_row().to_string());
+            }
+            txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
+                .await?;
+            for side in [&plan.from, &plan.joined] {
+                group_basis::enumerate_cells(txn, &side.plan, None).await?;
+            }
+            write_locked(txn, &plan, &mut mutations, true).await?
+        }
+        BuildWork::Side { side, scope } => {
+            let side_plan = plan.side_mut(*side);
+            side_plan.recompute = true;
+            // The region's rows come from one `GROUP BY` of the table (a whole
+            // side) or of the leaf, if the tree is as recorded; otherwise
+            // each cell's rows are probed through the root.
+            side_plan.node = match scope {
+                None => Some(side_plan.plan.source_row().to_string()),
+                Some(scope) if scope.read_node => scope.node.clone(),
+                Some(_) => None,
+            };
+            txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
+                .await?;
+            let side_plan = match side {
+                Side::From => &plan.from,
+                Side::Joined => &plan.joined,
+            };
+            group_basis::enumerate_cells(txn, &side_plan.plan, *scope).await?;
+            write_locked(txn, &plan, &mut mutations, false).await?
+        }
+        BuildWork::Final => {
+            txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
+                .await?;
+            group_basis::enumerate_target_groups(txn, &plan.t).await?;
+            txn.execute(&plan.t.lock_sql(), &[]).await?;
+            pause!(txn, AfterJoinTargetLock, &plan.target);
+            group_basis::apply_join_build_groups(txn, &plan.t, &mut mutations).await?
+        }
+    };
     let propagation = mutations.into_staged(txn).await?;
     super::append::append(txn, &propagation.changes).await?;
-    Ok((written, deleted))
+    Ok(counts)
+}
+
+/// What one transaction of a `JOIN`'s build does ([`build`]).
+#[derive(Clone, Copy)]
+pub(crate) enum BuildWork<'a> {
+    /// The whole build: both sides unpartitioned (or empty), S1T.
+    Single,
+    /// One side's cells in a region, a step of the per-side, per-leaf build
+    /// of a `JOIN` with a partitioned side that has rows (#1286): the whole
+    /// side (`scope` none), or the cells a leaf or the remainder of its
+    /// recorded tree covers.
+    Side {
+        side: Side,
+        scope: Option<&'a group_basis::RebuildScope>,
+    },
+    /// The last step of that build: every group of `T` and of the visible
+    /// target compared.
+    Final,
 }
 
 /// The column list of each of definition `id`'s hidden tables in
