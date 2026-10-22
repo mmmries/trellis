@@ -1025,8 +1025,10 @@ A group-basis or JOIN reader needs exact images, as capture gives a source.
   rebuild overwrites whatever they did, and a rebuild in place of a `live`
   definition parks nothing, because its hidden state matches its target. The
   park is in the transaction that completes the whole build, once: on a
-  partitioned source, the remainder's, after the last leaf's. Further hops
-  need nothing: a reader's visible rows always match its own partials.
+  partitioned source, the remainder's, after the last leaf's. A `JOIN`'s
+  `RESUME` build doesn't park yet: it halts while its target has rows and a
+  reader that isn't paused ([ADR-0019](0019-join-transforms.md)). Further
+  hops need nothing: a reader's visible rows always match its own partials.
 - **Must:** a writer that resolved the target's feed before a new reader's
   define committed must not leave the reader's build missing its write. A
   deterministic test freezes such a writer between its check and its

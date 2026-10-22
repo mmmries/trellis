@@ -1058,15 +1058,14 @@ pub async fn create_definition_without_backfill(
 }
 
 /// The test fixtures above flip what they register `live` without a build,
-/// and nothing builds or maintains a `JOIN` target yet (J3 #1108, J4 #1109):
-/// a `JOIN` reaches `live` through no path until then (#1107), so they refuse
+/// and a `JOIN` reaches `live` only through its build (#1109), so they refuse
 /// one. Text that doesn't parse is left to the fixture's own error.
 #[cfg(any(test, feature = "test-util"))]
 fn refuse_join_fixture(source_text: &str) {
     if let Ok(def) = parse(source_text) {
         assert!(
             !matches!(def.key_space, KeySpace::Join(_)),
-            "a JOIN definition can't be registered `live`: nothing builds one yet"
+            "a JOIN definition can't be registered `live`: only its build makes one live"
         );
     }
 }
@@ -9918,7 +9917,8 @@ mod go_live_tests {
     use super::*;
 
     /// #1107: the fixtures that flip a definition `live` without a build
-    /// refuse a `JOIN`, which nothing builds yet; any other shape passes.
+    /// refuse a `JOIN`, which only its build makes `live`; any other shape
+    /// passes.
     #[test]
     #[should_panic(expected = "a JOIN definition can't be registered `live`")]
     fn the_live_fixtures_refuse_a_join() {
