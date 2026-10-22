@@ -52,6 +52,20 @@ const POINTS: [PausePoint; 7] = [
     PausePoint::BeforeCommit,
 ];
 
+/// Whether the run puts a `FROM`-side-only page's `J` lock on `FOR SHARE`
+/// (#1230): `TRELLIS_DEV_JOIN_A_SHARE=1`. Two such pages of one key overlap;
+/// every other pair still queues.
+fn a_side_share() -> bool {
+    std::env::var(trellis::dev::staging::A_SIDE_SHARE_ENV).is_ok_and(|v| v == "1")
+}
+
+/// Whether `sql` changes only the `FROM` side's table (so, with the knob on,
+/// its page locks `J` `FOR SHARE`).
+fn a_only(sql: &str) -> bool {
+    let sql = sql.to_ascii_lowercase();
+    !sql.contains("public.b") && !sql.contains("truncate")
+}
+
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
 }
@@ -208,6 +222,7 @@ async fn lab(key: Key, kinds: &[Kind]) -> Lab {
 
 async fn lab_with_defaults(key: Key, kinds: &[Kind], defaults: &[(&str, &str)]) -> Lab {
     trellis::dev::staging::set_group_basis(true);
+    trellis::dev::staging::set_a_side_share(a_side_share());
     let definitions: Vec<String> = kinds.iter().map(|k| k.definition(key)).collect();
     let definitions: Vec<&str> = definitions.iter().map(String::as_str).collect();
     let d = Driver::start_with_database_defaults(
@@ -565,7 +580,14 @@ fn holds_j(point: PausePoint, new_key: bool) -> bool {
 /// at every point, with whether the other must queue. `shared`: the pages
 /// name a common join key; `new_key`: its `J` row doesn't exist before
 /// them.
-fn schedules(shared: bool, new_key: bool) -> Vec<(usize, Option<PausePoint>, Option<bool>)> {
+fn schedules(
+    shared: bool,
+    new_key: bool,
+    both_share: bool,
+) -> Vec<(usize, Option<PausePoint>, Option<bool>)> {
+    // Two `FOR SHARE` lockers overlap, unless the key's row is new: the
+    // frozen page's uncommitted insert holds it.
+    let shared = shared && (!both_share || new_key);
     let mut out = vec![(0, None, None), (1, None, None)];
     for paused in [0, 1] {
         for point in POINTS {
@@ -609,7 +631,8 @@ const DECOYS: &str = "insert into public.a values ({id} + 90, {g1}, {dk}, 1); \
 async fn run_races(lab: &mut Lab, races: &[(&str, &str, &str, &str, bool, bool)]) {
     let mut n = 0;
     for (name, setup, x, y, shared, new_key) in races {
-        for (paused, point, queues) in schedules(*shared, *new_key) {
+        let both_share = a_side_share() && a_only(x) && a_only(y);
+        for (paused, point, queues) in schedules(*shared, *new_key, both_share) {
             n += 1;
             if !setup.is_empty() {
                 lab.step(&fill(setup, n, lab.key)).await;

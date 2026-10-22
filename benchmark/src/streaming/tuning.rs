@@ -127,6 +127,14 @@ impl EngineTuning {
             reconcile_interval: self.reconcile_interval,
             drain_batch_cap: self.drain_batch_cap,
             build_chunk_rows: self.build_chunk_rows,
+            // #1230: segment retirement (a full ring waits for it) runs on
+            // this cadence, 5 s stock, which quantises a run's convergence
+            // time; `TRELLIS_BENCH_HOUSEKEEPING_MS` shortens it.
+            housekeeping_interval: std::env::var("TRELLIS_BENCH_HOUSEKEEPING_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map(Duration::from_millis)
+                .unwrap_or(ClientOptions::default().housekeeping_interval),
             ..Default::default()
         }
     }

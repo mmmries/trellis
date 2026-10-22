@@ -415,7 +415,7 @@ pub fn join_case(
 }
 
 #[cfg(feature = "proptest")]
-pub use strategy::join_case_strategy;
+pub use strategy::{join_case_strategy, join_case_strategy_phased};
 
 #[cfg(feature = "proptest")]
 mod strategy {
@@ -495,6 +495,18 @@ mod strategy {
     /// ops from one lane (`super::concurrent_plan`), so the other half keeps
     /// several lanes writing each table.
     pub fn join_case_strategy() -> impl Strategy<Value = JoinCase> {
+        join_case_strategy_with(false)
+    }
+
+    /// [`join_case_strategy`] with the ops grouped by table: of every three
+    /// bursts, two write only the `FROM` table and one only the joined table
+    /// (#1230), so most pages hold changes of one side, where the mixed
+    /// draw leaves almost every page both.
+    pub fn join_case_strategy_phased() -> impl Strategy<Value = JoinCase> {
+        join_case_strategy_with(true)
+    }
+
+    fn join_case_strategy_with(phased: bool) -> impl Strategy<Value = JoinCase> {
         prop_oneof![
             Just(KeyShape::Spread),
             Just(KeyShape::HotKey),
@@ -502,13 +514,15 @@ mod strategy {
             Just(KeyShape::Wide)
         ]
         .prop_flat_map(|shape| (Just(shape), any::<bool>()))
-        .prop_flat_map(|(shape, truncating)| {
+        .prop_flat_map(move |(shape, truncating)| {
             let joined_weight = if matches!(shape, KeyShape::FanOut | KeyShape::Wide) {
                 5
             } else {
                 3
             };
-            let burst_size = if shape == KeyShape::Wide {
+            let burst_size = if phased {
+                30usize..=120
+            } else if shape == KeyShape::Wide {
                 260usize..=600
             } else {
                 40usize..=600
@@ -522,7 +536,12 @@ mod strategy {
                 20u64..=200,
             )
                 .prop_map(
-                    move |(specs, draws, burst_size, lanes, workers, seal_interval_ms)| {
+                    move |(specs, mut draws, burst_size, lanes, workers, seal_interval_ms)| {
+                        if phased {
+                            for (i, draw) in draws.iter_mut().enumerate() {
+                                draw.joined = (i / burst_size) % 3 == 2;
+                            }
+                        }
                         join_case(
                             &specs,
                             shape,

@@ -99,8 +99,10 @@ use trellis::dev::defs::ast::ValueType;
 
 use crate::scenario::connect_raw;
 use crate::streaming::chain::wait_for_live;
+use crate::streaming::contention;
 use crate::streaming::disk_tier::json_escape;
 use crate::streaming::idle_cost::{wal_bytes_since, wal_lsn};
+use crate::streaming::scrape::{self, SumCountSnapshot};
 use crate::streaming::tuning::EngineTuning;
 
 /// J2's two data shapes.
@@ -148,6 +150,9 @@ pub enum Variant {
     S1,
     S2,
     B0,
+    /// #1155: S2 with a co-resident 1-1 transform (`c11`) and group-basis
+    /// aggregate (`cagg`) on `a`.
+    C,
 }
 
 impl Variant {
@@ -156,7 +161,8 @@ impl Variant {
             "s1" => Variant::S1,
             "s2" => Variant::S2,
             "b0" => Variant::B0,
-            other => panic!("unknown variant {other:?} (s1, s2, b0)"),
+            "c" => Variant::C,
+            other => panic!("unknown variant {other:?} (s1, s2, b0, c)"),
         }
     }
 
@@ -165,6 +171,44 @@ impl Variant {
             Variant::S1 => "s1",
             Variant::S2 => "s2",
             Variant::B0 => "b0",
+            Variant::C => "c",
+        }
+    }
+}
+
+/// #1155's engine arms: a drain-worker count and a scratch prototype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm {
+    pub threads: usize,
+    /// 0 main, 2 `share` (#1230: `FOR SHARE` on `J` for `FROM`-side pages).
+    pub proto: u8,
+}
+
+impl Arm {
+    /// `8`, `8:main`, `8:share`.
+    pub fn parse(raw: &str) -> Self {
+        let mut parts = raw.trim().split(':');
+        let threads = parts
+            .next()
+            .and_then(|t| t.parse().ok())
+            .unwrap_or_else(|| panic!("bad arm {raw:?}"));
+        let proto = match parts.next().map(str::to_ascii_lowercase).as_deref() {
+            None | Some("main") => 0,
+            Some("e3" | "share") => 2,
+            Some(other) => panic!("unknown prototype {other:?} (main, share)"),
+        };
+        Arm { threads, proto }
+    }
+
+    pub fn label(self) -> String {
+        let proto = ["main", "", "share"][self.proto as usize];
+        format!("{}:{proto}", self.threads)
+    }
+
+    fn tuning(self, base: &EngineTuning) -> EngineTuning {
+        EngineTuning {
+            application_threads: self.threads,
+            ..base.clone()
         }
     }
 }
@@ -190,6 +234,15 @@ pub struct JoinBench {
     pub seed: u64,
     /// The longest one page, or the load, may take to converge.
     pub timeout: Duration,
+    /// #1155: the engine arms every page runs under, interleaved. Empty:
+    /// one arm, the tuning's thread count on main.
+    pub arms: Vec<Arm>,
+    /// The arms the hot-key runs use; `None`: every arm.
+    pub hot_arms: Option<Vec<Arm>>,
+    /// Which hot-key runs: without and/or with the dimension writer.
+    pub hot_dims: Vec<bool>,
+    /// Abort when `MemAvailable` falls below this many GiB.
+    pub min_free_gib: f64,
 }
 
 impl Default for JoinBench {
@@ -208,6 +261,10 @@ impl Default for JoinBench {
             load_chunk: 100_000,
             seed: 1113,
             timeout: Duration::from_secs(1_800),
+            arms: Vec::new(),
+            hot_arms: None,
+            hot_dims: vec![false, true],
+            min_free_gib: 3.0,
         }
     }
 }
@@ -379,15 +436,157 @@ struct VariantDb {
     writer: RawClient,
     client: Option<trellis::Client>,
     targets: Vec<String>,
+    /// #1155: co-resident definitions' targets (variant C), not checked.
+    extra_targets: Vec<String>,
+    /// #1155: the contention sampler's connection.
+    sampler: RawClient,
 }
 
 /// One timed page.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PageTime {
     write_s: f64,
     apply_s: f64,
     wal_bytes: i64,
     changes: usize,
+    probe: Probe,
+}
+
+/// #1155: what one page's apply window looked like.
+#[derive(Debug, Clone, Default)]
+struct Probe {
+    /// Mean engine backends busy / in a row-lock wait, by table.
+    busy_by_table: Vec<(String, f64)>,
+    row_lock_by_table: Vec<(String, f64)>,
+    busy_mean: f64,
+    row_lock_mean: f64,
+    running_mean: f64,
+    samples: u64,
+    /// `trellis_join_lock_wait_seconds`' sum and count over the page.
+    j_lock_wait_s: f64,
+    j_lock_count: u64,
+    /// CPU seconds: this process (the engine and the harness), and the
+    /// cluster's backends.
+    proc_cpu_s: f64,
+    pg_cpu_s: f64,
+    deadlocks: i64,
+    rollbacks: i64,
+    /// Mean `trellis_transform_latency_seconds` per target, ms.
+    latency_ms: Vec<(String, Option<f64>)>,
+    /// The most-sampled `(wait class, statement)` pairs.
+    top: Vec<(String, String, f64)>,
+}
+
+impl Probe {
+    fn table(v: &[(String, f64)], t: &str) -> f64 {
+        v.iter().find(|(k, _)| k == t).map_or(0.0, |(_, m)| *m)
+    }
+
+    fn json(&self) -> String {
+        let map = |v: &[(String, f64)]| {
+            v.iter()
+                .map(|(k, m)| format!("\"{k}\":{m:.3}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "\"samples\":{},\"busy_mean\":{:.3},\"row_lock_mean\":{:.3},\"running_mean\":{:.3},\
+             \"busy_by_table\":{{{}}},\"row_lock_by_table\":{{{}}},\"j_lock_wait_s\":{:.4},\
+             \"j_lock_count\":{},\"proc_cpu_s\":{:.3},\"pg_cpu_s\":{:.3},\"deadlocks\":{},\
+             \"rollbacks\":{},\"latency_ms\":{{{}}},\"top\":[{}]",
+            self.samples,
+            self.busy_mean,
+            self.row_lock_mean,
+            self.running_mean,
+            map(&self.busy_by_table),
+            map(&self.row_lock_by_table),
+            self.j_lock_wait_s,
+            self.j_lock_count,
+            self.proc_cpu_s,
+            self.pg_cpu_s,
+            self.deadlocks,
+            self.rollbacks,
+            self.latency_ms
+                .iter()
+                .map(|(t, m)| format!(
+                    "\"{t}\":{}",
+                    m.map_or("null".to_string(), |m| format!("{m:.1}"))
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+            self.top
+                .iter()
+                .map(|(c, q, m)| format!("[\"{c}\",\"{}\",{m:.3}]", json_escape(q)))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
+}
+
+/// CPU seconds (user + system) of process `pid`, `0` if gone.
+fn cpu_s(pid: u32) -> f64 {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return 0.0;
+    };
+    let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+        return 0.0;
+    };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After `comm`: state is field 3, utime 14 and stime 15 (1-based).
+    let ticks: f64 = [11, 12]
+        .iter()
+        .filter_map(|&i| fields.get(i)?.parse::<f64>().ok())
+        .sum();
+    ticks / 100.0
+}
+
+/// CPU seconds of the postmaster `postmaster`'s children, summed.
+fn pg_cpu_s(postmaster: u32) -> f64 {
+    let mut total = 0.0;
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return 0.0;
+    };
+    for entry in dir.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if fields.get(1).and_then(|p| p.parse::<u32>().ok()) == Some(postmaster) {
+            total += cpu_s(pid);
+        }
+    }
+    total
+}
+
+/// `MemAvailable` in GiB.
+fn mem_available_gib() -> f64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| {
+            m.lines()
+                .find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())
+        })
+        .map_or(f64::INFINITY, |kb| kb / 1024.0 / 1024.0)
+}
+
+fn check_memory(cfg: &JoinBench) {
+    let free = mem_available_gib();
+    assert!(
+        free >= cfg.min_free_gib,
+        "ABORT: MemAvailable {free:.1} GiB is below {} GiB",
+        cfg.min_free_gib
+    );
 }
 
 impl PageTime {
@@ -409,6 +608,20 @@ fn definitions(variant: Variant) -> Vec<(&'static str, String)> {
                  SELECT b.gb AS gb, {FIELDS}"
             ),
         )],
+        Variant::C => {
+            let mut defs = definitions(Variant::S2);
+            defs.push((
+                "c11",
+                "TRANSFORM c11 FROM public.a SELECT day AS day, x AS x".to_string(),
+            ));
+            defs.push((
+                "cagg",
+                "TRANSFORM cagg FROM public.a GROUP BY day SELECT day AS day, COUNT(*) AS n, \
+                 SUM(x) AS sx"
+                    .to_string(),
+            ));
+            defs
+        }
         Variant::S2 => vec![(
             "s2",
             format!(
@@ -509,13 +722,19 @@ impl VariantDb {
             columns.insert("y".to_string(), int8);
         }
         let mut targets = Vec::new();
+        let mut extra_targets = Vec::new();
         for (target, text) in definitions(variant) {
             trellis::dev::defs::install_definition(&db.pool, &text, &columns, "public")
                 .await
                 .unwrap_or_else(|e| panic!("define {target}: {e:?}"));
             wait_for_live(&raw, target, Instant::now() + Duration::from_secs(120)).await;
-            targets.push(target.to_string());
+            if target.starts_with('c') {
+                extra_targets.push(target.to_string());
+            } else {
+                targets.push(target.to_string());
+            }
         }
+        let sampler = connect_raw(db.dsn()).await;
         VariantDb {
             variant,
             db,
@@ -523,6 +742,8 @@ impl VariantDb {
             writer,
             client: Some(client),
             targets,
+            extra_targets,
+            sampler,
         }
     }
 
@@ -568,7 +789,7 @@ impl VariantDb {
     }
 
     /// Writes one a-side page as one transaction and times it.
-    async fn a_page(&mut self, page: &[AGroup], timeout: Duration) -> PageTime {
+    async fn a_page(&mut self, page: &[AGroup], timeout: Duration, postmaster: u32) -> PageTime {
         let b0 = self.variant == Variant::B0;
         let wal0 = wal_lsn(&self.raw).await;
         let started = Instant::now();
@@ -582,19 +803,22 @@ impl VariantDb {
         }
         tx.commit().await.expect("commit the page");
         let write_s = started.elapsed().as_secs_f64();
-        timed_converge(&self.raw, timeout, "an a-side page").await;
-        let apply_s = started.elapsed().as_secs_f64() - write_s;
+        let (ended, probe) = self
+            .converge_probed(timeout, "an a-side page", started, postmaster)
+            .await;
+        let apply_s = ended - write_s;
         PageTime {
             write_s,
             apply_s,
             wal_bytes: wal_bytes_since(&self.raw, &wal0).await,
             changes,
+            probe,
         }
     }
 
     /// Writes one b-side page as one transaction and times it. B0 also
     /// rewrites every fact of each key.
-    async fn b_page(&mut self, page: &BPage, timeout: Duration) -> PageTime {
+    async fn b_page(&mut self, page: &BPage, timeout: Duration, postmaster: u32) -> PageTime {
         let b0 = self.variant == Variant::B0;
         let wal0 = wal_lsn(&self.raw).await;
         let started = Instant::now();
@@ -657,14 +881,106 @@ impl VariantDb {
         }
         tx.commit().await.expect("commit the page");
         let write_s = started.elapsed().as_secs_f64();
-        timed_converge(&self.raw, timeout, "a b-side page").await;
-        let apply_s = started.elapsed().as_secs_f64() - write_s;
+        let (ended, probe) = self
+            .converge_probed(timeout, "a b-side page", started, postmaster)
+            .await;
+        let apply_s = ended - write_s;
         PageTime {
             write_s,
             apply_s,
             wal_bytes: wal_bytes_since(&self.raw, &wal0).await,
             changes: page.keys.len(),
+            probe,
         }
+    }
+
+    /// #1155: waits for the page to converge while sampling the engine's
+    /// backends; returns when it converged (seconds since `started`) and
+    /// the window's probe.
+    async fn converge_probed(
+        &self,
+        timeout: Duration,
+        what: &str,
+        started: Instant,
+        postmaster: u32,
+    ) -> (f64, Probe) {
+        const LATENCY: &str = "trellis_transform_latency_seconds";
+        const J_WAIT: &str = "trellis_join_lock_wait_seconds";
+        let all: Vec<String> = self
+            .targets
+            .iter()
+            .chain(&self.extra_targets)
+            .cloned()
+            .collect();
+        let before = scrape::scrape();
+        let lat0: Vec<SumCountSnapshot> = all
+            .iter()
+            .map(|t| SumCountSnapshot::capture(&before, LATENCY, t))
+            .collect();
+        // The J lock metric is labelled with the qualified target.
+        let j_label = format!("public.{}", self.targets[0]);
+        let j0 = SumCountSnapshot::capture(&before, J_WAIT, &j_label);
+        let (dl0, rb0) = contention::deadlocks_and_rollbacks(&self.sampler).await;
+        let cpu0 = cpu_s(std::process::id());
+        let pg0 = pg_cpu_s(postmaster);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let converge = async {
+            timed_converge(&self.raw, timeout, what).await;
+            let ended = started.elapsed().as_secs_f64();
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            ended
+        };
+        let sample =
+            contention::sample_while_with(&self.sampler, "a", "", &all, Instant::now(), || {
+                !done.load(std::sync::atomic::Ordering::Relaxed)
+            });
+        let (ended, summary) = tokio::join!(converge, sample);
+        let cpu1 = cpu_s(std::process::id());
+        let pg1 = pg_cpu_s(postmaster);
+        let (dl1, rb1) = contention::deadlocks_and_rollbacks(&self.sampler).await;
+        let after = scrape::scrape();
+        let j = SumCountSnapshot::capture(&after, J_WAIT, &j_label).since(&j0);
+        let latency_ms = all
+            .iter()
+            .zip(&lat0)
+            .map(|(t, base)| {
+                (
+                    t.clone(),
+                    SumCountSnapshot::capture(&after, LATENCY, t)
+                        .since(base)
+                        .mean_ms(),
+                )
+            })
+            .collect();
+        let probe = Probe {
+            busy_by_table: summary.busy_by_table.clone(),
+            row_lock_by_table: summary.row_lock_by_table.clone(),
+            busy_mean: summary.engine_busy_mean,
+            row_lock_mean: summary.engine_row_lock_mean,
+            running_mean: summary.engine_running_mean,
+            samples: summary.samples,
+            j_lock_wait_s: j.sum,
+            j_lock_count: j.count,
+            proc_cpu_s: cpu1 - cpu0,
+            pg_cpu_s: pg1 - pg0,
+            deadlocks: dl1 - dl0,
+            rollbacks: rb1 - rb0,
+            latency_ms,
+            top: summary
+                .top_statements
+                .iter()
+                .map(|(c, q, m)| (c.label().to_string(), q.clone(), *m))
+                .collect(),
+        };
+        (ended, probe)
+    }
+
+    /// #1155: starts the client under `arm` and waits until it has nothing
+    /// left to apply.
+    async fn enter(&mut self, arm: Arm, tuning: &EngineTuning, timeout: Duration) {
+        trellis::dev::staging::set_a_side_share(arm.proto == 2);
+        self.restart(&arm.tuning(tuning));
+        timed_converge(&self.raw, timeout, "the restart").await;
     }
 
     /// The bytes of what this variant keeps: the `JOIN`'s hidden tables and
@@ -850,6 +1166,7 @@ pub struct PageResult {
     pub variant: Variant,
     pub kind: &'static str,
     times: Vec<PageTime>,
+    pub arm: Arm,
 }
 
 impl PageResult {
@@ -862,18 +1179,58 @@ impl PageResult {
         let min = page.iter().copied().fold(f64::INFINITY, f64::min);
         let max = page.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let changes = self.times.first().map_or(0, |t| t.changes);
+        let apply: Vec<f64> = self.times.iter().map(|t| t.apply_s).collect();
+        let amin = apply.iter().copied().fold(f64::INFINITY, f64::min);
+        let amax = apply.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let med =
+            |f: &dyn Fn(&Probe) -> f64| median(self.times.iter().map(|t| f(&t.probe)).collect());
+        let mut tables = Vec::new();
+        for t in ["j", "p", "m", "t", "l", "target", "claim", "other"] {
+            tables.push(format!(
+                "\"row_lock_{t}_median\":{:.3},\"busy_{t}_median\":{:.3}",
+                med(&|p| Probe::table(&p.row_lock_by_table, t)),
+                med(&|p| Probe::table(&p.busy_by_table, t)),
+            ));
+        }
+        let mut latency = Vec::new();
+        if let Some(first) = self.times.first() {
+            for (i, (t, _)) in first.probe.latency_ms.iter().enumerate() {
+                let v: Vec<f64> = self
+                    .times
+                    .iter()
+                    .filter_map(|p| p.probe.latency_ms.get(i)?.1)
+                    .collect();
+                latency.push(format!("\"latency_{t}_ms_median\":{:.1}", median(v)));
+            }
+        }
         format!(
             "{{\"scenario\":\"join\",\"dataset\":\"{}\",\"variant\":\"{}\",\"kind\":\"{}\",\
-             \"pages\":{},\"changes_per_page\":{changes},\"page_s_median\":{:.4},\
+             \"arm\":\"{}\",\"pages\":{},\"changes_per_page\":{changes},\"page_s_median\":{:.4},\
              \"page_s_min\":{min:.4},\"page_s_max\":{max:.4},\"write_s_median\":{:.4},\
-             \"apply_s_median\":{:.4},\"wal_bytes_per_change_median\":{:.0},{common}}}",
+             \"apply_s_median\":{:.4},\"apply_s_min\":{amin:.4},\"apply_s_max\":{amax:.4},\
+             \"busy_mean_median\":{:.3},\"row_lock_mean_median\":{:.3},\"running_mean_median\":{:.3},\
+             {},\"j_lock_wait_s_median\":{:.4},\"proc_cpu_s_median\":{:.3},\
+             \"pg_cpu_s_median\":{:.3},\"deadlocks_total\":{},\"rollbacks_total\":{},{}{}\
+             \"wal_bytes_per_change_median\":{:.0},{common}}}",
             self.dataset.name(),
             self.variant.name(),
             self.kind,
+            self.arm.label(),
             self.times.len(),
             self.median_page_s(),
             median(self.times.iter().map(|t| t.write_s).collect()),
             median(self.times.iter().map(|t| t.apply_s).collect()),
+            med(&|p| p.busy_mean),
+            med(&|p| p.row_lock_mean),
+            med(&|p| p.running_mean),
+            tables.join(","),
+            med(&|p| p.j_lock_wait_s),
+            med(&|p| p.proc_cpu_s),
+            med(&|p| p.pg_cpu_s),
+            self.times.iter().map(|t| t.probe.deadlocks).sum::<i64>(),
+            self.times.iter().map(|t| t.probe.rollbacks).sum::<i64>(),
+            latency.join(","),
+            if latency.is_empty() { "" } else { "," },
             median(
                 self.times
                     .iter()
@@ -896,6 +1253,64 @@ struct HotResult {
     dimension_pages: usize,
     retries: u64,
     deadlocks: i64,
+    /// #1230: WAL bytes, multixact ids and multixact member slots the run used
+    /// (a checkpoint's control data before and after).
+    wal_bytes: i64,
+    mxids: i64,
+    mx_members: i64,
+    /// #1230: `J` lock waits of the run's pages, by the mode the page locked.
+    share_waits: WaitStats,
+    update_waits: WaitStats,
+}
+
+/// A distribution of waits, in milliseconds.
+#[derive(Debug, Default, Clone, Copy)]
+struct WaitStats {
+    n: usize,
+    sum_ms: f64,
+    p50_ms: f64,
+    p99_ms: f64,
+    max_ms: f64,
+}
+
+impl WaitStats {
+    fn of(mut secs: Vec<f64>) -> Self {
+        if secs.is_empty() {
+            return Self::default();
+        }
+        secs.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        let at = |q: f64| secs[((secs.len() - 1) as f64 * q).round() as usize] * 1000.0;
+        WaitStats {
+            n: secs.len(),
+            sum_ms: secs.iter().sum::<f64>() * 1000.0,
+            p50_ms: at(0.5),
+            p99_ms: at(0.99),
+            max_ms: at(1.0),
+        }
+    }
+
+    fn json(&self, name: &str) -> String {
+        format!(
+            "\"{name}_n\":{},\"{name}_sum_ms\":{:.1},\"{name}_p50_ms\":{:.2},\"{name}_p99_ms\":{:.2},\"{name}_max_ms\":{:.2}",
+            self.n, self.sum_ms, self.p50_ms, self.p99_ms, self.max_ms
+        )
+    }
+}
+
+/// #1230: the WAL position and multixact counters, after a checkpoint (the
+/// control data's next multixact id and offset are as of the last one).
+async fn pg_cost_counters(raw: &RawClient) -> (i64, i64, i64) {
+    raw.batch_execute("checkpoint").await.expect("checkpoint");
+    let row = raw
+        .query_one(
+            "select pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::bigint, \
+                    (select next_multixact_id::text::bigint from pg_control_checkpoint()), \
+                    (select next_multi_offset::text::bigint from pg_control_checkpoint())",
+            &[],
+        )
+        .await
+        .expect("read the cost counters");
+    (row.get(0), row.get(1), row.get(2))
 }
 
 /// What [`run`] found: every measurement line it printed, and whether
@@ -938,6 +1353,18 @@ pub async fn run(cfg: &JoinBench, tuning: &EngineTuning) -> JoinOutcome {
         "join runs behind the group-basis knob; the CLI turns it on"
     );
     let cluster = TestCluster::start();
+    let postmaster: u32 = std::fs::read_to_string(cluster.data_dir().join("postmaster.pid"))
+        .ok()
+        .and_then(|p| p.lines().next()?.trim().parse().ok())
+        .unwrap_or(0);
+    let arms: Vec<Arm> = if cfg.arms.is_empty() {
+        vec![Arm {
+            threads: tuning.application_threads,
+            proto: 0,
+        }]
+    } else {
+        cfg.arms.clone()
+    };
     let d1_keys = (cfg.facts / Dataset::D1.facts_per_key()).max(10);
     let b_rows = cfg.b_page.unwrap_or_else(|| (d1_keys as usize / 50).max(1));
     let mut outcome = JoinOutcome::default();
@@ -951,20 +1378,26 @@ pub async fn run(cfg: &JoinBench, tuning: &EngineTuning) -> JoinOutcome {
         let keys = (cfg.facts / dataset.facts_per_key()).max(10);
         let b_pages = cfg.b_pages;
         let edits = b_pages.saturating_sub(1).max(1);
-        // Enough orphans for every insert page.
+        // Enough orphans for every insert page: each arm's delete page
+        // (before its insert page) hands its keys to the orphans.
         let orphans = (keys * dataset.orphan_percent() / 100).max((edits * b_rows) as i64);
         let all_keys = keys + orphans;
         eprintln!(
-            "join: {} — {} facts, {keys} keys + {orphans} orphan keys, b pages of {b_rows} rows",
+            "join: {} — {} facts, {keys} keys + {orphans} orphan keys, b pages of {b_rows} rows, \
+             arms {:?}",
             dataset.name(),
-            cfg.facts
+            cfg.facts,
+            arms.iter().map(|a| a.label()).collect::<Vec<_>>()
         );
         let mut dbs = Vec::new();
+        trellis::dev::staging::set_a_side_share(false);
         for &variant in &cfg.variants {
+            check_memory(cfg);
             let mut db = VariantDb::start(&cluster, variant, tuning).await;
             let load_s = db.load(cfg, keys, all_keys).await;
             outcome.rows_written += (cfg.facts + keys) as u64;
             let state = db.state_bytes().await;
+            db.shutdown().await;
             println!(
                 "{{\"scenario\":\"join\",\"dataset\":\"{}\",\"variant\":\"{}\",\"kind\":\"load\",\
                  \"load_s\":{load_s:.3},\"keys\":{keys},\"orphan_keys\":{orphans},\
@@ -987,41 +1420,73 @@ pub async fn run(cfg: &JoinBench, tuning: &EngineTuning) -> JoinOutcome {
         } else {
             0
         };
-        let mut results: BTreeMap<(usize, &'static str), Vec<PageTime>> = BTreeMap::new();
+        let mut results: BTreeMap<(usize, usize, &'static str), Vec<PageTime>> = BTreeMap::new();
         let mut rotation = 0usize;
-        // Rotates the variants' order with every page.
+        // Rotates an order with every page.
         let order = |rotation: usize, n: usize| -> Vec<usize> {
             (0..n).map(|i| (i + rotation) % n).collect()
         };
+        let page_line = |db: &VariantDb, arm: Arm, kind: &str, n: usize, t: &PageTime| {
+            println!(
+                "{{\"scenario\":\"join\",\"kind\":\"page\",\"dataset\":\"{}\",\"variant\":\"{}\",\
+                 \"arm\":\"{}\",\"page_kind\":\"{kind}\",\"page\":{n},\"page_s\":{:.4},\
+                 \"write_s\":{:.4},\"apply_s\":{:.4},\"changes\":{},{}}}",
+                dataset.name(),
+                db.variant.name(),
+                arm.label(),
+                t.page_s(),
+                t.write_s,
+                t.apply_s,
+                t.changes,
+                t.probe.json()
+            );
+        };
         for page in 0..=cfg.a_pages {
-            let groups = generator.a_page(cfg.a_page);
-            for i in order(rotation, dbs.len()) {
-                let time = dbs[i].a_page(&groups, cfg.timeout).await;
-                outcome.rows_written += time.changes as u64;
-                if page > 0 {
-                    results.entry((i, "a_page")).or_default().push(time);
+            for ai in order(rotation, arms.len()) {
+                let groups = generator.a_page(cfg.a_page);
+                for i in order(rotation + ai, dbs.len()) {
+                    check_memory(cfg);
+                    dbs[i].enter(arms[ai], tuning, cfg.timeout).await;
+                    let time = dbs[i].a_page(&groups, cfg.timeout, postmaster).await;
+                    dbs[i].shutdown().await;
+                    outcome.rows_written += time.changes as u64;
+                    page_line(&dbs[i], arms[ai], "a_page", page, &time);
+                    if page > 0 {
+                        results.entry((i, ai, "a_page")).or_default().push(time);
+                    }
                 }
             }
             rotation += 1;
         }
         let plan = std::iter::repeat_n(BKind::Update, b_pages)
-            .chain(std::iter::repeat_n(BKind::Insert, edits))
-            .chain(std::iter::repeat_n(BKind::Delete, edits));
-        for kind in plan {
-            let page = generator.b_page(kind, b_rows, protect);
-            for i in order(rotation, dbs.len()) {
-                let time = dbs[i].b_page(&page, cfg.timeout).await;
-                outcome.rows_written += time.changes as u64;
-                results.entry((i, kind.name())).or_default().push(time);
+            .chain(std::iter::repeat_n([BKind::Delete, BKind::Insert], edits).flatten());
+        for (n, kind) in plan.enumerate() {
+            for ai in order(rotation, arms.len()) {
+                let page = generator.b_page(kind, b_rows, protect);
+                if kind == BKind::Delete {
+                    // Deleted keys are orphans now: a later insert page may
+                    // take them.
+                    generator.orphans.extend(&page.keys);
+                }
+                for i in order(rotation + ai, dbs.len()) {
+                    check_memory(cfg);
+                    dbs[i].enter(arms[ai], tuning, cfg.timeout).await;
+                    let time = dbs[i].b_page(&page, cfg.timeout, postmaster).await;
+                    dbs[i].shutdown().await;
+                    outcome.rows_written += time.changes as u64;
+                    page_line(&dbs[i], arms[ai], kind.name(), n, &time);
+                    results.entry((i, ai, kind.name())).or_default().push(time);
+                }
             }
             rotation += 1;
         }
-        for ((i, kind), times) in results {
+        for ((i, ai, kind), times) in results {
             let result = PageResult {
                 dataset,
                 variant: dbs[i].variant,
                 kind,
                 times,
+                arm: arms[ai],
             };
             println!("{}", result.to_json(&common));
             outcome.pages.push(result);
@@ -1030,39 +1495,60 @@ pub async fn run(cfg: &JoinBench, tuning: &EngineTuning) -> JoinOutcome {
         if dataset == Dataset::D1 && cfg.hot_pages > 0 {
             // Only the variant measured runs a client: every variant's drain
             // workers and the hot writers together are more connections
-            // than the cluster takes.
-            for db in &mut dbs {
-                db.shutdown().await;
-            }
-            for dimension_writer in [false, true] {
-                let pages = hot_pages(cfg, &mut generator, &dbs[0]).await;
-                for i in order(rotation, dbs.len()) {
-                    dbs[i].restart(tuning);
-                    let hot = run_hot(&mut dbs[i], cfg, &pages, dimension_writer).await;
-                    dbs[i].shutdown().await;
-                    outcome.rows_written +=
-                        (hot.changes + hot.dimension_pages * cfg.hot_keys) as u64;
-                    println!(
-                        "{{\"scenario\":\"join\",\"dataset\":\"d1\",\"variant\":\"{}\",\
-                         \"kind\":\"hot_keys\",\"dimension_writer\":{},\"hot_keys\":{},\
-                         \"writers\":{},\"changes\":{},\"write_window_s\":{:.3},\
-                         \"converge_after_s\":{:.3},\"changes_per_s\":{:.0},\
-                         \"dimension_pages\":{},\"retries\":{},\"deadlocks\":{},{common}}}",
-                        hot.variant.name(),
-                        hot.dimension_writer,
-                        cfg.hot_keys,
-                        cfg.hot_writers,
-                        hot.changes,
-                        hot.write_window_s,
-                        hot.converge_after_s,
-                        hot.changes_per_s,
-                        hot.dimension_pages,
-                        hot.retries,
-                        hot.deadlocks
-                    );
+            // than the cluster takes. Variant C sits the hot-key runs out.
+            let hot_arms = cfg.hot_arms.clone().unwrap_or_else(|| arms.clone());
+            let reader = dbs
+                .iter()
+                .position(|d| d.variant != Variant::C)
+                .unwrap_or(0);
+            for &dimension_writer in &cfg.hot_dims {
+                for ai in order(rotation, hot_arms.len()) {
+                    let arm = hot_arms[ai];
+                    let pages = hot_pages(cfg, &mut generator, &dbs[reader]).await;
+                    for i in order(rotation + ai, dbs.len()) {
+                        if dbs[i].variant == Variant::C {
+                            continue;
+                        }
+                        check_memory(cfg);
+                        dbs[i].enter(arm, tuning, cfg.timeout).await;
+                        let hot = run_hot(&mut dbs[i], cfg, &pages, dimension_writer).await;
+                        dbs[i].shutdown().await;
+                        outcome.rows_written +=
+                            (hot.changes + hot.dimension_pages * cfg.hot_keys) as u64;
+                        println!(
+                            "{{\"scenario\":\"join\",\"dataset\":\"d1\",\"variant\":\"{}\",\
+                             \"kind\":\"hot_keys\",\"arm\":\"{}\",\"dimension_writer\":{},\"hot_keys\":{},\
+                             \"writers\":{},\"changes\":{},\"write_window_s\":{:.3},\
+                             \"converge_after_s\":{:.3},\"changes_per_s\":{:.0},\
+                             \"dimension_pages\":{},\"retries\":{},\"deadlocks\":{},\
+                             \"wal_bytes\":{},\"mxids\":{},\"mx_members\":{},{},{},{common}}}",
+                            hot.variant.name(),
+                            arm.label(),
+                            hot.dimension_writer,
+                            cfg.hot_keys,
+                            cfg.hot_writers,
+                            hot.changes,
+                            hot.write_window_s,
+                            hot.converge_after_s,
+                            hot.changes_per_s,
+                            hot.dimension_pages,
+                            hot.retries,
+                            hot.deadlocks,
+                            hot.wal_bytes,
+                            hot.mxids,
+                            hot.mx_members,
+                            hot.share_waits.json("jshare"),
+                            hot.update_waits.json("jupdate")
+                        );
+                    }
                 }
                 rotation += 1;
             }
+        }
+        trellis::dev::staging::set_a_side_share(false);
+        for db in &mut dbs {
+            db.restart(tuning);
+            timed_converge(&db.raw, cfg.timeout, "the final restart").await;
         }
 
         for db in &dbs {
@@ -1078,7 +1564,10 @@ pub async fn run(cfg: &JoinBench, tuning: &EngineTuning) -> JoinOutcome {
         // The same pages reached every database, so a `JOIN` target equals
         // the B0 target with its `GROUP BY`.
         if let Some(b0) = dbs.iter().find(|d| d.variant == Variant::B0) {
-            for db in dbs.iter().filter(|d| d.variant != Variant::B0) {
+            for db in dbs
+                .iter()
+                .filter(|d| d.variant != Variant::B0 && d.variant != Variant::C)
+            {
                 let target = &db.targets[0];
                 if db.target_rows(target).await != b0.target_rows(&format!("b0_{target}")).await {
                     outcome.failures.push(format!(
@@ -1151,7 +1640,9 @@ async fn hot_pages(cfg: &JoinBench, generator: &mut Generator, db: &VariantDb) -
         let mut g = AGroup::default();
         let mut taken = HashSet::new();
         let pick = |n: usize, rng: &mut StdRng, taken: &mut HashSet<i64>| -> Vec<i64> {
-            let n = n.min(owned[w].len());
+            // The three picks of a page share `taken`, so they cannot take
+            // more ids than the writer owns between them.
+            let n = n.min(owned[w].len() - taken.len());
             let mut out = Vec::with_capacity(n);
             while out.len() < n {
                 let id = owned[w][rng.random_range(0..owned[w].len())];
@@ -1223,6 +1714,8 @@ async fn run_hot(
         .map(|r| (r.get(0), r.get(1)))
         .collect();
     let (deadlocks0, _) = crate::streaming::contention::deadlocks_and_rollbacks(&db.raw).await;
+    let cost0 = pg_cost_counters(&db.raw).await;
+    trellis::dev::staging::record_join_lock_waits(true);
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let retries = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let started = Instant::now();
@@ -1283,6 +1776,18 @@ async fn run_hot(
     timed_converge(&db.raw, cfg.timeout, "the hot-key run").await;
     let total = started.elapsed().as_secs_f64();
     let (deadlocks1, _) = crate::streaming::contention::deadlocks_and_rollbacks(&db.raw).await;
+    let waits = trellis::dev::staging::take_join_lock_waits();
+    trellis::dev::staging::record_join_lock_waits(false);
+    let cost1 = pg_cost_counters(&db.raw).await;
+    let by_mode = |share: bool| {
+        WaitStats::of(
+            waits
+                .iter()
+                .filter(|(s, _)| *s == share)
+                .map(|(_, w)| *w)
+                .collect(),
+        )
+    };
     if dimension_writer {
         // Put `gb` back, so every variant's database holds the same rows
         // whatever number of dimension pages got through.
@@ -1304,6 +1809,11 @@ async fn run_hot(
         dimension_pages,
         retries: retries.load(std::sync::atomic::Ordering::Relaxed),
         deadlocks: deadlocks1 - deadlocks0,
+        wal_bytes: cost1.0 - cost0.0,
+        mxids: cost1.1 - cost0.1,
+        mx_members: cost1.2 - cost0.2,
+        share_waits: by_mode(true),
+        update_waits: by_mode(false),
     }
 }
 
@@ -1469,7 +1979,12 @@ mod tests {
                 apply_s: 0.0,
                 wal_bytes: 0,
                 changes: 1,
+                probe: Probe::default(),
             }],
+            arm: Arm {
+                threads: 8,
+                proto: 0,
+            },
         }
     }
 

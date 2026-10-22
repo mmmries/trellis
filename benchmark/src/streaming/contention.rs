@@ -413,15 +413,20 @@ pub struct ContentionSummary {
     /// class's backends, as a mean backend count. A Re-derive build's
     /// statements are counted here and not in the page classes above.
     pub build_waits: [Vec<(String, f64)>; 3],
+    /// #1155: busy engine backends by the table their statement writes or
+    /// locks ([`join_table_class`]), as mean backend counts.
+    pub busy_by_table: Vec<(String, f64)>,
+    /// #1155: the same, for backends in a row-lock wait only.
+    pub row_lock_by_table: Vec<(String, f64)>,
 }
 
 /// How many `(class, statement)` pairs [`ContentionSummary::top_statements`]
 /// keeps.
-pub const TOP_STATEMENTS: usize = 6;
+pub const TOP_STATEMENTS: usize = 10;
 
 /// How much of a statement's (whitespace-collapsed) text identifies it in
 /// [`ContentionSummary::top_statements`].
-const STATEMENT_PREFIX_CHARS: usize = 72;
+const STATEMENT_PREFIX_CHARS: usize = 140;
 
 /// `query` with runs of whitespace collapsed and cut to
 /// [`STATEMENT_PREFIX_CHARS`] — enough to tell the engine's statements apart,
@@ -591,6 +596,69 @@ pub struct Accumulator {
     page_waits: DurationRecorder,
     page_holds: DurationRecorder,
     build_waits: [HashMap<String, f64>; 3],
+    busy_by_table: HashMap<&'static str, f64>,
+    row_lock_by_table: HashMap<&'static str, f64>,
+    /// #1155: the visible targets [`join_table_class`] tells apart.
+    pub visible_targets: Vec<String>,
+}
+
+/// #1155: the table an engine statement writes or locks, for a `JOIN`'s
+/// apply: `j`, `p`, `m`, `t` or `l` for the definition's hidden tables
+/// (`"<schema>"."join_<id>_<x>"`; the session's working tables are
+/// `trellis_join_…` and never match), the earliest one written (`insert
+/// into`/`update`) or else the first named; `target` for a statement naming
+/// one of `visible_targets` as `"public"."<t>"` or `public.<t>`; `claim`;
+/// `other`.
+pub fn join_table_class(query: &str, visible_targets: &[String]) -> &'static str {
+    let q = query.to_ascii_lowercase();
+    let mut first: Option<&'static str> = None;
+    let mut written: Option<&'static str> = None;
+    let mut from = 0;
+    while let Some(at) = q[from..].find("\"join_") {
+        let start = from + at;
+        from = start + 6;
+        let rest = &q[start + 6..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let tail = &rest[digits..];
+        if digits == 0 || tail.len() < 3 || !tail.starts_with('_') || &tail[2..3] != "\"" {
+            continue;
+        }
+        let class = match &tail[1..2] {
+            "j" => "j",
+            "p" => "p",
+            "m" => "m",
+            "t" => "t",
+            "l" => "l",
+            _ => continue,
+        };
+        first.get_or_insert(class);
+        // What precedes the qualified name: `insert into "schema".` or
+        // `update "schema".`.
+        let before = q[..start].trim_end_matches('.');
+        let before = match before.rfind('"') {
+            Some(close) => match before[..close].rfind('"') {
+                Some(open) => &before[..open],
+                None => before,
+            },
+            None => before,
+        };
+        if written.is_none() && (before.ends_with("insert into ") || before.ends_with("update ")) {
+            written = Some(class);
+        }
+    }
+    if let Some(class) = written.or(first) {
+        return class;
+    }
+    if visible_targets
+        .iter()
+        .any(|t| q.contains(&format!("\"public\".\"{t}\"")) || q.contains(&format!("public.{t} ")))
+    {
+        return "target";
+    }
+    if statement_class(query, "") == StatementClass::Claim {
+        return "claim";
+    }
+    "other"
 }
 
 impl Accumulator {
@@ -608,6 +676,9 @@ impl Accumulator {
             page_waits: DurationRecorder::default(),
             page_holds: DurationRecorder::default(),
             build_waits: Default::default(),
+            busy_by_table: HashMap::new(),
+            row_lock_by_table: HashMap::new(),
+            visible_targets: Vec::new(),
         }
     }
 
@@ -645,6 +716,11 @@ impl Accumulator {
                 continue;
             }
             seen.push(row.pid);
+            let table = join_table_class(&row.query, &self.visible_targets);
+            *self.busy_by_table.entry(table).or_default() += 1.0;
+            if class == WaitClass::RowLock {
+                *self.row_lock_by_table.entry(table).or_default() += 1.0;
+            }
             let s = &mut self.summary;
             s.engine_busy_mean += 1.0;
             *self
@@ -794,6 +870,14 @@ impl Accumulator {
             return summary;
         }
         let n = summary.samples as f64;
+        let by_table = |m: &HashMap<&'static str, f64>| {
+            let mut v: Vec<(String, f64)> =
+                m.iter().map(|(k, c)| ((*k).to_string(), c / n)).collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        summary.busy_by_table = by_table(&self.busy_by_table);
+        summary.row_lock_by_table = by_table(&self.row_lock_by_table);
         for class in &mut summary.lock_wait_classes {
             class.wait_mean /= n;
         }
@@ -886,8 +970,22 @@ pub async fn sample_while(
     from: Instant,
     keep_going: impl Fn() -> bool,
 ) -> ContentionSummary {
+    sample_while_with(raw, source_table, target, &[], from, keep_going).await
+}
+
+/// [`sample_while`], telling `visible_targets` apart for
+/// [`ContentionSummary::busy_by_table`] (#1155).
+pub async fn sample_while_with(
+    raw: &RawClient,
+    source_table: &str,
+    target: &str,
+    visible_targets: &[String],
+    from: Instant,
+    keep_going: impl Fn() -> bool,
+) -> ContentionSummary {
     tokio::time::sleep_until(from.into()).await;
     let mut acc = Accumulator::new(generator_prefixes(source_table), target);
+    acc.visible_targets = visible_targets.to_vec();
     while keep_going() {
         let rows = raw
             .query(SAMPLE_SQL, &[])
@@ -1275,6 +1373,38 @@ mod tests {
             statement_prefix(&"a".repeat(200)).len(),
             STATEMENT_PREFIX_CHARS
         );
+    }
+
+    #[test]
+    fn join_statements_classify_by_the_hidden_table_they_write_or_lock() {
+        let t = vec!["s2".to_string()];
+        let c = |q: &str| join_table_class(q, &t);
+        assert_eq!(
+            c(
+                "select 1 from \"trellis\".\"join_5_j\" j where (j.\"k\") in (select k from pg_temp.\"trellis_join_p_5_ab\") order by j.\"k\" for update of j"
+            ),
+            "j"
+        );
+        assert_eq!(
+            c("insert into \"trellis\".\"join_5_j\" (\"k\") select 1"),
+            "j"
+        );
+        assert_eq!(c("select 1 from \"trellis\".\"join_12_l\" for share"), "l");
+        assert_eq!(
+            c(
+                "with d as (select * from \"trellis\".\"join_5_m\") insert into \"trellis\".\"join_5_p\" (a) select 1"
+            ),
+            "p"
+        );
+        assert_eq!(
+            c("insert into \"public\".\"s2\" (day) values (1)"),
+            "target"
+        );
+        assert_eq!(
+            c("insert into pg_temp.\"trellis_join_t_5_00\" select 1"),
+            "other"
+        );
+        assert_eq!(c("insert into seg_claims (seg_seq) values (1)"), "claim");
     }
 
     #[test]

@@ -106,6 +106,53 @@ use super::fold::{FoldedChange, earliest_origin};
 use super::group_basis::{self, Arg, GroupShape, GroupTargetPlan, Writer};
 use super::target_mutations::TargetMutations;
 
+/// #1230: whether a page that changes only the `FROM` side locks its `J`
+/// rows `FOR SHARE` instead of `FOR UPDATE` (see [`JoinTargetPlan::j_lock_mode`]).
+/// A dev knob while #1230 is an investigation: read from [`A_SIDE_SHARE_ENV`]
+/// or set with [`set_a_side_share`] before a client starts.
+pub const A_SIDE_SHARE_ENV: &str = "TRELLIS_DEV_JOIN_A_SHARE";
+
+/// 0: not read yet; 1: off; 2: on.
+static A_SIDE_SHARE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Sets the #1230 knob (see [`A_SIDE_SHARE_ENV`]); only while no client runs.
+#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
+pub fn set_a_side_share(on: bool) {
+    A_SIDE_SHARE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// #1230 measurement hook: while on, every page's `J` lock wait is kept with
+/// its lock mode for [`take_lock_waits`] (benchmark only).
+static RECORD_WAITS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WAITS: std::sync::Mutex<Vec<(bool, f64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Starts (`true`) or stops keeping the waits, clearing what was kept.
+#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
+pub fn record_lock_waits(on: bool) {
+    RECORD_WAITS.store(on, std::sync::atomic::Ordering::Relaxed);
+    WAITS.lock().expect("waits").clear();
+}
+
+/// The kept waits, `(share, seconds)`, emptying the list.
+#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
+pub fn take_lock_waits() -> Vec<(bool, f64)> {
+    std::mem::take(&mut *WAITS.lock().expect("waits"))
+}
+
+pub(crate) fn a_side_share() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match A_SIDE_SHARE.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var(A_SIDE_SHARE_ENV)
+                .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on"));
+            A_SIDE_SHARE.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
+}
+
 /// Whether `def` is a `JOIN` that applies: only behind the group-basis knob
 /// (see the module doc).
 pub(crate) fn applies(def: &TransformDef) -> bool {
@@ -573,13 +620,34 @@ impl JoinTargetPlan {
         )
     }
 
-    /// Step 2's `J` lock: the same keys, sorted, `FOR UPDATE`.
+    /// The row-lock mode of the page's `J` lock (ADR-0019's JR1): `share` for
+    /// a page whose only writes are `FROM`-side changes applied to `P` (it
+    /// changes no `M` cell, recomputes no cell, truncates nothing, so it
+    /// never writes `J` and reads `M` and `J.matches` that no writer of
+    /// either can change while it holds the share), `update` for every other
+    /// page. One mode per page, chosen from the plan alone, so a page never
+    /// upgrades a lock it holds.
+    fn j_lock_mode(&self) -> &'static str {
+        if a_side_share()
+            && !self.joined.writes()
+            && !self.from.recompute
+            && self.truncate.is_none()
+        {
+            "share"
+        } else {
+            "update"
+        }
+    }
+
+    /// Step 2's `J` lock: the same keys, sorted, `FOR UPDATE` (`FOR SHARE`
+    /// for [`Self::j_lock_mode`]'s `share`).
     fn j_lock_sql(&self) -> String {
+        let mode = self.j_lock_mode();
         let cols = quoted(&self.j_cols);
         let j_cols: Vec<String> = cols.iter().map(|c| format!("j.{c}")).collect();
         format!(
             "select 1 from {j} j where ({jc}) in (select {cols} from ({keys}) k) \
-             order by {jc} for update of j",
+             order by {jc} for {mode} of j",
             j = self.j_ident,
             jc = j_cols.join(", "),
             cols = cols.join(", "),
@@ -929,6 +997,12 @@ async fn write_locked(
     let waiting_since = std::time::Instant::now();
     txn.execute(&plan.j_lock_sql(), &[]).await?;
     crate::metrics::record_join_lock_wait(&plan.target, waiting_since.elapsed());
+    if RECORD_WAITS.load(std::sync::atomic::Ordering::Relaxed) {
+        WAITS.lock().expect("waits").push((
+            plan.j_lock_mode() == "share",
+            waiting_since.elapsed().as_secs_f64(),
+        ));
+    }
     pause!(txn, AfterJoinLock, &plan.target);
     for side in sides {
         if side.writes() {

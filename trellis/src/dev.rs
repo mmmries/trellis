@@ -100,6 +100,11 @@ pub mod staging {
     pub use crate::staging::group_basis::{
         KNOB_ENV as GROUP_BASIS_ENV, enabled as group_basis_enabled, set_enabled as set_group_basis,
     };
+    /// The #1230 knob: an a-side-only `JOIN` page locks `J` `FOR SHARE`.
+    pub use crate::staging::join::{
+        A_SIDE_SHARE_ENV, record_lock_waits as record_join_lock_waits, set_a_side_share,
+        take_lock_waits as take_join_lock_waits,
+    };
     /// One page of a `self_check` walk, for `benchmark`'s `self-check-walk`
     /// (#1198): it walks a JOIN target's `P` and `M` parts alone, from the
     /// cursor `p`, which the job (it walks `T` first) can't.

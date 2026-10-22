@@ -59,7 +59,7 @@
 use generative::backend::{Backend, ManualBackend};
 use generative::generate::join::{
     JoinCase, JoinDefSpec, JoinField, JoinGroups, JoinKey, JoinOpDraw, JoinOpKind, KeyShape,
-    join_case, join_case_strategy,
+    join_case, join_case_strategy, join_case_strategy_phased,
 };
 use generative::model::Op;
 use generative::run::{RunError, check_program, run_convergence_concurrent};
@@ -78,6 +78,10 @@ struct JoinCoverage {
     joined_ops: usize,
     truncates: usize,
     coverage: generative::run::Coverage,
+    /// #1230: pages whose `J` lock was `FOR SHARE` and `FOR UPDATE` (nonzero
+    /// shares only with the share knob on).
+    share_pages: usize,
+    update_pages: usize,
 }
 
 impl JoinCoverage {
@@ -131,6 +135,11 @@ impl std::fmt::Display for JoinCoverage {
         writeln!(f, "definitions: {:?}", self.definitions)?;
         writeln!(
             f,
+            "join pages by J lock: {} share, {} update",
+            self.share_pages, self.update_pages
+        )?;
+        writeln!(
+            f,
             "ops: {} on ja, {} on jb, {} of them truncates",
             self.from_ops, self.joined_ops, self.truncates
         )?;
@@ -161,6 +170,7 @@ thread_local! {
         // A `JOIN` applies only behind the group-basis knob, which must be
         // set before any client starts.
         trellis::dev::staging::set_group_basis(true);
+        trellis::dev::staging::record_join_lock_waits(true);
         Harness {
             runtime: tokio::runtime::Runtime::new().expect("build tokio runtime"),
             cluster: TestCluster::start().long_lived(),
@@ -227,6 +237,14 @@ fn run_case(case: &JoinCase) -> Result<(), String> {
                 }
                 Err(other) => return Err(format!("run error ({shape}): {other:?}")),
             }
+            for (share, _) in trellis::dev::staging::take_join_lock_waits() {
+                let mut coverage = h.coverage.borrow_mut();
+                if share {
+                    coverage.share_pages += 1;
+                } else {
+                    coverage.update_pages += 1;
+                }
+            }
             let statuses = backend.definition_statuses().await.expect("read statuses");
             if statuses.iter().any(|(_, status)| status != "live") {
                 return Err(format!(
@@ -246,6 +264,19 @@ proptest! {
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_join_targets_converge_under_concurrent_drains(case in join_case_strategy()) {
+        run_case(&case).map_err(TestCaseError::fail)?;
+    }
+}
+
+proptest! {
+    #![proptest_config(proptest_config())]
+
+    /// #1230: the same property over cases whose bursts write one table each
+    /// (two of three bursts only the `FROM` table), so most pages hold
+    /// changes of one side: the pages a `FROM`-side-only `J` lock changes.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_join_targets_converge_with_one_sided_pages(case in join_case_strategy_phased()) {
         run_case(&case).map_err(TestCaseError::fail)?;
     }
 }

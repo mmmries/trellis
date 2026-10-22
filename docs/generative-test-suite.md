@@ -224,8 +224,11 @@ unblocks it.
   be `live` at the end. Every definition is installed over the two empty tables,
   and the run waits for it before its first write: a join aggregate builds only
   over empty tables until its build exists (#1109). About one op in a hundred
-  is a `TRUNCATE` of either table. Run it with `cargo test -p generative --test
-  join_convergence -- --ignored`.
+  is a `TRUNCATE` of either table. A second property draws the same cases with
+  the ops grouped by table (two of every three bursts write only the `FROM`
+  table, the third only the joined table), so most pages hold changes of one
+  side. Run them with `cargo test -p generative --test join_convergence --
+  --ignored`.
 - **A second, structural oracle** *(needs an engine consistency auditor, if one
   exists)*. Run the engine's internal consistency check at end of run, require zero
   findings, prove the wiring with a negative test.

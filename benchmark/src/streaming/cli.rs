@@ -276,6 +276,22 @@ fn join_config(args: &[String]) -> join::JoinBench {
         load_chunk: number(args, "--load-chunk").map_or(default.load_chunk, |v| v as i64),
         seed: number(args, "--seed").map_or(default.seed, |v| v as u64),
         timeout: secs(args, "--timeout-secs").unwrap_or(default.timeout),
+        arms: flag(args, "--arms").map_or(Vec::new(), |raw| {
+            raw.split(',').map(join::Arm::parse).collect()
+        }),
+        hot_arms: flag(args, "--hot-arms")
+            .map(|raw| raw.split(',').map(join::Arm::parse).collect()),
+        hot_dims: flag(args, "--hot-dims").map_or(default.hot_dims.clone(), |raw| {
+            raw.split(',')
+                .map(|d| match d.trim() {
+                    "off" => false,
+                    "on" => true,
+                    other => panic!("--hot-dims takes off,on; got {other:?}"),
+                })
+                .collect()
+        }),
+        min_free_gib: flag(args, "--min-free-gib")
+            .map_or(default.min_free_gib, |v| v.parse().expect("--min-free-gib")),
     }
 }
 
