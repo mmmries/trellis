@@ -1,4 +1,4 @@
-//! The ring rows a group-basis or `JOIN` target hasn't applied yet, as
+//! The ring rows a 1-1, group-basis or `JOIN` target hasn't applied yet, as
 //! `self_check` subtracts them (#1140, ADR-0013 "Quiescence").
 //!
 //! Capture writes a change's ring row in the change's own transaction, so
@@ -10,6 +10,13 @@
 //! sign (its old image `+1`, its new image `-1`). Their aggregates are what
 //! the target has applied, in the same statement that reads the target, so
 //! a correct target compares equal whatever the ring holds.
+//!
+//! A 1-1 page ([`super::self_check`]) reads no weighted rows: a row's
+//! target holds the row as of the *old image of its key's earliest unapplied
+//! change* ([`Ring::one_to_one_ctes`]), or no row for an insert, and the live
+//! row when the key has none. A change its page would refuse is not counted:
+//! at or below the truncate floor, at or below its key's ledger entry's
+//! `applied_lsn`, or seen by that entry's `basis`.
 //!
 //! "Unapplied" is a ring row of the source that
 //!
@@ -43,6 +50,7 @@
 //! staging SQL (ADR-0013's independence).
 
 use crate::defs::ddl::{self, PrimaryKeyColumn};
+use crate::defs::ledger as ledger_schema;
 use crate::pool::{quote_ident, quote_literal};
 
 use super::converge::per_ring_table;
@@ -147,6 +155,77 @@ impl Ring<'_> {
                 pending = ring_row_pending_sql(slot, None),
             )
         })
+    }
+
+    /// The CTEs a 1-1 page needs of this source (ending `, `): the unapplied
+    /// rows, and `{tag}_pend`, `(__k, __i)`: for each key whose unapplied
+    /// changes can all be subtracted, the *old image* of its earliest
+    /// unapplied change (JSON `null` for an insert). A 1-1 target holds the
+    /// row as of that image, since it has applied every change before it and
+    /// none from it on. A key with an unapplied row that can't be
+    /// subtracted ([`Self::uncertain_keys_sql`]) isn't in it, and is compared
+    /// against its live source row.
+    ///
+    /// A change the page that applies it would refuse (ADR-0002's I2, against
+    /// the key's entry on `target`'s ledger, `target` being the target's
+    /// qualified identity) never reaches the target, so it is no unapplied
+    /// change here: one at or below the entry's `applied_lsn` (a later batch
+    /// of the key drained first), one its `basis` saw (a Re-derive read the
+    /// live row after it), and one at or below the target's truncate floor.
+    /// The changes I2 refuses are always a prefix of a key's in `lsn` order,
+    /// so the earliest one it doesn't is the first the target hasn't applied.
+    pub(super) fn one_to_one_ctes(&self, target: &str) -> String {
+        let rows = self.cte("rows");
+        let pend = self.cte("pend");
+        let q = |c: &str| quote_ident(c);
+        format!(
+            "{rows} as materialized ({rows_sql}), \
+             {pend} as materialized ( \
+                 select distinct on (d.__key) d.__key as __k, \
+                        case when jsonb_typeof(d.__x) = 'object' then d.__x -> 'old' \
+                             else d.__o end as __i \
+                 from {rows} d \
+                 left join {ledger} l on l.{key_col} = d.__key \
+                 where d.__kind = 'side' \
+                   and d.__key not in (select __key from {rows} where __kind <> 'side') \
+                   and d.__key not in (select ph.key from poison_held ph \
+                                       where ph.transform_id = {id} and ph.src_table = {src} \
+                                         and ph.origin_lsn is null) \
+                   and (l.{basis} is null or not pg_visible_in_snapshot(d.__txid, l.{basis})) \
+                   and (l.{applied} is null or d.__lsn > l.{applied}) \
+                   and d.__lsn > coalesce( \
+                       (select floor from ledger_truncate_floor where target_table = {floor}), \
+                       '0/0'::pg_lsn) \
+                 order by d.__key, d.__lsn), ",
+            rows_sql = self.rows_sql(),
+            id = self.transform_id,
+            src = quote_literal(self.src_table),
+            ledger = super::one_to_one_ledger::ledger_ident(target),
+            key_col = q(ledger_schema::KEY_COLUMN),
+            basis = q(ledger_schema::BASIS_COLUMN),
+            applied = q(ledger_schema::APPLIED_LSN_COLUMN),
+            floor = quote_literal(target),
+        )
+    }
+
+    /// The name of the CTE [`Self::one_to_one_ctes`] defines of each key's
+    /// earliest old image.
+    pub(super) fn pend_cte(&self) -> String {
+        self.cte("pend")
+    }
+
+    /// The keys (`(__k)`) of a 1-1 page the comparison can't vouch for: those
+    /// with an unapplied row that isn't subtractable, and held keys whose
+    /// parked origin is unknown.
+    pub(super) fn uncertain_keys_sql(&self) -> String {
+        format!(
+            "select __key as __k from {rows} where __kind = 'uncertain' \
+             union select ph.key from poison_held ph \
+             where ph.transform_id = {id} and ph.src_table = {src} and ph.origin_lsn is null",
+            rows = self.cte("rows"),
+            id = self.transform_id,
+            src = quote_literal(self.src_table),
+        )
     }
 
     /// The signed images of the `side` rows: `(__txid, __lsn, __sgn, __i)`,
