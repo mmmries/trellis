@@ -115,8 +115,14 @@
   },
   {
     "date": "2026-10-21",
-    "runs": 5,
-    "hours": 3.02,
-    "rows_validated": 340000
+    "runs": 32,
+    "hours": 11.52,
+    "rows_validated": 246456022
+  },
+  {
+    "date": "2026-10-22",
+    "runs": 0,
+    "hours": 0.0,
+    "rows_validated": 0
   }
 ]
