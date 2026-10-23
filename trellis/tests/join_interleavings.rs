@@ -193,7 +193,7 @@ impl Kind {
             .collect();
         format!(
             "TRANSFORM {} FROM public.a {} public.b ON {} GROUP BY {} \
-             SELECT {}, COUNT(*) AS n, COUNT(a.x) AS cx, SUM(a.x) AS sx, \
+            WITHOUT SOURCE INDEX SELECT {}, COUNT(*) AS n, COUNT(a.x) AS cx, SUM(a.x) AS sx, \
              COUNT(b.y) AS cy, SUM(b.y) AS sy",
             self.name,
             if self.left { "LEFT JOIN" } else { "JOIN" },
@@ -1440,7 +1440,7 @@ async fn composed_fields_expression_arguments_and_numeric_scale() {
         ],
         &[
             "TRANSFORM r FROM public.o LEFT JOIN public.c ON o.cid = c.id GROUP BY c.region \
-           SELECT c.region AS region, COUNT(*) AS n, SUM(o.amount) AS revenue, \
+          WITHOUT SOURCE INDEX SELECT c.region AS region, COUNT(*) AS n, SUM(o.amount) AS revenue, \
                   AVG(o.amount) AS mean, SUM(o.qty + 1) AS q1, COUNT(c.weight) AS w, \
                   COALESCE(SUM(c.weight), 0) + COUNT(o.qty) AS mixed, \
                   SUM(o.qty) > COUNT(*) AS many",
@@ -2296,7 +2296,7 @@ async fn a_partitioned_side_with_no_rows_builds_whole() {
         ],
         &[
             "TRANSFORM l FROM public.a LEFT JOIN public.b ON a.k = b.k GROUP BY a.ga \
-           SELECT a.ga AS ga, COUNT(*) AS n",
+          WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n",
         ],
         &["public.a", "public.b"],
     )
@@ -2382,7 +2382,7 @@ async fn a_truncate_of_the_joined_side_refills_typed_unmatched_groups() {
         &[
             "TRANSFORM r FROM public.o LEFT JOIN public.c ON o.cid = c.cid AND o.rid = c.rid \
              GROUP BY o.region, c.at, c.price \
-             SELECT o.region AS region, c.at AS at, c.price AS price, COUNT(*) AS n, \
+            WITHOUT SOURCE INDEX SELECT o.region AS region, c.at AS at, c.price AS price, COUNT(*) AS n, \
                     SUM(o.amount) AS revenue, SUM(c.w) AS w",
         ],
         &["public.o", "public.c"],
@@ -3522,7 +3522,7 @@ async fn build_refuses_a_field_build() {
 const I2_EXPECTED: &str = "select ga, sum(n), sum(sx) from ( \
         select a.ga as ga, count(*) as n, sum(a.x) as sx from public.a \
         join public.b on a.k = b.k group by a.ga, b.gb) s group by ga order by ga";
-const I3_EXPECTED: &str = "select n, count(*), sum(sx) from ( \
+const I3_EXPECTED: &str = "select n, count(*), count(sx) from ( \
         select ga, sum(n) as n, sum(sx) as sx from ( \
             select a.ga as ga, count(*) as n, sum(a.x) as sx from public.a \
             join public.b on a.k = b.k group by a.ga, b.gb) s group by ga) r \
@@ -3554,7 +3554,7 @@ async fn chained(deeper: bool) -> Lab {
         trellis::defs::install_definition(
             lab.d.pool(),
             "TRANSFORM i3 FROM public.i2 GROUP BY n WITHOUT SOURCE INDEX \
-             SELECT COUNT(*) AS groups, SUM(sx) AS t",
+             SELECT COUNT(*) AS groups, COUNT(sx) AS t",
             &columns(&[("ga", int4()), ("n", int8), ("sx", int8)]),
             "public",
         )
