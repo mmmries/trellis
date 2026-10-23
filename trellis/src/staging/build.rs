@@ -1179,6 +1179,73 @@ fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
     shape_of(&definition.def, &definition.source_columns)
 }
 
+/// The live entries [`retire_ledger`] retires per statement.
+const RETIRE_BATCH: i64 = 10_000;
+
+/// Retires every live entry of `definition`'s ledger, in a resume's `txn`
+/// (#1324): each becomes a tombstone, read as a key with no row
+/// ([`ledger::retire_statement`]), and its group sheds it through the group
+/// deltas. For a resume whose source's key is no longer the one the ledger is
+/// keyed under (`transform_definitions.source_key`): the entries' keys name
+/// rows of a key the table now at the name doesn't have, so no build may
+/// decode them against its key. The rebuild then re-derives every row the
+/// table has, over a ledger with no live entry, and its merger retracts the
+/// old groups as it adds the new ones. Nothing for a definition the
+/// Re-derive build doesn't take; the group basis and a `JOIN` keep no
+/// ledger.
+///
+/// `definition` is as the definition was paused, its `source_columns` the
+/// ones the ledger was made from. The definition is frozen: no page writes
+/// its entries, and the resume has waited out every chunk still writing
+/// them.
+pub(crate) async fn retire_ledger(
+    txn: &Transaction<'_>,
+    definition: &Definition,
+) -> Result<(), ApplyError> {
+    let Some(shape) = buildable_shape(definition) else {
+        return Ok(());
+    };
+    let pk = ddl::source_primary_key_in_txn(txn, &definition.source_table).await?;
+    let identity = ddl::identity_key_columns(txn, &definition.target_table).await?;
+    let plan = LedgerTargetPlan::new(
+        &definition.target_table,
+        &definition.source_table,
+        pk,
+        identity,
+        shape,
+    );
+    // In batches of [`RETIRE_BATCH`] keys, so no statement's key array grows
+    // with the ledger, as a sweep's batches don't (F-A8).
+    let (read, retire) = (
+        ledger::retire_keys_statement(&plan),
+        ledger::retire_statement(&plan),
+    );
+    let mut cursor: Option<String> = None;
+    let mut retired: i64 = 0;
+    loop {
+        let keys: Vec<String> = txn
+            .query_one(&read, &[&cursor, &RETIRE_BATCH])
+            .await?
+            .get(0);
+        let Some(last) = keys.last().cloned() else {
+            break;
+        };
+        let row = ledger::query_one_by_entry_key(txn, &retire, &[&keys]).await?;
+        retired += row.get::<_, i64>(0);
+        if keys.len() < RETIRE_BATCH as usize {
+            break;
+        }
+        cursor = Some(last);
+    }
+    crate::instance_log::info!(
+        target = %definition.target_table,
+        retired,
+        "the source's key changed while the definition was paused; its ledger entries \
+         are retired and the rebuild re-derives every row"
+    );
+    Ok(())
+}
+
 /// Whether the partition correction engine
 /// (`super::partition_correction`) can re-derive the keys of `definition`
 /// when a node of its partitioned source is added: an aggregate on the group
