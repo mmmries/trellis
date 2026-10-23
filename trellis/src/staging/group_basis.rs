@@ -965,6 +965,25 @@ impl GroupTargetPlan {
         &self.recompute_keys
     }
 
+    /// The join condition matching the group of `left`'s row to `right`'s,
+    /// `NULL` matching `NULL`: per column, `array[left.c] = array[right.c]`.
+    /// Array equality compares elements by the column type's default
+    /// equality under the column's collation and counts two `NULL` elements
+    /// equal, so it matches exactly the groups `GROUP BY` forms, and,
+    /// unlike `is not distinct from`, it can be hashed or merged: a join of
+    /// two group sets on it is a hash or merge join, not a nested loop
+    /// rescanning one set per row of the other (#1318). Both sides must hold
+    /// each column at the same type (the hidden table's, as
+    /// [`Self::group_values`] reads a source): unlike `is not distinct
+    /// from`, array equality coerces no element type.
+    pub(super) fn group_match(&self, left: &str, right: &str) -> String {
+        quoted(&self.shape.group_cols)
+            .iter()
+            .map(|c| format!("array[{left}.{c}] = array[{right}.{c}]"))
+            .collect::<Vec<_>>()
+            .join(" and ")
+    }
+
     /// The lookup of the row of `table` (quoted) whose group is `alias`'s,
     /// `NULL` matching `NULL`, returning `columns` (over `x`), as one index
     /// probe on the group identity's index: plain equality, and, for each
@@ -1324,10 +1343,7 @@ impl GroupTargetPlan {
             }
         }
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
-        let matched: Vec<String> = cols
-            .iter()
-            .map(|c| format!("array[sg.{c}] = array[b.{c}]"))
-            .collect();
+        let matched = self.group_match("sg", "b");
         format!(
             "with sg as ( \
                  select {col_list}, __txid, {sums} from {staged} \
@@ -1369,7 +1385,6 @@ impl GroupTargetPlan {
                     "x.ctid, x.__basis"
                 }
             ),
-            matched = matched.join(" and "),
             totals = totals.join(", "),
             hidden = self.hidden_ident,
             sets = sets.join(", "),
@@ -1497,23 +1512,26 @@ impl GroupTargetPlan {
                 probe = self.probe_rows_sql(),
             ),
             Some(node) => {
-                let matched: Vec<String> = cols
-                    .iter()
-                    .map(|c| format!("n.{c} is not distinct from rg.{c}"))
-                    .collect();
+                // The node's group columns at the hidden table's types, as
+                // `rg`'s: array equality needs both sides' element types
+                // the same (a `varchar` source column against a `text`
+                // group column has no `=`).
+                let matched = self.group_match("n", "rg");
+                let positions: Vec<String> = (1..=cols.len()).map(|p| p.to_string()).collect();
                 format!(
                     "n as materialized ( \
-                         select {col_list}, {fresh} from {node} s group by {col_list} \
+                         select {values}, {fresh} from {node} s group by {positions} \
                      ), \
                      r as ( \
                          select h.*, {zeroed} from rg \
                          cross join lateral {lookup_hidden} as h(__hc, {old_names}) \
                          left join n on {matched} \
                      )",
+                    values = self.group_values().join(", "),
                     fresh = fresh.join(", "),
+                    positions = positions.join(", "),
                     zeroed = zeroed.join(", "),
                     old_names = old_names.join(", "),
-                    matched = matched.join(" and "),
                 )
             }
         };
@@ -1678,10 +1696,7 @@ impl GroupTargetPlan {
             }
         }
         let positions: Vec<String> = (1..=cols.len()).map(|p| p.to_string()).collect();
-        let matched: Vec<String> = cols
-            .iter()
-            .map(|c| format!("array[a.{c}] = array[rg.{c}]"))
-            .collect();
+        let matched = self.group_match("a", "rg");
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
         let lookup_hidden = self.group_lookup(&self.hidden_ident, "rg", "x.ctid");
         let r = match read {
@@ -1705,7 +1720,6 @@ impl GroupTargetPlan {
                     fresh = fresh.join(", "),
                     positions = positions.join(", "),
                     kept = kept.join(", "),
-                    matched = matched.join(" and "),
                 )
             }
             // One index probe of the root per group, for a set that is not
@@ -2782,6 +2796,66 @@ pub async fn explain_apply(pool: &crate::pool::Pool, target: &str) -> Result<Str
         .map(|row| row.get::<_, String>(0))
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+/// The plans of the two statements that read a whole source (or node) by
+/// one `GROUP BY` and match its groups to the locked ones: the node form of
+/// [`GroupTargetPlan::recompute_sql`] (a `JOIN` side's build, `RESUME` and
+/// rebuild) and [`GroupTargetPlan::rebuild_sql`]'s source read (a plain
+/// aggregate's), for `target`'s group-basis definition, each read from the
+/// whole source. Planned with nested loops disabled, so a nested loop that
+/// matches the groups shows only where the match can't be hashed or merged
+/// (#1318); the lateral lookups of the hidden rows stay nested loops. It
+/// locks and writes nothing.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_whole_source_reads(
+    pool: &crate::pool::Pool,
+    target: &str,
+) -> Result<[String; 2], ApplyError> {
+    let Some(definition) = crate::defs::catalog::definition_by_target(pool, target).await? else {
+        return Err(ApplyError::TransformNotFound {
+            transform: target.to_string(),
+        });
+    };
+    let Some(shape) = route(&definition.def, &definition.source_columns) else {
+        return Err(ApplyError::GroupBasisUnsupported {
+            target: definition.target_table,
+            what: "a definition the group basis doesn't take",
+        });
+    };
+    let mut client = pool.get().await?;
+    let identity = ddl::identity_key_columns(&**client, &definition.target_table).await?;
+    let plan = GroupTargetPlan::new(
+        pool.schema(),
+        definition.id,
+        &definition.target_table,
+        &definition.source_table,
+        ddl::source_primary_key_in_txn(&**client, &definition.source_table).await?,
+        identity,
+        shape,
+    );
+    let txn = client.transaction().await?;
+    txn.batch_execute(&format!(
+        "{}; {}; set local enable_nestloop = off",
+        plan.staged_ddl(),
+        plan.recomputed_ddl()
+    ))
+    .await?;
+    let statements = [
+        plan.recompute_sql(None, Some(plan.source_row())),
+        plan.rebuild_sql(None, &RebuildRead::Source),
+    ];
+    let mut plans = [String::new(), String::new()];
+    for (out, sql) in plans.iter_mut().zip(statements) {
+        let rows = txn.query(&format!("explain {sql}"), &[]).await?;
+        *out = rows
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    txn.rollback().await?;
+    Ok(plans)
 }
 
 #[cfg(test)]
