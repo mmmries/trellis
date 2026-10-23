@@ -225,6 +225,21 @@ unblocks it.
   and the run waits for it before its first write. About one op in a hundred
   is a `TRUNCATE` of either table. Run it with `cargo test -p generative --test
   join_convergence -- --ignored`.
+- **Partitioned-source convergence** *(ADR-0017)*. The first table of a
+  generated program is a partitioned source: `HASH` over one to four leaves,
+  `LIST` with a leaf per grain value or fewer and a `DEFAULT`, or `RANGE` over
+  one to three bounds, partitioned by the grain column, which every
+  definition reading it groups by. Its primary key is `(pk, grain)`, so its
+  grain is a `bigint` and a `NULL` grain is written as `0`. The other tables
+  and definitions draw as usual. It runs serially
+  (`property_convergence_holds_over_a_partitioned_source` in
+  `tests/convergence.rs`) and under the concurrent backend
+  (`property_a_partitioned_source_converges_under_the_concurrent_backend`).
+  The coverage report's `partition_strategies` line counts the strategies
+  drawn. Every write names the root, so a write aimed at a leaf is not
+  drawn. Rows never move between partitions, and partition maintenance
+  (attach, detach, drop, truncate of a leaf) is not drawn either
+  ([#1320](https://github.com/salesforce-misc/trellis/issues/1320)).
 - **A second, structural oracle** *(needs an engine consistency auditor, if one
   exists)*. Run the engine's internal consistency check at end of run, require zero
   findings, prove the wiring with a negative test.
