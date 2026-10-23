@@ -348,7 +348,10 @@ columns), so a divergence is reported per key.
 For aggregate and JOIN targets `self_check` **detects and reports; it never
 repairs.** A target found wrong is repaired by the operator, with the tools any
 definition has: `request_backfill` of the source table, which rebuilds each reading
-definition without pausing it, or `PAUSE` and `RESUME`. There is no background
+definition without pausing it, or `PAUSE` and `RESUME`, or `DROP TRANSFORM` and
+define it again. A hand edit of a JOIN's hidden tables needs one of the last two
+([known correctness gaps](../known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema)).
+There is no background
 repair sweep. A sweep would put a continuous source `GROUP BY` load on the
 database, hold group locks that compete with pages, and silently mask Trellis's own
 bugs, which an audit exists to surface. A repair of only the groups an audit
