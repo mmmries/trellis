@@ -20,8 +20,14 @@
 //! [`diff_groups`] compares 1 against 2 and 3 against 4, and reports a group
 //! 1 has and 4 lacks, or the reverse, as a missing or extra row. It reports, never
 //! repairs: the remedy is a `request_backfill` of the source or a
-//! `PAUSE`/`RESUME` (ADR-0013). A group's partials are compared as values (a
-//! sum's trailing zeros are not part of it), the visible row byte for byte.
+//! `PAUSE`/`RESUME` (ADR-0013).
+//!
+//! Everything compares as values (ADR-0020: an aggregate target holds an
+//! equal value): the sides' groups are matched by the `GROUP BY` columns'
+//! equality, not their text ([`Keyset::ranked_by_value`]), so a group row
+//! keyed `1.25` is the source's `1.2500`; a partial sum drops its trailing
+//! zeros; and a visible field whose text differs is compared by its type's
+//! `=` ([`drop_equal_values`]).
 //!
 //! Like the 1-1 comparison, the page is read only after the convergence wait
 //! `super::self_check::audit` makes. Side 1 is read from the source's rows
@@ -51,7 +57,7 @@
 //! bound to the hidden side's last key ([`bound`]), which the ordered
 //! aggregate would read past to the end of the index.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use tokio_postgres::types::PgLsn;
 
@@ -271,7 +277,7 @@ fn page_sql(
          implied as (select __k{carried_cols_lead}, __f as __v from hid where __visible), \
          vis as materialized ({vis}), \
          unc as ( \
-            select distinct ({unc_key}) collate {BYTE_ORDER} as __k \
+            select distinct ({unc_key}) collate {BYTE_ORDER} as __k{unc_carried} \
             from ({uncertain}) u \
             cross join lateral jsonb_populate_record(null::{source}, u.__i) as r), ",
         ring_ctes = ring.ctes(&lands),
@@ -283,15 +289,19 @@ fn page_sql(
             .map(|c| format!(", {c}"))
             .collect::<String>(),
         unc_key = ddl::pk_key_sql_expr(identity, Some("r")),
+        unc_carried = keyset.select_carried(&keyset.refs(Some("r"))),
         uncertain = ring.uncertain_images_sql(),
         source = ring.source_row,
     );
+    // An uncertain image's key is the page's equal key's text, which may not
+    // be the image's own (`1.250` of the group the page reports as `1.25`).
     let extra = format!(
-        " union all select 5, page.page_end, unc.__k, null::text[] from unc, page \
+        " union all select 5, page.page_end, {unc_named}, null::text[] from unc, page \
           union all select 6, page.page_end, '', null::text[] from page where {global}",
+        unc_named = keyset.named_key("unc", "unc.__k"),
         global = ring.global_sql(),
     );
-    Ok(keyset.ranked(
+    Ok(keyset.ranked_by_value(
         &ctes,
         &[(1, "src"), (2, "hid"), (3, "implied"), (4, "vis")],
         &[1, 2, 4],
@@ -484,14 +494,113 @@ pub(super) async fn compare(
         .map(|c| format!("{hidden_name}.{c}"))
         .collect();
     let fields: Vec<&str> = shape.fields.iter().map(|(n, _, _)| n.as_str()).collect();
-    let diff = diff_groups(&partials, &fields, paused, src, hid, implied, vis, page_end);
+    let (rows_compared, next_after, mut divergences) =
+        diff_groups(&partials, &fields, paused, src, hid, implied, vis, page_end);
+    let types: HashMap<&str, &str> = shape
+        .fields
+        .iter()
+        .map(|(name, pg_type, _)| (name.as_str(), pg_type.as_str()))
+        .collect();
+    drop_equal_values(&client, &types, &mut divergences).await?;
     Ok(ComparePass {
         checked_through,
-        rows_compared: diff.0,
-        next_after: diff.1,
-        divergences: diff.2,
+        rows_compared,
+        next_after,
+        divergences,
         uncertain,
     })
+}
+
+/// Drops each [`Divergence::Cell`] of a visible field whose two texts are
+/// equal values of the field's type (`types`, by field name): an aggregate
+/// result is correct when it equals the recomputed one under its type's `=`,
+/// and its rendering may be any of the equal values' (ADR-0020), as a
+/// `numeric` sum's scale is the scale of the values it summed. A cell of a
+/// type with no `=`, or whose text the type doesn't read back, stays: its
+/// texts differ, and text is all it can be compared by.
+///
+/// Only a cell whose texts differ is a diverged cell, so this reads nothing
+/// but the cells already reported: one statement per type, linear in the
+/// cells (a page of a target whose every result re-rendered has thousands).
+pub(super) async fn drop_equal_values(
+    client: &tokio_postgres::Client,
+    types: &HashMap<&str, &str>,
+    divergences: &mut Vec<Divergence>,
+) -> Result<(), SelfCheckError> {
+    let mut by_type: BTreeMap<&str, Vec<(usize, &str, &str)>> = BTreeMap::new();
+    for (i, d) in divergences.iter().enumerate() {
+        if let Divergence::Cell {
+            column,
+            persisted: Some(p),
+            recomputed: Some(r),
+            ..
+        } = d
+            && let Some(ty) = types.get(column.as_str())
+        {
+            by_type
+                .entry(*ty)
+                .or_default()
+                .push((i, p.as_str(), r.as_str()));
+        }
+    }
+    let mut equal_cells: HashSet<usize> = HashSet::new();
+    for (ty, cells) in &by_type {
+        let (persisted, recomputed): (Vec<&str>, Vec<&str>) =
+            cells.iter().map(|(_, p, r)| (*p, *r)).unzip();
+        let batch = client
+            .query(
+                &format!(
+                    "select coalesce(u.p::{ty} = u.r::{ty}, false) \
+                     from unnest($1::text[], $2::text[]) with ordinality as u(p, r, o) \
+                     order by u.o"
+                ),
+                &[&persisted, &recomputed],
+            )
+            .await;
+        let verdicts: Vec<bool> = match batch {
+            Ok(rows) => rows.iter().map(|row| row.get(0)).collect(),
+            // A type with no `=`: every cell of it is compared as text.
+            Err(err)
+                if err.code() == Some(&tokio_postgres::error::SqlState::UNDEFINED_FUNCTION) =>
+            {
+                continue;
+            }
+            // A text the type doesn't read: each cell on its own, so the
+            // others are still compared by value.
+            Err(err) if err.as_db_error().is_some() => {
+                let mut verdicts = Vec::with_capacity(cells.len());
+                for (_, p, r) in cells {
+                    let one = client
+                        .query_one(
+                            &format!("select coalesce($1::text::{ty} = $2::text::{ty}, false)"),
+                            &[p, r],
+                        )
+                        .await;
+                    verdicts.push(match one {
+                        Ok(row) => row.get(0),
+                        Err(err) if err.as_db_error().is_some() => false,
+                        Err(err) => return Err(err.into()),
+                    });
+                }
+                verdicts
+            }
+            Err(err) => return Err(err.into()),
+        };
+        equal_cells.extend(
+            cells
+                .iter()
+                .zip(verdicts)
+                .filter(|(_, equal)| *equal)
+                .map(|((i, ..), _)| *i),
+        );
+    }
+    let mut i = 0;
+    divergences.retain(|_| {
+        let keep = !equal_cells.contains(&i);
+        i += 1;
+        keep
+    });
+    Ok(())
 }
 
 /// The pure half of [`compare`]: `(rows compared, next cursor, divergences)`.
@@ -574,4 +683,258 @@ fn diff_groups(
         .chain(vis.keys())
         .collect();
     (all.len() as i64, page_end, divergences)
+}
+
+/// Groups and aggregate results compared by value (#1297, ADR-0020): pages
+/// read from real tables, no definition and no waiting.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn connect(dsn: &str) -> tokio_postgres::Client {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    }
+
+    /// One page of groups keyed by `g`: the source's rows as sides 1 to 3
+    /// (its partials, the hidden table's and the row they imply) and the
+    /// target's as side 4, diffed as [`compare`] diffs them.
+    async fn diff_page(client: &mut tokio_postgres::Client) -> Vec<Divergence> {
+        let keyset = Keyset::resolve_columns(client, "public.tgt", &["g".to_string()])
+            .await
+            .expect("resolve the keyset");
+        let refs = keyset.refs(None);
+        let key = ddl::pk_key_sql_expr(keyset.columns(), None);
+        let carried = keyset.select_carried(&refs);
+        let order = keyset.order_by(&refs);
+        let side = |table: &str| {
+            keyset.side(&refs, |cond| {
+                format!(
+                    "select {key} as __k{carried}, array[n::text]::text[] as __v from {table} \
+                     where {cond} order by {order} limit $1"
+                )
+            })
+        };
+        let sql = keyset.ranked_by_value(
+            &format!(
+                "src as materialized ({s}), hid as materialized ({s}), \
+                 implied as materialized ({s}), vis as materialized ({t}), ",
+                s = side("public.src"),
+                t = side("public.tgt"),
+            ),
+            &[(1, "src"), (2, "hid"), (3, "implied"), (4, "vis")],
+            &[1, 2, 4],
+            "",
+        );
+        let rows = Keyset::run(client, &sql, 100, false)
+            .await
+            .unwrap_or_else(|e| panic!("{e:?}\n{sql}"));
+        let mut sides: [Side; 4] = Default::default();
+        for row in &rows {
+            let side: i32 = row.get(0);
+            sides[(side - 1) as usize].insert(row.get(2), row.get(3));
+        }
+        let [src, hid, implied, vis] = sides;
+        diff_groups(
+            &["h.__n".to_string()],
+            &["n"],
+            &HashSet::new(),
+            src,
+            hid,
+            implied,
+            vis,
+            None,
+        )
+        .2
+    }
+
+    /// A group whose key renders `1.25` against the source's `1.2500` is one
+    /// group, and the page agrees; a key that differs by value is a missing
+    /// row and an extra one.
+    #[tokio::test]
+    async fn a_group_key_matches_by_value_not_by_text() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let mut client = connect(db.dsn()).await;
+        client
+            .batch_execute(
+                "create table public.src (g numeric(8,4), n bigint); \
+                 create table public.tgt (g numeric, n bigint); \
+                 insert into public.src values (1.2500, 2), (3, 1); \
+                 insert into public.tgt values (1.25, 2), (3.000, 1)",
+            )
+            .await
+            .expect("seed");
+        assert_eq!(diff_page(&mut client).await, [], "equal keys, other texts");
+
+        client
+            .batch_execute("update public.tgt set g = 1.26 where g = 1.25")
+            .await
+            .expect("diverge a key");
+        assert_eq!(
+            diff_page(&mut client).await,
+            [
+                Divergence::MissingRow {
+                    key: "1.2500".to_string()
+                },
+                Divergence::ExtraRow {
+                    key: "1.26".to_string()
+                },
+            ]
+        );
+    }
+
+    /// An uncertain image's key is reported by the page's equal key's text:
+    /// an image keyed `1.250` covers the group the page reports as `1.25`,
+    /// so a divergence there is re-checked; a key the page doesn't hold
+    /// keeps its own text.
+    #[tokio::test]
+    async fn an_uncertain_images_key_names_the_pages_equal_key() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let mut client = connect(db.dsn()).await;
+        client
+            .batch_execute(
+                "create table public.src (g numeric, n bigint); \
+                 create table public.tgt (g numeric, n bigint); \
+                 create table public.images (g numeric); \
+                 insert into public.src values (1.25, 1); \
+                 insert into public.tgt values (1.25, 1); \
+                 insert into public.images values (1.250), (7)",
+            )
+            .await
+            .expect("seed");
+        let keyset = Keyset::resolve_columns(&client, "public.tgt", &["g".to_string()])
+            .await
+            .expect("resolve the keyset");
+        let refs = keyset.refs(None);
+        let key = ddl::pk_key_sql_expr(keyset.columns(), None);
+        let carried = keyset.select_carried(&refs);
+        let order = keyset.order_by(&refs);
+        let side = |table: &str| {
+            keyset.side(&refs, |cond| {
+                format!(
+                    "select {key} as __k{carried}, array[n::text]::text[] as __v from {table} \
+                     where {cond} order by {order} limit $1"
+                )
+            })
+        };
+        let sql = keyset.ranked_by_value(
+            &format!(
+                "src as materialized ({}), vis as materialized ({}), \
+                 unc as (select {key} as __k{carried} from public.images), ",
+                side("public.src"),
+                side("public.tgt"),
+            ),
+            &[(1, "src"), (2, "vis")],
+            &[1, 2],
+            &format!(
+                " union all select 5, page.page_end, {}, null::text[] from unc, page",
+                keyset.named_key("unc", "unc.__k")
+            ),
+        );
+        let rows = Keyset::run(&mut client, &sql, 100, false)
+            .await
+            .unwrap_or_else(|e| panic!("{e:?}\n{sql}"));
+        let uncertain: BTreeSet<String> = rows
+            .iter()
+            .filter(|row| row.get::<_, i32>(0) == 5)
+            .map(|row| row.get(2))
+            .collect();
+        assert_eq!(
+            uncertain,
+            BTreeSet::from(["1.25".to_string(), "7".to_string()])
+        );
+    }
+
+    fn cell(column: &str, persisted: &str, recomputed: &str) -> Divergence {
+        Divergence::Cell {
+            key: "1".to_string(),
+            column: column.to_string(),
+            persisted: Some(persisted.to_string()),
+            recomputed: Some(recomputed.to_string()),
+        }
+    }
+
+    /// An aggregate result equal to the recomputed one but rendered
+    /// otherwise is no divergence; one that differs by value is, and so is a
+    /// cell of a type with no `=` (compared as text), or of a column that is
+    /// no visible field.
+    #[tokio::test]
+    async fn an_aggregate_result_compares_by_its_types_equality() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let client = connect(db.dsn()).await;
+        let types = HashMap::from([("s", "numeric"), ("j", "json"), ("c", "bigint")]);
+        let mut divergences = vec![
+            cell("s", "1.5", "1.50"),
+            cell("s", "1.5", "1.6"),
+            cell("c", "2", "3"),
+            cell("h.__sum_1", "1.5", "1.50"),
+        ];
+        drop_equal_values(&client, &types, &mut divergences)
+            .await
+            .expect("compare");
+        assert_eq!(
+            divergences,
+            [
+                cell("s", "1.5", "1.6"),
+                cell("c", "2", "3"),
+                cell("h.__sum_1", "1.5", "1.50"),
+            ]
+        );
+
+        // `json` has no `=`: its cell keeps the text comparison, and the
+        // page's other cells are still compared by value.
+        let mut divergences = vec![
+            cell("j", r#"{"a":1}"#, r#"{"a": 1}"#),
+            cell("s", "2.0", "2"),
+        ];
+        drop_equal_values(&client, &types, &mut divergences)
+            .await
+            .expect("compare");
+        assert_eq!(divergences, [cell("j", r#"{"a":1}"#, r#"{"a": 1}"#)]);
+
+        // A text its type doesn't read stays, and the type's other cells are
+        // still compared by value.
+        let mut divergences = vec![
+            cell("s", "1.5", "not a number"),
+            cell("s", "2.0", "2"),
+            cell("s", "3", "4"),
+        ];
+        drop_equal_values(&client, &types, &mut divergences)
+            .await
+            .expect("compare");
+        assert_eq!(
+            divergences,
+            [cell("s", "1.5", "not a number"), cell("s", "3", "4")]
+        );
+
+        // Thousands of cells: one statement for the type, in their order.
+        let mut divergences: Vec<Divergence> = (0..20_000)
+            .map(|i| {
+                if i % 2 == 0 {
+                    cell("s", &format!("{i}.5"), &format!("{i}.50"))
+                } else {
+                    cell("s", &format!("{i}"), &format!("{}", i + 1))
+                }
+            })
+            .collect();
+        drop_equal_values(&client, &types, &mut divergences)
+            .await
+            .expect("compare");
+        assert_eq!(divergences.len(), 10_000);
+        assert!(
+            divergences
+                .iter()
+                .enumerate()
+                .all(|(n, d)| *d == cell("s", &format!("{}", 2 * n + 1), &format!("{}", 2 * n + 2))),
+            "the unequal half, in order"
+        );
+    }
 }

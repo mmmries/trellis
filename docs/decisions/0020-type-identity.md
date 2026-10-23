@@ -100,13 +100,36 @@ rebuilds from the source without casting any stored text. The changes are:
 - an enum `RENAME VALUE`. A new label (`ADD VALUE`) changes no stored text and
   pauses nothing.
 - a rewrite that re-renders existing key text: a `character(n)` length change,
-  a `bit(n)` change with `USING`, a `numeric` scale change, a narrower temporal
-  precision.
+  a `bit(n)` change with `USING`, a narrower `numeric` scale or one added to an
+  unconstrained `numeric` (the rewrite rounds), a narrower temporal precision.
+  A wider `numeric` scale pauses nothing: a group key's stored text is still an
+  equal value ([below](#an-aggregate-or-join-target-holds-an-equal-value)).
 
 Enum values are detected by their value OIDs, recorded with the definition.
 
 This is the one place a modifier matters: a change that alters how stored
 values render, not one that only widens what the column can hold.
+
+## An aggregate or `JOIN` target holds an equal value
+
+A group key and an aggregate result are correct when they are equal, under the
+column type's `=`, to what a fresh `GROUP BY` computes. Their text is one of
+the equal values' texts, as Postgres's own `GROUP BY` gives: it merges `1.25`
+and `1.2500` of a `numeric` column into one group and shows one of them. So a
+group row written as `1.25` is correct beside a source that a rewrite to a
+wider scale re-rendered as `1.2500`, and a rebuild doesn't rewrite a key whose
+text alone changed. A narrower scale changes values, not only their text, so it
+pauses the readers, and `RESUME` ends with every group equal by value.
+
+`self_check` holds these targets to the same rule: it matches their groups,
+cells and join keys by the key types' equality, and compares a result whose
+text differs by its type's `=`
+([ADR-0013](0013-self-check-production-recompute-audit.md#comparison-semantics-exact-text-for-1-1-equal-values-for-aggregates-and-joins)).
+
+Text identity for group keys was rejected: a fresh `GROUP BY` doesn't produce
+it either, since which of the equal texts it shows depends on the rows it
+read. Rewriting a key's text on a rebuild was rejected too: it costs a write
+per group for a difference in rendering only.
 
 ## A key's identity includes its collation
 
