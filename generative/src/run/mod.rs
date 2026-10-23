@@ -509,7 +509,7 @@ pub async fn run_convergence_bursty<B: Backend>(
     install_result.map_err(|e| RunError::Install(format!("{e:?}")))?;
 
     let mut op_index = 0usize;
-    for burst in program.ops.chunks(burst_size) {
+    for burst in bursts(program, burst_size) {
         for op in burst {
             apply_and_check_outcome(backend, op_index, op, timing_enabled).await?;
             op_index += 1;
@@ -527,6 +527,60 @@ pub async fn run_convergence_bursty<B: Backend>(
     }
 
     Ok(Outcome::Ran)
+}
+
+/// `program`'s ops in bursts of up to `burst_size` consecutive ops, split
+/// early so no burst both brings a leaf into a tree that may hold a `DEFAULT`
+/// (a new leaf, or an attach) and removes it again (a detach or drop): the
+/// second op starts a new burst. [`run_convergence_bursty`] settles between
+/// bursts, which waits for the reconcile pass that records the leaf, so a
+/// leaf beside a `DEFAULT` is never created and removed between two passes
+/// (a documented gap: `docs/known-correctness-gaps.md`, "A short-lived leaf
+/// beside a `DEFAULT` partition"). Any other partition maintenance may share
+/// a burst, and so a pass: the engine corrects a tree that changed several
+/// times between two passes, a leaf detached and attached again included.
+fn bursts(program: &Program, burst_size: usize) -> Vec<&[Op]> {
+    use crate::model::{PartitionAction, PartitionStrategy};
+    let may_have_default = |table: &str| {
+        program.tables.iter().any(|t| {
+            t.name == table
+                && t.partitioning.as_ref().is_some_and(|p| {
+                    matches!(p.strategy, PartitionStrategy::List { default: true, .. })
+                })
+        })
+    };
+    let ops = &program.ops;
+    let mut out = Vec::new();
+    let mut start = 0;
+    // `(root, leaf)` of each leaf brought into a tree in the current burst.
+    let mut joined: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+    for (i, op) in ops.iter().enumerate() {
+        let removes_joined = match op {
+            Op::Partition {
+                table,
+                action: PartitionAction::Detach { leaf, .. } | PartitionAction::Drop { leaf },
+                ..
+            } => may_have_default(table) && joined.contains(&(table.as_str(), leaf.as_str())),
+            _ => false,
+        };
+        if i - start == burst_size || removes_joined {
+            out.push(&ops[start..i]);
+            start = i;
+            joined.clear();
+        }
+        if let Op::Partition {
+            table,
+            action: PartitionAction::Attach { leaf, .. } | PartitionAction::Create { leaf, .. },
+            ..
+        } = op
+        {
+            joined.insert((table.as_str(), leaf.as_str()));
+        }
+    }
+    if start < ops.len() {
+        out.push(&ops[start..]);
+    }
+    out
 }
 
 /// Runs the three-way oracle check for every definition in `program` against
@@ -603,7 +657,99 @@ pub async fn check_defs(
 
 #[cfg(test)]
 mod tests {
-    use super::Outcome;
+    use super::{Outcome, bursts};
+    use crate::model::{Op, OpOutcome, PartitionAction, PartitionStrategy, Program};
+
+    /// A one-table program partitioned by `strategy`, its ops replaced by
+    /// `ops`.
+    fn partitioned(strategy: PartitionStrategy, ops: Vec<Op>) -> Program {
+        use crate::generate::{
+            AggregateFn, DefShape, TableSpec, build_program_multi_with_shapes, partition_table,
+        };
+        let mut program = partition_table(
+            build_program_multi_with_shapes(
+                &[TableSpec::numeric_only(vec![(Some(1), None)], Vec::new())],
+                &[(
+                    0,
+                    DefShape::Aggregate {
+                        functions: vec![AggregateFn::Count],
+                    },
+                )],
+            ),
+            0,
+            strategy,
+        );
+        program.ops = ops;
+        program
+    }
+
+    /// Issue #1320: beside a possible `DEFAULT`, a detach or drop of a leaf
+    /// created or attached earlier in the same burst starts a new burst (the
+    /// short-lived-leaf gap); every other partition operation shares a burst,
+    /// and without a `DEFAULT` nothing splits but `burst_size`.
+    #[test]
+    fn only_removing_a_leaf_that_joined_in_the_burst_beside_a_default_splits_it() {
+        let write = Op::Delete {
+            table: "t0".into(),
+            pk: "1".into(),
+            expect: OpOutcome::AffectsNoRows,
+        };
+        let ddl = |action| Op::Partition {
+            table: "t0".into(),
+            action,
+            expect: OpOutcome::Succeeds,
+        };
+        let ops = vec![
+            write.clone(),
+            ddl(PartitionAction::Create {
+                leaf: "t0_n1".into(),
+                bound: "for values in (1)".into(),
+                rows: Vec::new(),
+                standalone: false,
+            }),
+            write.clone(),
+            // A leaf the burst didn't bring in: no split.
+            ddl(PartitionAction::Detach {
+                leaf: "t0_p0".into(),
+                concurrently: false,
+            }),
+            ddl(PartitionAction::Drop {
+                leaf: "t0_n1".into(),
+            }),
+            ddl(PartitionAction::Attach {
+                leaf: "t0_p0".into(),
+                bound: "for values in (0)".into(),
+            }),
+            write.clone(),
+            ddl(PartitionAction::Detach {
+                leaf: "t0_p0".into(),
+                concurrently: false,
+            }),
+            write.clone(),
+            write,
+        ];
+        let sizes = |strategy, burst_size| -> Vec<usize> {
+            let program = partitioned(strategy, ops.clone());
+            bursts(&program, burst_size)
+                .iter()
+                .map(|b| b.len())
+                .collect()
+        };
+        let with_default = PartitionStrategy::List {
+            values: 2,
+            default: true,
+        };
+        assert_eq!(sizes(with_default, 20), vec![4, 3, 3]);
+        // A leaf brought in by an earlier burst is recorded by the settle
+        // between them, so removing it splits nothing.
+        assert_eq!(sizes(with_default, 3), vec![3, 3, 3, 1]);
+        let without = PartitionStrategy::List {
+            values: 2,
+            default: false,
+        };
+        assert_eq!(sizes(without, 20), vec![10]);
+        assert_eq!(sizes(without, 4), vec![4, 4, 2]);
+    }
 
     /// Design doc §6 / issue #4: only `Ran` passes. Fast, no database —
     /// this is the classifier logic itself, not the harness sanity check
