@@ -174,6 +174,18 @@ pub async fn reconcile(
     // restore pauses every definition and discards the ring, so nothing below
     // acts on the original database's records.
     super::restore::detect(client).await?;
+    // #1204, #1242: a type renamed or moved to another schema keeps its OID
+    // and its values. Each definition recorded the OID beside the name, so
+    // its name is re-recorded wherever Trellis casts by it, and the key-type
+    // checks below find the name current. After the restore check, which
+    // leaves a restored definition's OIDs out of the comparison. A failure
+    // (an owner's row locked past the lock timeout) is retried by the next
+    // pass and stops nothing else: no check below compares a type's name.
+    if let Err(err) = super::baseline::follow_renamed_types(client).await {
+        crate::instance_log::warn!(
+            "a renamed type's new name could not be recorded; retrying next pass: {err}"
+        );
+    }
     crate::staging::quarantine::resume_caused_definitions(client, schema).await?;
     crate::staging::quarantine::finish_requested_resumes(client, schema).await?;
     let snapshot = read_snapshot(client, schema).await?;
@@ -294,13 +306,6 @@ pub async fn reconcile(
                 outcome.failed.push((table.clone(), err));
                 continue;
             }
-        }
-        // #1204: a type renamed or moved to another schema keeps its oid and
-        // its values; its name is re-recorded where Trellis casts by it, and
-        // the key-type check below then finds the name it recorded.
-        if let Err(err) = super::baseline::follow_renamed_types(client, table).await {
-            outcome.failed.push((table.clone(), err));
-            continue;
         }
         // #760, #767: a key column whose type or collation define would
         // refuse now, a join pair that no longer matches, a type change that
