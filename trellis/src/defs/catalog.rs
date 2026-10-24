@@ -644,8 +644,8 @@ impl fmt::Display for CatalogError {
                 write!(
                     f,
                     ". Trellis needs USAGE on the schema of every source, and must own each \
-                     source and relationship to-side table or be a member of the role that owns \
-                     it, with INHERIT: see \"One Trellis role\" in docs/recommendations.md"
+                     source table or be a member of the role that owns it, with INHERIT: see \
+                     \"One Trellis role\" in docs/recommendations.md"
                 )
             }
             CatalogError::SourceKeyChanged {
@@ -821,8 +821,7 @@ impl fmt::Display for CatalogError {
             CatalogError::TransformNotLive { transform, status } => write!(
                 f,
                 "'{transform}' is {}, not live; only a fully-built, live definition can be \
-                 edited with ALTER TRANSFORM, read by another transform, or made a \
-                 relationship endpoint",
+                 edited with ALTER TRANSFORM or read by another transform",
                 status.as_str()
             ),
             CatalogError::AlterFieldNotFound {
@@ -4149,6 +4148,10 @@ fn reject_relationship_named_after_from_table(
 /// cleared), so a later `create_definition` call that resolves the same
 /// table as [`NodeKind::Target`] merges into the same node rather than
 /// conflicting with this choice.
+#[cfg_attr(
+    not(any(test, feature = "test-util")),
+    expect(dead_code, reason = "test-only until #1115 R2 deletes it")
+)]
 pub async fn create_relationship(
     pool: &Pool,
     source_text: &str,
@@ -4305,9 +4308,7 @@ struct ValidatedRelationship {
 /// (issue #429). A relationship this accepts must never halt its definitions
 /// later over something that was knowable when it was declared. Each check
 /// calls the same function, or reads the same allowlist, as the runtime path
-/// it protects, so the two can't drift apart. The full list, with the path
-/// behind each requirement, is in `docs/relationship-propagation.md`
-/// ("Endpoint requirements").
+/// it protects, so the two can't drift apart.
 ///
 /// In order, returning the first failure:
 ///
