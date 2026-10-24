@@ -34,7 +34,10 @@
 //! 2 to 6 drain workers sealing every 20 to 200 ms. A burst past the
 //! engine's split threshold can seal into one batch whose parts several
 //! workers claim; the coverage report's `drain` line says how often that
-//! happened. Every burst is checked
+//! happened. About half the cases also stall every page for a random time
+//! of up to 5 to 40 ms between its last write and its commit
+//! (`ConcurrentPlan::commit_stall`), so two pages of one key's opposite
+//! sides overlap there, where only the `J` lock orders them. Every burst is checked
 //! once it settles, and at the end every definition must still be `live`
 //! (a `JOIN` that halted would otherwise only show as a stale target).
 //!
@@ -79,6 +82,7 @@ use generative::generate::join::{
     join_case_strategy,
 };
 use generative::model::Op;
+use generative::plant_sweep::{self, SweepTier};
 use generative::run::{RunError, check_program, run_convergence_concurrent};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
@@ -99,6 +103,8 @@ struct JoinCoverage {
     cases_building_over_rows: usize,
     /// Cases that settled their up-front definitions over empty tables.
     cases_settled: usize,
+    /// Cases whose pages stalled before their commits.
+    cases_commit_stalled: usize,
     /// Read back from the engine: cases whose run moved the build-rows
     /// counter, its total over the run, and the cases with a build over rows
     /// in the model whose run didn't move it.
@@ -149,6 +155,7 @@ impl JoinCoverage {
         let builds = build_coverage(&case.program, &case.plan);
         self.cases_building_over_rows += usize::from(builds.builds_over_rows() > 0);
         self.cases_settled += usize::from(case.plan.settle_after_install);
+        self.cases_commit_stalled += usize::from(case.plan.commit_stall.is_some());
         self.builds.add(&builds);
         self.coverage.record_program(&case.program);
         self.coverage
@@ -185,6 +192,11 @@ impl std::fmt::Display for JoinCoverage {
             f,
             "ops: {} on ja, {} on jb, {} of them truncates",
             self.from_ops, self.joined_ops, self.truncates
+        )?;
+        writeln!(
+            f,
+            "commit stalls: {} of {} cases",
+            self.cases_commit_stalled, self.cases
         )?;
         let b = &self.builds;
         writeln!(
@@ -329,6 +341,102 @@ proptest! {
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_join_targets_converge_under_concurrent_drains(case in join_case_strategy()) {
         run_case(&case).map_err(TestCaseError::fail)?;
+    }
+}
+
+/// The `JOIN` tier's sweep: the plants a `JOIN` page or build can reach are
+/// gated (the `JOIN` plants and the group-basis writer's, which `P` and `M`
+/// share); the others break paths the tier never takes.
+///
+/// Measured (#1114, 4 seeds x 12 cases, logbook `20261024T051124-a-sweep`):
+/// `join_drop_flip` caught in 33 of 48, `gb_fold_sides_per_key` 27,
+/// `join_other_side_before_j` 6. Known misses: `join_no_j_lock` and
+/// `join_t_skip_lock` fired in 27 to 31 of 48 cases and were caught in none,
+/// with or without the commit stall: their race needs two pages of one key's
+/// opposite sides (or one `T` group) to read each other's uncommitted state,
+/// which the tier's pages, each a burst's many keys, rarely line up; and
+/// `gb_early_zero_gc` fired in 1. The deterministic pins named in
+/// `trellis/src/plant.rs` gate them meanwhile; #1373 tracks the generator
+/// reach.
+fn join_sweep_tier() -> SweepTier {
+    use generative::plant_sweep::{PlantPath, not_on_path};
+    let mut not_gated: Vec<(&'static str, &'static str)> = vec![(
+        "gb_lsn_not_visibility",
+        "it fired in 0 of 48 cases: no build's basis caught a writer of its cells in \
+         flight (the tier's writes are single statements); the concurrent tier's \
+         steady-load and mid-burst tiers gate it",
+    )];
+    not_gated.extend(not_on_path(
+        &[
+            PlantPath::Ledger,
+            PlantPath::OneToOne,
+            PlantPath::OneToOneOrLedger,
+            PlantPath::GroupBasis,
+        ],
+        "it breaks a 1-1, ledger or plain group-basis aggregate path, and the JOIN tier \
+             draws only JOIN definitions",
+    ));
+    SweepTier {
+        name: generative::baseline_quarantine::JOIN_TIER,
+        known_misses: &["join_no_j_lock", "join_t_skip_lock", "gb_early_zero_gc"],
+        not_gated,
+    }
+}
+
+/// #1114: shows the `JOIN` tier catches each planted bug a `JOIN` can reach
+/// (`trellis::dev::plant::Plant`), and how often: the concurrent tier's
+/// sweep (`generative::plant_sweep`, `concurrent_convergence.rs`'s
+/// `planted_bugs_are_caught`) over [`join_case_strategy`]'s seeded cases.
+/// Returns at once without `GENERATIVE_PLANTS`. Run it with:
+///
+/// ```text
+/// GENERATIVE_PLANTS=all cargo test -p generative --test join_convergence \
+///     join_planted_bugs_are_caught -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "planted-bug sweep: run with GENERATIVE_PLANTS=all and `--ignored`"]
+fn join_planted_bugs_are_caught() {
+    let strategy = join_case_strategy().boxed();
+    plant_sweep::sweep(
+        "join_planted_bugs_are_caught",
+        &join_sweep_tier(),
+        |seed, cases| plant_sweep::seeded_cases(&strategy, seed, cases),
+        |case: &JoinCase| {
+            run_case(case).map_err(|message| plant_sweep::CaseFailure {
+                // Every target is a `JOIN`.
+                key_spaces: case
+                    .program
+                    .defs
+                    .iter()
+                    .map(|def| Some(def.key_space.clone()))
+                    .collect(),
+                message,
+            })
+        },
+    );
+}
+
+/// Every `JOIN` plant and every group-basis writer plant is run by the tier
+/// (gated or a known miss), except `gb_lsn_not_visibility`, which the tier
+/// never reaches; nothing else is.
+#[test]
+fn the_join_tier_runs_every_join_plant() {
+    use trellis::dev::plant::Plant;
+    let tier = join_sweep_tier();
+    for plant in Plant::ALL {
+        let gated = !tier.not_gated.iter().any(|(name, _)| *name == plant.name())
+            || plant.name() == "gb_lsn_not_visibility";
+        let path = generative::plant_sweep::plant_path(*plant);
+        assert_eq!(
+            gated,
+            matches!(
+                path,
+                generative::plant_sweep::PlantPath::Join
+                    | generative::plant_sweep::PlantPath::GroupBasisWriter
+            ),
+            "{}",
+            plant.name()
+        );
     }
 }
 
