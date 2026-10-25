@@ -29,7 +29,6 @@
 //! chunk-draining helper is copied from `defs_install_definition.rs`.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
@@ -37,8 +36,8 @@ use trellis::Pool;
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ast::{Expr, ValueType};
 use trellis::defs::{
-    PgType, chunk_queue, create_definition, create_target_table, install_definition, parse,
-    recompute, render_expr_sql, source_primary_key, validate,
+    PgType, create_definition, create_target_table, install_definition, parse, recompute,
+    render_expr_sql, source_primary_key, validate,
 };
 use trellis::staging::apply;
 
@@ -146,42 +145,17 @@ async fn insert_cdc_row(client: &Client, key: &str, new_image: &str) {
         .expect("stage cdc row");
 }
 
-/// Drives the durable backfill chunk queue to completion, standing in for a
-/// running `application_threads` drain worker (copied from
-/// `defs_install_definition.rs`), then runs the Re-derive builds to `live`
-/// (#625 F8a: a plain 1-1 over a captured table is the Re-derive build's).
+/// Starts every registered definition's Re-derive build and runs it to
+/// `live`, standing in for the staging worker and a running
+/// `application_threads` drain worker (copied from
+/// `defs_install_definition.rs`).
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
-    trellis::intake::markers::discharge_registrations(pool)
+    // ADR-0002 (#418): registration only records a definition; the staging
+    // worker starts its build.
+    trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    const CLAIMED_BY: &str = "typed_literal_test_backfill_worker";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            trellis::staging::build::settle_builds(pool).await;
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// The declared Postgres type of `table`.`column`, straight from
@@ -405,12 +379,11 @@ async fn evaluator_and_sql_oracle_agree_on_every_literal() {
 // The full pipeline
 // ---------------------------------------------------------------------
 
-/// parse -> install -> **backfill/direct build** -> read. `install_definition`
-/// is the real front door, so this covers the SQL the build actually emits
-/// for a typed literal, plus the DDL that decides the target column's type.
-/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
-/// whose chunk renders each field through `defs::oracle` as the old range
-/// build did.
+/// parse -> install -> **build** -> read. `install_definition` is the real
+/// front door, so this covers the SQL the build actually emits for a typed
+/// literal, plus the DDL that decides the target column's type. #625 F8a: a
+/// plain 1-1 is the Re-derive build's, whose chunk renders each field
+/// through `defs::oracle`.
 #[tokio::test]
 async fn install_and_backfill_produce_real_typed_columns() {
     let cluster = TestCluster::start();

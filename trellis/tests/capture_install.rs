@@ -3,7 +3,7 @@
 //! `trellis::capture::install` (C5) is `capture_join.rs`'s subject.
 //!
 //! Every test here steps the pieces itself (the seal's phases, the drain, the
-//! discharge) and holds a writer open where it needs one. None waits for
+//! build) and holds a writer open where it needs one. None waits for
 //! anything to converge (#297).
 //!
 //! - A2: writers at `REPEATABLE READ` and `SERIALIZABLE` that took their
@@ -18,7 +18,7 @@
 //! - A6's trigger-fed half: a `TRUNCATE` whose writer straddles a seal
 //!   reaches the single-bucket barrier.
 //! - The widening gap: a widen waits out a writer running the old function,
-//!   and a new reader isn't dispatched until the rows the old function staged
+//!   and a new reader's build isn't started until the rows the old function staged
 //!   have drained, so none of them reaches it without the column it reads.
 //! - Install is idempotent, uninstall leaves nothing behind, a partial
 //!   install is repaired, and a read racing installs never sees a partial
@@ -37,7 +37,7 @@ use trellis::capture::install::{self, CaptureAction, Installed, LockingOperation
 use trellis::capture::sql::{CaptureEvent, CaptureSpec, function_name, trigger_name};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{TransformStatus, ValueType, install_definition};
-use trellis::intake::markers;
+use trellis::intake::harness;
 use trellis::locks::USER_TABLE_DDL_LOCK_TIMEOUT;
 use trellis::staging::converge::table_changes_pending_through;
 use trellis::staging::self_check::CheckPageExt;
@@ -131,12 +131,12 @@ async fn ring_rows(client: &Client, key: &str) -> Vec<(String, Option<String>, O
 async fn capture_gate(client: &Client, table: &str) -> Option<PgLsn> {
     client
         .query_opt(
-            "select capture_gate_lsn from pending_backfill where table_name = $1",
+            "select gate_lsn from capture_gates where table_name = $1",
             &[&table],
         )
         .await
-        .expect("read the marker")
-        .and_then(|row| row.get(0))
+        .expect("read the gate")
+        .map(|row| row.get(0))
 }
 
 /// The `xmin` of each of `public.t`'s capture functions and triggers, so a
@@ -177,10 +177,10 @@ async fn an_install_captures_writes_and_a_repeat_install_changes_nothing() {
             current: true
         }
     );
-    // The join marker commits with the triggers, gated at the install.
+    // The gate commits with the triggers, recorded at the install.
     let gate = capture_gate(&client, "public.t")
         .await
-        .expect("the install parks a gated join marker");
+        .expect("the install records a gate");
 
     client
         .batch_execute("insert into public.t values ('k', 1, 2)")
@@ -238,16 +238,9 @@ async fn an_install_captures_writes_and_a_repeat_install_changes_nothing() {
         .get(0);
     assert_eq!(foreign_owned, 0);
 
-    // A repeat install rewrites nothing and parks no new marker generation.
+    // A repeat install rewrites nothing and records no new gate.
     let versions = catalog_versions(&client).await;
-    let generation: i64 = client
-        .query_one(
-            "select generation from pending_backfill where table_name = 'public.t'",
-            &[],
-        )
-        .await
-        .expect("read generation")
-        .get(0);
+    let generation = capture_gate(&client, "public.t").await;
     assert!(
         !landed(
             install::install(&mut client, DEFAULT_SCHEMA, &spec, None)
@@ -265,15 +258,7 @@ async fn an_install_captures_writes_and_a_repeat_install_changes_nothing() {
         CaptureAction::Unchanged
     );
     assert_eq!(catalog_versions(&client).await, versions);
-    let generation_after: i64 = client
-        .query_one(
-            "select generation from pending_backfill where table_name = 'public.t'",
-            &[],
-        )
-        .await
-        .expect("read generation")
-        .get(0);
-    assert_eq!(generation_after, generation);
+    assert_eq!(capture_gate(&client, "public.t").await, generation);
 }
 
 /// The capture triggers are `ENABLE ALWAYS`, so a session in
@@ -971,8 +956,8 @@ async fn a_schema_pre_created_by_another_role_still_captures_writes() {
         .await
         .expect("define a reader of public.t");
     // A plain 1-1 over a captured table is the Re-derive build's (#625
-    // F8a), which the discharge only starts: run it to `live`.
-    markers::settle_registrations(&pool).await;
+    // F8a): run it to `live`.
+    harness::settle_builds(&pool).await;
     let def = trellis::defs::catalog::definition_by_target(&pool, "t_copy")
         .await
         .expect("read the definition")
@@ -1182,11 +1167,11 @@ async fn a_widen_waits_out_a_writer_running_the_old_function() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect(db.dsn()).await;
     install_t(&mut client).await;
-    // Discharge the install's marker by hand, so the widen's gate is its own.
+    // Clear the install's gate by hand, so the widen's gate is its own.
     client
-        .batch_execute("delete from pending_backfill")
+        .batch_execute("delete from capture_gates")
         .await
-        .expect("clear the join marker");
+        .expect("clear the install's gate");
 
     let holder = connect(db.dsn()).await;
     holder
@@ -1221,7 +1206,7 @@ async fn a_widen_waits_out_a_writer_running_the_old_function() {
 
     let gate = capture_gate(&client, "public.t")
         .await
-        .expect("the widen parks a gated marker");
+        .expect("the widen records a capture gate");
     for key in ["w1", "w2"] {
         let rows = ring_rows(&client, key).await;
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -1296,9 +1281,9 @@ async fn a_row_staged_while_the_widen_waits_for_its_lock_is_below_the_gate() {
     let mut client = connect(db.dsn()).await;
     install_t(&mut client).await;
     client
-        .batch_execute("delete from pending_backfill")
+        .batch_execute("delete from capture_gates")
         .await
-        .expect("clear the join marker");
+        .expect("clear the install's gate");
 
     let holder = connect(db.dsn()).await;
     holder
@@ -1353,7 +1338,7 @@ async fn a_row_staged_while_the_widen_waits_for_its_lock_is_below_the_gate() {
 
     let gate = capture_gate(&client, "public.t")
         .await
-        .expect("the widen parks a gated marker");
+        .expect("the widen records a capture gate");
     for key in ["w1", "w2"] {
         let rows = ring_rows(&client, key).await;
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -1421,10 +1406,10 @@ async fn catalog_spec(client: &Client, table: &str) -> CaptureSpec {
 /// The widening gap (the C2 review's finding). `sales` is captured for a 1-1
 /// reader of `sku`, so its images carry `id` and `sku` only. A change staged
 /// then is still undrained when an aggregate over `amount` registers and the
-/// table is widened for it. Dispatched at once, the aggregate would build, go
+/// table is widened for it. Started at once, the aggregate would build, go
 /// live and then drain that row, whose image has no `amount`:
 /// `EvalError::MissingColumn`, and the key quarantined. The widen's capture
-/// gate holds the discharge until the row has drained through the 1-1 reader
+/// gate holds the aggregate's start until the row has drained through the 1-1 reader
 /// alone; then the aggregate builds from the table and applies only rows
 /// that carry `amount`.
 #[tokio::test]
@@ -1458,15 +1443,12 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
         ),
         CaptureAction::Install
     );
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     assert_eq!(status_of(&client, "public.sku_of").await, "live");
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // Staged by the narrow function, and sealed into a batch of its own that
-    // stays undrained. Were it still in the active slot, the discharge's
-    // enumeration of the table (it has a reader) would stage a `Recompute`
-    // for the same key into the same batch, and the fold would re-derive the
-    // key from the live row, hiding the missing column.
+    // stays undrained until it drains alone below.
     client
         .batch_execute("insert into public.sales values (4, 'a', 1000)")
         .await
@@ -1494,19 +1476,19 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
     );
     let gate = capture_gate(&client, "public.sales")
         .await
-        .expect("the widen parks a gated marker");
+        .expect("the widen records a capture gate");
     assert!(
         table_changes_pending_through(&client, "public.sales", gate)
             .await
             .expect("gate predicate")
     );
 
-    // The discharge and a build pass: the gate holds the aggregate back.
-    markers::settle_builds(&db.pool).await;
+    // A build pass: the gate holds the aggregate back.
+    harness::settle_builds(&db.pool).await;
     assert_eq!(
         status_of(&client, "public.sku_totals").await,
         "waiting_to_backfill",
-        "the capture gate holds the dispatch while a pre-widen row is undrained"
+        "the capture gate holds the start while a pre-widen row is undrained"
     );
 
     // The pre-widen row drains through the 1-1 reader alone.
@@ -1516,7 +1498,7 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
             .await
             .expect("gate predicate")
     );
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     assert_eq!(status_of(&client, "public.sku_totals").await, "live");
 
     client

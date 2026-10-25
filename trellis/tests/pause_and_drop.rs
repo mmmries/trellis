@@ -10,8 +10,8 @@
 //! did.
 //!
 //! No test runs a live pipeline (issue #301). Where a scenario needs work a
-//! running `Client` would do — running a 1-1 target's backfill chunks,
-//! draining CDC changes, discharging a resume's backfill marker — the test
+//! running `Client` would do — starting and running a definition's build,
+//! draining CDC changes — the test
 //! does that step itself through the same engine function the `Client`
 //! calls, then asserts. Nothing waits for a pipeline to converge under a
 //! wall-clock budget.
@@ -22,12 +22,10 @@
 //!   is a success (`pausing_twice_is_a_no_op_success`)
 //! - a pause landing while a worker holds the last backfill chunk survives
 //!   that chunk finishing — issue #331
-//!   (`a_chunk_finishing_after_the_pause_does_not_unpause_the_definition`)
+//!   (`rederive_build::chunks_finishing_after_a_pause_leave_the_definition_paused`)
 //! - resume rebuilds by a fresh backfill rather than catching up over
 //!   buffered changes, and a paused definition never pins the ring for its
-//!   siblings (`resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring`),
-//!   and the paused definition's unclaimed chunks don't re-run on top of it —
-//!   issue #332 (`resuming_discards_the_paused_definitions_unclaimed_chunks`)
+//!   siblings (`resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring`)
 //! - a drop always takes the target table and its data with it
 //!   (`dropping_takes_the_target_table_and_its_data_with_it`)
 //! - a live dependent refuses the drop and is named
@@ -44,8 +42,6 @@
 //! - the target's `schema_nodes` row is actually reaped, not merely
 //!   unreachable — issue #232 (`dropping_reaps_the_targets_schema_nodes_row`)
 
-use std::time::Duration;
-
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
@@ -53,10 +49,10 @@ use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 // test targets), for two reasons. The durable chunk queue's dispatch gate has
 // no facade spelling, and asserting it through a hand-written copy of its own
 // `where` clause is what issue #231 called out. And the ring, the chunk queue
-// and the backfill discharge are driven by hand in place of a running
+// and the start of each build are driven by hand in place of a running
 // pipeline (issue #301); see the module doc.
 use trellis::defs::chunk_queue;
-use trellis::intake::markers;
+use trellis::intake::harness;
 use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions};
 
@@ -75,8 +71,8 @@ async fn connect_raw(dsn: &str) -> Client {
     client
 }
 
-/// The kinds of a Re-derive build's work rows (#625), which
-/// `chunk_queue::claim_chunks` (the old builds' kinds only) never claims.
+/// The kinds of a Re-derive build's work rows (#625), for
+/// `chunk_queue::claim_chunks_of`.
 const REDERIVE_KINDS: [&str; 3] = [
     chunk_queue::KIND_PLAN,
     chunk_queue::KIND_REDERIVE,
@@ -121,48 +117,17 @@ async fn count(raw: &Client, sql: &str) -> i64 {
     raw.query_one(sql, &[]).await.expect("count query").get(0)
 }
 
-/// Claims, runs, and finishes every pending backfill chunk until none remain:
-/// the hand-driven stand-in for a drain worker (`alter_transform.rs`'s helper
-/// of the same name). A chunked 1-1 target reaches `live` this way with no
-/// running pipeline and nothing to wait for.
+/// Starts every registered definition's build and runs it to completion: the
+/// hand-driven stand-in for the staging worker and a drain worker
+/// (`alter_transform.rs`'s helper of the same name). A 1-1 target reaches
+/// `live` this way with no running pipeline and nothing to wait for.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
-    trellis::intake::markers::discharge_registrations(pool)
+    // ADR-0002 (#418): registration only records a definition; the staging
+    // worker starts its build.
+    trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    const CLAIMED_BY: &str = "pause_and_drop_test_backfill_worker";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            // A plain aggregate or plain 1-1 is the Re-derive build's (#625 F3, F5, F8a).
-            trellis::staging::build::settle_builds(pool).await;
-            // The staging worker's next pass: the builds' go-live catch-ups
-            // take them `live` (issue #476).
-            trellis::intake::markers::discharge_registrations(pool)
-                .await
-                .expect("discharge the go-live catch-ups");
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// Stages the CDC row capture would stage for `insert into orders (id, g, a)
@@ -225,8 +190,8 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// Seeds a source table. Aggregates are this file's default
 /// transform shape. Registration only records one as `waiting_to_backfill`
 /// (issue #419); a test that needs it `live` settles it with
-/// [`markers::settle_registrations`], which dispatches and runs its one
-/// direct-build job in place of the staging worker and a drain thread.
+/// [`harness::settle_builds`], which starts and runs its build (one plan
+/// job) in place of the staging worker and a drain thread.
 async fn seed_source(raw: &Client, table: &str, rows: i64) {
     raw.batch_execute(&format!(
         "create table {table} (id bigint primary key, g bigint, a numeric(20,0)); \
@@ -271,13 +236,13 @@ async fn pausing_twice_is_a_no_op_success() {
             .expect("registered")
             .status,
         TransformStatus::WaitingToBackfill,
-        "registration only records an aggregate; its build is dispatched by the backfill discharge (#419)"
+        "registration only records an aggregate; the staging worker starts its build (#419)"
     );
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     assert_eq!(
         persisted_status(&raw, "order_rollup").await.as_deref(),
         Some("live"),
-        "precondition: the direct-build job took the aggregate live"
+        "precondition: the build took the aggregate live"
     );
 
     trellis
@@ -348,9 +313,9 @@ async fn pausing_an_unregistered_transform_reports_not_found() {
 /// 2. **Resume therefore rebuilds by backfill, not by catch-up.** Because its
 ///    share of the change stream was drained for the sibling and is *not*
 ///    recoverable by replay, there are no buffered changes to apply on the way
-///    back. Resume re-parks a `pending_backfill` marker — the exact mechanism
-///    a fresh definition's own initial backfill uses — and the target comes
-///    back reconciled against the *current* source, including rows that were
+///    back. Resume drops the definition to `waiting_to_backfill` — the state
+///    a fresh definition's own initial backfill starts from — and the target
+///    comes back reconciled against the *current* source, including rows that were
 ///    inserted while it was paused and whose change records are long gone.
 ///
 /// The second point is what makes this test's final assertion meaningful: if
@@ -364,8 +329,8 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     seed_source(&raw, "orders", 4).await;
 
     // No live pipeline (issue #301): every change below is staged by hand and
-    // drained through the engine's own apply path, and the resume's backfill
-    // marker is discharged and its build job run by hand, so each claim is checked the moment its
+    // drained through the engine's own apply path, and the resume's build is
+    // started and run by hand, so each claim is checked the moment its
     // precondition holds instead of polled for under a wall-clock budget.
     let trellis = define_only(db.dsn()).await;
     trellis
@@ -376,9 +341,9 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
         .apply("TRANSFORM order_echo FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define a sibling over the same source");
-    // Registration only records the two aggregates (#419); their direct-build
-    // jobs take both live before one is paused.
-    markers::settle_registrations(&db.pool).await;
+    // Registration only records the two aggregates (#419); their builds take
+    // both live before one is paused.
+    harness::settle_builds(&db.pool).await;
 
     trellis
         .apply("PAUSE TRANSFORM order_rollup")
@@ -472,16 +437,10 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
         "resume drops the definition back into the backfill lifecycle it was defined through"
     );
 
-    // Claim 2, mechanism continued: a plain `SUM` is the Re-derive build's
-    // (#625 F3). Its resume parks no marker; the staging worker's next pass
-    // starts the same build a freshly registered one gets: on the group basis
-    // that is one plan job, with no ledger to sweep (#1100).
-    assert_eq!(
-        count(&raw, "select count(*) from pending_backfill").await,
-        0,
-        "the resume of a re-derive shape parks no marker"
-    );
-    trellis::intake::markers::discharge_registrations(&db.pool)
+    // Claim 2, mechanism continued: the staging worker's next pass starts the
+    // same build a freshly registered one gets: on the group basis that is one
+    // plan job, with no ledger to sweep (#1100).
+    trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("start the rebuild");
     assert_eq!(
@@ -554,7 +513,7 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
         )
         .await
         .expect("define");
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     assert!(
         table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_rollup").await,
         "precondition: the target table exists"
@@ -598,8 +557,8 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
 }
 
 /// Issue #418: re-registering a transform after dropping it builds it again
-/// from scratch through the backfill discharge, like any registration: the
-/// drop leaves no marker, chunk or status behind that the new definition
+/// from scratch through its own build, like any registration: the
+/// drop leaves no gate, chunk or status behind that the new definition
 /// could trip over, and the new target holds every source row.
 #[tokio::test]
 async fn a_transform_registered_again_after_its_drop_is_built_afresh() {
@@ -743,14 +702,14 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define the upstream");
-    // A transform chains only off a live target; the upstream's direct-build
-    // job takes it there (#419).
-    markers::settle_registrations(&db.pool).await;
+    // A transform chains only off a live target; the upstream's build takes
+    // it there (#419).
+    harness::settle_builds(&db.pool).await;
     trellis
         .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g WITHOUT SOURCE INDEX SELECT count(*) AS t")
         .await
         .expect("define a transform chained off the first one's target");
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     assert_eq!(
         persisted_status(&raw, "grand_total").await.as_deref(),
         Some("live"),
@@ -836,9 +795,9 @@ async fn dropping_is_refused_by_a_dependent_in_any_status_not_only_live() {
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define the upstream");
-    // A transform chains only off a live target; the upstream's direct-build
-    // job takes it there (#419).
-    markers::settle_registrations(&db.pool).await;
+    // A transform chains only off a live target; the upstream's build takes
+    // it there (#419).
+    harness::settle_builds(&db.pool).await;
     trellis
         .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g WITHOUT SOURCE INDEX SELECT count(*) AS t")
         .await
@@ -961,7 +920,7 @@ async fn dropping_a_live_definition_is_refused_until_it_is_paused() {
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define");
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
 
     let err = trellis
         .apply("DROP TRANSFORM order_rollup")
@@ -1156,23 +1115,23 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
     seed_source(&raw, "orders", 40).await;
 
     let trellis = define_only(db.dsn()).await;
-    // A plain 1-1 transform's discharge starts its build with a durable
-    // plan job before it is built, which is exactly the in-flight backfill
+    // A plain 1-1 transform's build starts with a durable plan job before
+    // it is built, which is exactly the in-flight backfill
     // state under test here.
     trellis
         .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS x")
         .await
         .expect("define a 1-1 transform");
-    trellis::intake::markers::discharge_registrations(&db.pool)
+    trellis::intake::harness::start_registered_builds(&db.pool)
         .await
-        .expect("the discharge starts the re-derive build");
+        .expect("start the re-derive build");
     assert!(
         count(&raw, "select count(*) from backfill_chunks").await > 0,
-        "precondition: the chunk queue was enumerated"
+        "precondition: the build's plan job is queued"
     );
 
     // The real dispatch path, not a hand-written mirror of its predicate: a
-    // test that re-spells `claim_chunks`' own `where` clause passes no matter
+    // test that re-spells `claim_chunks_of`' own `where` clause passes no matter
     // what that clause becomes. Claim for real first, so "zero after the
     // pause" is a difference this call can actually see — then release, so the
     // pause is the only reason the next call comes back empty.
@@ -1221,226 +1180,6 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
         "per-definition chunk rows cascade off the definition"
     );
 }
-
-/// Issue #331: the pause gates *new* chunk claims, but a chunk a worker already
-/// holds is left to finish (see `claim_chunks`' own comment). Finishing the last
-/// of them used to run the `backfilling` -> `live` completion unconditionally,
-/// so a pause landing while a worker held the final chunk was silently undone
-/// the moment that worker finished: the definition went `live` and its fold
-/// resumed as if nobody had paused it.
-///
-/// The completion must leave a definition that is no longer `backfilling`
-/// exactly where it is, while still retiring the chunk — a paused definition's
-/// finished chunks are done, not re-queued, and resume rebuilds it by a fresh
-/// backfill of its own regardless.
-///
-/// `orders` is made to read as another definition's target
-/// ([`markers::feed_from_a_test_definition`]; no staging worker runs here):
-/// #625 F8a gives a plain 1-1 over a captured table to the Re-derive build,
-/// and the chunked build whose `finish_chunk` completion this pins survives
-/// for a seam-fed source.
-#[tokio::test]
-async fn a_chunk_finishing_after_the_pause_does_not_unpause_the_definition() {
-    const WORKER: &str = "issue-331-worker";
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
-    seed_source(&raw, "orders", 40).await;
-    markers::feed_from_a_test_definition(&raw, &format!("{DEFAULT_SCHEMA}.orders"))
-        .await
-        .expect("make orders another definition's target");
-
-    let trellis = define_only(db.dsn()).await;
-    trellis
-        .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS x")
-        .await
-        .expect("define a chunked 1-1 transform");
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("the discharge dispatches the chunked build");
-    assert_eq!(
-        persisted_status(&raw, "order_doubles").await.as_deref(),
-        Some("backfilling"),
-        "precondition: a chunked 1-1 definition is backfilling behind its queue"
-    );
-
-    // The worker takes every chunk *before* the pause, so the pause's dispatch
-    // gate has nothing left to withhold: this is exactly a worker already
-    // holding the definition's last chunk when the operator pauses.
-    let held = chunk_queue::claim_chunks(&raw, WORKER, 100)
-        .await
-        .expect("claim every chunk");
-    assert!(!held.is_empty(), "precondition: there were chunks to hold");
-    assert_eq!(
-        count(
-            &raw,
-            "select count(*) from backfill_chunks where not done and claimed_by is null"
-        )
-        .await,
-        0,
-        "precondition: the worker holds every chunk"
-    );
-
-    trellis
-        .apply("PAUSE TRANSFORM order_doubles")
-        .await
-        .expect("pause the backfilling definition");
-
-    for chunk in &held {
-        chunk_queue::run_claimed_chunk(
-            &db.pool,
-            chunk,
-            WORKER,
-            Duration::from_secs(5),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("an in-flight chunk runs to completion");
-        chunk_queue::finish_chunk(&db.pool, chunk, WORKER)
-            .await
-            .expect("an in-flight chunk finishes");
-    }
-
-    assert_eq!(
-        persisted_status(&raw, "order_doubles").await.as_deref(),
-        Some("paused"),
-        "finishing the last in-flight chunk must not undo the pause"
-    );
-    assert_eq!(
-        count(&raw, "select count(*) from backfill_chunks where not done").await,
-        0,
-        "the finished chunks are retired all the same, not left to be re-run"
-    );
-
-    // And the pause is still an ordinary one: resume hands the definition back
-    // to the backfill lifecycle rather than finding it already `live`.
-    trellis
-        .apply("RESUME TRANSFORM order_doubles")
-        .await
-        .expect("resume the still-paused definition");
-    assert_eq!(
-        persisted_status(&raw, "order_doubles").await.as_deref(),
-        Some("waiting_to_backfill"),
-        "resume rebuilds by backfill"
-    );
-}
-
-/// Issue #332: resume rebuilds the target with a fresh backfill, so a paused
-/// definition's leftover unclaimed chunks are redundant work and must not
-/// become claimable again once it is unfrozen. A chunk a worker still holds
-/// is left alone: its completion is what parks the catch-up marker that
-/// repairs the target should its write land after the rebuild (#331).
-///
-/// Both sources are made to read as another definition's target
-/// ([`markers::feed_from_a_test_definition`]; no staging worker runs here):
-/// #625 F8a gives a plain 1-1 over a captured table to the Re-derive build,
-/// and the chunked build whose range chunks this pins survives for a
-/// seam-fed source.
-#[tokio::test]
-async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
-    // One row past a single chunk's 50,000-row bound, so the queue holds one
-    // chunk to keep in flight and one to leave unclaimed.
-    seed_source(&raw, "orders", 50_001).await;
-    // A sibling definition's queue, which resuming `order_doubles` must not
-    // touch.
-    seed_source(&raw, "items", 10).await;
-    for source in ["orders", "items"] {
-        markers::feed_from_a_test_definition(&raw, &format!("{DEFAULT_SCHEMA}.{source}"))
-            .await
-            .expect("make the source another definition's target");
-    }
-
-    let trellis = define_only(db.dsn()).await;
-    trellis
-        .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS x")
-        .await
-        .expect("define a chunked 1-1 transform");
-    // Dispatched one at a time, so `order_doubles`' chunks get the lower ids.
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("the discharge dispatches the chunked build");
-    trellis
-        .apply("TRANSFORM item_doubles FROM items SELECT a + a AS x")
-        .await
-        .expect("define a sibling chunked 1-1 transform");
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("the discharge dispatches the chunked build");
-    assert_eq!(
-        count(&raw, "select count(*) from backfill_chunks").await,
-        3,
-        "precondition: the queues were enumerated as two chunks and one"
-    );
-
-    // `claim_chunks` hands out the lowest id first: `order_doubles`' first chunk.
-    let in_flight = chunk_queue::claim_chunks(&raw, "issue-332-worker", 1)
-        .await
-        .expect("claim one chunk");
-    assert_eq!(in_flight.len(), 1, "precondition: one chunk is in flight");
-    let in_flight = &in_flight[0];
-    let paused_id = in_flight.definition_id;
-
-    trellis
-        .apply("PAUSE TRANSFORM order_doubles")
-        .await
-        .expect("pause the backfilling definition");
-    trellis
-        .apply("RESUME TRANSFORM order_doubles")
-        .await
-        .expect("resume it");
-    assert_eq!(
-        persisted_status(&raw, "order_doubles").await.as_deref(),
-        Some("waiting_to_backfill"),
-        "precondition: resume re-parked the definition for a fresh backfill"
-    );
-
-    let reclaimed = chunk_queue::claim_chunks(&raw, "issue-332-worker", 100)
-        .await
-        .expect("claim after resume");
-    assert!(
-        reclaimed.iter().all(|c| c.definition_id != paused_id),
-        "no pre-pause chunk is claimable after resume, since the fresh backfill \
-         rebuilds the target anyway: {reclaimed:?}"
-    );
-    assert_eq!(
-        reclaimed.len(),
-        1,
-        "the sibling definition's queue is left intact: {reclaimed:?}"
-    );
-    let unclaimed: i64 = raw
-        .query_one(
-            "select count(*) from backfill_chunks \
-             where definition_id = $1 and not done and claimed_by is null",
-            &[&paused_id],
-        )
-        .await
-        .expect("count the paused definition's unclaimed chunks")
-        .get(0);
-    assert_eq!(
-        unclaimed, 0,
-        "the unclaimed chunk was discarded, not merely withheld"
-    );
-    let still_held: i64 = raw
-        .query_one(
-            "select count(*) from backfill_chunks \
-             where id = $1 and claimed_by = 'issue-332-worker' and not done",
-            &[&in_flight.id],
-        )
-        .await
-        .expect("read the in-flight chunk")
-        .get(0);
-    assert_eq!(
-        still_held, 1,
-        "the chunk a worker still holds is left for that worker to finish"
-    );
-}
-
-// ---------------------------------------------------------------------
-// Capture
-// ---------------------------------------------------------------------
 
 /// ADR-0014's capture set shrinks by reconciliation, which ADR-0002's
 /// staging worker runs from the catalog alone (issue #427) and #622 C5 restates it for trigger capture: a drop only

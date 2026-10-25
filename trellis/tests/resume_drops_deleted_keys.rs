@@ -1,32 +1,22 @@
-//! Issue #330: `RESUME TRANSFORM` rebuilds a frozen target by re-enumerating
-//! the source's *current* keys (`pending_backfill`'s discharge,
-//! `markers::run_pending_backfills`). That enumeration never visits a
-//! target row whose source rows all went away while the transform was frozen,
-//! so the discharge also deletes every target row no source row backs any
-//! more (`intake::resume_orphans`), reporting each deletion through the
-//! target-mutation seam.
+//! Issue #330, #888: `RESUME TRANSFORM` rebuilds a frozen target with a
+//! Re-derive build (`staging::build`), whose sweep deletes every target row
+//! no source row backs any more and tombstones its ledger entry
+//! (`staging::build::one_to_one::sweep_batch`), reporting each deletion
+//! through the target-mutation seam. The build's chunks only reach keys the
+//! source still has, so the sweep is what removes the rest.
 //!
 //! The deletes here are written straight to the source with no capture
 //! installed, which is exactly the frozen-transform gap: a paused definition's
 //! share of the change stream is never folded into its target. Every test
-//! drives the discharge and the drain by hand, so they wait on nothing. The
-//! ordering of the delete against the enumeration's snapshot is pinned by
-//! `intake::markers`'s own unit tests, which can hold a discharge
-//! mid-flight.
-//!
-//! The issue as filed says a 1-1 transform already drops such rows. It does
-//! not: the 1-1 path has the same gap, for the same reason, so it is pinned
-//! here too.
+//! drives the build and the drain by hand, so they wait on nothing.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
-use trellis::defs::{ValueType, chunk_queue, install_definition};
-use trellis::intake::markers;
-use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
+use trellis::defs::{ValueType, install_definition};
+use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{Config, Trellis, TrellisOptions};
 
 const TEST_NAME: &str = "resume_drops_deleted_keys_test";
@@ -57,42 +47,12 @@ async fn define_only(dsn: &str) -> Trellis {
 }
 
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
-    trellis::intake::markers::discharge_registrations(pool)
+    // ADR-0002 (#418): registration only records a definition; the staging
+    // worker's pass starts its build.
+    trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, TEST_NAME, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            // A plain aggregate is the Re-derive build's (#625 F3, F5).
-            trellis::staging::build::settle_builds(pool).await;
-            // The staging worker's next pass: the builds' go-live catch-ups
-            // take them `live` (issue #476).
-            trellis::intake::markers::discharge_registrations(pool)
-                .await
-                .expect("discharge the go-live catch-ups");
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                TEST_NAME,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, TEST_NAME)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// Seals and drains until nothing is pending anywhere in the ring. A bounded
@@ -124,28 +84,8 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
 }
 
-/// Discharges the marker `RESUME` parked, then drains what it staged.
+/// Builds what `RESUME` left `waiting_to_backfill`, then drains what it staged.
 async fn run_resume_rebuild(pool: &trellis::Pool, client: &mut Client) {
-    // Consume an xid so the marker's fence, captured inside the resume's own
-    // transaction, has settled.
-    client
-        .batch_execute("select txid_current()")
-        .await
-        .expect("consume an xid");
-    markers::run_pending_backfills(
-        client,
-        "wake",
-        &StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge the resume's backfill marker");
-    let pending: i64 = client
-        .query_one("select count(*) from pending_backfill", &[])
-        .await
-        .expect("count markers")
-        .get(0);
-    assert_eq!(pending, 0, "precondition: the resume's marker discharged");
     drain_backfill_chunks(pool).await;
     drain_to_quiescence(pool, client).await;
 }
@@ -201,18 +141,8 @@ async fn resume_drops_an_aggregate_group_whose_rows_were_all_deleted_while_pause
     )
     .await
     .expect("install the aggregate");
-    // Registration only records the aggregate (#419): run its direct-build
-    // job, then discharge the catch-up marker going live parks, so the only
-    // marker the rebuild below sees is the resume's.
+    // Registration only records the aggregate (#419): run its build.
     drain_backfill_chunks(&db.pool).await;
-    markers::run_pending_backfills(
-        &mut client,
-        "wake",
-        &StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge the build's catch-up marker");
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(status(&client, "order_rollup").await, "live");
     let built: Vec<(i64, String)> = client
@@ -289,16 +219,6 @@ async fn resume_drops_a_one_to_one_row_whose_source_row_was_deleted_while_paused
     .await
     .expect("install the 1-1");
     drain_backfill_chunks(&db.pool).await;
-    // The chunked build's completion parks its own catch-up marker; discharge
-    // it now so the only marker the rebuild below sees is the resume's.
-    markers::run_pending_backfills(
-        &mut client,
-        "wake",
-        &StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge the build's catch-up marker");
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(status(&client, "order_doubles").await, "live");
 
@@ -342,34 +262,45 @@ async fn resume_drops_a_one_to_one_row_whose_source_row_was_deleted_while_paused
         "the rebuild picked up id 7 and dropped ids 2, 4 and 6, whose source rows were \
          deleted while the transform was paused"
     );
+    // #888: the rebuild's sweep tombstones the ledger entries of the keys it
+    // deleted, so `retire::collect_tombstones` can collect them. A live entry
+    // with no row behind it would leak.
+    let entries: Vec<(String, bool)> = client
+        .query(
+            "select __from_key, __tombstone from public.order_doubles__ledger \
+             order by __from_key::bigint",
+            &[],
+        )
+        .await
+        .expect("read order_doubles' ledger")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(
+        entries,
+        vec![
+            ("1".to_string(), false),
+            ("2".to_string(), true),
+            ("3".to_string(), false),
+            ("4".to_string(), true),
+            ("5".to_string(), false),
+            ("6".to_string(), true),
+            ("7".to_string(), false),
+        ],
+        "a key deleted at the source while the definition was paused is tombstoned"
+    );
     operator.shutdown().await.expect("shut down");
 }
 
-/// Runs every settled marker, the chunks and the ring until nothing is left
-/// to do: a rebuild's own marker, plus the catch-ups a definition going
-/// `live` parks for its readers. A bounded loop, not a convergence wait.
+/// Runs the builds, their chunks and the ring until nothing is left to do: a
+/// rebuild, plus the rebuilds of the readers a build rewrote outside the
+/// seam. A bounded loop, not a convergence wait.
 async fn settle(pool: &trellis::Pool, client: &mut Client) {
     for _ in 0..8 {
         drain_backfill_chunks(pool).await;
-        client
-            .batch_execute("select txid_current()")
-            .await
-            .expect("consume an xid");
-        markers::run_pending_backfills(
-            client,
-            "wake",
-            &StagedWatermark::saturated(),
-            Duration::ZERO,
-        )
-        .await
-        .expect("discharge settled markers");
         drain_to_quiescence(pool, client).await;
         let outstanding: i64 = client
-            .query_one(
-                "select (select count(*) from pending_backfill) \
-                      + (select count(*) from backfill_chunks where not done)",
-                &[],
-            )
+            .query_one("select count(*) from backfill_chunks where not done", &[])
             .await
             .expect("count outstanding work")
             .get(0);
@@ -377,7 +308,7 @@ async fn settle(pool: &trellis::Pool, client: &mut Client) {
             return;
         }
     }
-    panic!("markers and chunks did not settle within 8 rounds");
+    panic!("builds and chunks did not settle within 8 rounds");
 }
 
 /// Every row of `sql`, each column rendered as text (`None` for SQL `NULL`).
@@ -519,9 +450,9 @@ async fn resume_rebuilds_an_aggregate_through_whole_partial_and_reinserted_delet
 
 /// A composite, nullable `GROUP BY`: two groups go extinct, one of them the
 /// `(1, NULL)` group, while the `(0, NULL)` group survives with one row fewer.
-/// The anti-join handles a `NULL` grouping column in its own statement (see
-/// `intake::resume_orphans`' "Keeping the anti-join hashable"), so this covers
-/// both the `NULL` and the non-`NULL` pattern.
+/// The aggregate's rebuild (`staging::group_basis::rebuild`) must match a
+/// `NULL` grouping column as well as a non-`NULL` one, so this covers both
+/// patterns.
 #[tokio::test]
 async fn resume_drops_extinct_composite_and_null_groups() {
     let cluster = TestCluster::start();
@@ -571,10 +502,9 @@ async fn resume_drops_extinct_composite_and_null_groups() {
 /// Two hops: `rollup_echo` aggregates `order_rollup`'s target and stays
 /// `live` while `order_rollup` is paused. When the rebuild deletes
 /// `order_rollup`'s extinct group 0, `rollup_echo` must drop its group 0 too.
-/// Its catch-up enumerates `order_rollup`'s *current* keys, which no longer
-/// include 0, and the seam's `Recompute` for the deleted key finds nothing
-/// when it re-reads it. Only the prior image that `Recompute` carries says
-/// which group the row left.
+/// The seam's `Recompute` for the deleted key finds nothing when it re-reads
+/// it, and the build that completes the resume rebuilds `rollup_echo` from
+/// `order_rollup`'s current rows, which no longer include 0.
 #[tokio::test]
 async fn resume_drops_an_extinct_group_one_hop_down_a_chain() {
     let cluster = TestCluster::start();
@@ -623,10 +553,9 @@ async fn resume_drops_an_extinct_group_one_hop_down_a_chain() {
 }
 
 /// A sibling on the same source that stayed `live` through the pause is not
-/// rebuilt, so the discharge must not touch its target. With no intake
+/// rebuilt, so the resume must not touch its target. With no intake
 /// running, the sibling never saw the gap's deletes, so its stale rows are
-/// still there afterwards: the orphan sweep left them alone. (The
-/// rebuild's enumeration still re-derives the sibling's surviving keys.)
+/// still there afterwards: the resumed definition's sweep left them alone.
 #[tokio::test]
 async fn resume_leaves_a_live_sibling_on_the_same_source_alone() {
     let cluster = TestCluster::start();
@@ -684,7 +613,7 @@ async fn resume_leaves_a_live_sibling_on_the_same_source_alone() {
 }
 
 /// Mixed-case target names (the lexer keeps an identifier's case, and the
-/// target is created quoted). The orphan delete must find their keys, not
+/// target is created quoted). The sweep must find their keys, not
 /// case-fold the name and skip the target as if it were gone.
 #[tokio::test]
 async fn resume_drops_orphans_from_mixed_case_targets() {

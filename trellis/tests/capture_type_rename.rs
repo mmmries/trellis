@@ -47,18 +47,12 @@ async fn definer(dsn: &str) -> Trellis {
     .expect("connect a definer")
 }
 
-/// One whole staging-worker pass: capture, markers, discharge, and the
-/// release of the keys a re-type asked for.
+/// One whole staging-worker pass: capture, the release of the keys a
+/// re-type asked for, and the start of ready builds.
 async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
-    trellis::client::reconcile_pass(
-        raw,
-        pool,
-        SCHEMA,
-        "capture_type_rename_wake",
-        Duration::from_secs(2),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(raw, pool, SCHEMA)
+        .await
+        .expect("reconcile pass");
 }
 
 /// The capture half of one pass only. Asserts no table failed.
@@ -139,33 +133,7 @@ async fn drain_past_failures(pool: &trellis::Pool, client: &mut Client) {
 }
 
 async fn run_backfill_chunks(pool: &trellis::Pool) {
-    use trellis::defs::chunk_queue;
-    const CLAIMED_BY: &str = "capture_type_rename_backfill";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            trellis::staging::build::settle_builds(pool).await;
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 async fn status(raw: &Client, target: &str) -> TransformStatus {
@@ -392,7 +360,7 @@ async fn follows(alter: &str, tone_type: &str, recorded: &[&str]) {
     }
     assert_eq!(recorded_names(&raw).await, recorded);
 
-    // The release is the discharge half of a pass.
+    // The release follows the capture in a whole pass.
     full_pass(&mut raw, &db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_converged(&raw).await;

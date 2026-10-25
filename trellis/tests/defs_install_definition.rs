@@ -1,17 +1,15 @@
 //! Integration tests for `defs::catalog::install_definition` (issue #63 C1):
 //! the front door that creates a definition's target table once, then
-//! records it for the backfill discharge (ADR-0002, #418, #419), which builds
-//! it by shape: a plain 1-1 definition's chunks, an aggregate's direct-build
-//! job (`backfill::backfill_definition`), or the ring enumeration for a shape
-//! the direct build can't render.
+//! records it `waiting_to_backfill` (ADR-0002, #418, #419) for the Re-derive
+//! build (`staging::build`): a plain 1-1 definition's `rederive` chunks, or an
+//! aggregate's one absolute write in its plan job.
 //!
-//! Each branch leaves a distinct, checkable signature in the ring: a direct or
-//! chunked build stages no enumeration `Recompute` rows, while the ring
-//! fallback enumerates every existing source row into the active segment.
-//! Tests assert on that signature directly, rather than only on the
-//! end-to-end target contents, to confirm each branch actually ran the code
-//! path it claims to. `discharge_registrations` stands in for the staging
-//! worker's discharge.
+//! The build reads the source itself and stages nothing in the ring, which
+//! some tests assert directly (no `Recompute` rows for the source in the
+//! active segment) beside the end-to-end target contents.
+//! `trellis::intake::harness::start_registered_builds` and `settle_builds`
+//! stand in for the staging worker's start of the build and the drain
+//! workers that run it.
 //!
 //! The staging harness (connect, stage a CDC row, seal/drain to quiescence)
 //! is this file's own.
@@ -23,61 +21,25 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::CatalogError;
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
-use trellis::defs::{TransformStatus, ValueType, chunk_queue, install_definition};
+use trellis::defs::{TransformStatus, ValueType, install_definition};
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
 
-/// Claims and executes every pending direct-build backfill chunk
-/// (`trellis::defs::chunk_queue`, ADR-0002) until none
-/// remain — the test-harness stand-in for a running `application_threads`
-/// drain worker, since `install_definition` no longer runs a plain
-/// 1-1 definition's backfill in-call: it now returns as
-/// soon as the chunk work is enumerated and persisted, `Backfilling` until a
-/// drain worker actually claims and finishes each chunk. Then runs the
-/// staging worker's discharge of the go-live catch-ups those builds parked,
-/// which takes them `live` (issue #476). Panics (via
-/// `expect`) rather than swallowing an error, matching this file's other
-/// harness helpers (`drain_to_quiescence`) — a chunk-execution failure here
-/// means the test itself is broken, not something to retry past.
+/// Starts the Re-derive build of every registered definition and runs each
+/// to completion, so each is `live` when this returns — the test-harness
+/// stand-in for the staging worker and a running `application_threads`
+/// drain worker, since `install_definition` only records a definition
+/// `WaitingToBackfill` (ADR-0002). Panics (via `expect`) rather than
+/// swallowing an error, matching this file's other harness helpers
+/// (`drain_to_quiescence`) — a build failure here means the test itself is
+/// broken, not something to retry past.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
-    trellis::intake::markers::discharge_registrations(pool)
+    // ADR-0002 (#418): registration only records a definition; the staging
+    // worker starts its build.
+    trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    const CLAIMED_BY: &str = "install_def_test_backfill_worker";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            // #625 F8a: a plain 1-1 over a captured table is the Re-derive
-            // build's, which the drain workers run to `live` on their own.
-            trellis::staging::build::settle_builds(pool).await;
-            // The staging worker's next pass: the builds' go-live catch-ups
-            // take them `live` (issue #476).
-            trellis::intake::markers::discharge_registrations(pool)
-                .await
-                .expect("discharge the go-live catch-ups");
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 async fn connect_raw(dsn: &str) -> Client {
@@ -111,8 +73,8 @@ async fn active_seg_table(client: &Client) -> String {
     format!("seg_{ring_slot}")
 }
 
-/// How many rows are currently staged in the active segment for `src_table` —
-/// the fast path's/ring fallback's distinguishing signature (see module doc).
+/// How many rows are currently staged in the active segment for `src_table`:
+/// zero after a build, which reads the source itself (see module doc).
 async fn staged_count_for_source(client: &Client, src_table: &str) -> i64 {
     let seg = active_seg_table(client).await;
     let sql = format!("select count(*) from {seg} where src_table = $1");
@@ -165,8 +127,7 @@ async fn stage_cdc(
 }
 
 /// A composite primary-key identity string, U+001F-joined in the key's own
-/// declared column order: the encoding the capture trigger and
-/// `intake::markers::enumerate_and_append` both produce, and the one
+/// declared column order: the encoding the capture trigger produces, and the one
 /// `ddl::pk_key_sql_expr`/`ddl::split_pk_key` on the apply side agree with
 /// (issue #126).
 fn composite_key(parts: &[&str]) -> String {
@@ -237,12 +198,11 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
     .await
     .expect("install_definition via the fast path");
 
-    // The direct build's chunk work is now enumerated and persisted, not
-    // executed in-call (ADR-0002) — drive it to
-    // completion the way a running `application_threads` drain worker would
-    // before asserting on the target's contents. Only the build: its go-live
-    // catch-up (#476) re-reads the source into the ring by design.
-    trellis::intake::markers::settle_builds(&db.pool).await;
+    // Registration only records the definition (ADR-0002) — run its build
+    // to completion the way the staging worker and a running
+    // `application_threads` drain worker would before asserting on the
+    // target's contents.
+    trellis::intake::harness::settle_builds(&db.pool).await;
 
     let mismatches: i64 = client
         .query_one(
@@ -258,189 +218,25 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
         "target built directly and matches every source row"
     );
 
-    // The fast path persists via `create_definition_without_backfill`, which
-    // stages no ring-enumeration `Recompute` rows — the opposite of the ring
-    // fallback exercised below. Zero staged rows for `s` is the positive
-    // signal that the direct build actually ran, not a silent fallback.
+    // The build reads the source itself and stages no `Recompute` rows in
+    // the ring: zero staged rows for `s`.
     assert_eq!(
         staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.s")).await,
         0,
-        "fast path must not enumerate the source into the ring"
+        "the build must not stage the source into the ring"
     );
 }
 
-/// Issue #121, regression guard, fast/unit-style form (issue #297): the direct
-/// build's chunk-boundary discovery (`defs::backfill::discover_pk_ranges`,
-/// exercised here through `install_definition`'s real `plan_one_to_one_chunks`
-/// -> persisted-`backfill_chunks` path) once had a live bug where an
-/// unqualified `order by <col>` resolved to the *output* list's same-named
-/// `<col>::text` cast instead of the input column, sorting lexicographically
-/// (`'9999' > '50000'`) instead of numerically — silently over-chunking a
-/// composite-keyed source into extra, overlapping chunks invisible to a
-/// final-state count/value check alone, since the direct build's
-/// overwrite-upsert is idempotent; only the *chunk count* itself exposes it.
-///
-/// This used to be a `client_e2e.rs` test that started a real `TrellisClient`
-/// and polled up to 20s for a live multi-threaded drain to converge, purely to
-/// get to a point where `backfill_chunks` could be counted — flaky under CI
-/// runner load (#297) despite the chunk count itself being knowable
-/// synchronously, right after `install_definition` returns, with no client
-/// and no polling at all. This test asserts exactly that, then drains the
-/// persisted chunks the same deterministic way
-/// `install_definition_fast_path_builds_target_without_staging_the_ring`
-/// above does, to also keep the final-built-value correctness check that a
-/// chunk-count-only assertion can't provide on its own.
-///
-/// 99999 rows, one key column (`b`) cycling `1..=3` per value of the other
-/// (`a`), forces the 50k-row chunk boundary to land *inside* an `a`-group
-/// rather than on a clean one — the shape that would silently duplicate work
-/// across chunks under the bug. See also
-/// `defs_backfill_direct.rs`'s `one_to_one_build_with_a_composite_key_is_exhaustive_across_a_boundary_inside_a_group`,
-/// which proves the same boundary shape is built exhaustively and correctly
-/// through the *other* (in-call, non-durable-queue) direct-build entry point,
-/// `backfill_definition` — that test doesn't assert chunk count (it can't:
-/// `backfill_definition` never persists to `backfill_chunks`), so it alone
-/// would not have caught the #121 over-chunking bug; this test is the one
-/// that does, for the durable-queue path `install_definition` actually uses.
-///
-/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
-/// which plans no `range` chunks, so `widgets` is made to read as another
-/// definition's target (`feed_from_a_test_definition`): the shape the
-/// chunked build still owns.
-#[tokio::test]
-async fn install_definition_chunks_a_composite_key_boundary_inside_a_group_into_exactly_two_chunks()
-{
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute(
-            "create table widgets (a bigint, b bigint, primary key (a, b)); \
-             insert into widgets (a, b) \
-             select (g - 1) / 3 + 1, (g - 1) % 3 + 1 from generate_series(1, 99999) g",
-        )
-        .await
-        .expect("seed widgets with a composite primary key");
-    trellis::intake::markers::feed_from_a_test_definition(
-        &client,
-        &qualify_fixture_table("widgets"),
-    )
-    .await
-    .expect("make widgets read as a seam-fed source");
-
-    let cols = numeric(&["a", "b"]);
-    let def = install_definition(
-        &db.pool,
-        "TRANSFORM widgets_calc FROM widgets SELECT a + b AS total",
-        &cols,
-        "public",
-    )
-    .await
-    .expect("install_definition records the definition and returns");
-    assert_eq!(def.status, TransformStatus::WaitingToBackfill);
-    // ADR-0002 (#418): the discharge plans and enqueues the chunks.
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("dispatch the build");
-
-    let chunk_count: i64 = client
-        .query_one(
-            "select count(*) from backfill_chunks where definition_id = $1",
-            &[&def.id],
-        )
-        .await
-        .expect("count persisted chunks")
-        .get(0);
-    assert_eq!(
-        chunk_count, 2,
-        "99999 rows at 50k rows/chunk must be exactly two chunks, \
-         not silently over-chunked by a boundary-discovery bug"
-    );
-
-    drain_backfill_chunks(&db.pool).await;
-
-    let mismatches: i64 = client
-        .query_one(
-            "select count(*) from widgets \
-             left join widgets_calc on widgets_calc.a = widgets.a and widgets_calc.b = widgets.b \
-             where widgets_calc.a is null \
-                or widgets_calc.total is distinct from (widgets.a + widgets.b)::numeric",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(
-        mismatches, 0,
-        "every composite-keyed row must be built exactly once with the right value"
-    );
-
-    let status: String = client
-        .query_one(
-            &format!(
-                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.widgets_calc'"
-            ),
-            &[],
-        )
-        .await
-        .expect("read back status")
-        .get(0);
-    assert_eq!(
-        status, "live",
-        "draining both persisted chunks must flip the definition to live"
-    );
-}
-
-/// A reviewer's high-severity follow-up to issue #76's own grammar work: the
-/// catalog correctly persists an explicitly-qualified source's fully-qualified
-/// identity (`defs_catalog.rs`'s
-/// `an_explicitly_qualified_source_resolves_to_that_exact_relation_not_search_path`
-/// already covers that), but every physical SQL builder that actually reads
-/// the *live* source table at backfill time used to still emit a bare,
-/// unqualified `def.source`, relying on this pool's own pinned `search_path`
-/// (`Config::schema`, `Config::target_schema`, `"public"` —
-/// `pool::session_bootstrap`) to resolve it. That's silently wrong the moment
-/// a same-named table sits in one of those pinned schemas while the
-/// definition explicitly named a *different* one — exactly the setup below:
-/// `public.orders` is a decoy (`public` is pinned, via this call's own
-/// `target_schema` argument), `custom.orders` is the real, explicitly-named
-/// source, and the two hold different row counts/values so a wrong-table read
-/// is unmistakable in the target's contents, not just in a persisted string.
-///
-/// Drives the definition all the way through the fast (plain 1-1)
-/// path's durable chunk queue (the backfill discharge ->
-/// `backfill::plan_one_to_one_chunks` -> `chunk_queue::dispatch_one_to_one`,
-/// claimed and executed by [`drain_backfill_chunks`] via
-/// `backfill::execute_one_to_one_chunk`) — the read-back leg that
-/// reconstructs a [`trellis::defs::model::Definition`] fresh via
-/// `catalog::definition_by_id` for every claimed chunk, so this also confirms
-/// that reconstruction actually carries the persisted qualified source
-/// through rather than re-deriving a bare one from re-parsed
-/// `definition_text`.
-///
-/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's
-/// (whose plan and chunks also read the definition back from the catalog),
-/// so the chunked build is kept on the decoy by making `custom.orders` read
-/// as a seam-fed source (`feed_from_a_test_definition`), the shape it still
-/// owns; the sibling below runs the same check through the Re-derive build.
-#[tokio::test]
-async fn install_definition_fast_path_reads_the_explicitly_qualified_source_not_a_same_named_decoy()
-{
-    explicitly_qualified_source_is_read_not_a_same_named_decoy(true).await;
-}
-
-/// #625 F8a: [`install_definition_fast_path_reads_the_explicitly_qualified_source_not_a_same_named_decoy`]'s
-/// check through the Re-derive build, which builds a plain 1-1 over a
-/// captured table: its plan and chunk SQL must read `custom.orders`, not the
-/// `public.orders` decoy.
+/// #625 F8a: the Re-derive build of a plain 1-1 over an explicitly-qualified
+/// source: its plan and chunk SQL must read `custom.orders`, not the
+/// `public.orders` decoy on the pool's pinned `search_path`.
 #[tokio::test]
 async fn rederive_build_reads_the_explicitly_qualified_source_not_a_same_named_decoy() {
     explicitly_qualified_source_is_read_not_a_same_named_decoy(false).await;
 }
 
-/// The decoy tests' body: `seam_fed` makes `custom.orders` read as another
-/// definition's target, which keeps the definition on the chunked build.
+/// The decoy test's body: `seam_fed` makes `custom.orders` read as another
+/// definition's target before the definition is registered.
 async fn explicitly_qualified_source_is_read_not_a_same_named_decoy(seam_fed: bool) {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -457,7 +253,7 @@ async fn explicitly_qualified_source_is_read_not_a_same_named_decoy(seam_fed: bo
         .await
         .expect("seed the public.orders decoy and the real custom.orders");
     if seam_fed {
-        trellis::intake::markers::feed_from_a_test_definition(&client, "custom.orders")
+        trellis::intake::harness::feed_from_a_test_definition(&client, "custom.orders")
             .await
             .expect("make custom.orders read as a seam-fed source");
     }
@@ -472,9 +268,8 @@ async fn explicitly_qualified_source_is_read_not_a_same_named_decoy(seam_fed: bo
     .await
     .expect("install_definition against the explicitly-qualified source");
 
-    // The shape picks the build under test: the dispatch starts a Re-derive
-    // build (`build = 'rederive'`) or plans the chunked build's ranges.
-    trellis::intake::markers::discharge_registrations(&db.pool)
+    // The start records the Re-derive build (`build = 'rederive'`).
+    trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("dispatch the build");
     let build: Option<String> = client
@@ -491,9 +286,7 @@ async fn explicitly_qualified_source_is_read_not_a_same_named_decoy(seam_fed: bo
         "the shape picks the build under test: {build:?}"
     );
 
-    // The fast path's chunk work is enumerated, not executed in-call
-    // (ADR-0002) — drive it to completion the way a
-    // real drain worker would.
+    // Run the build to completion the way a real drain worker would.
     drain_backfill_chunks(&db.pool).await;
 
     let row_count: i64 = client
@@ -529,7 +322,7 @@ async fn explicitly_qualified_source_is_read_not_a_same_named_decoy(seam_fed: bo
 /// Issue #76 / ADR-0011, through the real front door: an
 /// explicitly-qualified `TRANSFORM <schema>.<target>` must override the
 /// `target_schema` argument this function is called with, for *every* step —
-/// the physical `CREATE TABLE` DDL, the direct-build `INSERT`s, and the
+/// the physical `CREATE TABLE` DDL, the build's writes, and the
 /// persisted qualified identity all need to agree on `custom`, not the
 /// `"public"` this call still passes as its own `target_schema` argument
 /// (mirroring a real caller who never changed `Config::target_schema` but
@@ -611,14 +404,8 @@ async fn install_definition_honors_an_explicitly_qualified_target_schema() {
 }
 
 // ---------------------------------------------------------------------
-// Status lifecycle (issue #55): a definition that completes its backfill via
-// `install_definition` must come back — and be persisted — as `Live`, not
-// left sitting in the speculative `Backfilling` row the direct-build path
-// inserts ahead of the build (see `catalog::install_definition`'s doc
-// comment). Covers both the fast direct-build path and the ring-fallback
-// path, since each takes a different route to `Live` (an in-place status
-// flip vs. a fresh row from `create_definition` after the speculative row is
-// discarded).
+// Status lifecycle (issue #55): `install_definition` persists exactly one
+// `WaitingToBackfill` row, which its build flips in place to `Live`.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
@@ -671,7 +458,7 @@ async fn install_definition_fast_path_ends_up_live() {
     let persisted_status: String = rows[0].get(0);
     assert_eq!(
         persisted_status, "waiting_to_backfill",
-        "the persisted row waits for the discharge to dispatch its chunks"
+        "the persisted row waits for the staging worker to start its build"
     );
 
     // Driving the chunk queue to completion (the `application_threads` drain
@@ -695,11 +482,9 @@ async fn install_definition_fast_path_ends_up_live() {
 }
 
 /// A doubling alias chain (`f<k> = f<k-1> + f<k-1>`) whose inlined form
-/// outgrows the direct build's substitution budget is `Unsupported`, so the
-/// discharge enumerates its source into the ring instead, and flips it live
-/// in its own transaction.
+/// outgrows the substitution budget every build needs is refused at define.
 #[tokio::test]
-async fn install_definition_ring_fallback_ends_up_live() {
+async fn install_definition_refuses_fields_that_inline_past_the_budget() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
@@ -715,50 +500,40 @@ async fn install_definition_ring_fallback_ends_up_live() {
     let chain: Vec<String> = std::iter::once("a + a AS f0".to_string())
         .chain((1..=17).map(|k| format!("f{} + f{} AS f{k}", k - 1, k - 1)))
         .collect();
-    let def = install_definition(
+    let err = install_definition(
         &db.pool,
         &format!("TRANSFORM chain FROM s SELECT {}", chain.join(", ")),
         &numeric(&["a"]),
         "public",
     )
     .await
-    .expect("install_definition falls back to the ring path");
-
-    assert_eq!(
-        def.status,
-        TransformStatus::WaitingToBackfill,
-        "the ring-fallback path waits for the discharge too (ADR-0002, #418)"
+    .expect_err("every build inlines the chain into one expression");
+    assert!(
+        matches!(
+            err,
+            trellis::defs::CatalogError::Validate(
+                trellis::defs::ValidationError::FieldExpansionTooLarge
+            )
+        ),
+        "{err:?}"
     );
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("the discharge enumerates the source and takes it live");
-
-    let rows = client
-        .query(
-            &format!(
-                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.chain'"
-            ),
+    let left_behind: i64 = client
+        .query_one(
+            "select count(*) from information_schema.tables where table_name = 'chain'",
             &[],
         )
         .await
-        .expect("read back persisted status");
-    assert_eq!(
-        rows.len(),
-        1,
-        "the speculative row must have been deleted, leaving exactly the ring path's own row"
-    );
-    let persisted_status: String = rows[0].get(0);
-    assert_eq!(persisted_status, "live");
+        .expect("look for the target")
+        .get(0);
+    assert_eq!(left_behind, 0, "a refused definition leaves no target");
 }
 
 // ---------------------------------------------------------------------
 // Fast-path success branch: a plain 1-1 field that references another
 // calculated field's alias (issue #83 — `double_price + tax AS total` where
-// `double_price = price + price`). WI1 made this shape fall back to the ring
-// (safe, but slow); the direct build now inlines the alias chain
+// `double_price = price + price`). The build inlines the alias chain
 // (`substitute_all_fields`) and builds it set-based, so the source is never
-// enumerated into the ring. (Supersedes WI1's ring-fallback assertion for
-// this shape — expected and correct.)
+// staged into the ring.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
@@ -778,7 +553,7 @@ async fn install_definition_fast_path_builds_a_plain_cross_field_alias_chain() {
     let cols = numeric(&["price", "tax"]);
     // `total` references `double_price`, itself a calculated field
     // (`price + price`). Substitution inlines it to `(price + price) + tax`,
-    // so the direct build renders self-contained source SQL.
+    // so the build renders self-contained source SQL.
     install_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT price + price AS double_price, \
@@ -789,14 +564,11 @@ async fn install_definition_fast_path_builds_a_plain_cross_field_alias_chain() {
     .await
     .expect("install_definition builds the alias chain directly");
 
-    // The direct build's chunk work is enumerated/persisted, not executed
-    // in-call — drive it to completion before reading the target.
-    // Only the build: its go-live catch-up (#476) re-reads the source into
-    // the ring by design.
-    trellis::intake::markers::settle_builds(&db.pool).await;
+    // Run the build to completion before reading the target.
+    trellis::intake::harness::settle_builds(&db.pool).await;
 
-    // The direct build populates the target and stages nothing in the ring
-    // — the fast-path signature (see the sibling fast-path test).
+    // The build populates the target and stages nothing in the ring (see
+    // the sibling fast-path test).
     let mut rows: Vec<(i64, String, String)> = client
         .query(
             "select id, double_price::text, total::text from t order by id",
@@ -815,12 +587,12 @@ async fn install_definition_fast_path_builds_a_plain_cross_field_alias_chain() {
             (2, "40".to_string(), "42".to_string()),
             (3, "60".to_string(), "63".to_string()),
         ],
-        "direct build computes the alias chain correctly for every row"
+        "the build computes the alias chain correctly for every row"
     );
     assert_eq!(
         staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.s")).await,
         0,
-        "fast path must not enumerate the source into the ring"
+        "the build must not stage the source into the ring"
     );
 }
 
@@ -868,14 +640,12 @@ async fn install_definition_fast_path_builds_an_aggregate_cross_field_alias_chai
     )
     .await
     .expect("install_definition builds the aggregate alias chain directly");
-    // ADR-0002 (#419): the direct build runs as a background job the
-    // discharge dispatches; run it before reading the target. Only the
-    // build: its go-live catch-up re-reads the source into the ring by
-    // design (#468, #485).
-    trellis::intake::markers::settle_builds(&db.pool).await;
+    // ADR-0002 (#419): the build runs as a background job the staging
+    // worker starts; run it before reading the target.
+    trellis::intake::harness::settle_builds(&db.pool).await;
 
-    // The direct build populates the target synchronously and stages nothing
-    // in the ring — the fast-path signature (see the sibling fast-path tests).
+    // The build's plan job writes the target in one absolute write and
+    // stages nothing in the ring (see the sibling fast-path tests).
     let mut rows: Vec<(String, String, String)> = client
         .query(
             "select order_id::text, total::text, double_total::text \
@@ -894,13 +664,13 @@ async fn install_definition_fast_path_builds_an_aggregate_cross_field_alias_chai
             ("10".to_string(), "12".to_string(), "24".to_string()),
             ("20".to_string(), "3".to_string(), "6".to_string()),
         ],
-        "direct build computes the aggregate alias chain correctly for every group \
+        "the build computes the aggregate alias chain correctly for every group \
          (double_total = 2 * sum(amount))"
     );
     assert_eq!(
         staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.order_items")).await,
         0,
-        "fast path must not enumerate the source into the ring"
+        "the build must not stage the source into the ring"
     );
 }
 
@@ -946,11 +716,9 @@ async fn install_definition_builds_a_bare_alias_of_a_sum_field_declared_before_i
     )
     .await
     .expect("install_definition builds a bare alias of a SUM field declared before it");
-    // ADR-0002 (#419): the direct build runs as a background job the
-    // discharge dispatches; run it before reading the target. Only the
-    // build: its go-live catch-up re-reads the source into the ring by
-    // design (#468, #485).
-    trellis::intake::markers::settle_builds(&db.pool).await;
+    // ADR-0002 (#419): the build runs as a background job the staging
+    // worker starts; run it before reading the target.
+    trellis::intake::harness::settle_builds(&db.pool).await;
 
     let mut rows: Vec<(String, String, String)> = client
         .query(
@@ -1013,11 +781,9 @@ async fn install_definition_shares_one_count_column_across_several_aliases_of_a_
     )
     .await
     .expect("install_definition shares one count column across several SUM aliases");
-    // ADR-0002 (#419): the direct build runs as a background job the
-    // discharge dispatches; run it before reading the target. Only the
-    // build: its go-live catch-up re-reads the source into the ring by
-    // design (#468, #485).
-    trellis::intake::markers::settle_builds(&db.pool).await;
+    // ADR-0002 (#419): the build runs as a background job the staging
+    // worker starts; run it before reading the target.
+    trellis::intake::harness::settle_builds(&db.pool).await;
 
     // (order_id, total, grand_total, super_total)
     type Row = (String, Option<String>, Option<String>, Option<String>);
@@ -1085,7 +851,7 @@ async fn install_definition_fast_path_builds_a_coalesce_wrapped_aggregate() {
     )
     .await
     .expect("install_definition builds a coalesce-wrapped aggregate");
-    trellis::intake::markers::settle_builds(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
 
     let mut rows: Vec<(String, String)> = client
         .query(
@@ -1110,7 +876,7 @@ async fn install_definition_fast_path_builds_a_coalesce_wrapped_aggregate() {
     assert_eq!(
         staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.posts")).await,
         0,
-        "the build must not enumerate the source into the ring"
+        "the build must not stage the source into the ring"
     );
 }
 
@@ -1156,7 +922,7 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
     )
     .await
     .expect("install_definition builds the nested coalesce alias chain");
-    trellis::intake::markers::settle_builds(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
 
     let mut rows: Vec<(String, String, String, String)> = client
         .query(
@@ -1194,7 +960,7 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
     assert_eq!(
         staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.posts")).await,
         0,
-        "the build must not enumerate the source into the ring"
+        "the build must not stage the source into the ring"
     );
 }
 
@@ -1207,7 +973,7 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
 // never through `resolve_graph_identity`/`resolve_graph_identity_in_txn`'s
 // bare-target-suffix fallback the way `create_definition_inner`'s own
 // resolution of the identical bare source already does (issue #74). Since
-// `install_definition` runs its own DDL/backfill *before*
+// `install_definition` runs its own DDL *before*
 // `create_definition_inner` is ever reached — a distinct fast path, not a
 // thin wrapper around the ring — a second definition's bare `FROM t` failed
 // to find a first definition's target explicitly qualified into a schema
@@ -1219,7 +985,7 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
 /// Plain 1-1 repro: exercises `resolve_source_for_install`
 /// specifically, since a plain 1-1 definition's DDL step
 /// (`ddl::source_primary_key(pool, &qualified_source)`, run directly inside
-/// `install_definition` before it registers the definition for the discharge)
+/// `install_definition` before it registers the definition for its build)
 /// is the very first place this gap could fail.
 #[tokio::test]
 async fn install_definition_fast_path_resolves_a_bare_from_chained_off_a_non_default_schema_target()
@@ -1297,10 +1063,7 @@ async fn install_definition_fast_path_resolves_a_bare_from_chained_off_a_non_def
 
 /// ADR-0002 (#418): registration reads no source rows. It succeeds while
 /// another session holds the source `ACCESS EXCLUSIVE` (which blocks every
-/// read of it) — for a plain 1-1 definition, and for a shape the direct build
-/// can't render, whose ring fallback used to enumerate the source inside
-/// registration — and both go live once the lock is released and the
-/// discharge runs. The timeout only turns a registration stuck on the lock
+/// read of it) — and goes live once the lock is released and its build runs. The timeout only turns a registration stuck on the lock
 /// into a failure instead of a hang.
 #[tokio::test]
 async fn registration_reads_no_source_rows() {
@@ -1335,59 +1098,29 @@ async fn registration_reads_no_source_rows() {
     };
     let plain = register("TRANSFORM t FROM s SELECT a + a AS x".to_string()).await;
     assert_eq!(plain.status, TransformStatus::WaitingToBackfill);
-    // A doubling alias chain (`f<k> = f<k-1> + f<k-1>`) whose inlined form
-    // outgrows the direct build's substitution budget is `Unsupported`, so
-    // it falls back to the ring.
-    let chain: Vec<String> = std::iter::once("a + a AS f0".to_string())
-        .chain((1..=17).map(|k| format!("f{} + f{} AS f{k}", k - 1, k - 1)))
-        .collect();
-    let ring = register(format!("TRANSFORM u FROM s SELECT {}", chain.join(", "))).await;
-    assert_eq!(ring.status, TransformStatus::WaitingToBackfill);
-
     locker
         .batch_execute("commit")
         .await
         .expect("release the lock");
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("discharge the registrations");
-    let ring_rows: i64 = client
-        .query_one(
-            &format!("select count(*) from {}", active_seg_table(&client).await),
-            &[],
-        )
-        .await
-        .expect("count staged ring rows")
-        .get(0);
-    assert_eq!(
-        ring_rows, 50,
-        "only the ring fallback enumerates the source"
-    );
     drain_backfill_chunks(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
-    let statuses: Vec<String> = client
-        .query("select status from transform_definitions order by id", &[])
+    let status: String = client
+        .query_one("select status from transform_definitions", &[])
         .await
-        .expect("read statuses")
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    assert_eq!(statuses, ["live", "live"]);
+        .expect("read the status")
+        .get(0);
+    assert_eq!(status, "live");
     let mismatches: i64 = client
         .query_one(
-            "select count(*) from s \
-             left join t on t.id = s.id left join u on u.id = s.id \
-             where t.x is distinct from s.a + s.a or u.f17 is distinct from s.a * 262144",
+            "select count(*) from s left join t on t.id = s.id \
+             where t.x is distinct from s.a + s.a",
             &[],
         )
         .await
-        .expect("compare the targets to the source")
+        .expect("compare the target to the source")
         .get(0);
-    assert_eq!(
-        mismatches, 0,
-        "both targets are built from every source row"
-    );
+    assert_eq!(mismatches, 0, "the target is built from every source row");
 }
 
 // ---------------------------------------------------------------------
@@ -1747,7 +1480,7 @@ async fn install_definition_accepts_a_primary_key_column_under_another_name() {
     )
     .await
     .expect("a renamed primary key column installs");
-    trellis::intake::markers::settle_builds(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     let mismatches: i64 = client
         .query_one(
             "select count(*) from s full join t on t.id = s.id \
@@ -1923,7 +1656,7 @@ async fn an_aggregate_over_a_composite_pk_source_builds_and_drains() {
     )
     .await
     .expect("install an aggregate over a composite-pk source");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let read_totals = async |client: &Client| -> HashMap<String, Option<String>> {

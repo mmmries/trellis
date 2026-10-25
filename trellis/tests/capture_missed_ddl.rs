@@ -6,7 +6,7 @@
 //! the study's worktree; the ids below are its rows) on a table of its own,
 //! calls the capture pass directly at each of the study's `PASS` markers,
 //! and then checks what the pass did to the table's two readers: nothing,
-//! a rebuild (both `catching_up` or `backfilling`, counted in
+//! a rebuild (`backfilling`, or `catching_up` reported downstream of one, counted in
 //! `capture_auto_rebuilds_total`), or a pause. Nothing polls for
 //! convergence (#297).
 
@@ -42,17 +42,11 @@ async fn definer(dsn: &str) -> Trellis {
     .expect("connect a definer")
 }
 
-/// One whole staging-worker pass: capture, markers, discharge.
+/// One whole staging-worker pass: capture, then the start of ready builds.
 async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
-    trellis::client::reconcile_pass(
-        raw,
-        pool,
-        SCHEMA,
-        "capture_missed_ddl_wake",
-        Duration::from_secs(2),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(raw, pool, SCHEMA)
+        .await
+        .expect("reconcile pass");
 }
 
 /// The capture half of one pass only.
@@ -100,33 +94,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 }
 
 async fn run_backfill_chunks(pool: &trellis::Pool) {
-    use trellis::defs::chunk_queue;
-    const CLAIMED_BY: &str = "capture_missed_ddl_backfill";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            trellis::staging::build::settle_builds(pool).await;
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// Every definition's status, by bare target name.

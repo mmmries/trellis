@@ -7,7 +7,7 @@
 //! backfilling` with `build = 'rederive'`, it applies from that commit, a
 //! plan job enqueues `(lo, hi]` chunks of its source's primary key, a
 //! rebuild also gets a sweep, and the transaction that finishes the last
-//! chunk moves it `live` (B7). Nothing parks a catch-up for it.
+//! chunk moves it `live` (B7). Nothing is left to catch up after it.
 //!
 //! The chunk: a 1-1 target's rows are absolute, a target row is the
 //! evaluation of one source row, so a chunk writes the target rows
@@ -85,9 +85,10 @@ pub struct OneToOnePlan {
 }
 
 /// Whether `definition` is a 1-1 target the Re-derive build serves (#625
-/// F8a): a 1-1 key space, and fields whose aliases substitute to self-contained SQL
-/// (a cyclic alias chain is the ring enumeration's). Its source may be
-/// captured or seam-fed ([`super::qualifies`], #625 F6).
+/// F8a): a 1-1 key space, and fields whose aliases substitute to
+/// self-contained SQL, which define checks
+/// (`ValidationError::FieldExpansionTooLarge`). Its source may be captured or
+/// seam-fed (#625 F6).
 pub(crate) fn buildable(definition: &Definition) -> bool {
     matches!(
         definition.def.key_space,

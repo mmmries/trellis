@@ -41,9 +41,8 @@
 //!   active segment's again. A change captured after the detection stays in
 //!   the ring;
 //! - what the dump brought of the capture record (triggers, baselines,
-//!   partition trees, queued corrections) and of the backfill bookkeeping
-//!   (markers, resume requests) is forgotten: the next pass
-//!   records what it finds, and a resume parks its own markers.
+//!   partition trees, queued corrections) and the capture gates are
+//!   forgotten: the next pass records what it finds, and a resume rebuilds.
 //!
 //! # The drain side
 //!
@@ -160,7 +159,7 @@ pub(crate) async fn respond(client: &mut Client, recheck: bool) -> Result<bool, 
          delete from capture_baselines; \
          delete from partition_corrections; \
          delete from partition_sources; \
-         delete from pending_backfill",
+         delete from capture_gates",
     )
     .await?;
     txn.commit().await?;

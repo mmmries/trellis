@@ -718,15 +718,9 @@ async fn altering_a_passthrough_into_a_wider_expression_changes_no_column_type()
     // Rule 5: the next capture pass finds the column current, so it pauses
     // nothing for a widening or a drift.
     for _ in 0..2 {
-        trellis::client::reconcile_pass(
-            &mut raw,
-            &db.pool,
-            DEFAULT_SCHEMA,
-            "alter_transform_997",
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("capture pass");
+        trellis::client::reconcile_pass(&mut raw, &db.pool, DEFAULT_SCHEMA)
+            .await
+            .expect("capture pass");
     }
     assert_ne!(persisted_status(&raw, "t").await.as_deref(), Some("paused"));
     let failures: i64 = raw
@@ -900,49 +894,17 @@ async fn combined_add_drop_alter_in_one_statement() {
 // Single-pass backfill and the version fence
 // ---------------------------------------------------------------------
 
-/// Claims, runs, and finishes every pending direct-build backfill chunk
-/// until none remain, flipping a freshly-defined 1-1 target to `live` with
-/// no running `Client`. This is the hand-driven stand-in for a drain worker
-/// that `defs_install_definition.rs` uses.
+/// Starts every registered definition's build and runs it to completion,
+/// flipping a freshly-defined 1-1 target to `live` with no running
+/// `Client`. This is the hand-driven stand-in for the staging worker and a
+/// drain worker that `defs_install_definition.rs` uses.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
-    trellis::intake::markers::discharge_registrations(pool)
+    // ADR-0002 (#418): registration only records a definition; the staging
+    // worker starts its build.
+    trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    const CLAIMED_BY: &str = "alter_transform_test_backfill_worker";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            // #625 F8a: a plain 1-1 over a captured table is the Re-derive
-            // build's, which the drain workers run to `live` on their own.
-            trellis::staging::build::settle_builds(pool).await;
-            // The staging worker's next pass: the builds' go-live catch-ups
-            // take them `live` (issue #476).
-            trellis::intake::markers::discharge_registrations(pool)
-                .await
-                .expect("discharge the go-live catch-ups");
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// The target's rows as `(id, xmin)` text, in key order: a row any write
@@ -1569,7 +1531,7 @@ async fn dropping_a_paused_field_clears_its_quarantine_state() {
     // definition stopped reading at the DROP, so the staging worker may have
     // narrowed `b` out of the source's capture meanwhile: the field stays
     // paused (its own pause, nothing inherited) until the capture images `b`
-    // again and the edit's catch-up unpauses it (issue #622).
+    // again and the field build's start unpauses it (issue #622).
     trellis
         .apply("ALTER TRANSFORM order_calc ADD b AS b")
         .await
@@ -1602,12 +1564,10 @@ async fn dropping_a_paused_field_clears_its_quarantine_state() {
 /// build's plan job (its walk reads the source) but not the `ALTER`, which
 /// only registers the build and so returns with the source still locked.
 ///
-/// The ring is drained before the lock (issue #903). `order_next` reports
-/// `live` once its go-live catch-up has staged a re-derive of every
-/// `order_calc` row, before those pages drain. A page still in flight
-/// re-derives under `order_calc`'s version fence and would wait on the lock
-/// holding it; the pauses bump that fence, and would wait on the page in
-/// turn. Before the pauses bumped the fence, such a page wrote all three new
+/// The ring is drained before the lock (issue #903), so no page is in
+/// flight: a page re-derives under `order_calc`'s version fence and would
+/// wait on the lock holding it; the pauses bump that fence, and would wait
+/// on the page in turn. Before the pauses bumped the fence, such a page wrote all three new
 /// fields once the lock went, after both pauses had returned.
 #[tokio::test]
 async fn a_pause_landing_mid_field_build_survives_it() {
@@ -1634,7 +1594,7 @@ async fn a_pause_landing_mid_field_build_survives_it() {
     trellis
         .await_converged(token, Duration::from_secs(60))
         .await
-        .expect("drain the go-live catch-up's pages");
+        .expect("drain the ring");
 
     // Freeze the build: `order_calc` is `order_next`'s source.
     let mut locker = connect_raw(db.dsn()).await;
@@ -2688,7 +2648,7 @@ async fn altering_an_aggregate_transform_is_unsupported() {
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define the aggregate");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
 
     let err = trellis
         .apply("ALTER TRANSFORM order_rollup ADD g AS g2")

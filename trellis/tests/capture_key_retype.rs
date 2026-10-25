@@ -45,17 +45,11 @@ async fn definer(dsn: &str) -> Trellis {
     .expect("connect a definer")
 }
 
-/// One whole staging-worker pass: capture, markers, discharge.
+/// One whole staging-worker pass: capture, then the start of ready builds.
 async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
-    trellis::client::reconcile_pass(
-        raw,
-        pool,
-        SCHEMA,
-        "capture_key_retype_wake",
-        Duration::from_secs(2),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(raw, pool, SCHEMA)
+        .await
+        .expect("reconcile pass");
 }
 
 /// The capture half of one pass only. Asserts no table failed.
@@ -138,37 +132,11 @@ async fn drain_past_failures(pool: &trellis::Pool, client: &mut Client) {
 
 /// Claims, runs and finishes every pending backfill chunk.
 async fn run_backfill_chunks(pool: &trellis::Pool) {
-    use trellis::defs::chunk_queue;
-    const CLAIMED_BY: &str = "capture_key_retype_backfill";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            trellis::staging::build::settle_builds(pool).await;
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
-/// Whether `status` is a rebuild's: a go-live catch-up, or a Re-derive
-/// build.
+/// Whether `status` is a rebuild's: the Re-derive build's own, or a reader's
+/// of a rebuilding upstream (reported `catching_up`).
 fn rebuilding(status: TransformStatus) -> bool {
     matches!(
         status,
@@ -1532,7 +1500,7 @@ async fn failure_detected_at(raw: &Client, target: &str) -> String {
 }
 
 /// Whether `target` isn't paused and has no pause record. A reader of a
-/// target being rebuilt is `catching_up` (#476).
+/// target being rebuilt reports `catching_up` (#497).
 async fn assert_unpaused(trellis: &Trellis, target: &str) {
     let reported = trellis.status(target).await.expect("status").expect(target);
     assert!(!reported.status.is_frozen(), "{target}: {reported:?}");

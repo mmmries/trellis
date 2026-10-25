@@ -23,14 +23,12 @@ use trellis::defs::{
     CatalogError, Statement, TransformStatus, alter_transform, create_definition,
     install_definition, parse_statement, tables_to_capture,
 };
-use trellis::intake::markers;
+use trellis::intake::harness;
 use trellis::integer::IntWidth;
 use trellis::staging::build::{self, Step, WorkerOptions};
 use trellis::staging::interleave::PausePoint;
 use trellis::staging::quarantine;
-use trellis::staging::{
-    StagedChange, StagedWatermark, append, apply, has_pending, retire_drained_segments,
-};
+use trellis::staging::{StagedChange, append, apply, has_pending, retire_drained_segments};
 
 const WAKE: &str = "seam_wake";
 
@@ -222,7 +220,7 @@ async fn a_chained_target_is_never_captured() {
     )
     .await
     .expect("install the aggregate");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     // An aggregate over a seam-only target never reads its capture.
     install_definition(
         &db.pool,
@@ -262,7 +260,7 @@ async fn a_chained_target_is_never_captured() {
     )
     .await
     .expect("define t");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     install_definition(
         &db.pool,
         "TRANSFORM public.report_view FROM public.reports JOIN public.t \
@@ -286,8 +284,8 @@ async fn a_chained_target_is_never_captured() {
 
 /// A target's initial build writes it outside the seam, so a definition may
 /// only chain off it once it is live. A plain 1-1 target builds through the
-/// chunk queue its discharge dispatches, and with no drain worker running it
-/// stays `backfilling`.
+/// chunk queue its build's start enqueues, and with no drain worker running
+/// it stays `backfilling`.
 #[tokio::test]
 async fn defining_a_transform_off_a_target_that_is_still_backfilling_is_refused() {
     let (_cluster, db, raw) = setup().await;
@@ -306,9 +304,9 @@ async fn defining_a_transform_off_a_target_that_is_still_backfilling_is_refused(
     .await
     .expect("install h1");
     assert_eq!(h1.status.as_str(), "waiting_to_backfill");
-    trellis::intake::markers::discharge_registrations(&db.pool)
+    trellis::intake::harness::start_registered_builds(&db.pool)
         .await
-        .expect("dispatch h1's chunks");
+        .expect("start h1's build");
 
     let err = install_definition(
         &db.pool,
@@ -353,7 +351,7 @@ async fn resuming_an_aggregate_column_succeeds() {
     )
     .await
     .expect("install agg");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     raw.batch_execute(
         "insert into column_status (transform_table, column_name, last_error, local_fuse) \
          values ('agg', 'total', 'synthetic pause', true)",
@@ -466,7 +464,7 @@ async fn an_aggregate_targets_truncate_clear_reaches_a_chained_reader() {
     )
     .await
     .expect("install agg");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     install_definition(
         &db.pool,
         "TRANSFORM public.d FROM public.agg GROUP BY total WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
@@ -478,7 +476,7 @@ async fn an_aggregate_targets_truncate_clear_reaches_a_chained_reader() {
     )
     .await
     .expect("install d");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, "select total::text, n::text from public.d").await,
@@ -543,7 +541,7 @@ async fn a_numeric_grouped_aggregates_truncate_clear_drains_without_halting() {
     )
     .await
     .expect("a numeric-grouped aggregate over an integer-keyed table is accepted");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, "select p::text, t::text from public.agg").await,
@@ -628,70 +626,6 @@ async fn an_altered_column_propagates_to_a_chained_reader() {
     );
 }
 
-/// A definition created through the ring path enumerates its source inside
-/// its creating transaction. When that source is another definition's
-/// target, a write to it that commits after the enumeration's read, by a
-/// writer whose seam checked for readers before the new definition
-/// existed, stages nothing, and the target has no CDC to fall back on. The
-/// catch-up parked after the creating transaction commits is what catches
-/// it. The racing write is a raw insert standing in for that writer.
-#[tokio::test]
-async fn a_target_write_racing_a_chained_definitions_creation_is_caught_up() {
-    let (_cluster, db, mut raw) = setup().await;
-    raw.batch_execute(
-        "create table public.src (id integer primary key, v numeric); \
-         insert into public.src values (1, 1); \
-         create table public.t (id integer primary key, doubled numeric); \
-         create table public.d (id integer primary key, doubled numeric)",
-    )
-    .await
-    .expect("create tables");
-    one_to_one_ledgers(&raw, &["t", "d"]).await;
-    create_definition(
-        &db.pool,
-        "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
-        &numeric_columns(&["id", "v"]),
-    )
-    .await
-    .expect("define t");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-
-    let mut racer = connect_raw(db.dsn()).await;
-    let racing = racer.transaction().await.expect("begin the racing write");
-    racing
-        .execute("insert into public.t values (99, 42)", &[])
-        .await
-        .expect("racing insert");
-    create_definition(
-        &db.pool,
-        "TRANSFORM public.d FROM public.t SELECT doubled AS doubled",
-        &numeric_columns(&["id", "doubled"]),
-    )
-    .await
-    .expect("define d while the write is in flight");
-    racing.commit().await.expect("commit the racing write");
-
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    markers::run_pending_backfills(
-        &mut raw,
-        WAKE,
-        &StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("run pending backfills");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-
-    assert_eq!(
-        rows(&raw, "select id::text, doubled::text from public.d").await,
-        BTreeMap::from([
-            ("1".to_string(), "2".to_string()),
-            ("99".to_string(), "42".to_string()),
-        ]),
-        "the write that raced d's creation must still reach d"
-    );
-}
-
 /// `recompute_column` writes back in bounded transactions, one per chunk of
 /// keys, so a resume never holds row locks (and an xid) across the whole
 /// target. Every changed row in every chunk still reaches a chained reader.
@@ -768,8 +702,8 @@ async fn resuming_a_column_across_several_chunks_propagates_every_changed_row() 
 
 /// `src -> t -> d`, `d` reading `t`'s target as its source, both `live`.
 /// With `seam_fed_src`, `src` reads as another definition's target
-/// (`feed_from_a_test_definition`), so `t` takes the old chunked build and
-/// its go-live catch-up rather than the Re-derive build (#625 F8a).
+/// (`feed_from_a_test_definition`); `t` takes the Re-derive build either
+/// way (#625 F8a).
 async fn chained_pair(db: &TestDatabase, raw: &mut Client, seam_fed_src: bool) {
     raw.batch_execute(
         "create table public.src (id integer primary key, v numeric); \
@@ -781,7 +715,7 @@ async fn chained_pair(db: &TestDatabase, raw: &mut Client, seam_fed_src: bool) {
     .expect("create tables");
     one_to_one_ledgers(raw, &["t", "d"]).await;
     if seam_fed_src {
-        markers::feed_from_a_test_definition(&*raw, "public.src")
+        harness::feed_from_a_test_definition(&*raw, "public.src")
             .await
             .expect("make src read as a seam-fed source");
     }
@@ -801,7 +735,7 @@ async fn chained_pair(db: &TestDatabase, raw: &mut Client, seam_fed_src: bool) {
     .await
     .expect("define d");
     drain_to_quiescence(&db.pool, raw).await;
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, raw).await;
     assert_eq!(stored(raw, "t").await, "live", "precondition");
     assert_eq!(stored(raw, "d").await, "live", "precondition");
@@ -810,10 +744,10 @@ async fn chained_pair(db: &TestDatabase, raw: &mut Client, seam_fed_src: bool) {
 /// Issue #497: a definition whose source is another definition's target
 /// reports `catching_up` while that upstream is paused and while it
 /// rebuilds after the resume, applying throughout, and reports `live` again
-/// once the upstream is `live` and its own catch-up has run.
+/// once the upstream is `live`: the rebuild writes `t` through the seam, so
+/// `d` follows it with nothing parked for it.
 ///
-/// #625 F8a: the catch-up the rebuild parks for its readers is the old
-/// chunked build's, so `t` reads a seam-fed `src`; a Re-derive-built `t` is
+/// Here `t` reads a seam-fed `src`; over a captured `src` it is
 /// [`a_chained_reader_reports_catching_up_while_its_upstream_rederives`].
 #[tokio::test]
 async fn a_chained_reader_reports_catching_up_until_its_resumed_upstream_is_live() {
@@ -875,16 +809,11 @@ async fn a_chained_reader_reports_catching_up_until_its_resumed_upstream_is_live
     );
     assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
 
-    // The rebuild finishes: both are catching up, `t` on its own go-live
-    // catch-up and `d` on the one the rebuild parked for its readers.
-    markers::settle_builds(&db.pool).await;
-    assert_eq!(stored(&raw, "t").await, "catching_up");
-    assert_eq!(stored(&raw, "d").await, "catching_up");
-    assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
-
-    markers::discharge_registrations(&db.pool)
-        .await
-        .expect("discharge the catch-ups");
+    // The rebuild finishes: `t` is live, and `d` with it, since the
+    // rebuild wrote through the seam.
+    harness::settle_builds(&db.pool).await;
+    assert_eq!(stored(&raw, "t").await, "live");
+    assert_eq!(stored(&raw, "d").await, "live");
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(reported(&trellis, "t").await, TransformStatus::Live);
     assert_eq!(reported(&trellis, "d").await, TransformStatus::Live);
@@ -934,7 +863,7 @@ async fn a_chained_reader_reports_catching_up_while_its_upstream_rederives() {
     assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
 
     // The start: `t` rebuilds under the Re-derive build.
-    markers::discharge_registrations(&db.pool)
+    harness::start_registered_builds(&db.pool)
         .await
         .expect("start the rebuild");
     let build: Option<String> = raw
@@ -1021,16 +950,14 @@ async fn seal_and_drain_once(pool: &trellis::Pool, client: &mut Client) {
 }
 
 /// Issue #507: seam rows for a target staged before its pause (an update and
-/// a delete) are still undrained when the rebuild's go-live catch-up re-reads
-/// the target for its readers, and drain after it. Their images predate the
-/// rebuild, so neither may put its value back: `double_totals`, an aggregate
-/// chained off the target, ends at the rebuilt target.
+/// a delete) are still undrained when the target's resume rebuild runs, and
+/// drain after it. Their images predate the rebuild, so neither may put its
+/// value back: `double_totals`, an aggregate chained off the target, ends at
+/// the rebuilt target.
 ///
-/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
-/// whose rebuild writes the target through the seam and parks no catch-up.
-/// The go-live catch-up this pins is the old chunked build's, which a plain
-/// 1-1 over a seam-fed source still takes, so `orders` is made to read as
-/// another definition's target (`feed_from_a_test_definition`).
+/// #625 F8a: the rebuild is the Re-derive build, which writes the target
+/// through the seam. `orders` is made to read as another definition's target
+/// (`feed_from_a_test_definition`).
 #[tokio::test]
 async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_correct() {
     let (_cluster, db, mut raw) = setup().await;
@@ -1042,7 +969,7 @@ async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_co
     .await
     .expect("create tables");
     one_to_one_ledgers(&raw, &["order_doubles"]).await;
-    markers::feed_from_a_test_definition(&raw, "public.orders")
+    harness::feed_from_a_test_definition(&raw, "public.orders")
         .await
         .expect("make orders read as a seam-fed source");
     let mut columns = numeric_columns(&["id"]);
@@ -1057,7 +984,7 @@ async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_co
     .await
     .expect("define order_doubles");
     drain_to_quiescence(&db.pool, &mut raw).await;
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     columns.insert("x".to_string(), ValueType::Integer(IntWidth::Int4));
     install_definition(
         &db.pool,
@@ -1069,7 +996,7 @@ async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_co
     .await
     .expect("define an aggregate chained off the target");
     drain_to_quiescence(&db.pool, &mut raw).await;
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     let double_totals = "select g::text, total::text from public.double_totals";
     let total = |total: &str| BTreeMap::from([("1".to_string(), total.to_string())]);
@@ -1112,8 +1039,8 @@ async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_co
         .await
         .expect("seal the seam rows, undrained");
 
-    // Paused, the source moves on; the rebuild writes the target outside the
-    // seam, and its catch-up re-reads it for the reader.
+    // Paused, the source moves on; the rebuild writes the target through
+    // the seam for the reader.
     let trellis = trellis::Trellis::connect(
         trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
         trellis::TrellisOptions::default(),
@@ -1133,7 +1060,7 @@ async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_co
         .apply("RESUME TRANSFORM order_doubles")
         .await
         .expect("resume the target");
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     assert_eq!(
         rows(&raw, "select id::text, x::text from public.order_doubles").await,
         BTreeMap::from([
@@ -1143,9 +1070,9 @@ async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_co
         "precondition: the rebuild read the paused changes"
     );
 
-    // The pre-pause seam rows drain now, after the catch-up.
+    // The pre-pause seam rows drain now, after the rebuild.
     drain_to_quiescence(&db.pool, &mut raw).await;
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, double_totals).await,
@@ -1211,7 +1138,7 @@ async fn a_superseded_seam_delete_leaves_a_key_with_a_pending_reinsert_to_that_r
     .await
     .expect("define order_doubles");
     drain_to_quiescence(&db.pool, &mut raw).await;
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     columns.insert("x".to_string(), ValueType::Integer(IntWidth::Int4));
     install_definition(
         &db.pool,
@@ -1223,7 +1150,7 @@ async fn a_superseded_seam_delete_leaves_a_key_with_a_pending_reinsert_to_that_r
     .await
     .expect("define an aggregate chained off the target");
     drain_to_quiescence(&db.pool, &mut raw).await;
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     let double_totals = "select g::text, n::text || ' ' || total::text from public.double_totals";
     assert_eq!(
@@ -1435,14 +1362,9 @@ async fn a_seam_fed_build_plans_no_chunk_until_the_writer_open_at_its_fence_ends
     .expect("register the downstream");
     let id = definition_id(&d.ctl, "tot").await;
     let pool = d.pool().clone();
-    let taken = build::start_ready_builds(&mut d.ctl, &pool, &[id])
+    build::start_ready_builds(&mut d.ctl, &pool, &[id])
         .await
         .expect("start the downstream's build");
-    assert_eq!(
-        taken,
-        vec![id],
-        "the Re-derive build takes a seam-fed source"
-    );
     assert_eq!(stored(&d.ctl, "tot").await, "backfilling");
 
     // The plan job takes its fence, and plans nothing while the writer is
@@ -1572,14 +1494,9 @@ async fn build_over_u(
         .expect("register the downstream");
     let id = definition_id(&d.ctl, target).await;
     let pool = d.pool().clone();
-    let taken = build::start_ready_builds(&mut d.ctl, &pool, &[id])
+    build::start_ready_builds(&mut d.ctl, &pool, &[id])
         .await
         .expect("start the build");
-    assert_eq!(
-        taken,
-        vec![id],
-        "the Re-derive build takes a seam-fed source"
-    );
     build::settle_builds(&pool).await;
     settle_through_failures(d).await;
     assert_eq!(stored(&d.ctl, target).await, "live");
@@ -1784,10 +1701,9 @@ async fn a_captured_sources_build_takes_no_fence_and_waits_for_no_transaction() 
     .expect("register the aggregate");
     let id = definition_id(&d.ctl, "agg").await;
     let pool = d.pool().clone();
-    let taken = build::start_ready_builds(&mut d.ctl, &pool, &[id])
+    build::start_ready_builds(&mut d.ctl, &pool, &[id])
         .await
         .expect("start the build");
-    assert_eq!(taken, vec![id]);
     assert_eq!(
         build::work_once(&pool, "worker", &BUILD_OPTIONS)
             .await
@@ -1817,8 +1733,8 @@ async fn a_captured_sources_build_takes_no_fence_and_waits_for_no_transaction() 
 /// The fence holds a build until every transaction with an id below it has
 /// ended, and a writer that checked before the build's start committed
 /// stages nothing for it. A writer whose first write comes after its check
-/// (the discharge's orphan sweep, which checks first and then reads before
-/// it deletes) would otherwise take its id after the fence, and the build
+/// (one that checks first and then reads before it deletes) would otherwise
+/// take its id after the fence, and the build
 /// would run past it. Here the writer has written nothing when it checks,
 /// and nothing reads `t` yet; `tot` is then registered and started, and its
 /// plan job must wait for the writer.
@@ -1846,10 +1762,9 @@ async fn a_writer_that_checked_for_readers_before_a_seam_fed_build_holds_its_fen
     .expect("register the downstream");
     let id = definition_id(&d.ctl, "tot").await;
     let pool = d.pool().clone();
-    let taken = build::start_ready_builds(&mut d.ctl, &pool, &[id])
+    build::start_ready_builds(&mut d.ctl, &pool, &[id])
         .await
         .expect("start the downstream's build");
-    assert_eq!(taken, vec![id]);
     assert_eq!(
         build::work_once(&pool, "worker", &BUILD_OPTIONS)
             .await

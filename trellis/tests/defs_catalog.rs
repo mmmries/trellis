@@ -7,46 +7,20 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{
-    CatalogError, ValidationError, ValueType, all_source_tables, chunk_queue, create_definition,
+    CatalogError, ValidationError, ValueType, all_source_tables, create_definition,
     install_definition, transforms_for_source,
 };
 
-/// Runs every queued `backfill_chunks` build to completion by hand, so a
-/// chunked 1-1 target goes `live` without a running drain worker — a
-/// definition can only chain off a live target (issue #315). #625 F8a: a
-/// plain 1-1 over a captured table is the Re-derive build's, which this runs
-/// to `live` once the chunks are done.
+/// Starts every registered definition's Re-derive build and runs it to
+/// completion by hand, so a 1-1 target goes `live` without a running drain
+/// worker — a definition can only chain off a live target (issue #315).
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
-    trellis::intake::markers::discharge_registrations(pool)
+    // ADR-0002 (#418): registration only records a definition; the staging
+    // worker starts its build.
+    trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, "defs_catalog_test", 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            trellis::staging::build::settle_builds(pool).await;
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                "defs_catalog_test",
-                std::time::Duration::from_secs(5),
-                std::time::Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, "defs_catalog_test")
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 fn columns(names: &[&str]) -> HashMap<String, ValueType> {

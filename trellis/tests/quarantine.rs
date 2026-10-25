@@ -785,8 +785,8 @@ async fn a_composite_primary_key_source_drains_cleanly_with_no_quarantine_or_hal
         )
         .await
         .expect("create source table with a composite primary key");
-    // Seeded before `create_definition` so its own initial backfill
-    // enumeration (`intake::markers::enumerate_and_append`) stages this
+    // Seeded before `create_definition` so the fixture's enumeration of the
+    // source (`intake::harness::enumerate_and_append`) stages this
     // row as a `Recompute` into the ring, exercising the same
     // `staging::apply` drain path (pre-lock/upsert, no-op-suppression, key
     // decoding) every other scenario in this file drives.
@@ -1014,7 +1014,7 @@ async fn an_aggregate_over_an_unsupported_primary_key_type_source_is_rejected_at
     )
     .await
     .expect("a numeric-grouped aggregate over an integer-keyed table is accepted");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     let price_totals_columns: HashMap<String, ValueType> =
         [("price", ValueType::Numeric), ("units", ValueType::Numeric)]
             .into_iter()

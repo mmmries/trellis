@@ -23,7 +23,7 @@ use trellis::capture::columns::{capture_spec, load_catalog};
 use trellis::capture::install::{self, Progress};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
-use trellis::intake::markers;
+use trellis::intake::harness;
 
 use trellis::staging::interleave::{PausePoint, PauseScope, Reached, with_scope};
 use trellis::staging::{
@@ -185,9 +185,9 @@ impl Driver {
         phases.push(("capture_install", started.elapsed()));
         let started = Instant::now();
         if built {
-            markers::settle_registrations(&db.pool).await;
+            harness::settle_builds(&db.pool).await;
         } else {
-            markers::discharge_registrations(&db.pool)
+            harness::start_registered_builds(&db.pool)
                 .await
                 .expect("start the builds");
         }
@@ -260,7 +260,7 @@ impl Driver {
     }
 
     /// As [`Self::stage_recomputes`], each carrying a prior image (the
-    /// CDC text-format row image the go-live enumeration attaches, #392).
+    /// CDC text-format row image the old go-live enumeration attached, #392).
     pub async fn stage_recomputes_with_prior(
         &self,
         src_table: &str,
