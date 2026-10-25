@@ -27,6 +27,16 @@
 //!   shapes every page locks the same cells, which hides a missing `J`
 //!   lock).
 //!
+//! - `racing` (half the cases): 40 keys, both tables written alike, 500 to
+//!   900 ops in bursts of 600 to 900 paced from the first op, every
+//!   definition live before the first write, at least 3 workers sealing
+//!   every 20 to 40 ms, and every page stalled before its commit for up to
+//!   2 to 3.5 s (the stall is skewed toward short, so that maximum keeps
+//!   many pages open at once). Pages hold a few rows each and often share
+//!   no `P` or `M` cell, so only the `J` and `T` locks order them: it is the
+//!   only shape that has caught `join_no_j_lock` or `join_t_skip_lock`, now
+//!   and then. A case takes about 15 s.
+//!
 //! The ops are issued as the concurrent tier issues them
 //! (`generative::run::run_convergence_concurrent`): bursts of 40 to 600 ops,
 //! each split over 2 to 4 lanes on their own connections, so writes to both
@@ -47,12 +57,12 @@
 //!
 //! # Builds over rows
 //!
-//! A definition is installed up front or part way through the stream, so most
-//! `JOIN`s build (per-side steps and the final `T` step, #1109) over tables
+//! Outside the `racing` shape, a definition is installed up front or part way
+//! through the stream, so most of those `JOIN`s build (per-side steps and the final `T` step, #1109) over tables
 //! that hold rows, or that the lanes are still writing. Later bursts pause
 //! and resume a definition (the resume rebuilds its target in place) and
 //! re-read `ja` or `jb` (`request_backfill`), while the lanes keep writing
-//! both tables. About a quarter of the cases first settle the up-front
+//! both tables. About a quarter of those cases first settle the up-front
 //! definitions over the empty tables, as the tier did before it drew builds.
 //! The oracle is the same per-burst comparison with the definition's own
 //! query, so a build that lost or doubled a row diverges at the burst it ran
@@ -348,16 +358,22 @@ proptest! {
 /// gated (the `JOIN` plants and the group-basis writer's, which `P` and `M`
 /// share); the others break paths the tier never takes.
 ///
-/// Measured (#1114, 4 seeds x 12 cases, logbook `20261024T051124-a-sweep`):
-/// `join_drop_flip` caught in 33 of 48, `gb_fold_sides_per_key` 27,
-/// `join_other_side_before_j` 6. Known misses: `join_no_j_lock` and
-/// `join_t_skip_lock` fired in 27 to 31 of 48 cases and were caught in none,
-/// with or without the commit stall: their race needs two pages of one key's
-/// opposite sides (or one `T` group) to read each other's uncommitted state,
-/// which the tier's pages, each a burst's many keys, rarely line up; and
-/// `gb_early_zero_gc` fired in 1. The deterministic pins named in
-/// `trellis/src/plant.rs` gate them meanwhile; #1373 tracks the generator
-/// reach.
+/// Measured (4 seeds x 12 cases, logbooks `20261024T142312-b-sweep` and
+/// `20261024T152844-b-sweep`): `join_drop_flip` caught in 34 of 48. Known
+/// misses: `join_no_j_lock` and `join_t_skip_lock` fired in 41 of 48 and were
+/// caught in 1 or 2, only in `racing` cases, and not reliably: the race needs
+/// two pages of one key's opposite sides (or one `T` group) open at once with
+/// no shared `P` or `M` cell, and whether a case lines them up depends on
+/// timing, not only on the drawn case (repro `20261024T161704-b-repro`: the
+/// catching cases caught in 9 and 5 of 10 runs), so a sweep misses either
+/// plant often enough that gating them would fail at random. Neither more
+/// groups nor a longer commit stall raised the rate (`20261024T164110-b-sweep`;
+/// a stall of seconds more times the baseline out). A sweep that catches one
+/// says so. `gb_early_zero_gc` fired in 0 of 48: it needs a rebuild whose basis
+/// stamp is past the drained prefix while the GC pass runs, and the GC pass
+/// runs every `housekeeping_interval` (5 s by default, which the harness
+/// doesn't set). The deterministic pins named in `trellis/src/plant.rs` gate
+/// all three.
 fn join_sweep_tier() -> SweepTier {
     use generative::plant_sweep::{PlantPath, not_on_path};
     let mut not_gated: Vec<(&'static str, &'static str)> = vec![(

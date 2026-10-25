@@ -222,12 +222,20 @@ pub enum KeyShape {
     /// change one key from opposite sides without sharing a `P` or `M`
     /// cell, and only the `J` lock orders them.
     Wide,
+    /// Over [`RACING_KEYS`] keys, both tables written alike, and run with
+    /// short seals, paced writers and a long commit stall
+    /// (`RACING_COMMIT_STALL_MS`): pages hold a few rows each and many stay
+    /// open at once, so two pages that change one key from opposite sides
+    /// (or one `T` group) often share no `P` or `M` cell, and only the `J`
+    /// and `T` locks order them.
+    Racing,
 }
 
 pub const SPREAD_KEYS: u8 = 12;
 pub const HOT_OTHER_KEYS: u8 = 6;
 pub const FAN_OUT_KEYS: u8 = 3;
 pub const WIDE_KEYS: u8 = 64;
+pub const RACING_KEYS: u8 = 40;
 
 impl KeyShape {
     pub fn name(self) -> &'static str {
@@ -236,6 +244,7 @@ impl KeyShape {
             KeyShape::HotKey => "hot_key",
             KeyShape::FanOut => "fan_out",
             KeyShape::Wide => "wide",
+            KeyShape::Racing => "racing",
         }
     }
 
@@ -251,6 +260,7 @@ impl KeyShape {
             KeyShape::HotKey => 1 + raw % HOT_OTHER_KEYS,
             KeyShape::FanOut => raw % FAN_OUT_KEYS,
             KeyShape::Wide => raw % WIDE_KEYS,
+            KeyShape::Racing => raw % RACING_KEYS,
         })
     }
 }
@@ -798,6 +808,11 @@ mod strategy {
     /// their commits, where the `J` lock orders them.
     pub const COMMIT_STALL_MS: std::ops::RangeInclusive<u64> = 5..=40;
 
+    /// The longest commit stall a `racing` case draws, in milliseconds. The
+    /// stall is skewed toward zero, so a maximum of seconds is what keeps
+    /// many pages open at once.
+    pub const RACING_COMMIT_STALL_MS: std::ops::RangeInclusive<u64> = 2000..=3500;
+
     /// A JOIN-tier case: one to three definitions, each installed up front
     /// or part way through the stream, with pauses, resumes and re-reads
     /// in the later bursts ([`JoinBuildDraws`]), a [`KeyShape`], 120 to
@@ -812,34 +827,48 @@ mod strategy {
     /// ops from one lane (`super::concurrent_plan`), so the other half keeps
     /// several lanes writing each table. About half the cases stall each
     /// page before its commit ([`COMMIT_STALL_MS`]).
+    ///
+    /// Half the cases are [`KeyShape::Racing`]: 500 to [`MAX_OPS`] ops in
+    /// bursts of 600 to 900, paced from the first op, every definition live
+    /// over the empty tables before the first write (no builds or operator
+    /// actions), at least 3 workers sealing every 20 to 40 ms, and every
+    /// page stalled before its commit ([`RACING_COMMIT_STALL_MS`]).
     pub fn join_case_strategy() -> impl Strategy<Value = JoinCase> {
         prop_oneof![
-            Just(KeyShape::Spread),
-            Just(KeyShape::HotKey),
-            Just(KeyShape::FanOut),
-            Just(KeyShape::Wide)
+            1 => Just(KeyShape::Spread),
+            1 => Just(KeyShape::HotKey),
+            1 => Just(KeyShape::FanOut),
+            1 => Just(KeyShape::Wide),
+            4 => Just(KeyShape::Racing)
         ]
         .prop_flat_map(|shape| (Just(shape), any::<bool>()))
         .prop_flat_map(|(shape, truncating)| {
-            let joined_weight = if matches!(shape, KeyShape::FanOut | KeyShape::Wide) {
-                5
-            } else {
-                3
-            };
-            let burst_size = if shape == KeyShape::Wide {
+            let joined_weight =
+                if matches!(shape, KeyShape::FanOut | KeyShape::Wide | KeyShape::Racing) {
+                    5
+                } else {
+                    3
+                };
+            let racing = shape == KeyShape::Racing;
+            let ops = if racing { 500..=MAX_OPS } else { 120..=MAX_OPS };
+            let burst_size = if racing {
+                600usize..=900
+            } else if shape == KeyShape::Wide {
                 260usize..=600
             } else {
                 40usize..=600
             };
             (
                 proptest::collection::vec(spec(), 1..=3),
-                proptest::collection::vec(draw(joined_weight, truncating), 120..=MAX_OPS),
+                proptest::collection::vec(draw(joined_weight, truncating), ops),
                 burst_size,
                 2usize..=4,
                 2usize..=6,
                 20u64..=200,
                 builds(),
                 proptest::option::of(COMMIT_STALL_MS),
+                RACING_COMMIT_STALL_MS,
+                5_000u64..=10_000,
             )
                 .prop_map(
                     move |(
@@ -851,7 +880,21 @@ mod strategy {
                         seal_interval_ms,
                         builds,
                         commit_stall_ms,
+                        racing_stall_ms,
+                        racing_pace_micros,
                     )| {
+                        // A `racing` case builds nothing over rows: every
+                        // definition is live over the empty tables before
+                        // the first write, so every write reaches a target
+                        // through a page.
+                        let builds = if shape == KeyShape::Racing {
+                            JoinBuildDraws {
+                                settle_after_install: true,
+                                ..JoinBuildDraws::default()
+                            }
+                        } else {
+                            builds
+                        };
                         let mut case = join_case(
                             &specs,
                             shape,
@@ -864,6 +907,17 @@ mod strategy {
                         );
                         case.plan.commit_stall =
                             commit_stall_ms.map(std::time::Duration::from_millis);
+                        if shape == KeyShape::Racing {
+                            case.seal_interval_ms = 20 + case.seal_interval_ms % 21;
+                            case.workers = case.workers.max(3);
+                            case.plan.commit_stall =
+                                Some(std::time::Duration::from_millis(racing_stall_ms));
+                            case.plan.steady_load = Some(crate::model::SteadyLoad {
+                                pace: std::time::Duration::from_micros(racing_pace_micros),
+                                pace_from_start: true,
+                                stall: std::time::Duration::ZERO,
+                            });
+                        }
                         case
                     },
                 )
@@ -986,6 +1040,7 @@ mod tests {
             KeyShape::HotKey,
             KeyShape::FanOut,
             KeyShape::Wide,
+            KeyShape::Racing,
         ] {
             assert_eq!(shape.key(255), None);
             assert!((0..250u8).all(|raw| shape.key(raw).is_some()));
@@ -995,6 +1050,10 @@ mod tests {
             .filter_map(|raw| KeyShape::Wide.key(raw))
             .collect();
         assert_eq!(wide.len(), usize::from(WIDE_KEYS));
+        let racing: std::collections::BTreeSet<u8> = (0..250u8)
+            .filter_map(|raw| KeyShape::Racing.key(raw))
+            .collect();
+        assert_eq!(racing.len(), usize::from(RACING_KEYS));
     }
 
     fn inserts(n: usize) -> Vec<JoinOpDraw> {
