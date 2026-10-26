@@ -73,7 +73,7 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     (
         "segment_pointer",
         Class::Seed {
-            // V3 seeds the pointer at slot 0 and V53 points the slot mirror
+            // The migrations seed the pointer at slot 0 and point the slot mirror
             // (a sequence, whose value a schema-only dump doesn't carry) at it.
             statements: &[
                 "insert into {s}.segment_pointer (id, active_seq, ring_slot) values (true, 1, 0)",
@@ -102,7 +102,6 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     ("drain_cursor", Class::Runtime),
     ("drain_holdups", Class::Runtime),
     ("drainers", Class::Runtime),
-    ("engine_bootstrap", Class::Runtime),
     ("key_deaths", Class::Runtime),
     ("ledger_truncate_floor", Class::Runtime),
     ("partition_correction_progress", Class::Runtime),
