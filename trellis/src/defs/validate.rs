@@ -186,6 +186,20 @@ pub enum ValidationError {
         expected: ValueType,
         found: ValueType,
     },
+    /// `>` was given a float on one side and an exact numeric (an integer of
+    /// any width, or `numeric`) on the other. Postgres casts the exact side
+    /// to `double precision`, so the comparison inherits float rounding;
+    /// Trellis refuses the pair rather than admit a comparison that doesn't
+    /// compose (issue #1418).
+    MixedFloatExactComparison {
+        field: String,
+        lhs: ValueType,
+        rhs: ValueType,
+    },
+    /// A bare number literal compared with a float lies outside
+    /// `double precision`'s range (overflow, or a nonzero value that
+    /// underflows to zero). Postgres raises `22003` for it at plan time.
+    FloatComparisonLiteralOutOfRange { field: String, text: String },
     /// A function call's argument had the wrong [`ValueType`] for its
     /// position (issue #64) — e.g. `octet_length(1)`. Distinct from
     /// [`ValidationError::TypeMismatch`] so the message can name the
@@ -739,6 +753,19 @@ impl fmt::Display for ValidationError {
             } => write!(
                 f,
                 "calculated field '{field}' expects a {expected} value here, found {found}"
+            ),
+            ValidationError::FloatComparisonLiteralOutOfRange { field, text } => write!(
+                f,
+                "calculated field '{field}' compares a float with the literal {text}, which is \
+                 out of range for double precision"
+            ),
+            ValidationError::MixedFloatExactComparison { field, lhs, rhs } => write!(
+                f,
+                "calculated field '{field}' compares a {lhs} value with a {rhs} value using \
+                 '>'; a float and an exact numeric (an integer or numeric) cannot be \
+                 compared, because Postgres would round the exact side to a float. Compare \
+                 values of one family: rewrite so both sides are floats or both are exact \
+                 (only a bare number literal such as 0.5 is admitted against a float)"
             ),
             ValidationError::FunctionArgTypeMismatch {
                 field,
@@ -2659,6 +2686,43 @@ fn infer_expr(
             if let Some(result) = super::registry::operator_result_type(*op, lhs_t, rhs_t) {
                 return Ok(result);
             }
+            if matches!(op, super::ast::Operator::GreaterThan)
+                && super::registry::is_mixed_float_exact(lhs_t, rhs_t)
+            {
+                // A *bare* number literal against a float is Postgres's
+                // `float_col > 0.5`: the untyped literal is cast to
+                // `double precision` (a `real` operand widens to it) and
+                // the comparison runs as `float8`. Only the literal's own
+                // syntax is exempt: the same value in a column, a calculated
+                // field, an expression or a typed `NUMERIC '0.5'` literal
+                // still hits the refusal below.
+                let literal = match (&**lhs, &**rhs) {
+                    (Expr::NumberLiteral(text), _) if matches!(rhs_t, ValueType::Float(_)) => {
+                        Some(text)
+                    }
+                    (_, Expr::NumberLiteral(text)) if matches!(lhs_t, ValueType::Float(_)) => {
+                        Some(text)
+                    }
+                    _ => None,
+                };
+                if let Some(text) = literal {
+                    // Postgres raises `22003` at plan time for a literal
+                    // outside `double precision`'s range; refuse it at
+                    // define instead of failing every row.
+                    crate::float::literal_to_f64(text).map_err(|_| {
+                        ValidationError::FloatComparisonLiteralOutOfRange {
+                            field: field_name.to_string(),
+                            text: text.clone(),
+                        }
+                    })?;
+                    return Ok(ValueType::Boolean);
+                }
+                return Err(ValidationError::MixedFloatExactComparison {
+                    field: field_name.to_string(),
+                    lhs: lhs_t,
+                    rhs: rhs_t,
+                });
+            }
             // Blame the operand that actually isn't admissible. At least one
             // of them isn't (or resolution above would have succeeded), and
             // the left one is reported first so the error reads in source
@@ -3637,6 +3701,177 @@ mod tests {
                 found: ValueType::Text,
             }
         );
+    }
+
+    fn gt(lhs: Expr, rhs: Expr) -> Expr {
+        Expr::BinaryOp {
+            op: Operator::GreaterThan,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    #[test]
+    fn greater_than_refuses_a_float_against_an_exact_numeric_in_both_orders() {
+        let source_columns = HashMap::from([
+            ("f".to_string(), ValueType::Float(FloatWidth::Float4)),
+            ("d".to_string(), ValueType::Float(FloatWidth::Float8)),
+            ("n".to_string(), ValueType::Numeric),
+            ("i".to_string(), ValueType::Integer(IntWidth::Int4)),
+        ]);
+        for (float, exact) in [("f", "n"), ("f", "i"), ("d", "n"), ("d", "i")] {
+            for (l, r) in [(float, exact), (exact, float)] {
+                let d = def(vec![FieldDef {
+                    name: "out".to_string(),
+                    expr: gt(col(l), col(r)),
+                }]);
+                assert_eq!(
+                    validate(&d, &source_columns),
+                    Err(ValidationError::MixedFloatExactComparison {
+                        field: "out".to_string(),
+                        lhs: source_columns[l],
+                        rhs: source_columns[r],
+                    }),
+                    "{l} > {r}"
+                );
+            }
+        }
+        // float > float and exact > exact stay admitted.
+        for (l, r) in [("f", "d"), ("d", "f"), ("n", "i"), ("i", "n")] {
+            let d = def(vec![FieldDef {
+                name: "out".to_string(),
+                expr: gt(col(l), col(r)),
+            }]);
+            assert_eq!(validate(&d, &source_columns), Ok(()), "{l} > {r}");
+        }
+    }
+
+    #[test]
+    fn greater_than_refuses_the_mix_through_a_calculated_float_field() {
+        // `s` is a float (`real + integer` is `double precision`), so `s > n`
+        // is a float against an exact numeric even though no source column
+        // on either side of the `>` is a float... on its own.
+        let source_columns = HashMap::from([
+            ("f".to_string(), ValueType::Float(FloatWidth::Float4)),
+            ("n".to_string(), ValueType::Numeric),
+        ]);
+        for flip in [false, true] {
+            let (l, r) = if flip { ("n", "s") } else { ("s", "n") };
+            let d = def(vec![
+                FieldDef {
+                    name: "s".to_string(),
+                    expr: Expr::BinaryOp {
+                        op: Operator::Add,
+                        lhs: Box::new(col("f")),
+                        rhs: Box::new(Expr::NumberLiteral("1".to_string())),
+                    },
+                },
+                FieldDef {
+                    name: "out".to_string(),
+                    expr: gt(col(l), col(r)),
+                },
+            ]);
+            let err = validate(&d, &source_columns).unwrap_err();
+            assert!(
+                matches!(err, ValidationError::MixedFloatExactComparison { ref field, .. } if field == "out"),
+                "{err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("'out'")
+                    && msg.contains("double precision")
+                    && msg.contains("numeric"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn greater_than_admits_a_bare_number_literal_against_a_float() {
+        // #1418: Postgres casts an untyped literal to `double precision`
+        // when it meets a float (`explain verbose select r > 0.5` shows
+        // `r > '0.5'::double precision`), so a *bare* literal is admitted in
+        // either order and stays compared as a float. The same value in a
+        // column, a calculated field or an expression is still refused, and
+        // so is anything exact-typed (the grammar has no `NUMERIC '..'` /
+        // `INTEGER '..'` literal, so those fail to parse).
+        let source_columns = HashMap::from([
+            ("f".to_string(), ValueType::Float(FloatWidth::Float4)),
+            ("d".to_string(), ValueType::Float(FloatWidth::Float8)),
+            ("n".to_string(), ValueType::Numeric),
+            ("i".to_string(), ValueType::Integer(IntWidth::Int2)),
+            ("b".to_string(), ValueType::Integer(IntWidth::Int8)),
+        ]);
+        for expr in [
+            "f > 0.5",
+            "f > 1",
+            "0.5 > f",
+            "1 > d",
+            "d > 9223372036854775808",
+            "d > 3000000000",
+            "COALESCE(f, 0) > 0.5",
+            "COALESCE(f, n) > 1",
+            "f > f",
+            "f > REAL '0.5'",
+            "DOUBLE PRECISION '1' > d",
+            "f > d",
+            "i > 0.5",
+            "b > i",
+            "n > 1",
+            "(i + b) > n",
+        ] {
+            let d = parsed(&format!("TRANSFORM t FROM s SELECT {expr} AS out"));
+            assert_eq!(validate(&d, &source_columns), Ok(()), "{expr}");
+        }
+        for expr in [
+            "COALESCE(f, n) > n",
+            "(f + i) > b",
+            "f > (1 + 1)",
+            "f > (i + 1)",
+            "(1 + 1) > d",
+            "f > n",
+            "i > d",
+            "(f + 1) > n",
+        ] {
+            let d = parsed(&format!("TRANSFORM t FROM s SELECT {expr} AS out"));
+            let err = validate(&d, &source_columns).unwrap_err();
+            assert!(
+                matches!(err, ValidationError::MixedFloatExactComparison { ref field, .. } if field == "out"),
+                "{expr}: {err:?}"
+            );
+        }
+        for expr in ["f > NUMERIC '0.5'", "f > INTEGER '1'"] {
+            assert!(
+                crate::defs::parser::parse(&format!("TRANSFORM t FROM s SELECT {expr} AS out"))
+                    .is_err(),
+                "{expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_literal_outside_double_precision_is_refused_at_define() {
+        // Postgres raises 22003 for these at plan time (`select
+        // 1<309 digits>::float8`, and a nonzero value that underflows).
+        let source_columns =
+            HashMap::from([("f".to_string(), ValueType::Float(FloatWidth::Float4))]);
+        let big = "9".repeat(310);
+        let tiny = format!("0.{}1", "0".repeat(400));
+        let subnormal = format!("0.{}5", "0".repeat(323)); // 5e-324, finite
+        for text in [&big, &tiny] {
+            let d = parsed(&format!("TRANSFORM t FROM s SELECT f > {text} AS out"));
+            assert_eq!(
+                validate(&d, &source_columns),
+                Err(ValidationError::FloatComparisonLiteralOutOfRange {
+                    field: "out".to_string(),
+                    text: text.clone(),
+                })
+            );
+        }
+        let d = parsed(&format!("TRANSFORM t FROM s SELECT f > {subnormal} AS out"));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+        let d = parsed("TRANSFORM t FROM s SELECT f > 0.0000 AS out");
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -4644,6 +4879,19 @@ mod tests {
              items.qty = orders.id GROUP BY orders.region SELECT COUNT(*) AS n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn join_greater_than_refuses_a_float_against_an_exact_aggregate() {
+        // #1418: a JOIN's fields are typed by the same rule as a 1-1's. A
+        // float aggregate is refused there, even against a typed float literal.
+        let err = check("orders.region AS region, SUM(items.qty) > DOUBLE PRECISION '1' AS x")
+            .unwrap_err();
+        assert!(
+            matches!(err, ValidationError::MixedFloatExactComparison { ref field, .. } if field == "x"),
+            "{err:?}"
+        );
+        check("orders.region AS region, SUM(items.qty) > AVG(orders.total) AS x").unwrap();
     }
 
     #[test]
