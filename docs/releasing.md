@@ -43,7 +43,8 @@ prerelease. RubyGems writes its `-` as `.pre.`, so its gems are
    release had beyond CI (runs, hours and source rows written by the
    benchmarks, generative sweeps, soak and chaos runs and repro loops, from
    the maintainers' validation logbook).
-2. Push the annotated tag `v<version>` on that commit to
+2. Run the `.github/scripts/bump-version.sh <version>` command and commit the changes
+3. Push the annotated tag `v<version>` on that commit to
    `salesforce-misc/trellis`.
 
 The tag starts `release.yml`. It checks the versions, then builds:
