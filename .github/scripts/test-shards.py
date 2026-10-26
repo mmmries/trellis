@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Splits the workspace test suite across the CI `test` shards (issue #1226).
+"""Splits the workspace test suite across the CI `test` shards.
 
 A *unit* is what one `cargo test` selector names:
 
@@ -24,7 +24,7 @@ shard differ from the shard's units.
   test-shards.py weights LOG...     a fresh test-shards.txt from `cargo test`
                                     output (see docs/testing-strategy.md)
 
-The cargo flags are the ones `.claude/scripts/verify` uses.
+The cargo flags are the ones `cargo test --workspace` needs here: the benchmark binary's `engine-access` feature and `--no-fail-fast`.
 """
 
 import json
