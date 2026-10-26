@@ -25,14 +25,16 @@
 # Runs on Linux and macOS (its stock bash 3.2 and BSD tools too). Needs git,
 # curl, jq, perl, a Rust toolchain through rustup (it installs the version
 # rust-toolchain.toml pins), Erlang/Elixir (clients/elixir/.tool-versions;
-# asdf or mise pick it up from the clone) and Ruby's `gem`. And credentials, unless
+# asdf or mise pick it up from the clone) and Ruby's `gem`. GH_TOKEN or
+# GITHUB_TOKEN, if set, authenticates the GitHub API calls (the unauthenticated
+# limit is 60 an hour). And credentials, unless
 # --dry-run:
 #
 #   crates.io  `cargo login` (or CARGO_REGISTRY_TOKEN), a token with
 #              publish-new/publish-update for trellis-pg
 #   Hex        `mix hex.user auth` (or HEX_API_KEY)
-#   RubyGems   `gem signin` (or GEM_HOST_API_KEY); `gem push` asks for an
-#              OTP code when the account has MFA
+#   RubyGems   `gem signin` (or GEM_HOST_API_KEY); with MFA, the script asks
+#              for an OTP code once (or takes GEM_HOST_OTP_CODE) and reuses it
 #
 # What each step publishes:
 #
@@ -133,8 +135,17 @@ echo "ok"
 step "Checking the $tag GitHub release"
 # The public API's by-tag lookup sees only a published release, which is
 # what rustler_precompiled downloads from.
-release="$(curl -sS --fail-with-body -A "$ua" "https://api.github.com/repos/$repo/releases/tags/$tag")" ||
+# Unauthenticated calls share a 60-an-hour limit per IP, so send GH_TOKEN or
+# GITHUB_TOKEN when one is set.
+auth=()
+token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+[ -z "$token" ] || auth=(-H "Authorization: Bearer $token")
+release="$(curl -sS --fail-with-body -A "$ua" ${auth[@]+"${auth[@]}"} "https://api.github.com/repos/$repo/releases/tags/$tag")" || {
+  case "$release" in
+    *"rate limit"*) die "GitHub's API rate limit is exhausted; set GH_TOKEN (GH_TOKEN=\$(gh auth token) $0 ...) or wait" ;;
+  esac
   die "$repo has no published $tag release; push the tag and let release.yml finish (docs/releasing.md)"
+}
 jq -r '.assets[] | "  \(.name)  \(.size) bytes"' <<<"$release"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/trellis-publish-$version.XXXX")"
@@ -166,6 +177,32 @@ src="$work/trellis"
 sha="$(git -C "$src" rev-parse HEAD)"
 echo "$tag is $sha"
 "$src/.github/scripts/check-release-versions.sh" "$version" "$src"
+
+# Before anything is published, check that the runtimes a client's
+# .tool-versions pins are installed; otherwise a build fails later with a
+# message about the wrong Erlang, Elixir or Ruby. Only with asdf or mise, whose
+# install directories it looks in; without either, whatever is on PATH is used.
+tools_installed() {
+  local file="$1" tool ver missing=0
+  [ -f "$file" ] || die "the $tag clone has no ${file#"$src"/}"
+  while read -r tool ver _; do
+    case "$tool" in ''|'#'*) continue ;; esac
+    if [ -d "${ASDF_DATA_DIR:-$HOME/.asdf}/installs/$tool/$ver" ] ||
+       [ -d "${MISE_DATA_DIR:-$HOME/.local/share/mise}/installs/$tool/$ver" ]; then
+      echo "  ok   $tool $ver"
+    else
+      echo "  MISSING  $tool $ver" >&2
+      missing=1
+    fi
+  done <"$file"
+  [ "$missing" -eq 0 ] ||
+    die "install what ${file#"$src"/} pins (\`asdf install\` or \`mise install\` in a checkout's ${file#"$src"/} directory)"
+}
+if command -v asdf >/dev/null || command -v mise >/dev/null; then
+  step "Checking the pinned runtimes"
+  if wants hex; then tools_installed "$src/clients/elixir/.tool-versions"; fi
+  if wants gems; then tools_installed "$src/clients/ruby/.tool-versions"; fi
+fi
 
 if wants crates; then
   step "crates.io: trellis-pg $version"
@@ -261,8 +298,18 @@ if wants gems; then
     echo "dry run: would push, in this order:"
     printf '  %s\n' "${todo[@]##*/}"
   elif confirm "Push ${#todo[@]} gems to RubyGems, platform gems first?"; then
+    # `gem push` asks for an OTP code on every push; ask once and pass it
+    # along (empty: the account has no MFA). A code lasts about 30 seconds, so
+    # a failed push asks again, then retries that gem.
+    otp="${GEM_HOST_OTP_CODE:-}"
+    if [ -z "$otp" ]; then
+      read -r -p "RubyGems OTP code (empty if the account has no MFA): " otp </dev/tty
+    fi
     for gem in "${todo[@]}"; do
-      gem push "$gem" </dev/tty
+      until gem push ${otp:+--otp "$otp"} "$gem" </dev/tty; do
+        read -r -p "Push of ${gem##*/} failed. Fresh OTP code (empty to stop): " otp </dev/tty
+        [ -n "$otp" ] || die "stopped at ${gem##*/}; re-run to push the rest"
+      done
     done
   else
     echo "skipped"
