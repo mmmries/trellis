@@ -2,7 +2,7 @@
 //! with the rest of the engine: the inlining of a definition's calculated
 //! fields into self-contained expressions ([`substitute_all_fields`]), the
 //! primary-key range helpers a build chunk reads its keys with
-//! ([`range_keys`], [`next_pk_ranges`], [`pk_range_where`]), and the
+//! ([`next_pk_ranges`], [`pk_range_where`]), and the
 //! narrowing of a chunk that fails on its data to the key that causes it
 //! ([`narrow_one_to_one_chunk`]).
 //!
@@ -380,44 +380,6 @@ pub(crate) fn substituted_field_exprs(
         .iter()
         .map(|f| f.name.clone())
         .zip(substituted)
-        .collect())
-}
-
-/// The encoded keys of `source_table`'s rows in `(lo, hi]` of its primary
-/// key `pk`, leaving out a quarantined key and a key with a `NULL` part
-/// (which the build's plan stages instead, [`key_not_null`]), as a first
-/// build leaves them out: a field build's chunk
-/// (`staging::build`).
-pub(crate) async fn range_keys(
-    client: &impl GenericClient,
-    source_table: &str,
-    target: &str,
-    pk: &[PrimaryKeyColumn],
-    lo: &Option<Vec<String>>,
-    hi: &[String],
-) -> Result<Vec<String>, BackfillError> {
-    let source = ddl::qualified_source_table(source_table);
-    let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
-    let mut params = range_params(lo, hi);
-    let where_clause = format!(
-        "{} and {} and {}",
-        pk_range_where(&pk_idents, pk, lo),
-        key_not_null(&pk_idents),
-        not_quarantined(pk, params.len() + 1),
-    );
-    params.push(&source_table);
-    params.push(&target);
-    Ok(client
-        .query(
-            &format!(
-                "select {} from {source} as {SOURCE_ALIAS} where {where_clause}",
-                ddl::pk_key_sql_expr(pk, Some(SOURCE_ALIAS)),
-            ),
-            &params,
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
         .collect())
 }
 
@@ -889,7 +851,7 @@ mod tests {
         let out = substitute_all_fields(&def).expect("no cycle");
         let sql: Vec<String> = out.iter().map(render_expr_sql).collect();
         assert_eq!(sql[2], r#"min("val")"#);
-        assert_eq!(sql[3], r#"(max("val") + 1::numeric)"#);
+        assert_eq!(sql[3], r#"(max("val") + 1::integer)"#);
         assert_eq!(
             sql[4], r#"(sum("val") + count(*))"#,
             "a name outside an aggregate's argument still inlines the field"
@@ -909,7 +871,7 @@ mod tests {
         assert_eq!(out[2], call_sum(Expr::Column("val".to_string())));
         assert_eq!(
             render_expr_sql(&out[3]),
-            r#"("grp" + ("grp" + 1::numeric))"#,
+            r#"("grp" + ("grp" + 1::integer))"#,
             "the bare name still inlines the field"
         );
 
@@ -936,7 +898,7 @@ mod tests {
             ),
         ]);
         let out = substitute_all_fields(&def).expect("no cycle");
-        assert_eq!(render_expr_sql(&out[1]), r#"sum(("a" + 1::numeric))"#);
+        assert_eq!(render_expr_sql(&out[1]), r#"sum(("a" + 1::integer))"#);
     }
 
     /// A cyclic alias chain (`a = b + 1, b = a + 1`) must fall back to the ring
