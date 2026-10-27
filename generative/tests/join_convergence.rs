@@ -1,4 +1,4 @@
-//! The JOIN tier (#1113, J8): `JOIN … GROUP BY` targets kept by the engine
+//! The JOIN tier: `JOIN … GROUP BY` targets kept by the engine
 //! from writes to both of their tables, checked against the definition's own
 //! `JOIN … GROUP BY` query over the two tables
 //! (`generative::oracle::render_join_select`).
@@ -8,12 +8,12 @@
 //! [`property_join_targets_converge_under_concurrent_drains`] draws
 //! `generate::join::join_case_strategy`: one to three `LEFT` or `INNER`
 //! definitions over `ja` and `jb`, joined on `k` or on `(t, k)`, grouped by
-//! `jb.gb` (#1091 J2's S1), by `ja.ga, jb.gb` (S2) or by `ja.ga`, with
+//! `jb.gb` (S1), by `ja.ga, jb.gb` (S2) or by `ja.ga`, with
 //! `COUNT`/`SUM`/`AVG` fields on either side, an expression argument and
 //! composed fields; and 120 to 900 inserts, updates and deletes over both
 //! tables, with `NULL` keys, groups and values now and then, and about one
 //! op in a hundred a `TRUNCATE` of either table (ADR-0019's per-side
-//! truncate, #1110). Its key shape
+//! truncate). Its key shape
 //! is one of:
 //!
 //! - `spread`: a dozen join keys;
@@ -50,7 +50,7 @@
 //! sides overlap there, where only the `J` lock orders them. Every burst is checked
 //! once it settles (against the oracle, then by a `Strict` `self_check` of
 //! every definition, which audits the hidden `P`/`M`/`J`/`T` tables the
-//! oracle cannot see, #1388), and at the end every definition must still be `live`
+//! oracle cannot see), and at the end every definition must still be `live`
 //! (a `JOIN` that halted would otherwise only show as a stale target).
 //!
 //! Like every property in this crate it is `#[ignore]`d: run it with
@@ -60,26 +60,25 @@
 //! # Builds over rows
 //!
 //! Outside the `racing` shape, a definition is installed up front or part way
-//! through the stream, so most of those `JOIN`s build (per-side steps and the final `T` step, #1109) over tables
-//! that hold rows, or that the lanes are still writing. Later bursts pause
-//! and resume a definition (the resume rebuilds its target in place) and
-//! re-read `ja` or `jb` (`request_backfill`), while the lanes keep writing
-//! both tables. About a quarter of those cases first settle the up-front
-//! definitions over the empty tables, as the tier did before it drew builds.
-//! The oracle is the same per-burst comparison with the definition's own
-//! query, so a build that lost or doubled a row diverges at the burst it ran
-//! in, and a definition a build left paused, halted or quarantined fails the
-//! end check. The coverage report's `builds` lines count, per run, the
-//! installs, resumes and re-reads that fired over rows left by earlier
-//! bursts (more rows than their own burst can delete, so the build certainly
-//! read rows on both sides), the installs that fired in a burst whose own
-//! writes were still landing, and the cases that drew a build over rows; a
-//! run with none has drawn nothing worth reading. A last line reads the
-//! engine's build-rows counter (`trellis_build_rows_total`) around each
-//! passed case: the rows its builds wrote, the cases where they wrote any,
-//! and the cases with a build over rows in the model where the engine's
-//! builds wrote none (an `INNER` build with no matching key writes none, so
-//! that count is a prompt to look, not a failure).
+//! through the stream, so most of those `JOIN`s build (per-side steps and the final
+//! `T` step) over tables that hold rows, or that the lanes are still writing. Later
+//! bursts pause and resume a definition (the resume rebuilds its target in place)
+//! and re-read `ja` or `jb` (`request_backfill`), while the lanes keep writing both
+//! tables. About a quarter of those cases first settle the up-front definitions
+//! over the empty tables, as the tier did before it drew builds. The oracle is the
+//! same per-burst comparison with the definition's own query, so a build that lost
+//! or doubled a row diverges at the burst it ran in, and a definition a build left
+//! paused, halted or quarantined fails the end check. The coverage report's
+//! `builds` lines count, per run, the installs, resumes and re-reads that fired
+//! over rows left by earlier bursts (more rows than their own burst can delete, so
+//! the build certainly read rows on both sides), the installs that fired in a burst
+//! whose own writes were still landing, and the cases that drew a build over rows;
+//! a run with none has drawn nothing worth reading. A last line reads the engine's
+//! build-rows counter (`trellis_build_rows_total`) around each passed case: the
+//! rows its builds wrote, the cases where they wrote any, and the cases with a
+//! build over rows in the model where the engine's builds wrote none (an `INNER`
+//! build with no matching key writes none, so that count is a prompt to look, not a
+//! failure).
 //!
 //! Not drawn: partitioned sides, `DDL` between a build's steps, and
 //! definitions that read another's target.
@@ -356,7 +355,7 @@ fn run_case(case: &JoinCase) -> Result<(), String> {
 proptest! {
     #![proptest_config(proptest_config())]
 
-    /// #1113: see the module doc comment.
+    /// See the module doc comment.
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_join_targets_converge_under_concurrent_drains(case in join_case_strategy()) {
@@ -404,7 +403,7 @@ fn join_sweep_tier() -> SweepTier {
     }
 }
 
-/// #1114: shows the `JOIN` tier catches each planted bug a `JOIN` can reach
+/// Shows the `JOIN` tier catches each planted bug a `JOIN` can reach
 /// (`trellis::dev::plant::Plant`), and how often: the concurrent tier's
 /// sweep (`generative::plant_sweep`, `concurrent_convergence.rs`'s
 /// `planted_bugs_are_caught`) over [`join_case_strategy`]'s seeded cases.
@@ -606,7 +605,7 @@ fn the_join_oracle_catches_a_corrupted_target() {
     });
 }
 
-/// #1388: the `Strict` audit tells a damaged hidden table from a good one,
+/// The `Strict` audit tells a damaged hidden table from a good one,
 /// where the oracle (which reads the visible target) cannot: after a
 /// converged run, `T`'s row counts are changed by hand. The target is as it
 /// was, so the oracle still agrees, and the audit reports `T`.
