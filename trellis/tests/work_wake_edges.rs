@@ -95,10 +95,16 @@ impl Fixture {
         let columns = [
             (
                 "id".to_string(),
-                ValueType::Integer(trellis::IntWidth::Int4),
+                ValueType::Integer(trellis::integer::IntWidth::Int4),
             ),
-            ("g".to_string(), ValueType::Integer(trellis::IntWidth::Int4)),
-            ("v".to_string(), ValueType::Integer(trellis::IntWidth::Int8)),
+            (
+                "g".to_string(),
+                ValueType::Integer(trellis::integer::IntWidth::Int4),
+            ),
+            (
+                "v".to_string(),
+                ValueType::Integer(trellis::integer::IntWidth::Int8),
+            ),
         ]
         .into_iter()
         .collect();
@@ -234,8 +240,8 @@ async fn a_definition_entering_a_build_state_announces_itself() {
             status.as_str()
         ))
         .await;
-        let dispatchable =
-            trellis::defs::TransformStatus::dispatchable().contains(&status.as_str());
+        // The work-wake trigger's gate is the chunk queue's: not frozen.
+        let dispatchable = !status.is_frozen();
         assert_eq!(
             f.listener.heard().await,
             usize::from(dispatchable),

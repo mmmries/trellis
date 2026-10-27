@@ -117,6 +117,7 @@ impl WorkerOptions {
 
 /// Where a [`SelfCheckJob`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SelfCheckJobState {
     /// Registered, and no worker has taken it yet.
     Queued,
@@ -168,6 +169,7 @@ impl SelfCheckJobState {
 /// starts one and [`crate::Trellis::self_check_job`] returns when it is
 /// polled.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SelfCheckJob {
     /// The job's id, which [`crate::Trellis::self_check_job`] takes.
     pub id: i64,
@@ -188,6 +190,7 @@ pub struct SelfCheckJob {
 /// What a finished `self_check` job found: the whole target's comparison,
 /// not a page of it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SelfCheckReport {
     /// The audited target's bare table name.
     pub target: String,
@@ -200,7 +203,7 @@ pub struct SelfCheckReport {
     /// on either side of the comparison.
     pub rows_compared: i64,
     /// Whether the job stopped before the end of the target's keys: it found
-    /// [`MAX_DIVERGENCES`] divergences, or a page found the target no longer
+    /// `MAX_DIVERGENCES` divergences, or a page found the target no longer
     /// live or not caught up (or its capture broken) after earlier pages had
     /// compared rows. `rows_compared` says how far it got.
     pub truncated: bool,

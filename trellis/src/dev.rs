@@ -34,6 +34,30 @@
 //! they see `defs`/`staging`/`intake` through the `internals` feature
 //! instead. See `Cargo.toml`.
 
+/// The default instance schema name, for harnesses that build a `Config` or
+/// name Trellis's own tables without resolving one.
+pub mod config {
+    pub use crate::config::DEFAULT_SCHEMA;
+}
+
+/// The engine's Postgres-faithful `float4`/`float8` equality and text
+/// rendering, which `generative`'s oracle compares values with.
+pub mod float {
+    pub use crate::float::{equal, render};
+}
+
+/// The latency histogram boundaries and build-statement classes, for
+/// `benchmark`'s scrape of the engine's metrics.
+pub mod metrics {
+    pub use crate::metrics::{BuildStatement, LATENCY_BUCKETS, increment_changes_applied};
+}
+
+/// The exact decimal `numeric` type, which `generative`'s oracle does
+/// Postgres-faithful arithmetic and comparison in.
+pub mod numeric {
+    pub use crate::numeric::Numeric;
+}
+
 /// The engine items `generative` and `benchmark` reach for under `defs`.
 pub mod defs {
     /// The parsed definition AST. The fuzz generator emits definition *text*
@@ -52,6 +76,9 @@ pub mod defs {
     /// it from the engine's table rather than a second, drifting copy, for
     /// the same reason `registry` is reachable here.
     pub use crate::defs::typed_literal;
+
+    pub use crate::float::FloatWidth;
+    pub use crate::integer::IntWidth;
 
     pub use crate::defs::{
         CatalogError, DdlError, PgType, TransformStatus, ValueType, create_aggregate_target_table,
@@ -146,4 +173,206 @@ pub mod build {
 /// only [`plant::PLANT_ENV`] can. See `crate::plant`'s module doc.
 pub mod plant {
     pub use crate::plant::{PLANT_ENV, Plant, armed, fired};
+}
+
+/// Sample values of the public status and report structs, which are
+/// `#[non_exhaustive]` and so cannot be built with a struct literal outside
+/// this crate. A harness test builds one with [`fixture!`](crate::fixture):
+/// the sample, with the named fields overwritten.
+pub mod fixtures {
+    use std::time::SystemTime;
+
+    use crate::{
+        BackfillFailure, CaptureFailure, CaptureFailureKind, CaptureWait, CorrectingNode,
+        DefinitionStatus, DefinitionSummary, DrainFailure, HeldKeys, IndexRole, JoinStatus,
+        PoisonEntry, PoisonSample, QuarantineEntry, QuarantineState, QuarantineTarget,
+        SelfCheckJob, SelfCheckJobState, SelfCheckMode, SelfCheckOutcome, SelfCheckReport,
+        SourceIndexGap, TransformStatus,
+    };
+
+    #[allow(non_snake_case)]
+    pub fn BackfillFailure() -> BackfillFailure {
+        BackfillFailure {
+            source_table: String::new(),
+            attempts: 0,
+            last_error: String::new(),
+            next_attempt_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn CaptureFailure() -> CaptureFailure {
+        CaptureFailure {
+            kind: CaptureFailureKind::ALL[0],
+            source_table: String::new(),
+            columns: Vec::new(),
+            error: String::new(),
+            detected_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn CaptureWait() -> CaptureWait {
+        CaptureWait {
+            table: String::new(),
+            operation: String::new(),
+            lock_mode: String::new(),
+            waiting_since: SystemTime::UNIX_EPOCH,
+            observed_at: SystemTime::UNIX_EPOCH,
+            blockers: Vec::new(),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn CorrectingNode() -> CorrectingNode {
+        CorrectingNode {
+            node: String::new(),
+            since: SystemTime::UNIX_EPOCH,
+            keys_remaining: None,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn DefinitionStatus() -> DefinitionStatus {
+        DefinitionStatus {
+            status: TransformStatus::Live,
+            backfill_failure: None,
+            capture_wait: None,
+            capture_failure: None,
+            held_keys: None,
+            drain_failure: None,
+            source_index_gaps: Vec::new(),
+            join: None,
+            correcting: Vec::new(),
+            paused_upstream_columns: Vec::new(),
+            build_wait: None,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn DefinitionSummary() -> DefinitionSummary {
+        DefinitionSummary {
+            target_table: String::new(),
+            status: TransformStatus::Live,
+            created_at: SystemTime::UNIX_EPOCH,
+            backfill_failure: None,
+            halt: None,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn DrainFailure() -> DrainFailure {
+        DrainFailure {
+            seg_seq: 0,
+            tables: Vec::new(),
+            error: String::new(),
+            sqlstate: None,
+            since: SystemTime::UNIX_EPOCH,
+            last_seen: SystemTime::UNIX_EPOCH,
+            attempts: 0,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn HeldKeys() -> HeldKeys {
+        HeldKeys {
+            count: 0,
+            oldest_poisoned_at: SystemTime::UNIX_EPOCH,
+            max_retry_attempts: 0,
+            next_retry_at: None,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn JoinStatus() -> JoinStatus {
+        JoinStatus {
+            hidden_tables: Vec::new(),
+            partials_warning: None,
+            building: None,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn PoisonEntry() -> PoisonEntry {
+        PoisonEntry {
+            transform: String::new(),
+            src_table: String::new(),
+            key: String::new(),
+            last_error: String::new(),
+            poisoned_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn PoisonSample() -> PoisonSample {
+        PoisonSample {
+            src_table: String::new(),
+            key: String::new(),
+            error_message: String::new(),
+            retry_attempts: 0,
+            next_retry_at: None,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn QuarantineEntry() -> QuarantineEntry {
+        QuarantineEntry {
+            target: QuarantineTarget::Transform(String::new()),
+            state: QuarantineState::ALL[0],
+            paused_at: None,
+            last_error: None,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn SelfCheckJob() -> SelfCheckJob {
+        SelfCheckJob {
+            id: 0,
+            target: String::new(),
+            mode: SelfCheckMode::Strict,
+            state: SelfCheckJobState::Cancelled,
+            rows_compared: 0,
+            report: None,
+            error: None,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn SelfCheckReport() -> SelfCheckReport {
+        SelfCheckReport {
+            target: String::new(),
+            checked_through: 0.into(),
+            rows_compared: 0,
+            truncated: false,
+            outcome: SelfCheckOutcome::Converged,
+            held_keys: None,
+            drain_failures: Vec::new(),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn SourceIndexGap() -> SourceIndexGap {
+        SourceIndexGap {
+            table: String::new(),
+            columns: Vec::new(),
+            role: IndexRole::GroupBy,
+            opted_out: false,
+        }
+    }
+}
+
+/// Builds a `#[non_exhaustive]` status or report struct for a harness test:
+/// its [`dev::fixtures`](crate::dev::fixtures) sample with the named fields
+/// overwritten, so it reads like the struct literal it replaces.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! fixture {
+    (@value $field:ident) => { $field };
+    (@value $field:ident $value:expr) => { $value };
+    ($ty:ident { $($field:ident $(: $value:expr)?),* $(,)? }) => {{
+        #[allow(unused_mut)]
+        let mut sample = $crate::dev::fixtures::$ty();
+        $(sample.$field = $crate::fixture!(@value $field $($value)?);)*
+        sample
+    }};
 }

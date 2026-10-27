@@ -16,6 +16,7 @@ use crate::error_code::{self, ErrorCode};
 /// Failure modes specific to the staging ring (issue #6): resolving the
 /// active ring slot, appending, and the producer singleton.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StagingError {
     /// `segment_pointer` or its `ring_slot_mirror` sequence named a
     /// `ring_slot` outside `0..RING_SIZE` (`-1`: the mirror read NULL).
@@ -28,7 +29,7 @@ pub enum StagingError {
     ProducerAlreadyRunning,
     /// A seal would lap a ring slot that still holds a live registry row.
     /// A retirement pass is run and the seal retried once (see
-    /// [`super::seal::seal_if_active_nonempty`], [`super::retire::retire_drained_segments`]);
+    /// `super::seal::seal_if_active_nonempty`, `super::retire::retire_drained_segments`);
     /// this is what's returned if it's still full after that retry.
     RingFull { ring_slot: i16 },
     /// The seal gate: the predecessor's fence hasn't settled yet — a writer
@@ -39,7 +40,7 @@ pub enum StagingError {
     /// Another worker's `state = 'active'` update won the race; this
     /// worker's matched zero rows. Back off — the ring already advanced.
     Raced,
-    /// A batch's [`super::seal::fenced_rows`] read found `state = 'sealed'`
+    /// A batch's `super::seal::fenced_rows` read found `state = 'sealed'`
     /// with no `fence_snapshot` — the crash window between the seal's two
     /// phases. Failing loud here (rather than admitting or excluding every
     /// row) is what turns that window into a stall instead of a silent
@@ -47,7 +48,7 @@ pub enum StagingError {
     /// docs/staging-and-claiming/03-sealing-and-the-fence.md ("A
     /// deliberately-skipped case").
     UnfencedSealedSegment { seg_seq: i64 },
-    /// [`super::converge::await_converged`] exhausted its timeout budget
+    /// `super::converge::await_converged` exhausted its timeout budget
     /// without `converged_through(token)` ever returning true. Named rather
     /// than a generic "values not stabilizing" message
     /// (docs/staging-and-claiming/07-convergence-and-await.md, "A round did
@@ -55,8 +56,8 @@ pub enum StagingError {
     /// this is — it just means the token hasn't cleared yet, and the caller
     /// should widen its budget or investigate the drain, not the schema.
     ConvergenceTimeout { token: PgLsn, waited: Duration },
-    /// A [`super::session::ProducerSession`]'s DSN didn't parse. Carries
-    /// the [`crate::error::Error::Config`] from [`crate::config::parse_dsn`],
+    /// A `super::session::ProducerSession`'s DSN didn't parse. Carries
+    /// the [`crate::error::Error::Config`] from `crate::config::parse_dsn`,
     /// whose fixed message quotes none of the DSN (issue #608).
     Config(crate::error::Error),
     /// A direct Postgres protocol/query error.
@@ -149,7 +150,7 @@ impl From<tokio_postgres::Error> for StagingError {
     }
 }
 
-/// For [`crate::pool::connect_dedicated`]'s error: a connection failure
+/// For `crate::pool::connect_dedicated`'s error: a connection failure
 /// stays [`StagingError::Db`], anything else (a DSN that doesn't parse) is
 /// [`StagingError::Config`].
 impl From<crate::error::Error> for StagingError {

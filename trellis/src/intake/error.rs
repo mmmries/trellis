@@ -12,6 +12,7 @@ use crate::staging::StagingError;
 
 /// Failure modes of the intake helpers.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum IntakeError {
     /// The staging ring's append, or the transaction it runs in,
     /// failed. Composes [`StagingError`] via `From` rather than
@@ -22,7 +23,7 @@ pub enum IntakeError {
     Db(tokio_postgres::Error),
     /// A `src_table` string wasn't the `"schema.table"` shape.
     InvalidTableName(String),
-    /// [`super::qualify`] was asked to join a schema or table
+    /// `super::qualify` was asked to join a schema or table
     /// name that itself contains a literal `.` — legal as a quoted Postgres
     /// identifier, but this crate's `"schema.table"` joined-string
     /// representation has no way to tell that dot apart from the separator.
@@ -47,7 +48,7 @@ pub enum IntakeError {
 impl IntakeError {
     /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). Delegates to [`StagingError::code`] for
-    /// [`IntakeError::Staging`] and [`error_code::classify_pg_error`] for a
+    /// [`IntakeError::Staging`] and `error_code::classify_pg_error` for a
     /// raw Postgres error; every other variant is a data-integrity condition
     /// this crate can't attribute to a specific caller mistake, so it reports
     /// [`ErrorCode::Internal`].

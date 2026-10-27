@@ -57,7 +57,7 @@
 //! pause, resume and drop write only the catalog.
 //!
 //! **Every call returns within a deadline** (issue #599, `crate::deadline`):
-//! 30 seconds ([`DEFAULT_CALL_BUDGET`](crate::DEFAULT_CALL_BUDGET)) from when
+//! 30 seconds ([`DEFAULT_CALL_BUDGET`](crate::deadline::DEFAULT_CALL_BUDGET)) from when
 //! the call is made, a wait for a pooled connection included. What it started
 //! on the server is stopped by the server's own `statement_timeout`, not
 //! abandoned, and its transaction rolls back; the caller gets
@@ -183,7 +183,7 @@ pub struct TrellisOptions {
     /// so it never reads the cap.
     pub worker_threads: Option<usize>,
     /// The deadline of each public call, in place of
-    /// [`DEFAULT_CALL_BUDGET`](crate::DEFAULT_CALL_BUDGET). Not part of the
+    /// the default 30-second budget. Not part of the
     /// contract: it exists so tests can exercise the deadline without waiting
     /// out 30 seconds.
     #[doc(hidden)]
@@ -208,7 +208,7 @@ pub struct TrellisOptions {
     pub held_key_retry: Option<HeldKeyRetry>,
 }
 
-/// A connected Trellis instance — see the [module docs](self).
+/// A connected Trellis instance — see the [crate docs](crate).
 ///
 /// Holds a connection pool and, when [`TrellisOptions`] asked for it, a
 /// running background [`Client`] (staging worker and/or drain workers). Drop
@@ -254,7 +254,9 @@ impl Trellis {
         Ok(Self {
             _running: crate::metrics::RunningInstance::new(&instance),
             instance,
-            call_budget: options.call_deadline.unwrap_or(crate::DEFAULT_CALL_BUDGET),
+            call_budget: options
+                .call_deadline
+                .unwrap_or(crate::deadline::DEFAULT_CALL_BUDGET),
             held_key_retry: options.held_key_retry,
             config,
             pool,
@@ -360,7 +362,7 @@ impl Trellis {
     /// the same way, applies nothing, and so can refuse the wrong form before
     /// anything happens.
     ///
-    /// The statements it accepts (see [`defs::parse_statement`] for the full
+    /// The statements it accepts (see `defs::parse_statement` for the full
     /// grammar, and `docs/transforms.md` for the semantics):
     ///
     /// ```text
@@ -1403,7 +1405,7 @@ impl Trellis {
     /// The release first waits for the drain pages in flight on the key's
     /// table to commit, so it never misses a change one of them is parking
     /// for the key. A page that holds it past the session's `lock_timeout`
-    /// ([`crate::locks::LOCK_TIMEOUT`], 30 s) makes it error with
+    /// (`crate::locks::LOCK_TIMEOUT`, 30 s) makes it error with
     /// [`ApplyError::ReleaseLockTimeout`] (wrapped in
     /// [`TrellisError::Apply`], [`ErrorCode::Timeout`]), changing nothing:
     /// the key is still held, and retrying the call releases it once the
@@ -1467,13 +1469,13 @@ impl Trellis {
     /// **"Live" reuses the reclaim TTL's own notion of liveness** rather
     /// than inventing a second one, per the issue's explicit instruction:
     /// this compares each worker's last heartbeat against
-    /// [`DEFAULT_RECLAIM_TTL`] — the exact threshold
-    /// [`crate::staging::liveness::reclaim_stale`] already uses to decide a
+    /// `DEFAULT_RECLAIM_TTL` — the exact threshold
+    /// `crate::staging::liveness::reclaim_stale` already uses to decide a
     /// *claim* is dead, and the same value [`ClientOptions::default`]'s own
     /// `reclaim_ttl` carries (this facade never exposes a way to override
     /// it — every [`Trellis::connect`] call already gets this one value
     /// today, background `Client` or not). See
-    /// [`crate::staging::worker_registry`]'s doc comment for why this is a
+    /// `crate::staging::worker_registry`'s doc comment for why this is a
     /// read-time comparison rather than something that needs a reclaim pass
     /// to have already run — a design that did would be wrong precisely in
     /// the all-`drain_threads: 0` fleet this method exists to catch, since
@@ -1523,7 +1525,7 @@ impl Trellis {
 
     /// A read-your-writes watermark (issue #192): `pg_current_wal_insert_lsn()`,
     /// read on a freshly acquired pool connection — see
-    /// [`crate::staging::converge::watermark_token`] for the exact
+    /// `crate::staging::converge::watermark_token` for the exact
     /// semantics.
     ///
     /// **Call this after the write you want reflected has committed.**
@@ -1568,7 +1570,7 @@ impl Trellis {
     /// reaches for after writing to a source table and needing to see that
     /// write's effects in a transform's target table.
     ///
-    /// A thin facade over [`crate::staging::converge::await_converged`] (see
+    /// A thin facade over `crate::staging::converge::await_converged` (see
     /// its doc comment for the polling/backoff shape and exactly what
     /// "reflected" means). Errors with
     /// [`TrellisError::Staging`]`(`[`StagingError::ConvergenceTimeout`]`)`
@@ -1924,6 +1926,7 @@ fn capture_failure(row: &tokio_postgres::Row) -> Option<CaptureFailure> {
 /// One registered transform definition's status, as [`Trellis::status`]
 /// reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DefinitionStatus {
     /// Where the transform is in its lifecycle (issue #55).
     pub status: TransformStatus,
@@ -2086,6 +2089,7 @@ pub struct DefinitionStatus {
 /// Why capture of a table a definition reads is broken (issue #622 C6,
 /// #687); see [`DefinitionStatus::capture_failure`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CaptureFailure {
     /// Whether capture broke, or the drain halted on the definition (#663).
     pub kind: CaptureFailureKind,
@@ -2109,6 +2113,7 @@ pub struct CaptureFailure {
 
 /// What a [`CaptureFailure`] is (issue #663): `capture_failures.kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CaptureFailureKind {
     /// Capture of a table the definition reads is broken: a schema change,
     /// row-level security, a subscription, or a failing install or widen.
@@ -2172,6 +2177,7 @@ impl CaptureFailureKind {
 /// (an autovacuum included), so the definition waits until it lets go; this
 /// names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CaptureWait {
     /// The qualified table whose lock the capture operation waits for.
     pub table: String,
@@ -2195,6 +2201,7 @@ pub struct CaptureWait {
 /// narrowed to the key that causes it, which is quarantined; one that fails
 /// otherwise pauses the definition after a few charged attempts.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BackfillFailure {
     /// The qualified source table the build reads.
     pub source_table: String,
@@ -2211,6 +2218,7 @@ pub struct BackfillFailure {
 /// One registered transform definition, as [`Trellis::definitions`] reports
 /// it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DefinitionSummary {
     /// The schema-qualified target table, which identifies the transform.
     pub target_table: String,
@@ -2301,6 +2309,7 @@ impl Applied {
 
 /// One poison-quarantine entry, as [`Trellis::poisoned_since`] reports it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PoisonEntry {
     /// The bare target of the definition the key is held for (#799).
     pub transform: String,
@@ -2317,6 +2326,7 @@ pub struct PoisonEntry {
 /// has elsewhere for qualified column references, rather than inventing a
 /// new addressing idiom.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QuarantineTarget {
     /// The whole transform, named by its target table.
     Transform(String),
@@ -2374,6 +2384,7 @@ impl fmt::Display for QuarantineTarget {
 /// has no equivalent of, since column pausing doesn't touch a transform's
 /// overall lifecycle status at all).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QuarantineState {
     Live,
     WaitingToBackfill,
@@ -2449,6 +2460,7 @@ impl From<TransformStatus> for QuarantineState {
 /// whole list) and [`Trellis::quarantine_status`] (one target) both report
 /// it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct QuarantineEntry {
     pub target: QuarantineTarget,
     pub state: QuarantineState,
@@ -2465,6 +2477,7 @@ pub struct QuarantineEntry {
 /// One sampled quarantined row, as [`Trellis::sample_quarantined`] reports
 /// it — the ADR's `(src_table, key, error_message)` triple.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PoisonSample {
     pub src_table: String,
     pub key: String,
@@ -2485,6 +2498,7 @@ pub struct PoisonSample {
 /// category for this error alongside its `Display` message — see
 /// `docs/decisions/0008-public-api-design.md`, decision 3.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum TrellisError {
     /// A definition failed to parse before it could be registered.
     Parse(ParseError),
