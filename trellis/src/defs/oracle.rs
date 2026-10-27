@@ -1,96 +1,20 @@
-//! A from-scratch recompute of a 1-1 target from current source data,
-//! used to assert any incrementally-maintained target is
-//! byte-equal to a recompute (`docs/data-flow.md#correctness`).
+//! Renders a validated definition's expressions as Postgres SQL.
 //!
-//! **This module's [`recompute`] is the evaluator-driven recompute**: it reads
-//! each source row's text image and feeds it through the engine's own
-//! `evaluate`. Its role is a *secondary cross-check*, not the authority. The
-//! primary oracle is Postgres itself (by rendering the definition as a `SELECT`).
-//! Comparing the evaluator-driven recompute against the Postgres-SQL oracle
-//! ensures the engine mirrors Postgres semantics exactly.
+//! Postgres evaluates every calculated field: the engine renders the
+//! definition into the statement that writes it (ADR-0002) and computes no
+//! value itself. [`render_expr_sql`] and [`render_qualified_expr_sql`] are the
+//! renderers; [`render_aggregate_select_sql`] renders a whole aggregate
+//! definition as the `SELECT ... GROUP BY` that tests compare a target with.
 
-#[cfg(any(test, feature = "test-util"))]
-use std::collections::HashMap;
 use std::collections::HashSet;
-#[cfg(any(test, feature = "test-util"))]
-use std::fmt;
 
-#[cfg(any(test, feature = "test-util"))]
-use crate::pool::Pool;
 use crate::pool::quote_ident;
 
 #[cfg(any(test, feature = "test-util"))]
 use super::ast::KeySpace;
 use super::ast::{Expr, Operator, TransformDef, ValueType};
-#[cfg(any(test, feature = "test-util"))]
-use super::eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
 use super::typed_literal;
 use crate::integer::IntWidth;
-
-/// Why a from-scratch recompute failed.
-#[derive(Debug)]
-#[cfg(any(test, feature = "test-util"))]
-pub enum OracleError {
-    /// A direct Postgres protocol/query error.
-    Db(tokio_postgres::Error),
-    /// Acquiring a connection from the pool failed.
-    Pool(crate::error::Error),
-    /// Evaluating a source row's calculated fields failed (see
-    /// [`EvalError`]); a row that fails here would be quarantined by the
-    /// real apply path, not silently dropped from the recompute.
-    Eval(EvalError),
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl fmt::Display for OracleError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            OracleError::Db(err) => {
-                write!(f, "oracle recompute database error: ")?;
-                crate::error::write_pg_error(f, err)
-            }
-            OracleError::Pool(err) => write!(f, "failed to acquire a connection: {err}"),
-            OracleError::Eval(err) => write!(f, "oracle recompute evaluation error: {err}"),
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl std::error::Error for OracleError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            OracleError::Db(err) => Some(err),
-            OracleError::Pool(err) => Some(err),
-            OracleError::Eval(err) => Some(err),
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl From<tokio_postgres::Error> for OracleError {
-    fn from(err: tokio_postgres::Error) -> Self {
-        OracleError::Db(err)
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl From<crate::error::Error> for OracleError {
-    fn from(err: crate::error::Error) -> Self {
-        OracleError::Pool(err)
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl From<EvalError> for OracleError {
-    fn from(err: EvalError) -> Self {
-        OracleError::Eval(err)
-    }
-}
-
-/// A from-scratch recompute of `def`'s target: every source row's primary
-/// key (as text) mapped to its calculated columns.
-#[cfg(any(test, feature = "test-util"))]
-pub type Recomputed = HashMap<String, HashMap<String, Option<Value>>>;
 
 /// The `FROM`-clause identifier this test/benchmark-only oracle module
 /// should read `def`'s source through (ADR-0011 grammar clause
@@ -116,152 +40,38 @@ fn quoted_source_from(def: &TransformDef) -> String {
     }
 }
 
-/// Recomputes `def`'s entire target from `def.source`'s current contents,
-/// keyed by `pk_column` (the source table's single-column key, e.g. from
-/// [`super::ddl::source_primary_key`]). `source_columns` gives each
-/// referenced source column's [`ValueType`], the same map `def` was
-/// validated against.
-///
-/// A source keyed by a nullable unique index (an aggregate target's `GROUP
-/// BY` column) can hold a row whose key is `NULL`, and the 1-1 target keeps
-/// its row: it is keyed here by the key text such a key
-/// renders, [`super::ddl::NULL_KEY_SENTINEL`].
-///
-/// Reads `pk_column` plus every source column any calculated field
-/// references, as text, then runs each row through [`evaluate`] — the exact
-/// function the incremental path evaluates deltas with. No SQL expression
-/// here computes a calculated field's value; only column selection is SQL.
-#[cfg(any(test, feature = "test-util"))]
-pub async fn recompute(
-    pool: &Pool,
-    def: &TransformDef,
-    pk_column: &str,
-    source_columns: &HashMap<String, ValueType>,
-) -> Result<Recomputed, OracleError> {
-    let referenced = referenced_source_columns(def);
-
-    let mut select_list = vec![format!("{}::text", quote_ident(pk_column))];
-    select_list.extend(
-        referenced
-            .iter()
-            .map(|c| format!("{}::text", quote_ident(c))),
-    );
-
-    let sql = format!(
-        "select {} from {}",
-        select_list.join(", "),
-        quoted_source_from(def)
-    );
-
-    let client = pool.get().await?;
-    let rows = client.query(sql.as_str(), &[]).await?;
-
-    let mut result = Recomputed::with_capacity(rows.len());
-    // Reused across every row below: `def` is fixed for the
-    // whole recompute, so any `regexp_count` pattern it references compiles
-    // to the same `Regex` on every row.
-    let mut regex_cache = RegexCache::new();
-    for db_row in rows {
-        let pk_value: String = db_row
-            .get::<_, Option<String>>(0)
-            .unwrap_or_else(|| super::ddl::NULL_KEY_SENTINEL.to_string());
-        let mut image: Row = HashMap::with_capacity(referenced.len());
-        for (i, column) in referenced.iter().enumerate() {
-            let value: Option<String> = db_row.get(i + 1);
-            image.insert(column.clone(), value);
-        }
-        let evaluated = evaluate(def, &image, source_columns, &mut regex_cache)?;
-        result.insert(pk_value, evaluated);
-    }
-
-    Ok(result)
-}
-
-/// Recomputes an [`KeySpace::Aggregate`] `def`'s entire target from
-/// `def.source`'s current contents, keyed by the grouping columns' text
-/// values joined with `,` (there's no single primary-key column to key
-/// [`Recomputed`] by, unlike [`recompute`]'s 1-1 case — the group is the
-/// key). Groups rows in Rust (reading every grouping and referenced column
-/// as text, then partitioning by the grouping columns' values) rather than
-/// issuing a SQL `GROUP BY` itself, so this stays the same kind of
-/// evaluator-driven secondary cross-check `recompute` is: the real oracle is
-/// Postgres's own `GROUP BY` via [`render_aggregate_select_sql`], not this
-/// function.
+/// Renders a [`KeySpace::OneToOne`] `def` back to the Postgres `SELECT` that
+/// computes its whole target from the source's current contents: the primary
+/// key `pk_column` as text first, then each calculated field as text, in
+/// definition order. Tests compare a maintained target with the rows this
+/// returns. Every field is substituted first, as in
+/// [`render_aggregate_select_sql`].
 ///
 /// # Panics
 ///
-/// If `def.key_space` is not [`KeySpace::Aggregate`].
+/// If `def.key_space` is not [`KeySpace::OneToOne`], or if substitution fails
+/// (see [`render_aggregate_select_sql`]).
 #[cfg(any(test, feature = "test-util"))]
-pub async fn recompute_aggregate(
-    pool: &Pool,
-    def: &TransformDef,
-    source_columns: &HashMap<String, ValueType>,
-) -> Result<Recomputed, OracleError> {
-    let KeySpace::Aggregate { group_by } = &def.key_space else {
-        panic!("recompute_aggregate called on a non-aggregate definition");
-    };
-
-    let mut columns = referenced_source_columns(def);
-    for key in group_by {
-        columns.insert(key.clone());
-    }
-    let columns: Vec<String> = columns.into_iter().collect();
-
-    let select_list: Vec<String> = columns
-        .iter()
-        .map(|c| format!("{}::text", quote_ident(c)))
-        .collect();
-    let sql = format!(
+pub fn render_one_to_one_select_sql(def: &TransformDef, pk_column: &str) -> String {
+    assert!(
+        matches!(def.key_space, KeySpace::OneToOne),
+        "render_one_to_one_select_sql called on a non-1-1 definition"
+    );
+    let substituted = super::backfill::substituted_field_exprs(def)
+        .expect("1-1 oracle rendering requires a substitutable definition");
+    let mut select_list = vec![format!("{}::text", quote_ident(pk_column))];
+    select_list.extend(def.fields.iter().map(|field| {
+        format!(
+            "({})::text as {}",
+            render_expr_sql(&substituted[&field.name]),
+            quote_ident(&field.name)
+        )
+    }));
+    format!(
         "select {} from {}",
         select_list.join(", "),
         quoted_source_from(def)
-    );
-
-    let client = pool.get().await?;
-    let db_rows = client.query(sql.as_str(), &[]).await?;
-
-    let mut groups: HashMap<String, Vec<Row>> = HashMap::new();
-    for db_row in db_rows {
-        let mut image: Row = HashMap::with_capacity(columns.len());
-        for (i, column) in columns.iter().enumerate() {
-            let value: Option<String> = db_row.get(i);
-            image.insert(column.clone(), value);
-        }
-        let key = group_key(&image, group_by);
-        groups.entry(key).or_default().push(image);
-    }
-
-    let mut result = Recomputed::with_capacity(groups.len());
-    let mut regex_cache = RegexCache::new();
-    for rows in groups.values() {
-        let evaluated = evaluate_aggregate(def, rows, source_columns, &mut regex_cache)?;
-        let key = group_key(&rows[0], group_by);
-        result.insert(key, evaluated);
-    }
-
-    Ok(result)
-}
-
-/// The composite grouping-key text used by [`recompute_aggregate`] to key
-/// [`Recomputed`] — every row in a group shares these values, so any row's
-/// image gives the same key. A grouping column is assumed non-`NULL` (the
-/// typical case for a real foreign/primary key); this doesn't attempt to
-/// match Postgres's "`NULL` groups with `NULL`" `GROUP BY` semantics.
-#[cfg(any(test, feature = "test-util"))]
-fn group_key(image: &Row, group_by: &[String]) -> String {
-    // Length-prefix each component (`"{len}:{value}"`) rather than joining
-    // on a bare separator: a Text grouping column's value can itself
-    // contain any separator character (including a comma), which would
-    // make two distinct groupings collide, e.g. `(a="x,y", b="z")` vs.
-    // `(a="x", b="y,z")`. Prefixing each value with its own byte length
-    // makes the encoding unambiguous regardless of what characters the
-    // value contains — the length prefix itself is always parsed as a
-    // number, not searched for as a delimiter.
-    group_by
-        .iter()
-        .map(|k| image.get(k.as_str()).cloned().flatten().unwrap_or_default())
-        .map(|v| format!("{}:{v}", v.len()))
-        .collect::<String>()
+    )
 }
 
 /// Renders an [`KeySpace::Aggregate`] `def` back to the equivalent Postgres
@@ -321,40 +131,25 @@ pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
 
 /// The set of `def.source` column names any calculated field references —
 /// i.e. every [`Expr::Column`] name that isn't itself *another* calculated
-/// field's name. Used to select only the columns a recompute actually needs.
+/// field's name. `crate::capture::columns` uses it to decide which columns a
+/// table's capture trigger images; it leaves out `GROUP BY` keys, which that
+/// caller adds.
 ///
-/// A field referencing a source column of its own name (`SELECT c AS c`,
-/// the generative suite's improvement-plan task B1 identity-passthrough
-/// shape) is a passthrough, not a reference to another calculated field —
-/// this must mirror the same `is_self_passthrough` carve-out
-/// `eval.rs`'s `eval_expr` and `validate.rs`'s cycle detection already make,
-/// or a self-referencing passthrough field's own source column never makes
-/// it into the recompute's `SELECT` list and `eval_expr` fails with
-/// `EvalError::MissingColumn` even though the same definition installs and
-/// backfills correctly (the build's `SELECT a AS a` already has this
-/// carve-out via `ddl::passthrough_source_column`).
+/// A field referencing a source column of its own name (`SELECT c AS c`, an
+/// identity passthrough) is a passthrough, not a reference to another
+/// calculated field, so its own source column is included — the same
+/// `is_self_passthrough` carve-out `validate.rs`'s cycle detection makes (the
+/// build's `SELECT a AS a` has it via `ddl::passthrough_source_column`).
 ///
-/// Unlike `eval.rs`'s and `validate.rs`'s versions of this same carve-out,
-/// this one doesn't also check that `name` actually names a real source
-/// column (`is_self_passthrough = name == field_name &&
-/// source_columns.contains_key(name)`) — it can't, cheaply, since this
-/// function takes no `source_columns` map. That's safe only because both
-/// callers ([`recompute`], [`recompute_aggregate`]) are documented as
-/// running exclusively against an already-validated, already-installed
-/// `TransformDef` (see `recompute`'s own doc comment), and `validate()`
-/// already rejects a field naming itself when that name isn't a real source
-/// column (`UnresolvedColumn`, not treated as a passthrough) before a
-/// definition can ever be persisted. This is an implicit invariant enforced
-/// by caller discipline, not the type system — if a future caller ever
-/// invokes `recompute`/`recompute_aggregate` against a `TransformDef` that
-/// hasn't been through `validate()`, thread `source_columns` through here
-/// too and add the same guard.
-///
-/// `crate::capture::columns` also calls this, to decide which
-/// columns a table's capture trigger images. It runs against persisted
-/// definitions only, which `validate()` has already accepted, so the same
-/// invariant covers it. It leaves out `GROUP BY` keys; that caller adds
-/// them.
+/// Unlike `validate.rs`'s version of that carve-out, this one doesn't also
+/// check that `name` actually names a real source column: it takes no
+/// `source_columns` map. That's safe because the caller runs only against
+/// persisted definitions, which `validate()` has already accepted, and
+/// `validate()` rejects a field naming itself when that name isn't a real
+/// source column (`UnresolvedColumn`). It is an invariant enforced by caller
+/// discipline: a caller holding a definition that hasn't been through
+/// `validate()` must thread `source_columns` through here and add the same
+/// guard.
 pub(crate) fn referenced_source_columns(def: &TransformDef) -> HashSet<String> {
     let field_names: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
 
@@ -411,12 +206,10 @@ fn collect_columns(
 }
 
 /// Renders a calculated-field expression back to the equivalent Postgres
-/// SQL expression text, so the generative correctness oracle
-/// (`docs/generative-test-suite.md`) can cross-check a function call's
-/// rendered `SELECT` against this evaluator's output over the same source
-/// data — the ADR-0004 claim ("our grammar is an immutable subset of
-/// Postgres semantics") made checkable per expression, not just per
-/// operator. Column references are quoted identifiers, since a source
+/// SQL expression text: the statements that write a 1-1 target embed it, so
+/// Postgres computes the field (ADR-0002) — the ADR-0004 claim ("our grammar
+/// is an immutable subset of Postgres semantics") made literal for every
+/// expression. Column references are quoted identifiers, since a source
 /// column name could collide with a SQL keyword; literals carry an explicit
 /// cast so the rendered text is unambiguous regardless of context.
 pub fn render_expr_sql(expr: &Expr) -> String {
@@ -576,16 +369,11 @@ mod tests {
         );
     }
 
-    /// A field naming itself (`SELECT c AS c`, the generative suite's
-    /// improvement-plan task B1 identity-passthrough shape) must still
-    /// include its own source column — `is_self_passthrough`'s carve-out in
-    /// `collect_columns`. Before this test's fix, a field's own name was
-    /// treated identically to *any other* calculated field's name (both were
-    /// in `field_names`), so a self-named field's source column was silently
-    /// dropped from the recompute `SELECT` list and `evaluate` failed with
-    /// `EvalError::MissingColumn` even though the definition installs and
-    /// backfills correctly through its build (`SELECT a AS a`), which
-    /// already special-cases this via `ddl::passthrough_source_column`.
+    /// A field naming itself (`SELECT c AS c`, an identity passthrough) must
+    /// still include its own source column — `is_self_passthrough`'s carve-out
+    /// in `collect_columns` — or the capture trigger would not image it,
+    /// though the build (`SELECT a AS a`) special-cases it via
+    /// `ddl::passthrough_source_column`.
     #[test]
     fn referenced_source_columns_includes_a_self_named_passthrough_columns_own_source() {
         let def = TransformDef {
@@ -632,8 +420,7 @@ mod tests {
     #[test]
     fn render_expr_sql_renders_coalesce_as_a_postgres_function_call() {
         // COALESCE renders through the generic `name(args)` arm to lowercase
-        // `coalesce(...)` — valid Postgres — so the correctness oracle can
-        // cross-check the evaluator's COALESCE output against Postgres's own.
+        // `coalesce(...)` — valid Postgres.
         let expr = Expr::FunctionCall {
             name: "COALESCE".to_string(),
             args: vec![

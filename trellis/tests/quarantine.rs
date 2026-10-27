@@ -12,9 +12,13 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
+#[path = "support/sql_recompute.rs"]
+mod sql_recompute;
+
 use std::collections::HashMap;
 use std::time::SystemTime;
 
+use sql_recompute::recompute;
 use testkit::{TestCluster, TestDatabase};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::PgLsn;
@@ -23,7 +27,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     DdlError, create_aggregate_target_table, create_definition, create_target_table,
-    install_definition, parse, recompute, source_primary_key,
+    install_definition, parse, source_primary_key,
 };
 use trellis::staging::apply::{self, ApplyError, MAX_HOP_GEN};
 use trellis::staging::converge;
@@ -322,8 +326,8 @@ async fn quarantine_release_preserves_origin_position_so_convergence_stays_block
     );
 }
 
-/// Scenario: a batch with one key whose staged image is malformed (an
-/// evaluator-class failure — isolate-eligible, not transient/halting/fence)
+/// Scenario: a batch with one key whose staged image is malformed (a
+/// data-exception failure — isolate-eligible, not transient/halting/fence)
 /// and one healthy batch-mate. Below the death threshold, isolation
 /// attributes the failure to the bad key alone, charges it exactly one
 /// death, leaves the innocent key's counter and the `poison` marker
@@ -343,7 +347,7 @@ async fn an_innocent_batch_mate_is_not_charged_and_the_error_surfaces_unattribut
         .await
         .expect("seed orders rows");
 
-    // Key "1" carries a malformed numeric field — fails `eval::evaluate`
+    // Key "1" carries a malformed numeric field — fails the rendered cast
     // (`22P02`, a data exception), an isolate-eligible failure. Key "2" is
     // healthy.
     let orders = qualify_fixture_table("orders");
@@ -1187,10 +1191,7 @@ async fn release_of_a_key_held_across_batches_re_derives_it_to_the_oracle() {
     let seg_seq = seal_active_segment(&mut client).await;
     drain(&db.pool, seg_seq, "worker").await;
 
-    let source_columns = numeric_columns(&["id", "price", "tax"]);
-    let oracle = recompute(&db.pool, &def, "id", &source_columns)
-        .await
-        .expect("oracle recompute");
+    let oracle = recompute(&db.pool, &def, "id").await;
     let total: String = client
         .query_one("select total::text from order_totals where id = 1", &[])
         .await

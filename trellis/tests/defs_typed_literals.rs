@@ -12,15 +12,15 @@
 //! 2. **validate** — the literal is in canonical form, and the field's
 //!    inferred `ValueType` is `Other(Date)`, not `Text`.
 //! 3. **DDL** — the target column is declared `date`, not `text`.
-//! 4. **apply / backfill** — the value survives the `$n::text::date` write.
-//! 5. **both renderers** — the Rust evaluator's text and the SQL oracle's
-//!    `(expr)::text` are byte-identical, which is ADR-0013's continuous
-//!    cross-check and the reason `super::typed_literal` demands canonical
-//!    literals in the first place.
+//! 4. **apply / backfill** — the value survives the rendered write.
+//! 5. **the rendering** — the literal's source text and Postgres's
+//!    `(expr)::text` are byte-identical, which the self-check (ADR-0013) and
+//!    the generative suite compare byte for byte, and the reason
+//!    `super::typed_literal` demands canonical literals in the first place.
 //!
 //! Layer 5 is the one a parser test could never catch and the one the
 //! generative suite would otherwise catch only by luck, so it gets its own
-//! direct assertion here (`evaluator_and_sql_oracle_agree_on_every_literal`)
+//! direct assertion here (`postgres_renders_every_literal_as_its_source_text`)
 //! rather than being left to a fuzz run.
 //!
 //! Harness conventions (hand-built source table, `create_definition` +
@@ -28,16 +28,20 @@
 //! `drain_once`) are copied from `apply.rs`; the backfill leg's
 //! chunk-draining helper is copied from `defs_install_definition.rs`.
 
+#[path = "support/sql_recompute.rs"]
+mod sql_recompute;
+
 use std::collections::HashMap;
 
+use sql_recompute::recompute;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::Pool;
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ast::{Expr, ValueType};
 use trellis::defs::{
-    PgType, create_definition, create_target_table, install_definition, parse, recompute,
-    render_expr_sql, source_primary_key, validate,
+    PgType, create_definition, create_target_table, install_definition, parse, render_expr_sql,
+    source_primary_key, validate,
 };
 use trellis::staging::apply;
 
@@ -177,7 +181,7 @@ async fn column_pg_type(client: &Client, table: &str, column: &str) -> String {
 // ---------------------------------------------------------------------
 
 /// Both accepted spellings must produce the *same* AST, not merely
-/// equivalent ones — that identity is what lets one evaluator arm and one
+/// equivalent ones — that identity is what lets one
 /// renderer arm serve both, and it mirrors Postgres, which folds
 /// `CAST('2024-01-01' AS date)` and `DATE '2024-01-01'` to the same
 /// `'2024-01-01'::date` constant.
@@ -340,15 +344,15 @@ fn the_cast_operator_is_rejected_with_a_pointed_error() {
 // The renderer cross-check (ADR-0013)
 // ---------------------------------------------------------------------
 
-/// The load-bearing test. `render_expr_sql` is the SQL oracle's rendering of
-/// a typed literal; the evaluator's is the literal text carried verbatim in
-/// `Value::Other`. The generative suite compares those two as **byte-exact
-/// strings** for a `ValueType::Other` field (`Comparison::Exact`), so any
-/// literal whose Postgres rendering differs from its source text is a
-/// guaranteed false divergence. This asserts directly that it cannot happen
-/// for anything the grammar accepts.
+/// The load-bearing test. `render_expr_sql` renders a typed literal into the
+/// statements that write a target, and the target holds Postgres's text for
+/// it. The generative suite compares that with the literal's source text as
+/// **byte-exact strings** for a `ValueType::Other` field
+/// (`Comparison::Exact`), so any literal whose Postgres rendering differs
+/// from its source text is a guaranteed false divergence. This asserts
+/// directly that it cannot happen for anything the grammar accepts.
 #[tokio::test]
-async fn evaluator_and_sql_oracle_agree_on_every_literal() {
+async fn postgres_renders_every_literal_as_its_source_text() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
@@ -369,8 +373,8 @@ async fn evaluator_and_sql_oracle_agree_on_every_literal() {
 
         assert_eq!(
             &rendered, text,
-            "postgres renders {keyword} '{text}' back as {rendered:?}; the evaluator carries the \
-             source text verbatim, so the two renderers would disagree"
+            "postgres renders {keyword} '{text}' back as {rendered:?}, not its source text, so a \
+             converged target would read as a divergence"
         );
     }
 }
@@ -448,11 +452,10 @@ async fn install_and_backfill_produce_real_typed_columns() {
 }
 
 /// parse -> create -> stage CDC -> **apply** -> read, the incremental path
-/// (`$n::text::<type>`), cross-checked against `defs::oracle::recompute` —
-/// the independently-authored Rust evaluator — so the assertion is
-/// evaluator-vs-Postgres, not evaluator-vs-itself.
+/// (the rendered upsert), checked against the literal's source text and
+/// against a `SELECT` over the source.
 #[tokio::test]
-async fn a_cdc_apply_writes_typed_literal_values_matching_the_evaluator() {
+async fn a_cdc_apply_writes_typed_literal_values_matching_the_source_text() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -497,14 +500,12 @@ async fn a_cdc_apply_writes_typed_literal_values_matching_the_evaluator() {
     .expect("drain_once must claim and drain something");
 
     // Both columns' declared types survive the apply path, and the persisted
-    // values match what the Rust evaluator computed for the same rows.
+    // values match what a `SELECT` over the same rows computes.
     for (name, _, _, expected_pg_type) in CASES {
         assert_eq!(&column_pg_type(&client, "t", name).await, expected_pg_type);
     }
 
-    let oracle = recompute(&db.pool, &def, &pk[0].name, &cols)
-        .await
-        .expect("oracle recompute");
+    let oracle = recompute(&db.pool, &def, &pk[0].name).await;
     let select_list = CASES
         .iter()
         .map(|(name, _, _, _)| format!("{name}::text"))
@@ -529,7 +530,7 @@ async fn a_cdc_apply_writes_typed_literal_values_matching_the_evaluator() {
             assert_eq!(
                 persisted,
                 expected[*name].as_ref().map(|v| v.to_string()),
-                "{name} for id {id}: persisted value must match the Rust evaluator"
+                "{name} for id {id}: persisted value must match the SELECT"
             );
         }
     }
@@ -539,9 +540,9 @@ async fn a_cdc_apply_writes_typed_literal_values_matching_the_evaluator() {
 ///
 /// The canonical-form rule has two halves. The first — an ISO
 /// literal *parses* to the same value under every `DateStyle` — is a
-/// property of the literal itself and needs no help. The second — the Rust
-/// evaluator's text and Postgres's rendering are byte-identical — is only
-/// true if Postgres renders in ISO, and Trellis pinned no output GUC
+/// property of the literal itself and needs no help. The second — the
+/// literal's source text and Postgres's rendering are byte-identical — is
+/// only true if Postgres renders in ISO, and Trellis pinned no output GUC
 /// anywhere before this test's fix: `pool::session_bootstrap` and the
 /// non-pooled connect sites all set `search_path` and nothing else.
 ///
@@ -636,9 +637,9 @@ async fn a_hostile_database_level_output_guc_does_not_change_what_the_engine_rea
     // The float half of the same hazard. `extra_float_digits = 0` is the
     // pre-Postgres-12 default and rounds to `DBL_DIG` significant digits,
     // which is *lossy*: `0.1::float8 + 0.2::float8` renders `0.3` under `0`
-    // and `0.30000000000000004` under `1`. `float::render` reproduces the
-    // `>= 1` spelling, so a connection that inherited `0` would make the
-    // evaluator and the server disagree byte-for-byte on a converged value.
+    // and `0.30000000000000004` under `1`. A staged image is a value's text,
+    // so an engine session that inherited `0` would carry a rounded value
+    // into the target.
     let rendered_float: String = pooled
         .query_one("select (0.1::float8 + 0.2::float8)::text", &[])
         .await

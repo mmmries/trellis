@@ -1,9 +1,9 @@
 //! Transform-definition grammar and parser.
 //!
 //! Parses the concrete syntax documented in [`parser`] into the typed
-//! [`ast::TransformDef`] the validator and evaluator
-//! consume. Per ADR-0004, only constructs this crate can actually evaluate
-//! are accepted:
+//! [`ast::TransformDef`] the validator and the SQL renderer
+//! consume. Per ADR-0004, only constructs the renderer can express in
+//! Postgres SQL are accepted:
 //!
 //! - **Key-space**: 1-1 ([`ast::KeySpace::OneToOne`]), aggregate
 //!   ([`ast::KeySpace::Aggregate`], a `GROUP BY <cols>` clause), or a `JOIN`
@@ -27,6 +27,7 @@
 //! Everything else is rejected at parse time with an error naming the
 //! specific unsupported construct (see [`error::ParseError`]).
 
+pub mod alias_readers;
 pub mod ast;
 pub mod backfill;
 pub mod catalog;
@@ -35,7 +36,6 @@ pub(crate) mod copies;
 pub(crate) mod copy_type;
 pub mod ddl;
 pub mod error;
-pub mod eval;
 pub mod grammar;
 pub mod hierarchy;
 pub(crate) mod join;
@@ -88,10 +88,7 @@ pub use ddl::{
     source_primary_key,
 };
 #[cfg(any(test, feature = "internals"))]
-pub use oracle::{
-    OracleError, Recomputed, recompute, recompute_aggregate, render_aggregate_select_sql,
-    render_expr_sql,
-};
+pub use oracle::{render_aggregate_select_sql, render_expr_sql, render_one_to_one_select_sql};
 
 // Reached only by this crate's own `tests/*.rs`, through the `internals`
 // feature (ADR-0012; see `Cargo.toml`). Not part of `dev`.
@@ -111,8 +108,6 @@ pub use catalog::{
 };
 #[cfg(any(test, feature = "internals"))]
 pub use ddl::{PrimaryKeyColumn, neighbor_table_name};
-#[cfg(any(test, feature = "internals"))]
-pub use eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
 #[cfg(any(test, feature = "internals"))]
 #[cfg(any(test, feature = "internals"))]
 pub use model::{EdgeKind, NodeKind, SchemaEdge, SchemaNode};
