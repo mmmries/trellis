@@ -256,10 +256,13 @@ pub fn render_expr_sql(expr: &Expr) -> String {
             // below.
             "count(*)".to_string()
         }
-        Expr::FunctionCall { name, args } => {
-            let rendered_args: Vec<String> = args.iter().map(render_expr_sql).collect();
-            format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
-        }
+        Expr::FunctionCall { name, args } => match super::ast::as_extract(name, args) {
+            Some((field, operand)) => format!("extract({field} from {})", render_expr_sql(operand)),
+            None => {
+                let rendered_args: Vec<String> = args.iter().map(render_expr_sql).collect();
+                format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
+            }
+        },
     }
 }
 
@@ -290,8 +293,9 @@ pub(crate) fn render_case_sql(
 /// Postgres's own lexer gives the bare literal. Overflow, and the result
 /// type an operator over it has, are then the ones the definition's
 /// declared column types were inferred with: `int4_col + 1` is `integer`
-/// and overflows where an `integer` does.
-fn number_literal_sql(text: &str) -> String {
+/// and overflows where an `integer` does. `self_check`'s audit renders a
+/// literal with this too, so a date takes `date + integer` there as here.
+pub(crate) fn number_literal_sql(text: &str) -> String {
     // A negative literal is parenthesized: `::` binds tighter than the sign,
     // and `-2147483648::integer` casts 2147483648 first.
     let shown = if text.starts_with('-') {
@@ -349,13 +353,19 @@ pub(crate) fn render_qualified_expr_sql(expr: &Expr, source_sql: &str) -> String
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "count(*)".to_string()
         }
-        Expr::FunctionCall { name, args } => {
-            let rendered: Vec<String> = args
-                .iter()
-                .map(|arg| render_qualified_expr_sql(arg, source_sql))
-                .collect();
-            format!("{}({})", name.to_lowercase(), rendered.join(", "))
-        }
+        Expr::FunctionCall { name, args } => match super::ast::as_extract(name, args) {
+            Some((field, operand)) => format!(
+                "extract({field} from {})",
+                render_qualified_expr_sql(operand, source_sql)
+            ),
+            None => {
+                let rendered: Vec<String> = args
+                    .iter()
+                    .map(|arg| render_qualified_expr_sql(arg, source_sql))
+                    .collect();
+                format!("{}({})", name.to_lowercase(), rendered.join(", "))
+            }
+        },
     }
 }
 
