@@ -70,6 +70,25 @@ pub mod defs {
         create_definition_without_backfill, create_target_table, install_definition, parse,
         qualified_target_table, source_primary_key,
     };
+
+    /// The define-time checks, for the expression conformance harness: it
+    /// runs `validate` on a bare definition and names the refusal it gets.
+    pub use crate::defs::validate::{ValidationError, validate};
+
+    /// `def` rendered back to the definition text the catalog stores, which
+    /// `parse` reads back to an equal definition (the round-trip property of
+    /// the expression conformance harness).
+    pub fn render_definition_text(def: &crate::defs::ast::TransformDef) -> String {
+        crate::defs::ast::render_definition_text(def)
+    }
+
+    /// `expr` rendered as the SQL a 1-1 apply and a `JOIN` write embed, each
+    /// column read through `source_sql`. The expression conformance harness
+    /// checks it against the user's text beside `oracle::render_expr_sql`
+    /// (the build's renderer), since the two are separate code.
+    pub fn render_qualified_expr_sql(expr: &crate::defs::ast::Expr, source_sql: &str) -> String {
+        crate::defs::oracle::render_qualified_expr_sql(expr, source_sql)
+    }
 }
 
 /// The engine items `generative`'s backend drivers reach for under `staging`.
