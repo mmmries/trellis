@@ -131,6 +131,97 @@ impl Numeric {
         }
     }
 
+    /// The value with its sign flipped (zero stays zero).
+    pub fn negate(&self) -> Numeric {
+        Numeric {
+            negative: !self.negative && !self.is_zero(),
+            digits: self.digits.clone(),
+            scale: self.scale,
+        }
+    }
+
+    /// The absolute value.
+    pub fn abs(&self) -> Numeric {
+        Numeric {
+            negative: false,
+            digits: self.digits.clone(),
+            scale: self.scale,
+        }
+    }
+
+    /// Whether the value is zero, at any scale.
+    pub fn is_zero(&self) -> bool {
+        self.digits.iter().all(|&d| d == 0)
+    }
+
+    /// Postgres `numeric` subtraction: `self + (-other)`.
+    pub fn sub(&self, other: &Numeric) -> Numeric {
+        self.add(&other.negate())
+    }
+
+    /// Postgres `numeric` multiplication. The exact product's scale is the
+    /// sum of the operands' (Postgres's `mul_var` result scale before it
+    /// rounds to its display scale, which only matters past 16 digits).
+    pub fn mul(&self, other: &Numeric) -> Numeric {
+        let mut product = vec![0u32; self.digits.len() + other.digits.len()];
+        for (i, &a) in self.digits.iter().enumerate().rev() {
+            for (j, &b) in other.digits.iter().enumerate().rev() {
+                product[i + j + 1] += u32::from(a) * u32::from(b);
+            }
+        }
+        for k in (1..product.len()).rev() {
+            product[k - 1] += product[k] / 10;
+            product[k] %= 10;
+        }
+        let mut digits: Vec<u8> = product.into_iter().map(|d| d as u8).collect();
+        strip_leading_zeros(&mut digits);
+        let is_zero = digits.iter().all(|&d| d == 0);
+        Numeric {
+            negative: (self.negative != other.negative) && !is_zero,
+            digits,
+            scale: self.scale + other.scale,
+        }
+    }
+
+    /// Postgres `numeric` remainder (`%`): the result has the dividend's sign
+    /// and the common scale of the operands, and `None` for a zero divisor.
+    pub fn rem(&self, other: &Numeric) -> Option<Numeric> {
+        if other.is_zero() {
+            return None;
+        }
+        let scale = self.scale.max(other.scale);
+        let (_, remainder) =
+            divmod_magnitudes(&self.scaled_digits(scale), &other.scaled_digits(scale));
+        let is_zero = remainder.iter().all(|&d| d == 0);
+        Some(Numeric {
+            negative: self.negative && !is_zero,
+            digits: remainder,
+            scale,
+        })
+    }
+
+    /// The quotient, to at least forty significant digits (truncated), and
+    /// `None` for a zero divisor. Postgres rounds its quotient to a scale of
+    /// its own choosing (at least sixteen significant digits); a define-time
+    /// fold needs the value only to decide zero and range, which the extra
+    /// digits serve.
+    pub fn div(&self, other: &Numeric) -> Option<Numeric> {
+        if other.is_zero() {
+            return None;
+        }
+        let extra = 40 + other.digits.len() + other.scale as usize;
+        let mut dividend = self.digits.clone();
+        dividend.extend(std::iter::repeat_n(0, extra));
+        let (quotient, _) = divmod_magnitudes(&dividend, &other.digits);
+        let scale = extra as u32 + self.scale - other.scale;
+        let is_zero = quotient.iter().all(|&d| d == 0);
+        Some(Numeric {
+            negative: (self.negative != other.negative) && !is_zero,
+            digits: quotient,
+            scale,
+        })
+    }
+
     /// This value's digit vector re-expressed at `scale` (which must be
     /// `>= self.scale`), by appending trailing zero digits — the digit
     /// vector's fractional end, since digits are most-significant first.
@@ -179,6 +270,37 @@ impl fmt::Display for Numeric {
         }
         Ok(())
     }
+}
+
+/// Schoolbook long division of two magnitude digit vectors (most-significant
+/// first): the quotient and the remainder, both normalized. `divisor` is
+/// nonzero.
+fn divmod_magnitudes(dividend: &[u8], divisor: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut quotient = Vec::with_capacity(dividend.len());
+    let mut remainder: Vec<u8> = vec![0];
+    for &digit in dividend {
+        remainder.push(digit);
+        strip_leading_zeros(&mut remainder);
+        let mut count = 0u8;
+        loop {
+            let len = remainder.len().max(divisor.len());
+            let mut a = remainder.clone();
+            let mut b = divisor.to_vec();
+            pad_front(&mut a, len);
+            pad_front(&mut b, len);
+            if compare_magnitudes(&a, &b) == Ordering::Less {
+                break;
+            }
+            remainder = sub_magnitudes(&a, &b);
+            count += 1;
+        }
+        quotient.push(count);
+    }
+    strip_leading_zeros(&mut quotient);
+    if quotient.is_empty() {
+        quotient.push(0);
+    }
+    (quotient, remainder)
 }
 
 /// Pads `digits` with leading zeros (the front, since digits are
@@ -320,6 +442,50 @@ mod tests {
         let a = Numeric::parse(&big).unwrap();
         let sum = a.add(&n("1")).to_string();
         assert_eq!(sum, format!("1{}", "0".repeat(50)));
+    }
+
+    #[test]
+    fn sub_mul_and_sign_operations() {
+        assert_eq!(n("5").sub(&n("7.5")).to_string(), "-2.5");
+        assert_eq!(n("-2").mul(&n("3.5")).to_string(), "-7.0");
+        assert_eq!(n("0").mul(&n("-3")).to_string(), "0");
+        assert_eq!(
+            n("99999999999999999999")
+                .mul(&n("99999999999999999999"))
+                .to_string(),
+            "9999999999999999999800000000000000000001"
+        );
+        assert_eq!(n("-0.50").negate().negate().to_string(), "-0.50");
+        assert!(n("0.00").negate().is_zero());
+        assert_eq!(n("-3").abs().to_string(), "3");
+    }
+
+    #[test]
+    fn rem_and_div_follow_the_dividends_sign() {
+        assert_eq!(n("-7").rem(&n("2")).unwrap().to_string(), "-1");
+        assert_eq!(n("7").rem(&n("-2")).unwrap().to_string(), "1");
+        assert_eq!(n("-1.5").rem(&n("1.0")).unwrap().to_string(), "-0.5");
+        assert_eq!(n("4").rem(&n("2")).unwrap().to_string(), "0");
+        assert!(n("4").rem(&n("0.0")).is_none());
+        assert!(n("4").div(&n("0")).is_none());
+        assert!(n("0").div(&n("9223372036854775808")).unwrap().is_zero());
+        let quotient = n("1").div(&n("3")).unwrap().to_string();
+        assert!(
+            quotient.starts_with("0.33333333333333333333333333333333333333"),
+            "{quotient}"
+        );
+        assert_eq!(
+            n("9223372036854775808")
+                .div(&n("1"))
+                .unwrap()
+                .to_string()
+                .split('.')
+                .next(),
+            Some("9223372036854775808")
+        );
+        // A tiny quotient keeps its significant digits.
+        let tiny = n("1").div(&n(&format!("1{}", "0".repeat(400)))).unwrap();
+        assert!(!tiny.is_zero());
     }
 
     #[test]

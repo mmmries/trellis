@@ -20,9 +20,9 @@
 //! `FROM <source>` is where the key-space clause slots in: absent for 1-1,
 //! `GROUP BY <cols>` for an aggregate, `[LEFT|INNER] JOIN <other> ON <cond>
 //! GROUP BY <cols>` for a join aggregate (ADR-0019). `<expr>` supports column references,
-//! numeric and string literals, `+`, `>`, parenthesized
-//! grouping (`(<expr>)` — needed once a caller composes `+` and
-//! `>` and must override the precedence table's own grouping), `name(args)`
+//! numeric and string literals, `+`, `-`, `*`, `/`, `%`, `>`, prefix `-`,
+//! parenthesized grouping (`(<expr>)`, to override the precedence table's own
+//! grouping), `CAST(<expr> AS <integer or numeric type>)`, `name(args)`
 //! function calls against [`super::registry::FUNCTIONS`], and
 //! qualified columns, `<table>.<column>` or `<schema>.<table>.<column>`
 //! (see [`Parser::parse_dotted_reference`]). **Typed literals** are spelled
@@ -38,8 +38,8 @@ use super::ast::{
 use super::error::ParseError;
 use super::lexer::{Token, lex};
 use super::registry::{
-    AGGREGATE_FUNCTIONS, NON_IMMUTABLE_NAMES, lookup_aggregate_function, lookup_function,
-    lookup_operator, operator_spec,
+    AGGREGATE_FUNCTIONS, NON_IMMUTABLE_NAMES, cast_target, function_overloads,
+    lookup_aggregate_function, lookup_operator, operator_spec,
 };
 use super::typed_literal::lookup_typed_literal;
 use super::validate::is_deferred_aggregate_name;
@@ -51,6 +51,10 @@ use super::validate::is_deferred_aggregate_name;
 pub const MAX_EXPRESSION_DEPTH: usize = 100;
 
 const OPERATOR_CHARS: &[char] = &['+', '-', '*', '/', '%', '>', '<', '='];
+
+/// The longest run of prefix `-` operators (`- - - a`) the parser keeps. Each
+/// one is a node deep, and the tree is walked recursively.
+const MAX_PREFIX_MINUS: usize = 100;
 
 /// What [`Parser::parse_statement`] expects to lead a statement, spelled out
 /// in the error a caller sees when it leads with something else — the closest
@@ -832,7 +836,7 @@ impl Parser {
     /// `a > (b + c)`, since `+` outranks `>` and so gets pulled into the
     /// `parse_binary_expr(COMPARISON + 1)` call parsing `>`'s rhs).
     fn parse_binary_expr(&mut self, min_precedence: u8) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_primary()?;
+        let mut lhs = self.parse_unary()?;
         let mut lhs_height = self.last_height;
         loop {
             let symbol = match self.peek() {
@@ -881,6 +885,52 @@ impl Parser {
         Ok(lhs)
     }
 
+    /// A primary term under any number of prefix `-`, which binds tighter
+    /// than every binary operator. The operators are counted in a loop, not
+    /// recursed into, so a long run costs no stack.
+    ///
+    /// Postgres reads `-<number>` as one negative constant (`-2147483648` is
+    /// an `integer`), so a minus applied straight to a number literal flips
+    /// the literal's sign instead of building a node; any other operand is
+    /// wrapped once per remaining minus.
+    fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        let mut minuses = 0usize;
+        while self.peek_is_symbol('-') {
+            self.advance();
+            minuses += 1;
+            if minuses > MAX_PREFIX_MINUS {
+                return Err(ParseError::PrefixMinusChainTooLong {
+                    max: MAX_PREFIX_MINUS,
+                });
+            }
+        }
+        let mut expr = self.parse_primary()?;
+        if minuses > 0
+            && let Expr::NumberLiteral(text) = &mut expr
+        {
+            if minuses % 2 == 1 {
+                *text = match text.strip_prefix('-') {
+                    Some(positive) => positive.to_string(),
+                    None => format!("-{text}"),
+                };
+            }
+            return Ok(expr);
+        }
+        for _ in 0..minuses {
+            expr = Expr::Negate(Box::new(expr));
+        }
+        // Each wrapped `Negate` is a level of the tree, so it counts toward
+        // the height bound like a call does (otherwise a run of minuses at
+        // every parenthesis level builds a tree far deeper than the bound).
+        self.last_height += minuses;
+        if self.last_height > MAX_EXPRESSION_DEPTH {
+            return Err(ParseError::ExpressionTooDeep {
+                limit: MAX_EXPRESSION_DEPTH,
+            });
+        }
+        Ok(expr)
+    }
+
     /// [`Self::parse_primary_inner`], recording the term's height in
     /// `last_height`: a leaf is 1, a call is 1 above its tallest argument
     /// (left in `last_height` by `parse_call_args`), a parenthesized
@@ -891,7 +941,7 @@ impl Parser {
         let expr = self.parse_primary_inner()?;
         if grouping {
             // Keeps the inner expression's height.
-        } else if matches!(expr, Expr::FunctionCall { .. }) {
+        } else if matches!(expr, Expr::FunctionCall { .. } | Expr::Cast { .. }) {
             self.last_height += 1;
             if self.last_height > MAX_EXPRESSION_DEPTH {
                 return Err(ParseError::ExpressionTooDeep {
@@ -1076,19 +1126,25 @@ impl Parser {
                         return Ok(Expr::FunctionCall { name: upper, args });
                     }
 
-                    let spec = match lookup_function(&upper) {
-                        Some(spec) => spec,
-                        None => {
-                            self.skip_balanced_parens()?;
-                            return Err(ParseError::UnsupportedFunction { name });
-                        }
+                    // A name can have several signatures (`ROUND(a)`,
+                    // `ROUND(a, n)`); the arity must match one of them.
+                    let arities: Vec<usize> = function_overloads(&upper)
+                        .map(|spec| spec.arg_types.len())
+                        .collect();
+                    let Some(&widest) = arities.iter().max() else {
+                        self.skip_balanced_parens()?;
+                        return Err(ParseError::UnsupportedFunction { name });
                     };
 
                     let args = self.parse_call_args()?;
-                    if args.len() != spec.arg_types.len() {
+                    if !arities.contains(&args.len()) {
                         return Err(ParseError::FunctionArityMismatch {
                             name,
-                            expected: spec.arg_types.len(),
+                            expected: if args.len() < widest {
+                                *arities.iter().min().unwrap_or(&widest)
+                            } else {
+                                widest
+                            },
                             found: args.len(),
                         });
                     }
@@ -1142,33 +1198,43 @@ impl Parser {
         })
     }
 
-    /// Parses the remainder of a `CAST(...)` — `'<literal>' AS <type>)`,
-    /// with `CAST` and its `(` already consumed — into the same
-    /// [`Expr::TypedLiteral`] the `<type> '<literal>'` spelling builds.
+    /// Parses the remainder of a `CAST(...)`, with `CAST` and its `(`
+    /// already consumed.
     ///
-    /// Only a single-quoted literal is accepted as the operand. A general
-    /// `CAST(<expr> AS <type>)` is rejected by name
-    /// ([`ParseError::UnsupportedCast`]) rather than parsed-then-refused
-    /// later, so the message can explain that a coercion lattice belongs to
-    /// each type family's own issue — see [`super::typed_literal`]'s module
-    /// doc comment for the reasoning.
+    /// A quoted literal operand (`'<literal>' AS <type>)`) builds the same
+    /// [`Expr::TypedLiteral`] the `<type> '<literal>'` spelling builds. Any
+    /// other operand is a cast of an expression, to one of
+    /// `CAST_TARGETS` or an alias of one; whether that operand converts to it is the
+    /// validator's to check.
     fn parse_cast_body(&mut self) -> Result<Expr, ParseError> {
-        let text = match self.advance() {
-            Token::String(text) => text,
-            Token::Eof => {
-                return Err(ParseError::UnexpectedEof {
-                    expected: "a single-quoted literal".to_string(),
+        if !matches!(self.peek(), Token::String(_)) {
+            let operand = self.parse_expr()?;
+            self.expect_keyword("AS")?;
+            let type_name = self.expect_ident()?;
+            let keyword = self.take_type_keyword(&type_name.to_ascii_uppercase());
+            let target = cast_target(&keyword);
+            if self.peek_is_symbol('(') {
+                // A modifier: `numeric(10,2)`. Consume it so the error is the
+                // only one reported.
+                self.advance();
+                self.skip_balanced_parens()?;
+                self.expect_symbol(')')?;
+                return Err(ParseError::UnsupportedCastTarget {
+                    name: format!("{type_name}(...)"),
                 });
             }
-            other => {
-                // Consume the rest of the call so a rejected general cast
-                // doesn't desync the parse into a second, confusing error —
-                // the same courtesy `skip_balanced_parens` does for an
-                // unsupported function call.
-                let found = other.describe();
+            let Some(target) = target else {
                 self.skip_balanced_parens()?;
-                return Err(ParseError::UnsupportedCast { found });
-            }
+                return Err(ParseError::UnsupportedCastTarget { name: type_name });
+            };
+            self.expect_symbol(')')?;
+            return Ok(Expr::Cast {
+                expr: Box::new(operand),
+                target,
+            });
+        }
+        let Token::String(text) = self.advance() else {
+            unreachable!("peeked a string literal");
         };
         self.expect_keyword("AS")?;
         let type_name = self.expect_ident()?;
@@ -1333,6 +1399,49 @@ mod depth_tests {
             }
             refused
         })
+    }
+
+    /// `-(-(... -(c)))` with `minuses` prefix minuses at each of `levels`
+    /// parenthesis levels (spaced so no `--` comment forms).
+    fn minuses_at_each_level(minuses: usize, levels: usize) -> String {
+        let unit = format!("{}(", "- ".repeat(minuses));
+        format!("{}c{}", unit.repeat(levels), ")".repeat(levels))
+    }
+
+    #[test]
+    fn prefix_minuses_and_casts_count_toward_the_height_bound() {
+        // 100 minuses at each of 99 parenthesis levels is ~10,000 nodes deep
+        // while no single chain or nest exceeds its own bound.
+        assert!(matches!(
+            define(minuses_at_each_level(100, 99)),
+            Err(ParseError::ExpressionTooDeep { .. })
+        ));
+        // Minuses count one level each, wherever they sit.
+        assert!(define(minuses_at_each_level(1, 50)).is_ok());
+        assert!(matches!(
+            define(minuses_at_each_level(2, 99)),
+            Err(ParseError::ExpressionTooDeep { .. })
+        ));
+        // A cast counts a level like a call.
+        let casts = |n: usize| format!("{}1{}", "CAST(".repeat(n), " AS bigint)".repeat(n));
+        assert!(matches!(
+            define(casts(MAX_EXPRESSION_DEPTH + 1)),
+            Err(ParseError::ExpressionTooDeep { .. })
+        ));
+        assert!(!matches!(
+            define(casts(MAX_EXPRESSION_DEPTH - 1)),
+            Err(ParseError::ExpressionTooDeep { .. })
+        ));
+    }
+
+    #[test]
+    fn calculated_fields_reading_each_other_through_minus_and_cast_are_bounded() {
+        assert!(fields_refused(MAX_EXPRESSION_DEPTH / 2 + 1, "-{prev} + 1"));
+        assert!(fields_refused(
+            MAX_EXPRESSION_DEPTH + 1,
+            "CAST({prev} AS bigint)"
+        ));
+        assert!(fields_refused(100_000, "-{prev}"));
     }
 
     #[test]

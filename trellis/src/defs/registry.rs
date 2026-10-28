@@ -52,6 +52,8 @@ pub mod precedence {
     pub const COMPARISON: u8 = 10;
     /// Binary `+`, `-`.
     pub const ADDITIVE: u8 = 20;
+    /// Binary `*`, `/`, `%`.
+    pub const MULTIPLICATIVE: u8 = 30;
 }
 
 /// The full set of operators this grammar supports.
@@ -91,6 +93,30 @@ pub const OPERATORS: &[OperatorSpec] = &[
         precedence: precedence::ADDITIVE,
     },
     OperatorSpec {
+        symbol: "-",
+        operator: Operator::Subtract,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::ADDITIVE,
+    },
+    OperatorSpec {
+        symbol: "*",
+        operator: Operator::Multiply,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::MULTIPLICATIVE,
+    },
+    OperatorSpec {
+        symbol: "/",
+        operator: Operator::Divide,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::MULTIPLICATIVE,
+    },
+    OperatorSpec {
+        symbol: "%",
+        operator: Operator::Modulo,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::MULTIPLICATIVE,
+    },
+    OperatorSpec {
         symbol: ">",
         operator: Operator::GreaterThan,
         arg_types: (ValueType::Numeric, ValueType::Numeric),
@@ -111,9 +137,9 @@ pub fn operator_spec(operator: Operator) -> &'static OperatorSpec {
 }
 
 /// The result type of `op` applied to operands of `lhs`/`rhs` type, or
-/// `None` if Postgres has no such operator — the **overload-resolution**
-/// replacement for the old "compare both operands to [`OperatorSpec::arg_types`]
-/// for exact equality" check.
+/// `None` if Postgres has no such operator or the grammar refuses it — the
+/// **overload-resolution** replacement for the old "compare both operands to
+/// [`OperatorSpec::arg_types`] for exact equality" check.
 ///
 /// Exact equality was sufficient while every arithmetic/comparison operand
 /// was the single [`ValueType::Numeric`] bucket. It stops being sufficient
@@ -123,20 +149,21 @@ pub fn operator_spec(operator: Operator) -> &'static OperatorSpec {
 /// `int4_col + numeric_col` is `numeric`. This function encodes exactly that
 /// and nothing more — it is deliberately **not** a general coercion lattice
 /// (`super::typed_literal` rejects building one for the same reason), just
-/// the closed set of combinations the two registered operators admit:
+/// the closed set of combinations the registered operators admit:
 ///
-/// | lhs | rhs | `+` | `>` |
-/// |---|---|---|---|
-/// | `Integer(a)` | `Integer(b)` | `Integer(wider(a,b))` | `Boolean` |
-/// | `Integer(_)` | `Numeric` | `Numeric` | `Boolean` |
-/// | `Numeric` | `Integer(_)` | `Numeric` | `Boolean` |
-/// | `Numeric` | `Numeric` | `Numeric` | `Boolean` |
-/// | `Float(a)` | `Float(b)` | `Float(wider(a,b))` | `Boolean` |
-/// | `Float(_)` | `Integer(_)`/`Numeric` | `Float(Float8)` | `Boolean` |
-/// | `Integer(_)`/`Numeric` | `Float(_)` | `Float(Float8)` | `Boolean` |
+/// | lhs | rhs | `+` `-` `*` | `/` | `%` | `>` |
+/// |---|---|---|---|---|---|
+/// | `Integer(a)` | `Integer(b)` | `Integer(wider(a,b))` | refused | `Integer(wider(a,b))` | `Boolean` |
+/// | `Integer(_)` | `Numeric` | `Numeric` | `Numeric` | `Numeric` | `Boolean` |
+/// | `Numeric` | `Integer(_)` | `Numeric` | `Numeric` | `Numeric` | `Boolean` |
+/// | `Numeric` | `Numeric` | `Numeric` | `Numeric` | `Numeric` | `Boolean` |
+/// | `Float(a)` | `Float(b)` | `Float(wider(a,b))` | `Float(wider(a,b))` | refused | `Boolean` |
+/// | `Float(_)` | `Integer(_)`/`Numeric` | `Float(Float8)` | `Float(Float8)` | refused | refused |
+/// | `Integer(_)`/`Numeric` | `Float(_)` | `Float(Float8)` | `Float(Float8)` | refused | refused |
 ///
 /// Any other combination is `None`: `Text`/`Boolean`/`Uuid`/`Other` have no
-/// `+` or `>` in this grammar, exactly as before.
+/// arithmetic or `>` in this grammar. `Integer / Integer` is refused because
+/// Postgres truncates the quotient, and `%` has no float form in Postgres.
 ///
 /// `Integer + Numeric -> Numeric` mirrors Postgres promoting the integer
 /// operand through its implicit cast and then running `numeric_add`, which
@@ -161,16 +188,28 @@ pub fn operator_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Opt
     if !lhs.is_numeric_family() || !rhs.is_numeric_family() {
         return None;
     }
+    // The type `+`, `-` and `*` give: two integers the wider width, a float
+    // beside anything the float rule, otherwise `numeric`.
+    let arithmetic = || match (lhs, rhs) {
+        (ValueType::Float(a), ValueType::Float(b)) => ValueType::Float(a.wider(b)),
+        // A float mixed with anything else is the `float8` operator on two
+        // `double precision` operands.
+        (ValueType::Float(_), _) | (_, ValueType::Float(_)) => ValueType::Float(FloatWidth::Float8),
+        (ValueType::Integer(a), ValueType::Integer(b)) => ValueType::Integer(a.wider(b)),
+        _ => ValueType::Numeric,
+    };
     Some(match op {
-        Operator::Add => match (lhs, rhs) {
-            (ValueType::Float(a), ValueType::Float(b)) => ValueType::Float(a.wider(b)),
-            // A float mixed with anything else is `float8pl` on two
-            // `double precision` operands.
-            (ValueType::Float(_), _) | (_, ValueType::Float(_)) => {
-                ValueType::Float(FloatWidth::Float8)
-            }
-            (ValueType::Integer(a), ValueType::Integer(b)) => ValueType::Integer(a.wider(b)),
-            _ => ValueType::Numeric,
+        Operator::Add | Operator::Subtract | Operator::Multiply => arithmetic(),
+        // Postgres truncates `integer / integer` (`7 / 2` is `3`), so the
+        // quotient of two integers is refused rather than typed.
+        Operator::Divide => match (lhs, rhs) {
+            (ValueType::Integer(_), ValueType::Integer(_)) => return None,
+            _ => arithmetic(),
+        },
+        // Postgres has no float modulo.
+        Operator::Modulo => match (lhs, rhs) {
+            (ValueType::Float(_), _) | (_, ValueType::Float(_)) => return None,
+            _ => arithmetic(),
         },
         // A float against an exact numeric is refused: Postgres resolves it
         // by casting the exact side to `double precision`, so the comparison
@@ -181,6 +220,62 @@ pub fn operator_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Opt
         Operator::GreaterThan if is_mixed_float_exact(lhs, rhs) => return None,
         Operator::GreaterThan => ValueType::Boolean,
     })
+}
+
+/// The result type of prefix `-` over an operand of type `operand`: the
+/// operand's own type (`int2um`, `int4um`, `int8um`, `numeric_uminus`,
+/// `float4um`, `float8um`), `None` for a non-numeric operand.
+pub fn negate_result_type(operand: ValueType) -> Option<ValueType> {
+    operand.is_numeric_family().then_some(operand)
+}
+
+/// The types `CAST(<expr> AS <type>)` can name, spelled as Postgres prints
+/// them. A modifier (`numeric(10,2)`) is not a target.
+pub const CAST_TARGETS: &[ValueType] = &[
+    ValueType::Integer(IntWidth::Int4),
+    ValueType::Integer(IntWidth::Int8),
+    ValueType::Numeric,
+];
+
+/// Postgres's exact, permanent synonyms for the [`CAST_TARGETS`], accepted in
+/// `CAST` target position only (issue #1455): `int` and `int4` for `integer`,
+/// `int8` for `bigint`, `decimal` for `numeric`. Every other place a type name
+/// appears (typed literals, column names) is unchanged, and rendering always
+/// emits the canonical name.
+pub const CAST_TARGET_ALIASES: &[(&str, ValueType)] = &[
+    ("int", ValueType::Integer(IntWidth::Int4)),
+    ("int4", ValueType::Integer(IntWidth::Int4)),
+    ("int8", ValueType::Integer(IntWidth::Int8)),
+    ("decimal", ValueType::Numeric),
+];
+
+/// The `CAST` target a type keyword names, matched case-insensitively: a
+/// canonical spelling or an alias, resolved to its canonical [`ValueType`].
+pub fn cast_target(keyword: &str) -> Option<ValueType> {
+    CAST_TARGETS
+        .iter()
+        .copied()
+        .find(|t| t.to_string().eq_ignore_ascii_case(keyword))
+        .or_else(|| {
+            CAST_TARGET_ALIASES
+                .iter()
+                .find(|(alias, _)| alias.eq_ignore_ascii_case(keyword))
+                .map(|&(_, t)| t)
+        })
+}
+
+/// The result type of `CAST(<operand> AS <target>)`, or `None` if the cast is
+/// not one of the lossless, total ones: an integer to a strictly wider
+/// integer, or any integer to `numeric`. Every other cast narrows (and can
+/// overflow), rounds, or goes to or from a float.
+pub fn cast_result_type(operand: ValueType, target: ValueType) -> Option<ValueType> {
+    match (operand, target) {
+        (ValueType::Integer(from), ValueType::Integer(to)) if from.range().1 < to.range().1 => {
+            Some(target)
+        }
+        (ValueType::Integer(_), ValueType::Numeric) => Some(ValueType::Numeric),
+        _ => None,
+    }
 }
 
 /// Whether one operand is a float and the other an exact numeric (an integer
@@ -211,9 +306,11 @@ pub struct FunctionSpec {
 /// each rendered as the Postgres function of the same name (per ADR-0004:
 /// the grammar and renderer function sets are one list).
 ///
-/// All four return Postgres `integer` (`int4`), not `numeric` — checked
-/// against `pg_proc.prorettype` for `strpos`/`octet_length`/`char_length`/
-/// `regexp_count`. Declaring them as [`ValueType`] integers is what
+/// The four text functions return Postgres `integer` (`int4`), not `numeric` —
+/// checked against `pg_proc.prorettype` for `strpos`/`octet_length`/
+/// `char_length`/`regexp_count`. The numeric functions (`ABS`, `CEIL`,
+/// `FLOOR`, `ROUND`, `TRUNC`) are typed by their argument, so a name has one
+/// entry per signature ([`function_overloads`], [`resolve_function`]). Declaring them as [`ValueType`] integers is what
 /// makes `char_length(t) + 1` type — and overflow — the way Postgres does,
 /// and what declares the derived column `integer` rather than `numeric`.
 pub const FUNCTIONS: &[FunctionSpec] = &[
@@ -237,12 +334,109 @@ pub const FUNCTIONS: &[FunctionSpec] = &[
         arg_types: &[ValueType::Text, ValueType::Text],
         return_type: ValueType::Integer(IntWidth::Int4),
     },
+    FunctionSpec {
+        name: "ABS",
+        arg_types: &[ValueType::Integer(IntWidth::Int2)],
+        return_type: ValueType::Integer(IntWidth::Int2),
+    },
+    FunctionSpec {
+        name: "ABS",
+        arg_types: &[ValueType::Integer(IntWidth::Int4)],
+        return_type: ValueType::Integer(IntWidth::Int4),
+    },
+    FunctionSpec {
+        name: "ABS",
+        arg_types: &[ValueType::Integer(IntWidth::Int8)],
+        return_type: ValueType::Integer(IntWidth::Int8),
+    },
+    FunctionSpec {
+        name: "ABS",
+        arg_types: &[ValueType::Numeric],
+        return_type: ValueType::Numeric,
+    },
+    FunctionSpec {
+        name: "ABS",
+        arg_types: &[ValueType::Float(FloatWidth::Float4)],
+        return_type: ValueType::Float(FloatWidth::Float4),
+    },
+    FunctionSpec {
+        name: "ABS",
+        arg_types: &[ValueType::Float(FloatWidth::Float8)],
+        return_type: ValueType::Float(FloatWidth::Float8),
+    },
+    FunctionSpec {
+        name: "CEIL",
+        arg_types: &[ValueType::Numeric],
+        return_type: ValueType::Numeric,
+    },
+    FunctionSpec {
+        name: "CEIL",
+        arg_types: &[ValueType::Float(FloatWidth::Float8)],
+        return_type: ValueType::Float(FloatWidth::Float8),
+    },
+    FunctionSpec {
+        name: "FLOOR",
+        arg_types: &[ValueType::Numeric],
+        return_type: ValueType::Numeric,
+    },
+    FunctionSpec {
+        name: "FLOOR",
+        arg_types: &[ValueType::Float(FloatWidth::Float8)],
+        return_type: ValueType::Float(FloatWidth::Float8),
+    },
+    FunctionSpec {
+        name: "TRUNC",
+        arg_types: &[ValueType::Numeric],
+        return_type: ValueType::Numeric,
+    },
+    FunctionSpec {
+        name: "TRUNC",
+        arg_types: &[ValueType::Float(FloatWidth::Float8)],
+        return_type: ValueType::Float(FloatWidth::Float8),
+    },
+    FunctionSpec {
+        name: "ROUND",
+        arg_types: &[ValueType::Numeric],
+        return_type: ValueType::Numeric,
+    },
+    FunctionSpec {
+        name: "ROUND",
+        arg_types: &[ValueType::Numeric, ValueType::Integer(IntWidth::Int4)],
+        return_type: ValueType::Numeric,
+    },
+    FunctionSpec {
+        name: "TRUNC",
+        arg_types: &[ValueType::Numeric, ValueType::Integer(IntWidth::Int4)],
+        return_type: ValueType::Numeric,
+    },
 ];
 
-/// Looks up a function by its canonical uppercased name.
-pub fn lookup_function(name: &str) -> Option<&'static FunctionSpec> {
-    FUNCTIONS.iter().find(|spec| spec.name == name)
+/// Every overload of the function named `name` (canonical uppercase).
+///
+/// A name with one signature has one entry. The numeric functions have
+/// several, because Postgres types them by argument: `ABS` of a `smallint`
+/// is `smallint`, of a `numeric` is `numeric`.
+pub fn function_overloads(name: &str) -> impl Iterator<Item = &'static FunctionSpec> + '_ {
+    FUNCTIONS.iter().filter(move |spec| spec.name == name)
 }
+
+/// Looks up a function by its canonical uppercased name: its first
+/// overload.
+pub fn lookup_function(name: &str) -> Option<&'static FunctionSpec> {
+    function_overloads(name).next()
+}
+
+/// The overload of `name` whose declared argument types are exactly
+/// `arg_types`.
+pub fn resolve_function(name: &str, arg_types: &[ValueType]) -> Option<&'static FunctionSpec> {
+    function_overloads(name).find(|spec| spec.arg_types == arg_types)
+}
+
+/// Function arguments the grammar requires to be an integer literal, as
+/// `(function, argument index)`: the scale of `ROUND(a, n)` and
+/// `TRUNC(a, n)`. A column there would make the result's scale depend on the
+/// row; a literal may be negative (`ROUND(a, -2)`).
+pub const INTEGER_LITERAL_ARGS: &[(&str, usize)] = &[("ROUND", 1), ("TRUNC", 1)];
 
 /// Aggregate function names, called out specifically so a rejection can
 /// explain that they need an aggregate key-space (`GROUP BY`), not that
