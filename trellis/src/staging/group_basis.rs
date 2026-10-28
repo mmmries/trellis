@@ -429,6 +429,10 @@ pub(super) fn rewrite(
             expr: Box::new(rewrite(operand, type_of, arg_of, shape)?),
             target: *target,
         }),
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
+            .map_logic_children(|child| rewrite(child, type_of, arg_of, shape).ok_or(()))
+            .expect("a logic node")
+            .ok(),
         other => Some(other.clone()),
     }
 }
@@ -458,6 +462,11 @@ fn distinct_arguments(
                 walk(rhs, out);
             }
             Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk(operand, out),
+            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+                for child in expr.logic_children() {
+                    walk(child, out);
+                }
+            }
             Expr::Column(_)
             | Expr::SourceColumn { .. }
             | Expr::NumberLiteral(_)
@@ -3391,6 +3400,12 @@ mod tests {
             "TRANSFORM t FROM s GROUP BY g SELECT SUM(a + b) AS s, COUNT(f) AS n",
             "TRANSFORM t FROM s GROUP BY g SELECT SUM(a) + COUNT(b) AS x, \
              COALESCE(SUM(a), 0) AS y, SUM(a) > COUNT(*) AS z",
+            // An aggregate whose argument is read only under `NOT`,
+            // `IS NULL` or a `CASE` still gets its partial.
+            "TRANSFORM t FROM s GROUP BY g SELECT NOT (SUM(a) > 0) AS x",
+            "TRANSFORM t FROM s GROUP BY g SELECT SUM(b) IS NULL AS x",
+            "TRANSFORM t FROM s GROUP BY g SELECT CASE WHEN COUNT(*) > 1 THEN SUM(a) END AS x, \
+             CASE WHEN COUNT(h) > 0 THEN 1 ELSE AVG(b) END AS y",
         ] {
             assert!(shape(text).is_some(), "{text}");
         }

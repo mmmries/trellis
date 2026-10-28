@@ -185,15 +185,67 @@ pub enum ValidationError {
         expected: ValueType,
         found: ValueType,
     },
-    /// `>` was given a float on one side and an exact numeric (an integer of
-    /// any width, or `numeric`) on the other. Postgres casts the exact side
-    /// to `double precision`, so the comparison inherits float rounding;
-    /// Trellis refuses the pair rather than admit a comparison that doesn't
-    /// compose.
+    /// A comparison (or `NULLIF`) was given a float on one side and an exact
+    /// numeric (an integer of any width, or `numeric`) on the other.
+    /// Postgres casts the exact side to `double precision`, so the comparison
+    /// inherits float rounding; Trellis refuses the pair rather than admit a
+    /// comparison that doesn't compose. `operator` is its symbol.
     MixedFloatExactComparison {
+        field: String,
+        operator: &'static str,
+        lhs: ValueType,
+        rhs: ValueType,
+    },
+    /// A comparison between two different temporal types (`date` and
+    /// `timestamp`): Postgres converts one side, and for `timestamptz` the
+    /// conversion depends on the session's time zone.
+    MixedTemporalComparison {
+        field: String,
+        operator: &'static str,
+        lhs: ValueType,
+        rhs: ValueType,
+    },
+    /// `<`, `<=`, `>` or `>=` over `text`, whose order depends on the
+    /// collation.
+    TextOrderingComparison {
+        field: String,
+        operator: &'static str,
+    },
+    /// A comparison (or `NULLIF`) between two types no comparison family
+    /// covers.
+    ComparisonTypeMismatch {
+        field: String,
+        operator: &'static str,
+        lhs: ValueType,
+        rhs: ValueType,
+    },
+    /// `NULLIF(a, b)` where Postgres casts `a` to compare it (an integer
+    /// beside a `numeric`, an exact numeric beside a float), so the result
+    /// has that cast's type rather than `a`'s.
+    NullIfFirstArgumentCast {
         field: String,
         lhs: ValueType,
         rhs: ValueType,
+        result: ValueType,
+    },
+    /// A `CASE` condition that is not a `boolean`.
+    CaseConditionNotBoolean { field: String, found: ValueType },
+    /// The results of a `CASE` (its `THEN`s and `ELSE`) have types Postgres
+    /// cannot unify the way `COALESCE` does.
+    CaseResultTypeMismatch {
+        field: String,
+        expected: ValueType,
+        found: ValueType,
+    },
+    /// A constant result of a `CASE` whose type is a float (a number
+    /// literal, or arithmetic over literals) lies outside that float type's
+    /// range. Postgres folds the constant, casts it to the `CASE`'s type and
+    /// raises `22003` at plan time, for every row. `text` is the result as
+    /// written.
+    CaseLiteralOutOfRange {
+        field: String,
+        text: String,
+        target: ValueType,
     },
     /// A bare number literal compared with a float lies outside
     /// `double precision`'s range (overflow, or a nonzero value that
@@ -520,6 +572,10 @@ fn collect_refusing_calls(
             } else {
                 fields_by_name
             };
+            if name == "NULLIF" {
+                let operands: Vec<&Expr> = args.iter().collect();
+                collect_text_comparison("NULLIF", &operands, field, fields_by_name, out);
+            }
             if NONDETERMINISTIC_COLLATION_REFUSING_FUNCTIONS.contains(&name.as_str()) {
                 let mut columns = Vec::new();
                 let mut visited = HashSet::new();
@@ -536,18 +592,101 @@ fn collect_refusing_calls(
                 collect_refusing_calls(arg, field, fields_by_name, out);
             }
         }
-        Expr::BinaryOp { lhs, rhs, .. } => {
+        Expr::BinaryOp { op, lhs, rhs } => {
+            if op.is_comparison() && !op.is_ordering() {
+                collect_text_comparison(
+                    super::registry::operator_spec(*op).symbol,
+                    &[lhs, rhs],
+                    field,
+                    fields_by_name,
+                    out,
+                );
+            }
             collect_refusing_calls(lhs, field, fields_by_name, out);
             collect_refusing_calls(rhs, field, fields_by_name, out);
         }
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
             collect_refusing_calls(operand, field, fields_by_name, out);
         }
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            for child in expr.logic_children() {
+                collect_refusing_calls(child, field, fields_by_name, out);
+            }
+        }
         Expr::Column(_)
         | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => {}
+    }
+}
+
+/// The reads of a text comparison (`construct`: its operator, or `NULLIF`)
+/// of `operands`: the columns whose text values reach it. Under a
+/// nondeterministic collation `=` calls two different texts equal, which
+/// Trellis's own exact-text comparisons do not.
+fn collect_text_comparison(
+    construct: &str,
+    operands: &[&Expr],
+    field: &str,
+    fields_by_name: &HashMap<&str, &FieldDef>,
+    out: &mut Vec<CollationRefusingRead>,
+) {
+    let mut columns = Vec::new();
+    let mut visited = HashSet::new();
+    for operand in operands {
+        collect_value_columns(operand, field, fields_by_name, &mut visited, &mut columns);
+    }
+    out.extend(columns.into_iter().map(|column| CollationRefusingRead {
+        field: field.to_string(),
+        function: construct.to_string(),
+        column,
+    }));
+}
+
+/// The columns whose values `expr` can return as its own value: a column, a
+/// calculated field it reads, and the arguments of `COALESCE` and `NULLIF`
+/// and the results (not the conditions) of a `CASE`. Anything else (a call,
+/// an operator) returns a value of another type or a computed one.
+fn collect_value_columns<'a>(
+    expr: &Expr,
+    field: &str,
+    fields_by_name: &HashMap<&str, &'a FieldDef>,
+    visited: &mut HashSet<&'a str>,
+    out: &mut Vec<String>,
+) {
+    match expr {
+        Expr::Column(name) => match fields_by_name.get(name.as_str()) {
+            Some(other) if name != field => {
+                if visited.insert(other.name.as_str()) {
+                    collect_value_columns(&other.expr, &other.name, fields_by_name, visited, out);
+                }
+            }
+            _ => out.push(name.clone()),
+        },
+        Expr::SourceColumn { column, .. } => out.push(column.clone()),
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            for arg in args {
+                collect_value_columns(arg, field, fields_by_name, visited, out);
+            }
+        }
+        Expr::FunctionCall { name, args } if name == "NULLIF" => {
+            if let Some(first) = args.first() {
+                collect_value_columns(first, field, fields_by_name, visited, out);
+            }
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for (_, result) in branches {
+                collect_value_columns(result, field, fields_by_name, visited, out);
+            }
+            if let Some(otherwise) = otherwise {
+                collect_value_columns(otherwise, field, fields_by_name, visited, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -582,6 +721,11 @@ fn collect_text_columns<'a>(
         }
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
             collect_text_columns(operand, field, fields_by_name, visited, out);
+        }
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            for child in expr.logic_children() {
+                collect_text_columns(child, field, fields_by_name, visited, out);
+            }
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
     }
@@ -656,19 +800,39 @@ impl fmt::Display for ValidationError {
                  column is in the target without it), or give it a name that isn't a key \
                  column's (e.g. `{field} AS source_{field}`)"
             ),
-            ValidationError::UnresolvedColumn { field, column } => write!(
-                f,
-                "calculated field '{field}' references '{column}', which is neither a \
-                 source column nor another calculated field on this target"
-            ),
+            ValidationError::UnresolvedColumn { field, column } => {
+                write!(
+                    f,
+                    "calculated field '{field}' references '{column}', which is neither a \
+                     source column nor another calculated field on this target"
+                )?;
+                if column.eq_ignore_ascii_case("not") || column.eq_ignore_ascii_case("case") {
+                    write!(
+                        f,
+                        "; if you meant the {} operator, note that a {} directly before a '-' \
+                         reads as a column of that name minus the rest (a column called {} \
+                         keeps working), so parenthesize the operand: {}",
+                        column.to_uppercase(),
+                        column.to_uppercase(),
+                        column,
+                        if column.eq_ignore_ascii_case("not") {
+                            "NOT (-x > 0)"
+                        } else {
+                            "CASE WHEN (-x > 0) THEN ..."
+                        }
+                    )?;
+                }
+                Ok(())
+            }
             ValidationError::Cycle { cycle } => {
                 write!(f, "cycle among calculated columns: {}", cycle.join(" -> "))
             }
             ValidationError::FieldExpansionTooLarge => write!(
                 f,
-                "the calculated fields read each other so deeply or so many times that inlining \
+                "the calculated fields read each other so deeply or so many times, or one \
+                 expression is so large (a CASE with thousands of branches), that inlining \
                  them into one expression yields more than a build can render; make the chain \
-                 shorter"
+                 or the expression shorter"
             ),
             ValidationError::TableCycle { cycle } => {
                 write!(f, "cycle among tables: {}", cycle.join(" -> "))
@@ -762,7 +926,8 @@ impl fmt::Display for ValidationError {
                  precise value in the group, which a running sum can't track (see \"Supported \
                  sources and targets\" in docs/transforms.md). Sum a numeric(p,s) column \
                  directly (ALTER TABLE ... ALTER COLUMN ... TYPE numeric(p,s)); an expression \
-                 over numeric has no declared scale"
+                 over numeric (arithmetic, a CASE) has no declared scale: Postgres drops the \
+                 column's modifier there, and a branch such as ELSE 0 would mix scales"
             ),
             ValidationError::ChainedNumericAggregate { function, column } => write!(
                 f,
@@ -869,13 +1034,84 @@ impl fmt::Display for ValidationError {
                 "calculated field '{field}': the scale argument of {function} must be an \
                  integer literal (it may be negative), not a column or expression"
             ),
-            ValidationError::MixedFloatExactComparison { field, lhs, rhs } => write!(
+            ValidationError::MixedFloatExactComparison {
+                field,
+                operator,
+                lhs,
+                rhs,
+            } => write!(
                 f,
                 "calculated field '{field}' compares a {lhs} value with a {rhs} value using \
-                 '>'; a float and an exact numeric (an integer or numeric) cannot be \
+                 '{operator}'; a float and an exact numeric (an integer or numeric) cannot be \
                  compared, because Postgres would round the exact side to a float. Compare \
                  values of one family: rewrite so both sides are floats or both are exact \
                  (only a bare number literal such as 0.5 is admitted against a float)"
+            ),
+            ValidationError::MixedTemporalComparison {
+                field,
+                operator,
+                lhs,
+                rhs,
+            } => write!(
+                f,
+                "calculated field '{field}' compares a {lhs} value with a {rhs} value using \
+                 '{operator}'; Postgres converts one side first, and a conversion to or from \
+                 timestamptz depends on the session time zone. Compare two values of one \
+                 temporal type: cast one side, as in CAST(d AS timestamp)"
+            ),
+            ValidationError::TextOrderingComparison { field, operator } => write!(
+                f,
+                "calculated field '{field}' orders text with '{operator}'; the order of text \
+                 depends on the column's collation, which Trellis does not evaluate. Only \
+                 =, <>, != and IS [NOT] DISTINCT FROM compare text; order by a non-text value, \
+                 or compare length(s) with CHAR_LENGTH"
+            ),
+            ValidationError::ComparisonTypeMismatch {
+                field,
+                operator,
+                lhs,
+                rhs,
+            } => write!(
+                f,
+                "calculated field '{field}': '{operator}' cannot compare a {lhs} value with a \
+                 {rhs} value; it compares two exact numerics, two floats, two values of one \
+                 temporal type (date, timestamp, timestamptz, time, timetz), two booleans, two \
+                 uuids, or two text values (text with =, <>, != and IS [NOT] DISTINCT FROM only)"
+            ),
+            ValidationError::NullIfFirstArgumentCast {
+                field,
+                lhs,
+                rhs,
+                result,
+            } => write!(
+                f,
+                "calculated field '{field}': NULLIF of a {lhs} value and a {rhs} value is a \
+                 {result} in Postgres, which casts the first argument to compare it, not the \
+                 first argument's type. Cast the first argument to {result} yourself, or \
+                 write the {rhs} value first"
+            ),
+            ValidationError::CaseConditionNotBoolean { field, found } => write!(
+                f,
+                "calculated field '{field}': a CASE condition must be a boolean, found {found}"
+            ),
+            ValidationError::CaseResultTypeMismatch {
+                field,
+                expected,
+                found,
+            } => write!(
+                f,
+                "calculated field '{field}': the results of a CASE must share a type, as the \
+                 arguments of COALESCE do; found a {found} result beside {expected}"
+            ),
+            ValidationError::CaseLiteralOutOfRange {
+                field,
+                text,
+                target,
+            } => write!(
+                f,
+                "calculated field '{field}' has a CASE result {text}, a constant out of range \
+                 for {target}, the type the CASE resolves to; Postgres cannot cast it, and \
+                 would fail for every row"
             ),
             ValidationError::FunctionArgTypeMismatch {
                 field,
@@ -1019,12 +1255,25 @@ impl fmt::Display for ValidationError {
                     column,
                     collation,
                 } = refused.as_ref();
+                let reason = if NONDETERMINISTIC_COLLATION_REFUSING_FUNCTIONS
+                    .contains(&function.as_str())
+                {
+                    format!(
+                        "Postgres refuses {function} under a nondeterministic collation, while \
+                         Trellis would compute it from the exact text"
+                    )
+                } else {
+                    format!(
+                        "such a collation can call two different texts equal (a case-insensitive \
+                         one equates 'a' and 'A'), which {function} would then also do while \
+                         Trellis compares the exact text"
+                    )
+                };
                 write!(
                     f,
                     "calculated field '{field}': {function} reads {table}.{column}, whose \
-                     collation \"{collation}\" is nondeterministic; Postgres refuses {function} \
-                     under a nondeterministic collation, while Trellis would compute it from \
-                     the exact text, so the column needs a deterministic collation"
+                     collation \"{collation}\" is nondeterministic; {reason}, so the column \
+                     needs a deterministic collation"
                 )
             }
             ValidationError::QualifiedSourceTableNotFound { schema, table } => write!(
@@ -1471,6 +1720,12 @@ fn check_aggregate_calls(
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
             check_aggregate_calls(operand, columns, value_types)
         }
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            for child in expr.logic_children() {
+                check_aggregate_calls(child, columns, value_types)?;
+            }
+            Ok(())
+        }
         Expr::FunctionCall { name, args } => {
             let upper = name.to_ascii_uppercase();
             if !(is_deferred_aggregate_name(&upper)
@@ -1811,6 +2066,20 @@ fn check_join_field_expr<'a>(
             right,
             aggregates,
         ),
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            for child in expr.logic_children() {
+                check_join_field_expr(
+                    child,
+                    field,
+                    resolve,
+                    in_aggregate.as_deref_mut(),
+                    left,
+                    right,
+                    aggregates,
+                )?;
+            }
+            Ok(())
+        }
         Expr::FunctionCall { name, args } => {
             let upper = name.to_ascii_uppercase();
             let is_aggregate = is_deferred_aggregate_name(&upper)
@@ -1931,6 +2200,11 @@ fn rename_join_columns(
                 rename_join_columns(arg, source, left, right, types);
             }
         }
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            for child in expr.logic_children_mut() {
+                rename_join_columns(child, source, left, right, types);
+            }
+        }
         _ => {}
     }
 }
@@ -2021,6 +2295,10 @@ pub(crate) fn validate_qualified_columns(
             Expr::FunctionCall { args, .. } => args
                 .iter()
                 .try_for_each(|arg| walk(arg, field, def, source_columns, source_schema)),
+            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
+                .logic_children()
+                .into_iter()
+                .try_for_each(|child| walk(child, field, def, source_columns, source_schema)),
             Expr::Column(_)
             | Expr::NumberLiteral(_)
             | Expr::StringLiteral(_)
@@ -2089,6 +2367,11 @@ fn reject_ambiguous_names(
                     in_aggregate_arg || super::registry::lookup_aggregate_function(name).is_some();
                 args.iter()
                     .find_map(|arg| first_ambiguous(arg, reader, in_arg, shadowing, aggregates))
+            }
+            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+                expr.logic_children().into_iter().find_map(|child| {
+                    first_ambiguous(child, reader, in_aggregate_arg, shadowing, aggregates)
+                })
             }
             Expr::SourceColumn { .. }
             | Expr::NumberLiteral(_)
@@ -2222,6 +2505,18 @@ fn validate_aggregate_field_expr(
             }
             Ok(())
         }
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            for child in expr.logic_children() {
+                validate_aggregate_field_expr(
+                    child,
+                    field_name,
+                    group_by,
+                    source_columns,
+                    in_aggregate_call,
+                )?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -2251,6 +2546,11 @@ pub(super) fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
                 collect_columns(arg, out);
             }
         }
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            for child in expr.logic_children() {
+                collect_columns(child, out);
+            }
+        }
     }
 }
 
@@ -2263,6 +2563,9 @@ fn has_aggregate_call(expr: &Expr) -> bool {
         }
         Expr::BinaryOp { lhs, rhs, .. } => has_aggregate_call(lhs) || has_aggregate_call(rhs),
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => has_aggregate_call(operand),
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            expr.logic_children().into_iter().any(has_aggregate_call)
+        }
         Expr::Column(_)
         | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
@@ -2366,6 +2669,11 @@ pub(crate) fn collect_reads(
                 in_aggregate_arg || super::registry::lookup_aggregate_function(name).is_some();
             for arg in args {
                 collect_reads(arg, aggregates, in_arg, fields, aggregate_args);
+            }
+        }
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            for child in expr.logic_children() {
+                collect_reads(child, aggregates, in_aggregate_arg, fields, aggregate_args);
             }
         }
     }
@@ -2738,6 +3046,16 @@ fn infer_field(
 enum Constant {
     Exact(crate::numeric::Numeric),
     Float(f64, crate::float::FloatWidth),
+    /// A `boolean` constant (a comparison or logic over constants).
+    Bool(bool),
+    /// A text or typed-literal constant, by its type and canonical text. It
+    /// is never `NULL`; two of one type are equal exactly when their
+    /// canonical texts are (a canonical form is unique per value, and `timetz`
+    /// compares its zone too).
+    Literal(ValueType, String),
+    /// `NULL`: what `NULLIF` of two equal constants, or a `CASE` that no
+    /// condition selects, folds to.
+    Null,
 }
 
 impl Constant {
@@ -2746,6 +3064,7 @@ impl Constant {
         match self {
             Constant::Exact(n) => n.is_zero(),
             Constant::Float(v, _) => *v == 0.0,
+            Constant::Bool(_) | Constant::Literal(..) | Constant::Null => false,
         }
     }
 
@@ -2757,7 +3076,113 @@ impl Constant {
                 .ok()
                 .map(|v| (v, crate::float::FloatWidth::Float8)),
             Constant::Float(v, w) => Some((*v, *w)),
+            Constant::Bool(_) | Constant::Literal(..) | Constant::Null => None,
         }
+    }
+
+    /// The order of two constants of one comparable pair, when this check
+    /// can tell: exact and float values by value (a float beside an exact
+    /// one as `double precision`), `false` before `true`, and the canonical
+    /// `date`, `timestamp` and `time` literals, whose fixed-width text sorts
+    /// as the value does.
+    fn order(&self, other: &Constant) -> Option<std::cmp::Ordering> {
+        Some(match (self, other) {
+            (Constant::Exact(a), Constant::Exact(b)) => exact_order(a, b),
+            (Constant::Bool(a), Constant::Bool(b)) => a.cmp(b),
+            (Constant::Literal(ta, a), Constant::Literal(tb, b))
+                if ta == tb
+                    && matches!(
+                        ta,
+                        ValueType::Other(PgType::Date | PgType::Timestamp | PgType::Time)
+                    ) =>
+            {
+                a.cmp(b)
+            }
+            (Constant::Literal(ta, a), Constant::Literal(tb, b))
+                if ta == tb && *ta == ValueType::Other(PgType::TimeTz) =>
+            {
+                timetz_key(a)?.cmp(&timetz_key(b)?)
+            }
+            (Constant::Literal(..) | Constant::Bool(_) | Constant::Null, _)
+            | (_, Constant::Literal(..) | Constant::Bool(_) | Constant::Null) => return None,
+            (a, b) => float_order(a.as_float()?.0, b.as_float()?.0),
+        })
+    }
+
+    /// Whether two constants of one comparable pair are equal, when this
+    /// check can tell: exact and float values by value (a float beside an
+    /// exact one as `double precision`), literals of one type by text.
+    fn equals(&self, other: &Constant) -> Option<bool> {
+        Some(match (self, other) {
+            (Constant::Exact(a), Constant::Exact(b)) => {
+                exact_order(a, b) == std::cmp::Ordering::Equal
+            }
+            (Constant::Literal(ta, a), Constant::Literal(tb, b)) if ta == tb => a == b,
+            (Constant::Bool(a), Constant::Bool(b)) => a == b,
+            (a, b) => float_order(a.as_float()?.0, b.as_float()?.0) == std::cmp::Ordering::Equal,
+        })
+    }
+}
+
+/// A canonical `timetz` literal as Postgres orders it: by the instant (the
+/// time plus the seconds the zone lies west of UTC, in microseconds), then
+/// by that zone.
+fn timetz_key(text: &str) -> Option<(i64, i64)> {
+    let sign_at = text.rfind(['+', '-'])?;
+    let (clock, zone) = text.split_at(sign_at);
+    let (hms, fraction) = clock.split_once('.').unwrap_or((clock, ""));
+    let mut parts = hms.split(':').map(|p| p.parse::<i64>().ok());
+    let (h, m, s) = (parts.next()??, parts.next()??, parts.next()??);
+    let micros = if fraction.is_empty() {
+        0
+    } else {
+        format!("{fraction:0<6}").parse::<i64>().ok()?
+    };
+    let time = ((h * 60 + m) * 60 + s) * 1_000_000 + micros;
+    let mut fields = zone[1..].split(':').map(|p| p.parse::<i64>().ok());
+    let east = fields.next()?? * 3600
+        + fields.next().flatten().unwrap_or(0) * 60
+        + fields.next().flatten().unwrap_or(0);
+    // The sign in the text is the offset east of UTC.
+    let west = if zone.starts_with('-') { east } else { -east };
+    Some((time + west * 1_000_000, west))
+}
+
+/// Postgres's order on two `double precision` values: `NaN` equals itself and
+/// sorts above every number, `-0` equals `0`.
+fn float_order(a: f64, b: f64) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => a.partial_cmp(&b).expect("neither is NaN"),
+    }
+}
+
+/// The order of two exact constants.
+fn exact_order(a: &crate::numeric::Numeric, b: &crate::numeric::Numeric) -> std::cmp::Ordering {
+    let difference = a.sub(b);
+    if difference.is_zero() {
+        std::cmp::Ordering::Equal
+    } else if difference.to_string().starts_with('-') {
+        std::cmp::Ordering::Less
+    } else {
+        std::cmp::Ordering::Greater
+    }
+}
+
+/// Whether `op` holds when its operands compare as `order`.
+fn comparison_holds(op: super::ast::Operator, order: std::cmp::Ordering) -> bool {
+    use super::ast::Operator;
+    use std::cmp::Ordering;
+    match op {
+        Operator::Equal | Operator::IsNotDistinctFrom => order == Ordering::Equal,
+        Operator::NotEqual | Operator::IsDistinctFrom => order != Ordering::Equal,
+        Operator::LessThan => order == Ordering::Less,
+        Operator::LessThanOrEqual => order != Ordering::Greater,
+        Operator::GreaterThan => order == Ordering::Greater,
+        Operator::GreaterThanOrEqual => order != Ordering::Less,
+        _ => unreachable!("only a comparison is decided by an order"),
     }
 }
 
@@ -2802,9 +3227,98 @@ fn fold_constant<'f>(
         } => crate::float::parse(text, *width)
             .ok()
             .map(|v| Constant::Float(v, *width)),
+        Expr::StringLiteral(text) => Some(Constant::Literal(ValueType::Text, text.clone())),
+        Expr::TypedLiteral { value_type, text } => {
+            Some(Constant::Literal(*value_type, text.clone()))
+        }
+        Expr::BinaryOp { op, lhs, rhs } if op.is_comparison() => {
+            use super::ast::Operator;
+            let (a, b) = (recurse(lhs, field_name)?, recurse(rhs, field_name)?);
+            // `IS [NOT] DISTINCT FROM` takes `NULL` as a value; the rest are
+            // `NULL` beside it.
+            let distinct = matches!(op, Operator::IsDistinctFrom | Operator::IsNotDistinctFrom);
+            match (&a, &b) {
+                (Constant::Null, Constant::Null) if distinct => {
+                    return Some(Constant::Bool(matches!(op, Operator::IsNotDistinctFrom)));
+                }
+                (Constant::Null, _) | (_, Constant::Null) if distinct => {
+                    return Some(Constant::Bool(matches!(op, Operator::IsDistinctFrom)));
+                }
+                (Constant::Null, _) | (_, Constant::Null) => return Some(Constant::Null),
+                _ => {}
+            }
+            if op.is_ordering() {
+                return Some(Constant::Bool(comparison_holds(*op, a.order(&b)?)));
+            }
+            let equal = a.equals(&b)?;
+            Some(Constant::Bool(match op {
+                Operator::Equal | Operator::IsNotDistinctFrom => equal,
+                _ => !equal,
+            }))
+        }
+        // The planner stops at the first operand that decides the result
+        // (`false AND x`, `true OR x`), whatever the rest reads. A `NULL`
+        // operand decides nothing: `NULL AND true` is `NULL`.
+        Expr::BinaryOp {
+            op: op @ (super::ast::Operator::And | super::ast::Operator::Or),
+            lhs,
+            rhs,
+        } => {
+            let decides = matches!(op, super::ast::Operator::Or);
+            let (a, b) = (recurse(lhs, field_name), recurse(rhs, field_name));
+            match (a, b) {
+                (Some(Constant::Bool(x)), _) if x == decides => Some(Constant::Bool(decides)),
+                (_, Some(Constant::Bool(y))) if y == decides => Some(Constant::Bool(decides)),
+                (Some(Constant::Bool(_)), Some(Constant::Bool(_))) => {
+                    Some(Constant::Bool(!decides))
+                }
+                (Some(Constant::Null), Some(Constant::Bool(_) | Constant::Null))
+                | (Some(Constant::Bool(_)), Some(Constant::Null)) => Some(Constant::Null),
+                _ => None,
+            }
+        }
+        Expr::Not(operand) => match recurse(operand, field_name)? {
+            Constant::Bool(b) => Some(Constant::Bool(!b)),
+            Constant::Null => Some(Constant::Null),
+            _ => None,
+        },
+        Expr::IsNull { expr, negated } => {
+            let is_null = matches!(recurse(expr, field_name)?, Constant::Null);
+            Some(Constant::Bool(is_null != *negated))
+        }
+        // A `NULL` condition selects nothing, like a false one.
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for (condition, result) in branches {
+                match recurse(condition, field_name)? {
+                    Constant::Bool(true) => return recurse(result, field_name),
+                    Constant::Bool(false) | Constant::Null => {}
+                    _ => return None,
+                }
+            }
+            match otherwise {
+                Some(otherwise) => recurse(otherwise, field_name),
+                None => Some(Constant::Null),
+            }
+        }
+        Expr::FunctionCall { name, args } if name == "NULLIF" && args.len() == 2 => {
+            let (a, b) = (
+                recurse(&args[0], field_name)?,
+                recurse(&args[1], field_name)?,
+            );
+            match (&a, &b) {
+                (Constant::Null, _) => Some(Constant::Null),
+                (_, Constant::Null) => Some(a),
+                _ => Some(if a.equals(&b)? { Constant::Null } else { a }),
+            }
+        }
+        // An arithmetic operator is strict: a `NULL` operand makes it `NULL`.
         Expr::BinaryOp { op, lhs, rhs } => {
             let op = ConstOp::of_operator(*op)?;
             match (recurse(lhs, field_name)?, recurse(rhs, field_name)?) {
+                (Constant::Null, _) | (_, Constant::Null) => Some(Constant::Null),
                 (Constant::Exact(a), Constant::Exact(b)) => {
                     op.exact(&a, Some(&b)).map(Constant::Exact)
                 }
@@ -2820,6 +3334,8 @@ fn fold_constant<'f>(
         Expr::Negate(operand) => match recurse(operand, field_name)? {
             Constant::Exact(n) => Some(Constant::Exact(n.negate())),
             Constant::Float(v, w) => Some(Constant::Float(-v, w)),
+            Constant::Null => Some(Constant::Null),
+            Constant::Bool(_) | Constant::Literal(..) => None,
         },
         // A widening cast keeps the value.
         Expr::Cast { expr, .. } => recurse(expr, field_name),
@@ -2827,10 +3343,19 @@ fn fold_constant<'f>(
             match recurse(&args[0], field_name)? {
                 Constant::Exact(n) => Some(Constant::Exact(n.abs())),
                 Constant::Float(v, w) => Some(Constant::Float(v.abs(), w)),
+                Constant::Null => Some(Constant::Null),
+                Constant::Bool(_) | Constant::Literal(..) => None,
             }
         }
+        // The first argument that is not `NULL` is the result.
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
-            recurse(args.first()?, field_name)
+            for arg in args {
+                match recurse(arg, field_name)? {
+                    Constant::Null => {}
+                    value => return Some(value),
+                }
+            }
+            Some(Constant::Null)
         }
         Expr::Column(name) => {
             let is_self_passthrough = name == field_name && source_columns.contains_key(name);
@@ -2873,8 +3398,29 @@ fn reads_no_column<'f>(
     match expr {
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => true,
         Expr::SourceColumn { .. } => false,
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            reads_no_column(
+        // Here "constant" means a constant that is not `NULL`: a `COALESCE`
+        // skips a `NULL` one. An operator over a `NULL` constant is `NULL`
+        // (so not constant here) unless it decides regardless (`false AND
+        // NULL`, `NULL IS NULL`), which the fold knows.
+        Expr::BinaryOp { op, lhs, rhs } => {
+            // `IS [NOT] DISTINCT FROM` takes `NULL` as a value, so it is a
+            // constant whenever both sides are constants, `NULL` included.
+            if matches!(
+                op,
+                super::ast::Operator::IsDistinctFrom | super::ast::Operator::IsNotDistinctFrom
+            ) && [lhs, rhs].into_iter().all(|side| {
+                constant_even_if_null(
+                    side,
+                    field_name,
+                    source_columns,
+                    fields_by_name,
+                    memo,
+                    depth,
+                )
+            }) {
+                return true;
+            }
+            (reads_no_column(
                 lhs,
                 field_name,
                 source_columns,
@@ -2888,8 +3434,45 @@ fn reads_no_column<'f>(
                 fields_by_name,
                 memo,
                 depth + 1,
-            )
+            )) || folds_to_a_value(expr, field_name, source_columns, fields_by_name, depth)
         }
+        Expr::Not(operand) => reads_no_column(
+            operand,
+            field_name,
+            source_columns,
+            fields_by_name,
+            memo,
+            depth + 1,
+        ),
+        Expr::IsNull { expr: operand, .. } => constant_even_if_null(
+            operand,
+            field_name,
+            source_columns,
+            fields_by_name,
+            memo,
+            depth,
+        ),
+        // A `CASE` or `NULLIF` is constant when the planner folds it to a
+        // value; one it folds to `NULL` is not, and one this check cannot
+        // evaluate is constant if everything under it is.
+        Expr::Case { .. } => nullable_is_constant(
+            expr,
+            expr.logic_children(),
+            field_name,
+            source_columns,
+            fields_by_name,
+            memo,
+            depth,
+        ),
+        Expr::FunctionCall { name, args } if name == "NULLIF" => nullable_is_constant(
+            expr,
+            args.iter().collect(),
+            field_name,
+            source_columns,
+            fields_by_name,
+            memo,
+            depth,
+        ),
         Expr::Negate(operand) => reads_no_column(
             operand,
             field_name,
@@ -2910,16 +3493,32 @@ fn reads_no_column<'f>(
         // constant and drops the rest unevaluated, so what follows the first
         // argument does not matter.
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
-            args.first().is_some_and(|arg| {
-                reads_no_column(
-                    arg,
-                    field_name,
-                    source_columns,
-                    fields_by_name,
-                    memo,
-                    depth + 1,
-                )
-            })
+            // A `NULL` constant argument is dropped; the first other one
+            // decides.
+            for arg in args {
+                let null = matches!(
+                    fold_constant(
+                        arg,
+                        field_name,
+                        source_columns,
+                        fields_by_name,
+                        &mut HashMap::new(),
+                        depth + 1,
+                    ),
+                    Some(Constant::Null)
+                );
+                if !null {
+                    return reads_no_column(
+                        arg,
+                        field_name,
+                        source_columns,
+                        fields_by_name,
+                        memo,
+                        depth + 1,
+                    );
+                }
+            }
+            false
         }
         Expr::FunctionCall { name, args } => {
             super::registry::lookup_aggregate_function(name).is_none()
@@ -2960,6 +3559,89 @@ fn reads_no_column<'f>(
     }
 }
 
+/// [`reads_no_column`] for a node that can fold to `NULL` (`CASE`,
+/// `NULLIF`), whose `children` are the expressions under it.
+fn nullable_is_constant<'f>(
+    expr: &Expr,
+    children: Vec<&Expr>,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
+    memo: &mut HashMap<&'f str, bool>,
+    depth: usize,
+) -> bool {
+    match fold_constant(
+        expr,
+        field_name,
+        source_columns,
+        fields_by_name,
+        &mut HashMap::new(),
+        depth + 1,
+    ) {
+        Some(Constant::Null) => false,
+        Some(_) => true,
+        None => children.into_iter().all(|child| {
+            reads_no_column(
+                child,
+                field_name,
+                source_columns,
+                fields_by_name,
+                memo,
+                depth + 1,
+            )
+        }),
+    }
+}
+
+/// Whether `expr` is a constant, a `NULL` one included.
+fn constant_even_if_null<'f>(
+    expr: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
+    memo: &mut HashMap<&'f str, bool>,
+    depth: usize,
+) -> bool {
+    fold_constant(
+        expr,
+        field_name,
+        source_columns,
+        fields_by_name,
+        &mut HashMap::new(),
+        depth + 1,
+    )
+    .is_some()
+        || reads_no_column(
+            expr,
+            field_name,
+            source_columns,
+            fields_by_name,
+            memo,
+            depth + 1,
+        )
+}
+
+/// Whether the planner folds `expr` to a value that is not `NULL`.
+fn folds_to_a_value<'f>(
+    expr: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
+    depth: usize,
+) -> bool {
+    !matches!(
+        fold_constant(
+            expr,
+            field_name,
+            source_columns,
+            fields_by_name,
+            &mut HashMap::new(),
+            depth + 1,
+        ),
+        None | Some(Constant::Null)
+    )
+}
+
 /// [`fold_constant`] restricted to an exact value.
 fn exact_constant<'f>(
     expr: &Expr,
@@ -2970,7 +3652,7 @@ fn exact_constant<'f>(
 ) -> Option<crate::numeric::Numeric> {
     match fold_constant(expr, field_name, source_columns, fields_by_name, memo, 0)? {
         Constant::Exact(n) => Some(n),
-        Constant::Float(..) => None,
+        Constant::Float(..) | Constant::Bool(_) | Constant::Literal(..) | Constant::Null => None,
     }
 }
 
@@ -2995,7 +3677,7 @@ impl ConstOp {
             Operator::Multiply => ConstOp::Multiply,
             Operator::Divide => ConstOp::Divide,
             Operator::Modulo => ConstOp::Modulo,
-            Operator::GreaterThan => return None,
+            _ => return None,
         })
     }
 
@@ -3045,10 +3727,12 @@ impl ConstOp {
 /// constant, so `col + 2147483647` still defines and fails only for the rows
 /// it overflows. Each nested operation is checked as it is inferred, so the
 /// innermost offender is the one reported.
+#[allow(clippy::too_many_arguments)]
 fn check_constant_op<'f>(
     expr: &Expr,
     op: ConstOp,
     operands: &[&Expr],
+    operand_types: &[ValueType],
     result: ValueType,
     field_name: &str,
     source_columns: &HashMap<String, ValueType>,
@@ -3062,7 +3746,29 @@ fn check_constant_op<'f>(
     let mut memo = HashMap::new();
     let mut fold =
         |e: &Expr| fold_constant(e, field_name, source_columns, fields_by_name, &mut memo, 0);
-    let folded: Vec<Option<Constant>> = operands.iter().map(|e| fold(e)).collect();
+    // A `CASE` or `COALESCE` casts the result it picks to the type of the
+    // whole, so a constant under a float-typed operand is computed in that
+    // float type (`CASE WHEN true THEN 5 ELSE f4 END` is a `real` 5).
+    let folded: Vec<Option<Constant>> = operands
+        .iter()
+        .zip(operand_types)
+        .map(|(e, ty)| match (fold(e), ty) {
+            (Some(Constant::Exact(n)), ValueType::Float(width)) => {
+                crate::float::literal_to_width(&n.to_string(), *width)
+                    .ok()
+                    .map(|v| Constant::Float(v, *width))
+            }
+            (Some(Constant::Float(v, _)), ValueType::Float(width)) => {
+                Some(Constant::Float(v, *width))
+            }
+            (folded, _) => folded,
+        })
+        .collect();
+    // An operator is strict: a `NULL` constant operand makes it `NULL` without
+    // evaluating it (`NULLIF(1, 1) / 0` is `NULL`).
+    if folded.iter().any(|c| matches!(c, Some(Constant::Null))) {
+        return Ok(());
+    }
     // A `NaN` dividend divides by zero to `NaN` without an error
     // (`float8div` checks the dividend first), so only that constant is
     // spared.
@@ -3120,6 +3826,249 @@ fn check_constant_op<'f>(
         _ => {}
     }
     Ok(())
+}
+
+/// What the planner makes of a `CASE` condition or an `AND`/`OR` operand.
+enum Truth {
+    /// It folds to this value.
+    Known(bool),
+    /// It folds to `NULL`: a `CASE` skips it like a false one, an `AND` or
+    /// `OR` is not decided by it.
+    Null,
+    /// It reads no column, but this check cannot compute its value (so what
+    /// the planner skips after it is unknown, and nothing after it is
+    /// refused).
+    Unknown,
+    /// It reads a column: the planner evaluates what follows.
+    Variable,
+}
+
+fn classify_condition<'f>(
+    expr: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
+) -> Truth {
+    match fold_constant(
+        expr,
+        field_name,
+        source_columns,
+        fields_by_name,
+        &mut HashMap::new(),
+        0,
+    ) {
+        Some(Constant::Bool(value)) => return Truth::Known(value),
+        Some(Constant::Null) => return Truth::Null,
+        _ => {}
+    }
+    if reads_no_column(
+        expr,
+        field_name,
+        source_columns,
+        fields_by_name,
+        &mut HashMap::new(),
+        0,
+    ) {
+        Truth::Unknown
+    } else {
+        Truth::Variable
+    }
+}
+
+/// The operands of a chain of `op` (`a AND (b AND c) AND d` is `a, b, c,
+/// d`), the way the planner flattens it.
+fn flatten_logic<'a>(expr: &'a Expr, op: super::ast::Operator, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::BinaryOp { op: this, lhs, rhs } if *this == op => {
+            flatten_logic(lhs, op, out);
+            flatten_logic(rhs, op, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// The type of a searched `CASE`. The planner simplifies the conditions in
+/// order and stops at the first one that is constant true; a branch whose
+/// condition is constant false is dropped with its result unevaluated; every
+/// other result is simplified, so a constant in it that raises (`CASE WHEN x
+/// > 0 THEN 1 / 0 END`) fails every row, whatever `x` is. `folded` is whether
+/// the planner reaches the `CASE` at all.
+#[allow(clippy::too_many_arguments)]
+fn infer_case(
+    branches: &[(Expr, Expr)],
+    otherwise: Option<&Expr>,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+    types: &mut HashMap<String, ValueType>,
+    in_progress: &mut HashSet<String>,
+    folded: bool,
+) -> Result<ValueType, ValidationError> {
+    let mut reached = folded;
+    // Each result with whether the planner simplifies it.
+    let mut results: Vec<(&Expr, bool)> = Vec::with_capacity(branches.len() + 1);
+    let mut common: Option<ValueType> = None;
+    let mut unify = |found: ValueType| -> Result<(), ValidationError> {
+        match common {
+            None => common = Some(found),
+            Some(so_far) => match common_numeric_type(so_far, found) {
+                Some(unified) => common = Some(unified),
+                None => {
+                    return Err(ValidationError::CaseResultTypeMismatch {
+                        field: field_name.to_string(),
+                        expected: so_far,
+                        found,
+                    });
+                }
+            },
+        }
+        Ok(())
+    };
+    for (condition, result) in branches {
+        let condition_t = infer_expr(
+            condition,
+            field_name,
+            source_columns,
+            fields_by_name,
+            types,
+            in_progress,
+            reached,
+        )?;
+        if condition_t != ValueType::Boolean {
+            return Err(ValidationError::CaseConditionNotBoolean {
+                field: field_name.to_string(),
+                found: condition_t,
+            });
+        }
+        let truth = if reached {
+            classify_condition(condition, field_name, source_columns, fields_by_name)
+        } else {
+            Truth::Variable
+        };
+        let result_reached =
+            reached && !matches!(truth, Truth::Known(false) | Truth::Null | Truth::Unknown);
+        let result_t = infer_expr(
+            result,
+            field_name,
+            source_columns,
+            fields_by_name,
+            types,
+            in_progress,
+            result_reached,
+        )?;
+        unify(result_t)?;
+        results.push((result, result_reached));
+        if matches!(truth, Truth::Known(true) | Truth::Unknown) {
+            reached = false;
+        }
+    }
+    if let Some(otherwise) = otherwise {
+        let otherwise_t = infer_expr(
+            otherwise,
+            field_name,
+            source_columns,
+            fields_by_name,
+            types,
+            in_progress,
+            reached,
+        )?;
+        unify(otherwise_t)?;
+        results.push((otherwise, reached));
+    }
+    let common = common.expect("a CASE has at least one branch");
+    // Postgres casts each result to the CASE's type and folds a constant one;
+    // for an exact result the constant's own type already unifies upward, so
+    // only a float result can leave one out of range.
+    if let ValueType::Float(width) = common {
+        let mut memo = HashMap::new();
+        for (result, simplified) in results {
+            if simplified
+                && let Some(value) = exact_constant(
+                    result,
+                    field_name,
+                    source_columns,
+                    fields_by_name,
+                    &mut memo,
+                )
+                && crate::float::literal_to_width(&value.to_string(), width).is_err()
+            {
+                return Err(ValidationError::CaseLiteralOutOfRange {
+                    field: field_name.to_string(),
+                    text: super::ast::render_field_expr(result),
+                    target: common,
+                });
+            }
+        }
+    }
+    Ok(common)
+}
+
+/// The result type of the comparison `op` over `lhs` and `rhs` (typed
+/// `lhs_t` and `rhs_t`), or the refusal naming why the pair is not one a
+/// comparison family covers ([`super::registry::comparison_result_type`]).
+/// A float against a *bare number literal* is admitted: Postgres casts the
+/// untyped literal to `double precision` (a `real` operand widens to it) and
+/// runs the comparison as `float8`. Only the literal's own syntax is exempt:
+/// the same value in a column, a calculated field, an expression or a typed
+/// `NUMERIC '0.5'` literal still hits the refusal.
+fn comparison_type(
+    op: super::ast::Operator,
+    lhs: &Expr,
+    rhs: &Expr,
+    lhs_t: ValueType,
+    rhs_t: ValueType,
+    field_name: &str,
+    folded: bool,
+) -> Result<ValueType, ValidationError> {
+    if let Some(result) = super::registry::comparison_result_type(op, lhs_t, rhs_t) {
+        return Ok(result);
+    }
+    let operator = super::registry::operator_spec(op).symbol;
+    if super::registry::is_mixed_float_exact(lhs_t, rhs_t) {
+        let literal = match (lhs, rhs) {
+            (Expr::NumberLiteral(text), _) if matches!(rhs_t, ValueType::Float(_)) => Some(text),
+            (_, Expr::NumberLiteral(text)) if matches!(lhs_t, ValueType::Float(_)) => Some(text),
+            _ => None,
+        };
+        if let Some(text) = literal {
+            // Postgres raises `22003` at plan time for a literal outside
+            // `double precision`'s range; refuse it at define instead of
+            // failing every row.
+            if folded {
+                crate::float::literal_to_f64(text).map_err(|_| {
+                    ValidationError::FloatComparisonLiteralOutOfRange {
+                        field: field_name.to_string(),
+                        text: text.clone(),
+                    }
+                })?;
+            }
+            return Ok(ValueType::Boolean);
+        }
+        return Err(ValidationError::MixedFloatExactComparison {
+            field: field_name.to_string(),
+            operator,
+            lhs: lhs_t,
+            rhs: rhs_t,
+        });
+    }
+    let field = field_name.to_string();
+    Err(if super::registry::is_mixed_temporal(lhs_t, rhs_t) {
+        ValidationError::MixedTemporalComparison {
+            field,
+            operator,
+            lhs: lhs_t,
+            rhs: rhs_t,
+        }
+    } else if lhs_t == ValueType::Text && rhs_t == ValueType::Text && op.is_ordering() {
+        ValidationError::TextOrderingComparison { field, operator }
+    } else {
+        ValidationError::ComparisonTypeMismatch {
+            field,
+            operator,
+            lhs: lhs_t,
+            rhs: rhs_t,
+        }
+    })
 }
 
 /// `folded` is whether Postgres's planner simplifies `expr`, so that a
@@ -3195,6 +4144,139 @@ fn infer_expr(
             })?;
             Ok(spec.value_type)
         }
+        // `AND` and `OR` chains are typed operand by operand, in the order
+        // the planner simplifies them: it stops at the first operand that
+        // decides the result (`false AND x`, `true OR x`) and drops the rest
+        // unevaluated, so no constant after it raises.
+        Expr::BinaryOp {
+            op: op @ (super::ast::Operator::And | super::ast::Operator::Or),
+            ..
+        } => {
+            let mut operands = Vec::new();
+            flatten_logic(expr, *op, &mut operands);
+            let decides = matches!(op, super::ast::Operator::Or);
+            let mut evaluated = folded;
+            for operand in operands {
+                let operand_t = infer_expr(
+                    operand,
+                    field_name,
+                    source_columns,
+                    fields_by_name,
+                    types,
+                    in_progress,
+                    evaluated,
+                )?;
+                if operand_t != ValueType::Boolean {
+                    return Err(ValidationError::TypeMismatch {
+                        field: field_name.to_string(),
+                        operator: super::registry::operator_spec(*op).symbol,
+                        expected: ValueType::Boolean,
+                        found: operand_t,
+                    });
+                }
+                if evaluated {
+                    evaluated = match classify_condition(
+                        operand,
+                        field_name,
+                        source_columns,
+                        fields_by_name,
+                    ) {
+                        Truth::Known(value) => value != decides,
+                        Truth::Unknown => false,
+                        Truth::Null | Truth::Variable => true,
+                    };
+                }
+            }
+            Ok(ValueType::Boolean)
+        }
+        Expr::Not(operand) => {
+            let operand_t = infer_expr(
+                operand,
+                field_name,
+                source_columns,
+                fields_by_name,
+                types,
+                in_progress,
+                folded,
+            )?;
+            if operand_t != ValueType::Boolean {
+                return Err(ValidationError::TypeMismatch {
+                    field: field_name.to_string(),
+                    operator: "NOT",
+                    expected: ValueType::Boolean,
+                    found: operand_t,
+                });
+            }
+            Ok(ValueType::Boolean)
+        }
+        Expr::IsNull { expr: operand, .. } => {
+            infer_expr(
+                operand,
+                field_name,
+                source_columns,
+                fields_by_name,
+                types,
+                in_progress,
+                folded,
+            )?;
+            Ok(ValueType::Boolean)
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => infer_case(
+            branches,
+            otherwise.as_deref(),
+            field_name,
+            source_columns,
+            fields_by_name,
+            types,
+            in_progress,
+            folded,
+        ),
+        Expr::FunctionCall { name, args } if name == "NULLIF" && args.len() == 2 => {
+            let mut arg_types = [ValueType::Boolean; 2];
+            for (slot, arg) in arg_types.iter_mut().zip(args) {
+                *slot = infer_expr(
+                    arg,
+                    field_name,
+                    source_columns,
+                    fields_by_name,
+                    types,
+                    in_progress,
+                    folded,
+                )?;
+            }
+            let [lhs_t, rhs_t] = arg_types;
+            comparison_type(
+                super::ast::Operator::Equal,
+                &args[0],
+                &args[1],
+                lhs_t,
+                rhs_t,
+                field_name,
+                folded,
+            )?;
+            // Postgres casts the first argument when no `=` takes the pair as
+            // it is (there is no `integer = numeric` or `numeric = float8`
+            // operator), so the result is that cast's type, not `lhs_t`.
+            let cast = match (lhs_t, rhs_t) {
+                (ValueType::Integer(_), ValueType::Numeric) => Some(ValueType::Numeric),
+                (l, ValueType::Float(_)) if l.is_exact_numeric_family() => {
+                    Some(ValueType::Float(crate::float::FloatWidth::Float8))
+                }
+                _ => None,
+            };
+            if let Some(result) = cast {
+                return Err(ValidationError::NullIfFirstArgumentCast {
+                    field: field_name.to_string(),
+                    lhs: lhs_t,
+                    rhs: rhs_t,
+                    result,
+                });
+            }
+            Ok(lhs_t)
+        }
         Expr::BinaryOp { op, lhs, rhs } => {
             let lhs_t = infer_expr(
                 lhs,
@@ -3227,6 +4309,7 @@ fn infer_expr(
                         expr,
                         kind,
                         &[lhs, rhs],
+                        &[lhs_t, rhs_t],
                         result,
                         field_name,
                         source_columns,
@@ -3235,44 +4318,8 @@ fn infer_expr(
                 }
                 return Ok(result);
             }
-            if matches!(op, super::ast::Operator::GreaterThan)
-                && super::registry::is_mixed_float_exact(lhs_t, rhs_t)
-            {
-                // A *bare* number literal against a float is Postgres's
-                // `float_col > 0.5`: the untyped literal is cast to
-                // `double precision` (a `real` operand widens to it) and
-                // the comparison runs as `float8`. Only the literal's own
-                // syntax is exempt: the same value in a column, a calculated
-                // field, an expression or a typed `NUMERIC '0.5'` literal
-                // still hits the refusal below.
-                let literal = match (&**lhs, &**rhs) {
-                    (Expr::NumberLiteral(text), _) if matches!(rhs_t, ValueType::Float(_)) => {
-                        Some(text)
-                    }
-                    (_, Expr::NumberLiteral(text)) if matches!(lhs_t, ValueType::Float(_)) => {
-                        Some(text)
-                    }
-                    _ => None,
-                };
-                if let Some(text) = literal {
-                    // Postgres raises `22003` at plan time for a literal
-                    // outside `double precision`'s range; refuse it at
-                    // define instead of failing every row.
-                    if folded {
-                        crate::float::literal_to_f64(text).map_err(|_| {
-                            ValidationError::FloatComparisonLiteralOutOfRange {
-                                field: field_name.to_string(),
-                                text: text.clone(),
-                            }
-                        })?;
-                    }
-                    return Ok(ValueType::Boolean);
-                }
-                return Err(ValidationError::MixedFloatExactComparison {
-                    field: field_name.to_string(),
-                    lhs: lhs_t,
-                    rhs: rhs_t,
-                });
+            if op.is_comparison() {
+                return comparison_type(*op, lhs, rhs, lhs_t, rhs_t, field_name, folded);
             }
             if lhs_t.is_numeric_family() && rhs_t.is_numeric_family() {
                 match op {
@@ -3331,6 +4378,7 @@ fn infer_expr(
                     expr,
                     ConstOp::Negate,
                     &[operand],
+                    &[operand_t],
                     result,
                     field_name,
                     source_columns,
@@ -3687,6 +4735,7 @@ fn infer_overloaded_call(
             expr,
             ConstOp::Abs,
             &[&args[0]],
+            &arg_types[..1],
             spec.return_type,
             field_name,
             source_columns,
@@ -3779,6 +4828,11 @@ pub(crate) fn regexp_pattern_literals(def: &TransformDef) -> Vec<(String, String
                 walk(rhs, field, out);
             }
             Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk(operand, field, out),
+            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+                for child in expr.logic_children() {
+                    walk(child, field, out);
+                }
+            }
             Expr::Column(_)
             | Expr::SourceColumn { .. }
             | Expr::NumberLiteral(_)
@@ -3830,6 +4884,12 @@ fn column_depths_in(expr: &Expr, depth: usize, out: &mut HashMap<String, usize>)
         Expr::Negate(inner) | Expr::Cast { expr: inner, .. } => {
             column_depths_in(inner, depth + 1, out)
         }
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
+            .logic_children()
+            .into_iter()
+            .map(|child| column_depths_in(child, depth + 1, out))
+            .max()
+            .unwrap_or(depth),
     }
 }
 
@@ -4528,7 +5588,7 @@ mod tests {
     }
 
     #[test]
-    fn greater_than_over_a_text_operand_is_a_type_mismatch() {
+    fn greater_than_over_a_text_operand_is_a_comparison_type_mismatch() {
         let d = def(vec![FieldDef {
             name: "out".to_string(),
             expr: Expr::BinaryOp {
@@ -4541,11 +5601,11 @@ mod tests {
         let err = validate(&d, &source_columns).unwrap_err();
         assert_eq!(
             err,
-            ValidationError::TypeMismatch {
+            ValidationError::ComparisonTypeMismatch {
                 field: "out".to_string(),
                 operator: ">",
-                expected: ValueType::Numeric,
-                found: ValueType::Text,
+                lhs: ValueType::Text,
+                rhs: ValueType::Integer(IntWidth::Int4),
             }
         );
     }
@@ -4576,6 +5636,7 @@ mod tests {
                     validate(&d, &source_columns),
                     Err(ValidationError::MixedFloatExactComparison {
                         field: "out".to_string(),
+                        operator: ">",
                         lhs: source_columns[l],
                         rhs: source_columns[r],
                     }),
