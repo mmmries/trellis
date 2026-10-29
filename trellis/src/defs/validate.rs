@@ -843,17 +843,10 @@ impl fmt::Display for ValidationError {
                 if column.eq_ignore_ascii_case("not") || column.eq_ignore_ascii_case("case") {
                     write!(
                         f,
-                        "; if you meant the {} operator, note that a {} directly before a '-' \
-                         reads as a column of that name minus the rest (a column called {} \
-                         keeps working), so parenthesize the operand: {}",
-                        column.to_uppercase(),
-                        column.to_uppercase(),
-                        column,
-                        if column.eq_ignore_ascii_case("not") {
-                            "NOT (-x > 0)"
-                        } else {
-                            "CASE WHEN (-x > 0) THEN ..."
-                        }
+                        "; {} reads as a column name here because no operand follows it (an \
+                         operand starts with a name, a number, a string, '(' or '-'); write \
+                         the operand right after the keyword",
+                        column.to_uppercase()
                     )?;
                 }
                 Ok(())
