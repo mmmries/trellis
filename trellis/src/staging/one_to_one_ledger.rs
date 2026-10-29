@@ -64,7 +64,7 @@ pub(crate) fn ledger_ident(target: &str) -> String {
 
 /// One ordering ledger the functions below work on: the 1-1 target's
 /// `<target>__ledger`, or a hidden ledger (a 1-1 `JOIN`'s `R` or `M`,
-/// [`crate::defs::join_one_to_one_ledger`]). The ledger's ident, its
+/// [`crate::defs::join_one_to_one::HiddenTable::LEDGERS`]). The ledger's ident, its
 /// `ledger_truncate_floor` key, its pause label and its definition's build
 /// lookup are separate fields, since a hidden ledger shares none of them
 /// with its definition's target.
@@ -103,10 +103,10 @@ impl LedgerRef {
     pub(crate) fn hidden(
         catalog_schema: &str,
         id: i64,
-        table: crate::defs::join_one_to_one_ledger::LedgerTable,
+        table: crate::defs::join_one_to_one::HiddenTable,
         owner_target: &str,
     ) -> Self {
-        let ident = table.ident(catalog_schema, id);
+        let ident = table.qualified(catalog_schema, id);
         LedgerRef {
             floor_key: ident.clone(),
             label: format!("{catalog_schema}.{}", table.name(id)),
@@ -535,7 +535,7 @@ pub(crate) async fn truncate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::defs::join_one_to_one_ledger::LedgerTable;
+    use crate::defs::join_one_to_one::HiddenTable;
 
     /// A target's ledger keys everything by the target, as before the split;
     /// a hidden ledger keys its floor by its own quoted ident and keeps the
@@ -553,7 +553,7 @@ mod tests {
             )
         );
 
-        let r = LedgerRef::hidden("trellis", 7, LedgerTable::From, "public.joined");
+        let r = LedgerRef::hidden("trellis", 7, HiddenTable::FromEntries, "public.joined");
         assert_eq!(r.ident, "\"trellis\".\"join1_7_r\"");
         assert_eq!(r.floor_key, r.ident);
         assert_eq!(r.label, "trellis.join1_7_r");

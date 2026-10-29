@@ -174,7 +174,7 @@ mod tests {
     /// are: a hidden ledger answers for its definition's build.
     #[tokio::test]
     async fn the_build_start_rule_reads_the_owner_targets_build_for_a_hidden_ledger() {
-        use crate::defs::join_one_to_one_ledger::LedgerTable;
+        use crate::defs::join_one_to_one::HiddenTable;
         use crate::staging::one_to_one_ledger::LedgerRef;
 
         let cluster = testkit::TestCluster::start();
@@ -197,7 +197,7 @@ mod tests {
             .expect("a definition with a build");
         let mut client = client;
         let txn = client.transaction().await.expect("begin");
-        let hidden = LedgerRef::hidden("trellis", 1, LedgerTable::From, "public.joined");
+        let hidden = LedgerRef::hidden("trellis", 1, HiddenTable::FromEntries, "public.joined");
         assert!(page_may_predate_build(&txn, &hidden, 5).await.unwrap());
         assert!(!page_may_predate_build(&txn, &hidden, 6).await.unwrap());
         let named_by_its_own_ident = LedgerRef {

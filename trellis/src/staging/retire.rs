@@ -219,7 +219,7 @@ const DRAINED_PREFIX_SQL: &str = "\
 /// Every ledger table there is, schema-qualified and quoted: a
 /// definition's `<target>__ledger`, where it exists, with the definition's
 /// id, and a 1-1 `JOIN`'s hidden ledgers `R` and `M`
-/// ([`crate::defs::join_one_to_one_ledger`], in the catalog schema, as
+/// ([`crate::defs::join_one_to_one::HiddenTable::LEDGERS`], in the catalog schema, as
 /// [`hidden_tables_sql`] finds the other hidden tables). An aggregate
 /// target's, a 1-1 target's and a hidden ledger carry the same
 /// ordering-state columns, so [`collect_tombstones`] collects them alike.

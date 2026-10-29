@@ -4614,9 +4614,13 @@ async fn empty_if_keyed_by_an_enum(
 /// that a logical restore left holding the original database's WAL positions
 /// and transaction ids (ADR-0002 I2): the 1-1 ledger's and the group
 /// ledger's `__applied_lsn` and `__basis`, a 1-1 `JOIN`'s hidden ledgers'
-/// (`R`, `M`), and the truncate floors of the target and of the hidden tables. A group-basis aggregate's and a JOIN's hidden
-/// tables are recreated by the resume itself, with no basis or stamp. Entries keep their other
-/// columns, so the rebuild still diffs each key against what it contributed.
+/// (`R`, `M`), and the truncate floors of the target and of the hidden
+/// tables. A group-basis aggregate's and a JOIN's hidden tables are recreated
+/// by the resume itself, with no basis or stamp; a 1-1 `JOIN`'s `R` and `M`
+/// are recreated too, so the reset of their ordering columns is redundant
+/// there, kept so the function stays correct for any caller that does not
+/// recreate them. Entries keep their other columns, so the rebuild still
+/// diffs each key against what it contributed.
 async fn reset_ordering_state(
     txn: &Transaction<'_>,
     schema: &str,
@@ -4641,8 +4645,8 @@ async fn reset_ordering_state(
     }
     // A 1-1 JOIN's hidden ledgers (`R`, `M`) carry the same ordering state
     // as the target's.
-    for table in crate::defs::join_one_to_one_ledger::LedgerTable::ALL {
-        let ident = table.ident(schema, id);
+    for table in crate::defs::join_one_to_one::HiddenTable::LEDGERS {
+        let ident = table.qualified(schema, id);
         let exists: bool = txn
             .query_one("select pg_catalog.to_regclass($1) is not null", &[&ident])
             .await?
@@ -4657,7 +4661,9 @@ async fn reset_ordering_state(
     }
     let hidden = super::group_basis::hidden_table_ident(schema, id);
     let mut floors = vec![target.to_string(), hidden];
-    floors.extend(crate::defs::join_one_to_one_ledger::floor_keys(schema, id));
+    floors.extend(crate::defs::join_one_to_one::HiddenTable::floor_keys(
+        schema, id,
+    ));
     floors.extend(crate::defs::join::HiddenTable::ALL.iter().map(|table| {
         format!(
             "{}.{}",
