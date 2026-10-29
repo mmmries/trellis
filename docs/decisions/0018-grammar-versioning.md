@@ -85,7 +85,9 @@ text and its version and returns the definition in the current grammar's terms:
 - **Newer than the binary knows:** refused, and the definition is neither read
   nor written. Text that fails to parse at a known version fails the same way,
   which is how a downgrade past an additive change shows up, and is how a load
-  outside an attach sees text this release refuses.
+  outside an attach sees text this release refuses. After a downgrade, run the
+  binary that wrote the definition and `RESUME` the transform; for text this
+  release refuses, drop the transform and define it again.
 
 Nothing after the entry point sees a version. Names are resolved in several
 places after the parse; translating once keeps every one of them on the current
