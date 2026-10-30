@@ -29,8 +29,10 @@
 //! `trellis::dev::defs::set_one_to_one_join(true)` before a client starts.
 //! The gate is at define (`super::validate_join_one_to_one`), never at parse,
 //! so a definition stored while the knob was on still loads with it off.
-//! Until the apply and build paths exist, a definition defined with the knob
-//! on is held at its build start, not run wrong.
+//! The `FROM` side's page and a one-transaction build run
+//! (`crate::staging::join_one_to_one`); a change of the joined side, a
+//! `TRUNCATE` of either side and a schema change halt the transform with the
+//! reason rather than run wrong.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -109,6 +111,11 @@ impl HiddenTable {
     /// The table's bare name in the catalog schema, for definition `id`.
     pub(crate) fn name(self, id: i64) -> String {
         format!("join1_{id}_{}", self.part())
+    }
+
+    /// [`Self::name`] as SQL, over the definition id expression `id`.
+    pub(crate) fn name_sql(self, id: &str) -> String {
+        format!("('join1_' || {id} || '_{}')", self.part())
     }
 
     /// The `ledger_truncate_floor` keys of the two hidden ledgers of
