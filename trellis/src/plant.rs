@@ -187,8 +187,12 @@ pub enum Plant {
     /// in the key set it locked. A row that moved keys since the unlocked
     /// read is then written under a `J` lock it doesn't hold.
     ///
+    /// A build chunk runs the same check on the entries it re-derives.
+    ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `a_key_that_moved_under_the_page_rolls_it_back_and_the_retry_locks_both`.
+    /// `a_key_that_moved_under_the_page_rolls_it_back_and_the_retry_locks_both`,
+    /// and in a chunk by `join_one_to_one_build`'s
+    /// `c10_a_chunk_whose_entry_moved_off_its_key_set_retries`.
     Join1NoRecheck,
     /// ADR-0002's I2 on a 1-1 `JOIN`'s hidden ledger keeps only its
     /// applied-position check (`staging::one_to_one_ledger::update_entries`):
@@ -244,8 +248,12 @@ pub enum Plant {
     /// of it is then written under no `J` lock on that key, so a `b` page on
     /// the key reads around it.
     ///
+    /// A build chunk runs the same check on the rows it re-derives.
+    ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `r19_an_a_rederive_whose_row_moved_onto_a_held_key_retries`.
+    /// `r19_an_a_rederive_whose_row_moved_onto_a_held_key_retries`, and in a
+    /// chunk by `join_one_to_one_build`'s
+    /// `c10_a_chunk_whose_rederived_row_moved_onto_a_key_it_did_not_lock_retries`.
     Join1RdNoKey,
     /// ADR-0021 (#1375 R18, `brd_nokey`): the same for a Re-derive of a `b`
     /// row: its `M` entry is written, and its new key fanned out to, under no
@@ -274,6 +282,41 @@ pub enum Plant {
     /// `f1_an_a_page_on_a_key_reads_m_only_after_the_b_page_on_it_commits`
     /// and `m_two_crossing_mixed_pages_queue_on_j_without_deadlock`.
     Join1MBeforeJ,
+    /// ADR-0021 (#1375 C10, `chunk_nokey`): a 1-1 `JOIN` build chunk doesn't
+    /// check that the join keys its insert-from-read found are in the key set
+    /// it locked. A row that moved onto a key after the chunk's unlocked read
+    /// gets its `R` entry and target row under no `J` lock on that key, so a
+    /// `b` page on the key fans out around the uncommitted entry, and the
+    /// chunk's target row keeps the `b` row it read before.
+    ///
+    /// Pinned by `join_one_to_one_build`'s
+    /// `c10_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_retries`.
+    Join1ChunkNoKey,
+    /// ADR-0021 (#1481 H1): a 1-1 `JOIN`'s rebuild sweep skips its orphan
+    /// pass. A `RESUME` recreates `R` empty and keeps the target, so the
+    /// target row of an `a` row deleted while the transform was paused is
+    /// backed by no entry, and nothing removes it.
+    ///
+    /// Pinned by `join_one_to_one_build`'s
+    /// `h1_a_resume_removes_the_rows_of_a_rows_deleted_while_paused`.
+    Join1NoOrphanPass,
+    /// ADR-0021 (#1481 H3): a 1-1 `JOIN`'s orphan pass deletes the target
+    /// rows of the orphans it read by statement, without their entry lock and
+    /// a re-read of `a`. A row re-inserted and applied between the read and
+    /// the delete is lost.
+    ///
+    /// Pinned by `join_one_to_one_build`'s
+    /// `h3_a_row_reinserted_after_the_orphan_read_is_kept`.
+    Join1OrphanDelete,
+    /// ADR-0021 (#1400, an `M` build with a rebuild sweep): a 1-1 `JOIN`'s
+    /// rebuild sweep re-derives only `R`'s stale entries, not `M`'s. A `b`
+    /// row deleted while the definition didn't apply keeps its live `M`
+    /// entry: the build's `M` pass reads only the rows `b` has, so the
+    /// chunks join `a` rows to the gone row.
+    ///
+    /// Pinned by `join_one_to_one_build`'s
+    /// `the_sweep_tombstones_the_m_entries_of_b_rows_gone_before_a_rebuild`.
+    Join1SweepROnly,
 }
 
 impl Plant {
@@ -302,6 +345,10 @@ impl Plant {
         Plant::Join1BrdNoKey,
         Plant::Join1NoPlaceholder,
         Plant::Join1MBeforeJ,
+        Plant::Join1ChunkNoKey,
+        Plant::Join1NoOrphanPass,
+        Plant::Join1OrphanDelete,
+        Plant::Join1SweepROnly,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -330,6 +377,10 @@ impl Plant {
             Plant::Join1BrdNoKey => "join1_brd_no_key",
             Plant::Join1NoPlaceholder => "join1_no_placeholder",
             Plant::Join1MBeforeJ => "join1_m_before_j",
+            Plant::Join1ChunkNoKey => "join1_chunk_no_key",
+            Plant::Join1NoOrphanPass => "join1_no_orphan_pass",
+            Plant::Join1OrphanDelete => "join1_orphan_delete",
+            Plant::Join1SweepROnly => "join1_sweep_r_only",
         }
     }
 
