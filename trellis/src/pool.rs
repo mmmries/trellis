@@ -960,11 +960,102 @@ pub(crate) fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// The most key/value pairs one `jsonb_build_object` call is given.
+/// Postgres caps a function call at 100 arguments (`FUNC_MAX_ARGS`, SQLSTATE
+/// 54023), and a pair is two.
+pub(crate) const MAX_PAIRS_PER_BUILD: usize = 50;
+
+/// A JSON object of `pairs` (each already `'<key>', <value>`), built from
+/// calls of at most [`MAX_PAIRS_PER_BUILD`] pairs joined with `||`, so a row
+/// of any width stays under `jsonb_build_object`'s argument cap. Every
+/// `jsonb_build_object` whose pairs grow with a table's columns goes through
+/// this. An empty `pairs` is the empty object.
+///
+/// More than one call is parenthesized, so the result is one operand wherever
+/// it is embedded: `::` binds tighter than `||`, and `a || b::text` is
+/// `jsonb || text`, which Postgres resolves to text concatenation
+/// (`{"a": 1}{"b": 2}`), not an error.
+///
+/// Keys are distinct (column names), so `||`'s right-wins merge never drops a
+/// pair.
+pub(crate) fn jsonb_build_object_sql(pairs: &[String]) -> String {
+    match jsonb_build_object_calls(pairs).as_slice() {
+        [one] => one.clone(),
+        calls => format!("({})", calls.join(" || ")),
+    }
+}
+
+/// The `jsonb_build_object` calls [`jsonb_build_object_sql`] joins: one for an
+/// empty `pairs`, else one per [`MAX_PAIRS_PER_BUILD`] pairs.
+pub(crate) fn jsonb_build_object_calls(pairs: &[String]) -> Vec<String> {
+    if pairs.is_empty() {
+        return vec!["jsonb_build_object()".to_string()];
+    }
+    pairs
+        .chunks(MAX_PAIRS_PER_BUILD)
+        .map(|chunk| format!("jsonb_build_object({})", chunk.join(", ")))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::str::FromStr;
     use tokio_postgres::NoTls;
+
+    /// The number of top-level arguments in each `jsonb_build_object(...)` call
+    /// of `sql`, counting commas outside parentheses and string literals.
+    fn call_arities(sql: &str) -> Vec<usize> {
+        let mut arities = Vec::new();
+        let chained = sql.contains(" || ");
+        assert_eq!(
+            chained,
+            sql.starts_with('(') && sql.ends_with(')'),
+            "a chain is parenthesized, one call is bare: {sql}"
+        );
+        let sql = if chained { &sql[1..sql.len() - 1] } else { sql };
+        for call in sql.split(" || ") {
+            let inner = call
+                .strip_prefix("jsonb_build_object(")
+                .and_then(|c| c.strip_suffix(')'))
+                .expect("a jsonb_build_object call");
+            let (mut depth, mut quoted, mut args) = (0, false, usize::from(!inner.is_empty()));
+            for c in inner.chars() {
+                match c {
+                    '\'' => quoted = !quoted,
+                    '(' if !quoted => depth += 1,
+                    ')' if !quoted => depth -= 1,
+                    ',' if !quoted && depth == 0 => args += 1,
+                    _ => {}
+                }
+            }
+            arities.push(args);
+        }
+        arities
+    }
+
+    #[test]
+    fn jsonb_build_object_sql_stays_under_the_argument_cap_at_every_width() {
+        let pairs = |n: usize| -> Vec<String> {
+            (0..n)
+                .map(|i| format!("'c{i}', t.\"c{i}\"::text"))
+                .collect()
+        };
+        assert_eq!(jsonb_build_object_sql(&[]), "jsonb_build_object()");
+        assert_eq!(
+            jsonb_build_object_sql(&pairs(1)),
+            "jsonb_build_object('c0', t.\"c0\"::text)"
+        );
+        for (width, calls) in [(50, 1), (51, 2), (100, 2), (101, 3), (120, 3), (1600, 32)] {
+            let arities = call_arities(&jsonb_build_object_sql(&pairs(width)));
+            assert_eq!(arities.len(), calls, "{width} columns");
+            assert!(
+                arities.iter().all(|&a| a <= 100),
+                "{width} columns: {arities:?}"
+            );
+            assert_eq!(arities.iter().sum::<usize>(), 2 * width, "{width} columns");
+        }
+    }
 
     #[test]
     fn quote_ident_escapes_embedded_quotes() {
