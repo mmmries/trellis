@@ -430,6 +430,90 @@ async fn the_chunk_plan_setting_ends_with_its_statement() {
     txn.commit().await.expect("commit the sweep batch");
 }
 
+/// The sweep's orphan walk pages by key cursor: with more orphans (target
+/// rows no live entry backs, whose source rows are gone) than one batch
+/// takes, every batch returns a cursor past the last orphan it took, the
+/// cursors strictly increase, the walk ends on the first short batch, and no
+/// orphan it passed is left. A batch looks only after its cursor: an orphan
+/// planted behind it after the first batch is left to the next sweep, which
+/// removes it.
+#[tokio::test]
+async fn the_orphan_walk_pages_by_key_cursor_and_removes_every_orphan() {
+    let (d, plan) = start_build(&[(1, 1, 1)]).await;
+    let orphans: Vec<String> = (101..=107).map(|id| format!("({id}, 1, 2)")).collect();
+    d.ctl
+        .batch_execute(&format!(
+            "insert into public.one (id, g, dbl) values {}",
+            orphans.join(", ")
+        ))
+        .await
+        .expect("seven orphans");
+    let mut client = d.pool().get().await.expect("a connection");
+    let mut sweep = async |cursor: Option<&str>| {
+        let txn = client.transaction().await.expect("begin");
+        let out = one_to_one::sweep_batch(&txn, &plan, "18446744073709551615", cursor, 3)
+            .await
+            .expect("sweep batch");
+        txn.commit().await.expect("commit");
+        out
+    };
+    let mut cursor: Option<String> = None;
+    let mut seen: Vec<String> = Vec::new();
+    let mut batches = 0;
+    loop {
+        batches += 1;
+        assert!(batches <= 10, "the walk must end");
+        let out = sweep(cursor.as_deref()).await;
+        let next = out.next.clone().or(cursor.clone());
+        if out.finished {
+            break;
+        }
+        let next = next.expect("an unfinished batch has a cursor");
+        assert!(
+            seen.last().is_none_or(|last| *last < next),
+            "the cursor advances: {seen:?} then {next:?}"
+        );
+        seen.push(next.clone());
+        cursor = Some(next);
+        if batches == 1 {
+            // Behind the cursor ('100' sorts before '101').
+            d.ctl
+                .batch_execute("insert into public.one (id, g, dbl) values (100, 1, 2)")
+                .await
+                .expect("an orphan behind the cursor");
+        }
+    }
+    // 7 orphans in batches of 3: two full batches, then a short one.
+    assert_eq!(batches, 3, "the cursors: {seen:?}");
+    let left = async || -> Vec<i32> {
+        d.ctl
+            .query("select id from public.one where id >= 100 order by id", &[])
+            .await
+            .expect("read the orphans")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect()
+    };
+    assert_eq!(
+        left().await,
+        [100],
+        "only the orphan behind the cursor is left"
+    );
+    // A new sweep, from the start of the ledger (seven tombstones now).
+    let mut cursor: Option<String> = None;
+    let mut finished = false;
+    for _ in 0..10 {
+        let out = sweep(cursor.as_deref()).await;
+        finished = out.finished;
+        if finished {
+            break;
+        }
+        cursor = out.next.or(cursor);
+    }
+    assert!(finished, "the new sweep ends");
+    assert_eq!(left().await, Vec::<i32>::new(), "the next sweep removes it");
+}
+
 // ------------------------------------------------------- chunk lock waits
 
 /// A chunk frozen after its entry lock holds an existing key's entry (the
