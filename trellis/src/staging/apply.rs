@@ -3017,14 +3017,21 @@ pub(super) async fn compute_page(
                     };
                     target_plan.truncate(side, truncate_lsn, change);
                 }
-                // A TRUNCATE of either side of a 1-1 JOIN is the truncate
-                // milestone's (ADR-0021, #1399): until it exists the page
-                // halts rather than clear nothing.
+                // A TRUNCATE of either side of a 1-1 JOIN is settled by the
+                // JOIN's page, under its lock row (`super::join_one_to_one`).
                 KeySpace::JoinOneToOne(_) => {
-                    return Err(ApplyError::GroupBasisUnsupported {
-                        target: def.def.target.clone(),
-                        what: "a TRUNCATE of a 1-1 JOIN side (its apply path is not built yet)",
-                    });
+                    let side = crate::defs::join::side_of_table(&def.def, &change.src_table)
+                        .ok_or_else(|| ApplyError::GroupBasisUnsupported {
+                            target: def.def.target.clone(),
+                            what: "a TRUNCATE of a table that is neither side of a 1-1 JOIN",
+                        })?;
+                    let target_plan = match join1_targets.entry(def.def.target.clone()) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                            super::join_one_to_one::plan_for(pool, def, side, pk.clone()).await?,
+                        ),
+                    };
+                    target_plan.truncate(side, truncate_lsn, change);
                 }
                 KeySpace::Aggregate { .. } => {
                     if let Some(existing) = aggregate_clears.get_mut(&def.def.target) {
@@ -4569,7 +4576,12 @@ pub(crate) async fn apply_page(
         keys_deleted += deleted;
     }
 
-    // 3d. 1-1 `JOIN` targets, in target order.
+    // 3d. 1-1 `JOIN` targets, in target order, after the definition rows of
+    // those whose `b` the page truncates, in id order: a rebuild's start
+    // takes them before any lock row (`join_one_to_one`'s module doc).
+    let join1_rebuilds =
+        super::join_one_to_one::lock_truncated_definitions(txn, plan.join1_targets.values())
+            .await?;
     for join1_plan in plan.join1_targets.values() {
         let (written, deleted) = super::join_one_to_one::apply_page(
             txn,
@@ -4640,6 +4652,11 @@ pub(crate) async fn apply_page(
         super::holdup::clear(txn, step).await?;
         segments_drained.push((step.seg_seq, batch_drained));
     }
+
+    // 5b. The rebuilds a `TRUNCATE` of a 1-1 `JOIN`'s `b` starts, after the
+    // segment rows step 5 locked: the start's segment stamp takes the
+    // segment pointer, which seal phase 1 updates after a segment's row.
+    super::join_one_to_one::start_rebuilds(txn, &join1_rebuilds).await?;
 
     // 6. Wake anything awaiting convergence.
     txn.execute("select pg_notify($1, '')", &[&wake_channel])

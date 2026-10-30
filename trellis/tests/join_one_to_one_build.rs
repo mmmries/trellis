@@ -397,6 +397,65 @@ async fn c_a_chunk_on_a_pages_key_gives_up_and_retries() {
     }
 }
 
+/// A `TRUNCATE b` in the middle of a build (#1399): the chunks that ran
+/// before it wrote their rows from the `b` side it removed, and the chunks
+/// still to run read the `M` it emptied. The page starts a rebuild of its
+/// own, which re-derives every row, so the target ends as the live join
+/// whichever chunks had run.
+#[tokio::test]
+async fn a_truncate_of_b_in_the_middle_of_a_build_is_rebuilt() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(&[kind], false).await;
+        assert_eq!(build_step(d.pool(), "planner", 3).await, Step::Planned);
+        assert_eq!(build_step(d.pool(), "chunk", 3).await, Step::Chunk);
+        assert_eq!(build_step(d.pool(), "chunk", 3).await, Step::Chunk);
+        write(
+            &d,
+            "truncate public.b; \
+             insert into public.b values (7, 30, 700, 'after')",
+        )
+        .await;
+        let batch = d.seal().await;
+        d.drain(batch, "truncate").await;
+        // The unfinished build and the rebuild's two jobs are all queued.
+        assert!(pending(&d, &["plan", "rederive", "sweep"]).await > 5);
+        assert_oracle(&mut d, &[kind], "a truncate of b mid-build").await;
+    }
+}
+
+/// A `TRUNCATE b` page queues behind a chunk in flight, on the pair's lock
+/// row (the chunk holds it `FOR SHARE` and the page wants it `FOR UPDATE`),
+/// so a chunk never writes rows from the `M` a truncate is emptying; the
+/// chunk's rows are rebuilt after.
+#[tokio::test]
+async fn a_truncate_of_b_queues_behind_a_chunk_in_flight() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(&[kind], false).await;
+        assert_eq!(build_step(d.pool(), "planner", 100).await, Step::Planned);
+        let mut chunk = d
+            .run_frozen(
+                &[(PausePoint::BeforeRebuildCommit, &kind.target())],
+                |pool| async move { Ok(build_step(&pool, "chunk", 100).await) },
+            )
+            .await;
+        let reached = chunk.reached(PausePoint::BeforeRebuildCommit).await;
+        write(&d, "truncate public.b").await;
+        let batch = d.seal().await;
+        let page = d.drain_frozen(batch, "page", &[]).await;
+        d.wait_blocked_behind(reached.backend_pid).await;
+        assert!(
+            !page.is_finished(),
+            "the page queued on the chunk's lock row"
+        );
+        d.release(&mut chunk, PausePoint::BeforeRebuildCommit).await;
+        chunk.finish().await;
+        page.finish().await;
+        assert_oracle(&mut d, &[kind], "a truncate of b behind a chunk").await;
+    }
+}
+
 /// C10 (`chunk_nokey`): row `a01` moves from key 10 onto key 70 after the
 /// chunk's unlocked read of its range, so its insert-from-read finds key 70,
 /// which it holds no `J` row for. It rolls back and its retry locks 70.
@@ -757,6 +816,43 @@ async fn h3_a_row_reinserted_after_the_orphan_read_is_kept() {
     }
 }
 
+/// A `TRUNCATE a` whose page meets the rebuild sweep between its orphan read
+/// and its re-derive. The sweep has read `R` and the target unlocked and
+/// takes the lock row next. The page, holding the lock row `FOR UPDATE`,
+/// empties `R` with a `DELETE`, which waits on nothing the sweep holds, so it
+/// commits and the sweep then re-derives against the emptied `R`. A
+/// `TRUNCATE` of `R` waits for the sweep's read to commit, while the sweep
+/// waits for the lock row: a deadlock.
+#[tokio::test]
+async fn a_truncate_of_a_runs_past_the_sweeps_orphan_read() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(&[kind], true).await;
+        change_while_paused(&mut d, &[kind], "delete from public.a where id = 'a03'").await;
+        run_until_the_sweep(&d).await;
+        write(&d, "truncate public.a").await;
+        let truncate = d.seal().await;
+        let target = kind.target();
+        let mut sweep = d
+            .run_frozen(
+                &[(PausePoint::AfterJoin1OrphanRead, &target)],
+                |pool| async move { Ok(build_step(&pool, "sweep", 3).await) },
+            )
+            .await;
+        let reached = sweep.reached(PausePoint::AfterJoin1OrphanRead).await;
+        let page = d.drain_frozen(truncate, "truncate", &[]).await;
+        assert!(
+            !queued_or_finished(&d, reached.backend_pid, &page).await,
+            "the truncate's page queued behind the sweep's read of R"
+        );
+        page.finish().await;
+        d.release(&mut sweep, PausePoint::AfterJoin1OrphanRead)
+            .await;
+        sweep.finish().await;
+        assert_oracle(&mut d, &[kind], "a truncate of a past the orphan read").await;
+    }
+}
+
 /// The `M` pass over `b` ∪ `M` on a rebuild in place of a live join whose
 /// `b` row 2 (key 20) was deleted, row 1 changed and row 8 inserted (on key
 /// 0), and whose `a01` moved onto 40, all past capture, so `R` and `M` hold
@@ -898,6 +994,21 @@ async fn plan_job(d: &Driver) -> (Option<String>, Option<String>, bool) {
     (job.get(0), job.get(1), job.get(2))
 }
 
+/// Ends a killed job's session and waits until it has exited.
+/// `pg_terminate_backend` alone only signals the backend, and until it has
+/// rolled back, its fenced transaction still holds the job's claim row `FOR
+/// KEY SHARE` (`ClaimFence::hold`): a claim's `FOR UPDATE SKIP LOCKED` then
+/// skips the row the test freed, and finds nothing to run.
+async fn end_session(d: &Driver, pid: i32) {
+    let ended: bool = d
+        .ctl
+        .query_one("select pg_terminate_backend($1, 60000)", &[&pid])
+        .await
+        .expect("end the job's session")
+        .get(0);
+    assert!(ended, "the job's session {pid} exited");
+}
+
 /// `kind`'s `M` entries' row versions, by key.
 async fn m_versions(d: &Driver, kind: Kind) -> Vec<String> {
     let id = definition_id(d, kind).await;
@@ -1005,10 +1116,7 @@ async fn a_plan_job_killed_after_its_m_pass_resumes_at_the_walk_of_a() {
         let before = m_versions(&d, kind).await;
         assert_eq!(before.len(), 6, "{before:?}");
         planner.kill().await;
-        d.ctl
-            .execute("select pg_terminate_backend($1)", &[&reached.backend_pid])
-            .await
-            .expect("end the plan job's session");
+        end_session(&d, reached.backend_pid).await;
         d.ctl
             .batch_execute(
                 "update backfill_chunks \
@@ -1238,10 +1346,7 @@ async fn a_sweep_killed_in_its_orphan_pass_resumes_from_its_cursor() {
             "the stale pass is done and committed"
         );
         sweep.kill().await;
-        d.ctl
-            .execute("select pg_terminate_backend($1)", &[&reached.backend_pid])
-            .await
-            .expect("end the sweep's session");
+        end_session(&d, reached.backend_pid).await;
         d.ctl
             .batch_execute(
                 "update backfill_chunks \
