@@ -32,9 +32,10 @@
 //! to the chained tables alone.
 //!
 //! The `pin_…` tests are the pins of the 1-1 `JOIN`'s page plants
-//! (`join1_*`, #1396–#1398) from `join_one_to_one_interleavings`, with `a` a
-//! seam-fed 1-1 target joined on a non-key column: each of those plants
-//! fails at least one of them. S2 pins `seam_token_early`.
+//! (`join1_*`, #1396–#1398) from `join_one_to_one_interleavings`, and of its
+//! fan-out quarantine plants (#1513) from `join_one_to_one_quarantine`, with
+//! `a` a seam-fed 1-1 target joined on a non-key column: each of those
+//! plants fails at least one of them. S2 pins `seam_token_early`.
 //!
 //! Each test drives the pipeline by hand through `support/drain_driver.rs`;
 //! nothing sleeps or polls for convergence; the waits are for states a test
@@ -52,6 +53,7 @@ use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
 use trellis::defs::join_one_to_one::{set_enabled, set_max_fanout};
 use trellis::integer::IntWidth;
+use trellis::staging::converge;
 use trellis::staging::interleave::PausePoint;
 use trellis::staging::quarantine;
 use trellis::staging::self_check::{SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page};
@@ -621,18 +623,44 @@ async fn s4_a_truncate_of_an_upstream_source_reaches_the_join_as_deletes() {
     set_max_fanout(0);
     let halted = d
         .rows(
-            "select substr(d.target_table, 8), f.error like '%TRELLIS_ONE_TO_ONE_JOIN_MAX_FANOUT%' \
+            "select substr(d.target_table, 8), f.kind, \
+                    f.error like '%TRELLIS_ONE_TO_ONE_JOIN_MAX_FANOUT%' \
              from transform_definitions d join capture_failures f on f.transform_id = d.id \
              where d.status = 'paused' order by d.id",
         )
         .await;
+    // The `a`-on-pk `JOIN`s match 3 rows, the non-key ones 5.
+    let expected: Vec<String> = JOINS
+        .into_iter()
+        .filter(|join| join.on == On::ANonKey)
+        .map(|join| format!("({},halt,t)", join.name()))
+        .collect();
+    assert_eq!(
+        halted, expected,
+        "only the widest JOINs halt, on the cap: {halted:?}"
+    );
     assert!(
-        !halted.is_empty() && halted.iter().all(|row| row.ends_with(",t)")),
-        "the widest JOINs halt on the cap: {halted:?}"
+        statuses(&d)
+            .await
+            .iter()
+            .filter(|s| s.ends_with(",paused)"))
+            .count()
+            == expected.len(),
+        "nothing else pauses"
     );
 }
 
 // ------------------------------------------------------------------- S5
+
+/// Each `JOIN`'s build segment: a rebuild of a `JOIN` stamps a new one.
+async fn join_build_segs(d: &Driver) -> Vec<String> {
+    d.rows(
+        "select substr(target_table, 8), build_seg from transform_definitions \
+         where target_table in ('public.jlp', 'public.jip', 'public.jln', 'public.jin') \
+         order by id",
+    )
+    .await
+}
 
 /// S5, a rebuild in place of either upstream (`request_backfill` of its
 /// source): the upstream's Re-derive build writes through the seam, as images
@@ -661,6 +689,7 @@ async fn s5_an_upstream_rebuild_in_place_reaches_the_join_through_the_seam() {
     ] {
         write(&d, sql).await;
         let undrained = d.seal().await;
+        let segs = join_build_segs(&d).await;
         trellis
             .request_backfill(table)
             .await
@@ -676,6 +705,11 @@ async fn s5_an_upstream_rebuild_in_place_reaches_the_join_through_the_seam() {
         assert_live(&d, table).await;
         d.drain(undrained, "undrained").await;
         assert_exact(&mut d, table).await;
+        assert_eq!(
+            join_build_segs(&d).await,
+            segs,
+            "{table}: no JOIN was rebuilt"
+        );
     }
 }
 
@@ -713,6 +747,7 @@ async fn s5_an_upstream_resume_reaches_the_join() {
         step(&mut d, sql).await;
         // The paused upstream's target is as it was; the `JOIN`s follow it.
         assert_over_targets(&d, &format!("{upstream} paused")).await;
+        let segs = join_build_segs(&d).await;
         quarantine::resume_transform(d.pool(), upstream)
             .await
             .expect("resume the upstream");
@@ -733,6 +768,11 @@ async fn s5_an_upstream_resume_reaches_the_join() {
         .await;
         settle_all(&mut d).await;
         assert_exact(&mut d, &format!("{upstream} resumed")).await;
+        assert_eq!(
+            join_build_segs(&d).await,
+            segs,
+            "{upstream}: the JOINs follow the resume with no rebuild"
+        );
         step(&mut d, "delete from public.asrc where id = 20").await;
         assert_exact(&mut d, &format!("after {upstream}'s resume")).await;
     }
@@ -1078,7 +1118,8 @@ async fn wait_polling<T>(d: &Driver, since: &str, checking: &tokio::task::JoinHa
             .ctl
             .query_one(
                 "select exists (select 1 from pg_stat_activity \
-                 where query like '%select not (((select ring_slot from segment_pointer)%' \
+                 where datname = current_database() \
+                   and query like '%select not (((select ring_slot from segment_pointer)%' \
                    and query_start > $1::text::timestamptz \
                    and pid <> pg_backend_pid())",
                 &[&since],
@@ -1092,7 +1133,10 @@ async fn wait_polling<T>(d: &Driver, since: &str, checking: &tokio::task::JoinHa
         if std::time::Instant::now() >= deadline {
             let activity = d
                 .rows(
-                    "select pid, state, wait_event_type, wait_event, query_start::text, left(query, 300)                      from pg_stat_activity where pid <> pg_backend_pid() and datname = current_database()",
+                    "select pid, state, wait_event_type, wait_event, query_start::text, \
+                            left(query, 300) \
+                     from pg_stat_activity \
+                     where pid <> pg_backend_pid() and datname = current_database()",
                 )
                 .await;
             panic!("no convergence wait started within 60 s (since {since}): {activity:#?}");
@@ -1147,7 +1191,9 @@ async fn check_while_the_join_lags(
     outcome
 }
 
-/// S9: `self_check` of each `JOIN` while its upstreams lag. With the
+/// S9: `self_check` of each `JOIN` while its upstreams lag. A watermark
+/// through a source change waits for the change's seam rows, which carry the
+/// source change's origin, not the upstream's later write token. With the
 /// upstreams' source changes pending, its convergence wait times out as
 /// `NotCaughtUp`, never a divergence. With the `JOIN` behind changes its
 /// upstreams applied after the check's watermark, it compares against the
@@ -1157,6 +1203,31 @@ async fn check_while_the_join_lags(
 async fn s9_self_check_while_the_upstream_lags_reports_nothing_and_misses_nothing() {
     let _serial = SERIAL.lock().await;
     let mut d = start().await;
+    write(
+        &d,
+        "update public.asrc set x = 77 where id = 3; update public.bsrc set w = 78 where id = 2",
+    )
+    .await;
+    let token = converge::watermark_token(&d.ctl)
+        .await
+        .expect("a watermark");
+    let source = d.seal().await;
+    d.drain(source, "the upstreams").await;
+    assert!(
+        !converge::converged_through(&d.ctl, token)
+            .await
+            .expect("converged_through"),
+        "the watermark waits for the JOINs' seam rows"
+    );
+    let seam_rows = d.seal().await;
+    d.drain(seam_rows, "the seam rows").await;
+    assert!(
+        converge::converged_through(&d.ctl, token)
+            .await
+            .expect("converged_through"),
+        "the seam rows applied, the watermark has converged"
+    );
+    assert_exact(&mut d, "the watermark").await;
     write(
         &d,
         "update public.asrc set k = 20, x = 70 where id = 1; delete from public.asrc where id = 2; \
@@ -1231,7 +1302,9 @@ async fn s9_self_check_while_the_upstream_lags_reports_nothing_and_misses_nothin
 // `k`, and `b` captured: a change of `a` is applied by the upstream's page
 // and reaches the `JOIN` as its seam row, in a batch of its own, and the
 // interleaving of the `JOIN`'s pages is the pin's. Each plant fails at least
-// one of them.
+// one of them. The last two port `join_one_to_one_quarantine`'s pins of the
+// fan-out quarantine plants (#1513) the same way: the row the `JOIN` holds is
+// held under `ta`'s key and re-derived from `ta`.
 
 const PIN_DDL: &str = "create table public.a (id integer primary key, k integer, x integer, \
                            y text); \
@@ -1889,6 +1962,81 @@ async fn pin_r18_a_b_rederive_whose_row_moved_onto_a_held_key_retries() {
             trellis::dev::interleave::join_key_moves(),
             moves + 1,
             "{kind:?}: the Re-derive's read found a key it hadn't locked"
+        );
+        assert_pin(&mut d, kind).await;
+    }
+}
+
+/// `ta`'s row 23 on key 10, with an `x` that overflows `total` once `b`'s
+/// `w` on 10 reaches 1000, and a `b` change that takes it there: the
+/// `JOIN`'s fan-out holds the row under `ta`'s key.
+async fn hold_a_seam_fed_row(d: &mut Driver, kind: Kind) {
+    upstream(d, "insert into public.a values (23, 10, 2147483000, 'big')").await;
+    d.settle().await;
+    write(d, "update public.b set w = 1000 where id = 1").await;
+    let fan_out = d.seal().await;
+    d.drain(fan_out, "fan-out").await;
+    assert_eq!(
+        d.rows("select src_table, key from poison").await,
+        ["(public.ta,23)"],
+        "{kind:?}: the fan-out holds the row"
+    );
+}
+
+/// Releases `ta`'s key 23 for `kind`.
+async fn release_23(d: &Driver, kind: Kind) {
+    let released = quarantine::release_key(d.pool(), kind.pin_name(), "public.ta", "23")
+        .await
+        .expect("release the key");
+    assert_eq!(released, 1, "{kind:?}: 23 had its parked work");
+}
+
+/// `join1_fan_out_held_row`: a later fan-out of `b` leaves the row the
+/// `JOIN` holds of its seam-fed `a` as it was, though its fields would
+/// compute, until the release re-derives it from `ta`.
+#[tokio::test]
+async fn pin_a_fan_out_leaves_a_held_row_of_a_seam_fed_a_as_it_was() {
+    let _serial = SERIAL.lock().await;
+    for kind in PIN_KINDS {
+        let mut d = start_pin(kind).await;
+        hold_a_seam_fed_row(&mut d, kind).await;
+        write(&d, "update public.b set w = 0, tag = 'zero' where id = 1").await;
+        let fan_out = d.seal().await;
+        d.drain(fan_out, "a second fan-out").await;
+        assert_eq!(
+            d.rows(&format!(
+                "select total, tag from {} where id = 23",
+                kind.pin_target()
+            ))
+            .await,
+            [format!("({},ten)", 2_147_483_000 + 100)],
+            "{kind:?}: the held row isn't rewritten"
+        );
+        release_23(&d, kind).await;
+        assert_pin(&mut d, kind).await;
+        assert!(d.rows("select key from poison").await.is_empty());
+    }
+}
+
+/// `join1_release_no_rederive`: the held row's change through the seam is
+/// parked; its release while a `b` change on its key waits in an earlier
+/// batch re-derives the row's `R` entry from `ta` in its own transaction,
+/// so the pending fan-out doesn't hold it again.
+#[tokio::test]
+async fn pin_a_release_of_a_seam_fed_row_before_a_pending_fan_out_stays_released() {
+    let _serial = SERIAL.lock().await;
+    for kind in PIN_KINDS {
+        let mut d = start_pin(kind).await;
+        hold_a_seam_fed_row(&mut d, kind).await;
+        let change = seal_a(&mut d, "update public.a set x = 23 where id = 23").await;
+        d.drain(change, "the held row's change").await;
+        write(&d, "update public.b set w = 1001 where id = 1").await;
+        let pending = d.seal().await;
+        release_23(&d, kind).await;
+        d.drain(pending, "pending").await;
+        assert!(
+            d.rows("select key from poison").await.is_empty(),
+            "{kind:?}: the pending fan-out held the released row again"
         );
         assert_pin(&mut d, kind).await;
     }
