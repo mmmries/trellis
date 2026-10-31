@@ -3043,6 +3043,7 @@ pub async fn settle_builds(pool: &Pool) {
 pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
     const CLAIMED_BY: &str = "settle_rederive_builds";
     const STALL: Duration = Duration::from_secs(10);
+    const RETRY_STALL: Duration = Duration::from_secs(30);
     let options = WorkerOptions {
         chunk_rows,
         drain_batch_cap: usize::MAX,
@@ -3050,6 +3051,7 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
         reclaim_ttl: Duration::from_secs(60),
     };
     let mut last_progress = Instant::now();
+    let mut last_retry: Option<Instant> = None;
     // A field build's plan job that gave its claim back to wait on capture
     // is tried again now, once: the capture pass that may have readied it
     // ran before this call, not on the job's backoff.
@@ -3088,8 +3090,21 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
             .expect("claim build work")
         };
         for chunk in &claimed {
+            let failures_before = failures_of(pool, chunk).await;
             run_claimed(pool, chunk, CLAIMED_BY, &options).await;
-            progressed |= !deferred(pool, chunk).await;
+            // A chunk that failed and was released for a retry after a
+            // backoff, without a charge, is not progress: a transient
+            // failure is retried forever, so a chunk that fails that way
+            // every time would otherwise keep this loop alive. (A charged
+            // failure ends in a pause, and a narrowing is released at once.)
+            let failures = failures_of(pool, chunk).await;
+            let retried = failures.0 != failures_before.0
+                && failures.1 == failures_before.1
+                && backing_off(pool, chunk).await;
+            if retried {
+                last_retry = Some(Instant::now());
+            }
+            progressed |= !retried && !deferred(pool, chunk).await;
         }
         for id in &building {
             progressed |= try_complete(pool, *id).await.expect("complete a build");
@@ -3099,13 +3114,50 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
         } else if only_capture_waits(pool).await {
             return;
         } else {
+            // A run of retries gets longer than `STALL`: a few lock timeouts
+            // in a row behind a slow page are not a stall, and the backoff
+            // between two retries alone reaches `REDERIVE_RETRY_CAP` (5s).
+            let retrying = last_retry.is_some_and(|at| at.elapsed() < STALL);
+            let stall = if retrying { RETRY_STALL } else { STALL };
             assert!(
-                last_progress.elapsed() < STALL,
-                "the running re-derive builds {building:?} made no progress for {STALL:?}"
+                last_progress.elapsed() < stall,
+                "the running re-derive builds {building:?} made no progress for {stall:?} \
+                 (a chunk that fails and retries every time is no progress)"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+}
+
+/// The failures `chunk`'s row has recorded and how many were charged
+/// (`(0, 0)` once the row is gone).
+#[cfg(any(test, feature = "internals"))]
+async fn failures_of(pool: &Pool, chunk: &ClaimedChunk) -> (i32, i32) {
+    let client = pool.get().await.expect("acquire a connection");
+    client
+        .query_opt(
+            "select attempts, charged from backfill_chunks where id = $1",
+            &[&chunk.id],
+        )
+        .await
+        .expect("read a build row")
+        .map_or((0, 0), |row| (row.get(0), row.get(1)))
+}
+
+/// Whether `chunk`'s row waits out a retry backoff, unclaimed.
+#[cfg(any(test, feature = "internals"))]
+async fn backing_off(pool: &Pool, chunk: &ClaimedChunk) -> bool {
+    let client = pool.get().await.expect("acquire a connection");
+    client
+        .query_one(
+            "select exists (select 1 from backfill_chunks \
+             where id = $1 and not done and claimed_by is null \
+               and last_error is not null and next_attempt_at > now())",
+            &[&chunk.id],
+        )
+        .await
+        .expect("read a build row")
+        .get(0)
 }
 
 /// Whether `chunk`, just run, gave its claim back to wait on capture or on
