@@ -63,8 +63,8 @@ pub enum ParseError {
     PrefixMinusChainTooLong { max: usize },
     /// A bare identifier equal to a word Postgres reserves (`order`, `not`,
     /// `end`, `user`...), which Postgres can't take as an unquoted column
-    /// name. `true`, `false` and `null` are literals in Postgres, and Trellis
-    /// has no literal for them yet.
+    /// name. In an expression, `true`, `false` and `null` are the literals
+    /// instead.
     ReservedWord { name: String },
     /// A two-character comparison split by whitespace (`a < = b`, `a ! = b`).
     /// Postgres lexes `<=`, `>=`, `<>` and `!=` only when adjacent, so the
@@ -258,25 +258,13 @@ impl fmt::Display for ParseError {
             ),
             ParseError::ReservedWord { name } => {
                 let lower = name.to_ascii_lowercase();
-                if matches!(lower.as_str(), "true" | "false" | "null") {
-                    write!(
-                        f,
-                        "'{name}' is a literal in Postgres, and this grammar doesn't support the \
-                         true, false and null literals yet; a column named '{name}' can't be \
-                         named bare either, since Postgres needs it quoted and this grammar has no \
-                         quoted identifiers: read a source column of that name qualified with its \
-                         table (`<table>.{lower}`), as Postgres allows, or rename the column or \
-                         field"
-                    )
-                } else {
-                    write!(
-                        f,
-                        "'{name}' is a reserved word in Postgres, so it can't be a column name \
-                         without quotes, and this grammar has no quoted identifiers: read a \
-                         source column of that name qualified with its table \
-                         (`<table>.{lower}`), as Postgres allows, or rename the column or field"
-                    )
-                }
+                write!(
+                    f,
+                    "'{name}' is a reserved word in Postgres, so it can't be a column name \
+                     without quotes, and this grammar has no quoted identifiers: read a \
+                     source column of that name qualified with its table \
+                     (`<table>.{lower}`), as Postgres allows, or rename the column or field"
+                )
             }
             ParseError::SplitOperator { found, joined } => write!(
                 f,
