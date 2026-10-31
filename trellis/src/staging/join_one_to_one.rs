@@ -1786,7 +1786,7 @@ async fn write_target(
     {
         let key_expr = ddl::pk_key_sql_expr(&shape.pk, Some("t"));
         let unbacked = format!(
-            "not exists (select 1 from {r} r where r.{key} = {key_expr} and {has})",
+            "not exists (select 1 from {r} r where r.{key} = ({key_expr}) collate \"C\" and {has})",
             r = shape.r.ident,
             key = quote_ident(schema::KEY_COLUMN),
             has = shape.has_target_row_sql(),
@@ -1913,7 +1913,8 @@ fn on_conflict_sql(target: &str, pk_cols: &[String], field_cols: &[String]) -> S
 /// the definition's fields say, each field cast to its target column's type
 /// and compared by text, as every other 1-1 comparison is. It reads the live
 /// tables once, in one statement, and takes no lock, so it is exact only on a
-/// quiescent instance. The audit that pages, retries and reports is #1402's.
+/// quiescent instance. The audit that pages, retries and reports is
+/// [`super::self_check_join_one_to_one`]'s.
 #[cfg(any(test, feature = "internals"))]
 pub async fn diverging_keys(pool: &Pool, target_table: &str) -> Result<Vec<String>, ApplyError> {
     let definition = crate::defs::catalog::definition_by_target(pool, target_table)
