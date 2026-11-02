@@ -9,7 +9,7 @@
 #   upgrade-battery.sh [options] [step ...]
 #
 # Steps (default: all, in this order):
-#   migrations    1. history rows unchanged; refuses a tampered checksum (control)
+#   migrations    1. the tag's files and history rows unchanged; refuses a tampered checksum (control)
 #   definitions   2. every shape resumes, converges, self_check is clean
 #   grammar       3. definitions the candidate refuses pause with a remedy, and it works
 #   inflight      4. mid-build, mid-rebuild, paused, held key, waiting for capture
@@ -17,13 +17,18 @@
 #   pgrestore     5b. a pg_dump/pg_restore of a v0.1.0 database (documented pauses, then RESUME)
 #   basebackup    5c. a pg_basebackup restore of a running v0.1.0 database
 #   clients       6. Ruby gem and Elixir package (manual)
-#   mixed         7. v0.1.0 and the candidate attached to one database
+#   mixed         7. the candidate stands by beside a live v0.1.0, then takes over
 #   downgrade     8. v0.1.0 pointed at a database the candidate wrote
 #
 # Options:
-#   --candidate REV|DIR   the release candidate: a directory (built in place) or a
-#                         git revision (built in a scratch worktree). Default: the
-#                         checkout this script is in.
+#   --candidate REV|DIR   the release candidate: a directory or a git revision.
+#                         Default: the checkout this script is in.
+#   --candidate-version V the version string the candidate is built as (default
+#                         0.2.0, the release version: a candidate must report
+#                         exactly it, since version handover compares the exact
+#                         string). It is set in a scratch checkout, never in the
+#                         tree under test, and nothing is committed. `none`
+#                         builds the tree with the version it carries.
 #   --candidate-bin PATH  use this CLI binary; the candidate's source is still
 #                         needed (--candidate) for the library probe
 #   --old-tag TAG         the released version to start from (default v0.1.0)
@@ -36,6 +41,11 @@
 #   --work DIR            scratch directory (default <repo>/target/upgrade-battery)
 #   --keep                keep clusters running and files in place on exit
 #   -h, --help            this text
+#
+# A revision is built in a scratch worktree. A directory is built in place only
+# with --candidate-version none; otherwise it is rebuilt in a scratch worktree
+# of its HEAD with the directory's uncommitted and untracked changes copied in.
+# --candidate-bin is used as it is: its own version is the candidate's.
 #
 # Needs: git, cargo, curl or gh (to download the release), PostgreSQL 15+
 # server binaries (initdb, pg_ctl, psql, pg_dump, pg_restore, pg_basebackup).
@@ -53,6 +63,7 @@ old_bin=""
 build_old=0
 candidate="$repo"
 candidate_bin=""
+cand_ver_req=0.2.0
 pg_bin="${PGBIN:-}"
 port=54920
 work="$repo/target/upgrade-battery"
@@ -66,6 +77,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --candidate) candidate="${2:?--candidate needs a revision or directory}"; shift 2 ;;
     --candidate-bin) candidate_bin="${2:?}"; shift 2 ;;
+    --candidate-version) cand_ver_req="${2:?--candidate-version needs a version or none}"; shift 2 ;;
     --old-tag) old_tag="${2:?}"; shift 2 ;;
     --old-bin) old_bin="${2:?}"; shift 2 ;;
     --build-old) build_old=1; shift ;;
@@ -78,6 +90,8 @@ while [ $# -gt 0 ]; do
     *) steps+=("$1"); shift ;;
   esac
 done
+[ "$cand_ver_req" = none ] || [[ "$cand_ver_req" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] ||
+  die "--candidate-version $cand_ver_req is not a version (want e.g. 0.2.0, or none)"
 all_steps="migrations definitions grammar inflight structure pgrestore basebackup clients mixed downgrade"
 [ ${#steps[@]} -gt 0 ] || read -r -a steps <<< "$all_steps"
 for s in "${steps[@]}"; do
@@ -265,7 +279,7 @@ fi
 # killed run left behind is moved to <rev>, so a re-run never tests a stale tree.
 checkout_at() {
   if [ -f "$1/.git" ]; then
-    git -C "$1" checkout -q --force --detach "$2"
+    git -C "$1" checkout -q --force --detach "$2" && git -C "$1" clean -fdq
   else
     rm -rf "$1"; git -C "$repo" worktree prune
     git -C "$repo" worktree add -q --detach "$1" "$2"
@@ -292,25 +306,68 @@ echo "old: $old_bin ($old_version)"
 
 # ---------------------------------------------------------------- the candidate
 say "building the candidate"
-if [ -d "$candidate" ]; then
+# The version handover compares the exact version string, so a candidate is
+# built reporting the release version, set in a scratch checkout: the tree under
+# test is never touched and nothing is committed.
+override_version=""
+if [ "$cand_ver_req" != none ] && [ -z "$candidate_bin" ]; then override_version=$cand_ver_req; fi
+cand_dirty=""
+if [ -d "$candidate" ] && [ -z "$override_version" ]; then
   cand_src=$(cd "$candidate" && pwd)
   cand_target="$cand_src/target"
+elif [ -d "$candidate" ]; then
+  # The checkout's top level, so a subdirectory candidate copies every change.
+  dir_src=$(git -C "$candidate" rev-parse --show-toplevel) || die "$candidate is not a git checkout"
+  cand_src="$work/cand-src"
+  cand_head=$(git -C "$dir_src" rev-parse HEAD) || die "$dir_src is not a git checkout"
+  checkout_at "$cand_src" "$cand_head" || die "cannot check out $cand_head of $dir_src (the candidate directory must be a worktree of $repo)"
+  extra_worktrees+=("$cand_src")
+  # A plain patch for git apply, whatever the user's diff settings.
+  git -C "$dir_src" diff --binary --no-color --no-ext-diff --no-textconv --no-relative \
+    --src-prefix=a/ --dst-prefix=b/ HEAD >"$work/cand-uncommitted.patch"
+  [ ! -s "$work/cand-uncommitted.patch" ] || git -C "$cand_src" apply --whitespace=nowarn "$work/cand-uncommitted.patch" ||
+    die "cannot copy the uncommitted changes of $dir_src"
+  git -C "$dir_src" ls-files -z --others --exclude-standard >"$work/cand-untracked.list"
+  if [ -s "$work/cand-untracked.list" ]; then
+    (cd "$dir_src" && tar -cf - --null -T "$work/cand-untracked.list") | tar -xf - -C "$cand_src" ||
+      die "cannot copy the untracked files of $dir_src"
+  fi
+  [ -z "$(git -C "$dir_src" status --porcelain 2>/dev/null)" ] || cand_dirty="+uncommitted changes"
+  cand_target="$work/cand-target"
 else
   cand_src="$work/cand-src"
   checkout_at "$cand_src" "$candidate" || die "cannot check out the candidate $candidate"
   extra_worktrees+=("$cand_src")
   cand_target="$work/cand-target"
 fi
-cand_rev=$(git -C "$cand_src" rev-parse --short HEAD 2>/dev/null || echo unknown)
-cand_dirty=""
-[ -z "$(git -C "$cand_src" status --porcelain 2>/dev/null)" ] || cand_dirty="+uncommitted changes"
+cand_rev=$(git -C "${dir_src:-$cand_src}" rev-parse --short HEAD 2>/dev/null || echo unknown)
+[ -n "${dir_src:-}" ] || [ -z "$(git -C "$cand_src" status --porcelain 2>/dev/null)" ] || cand_dirty="+uncommitted changes"
+if [ -n "$override_version" ]; then
+  # The crates the CLI and the library read their version from, and the
+  # lockfile entries for them (the build is --locked).
+  for f in cli/Cargo.toml trellis/Cargo.toml; do
+    V="$override_version" perl -0pi -e 's/^version = "[^"]*"$/version = "$ENV{V}"/m' "$cand_src/$f"
+  done
+  (cd "$cand_src" && cargo update --workspace --offline --quiet) >"$logs/set-version.log" 2>&1 ||
+    die "setting the candidate's version in the scratch checkout failed (see $logs/set-version.log)"
+  for c in trellis-cli trellis; do
+    got=$(cd "$cand_src" && cargo pkgid -p "$c" --offline | sed 's/.*[#@]//')
+    [ "$got" = "$override_version" ] || die "the scratch checkout's $c is version $got, not $override_version"
+  done
+fi
 if [ -z "$candidate_bin" ]; then
   (cd "$cand_src" && CARGO_TARGET_DIR="$cand_target" cargo build --release -p trellis-cli --locked) >"$logs/build-candidate.log" 2>&1 ||
     die "building the candidate failed (see $logs/build-candidate.log)"
   candidate_bin="$cand_target/release/trellis"
 fi
 cand_version=$("$candidate_bin" --version)
-echo "candidate: $candidate_bin ($cand_version) at $cand_rev$cand_dirty"
+cand_ver=${cand_version#trellis }
+[ -z "$override_version" ] || [ "$cand_ver" = "$override_version" ] ||
+  die "the candidate binary reports version '$cand_ver', not $override_version"
+if [ -n "$override_version" ]; then cand_built="built as version $override_version, set in a scratch checkout, never committed"
+elif [ "$cand_ver_req" != none ]; then cand_built="a prebuilt binary: version $cand_ver as it is (--candidate-version applies to builds)"
+else cand_built="built with the version the tree carries"; fi
+echo "candidate: $candidate_bin ($cand_version) at $cand_rev$cand_dirty, $cand_built"
 
 # build_probe <name> <source tree>: the library probe against that tree.
 build_probe() {
@@ -526,13 +583,18 @@ if want migrations; then
     # The candidate's files as they are on disk (a directory candidate may hold
     # uncommitted or untracked migrations), against the tag's.
     old_mig_n=$(git -C "$cand_src" ls-tree --name-only "$old_tag" trellis/migrations/ | wc -l | tr -d ' ')
-    mig_untracked=$(git -C "$cand_src" ls-files --others --exclude-standard -- trellis/migrations | sed 's/^/?? /')
+    # Every file the tag shipped must be unchanged; files the candidate adds
+    # are new migrations (for 0.2.0, V9), reported for the release notes.
+    mig_changed=$(git -C "$cand_src" diff --name-status --diff-filter=a "$old_tag" -- trellis/migrations | tr '\t' ' ' | tr '\n' ';')
+    mig_added=$( (git -C "$cand_src" diff --name-only --diff-filter=A "$old_tag" -- trellis/migrations; git -C "$cand_src" ls-files --others --exclude-standard -- trellis/migrations) | grep . | xargs -r -n1 basename | tr '\n' ' ')
     if [ "$old_mig_n" -eq 0 ]; then
       record FAIL migrations "$old_tag has no files in trellis/migrations: the script's migrations path is out of date, so nothing was compared"
-    elif git -C "$cand_src" diff --quiet "$old_tag" -- trellis/migrations && [ -z "$mig_untracked" ]; then
-      record PASS migrations "trellis/migrations at the candidate is byte-identical to $old_tag's ($old_mig_n files)"
+    elif [ -n "$mig_changed" ]; then
+      record FAIL migrations "the candidate changes or removes migrations $old_tag shipped: $mig_changed"
     else
-      record INFO migrations "the candidate changes trellis/migrations since $old_tag: $( (git -C "$cand_src" diff --name-status "$old_tag" -- trellis/migrations; echo "$mig_untracked") | grep . | tr '\n' ';') (the upgrade path runs them; downgrade is ruled out)"
+      record PASS migrations "the $old_mig_n migration files of $old_tag are byte-identical at the candidate"
+      [ -z "$mig_added" ] ||
+        record INFO migrations "the candidate adds migrations: ${mig_added% } (the upgrade path runs them; $old_tag can't open a database they ran on, so downgrade is ruled out)"
     fi
   else
     record SKIP migrations "the candidate checkout does not have tag $old_tag, so its migration files were not compared"
@@ -556,8 +618,9 @@ if want migrations; then
     record FAIL migrations "control: the candidate did not refuse an altered checksum (rc=$ctl_rc): $ctl_out"
   fi
   ctl_ok=$(trellis "$port" ctl "$candidate_bin" apply 'PAUSE TRANSFORM tc' 2>&1) && ctl_ok_rc=0 || ctl_ok_rc=$?
-  if [ "$ctl_ok_rc" -eq 0 ] && [ "$(history "$port" ctl)" = "$pre_ctl_history" ]; then
-    record PASS migrations "the candidate opens an unaltered $old_tag-created database through the CLI and leaves its history alone ($ctl_ok)"
+  ctl_history=$(history "$port" ctl)
+  if [ "$ctl_ok_rc" -eq 0 ] && [ "$(head -n "$(wc -l <<<"$pre_ctl_history")" <<<"$ctl_history")" = "$pre_ctl_history" ]; then
+    record PASS migrations "the candidate opens an unaltered $old_tag-created database through the CLI, leaves its history rows alone and adds $(( $(wc -l <<<"$ctl_history") - $(wc -l <<<"$pre_ctl_history") )) ($ctl_ok)"
   else
     record FAIL migrations "the candidate refused an unaltered database: $ctl_ok"
   fi
@@ -765,20 +828,60 @@ if want mixed; then
   apply_old mixed 'TRANSFORM m_agg FROM m GROUP BY g SELECT g AS g, COUNT(*) AS n'
   run_bg old-mixed "$port" mixed "$old_bin"
   WAIT=120 wait_all "$port" mixed "$old_bin" live m_agg || true
+  pre_mixed_history=$(history "$port" mixed)
   run_bg new-mixed "$port" mixed "$candidate_bin"
   sleep 15
   workers=$(scalar "$port" mixed "select count(*) from trellis.worker_registry where last_seen > now() - interval '30 seconds'")
   paused_n=$(scalar "$port" mixed "select count(*) from trellis.capture_failures")
-  if ! run_alive new-mixed && grep -qi 'version\|older\|newer\|instance' "$logs/run-new-mixed.log"; then
-    record PASS mixed "the candidate refused to attach beside a live $old_tag instance: $(head -c 150 "$logs/run-new-mixed.log")"
-  elif [ "$paused_n" -gt 0 ]; then
-    record PASS mixed "attaching the candidate paused the definitions with a reason: $(scalar "$port" mixed "select error from trellis.capture_failures limit 1" | cut -c1-150)"
+  # ADR-0023: the candidate's `trellis run` stands by, with this message, and
+  # runs no migration while the old instance is live.
+  standby_msg='trellis standing by: migrations are pending and Trellis processes are live on this instance'
+  if run_alive new-mixed && grep -qF "$standby_msg" "$logs/run-new-mixed.log" &&
+     [ "$(history "$port" mixed)" = "$pre_mixed_history" ] && [ "$paused_n" -eq 0 ]; then
+    record PASS mixed "the candidate stands by beside a live $old_tag instance: no migration ran, nothing paused ($(grep -F "$standby_msg" "$logs/run-new-mixed.log" | head -1 | cut -c1-200))"
   else
-    record FAIL mixed "the candidate attached beside a live $old_tag instance: no refusal, no pause ($workers workers registered, candidate process $(run_alive new-mixed && echo running || echo exited), status $(status_lines "$port" mixed "$candidate_bin" | tr '\n' ' '))"
+    record FAIL mixed "the candidate did not stand by beside a live $old_tag instance ($workers workers registered, $paused_n paused, candidate process $(run_alive new-mixed && echo running || echo exited), history $( [ "$(history "$port" mixed)" = "$pre_mixed_history" ] && echo unchanged || echo changed), log: $(tr '\n' ' ' <"$logs/run-new-mixed.log" | cut -c1-300))"
   fi
+  # The message must name the candidate's exact version and the old build as a
+  # release with no registered version. With migrations pending the candidate
+  # stands by beside a live process of any version, its own included, so the
+  # standby alone does not show a handover between two versions: a candidate
+  # that reports the old build's version string fails here.
+  case "$old_tag" in
+    v0.1.*)
+      if [ "$cand_ver" = "${old_version#trellis }" ]; then
+        record FAIL mixed "the candidate reports version $cand_ver, the same string as $old_tag, so this is no handover between two versions: build it as the release version (--candidate-version, default 0.2.0)"
+      elif grep -qF "this binary is version $cand_ver;" "$logs/run-new-mixed.log" &&
+         grep -qF 'at a release before 0.2.0' "$logs/run-new-mixed.log"; then
+        record PASS mixed "the standby message names this binary's version $cand_ver and $old_tag as a release before 0.2.0 (it registers no version)"
+      else
+        record FAIL mixed "the standby message does not name 'this binary is version $cand_ver;' and 'at a release before 0.2.0': $(head -c 300 "$logs/run-new-mixed.log" | tr '\n' ' ')"
+      fi ;;
+    *) record INFO mixed "$old_tag may register a version, so the standby message's version names were not asserted" ;;
+  esac
+  # The old instance keeps the pipeline: the writes made now converge under it.
   sql "$port" mixed -c "insert into m select g, g % 5 from generate_series(201,400) g"
+  # Stopping the old instance hands over: the candidate migrates and takes over.
+  stop_run old-mixed
+  taken=0
+  for _ in $(seq 1 120); do
+    if [ "$(history "$port" mixed | wc -l)" -gt "$(wc -l <<<"$pre_mixed_history")" ] &&
+       grep -q 'migrated, taking over' "$logs/run-new-mixed.log"; then taken=1; break; fi
+    sleep 0.5
+  done
+  if [ "$taken" -eq 1 ] && run_alive new-mixed; then
+    record PASS mixed "once $old_tag stopped, the candidate migrated and took over"
+    reg=$(scalar "$port" mixed "select count(*) from trellis.worker_registry where version = '$cand_ver' and last_seen > now() - interval '30 seconds'")
+    [ "$reg" -ge 1 ] &&
+      record PASS mixed "the candidate's live worker_registry row carries version $cand_ver" ||
+      record FAIL mixed "no live worker_registry row carries version $cand_ver (versions: $(scalar "$port" mixed "select coalesce(string_agg(distinct coalesce(version, 'none'), ','), '') from trellis.worker_registry where last_seen > now() - interval '30 seconds'"))"
+  else
+    record FAIL mixed "the candidate did not take over within 60 s of $old_tag stopping (process $(run_alive new-mixed && echo running || echo exited), log: $(tail -c 300 "$logs/run-new-mixed.log" | tr '\n' ' '))"
+  fi
+  sql "$port" mixed -c "insert into m select g, g % 5 from generate_series(401,600) g"
+  WAIT=120 wait_all "$port" mixed "$candidate_bin" live m_agg || true
   check_self "$port" mixed mixed m_agg
-  stop_run new-mixed; stop_run old-mixed
+  stop_run new-mixed
 else
   record SKIP mixed "not selected"
 fi
@@ -790,7 +893,7 @@ if want downgrade; then
   run_bg down-shapes "$port" shapes "$old_bin"
   sleep 15
   if run_alive down-shapes; then
-    record INFO downgrade "$old_tag opened a database the candidate wrote (migrations are identical): statuses $(status_lines "$port" shapes "$old_bin" | tr '\n' ' ')"
+    record INFO downgrade "$old_tag opened a database the candidate wrote: statuses $(status_lines "$port" shapes "$old_bin" | tr '\n' ' ')"
   else
     record INFO downgrade "$old_tag refused a database the candidate wrote: $(head -c 200 "$logs/run-down-shapes.log")"
   fi
@@ -804,7 +907,7 @@ fi
 stop_run new-shapes 2>/dev/null || true; stop_run new-inflight 2>/dev/null || true
 say "summary"
 echo "old:        $old_version ($old_bin)"
-echo "candidate:  $cand_version at $cand_rev$cand_dirty"
+echo "candidate:  $cand_version at $cand_rev$cand_dirty ($cand_built)"
 echo "postgres:   $("$pg_bin/postgres" --version 2>/dev/null || echo "server_version_num $pg_major")"
 est_rows=$((seed_rows + writer_iters * 80))
 echo "rows written (estimate, for the logbook): $est_rows ($seed_rows seeded, $writer_iters writer iterations of about 80)"

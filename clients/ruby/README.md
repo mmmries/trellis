@@ -164,7 +164,7 @@ one stand by; that is harmless, and each polls the lock every 5 seconds (see
 At the defaults, a handle holds up to 20 Postgres connections (its call pool,
 opened as calls need them and closed after 60 seconds idle) and 3 threads. A
 worker handle (`staging: true, drain_threads: N`) also owns a background pool
-of up to `2N + 5` connections (`2N + 4` without staging, `1` with staging
+of up to `2N + 6` connections (`2N + 5` without staging, `2` with staging
 alone), closed after 60 seconds idle, and two connections that stay open: the
 staging session and one `LISTEN` shared by its drain threads. It holds 6
 threads: drain threads are tasks on its runtime, not OS threads. Its memory is
@@ -265,7 +265,8 @@ default one included.
   ```
 - **Errors** are raised as a subclass of `Trellis::Error` per error code
   (`ParseError`, `ValidationError`, `ConnectivityError`, `ConflictError`,
-  `NotFoundError`, `InternalError`, `TimeoutError`), each with `#code` (a
+  `NotFoundError`, `InternalError`, `TimeoutError`, `VersionHandoverError`),
+  each with `#code` (a
   symbol) and `#message`. A code newer than the binding arrives as
   `UnknownError`, naming the code in its message. `ForkedHandleError` is a
   `ValidationError`. Raising is Ruby's idiom, so where the Elixir binding

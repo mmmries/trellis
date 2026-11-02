@@ -51,7 +51,9 @@ Four rules sit behind that table, and they hold for each instance separately:
   run them; the dedicated worker's own are usually enough.
 * **`migrate` runs before the worker connects.** The staging worker reads
   Trellis's own tables as it starts, so a `staging: true` connect to a
-  schema `migrate` hasn't created yet fails with a `not_found` error.
+  schema `migrate` hasn't created yet fails with a `not_found` error. One
+  connected to a schema an older release migrated stands by until `migrate`
+  has run this release's migrations ([rolling deploys](#rolling-deploys)).
 * **Nothing errors when a rule is broken.** The transforms just never go
   `live` ([the silent-stall hazard](#the-silent-stall-hazard), and
   the health checks that catch it).
@@ -107,6 +109,30 @@ A preforking server such as Puma, started with `TRELLIS_WORKER=1`, connects
 once per forked worker, so every worker after the first is a standby. That is
 harmless; each one polls every 5 seconds.
 
+**Across a version boundary** the same deploy works, and the two versions never
+run side by side ([version handover](decisions/0023-version-handover.md)).
+Every process with `staging` or `drain_threads` registers its Trellis version.
+A process of the new version that finds one of the old version live stands by
+as a whole: it stages, drains and builds nothing, and checks again every 5
+seconds. Its handles' state-changing calls (`apply` and the define, `ALTER`,
+`PAUSE`, `RESUME` and `DROP` it runs, `request_backfill`, `release_key`,
+`detect_capture_disruptions`, `self_check`) refuse with the
+`version_handover` error code, from a web process's handle as much as the
+worker's, while `status()`, the listings and the health checks keep working,
+and `status()` shows `version_handover`, naming the old version's workers. Stop
+the old version, and the new one takes over at its next poll. A process killed
+without a clean shutdown leaves its registry row live for up to the reclaim
+TTL, 30 seconds, which delays the takeover by as much. Versions match exactly:
+any change of release is a handover.
+
+A release that adds a migration can't run it while any process of the old
+version is live: `migrate` refuses with the same code until the old version
+has stopped, and the new version's background processes wait for it.
+`trellis run` migrates by itself once the old version is gone. An embedded
+fleet runs `migrate` after stopping the old version, in a release step that
+runs after the old processes are gone; with no migration pending, `migrate`
+beside the old version changes nothing and succeeds.
+
 ### What a handle uses
 
 A handle's connections, threads and memory depend on its options. Nothing is
@@ -125,7 +151,7 @@ it is over.
 | Holder | Count | Held |
 |---|---|---|
 | The call pool | up to `max_call_pool_size` (20) | opened as calls need them, closed after 60 s idle |
-| The background pool, when `staging` or `drain_threads` starts a client | `2N + 5` with both, `2N + 4` with drain threads only, `1` with staging only (`N` = `drain_threads`) | opened as the workers need them, closed after 60 s idle |
+| The background pool, when `staging` or `drain_threads` starts a client | `2N + 6` with both, `2N + 5` with drain threads only, `2` with staging only (`N` = `drain_threads`) | opened as the workers need them, closed after 60 s idle |
 | The staging worker's session (`staging: true`, while leading) | 1 | as long as it leads |
 | The `LISTEN` connection (`drain_threads` at least 1) | 1, shared by the drain threads and `self_check` | as long as the client runs |
 | The claim keep-alive (`drain_threads` at least 1) | up to 1, shared by the drain threads | while a claim outlives one heartbeat interval |
@@ -139,12 +165,12 @@ holds no staging session; it opens a connection for a moment every 5 seconds to
 try the lock.
 
 A worker handle with `staging: true, drain_threads: 2` therefore holds a
-background pool of up to 9, and two connections that stay open for as long as
+background pool of up to 10, and two connections that stay open for as long as
 it runs: the staging session and the `LISTEN`. When the work stops, the
 background pool shrinks to the one or two connections the idle drain threads'
 polls keep in use. On top of those come a heartbeat connection while a claim
 runs long, a session for each paged drain, and a call pool that empties when
-idle. Its worst case is 35 connections (20 + 9 + 1 + 1 + 1 + 2 + 1: call pool,
+idle. Its worst case is 36 connections (20 + 10 + 1 + 1 + 1 + 2 + 1: call pool,
 background pool, session, `LISTEN`, keep-alive, two paged drains, attach); idle,
 it holds three or four.
 A handle at the defaults uses at most `max_call_pool_size`, plus one while it
@@ -758,6 +784,12 @@ So keep Trellis out of the host's transaction, in this order:
 3. The transforms are defined, once each, outside any host transaction.
 4. The dedicated worker starts or restarts. It doesn't need the definitions
    to exist first; it picks each one up on its next pass.
+
+In a deploy that changes the Trellis release, steps 2 and 3 refuse with the
+`version_handover` code while a process of the old release is live: `migrate`
+when the new release carries a migration, and every define, `ALTER`, `PAUSE`,
+`RESUME` and `DROP` ([rolling deploys](#rolling-deploys)). Run them once the
+old release's processes have stopped.
 
 Step 3 can be a deploy step of its own, run after migrations, or a migration
 of its own with the host's transaction turned off (`@disable_ddl_transaction
