@@ -1,6 +1,5 @@
 //! Define of a 1-1 JOIN (`FROM a [INNER|LEFT] JOIN b ON ...` with no
-//! `GROUP BY`, ADR-0021, epic #1392) behind the dev knob
-//! `TRELLIS_DEV_ONE_TO_ONE_JOIN`: the accept/refuse matrix, the catalog state
+//! `GROUP BY`, ADR-0021, epic #1392): the accept/refuse matrix, the catalog state
 //! and hidden tables define creates, the lifecycle (pause, resume, drop), and
 //! one test per site that would otherwise treat the new key space as a plain
 //! 1-1 or an aggregate JOIN without saying so.
@@ -13,23 +12,11 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio::sync::{Mutex, MutexGuard};
 use tokio_postgres::{Client, NoTls};
 use trellis::capture::install::{Installed, installed};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::defs::{CatalogError, ValidationError, ValueType, install_definition};
 use trellis::{Applied, Config, TransformStatus, Trellis, TrellisOptions};
-
-/// The knob is process-wide and these tests run on threads of one process:
-/// each takes this for its whole body and sets the state it needs.
-static KNOB: Mutex<()> = Mutex::const_new(());
-
-async fn with_knob(on: bool) -> MutexGuard<'static, ()> {
-    let guard = KNOB.lock().await;
-    set_enabled(on);
-    guard
-}
 
 async fn batch(pool: &trellis::pool::Pool, sql: &str) {
     pool.get()
@@ -152,49 +139,37 @@ const LEFT_JOIN: &str = "TRANSFORM order_view FROM orders LEFT JOIN customers \
      SELECT customers.name AS who, orders.total * 2 AS doubled, \
             COALESCE(customers.tier, 'none') AS tier";
 
+/// A 1-1 JOIN defines with nothing set in the process or its environment:
+/// it registers the definition and creates its target and hidden tables.
 #[tokio::test]
-async fn the_knob_off_refuses_a_one_to_one_join_at_define_and_leaves_nothing() {
-    let _knob = with_knob(false).await;
+async fn a_one_to_one_join_defines_with_no_setting() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     batch(&db.pool, TABLES).await;
 
-    let err = define_err(&db.pool, LEFT_JOIN).await;
-    assert!(
-        matches!(
-            err,
-            CatalogError::Validate(ValidationError::OneToOneJoinDisabled)
-        ),
-        "{err:?}"
+    install_definition(&db.pool, LEFT_JOIN, &HashMap::new(), "public")
+        .await
+        .expect("a 1-1 JOIN defines");
+    let raw = connect_raw(db.dsn()).await;
+    let exists: bool = raw
+        .query_one(
+            "select pg_catalog.to_regclass('public.order_view') is not null",
+            &[],
+        )
+        .await
+        .expect("probe target")
+        .get(0);
+    assert!(exists, "define creates the target");
+    let id = definition_id(&raw, "order_view").await;
+    assert_eq!(
+        hidden_tables(&raw, id).await.len(),
+        4,
+        "R, M, J and the lock row"
     );
-    assert!(err.to_string().contains("needs a GROUP BY"), "{err}");
-    assert_nothing_registered(&db.pool, "order_view").await;
-
-    // The gate is at define, not at parse: the text still parses and loads
-    // under the current grammar, so a definition stored while the knob was on
-    // does not fail `grammar::load` in a process that has it off.
-    let def = trellis::defs::parse(LEFT_JOIN).expect("a 1-1 JOIN parses with the knob off");
-    assert!(matches!(
-        def.key_space,
-        trellis::defs::ast::KeySpace::JoinOneToOne(_)
-    ));
-
-    // An aggregate JOIN is unaffected.
-    install_definition(
-        &db.pool,
-        "TRANSFORM by_region FROM orders JOIN customers ON orders.cust = customers.id \
-         GROUP BY orders.region WITHOUT SOURCE INDEX SELECT orders.region AS region, \
-         COUNT(*) AS n",
-        &HashMap::new(),
-        "public",
-    )
-    .await
-    .expect("an aggregate JOIN still defines");
 }
 
 #[tokio::test]
 async fn the_accept_and_refuse_matrix() {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     batch(&db.pool, TABLES).await;
@@ -413,7 +388,6 @@ async fn the_accept_and_refuse_matrix() {
 
 #[tokio::test]
 async fn a_partitioned_side_is_refused() {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     batch(
@@ -461,7 +435,6 @@ async fn make_live(raw: &Client, target: &str) {
 #[tokio::test]
 async fn a_one_to_one_target_side_needs_its_primary_key_and_no_transform_reads_a_one_to_one_join_target()
  {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -554,7 +527,6 @@ async fn a_one_to_one_target_side_needs_its_primary_key_and_no_transform_reads_a
 #[tokio::test]
 async fn a_one_to_one_target_is_an_a_side_on_any_columns_and_a_b_side_on_columns_containing_its_primary_key()
  {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -658,7 +630,6 @@ async fn a_one_to_one_target_is_an_a_side_on_any_columns_and_a_b_side_on_columns
 
 #[tokio::test]
 async fn define_registers_both_tables_the_target_and_the_hidden_tables() {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect_raw(db.dsn()).await;
@@ -873,7 +844,6 @@ async fn define_registers_both_tables_the_target_and_the_hidden_tables() {
 
 #[tokio::test]
 async fn a_build_start_runs_the_minimal_build_of_a_one_to_one_join() {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect_raw(db.dsn()).await;
@@ -958,7 +928,6 @@ async fn a_build_start_runs_the_minimal_build_of_a_one_to_one_join() {
 
 #[tokio::test]
 async fn a_one_to_one_join_pauses_resumes_revalidates_and_drops_with_its_hidden_tables() {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -1127,7 +1096,6 @@ async fn drain(raw: &mut Client, pool: &trellis::pool::Pool) {
 /// rebuild of the target, and one of `a` empties it.
 #[tokio::test]
 async fn a_change_of_either_side_applies_and_a_truncate_clears_or_rebuilds_a_one_to_one_join() {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect_raw(db.dsn()).await;
@@ -1248,7 +1216,6 @@ async fn a_change_of_either_side_applies_and_a_truncate_clears_or_rebuilds_a_one
 /// of the recreate.
 #[tokio::test]
 async fn a_restored_one_to_one_joins_resume_recreates_its_ledgers_and_keeps_the_target() {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -1334,7 +1301,6 @@ async fn a_restored_one_to_one_joins_resume_recreates_its_ledgers_and_keeps_the_
 /// yet dropped `R`.
 #[tokio::test]
 async fn a_resume_waits_out_an_in_flight_chunk_before_recreating_the_hidden_tables() {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -1419,51 +1385,77 @@ async fn a_resume_waits_out_an_in_flight_chunk_before_recreating_the_hidden_tabl
     );
 }
 
-/// No transform reads a 1-1 JOIN target, however it came to: a reader whose
-/// source was dropped while it was paused, and whose source's name a 1-1
-/// JOIN's target then took, is refused at `RESUME` as at define.
+/// No transform reads a 1-1 JOIN target, however it came to: a 1-1 JOIN
+/// whose target would take the name of a table another definition reads (its
+/// `FROM` or its joined table, dropped since) is refused at define and
+/// leaves nothing, whether that reader is still running (the staging worker
+/// would never pause it for its dropped source once the name is a target's)
+/// or paused (its `RESUME` would read the target). With the readers dropped,
+/// it defines.
 #[tokio::test]
-async fn a_resume_refuses_a_reader_whose_source_became_a_one_to_one_join_target() {
-    let _knob = with_knob(true).await;
+async fn a_one_to_one_join_whose_target_takes_the_name_of_a_read_table_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
     raw.batch_execute("create table public.shadow (id integer primary key, who text)")
         .await
-        .expect("the reader's source");
+        .expect("the readers' table");
     let trellis = define_only(db.dsn()).await;
     trellis
         .apply("TRANSFORM shadow_copy FROM shadow SELECT who AS who")
         .await
-        .expect("define the reader");
+        .expect("define the FROM reader");
+    trellis
+        .apply(
+            "TRANSFORM by_who FROM orders JOIN shadow ON orders.cust = shadow.id \
+             GROUP BY shadow.who WITHOUT SOURCE INDEX SELECT shadow.who AS who, COUNT(*) AS n",
+        )
+        .await
+        .expect("define the joined-table reader");
+    raw.batch_execute("drop table public.shadow")
+        .await
+        .expect("drop the readers' table");
+    const TAKES_THE_NAME: &str = "TRANSFORM shadow FROM orders LEFT JOIN customers \
+                                  ON orders.cust = customers.id SELECT customers.name AS who";
+    let refused = |reader: &'static str| {
+        move |err: CatalogError| {
+            assert!(
+                matches!(
+                    &err,
+                    CatalogError::Validate(ValidationError::OneToOneJoinTargetHasReader {
+                        target, reader: r,
+                    }) if target == "public.shadow" && r == &format!("public.{reader}")
+                ),
+                "{err:?}"
+            );
+        }
+    };
+
+    refused("shadow_copy")(define_err(&db.pool, TAKES_THE_NAME).await);
+    assert_nothing_registered(&db.pool, "shadow").await;
     trellis
         .apply("PAUSE TRANSFORM shadow_copy")
         .await
-        .expect("pause the reader");
-    raw.batch_execute("drop table public.shadow")
-        .await
-        .expect("drop the reader's source");
+        .expect("pause the FROM reader");
+    refused("shadow_copy")(define_err(&db.pool, TAKES_THE_NAME).await);
     trellis
-        .apply(
-            "TRANSFORM shadow FROM orders LEFT JOIN customers ON orders.cust = customers.id \
-             SELECT customers.name AS who",
-        )
+        .apply("DROP TRANSFORM shadow_copy")
         .await
-        .expect("a 1-1 JOIN whose target takes the dropped source's name");
-    // Live, as a later milestone's build would leave it; a resume otherwise
-    // waits for its upstream to go live, and revalidates then.
-    make_live(&raw, "shadow").await;
-
-    let err = trellis
-        .apply("RESUME TRANSFORM shadow_copy")
+        .expect("drop the FROM reader");
+    refused("by_who")(define_err(&db.pool, TAKES_THE_NAME).await);
+    assert_nothing_registered(&db.pool, "shadow").await;
+    trellis
+        .apply("PAUSE TRANSFORM by_who")
         .await
-        .expect_err("the resumed reader would read a 1-1 JOIN target");
-    assert!(err.to_string().contains("1-1 JOIN"), "{err}");
-    assert_eq!(
-        status(&trellis, "shadow_copy").await,
-        Some(TransformStatus::Paused)
-    );
+        .expect("pause the joined-table reader");
+    trellis
+        .apply("DROP TRANSFORM by_who")
+        .await
+        .expect("drop the joined-table reader");
+    install_definition(&db.pool, TAKES_THE_NAME, &HashMap::new(), "public")
+        .await
+        .expect("with no reader of the name, the 1-1 JOIN defines");
 }
 
 /// A rebuild of a live 1-1 JOIN in place (`request_backfill`, which also
@@ -1472,7 +1464,6 @@ async fn a_resume_refuses_a_reader_whose_source_became_a_one_to_one_join_target(
 /// to the live join, and the definition goes live again with no sweep job.
 #[tokio::test]
 async fn a_rebuild_in_place_drops_the_entries_whose_rows_are_gone() {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect_raw(db.dsn()).await;
@@ -1544,7 +1535,6 @@ async fn a_rebuild_in_place_drops_the_entries_whose_rows_are_gone() {
 /// qualifier naming neither table is refused.
 #[tokio::test]
 async fn a_qualified_read_of_a_reserved_word_column_is_copied_under_its_name() {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     batch(

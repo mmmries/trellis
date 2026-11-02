@@ -1,5 +1,4 @@
-//! 1-1 `JOIN` transforms: the tables Trellis keeps for one, and the dev knob
-//! that admits them (ADR-0021).
+//! 1-1 `JOIN` transforms: the tables Trellis keeps for one (ADR-0021).
 //!
 //! A 1-1 `JOIN` definition (`FROM a [INNER|LEFT] JOIN b ON ...` with no
 //! `GROUP BY`, [`super::ast::KeySpace::JoinOneToOne`]) reads the same two
@@ -24,18 +23,13 @@
 //! They're fully derived: define creates them empty, `DROP TRANSFORM` drops
 //! them, and a resume drops and recreates them.
 //!
-//! **The dev knob.** The whole feature is admitted only while
-//! [`enabled`]: `TRELLIS_DEV_ONE_TO_ONE_JOIN=1`, or
-//! `trellis::dev::defs::set_one_to_one_join(true)` before a client starts.
-//! The gate is at define (`super::validate_join_one_to_one`), never at parse,
-//! so a definition stored while the knob was on still loads with it off.
 //! Pages of either side's changes, Re-derives and `TRUNCATE`s, and the
-//! chunked build, run (`crate::staging::join_one_to_one`); a schema change
-//! halts the transform with the reason rather than run wrong. So does a page
-//! whose fan-out passes the cap ([`max_fanout`]) or fails on a row.
+//! chunked build, run in `crate::staging::join_one_to_one`. A page whose
+//! fan-out passes the cap ([`max_fanout`]) halts the transform with the reason
+//! rather than fan out in one transaction.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio_postgres::GenericClient;
 
@@ -44,34 +38,6 @@ use super::ddl::PrimaryKeyColumn;
 use super::join::{Side, join_key, side_columns};
 use super::validate::{JoinColumnInfo, ValidationError};
 use crate::pool::quote_ident;
-
-/// The environment variable that turns the knob on (`1`, `true` or `on`)
-/// when nothing has set it: see the module doc.
-pub const KNOB_ENV: &str = "TRELLIS_DEV_ONE_TO_ONE_JOIN";
-
-/// 0: not read yet; 1: off; 2: on.
-static KNOB: AtomicU8 = AtomicU8::new(0);
-
-/// Whether 1-1 `JOIN` transforms are admitted (see the module doc).
-pub fn enabled() -> bool {
-    match KNOB.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = std::env::var(KNOB_ENV)
-                .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on"));
-            KNOB.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// Turns the knob on or off for this process. Only before any client starts:
-/// the stored definitions and the staging worker read it at their own pace.
-#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
-pub fn set_enabled(on: bool) {
-    KNOB.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-}
 
 /// The environment variable that sets the hard fan-out cap: the most `a` rows
 /// one page's `b` changes may recompute (ADR-0021's v1 limits). A page past it
@@ -429,6 +395,37 @@ pub(crate) async fn reject_reader_of_target(
     Ok(())
 }
 
+/// Refuses a 1-1 `JOIN` whose target, `qualified_target`, names a table
+/// another definition reads, as its `FROM` or joined table, whatever that
+/// definition's status ([`ValidationError::OneToOneJoinTargetHasReader`]).
+/// Such a table was dropped after the reader was defined, so the reader
+/// would go on to read the 1-1 `JOIN`'s target: a running one at once (the
+/// staging worker never pauses it for its dropped source once the name is a
+/// target's), and a paused one on its `RESUME`. The converse of
+/// [`reject_reader_of_target`], which refuses a reader of a 1-1 `JOIN`
+/// target that exists.
+pub(crate) async fn reject_target_with_reader(
+    client: &impl GenericClient,
+    qualified_target: &str,
+) -> Result<(), super::catalog::CatalogError> {
+    let reader: Option<String> = client
+        .query_opt(
+            "select target_table from transform_definitions \
+             where source_table = $1 or join_table = $1 order by id limit 1",
+            &[&qualified_target],
+        )
+        .await?
+        .map(|row| row.get(0));
+    match reader {
+        Some(reader) => Err(ValidationError::OneToOneJoinTargetHasReader {
+            target: qualified_target.to_string(),
+            reader,
+        }
+        .into()),
+        None => Ok(()),
+    }
+}
+
 /// The define-time checks of a 1-1 `JOIN` that read the catalog, once its
 /// joined table is resolved (`joined`, qualified): the joined table's `ON`
 /// columns are unique, and a joined table that is another transform's 1-1
@@ -477,14 +474,11 @@ pub(crate) async fn check_define(
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use crate::defs::ast::ValueType;
     use crate::defs::parse;
     use crate::integer::IntWidth;
-
-    /// Tests that set the knob take this, so they don't see each other's.
-    pub(crate) static KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn info(pg_type: &str, value_type: ValueType) -> JoinColumnInfo {
         JoinColumnInfo {
@@ -747,14 +741,5 @@ pub(crate) mod tests {
                 .expect("read the keys"),
             "a table that doesn't exist has no key"
         );
-    }
-
-    #[test]
-    fn the_knob_is_settable() {
-        let _lock = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        set_enabled(true);
-        assert!(enabled());
-        set_enabled(false);
-        assert!(!enabled());
     }
 }

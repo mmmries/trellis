@@ -36,13 +36,15 @@ mod drain_driver;
 use drain_driver::Driver;
 use trellis::config::Config;
 use trellis::defs::ValueType;
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::integer::IntWidth;
 use trellis::staging::build::{self, Step, WorkerOptions};
 use trellis::staging::self_check::{SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page};
 use trellis::{Trellis, TrellisOptions};
 
-/// The 1-1 `JOIN` tests turn the dev knob on, which is process-wide.
+/// These tests run one at a time. Side by side, each a cluster of its own
+/// running rebuilds, they load the box enough that a build chunk's statement
+/// hits its 1 s lock timeout, and `work_to_idle` stops at the chunk's retry
+/// with the target not yet rebuilt (#1594).
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn options() -> WorkerOptions {
@@ -322,7 +324,6 @@ async fn apply_changes(d: &mut Driver, layout: &Layout, round: i32, name: &str) 
 async fn run_cell(cell: &Cell, kind: &str) {
     let name = format!("{} ({kind})", cell.name);
     let name = name.as_str();
-    set_enabled(true);
     let mut d = Driver::start(
         &cell.layout.ddl(),
         &cell.layout.columns(),
@@ -609,7 +610,6 @@ async fn a_held_row_is_released_after_a_re_collation(cell: Cell) {
     for kind in ["", "LEFT"] {
         let case = format!("{} ({kind})", cell.name);
         let case = case.as_str();
-        set_enabled(true);
         let mut d = Driver::start(
             &cell.layout.ddl(),
             &cell.layout.columns(),
@@ -711,7 +711,6 @@ async fn run_keys_cell(
     target: &str,
     oracle: &str,
 ) {
-    set_enabled(true);
     let mut d = Driver::start(ddl, columns, &[definition], &["public.a", "public.b"]).await;
     assert_eq!(d.rows(target).await, d.rows(oracle).await, "{case}: built");
     for stmt in recollate {
@@ -922,7 +921,6 @@ async fn a_composite_on_and_a_composite_primary_key_re_collated() {
 async fn the_from_tables_keys_re_collated_during_its_build() {
     let _serial = SERIAL.lock().await;
     for kind in ["", "LEFT"] {
-        set_enabled(true);
         let ddl = "create table public.a (id text collate \"und-x-icu\" primary key, \
                  kt text collate \"und-x-icu\", v integer); \
              create table public.b (id integer primary key, \

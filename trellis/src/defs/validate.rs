@@ -169,9 +169,6 @@ pub enum ValidationError {
     /// A `JOIN` definition's field is neither a `GROUP BY` key passthrough
     /// nor an admitted aggregate over a single column.
     JoinFieldShape { field: String, detail: String },
-    /// A 1-1 `JOIN` (a `JOIN` with no `GROUP BY`, ADR-0021) was defined while
-    /// the dev knob that admits it is off.
-    OneToOneJoinDisabled,
     /// A 1-1 `JOIN` field calls an aggregate. A 1-1 `JOIN` has one target row
     /// per `FROM` row and no `GROUP BY` to aggregate over.
     OneToOneJoinAggregate { field: String, function: String },
@@ -183,6 +180,10 @@ pub enum ValidationError {
     /// A definition reads the target of a 1-1 `JOIN`, which no transform may
     /// until the seam can stream a large fan-out (ADR-0021).
     OneToOneJoinTargetRead { table: String },
+    /// A 1-1 `JOIN` whose target would take the name of a table another
+    /// definition reads (one whose source was dropped), which would then
+    /// read the 1-1 `JOIN`'s target (ADR-0021).
+    OneToOneJoinTargetHasReader { target: String, reader: String },
     /// An aggregate in a deferred family (`MIN`/`MAX`, `bool_*`/`bit_*`,
     /// float or `interval` `SUM`/`AVG`, `array_agg`/`string_agg`/`jsonb_agg`).
     /// Only the aggregates the group basis keeps exact from signed deltas are
@@ -1082,11 +1083,6 @@ impl fmt::Display for ValidationError {
             ValidationError::JoinFieldShape { field, detail } => {
                 write!(f, "field '{field}' of a JOIN definition: {detail}")
             }
-            ValidationError::OneToOneJoinDisabled => write!(
-                f,
-                "a JOIN aggregates, so it needs a GROUP BY after the ON clause (a JOIN without \
-                 one, a 1-1 JOIN, is not available yet)"
-            ),
             ValidationError::OneToOneJoinAggregate { field, function } => write!(
                 f,
                 "field '{field}' of a 1-1 JOIN calls {function}, an aggregate, but a JOIN \
@@ -1110,6 +1106,12 @@ impl fmt::Display for ValidationError {
                  target-mutation seam holds each changed key's prior image in memory until \
                  commit (about 300 MB per million rows). Read the sources of the 1-1 JOIN \
                  instead"
+            ),
+            ValidationError::OneToOneJoinTargetHasReader { target, reader } => write!(
+                f,
+                "the 1-1 JOIN's target '{target}' would take the name of a table the transform \
+                 '{reader}' reads, and no transform can read a 1-1 JOIN's target yet. Drop \
+                 '{reader}' first, or give the 1-1 JOIN another target name"
             ),
             ValidationError::OneToOneJoinUnsupported { what, remedy } => {
                 write!(f, "a 1-1 JOIN doesn't take {what}: {remedy}")
