@@ -43,10 +43,11 @@ use std::time::{Duration, Instant};
 
 use testkit::crash::CrashGuard;
 use tokio_postgres::NoTls;
+use trellis::Config;
 use trellis::dev::defs::ast::TransformDef;
 use trellis::dev::defs::{CatalogError, DdlError, install_definition};
+use trellis::dev::pool::Pool;
 use trellis::dev::staging::StagingError;
-use trellis::{Config, Pool};
 
 use super::Snapshot;
 use super::sql;
@@ -585,7 +586,8 @@ impl super::Backend for SubprocessBackend {
                     // for every definition this suite actually generates,
                     // only) column, matching `sql::read_table`'s single
                     // `pk_col` contract.
-                    let pk = source_primary_key(&self.pool, &def.source).await?;
+                    let source = super::sql::persisted_source(&self.raw, &def.target).await?;
+                    let pk = source_primary_key(&self.pool, &source).await?;
                     let target_columns: Vec<crate::model::Column> =
                         std::iter::once(crate::model::Column {
                             name: pk[0].name.clone(),

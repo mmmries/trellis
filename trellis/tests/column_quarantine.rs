@@ -201,7 +201,7 @@ async fn seed_order_summaries(db: &TestDatabase, orders_def: &TransformDef) {
         "public",
         &pk,
         &order_totals_columns,
-        &summary_def.def.source,
+        &summary_def.source_table,
     )
     .await
     .expect("create order_summaries table");
@@ -221,7 +221,7 @@ async fn seed_order_summaries(db: &TestDatabase, orders_def: &TransformDef) {
 /// and nothing here ever retires a stuck segment, so batching every id this
 /// call needs into one segment keeps every test's total segment count under
 /// that ceiling instead of exhausting the ring.
-async fn stage_bad_orders(client: &mut Client, pool: &trellis::Pool, ids: &[i64]) {
+async fn stage_bad_orders(client: &mut Client, pool: &trellis::pool::Pool, ids: &[i64]) {
     let table = active_segment_table(client).await;
     for id in ids {
         insert_cdc_row(
@@ -378,7 +378,7 @@ async fn a_column_fuse_trip_that_waits_out_the_lock_timeout_trips_on_the_next_fa
     let below_threshold: Vec<i64> = (1..DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
     stage_bad_orders(&mut client, &db.pool, &below_threshold).await;
 
-    let impatient = trellis::Pool::new(
+    let impatient = trellis::pool::Pool::new(
         &Config::from_dsn(format!("{} options='-c lock_timeout=100'", db.dsn()))
             .expect("valid dsn"),
     )
@@ -625,7 +625,7 @@ async fn seed_order_reports(db: &TestDatabase, orders_def: &TransformDef) {
         "public",
         &pk,
         &order_summaries_columns,
-        &reports_def.def.source,
+        &reports_def.source_table,
     )
     .await
     .expect("create order_reports table");
@@ -660,8 +660,8 @@ async fn hold_fence_of<'a>(raw: &'a mut Client, target: &str) -> tokio_postgres:
 /// A pool whose sessions give up on a lock after 100 ms (a setting shorter
 /// than Trellis's 30 s cap is kept), so a pause's fence bump behind a held
 /// fence fails fast.
-fn impatient_pool(db: &TestDatabase) -> trellis::Pool {
-    trellis::Pool::new(
+fn impatient_pool(db: &TestDatabase) -> trellis::pool::Pool {
+    trellis::pool::Pool::new(
         &Config::from_dsn(format!("{} options='-c lock_timeout=100'", db.dsn()))
             .expect("valid dsn"),
     )
@@ -2349,7 +2349,7 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
 /// file's machinery is exercised at all). This is what a durable ring row staged
 /// under the bare spelling looks like, and what several of this crate's other integration
 /// fixtures still stage by hand.
-async fn stage_bad_orders_bare(client: &mut Client, pool: &trellis::Pool, ids: &[i64]) {
+async fn stage_bad_orders_bare(client: &mut Client, pool: &trellis::pool::Pool, ids: &[i64]) {
     let table = active_segment_table(client).await;
     for id in ids {
         client
@@ -2716,7 +2716,7 @@ async fn seed_items_transform_of(
     )
     .await
     .expect("create definition");
-    let pk = source_primary_key(&db.pool, &definition.def.source)
+    let pk = source_primary_key(&db.pool, &definition.source_table)
         .await
         .expect("introspect source primary key");
     create_target_table(
@@ -2725,7 +2725,7 @@ async fn seed_items_transform_of(
         "public",
         &pk,
         &source_columns,
-        &definition.def.source,
+        &definition.source_table,
     )
     .await
     .expect("create target table");
@@ -2736,7 +2736,7 @@ async fn seed_items_transform_of(
 /// everything staged.
 async fn change_item(
     client: &mut Client,
-    pool: &trellis::Pool,
+    pool: &trellis::pool::Pool,
     id: i64,
     before: Option<(i64, i64, i64)>,
     after: (i64, i64, i64),
@@ -2774,7 +2774,7 @@ async fn change_item(
 }
 
 /// Seals and drains every staged change, as the last test above does.
-async fn drain_staged(client: &mut Client, pool: &trellis::Pool) {
+async fn drain_staged(client: &mut Client, pool: &trellis::pool::Pool) {
     use trellis::staging::{has_pending, retire_drained_segments};
     for _ in 0..16 {
         let seg_seq = seal_active_segment(client).await;
@@ -3155,7 +3155,7 @@ async fn a_definition_reading_a_frozen_sibling_is_paused_and_resumed_through_it(
     )
     .await
     .expect("create the downstream definition");
-    let pk = source_primary_key(&db.pool, &downstream.def.source)
+    let pk = source_primary_key(&db.pool, &downstream.source_table)
         .await
         .expect("introspect source primary key");
     create_target_table(
@@ -3164,7 +3164,7 @@ async fn a_definition_reading_a_frozen_sibling_is_paused_and_resumed_through_it(
         "public",
         &pk,
         &sib_columns,
-        &downstream.def.source,
+        &downstream.source_table,
     )
     .await
     .expect("create the downstream target table");
@@ -5408,8 +5408,8 @@ async fn another_instances_held_column_pause_lock_does_not_hold_up_this_ones() {
         INSTANCE_B,
     )
     .expect("valid schema");
-    let pool_b = trellis::Pool::new(&config_b).expect("build instance B's pool");
-    trellis::migrate(&pool_b, &config_b)
+    let pool_b = trellis::pool::Pool::new(&config_b).expect("build instance B's pool");
+    trellis::migrate::migrate_with_pool(&pool_b, &config_b)
         .await
         .expect("migrate instance B");
 
@@ -5433,7 +5433,7 @@ async fn another_instances_held_column_pause_lock_does_not_hold_up_this_ones() {
     )
     .await
     .expect("instance B's define takes its own lock");
-    let pk = source_primary_key(&pool_b, &definition.def.source)
+    let pk = source_primary_key(&pool_b, &definition.source_table)
         .await
         .expect("introspect source primary key");
     create_target_table(
@@ -5442,7 +5442,7 @@ async fn another_instances_held_column_pause_lock_does_not_hold_up_this_ones() {
         "public",
         &pk,
         &source_columns,
-        &definition.def.source,
+        &definition.source_table,
     )
     .await
     .expect("create target table");

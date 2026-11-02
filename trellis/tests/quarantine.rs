@@ -42,7 +42,7 @@ fn is_data_exception(err: &ApplyError) -> bool {
     }
 }
 
-/// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
+/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), matching
 /// `apply.rs`/`converge.rs`'s convention.
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -265,7 +265,7 @@ async fn poison_marker_exists(client: &Client, src_table: &str, key: &str) -> bo
         .is_some()
 }
 
-async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
+async fn drain(pool: &trellis::pool::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
     // A throwaway, always-caught-up watermark — no live
     // capture runs in this test file, and it isn't exercising guard (a).
     apply::drain_once(pool, seg_seq, claimed_by, 1, "trellis_quarantine_test")
@@ -565,7 +565,7 @@ async fn seed_order_summary(db: &TestDatabase, def: &TransformDef) {
         "public",
         &pk,
         &order_totals_columns,
-        &summary_def.def.source,
+        &summary_def.source_table,
     )
     .await
     .expect("create order_summary table");
@@ -1968,7 +1968,7 @@ async fn stage_large_page(
 /// `drain_once` for a batch expected to fail: the error it surfaces, or
 /// whatever it returned instead.
 async fn drain_result(
-    pool: &trellis::Pool,
+    pool: &trellis::pool::Pool,
     seg_seq: i64,
 ) -> Result<Option<apply::ApplyOutcome>, ApplyError> {
     apply::drain_once(pool, seg_seq, "worker", 1, "trellis_quarantine_test").await
@@ -2218,7 +2218,7 @@ async fn seed_two_readers(db: &TestDatabase, client: &Client) {
         "public",
         &pk,
         &source_columns,
-        &prices.def.source,
+        &prices.source_table,
     )
     .await
     .expect("create order_prices table");
@@ -2276,7 +2276,7 @@ async fn write_order(client: &Client, id: i32, price: &str, tax: &str) {
 /// drain charges every key that fails alone one death, and the drain whose
 /// charge crosses the threshold evicts the key and commits the rest of the
 /// page. Returns how many drains failed first.
-async fn drain_through_evictions(client: &mut Client, pool: &trellis::Pool) -> usize {
+async fn drain_through_evictions(client: &mut Client, pool: &trellis::pool::Pool) -> usize {
     let seg_seq = seal_active_segment(client).await;
     let mut failures = 0;
     loop {

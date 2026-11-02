@@ -85,7 +85,7 @@ async fn insert_cdc_row(
         .unwrap_or_else(|e| panic!("insert cdc row {key:?} into {table} failed: {e}"));
 }
 
-async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
+async fn drain(pool: &trellis::pool::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
     // A throwaway, always-caught-up watermark — no live
     // capture runs in this test, and this file isn't exercising guard (a).
     apply::drain_once(pool, seg_seq, claimed_by, 1, "trellis_e2e_latency_test")
@@ -208,7 +208,7 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
         "public",
         &pk,
         &totals_columns,
-        &summary_def.def.source,
+        &summary_def.source_table,
     )
     .await
     .expect("create chain_summary table");

@@ -312,7 +312,7 @@ let worker = Trellis::connect(
 The `trellis` library's public surface is its crate root. `Trellis` (async) and
 `BlockingTrellis` (for threads without a Tokio runtime) are the front doors,
 built from a `Config` and `TrellisOptions`; `Client` starts the in-process
-workers directly. `migrate`, `Pool` (whose `get` hands out a `PooledClient`),
+workers directly. `migrate` (which opens its own connection from a `Config`),
 `Metrics`, `statement_kind` and, behind the `otlp` feature, `otel` are the
 building blocks beneath them, and `Error`, `ErrorCode` and the error and status
 types the facade returns are exported alongside. The engine's modules are private. `.github/public-api.txt` lists
@@ -324,11 +324,10 @@ wildcard arm, and read a struct's fields rather than building or destructuring
 it exhaustively. The options structs (`TrellisOptions`, `ClientOptions`) are
 built with a struct literal and `..Default::default()`, so they are not.
 
-`Trellis::pool()` is meant for queries against your own tables and the target
-tables. Its connections run with `search_path` set to the instance schema, then
-the target schema, then `public`, so an unqualified `create table` through it
-lands in the instance schema, next to Trellis's own tables. Schema-qualify the
-objects an embedder creates, or use a separate pool.
+Trellis does not hand out its connections. An embedder reads the target tables
+and its own tables through its own connections, with the credentials it already
+has, and schema-qualifies target names (`select ... from analytics.order_totals`)
+or sets its own `search_path`.
 
 ## Configuration from the environment
 
@@ -417,10 +416,11 @@ The rules:
   They are checked like the same options in a connection string. A
   connection string given explicitly is used as written: these variables do
   not add to it.
-* **Files are read when the connection machinery is built**: when a `Pool` is
-  created, and for each dedicated connection when it is opened. A rotated
-  client certificate or CA file takes effect for a new `Pool` (a restart, for
-  the CLI); a rotated server certificate is accepted on the next connect.
+* **Files are read when the connection machinery is built**: when a `Trellis`
+  or `Client` handle builds its connection pools, and for each dedicated
+  connection when it is opened. A rotated client certificate or CA file takes
+  effect for a new handle (a restart, for the CLI); a rotated server
+  certificate is accepted on the next connect.
 * The Ruby and Elixir clients pass the string through, so the same options
   work there.
 

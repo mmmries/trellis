@@ -40,11 +40,12 @@ use trellis::dev::defs::ast::{KeySpace, TransformDef, ValueType};
 use trellis::dev::defs::{
     CatalogError, DdlError, install_definition, qualified_target_table, source_primary_key,
 };
+use trellis::dev::pool::Pool;
 use trellis::dev::staging::{
     StagingError, has_pending as staging_has_pending, retire_drained_segments,
     seal_if_active_nonempty, seal_phase1, seal_phase2,
 };
-use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
+use trellis::{Client as EngineClient, ClientError, ClientOptions, Config};
 
 use super::Snapshot;
 use super::sql::{self, quote_ident};
@@ -1244,7 +1245,8 @@ impl super::Backend for ManualBackend {
                     // only takes one `pk_col` name — narrowed to the first
                     // (and, for every definition this suite actually
                     // generates, only) column.
-                    let pk = source_primary_key(&self.pool, &def.source).await?;
+                    let source = sql::persisted_source(&self.raw, &def.target).await?;
+                    let pk = source_primary_key(&self.pool, &source).await?;
                     let target_columns: Vec<Column> = std::iter::once(Column {
                         name: pk[0].name.clone(),
                         value_type: ValueType::Numeric,
