@@ -212,9 +212,9 @@ pub mod fixtures {
     use crate::{
         BackfillFailure, CaptureFailure, CaptureFailureKind, CaptureWait, CorrectingNode,
         DefinitionStatus, DefinitionSummary, DrainFailure, FanOutWarning, HeldKeys, IndexRole,
-        JoinStatus, PoisonEntry, PoisonSample, QuarantineEntry, QuarantineState, QuarantineTarget,
-        SelfCheckJob, SelfCheckJobState, SelfCheckMode, SelfCheckOutcome, SelfCheckReport,
-        SourceIndexGap, TransformStatus,
+        JoinStatus, OtherProcess, OtherVersionLive, PoisonEntry, PoisonSample, QuarantineEntry,
+        QuarantineState, QuarantineTarget, SelfCheckJob, SelfCheckJobState, SelfCheckMode,
+        SelfCheckOutcome, SelfCheckReport, SourceIndexGap, TransformStatus,
     };
 
     #[allow(non_snake_case)]
@@ -274,6 +274,24 @@ pub mod fixtures {
             paused_upstream_columns: Vec::new(),
             build_wait: None,
             version_handover: None,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn OtherProcess() -> OtherProcess {
+        OtherProcess {
+            worker_id: String::new(),
+            version: None,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn OtherVersionLive() -> OtherVersionLive {
+        OtherVersionLive {
+            this_version: String::new(),
+            processes: Vec::new(),
+            unregistered_staging_worker: false,
+            migrations_pending: false,
         }
     }
 
