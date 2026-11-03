@@ -1,9 +1,11 @@
 //! Statements shared by the 1-1 side ledger (`super::one_to_one_ledger`) and
 //! the writers around it: the plan settings every entry-keyed statement runs
-//! under, the entry lock, ADR-0002 I2's apply predicate, and the build-start
-//! check a page makes.
+//! under, the entry lock, ADR-0002 I2's apply predicate, the build-start
+//! check a page makes, and the raise of a truncate floor, which the
+//! group-basis writers share.
 
 use tokio_postgres::Transaction;
+use tokio_postgres::types::PgLsn;
 
 use crate::defs::ledger as schema;
 use crate::pool::quote_ident;
@@ -114,6 +116,27 @@ pub(crate) async fn page_may_predate_build(
         )
         .await?
         .get(0))
+}
+
+/// Raises the truncate floor `key` names (a `ledger_truncate_floor` key) to
+/// `lsn`, if it is below it. A change at or below the floor is refused: the
+/// 1-1 ledger's entry writes (`super::one_to_one_ledger`) and a group-basis
+/// table's apply of a staged side (`super::group_basis::GroupTargetPlan`)
+/// read it. A 1-1 ledger raises its floor through
+/// `super::one_to_one_ledger::raise_floor`, a group-basis table directly.
+pub(crate) async fn raise_truncate_floor(
+    txn: &Transaction<'_>,
+    key: &str,
+    lsn: PgLsn,
+) -> Result<(), tokio_postgres::Error> {
+    txn.execute(
+        "insert into ledger_truncate_floor (target_table, floor) values ($1, $2) \
+         on conflict (target_table) do update \
+         set floor = greatest(ledger_truncate_floor.floor, excluded.floor)",
+        &[&key, &lsn],
+    )
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
