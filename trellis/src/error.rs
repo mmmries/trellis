@@ -62,8 +62,14 @@ impl fmt::Display for Error {
         match self {
             Error::Config(msg) => write!(f, "invalid trellis configuration: {msg}"),
             Error::BuildPool(err) => write!(f, "failed to build connection pool: {err}"),
-            Error::Pool(err) => write!(f, "failed to acquire a connection: {err}"),
-            Error::Connect(err) => write!(f, "postgres connection error: {err}"),
+            Error::Pool(err) => {
+                write!(f, "failed to acquire a connection: ")?;
+                write_pool_error(f, err)
+            }
+            Error::Connect(err) => {
+                write!(f, "postgres connection error: ")?;
+                write_pg_error(f, err)
+            }
             Error::Migrate(err) => write!(f, "failed to apply migrations: {err}"),
             Error::IncompatibleInstance(msg) => write!(f, "refusing to attach: {msg}"),
         }
@@ -123,6 +129,33 @@ pub fn write_pg_error(f: &mut fmt::Formatter<'_>, err: &tokio_postgres::Error) -
         write!(f, ": {db_err}")?;
     }
     Ok(())
+}
+
+/// Writes a failed pool checkout's message, with the server's own text
+/// when the server refused the connection or the new connection's session
+/// setup.
+///
+/// `deadpool`'s `PoolError` displays the `tokio_postgres::Error` it carries
+/// (`Backend`, or a `post_create` hook's `HookError::Backend`) with `{}`,
+/// which reads only "db error": a connection the server refused (no such
+/// database or role, a rejected password) lost its `FATAL` text. The
+/// wrapper error types in this crate that hold a pool checkout's [`Error`]
+/// print it through [`Error`]'s `Display`, so this is the one place that
+/// text is restored.
+fn write_pool_error(f: &mut fmt::Formatter<'_>, err: &deadpool_postgres::PoolError) -> fmt::Result {
+    match err {
+        deadpool_postgres::PoolError::Backend(err) => {
+            write!(f, "Error occurred while creating a new object: ")?;
+            write_pg_error(f, err)
+        }
+        deadpool_postgres::PoolError::PostCreateHook(deadpool_postgres::HookError::Backend(
+            err,
+        )) => {
+            write!(f, "setting up a new connection's session failed: ")?;
+            write_pg_error(f, err)
+        }
+        other => write!(f, "{other}"),
+    }
 }
 
 #[cfg(test)]
