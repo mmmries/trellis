@@ -569,6 +569,10 @@ another page or writer holding one of its join keys, so a rising tail shows
 contention on hot keys.
 `trellis status` prints a `join tables` line, a `join build` line while a build is
 under way, and one warning line per finding (a 1-1 `JOIN`'s fan-out included).
+The Elixir and Ruby bindings' `status` carries `join` too (`nil` for any other
+transform), with the build step flattened to a `step` word and the `side`, `part`, `leaf`
+or `remaining` its kind of step has; a step, side or part newer than the binding reads
+`unknown`.
 
 ### A build's fence on a seam-fed source
 
