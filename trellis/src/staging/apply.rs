@@ -2432,8 +2432,11 @@ mod tests {
 /// Which targets have downstream readers is *not* decided here: Phase 3's
 /// target-mutation seam (`staging::target_mutations`) resolves that inside
 /// its own transaction, for every target any step wrote.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ApplyPlan {
+    /// What the page's reads of its definitions skip (ADR-0024 rule 3): the
+    /// floors of the pool that computed it.
+    floors: crate::defs::floor::Floors,
     versions: BTreeMap<String, Option<i64>>,
     targets: BTreeMap<String, TargetPlan>,
     /// The aggregate targets on the group basis (`super::group_basis`),
@@ -3352,6 +3355,7 @@ pub(super) async fn compute_page(
     }
 
     Ok(ApplyPlan {
+        floors: pool.floors().clone(),
         versions,
         targets,
         group_targets,
@@ -4597,7 +4601,8 @@ pub(crate) async fn apply_page(
     // bookkeeping ("which batch's contribution is this"), not something
     // later correctness depends on picking exactly right among several
     // equally-valid coalesced segments.
-    quarantine::park_batch_contribution(txn, steps[0].seg_seq, &plan.poisoned_park).await?;
+    quarantine::park_batch_contribution(txn, &plan.floors, steps[0].seg_seq, &plan.poisoned_park)
+        .await?;
 
     let mut keys_written = 0usize;
     let mut keys_deleted = 0usize;

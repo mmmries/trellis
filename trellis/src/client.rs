@@ -2809,6 +2809,22 @@ impl BackgroundProcess {
     }
 }
 
+/// Takes the transaction-scoped handover lock of the instance whose schema is
+/// `schema` (ADR-0023): the lock a background process's pass, and a call that
+/// pauses what this release can't run, hold while they check for another live
+/// version. The one place besides `migrate` that takes it.
+pub(crate) async fn lock_handover_xact(
+    txn: &impl tokio_postgres::GenericClient,
+    schema: &str,
+) -> Result<(), tokio_postgres::Error> {
+    txn.execute(
+        "select pg_advisory_xact_lock($1)",
+        &[&handover::handover_lock_key(schema)],
+    )
+    .await
+    .map(|_| ())
+}
+
 /// One handover pass (ADR-0023): under the instance's handover lock, reads
 /// the registry and the staging lock, decides whether this process takes over
 /// or stands by, and registers its row with that decision, its version and
@@ -2822,11 +2838,7 @@ async fn handover_pass(process: &BackgroundProcess, drain: bool) -> Result<Verdi
     let mut client = process.pool.get().await.map_err(checkout_error)?;
     let pg: &mut tokio_postgres::Client = &mut client;
     let txn = pg.transaction().await?;
-    txn.execute(
-        "select pg_advisory_xact_lock($1)",
-        &[&handover::handover_lock_key(&process.schema)],
-    )
-    .await?;
+    lock_handover_xact(&txn, &process.schema).await?;
     if let Some(refused) =
         crate::migrate::below_catalog_floor(&txn, &process.schema, &process.version).await?
     {
@@ -2837,6 +2849,20 @@ async fn handover_pass(process: &BackgroundProcess, drain: bool) -> Result<Verdi
     }
     let observed = handover::observe(&txn, &process.schema, true).await?;
     let verdict = handover::decide(&process.version, &observed, handover::Asker::Background);
+    // ADR-0024 rule 3: before it stages, drains or builds anything, a process
+    // that takes over pauses each definition this release can't run, which
+    // nothing it runs then reads. Under the handover lock, so no other
+    // version writes meanwhile; a pass that finds them paused changes nothing.
+    let paused = if verdict == Verdict::TakeOver && !observed.migrations_pending {
+        crate::defs::grammar::pause_unrunnable_in(
+            &txn,
+            process.pool.floors(),
+            crate::defs::grammar::CURRENT_GRAMMAR_VERSION,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
     if observed.registry_exists && !observed.migrations_pending {
         let pid = process.staging_pid.load(Ordering::SeqCst);
         staging::register_worker(
@@ -2853,6 +2879,7 @@ async fn handover_pass(process: &BackgroundProcess, drain: bool) -> Result<Verdi
         .await?;
     }
     txn.commit().await?;
+    crate::defs::grammar::log_unrunnable_pauses(&paused);
     Ok(verdict)
 }
 
