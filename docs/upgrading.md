@@ -158,9 +158,11 @@ A definition stored under a grammar newer than the older release reads
 ([ADR-0018](decisions/0018-grammar-versioning.md)) pauses the same way, naming
 its grammar version; when the older release meets its floor, it drops as
 usual. A definition for which a newer release stored a value the older one
-doesn't know (its status, its build, a build chunk's kind, a partition
-correction's phase, a capture failure's kind) pauses the same way, naming the
-value.
+doesn't know (its status, its build, a build chunk's kind or cursor tag, a
+partition correction's phase, a capture failure's kind) pauses the same way,
+naming the value, and so does every definition reading a partitioned source
+whose recorded partition tree the newer release stored in a shape the older
+one can't read.
 
 While it is paused, its target keeps its rows and stops updating, and a
 definition reading that target reads it as it would any paused upstream: it
@@ -168,7 +170,9 @@ reports `catching_up`. The older release refuses to act on it, with the
 `version_floor` error code, changing nothing:
 
 - `RESUME TRANSFORM`, `ALTER TRANSFORM` and `self_check` of it refuse with
-  the reason above.
+  the reason above while what the older release can't run is still stored.
+  The pause itself replaces an unknown status or capture failure kind, so
+  such a definition resumes under the older release.
 - `DROP TRANSFORM` of it refuses whether it is paused or not. Only a release
   that meets its floor knows everything it owns, so only that release can
   drop it completely:
