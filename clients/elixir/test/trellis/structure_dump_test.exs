@@ -170,7 +170,7 @@ defmodule Trellis.StructureDumpTest do
     assert appendix =~ "dump_raced_prices"
   end
 
-  test "definitions that change during every dump are refused", %{pg: pg} do
+  test "definitions that change during every dump are refused", %{pg: pg, tmp_dir: dir} do
     Postgrex.query!(pg, "create table dump_churn (id integer primary key, price integer)", [])
     {:ok, source} = Trellis.connect(url: TestRepo.config()[:trellis][:url])
     on_exit(fn -> Trellis.shutdown(source) end)
@@ -188,6 +188,51 @@ defmodule Trellis.StructureDumpTest do
     assert {:error, message} = StructureDump.dump([{TestRepo, []}], dump)
     assert message =~ "changed during each of 3 dumps"
     assert :counters.get(runs, 1) == 3
+    # What pg_dump wrote has the capture triggers in and no definitions:
+    # not left for `ecto.load` to load.
+    refute File.exists?(Path.join(dir, "structure.sql"))
+  end
+
+  test "a dump that fails leaves no file to load, and a failure before pg_dump keeps the old one",
+       %{cluster: cluster, tmp_dir: dir} do
+    path = Path.join(dir, "structure.sql")
+    {:ok, source} = Trellis.connect(url: TestRepo.config()[:trellis][:url])
+    on_exit(fn -> Trellis.shutdown(source) end)
+    Trellis.migrate!(source)
+
+    failing = fn plan, args ->
+      :ok = StructureDump.pg_dump(plan, args)
+      {:error, "boom"}
+    end
+
+    assert {:error, "boom"} = StructureDump.dump([{TestRepo, []}], failing)
+    refute File.exists?(path)
+
+    raising = fn plan, args ->
+      :ok = StructureDump.pg_dump(plan, args)
+      raise "boom"
+    end
+
+    assert_raise RuntimeError, "boom", fn -> StructureDump.dump([{TestRepo, []}], raising) end
+    refute File.exists?(path)
+
+    # A pg_dump that fails before it opens the file (it can't connect, or
+    # it is older than the server) leaves the file that was there...
+    File.write!(path, "-- previous\n")
+    unopened = fn _plan, _args -> {:error, "pg_dump: error: connection failed"} end
+    assert {:error, _} = StructureDump.dump([{TestRepo, []}], unopened)
+    assert File.read!(path) == "-- previous\n"
+
+    # ...and one that wrote to it doesn't.
+    assert {:error, "boom"} = StructureDump.dump([{TestRepo, []}], failing)
+    refute File.exists?(path)
+
+    # Refused before pg_dump runs: the file that was there stays.
+    File.write!(path, "-- previous\n")
+    point_trellis_at(cluster, "elsewhere")
+    assert {:error, message} = StructureDump.dump([{TestRepo, dump_path: path}], failing)
+    assert message =~ "elsewhere"
+    assert File.read!(path) == "-- previous\n"
   end
 
   test "append refuses a structure file that isn't there", %{tmp_dir: dir} do
@@ -224,6 +269,238 @@ defmodule Trellis.StructureDumpTest do
     text = File.read!(path)
     assert String.starts_with?(text, body <> "-- Trellis definitions (trellis::")
     assert length(String.split(text, "-- Trellis definitions (")) == 3
+  end
+
+  test "the target schema's schema_migrations is not dumped", %{
+    cluster: cluster,
+    pg: pg,
+    tmp_dir: dir
+  } do
+    Postgrex.query!(pg, "create schema dump_reports", [])
+    Postgrex.query!(pg, "create table public.dump_versions (version bigint primary key)", [])
+
+    Postgrex.query!(
+      pg,
+      "create table dump_reports.dump_versions (version bigint primary key)",
+      []
+    )
+
+    Postgrex.query!(pg, "insert into public.dump_versions values (5)", [])
+    Postgrex.query!(pg, "insert into dump_reports.dump_versions values (7)", [])
+
+    trellis = [url: cluster["dsn"], target_schema: "dump_reports"]
+
+    put_repo_config(cluster,
+      migration_source: "dump_versions",
+      dump_path: Path.join(dir, "structure.sql"),
+      trellis: trellis
+    )
+
+    {:ok, source} = Trellis.connect(trellis)
+    on_exit(fn -> Trellis.shutdown(source) end)
+    Trellis.migrate!(source)
+
+    assert {:ok, [path]} = StructureDump.dump([{TestRepo, dump_prefixes: ["public"]}])
+    text = File.read!(path)
+    # The target schema is dumped for its tables...
+    assert text =~ "CREATE TABLE dump_reports.dump_versions"
+    # ...but only the schemas `--prefix` names have their migrations dumped.
+    assert text =~ ~s[INSERT INTO public."dump_versions" (version) VALUES (5);]
+    refute text =~ ~s[INSERT INTO dump_reports]
+  end
+
+  test "a repo and a :trellis url at different databases are refused", %{
+    cluster: cluster,
+    tmp_dir: dir
+  } do
+    path = Path.join(dir, "structure.sql")
+    point_trellis_at(cluster, "elsewhere")
+
+    assert {:error, message} = StructureDump.dump([{TestRepo, []}])
+    assert message =~ "elsewhere"
+    assert message =~ cluster["dbname"]
+    assert message =~ "Trellis.TestRepo"
+    refute File.exists?(path)
+
+    File.write!(path, "create table t ();")
+    assert {:error, ^message} = StructureDump.append(TestRepo)
+    assert File.read!(path) == "create table t ();"
+
+    assert_raise Mix.Error, ~r/elsewhere/, fn ->
+      Mix.Tasks.Trellis.Load.run(~w(-r Trellis.TestRepo --quiet))
+    end
+
+    assert_raise Mix.Error, ~r/elsewhere/, fn ->
+      Mix.Tasks.Trellis.Dump.run(~w(-r Trellis.TestRepo --quiet))
+    end
+  end
+
+  test "the databases a repo and a url name are compared by host, port and database" do
+    same? = fn config, url ->
+      Trellis.StructureDump.Database.verify(TestRepo, config, url: url) == :ok
+    end
+
+    socket = [socket_dir: "/run/pg", port: 5433, database: "app", username: "me"]
+    assert same?.(socket, "host=/run/pg port=5433 dbname=app user=me")
+    assert same?.(socket, "postgres://me@%2Frun%2Fpg:5433/app")
+    assert same?.(socket, "postgres://me@localhost:5433/app")
+    assert same?.(socket, "postgres:///app?host=/run/pg&port=5433&user=me")
+    refute same?.(socket, "host=/run/pg port=5432 dbname=app")
+    refute same?.(socket, "host=/run/pg port=5433 dbname=other")
+    refute same?.(socket, "host=db.internal port=5433 dbname=app")
+
+    tcp = [hostname: "db.internal", database: "app", username: "me"]
+    assert same?.(tcp, "postgres://me:p%40ss@db.internal/app?sslmode=require")
+    assert same?.(tcp, "host = db.internal dbname = 'app' password='a b\\'c'")
+    assert same?.(tcp, "postgresql://db.internal:5432/app")
+    # Hosts are not equated across spellings.
+    refute same?.(tcp, "postgres://db.internal.example/app")
+    refute same?.([hostname: "localhost", database: "app"], "postgres://127.0.0.1/app")
+    refute same?.([hostname: "localhost", database: "app"], "host=/run/pg dbname=app")
+    # A repo naming no host matches a local one, as a Rails config naming none
+    # does in the Ruby client (when PGHOST names none either).
+    if is_nil(System.get_env("PGHOST")) do
+      assert same?.([database: "app"], "postgres://127.0.0.1/app")
+      assert same?.([database: "app"], "host=/run/pg dbname=app")
+      refute same?.([database: "app"], "postgres://db.internal/app")
+    end
+
+    # The database defaults to the user, as libpq's does.
+    refute same?.(tcp, "postgres://me@db.internal")
+    assert same?.([hostname: "h", database: "me"], "postgres://me@h")
+    # A url the check can't read, or that names several hosts, is not compared.
+    assert same?.(tcp, "not a url")
+    assert same?.(tcp, "postgres://a.example,b.example/other")
+
+    # The message doesn't quote the url.
+    assert {:error, message} =
+             Trellis.StructureDump.Database.verify(TestRepo, tcp,
+               url: "postgres://me:hunter2@elsewhere/app"
+             )
+
+    refute message =~ "hunter2"
+    assert message =~ "app on elsewhere:5432"
+  end
+
+  test "mix trellis.dump also dumps the repo's migration_repo, as mix ecto.dump does",
+       %{cluster: cluster, tmp_dir: dir} do
+    structure = Path.join(dir, "structure.sql")
+    migrations = Path.join(dir, "migrations.sql")
+    put_repo_config(cluster, migration_repo: Trellis.TestMigrationRepo, dump_path: structure)
+
+    Application.put_env(
+      :trellis_pg,
+      Trellis.TestMigrationRepo,
+      socket_dir: cluster["host"],
+      port: cluster["port"],
+      username: cluster["user"],
+      database: cluster["dbname"],
+      dump_path: migrations
+    )
+
+    {:ok, source} = Trellis.connect(url: cluster["dsn"])
+    on_exit(fn -> Trellis.shutdown(source) end)
+    Trellis.migrate!(source)
+
+    Mix.Tasks.Trellis.Dump.run(~w(-r Trellis.TestRepo --prefix public --quiet))
+
+    assert File.read!(migrations) =~ "PostgreSQL database dump"
+    assert File.read!(structure) =~ "-- Trellis definitions ("
+  end
+
+  test "a declined ecto.load prompt is matched to its repo by the whole name" do
+    # `mix ecto.load`'s two prompts, as it words them.
+    new = fn repo ->
+      "Are you sure you want to load a new structure for #{inspect(repo)}? Any existing " <>
+        "data in this repo may be lost."
+    end
+
+    loaded = fn repo ->
+      "It looks like a structure was already loaded for #{inspect(repo)}. Any attempt to " <>
+        "load it again might fail.\nAre you sure you want to proceed?\n"
+    end
+
+    declined? = &Mix.Tasks.Trellis.Load.declined?/2
+    assert declined?.([new.(MyApp.Repo)], MyApp.Repo)
+    assert declined?.([loaded.(MyApp.Repo)], MyApp.Repo)
+    # A "no" for a repo whose name extends this one's is not a "no" for it.
+    refute declined?.([new.(MyApp.Repo.Replica)], MyApp.Repo)
+    refute declined?.([loaded.(MyApp.Repo.Replica)], MyApp.Repo)
+    refute declined?.([new.(MyApp.Repo)], MyApp.Repo.Replica)
+  end
+
+  describe "mix trellis.load leaves a repo alone that ecto.load left alone" do
+    setup %{cluster: cluster, pg: pg, tmp_dir: dir} do
+      # A database that already has its migrations table, and no Trellis.
+      database = "dump_loaded_before_#{System.unique_integer([:positive])}"
+      Postgrex.query!(pg, "create database #{database}", [])
+      url = String.replace(cluster["dsn"], cluster["dbname"], database)
+      stop_supervised!(TestRepo)
+
+      put_repo_config(cluster,
+        database: database,
+        dump_path: Path.join(dir, "structure.sql"),
+        trellis: [url: url]
+      )
+
+      loaded = TestCluster.postgrex!(Map.put(cluster, "dbname", database))
+      Postgrex.query!(loaded, "create table schema_migrations (version bigint primary key)", [])
+      File.write!(Path.join(dir, "structure.sql"), "create table dump_from_file ();\n")
+
+      shell = Mix.shell()
+      Mix.shell(Mix.Shell.Process)
+
+      on_exit(fn ->
+        Mix.shell(shell)
+      end)
+
+      %{loaded: loaded}
+    end
+
+    test "with --skip-if-loaded on a database that has its migrations table", %{loaded: loaded} do
+      Mix.Tasks.Trellis.Load.run(~w(-r Trellis.TestRepo --skip-if-loaded --quiet))
+      assert nothing_loaded?(loaded)
+    end
+
+    test "when the prompt is declined", %{loaded: loaded} do
+      send(self(), {:mix_shell_input, :yes?, false})
+      Mix.Tasks.Trellis.Load.run(~w(-r Trellis.TestRepo --quiet))
+      assert nothing_loaded?(loaded)
+      assert_received {:mix_shell, :yes?, [prompt]}
+      assert prompt =~ "already loaded for Trellis.TestRepo"
+    end
+
+    test "but runs the restore when the prompt is accepted", %{loaded: loaded} do
+      send(self(), {:mix_shell_input, :yes?, true})
+      Mix.Tasks.Trellis.Load.run(~w(-r Trellis.TestRepo --quiet))
+
+      assert %{rows: [[true, true]]} =
+               Postgrex.query!(
+                 loaded,
+                 "select to_regclass('public.dump_from_file') is not null, " <>
+                   "exists (select 1 from pg_namespace where nspname = 'trellis')",
+                 []
+               )
+    end
+
+    defp nothing_loaded?(loaded) do
+      %{rows: [[false, false]]} =
+        Postgrex.query!(
+          loaded,
+          "select to_regclass('public.dump_from_file') is not null, " <>
+            "exists (select 1 from pg_namespace where nspname = 'trellis')",
+          []
+        )
+
+      true
+    end
+  end
+
+  # Points the repo's `:trellis` url at another database than its own.
+  defp point_trellis_at(cluster, database) do
+    config = Application.fetch_env!(:trellis_pg, TestRepo)
+    url = String.replace(config[:trellis][:url], cluster["dbname"], database)
+    Application.put_env(:trellis_pg, TestRepo, Keyword.put(config, :trellis, url: url))
   end
 
   # Defines dump_widget_prices_<suffix>, a 1-1 transform, in the repo's

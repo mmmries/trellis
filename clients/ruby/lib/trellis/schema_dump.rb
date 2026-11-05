@@ -2,6 +2,7 @@
 
 require "active_record"
 require "etc"
+require "fileutils"
 require "trellis/pg"
 
 module Trellis
@@ -185,6 +186,16 @@ module Trellis
         File.write(filename, "#{sql}\n#{appendix}", encoding: "utf-8")
       end
 
+      # Removes what a dump that failed left at filename, unless it is
+      # previous (the file's bytes before the dump, nil when there was none):
+      # a failure before `pg_dump` wrote to the file leaves it alone.
+      def discard_unfinished(filename, previous)
+        return unless File.exist?(filename)
+        return if previous && File.binread(filename) == previous
+
+        FileUtils.rm_f(filename)
+      end
+
       # Restores the definitions a load of db_config's dump queued: `migrate`
       # on each configured instance, in the database db_config names.
       def restore(db_config)
@@ -227,10 +238,11 @@ module Trellis
 
       # A libpq connection string for the database db_config names, in
       # another environment than configured_url's: configured_url's
-      # settings with db_config's database, and its host, port, user and
-      # password where db_config names them (a host left to libpq's default
-      # keeps configured_url's, a local one by verify_same_database!). A
-      # db_config with a url is that url.
+      # settings with db_config's database, and its host, port, user,
+      # password and other libpq keywords (sslmode, sslrootcert, ...) where
+      # db_config names them (a host left to libpq's default keeps
+      # configured_url's, a local one by verify_same_database!). A db_config
+      # with a url is that url.
       def environment_url(db_config, configured_url, what)
         hash = db_config.configuration_hash.transform_keys(&:to_sym)
         return hash[:url].to_s if hash[:url]
@@ -246,7 +258,16 @@ module Trellis
         end
         user = hash[:username] || hash[:user]
         keywords["user"] = user.to_s if user
-        keywords["password"] = hash[:password].to_s if hash[:password]
+        # Every other libpq keyword the config names (sslmode, sslrootcert,
+        # connect_timeout, ...) is the connection Rails makes: the adapter
+        # hands them all to libpq. A blank one names nothing, a blank password
+        # included: it doesn't blank the url's.
+        PG::Connection.conndefaults_hash.each_key do |key|
+          next if %i[host port dbname user].include?(key)
+
+          value = hash[key]
+          keywords[key.to_s] = value.to_s unless value.nil? || value.to_s.empty?
+        end
         keywords.map { |key, value| "#{key}='#{value.to_s.gsub(/[\\']/) { |c| "\\#{c}" }}'" }.join(" ")
       end
 
@@ -346,22 +367,34 @@ module Trellis
 
         SchemaDump.verify_same_database!(db_config)
 
-        SchemaDump::ATTEMPTS.times do
-          before = SchemaDump.parts
-          begin
-            Thread.current[SchemaDump::PARTS_KEY] = before
-            super(db_config, format)
-          ensure
-            Thread.current[SchemaDump::PARTS_KEY] = nil
+        previous = File.exist?(filename) ? File.binread(filename) : nil
+        finished = false
+        begin
+          SchemaDump::ATTEMPTS.times do
+            before = SchemaDump.parts
+            begin
+              Thread.current[SchemaDump::PARTS_KEY] = before
+              super(db_config, format)
+            ensure
+              Thread.current[SchemaDump::PARTS_KEY] = nil
+            end
+            if SchemaDump.parts == before
+              SchemaDump.finish(filename, before)
+              finished = true
+              return nil
+            end
           end
-          if SchemaDump.parts == before
-            SchemaDump.finish(filename, before)
-            return nil
-          end
+          raise Trellis::ConflictError,
+                "Trellis's definitions changed during each of #{SchemaDump::ATTEMPTS} dumps of " \
+                "#{db_config.name}: run the dump when no define or drop is running"
+        ensure
+          # Whatever Rails wrote is raw `pg_dump` output with the capture
+          # triggers in and no definitions: left in place, a later
+          # `db:schema:load` would load it without a word. A file no
+          # `pg_dump` wrote to (a failure before the first, or a `pg_dump`
+          # that failed before opening it) is the previous dump: left alone.
+          SchemaDump.discard_unfinished(filename, previous) unless finished
         end
-        raise Trellis::ConflictError,
-              "Trellis's definitions changed during each of #{SchemaDump::ATTEMPTS} dumps of " \
-              "#{db_config.name}: run the dump when no define or drop is running"
       end
 
       # After Rails loads the dump database's `structure.sql`, restores the
