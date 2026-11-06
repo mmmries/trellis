@@ -537,7 +537,8 @@ beside them run on every `cargo test`.
   key to read their tokens in one order and lock the key in the other, and
   the tier caught it in none of 48. Its deterministic pin gates it.
 - **Partitioned-source convergence** *(ADR-0017)*. The first table of a
-  generated program is a partitioned source: `HASH` over one to four leaves,
+  generated program is a partitioned source, one level deep (no leaf is
+  itself partitioned): `HASH` over one to four leaves,
   `LIST` with a leaf per grain value or fewer and a `DEFAULT`, or `RANGE` over
   one to three bounds, partitioned by the grain column, which every
   definition reading it groups by. Its primary key is `(pk, grain)`, so its
@@ -551,7 +552,12 @@ beside them run on every `cargo test`.
   partition maintenance (a leaf detached, also `CONCURRENTLY`, attached
   again with its rows, dropped or truncated, and a new leaf created empty,
   written directly, or built outside the tree and attached with rows, in
-  place of a dropped leaf when every bound is held),
+  place of a dropped leaf when every bound is held), bound changes (a
+  detached table attached under another free bound once its rows are moved
+  into it, where a `CHECK` constraint a concurrent detach left on it stays
+  and refuses the move, or the new bound's rows; a `LIST` leaf's value list
+  widened by a detach and an attach; a `HASH` leaf re-split into leaves at
+  a multiple of its modulus, so one tree mixes moduli),
   partition-key updates that move a row to another partition (or are
   refused, to a value no leaf holds), and writes named on a leaf, or on a
   detached table, instead of the root. Each op's expected outcome comes from
