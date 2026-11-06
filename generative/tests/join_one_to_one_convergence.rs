@@ -360,11 +360,17 @@ fn run_case(case: &JoinCase) -> Result<(), String> {
                 }
                 Err(RunError::InRunInvariant {
                     burst,
+                    settled,
                     failure: Ok(failure),
                 }) => {
+                    let when = if settled {
+                        "once it settled"
+                    } else {
+                        "mid-burst"
+                    };
                     return Err(format!(
-                        "the in-run hidden-state invariant broke during burst {burst} ({shape}), \
-                         target {}:\n{}",
+                        "the in-run hidden-state invariant broke in burst {burst}, {when} \
+                         ({shape}), target {}:\n{}",
                         failure.target,
                         failure
                             .violations
@@ -441,15 +447,34 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
 /// twice. A plant caught in one case in twelve is listed here too: a 24-case
 /// sweep would miss it about one time in eight.
 ///
-/// With the in-run invariant on (`generative::invariant`), a 4 × 12 sweep
-/// (seeds 1 to 4, twelve cases each) caught, of 48 cases, with the cases its
-/// samples caught first in brackets: `join1_no_j_lock` 5 (1),
-/// `join1_vis_only` 3 (0), `join1_brd_no_key` 1 (1, a key with no `J` row),
-/// `join1_rd_no_key` 1 (1, the same), `join1_lsn_only` 1 (1, an `R` entry off
-/// `ja`), `join1_snapshot_after_read` 1 (1, an `M` entry off `jb`),
-/// `join1_no_entry_lock` 1 (0), `join1_no_recheck` 0 and
-/// `join1_truncate_keeps_m` 0; and the gated `join1_m_before_j` 11 (5). None
-/// reaches the one case in five that gating takes, so the list stands.
+/// The in-run invariant (`generative::invariant`) reaches the plants that
+/// leave hidden state wrong where the target can't show it, and shows no
+/// measurable reach for the lost updates later writes repair. Over 4 × 12
+/// sweeps (seeds 1 to 4, twelve cases each), caught of 48 with it off, then
+/// with it on in two sweeps (in brackets, the cases one of its samples
+/// caught first: in the second sweep each was a mid-burst sample; the first
+/// sweep didn't record which):
+///
+/// - a join key with no `J` row: `join1_brd_no_key` 0; 1 (1), 3 (3);
+///   `join1_rd_no_key` 0; 1 (1), 3 (3); `join1_chunk_no_key` 1 (1) in the
+///   second sweep only.
+/// - an `R` or `M` entry off its table as applied: `join1_lsn_only` 0;
+///   1 (1), 1 (1); `join1_snapshot_after_read` 0; 1 (1), 1 (1).
+/// - a lost update: `join1_no_j_lock` 4; 5 (1), 5 (2); `join1_vis_only` 3;
+///   3 (0), 3 (1); the gated `join1_m_before_j` 8; 11 (5), 10 (3). Each
+///   catch of `join1_no_j_lock` is one of the 15 `racing` cases. The
+///   differences are within run-to-run noise (Fisher's exact test, p > 0.5
+///   for each), and sweeps this size would show only a gain of about two and
+///   a half times the rate or more. A sample catching first doesn't mean the
+///   end-state check would have missed it: with the invariant off, the
+///   oracle caught `join1_no_j_lock`'s case 1:8 and `join1_m_before_j`'s
+///   case 1:12, which a sample catches first with it on.
+/// - `join1_no_entry_lock` 0; 1 (0), 0; `join1_no_recheck` 0, 0;
+///   `join1_truncate_keeps_m` 0, 0 (both measured with it on only).
+///
+/// None reaches the one case in five that gating takes (a 48-case sweep at
+/// `join1_no_j_lock`'s rate with it on misses it about one time in 200), so
+/// the list stands.
 ///
 /// - `join1_no_j_lock`: caught 4, fired 48 (this tier's `racing` cases
 ///   don't cap their drains or pair their ops, which is what reaches the
