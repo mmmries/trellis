@@ -330,6 +330,20 @@ pub enum CatalogError {
         /// The qualified `schema.table` spelling that already exists.
         table: String,
     },
+    /// Registering this definition would give its target the name of a
+    /// table other definitions read, as their `FROM` or joined table: one
+    /// dropped or renamed away since they were defined, or one `ADOPT
+    /// EXISTING TABLE` would adopt. Those readers would go on reading the
+    /// new target, through the target-mutation seam, keeping the rows they
+    /// derived from the table that had the name. Refused whatever the
+    /// readers' status, the way [`CatalogError::DependentsBlockDrop`]
+    /// refuses a drop: the readers are dropped first.
+    TargetNameHasReaders {
+        /// The qualified `schema.table` the target would take.
+        target: String,
+        /// The bare target names of the definitions that read that name.
+        readers: Vec<String>,
+    },
     /// A define with `ADOPT EXISTING TABLE` found its target missing, or a
     /// table Trellis can't maintain as its target: one with rows, one the
     /// defining role can't write or alter, or one whose shape differs from
@@ -518,6 +532,7 @@ impl CatalogError {
             // definition's own text.
             CatalogError::TargetTableSuffixCollision { .. } => ErrorCode::Conflict,
             CatalogError::TargetTableExists { .. } => ErrorCode::Conflict,
+            CatalogError::TargetNameHasReaders { .. } => ErrorCode::Conflict,
             CatalogError::TargetNotAdoptable { refusal, .. } => match refusal {
                 super::adopt::NotAdoptable::Missing => ErrorCode::NotFound,
                 _ => ErrorCode::Validation,
@@ -748,6 +763,26 @@ impl fmt::Display for CatalogError {
                  same bare table name — two definitions cannot share a bare target-table \
                  name under different schemas"
             ),
+            CatalogError::TargetNameHasReaders { target, readers } => write!(
+                f,
+                "target table \"{target}\" would take the name of a table the {} {} \
+                 read{}: {} would go on reading the new target and keep the rows derived \
+                 from the table that had the name. DROP TRANSFORM {} first, paused or not, \
+                 or give the target another name",
+                if readers.len() == 1 {
+                    "transform"
+                } else {
+                    "transforms"
+                },
+                readers.join(", "),
+                if readers.len() == 1 { "s" } else { "" },
+                if readers.len() == 1 { "it" } else { "they" },
+                if readers.len() == 1 {
+                    "it"
+                } else {
+                    "each of them"
+                },
+            ),
             CatalogError::TargetTableExists { table } => write!(
                 f,
                 "target table \"{table}\" already exists; Trellis only writes to target tables \
@@ -869,6 +904,7 @@ impl std::error::Error for CatalogError {
             CatalogError::TargetInCatalogSchema { .. } => None,
             CatalogError::TargetTableSuffixCollision { .. } => None,
             CatalogError::TargetTableExists { .. } => None,
+            CatalogError::TargetNameHasReaders { .. } => None,
             CatalogError::TargetNotAdoptable { .. } => None,
             CatalogError::SourceNotChangeKeyed { .. } => None,
             CatalogError::PartitionedSource(_) => None,
@@ -3267,13 +3303,6 @@ async fn create_definition_inner(
     // The authoritative check (`install_definition` repeats it
     // earlier, before any DDL, as a fail-fast).
     reject_non_live_upstream(&*txn, &qualified_source, restoring.is_some()).await?;
-    // No transform reads a 1-1 JOIN's target (ADR-0021).
-    super::join_one_to_one::reject_reader_of_target(
-        &*txn,
-        pool.floors(),
-        &[qualified_source.as_str()],
-    )
-    .await?;
     // A JOIN's joined table resolves the way its `FROM` does, and is
     // held to the same checks. Its columns are read here, in this
     // transaction, for the catalog row and the hidden tables.
@@ -3294,12 +3323,6 @@ async fn create_definition_inner(
                 },
             };
             reject_non_live_upstream(&*txn, &joined, restoring.is_some()).await?;
-            super::join_one_to_one::reject_reader_of_target(
-                &*txn,
-                pool.floors(),
-                &[joined.as_str()],
-            )
-            .await?;
             let sides = JoinSides::read(&*txn, qualified_source.clone(), joined).await?;
             super::validate::validate_join(&def, &sides.from_columns, &sides.joined_columns)?;
             reject_virtual_join_reads(&def, &sides)?;
@@ -3427,11 +3450,6 @@ async fn create_definition_inner(
     // Not in a catalog schema, this instance's or another's. Before
     // any DDL, so nothing is created there.
     reject_target_in_catalog_schema(&*txn, pool.schema(), &qualified_target).await?;
-    // No transform reads a 1-1 JOIN's target (ADR-0021), even one defined
-    // over a table of the target's name that has since been dropped.
-    if super::join::is_one_to_one(&def) {
-        super::join_one_to_one::reject_target_with_reader(&*txn, &qualified_target).await?;
-    }
     // The test-fixture entry points (`target_ddl` is `None`) register against
     // a target their caller already created; `install_definition` creates it
     // below, after every check on the definition itself.
@@ -3868,6 +3886,11 @@ async fn create_target_in_txn(
     if let Some(taken) = taken {
         return Err(already_exists(&taken));
     }
+    // Not a name another definition reads (#1723): that reader would read
+    // the new target and keep what it derived from the table that had it.
+    // After the check above, so a table still at the name is reported as
+    // taken; an adopted one is refused here.
+    reject_target_name_with_readers(txn, qualified_target).await?;
     if adopt {
         // Another definition's target is Trellis's already: two definitions
         // can't share one (its ledger, for a 1-1 target, is refused above).
@@ -4913,6 +4936,39 @@ async fn side_read_table(
 }
 
 /// Refuses `target` (`schema.table`) with
+/// [`CatalogError::TargetNameHasReaders`] when another definition, of any
+/// status, reads a table of that name as its `FROM` or joined table (#1723).
+/// While that table is still there define refuses the target anyway
+/// ([`CatalogError::TargetTableExists`], checked first), unless it is
+/// adopted; once it is
+/// dropped or renamed away, the reader's next reconcile pass would find the
+/// name a target's, which the target-mutation seam feeds and the capture
+/// audit skips, so nothing would pause the reader for the table that went.
+/// Matched on the stored names, so a rename is caught as a drop is.
+async fn reject_target_name_with_readers(
+    client: &impl GenericClient,
+    target: &str,
+) -> Result<(), CatalogError> {
+    let readers: Vec<String> = client
+        .query(
+            "select split_part(target_table, '.', 2) from transform_definitions \
+             where source_table = $1 or join_table = $1 order by id",
+            &[&target],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    if readers.is_empty() {
+        return Ok(());
+    }
+    Err(CatalogError::TargetNameHasReaders {
+        target: target.to_string(),
+        readers,
+    })
+}
+
+/// Refuses `target` (`schema.table`) with
 /// [`CatalogError::TargetInCatalogSchema`] when its schema is
 /// `catalog_schema`, this instance's catalog schema, or holds a
 /// `trellis_instance` table, another instance's. A 1-1 target's
@@ -4982,11 +5038,6 @@ pub(crate) async fn revalidate(
     let source = definition.source_table.as_str();
     reject_target_in_catalog_schema(txn, schema, &definition.target_table).await?;
     let joined = join_table_of(txn, definition.id).await?;
-    // No transform reads a 1-1 JOIN's target (ADR-0021), even one whose
-    // table took the name of a source dropped while this one was paused.
-    let mut read = vec![source];
-    read.extend(joined.as_deref());
-    super::join_one_to_one::reject_reader_of_target(txn, floors, &read).await?;
     if let Some(joined) = joined {
         return revalidate_join(txn, schema, floors, definition, joined).await;
     }
