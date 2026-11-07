@@ -14,6 +14,14 @@ fn right_key(def: &TransformDef) -> Option<Vec<String>> {
     }
 }
 
+/// A definition's text, its `FROM` key, its `JOIN` key and its rendering.
+type Case = (
+    &'static str,
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+    &'static str,
+);
+
 fn key(columns: &[&str]) -> Option<Vec<String>> {
     Some(columns.iter().map(|c| c.to_string()).collect())
 }
@@ -23,7 +31,7 @@ fn key(columns: &[&str]) -> Option<Vec<String>> {
 /// same key.
 #[test]
 fn a_key_parses_on_from_and_join_and_round_trips_through_its_rendered_text() {
-    let cases: &[(&str, Option<Vec<String>>, Option<Vec<String>>, &str)] = &[
+    let cases: &[Case] = &[
         (
             "TRANSFORM t FROM orders KEY (customer_id, id) SELECT total AS total",
             key(&["customer_id", "id"]),
