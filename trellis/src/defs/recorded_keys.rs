@@ -186,7 +186,14 @@ async fn record_except(
             None => {}
         }
     }
-    let source_key = key_of(client, source).await?;
+    // A 1-1 target over a source left unkeyed is keyed by its own primary
+    // key, the key its source had at define, not by whatever the source's
+    // identity reads as now.
+    let source_key = if unkeyed == Some(source) && keys_target_by_source(def) {
+        primary_key_names(client, target).await?
+    } else {
+        key_of(client, source).await?
+    };
     write(client, target, &target_key(def, &source_key)).await
 }
 
@@ -809,7 +816,8 @@ pub(crate) async fn backfill_in(
         let Ok(mut def) = super::grammar::load_in(text, grammar_version, oldest, current) else {
             continue;
         };
-        let unkeyed = declare_released_keys(txn, id, &mut def, &source, joined.as_deref()).await?;
+        let unkeyed =
+            declare_released_keys(txn, id, &mut def, &source, joined.as_deref(), &target).await?;
         record_except(
             txn,
             &def,
@@ -819,14 +827,8 @@ pub(crate) async fn backfill_in(
             unkeyed.as_ref().map(|(table, _)| table.as_str()),
         )
         .await?;
-        if let Some((table, indexes)) = &unkeyed
-            && super::lifecycle::pause_for_included_key(
-                txn,
-                id,
-                &source,
-                &unkeyed_reason(&target, table, indexes),
-            )
-            .await?
+        if let Some((_, reason)) = &unkeyed
+            && super::lifecycle::pause_for_included_key(txn, id, &source, reason).await?
         {
             paused += 1;
         }
@@ -894,6 +896,51 @@ pub(crate) fn unkeyed_reason(target: &str, table: &str, indexes: &[String]) -> S
     )
 }
 
+/// The `capture_failure` of a 1-1 definition reading `table`, which has no
+/// primary key, whose target is keyed by `built_on` (the primary key
+/// `table` had at define) while the index an earlier release chose for
+/// `table` is over `chosen` ([`declare_released_keys`]).
+pub(crate) fn rebuilt_key_reason(
+    target: &str,
+    table: &str,
+    chosen: &[String],
+    built_on: &[String],
+) -> String {
+    format!(
+        "transform {target} reads {table}, which has no primary key. Its target is keyed by \
+         ({}), the key {table} had when the transform was defined, and the unique index an \
+         earlier release chose for {table} is over ({}), another key. Add the primary key \
+         back (ALTER TABLE {table} ADD PRIMARY KEY ({})) and RESUME this transform, or \
+         DROP TRANSFORM and define it again with a valid KEY (...)",
+        built_on.join(", "),
+        chosen.join(", "),
+        built_on.join(", "),
+    )
+}
+
+/// `table`'s primary key columns, in key order; none when it has no primary
+/// key or doesn't exist.
+async fn primary_key_names(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    Ok(client
+        .query_one(
+            "select array( \
+                 select a.attname::text \
+                 from pg_catalog.pg_index i \
+                 cross join unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
+                 join pg_catalog.pg_attribute a \
+                   on a.attrelid = i.indrelid and a.attnum = k.attnum \
+                 where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary \
+                   and k.ord <= i.indnkeyatts \
+                 order by k.ord)",
+            &[&ddl::regclass_arg(table)],
+        )
+        .await?
+        .get(0))
+}
+
 /// A released definition over a user table with no primary key, which an
 /// earlier release keyed by a unique index it chose (its oldest qualifying
 /// one): the definition `id` gets that index's key columns as an explicit
@@ -901,16 +948,27 @@ pub(crate) fn unkeyed_reason(target: &str, table: &str, indexes: &[String]) -> S
 /// backs a key now ([`super::source_key::backing`], and the key types'
 /// allowlist), so it keeps running on the same key (ADR-0026, #1745 rule
 /// 8). Otherwise returns the table and its unique indexes, and nothing is
-/// written: [`backfill_in`] pauses the definition. A table that has a
-/// primary key, a `KEY` the definition declares already, or that is
-/// another transform's target, is left as it is.
+/// written: [`backfill_in`] pauses the definition with the returned
+/// reason. A table that has a primary key, a `KEY` the definition declares
+/// already, or that is another transform's target, is left as it is.
+///
+/// A 1-1 target (plain or `JOIN`) is keyed by its source's key as it was
+/// at define, its primary key and its ledger over the same columns. Its
+/// source can have no primary key now only because that key was dropped
+/// after define, so the index the earlier release chose may be over other
+/// columns than the target was built on. The index is taken only when its
+/// columns are the target's primary key's; otherwise the definition is
+/// paused, and adding the primary key back and `RESUME` repairs it. An
+/// aggregate's or `JOIN`'s target is keyed by its group columns, which a
+/// rebuild-free change of its source's key leaves alone.
 async fn declare_released_keys(
     txn: &tokio_postgres::Transaction<'_>,
     id: i64,
     def: &mut TransformDef,
     source: &str,
     joined: Option<&str>,
-) -> Result<Option<(String, Vec<String>)>, CatalogError> {
+    target: &str,
+) -> Result<Option<(String, String)>, CatalogError> {
     use super::join::Side;
     let join = super::join::spec(def).is_some();
     let sides = std::iter::once((source, join.then_some(Side::From)))
@@ -949,7 +1007,24 @@ async fn declare_released_keys(
             None => false,
         };
         if !admitted {
-            return Ok(Some((table.to_string(), unique_indexes(txn, table).await?)));
+            let indexes = unique_indexes(txn, table).await?;
+            return Ok(Some((
+                table.to_string(),
+                unkeyed_reason(target, table, &indexes),
+            )));
+        }
+        if keys_target_by_source(def) && side != Some(Side::Joined) {
+            let built_on = primary_key_names(txn, target).await?;
+            let mut chosen_set = chosen.clone();
+            chosen_set.sort();
+            let mut built_set = built_on.clone();
+            built_set.sort();
+            if chosen_set != built_set {
+                return Ok(Some((
+                    table.to_string(),
+                    rebuilt_key_reason(target, table, &chosen, &built_on),
+                )));
+            }
         }
         declared.push((side, chosen));
     }

@@ -5,7 +5,8 @@
 //! definition whose table's chosen index backs a key now gets it written
 //! into its stored text as an explicit `KEY` and keeps running; one whose
 //! table has no index that does is paused, naming the table and the
-//! remedies.
+//! remedies. A 1-1 definition is converted only when the index is over the
+//! key its target was built on, the primary key its source had at define.
 //!
 //! The test builds that state as an earlier release left it: definitions
 //! over tables whose primary key was then dropped, with the catalog's key
@@ -149,4 +150,105 @@ async fn a_released_definition_over_a_table_with_no_primary_key_takes_its_index_
         ["(public.s_one,live)", "(public.u_sums,live)"]
     );
     assert_eq!(d.rows(SUMS_ACTUAL).await, d.rows(SUMS_EXPECTED).await);
+}
+
+/// The primary key a released 1-1 definition's target was built on was
+/// dropped, and the index the earlier release's rule chooses is over other
+/// columns: taking it as the `KEY` would key the source by columns the
+/// target and its ledger aren't keyed by, so the definition pauses, naming
+/// the key to add back. An aggregate over such a table is keyed by its
+/// group columns, takes the index as its `KEY` and keeps running.
+#[tokio::test]
+async fn a_released_one_to_one_whose_dropped_key_differs_from_the_chosen_index_pauses() {
+    const BY_N: &str = "TRANSFORM s_one FROM public.s SELECT v AS v";
+    const BY_N_ACTUAL: &str = "select id, v from public.s_one order by id";
+    const BY_N_EXPECTED: &str = "select id, v from public.s order by id";
+    const AGG: &str = "TRANSFORM u_sums FROM public.u GROUP BY g WITHOUT SOURCE INDEX \
+                       SELECT COUNT(*) AS n, SUM(v) AS total";
+    let mut d = Driver::start(
+        "create table public.s (id integer not null, n integer not null, v integer, \
+             primary key (id)); \
+         create unique index s_n on public.s (n); \
+         create table public.u (id integer not null, n integer not null, g integer, \
+             v integer, primary key (id)); \
+         create unique index u_n on public.u (n)",
+        &[("id", int4()), ("n", int4()), ("g", int4()), ("v", int4())],
+        &[BY_N, AGG],
+        &["public.s", "public.u"],
+    )
+    .await;
+    exec(
+        &d,
+        "insert into public.s values (1, 10, 100), (2, 20, 200); \
+         insert into public.u values (1, 10, 1, 5), (2, 20, 1, 6), (3, 30, 2, 7)",
+    )
+    .await;
+    d.settle().await;
+    exec(
+        &d,
+        "alter table public.s drop constraint s_pkey; \
+         alter table public.u drop constraint u_pkey",
+    )
+    .await;
+    d.ctl
+        .batch_execute("delete from definition_keys")
+        .await
+        .expect("a catalog from before the record");
+    let config = trellis::Config::from_dsn(d.db.dsn().to_string()).expect("config");
+    trellis::migrate::migrate_with_pool(d.pool(), &config)
+        .await
+        .expect("attach");
+
+    assert_eq!(
+        d.rows("select definition_text from transform_definitions order by id")
+            .await,
+        [
+            format!("(\"{BY_N}\")"),
+            "(\"TRANSFORM u_sums FROM public.u KEY (n) GROUP BY g WITHOUT SOURCE INDEX \
+             SELECT COUNT(*) AS n, SUM(v) AS total\")"
+                .to_string(),
+        ]
+    );
+    assert_eq!(
+        statuses(&d).await,
+        ["(public.s_one,paused)", "(public.u_sums,live)"]
+    );
+    let reasons = d
+        .rows("select error from capture_failures order by transform_id")
+        .await;
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("transform public.s_one reads public.s, which has no primary key")
+            && reasons[0].contains("Its target is keyed by (id)")
+            && reasons[0].contains("is over (n), another key")
+            && reasons[0].contains("ALTER TABLE public.s ADD PRIMARY KEY (id)"),
+        "{}",
+        reasons[0]
+    );
+
+    exec(
+        &d,
+        "update public.s set v = 101 where id = 1; update public.s set n = 99 where id = 2; \
+         insert into public.s values (3, 30, 300); \
+         update public.u set g = 2 where id = 1; update public.u set n = 99 where id = 2; \
+         delete from public.u where id = 3",
+    )
+    .await;
+    settle(&mut d).await;
+    assert_eq!(d.rows(SUMS_ACTUAL).await, d.rows(SUMS_EXPECTED).await);
+
+    // The remedy the message names.
+    exec(&d, "alter table public.s add primary key (id)").await;
+    trellis::staging::quarantine::resume_transform(d.pool(), "s_one")
+        .await
+        .expect("resume");
+    settle(&mut d).await;
+    assert_eq!(
+        statuses(&d).await,
+        ["(public.s_one,live)", "(public.u_sums,live)"]
+    );
+    assert_eq!(d.rows(BY_N_ACTUAL).await, d.rows(BY_N_EXPECTED).await);
+    exec(&d, "update public.s set v = 102 where id = 1").await;
+    settle(&mut d).await;
+    assert_eq!(d.rows(BY_N_ACTUAL).await, d.rows(BY_N_EXPECTED).await);
 }

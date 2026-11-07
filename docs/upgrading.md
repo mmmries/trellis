@@ -62,9 +62,12 @@ At the takeover, when that index backs a key now (valid, not deferrable, not
 partial, over plain columns that are `NOT NULL` or `NULLS NOT DISTINCT`), its
 key columns are written into the stored definition as an explicit `KEY (…)`,
 and the definition keeps running; `status()` and a schema dump show the new
-text. Otherwise it pauses, with a `capture_failure` naming the table and its
-unique indexes: add a primary key and `RESUME`, or `DROP TRANSFORM` and define
-it again with a valid `KEY (…)`.
+text. A 1-1 transform's target is keyed by the primary key its source had at
+define, so for a 1-1 transform (plain or `JOIN`, its `FROM` table) the index
+must also be over that key's columns. Otherwise it pauses, with a
+`capture_failure` naming the table and its unique indexes, or the key its
+target is keyed by: add a primary key (for a 1-1 transform, that key back) and
+`RESUME`, or `DROP TRANSFORM` and define it again with a valid `KEY (…)`.
 
 For an embedded fleet, [Rolling deploys](embedding.md#rolling-deploys) covers
 the handover in detail, and
