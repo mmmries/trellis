@@ -14,8 +14,7 @@ for one. That fallback was added so a transform could chain off an aggregate
 target, whose identity is a `UNIQUE NULLS NOT DISTINCT` group key. It was
 never decided for user tables, and it is a guess: which index is oldest
 changes under `REINDEX CONCURRENTLY`, a dump restore creates constraints in
-name order, and a user may add a unique index to any table at any time
-(#1719).
+name order, and a user may add a unique index to any table at any time.
 
 This ADR settles how a definition's key for each table it reads is chosen,
 validated and kept. The principle: a strict rule with no ambiguity and no
@@ -37,7 +36,9 @@ Every transform kind that reads a table takes it, on its `FROM` table and on a
 `JOIN`'s joined table. A table with neither a primary key nor a `KEY` is
 refused at define, and the refusal names both remedies: `KEY (…)`, or
 `ALTER TABLE … ADD PRIMARY KEY`. Trellis never keys a user table by a unique
-index it picked itself.
+index it picked itself. Neither a primary key nor a `KEY` may be deferrable: a
+deferrable key can hold duplicates inside a transaction, which writes keyed by
+it can't rely on.
 
 `KEY` is part of Trellis's statement language, like `GROUP BY` and `ADOPT
 EXISTING TABLE`, not of the expression grammar, so
@@ -50,7 +51,7 @@ keep it. A definition using it carries the floor of the release it arrived in
 ## A `KEY` is backed by a unique index, matched by shape
 
 A `KEY` must be backed by a unique index whose key columns are exactly the
-named columns, in any order (`INCLUDE` columns are not key columns, #1722),
+named columns, in any order (`INCLUDE` columns are not key columns),
 that is valid, immediate, not partial and over no expression, with every
 column `NOT NULL` or the index `NULLS NOT DISTINCT`. Its column types go
 through the key-type allowlist a primary key's do.
@@ -81,7 +82,7 @@ second transform over a `KEY` table repeats its `KEY`.
 
 Trellis records the key of each table the first time a definition keys by it,
 tied to the relation it was taken from, and keys the table by the index over
-exactly those columns for every definition that reads or writes it (#1719).
+exactly those columns for every definition that reads or writes it.
 
 Any change to the key a transform uses pauses it with a message: a default
 reader's primary key redefined, or the table created again with another one.
@@ -89,13 +90,14 @@ A change to a key the transform does not use pauses nothing: a primary key
 added, redefined or dropped on a table whose readers use `KEY`.
 
 A `KEY`'s backing index going missing pauses every reader of the table, with
-no grace (#1708 rule 3). That detector is built only after the false-positive
-study of the key-rule pauses (#1744) is posted and decided.
+no grace. That detector is built only once a false-positive study of the
+key-rule pauses against routine maintenance and migrations is posted and
+decided.
 
 `RESUME` re-validates everything define validates, against the table as it is
 now, and if that passes, re-records the key and rebuilds. An aggregate or
 `JOIN` reader of a default-keyed table takes its primary key now; a 1-1
-transform is amended to carry the new key (#1746). A `KEY` definition's
+transform is amended to carry the new key. A `KEY` definition's
 columns never change: its `RESUME` needs an index backing them to exist again.
 
 ## Definitions an earlier release kept over a table with no primary key
