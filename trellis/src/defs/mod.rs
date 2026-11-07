@@ -138,6 +138,8 @@ mod literal_tests;
 mod logic_tests;
 #[cfg(test)]
 mod table_alias_tests;
+#[cfg(test)]
+mod table_key_tests;
 
 #[cfg(test)]
 mod tests {
