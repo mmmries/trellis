@@ -5942,12 +5942,15 @@ async fn reject_unkeyed_source(
         // The plain-table rule's primary key holds for a partitioned root
         // too: `ddl::source_primary_key` also takes a qualifying unique
         // index, which [`change_keyed`] doesn't.
+        // A partitioned root is keyed as a plain table is: by its primary
+        // key or a `KEY (...)`, never by a unique index Trellis picks
+        // (ADR-0026).
         if super::source_key::declared_for(def, qualified_source).is_none()
             && !has_primary_key(client, qualified_source).await?
         {
-            return Err(CatalogError::SourceNotChangeKeyed {
+            return Err(CatalogError::Ddl(DdlError::NoPrimaryKey {
                 source_table: qualified_source.to_string(),
-            });
+            }));
         }
         let refusal = match &def.key_space {
             // ADR-0019: a side's partials are a single-table aggregate keyed
