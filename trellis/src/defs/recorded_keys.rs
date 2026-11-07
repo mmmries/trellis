@@ -44,8 +44,10 @@
 //! guess ([`check`], [`super::ddl::DdlError::RecordedKeyMissing`]).
 //!
 //! Definitions stored before the record existed get theirs at attach
-//! ([`backfill_in`]), from their parsed text. A definition built over a source
-//! key with `INCLUDE` columns was built by an earlier release over the
+//! ([`backfill_in`]), from their parsed text; one over a table whose primary
+//! key is deferrable, which an earlier release keyed it by, records that
+//! key's columns and is paused with the remedy ([`deferrable_reasons`]). A
+//! definition built over a source key with `INCLUDE` columns was built by an earlier release over the
 //! included columns too (#1722): the backfill records the corrected key and
 //! pauses it, and its `RESUME` re-keys a 1-1 target in place
 //! ([`repair_target_key`]) and rebuilds.
@@ -100,6 +102,21 @@ async fn key_names(
         .into_iter()
         .map(|c| c.name)
         .collect())
+}
+
+/// The key columns `table` is keyed by, for a record or a released
+/// definition's attach ([`backfill_in`]): its row identity, or a deferrable
+/// primary key's key columns, which no row identity reads but which define
+/// keyed the table by (or an earlier release did), so they stay its key
+/// while it refuses to key by them ([`missing`]).
+async fn released_key_names(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    match super::source_key::deferrable_primary_key(client, table).await? {
+        Some(DdlError::DeferrablePrimaryKey { key, .. }) => Ok(key),
+        _ => key_names(client, table).await,
+    }
 }
 
 /// `table`'s key: the one recorded for it, else its row identity now. A 1-1
@@ -180,8 +197,11 @@ async fn record_except(
         match declared {
             Some(key) if recorded.as_deref() != Some(key) => write(client, table, key).await?,
             Some(_) => {}
+            // A deferrable primary key's columns are recorded, not another
+            // unique index's: the table keys nothing until the key is
+            // recreated not deferrable ([`deferrable_reasons`]).
             None if recorded.is_none() => {
-                write(client, table, &key_names(client, table).await?).await?;
+                write(client, table, &released_key_names(client, table).await?).await?;
             }
             None => {}
         }
@@ -330,12 +350,31 @@ pub(crate) async fn missing(
     if !ddl::identity_key_columns(client, table).await?.is_empty() {
         return Ok(None);
     }
+    let trellis_target = super::source_key::is_trellis_target(client, table).await?;
+    // The recorded key's index is there, as a deferrable primary key (made
+    // deferrable after define, or defined by an earlier release): that is
+    // the refusal, with its remedy.
+    if !trellis_target
+        && let Some(deferrable) = super::source_key::deferrable_primary_key(client, table).await?
+        && let DdlError::DeferrablePrimaryKey { key, .. } = &deferrable
+        && same_columns(key, &recorded)
+    {
+        return Ok(Some(deferrable));
+    }
     Ok(Some(DdlError::RecordedKeyMissing {
         table: table.to_string(),
         indexes: unique_indexes(client, table).await?,
-        trellis_target: super::source_key::is_trellis_target(client, table).await?,
+        trellis_target,
         recorded,
     }))
+}
+
+/// Whether `a` and `b` are the same key columns, in any order.
+fn same_columns(a: &[String], b: &[String]) -> bool {
+    let (mut a, mut b) = (a.to_vec(), b.to_vec());
+    a.sort();
+    b.sort();
+    a == b
 }
 
 /// What a resume reads of one table a definition keys by ([`decide`]).
@@ -909,9 +948,14 @@ pub(crate) async fn backfill_in(
         {
             paused += 1;
         }
+        for reason in deferrable_reasons(txn, &def, &source, joined.as_deref(), &target).await? {
+            if super::lifecycle::pause_for_included_key(txn, id, &source, &reason).await? {
+                paused += 1;
+            }
+        }
         let mut included = Vec::new();
         for table in std::iter::once(&source).chain(joined.as_ref()) {
-            let key = key_names(txn, table).await?;
+            let key = released_key_names(txn, table).await?;
             let columns = included_columns(txn, table, &key).await?;
             if !columns.is_empty() {
                 included.push((table.clone(), columns));
@@ -995,6 +1039,58 @@ pub(crate) fn rebuilt_key_reason(
     )
 }
 
+/// The `capture_failure` of a definition reading `table`, whose primary key
+/// (`constraint`, over `key`) is deferrable: an earlier release keyed a
+/// table by one, and Trellis now refuses it ([`DdlError::DeferrablePrimaryKey`]).
+pub(crate) fn deferrable_key_reason(
+    target: &str,
+    table: &str,
+    constraint: &str,
+    key: &[String],
+) -> String {
+    format!(
+        "transform {target} reads {table}, whose primary key ({}) is deferrable. An earlier \
+         release keyed it by that key; Trellis no longer keys a table by a deferrable key, \
+         which can hold duplicate keys inside a transaction. Recreate it not deferrable, in \
+         one statement (ALTER TABLE {table} DROP CONSTRAINT {constraint}, ADD PRIMARY KEY \
+         ({})), and RESUME this transform, or DROP TRANSFORM and define it again with KEY (...) \
+         over a unique index that isn't deferrable",
+        key.join(", "),
+        key.join(", "),
+    )
+}
+
+/// The `capture_failure` reasons ([`deferrable_key_reason`]) of a released
+/// definition `def` over `source` and `joined`, one for each that is a user
+/// table with a deferrable primary key and no `KEY` the definition declares
+/// for it. Such a table keys nothing now: its record is that key's columns
+/// ([`record_except`]), with no index the identity reads over them, and the
+/// definition pauses; recreating the key not deferrable and `RESUME` repairs
+/// it.
+async fn deferrable_reasons(
+    client: &impl GenericClient,
+    def: &TransformDef,
+    source: &str,
+    joined: Option<&str>,
+    target: &str,
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    let mut reasons = Vec::new();
+    for table in std::iter::once(source).chain(joined) {
+        if super::source_key::declared_by_reader(def, source, joined, table).is_some()
+            || super::source_key::is_trellis_target(client, table).await?
+        {
+            continue;
+        }
+        if let Some(DdlError::DeferrablePrimaryKey {
+            constraint, key, ..
+        }) = super::source_key::deferrable_primary_key(client, table).await?
+        {
+            reasons.push(deferrable_key_reason(target, table, &constraint, &key));
+        }
+    }
+    Ok(reasons)
+}
+
 /// `table`'s primary key columns, in key order; none when it has no primary
 /// key or doesn't exist.
 async fn primary_key_names(
@@ -1026,8 +1122,10 @@ async fn primary_key_names(
 /// allowlist), so it keeps running on the same key (ADR-0026, #1745 rule
 /// 8). Otherwise returns the table and its unique indexes, and nothing is
 /// written: [`backfill_in`] pauses the definition with the returned
-/// reason. A table that has a primary key, a `KEY` the definition declares
-/// already, or that is another transform's target, is left as it is.
+/// reason. A table that has a primary key (a deferrable one among them,
+/// which [`deferrable_reasons`] pauses the definition for), a `KEY` the
+/// definition declares already, or that is another transform's target, is
+/// left as it is.
 ///
 /// A 1-1 target (plain or `JOIN`) is keyed by its source's key as it was
 /// at define, its primary key and its ledger over the same columns. Its

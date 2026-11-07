@@ -7,6 +7,8 @@
 //! table has no index that does is paused, naming the table and the
 //! remedies. A 1-1 definition is converted only when the index is over the
 //! key its target was built on, the primary key its source had at define.
+//! A definition over a table whose primary key is deferrable pauses too
+//! (#1742): no key is taken for it.
 //!
 //! The test builds that state as an earlier release left it: definitions
 //! over tables whose primary key was then dropped, with the catalog's key
@@ -251,4 +253,195 @@ async fn a_released_one_to_one_whose_dropped_key_differs_from_the_chosen_index_p
     exec(&d, "update public.s set v = 102 where id = 1").await;
     settle(&mut d).await;
     assert_eq!(d.rows(BY_N_ACTUAL).await, d.rows(BY_N_EXPECTED).await);
+}
+
+/// A released definition over a table whose primary key is deferrable
+/// (#1742): an earlier release keyed the table by it, and Trellis no longer
+/// keys a table by a deferrable key. At attach each definition pauses,
+/// naming the key and the remedy. The key's columns are recorded as the
+/// table's, never another unique index's, and a unique index over the same
+/// columns that isn't deferrable doesn't stand in for the primary key:
+/// `RESUME` refuses until the key is recreated not deferrable, then
+/// rebuilds.
+#[tokio::test]
+async fn a_released_definition_over_a_deferrable_primary_key_pauses() {
+    let mut d = Driver::start(
+        "create table public.s (id integer not null, v integer, primary key (id)); \
+         create unique index s_id on public.s (id); \
+         create table public.u (id integer not null, n integer, g integer, v integer, \
+             primary key (id))",
+        &[("id", int4()), ("n", int4()), ("g", int4()), ("v", int4())],
+        &[ONE, SUMS],
+        &["public.s", "public.u"],
+    )
+    .await;
+    exec(
+        &d,
+        "insert into public.s values (1, 10), (2, 20); \
+         insert into public.u values (1, 1, 1, 5), (2, 2, 1, 6), (3, null, 2, 7)",
+    )
+    .await;
+    d.settle().await;
+
+    // What an earlier release left: definitions over deferrable primary
+    // keys (in both modes), and no key records.
+    exec(
+        &d,
+        "alter table public.s drop constraint s_pkey, \
+             add primary key (id) deferrable initially immediate; \
+         alter table public.u drop constraint u_pkey, \
+             add primary key (id) deferrable initially deferred",
+    )
+    .await;
+    d.ctl
+        .batch_execute("delete from definition_keys")
+        .await
+        .expect("a catalog from before the record");
+    let config = trellis::Config::from_dsn(d.db.dsn().to_string()).expect("config");
+    trellis::migrate::migrate_with_pool(d.pool(), &config)
+        .await
+        .expect("attach");
+
+    assert_eq!(
+        statuses(&d).await,
+        ["(public.s_one,paused)", "(public.u_sums,paused)"]
+    );
+    assert_eq!(
+        d.rows(
+            "select table_name, key_columns::text from definition_keys \
+             where table_name in ('public.s', 'public.u') order by 1"
+        )
+        .await,
+        ["(public.s,{id})", "(public.u,{id})"],
+        "the deferrable key's columns are recorded"
+    );
+    let reasons = d
+        .rows("select error from capture_failures order by transform_id")
+        .await;
+    assert_eq!(reasons.len(), 2, "{reasons:?}");
+    for (reason, (target, table)) in reasons
+        .iter()
+        .zip([("public.s_one", "public.s"), ("public.u_sums", "public.u")])
+    {
+        assert!(
+            reason.contains(&format!(
+                "transform {target} reads {table}, whose primary key (id) is deferrable"
+            )) && reason.contains(&format!(
+                "ALTER TABLE {table} DROP CONSTRAINT {}_pkey, ADD PRIMARY KEY (id)",
+                &table["public.".len()..]
+            )) && reason.contains("RESUME this transform")
+                && reason.contains("DROP TRANSFORM and define it again with KEY (...)"),
+            "{reason}"
+        );
+    }
+
+    let err = trellis::staging::quarantine::resume_transform(d.pool(), "s_one")
+        .await
+        .expect_err("the primary key is still deferrable");
+    let reason = std::error::Error::source(&err)
+        .expect("the refusal's reason")
+        .to_string();
+    assert!(
+        reason.contains("the primary key of 'public.s' (id) is deferrable"),
+        "{reason}"
+    );
+
+    // The remedy: recreate each key not deferrable, then RESUME.
+    exec(
+        &d,
+        "alter table public.s drop constraint s_pkey, add primary key (id); \
+         alter table public.u drop constraint u_pkey, add primary key (id); \
+         insert into public.s values (3, 30); update public.u set v = 60 where id = 2",
+    )
+    .await;
+    for target in ["s_one", "u_sums"] {
+        trellis::staging::quarantine::resume_transform(d.pool(), target)
+            .await
+            .expect(target);
+    }
+    settle(&mut d).await;
+    assert_eq!(
+        statuses(&d).await,
+        ["(public.s_one,live)", "(public.u_sums,live)"]
+    );
+    assert_eq!(d.rows(ONE_ACTUAL).await, d.rows(ONE_EXPECTED).await);
+    assert_eq!(d.rows(SUMS_ACTUAL).await, d.rows(SUMS_EXPECTED).await);
+}
+
+/// A released `JOIN` with a cause on each table: its `FROM` table's primary
+/// key is deferrable, and its joined table has no primary key and a unique
+/// index that backs a key. At attach the joined table's index becomes the
+/// definition's `KEY`, as for any released definition over a table with no
+/// primary key, and the definition pauses for the deferrable key alone; once
+/// that is recreated not deferrable, `RESUME` rebuilds it.
+#[tokio::test]
+async fn a_released_join_over_a_deferrable_key_and_a_table_with_none_takes_both() {
+    const JOIN: &str = "TRANSFORM j FROM public.a JOIN public.b ON a.bk = b.id \
+                        GROUP BY a.g WITHOUT SOURCE INDEX SELECT COUNT(*) AS n";
+    const ACTUAL: &str = "select g, n from public.j order by g";
+    const EXPECTED: &str = "select a.g, count(*) from public.a join public.b on a.bk = b.id \
+                            group by a.g order by a.g";
+    let mut d = Driver::start(
+        "create table public.a (id integer primary key, g integer, bk integer); \
+         create table public.b (id integer not null, primary key (id)); \
+         create unique index b_id on public.b (id); \
+         create index b_on on public.b (id); create index a_on on public.a (bk)",
+        &[("id", int4()), ("g", int4()), ("bk", int4())],
+        &[JOIN],
+        &["public.a", "public.b"],
+    )
+    .await;
+    exec(
+        &d,
+        "insert into public.b values (1), (2); \
+         insert into public.a values (1, 1, 1), (2, 1, 2), (3, 2, 1)",
+    )
+    .await;
+    d.settle().await;
+    assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
+
+    exec(
+        &d,
+        "alter table public.a drop constraint a_pkey, add primary key (id) deferrable; \
+         alter table public.b drop constraint b_pkey",
+    )
+    .await;
+    d.ctl
+        .batch_execute("delete from definition_keys")
+        .await
+        .expect("a catalog from before the record");
+    let config = trellis::Config::from_dsn(d.db.dsn().to_string()).expect("config");
+    trellis::migrate::migrate_with_pool(d.pool(), &config)
+        .await
+        .expect("attach");
+    assert_eq!(statuses(&d).await, ["(public.j,paused)"]);
+    assert_eq!(
+        d.rows("select definition_text from transform_definitions")
+            .await,
+        [
+            "(\"TRANSFORM j FROM public.a INNER JOIN public.b KEY (id) ON a.bk = b.id GROUP BY a.g \
+             WITHOUT SOURCE INDEX SELECT COUNT(*) AS n\")"
+        ]
+    );
+    let reasons = d.rows("select error from capture_failures").await;
+    assert!(
+        reasons.len() == 1
+            && reasons[0].contains(
+                "transform public.j reads public.a, whose primary key (id) is deferrable"
+            ),
+        "{reasons:?}"
+    );
+
+    exec(
+        &d,
+        "alter table public.a drop constraint a_pkey, add primary key (id); \
+         insert into public.a values (4, 2, 2)",
+    )
+    .await;
+    trellis::staging::quarantine::resume_transform(d.pool(), "j")
+        .await
+        .expect("resume");
+    settle(&mut d).await;
+    assert_eq!(statuses(&d).await, ["(public.j,live)"]);
+    assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
 }
