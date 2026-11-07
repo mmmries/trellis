@@ -127,9 +127,13 @@ pub use claim::{
     DEFAULT_DRAINER_WINDOW, claim, count_live_drainers, reclaim_stale_drainers, register_drainers,
 };
 #[cfg(any(test, feature = "internals"))]
+pub use drift_memo::backing_checks as key_backing_checks;
+#[cfg(any(test, feature = "internals"))]
 pub use drift_memo::checks as drift_checks;
 #[cfg(any(test, feature = "internals"))]
 pub use drift_memo::key_checks as unique_key_checks;
+#[cfg(any(test, feature = "internals"))]
+pub use drift_memo::{probe_index_checks, set_extreme_index_grace};
 pub use error::StagingError;
 pub use liveness::{
     DEFAULT_RECLAIM_TTL, HeartbeatDaemon, HeartbeatDaemonConfig, reclaim_stale, release_segments,

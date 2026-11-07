@@ -187,7 +187,8 @@ CREATE INDEX ON orders (customer_id, created_at);
 One index serves `MIN` and `MAX` of the same argument, and also serves as
 the `GROUP BY` index. If it is dropped later, each such read scans the
 group's rows through the `GROUP BY` index, or the whole source when that is
-missing too. On a 1-million-row source, a page that re-read 3,334 groups' `MIN` and `MAX`
+missing too, and once it has been missing for 5 minutes the transform pauses
+([Keep the indexes a definition relies on](#keep-the-indexes-a-definition-relies-on)). On a 1-million-row source, a page that re-read 3,334 groups' `MIN` and `MAX`
 took about 30 ms with the index and 305 ms with only the `GROUP BY` index;
 with neither, each group took about 78 ms. A missing index never changes
 results.
@@ -232,9 +233,15 @@ has the details):
   table, and `status()` says so. The transforms that read it pause when
   Trellis next applies a change of it.
 * **The unique index backing a source's `KEY (…)`**: build its replacement
-  before dropping it. Any equivalent index backs the key; with none, the
-  transforms reading the table pause when Trellis next applies a change of
-  it, and `RESUME` refuses until one is built again.
+  before dropping it. Any equivalent index backs the key, so `REINDEX
+  CONCURRENTLY`, a rename, pg_repack and `ADD PRIMARY KEY USING INDEX` change
+  nothing. With none valid, the staging worker's next reconcile pass pauses
+  every transform reading the table, whether or not a write arrived, and the
+  message gives the `CREATE UNIQUE INDEX` to run. So does a swap that drops the
+  old index before it builds the new one, when a pass runs between the two.
+  On a partitioned table, a root index whose leaf index was repaired stays
+  invalid until `ALTER INDEX … ATTACH PARTITION` is run again for that leaf.
+  `RESUME` refuses until an index backs the key, then rebuilds.
 * **The unique key on a 1-1 `JOIN`'s `b` `ON` columns:** the staging worker's
   next reconcile pass pauses the transform, naming `b` and its `ON` columns,
   whether or not a duplicate arrived. So does a swap that drops the old index
@@ -246,9 +253,13 @@ has the details):
   walk the definition (unless it was defined `WITHOUT SOURCE INDEX`) until the
   index is back.
 * **A `MIN`/`MAX` argument's index** (the `GROUP BY` columns, then the
-  argument): nothing pauses and the target stays exact. `status()` lists an
-  `extreme_index_gap`, and each re-read of an extreme scans its group until
-  the index is back.
+  argument): the target stays exact. `status()` lists an `extreme_index_gap`,
+  and each re-read of an extreme scans its group. Once the staging worker has
+  found no valid such index for 5 minutes, it pauses the transform, naming
+  the index to create; `RESUME` refuses until it is back, then rebuilds. A
+  swap that builds the replacement first pauses nothing; one that drops the
+  old index first pauses if the new one takes longer than 5 minutes to
+  build, which on a large table or beside a long-running transaction it can.
 
 ## Partition large sources
 
