@@ -168,6 +168,7 @@ impl CaptureSpec {
     }
 
     /// Whether the key is a declared `KEY (...)`, not the primary key.
+    #[cfg(any(test, feature = "internals"))]
     pub fn declared_key(&self) -> bool {
         self.declared
     }
