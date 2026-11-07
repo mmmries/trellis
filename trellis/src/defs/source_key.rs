@@ -139,27 +139,19 @@ pub(crate) async fn backing(
     ))
 }
 
-/// `table`'s primary key's key columns, in key order, and whether it is
-/// deferrable; `None` when it has none.
-async fn primary_key(
+/// Whether `table` (an unquoted `schema.table`) has a primary key.
+async fn has_primary_key(
     client: &impl GenericClient,
     table: &str,
-) -> Result<Option<(Vec<String>, bool)>, tokio_postgres::Error> {
+) -> Result<bool, tokio_postgres::Error> {
     Ok(client
-        .query_typed_opt(
-            "select array(select a.attname::text \
-                          from pg_catalog.unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
-                          join pg_catalog.pg_attribute a \
-                            on a.attrelid = i.indrelid and a.attnum = k.attnum \
-                          where k.ord <= i.indnkeyatts \
-                          order by k.ord), \
-                    not i.indimmediate \
-             from pg_catalog.pg_index i \
-             where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary",
-            &[(&ddl::regclass_arg(table), Type::TEXT)],
+        .query_one(
+            "select exists (select 1 from pg_catalog.pg_index i \
+                 where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary)",
+            &[&ddl::regclass_arg(table)],
         )
         .await?
-        .map(|row| (row.get(0), row.get(1))))
+        .get(0))
 }
 
 /// Whether `table` (an unquoted `schema.table`) is a definition's target.
@@ -199,8 +191,8 @@ async fn is_partitioned(
 ///   ([`ddl::admitted_primary_key`]); a declared key is refused.
 /// - A declared key: the columns as declared, read through the index that
 ///   backs them ([`backing`]); refused when none does.
-/// - Otherwise the table's primary key, which must exist and be immediate:
-///   no unique index stands in for one.
+/// - Otherwise the table's primary key, which must exist: no unique index
+///   stands in for one.
 pub(crate) async fn admitted_key(
     client: &impl GenericClient,
     table: &str,
@@ -227,23 +219,17 @@ pub(crate) async fn admitted_key(
         let admitted_by = ddl::admit_key_types(client, table, &columns).await?;
         return Ok((columns, admitted_by));
     }
-    match primary_key(client, table).await? {
-        None => {
-            // A table with a record and no index over it reports that
-            // first: its key was dropped after define.
-            if let Some(missing) = super::recorded_keys::missing(client, table).await? {
-                return Err(missing);
-            }
-            Err(DdlError::NoPrimaryKey {
-                source_table: table.to_string(),
-            })
+    if !has_primary_key(client, table).await? {
+        // A table with a record and no index over it reports that first:
+        // its key was dropped after define.
+        if let Some(missing) = super::recorded_keys::missing(client, table).await? {
+            return Err(missing);
         }
-        Some((key, true)) => Err(DdlError::DeferrablePrimaryKey {
-            table: table.to_string(),
-            key,
-        }),
-        Some(_) => ddl::admitted_primary_key(client, table).await,
+        return Err(DdlError::NoPrimaryKey {
+            source_table: table.to_string(),
+        });
     }
+    ddl::admitted_primary_key(client, table).await
 }
 
 /// How the transforms reading a table key it: by its primary key, or by a

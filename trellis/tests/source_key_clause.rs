@@ -200,7 +200,7 @@ async fn a_primary_key_change_on_a_table_keyed_by_key_pauses_nothing() {
 
 /// Every define refusal of a key: none at all, a `KEY` no index backs (none
 /// over its columns, a partial, expression, nullable or deferrable one), a
-/// deferrable primary key (#1742), a `KEY` on another transform's target,
+/// deferrable primary key named as a `KEY`, a `KEY` on another transform's target,
 /// and a key other than the one the table's other transforms use.
 #[tokio::test]
 async fn define_refuses_a_key_it_cannot_key_by() {
@@ -280,9 +280,11 @@ async fn define_refuses_a_key_it_cannot_key_by() {
             "{text}: {message}"
         );
     }
-    let message = refused("TRANSFORM dpk_copy FROM public.deferred_pk SELECT v AS v").await;
+    // A deferrable primary key backs no KEY (#1742 is about the default).
+    let message =
+        refused("TRANSFORM dpk_copy FROM public.deferred_pk KEY (id) SELECT v AS v").await;
     assert!(
-        message.contains("the primary key (id) of 'public.deferred_pk' is deferrable"),
+        message.contains("no unique index backs KEY (id)") && message.contains("deferrable"),
         "{message}"
     );
     let message = refused("TRANSFORM chained FROM public.base_sums KEY (g) SELECT n AS n").await;

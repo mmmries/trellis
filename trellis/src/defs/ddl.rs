@@ -231,9 +231,6 @@ pub enum DdlError {
         /// the partition key.
         partitioned: bool,
     },
-    /// `table`'s primary key is deferrable: it may hold duplicates until
-    /// commit, so it is no key Trellis can key rows by (#1742).
-    DeferrablePrimaryKey { table: String, key: Vec<String> },
     /// A table is keyed one way for every transform that reads it, and
     /// another definition (`reader`, its target) keys `table` by `theirs`,
     /// not `written` (ADR-0026).
@@ -343,7 +340,6 @@ impl DdlError {
             DdlError::NoPrimaryKey { .. }
             | DdlError::KeyOnTrellisTarget { .. }
             | DdlError::KeyNotBacked { .. }
-            | DdlError::DeferrablePrimaryKey { .. }
             | DdlError::KeyDiffersFromReaders { .. }
             | DdlError::UnsupportedPrimaryKeyType { .. }
             | DdlError::RecordedKeyMissing { .. }
@@ -413,14 +409,6 @@ impl fmt::Display for DdlError {
                 }
                 Ok(())
             }
-            DdlError::DeferrablePrimaryKey { table, key } => write!(
-                f,
-                "the primary key ({}) of '{table}' is deferrable, so it can hold duplicates \
-                 until commit and Trellis can't key rows by it. Make it NOT DEFERRABLE, or \
-                 name another key with KEY (column, ...) after the table, backed by an \
-                 immediate unique index",
-                key.join(", ")
-            ),
             DdlError::KeyDiffersFromReaders {
                 table,
                 written,
@@ -534,7 +522,6 @@ impl std::error::Error for DdlError {
             DdlError::NoPrimaryKey { .. }
             | DdlError::KeyOnTrellisTarget { .. }
             | DdlError::KeyNotBacked { .. }
-            | DdlError::DeferrablePrimaryKey { .. }
             | DdlError::KeyDiffersFromReaders { .. }
             | DdlError::RecordedKeyMissing { .. }
             | DdlError::NoPrimaryKeyToRecord { .. }
