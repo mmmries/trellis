@@ -249,6 +249,7 @@ fn type_rules() -> Vec<TypeRule> {
         T::AggregateAdmission(AggregateAdmissionRule::Count),
         T::AggregateAdmission(AggregateAdmissionRule::SumAvgInteger),
         T::AggregateAdmission(AggregateAdmissionRule::SumAvgScaledNumeric),
+        T::AggregateAdmission(AggregateAdmissionRule::SumAvgNumeric),
         T::AggregateAdmission(AggregateAdmissionRule::Extreme),
         T::GroupByKey(GroupByKeyRule::Integer),
         T::GroupByKey(GroupByKeyRule::Numeric),
@@ -326,6 +327,7 @@ fn type_rules() -> Vec<TypeRule> {
             AggregateAdmissionRule::SumAvgInteger => 37,
             AggregateAdmissionRule::SumAvgScaledNumeric => 38,
             AggregateAdmissionRule::Extreme => 58,
+            AggregateAdmissionRule::SumAvgNumeric => 59,
         },
         T::GroupByKey(r) => match r {
             GroupByKeyRule::Integer => 39,
@@ -423,6 +425,7 @@ fn features() -> Vec<Feature> {
         Layout::GroupBasisExtremes,
         Layout::Join,
         Layout::JoinOneToOne,
+        Layout::NumericSums,
     ];
     features.extend(
         every(&layouts, |l| match l {
@@ -432,6 +435,7 @@ fn features() -> Vec<Feature> {
             Layout::Join => 3,
             Layout::JoinOneToOne => 4,
             Layout::GroupBasisExtremes => 5,
+            Layout::NumericSums => 6,
         })
         .into_iter()
         .map(Feature::Layout),

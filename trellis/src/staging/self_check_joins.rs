@@ -82,11 +82,13 @@ use crate::defs::model::Definition;
 use crate::defs::registry;
 use crate::pool::{Pool, quote_ident};
 
+use super::group_basis::{self, SumPart};
 use super::self_check::{
     ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_call_arg, render_leaf,
 };
 use super::self_check_groups::{
-    Side, Uncertain, bound, drop_equal_values, partial_text, weighted_partials,
+    Side, Uncertain, bound, drop_equal_values, partial_names, partial_text, weighted_partials,
+    zero_text,
 };
 use super::self_check_keyset::{BYTE_ORDER, Keyset, recollated_pairs};
 use super::self_check_ring::{Basis, Lands, Ring, WEIGHT};
@@ -301,7 +303,7 @@ pub(super) fn check_renders(def: &Definition) -> Result<(), SelfCheckError> {
         .collect();
     for field in value_fields(&def.def) {
         render(&def.def, &field.expr, "a", "b")
-            .and_then(|_| render_signed(&def.def, &field.expr, &args))
+            .and_then(|_| render_signed(&def.def, &field.expr, &args, &[]))
             .map_err(|detail| SelfCheckError::UnsupportedExpr {
                 target: def.def.target.clone(),
                 detail,
@@ -346,17 +348,35 @@ fn summed(def: &TransformDef, args: &[Expr]) -> Vec<bool> {
     out
 }
 
-/// One table's partial columns, as named in its hidden table: the row
-/// count, then per argument its non-null count and, if summed, its sum.
-fn partial_columns(summed: &[bool]) -> Vec<String> {
-    let mut names = vec!["__n".to_string()];
-    for (i, summed) in summed.iter().enumerate() {
-        names.push(format!("__count_{}", i + 1));
-        if *summed {
-            names.push(format!("__sum_{}", i + 1));
-        }
-    }
-    names
+/// Each argument's sum partials (`group_basis::SumPart`): none for one no
+/// `SUM` or `AVG` reads, all five for a `numeric` one (`numeric`: the
+/// hidden table keeps its scale map, `__scales_<i>`), its sum otherwise.
+fn sum_parts(summed: &[bool], numeric: &HashSet<usize>) -> Vec<&'static [SumPart]> {
+    summed
+        .iter()
+        .enumerate()
+        .map(|(i, summed)| group_basis::sum_parts(*summed, numeric.contains(&(i + 1))))
+        .collect()
+}
+
+/// The arguments (1-based) whose partials in the hidden table `hidden`
+/// (quoted and qualified) keep a scale map: the `numeric` ones.
+async fn numeric_arguments(
+    client: &tokio_postgres::Client,
+    hidden: &str,
+) -> Result<HashSet<usize>, SelfCheckError> {
+    let rows = client
+        .query(
+            "select attname::text from pg_attribute \
+             where attrelid = $1::text::regclass and attnum > 0 and not attisdropped \
+               and attname::text like '\\_\\_scales\\_%'",
+            &[&hidden],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| row.get::<_, String>(0)["__scales_".len()..].parse().ok())
+        .collect())
 }
 
 /// The key text of `key` read through `alias`, under byte order.
@@ -470,8 +490,9 @@ struct Audit<'a> {
     target: String,
     from_args: Vec<Expr>,
     joined_args: Vec<Expr>,
-    from_summed: Vec<bool>,
-    joined_summed: Vec<bool>,
+    /// Each argument's sum partials ([`sum_parts`]).
+    from_parts: Vec<&'static [SumPart]>,
+    joined_parts: Vec<&'static [SumPart]>,
     /// For each of a side's cell columns, the collation an unapplied
     /// change's column is read under to find its cell in `P` or `M`
     /// ([`Basis::collations`]): the hidden copy's, where the source column
@@ -607,9 +628,9 @@ impl Audit<'_> {
         keyset: &Keyset,
         steer: bool,
     ) -> Result<(String, Vec<String>), SelfCheckError> {
-        let (part, args, summed) = match side {
-            JoinSide::From => (Part::From, &self.from_args, &self.from_summed),
-            JoinSide::Joined => (Part::Joined, &self.joined_args, &self.joined_summed),
+        let (part, args, parts) = match side {
+            JoinSide::From => (Part::From, &self.from_args, &self.from_parts),
+            JoinSide::Joined => (Part::Joined, &self.joined_args, &self.joined_parts),
         };
         let key = keyset.columns();
         // A joined row with a `NULL` join-key part joins nothing, and has no
@@ -621,11 +642,11 @@ impl Audit<'_> {
                 .map(|c| format!(" and __s.{} is not null", quote_ident(c)))
                 .collect(),
         };
-        let columns = partial_columns(summed);
-        let rendered: Vec<(String, bool)> = self
+        let columns = partial_names(parts);
+        let rendered: Vec<(String, &[SumPart])> = self
             .render_args(args, "__s")?
             .into_iter()
-            .zip(summed.iter().copied())
+            .zip(parts.iter().copied())
             .collect();
         let (values, nonzero) = weighted_partials(&rendered);
         let ring = self.ring(side);
@@ -750,17 +771,18 @@ impl Audit<'_> {
             let rendered = render(self.def, arg, "__a", "__b").map_err(|d| self.unsupported(d))?;
             xs.push_str(&format!(", {rendered} as __x{}", i + 1));
         }
-        let summed: Vec<bool> = self
-            .from_summed
+        let parts: Vec<&[SumPart]> = self
+            .from_parts
             .iter()
-            .chain(&self.joined_summed)
+            .chain(&self.joined_parts)
             .copied()
             .collect();
-        let columns = partial_columns(&summed);
-        let x_columns: Vec<(String, bool)> = summed
+        let numeric: Vec<bool> = parts.iter().map(|p| p.len() > 1).collect();
+        let columns = partial_names(&parts);
+        let x_columns: Vec<(String, &[SumPart])> = parts
             .iter()
             .enumerate()
-            .map(|(i, s)| (format!("__x{}", i + 1), *s))
+            .map(|(i, p)| (format!("__x{}", i + 1), *p))
             .collect();
         let (sv, nonzero) = weighted_partials(&x_columns);
         let mut oracle_fields = Vec::with_capacity(fields.len());
@@ -768,7 +790,8 @@ impl Audit<'_> {
             let pg_type = field_types.get(&field.name).map_or("text", String::as_str);
             oracle_fields.push(format!(
                 "(({})::{pg_type})::text",
-                render_signed(self.def, &field.expr, &all_args).map_err(|d| self.unsupported(d))?
+                render_signed(self.def, &field.expr, &all_args, &numeric)
+                    .map_err(|d| self.unsupported(d))?
             ));
         }
         let on: Vec<String> = join
@@ -933,13 +956,22 @@ impl Audit<'_> {
 /// Renders a visible field of a `JOIN` over the weighted pairs of
 /// [`Audit::target_page`] (aliased `__g`): each aggregate sums the pairs'
 /// weights, `COUNT(*)` their weights, `COUNT(x)` those where `x` isn't
-/// `NULL`, `SUM(x)` the positive pairs' finite `x` less the negative ones'
-/// (`NULL` while that count is 0, as `sum()` is; `NaN` while the weighted
-/// `NaN`s don't cancel out, as `NaN − NaN` would not) and `AVG(x)` that sum
-/// over that count, as Postgres's `avg()` divides. `args` are the pairs' `__x<i>`
-/// columns, in order. [`render`]'s twin for weighted rows, written fresh
-/// here, not shared with the apply path.
-fn render_signed(def: &TransformDef, expr: &Expr, args: &[Expr]) -> Result<String, String> {
+/// `NULL`, `SUM(x)` the positive pairs' `x` less the negative ones' (`NULL`
+/// while that count is 0, as `sum()` is) and `AVG(x)` that sum over that
+/// count, as Postgres's `avg()` divides. Over a `numeric` `x` (`numeric`,
+/// one flag per argument) the sum is Postgres's `sum(numeric)` of the pairs
+/// still present: `NaN` while the weighted `NaN`s, or both weighted
+/// infinities, don't cancel out (as `NaN − NaN` and `Infinity − Infinity`
+/// would not), the infinity while one doesn't, and otherwise the weighted
+/// finite values' sum at the largest scale whose weighted count is above 0.
+/// `args` are the pairs' `__x<i>` columns, in order. [`render`]'s twin for
+/// weighted rows, written fresh here, not shared with the apply path.
+fn render_signed(
+    def: &TransformDef,
+    expr: &Expr,
+    args: &[Expr],
+    numeric: &[bool],
+) -> Result<String, String> {
     let w = WEIGHT;
     Ok(match expr {
         Expr::FunctionCall { name, args: called } => {
@@ -953,17 +985,37 @@ fn render_signed(def: &TransformDef, expr: &Expr, args: &[Expr]) -> Result<Strin
                         .ok_or_else(|| format!("{aggregate} of an expression it doesn't read"))?;
                     let x = format!("__x{}", i + 1);
                     let count = format!("sum({w} * ({x} is not null)::int)");
-                    // The finite pairs' `x`, positive less negative, in
-                    // `sum()`'s own type (`bigint` over `integer`), plus a
-                    // `NaN` while the weighted `NaN`s don't cancel out
-                    // (`0` of that type otherwise).
-                    let nan = format!("(({x})::numeric = 'NaN'::numeric)");
-                    let sum = format!(
-                        "(coalesce(sum({x}) filter (where {w} > 0 and not {nan}), 0) \
-                          - coalesce(sum({x}) filter (where {w} < 0 and not {nan}), 0) \
-                          + coalesce(case when sum({w} * {nan}::int) <> 0 \
-                                     then min({x}) filter (where {nan}) end, 0))"
-                    );
+                    let sum = if numeric.get(i).copied().unwrap_or(false) {
+                        let net = |value: &str| {
+                            format!("coalesce(sum({w}) filter (where {x} = '{value}'), 0)")
+                        };
+                        format!(
+                            "(case when {nan} > 0 or ({pinf} > 0 and {ninf} > 0) \
+                                   then 'NaN'::numeric \
+                                   when {pinf} > 0 then 'Infinity'::numeric \
+                                   when {ninf} > 0 then '-Infinity'::numeric \
+                                   else round(coalesce(sum({w} * {x}) \
+                                                  filter (where scale({x}) is not null), 0), \
+                                              (select coalesce(max(__z.__s), 0) from ( \
+                                                   select __u.__s from ( \
+                                                       select array_agg(scale({x})) as __as, \
+                                                              array_agg({w}) as __aw) as __a \
+                                                   cross join lateral \
+                                                       unnest(__a.__as, __a.__aw) as __u(__s, __w) \
+                                                   where __u.__s is not null group by __u.__s \
+                                                   having sum(__u.__w) > 0) as __z)) end)",
+                            nan = net("NaN"),
+                            pinf = net("Infinity"),
+                            ninf = net("-Infinity"),
+                        )
+                    } else {
+                        // Positive less negative, in `sum()`'s own type
+                        // (`bigint` over `integer`).
+                        format!(
+                            "(coalesce(sum({x}) filter (where {w} > 0), 0) \
+                              - coalesce(sum({x}) filter (where {w} < 0), 0))"
+                        )
+                    };
                     match aggregate {
                         "COUNT" => count,
                         "SUM" => format!("(case when {count} = 0 then null else {sum} end)"),
@@ -977,7 +1029,7 @@ fn render_signed(def: &TransformDef, expr: &Expr, args: &[Expr]) -> Result<Strin
                     let (field, operand) = as_extract(name, called).expect("checked");
                     format!(
                         "extract({field} from {})",
-                        render_signed(def, operand, args)?
+                        render_signed(def, operand, args, numeric)?
                     )
                 }
                 _ => {
@@ -985,7 +1037,7 @@ fn render_signed(def: &TransformDef, expr: &Expr, args: &[Expr]) -> Result<Strin
                     for (i, arg) in called.iter().enumerate() {
                         rendered.push(match arg {
                             Expr::NumberLiteral(_) => render_call_arg(name, i, arg, render_leaf),
-                            _ => render_signed(def, arg, args)?,
+                            _ => render_signed(def, arg, args, numeric)?,
                         });
                     }
                     format!("{}({})", name.to_lowercase(), rendered.join(", "))
@@ -996,25 +1048,28 @@ fn render_signed(def: &TransformDef, expr: &Expr, args: &[Expr]) -> Result<Strin
             let symbol = registry::operator_spec(*op).symbol;
             format!(
                 "({} {symbol} {})",
-                render_signed(def, lhs, args)?,
-                render_signed(def, rhs, args)?
+                render_signed(def, lhs, args, numeric)?,
+                render_signed(def, rhs, args, numeric)?
             )
         }
-        Expr::Negate(operand) => format!("(-({}))", render_signed(def, operand, args)?),
+        Expr::Negate(operand) => format!("(-({}))", render_signed(def, operand, args, numeric)?),
         Expr::Cast { expr, target } => {
-            format!("cast({} as {target})", render_signed(def, expr, args)?)
+            format!(
+                "cast({} as {target})",
+                render_signed(def, expr, args, numeric)?
+            )
         }
-        Expr::Not(operand) => format!("(not {})", render_signed(def, operand, args)?),
+        Expr::Not(operand) => format!("(not {})", render_signed(def, operand, args, numeric)?),
         Expr::IsNull { expr, negated } => format!(
             "({} {})",
-            render_signed(def, expr, args)?,
+            render_signed(def, expr, args, numeric)?,
             if *negated { "is not null" } else { "is null" }
         ),
         Expr::Case {
             branches,
             otherwise,
         } => case_sql(branches, otherwise.as_deref(), |e| {
-            render_signed(def, e, args)
+            render_signed(def, e, args, numeric)
         })?,
         Expr::SourceColumn { table, column, .. }
             if join_of(def)
@@ -1073,14 +1128,22 @@ async fn build_audit<'a>(
         from_pk,
         joined_pk,
         target: ddl::qualified_target_table_ident(&def.target_table),
-        from_summed: summed(&def.def, &from_args),
-        joined_summed: summed(&def.def, &joined_args),
+        from_parts: Vec::new(),
+        joined_parts: Vec::new(),
         from_args,
         joined_args,
         from_basis: Vec::new(),
         joined_basis: Vec::new(),
     };
     let client = pool.get().await?;
+    audit.from_parts = sum_parts(
+        &summed(&def.def, &audit.from_args),
+        &numeric_arguments(&client, &audit.hidden(Part::From)).await?,
+    );
+    audit.joined_parts = sum_parts(
+        &summed(&def.def, &audit.joined_args),
+        &numeric_arguments(&client, &audit.hidden(Part::Joined)).await?,
+    );
     for side in [JoinSide::From, JoinSide::Joined] {
         let (source, part) = match side {
             JoinSide::From => (&audit.from_table, Part::From),
@@ -1301,7 +1364,7 @@ pub(super) async fn compare(
 /// list's values named by `columns`. A key on one side only is all zeros on
 /// the other.
 fn diff_partials(columns: &[String], src: &Side, hid: &Side, out: &mut Vec<Divergence>) {
-    let zeros: Vec<Option<String>> = columns.iter().map(|_| Some("0".to_string())).collect();
+    let zeros: Vec<Option<String>> = columns.iter().map(|c| Some(zero_text(c))).collect();
     let keys: BTreeSet<&String> = src.keys().chain(hid.keys()).collect();
     for key in keys {
         let expected = src.get(key).unwrap_or(&zeros);
@@ -1483,9 +1546,21 @@ mod tests {
         let joined = spec::side_arguments(&def, JoinSide::Joined);
         assert_eq!(summed(&def, &from), [false, true]);
         assert_eq!(summed(&def, &joined), [true, false]);
+        let numeric = HashSet::from([3]);
         assert_eq!(
-            partial_columns(&[false, true]),
-            ["__n", "__count_1", "__count_2", "__sum_2"]
+            partial_names(&sum_parts(&[false, true, true], &numeric)),
+            [
+                "__n",
+                "__count_1",
+                "__count_2",
+                "__sum_2",
+                "__count_3",
+                "__sum_3",
+                "__scales_3",
+                "__nan_3",
+                "__pinf_3",
+                "__ninf_3"
+            ]
         );
     }
 }

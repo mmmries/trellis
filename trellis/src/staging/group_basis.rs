@@ -388,8 +388,8 @@ pub(super) struct Arg {
     pub(super) expr: Expr,
     /// Whether a `SUM` or `AVG` reads it, so it has a `__sum_<i>`.
     pub(super) summed: bool,
-    /// Whether it is a `numeric` column a `SUM` or `AVG` reads, which may
-    /// hold `NaN`: its sum counts each `NaN` as [`NAN_WEIGHT`] ([`summand`]).
+    /// Whether it is a `numeric` argument a `SUM` or `AVG` reads, so it
+    /// keeps [`NUMERIC_PARTS`] (see "Numeric sums" in the module doc).
     pub(super) numeric: bool,
 }
 
@@ -409,9 +409,6 @@ pub(crate) struct GroupShape {
     /// expression with each aggregate call replaced by its placeholder
     /// column ([`placeholder`]).
     pub(super) fields: Vec<(String, String, Expr)>,
-    /// The `numeric` source columns a `SUM` or `AVG` reads, whose declared
-    /// scale define checks ([`check_define`]).
-    pub(super) numeric_args: Vec<String>,
 }
 
 impl GroupShape {
@@ -507,7 +504,6 @@ pub(crate) fn route(
             .collect(),
         aggs: Vec::new(),
         fields: Vec::new(),
-        numeric_args: Vec::new(),
     };
     let arg_of = |arg: &Expr| distinct.iter().position(|d| d == arg);
     for field in &def.fields {
@@ -576,18 +572,7 @@ fn rewrite_with(
                     let cast = match value_type {
                         ValueType::Integer(IntWidth::Int2 | IntWidth::Int4) => "bigint",
                         ValueType::Integer(IntWidth::Int8) => "numeric",
-                        // A `numeric` argument only as a column, whose
-                        // declared scale define checks: an expression's
-                        // `numeric` result has none.
-                        ValueType::Numeric => match arg {
-                            Expr::Column(column) | Expr::SourceColumn { column, .. } => {
-                                if !shape.numeric_args.contains(column) {
-                                    shape.numeric_args.push(column.clone());
-                                }
-                                "numeric"
-                            }
-                            _ => return None,
-                        },
+                        ValueType::Numeric => "numeric",
                         _ => return None,
                     };
                     shape.args[i].summed = true;
@@ -716,37 +701,315 @@ pub(crate) fn hidden_table_ident(schema: &str, id: i64) -> String {
     )
 }
 
-/// What a `NaN` adds to a `numeric` argument's `__sum_<i>`: `10^2100`.
-/// A `numeric(p,s)` value is below `10^(p-s)`, at most `10^2000`, so every
-/// finite sum a partial or a `JOIN` product holds (under `2^63` rows on a
-/// side, times as many matches) stays below `10^2040`, far under half of
-/// it. A sum is then `f + c × NAN_WEIGHT` for a finite `f` and a `NaN`
-/// count `c`, and stays so under every partial's arithmetic (sums,
-/// differences, products by counts): a `NaN` leaving takes back exactly
-/// what it added, and a count times no match is 0, where `NaN` itself is
-/// absorbing. `±Infinity` never reaches a sum: a `numeric(p,s)` column
-/// refuses it, and an unconstrained `numeric` is refused at define.
-pub(crate) const NAN_WEIGHT: &str = "1e2100";
+/// One partial a summed argument keeps beside its non-null count (see
+/// "Numeric sums" in the module doc). An integer argument keeps its sum
+/// alone ([`INTEGER_PARTS`]); a `numeric` one keeps all five
+/// ([`NUMERIC_PARTS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SumPart {
+    /// The sum of the finite values, as `numeric`.
+    Sum,
+    /// The count of finite values per display scale (`scale(x)`), as a
+    /// `jsonb` object from the scale's text to its count, with no zero
+    /// entry: `{"2": 3, "5": 1}`.
+    Scales,
+    /// The count of `NaN`s.
+    NaN,
+    /// The count of `Infinity`s.
+    PosInf,
+    /// The count of `-Infinity`s.
+    NegInf,
+}
 
-/// What the row value `value` of an argument adds to its sum, `0` for
-/// `NULL`: with `numeric` ([`Arg::numeric`]) a `NaN` counts as
-/// [`NAN_WEIGHT`] (`NaN` sorts above every number, so `least` maps it
-/// alone).
-pub(crate) fn summand(value: &str, numeric: bool) -> String {
-    if numeric {
-        format!("least(coalesce(({value})::numeric, 0), {NAN_WEIGHT})")
-    } else {
-        format!("coalesce(({value})::numeric, 0)")
+/// The partials of a summed integer argument: its sum.
+pub(crate) const INTEGER_PARTS: &[SumPart] = &[SumPart::Sum];
+
+/// The partials of a summed `numeric` argument, in the order every
+/// statement and table lists them.
+pub(crate) const NUMERIC_PARTS: &[SumPart] = &[
+    SumPart::Sum,
+    SumPart::Scales,
+    SumPart::NaN,
+    SumPart::PosInf,
+    SumPart::NegInf,
+];
+
+/// The empty scale map.
+const NO_SCALES: &str = "'{}'::jsonb";
+
+impl SumPart {
+    /// The stem of its working columns: `<prefix><stem><i>`, so `__ds1`,
+    /// `__dk1`, `__dnan1`, ….
+    fn stem(self) -> &'static str {
+        match self {
+            SumPart::Sum => "s",
+            SumPart::Scales => "k",
+            SumPart::NaN => "nan",
+            SumPart::PosInf => "pinf",
+            SumPart::NegInf => "ninf",
+        }
+    }
+
+    /// Its working column for argument `i` (1-based) under `prefix`.
+    pub(crate) fn name(self, prefix: &str, i: usize) -> String {
+        format!("{prefix}{}{i}", self.stem())
+    }
+
+    /// Its hidden-table column for argument `i` (1-based).
+    pub(crate) fn hidden(self, i: usize) -> String {
+        match self {
+            SumPart::Sum => format!("__sum_{i}"),
+            SumPart::Scales => format!("__scales_{i}"),
+            SumPart::NaN => format!("__nan_{i}"),
+            SumPart::PosInf => format!("__pinf_{i}"),
+            SumPart::NegInf => format!("__ninf_{i}"),
+        }
+    }
+
+    /// Its SQL type.
+    pub(crate) fn sql_type(self) -> &'static str {
+        match self {
+            SumPart::Sum => "numeric",
+            SumPart::Scales => "jsonb",
+            SumPart::NaN | SumPart::PosInf | SumPart::NegInf => "bigint",
+        }
+    }
+
+    /// Its zero, typed.
+    pub(crate) fn zero(self) -> &'static str {
+        match self {
+            SumPart::Sum => "0::numeric",
+            SumPart::Scales => NO_SCALES,
+            SumPart::NaN | SumPart::PosInf | SumPart::NegInf => "0::bigint",
+        }
+    }
+
+    /// Its hidden-table column definition for argument `i`.
+    pub(crate) fn ddl(self, i: usize) -> String {
+        let default = match self {
+            SumPart::Scales => "'{}'",
+            _ => "0",
+        };
+        format!(
+            "{} {} not null default {default}",
+            self.hidden(i),
+            self.sql_type()
+        )
+    }
+
+    /// Whether `value` is this partial's zero.
+    pub(crate) fn is_zero(self, value: &str) -> String {
+        match self {
+            SumPart::Scales => format!("{value} = {NO_SCALES}"),
+            _ => format!("{value} = 0"),
+        }
+    }
+
+    /// Whether `value` is not this partial's zero.
+    pub(crate) fn nonzero(self, value: &str) -> String {
+        match self {
+            SumPart::Scales => format!("{value} <> {NO_SCALES}"),
+            _ => format!("{value} <> 0"),
+        }
+    }
+
+    /// What one row's argument value `x` (`numeric` when `numeric`)
+    /// contributes to this partial, times the integer weight `w`, as the
+    /// argument of a `sum()`; `NULL` (which `sum()` skips) when it
+    /// contributes nothing. Not for [`SumPart::Scales`], which no `sum()`
+    /// totals ([`scales_of`]).
+    fn weighted(self, x: &str, numeric: bool, w: &str) -> String {
+        let w = if w == "1" {
+            String::new()
+        } else {
+            format!("{w} * ")
+        };
+        match self {
+            SumPart::Sum if numeric => {
+                format!("{w}(case when scale(({x})) is not null then ({x}) end)")
+            }
+            SumPart::Sum => format!("{w}({x})::numeric"),
+            SumPart::NaN => format!("{w}(({x}) = 'NaN'::numeric)::int"),
+            SumPart::PosInf => format!("{w}(({x}) = 'Infinity'::numeric)::int"),
+            SumPart::NegInf => format!("{w}(({x}) = '-Infinity'::numeric)::int"),
+            SumPart::Scales => unreachable!("a scale map is no sum"),
+        }
+    }
+
+    /// The total of this partial over the rows of an aggregate, each row's
+    /// argument value `x` weighted by `w` (`1` for an absolute write's rows,
+    /// a side's sign on a page): its zero over no rows.
+    pub(crate) fn of_rows(self, x: &str, numeric: bool, w: &str) -> String {
+        match self {
+            SumPart::Scales => scales_of(
+                &format!("array_agg(scale(({x})))"),
+                (w != "1").then(|| format!("array_agg({w})")).as_deref(),
+            ),
+            SumPart::Sum => format!("coalesce(sum({}), 0)", self.weighted(x, numeric, w)),
+            _ => format!("coalesce(sum({}), 0)::bigint", self.weighted(x, numeric, w)),
+        }
+    }
+
+    /// The total of this partial's values `value` over the rows of an
+    /// aggregate (`filter`, ` filter (where …)` or empty, picks the rows):
+    /// its zero over no rows.
+    pub(crate) fn total(self, value: &str, filter: &str) -> String {
+        match self {
+            SumPart::Scales => scales_sum(&format!("array_agg({value}){filter}")),
+            SumPart::Sum => format!("coalesce(sum({value}){filter}, 0)"),
+            _ => format!("coalesce(sum({value}){filter}, 0)::bigint"),
+        }
+    }
+
+    /// `a + b`.
+    pub(crate) fn add(self, a: &str, b: &str) -> String {
+        match self {
+            SumPart::Scales => scales_add(a, b, "1"),
+            _ => format!("({a} + {b})"),
+        }
+    }
+
+    /// `a - b`.
+    pub(crate) fn sub(self, a: &str, b: &str) -> String {
+        match self {
+            SumPart::Scales => scales_add(a, b, "-1"),
+            _ => format!("({a} - {b})"),
+        }
+    }
+
+    /// `a × n`, for the integer `n`.
+    pub(crate) fn times(self, a: &str, n: &str) -> String {
+        match self {
+            SumPart::Scales => scales_times(a, n),
+            _ => format!("({a} * {n})"),
+        }
     }
 }
 
-/// The value a sum of [`summand`]s, `sum` (a `__sum_<i>` or an expression
-/// over partials), stands for: `NaN` while it counts a `NaN` (its
-/// magnitude is at least half of [`NAN_WEIGHT`]), else itself. A sum
-/// written as `NaN` before `NaN`s were counted reads as `NaN` until a
-/// rebuild rewrites it.
-pub(crate) fn visible_sum(sum: &str) -> String {
-    format!("(case when abs({sum}) >= 5e2099 then 'NaN'::numeric else {sum} end)")
+/// The partials of an argument: none unsummed, [`NUMERIC_PARTS`] for a
+/// `numeric` sum, [`INTEGER_PARTS`] otherwise.
+pub(crate) fn sum_parts(summed: bool, numeric: bool) -> &'static [SumPart] {
+    match (summed, numeric) {
+        (false, _) => &[],
+        (true, true) => NUMERIC_PARTS,
+        (true, false) => INTEGER_PARTS,
+    }
+}
+
+impl Arg {
+    /// Its partials beside its count ([`sum_parts`]).
+    pub(crate) fn parts(&self) -> &'static [SumPart] {
+        sum_parts(self.summed, self.numeric)
+    }
+}
+
+/// The scale map of the scales `keys` (an `int[]`, `NULL` elements
+/// skipped), each weighted by its element of `weights` (a same-length
+/// integer array), or by 1 with none: each scale's weights summed, zeros
+/// dropped. Both are aggregates of the enclosing query (`array_agg(…)`),
+/// read once in the select list: an aggregate can't be a function's argument
+/// in `FROM`, and one over no column of that query would be the subquery's
+/// own.
+pub(crate) fn scales_of(keys: &str, weights: Option<&str>) -> String {
+    let (weights, weight) = match weights {
+        Some(weights) => (weights.to_string(), "__u.__sw"),
+        None => ("null::bigint[]".to_string(), "1"),
+    };
+    format!(
+        "(select coalesce(jsonb_object_agg(__z.__sk, __z.__sc), {NO_SCALES}) from ( \
+             select __u.__sk::text as __sk, sum({weight})::bigint as __sc \
+             from (select {keys} as __ka, {weights} as __wa) as __v \
+             cross join lateral unnest(__v.__ka, __v.__wa) as __u(__sk, __sw) \
+             where __u.__sk is not null group by __u.__sk having sum({weight}) <> 0) as __z)"
+    )
+}
+
+/// The sum of the scale maps `maps` (a `jsonb[]`, `NULL` elements
+/// skipped), zeros dropped. A single map is itself.
+pub(crate) fn scales_sum(maps: &str) -> String {
+    format!(
+        "(select case when cardinality(__m) = 1 then coalesce(__m[1], {NO_SCALES}) else ( \
+             select coalesce(jsonb_object_agg(__sk, __sc), {NO_SCALES}) from ( \
+                 select __e.key as __sk, sum(__e.value::bigint)::bigint as __sc \
+                 from unnest(__m) as __u(__j) cross join lateral jsonb_each_text(__u.__j) as __e \
+                 group by __e.key having sum(__e.value::bigint) <> 0) as __z) end \
+          from (select {maps} as __m) as __v)"
+    )
+}
+
+/// The scale map `a + sign × b`, zeros dropped.
+fn scales_add(a: &str, b: &str, sign: &str) -> String {
+    format!(
+        "(select case when __b = {NO_SCALES} then __a \
+                      when __a = {NO_SCALES} and {sign} = 1 then __b else ( \
+             select coalesce(jsonb_object_agg(__sk, __sc), {NO_SCALES}) from ( \
+                 select __sk, sum(__sc)::bigint as __sc from ( \
+                     select key as __sk, value::bigint as __sc from jsonb_each_text(__a) \
+                     union all \
+                     select key, {sign} * value::bigint from jsonb_each_text(__b)) as __e \
+                 group by __sk having sum(__sc) <> 0) as __z) end \
+          from (select coalesce({a}, {NO_SCALES}) as __a, coalesce({b}, {NO_SCALES}) as __b) as __v)"
+    )
+}
+
+/// The scale map `a × n`, for the integer `n`: empty when `n` is 0.
+fn scales_times(a: &str, n: &str) -> String {
+    format!(
+        "(select case when __n = 0 or __a = {NO_SCALES} then {NO_SCALES} \
+                      when __n = 1 then __a else ( \
+             select jsonb_object_agg(key, value::bigint * __n) from jsonb_each_text(__a)) end \
+          from (select coalesce({a}, {NO_SCALES}) as __a, ({n})::bigint as __n) as __v)"
+    )
+}
+
+/// The largest scale with a count above 0 in the scale map `map`, `0` for
+/// none.
+fn max_scale(map: &str) -> String {
+    format!(
+        "coalesce((select max(key::int) from jsonb_each_text({map}) \
+                   where value::bigint > 0), 0)"
+    )
+}
+
+/// The value of a summed argument's `SUM` from its partials, `part` naming
+/// each ([`SumPart`]); `NULL` handling (a count of 0) is the caller's. An
+/// integer argument's is its sum. A `numeric` one's is Postgres's
+/// `sum(numeric)`: `NaN` while it counts a `NaN` or both infinities, the
+/// infinity while it counts one, else the finite sum at the largest scale
+/// it counts a value of.
+pub(crate) fn sum_value(numeric: bool, part: &dyn Fn(SumPart) -> String) -> String {
+    if !numeric {
+        return part(SumPart::Sum);
+    }
+    let (nan, pinf, ninf) = (
+        part(SumPart::NaN),
+        part(SumPart::PosInf),
+        part(SumPart::NegInf),
+    );
+    format!(
+        "(case when {nan} > 0 or ({pinf} > 0 and {ninf} > 0) then 'NaN'::numeric \
+               when {pinf} > 0 then 'Infinity'::numeric \
+               when {ninf} > 0 then '-Infinity'::numeric \
+               else round({sum}, {scale}) end)",
+        sum = part(SumPart::Sum),
+        scale = max_scale(&part(SumPart::Scales)),
+    )
+}
+
+/// An absolute write's aggregates of argument `arg` (`i`, 1-based) over
+/// the rows `s` it reads: each of its partials ([`SumPart::of_rows`]),
+/// named `__r<stem><i>`.
+fn fresh_parts(arg: &Arg, i: usize) -> Vec<String> {
+    arg.parts()
+        .iter()
+        .map(|part| {
+            format!(
+                "{} as {}",
+                part.of_rows(&arg.sql, arg.numeric, "1"),
+                part.name("__r", i)
+            )
+        })
+        .collect()
 }
 
 /// The columns of the hidden table `shape` gives a definition, in order:
@@ -770,9 +1033,9 @@ fn hidden_table_columns(shape: &GroupShape) -> Vec<String> {
     for (i, arg) in shape.args.iter().enumerate() {
         columns.push(format!("__count_{} bigint not null default 0", i + 1));
         zero.push(format!("__count_{} = 0", i + 1));
-        if arg.summed {
-            columns.push(format!("__sum_{} numeric not null default 0", i + 1));
-            zero.push(format!("__sum_{} = 0", i + 1));
+        for part in arg.parts() {
+            columns.push(part.ddl(i + 1));
+            zero.push(part.is_zero(&part.hidden(i + 1)));
         }
     }
     let extremes = shape.extremes();
@@ -1085,8 +1348,8 @@ fn staged_columns(shape: &GroupShape) -> Vec<String> {
     columns.push("__n bigint".to_string());
     for (i, arg) in shape.args.iter().enumerate() {
         columns.push(format!("__c{} bigint", i + 1));
-        if arg.summed {
-            columns.push(format!("__s{} numeric", i + 1));
+        for part in arg.parts() {
+            columns.push(format!("{} {}", part.name("__", i + 1), part.sql_type()));
         }
     }
     // Per extreme, the extreme of the insertion sides and of the
@@ -1360,14 +1623,18 @@ impl GroupTargetPlan {
     }
 
     /// The working columns a staged row or an applied delta carries after
-    /// the group's: `<prefix>n`, then per argument `<prefix>c<i>` and, when
-    /// summed, `<prefix>s<i>`, each `null::<type> as <name>`.
-    fn working_columns(&self, n: &str, count: &str, sum: &str) -> Vec<String> {
-        let mut columns = vec![format!("null::bigint as {n}")];
+    /// the group's: `<prefix>n`, then per argument `<prefix>c<i>` and each
+    /// of its partials' ([`SumPart::name`]), each `null::<type> as <name>`.
+    fn working_columns(&self, prefix: &str) -> Vec<String> {
+        let mut columns = vec![format!("null::bigint as {prefix}n")];
         for (i, arg) in self.shape.args.iter().enumerate() {
-            columns.push(format!("null::bigint as {count}{}", i + 1));
-            if arg.summed {
-                columns.push(format!("null::numeric as {sum}{}", i + 1));
+            columns.push(format!("null::bigint as {prefix}c{}", i + 1));
+            for part in arg.parts() {
+                columns.push(format!(
+                    "null::{} as {}",
+                    part.sql_type(),
+                    part.name(prefix, i + 1)
+                ));
             }
         }
         columns
@@ -1411,7 +1678,7 @@ impl GroupTargetPlan {
     pub(super) fn deltas_ddl(&self) -> Option<String> {
         match &self.writer {
             Writer::JoinPartials { deltas } => {
-                Some(self.join_working_ddl(deltas, &self.working_columns("__dn", "__dc", "__ds")))
+                Some(self.join_working_ddl(deltas, &self.working_columns("__d")))
             }
             _ => None,
         }
@@ -1552,7 +1819,7 @@ impl GroupTargetPlan {
                 "null::xid8 as __txid".to_string(),
                 "null::pg_lsn as __lsn".to_string(),
             ];
-            extra.extend(self.working_columns("__n", "__c", "__s"));
+            extra.extend(self.working_columns("__"));
             return self.join_working_ddl(&self.staged, &extra);
         }
         format!(
@@ -1664,11 +1931,8 @@ impl GroupTargetPlan {
             let i = i + 1;
             values.push(format!("{} as __a{i}", arg.sql));
             sums.push(format!("sum(__sgn * (__a{i} is not null)::int)::bigint"));
-            if arg.summed {
-                sums.push(format!(
-                    "sum(__sgn * {})",
-                    summand(&format!("__a{i}"), arg.numeric)
-                ));
+            for part in arg.parts() {
+                sums.push(part.of_rows(&format!("__a{i}"), arg.numeric, "__sgn"));
             }
         }
         for extreme in self.shape.extremes() {
@@ -1787,16 +2051,19 @@ impl GroupTargetPlan {
         )
     }
 
-    /// The SQL of aggregate `agg` over partials named by `n`, `count` and
-    /// `sum` (each a function of the argument's 1-based index), and
-    /// `extreme` (of the extreme).
+    /// The SQL of aggregate `agg` over partials named by `n`, `count` (a
+    /// function of the argument's 1-based index), `sum` (of the index and
+    /// the partial, [`SumPart`]) and `extreme` (of the extreme). `args` are
+    /// the shape's arguments.
     fn agg_sql(
         agg: &Agg,
+        args: &[Arg],
         n: &str,
         count: &dyn Fn(usize) -> String,
-        sum: &dyn Fn(usize) -> String,
+        sum: &dyn Fn(usize, SumPart) -> String,
         extreme: &dyn Fn(&Extreme) -> String,
     ) -> String {
+        let value = |i: usize| sum_value(args[i].numeric, &|part| sum(i + 1, part));
         match agg {
             Agg::Extreme { max, arg, pg_type } => extreme(&Extreme {
                 max: *max,
@@ -1806,14 +2073,14 @@ impl GroupTargetPlan {
             Agg::CountStar => n.to_string(),
             Agg::Count(i) => count(i + 1),
             Agg::Sum(i, cast) => format!(
-                "case when {c} = 0 then null else {s}::{cast} end",
+                "case when {c} = 0 then null else ({s})::{cast} end",
                 c = count(i + 1),
-                s = visible_sum(&sum(i + 1))
+                s = value(*i)
             ),
             Agg::Avg(i) => format!(
-                "case when {c} = 0 then null else {s} / ({c})::numeric end",
+                "case when {c} = 0 then null else ({s}) / ({c})::numeric end",
                 c = count(i + 1),
-                s = visible_sum(&sum(i + 1))
+                s = value(*i)
             ),
         }
     }
@@ -1826,7 +2093,7 @@ impl GroupTargetPlan {
         prefix: &str,
         n: &str,
         count: &dyn Fn(usize) -> String,
-        sum: &dyn Fn(usize) -> String,
+        sum: &dyn Fn(usize, SumPart) -> String,
         extreme: &dyn Fn(&Extreme) -> String,
     ) -> String {
         let aggs: Vec<String> = self
@@ -1837,7 +2104,7 @@ impl GroupTargetPlan {
             .map(|(k, agg)| {
                 format!(
                     "{} as {}",
-                    Self::agg_sql(agg, n, count, sum, extreme),
+                    Self::agg_sql(agg, &self.shape.args, n, count, sum, extreme),
                     quote_ident(&placeholder(k))
                 )
             })
@@ -1944,12 +2211,20 @@ impl GroupTargetPlan {
             sets.push(format!("__count_{i} = u.__count_{i} + t.__c{i}"));
             nonzero.push(format!("t.__c{i} <> 0"));
             returning.push(format!("t.__c{i} as __dc{i}, u.__count_{i} as __nc{i}"));
-            if arg.summed {
-                sums.push(format!("sum(__s{i}) as __s{i}"));
-                totals.push(format!("sum(__s{i}) as __s{i}"));
-                sets.push(format!("__sum_{i} = u.__sum_{i} + t.__s{i}"));
-                nonzero.push(format!("t.__s{i} <> 0"));
-                returning.push(format!("t.__s{i} as __ds{i}, u.__sum_{i} as __ns{i}"));
+            for part in arg.parts() {
+                let (staged, hidden) = (part.name("__", i), part.hidden(i));
+                sums.push(format!("{} as {staged}", part.total(&staged, "")));
+                totals.push(format!("{} as {staged}", part.total(&staged, "")));
+                sets.push(format!(
+                    "{hidden} = {}",
+                    part.add(&format!("u.{hidden}"), &format!("t.{staged}"))
+                ));
+                nonzero.push(part.nonzero(&format!("t.{staged}")));
+                returning.push(format!(
+                    "t.{staged} as {}, u.{hidden} as {}",
+                    part.name("__d", i),
+                    part.name("__n", i)
+                ));
             }
         }
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
@@ -2023,9 +2298,11 @@ impl GroupTargetPlan {
             totals.push(format!(
                 "coalesce(sum(__c{i}) filter (where __ok), 0)::bigint as __c{i}"
             ));
-            if arg.summed {
+            for part in arg.parts() {
+                let staged = part.name("__", i);
                 totals.push(format!(
-                    "coalesce(sum(__s{i}) filter (where __ok), 0) as __s{i}"
+                    "{} as {staged}",
+                    part.total(&staged, " filter (where __ok)")
                 ));
             }
         }
@@ -2186,8 +2463,8 @@ impl GroupTargetPlan {
         columns.push("__dn".to_string());
         for (i, arg) in self.shape.args.iter().enumerate() {
             columns.push(format!("__dc{}", i + 1));
-            if arg.summed {
-                columns.push(format!("__ds{}", i + 1));
+            for part in arg.parts() {
+                columns.push(part.name("__d", i + 1));
             }
         }
         let columns = columns.join(", ");
@@ -2355,8 +2632,14 @@ impl GroupTargetPlan {
         for (i, arg) in self.shape.args.iter().enumerate() {
             let i = i + 1;
             returning.push(format!("0::bigint as __dc{i}, u.__count_{i} as __nc{i}"));
-            if arg.summed {
-                returning.push(format!("0::numeric as __ds{i}, u.__sum_{i} as __ns{i}"));
+            for part in arg.parts() {
+                returning.push(format!(
+                    "{} as {}, u.{} as {}",
+                    part.zero(),
+                    part.name("__d", i),
+                    part.hidden(i),
+                    part.name("__n", i)
+                ));
             }
         }
         for x in &extremes {
@@ -2462,17 +2745,19 @@ impl GroupTargetPlan {
             returning.push(format!(
                 "u.__count_{i} - r.__oc{i} as __dc{i}, u.__count_{i} as __nc{i}"
             ));
-            if arg.summed {
-                old.push(format!("x.__sum_{i}"));
-                old_names.push(format!("__os{i}"));
-                fresh.push(format!(
-                    "coalesce(sum({}), 0) as __rs{i}",
-                    summand(&arg.sql, arg.numeric)
-                ));
-                sets.push(format!("__sum_{i} = r.__rs{i}"));
-                zeroed.push(format!("coalesce(n.__rs{i}, 0) as __rs{i}"));
+            fresh.extend(fresh_parts(arg, i));
+            for part in arg.parts() {
+                let (hidden, held, read) =
+                    (part.hidden(i), part.name("__o", i), part.name("__r", i));
+                old.push(format!("x.{hidden}"));
+                old_names.push(held.clone());
+                sets.push(format!("{hidden} = r.{read}"));
+                zeroed.push(format!("coalesce(n.{read}, {}) as {read}", part.zero()));
                 returning.push(format!(
-                    "u.__sum_{i} - r.__os{i} as __ds{i}, u.__sum_{i} as __ns{i}"
+                    "{} as {}, u.{hidden} as {}",
+                    part.sub(&format!("u.{hidden}"), &format!("r.{held}")),
+                    part.name("__d", i),
+                    part.name("__n", i)
                 ));
             }
         }
@@ -2601,12 +2886,9 @@ impl GroupTargetPlan {
                 arg.sql
             ));
             nulls.push("null".to_string());
-            if arg.summed {
-                fresh.push(format!(
-                    "coalesce(sum({}), 0) as __rs{i}",
-                    summand(&arg.sql, arg.numeric)
-                ));
-                nulls.push("null".to_string());
+            fresh.extend(fresh_parts(arg, i));
+            for part in arg.parts() {
+                nulls.push(format!("null::{}", part.sql_type()));
             }
         }
         let positions: Vec<String> = (4..4 + cols.len()).map(|p| p.to_string()).collect();
@@ -2693,15 +2975,17 @@ impl GroupTargetPlan {
             insert_values.push(format!("r.__rc{i}"));
             delta_cols.push(format!("__dc{i}"));
             delta_values.push(format!("r.__rc{i} - r.__oc{i}"));
-            if arg.summed {
-                held.push(format!("x.__sum_{i} as __os{i}"));
-                cell.push(format!("coalesce(h.__os{i}, 0) as __os{i}"));
-                cell.push(format!("coalesce(n.__rs{i}, 0) as __rs{i}"));
-                sets.push(format!("__sum_{i} = r.__rs{i}"));
-                insert_cols.push(format!("__sum_{i}"));
-                insert_values.push(format!("r.__rs{i}"));
-                delta_cols.push(format!("__ds{i}"));
-                delta_values.push(format!("r.__rs{i} - r.__os{i}"));
+            for part in arg.parts() {
+                let (hidden, old, read) =
+                    (part.hidden(i), part.name("__o", i), part.name("__r", i));
+                held.push(format!("x.{hidden} as {old}"));
+                cell.push(format!("coalesce(h.{old}, {}) as {old}", part.zero()));
+                cell.push(format!("coalesce(n.{read}, {}) as {read}", part.zero()));
+                sets.push(format!("{hidden} = r.{read}"));
+                insert_cols.push(hidden);
+                insert_values.push(format!("r.{read}"));
+                delta_cols.push(part.name("__d", i));
+                delta_values.push(part.sub(&format!("r.{read}"), &format!("r.{old}")));
             }
         }
         insert_cols.extend(["__basis", "__stamp"].map(String::from));
@@ -2883,14 +3167,12 @@ impl GroupTargetPlan {
             kept.push(format!("coalesce(a.__rc{i}, 0) as __rc{i}"));
             sets.push(format!("__count_{i} = r.__rc{i}"));
             returning.push(format!("u.__count_{i} as __nc{i}"));
-            if arg.summed {
-                fresh.push(format!(
-                    "coalesce(sum({}), 0) as __rs{i}",
-                    summand(&arg.sql, arg.numeric)
-                ));
-                kept.push(format!("coalesce(a.__rs{i}, 0) as __rs{i}"));
-                sets.push(format!("__sum_{i} = r.__rs{i}"));
-                returning.push(format!("u.__sum_{i} as __ns{i}"));
+            fresh.extend(fresh_parts(arg, i));
+            for part in arg.parts() {
+                let (hidden, read) = (part.hidden(i), part.name("__r", i));
+                kept.push(format!("coalesce(a.{read}, {}) as {read}", part.zero()));
+                sets.push(format!("{hidden} = r.{read}"));
+                returning.push(format!("u.{hidden} as {}", part.name("__n", i)));
             }
         }
         // Rx6: the extremes from the same `GROUP BY` and snapshot, which
@@ -3015,12 +3297,7 @@ impl GroupTargetPlan {
                 "(count(*) filter (where ({}) is not null))::bigint as __rc{i}",
                 arg.sql
             ));
-            if arg.summed {
-                fresh.push(format!(
-                    "coalesce(sum({}), 0) as __rs{i}",
-                    summand(&arg.sql, arg.numeric)
-                ));
-            }
+            fresh.extend(fresh_parts(arg, i));
         }
         for x in self.shape.extremes() {
             fresh.push(format!(
@@ -3078,7 +3355,7 @@ impl GroupTargetPlan {
             "__nf",
             "up.__nn",
             &|i| format!("up.__nc{i}"),
-            &|i| format!("up.__ns{i}"),
+            &|i, part| part.name("up.__n", i),
             &|x| x.named("up.__n"),
         );
         let nf: Vec<String> = (0..field_count).map(|j| format!("nv.__nf{j}")).collect();
@@ -3196,9 +3473,9 @@ impl GroupTargetPlan {
             let i = i + 1;
             names.push(format!("__nc{i}"));
             columns.push(format!("x.__count_{i}"));
-            if arg.summed {
-                names.push(format!("__ns{i}"));
-                columns.push(format!("x.__sum_{i}"));
+            for part in arg.parts() {
+                names.push(part.name("__n", i));
+                columns.push(format!("x.{}", part.hidden(i)));
             }
         }
         let up_groups: Vec<String> = cols.iter().map(|c| format!("rg.{c}")).collect();
@@ -3245,9 +3522,9 @@ impl GroupTargetPlan {
             let i = i + 1;
             insert.push(format!("__c{i}"));
             zeros.push("0".to_string());
-            if arg.summed {
-                insert.push(format!("__s{i}"));
-                zeros.push("0".to_string());
+            for part in arg.parts() {
+                insert.push(part.name("__", i));
+                zeros.push(part.zero().to_string());
             }
         }
         format!(
@@ -3282,14 +3559,14 @@ impl GroupTargetPlan {
             "__nf",
             "up.__nn",
             &|i| format!("up.__nc{i}"),
-            &|i| format!("up.__ns{i}"),
+            &|i, part| part.name("up.__n", i),
             &|x| x.named("up.__n"),
         );
         let prior_fields = self.fields_lateral(
             "__pf",
             "(up.__nn - up.__dn)",
             &|i| format!("(up.__nc{i} - up.__dc{i})"),
-            &|i| format!("(up.__ns{i} - up.__ds{i})"),
+            &|i, part| part.sub(&part.name("up.__n", i), &part.name("up.__d", i)),
             &|x| x.named("up.__o"),
         );
         let field_count = self.shape.fields.len();
@@ -4610,12 +4887,13 @@ mod tests {
             "TRANSFORM t FROM s GROUP BY g SELECT MAX(h) AS n",
             "TRANSFORM t FROM s GROUP BY g SELECT SUM(f) AS n",
             "TRANSFORM t FROM s GROUP BY g SELECT AVG(f) AS n",
-            // A `numeric` expression has no declared scale.
-            "TRANSFORM t FROM s GROUP BY g SELECT SUM(m + a) AS n",
             "TRANSFORM t FROM s SELECT a AS a",
         ] {
             assert!(shape(text).is_none(), "{text}");
         }
+        // A `numeric` expression keeps a `numeric` argument's partials.
+        let shape = shape("TRANSFORM t FROM s GROUP BY g SELECT SUM(m + a) AS n").expect("taken");
+        assert!(shape.args[0].numeric);
     }
 
     /// `MIN`/`MAX` over a plain column of an ordered, uncollated type is one
@@ -5269,21 +5547,23 @@ mod tests {
                 Agg::CountStar
             ]
         );
-        assert_eq!(shape.numeric_args, Vec::<String>::new());
     }
 
     #[test]
     fn hidden_and_visible_tables_hold_what_the_module_doc_says() {
         let shape = shape("TRANSFORM t FROM s GROUP BY g SELECT SUM(m) AS s, COUNT(h) AS c")
             .expect("taken");
-        assert_eq!(shape.numeric_args, vec!["m".to_string()]);
+        assert!(shape.args[0].numeric && !shape.args[1].numeric);
         assert_eq!(
             hidden_table_ddl("trellis", 7, &shape),
             "create table \"trellis\".\"agg_7\" (\"g\" integer, __n bigint not null default 0, \
              __count_1 bigint not null default 0, __sum_1 numeric not null default 0, \
+             __scales_1 jsonb not null default '{}', __nan_1 bigint not null default 0, \
+             __pinf_1 bigint not null default 0, __ninf_1 bigint not null default 0, \
              __count_2 bigint not null default 0, __basis pg_snapshot, __stamp bigint, \
              __zero boolean not null generated always as \
-             (__n = 0 and __count_1 = 0 and __sum_1 = 0 and __count_2 = 0) stored, \
+             (__n = 0 and __count_1 = 0 and __sum_1 = 0 and __scales_1 = '{}'::jsonb \
+             and __nan_1 = 0 and __pinf_1 = 0 and __ninf_1 = 0 and __count_2 = 0) stored, \
              unique nulls not distinct (\"g\")); \
              create index on \"trellis\".\"agg_7\" (\"g\") where __zero"
         );

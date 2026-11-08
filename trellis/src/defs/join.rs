@@ -389,27 +389,36 @@ pub(crate) fn lock_row_ddl(lock: &str) -> String {
     )
 }
 
-/// The partial columns of a hidden table: the row count, then a non-null
-/// count and a `numeric` sum per aggregate argument.
-fn partial_columns(arguments: usize) -> Vec<String> {
+/// The partial columns of a hidden table: the row count, then per
+/// aggregate argument a non-null count and its sum's partials
+/// (`crate::staging::group_basis::SumPart`): a `numeric` argument's
+/// (`numeric`, one flag per argument) keep all five, any other's its sum.
+fn partial_columns(numeric: &[bool]) -> Vec<String> {
     let mut columns = vec!["__n bigint not null default 0".to_string()];
-    for i in 1..=arguments {
+    for (i, numeric) in numeric.iter().enumerate() {
+        let i = i + 1;
         columns.push(format!("__count_{i} bigint not null default 0"));
-        columns.push(format!("__sum_{i} numeric not null default 0"));
+        for part in crate::staging::group_basis::sum_parts(true, *numeric) {
+            columns.push(part.ddl(i));
+        }
     }
     columns
 }
 
-/// The `__zero` column of a hidden partials table with `arguments`
-/// aggregate arguments: whether every partial is zero, as an aggregate's zero
-/// group (`crate::staging::group_basis`'s "Zero groups"). Stored and
-/// generated, so every writer keeps it current; the tombstone pass collects
-/// zero rows through a partial index `where __zero` on the table's identity.
-fn zero_column(arguments: usize) -> String {
+/// The `__zero` column of a hidden partials table over arguments
+/// `numeric` (as [`partial_columns`]'): whether every partial is zero, as an
+/// aggregate's zero group (`crate::staging::group_basis`'s "Zero groups").
+/// Stored and generated, so every writer keeps it current; the tombstone
+/// pass collects zero rows through a partial index `where __zero` on the
+/// table's identity.
+fn zero_column(numeric: &[bool]) -> String {
     let mut zero = vec!["__n = 0".to_string()];
-    for i in 1..=arguments {
+    for (i, numeric) in numeric.iter().enumerate() {
+        let i = i + 1;
         zero.push(format!("__count_{i} = 0"));
-        zero.push(format!("__sum_{i} = 0"));
+        for part in crate::staging::group_basis::sum_parts(true, *numeric) {
+            zero.push(part.is_zero(&part.hidden(i)));
+        }
     }
     format!(
         "__zero boolean not null generated always as ({}) stored",
@@ -418,21 +427,42 @@ fn zero_column(arguments: usize) -> String {
 }
 
 /// The columns of a side's hidden partials table after its key columns: the
-/// partials of its `arguments`, the basis, the stamp and the zero flag.
-fn side_partials_tail(arguments: usize) -> Vec<String> {
-    let mut columns = partial_columns(arguments);
+/// partials of its arguments (`numeric` as [`partial_columns`]'), the basis,
+/// the stamp and the zero flag.
+fn side_partials_tail(numeric: &[bool]) -> Vec<String> {
+    let mut columns = partial_columns(numeric);
     columns.push("__basis pg_snapshot".to_string());
     columns.push("__stamp bigint not null default 0".to_string());
-    columns.push(zero_column(arguments));
+    columns.push(zero_column(numeric));
     columns
 }
 
 /// The columns of `T` after its group columns: the partials of all the
-/// definition's `arguments`, and the zero flag.
-fn target_partials_tail(arguments: usize) -> Vec<String> {
-    let mut columns = partial_columns(arguments);
-    columns.push(zero_column(arguments));
+/// definition's arguments (`numeric` as [`partial_columns`]'), and the zero
+/// flag.
+fn target_partials_tail(numeric: &[bool]) -> Vec<String> {
+    let mut columns = partial_columns(numeric);
+    columns.push(zero_column(numeric));
     columns
+}
+
+/// Whether each of `side`'s aggregate arguments ([`side_arguments`]) is
+/// `numeric`, so its partials keep scale and special-value counts.
+pub(crate) fn numeric_arguments(
+    def: &TransformDef,
+    side: Side,
+    from: &HashMap<String, JoinColumnInfo>,
+    joined: &HashMap<String, JoinColumnInfo>,
+) -> Vec<bool> {
+    side_arguments(def, side)
+        .iter()
+        .map(|arg| {
+            matches!(
+                argument_type(def, arg, from, joined),
+                Ok(ValueType::Numeric)
+            )
+        })
+        .collect()
 }
 
 /// The fields of a `JOIN` target that are not one of its `GROUP BY` keys, in
@@ -452,10 +482,15 @@ fn non_key_fields<'a>(
 /// truncate lock are as wide as the join key and two columns, which
 /// `check_index_key_width` bounds. Each width is the length of the column list
 /// the table's DDL is built from, so a limit on it is the table's width.
-pub(crate) fn table_widths(def: &TransformDef) -> Vec<(String, usize)> {
+pub(crate) fn table_widths(
+    def: &TransformDef,
+    from: &HashMap<String, JoinColumnInfo>,
+    joined: &HashMap<String, JoinColumnInfo>,
+) -> Vec<(String, usize)> {
     let Some(join) = spec(def) else {
         return Vec::new();
     };
+    let numeric = |side| numeric_arguments(def, side, from, joined);
     let mut widths = vec![(
         "the target table".to_string(),
         join.group_by.len() + non_key_fields(def, join).count(),
@@ -463,14 +498,13 @@ pub(crate) fn table_widths(def: &TransformDef) -> Vec<(String, usize)> {
     for (side, table) in [(Side::From, &def.source), (Side::Joined, &join.right)] {
         widths.push((
             format!("{table}'s hidden partials table"),
-            side_key_columns(def, side).len()
-                + side_partials_tail(side_arguments(def, side).len()).len(),
+            side_key_columns(def, side).len() + side_partials_tail(&numeric(side)).len(),
         ));
     }
-    let arguments = side_arguments(def, Side::From).len() + side_arguments(def, Side::Joined).len();
+    let arguments = [numeric(Side::From), numeric(Side::Joined)].concat();
     widths.push((
         "the hidden table of the JOIN's group partials".to_string(),
-        join.group_by.len() + target_partials_tail(arguments).len(),
+        join.group_by.len() + target_partials_tail(&arguments).len(),
     ));
     widths
 }
@@ -506,9 +540,9 @@ pub(crate) fn hidden_tables_ddl(
         (HiddenTable::JoinedPartials, Side::Joined, joined),
     ] {
         let keys = side_key_columns(def, side);
-        let arguments = side_arguments(def, side).len();
+        let numeric = numeric_arguments(def, side, from, joined);
         let mut body: Vec<String> = keys.iter().map(|c| typed_column(columns, c)).collect();
-        body.extend(side_partials_tail(arguments));
+        body.extend(side_partials_tail(&numeric));
         // The cell identity is the key columns in order, the join key first
         // (`side_key_columns`).
         let identity: Vec<String> = keys.iter().map(|c| quote_ident(c)).collect();
@@ -538,9 +572,12 @@ pub(crate) fn hidden_tables_ddl(
                 _ => typed_column(from, &key.column),
             })
             .collect();
-        let arguments =
-            side_arguments(def, Side::From).len() + side_arguments(def, Side::Joined).len();
-        body.extend(target_partials_tail(arguments));
+        let arguments = [
+            numeric_arguments(def, Side::From, from, joined),
+            numeric_arguments(def, Side::Joined, from, joined),
+        ]
+        .concat();
+        body.extend(target_partials_tail(&arguments));
         let groups: Vec<String> = join
             .group_by
             .iter()
@@ -768,7 +805,8 @@ mod tests {
         assert!(
             ddl.contains(
                 "__stamp bigint not null default 0, __zero boolean not null generated always as \
-                 (__n = 0 and __count_1 = 0 and __sum_1 = 0) stored, \
+                 (__n = 0 and __count_1 = 0 and __sum_1 = 0 and __scales_1 = '{}'::jsonb \
+                 and __nan_1 = 0 and __pinf_1 = 0 and __ninf_1 = 0) stored, \
                  unique nulls not distinct (\"id\", \"tenant\", \"region\"));\n\
                  create index on \"trellis\".\"join_7_p\" (\"id\", \"tenant\", \"region\") \
                  where __zero;\n"
@@ -781,10 +819,13 @@ mod tests {
             ddl.contains(
                 "\"join_7_t\" (\"region\" text, \"sku\" text, __n bigint not null default 0, \
                  __count_1 bigint not null default 0, __sum_1 numeric not null default 0, \
+                 __scales_1 jsonb not null default '{}', __nan_1 bigint not null default 0, \
+                 __pinf_1 bigint not null default 0, __ninf_1 bigint not null default 0, \
                  __count_2 bigint not null default 0, __sum_2 numeric not null default 0, \
                  __count_3 bigint not null default 0, __sum_3 numeric not null default 0, \
                  __zero boolean not null generated always as (__n = 0 and __count_1 = 0 \
-                 and __sum_1 = 0 and __count_2 = 0 and __sum_2 = 0 and __count_3 = 0 \
+                 and __sum_1 = 0 and __scales_1 = '{}'::jsonb and __nan_1 = 0 and __pinf_1 = 0 \
+                 and __ninf_1 = 0 and __count_2 = 0 and __sum_2 = 0 and __count_3 = 0 \
                  and __sum_3 = 0) stored, \
                  unique nulls not distinct (\"region\", \"sku\"));\n\
                  create index on \"trellis\".\"join_7_t\" (\"region\", \"sku\") where __zero;\n"
@@ -814,7 +855,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} in {created:?}"))
                 .1
         };
-        let widths = table_widths(&def);
+        let widths = table_widths(&def, &from, &joined);
         assert_eq!(
             widths,
             [
@@ -834,8 +875,9 @@ mod tests {
             ]
         );
         // Spelled out: `P` is 3 key columns (id, tenant, region), the row
-        // count, a pair for its one argument, then basis, stamp and zero flag.
-        assert_eq!(widths[1].1, 3 + 1 + 2 + 3);
+        // count, its one `numeric` argument's count and five sum partials,
+        // then basis, stamp and zero flag.
+        assert_eq!(widths[1].1, 3 + 1 + 6 + 3);
 
         let target = target_ddl(&def, "\"public\".\"by_region\"", &from, &joined).unwrap();
         assert_eq!(

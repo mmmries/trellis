@@ -185,6 +185,14 @@ pub enum Layout {
     Join,
     /// A 1-1 `JOIN`'s hidden tables (`join1_<id>_*`) and pending fan-outs.
     JoinOneToOne,
+    /// The partials of a `SUM` or `AVG` over a `numeric` argument, in an
+    /// aggregate's or a `JOIN`'s hidden tables: the finite values' sum, a
+    /// count per display scale and counts of `NaN`, `Infinity` and
+    /// `-Infinity` (`crate::staging::group_basis::SumPart`). A release
+    /// without them reads the sum column as the whole sum. Recorded by the
+    /// validator as it admits such an argument, since the key space alone
+    /// doesn't tell.
+    NumericSums,
 }
 
 impl Layout {
@@ -337,7 +345,8 @@ impl Feature {
                 | Layout::GroupBasis
                 | Layout::GroupBasisExtremes
                 | Layout::Join
-                | Layout::JoinOneToOne => BASELINE,
+                | Layout::JoinOneToOne
+                | Layout::NumericSums => BASELINE,
             }),
             Feature::TypeRule(rule) => Some(rule.since()),
             Feature::Value(value) => value.since(),

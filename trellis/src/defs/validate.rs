@@ -185,14 +185,6 @@ pub enum ValidationError {
         function: String,
         family: &'static str,
     },
-    /// `SUM`/`AVG` over an unconstrained `numeric` column, whose display
-    /// scale a running sum can't track.
-    UnconstrainedNumericAggregate { function: String, column: String },
-    /// `SUM`/`AVG` over a `numeric` column of a table Trellis creates (a
-    /// target): Trellis creates its columns with no type modifier, so the
-    /// column has no declared scale whatever the scale of the column it
-    /// copies (ADR-0020, #1120).
-    ChainedNumericAggregate { function: String, column: String },
     /// `SUM`/`AVG` over a column whose type is not an integer or a
     /// `numeric(p,s)`.
     UnsupportedAggregateArgument {
@@ -1142,24 +1134,6 @@ impl fmt::Display for ValidationError {
                  JOIN, MIN/MAX of a number, date or time column (see \"Supported sources and \
                  targets\" in docs/transforms.md)"
             ),
-            ValidationError::UnconstrainedNumericAggregate { function, column } => write!(
-                f,
-                "{function}({column}) is over a numeric with no declared scale, which is not \
-                 supported: Postgres shows a sum with as many decimal places as the most \
-                 precise value in the group, which a running sum can't track (see \"Supported \
-                 sources and targets\" in docs/transforms.md). Sum a numeric(p,s) column \
-                 directly (ALTER TABLE ... ALTER COLUMN ... TYPE numeric(p,s)); an expression \
-                 over numeric (arithmetic, a CASE) has no declared scale: Postgres drops the \
-                 column's modifier there, and a branch such as ELSE 0 would mix scales"
-            ),
-            ValidationError::ChainedNumericAggregate { function, column } => write!(
-                f,
-                "{function}({column}) is over a numeric column of a table Trellis creates, \
-                 which has no declared scale: Trellis creates its columns with no type \
-                 modifier, so a chained SUM/AVG over one is not supported (see \"Supported \
-                 sources and targets\" in docs/transforms.md). Sum the source's numeric(p,s) \
-                 column in the transform that reads the source"
-            ),
             ValidationError::UnsupportedAggregateArgument {
                 function,
                 column,
@@ -2039,19 +2013,18 @@ pub(crate) fn check_aggregate_admitted(
             let Some(arg) = arg else { return Ok(()) };
             match arg.value_type {
                 ValueType::Integer(_) => admitted(AggregateAdmissionRule::SumAvgInteger),
-                ValueType::Numeric if arg.typmod != -1 => {
-                    admitted(AggregateAdmissionRule::SumAvgScaledNumeric)
-                }
-                ValueType::Numeric if arg.trellis_target => {
-                    Err(ValidationError::ChainedNumericAggregate {
-                        function,
-                        column: arg.column.to_string(),
+                ValueType::Numeric => {
+                    // Its partials keep scale and special-value counts, a
+                    // layout of their own.
+                    super::floor::record(super::floor::Feature::Layout(
+                        super::floor::Layout::NumericSums,
+                    ));
+                    admitted(if arg.typmod != -1 {
+                        AggregateAdmissionRule::SumAvgScaledNumeric
+                    } else {
+                        AggregateAdmissionRule::SumAvgNumeric
                     })
                 }
-                ValueType::Numeric => Err(ValidationError::UnconstrainedNumericAggregate {
-                    function,
-                    column: arg.column.to_string(),
-                }),
                 ValueType::Float(_) | ValueType::Other(PgType::Interval) => {
                     Err(ValidationError::DeferredAggregate {
                         function,
@@ -2460,7 +2433,7 @@ pub fn validate_join(
     check_join_collation_reads(def, join, left, right)?;
     // The target and each hidden table carry columns per field (two per
     // distinct aggregate argument in the partials).
-    for (table, columns) in super::join::table_widths(def) {
+    for (table, columns) in super::join::table_widths(def, left, right) {
         check_table_width(|| table, columns)?;
     }
     Ok(())
@@ -8633,37 +8606,44 @@ mod tests {
         }
     }
 
-    /// ADR-0020, rule 7: a `numeric` column of a table Trellis creates has no
-    /// declared scale whatever the column it copies had, so a chained `SUM` or
-    /// `AVG` over it gets its own named refusal; the same column of a source
-    /// keeps the plain one.
+    /// `SUM`/`AVG` over a `numeric` with no declared scale (a source's
+    /// unconstrained column, a Trellis target's column) is admitted (#1120):
+    /// its partials keep a count per scale, recorded as the layout they
+    /// need, and by its own admission rule, apart from a declared scale's.
     #[test]
-    fn a_chained_sum_over_a_trellis_targets_numeric_is_a_named_refusal() {
-        let arg = |trellis_target| AggregateArg {
+    fn a_sum_over_a_numeric_with_no_declared_scale_is_admitted() {
+        use super::super::floor::{Feature, Layout, collect};
+        use super::super::registry::{AggregateAdmissionRule, TypeRule};
+        let arg = |trellis_target, typmod| AggregateArg {
             column: "p",
             value_type: ValueType::Numeric,
             pg_type: "numeric",
-            typmod: -1,
+            typmod,
             trellis_target,
             expression: false,
         };
+        let rule = |r| Feature::TypeRule(TypeRule::AggregateAdmission(r));
         for function in ["SUM", "AVG"] {
-            assert!(matches!(
-                check_aggregate_admitted(function, AggregateScope::Plain, Some(&arg(true))),
-                Err(ValidationError::ChainedNumericAggregate { .. })
-            ));
-            assert!(matches!(
-                check_aggregate_admitted(function, AggregateScope::Plain, Some(&arg(false))),
-                Err(ValidationError::UnconstrainedNumericAggregate { .. })
-            ));
+            for (target, typmod, admitted) in [
+                (true, -1, AggregateAdmissionRule::SumAvgNumeric),
+                (false, -1, AggregateAdmissionRule::SumAvgNumeric),
+                (false, 655366, AggregateAdmissionRule::SumAvgScaledNumeric),
+            ] {
+                let (result, used) = collect(|| {
+                    check_aggregate_admitted(
+                        function,
+                        AggregateScope::Plain,
+                        Some(&arg(target, typmod)),
+                    )
+                });
+                assert_eq!(result, Ok(()), "{function} {target} {typmod}");
+                assert!(used.contains(&rule(admitted)), "{used:?}");
+                assert!(
+                    used.contains(&Feature::Layout(Layout::NumericSums)),
+                    "{used:?}"
+                );
+            }
         }
-        let message = check_aggregate_admitted("SUM", AggregateScope::Plain, Some(&arg(true)))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            message.contains("docs/transforms.md") && message.contains("no declared scale"),
-            "{message}"
-        );
     }
 
     /// `MIN`/`MAX` in a plain aggregate (#1117 rule 3, #1681): typed as its
@@ -8891,12 +8871,14 @@ mod tests {
                 other => panic!("{call}: expected DeferredAggregate, got {other:?}"),
             }
         }
+        // A `numeric` with no declared scale is admitted (#1120): an
+        // unconstrained column, and any expression whose result is
+        // `numeric`.
         for call in [
             "SUM(price)",
             "AVG(price)",
             "SUM(cost + 1)",
             "AVG(cost + qty)",
-            // Arithmetic over a `numeric` still has no declared scale.
             "SUM(cost * 2)",
             "AVG(cost - 1)",
             "SUM(-cost)",
@@ -8906,17 +8888,13 @@ mod tests {
             "SUM(ABS(cost))",
             "SUM(ROUND(cost, 2))",
             "SUM(CAST(qty AS numeric))",
-            // A cast to its own type drops `cost`'s modifier, as in Postgres
-            // (`cost::numeric` is an unconstrained `numeric`).
             "SUM(CAST(cost AS numeric))",
             "AVG(CAST(cost AS decimal))",
+            "SUM(CASE WHEN qty > 1 THEN cost ELSE 0 END)",
         ] {
-            let err = check(&format!("{call} AS v")).unwrap_err();
-            assert!(
-                matches!(err, ValidationError::UnconstrainedNumericAggregate { .. }),
-                "{call}: {err:?}"
-            );
-            assert!(err.to_string().contains("numeric(p,s)"), "{call}: {err}");
+            if let Err(err) = check(&format!("{call} AS v")) {
+                panic!("{call}: {err:?}");
+            }
         }
         for fields in [
             "COUNT(*) AS n, COUNT(note) AS notes, COUNT(price) AS priced",
@@ -8966,15 +8944,10 @@ mod tests {
     }
 
     #[test]
-    fn join_refuses_sum_and_avg_over_unconstrained_numeric_on_either_side() {
+    fn join_admits_sum_and_avg_over_unconstrained_numeric_on_either_side() {
         for call in ["SUM(items.price)", "AVG(items.price)"] {
-            assert!(
-                matches!(
-                    check(&format!("orders.region AS region, {call} AS v")),
-                    Err(ValidationError::UnconstrainedNumericAggregate { .. })
-                ),
-                "{call}"
-            );
+            check(&format!("orders.region AS region, {call} AS v"))
+                .unwrap_or_else(|err| panic!("{call}: {err:?}"));
         }
         // The same on the FROM side.
         let (mut left, right) = tables();
@@ -8987,10 +8960,7 @@ mod tests {
              GROUP BY orders.region SELECT SUM(orders.loose) AS v",
         )
         .unwrap();
-        assert!(matches!(
-            validate_join(&def, &left, &right),
-            Err(ValidationError::UnconstrainedNumericAggregate { .. })
-        ));
+        assert_eq!(validate_join(&def, &left, &right), Ok(()));
     }
 
     #[test]
@@ -9433,15 +9403,10 @@ mod tests {
                 "{select}"
             );
         }
-        // A numeric argument has no declared scale, whatever is done to it.
+        // An expression over a numeric is admitted (#1120).
         for select in ["SUM(orders.total * 2) AS v", "SUM(-orders.total) AS v"] {
-            assert!(
-                matches!(
-                    check(&format!("orders.region AS region, {select}")),
-                    Err(ValidationError::UnconstrainedNumericAggregate { .. })
-                ),
-                "{select}"
-            );
+            check(&format!("orders.region AS region, {select}"))
+                .unwrap_or_else(|err| panic!("{select}: {err:?}"));
         }
     }
 
@@ -9464,11 +9429,8 @@ mod tests {
     #[test]
     fn join_refuses_bad_expression_arguments_and_compositions() {
         let refused = |select: &str| check(&format!("orders.region AS region, {select}"));
-        // An expression over numeric has no declared scale.
-        assert!(matches!(
-            refused("SUM(orders.total + 1) AS v"),
-            Err(ValidationError::UnconstrainedNumericAggregate { .. })
-        ));
+        // An expression over numeric is admitted (#1120).
+        assert_eq!(refused("SUM(orders.total + 1) AS v"), Ok(()));
         // A deferred aggregate is refused inside a composition too.
         assert!(matches!(
             refused("COALESCE(MIN(items.qty), 0) AS v"),
