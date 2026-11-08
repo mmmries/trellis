@@ -383,6 +383,15 @@ pub enum Plant {
     /// Pinned by `join_one_to_one_quarantine`'s
     /// `a_release_before_a_pending_fan_out_of_its_key_stays_released`.
     Join1ReleaseNoRederive,
+    /// #1464 U1 (`star_j_unsorted`): a 1-1 `JOIN` page's `J` statements,
+    /// the insert of its keys and their lock
+    /// (`staging::join_one_to_one::j_statements`), run unsorted, so two
+    /// pages that share keys at one position or across positions take their
+    /// `J` rows in different orders and deadlock.
+    ///
+    /// Pinned by `staging::join_one_to_one`'s unit test
+    /// `u1_the_j_statements_are_one_insert_and_one_lock_sorted_by_position_and_key`.
+    StarJUnsorted,
     /// ADR-0002 "Multi-hop" (#1482's `token_early`): a drain page reads the
     /// target-mutation seam's write token when it begins
     /// (`staging::target_mutations`), before its row locks, rather than after
@@ -537,6 +546,7 @@ impl Plant {
         Plant::Join1TruncateDefAfterLock,
         Plant::Join1FanOutHeldRow,
         Plant::Join1ReleaseNoRederive,
+        Plant::StarJUnsorted,
         Plant::SeamTokenEarly,
         Plant::SeamImagelessRow,
         Plant::GbxProbeNoXbasis,
@@ -589,6 +599,7 @@ impl Plant {
             Plant::Join1TruncateDefAfterLock => "join1_truncate_def_after_lock",
             Plant::Join1FanOutHeldRow => "join1_fan_out_held_row",
             Plant::Join1ReleaseNoRederive => "join1_release_no_rederive",
+            Plant::StarJUnsorted => "star_j_unsorted",
             Plant::SeamTokenEarly => "seam_token_early",
             Plant::SeamImagelessRow => "seam_imageless_row",
             Plant::GbxProbeNoXbasis => "gbx_probe_no_xbasis",

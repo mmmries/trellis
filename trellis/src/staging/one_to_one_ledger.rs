@@ -64,7 +64,7 @@ pub(crate) fn ledger_ident(target: &str) -> String {
 
 /// One ordering ledger the functions below work on: the 1-1 target's
 /// `<target>__ledger`, or a hidden ledger (a 1-1 `JOIN`'s `R` or `M`,
-/// [`crate::defs::join_one_to_one::HiddenTable::LEDGERS`]). The ledger's ident, its
+/// [`crate::defs::join_one_to_one::HiddenTable::ledgers`]). The ledger's ident, its
 /// `ledger_truncate_floor` key, its pause label and its definition's build
 /// lookup are separate fields, since a hidden ledger shares none of them
 /// with its definition's target.

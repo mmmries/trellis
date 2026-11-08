@@ -36,7 +36,7 @@ use tokio_postgres::GenericClient;
 use super::ast::{Expr, FieldDef, TransformDef};
 use super::ddl::PrimaryKeyColumn;
 use super::join::{
-    JOINED, Side, column_type, join_key, keys_table_ddl, lock_row_ddl, side_columns, typed_column,
+    JOINED, Position, Side, column_type, join_key, lock_row_ddl, side_columns, typed_column,
 };
 use super::validate::{JoinColumnInfo, ValidationError};
 use crate::pool::quote_ident;
@@ -46,37 +46,60 @@ use crate::pool::quote_ident;
 pub(crate) enum HiddenTable {
     /// `R`: an entry per `a` row.
     FromEntries,
-    /// `M`: an entry per `b` row.
-    JoinedEntries,
-    /// `J`: a lock row per join key.
+    /// `M` of a position: an entry per row of the table joined there.
+    JoinedEntries(Position),
+    /// `J`: a lock row per `(position, join key)`.
     Keys,
-    /// The pair's one truncate lock row.
+    /// The definition's one truncate lock row.
     TruncateLock,
 }
 
+/// The first position's `M`: the only one a two-table JOIN has.
+pub(crate) const M: HiddenTable = HiddenTable::JoinedEntries(Position::FIRST);
+
 impl HiddenTable {
-    pub(crate) const ALL: [HiddenTable; 4] = [
-        HiddenTable::FromEntries,
-        HiddenTable::JoinedEntries,
-        HiddenTable::Keys,
-        HiddenTable::TruncateLock,
-    ];
+    /// Every hidden table of `def`: `R`, each position's `M`, `J` and the
+    /// lock row.
+    pub(crate) fn all(def: &TransformDef) -> Vec<HiddenTable> {
+        let mut tables = Self::ledgers(def);
+        tables.extend([HiddenTable::Keys, HiddenTable::TruncateLock]);
+        tables
+    }
 
-    /// The two ledger-bearing tables: `R` for the `FROM` side, `M` for the
-    /// joined one.
-    pub(crate) const LEDGERS: [HiddenTable; 2] =
-        [HiddenTable::FromEntries, HiddenTable::JoinedEntries];
+    /// The ledger-bearing tables of `def`: `R` for the `FROM` side, then
+    /// each position's `M`.
+    pub(crate) fn ledgers(def: &TransformDef) -> Vec<HiddenTable> {
+        let positions: Vec<Position> = super::join::spec(def)
+            .map(|join| super::join::positions(join).map(|(p, _)| p).collect())
+            .unwrap_or_default();
+        Self::ledgers_at(positions)
+    }
 
-    fn part(self) -> &'static str {
+    /// Every ledger-bearing table a definition may have, at every position up
+    /// to the cap: what a sweep that reads no definition (tombstone
+    /// collection, a drop) covers. A table that doesn't exist is skipped.
+    pub(crate) fn every_ledger() -> Vec<HiddenTable> {
+        Self::ledgers_at(Position::every())
+    }
+
+    fn ledgers_at(positions: impl IntoIterator<Item = Position>) -> Vec<HiddenTable> {
+        std::iter::once(HiddenTable::FromEntries)
+            .chain(positions.into_iter().map(HiddenTable::JoinedEntries))
+            .collect()
+    }
+
+    fn part(self) -> String {
         match self {
-            HiddenTable::FromEntries => "r",
-            HiddenTable::JoinedEntries => "m",
-            HiddenTable::Keys => "j",
-            HiddenTable::TruncateLock => "l",
+            HiddenTable::FromEntries => "r".to_string(),
+            HiddenTable::JoinedEntries(Position::FIRST) => "m".to_string(),
+            HiddenTable::JoinedEntries(position) => format!("m{}", position.number()),
+            HiddenTable::Keys => "j".to_string(),
+            HiddenTable::TruncateLock => "l".to_string(),
         }
     }
 
-    /// The table's bare name in the catalog schema, for definition `id`.
+    /// The table's bare name in the catalog schema, for definition `id`:
+    /// `M` is `_m` at position 1 and `_m{p}` at each position `p` after it.
     pub(crate) fn name(self, id: i64) -> String {
         format!("join1_{id}_{}", self.part())
     }
@@ -86,11 +109,11 @@ impl HiddenTable {
         format!("('join1_' || {id} || '_{}')", self.part())
     }
 
-    /// The `ledger_truncate_floor` keys of the two hidden ledgers of
-    /// definition `id`: their quoted, qualified idents, as a `JOIN`'s `P`
-    /// and `M` floors are keyed.
+    /// The `ledger_truncate_floor` keys of every hidden ledger definition
+    /// `id` may have ([`Self::every_ledger`]): their quoted, qualified idents,
+    /// as a `JOIN`'s `P` and `M` floors are keyed.
     pub(crate) fn floor_keys(catalog_schema: &str, id: i64) -> Vec<String> {
-        HiddenTable::LEDGERS
+        HiddenTable::every_ledger()
             .iter()
             .map(|table| table.qualified(catalog_schema, id))
             .collect()
@@ -107,25 +130,44 @@ impl HiddenTable {
     }
 }
 
+/// The name of `J`'s column for the `FROM` table's join key column `column`
+/// at `position`: each position has its own group of key columns in the one
+/// `J` (ADR-0021), `NULL` on every other position's rows. A name over
+/// [`MAX_NAME_BYTES`](crate::defs::lexer::MAX_NAME_BYTES) is cut there, at a
+/// character boundary, as Postgres cuts it when it creates the column, so a
+/// lookup of the column by name in the catalog (copy re-typing,
+/// `crate::defs::copies`) finds it.
+pub(crate) fn j_column(position: Position, column: &str) -> String {
+    let mut name = format!("p{}_{column}", position.number());
+    let mut end = crate::defs::lexer::MAX_NAME_BYTES.min(name.len());
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name.truncate(end);
+    name
+}
+
 /// The columns `side`'s ledger table copies from its source, in order: the
-/// join key, then the other columns the fields read.
+/// join key, then the other columns the fields read, each once. `R`'s join
+/// key is every position's, in position order.
 pub(crate) fn read_columns(def: &TransformDef, side: Side) -> Vec<String> {
     let key = join_key(def, side);
-    let mut read = key.clone();
-    read.extend(
-        side_columns(def, side)
-            .into_iter()
-            .filter(|column| !key.contains(column)),
-    );
+    let mut read: Vec<String> = Vec::with_capacity(key.len());
+    for column in key.into_iter().chain(side_columns(def, side)) {
+        if !read.contains(&column) {
+            read.push(column);
+        }
+    }
     read
 }
 
 /// Each table a 1-1 `JOIN` definition creates whose width follows its
 /// definition, apart from the target (whose columns are the primary key's and
-/// the fields'): the two ledgers `R` and `M`, with the subject a refusal
-/// names each by. `J` is as wide as the join key and one column, which
-/// `check_index_key_width` bounds. Each width counts the columns the ledger's
-/// DDL ([`hidden_tables_ddl`]) is built from.
+/// the fields'): the ledgers `R` and each position's `M`, with the subject a
+/// refusal names each by. `J` holds `position` and every position's join key
+/// at `a`, never more columns than `R`, whose ledger columns outnumber the
+/// one `position`. Each width counts the columns the ledger's DDL
+/// ([`hidden_tables_ddl`]) is built from.
 pub(crate) fn ledger_widths(def: &TransformDef) -> Vec<(String, usize)> {
     let Some(join) = super::join::spec(def) else {
         return Vec::new();
@@ -143,21 +185,30 @@ pub(crate) fn ledger_widths(def: &TransformDef) -> Vec<(String, usize)> {
 
 /// Renders the `create table` statements of `def`'s hidden tables
 /// ([`HiddenTable`]) in `catalog_schema`, for definition `id`. `from` and
-/// `joined` are the two sides' live columns, as define read them.
+/// `joined` are the live columns of the `FROM` table and of the table at each
+/// position (`joined[p - 1]`), as define read them.
 pub(crate) fn hidden_tables_ddl(
     catalog_schema: &str,
     id: i64,
     def: &TransformDef,
     from: &HashMap<String, JoinColumnInfo>,
-    joined: &HashMap<String, JoinColumnInfo>,
+    joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> String {
+    let positions: Vec<Position> = super::join::spec(def)
+        .map(|join| super::join::positions(join).map(|(p, _)| p).collect())
+        .unwrap_or_default();
     let mut sql = String::new();
-    for (table, side, columns) in [
-        (HiddenTable::FromEntries, Side::From, from),
-        (HiddenTable::JoinedEntries, JOINED, joined),
-    ] {
+    let ledgers = std::iter::once((HiddenTable::FromEntries, Side::From, from)).chain(
+        positions.iter().map(|p| {
+            (
+                HiddenTable::JoinedEntries(*p),
+                Side::Joined(*p),
+                joined[p.index()],
+            )
+        }),
+    );
+    for (table, side, columns) in ledgers {
         let name = table.qualified(catalog_schema, id);
-        let key = join_key(def, side);
         // The join key leads, then the other columns the fields read.
         let read = read_columns(def, side);
         let mut body = vec![format!(
@@ -166,19 +217,31 @@ pub(crate) fn hidden_tables_ddl(
         )];
         body.push(super::ledger::ordering_state_columns());
         body.extend(read.iter().map(|column| typed_column(columns, column)));
-        let mut quoted_key: Vec<String> = key.iter().map(|c| quote_ident(c)).collect();
-        // `R`'s index ends with the entry key: a fan-out chunk walks one
-        // join key's entries in key order from a cursor
-        // (`crate::staging::join_one_to_one::fan_out`).
-        if table == HiddenTable::FromEntries {
-            quoted_key.push(quote_ident(super::ledger::KEY_COLUMN));
+        // `R` has one index per position: that position's join key, then the
+        // entry key, which a fan-out chunk walks one join key's entries by
+        // from a cursor (`crate::staging::join_one_to_one::fan_out`). `M` has
+        // its own join key's.
+        let indexes: Vec<Vec<String>> = match side {
+            Side::From => positions
+                .iter()
+                .map(|p| {
+                    let mut key = super::join::from_key_at(def, *p);
+                    key.push(super::ledger::KEY_COLUMN.to_string());
+                    key
+                })
+                .collect(),
+            Side::Joined(_) => vec![join_key(def, side)],
+        };
+        sql.push_str(&format!("create table {name} ({});\n", body.join(", ")));
+        for index in indexes {
+            let quoted: Vec<String> = index.iter().map(|c| quote_ident(c)).collect();
+            sql.push_str(&format!(
+                "create index on {name} ({});\n",
+                quoted.join(", ")
+            ));
         }
         sql.push_str(&format!(
-            "create table {name} ({});\n\
-             create index on {name} ({});\n\
-             create index on {name} ({}) where {};\n",
-            body.join(", "),
-            quoted_key.join(", "),
+            "create index on {name} ({}) where {};\n",
             quote_ident(super::ledger::APPLIED_SEG_COLUMN),
             quote_ident(super::ledger::TOMBSTONE_COLUMN),
         ));
@@ -186,8 +249,8 @@ pub(crate) fn hidden_tables_ddl(
     sql.push_str(&keys_table_ddl(
         &HiddenTable::Keys.qualified(catalog_schema, id),
         def,
+        &positions,
         from,
-        &[],
     ));
     sql.push_str(&lock_row_ddl(
         &HiddenTable::TruncateLock.qualified(catalog_schema, id),
@@ -195,13 +258,62 @@ pub(crate) fn hidden_tables_ddl(
     sql
 }
 
-/// The statements dropping every hidden table of definition `id` from
+/// The statements creating `J`, `name` (quoted and qualified), the #1765
+/// layout (ADR-0021): a `position` column, checked to lie between 1 and the
+/// number of `positions`, and per position a group of `a`'s join key columns
+/// at it ([`j_column`]), typed from `from` with no modifiers (ADR-0020), so
+/// keys equal by value share a row. A group is `NULL` on every other
+/// position's rows. Per position, a partial unique index on its group `where
+/// position = i`, and a check that a row of the position has every column of
+/// its group: with no primary key, a `NULL` key would otherwise let two
+/// writers insert, and lock, two rows for one key. `J` has no primary key.
+fn keys_table_ddl(
+    name: &str,
+    def: &TransformDef,
+    positions: &[Position],
+    from: &HashMap<String, JoinColumnInfo>,
+) -> String {
+    let mut body = vec![format!(
+        "position smallint not null check (position between 1 and {})",
+        positions.len()
+    )];
+    let mut checks = Vec::new();
+    let mut indexes = String::new();
+    for position in positions {
+        let key = super::join::from_key_at(def, *position);
+        let group: Vec<String> = key
+            .iter()
+            .map(|c| quote_ident(&j_column(*position, c)))
+            .collect();
+        body.extend(key.iter().map(|c| {
+            let pg_type = from.get(c).map_or_else(|| "text".to_string(), column_type);
+            format!("{} {pg_type}", quote_ident(&j_column(*position, c)))
+        }));
+        let present: Vec<String> = group.iter().map(|c| format!("{c} is not null")).collect();
+        checks.push(format!(
+            "check (position <> {n} or ({}))",
+            present.join(" and "),
+            n = position.number()
+        ));
+        indexes.push_str(&format!(
+            "create unique index on {name} ({}) where position = {};\n",
+            group.join(", "),
+            position.number()
+        ));
+    }
+    body.extend(checks);
+    format!("create table {name} ({});\n{indexes}", body.join(", "))
+}
+
+/// The statements dropping every hidden table definition `id` may have
+/// ([`HiddenTable::every_ledger`], `J` and the lock row) from
 /// `catalog_schema`, any that is already gone included, and deleting its
 /// pending fan-outs (`join1_fan_out`), which name keys of the `R` and `J`
 /// they drop: a resume's build recomputes every row.
 pub(crate) fn drop_hidden_tables_sql(catalog_schema: &str, id: i64) -> String {
-    let tables: Vec<String> = HiddenTable::ALL
-        .iter()
+    let tables: Vec<String> = HiddenTable::every_ledger()
+        .into_iter()
+        .chain([HiddenTable::Keys, HiddenTable::TruncateLock])
         .map(|table| table.qualified(catalog_schema, id))
         .collect();
     format!(
@@ -445,14 +557,19 @@ mod tests {
     #[test]
     fn hidden_tables_are_named_by_definition_id_apart_from_an_aggregate_joins() {
         assert_eq!(HiddenTable::FromEntries.name(7), "join1_7_r");
-        assert_eq!(HiddenTable::JoinedEntries.name(7), "join1_7_m");
+        assert_eq!(M.name(7), "join1_7_m");
+        assert_eq!(
+            HiddenTable::JoinedEntries(Position::from_number(3).unwrap()).name(7),
+            "join1_7_m3"
+        );
         assert_eq!(HiddenTable::Keys.name(7), "join1_7_j");
         assert_eq!(HiddenTable::TruncateLock.name(7), "join1_7_l");
         assert_eq!(
             HiddenTable::FromEntries.qualified("trellis", 7),
             "\"trellis\".\"join1_7_r\""
         );
-        for table in HiddenTable::ALL {
+        let def = parse(DEF).unwrap();
+        for table in HiddenTable::all(&def) {
             assert!(
                 !crate::defs::join::HiddenTable::ALL
                     .iter()
@@ -462,9 +579,26 @@ mod tests {
         assert_eq!(
             drop_hidden_tables_sql("trellis", 7),
             "drop table if exists \"trellis\".\"join1_7_r\", \"trellis\".\"join1_7_m\", \
-             \"trellis\".\"join1_7_j\", \"trellis\".\"join1_7_l\"; \
+             \"trellis\".\"join1_7_m2\", \"trellis\".\"join1_7_m3\", \
+             \"trellis\".\"join1_7_m4\", \"trellis\".\"join1_7_j\", \"trellis\".\"join1_7_l\"; \
              delete from \"trellis\".join1_fan_out where transform_id = 7"
         );
+    }
+
+    /// `J`'s column for a join key column is `p<i>_<column>`, cut as
+    /// Postgres cuts an identifier: at 63 bytes, on a character boundary.
+    #[test]
+    fn a_j_column_name_is_cut_where_postgres_cuts_it() {
+        let first = Position::FIRST;
+        assert_eq!(j_column(first, "cust"), "p1_cust");
+        // 60 bytes fit beside `p1_`; 61 are cut to 63.
+        let fits = "a".repeat(60);
+        assert_eq!(j_column(first, &fits), format!("p1_{fits}"));
+        let long = "b".repeat(63);
+        assert_eq!(j_column(first, &long), format!("p1_{}", "b".repeat(60)));
+        // `é` is two bytes: one that would straddle byte 63 is dropped whole.
+        let wide = format!("{}é", "c".repeat(59));
+        assert_eq!(j_column(first, &wide), format!("p1_{}", "c".repeat(59)));
     }
 
     /// The widths a definition is checked against are the widths of the
@@ -474,7 +608,11 @@ mod tests {
         let def = parse(DEF).unwrap();
         let (from, joined) = sides();
         let created = crate::defs::ddl::declared_column_counts(&hidden_tables_ddl(
-            "trellis", 7, &def, &from, &joined,
+            "trellis",
+            7,
+            &def,
+            &from,
+            &[&joined],
         ));
         let created = |name: &str| {
             created
@@ -505,7 +643,7 @@ mod tests {
     fn the_hidden_tables_ddl_holds_the_ledger_the_join_key_and_the_columns_read() {
         let def = parse(DEF).unwrap();
         let (from, joined) = sides();
-        let ddl = hidden_tables_ddl("trellis", 7, &def, &from, &joined);
+        let ddl = hidden_tables_ddl("trellis", 7, &def, &from, &[&joined]);
         // `R`: the ledger, the join key in `ON` order, then what the fields
         // read of `a`; both indexes the ledger's collection needs.
         assert!(
@@ -530,14 +668,19 @@ mod tests {
             ),
             "{ddl}"
         );
-        // `J`: one row per join key, with no match count.
+        // `J`: one row per `(position, join key)`, with no match count; the
+        // two-table JOIN's is position 1 with one group.
         assert!(
             ddl.contains(
-                "create table \"trellis\".\"join1_7_j\" (\"cust\" integer, \"tenant\" integer, \
-                 primary key (\"cust\", \"tenant\"));\n"
+                "create table \"trellis\".\"join1_7_j\" (position smallint not null \
+                 check (position between 1 and 1), \"p1_cust\" integer, \"p1_tenant\" integer, \
+                 check (position <> 1 or (\"p1_cust\" is not null and \"p1_tenant\" is not null)));\n\
+                 create unique index on \"trellis\".\"join1_7_j\" (\"p1_cust\", \"p1_tenant\") \
+                 where position = 1;\n"
             ),
             "{ddl}"
         );
+        assert!(!ddl.contains("primary key (\"p1_"), "{ddl}");
         assert!(
             ddl.contains("\"join1_7_l\" (id boolean primary key default true check (id))"),
             "{ddl}"
