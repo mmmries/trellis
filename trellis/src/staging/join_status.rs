@@ -37,7 +37,8 @@ pub(crate) const PARTIALS_WARNING_MIN_FACT_ROWS: i64 = 1000;
 pub struct HiddenTableSize {
     /// Which table: `P` (the `FROM` side's partials), `M` (the joined
     /// side's), `J` (the matches per join key) or `T` (the target's
-    /// partials).
+    /// partials); of a 1-1 `JOIN`, `R`, `M` (`M2` and on at the positions
+    /// after the first) or `J`.
     pub table: &'static str,
     /// The table's name in the catalog schema.
     pub name: String,

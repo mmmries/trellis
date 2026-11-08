@@ -438,22 +438,33 @@ async fn join_one_to_one_copies(
             &key.name,
         ));
     }
+    // `R`, and the `M` of each position whose table the catalog records:
+    // the first's (`join_table`).
     for (side, table) in [
         (Side::From, HiddenTable::FromEntries),
-        (super::join::JOINED, HiddenTable::JoinedEntries),
+        (super::join::JOINED, super::join_one_to_one::M),
     ] {
         for column in super::join_one_to_one::read_columns(def, side) {
             copies.push(copy(CopyKind::JoinHidden, hidden(table), side, &column));
         }
     }
-    // `J` is typed from the `FROM` side's join key, as its DDL is.
-    for column in super::join::join_key(def, Side::From) {
-        copies.push(copy(
-            CopyKind::JoinHidden,
-            hidden(HiddenTable::Keys),
-            Side::From,
-            &column,
-        ));
+    // `J` is typed from the `FROM` side's join key at each position, a
+    // group of columns per position, as its DDL is.
+    for (position, _) in super::join::spec(def)
+        .into_iter()
+        .flat_map(super::join::positions)
+    {
+        for column in super::join::from_key_at(def, position) {
+            copies.push(TypedCopy {
+                column: super::join_one_to_one::j_column(position, &column),
+                ..copy(
+                    CopyKind::JoinHidden,
+                    hidden(HiddenTable::Keys),
+                    Side::From,
+                    &column,
+                )
+            });
+        }
     }
     let sides =
         match super::catalog::JoinSides::read(client, source.to_string(), vec![joined.clone()])
@@ -540,7 +551,7 @@ pub(crate) fn inputs(
         names.extend(joined.iter().map(|table| super::ddl::regclass_arg(table)));
         if super::join::is_one_to_one(def) {
             names.extend(
-                super::join_one_to_one::HiddenTable::ALL
+                super::join_one_to_one::HiddenTable::all(def)
                     .iter()
                     .map(|table| table.qualified(schema, id)),
             );

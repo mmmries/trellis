@@ -413,6 +413,13 @@ proptest! {
 /// each. Rates are of the 24 cases of seeds 1 to 4 (six cases each).
 const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
     (
+        "star_j_unsorted",
+        "it leaves the J statements unsorted, which only changes the order two pages queue \
+         on J rows in: a deadlock, which the engine retries, never a wrong row; the unit \
+         test u1_the_j_statements_are_one_insert_and_one_lock_sorted_by_position_and_key \
+         pins it",
+    ),
+    (
         "join1_fan_out_held_row",
         "it needs a row held in quarantine (a field that fails on it), and the tier draws \
          no value that makes a field fail: a held row keeps a burst from converging; \

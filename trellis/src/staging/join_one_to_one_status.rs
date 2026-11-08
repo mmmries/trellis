@@ -136,6 +136,10 @@ pub enum OneToOneBuildStep {
     SweepOrphans,
 }
 
+/// The label of each position's `M` in [`JoinStatus::hidden_tables`]: `M` at
+/// position 1, `M2` and on after it.
+const M_LABELS: [&str; spec::MAX_POSITIONS] = ["M", "M2", "M3", "M4"];
+
 /// The status of definition `id`, a 1-1 `JOIN`, in `catalog_schema`.
 pub(crate) async fn for_definition(
     client: &impl GenericClient,
@@ -144,11 +148,16 @@ pub(crate) async fn for_definition(
     def: &TransformDef,
 ) -> Result<JoinStatus, tokio_postgres::Error> {
     let mut hidden_tables = Vec::new();
-    for (label, table) in [
-        ("R", HiddenTable::FromEntries),
-        ("M", HiddenTable::JoinedEntries),
-        ("J", HiddenTable::Keys),
-    ] {
+    // `R`, each position's `M` (`M` at position 1, `M2` and on after it),
+    // then `J`.
+    let mut tables = HiddenTable::ledgers(def);
+    tables.push(HiddenTable::Keys);
+    for table in tables {
+        let label = match table {
+            HiddenTable::FromEntries => "R",
+            HiddenTable::JoinedEntries(position) => M_LABELS[position.index()],
+            HiddenTable::Keys | HiddenTable::TruncateLock => "J",
+        };
         if let Some(size) =
             hidden_table_size(client, catalog_schema, label, &table.name(id)).await?
         {

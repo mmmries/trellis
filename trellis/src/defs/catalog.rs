@@ -3960,7 +3960,7 @@ async fn create_definition_inner(
                 id,
                 &def,
                 &sides.from_columns,
-                &sides.first_joined().columns,
+                &sides.joined_column_maps(),
             )
         } else {
             super::join::hidden_tables_ddl(
@@ -4838,6 +4838,13 @@ impl JoinSides {
         }
     }
 
+    /// Each joined table's live columns, by position.
+    pub(crate) fn joined_column_maps(
+        &self,
+    ) -> Vec<&HashMap<String, super::validate::JoinColumnInfo>> {
+        self.joined.iter().map(|side| &side.columns).collect()
+    }
+
     /// Every joined table's qualified name, by position.
     pub(crate) fn joined_tables(&self) -> impl Iterator<Item = &str> {
         self.joined.iter().map(|side| side.table.as_str())
@@ -5544,7 +5551,7 @@ pub(crate) async fn recreate_hidden_tables(
                 id,
                 def,
                 &sides.from_columns,
-                &sides.first_joined().columns,
+                &sides.joined_column_maps(),
             ),
         )
     } else {
@@ -5566,7 +5573,7 @@ pub(crate) async fn recreate_hidden_tables(
 /// Every joined table of every `JOIN` definition, by position, as one
 /// relation (`transform_id`, `position`, `table_name`, `columns`): position
 /// 1 is `transform_definitions.join_table` and `join_columns`, and each
-/// later position a row of `definition_join_tables` (migration V19).
+/// later position a row of `definition_join_tables` (migration V20).
 pub(crate) const JOINED_TABLES_SQL: &str = "(select id as transform_id, 1::smallint as position, \
      join_table as table_name, join_columns as columns from transform_definitions \
      where join_table is not null \

@@ -953,7 +953,7 @@ async fn a_one_to_one_join_pauses_resumes_revalidates_and_drops_with_its_hidden_
     // A resume drops and recreates the hidden tables: whatever was in them
     // is gone.
     raw.batch_execute(&format!(
-        "insert into {DEFAULT_SCHEMA}.join1_{id}_j (cust) values (1);
+        "insert into {DEFAULT_SCHEMA}.join1_{id}_j (position, p1_cust) values (1, 1);
          insert into {DEFAULT_SCHEMA}.join1_{id}_r (__from_key, cust) values ('1', 1)"
     ))
     .await
