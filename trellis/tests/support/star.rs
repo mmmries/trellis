@@ -25,7 +25,8 @@
 //! A shape of more than one position defines a star, which define admits
 //! only behind the development knob [`STAR_KNOB`] until the knob is removed
 //! ([`definable`]); [`runnable`] says whether a shape's pins can run in this
-//! process, which a star's can't until its apply is built.
+//! process, and [`truncate_runnable`] whether its truncate pins can, which a
+//! star's can't until a truncate of its joined tables is built.
 //!
 //! A binary using this module also declares `support/drain_driver.rs` as
 //! `mod drain_driver` at its root.
@@ -75,11 +76,16 @@ pub fn definable(shape: Shape) -> bool {
     shape.positions == 1 || star_join_enabled()
 }
 
-/// Whether `shape`'s pins can run in this process: it is [`definable`], and
-/// its apply is built. A star defines with the knob on, then halts at its
-/// first page or build ("whose apply is not built yet") until the root and
-/// joined apply land (#1773, #1774), so only the two-table JOIN runs.
+/// Whether `shape`'s pins can run in this process: it is [`definable`].
+/// A star's build and its root and joined apply run (#1773); its joined
+/// tables' writers take the R-entry rule only from #1774.
 pub fn runnable(shape: Shape) -> bool {
+    definable(shape)
+}
+
+/// Whether `shape`'s pins that `TRUNCATE` a joined table can run: a star's
+/// page halts on one ("whose apply is not built yet") until #1776.
+pub fn truncate_runnable(shape: Shape) -> bool {
     definable(shape) && shape.positions == 1
 }
 
