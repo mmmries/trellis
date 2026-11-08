@@ -121,10 +121,12 @@ impl LedgerRef {
     }
 }
 
-/// More entries for [`lock_entries`]'s lock statement: `predicate`, over
-/// the ledger as `l`, with its parameters from `$2`.
+/// More entries for [`lock_entries`]'s lock statement: `keys`, a query of
+/// the entry keys to lock, with its parameters from `$2`. A query of keys
+/// rather than a predicate over the locked rows: an `or` beside the
+/// statement's own keys would scan the whole ledger.
 pub(crate) struct AlsoLock<'a> {
-    pub predicate: String,
+    pub keys: String,
     pub params: Vec<&'a (dyn tokio_postgres::types::ToSql + Sync)>,
 }
 
@@ -153,7 +155,7 @@ pub(crate) struct Inserted {
 /// without the lock.
 ///
 /// `also` adds more entries to the same sorted lock statement: those its
-/// predicate matches (a 1-1 `JOIN` page's fan-out rows, the R-entry rule,
+/// query lists (a 1-1 `JOIN` page's fan-out rows, the R-entry rule,
 /// `super::join_one_to_one`), which `skip_lock` doesn't leave out.
 pub(crate) async fn lock_entries(
     txn: &Transaction<'_>,
@@ -242,9 +244,9 @@ pub(crate) async fn lock_entries(
     if let Some(also) = also {
         let sql = format!(
             "select l.{key_col} = any($1::text[]) from {ledger_sql} l \
-             where l.{key_col} = any($1::text[]) or ({}) \
+             where l.{key_col} in (select unnest($1::text[]) union all {}) \
              order by l.{key_col} for update of l",
-            also.predicate
+            also.keys
         );
         let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&existing];
         params.extend(also.params.iter().copied());
