@@ -4,12 +4,12 @@
 //! - The fixture's generated text: the two-table shape's definition and
 //!   oracle, and the DDL, seed and oracle of every shape up to the cap, run on
 //!   a plain Postgres database with no transform defined.
-//! - Every star shape up to the cap defines with the development knob on,
-//!   and its build refuses, naming why, until its apply is built.
+//! - Every star shape up to the cap defines with the development knob on
+//!   and builds, at its first and last position.
 //! - Pins written once against "the joined table at `at`" and run at every
 //!   shape this process can run ([`star::runnable`]): the two-table JOIN
-//!   always, a star of three tables (its last position) once its apply is
-//!   built, with the development knob on.
+//!   and a star of three tables at its last position, with the development
+//!   knob on.
 //!   - the build, then changes of `a` and of the table at `at`;
 //!   - F3 (#1371): an `a` move racing an update of its new key, a family;
 //!   - M (#1375): two crossing mixed pages, a race;
@@ -43,8 +43,10 @@ const SHAPES: [Shape; 2] = [
     },
 ];
 
-/// [`SHAPES`] this process can define; a skipped shape says so.
+/// [`SHAPES`] this process can define, with the development knob on (this
+/// binary's pins all run a star); a skipped shape says so.
 fn shapes() -> Vec<Shape> {
+    trellis::dev::defs::set_star_join(true);
     SHAPES
         .into_iter()
         .filter(|shape| {

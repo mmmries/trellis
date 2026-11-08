@@ -8,6 +8,13 @@
 //! row per join key; and the pair's truncate lock row. Neither side reads the
 //! other's source, only its copy under `J`.
 //!
+//! A star (more than one joined table, behind the development knob until it
+//! ships) is the same path indexed by position: an `M` per joined table,
+//! `J`'s rows per position, and `a`'s key one per position. The two-table
+//! JOIN is its one-position case. Each joined table's change is of its own
+//! position; a key, and K below, is per position, and a step over `M` runs
+//! for each position in position order.
+//!
 //! # One page ([`apply_page`])
 //!
 //! A page carries changes and Re-derives of either side, in one transaction
@@ -23,18 +30,21 @@
 //!    or `M`) holds for each id, and the live key of each Re-derive row (read
 //!    unlocked from its table, which keeps the retry below rare); for the `b`
 //!    side also each change's old key from its first change's pre-image
-//!    [`join1_old_key_unlocked`]. A key with a `NULL` part is left out: it
-//!    matches nothing and takes no `J` row.
-//! 3. **`J`.** K, both sides' keys together, inserted sorted `on conflict do
-//!    nothing`, then locked `FOR UPDATE` in one sorted statement
-//!    [`join1_no_j_lock`]. Nothing reads `M`, or `R` for a fan-out, before
+//!    [`join1_old_key_unlocked`]. An `a` row's keys are one per position, so
+//!    a root writer's K holds its new key and the key `R` holds at every
+//!    position [`star_root_skip_j_*`]. A key with a `NULL` part is left out
+//!    at its position: it matches nothing there and takes no `J` row.
+//! 3. **`J`.** K, every side's keys together, inserted sorted `on conflict
+//!    do nothing`, then locked `FOR UPDATE` in one statement sorted by
+//!    `(position, key)` [`join1_no_j_lock`, `star_j_unsorted`]. Nothing reads `M`, or `R` for a fan-out, before
 //!    this [`join1_m_before_j`].
 //! 4. **Entries.** The `R` placeholders and entry lock, then `M`'s
 //!    ([`super::one_to_one_ledger::lock_entries`], I5)
 //!    [`join1_no_placeholder`, `join1_no_entry_lock`]. After each, every
-//!    held key is checked against K: one outside it moved after K was read,
-//!    so the page rolls back with [`ApplyError::JoinKeyMoved`] and retries
-//!    [`join1_no_recheck`]. The entry lock also orders the writers of a
+//!    held key, at every position, is checked against K: one outside it
+//!    moved after K was read, so the page rolls back with
+//!    [`ApplyError::JoinKeyMoved`] and retries [`join1_no_recheck`,
+//!    `star_late_skip_*`]. The entry lock also orders the writers of a
 //!    `NULL`-keyed row, which has no `J` row.
 //! 5. **Re-derive read.** For each side, one statement reads its Re-derive
 //!    rows live and `pg_current_snapshot()`, which becomes those entries'
@@ -50,10 +60,11 @@
 //!    columns are written for the entries that changed; a row that is gone
 //!    has its key cleared, so it matches nothing.
 //! 7. **Recompute and write.** Each changed `a` row's target row is rendered
-//!    from `R` and the newest live `M` entry on its key (`LEFT JOIN
-//!    LATERAL`); a row that no longer exists, or an `INNER` row with no
-//!    match, is deleted ([`write_a_changes`]). Then the fan-out
-//!    ([`fan_out`]): every other live `R` entry on a key a changed `M` entry
+//!    from `R` and, at each position, the newest live `M` entry on its key
+//!    there (a `LEFT JOIN LATERAL` per position); a row that no longer
+//!    exists, or one with no match at an `INNER` position, is deleted
+//!    ([`write_a_changes`]). Then the fan-out of each position in position
+//!    order ([`fan_out`]): every other live `R` entry on a key a changed `M` entry
 //!    held before the page or holds after it is recomputed the same way, in
 //!    sorted keyset batches of 10k, one statement each, for the keys whose
 //!    entries fit one chunk between them; every other key is left to the
