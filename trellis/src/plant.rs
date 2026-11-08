@@ -623,14 +623,17 @@ pub enum Plant {
     /// `self_check_compares_the_groups_only_the_extremes_have`.
     ScExtremeGroupsUncompared,
     /// #1780 (`star_fence_first_only`): a column pause or resume of a star
-    /// 1-1 `JOIN` (`staging::quarantine::pause_fence`) bumps the version
+    /// 1-1 `JOIN` (`staging::quarantine::pause_fence`), and a `RESUME` of the
+    /// whole star (`staging::quarantine::lock_frozen`), bump the version
     /// fences of the `FROM` table and the first joined table only, not the
     /// joined table at every position. A page of a later position's table
     /// that planned the column as live then commits a write of it after the
-    /// pause returns. Fires only on a star.
+    /// pause returns, and one that judged the star frozen commits after the
+    /// resume. Fires only on a star.
     ///
     /// Pinned by `join_star_quarantine`'s
-    /// `a_column_pause_waits_for_a_page_of_the_middle_joined_table`.
+    /// `a_column_pause_waits_for_a_page_of_the_middle_joined_table` and
+    /// `a_resume_waits_for_a_page_of_the_middle_joined_table`.
     StarFenceFirstOnly,
     /// #1780 (`star_held_origin_first_only`): a star page's held rows park
     /// with the origin of its first position's changes only

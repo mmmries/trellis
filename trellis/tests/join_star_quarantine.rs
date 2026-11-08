@@ -8,10 +8,11 @@
 //!   entry as it last applied, and its release re-derives it and fans out.
 //!   A row of `a` a `b2` fan-out holds is parked with the `b2` change's
 //!   origin (`held_origin` merges every position's changes).
-//! - **Fences over every joined table.** A column pause bumps the version
-//!   fence of every table the star reads, so it waits for a page of `b2`; a
-//!   `b2` fan-out that holds a row takes the definition's row before its lock
-//!   row, so a rebuild's start queues behind it rather than deadlocking.
+//! - **Fences over every joined table.** A column pause and a `RESUME` of
+//!   the whole star bump the version fence of every table the star reads,
+//!   so each waits for a page of `b2`; a `b2` fan-out that holds a row takes
+//!   the definition's row before its lock row, so a rebuild's start queues
+//!   behind it rather than deadlocking.
 //! - **Readers of a star target**, an aggregate on the group basis, a 1-1
 //!   copy and a two-table 1-1 `JOIN` over its primary key, converge through
 //!   the target-mutation seam's image feed.
@@ -316,6 +317,70 @@ async fn a_column_pause_waits_for_a_page_of_the_middle_joined_table() {
         Some(1 + 500 + 4000),
         "the paused column is frozen"
     );
+}
+
+/// A `RESUME` of a paused star bumps the version fence of every table it
+/// reads (`quarantine::lock_frozen`), so it waits for a page of `b2` holding
+/// `b2`'s fence: a page that judged the star frozen can't commit after the
+/// resume. The page is one of a 1-1 copy of `b2`, which applies while the
+/// star is paused and freezes before its commit.
+///
+/// Pins the `star_fence_first_only` plant (the resume runs beside the page).
+#[tokio::test]
+async fn a_resume_waits_for_a_page_of_the_middle_joined_table() {
+    let _serial = star::serial().await;
+    knob();
+    let star = left();
+    let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+    let columns: HashMap<String, ValueType> = [("w".to_string(), int4())].into_iter().collect();
+    trellis::defs::install_definition(
+        d.pool(),
+        "TRANSFORM b2_copy FROM public.b2 SELECT w AS w",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("define the copy of b2");
+    trellis::intake::harness::settle_builds(d.pool()).await;
+    d.settle().await;
+    let target = star.target();
+    d.ctl
+        .execute(
+            "update transform_definitions set status = 'paused' where target_table = $1",
+            &[&target],
+        )
+        .await
+        .expect("pause the star");
+    star::write(&d, "update public.b2 set w = 500 where id = 1").await;
+    let batch = d.seal().await;
+    let mut page = d
+        .drain_frozen(
+            batch,
+            "page",
+            &[(PausePoint::BeforeCommit, "public.b2_copy")],
+        )
+        .await;
+    let reached = page.reached(PausePoint::BeforeCommit).await;
+    let name = star.name();
+    let resume = d
+        .run_frozen(&[], |pool| async move {
+            quarantine::resume_transform(&pool, &name).await
+        })
+        .await;
+    let queued = queued_or_finished(&d, reached.backend_pid, &resume).await;
+    d.release(&mut page, PausePoint::BeforeCommit).await;
+    page.finish().await;
+    resume.finish().await;
+    assert!(
+        queued,
+        "the resume ran beside a page of b2, which may judge the star frozen"
+    );
+    trellis::intake::harness::start_registered_builds(d.pool())
+        .await
+        .expect("dispatch the star's rebuild");
+    trellis::intake::harness::settle_builds(d.pool()).await;
+    d.settle().await;
+    star::assert_oracle(&mut d, &[star]).await;
 }
 
 /// Port of `a_fan_out_that_holds_a_row_and_a_rebuild_start_never_deadlock`
