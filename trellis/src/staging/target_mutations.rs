@@ -328,21 +328,20 @@ impl TargetMutations {
             // as a definition's reads, so a star reading the target at a
             // later position is no reader. See `crate::plant`.
             #[cfg(any(test, feature = "test-util"))]
-            let readers =
-                if crate::plant::armed() == Some(crate::plant::Plant::StarReadsFirstOnly) {
-                    let first = readers_of(txn, target, |d, table| {
-                        format!("({d}.source_table = {table} or {d}.join_table = {table})")
-                    })
-                    .await?;
-                    if crate::plant::fires(crate::plant::Plant::StarReadsFirstOnly, first != readers)
-                    {
-                        first
-                    } else {
-                        readers
-                    }
+            let readers = if crate::plant::armed() == Some(crate::plant::Plant::StarReadsFirstOnly)
+            {
+                let first = readers_of(txn, target, |d, table| {
+                    format!("({d}.source_table = {table} or {d}.join_table = {table})")
+                })
+                .await?;
+                if crate::plant::fires(crate::plant::Plant::StarReadsFirstOnly, first != readers) {
+                    first
                 } else {
                     readers
-                };
+                }
+            } else {
+                readers
+            };
             let (direct_readers, image_readers) = readers;
             let image_feed = resolve_image_feed(txn, target, image_readers).await?;
             let has_readers = direct_readers || image_feed.is_some();

@@ -153,7 +153,11 @@ async fn a_held_key_at_the_middle_position_is_released_by_a_rederive_and_its_fan
             ))
             .await
             .expect("add the check");
-        star::write(&d, "update public.b2 set w = 9999, tag = 'big' where id = 1").await;
+        star::write(
+            &d,
+            "update public.b2 set w = 9999, tag = 'big' where id = 1",
+        )
+        .await;
         let batch = d.seal().await;
         let mut drained = false;
         for _ in 0..12 {
@@ -192,9 +196,10 @@ async fn a_held_key_at_the_middle_position_is_released_by_a_rederive_and_its_fan
 }
 
 /// A field failing on one row of a `b2` change's fan-out holds that row of
-/// `a`, and the change applies to every other row. The row is parked with
-/// the `b2` change's origin, so it holds back the watermark tokens that
-/// change does; its release re-derives it.
+/// `a`, and the change applies to every other row. The hold names the
+/// position and join key that caused it (#1457 review finding 10), and the
+/// row is parked with the `b2` change's origin, so it holds back the
+/// watermark tokens that change does; its release re-derives it.
 ///
 /// Pins the `star_held_origin_first_only` plant (the parked row's origin is
 /// unknown).
@@ -218,6 +223,15 @@ async fn a_row_a_middle_fan_out_holds_is_parked_with_the_changes_origin() {
                 .await,
             ["(public.a,23,t)"],
             "{name}: the held row is parked with the b2 change's origin"
+        );
+        let error = d.rows("select last_error from poison").await;
+        assert!(
+            error.len() == 1
+                && error[0].contains(
+                    "held by the fan-out of a change of public.b2, the joined table at \
+                     position 2, on join key (10)"
+                ),
+            "{name}: the hold names the position and key that caused it: {error:?}"
         );
         assert_eq!(
             total(&d, star, 23).await,
@@ -291,7 +305,10 @@ async fn a_column_pause_waits_for_a_page_of_the_middle_joined_table() {
     d.release(&mut page, PausePoint::BeforeCommit).await;
     page.finish().await;
     pause.finish().await;
-    assert!(queued, "the pause ran beside a page of b2, which writes the column");
+    assert!(
+        queued,
+        "the pause ran beside a page of b2, which writes the column"
+    );
     assert_eq!(total(&d, star, 1).await, Some(1 + 500 + 4000));
     star::step(&mut d, "update public.b2 set w = 600 where id = 1").await;
     assert_eq!(
@@ -434,11 +451,23 @@ async fn readers_of_a_star_target_converge() {
         ];
         for (when, sql) in [
             ("the seed", ""),
-            ("a b2 row changing tag", "update public.b2 set tag = 'moved' where id = 1"),
-            ("a root row moving key", "update public.a set k2 = 10 where id = 2"),
+            (
+                "a b2 row changing tag",
+                "update public.b2 set tag = 'moved' where id = 1",
+            ),
+            (
+                "a root row moving key",
+                "update public.a set k2 = 10 where id = 2",
+            ),
             ("a b2 row deleted", "delete from public.b2 where id = 2"),
-            ("a b2 row inserted", "insert into public.b2 values (3, 30, 300, 'thirty')"),
-            ("a b2 row moving key", "update public.b2 set k = 20 where id = 1"),
+            (
+                "a b2 row inserted",
+                "insert into public.b2 values (3, 30, 300, 'thirty')",
+            ),
+            (
+                "a b2 row moving key",
+                "update public.b2 set k = 20 where id = 1",
+            ),
             ("a root row deleted", "delete from public.a where id = 3"),
         ] {
             if !sql.is_empty() {
@@ -530,11 +559,23 @@ async fn a_star_with_a_one_to_one_target_at_the_middle_position_converges() {
         let actual = "select id, total, tag2 from public.jt order by id";
         for (when, sql) in [
             ("the build", ""),
-            ("a src row changing value", "update public.src set w = 150, tag = 'ten!' where id = 10"),
-            ("a src row inserted", "insert into public.src values (30, 300, 'thirty')"),
+            (
+                "a src row changing value",
+                "update public.src set w = 150, tag = 'ten!' where id = 10",
+            ),
+            (
+                "a src row inserted",
+                "insert into public.src values (30, 300, 'thirty')",
+            ),
             ("a src row deleted", "delete from public.src where id = 20"),
-            ("a src row's key moving", "update public.src set id = 20 where id = 30"),
-            ("a root row moving key", "update public.a set k2 = 20 where id = 1"),
+            (
+                "a src row's key moving",
+                "update public.src set id = 20 where id = 30",
+            ),
+            (
+                "a root row moving key",
+                "update public.a set k2 = 20 where id = 1",
+            ),
         ] {
             if !sql.is_empty() {
                 star::step(&mut d, sql).await;
@@ -607,7 +648,9 @@ async fn a_middle_fan_out_that_outlives_its_claim_is_applied_once_by_the_next_in
     knob();
     for star in SHAPE.stars() {
         let name = star.name();
-        let rows: Vec<String> = (1..=CAP).map(|id| format!("({id}, 10, {id}, 'r')")).collect();
+        let rows: Vec<String> = (1..=CAP)
+            .map(|id| format!("({id}, 10, {id}, 'r')"))
+            .collect();
         let a_rows = format!("{}, (100, 20, 100, 'r')", rows.join(", "));
         let mut d = star::start(&[star], &a_rows, B_ROWS).await;
         star::write(&d, "update public.b2 set w = 500 where id = 1").await;

@@ -214,6 +214,55 @@ pub(super) async fn holds_any(
         .is_some())
 }
 
+/// For each of `keys` (`R` keys) a fan-out of the joined table at `side`'s
+/// position holds: what caused the hold, naming that table, its position
+/// and the row's join key there, read from its `R` entry in the page's
+/// transaction (#1457 review finding 10: a star's hold names the dimension
+/// that caused it). `None` for each of the page's own `a` changes.
+async fn fan_out_causes(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    side: Side,
+    keys: &[&str],
+) -> Result<Vec<Option<String>>, ApplyError> {
+    let Side::Joined(position) = side else {
+        return Ok(vec![None; keys.len()]);
+    };
+    let at = shape.joined_at(position);
+    let columns: Vec<String> = at
+        .key
+        .iter()
+        .map(|c| format!("r.{}", quote_ident(&c.name)))
+        .collect();
+    let key = quote_ident(schema::KEY_COLUMN);
+    let found: std::collections::HashMap<String, String> = txn
+        .query(
+            &format!(
+                "select r.{key}::text, row({})::text from {} r \
+                 where r.{key} = any($1::text[])",
+                columns.join(", "),
+                shape.ledger(Side::From).ident,
+            ),
+            &[&keys],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    Ok(keys
+        .iter()
+        .map(|k| {
+            let join_key = found.get(*k).map_or("unknown", String::as_str);
+            Some(format!(
+                "held by the fan-out of a change of {}, the joined table at position {}, \
+                 on join key {join_key}",
+                at.table(),
+                position.number()
+            ))
+        })
+        .collect())
+}
+
 /// Holds `rows` of `a` in quarantine for `shape`'s definition, in the page's
 /// transaction (the module doc): a `poison` row each, a death, and a parked
 /// Re-derive in `poison_held` with the page's `seg_seq` and the row's
@@ -235,18 +284,28 @@ pub(super) async fn hold(
     let mut rows: Vec<(&HeldRow, &HeldOrigin)> = rows.to_vec();
     rows.sort_by(|a, b| a.0.key.cmp(&b.0.key));
     let keys: Vec<&str> = rows.iter().map(|(r, _)| r.key.as_str()).collect();
-    let errors: Vec<&str> = rows.iter().map(|(r, _)| r.error.as_str()).collect();
+    let causes = fan_out_causes(txn, shape, side, &keys).await?;
+    let errors: Vec<String> = rows
+        .iter()
+        .zip(&causes)
+        .map(|((r, _), cause)| match cause {
+            Some(cause) => format!("{} ({cause})", r.error),
+            None => r.error.clone(),
+        })
+        .collect();
     let codes: Vec<Option<&str>> = rows.iter().map(|(r, _)| r.sqlstate.as_deref()).collect();
     let origin_lsns: Vec<Option<PgLsn>> = rows.iter().map(|(_, o)| o.origin_lsn).collect();
     let src_changed: Vec<Option<SystemTime>> = rows.iter().map(|(_, o)| o.src_changed).collect();
     let hop_gens: Vec<i32> = rows.iter().map(|(_, o)| o.hop_gen).collect();
-    for (row, _) in &rows {
+    for ((row, _), error) in rows.iter().zip(&errors) {
         match side {
-            Side::Joined(_) => crate::instance_log::warn!(
+            Side::Joined(position) => crate::instance_log::warn!(
                 transform = %shape.target,
                 src_table = %shape.source_table,
                 key = %row.key,
-                last_error = %row.error,
+                joined_table = %shape.joined_at(position).table(),
+                position = position.number(),
+                last_error = %error,
                 "holding a row of a 1-1 JOIN's FROM table in quarantine: a field fails on it in \
                  the fan-out of a change of the joined table, which applies to every other row"
             ),

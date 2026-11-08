@@ -2640,7 +2640,7 @@ async fn pause_fence(pool: &Pool, transform: &str) -> Result<Vec<String>, ApplyE
     Ok(sources)
 }
 
-/// `joined`, a definition's joined tables by position, as a fence over them
+/// `joined`, a definition's joined tables by position, as [`pause_fence`]
 /// takes them: all of them, or with the `star_fence_first_only` plant armed,
 /// only the first. See `crate::plant`.
 fn star_fence_planted(joined: Vec<String>) -> Vec<String> {
@@ -4006,9 +4006,8 @@ async fn lock_frozen(
         .await?
         .map(|row| row.get(0))
         .unwrap_or_default();
-    let bumped = star_fence_planted(fenced_join.clone());
     let mut fenced: Vec<&str> = std::iter::once(fenced_source)
-        .chain(bumped.iter().map(String::as_str))
+        .chain(fenced_join.iter().map(String::as_str))
         .collect();
     fenced.sort_unstable();
     for table in fenced {

@@ -360,6 +360,8 @@ key. Then:
 - A `TRUNCATE` of `a` empties the target; one of `b` rebuilds it.
 - A row whose field Postgres can't compute (an overflow, a division by zero)
   is held in quarantine on its first failure, and the page applies the rest.
+  A row held by a joined table's change says so in its error
+  (`sample_quarantined`): the table, its position and the row's join key there.
 
 A schema change of either table pauses the whole transform as it does a join
 aggregate. `self_check` compares the target, both copies and the uniqueness of
