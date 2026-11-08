@@ -27,9 +27,19 @@
 //! Pages of either side's changes, Re-derives and `TRUNCATE`s, the chunks of
 //! a pending fan-out, and the chunked build, run in
 //! `crate::staging::join_one_to_one`.
+//!
+//! **The star knob.** A 1-1 `JOIN` of more than two tables (a star, one
+//! `FROM` table and up to four joined ones) is admitted only while
+//! [`star_enabled`]: `TRELLIS_DEV_STAR_JOIN` set to anything but `""`, `0`,
+//! `off` or `false`, or `trellis::dev::defs::set_star_join(true)` before a
+//! client starts. The gate is at define and `RESUME`
+//! (`super::validate_join_one_to_one`), never at parse, so a star stored
+//! while the knob was on still loads with it off; the staging worker halts
+//! it with the reason instead of running it.
 
 use super::floor::Floors;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use tokio_postgres::GenericClient;
 
@@ -40,6 +50,43 @@ use super::join::{
 };
 use super::validate::{JoinColumnInfo, ValidationError};
 use crate::pool::quote_ident;
+
+/// The environment variable that turns the star knob on (the module doc)
+/// when nothing has set it.
+pub const STAR_KNOB_ENV: &str = "TRELLIS_DEV_STAR_JOIN";
+
+/// 0: not read yet; 1: off; 2: on.
+static STAR_KNOB: AtomicU8 = AtomicU8::new(0);
+
+/// Whether a 1-1 `JOIN` of more than two tables is admitted (the module
+/// doc). Read from [`STAR_KNOB_ENV`] once, unless [`set_star_enabled`] ran
+/// first.
+pub fn star_enabled() -> bool {
+    match STAR_KNOB.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var(STAR_KNOB_ENV).is_ok_and(|v| knob_value_is_on(&v));
+            STAR_KNOB.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Whether the knob's variable set to `value` turns it on: anything but
+/// `""`, `0`, `off` or `false`, in any case and with surrounding spaces.
+fn knob_value_is_on(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    !matches!(value.as_str(), "" | "0" | "off" | "false")
+}
+
+/// Turns the star knob on or off for this process. Only before any client
+/// starts: the stored definitions and the staging worker read it at their
+/// own pace.
+#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
+pub fn set_star_enabled(on: bool) {
+    STAR_KNOB.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+}
 
 /// One hidden table of a 1-1 `JOIN` definition (this module's doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,15 +377,25 @@ fn field_column_type(
     def: &TransformDef,
     field: &FieldDef,
     from: &HashMap<String, JoinColumnInfo>,
-    joined: &HashMap<String, JoinColumnInfo>,
+    joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<String, ValidationError> {
     if let Expr::SourceColumn { table, column, .. } = &field.expr {
-        let columns = if *table == def.source { from } else { joined };
-        if let Some(info) = columns.get(column) {
+        let columns = if *table == def.source {
+            Some(from)
+        } else {
+            super::join::spec(def).and_then(|join| {
+                super::join::positions(join)
+                    .find(|(_, joined)| joined.right == *table)
+                    .and_then(|(position, _)| joined.get(position.index()).copied())
+            })
+        };
+        if let Some(info) = columns.and_then(|columns| columns.get(column)) {
             return Ok(column_type(info));
         }
     }
-    super::join::field_pg_type(def, field, from, joined)
+    // A 1-1 JOIN's field calls no aggregate: its type is its inference's.
+    let value_type = super::validate::join_field_value_type(def, field, from, joined)?;
+    Ok(super::ddl::pg_type_name(value_type).into_owned())
 }
 
 /// Renders the `create table` statement of a 1-1 `JOIN` definition's visible
@@ -350,7 +407,7 @@ pub(crate) fn target_ddl(
     qualified_target: &str,
     pk: &[PrimaryKeyColumn],
     from: &HashMap<String, JoinColumnInfo>,
-    joined: &HashMap<String, JoinColumnInfo>,
+    joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<String, ValidationError> {
     let (mut columns, constraint) = super::ddl::pk_columns_ddl(pk);
     for field in &def.fields {
@@ -400,24 +457,37 @@ pub(crate) async fn unique_keys_of(
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 
-/// Whether `joined` (qualified), `def`'s joined table, has a unique key
-/// within its `ON` columns ([`unique_keys_of`], [`key_is_unique`]): the rule
-/// define and `RESUME` hold a 1-1 `JOIN` to ([`check_define`]), and that the
-/// staging worker's capture pass re-checks while it runs
-/// (`staging::schema_change::pause_joins_without_unique_key`). One catalog
-/// query. A table that doesn't exist has no key.
+/// Whether `joined` (qualified), `def`'s first joined table, has a unique
+/// key within its `ON` columns: [`joined_key_is_unique_at`] at position 1,
+/// for the staging worker's capture pass
+/// (`staging::schema_change::pause_joins_without_unique_key`), which checks
+/// the first joined table only.
 pub(crate) async fn joined_key_is_unique(
     client: &impl GenericClient,
     def: &TransformDef,
     joined: &str,
 ) -> Result<bool, tokio_postgres::Error> {
+    joined_key_is_unique_at(client, def, Position::FIRST, joined).await
+}
+
+/// Whether `joined` (qualified), the table `def` joins at `position`, has a
+/// unique key within that position's `ON` columns ([`unique_keys_of`],
+/// [`key_is_unique`]): the rule define and `RESUME` hold a 1-1 `JOIN` to
+/// ([`check_define`]). One catalog query. A table that doesn't exist has no
+/// key.
+pub(crate) async fn joined_key_is_unique_at(
+    client: &impl GenericClient,
+    def: &TransformDef,
+    position: Position,
+    joined: &str,
+) -> Result<bool, tokio_postgres::Error> {
     Ok(key_is_unique(
         &unique_keys_of(client, joined).await?,
-        &joined_on_columns(def),
+        &join_key(def, Side::Joined(position)),
     ))
 }
 
-/// The joined table's `ON` columns of `def`, in `ON` order.
+/// The first joined table's `ON` columns of `def`, in `ON` order.
 pub(crate) fn joined_on_columns(def: &TransformDef) -> Vec<String> {
     join_key(def, JOINED)
 }
@@ -458,48 +528,52 @@ async fn target_key_space(
 }
 
 /// The define-time checks of a 1-1 `JOIN` that read the catalog, once its
-/// joined table is resolved (`joined`, qualified): the joined table's `ON`
-/// columns are unique, and a joined table that is another transform's 1-1
-/// target is joined on columns that include its primary key. Trellis orders
-/// changes per primary-key value only, so the primary key is the one column
-/// set of a target that stays unique at every instant while its upstream
-/// drains; a unique index on any other column can hold transient duplicates.
-/// The `FROM` table has no such rule: its `ON` columns carry no uniqueness.
+/// joined tables are resolved (`joined`, qualified, by position): at every
+/// position, the joined table's `ON` columns are unique, and a joined table
+/// that is another transform's 1-1 target is joined on columns that include
+/// its primary key. Trellis orders changes per primary-key value only, so the
+/// primary key is the one column set of a target that stays unique at every
+/// instant while its upstream drains; a unique index on any other column can
+/// hold transient duplicates. The `FROM` table has no such rule: its `ON`
+/// columns carry no uniqueness.
 pub(crate) async fn check_define(
     client: &impl GenericClient,
     floors: &Floors,
     def: &TransformDef,
-    joined: &str,
+    joined: &[&str],
 ) -> Result<(), super::catalog::CatalogError> {
-    let on = joined_on_columns(def);
-    if !joined_key_is_unique(client, def, joined).await? {
-        return Err(ValidationError::OneToOneJoinKeyNotUnique {
-            table: joined.to_string(),
-            columns: on,
-        }
-        .into());
-    }
-    if matches!(
-        target_key_space(client, floors, joined).await?,
-        Some(super::ast::KeySpace::OneToOne)
-    ) {
-        let pk: Vec<String> = super::ddl::identity_key_columns(client, joined)
-            .await?
-            .into_iter()
-            .map(|c| c.name)
-            .collect();
-        if !pk.iter().all(|column| on.contains(column)) {
-            return Err(ValidationError::OneToOneJoinUnsupported {
-                what: format!(
-                    "'{joined}', the 1-1 target of another transform, joined on columns that \
-                     leave out part of its primary key ({})",
-                    pk.join(", ")
-                ),
-                remedy: "join on columns that include its primary key, or join the table that \
-                         transform reads"
-                    .to_string(),
+    for (index, joined) in joined.iter().copied().enumerate() {
+        let position = Position::of_index(index);
+        let on = join_key(def, Side::Joined(position));
+        if !joined_key_is_unique_at(client, def, position, joined).await? {
+            return Err(ValidationError::OneToOneJoinKeyNotUnique {
+                table: joined.to_string(),
+                columns: on,
             }
             .into());
+        }
+        if matches!(
+            target_key_space(client, floors, joined).await?,
+            Some(super::ast::KeySpace::OneToOne)
+        ) {
+            let pk: Vec<String> = super::ddl::identity_key_columns(client, joined)
+                .await?
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            if !pk.iter().all(|column| on.contains(column)) {
+                return Err(ValidationError::OneToOneJoinUnsupported {
+                    what: format!(
+                        "'{joined}', the 1-1 target of another transform, joined on columns \
+                         that leave out part of its primary key ({})",
+                        pk.join(", ")
+                    ),
+                    remedy: "join on columns that include its primary key, or join the table \
+                             that transform reads"
+                        .to_string(),
+                }
+                .into());
+            }
         }
     }
     Ok(())
@@ -698,7 +772,7 @@ mod tests {
             nullable: false,
             collation: None,
         }];
-        let ddl = target_ddl(&def, "\"public\".\"v\"", &pk, &from, &joined).unwrap();
+        let ddl = target_ddl(&def, "\"public\".\"v\"", &pk, &from, &[&joined]).unwrap();
         // A copy of a column keeps its type (no modifier); an expression has
         // the type its inference gives.
         assert_eq!(

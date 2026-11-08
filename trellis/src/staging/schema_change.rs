@@ -1291,7 +1291,7 @@ pub(crate) async fn pause_readers_of_retyped(
                 crate::defs::validate::validate_join(
                     &reader.def,
                     &sides.from_columns,
-                    &sides.first_joined().columns,
+                    &sides.joined_column_maps(),
                 )
             {
                 refused = true;

@@ -30,13 +30,26 @@ use super::validate::{
 pub fn validate(
     def: &TransformDef,
     root: &HashMap<String, JoinColumnInfo>,
-    joined: &[HashMap<String, JoinColumnInfo>],
+    joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
     let KeySpace::JoinOneToOne(join) = &def.key_space else {
         return Ok(());
     };
+    let tables = join.joins.len() + 1;
+    if join.joins.len() > super::join::MAX_POSITIONS {
+        return Err(ValidationError::StarJoinTooManyTables { tables });
+    }
+    if join.joins.len() > 1 && !super::join_one_to_one::star_enabled() {
+        return Err(ValidationError::StarJoinDisabled { tables });
+    }
+    assert_eq!(
+        joined.len(),
+        join.joins.len(),
+        "a 1-1 JOIN is validated against every joined table's columns"
+    );
     validate_join_tables_and_on(def, join, root, joined)?;
     let resolve = join_resolver(def, join, root, joined);
+    check_key_column_names(def, join)?;
 
     // The hidden tables copy these columns beside their ledger columns.
     for side in super::join::sides(join) {
@@ -86,6 +99,50 @@ pub fn validate(
         super::validate::check_table_width(|| table, columns)?;
     }
     Ok(())
+}
+
+/// `J` names its key column for each `FROM` column a position's `ON` reads
+/// `p<position>_<column>`, cut at Postgres's 63 bytes
+/// ([`super::join_one_to_one::j_column`]): two such columns of one position
+/// whose names share their first 60 bytes would be one column of `J`.
+fn check_key_column_names(
+    def: &TransformDef,
+    join: &super::ast::JoinSpec,
+) -> Result<(), ValidationError> {
+    for (position, table) in super::join::positions(join) {
+        let mut seen: HashMap<String, String> = HashMap::new();
+        for term in &table.on {
+            let column = if term.lhs.table == def.source {
+                &term.lhs.column
+            } else {
+                &term.rhs.column
+            };
+            let name = super::join_one_to_one::j_column(position, column);
+            if let Some(earlier) = seen.insert(name, column.clone())
+                && earlier != *column
+            {
+                return Err(ValidationError::OneToOneJoinUnsupported {
+                    what: format!(
+                        "the columns '{earlier}' and '{column}' of {} in the ON of '{}', whose \
+                         names share their first {} bytes",
+                        def.source,
+                        table.right,
+                        crate::defs::lexer::MAX_NAME_BYTES - position_prefix_len(position)
+                    ),
+                    remedy: "Trellis keeps a key column for each, named after that many bytes \
+                             of its name; join on columns whose names differ sooner, or rename \
+                             one"
+                    .to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The bytes `J`'s `p<position>_` prefix takes.
+fn position_prefix_len(position: super::join::Position) -> usize {
+    format!("p{}_", position.number()).len()
 }
 
 /// Walks one field's expression: every column is qualified and resolves, and
@@ -200,7 +257,7 @@ mod tests {
         ))
         .unwrap();
         let (from, joined) = sides();
-        validate_join(&def, &from, &joined)
+        validate_join(&def, &from, &[&joined])
     }
 
     /// A 1-1 `JOIN` is admitted with no setting: the development knob that
@@ -215,7 +272,7 @@ mod tests {
         )
         .unwrap();
         let (from, joined) = sides();
-        assert_eq!(validate_join(&def, &from, &joined), Ok(()));
+        assert_eq!(validate_join(&def, &from, &[&joined]), Ok(()));
     }
 
     /// Runs [`a_one_to_one_join_is_admitted_with_no_knob`] in a child process
@@ -252,7 +309,7 @@ mod tests {
                 "TRANSFORM v FROM orders LEFT JOIN customers ON {on} SELECT customers.name AS n"
             ))
             .unwrap();
-            validate_join(&def, &from, &joined)
+            validate_join(&def, &from, &[&joined])
         };
         // The joined side's column repeated.
         assert_eq!(
@@ -339,11 +396,11 @@ mod tests {
         )
         .unwrap();
         let (from, mut joined) = sides();
-        assert_eq!(validate_join(&def, &from, &joined), Ok(()));
+        assert_eq!(validate_join(&def, &from, &[&joined]), Ok(()));
         joined.get_mut("name").unwrap().collation_deterministic = false;
         joined.get_mut("name").unwrap().collation = Some("ci".to_string());
         assert!(matches!(
-            validate_join(&def, &from, &joined),
+            validate_join(&def, &from, &[&joined]),
             Err(ValidationError::NondeterministicCollationTextFunction(refused))
                 if refused.field == "pos" && refused.table == "customers"
         ));
