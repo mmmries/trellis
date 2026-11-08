@@ -117,9 +117,10 @@ async fn corrected_by_new_node(
 ) -> Result<bool, IntakeError> {
     if crate::staging::join::applies(&definition.def) {
         return Ok(tables.contains(&definition.source_table)
-            || crate::defs::catalog::join_table_of(client, definition.id)
+            || crate::defs::catalog::joined_tables_of(client, definition.id)
                 .await?
-                .is_some_and(|joined| tables.contains(&joined)));
+                .iter()
+                .any(|joined| tables.contains(joined)));
     }
     Ok(tables.contains(&definition.source_table)
         && crate::staging::build::corrected_on_partitioned_source(definition))

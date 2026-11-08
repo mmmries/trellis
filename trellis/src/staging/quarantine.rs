@@ -2628,7 +2628,7 @@ async fn pause_fence(pool: &Pool, transform: &str) -> Result<Vec<String>, ApplyE
         KeySpace::OneToOne => vec![def.source_table],
         KeySpace::JoinOneToOne(_) => {
             let client = pool.get().await?;
-            let joined = catalog::join_table_of(&**client, def.id).await?;
+            let joined = catalog::joined_tables_of(&**client, def.id).await?;
             std::iter::once(def.source_table).chain(joined).collect()
         }
         _ => Vec::new(),
@@ -3983,15 +3983,17 @@ async fn lock_frozen(
     value: &(dyn tokio_postgres::types::ToSql + Sync),
     fenced_source: &str,
 ) -> Result<Option<(i64, StoredStatus)>, ApplyError> {
-    let fenced_join: Option<String> = txn
+    let joined = catalog::joined_tables_array_sql("d");
+    let fenced_join: Vec<String> = txn
         .query_opt(
-            &format!("select join_table from transform_definitions where {column} = $1"),
+            &format!("select {joined} from transform_definitions d where d.{column} = $1"),
             &[value],
         )
         .await?
-        .and_then(|row| row.get(0));
+        .map(|row| row.get(0))
+        .unwrap_or_default();
     let mut fenced: Vec<&str> = std::iter::once(fenced_source)
-        .chain(fenced_join.as_deref())
+        .chain(fenced_join.iter().map(String::as_str))
         .collect();
     fenced.sort_unstable();
     for table in fenced {
@@ -4000,8 +4002,8 @@ async fn lock_frozen(
     let row = txn
         .query_opt(
             &format!(
-                "select id, source_table, status, join_table from transform_definitions \
-                 where {column} = $1 for update"
+                "select d.id, d.source_table, d.status, {joined} from transform_definitions d \
+                 where d.{column} = $1 for update of d"
             ),
             &[value],
         )
@@ -4010,7 +4012,7 @@ async fn lock_frozen(
         return Ok(None);
     };
     let source_table: String = row.get(1);
-    if source_table != fenced_source || row.get::<_, Option<String>>(3) != fenced_join {
+    if source_table != fenced_source || row.get::<_, Vec<String>>(3) != fenced_join {
         // Dropped and defined again on other sources between the two
         // reads: not the definition the caller resumed.
         return Ok(None);
@@ -4061,15 +4063,9 @@ async fn upstream_not_live(
     id: i64,
     source_table: &str,
 ) -> Result<Option<Upstream>, ApplyError> {
-    let join_table: Option<String> = client
-        .query_one(
-            "select join_table from transform_definitions where id = $1",
-            &[&id],
-        )
-        .await?
-        .get(0);
+    let joined = catalog::joined_tables_of(client, id).await?;
     let mut tables: Vec<String> = vec![source_table.to_string()];
-    tables.extend(join_table);
+    tables.extend(joined);
     let upstreams = client
         .query(
             "select id, split_part(target_table, '.', 2), target_table, status \
@@ -4157,9 +4153,12 @@ async fn relabel_changes_pending(
 ) -> Result<bool, ApplyError> {
     let Some(row) = txn
         .query_opt(
-            "select f.relabel_lsn, d.join_table from capture_failures f \
-             join transform_definitions d on d.id = f.transform_id \
-             where f.transform_id = $1 and f.relabel_lsn is not null",
+            &format!(
+                "select f.relabel_lsn, {} from capture_failures f \
+                 join transform_definitions d on d.id = f.transform_id \
+                 where f.transform_id = $1 and f.relabel_lsn is not null",
+                catalog::joined_tables_array_sql("d")
+            ),
             &[&id],
         )
         .await?
@@ -4167,8 +4166,8 @@ async fn relabel_changes_pending(
         return Ok(false);
     };
     let gate: crate::PgLsn = row.get(0);
-    let joined: Option<String> = row.get(1);
-    for table in std::iter::once(source_table).chain(joined.as_deref()) {
+    let joined: Vec<String> = row.get(1);
+    for table in std::iter::once(source_table).chain(joined.iter().map(String::as_str)) {
         if super::converge::table_rows_pending_through(txn, table, gate).await? {
             return Ok(true);
         }
@@ -4480,9 +4479,20 @@ async fn complete_resume(
         catalog::record_join_columns(txn, id, &sides.joined_value_types()).await?;
     }
     // After both, whose enum tokens it records the type OIDs of.
-    let joined = revalidated.join.as_ref().map(|sides| sides.joined.as_str());
-    crate::defs::key_types::record_definition(txn, id, &definition.def, source_table, joined, true)
-        .await?;
+    let joined: Vec<&str> = revalidated
+        .join
+        .iter()
+        .flat_map(catalog::JoinSides::joined_tables)
+        .collect();
+    crate::defs::key_types::record_definition(
+        txn,
+        id,
+        &definition.def,
+        source_table,
+        &joined,
+        true,
+    )
+    .await?;
     // A definition paused by a logical restore starts over on this
     // database's own positions. The rebuild below keeps the ledger's
     // `__applied_lsn` (B4), which is right for an ordinary one and would skip
@@ -4503,7 +4513,7 @@ async fn complete_resume(
     // empty.
     if let Some(gate) = relabelled {
         let mut tables = vec![source_table.to_string()];
-        tables.extend(revalidated.join.as_ref().map(|sides| sides.joined.clone()));
+        tables.extend(joined.iter().map(|table| table.to_string()));
         discard_drained_changes(txn, &tables, gate).await?;
         if matches!(definition.def.key_space, KeySpace::OneToOne) {
             empty_if_keyed_by_an_enum(txn, source_table, &definition.target_table).await?;
@@ -6147,13 +6157,16 @@ pub(crate) async fn request_upstream_releases(
 ) -> Result<(), tokio_postgres::Error> {
     client
         .execute(
-            "insert into upstream_releases (transform_id) \
+            &format!(
+                "insert into upstream_releases (transform_id) \
              select r.id from transform_definitions u join transform_definitions r \
-               on r.source_table = u.target_table or r.join_table = u.target_table \
+               on {} \
              where u.id = $1 \
              order by r.id \
              on conflict (transform_id) do update \
                set requested_at = now(), first_read_at = null",
+                catalog::reads_table_sql("r", "u.target_table")
+            ),
             &[&upstream],
         )
         .await?;

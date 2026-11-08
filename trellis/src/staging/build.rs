@@ -342,18 +342,18 @@ pub async fn start_ready_builds(
         if definition.status != StoredStatus::WaitingToBackfill {
             continue;
         }
-        // A JOIN's plan job builds both structures
-        // (`super::join`), so both of its tables' gates hold it.
-        // A 1-1 JOIN's build reads `b` too (ADR-0021).
-        let join = match &definition.def.key_space {
+        // A JOIN's plan job builds every structure
+        // (`super::join`), so every one of its tables' gates holds it.
+        // A 1-1 JOIN's build reads every joined table too (ADR-0021).
+        let joined = match &definition.def.key_space {
             crate::defs::ast::KeySpace::Join(_) | crate::defs::ast::KeySpace::JoinOneToOne(_) => {
-                catalog::join_table_of(&*client, id).await?
+                catalog::joined_tables_of(&*client, id).await?
             }
-            _ => None,
+            _ => Vec::new(),
         };
         let mut gated = crate::capture::gate::holds(&*client, &definition.source_table).await?;
-        if let Some(joined) = &join {
-            gated = gated || crate::capture::gate::holds(&*client, joined).await?;
+        for table in &joined {
+            gated = gated || crate::capture::gate::holds(&*client, table).await?;
         }
         if gated {
             crate::instance_log::debug!(
@@ -738,10 +738,12 @@ pub(crate) async fn rebuild_candidates(
 ) -> Result<Vec<i64>, tokio_postgres::Error> {
     Ok(client
         .query(
-            "select id from transform_definitions \
-             where (source_table = any($1) or join_table = any($1)) \
-               and (status = $2 or (status = $3 and build = $4)) \
-             order by id",
+            "select d.id from transform_definitions d \
+             where (d.source_table = any($1) or d.join_table = any($1) \
+                    or exists (select from definition_join_tables j \
+                               where j.transform_id = d.id and j.table_name = any($1))) \
+               and (d.status = $2 or (d.status = $3 and d.build = $4)) \
+             order by d.id",
             &[
                 &tables,
                 &StoredStatus::Live.as_str(),
@@ -2397,10 +2399,12 @@ async fn reads_a_target(
     if catalog::is_definition_target(client, &definition.source_table).await? {
         return Ok(true);
     }
-    if crate::defs::join::spec(&definition.def).is_some()
-        && let Some(joined) = catalog::join_table_of(client, definition.id).await?
-    {
-        return Ok(catalog::is_definition_target(client, &joined).await?);
+    if crate::defs::join::spec(&definition.def).is_some() {
+        for joined in catalog::joined_tables_of(client, definition.id).await? {
+            if catalog::is_definition_target(client, &joined).await? {
+                return Ok(true);
+            }
+        }
     }
     Ok(false)
 }
@@ -2412,12 +2416,14 @@ async fn join_partitioned_sides(
     client: &impl GenericClient,
     definition: &Definition,
 ) -> Result<Vec<(crate::defs::join::Side, String)>, ChunkQueueError> {
-    use crate::defs::join::{JOINED, Side};
+    use crate::defs::join::{Position, Side};
     let mut sides = vec![(Side::From, definition.source_table.clone())];
     sides.extend(
-        catalog::join_table_of(client, definition.id)
+        catalog::joined_tables_of(client, definition.id)
             .await?
-            .map(|t| (JOINED, t)),
+            .into_iter()
+            .enumerate()
+            .map(|(index, t)| (Side::Joined(Position::of_index(index)), t)),
     );
     let mut partitioned = Vec::new();
     for (side, table) in sides {

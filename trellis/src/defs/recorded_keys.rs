@@ -162,8 +162,8 @@ async fn write(
 }
 
 /// Records the key of each table a define of `def` keys by: its qualified
-/// `source` and a `JOIN`'s qualified `joined` table (the `KEY (...)` `def`
-/// declares for it, else its row-identity key now unless the table has a
+/// `source` and each of a `JOIN`'s qualified `joined` tables, by position
+/// (the `KEY (...)` `def` declares for it, else its row-identity key now unless the table has a
 /// record already, which it keeps) and its qualified `target`
 /// ([`target_key`]), which the define keys and whose record is always its
 /// own. A declared key is the table's for every reader of it: define
@@ -173,7 +173,7 @@ pub(crate) async fn record(
     client: &impl GenericClient,
     def: &TransformDef,
     source: &str,
-    joined: Option<&str>,
+    joined: &[&str],
     target: &str,
 ) -> Result<(), tokio_postgres::Error> {
     record_except(client, def, source, joined, target, None).await
@@ -186,11 +186,11 @@ async fn record_except(
     client: &impl GenericClient,
     def: &TransformDef,
     source: &str,
-    joined: Option<&str>,
+    joined: &[&str],
     target: &str,
     unkeyed: Option<&str>,
 ) -> Result<(), tokio_postgres::Error> {
-    for table in std::iter::once(source).chain(joined) {
+    for table in std::iter::once(source).chain(joined.iter().copied()) {
         if unkeyed == Some(table) {
             continue;
         }
@@ -536,8 +536,8 @@ fn declared_on_source(definition: &Definition) -> Option<Vec<String>> {
 }
 
 /// The tables `definition` keys by, each with the `KEY (...)` it declares
-/// for it: its source, a `JOIN`'s joined table and its target, in that
-/// order.
+/// for it: its source, each of a `JOIN`'s joined tables by position, and
+/// its target, in that order.
 async fn tables_of(
     client: &impl GenericClient,
     definition: &Definition,
@@ -546,11 +546,12 @@ async fn tables_of(
         definition.source_table.clone(),
         declared_on_source(definition),
     )];
-    if let Some(joined) = super::catalog::join_table_of(client, definition.id).await? {
+    let joined = super::catalog::joined_tables_of(client, definition.id).await?;
+    for (index, joined) in joined.into_iter().enumerate() {
+        let side = super::join::Side::Joined(super::join::Position::of_index(index));
         tables.push((
             joined,
-            super::source_key::declared_on(&definition.def, Some(super::join::JOINED))
-                .map(<[String]>::to_vec),
+            super::source_key::declared_on(&definition.def, Some(side)).map(<[String]>::to_vec),
         ));
     }
     tables.push((definition.target_table.clone(), None));
@@ -732,9 +733,12 @@ async fn pause_running_readers(
 ) -> Result<(), CatalogError> {
     let running: Vec<i64> = txn
         .query(
-            "select id from transform_definitions \
-             where id <> $1 and (source_table = $2 or join_table = $2) and status = any($3) \
-             order by id",
+            &format!(
+                "select id from transform_definitions \
+                 where id <> $1 and {} and status = any($3) \
+                 order by id",
+                super::catalog::reads_table_sql("transform_definitions", "$2")
+            ),
             &[
                 &resumed,
                 &table,
@@ -902,12 +906,15 @@ pub(crate) async fn backfill_in(
     retie_restored(txn).await?;
     let rows = txn
         .query(
-            "select d.id, d.source_table, d.target_table, d.join_table, d.definition_text, \
-                    d.grammar_version, d.floor_version \
-             from transform_definitions d \
-             where not exists (select 1 from definition_keys k \
-                               where k.table_name = d.target_table) \
-             order by d.id",
+            &format!(
+                "select d.id, d.source_table, d.target_table, {}, d.definition_text, \
+                        d.grammar_version, d.floor_version \
+                 from transform_definitions d \
+                 where not exists (select 1 from definition_keys k \
+                                   where k.table_name = d.target_table) \
+                 order by d.id",
+                super::catalog::joined_tables_array_sql("d")
+            ),
             &[],
         )
         .await?;
@@ -916,8 +923,9 @@ pub(crate) async fn backfill_in(
     // the table and the columns: a 1-1 reader of one is keyed by them too.
     let mut mis_keyed: Vec<(String, String, Vec<String>)> = Vec::new();
     for row in &rows {
-        let (id, source, target, joined): (i64, String, String, Option<String>) =
+        let (id, source, target, joined): (i64, String, String, Vec<String>) =
             (row.get(0), row.get(1), row.get(2), row.get(3));
+        let joined: Vec<&str> = joined.iter().map(String::as_str).collect();
         let (text, grammar_version, floor): (&str, i32, &str) =
             (row.get(4), row.get(5), row.get(6));
         if floors
@@ -929,13 +937,12 @@ pub(crate) async fn backfill_in(
         let Ok(mut def) = super::grammar::load_in(text, grammar_version, oldest, current) else {
             continue;
         };
-        let unkeyed =
-            declare_released_keys(txn, id, &mut def, &source, joined.as_deref(), &target).await?;
+        let unkeyed = declare_released_keys(txn, id, &mut def, &source, &joined, &target).await?;
         record_except(
             txn,
             &def,
             &source,
-            joined.as_deref(),
+            &joined,
             &target,
             unkeyed.as_ref().map(|(table, _)| table.as_str()),
         )
@@ -945,17 +952,17 @@ pub(crate) async fn backfill_in(
         {
             paused += 1;
         }
-        for reason in deferrable_reasons(txn, &def, &source, joined.as_deref(), &target).await? {
+        for reason in deferrable_reasons(txn, &def, &source, &joined, &target).await? {
             if super::lifecycle::pause_for_included_key(txn, id, &source, &reason).await? {
                 paused += 1;
             }
         }
         let mut included = Vec::new();
-        for table in std::iter::once(&source).chain(joined.as_ref()) {
+        for table in std::iter::once(source.as_str()).chain(joined.iter().copied()) {
             let key = released_key_names(txn, table).await?;
             let columns = included_columns(txn, table, &key).await?;
             if !columns.is_empty() {
-                included.push((table.clone(), columns));
+                included.push((table.to_string(), columns));
             }
         }
         let one_to_one = matches!(
@@ -1068,11 +1075,11 @@ async fn deferrable_reasons(
     client: &impl GenericClient,
     def: &TransformDef,
     source: &str,
-    joined: Option<&str>,
+    joined: &[&str],
     target: &str,
 ) -> Result<Vec<String>, tokio_postgres::Error> {
     let mut reasons = Vec::new();
-    for table in std::iter::once(source).chain(joined) {
+    for table in std::iter::once(source).chain(joined.iter().copied()) {
         if super::source_key::declared_by_reader(def, source, joined, table).is_some()
             || super::source_key::is_trellis_target(client, table).await?
         {
@@ -1138,13 +1145,17 @@ async fn declare_released_keys(
     id: i64,
     def: &mut TransformDef,
     source: &str,
-    joined: Option<&str>,
+    joined: &[&str],
     target: &str,
 ) -> Result<Option<(String, String)>, CatalogError> {
-    use super::join::{JOINED, Side};
+    use super::join::{Position, Side};
     let join = super::join::spec(def).is_some();
-    let sides = std::iter::once((source, join.then_some(Side::From)))
-        .chain(joined.map(|table| (table, Some(JOINED))));
+    let sides = std::iter::once((source, join.then_some(Side::From))).chain(
+        joined
+            .iter()
+            .enumerate()
+            .map(|(index, table)| (*table, Some(Side::Joined(Position::of_index(index))))),
+    );
     let mut declared = Vec::new();
     for (table, side) in sides {
         if super::source_key::declared_on(def, side).is_some()
@@ -1185,7 +1196,7 @@ async fn declare_released_keys(
                 unkeyed_reason(target, table, &indexes),
             )));
         }
-        if keys_target_by_source(def) && side != Some(JOINED) {
+        if keys_target_by_source(def) && !matches!(side, Some(Side::Joined(_))) {
             let built_on = primary_key_names(txn, target).await?;
             let mut chosen_set = chosen.clone();
             chosen_set.sort();

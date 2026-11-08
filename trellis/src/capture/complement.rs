@@ -709,7 +709,7 @@ pub(crate) async fn sweep(
             KeySpace::Aggregate { .. } if r.source == table => Some((r.id, None)),
             // A `JOIN` reading the table as either side: its side's cells
             // hold the partition-key columns, the target may not.
-            KeySpace::Join(_) if r.source == table || r.join.as_deref() == Some(table) => {
+            KeySpace::Join(_) if r.source == table || r.joined.iter().any(|j| j == table) => {
                 crate::defs::join::side_of_table(&r.def, table).map(|side| {
                     let hidden = crate::defs::join::HiddenTable::partials(side);
                     (r.id, Some(hidden.name(r.id)))

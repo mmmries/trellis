@@ -59,16 +59,17 @@ pub struct CaptureReader {
     pub refresh_stamp: Option<String>,
     /// The qualified `target_table` it writes.
     pub target: String,
-    /// A `JOIN`'s qualified joined table, its second source.
-    pub join: Option<String>,
+    /// A `JOIN`'s qualified joined tables, by position (index 0 is
+    /// position 1); empty for any other definition.
+    pub joined: Vec<String>,
 }
 
 impl CaptureReader {
     /// The columns of `table` this definition reads, as its source or as
     /// either table of a `JOIN`; `None` if it doesn't read `table`.
     pub(crate) fn reads(&self, table: &str) -> Option<BTreeSet<String>> {
-        if self.join.is_some() {
-            if self.source != table && self.join.as_deref() != Some(table) {
+        if !self.joined.is_empty() {
+            if self.source != table && !self.joined.iter().any(|joined| joined == table) {
                 return None;
             }
             return crate::defs::join::side_of_table(&self.def, table)
@@ -177,7 +178,7 @@ pub async fn load_catalog_for(
             capture_failed: row.capture_failed,
             refresh_stamp: row.refresh_stamp,
             target: row.target,
-            join: row.join,
+            joined: row.joined,
         })
         .collect();
     Ok(CaptureCatalog { definitions })
@@ -324,7 +325,7 @@ pub(crate) fn declared_key(catalog: &CaptureCatalog, table: &str) -> Option<Vec<
         crate::defs::source_key::declared_by_reader(
             &reader.def,
             &reader.source,
-            reader.join.as_deref(),
+            &reader.joined,
             table,
         )
         .map(<[String]>::to_vec)
@@ -356,7 +357,7 @@ mod tests {
                     capture_failed: false,
                     refresh_stamp: None,
                     target: format!("public.target_{}", i + 1),
-                    join: None,
+                    joined: Vec::new(),
                 })
                 .collect(),
         }
@@ -384,7 +385,7 @@ mod tests {
                  GROUP BY items.sku SELECT items.sku AS sku, SUM(orders.total) AS total, \
                  COUNT(items.qty) AS n",
         )]);
-        catalog.definitions[0].join = Some("public.items".to_string());
+        catalog.definitions[0].joined = vec!["public.items".to_string()];
         assert_eq!(
             read_columns(&catalog, "public.orders").columns,
             set(&["id", "total"])
@@ -514,7 +515,7 @@ mod tests {
             "TRANSFORM v FROM orders LEFT JOIN customers ON orders.cust = customers.id \
              SELECT customers.name AS who, orders.total * 2 AS doubled",
         )]);
-        catalog.definitions[0].join = Some("public.customers".to_string());
+        catalog.definitions[0].joined = vec!["public.customers".to_string()];
         assert_eq!(
             read_columns(&catalog, "public.orders").columns,
             set(&["cust", "total"])

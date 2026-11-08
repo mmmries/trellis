@@ -593,7 +593,7 @@ pub(crate) async fn pause_joins_without_unique_key(
         .iter()
         .filter(|r| {
             !r.capture_failed
-                && r.join.as_deref() == Some(table)
+                && r.joined.iter().any(|joined| joined == table)
                 && crate::defs::join::is_one_to_one(&r.def)
         })
         .collect();
@@ -853,7 +853,7 @@ pub(crate) async fn pause_readers_of_missing_probe_index(
         .filter(|r| {
             !r.capture_failed
                 && r.source == table
-                && r.join.is_none()
+                && r.joined.is_empty()
                 && matches!(r.def.key_space, KeySpace::Aggregate { .. })
         })
         .collect();
@@ -1280,20 +1280,18 @@ pub(crate) async fn pause_readers_of_retyped(
                 (Some((old, _)), Some(now)) if old != &now.ty
             )
         });
-        if let Some(joined) = &reader.join
-            && join_key_moved
-        {
+        if !reader.joined.is_empty() && join_key_moved {
             let sides = crate::defs::catalog::JoinSides::read(
                 &*client,
                 reader.source.clone(),
-                joined.clone(),
+                reader.joined.clone(),
             )
             .await?;
             if let Err(err @ ValidationError::JoinKeyTypeMismatch { .. }) =
                 crate::defs::validate::validate_join(
                     &reader.def,
                     &sides.from_columns,
-                    &sides.joined_columns,
+                    &sides.first_joined().columns,
                 )
             {
                 refused = true;
@@ -1388,7 +1386,7 @@ pub(crate) async fn pause_readers_of_retyped(
                 floors,
                 &reader.def,
                 &reader.source,
-                reader.join.as_deref(),
+                &reader.joined.iter().map(String::as_str).collect::<Vec<_>>(),
             )
             .await?
             {
@@ -2637,7 +2635,7 @@ mod tests {
                         capture_failed: *capture_failed,
                         refresh_stamp: None,
                         target: format!("public.t{}", i + 1),
-                        join: join.map(str::to_string),
+                        joined: join.map(str::to_string).into_iter().collect(),
                     }
                 })
                 .collect(),

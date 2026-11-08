@@ -584,7 +584,7 @@ fn refusal_for(
     tree: &PartitionTree,
     server_version_num: i32,
 ) -> Option<PartitionRefusal> {
-    if reader.source != table && reader.join.as_deref() != Some(table) {
+    if reader.source != table && !reader.joined.iter().any(|joined| joined == table) {
         return None;
     }
     match &reader.def.key_space {

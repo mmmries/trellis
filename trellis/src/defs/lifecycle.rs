@@ -705,16 +705,17 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // below. The bump waits for every page holding the fence `for share`
     // (Phase 3 holds it to its commit), and a page that reaches the fence
     // after this commit misses it and plans again, without the definition.
-    // A `JOIN` reads two tables, and a page of either may have planned it.
+    // A `JOIN` reads several tables, and a page of any may have planned it.
     // The names are read without a lock and bumped in table-name
     // order, the order every taker of two fences takes them in.
     let mut fences: Vec<String> = txn
         .query(
             &format!(
-                "select distinct f from transform_definitions, \
-                     unnest(array[source_table, join_table]) f \
-                 where f is not null and {}",
-                super::catalog::target_match_sql("target_table", 1),
+                "select distinct f from transform_definitions d, \
+                     unnest(array[d.source_table] || {}) f \
+                 where {}",
+                super::catalog::joined_tables_array_sql("d"),
+                super::catalog::target_match_sql("d.target_table", 1),
             ),
             &[&target],
         )
@@ -837,7 +838,8 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     txn.execute(
         "delete from definition_keys k where not exists ( \
              select 1 from transform_definitions d \
-             where k.table_name in (d.source_table, d.target_table, d.join_table))",
+             where k.table_name in (d.source_table, d.target_table, d.join_table)) \
+         and not exists (select 1 from definition_join_tables j where j.table_name = k.table_name)",
         &[],
     )
     .await?;

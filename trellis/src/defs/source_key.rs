@@ -23,7 +23,7 @@ use tokio_postgres::types::Type;
 
 use super::ast::TransformDef;
 use super::ddl::{self, DdlError, PrimaryKeyColumn};
-use super::join::{JOINED, Side};
+use super::join::Side;
 
 /// The key `def` declares with `KEY (...)` for the table it reads on
 /// `side` (`None` for a definition that isn't a `JOIN`, whose only table is
@@ -48,22 +48,23 @@ pub(crate) fn declared_for<'a>(def: &'a TransformDef, table: &str) -> Option<&'a
     }
 }
 
-/// The key a definition reading `table` as its stored `source` or `joined`
-/// table (qualified names) declares for it; `None` when it declares none,
-/// or doesn't read `table`.
-pub(crate) fn declared_by_reader<'a>(
+/// The key a definition reading `table` as its stored `source` or one of
+/// its `joined` tables (qualified names, by position) declares for it;
+/// `None` when it declares none, or doesn't read `table`.
+pub(crate) fn declared_by_reader<'a, T: AsRef<str>>(
     def: &'a TransformDef,
     source: &str,
-    joined: Option<&str>,
+    joined: &[T],
     table: &str,
 ) -> Option<&'a [String]> {
     if source == table {
-        declared_on(def, super::join::spec(def).map(|_| Side::From))
-    } else if joined == Some(table) {
-        declared_on(def, Some(JOINED))
-    } else {
-        None
+        return declared_on(def, super::join::spec(def).map(|_| Side::From));
     }
+    let index = joined.iter().position(|joined| joined.as_ref() == table)?;
+    declared_on(
+        def,
+        Some(Side::Joined(super::join::Position::of_index(index))),
+    )
 }
 
 /// The unique index backing `columns` as `table`'s key (an unquoted
@@ -315,21 +316,26 @@ async fn forms_of_readers(
 ) -> Result<Vec<(String, KeyForm)>, tokio_postgres::Error> {
     let rows = client
         .query(
-            "select target_table, source_table, join_table, definition_text, grammar_version \
-             from transform_definitions \
-             where (source_table = $1 or join_table = $1) and target_table is distinct from $2 \
-             order by id",
+            &format!(
+                "select d.target_table, d.source_table, {}, d.definition_text, \
+                        d.grammar_version \
+                 from transform_definitions d \
+                 where {} and d.target_table is distinct from $2 \
+                 order by d.id",
+                super::catalog::joined_tables_array_sql("d"),
+                super::catalog::reads_table_sql("d", "$1")
+            ),
             &[&table, &this],
         )
         .await?;
     let mut forms = Vec::with_capacity(rows.len());
     for row in rows {
-        let (target, source, joined, text, grammar): (String, String, Option<String>, String, i32) =
+        let (target, source, joined, text, grammar): (String, String, Vec<String>, String, i32) =
             (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
         let Ok(def) = super::grammar::load(&text, grammar) else {
             continue;
         };
-        let form = match declared_by_reader(&def, &source, joined.as_deref(), table) {
+        let form = match declared_by_reader(&def, &source, &joined, table) {
             Some(key) => KeyForm::Declared(key.to_vec()),
             None => KeyForm::PrimaryKey,
         };

@@ -260,12 +260,12 @@ pub(crate) async fn open(
 }
 
 /// The oldest open holdup on a page holding `source_table`, a definition's
-/// source, or `join_table`, the table a `JOIN` definition joins. The caller
-/// decides whether the definition is unfrozen.
+/// source, or one of `joined`, the tables a `JOIN` definition joins. The
+/// caller decides whether the definition is unfrozen.
 pub(crate) async fn for_definition(
     client: &impl GenericClient,
     source_table: &str,
-    join_table: Option<&str>,
+    joined: &[String],
 ) -> Result<Option<DrainFailure>, tokio_postgres::Error> {
     // `drain_holdups` holds a row per failing segment, so it's empty, or
     // nearly so, and read whole.
@@ -273,10 +273,10 @@ pub(crate) async fn for_definition(
         .query_opt(
             &format!(
                 "select {COLUMNS} from drain_holdups h \
-                 where $1 = any(h.tables) or $2 = any(h.tables) \
+                 where $1 = any(h.tables) or h.tables && $2::text[] \
                  order by h.since, h.seg_seq limit 1"
             ),
-            &[&source_table, &join_table],
+            &[&source_table, &joined],
         )
         .await?;
     Ok(row.as_ref().map(from_row))

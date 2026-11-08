@@ -157,7 +157,7 @@ fn inputs_of(schema: &str, reader: &CaptureReader) -> Vec<String> {
         &reader.def,
         &reader.source,
         &reader.target,
-        reader.join.as_deref().map(|joined| (reader.id, joined)),
+        (!reader.joined.is_empty()).then_some((reader.id, reader.joined.as_slice())),
     )
 }
 
