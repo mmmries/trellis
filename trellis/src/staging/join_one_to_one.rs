@@ -1338,9 +1338,11 @@ fn root_skip_j(
 }
 
 /// The R-entry rule's lock of the fan-out rows on `keys` (each position's,
-/// index 0 is position 1): a predicate over `R` as `l` that matches every
-/// entry on one of them, its parameters bound from `$first`, and those
-/// parameters. `None` when no position has a key.
+/// index 0 is position 1): a query of the entry keys of `R`'s rows on one of
+/// them, one indexed `union all` arm per position, its parameters bound from
+/// `$first`, and those parameters. `None` when no position has a key. The
+/// lock statement matches its rows by entry key against it, never by an
+/// `or` of the positions' keys, which would scan the whole of `R`.
 fn fan_lock<'a>(
     shape: &JoinShape,
     keys: &'a PageKeys,
@@ -1366,18 +1368,20 @@ fn fan_lock<'a>(
         let columns: Vec<String> = at
             .key
             .iter()
-            .map(|c| format!("l.{}", quote_ident(&c.name)))
+            .map(|c| format!("x.{}", quote_ident(&c.name)))
             .collect();
         terms.push(format!(
-            "({}) in (select {} from unnest({}) as {alias}({}))",
+            "select x.{key} from {r} x where ({}) in (select {} from unnest({}) as {alias}({}))",
             columns.join(", "),
             casts.join(", "),
             arrays.join(", "),
-            names.join(", ")
+            names.join(", "),
+            key = quote_ident(schema::KEY_COLUMN),
+            r = shape.r.ident,
         ));
         params.extend(key_arrays(n, keys));
     }
-    (!terms.is_empty()).then(|| (terms.join(" or "), params))
+    (!terms.is_empty()).then(|| (terms.join(" union all "), params))
 }
 
 /// Locks the `R` entries on `keys` ([`fan_lock`]) `FOR UPDATE`, sorted, in
@@ -1388,14 +1392,14 @@ async fn lock_fan_rows(
     shape: &JoinShape,
     keys: &PageKeys,
 ) -> Result<(), ApplyError> {
-    let Some((predicate, params)) = fan_lock(shape, keys, 1) else {
+    let Some((rows, params)) = fan_lock(shape, keys, 1) else {
         return Ok(());
     };
     let params: Vec<&(dyn ToSql + Sync)> = params.iter().map(|c| c as _).collect();
     super::ledger::query_by_entry_key(
         txn,
         &format!(
-            "select 1 from {r} l where {predicate} order by l.{key} for update of l",
+            "select 1 from {r} l where l.{key} in ({rows}) order by l.{key} for update of l",
             r = shape.r.ident,
             key = quote_ident(schema::KEY_COLUMN),
         ),
@@ -1993,8 +1997,8 @@ async fn lock_side(
     #[cfg(not(any(test, feature = "test-util")))]
     let skip_lock = false;
     let ledger = shape.ledger(side);
-    let also = first.as_ref().map(|(predicate, params)| ledger::AlsoLock {
-        predicate: predicate.clone(),
+    let also = first.as_ref().map(|(rows, params)| ledger::AlsoLock {
+        keys: rows.clone(),
         params: params.iter().map(|c| c as &(dyn ToSql + Sync)).collect(),
     });
     let inserted = if to_lock.is_empty() && also.is_none() {
