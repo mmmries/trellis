@@ -440,13 +440,13 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
     (
         "star_own_j_only",
         "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_joined's cx_f1a, cx_f1b, cx_f1d, cx_f6e and \
-         join_star_crossing's per-position target batch pin pin it",
+         (the star tier is #1781); join_star_joined's cx_f1a to cx_f1f and cx_f6e, and \
+         join_star_crossing's per-position target batch pin, pin it",
     ),
     (
         "star_r_after_m",
         "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_joined's cx_f1a, cx_f1b and cx_f1e pin it",
+         (the star tier is #1781); join_star_joined's cx_f1a, cx_f1b, cx_f1e and cx_f6e pin it",
     ),
     (
         "star_last_no_r",

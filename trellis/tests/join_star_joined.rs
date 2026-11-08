@@ -165,8 +165,8 @@ const TAKE: &str = "insert into public.b1 values (5, 1, 50, 'b5')";
 const A5: &str = "insert into public.a (id, k1, k2, x, y) values (5, 1, 1, 5, 'a5')";
 
 /// F4a: the take ‖ a page with a `b2` change on key 1 and an `a` insert on
-/// `(1, 1)`, before the leave applies (`join1_m_before_j`,
-/// `join1_no_placeholder`).
+/// `(1, 1)`, before the leave applies (`join1_no_placeholder`; the R-entry
+/// lock now orders the pages without `J`, so `join1_m_before_j` passes it).
 #[tokio::test]
 async fn cx_f4a_a_hand_off_out_of_order_races_a_change_and_a_root_insert() {
     let _serial = star::serial().await;
@@ -306,8 +306,10 @@ async fn cx_f6e_a_joined_rederive_whose_row_moved_races_a_change_at_the_other_po
 // ---------------------------------------------------------------- CX F9c
 
 /// F9c: `a` row 1 moves to `NULL` at position 2 ‖ a page changing `b1` row
-/// 1 and `b2` row 1, its keys before the move; both orientations
-/// (`star_own_j_only`, `join1_no_entry_lock`).
+/// 1 and `b2` row 1, its keys before the move; both orientations. The root
+/// page locks `J` for the key `R` holds at position 2 (and its key at
+/// position 1), which the joined page locks too, so `J` orders them here:
+/// neither `star_own_j_only` nor `join1_no_entry_lock` fails it.
 #[tokio::test]
 async fn cx_f9c_a_root_row_moving_to_null_races_a_page_of_both_joined_tables() {
     let _serial = star::serial().await;
