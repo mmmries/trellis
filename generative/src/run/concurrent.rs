@@ -343,15 +343,16 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
     })
 }
 
-/// The targets of `installed`'s 1-1 `JOIN` definitions, which the in-run
-/// invariant samples.
+/// The targets of `installed`'s two-table 1-1 `JOIN` definitions, which the
+/// in-run invariant samples. A star's is left out: the snapshot read covers
+/// position 1 alone, and `invariant::check_star` takes every position's.
 fn join1_targets(installed: &[TransformDef]) -> Vec<String> {
     installed
         .iter()
         .filter(|def| {
             matches!(
-                def.key_space,
-                trellis::dev::defs::ast::KeySpace::JoinOneToOne(_)
+                &def.key_space,
+                trellis::dev::defs::ast::KeySpace::JoinOneToOne(join) if join.joins.len() == 1
             )
         })
         .map(|def| def.target.clone())
@@ -391,5 +392,35 @@ impl CommitStallGuard {
 impl Drop for CommitStallGuard {
     fn drop(&mut self) {
         trellis::dev::interleave::set_commit_stall(None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::generate::join_one_to_one::{
+        OnShape, OneToOneField, OneToOneSpec, StarPosition, one_to_one_definition,
+    };
+
+    /// The in-run invariant samples a two-table 1-1 JOIN's target and no
+    /// star's: the snapshot read covers position 1 alone.
+    #[test]
+    fn the_sampler_leaves_stars_out() {
+        let spec = |more: Vec<StarPosition>| OneToOneSpec {
+            left: true,
+            on: OnShape::KeyPk,
+            fields: vec![OneToOneField::AX, OneToOneField::BY],
+            more,
+        };
+        let two = one_to_one_definition("two", &spec(Vec::new()));
+        let star = one_to_one_definition(
+            "star",
+            &spec(vec![StarPosition {
+                left: false,
+                on: OnShape::KeyUnique,
+                own_key: true,
+                fields: vec![OneToOneField::BW],
+            }]),
+        );
+        assert_eq!(super::join1_targets(&[two, star]), ["two"]);
     }
 }
