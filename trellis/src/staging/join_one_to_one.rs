@@ -896,9 +896,7 @@ fn moved_key(shape: &JoinShape, side: Side, parts: &[Option<String>], k: &PageKe
             Some(plant @ crate::plant::Plant::StarLateSkipLast) => {
                 shape.positions.last().map(|p| (plant, p.position))
             }
-            Some(plant @ crate::plant::Plant::StarLateSkipFirst) => {
-                Some((plant, Position::FIRST))
-            }
+            Some(plant @ crate::plant::Plant::StarLateSkipFirst) => Some((plant, Position::FIRST)),
             _ => None,
         };
         if let Some((plant, at)) = at
@@ -1109,7 +1107,16 @@ pub(crate) async fn apply_page(
         .map(|p| (Side::Joined(p.position), p.position.index()))
     {
         b_changed.push(
-            update_side(txn, shape, side, &b[i], &b_locked[i].0, &b_read[i], predicate).await?,
+            update_side(
+                txn,
+                shape,
+                side,
+                &b[i],
+                &b_locked[i].0,
+                &b_read[i],
+                predicate,
+            )
+            .await?,
         );
     }
 
@@ -1150,7 +1157,12 @@ pub(crate) async fn apply_page(
 /// The keys a page locks in `J`: `k`, but under a planted bug, a star's
 /// root keys at one position that no joined change of the page holds too
 /// (`root_k` and `joined_k`, the two parts of `k`). See `crate::plant`.
-fn root_skip_j(shape: &JoinShape, k: &PageKeys, root_k: &PageKeys, joined_k: &PageKeys) -> PageKeys {
+fn root_skip_j(
+    shape: &JoinShape,
+    k: &PageKeys,
+    root_k: &PageKeys,
+    joined_k: &PageKeys,
+) -> PageKeys {
     #[cfg(any(test, feature = "test-util"))]
     if shape.is_star() {
         let at = match crate::plant::armed() {
@@ -1159,9 +1171,7 @@ fn root_skip_j(shape: &JoinShape, k: &PageKeys, root_k: &PageKeys, joined_k: &Pa
             }
             Some(plant @ crate::plant::Plant::StarRootSkipJFirst) => Some((plant, 0)),
             // The middle position of a star of three or more joined tables.
-            Some(plant @ crate::plant::Plant::StarRootSkipJMiddle)
-                if shape.positions.len() > 2 =>
-            {
+            Some(plant @ crate::plant::Plant::StarRootSkipJMiddle) if shape.positions.len() > 2 => {
                 Some((plant, shape.positions.len() / 2))
             }
             _ => None,
@@ -1620,7 +1630,11 @@ pub(crate) fn j_statements<'a>(j: &str, groups: &[PositionKeys<'a>]) -> Option<J
 
 /// Inserts K into `J` and locks it, every position's keys in one sorted
 /// statement each ([`j_statements`]).
-async fn lock_keys(txn: &Transaction<'_>, shape: &JoinShape, k: &PageKeys) -> Result<(), ApplyError> {
+async fn lock_keys(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    k: &PageKeys,
+) -> Result<(), ApplyError> {
     let groups: Vec<PositionKeys<'_>> = shape
         .positions
         .iter()
@@ -2782,9 +2796,7 @@ pub async fn diverging_keys(pool: &Pool, target_table: &str) -> Result<Vec<Strin
                 .key
                 .iter()
                 .zip(&p.m_key)
-                .map(|(a, b)| {
-                    format!("r.{} = {alias}.{}", quote_ident(&a.name), quote_ident(b))
-                })
+                .map(|(a, b)| format!("r.{} = {alias}.{}", quote_ident(&a.name), quote_ident(b)))
                 .collect();
             format!(
                 "{kind} join {table} {alias} on {on}",

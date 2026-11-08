@@ -577,10 +577,7 @@ mod tests {
                 PlanStage::Gone(Position::FIRST, Some("2".into())),
                 OneToOneBuildStep::JoinedGone,
             ),
-            (
-                PlanStage::Gone(last(), None),
-                OneToOneBuildStep::JoinedGone,
-            ),
+            (PlanStage::Gone(last(), None), OneToOneBuildStep::JoinedGone),
             (PlanStage::Walk(None), OneToOneBuildStep::PlanningChunks),
             (
                 PlanStage::Walk(Some("a9".into())),
@@ -703,7 +700,10 @@ mod tests {
             }
         }
         for tag in PLAN_TAGS {
-            assert!(written.iter().any(|w| w == tag), "{tag} is written by no stage");
+            assert!(
+                written.iter().any(|w| w == tag),
+                "{tag} is written by no stage"
+            );
         }
         for stage in [
             Stage::Stale(None),

@@ -178,7 +178,11 @@ async fn null_keyed_pages_queue_on_the_entry(both_null: bool) {
         held.finish().await;
         queued.finish().await;
         star::assert_oracle(&mut d, &[star]).await;
-        assert!(blocked, "{}: the second page queued on the entry", star.name());
+        assert!(
+            blocked,
+            "{}: the second page queued on the entry",
+            star.name()
+        );
     }
 }
 
@@ -252,10 +256,18 @@ async fn n_rederives_move_root_rows_onto_and_off_a_null_key() {
     knob();
     let stars = AT.stars();
     let mut d = star::start(&stars, A_ROWS, B_ROWS).await;
-    star::write_uncaptured(&d, "public.a", &AT.sql("update public.a set {k} = 10 where id = 4"))
-        .await;
-    star::write_uncaptured(&d, "public.a", &AT.sql("update public.a set {k} = null where id = 2"))
-        .await;
+    star::write_uncaptured(
+        &d,
+        "public.a",
+        &AT.sql("update public.a set {k} = 10 where id = 4"),
+    )
+    .await;
+    star::write_uncaptured(
+        &d,
+        "public.a",
+        &AT.sql("update public.a set {k} = null where id = 2"),
+    )
+    .await;
     star::write_uncaptured(
         &d,
         "public.a",
@@ -286,15 +298,25 @@ async fn r_root_rederives_race_changes_of_either_side() {
     knob();
     const A1: Writer = Writer::Rederive("public.a", &["1"]);
     for (first, second) in [
-        (A1, Writer::Change(leak(AT.sql("update {b} set w = 102 where id = 1")))),
+        (
+            A1,
+            Writer::Change(leak(AT.sql("update {b} set w = 102 where id = 1"))),
+        ),
         (
             Writer::Rederive("public.a", &["3"]),
             Writer::Change(leak(AT.sql("update {b} set k = 30 where id = 3"))),
         ),
-        (A1, Writer::Change(leak(AT.sql("update public.a set {k} = 20 where id = 1")))),
+        (
+            A1,
+            Writer::Change(leak(AT.sql("update public.a set {k} = 20 where id = 1"))),
+        ),
         (A1, Writer::Rederive("public.b2", &["1"])),
         (
-            Writer::Both("public.a", &["1"], leak(AT.sql("update {b} set w = 9 where id = 2"))),
+            Writer::Both(
+                "public.a",
+                &["1"],
+                leak(AT.sql("update {b} set w = 9 where id = 2")),
+            ),
             Writer::Change(leak(AT.sql("update {b} set w = 103 where id = 1"))),
         ),
     ] {
@@ -425,8 +447,12 @@ async fn root_rederives_repair_uncaptured_changes() {
     .await;
     star::write_uncaptured(&d, "public.a", "update public.a set k1 = 1005 where id = 3").await;
     star::write_uncaptured(&d, "public.a", "delete from public.a where id = 2").await;
-    star::write_uncaptured(&d, "public.a", &AT.sql("insert into {a_ins} values (8, 10, 8, 'eight')"))
-        .await;
+    star::write_uncaptured(
+        &d,
+        "public.a",
+        &AT.sql("insert into {a_ins} values (8, 10, 8, 'eight')"),
+    )
+    .await;
     d.stage_recomputes("public.a", &["1", "2", "3", "8"]).await;
     let batch = d.seal().await;
     let moves = trellis::dev::interleave::join_key_moves();
@@ -557,6 +583,10 @@ async fn two_root_pages_on_a_new_row_queue_on_the_placeholder() {
         queued.finish().await;
         assert_eq!(total(&d, star, 9).await, joined_total(99, 100), "{star:?}");
         star::assert_oracle(&mut d, &[star]).await;
-        assert!(blocked, "{}: the older page queued on the placeholder", star.name());
+        assert!(
+            blocked,
+            "{}: the older page queued on the placeholder",
+            star.name()
+        );
     }
 }
