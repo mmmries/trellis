@@ -416,6 +416,14 @@ pub(super) struct Arg {
     /// Whether it is a `numeric` argument a `SUM` or `AVG` reads, so it
     /// keeps [`NUMERIC_PARTS`] (see "Numeric sums" in the module doc).
     pub(super) numeric: bool,
+    /// The scale a `numeric` sum's column declares (`numeric(p,s)`, a
+    /// negative `s` as 0), when the plan read one ([`declare_scales`]): every
+    /// finite value it holds has that scale, so the statements count it
+    /// without folding scale maps. Only a hint: each statement stays exact
+    /// for a map that counts another scale, which a change of the column's
+    /// type can leave behind. `None` for any other argument, and in every
+    /// plan that reads no declared scale.
+    pub(super) scale: Option<i32>,
 }
 
 /// What a group-basis definition's target looks like ([`route`]).
@@ -525,6 +533,7 @@ pub(crate) fn route(
                 expr: arg.clone(),
                 summed: false,
                 numeric: false,
+                scale: None,
             })
             .collect(),
         aggs: Vec::new(),
@@ -863,14 +872,40 @@ impl SumPart {
 
     /// The total of this partial over the rows of an aggregate, each row's
     /// argument value `x` weighted by `w` (`1` for an absolute write's rows,
-    /// a side's sign on a page): its zero over no rows.
-    pub(crate) fn of_rows(self, x: &str, numeric: bool, w: &str) -> String {
-        match self {
-            SumPart::Scales => scales_of(
+    /// a side's sign on a page): its zero over no rows. `scale` is the
+    /// argument's declared scale, when it has one ([`Arg::scale`]): a scale
+    /// map then counts the rows at that scale without folding a map, and
+    /// folds only the rows at any other scale, which no row of a column of
+    /// that type has.
+    pub(crate) fn of_rows(self, x: &str, numeric: bool, w: &str, scale: Option<i32>) -> String {
+        match (self, scale) {
+            (SumPart::Scales, Some(s)) => {
+                let other = format!("scale(({x})) <> {s}");
+                let at = if w == "1" {
+                    format!("count(*) filter (where scale(({x})) = {s})")
+                } else {
+                    format!("coalesce(sum({w}) filter (where scale(({x})) = {s}), 0)")
+                };
+                let others = scales_of(
+                    &format!("array_agg(scale(({x}))) filter (where {other})"),
+                    (w != "1")
+                        .then(|| format!("array_agg({w}) filter (where {other})"))
+                        .as_deref(),
+                );
+                format!(
+                    "(case when bool_or({other}) is not true then {single} \
+                           else {merged} end)",
+                    single = single_scale(s, &at),
+                    merged = scales_add(&single_scale(s, &at), &others, "1"),
+                )
+            }
+            (SumPart::Scales, None) => scales_of(
                 &format!("array_agg(scale(({x})))"),
                 (w != "1").then(|| format!("array_agg({w})")).as_deref(),
             ),
-            SumPart::Sum => format!("coalesce(sum({}), 0)", self.weighted(x, numeric, w)),
+            (SumPart::Sum, _) => {
+                format!("coalesce(sum({}), 0)", self.weighted(x, numeric, w))
+            }
             _ => format!("coalesce(sum({}), 0)::bigint", self.weighted(x, numeric, w)),
         }
     }
@@ -878,46 +913,106 @@ impl SumPart {
     /// The total of this partial's values `value` over the rows of an
     /// aggregate (those meeting `condition`, if any): its zero over no rows.
     /// A scale map folds only the maps that aren't empty, so one change's
-    /// map, the common case, is taken as it is.
-    pub(crate) fn total(self, value: &str, condition: Option<&str>) -> String {
+    /// map, the common case, is taken as it is. Under a declared `scale`
+    /// ([`Arg::scale`]) it sums each map's count at that scale, and folds
+    /// only the maps that have another.
+    pub(crate) fn total(self, value: &str, condition: Option<&str>, scale: Option<i32>) -> String {
         let filter = condition
             .map(|c| format!(" filter (where {c})"))
             .unwrap_or_default();
-        match self {
-            SumPart::Scales => {
+        match (self, scale) {
+            (SumPart::Scales, Some(s)) => {
+                let both = |c: String| match condition {
+                    Some(cond) => format!("({cond}) and {c}"),
+                    None => c,
+                };
+                let at = format!("coalesce(sum({}){filter}, 0)", scale_count(value, s));
+                let others = scales_sum(&format!(
+                    "array_agg(({value}) - '{s}'::text) filter (where {})",
+                    both(format!("not {}", only_scale(value, s)))
+                ));
+                format!(
+                    "(case when bool_and({only}){filter} is not false then {single} \
+                           else {merged} end)",
+                    only = only_scale(value, s),
+                    single = single_scale(s, &at),
+                    merged = scales_add(&single_scale(s, &at), &others, "1"),
+                )
+            }
+            (SumPart::Scales, None) => {
                 let only = match condition {
                     Some(c) => format!("{value} <> {NO_SCALES} and ({c})"),
                     None => format!("{value} <> {NO_SCALES}"),
                 };
                 scales_sum(&format!("array_agg({value}) filter (where {only})"))
             }
-            SumPart::Sum => format!("coalesce(sum({value}){filter}, 0)"),
+            (SumPart::Sum, _) => format!("coalesce(sum({value}){filter}, 0)"),
             _ => format!("coalesce(sum({value}){filter}, 0)::bigint"),
         }
     }
 
-    /// `a + b`.
-    pub(crate) fn add(self, a: &str, b: &str) -> String {
+    /// `a + b`, under the argument's declared `scale` ([`Arg::scale`]).
+    pub(crate) fn add(self, a: &str, b: &str, scale: Option<i32>) -> String {
         match self {
-            SumPart::Scales => scales_add(a, b, "1"),
+            SumPart::Scales => scales_add_at(a, b, "1", scale),
             _ => format!("({a} + {b})"),
         }
     }
 
-    /// `a - b`.
-    pub(crate) fn sub(self, a: &str, b: &str) -> String {
+    /// `a - b`, under the argument's declared `scale` ([`Arg::scale`]).
+    pub(crate) fn sub(self, a: &str, b: &str, scale: Option<i32>) -> String {
         match self {
-            SumPart::Scales => scales_add(a, b, "-1"),
+            SumPart::Scales => scales_add_at(a, b, "-1", scale),
             _ => format!("({a} - {b})"),
         }
     }
 
-    /// `a × n`, for the integer `n`.
-    pub(crate) fn times(self, a: &str, n: &str) -> String {
-        match self {
-            SumPart::Scales => scales_times(a, n),
+    /// `a × n`, for the integer `n`, under the argument's declared `scale`
+    /// ([`Arg::scale`]).
+    pub(crate) fn times(self, a: &str, n: &str, scale: Option<i32>) -> String {
+        match (self, scale) {
+            (SumPart::Scales, Some(s)) => format!(
+                "(case when {only} then {single} else {general} end)",
+                only = only_scale(a, s),
+                single = single_scale(s, &format!("{} * ({n})::bigint", scale_count(a, s))),
+                general = scales_times(a, n),
+            ),
+            (SumPart::Scales, None) => scales_times(a, n),
             _ => format!("({a} * {n})"),
         }
+    }
+}
+
+/// The scale map `{"<s>": <count>}`, or the empty map when `count` is 0.
+fn single_scale(s: i32, count: &str) -> String {
+    format!("jsonb_strip_nulls(jsonb_build_object('{s}', nullif({count}, 0)))")
+}
+
+/// Whether the scale map `map` counts no scale but `s`.
+fn only_scale(map: &str, s: i32) -> String {
+    format!("((({map}) - '{s}'::text) = {NO_SCALES})")
+}
+
+/// The scale map `map`'s count at scale `s`, 0 for none.
+fn scale_count(map: &str, s: i32) -> String {
+    format!("coalesce(((({map}) ->> '{s}'))::bigint, 0)")
+}
+
+/// The scale map `a + sign × b`, zeros dropped. Under a declared `scale`,
+/// two maps that count no other scale add as two counts.
+fn scales_add_at(a: &str, b: &str, sign: &str, scale: Option<i32>) -> String {
+    match scale {
+        Some(s) => format!(
+            "(case when {only_a} and {only_b} then {single} else {general} end)",
+            only_a = only_scale(a, s),
+            only_b = only_scale(b, s),
+            single = single_scale(
+                s,
+                &format!("{} + {sign} * {}", scale_count(a, s), scale_count(b, s))
+            ),
+            general = scales_add(a, b, sign),
+        ),
+        None => scales_add(a, b, sign),
     }
 }
 
@@ -1013,7 +1108,14 @@ fn max_scale(map: &str) -> String {
 /// `sum(numeric)`: `NaN` while it counts a `NaN` or both infinities, the
 /// infinity while it counts one, else the finite sum at the largest scale
 /// it counts a value of.
-pub(crate) fn sum_value(numeric: bool, part: &dyn Fn(SumPart) -> String) -> String {
+///
+/// Under a declared `scale` ([`Arg::scale`]) the largest scale is that one
+/// whenever the map counts no other, without reading the map's keys.
+pub(crate) fn sum_value(
+    numeric: bool,
+    scale: Option<i32>,
+    part: &dyn Fn(SumPart) -> String,
+) -> String {
     if !numeric {
         return part(SumPart::Sum);
     }
@@ -1028,7 +1130,18 @@ pub(crate) fn sum_value(numeric: bool, part: &dyn Fn(SumPart) -> String) -> Stri
                when {ninf} > 0 then '-Infinity'::numeric \
                else round({sum}, {scale}) end)",
         sum = part(SumPart::Sum),
-        scale = max_scale(&part(SumPart::Scales)),
+        scale = match scale {
+            Some(s) => {
+                let map = part(SumPart::Scales);
+                format!(
+                    "(case when {} and {} > 0 then {s} else {} end)",
+                    only_scale(&map, s),
+                    scale_count(&map, s),
+                    max_scale(&map)
+                )
+            }
+            None => max_scale(&part(SumPart::Scales)),
+        },
     )
 }
 
@@ -1233,6 +1346,73 @@ pub(crate) async fn column_collations(
         .into_iter()
         .map(|row| (row.get(0), row.get(1)))
         .collect())
+}
+
+/// The scale each of `args` declares as a column of `table` (a name
+/// `to_regclass` resolves), at the time of the call ([`Arg::scale`]): for a
+/// `numeric` sum over a plain column typed `numeric(p,s)`, `s` (0 for a
+/// negative `s`, whose values have scale 0), and `None` for every other
+/// argument. Each statement of a plan stays exact whatever scale its rows
+/// hold, so a type changed since makes a slower statement, never a wrong one.
+pub(super) async fn declared_scales(
+    client: &impl tokio_postgres::GenericClient,
+    table: &str,
+    args: &[Arg],
+) -> Result<Vec<Option<i32>>, tokio_postgres::Error> {
+    fn column(arg: &Arg) -> Option<&str> {
+        extreme_column(&arg.expr).filter(|_| arg.summed && arg.numeric)
+    }
+    let columns: Vec<&str> = args.iter().filter_map(column).collect();
+    if columns.is_empty() {
+        return Ok(vec![None; args.len()]);
+    }
+    let typmods: HashMap<String, i32> = client
+        .query(
+            "select a.attname::text, a.atttypmod from pg_catalog.pg_attribute a \
+             where a.attrelid = pg_catalog.to_regclass($1) and a.attname = any($2) \
+               and a.attnum > 0 and not a.attisdropped \
+               and a.atttypid = 'pg_catalog.numeric'::pg_catalog.regtype \
+               and a.atttypmod >= 4",
+            &[&ddl::regclass_arg(table), &columns],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    Ok(args
+        .iter()
+        .map(|arg| {
+            let typmod = typmods.get(column(arg)?)?;
+            Some(numeric_scale(*typmod).max(0))
+        })
+        .collect())
+}
+
+/// The scale a `numeric` type modifier declares (Postgres's
+/// `NUMERIC_TYPMOD_SCALE`: 11 bits, signed).
+fn numeric_scale(typmod: i32) -> i32 {
+    (((typmod - 4) & 0x7ff) ^ 1024) - 1024
+}
+
+impl GroupShape {
+    /// Sets each argument's declared scale as a column of `table`
+    /// ([`declared_scales`]).
+    pub(crate) async fn declare_scales(
+        &mut self,
+        client: &impl tokio_postgres::GenericClient,
+        table: &str,
+    ) -> Result<(), tokio_postgres::Error> {
+        let scales = declared_scales(client, table, &self.args).await?;
+        self.set_scales(&scales);
+        Ok(())
+    }
+
+    /// Sets each argument's declared scale to its element of `scales`.
+    pub(super) fn set_scales(&mut self, scales: &[Option<i32>]) {
+        for (arg, scale) in self.args.iter_mut().zip(scales) {
+            arg.scale = *scale;
+        }
+    }
 }
 
 /// The collations of a `JOIN` structure's group columns, in each population
@@ -1949,7 +2129,8 @@ impl GroupTargetPlan {
         let mut sums = vec!["sum(__sgn)::bigint".to_string()];
         // A `numeric` sum's scale is a grouping key too, so each staged row
         // holds one scale, and its map is that scale's signed count: no
-        // per-row map to fold.
+        // per-row map to fold. One with a declared scale counts that scale
+        // instead ([`SumPart::of_rows`]), with no key of its own.
         let mut scale_keys = String::new();
         for (i, arg) in self.shape.args.iter().enumerate() {
             let i = i + 1;
@@ -1958,14 +2139,14 @@ impl GroupTargetPlan {
             sums.push(count.clone());
             for part in arg.parts() {
                 sums.push(match part {
-                    SumPart::Scales => {
+                    SumPart::Scales if arg.scale.is_none() => {
                         scale_keys.push_str(&format!(", scale(__a{i})"));
                         format!(
                             "(case when scale(__a{i}) is null or {count} = 0 then {NO_SCALES} \
                                    else jsonb_build_object(scale(__a{i})::text, {count}) end)"
                         )
                     }
-                    _ => part.of_rows(&format!("__a{i}"), arg.numeric, "__sgn"),
+                    _ => part.of_rows(&format!("__a{i}"), arg.numeric, "__sgn", arg.scale),
                 });
             }
         }
@@ -2097,7 +2278,7 @@ impl GroupTargetPlan {
         sum: &dyn Fn(usize, SumPart) -> String,
         extreme: &dyn Fn(&Extreme) -> String,
     ) -> String {
-        let value = |i: usize| sum_value(args[i].numeric, &|part| sum(i + 1, part));
+        let value = |i: usize| sum_value(args[i].numeric, args[i].scale, &|part| sum(i + 1, part));
         match agg {
             Agg::Extreme { max, arg, pg_type } => extreme(&Extreme {
                 max: *max,
@@ -2247,11 +2428,17 @@ impl GroupTargetPlan {
             returning.push(format!("t.__c{i} as __dc{i}, u.__count_{i} as __nc{i}"));
             for part in arg.parts() {
                 let (staged, hidden) = (part.name("__", i), part.hidden(i));
-                sums.push(format!("{} as {staged}", part.total(&staged, None)));
-                totals.push(format!("{} as {staged}", part.total(&staged, None)));
+                sums.push(format!(
+                    "{} as {staged}",
+                    part.total(&staged, None, arg.scale)
+                ));
+                totals.push(format!(
+                    "{} as {staged}",
+                    part.total(&staged, None, arg.scale)
+                ));
                 sets.push(format!(
                     "{hidden} = {}",
-                    part.add(&format!("u.{hidden}"), &format!("t.{staged}"))
+                    part.add(&format!("u.{hidden}"), &format!("t.{staged}"), arg.scale)
                 ));
                 nonzero.push(part.nonzero(&format!("t.{staged}")));
                 returning.push(format!(
@@ -2334,7 +2521,10 @@ impl GroupTargetPlan {
             ));
             for part in arg.parts() {
                 let staged = part.name("__", i);
-                totals.push(format!("{} as {staged}", part.total(&staged, Some("__ok"))));
+                totals.push(format!(
+                    "{} as {staged}",
+                    part.total(&staged, Some("__ok"), arg.scale)
+                ));
             }
         }
         let mut sets = sets.to_vec();
@@ -2780,7 +2970,7 @@ impl GroupTargetPlan {
                 zeroed.push(format!("coalesce(n.{read}, {}) as {read}", part.zero()));
                 returning.push(format!(
                     "{} as {}, u.{hidden} as {}",
-                    part.sub(&format!("u.{hidden}"), &format!("r.{held}")),
+                    part.sub(&format!("u.{hidden}"), &format!("r.{held}"), arg.scale),
                     part.name("__d", i),
                     part.name("__n", i)
                 ));
@@ -2988,7 +3178,7 @@ impl GroupTargetPlan {
                 insert_cols.push(hidden);
                 insert_values.push(format!("r.{read}"));
                 delta_cols.push(part.name("__d", i));
-                delta_values.push(part.sub(&format!("r.{read}"), &format!("r.{old}")));
+                delta_values.push(part.sub(&format!("r.{read}"), &format!("r.{old}"), arg.scale));
             }
         }
         insert_cols.extend(["__basis", "__stamp"].map(String::from));
@@ -3297,7 +3487,7 @@ impl GroupTargetPlan {
     fn fresh_select(&self, values: &[String], from: &str) -> String {
         let args = &self.shape.args;
         let scaled: Vec<usize> = (0..args.len())
-            .filter(|&i| args[i].parts().contains(&SumPart::Scales))
+            .filter(|&i| args[i].scale.is_none() && args[i].parts().contains(&SumPart::Scales))
             .collect();
         // Each partial: its name, its aggregate over the rows, and, when the
         // rows are grouped by scale first, how the second step folds it.
@@ -3320,13 +3510,17 @@ impl GroupTargetPlan {
             for part in arg.parts() {
                 let name = part.name("__r", i);
                 let fold = match part {
-                    SumPart::Scales => scales_of(
+                    SumPart::Scales if arg.scale.is_none() => scales_of(
                         &format!("array_agg(__g{i})"),
                         Some(&format!("array_agg({count})")),
                     ),
-                    _ => part.total(&name, None),
+                    _ => part.total(&name, None, arg.scale),
                 };
-                partials.push((name, part.of_rows(&arg.sql, arg.numeric, "1"), fold));
+                partials.push((
+                    name,
+                    part.of_rows(&arg.sql, arg.numeric, "1", arg.scale),
+                    fold,
+                ));
             }
         }
         for x in self.shape.extremes() {
@@ -3365,8 +3559,14 @@ impl GroupTargetPlan {
             inner.push(format!("scale(({})) as __g{}", args[i].sql, i + 1));
         }
         let keys = inner.len();
+        // The scale maps the scale keys fold are computed by the outer step
+        // alone.
+        let keyed: Vec<String> = scaled
+            .iter()
+            .map(|&i| SumPart::Scales.name("__r", i + 1))
+            .collect();
         for (name, agg, _) in &partials {
-            if !name.starts_with("__rk") {
+            if !keyed.contains(name) {
                 inner.push(format!("{agg} as {name}"));
             }
         }
@@ -3635,7 +3835,13 @@ impl GroupTargetPlan {
             "__pf",
             "(up.__nn - up.__dn)",
             &|i| format!("(up.__nc{i} - up.__dc{i})"),
-            &|i, part| part.sub(&part.name("up.__n", i), &part.name("up.__d", i)),
+            &|i, part| {
+                part.sub(
+                    &part.name("up.__n", i),
+                    &part.name("up.__d", i),
+                    self.shape.args[i - 1].scale,
+                )
+            },
             &|x| x.named("up.__o"),
         );
         let field_count = self.shape.fields.len();
@@ -4242,9 +4448,10 @@ async fn plan_of(
     catalog_schema: &str,
     definition: &crate::defs::model::Definition,
 ) -> Result<Option<GroupTargetPlan>, ApplyError> {
-    let Some(shape) = route(&definition.def, &definition.source_columns) else {
+    let Some(mut shape) = route(&definition.def, &definition.source_columns) else {
         return Ok(None);
     };
+    shape.declare_scales(txn, &definition.source_table).await?;
     let source_pk = ddl::source_primary_key_in_txn(txn, &definition.source_table).await?;
     let identity = ddl::identity_key_columns(txn, &definition.target_table).await?;
     Ok(Some(GroupTargetPlan::new(
@@ -4468,9 +4675,10 @@ pub(crate) async fn rebuild_definition(
     definition: &crate::defs::model::Definition,
     scope: Option<&RebuildScope>,
 ) -> Result<Option<(usize, usize)>, ApplyError> {
-    let Some(shape) = route(&definition.def, &definition.source_columns) else {
+    let Some(mut shape) = route(&definition.def, &definition.source_columns) else {
         return Ok(None);
     };
+    shape.declare_scales(txn, &definition.source_table).await?;
     let source_pk = ddl::source_primary_key_in_txn(txn, &definition.source_table).await?;
     let identity = ddl::identity_key_columns(txn, &definition.target_table).await?;
     let plan = GroupTargetPlan::new(
@@ -4640,13 +4848,16 @@ pub async fn explain_apply(pool: &crate::pool::Pool, target: &str) -> Result<Str
             transform: target.to_string(),
         });
     };
-    let Some(shape) = route(&definition.def, &definition.source_columns) else {
+    let Some(mut shape) = route(&definition.def, &definition.source_columns) else {
         return Err(ApplyError::GroupBasisUnsupported {
             target: definition.target_table,
             what: "a definition the group basis doesn't take",
         });
     };
     let mut client = pool.get().await?;
+    shape
+        .declare_scales(&**client, &definition.source_table)
+        .await?;
     let identity = ddl::identity_key_columns(&**client, &definition.target_table).await?;
     let plan = GroupTargetPlan::new(
         pool.schema(),
@@ -5597,12 +5808,14 @@ mod tests {
                     expr: Expr::Column("a".to_string()),
                     summed: true,
                     numeric: false,
+                    scale: None,
                 },
                 Arg {
                     sql: "s.\"b\"".to_string(),
                     expr: Expr::Column("b".to_string()),
                     summed: false,
                     numeric: false,
+                    scale: None,
                 },
             ]
         );
@@ -5645,5 +5858,143 @@ mod tests {
             drop_hidden_table_sql("trellis", 7),
             "drop table if exists \"trellis\".\"agg_7\""
         );
+    }
+
+    /// Postgres's `NUMERIC_TYPMOD_SCALE`, a negative scale included.
+    #[test]
+    fn a_numeric_type_modifier_declares_its_scale() {
+        // `numeric(10,2)`, `numeric(5,0)`, `numeric(5,-2)`, `numeric(1000,1000)`.
+        for (typmod, scale) in [
+            ((10 << 16) + 2 + 4, 2),
+            ((5 << 16) + 4, 0),
+            ((5 << 16) + (-2_i32 & 0x7ff) + 4, -2),
+            ((1000 << 16) + 1000 + 4, 1000),
+        ] {
+            assert_eq!(numeric_scale(typmod), scale, "{typmod}");
+        }
+    }
+
+    /// A declared scale is only a hint ([`Arg::scale`]): every statement it
+    /// specialises stays exact for maps and rows at another scale, which a
+    /// change of the column's type can leave behind. Each specialised
+    /// expression is evaluated beside the general one, over maps and rows
+    /// that count only the declared scale, none, or others too; and
+    /// [`declared_scales`] reads the scale a column declares.
+    #[tokio::test]
+    async fn a_declared_scale_is_exact_for_any_scales() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let text = |sql: String| {
+            let client = &client;
+            async move {
+                client
+                    .query_one(&format!("select ({sql})::text"), &[])
+                    .await
+                    .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                    .get::<_, Option<String>>(0)
+            }
+        };
+        let maps = [
+            "'{}'::jsonb",
+            "'{\"2\": 3}'::jsonb",
+            "'{\"2\": -3}'::jsonb",
+            "'{\"5\": 1}'::jsonb",
+            "'{\"2\": 1, \"5\": 2}'::jsonb",
+        ];
+        let part = SumPart::Scales;
+        for a in maps {
+            for b in maps {
+                for (special, general) in [
+                    (part.add(a, b, Some(2)), part.add(a, b, None)),
+                    (part.sub(a, b, Some(2)), part.sub(a, b, None)),
+                ] {
+                    assert_eq!(text(special).await, text(general).await, "{a}, {b}");
+                }
+            }
+            for n in ["0", "1", "-2"] {
+                assert_eq!(
+                    text(part.times(a, n, Some(2))).await,
+                    text(part.times(a, n, None)).await,
+                    "{a} * {n}"
+                );
+            }
+            let value = |scale| {
+                sum_value(true, scale, &|p| match p {
+                    SumPart::Sum => "1.123456".to_string(),
+                    SumPart::Scales => a.to_string(),
+                    _ => "0".to_string(),
+                })
+            };
+            assert_eq!(text(value(Some(2))).await, text(value(None)).await, "{a}");
+        }
+        // Totals over maps, with and without a condition.
+        for rows in [
+            "values ('{}'::jsonb, true)",
+            "values ('{\"2\": 1}'::jsonb, true), ('{\"2\": 2}', false), ('{\"2\": -1}', true)",
+            "values ('{\"2\": 1}'::jsonb, true), ('{\"5\": 2}', true), ('{\"2\": 1, \"3\": 1}', false)",
+        ] {
+            for condition in [None, Some("c")] {
+                let total = |scale| {
+                    format!(
+                        "select {} from ({rows}) as v(m, c)",
+                        part.total("m", condition, scale)
+                    )
+                };
+                assert_eq!(
+                    text(total(Some(2))).await,
+                    text(total(None)).await,
+                    "{rows} {condition:?}"
+                );
+            }
+        }
+        // Counts over rows, weighted and not.
+        for rows in [
+            "values (1.25::numeric, 1), (2.50, -1), (3.75, 1)",
+            "values (1.25::numeric, 1), (2.5, 1), (1.12345, -1), ('NaN', 1), (null, 1)",
+            "values (null::numeric, 1)",
+        ] {
+            for w in ["1", "w"] {
+                let count = |scale| {
+                    format!(
+                        "select {} from ({rows}) as v(x, w)",
+                        part.of_rows("x", true, w, scale)
+                    )
+                };
+                assert_eq!(
+                    text(count(Some(2))).await,
+                    text(count(None)).await,
+                    "{rows} {w}"
+                );
+            }
+        }
+        client
+            .batch_execute(
+                "create table public.s (a numeric(10,2), b numeric, c numeric(5,-2), d integer)",
+            )
+            .await
+            .expect("source");
+        let def = crate::defs::parse(
+            "TRANSFORM t FROM s GROUP BY d SELECT SUM(a) AS a, SUM(b) AS b, SUM(c) AS c, \
+             SUM(a + 1) AS e, COUNT(a) AS n",
+        )
+        .expect("parses");
+        let mut cols = HashMap::new();
+        for c in ["a", "b", "c"] {
+            cols.insert(c.to_string(), ValueType::Numeric);
+        }
+        cols.insert("d".to_string(), ValueType::Integer(IntWidth::Int4));
+        let mut shape = route(&def, &cols).expect("admitted");
+        shape
+            .declare_scales(&client, "public.s")
+            .await
+            .expect("declared scales");
+        let scales: Vec<Option<i32>> = shape.args.iter().map(|arg| arg.scale).collect();
+        assert_eq!(scales, [Some(2), None, Some(0), None]);
     }
 }

@@ -473,6 +473,7 @@ impl JoinTargetPlan {
                 expr: arg.clone(),
                 summed: false,
                 numeric: false,
+                scale: None,
             })
             .collect();
         let t_groups: Vec<(Side, String)> = join
@@ -740,7 +741,7 @@ impl JoinTargetPlan {
                 let staged = part.name("__", i);
                 insert_cols.push(staged.clone());
                 if from {
-                    let total = part.total(&part.hidden(i), None);
+                    let total = part.total(&part.hidden(i), None, arg.scale);
                     sums.push(format!("{total} as {staged}"));
                     nonzero.push(part.nonzero(&total));
                     select.push(format!("q.{staged}"));
@@ -798,7 +799,10 @@ impl JoinTargetPlan {
                 columns.push(format!("sum(__dc{i})::bigint as __dc{i}"));
                 for part in arg.parts() {
                     let delta = part.name("__d", i);
-                    columns.push(format!("{} as {delta}", part.total(&delta, None)));
+                    columns.push(format!(
+                        "{} as {delta}",
+                        part.total(&delta, None, arg.scale)
+                    ));
                 }
             }
             format!(
@@ -864,10 +868,19 @@ impl JoinTargetPlan {
         // `P_old` of cell `p`, given its delta row `d` (left joined).
         let p_old_n = "(p.__n - coalesce(d.__dn, 0))".to_string();
         let p_old_c = |i: usize| format!("(p.__count_{i} - coalesce(d.__dc{i}, 0))");
+        // The declared scale of `T`'s argument `i` (1-based).
+        let scale_of = |i: usize| {
+            if i <= fa {
+                p_args[i - 1].scale
+            } else {
+                m_args[i - 1 - fa].scale
+            }
+        };
         let p_old = |i: usize, part: SumPart| {
             part.sub(
                 &format!("p.{}", part.hidden(i)),
                 &format!("coalesce(d.{}, {})", part.name("__d", i), part.zero()),
+                scale_of(i),
             )
         };
         // The argument `i` of `T` (1-based) as the `i - fa`-th of `M`.
@@ -884,9 +897,13 @@ impl JoinTargetPlan {
             }
             let part = |i: usize, part: SumPart| {
                 if i <= fa {
-                    part.times(&format!("d.{}", part.name("__d", i)), "m.__n")
+                    part.times(&format!("d.{}", part.name("__d", i)), "m.__n", scale_of(i))
                 } else {
-                    part.times(&format!("m.{}", part.hidden(m_index(i))), "d.__dn")
+                    part.times(
+                        &format!("m.{}", part.hidden(m_index(i))),
+                        "d.__dn",
+                        scale_of(i),
+                    )
                 }
             };
             terms.push(format!(
@@ -906,9 +923,13 @@ impl JoinTargetPlan {
             }
             let part = |i: usize, part: SumPart| {
                 if i <= fa {
-                    part.times(&p_old(i, part), "e.__dn")
+                    part.times(&p_old(i, part), "e.__dn", scale_of(i))
                 } else {
-                    part.times(&format!("e.{}", part.name("__d", m_index(i))), &p_old_n)
+                    part.times(
+                        &format!("e.{}", part.name("__d", m_index(i))),
+                        &p_old_n,
+                        scale_of(i),
+                    )
                 }
             };
             terms.push(format!(
@@ -952,8 +973,9 @@ impl JoinTargetPlan {
                 let part = |i: usize, part: SumPart| {
                     if i <= fa {
                         part.sub(
-                            &part.times(&format!("p.{}", part.hidden(i)), "jd.__new"),
-                            &part.times(&p_old(i, part), "jd.__old"),
+                            &part.times(&format!("p.{}", part.hidden(i)), "jd.__new", scale_of(i)),
+                            &part.times(&p_old(i, part), "jd.__old", scale_of(i)),
+                            scale_of(i),
                         )
                     } else {
                         part.zero().to_string()
@@ -1036,7 +1058,7 @@ impl JoinTargetPlan {
             nonzero.push(format!("sum(__c{i}) <> 0"));
             for part in arg.parts() {
                 let staged = part.name("__", i);
-                let total = part.total(&staged, None);
+                let total = part.total(&staged, None, arg.scale);
                 nonzero.push(part.nonzero(&total));
                 sums.push(total);
                 insert_cols.push(staged);
@@ -1155,7 +1177,7 @@ impl JoinTargetPlan {
                 .iter()
                 .map(|c| {
                     if c.starts_with("__scales_") {
-                        format!("{} as {c}", SumPart::Scales.total(c, None))
+                        format!("{} as {c}", SumPart::Scales.total(c, None, None))
                     } else {
                         format!("sum({c}) as {c}")
                     }
@@ -1556,7 +1578,7 @@ pub(crate) async fn plan_for(
         let columns = group_basis::column_collations(client, &name).await?;
         collations.hidden.insert(table, columns);
     }
-    JoinTargetPlan::new(
+    let mut plan = JoinTargetPlan::new(
         catalog_schema,
         definition,
         &joined,
@@ -1565,7 +1587,19 @@ pub(crate) async fn plan_for(
         &collations,
         identity,
         source_pks,
-    )
+    )?;
+    // Each sum's declared scale, by the column of its side (`T`'s
+    // arguments are `P`'s then `M`'s).
+    let mut scales =
+        group_basis::declared_scales(client, &definition.source_table, &plan.from.plan.shape.args)
+            .await?;
+    let joined_scales =
+        group_basis::declared_scales(client, &joined.0, &plan.joined.plan.shape.args).await?;
+    plan.from.plan.shape.set_scales(&scales);
+    plan.joined.plan.shape.set_scales(&joined_scales);
+    scales.extend(joined_scales);
+    plan.t.shape.set_scales(&scales);
+    Ok(plan)
 }
 
 /// A quarantine release's (or the automatic retry's) work on `definition`, a
