@@ -892,17 +892,19 @@ pub(crate) fn put_unrunnable_reason(reasons: &mut Vec<Reason>, source_table: &st
     reasons.push(Reason::standing(source_table, &[], reason));
 }
 
-/// The floor of `def`, which reads `source` and, for a `JOIN`, `joined`,
-/// over those tables' columns as they are now: what define writes, and what
+/// The floor of `def`, which reads `source` and, for a `JOIN`, each of
+/// `joined` by position, over those tables' columns as they are now: what define writes, and what
 /// [`stamp`] stores.
 pub(crate) async fn of_live(
     client: &impl tokio_postgres::GenericClient,
     floors: &Floors,
     def: &TransformDef,
     source: &str,
-    joined: Option<&str>,
+    joined: &[&str],
 ) -> Result<Release, super::catalog::CatalogError> {
-    let tables: Vec<&str> = std::iter::once(source).chain(joined).collect();
+    let tables: Vec<&str> = std::iter::once(source)
+        .chain(joined.iter().copied())
+        .collect();
     Ok(
         match on_live_retype(client, floors, def, source, joined).await? {
             OnRetype::Restamp(floor) => floor,
@@ -947,13 +949,17 @@ pub(crate) async fn stamp(
 ) -> Result<Release, super::catalog::CatalogError> {
     let row = client
         .query_one(
-            "select source_table, join_table from transform_definitions where id = $1",
+            &format!(
+                "select d.source_table, {} from transform_definitions d where d.id = $1",
+                super::catalog::joined_tables_array_sql("d")
+            ),
             &[&id],
         )
         .await?;
     let source: String = row.get(0);
-    let joined: Option<String> = row.get(1);
-    let floor = of_live(client, floors, def, &source, joined.as_deref()).await?;
+    let joined: Vec<String> = row.get(1);
+    let joined: Vec<&str> = joined.iter().map(String::as_str).collect();
+    let floor = of_live(client, floors, def, &source, &joined).await?;
     store(client, id, floor).await?;
     Ok(floor)
 }
@@ -1044,19 +1050,22 @@ pub(crate) async fn live_key_features(
     Ok(Some(features))
 }
 
-/// [`on_retype`] over the live columns of `source` and `joined`, the tables
-/// `def` reads.
+/// [`on_retype`] over the live columns of `source` and each of `joined`, by
+/// position, the tables `def` reads. The validation reads the columns of
+/// position 1 alone, as [`super::validate::validate_join`] does.
 pub(crate) async fn on_live_retype(
     client: &impl tokio_postgres::GenericClient,
     floors: &Floors,
     def: &TransformDef,
     source: &str,
-    joined: Option<&str>,
+    joined: &[&str],
 ) -> Result<OnRetype, super::catalog::CatalogError> {
-    let tables: Vec<&str> = std::iter::once(source).chain(joined).collect();
+    let tables: Vec<&str> = std::iter::once(source)
+        .chain(joined.iter().copied())
+        .collect();
     let partitioned = any_partitioned(client, &tables).await?;
     let from = super::catalog::column_infos(client, source).await?;
-    let joined_columns = match joined {
+    let joined_columns = match joined.first() {
         Some(joined) => Some(super::catalog::column_infos(client, joined).await?),
         None => None,
     };

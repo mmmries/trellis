@@ -593,7 +593,7 @@ pub(crate) async fn pause_joins_without_unique_key(
         .iter()
         .filter(|r| {
             !r.capture_failed
-                && r.join.as_deref() == Some(table)
+                && r.joined.iter().any(|joined| joined == table)
                 && crate::defs::join::is_one_to_one(&r.def)
         })
         .collect();
@@ -853,7 +853,7 @@ pub(crate) async fn pause_readers_of_missing_probe_index(
         .filter(|r| {
             !r.capture_failed
                 && r.source == table
-                && r.join.is_none()
+                && r.joined.is_empty()
                 && matches!(r.def.key_space, KeySpace::Aggregate { .. })
         })
         .collect();
@@ -1280,20 +1280,18 @@ pub(crate) async fn pause_readers_of_retyped(
                 (Some((old, _)), Some(now)) if old != &now.ty
             )
         });
-        if let Some(joined) = &reader.join
-            && join_key_moved
-        {
+        if !reader.joined.is_empty() && join_key_moved {
             let sides = crate::defs::catalog::JoinSides::read(
                 &*client,
                 reader.source.clone(),
-                joined.clone(),
+                reader.joined.clone(),
             )
             .await?;
             if let Err(err @ ValidationError::JoinKeyTypeMismatch { .. }) =
                 crate::defs::validate::validate_join(
                     &reader.def,
                     &sides.from_columns,
-                    &sides.joined_columns,
+                    &sides.first_joined().columns,
                 )
             {
                 refused = true;
@@ -1388,7 +1386,7 @@ pub(crate) async fn pause_readers_of_retyped(
                 floors,
                 &reader.def,
                 &reader.source,
-                reader.join.as_deref(),
+                &reader.joined.iter().map(String::as_str).collect::<Vec<_>>(),
             )
             .await?
             {
@@ -1758,7 +1756,7 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
 
 /// `(transform_id, tbl, col, kind, was, now)`, one row for each column a
 /// definition reads whose recorded type is one enum and whose live type is
-/// another: `kind` `source` or `join` for a column of its
+/// another: `kind` `source`, `join` (position 1) or `joined` (a later position) for a column of its
 /// `source_columns` or `join_columns` whose token (`enum:schema.typname`)
 /// names another type than the column's, `key` for a key column whose
 /// `definition_key_types` OID is an enum's and isn't the column's. `was`
@@ -1777,7 +1775,11 @@ const RETYPED_ENUM_COLUMNS: &str = "\
         from pg_catalog.jsonb_each_text(d.source_columns) e \
         union all \
         select d.join_table, e.key, 'join', e.value \
-        from pg_catalog.jsonb_each_text(coalesce(d.join_columns, '{}'::jsonb)) e) c \
+        from pg_catalog.jsonb_each_text(coalesce(d.join_columns, '{}'::jsonb)) e \
+        union all \
+        select j.table_name, e.key, 'joined', e.value from definition_join_tables j \
+        cross join lateral pg_catalog.jsonb_each_text(j.columns) e \
+        where j.transform_id = d.id) c \
     join pg_catalog.pg_attribute a \
       on a.attrelid = pg_catalog.to_regclass( \
              pg_catalog.quote_ident(pg_catalog.split_part(c.tbl, '.', 1)) || '.' || \
@@ -1853,6 +1855,16 @@ async fn rerecord_retyped_enums(
                                                              pg_catalog.to_jsonb($3::text)) \
                      where id = $1",
                     &[&c.id, &c.column, &token],
+                )
+                .await?;
+            }
+            "joined" => {
+                txn.execute(
+                    "update definition_join_tables \
+                     set columns = pg_catalog.jsonb_set(columns, array[$2], \
+                                                        pg_catalog.to_jsonb($3::text)) \
+                     where transform_id = $1 and table_name = $4",
+                    &[&c.id, &c.column, &token, &c.table],
                 )
                 .await?;
             }
@@ -2063,9 +2075,9 @@ fn reads_both(copy: &copies::TypedCopy) -> bool {
 
 /// The source columns, as `(qualified table, column)`, that `states`' copies
 /// read and whose value type is no longer the one `reader`'s definition
-/// recorded for them (`transform_definitions.source_columns` and
-/// `join_columns`, as define or the last resume recorded): a column that
-/// widened, as opposed to one whose modifier alone changed, which is no
+/// recorded for them (`transform_definitions.source_columns`, and each
+/// joined table's columns, as define or the last resume recorded): a column
+/// that widened, as opposed to one whose modifier alone changed, which is no
 /// change of value type. A column with no recorded type, or none live, is not
 /// counted.
 async fn changed_inputs(
@@ -2078,7 +2090,7 @@ async fn changed_inputs(
         reader.source.clone(),
         crate::defs::catalog::source_columns_in(client, reader.id).await?,
     );
-    if let Some((joined, columns)) = crate::defs::catalog::join_side_of(client, reader.id).await? {
+    for (joined, columns) in crate::defs::catalog::join_sides_of(client, reader.id).await? {
         recorded.insert(joined, columns);
     }
     let mut live: HashMap<String, HashMap<String, crate::defs::ValueType>> = HashMap::new();
@@ -2637,7 +2649,7 @@ mod tests {
                         capture_failed: *capture_failed,
                         refresh_stamp: None,
                         target: format!("public.t{}", i + 1),
-                        join: join.map(str::to_string),
+                        joined: join.map(str::to_string).into_iter().collect(),
                     }
                 })
                 .collect(),

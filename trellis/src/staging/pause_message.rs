@@ -520,7 +520,7 @@ async fn recheck(
         .map(|r| r.source_table.as_str())
         .collect();
     tables.insert(reader.source.as_str());
-    tables.extend(reader.join.as_deref());
+    tables.extend(reader.joined.iter().map(String::as_str));
     let mut live = std::collections::HashMap::new();
     for table in tables {
         let columns = crate::capture::columns::live_columns(client, table).await?;
@@ -619,7 +619,7 @@ fn recheck_against(
         }
     }
     let tables: Vec<&str> = std::iter::once(reader.source.as_str())
-        .chain(reader.join.as_deref())
+        .chain(reader.joined.iter().map(String::as_str))
         .collect();
     for table in tables {
         let Some((present, _)) = live(table) else {
@@ -745,12 +745,24 @@ async fn resume_outcome(
     outcome.step(format!(
         "rebuild {} from {}",
         definition.target_table,
-        match catalog::join_table_of(txn, id).await? {
-            Some(joined) => format!("{} and {joined}", definition.source_table),
-            None => definition.source_table.clone(),
-        }
+        and_list(
+            std::iter::once(definition.source_table.clone())
+                .chain(catalog::joined_tables_of(txn, id).await?)
+        )
     ));
     Ok(Some(outcome))
+}
+
+/// `items` as an English list: `a`, `a and b`, `a, b and c`.
+fn and_list(items: impl IntoIterator<Item = String>) -> String {
+    let mut items: Vec<String> = items.into_iter().collect();
+    let Some(last) = items.pop() else {
+        return String::new();
+    };
+    if items.is_empty() {
+        return last;
+    }
+    format!("{} and {last}", items.join(", "))
 }
 
 /// The resume outcome's re-keying provider: what a resume does with
@@ -983,7 +995,7 @@ mod tests {
             capture_failed: true,
             refresh_stamp: None,
             target: "public.t".to_string(),
-            join: None,
+            joined: Vec::new(),
         }
     }
 

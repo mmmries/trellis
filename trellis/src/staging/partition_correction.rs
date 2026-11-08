@@ -1031,7 +1031,8 @@ async fn readers(
         .query(
             &format!(
                 "select id from transform_definitions \
-                 where (source_table = $1 or join_table = $1) and {APPLYING_SQL} order by id"
+                 where {} and {APPLYING_SQL} order by id",
+                crate::defs::catalog::reads_table_sql("transform_definitions", "$1")
             ),
             &[&source_table],
         )

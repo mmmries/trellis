@@ -582,6 +582,15 @@ pub(crate) async fn follow_renamed_types(client: &mut Client) -> Result<(), Capt
             )
             .await?;
             txn.execute(
+                &format!(
+                    "update definition_join_tables j set columns = {} \
+                     where j.transform_id = any($1)",
+                    rename("j.table_name", "j.columns"),
+                ),
+                &[&owners, &old_token, &new_token, oid],
+            )
+            .await?;
+            txn.execute(
                 "update definition_key_types set type_name = $2 \
                  where transform_id = any($1) and type_oid = $3",
                 &[&owners, new, oid],
@@ -967,13 +976,21 @@ async fn respond(
             definition.source_columns.get(column).cloned(),
             revalidated.source_columns.get(column).cloned(),
         )
-    } else if let Some(sides) = revalidated.join.as_ref().filter(|s| s.joined == table) {
-        let recorded = crate::defs::catalog::join_side_of(txn, reader.id)
+    } else if let Some((index, side)) = revalidated.join.as_ref().and_then(|sides| {
+        sides
+            .joined
+            .iter()
+            .enumerate()
+            .find(|(_, side)| side.table == table)
+    }) {
+        let recorded = crate::defs::catalog::join_sides_of(txn, reader.id)
             .await?
+            .into_iter()
+            .nth(index)
             .and_then(|(_, columns)| columns.get(column).cloned());
         (
             recorded,
-            sides.joined_columns.get(column).map(|info| info.value_type),
+            side.columns.get(column).map(|info| info.value_type),
         )
     } else {
         (None, None)

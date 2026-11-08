@@ -99,6 +99,7 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
             reset: r#"{"status":"waiting_to_backfill","fuse_rearmed_at":null,"build":null,"build_seg":null}"#,
         },
     ),
+    ("definition_join_tables", Class::Definition { reset: NONE }),
     ("definition_key_types", Class::Definition { reset: NONE }),
     ("definition_types", Class::Definition { reset: NONE }),
     ("definition_enum_values", Class::Definition { reset: NONE }),
@@ -413,6 +414,18 @@ pub async fn dump_definitions_sql(pool: &Pool, config: &Config) -> Result<String
 ///     floor_version text not null      -- its floor (ADR-0024)
 /// )
 /// ```
+///
+/// A dump with a definition that joins more than one table writes one more
+/// column, last, and the same columns before it:
+///
+/// ```sql
+///     later_join_tables text[] not null -- schema.table of each joined table
+///                                       -- after `join_table`, by position
+/// ```
+///
+/// A dump without one writes the columns above alone, so its file is what
+/// it was before the column existed, and a release that reads only them
+/// still loads it. Every release reads both shapes.
 pub const RESTORE_QUEUE: &str = "restore_queue";
 
 /// The columns of [`RESTORE_QUEUE`], in order.
@@ -425,6 +438,10 @@ const QUEUE_COLUMNS: &[&str] = &[
     "grammar_version",
     "floor_version",
 ];
+
+/// The column [`RESTORE_QUEUE`] has after [`QUEUE_COLUMNS`] in a dump with a
+/// definition that joins more than one table.
+const LATER_JOIN_TABLES: &str = "later_join_tables";
 
 /// What a schema dump of an embedded database needs from Trellis
 /// ([`crate::Trellis::schema_dump`]): the `pg_dump` arguments that leave Trellis's own
@@ -474,13 +491,25 @@ fn one_line_literal(text: &str) -> String {
     literal
 }
 
+/// ` joined with b`, ` joined with b and c` or ` joined with b, c and d`
+/// for a definition's joined tables; empty for none.
+fn joined_with(joined: &[&str]) -> String {
+    match joined.split_last() {
+        None => String::new(),
+        Some((last, [])) => format!(" joined with {last}"),
+        Some((last, before)) => format!(" joined with {} and {last}", before.join(", ")),
+    }
+}
+
 /// One definition as the dump records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Recorded {
     id: i64,
     source_table: String,
     target_table: String,
-    join_table: Option<String>,
+    /// Its joined tables, by position: empty for a definition that isn't
+    /// a `JOIN`.
+    joined: Vec<String>,
     definition_text: String,
     grammar_version: i32,
     floor_version: String,
@@ -500,7 +529,7 @@ fn restore_order(mut definitions: Vec<Recorded>) -> Vec<Recorded> {
             left.iter().map(|d| d.target_table.clone()).collect();
         let next = left.iter().position(|d| {
             std::iter::once(&d.source_table)
-                .chain(d.join_table.as_ref())
+                .chain(&d.joined)
                 .all(|read| read == &d.target_table || !unplaced_targets.contains(read))
         });
         placed.push(left.remove(next.unwrap_or(0)));
@@ -532,9 +561,15 @@ pub async fn schema_dump(pool: &Pool, config: &Config) -> Result<SchemaDump, Tre
     let rows = txn
         .query(
             &format!(
-                "select id, source_table, target_table, join_table, definition_text, \
-                        grammar_version, floor_version \
-                 from {quoted_schema}.transform_definitions order by id"
+                "select d.id, d.source_table, d.target_table, \
+                        array(select j.table_name from \
+                              (select 1 as position, d.join_table as table_name \
+                               where d.join_table is not null \
+                               union all select f.position, f.table_name \
+                               from {quoted_schema}.definition_join_tables f \
+                               where f.transform_id = d.id) j order by j.position), \
+                        d.definition_text, d.grammar_version, d.floor_version \
+                 from {quoted_schema}.transform_definitions d order by d.id"
             ),
             &[],
         )
@@ -545,12 +580,13 @@ pub async fn schema_dump(pool: &Pool, config: &Config) -> Result<SchemaDump, Tre
             id: row.get(0),
             source_table: row.get(1),
             target_table: row.get(2),
-            join_table: row.get(3),
+            joined: row.get(3),
             definition_text: row.get(4),
             grammar_version: row.get(5),
             floor_version: row.get(6),
         })
         .collect();
+    let later_joins = definitions.iter().any(|d| d.joined.len() > 1);
     // Each target's ledger that exists: a 1-1 target's.
     let mut ledgers: Vec<String> = Vec::new();
     for definition in &definitions {
@@ -584,24 +620,40 @@ pub async fn schema_dump(pool: &Pool, config: &Config) -> Result<SchemaDump, Tre
     pg_dump_args.extend(ledgers.into_iter().map(|l| format!("--exclude-table={l}")));
 
     let queue = format!("{quoted_schema}.{RESTORE_QUEUE}");
+    let later_column = if later_joins {
+        format!(", {LATER_JOIN_TABLES} text[] not null")
+    } else {
+        String::new()
+    };
     let mut appendix = format!(
         "-- Trellis definitions (trellis::dump::schema_dump): `migrate` restores each into its\n\
          -- target and drops the queue (docs/embedding.md, schema dumps).\n\
          create schema if not exists {quoted_schema};\n\
          create table {queue} (ordinal integer primary key, source_table text not null, \
          target_table text not null, join_table text, definition_text text not null, \
-         grammar_version integer not null, floor_version text not null);\n"
+         grammar_version integer not null, floor_version text not null{later_column});\n"
     );
     for (ordinal, definition) in restore_order(definitions).into_iter().enumerate() {
+        let later = if later_joins {
+            let tables: Vec<String> = definition
+                .joined
+                .iter()
+                .skip(1)
+                .map(|table| one_line_literal(table))
+                .collect();
+            format!(", array[{}]::text[]", tables.join(", "))
+        } else {
+            String::new()
+        };
         appendix.push_str(&format!(
-            "insert into {queue} values ({}, {}, {}, {}, {}, {}, {});\n",
+            "insert into {queue} values ({}, {}, {}, {}, {}, {}, {}{later});\n",
             ordinal + 1,
             one_line_literal(&definition.source_table),
             one_line_literal(&definition.target_table),
             definition
-                .join_table
-                .as_deref()
-                .map_or_else(|| "null".to_string(), one_line_literal),
+                .joined
+                .first()
+                .map_or_else(|| "null".to_string(), |table| one_line_literal(table)),
             one_line_literal(&definition.definition_text),
             definition.grammar_version,
             one_line_literal(&definition.floor_version),
@@ -778,18 +830,27 @@ pub(crate) async fn restore_queued(
     }
     // ADR-0024 rule 6: a queue of another shape was written by a format
     // this release doesn't know, and isn't read as if it were this one.
-    if columns != QUEUE_COLUMNS {
-        return Err(Error::IncompatibleInstance(format!(
-            "the schema dump's restore queue {queue} has the columns {columns:?}, and this \
-             release reads {QUEUE_COLUMNS:?}: load the dump with the release that wrote it, \
-             or a later one"
-        )));
-    }
+    let later_joins = match columns.split_last() {
+        Some((last, before)) if last == LATER_JOIN_TABLES && before == QUEUE_COLUMNS => true,
+        _ if columns == QUEUE_COLUMNS => false,
+        _ => {
+            return Err(Error::IncompatibleInstance(format!(
+                "the schema dump's restore queue {queue} has the columns {columns:?}, and this \
+                 release reads {QUEUE_COLUMNS:?}, with or without {LATER_JOIN_TABLES:?} after \
+                 them: load the dump with the release that wrote it, or a later one"
+            )));
+        }
+    };
+    let later = if later_joins {
+        LATER_JOIN_TABLES
+    } else {
+        "'{}'::text[]"
+    };
     let rows = client
         .query(
             &format!(
                 "select ordinal, source_table, target_table, join_table, definition_text, \
-                        grammar_version, floor_version \
+                        grammar_version, floor_version, {later} \
                  from {queue} order by ordinal"
             ),
             &[],
@@ -801,10 +862,15 @@ pub(crate) async fn restore_queued(
     let mut already_defined = 0;
     for row in &rows {
         let ordinal: i32 = row.get(0);
+        let later: Vec<&str> = row.get(7);
         let unparsed = crate::defs::catalog::Unparsed {
             source_table: row.get(1),
             target_table: row.get(2),
-            join_table: row.get(3),
+            joined: row
+                .get::<_, Option<&str>>(3)
+                .into_iter()
+                .chain(later)
+                .collect(),
             definition_text: row.get(4),
             grammar_version: row.get(5),
             floor_version: row.get(6),
@@ -826,38 +892,35 @@ pub(crate) async fn restore_queued(
         let client = pool.get().await?;
         let existing = client
             .query_opt(
-                "select source_table, join_table, definition_text, grammar_version \
-                 from transform_definitions where target_table = $1",
+                &format!(
+                    "select d.source_table, {}, d.definition_text, d.grammar_version \
+                     from transform_definitions d where d.target_table = $1",
+                    crate::defs::catalog::joined_tables_array_sql("d")
+                ),
                 &[&target],
             )
             .await?;
         drop(client);
         if let Some(existing) = existing {
+            let found_joined: Vec<String> = existing.get(1);
             let found = (
-                existing.get::<_, String>(0),
-                existing.get::<_, Option<String>>(1),
-                existing.get::<_, String>(2),
+                existing.get::<_, &str>(0),
+                found_joined.iter().map(String::as_str).collect::<Vec<_>>(),
+                existing.get::<_, &str>(2),
                 existing.get::<_, i32>(3),
             );
             let recorded = (
                 unparsed.source_table,
-                unparsed.join_table,
+                unparsed.joined.clone(),
                 unparsed.definition_text,
                 unparsed.grammar_version,
             );
-            let found = (
-                found.0.as_str(),
-                found.1.as_deref(),
-                found.2.as_str(),
-                found.3,
-            );
             if found != recorded {
                 // Both sides in full: they can differ in any one field.
-                let described = |(source, join, text, grammar): (&str, Option<&str>, &str, i32)| {
+                let described = |(source, joined, text, grammar): (&str, Vec<&str>, &str, i32)| {
                     format!(
                         "from {source}{} as `{text}` (grammar version {grammar})",
-                        join.map(|j| format!(" joined with {j}"))
-                            .unwrap_or_default(),
+                        joined_with(&joined),
                     )
                 };
                 return Err(refused(
@@ -889,7 +952,7 @@ pub(crate) async fn restore_queued(
             continue;
         }
         let upstream_paused = std::iter::once(unparsed.source_table)
-            .chain(unparsed.join_table)
+            .chain(unparsed.joined.iter().copied())
             .find(|read| paused_targets.iter().any(|t| t == read));
         // Why this release can't run the row, if it can't: the attach's own
         // reasons (`Floors::unrunnable`, ADR-0024 rule 3) first, then a
@@ -948,22 +1011,25 @@ pub(crate) async fn restore_queued(
         )
         .map_err(|err| catalog(crate::defs::CatalogError::from(err)))?;
         let resolved_source = resolve(def.explicit_source_schema.as_deref(), &def.source).await?;
-        let resolved_join = match crate::defs::join::spec(&def) {
-            Some(join) => {
-                let joined = crate::defs::join::first_joined(join);
-                Some(resolve(joined.explicit_right_schema.as_deref(), &joined.right).await?)
+        let mut resolved_joined = Vec::new();
+        if let Some(join) = crate::defs::join::spec(&def) {
+            for joined in &join.joins {
+                resolved_joined
+                    .push(resolve(joined.explicit_right_schema.as_deref(), &joined.right).await?);
             }
-            None => None,
-        };
+        }
         let recorded = (
             unparsed.source_table,
             unparsed.target_table,
-            unparsed.join_table,
+            unparsed.joined.clone(),
         );
         let now = (
             resolved_source.as_str(),
             resolved_target.as_str(),
-            resolved_join.as_deref(),
+            resolved_joined
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
         );
         if recorded != now {
             return Err(refused(
@@ -974,15 +1040,10 @@ pub(crate) async fn restore_queued(
                      instance schema), or define it again",
                     now.0,
                     now.1,
-                    now.2
-                        .map(|j| format!(" joined with {j}"))
-                        .unwrap_or_default(),
+                    joined_with(&now.2),
                     recorded.0,
                     recorded.1,
-                    recorded
-                        .2
-                        .map(|j| format!(" joined with {j}"))
-                        .unwrap_or_default(),
+                    joined_with(&recorded.2),
                 ),
             ));
         }
@@ -1171,15 +1232,42 @@ mod tests {
     }
 
     fn recorded(id: i64, source: &str, target: &str, join: Option<&str>) -> Recorded {
+        recorded_joining(id, source, target, join.into_iter().collect())
+    }
+
+    fn recorded_joining(id: i64, source: &str, target: &str, joined: Vec<&str>) -> Recorded {
         Recorded {
             id,
             source_table: source.into(),
             target_table: target.into(),
-            join_table: join.map(Into::into),
+            joined: joined.into_iter().map(Into::into).collect(),
             definition_text: String::new(),
             grammar_version: 1,
             floor_version: "0.2.0".into(),
         }
+    }
+
+    #[test]
+    fn a_definition_s_joined_tables_are_named_in_order() {
+        assert_eq!(joined_with(&[]), "");
+        assert_eq!(joined_with(&["s.b"]), " joined with s.b");
+        assert_eq!(joined_with(&["s.b", "s.c"]), " joined with s.b and s.c");
+        assert_eq!(
+            joined_with(&["s.b", "s.c", "s.d"]),
+            " joined with s.b, s.c and s.d"
+        );
+    }
+
+    /// A reader of any joined table, not only the first, is restored after
+    /// the definition that targets it.
+    #[test]
+    fn a_reader_of_a_later_joined_table_is_restored_after_its_upstream() {
+        let order = restore_order(vec![
+            recorded_joining(1, "s.x", "s.v", vec!["s.y", "s.u"]),
+            recorded(2, "s.z", "s.u", None),
+        ]);
+        let ids: Vec<i64> = order.iter().map(|d| d.id).collect();
+        assert_eq!(ids, [2, 1]);
     }
 
     #[test]

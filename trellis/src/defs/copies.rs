@@ -332,7 +332,9 @@ async fn join_copies(
         );
     }
     let sides =
-        match super::catalog::JoinSides::read(client, source.to_string(), joined.clone()).await {
+        match super::catalog::JoinSides::read(client, source.to_string(), vec![joined.clone()])
+            .await
+        {
             Ok(sides) => sides,
             Err(super::catalog::CatalogError::Db(err)) => return Err(err),
             Err(_) => return Ok(copies),
@@ -353,9 +355,12 @@ async fn join_copies(
             .into_iter()
             .map(|(side, column)| (side_table(side), column))
             .collect();
-        let Ok(inferred) =
-            super::join::field_pg_type(def, field, &sides.from_columns, &sides.joined_columns)
-        else {
+        let Ok(inferred) = super::join::field_pg_type(
+            def,
+            field,
+            &sides.from_columns,
+            &sides.first_joined().columns,
+        ) else {
             continue;
         };
         copies.push(TypedCopy {
@@ -462,7 +467,9 @@ async fn join_one_to_one_copies(
         }
     }
     let sides =
-        match super::catalog::JoinSides::read(client, source.to_string(), joined.clone()).await {
+        match super::catalog::JoinSides::read(client, source.to_string(), vec![joined.clone()])
+            .await
+        {
             Ok(sides) => sides,
             Err(super::catalog::CatalogError::Db(err)) => return Err(err),
             Err(_) => return Ok(copies),
@@ -470,29 +477,28 @@ async fn join_one_to_one_copies(
     for field in &def.fields {
         let reads: Vec<(Side, String)> = super::join::expr_columns(def, &field.expr);
         // A bare column of either table is a copy of it.
-        if let (Expr::SourceColumn { .. }, [(side, column)]) = (&field.expr, reads.as_slice()) {
-            let columns = match side {
-                Side::From => &sides.from_columns,
-                Side::Joined(_) => &sides.joined_columns,
-            };
-            if columns.contains_key(column) {
-                copies.push(TypedCopy {
-                    kind: CopyKind::Passthrough,
-                    table: target_table.0.clone(),
-                    table_name: target_table.1.clone(),
-                    column: field.name.clone(),
-                    reads: vec![(side_table(*side), column.clone())],
-                    inferred: None,
-                });
-                continue;
-            }
+        if let (Expr::SourceColumn { .. }, [(side, column)]) = (&field.expr, reads.as_slice())
+            && sides.columns(*side).contains_key(column)
+        {
+            copies.push(TypedCopy {
+                kind: CopyKind::Passthrough,
+                table: target_table.0.clone(),
+                table_name: target_table.1.clone(),
+                column: field.name.clone(),
+                reads: vec![(side_table(*side), column.clone())],
+                inferred: None,
+            });
+            continue;
         }
         if reads.is_empty() || !reads_live(&reads, &sides) {
             continue;
         }
-        let Ok(inferred) =
-            super::join::field_pg_type(def, field, &sides.from_columns, &sides.joined_columns)
-        else {
+        let Ok(inferred) = super::join::field_pg_type(
+            def,
+            field,
+            &sides.from_columns,
+            &sides.first_joined().columns,
+        ) else {
             continue;
         };
         copies.push(TypedCopy {
@@ -516,17 +522,16 @@ async fn join_one_to_one_copies(
 /// definition, naming the column), so [`join_copies`] and
 /// [`join_one_to_one_copies`] leave it out rather than type it without one.
 fn reads_live(reads: &[(super::join::Side, String)], sides: &super::catalog::JoinSides) -> bool {
-    reads.iter().all(|(side, column)| match side {
-        super::join::Side::From => sides.from_columns.contains_key(column),
-        super::join::Side::Joined(_) => sides.joined_columns.contains_key(column),
-    })
+    reads
+        .iter()
+        .all(|(side, column)| sides.columns(*side).contains_key(column))
 }
 
 /// Every relation [`typed_copies`] and [`inspect`] read for `def`, which
 /// reads `source` (qualified) into `target` (qualified), as SQL resolves
 /// them (`to_regclass` text): the source and the target. For a `JOIN` or a
-/// 1-1 `JOIN`, `join` is its definition id and its joined table (qualified),
-/// which adds that table and the definition's hidden tables.
+/// 1-1 `JOIN`, `join` is its definition id and its joined tables (qualified,
+/// by position), which adds those tables and the definition's hidden tables.
 /// A superset of the tables the copies are in and read from: the capture
 /// pass fingerprints these to skip the comparison while none changed
 /// (`staging::drift_memo`). A table `typed_copies` starts reading
@@ -536,14 +541,14 @@ pub(crate) fn inputs(
     def: &TransformDef,
     source: &str,
     target: &str,
-    join: Option<(i64, &str)>,
+    join: Option<(i64, &[String])>,
 ) -> Vec<String> {
     let mut names = vec![
         super::ddl::regclass_arg(source),
         super::ddl::qualified_target_table_ident(target),
     ];
     if let Some((id, joined)) = join {
-        names.push(super::ddl::regclass_arg(joined));
+        names.extend(joined.iter().map(|table| super::ddl::regclass_arg(table)));
         if super::join::is_one_to_one(def) {
             names.extend(
                 super::join_one_to_one::HiddenTable::all(def)
@@ -1314,7 +1319,7 @@ mod tests {
                 def,
                 "public.a",
                 "public.v",
-                Some((7, "public.b")),
+                Some((7, &["public.b".to_string()])),
             )
         };
         let hidden = |names: Vec<String>| -> Vec<String> {
