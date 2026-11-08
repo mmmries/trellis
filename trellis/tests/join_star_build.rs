@@ -661,8 +661,9 @@ const N4_CHANGES: &str = "update public.a set k1 = 2, k2 = 3, k3 = 4 where id = 
 /// tuple: a build in chunks of 3 (each position's `M` pass in several
 /// batches), a `RESUME` after changes of every table while paused (which
 /// recreates `R` and the `M` of every position), a rebuild in place after
-/// changes of every table past capture, and changes applied after it, each
-/// checked against the oracle.
+/// changes of every table past capture (a row of each joined table deleted,
+/// so each position's `M` pass tombstones an entry whose row is gone), and
+/// changes applied after it, each checked against the oracle.
 #[tokio::test]
 async fn an_n4_star_builds_resumes_and_rebuilds_with_rows_at_every_position() {
     let _serial = star::serial().await;
@@ -687,9 +688,15 @@ async fn an_n4_star_builds_resumes_and_rebuilds_with_rows_at_every_position() {
             "public.a",
             "update public.a set k1 = 3, k3 = 2 where id = 7; delete from public.a where id = 8",
         ),
-        ("public.b1", "update public.b1 set k = 9 where id = 4"),
+        (
+            "public.b1",
+            "update public.b1 set k = 9 where id = 4; delete from public.b1 where id = 3",
+        ),
         ("public.b2", "delete from public.b2 where id = 1"),
-        ("public.b3", "update public.b3 set w = 7 where id = 2"),
+        (
+            "public.b3",
+            "update public.b3 set w = 7 where id = 2; delete from public.b3 where id = 5",
+        ),
     ] {
         star::write_uncaptured(&d, table, sql).await;
     }
