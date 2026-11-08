@@ -500,3 +500,63 @@ async fn f7_a_hand_off_applied_out_of_order_with_a_root_insert() {
         star::assert_oracle(&mut d, &[star]).await;
     }
 }
+
+/// R (`rd_latesnap`): a change that commits after a root Re-derive's read
+/// statement is not in the row it wrote, so it must not be in the entry's
+/// basis (`join1_snapshot_after_read`): its Apply, drained after the
+/// Re-derive, applies.
+#[tokio::test]
+async fn a_root_change_between_a_rederives_read_and_its_snapshot_is_applied() {
+    let _serial = star::serial().await;
+    knob();
+    for star in AT.stars() {
+        let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+        let target = star.target();
+        d.stage_recomputes("public.a", &["1"]).await;
+        let rederive = d.seal().await;
+        let mut page = d
+            .drain_frozen(
+                rederive,
+                "rederive",
+                &[(PausePoint::AfterRederiveRead, &target)],
+            )
+            .await;
+        page.reached(PausePoint::AfterRederiveRead).await;
+        star::write(&d, "update public.a set x = 500 where id = 1").await;
+        let change = d.seal().await;
+        d.release(&mut page, PausePoint::AfterRederiveRead).await;
+        page.finish().await;
+        d.drain(change, "change").await;
+        assert_eq!(total(&d, star, 1).await, joined_total(500, 100), "{star:?}");
+        star::assert_oracle(&mut d, &[star]).await;
+    }
+}
+
+/// F15 on `a` (`join1_no_placeholder`): two pages on a root row no `R` entry
+/// exists for yet, drained newer first: the newer page's placeholder is
+/// uncommitted, so the older page queues on it rather than overwriting it.
+#[tokio::test]
+async fn two_root_pages_on_a_new_row_queue_on_the_placeholder() {
+    let _serial = star::serial().await;
+    knob();
+    for star in AT.stars() {
+        let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+        let label = star::r_label(&d, star).await;
+        star::write(&d, &AT.sql("insert into {a_ins} values (9, 10, 9, 'nine')")).await;
+        let older = d.seal().await;
+        star::write(&d, "update public.a set x = 99 where id = 9").await;
+        let newer = d.seal().await;
+        let mut held = d
+            .drain_frozen(newer, "newer", &[(PausePoint::AfterPlaceholders, &label)])
+            .await;
+        let reached = held.reached(PausePoint::AfterPlaceholders).await;
+        let queued = d.drain_frozen(older, "older", &[]).await;
+        let blocked = star::queued_or_finished(&d, reached.backend_pid, &queued).await;
+        d.release(&mut held, PausePoint::AfterPlaceholders).await;
+        held.finish().await;
+        queued.finish().await;
+        assert_eq!(total(&d, star, 9).await, joined_total(99, 100), "{star:?}");
+        star::assert_oracle(&mut d, &[star]).await;
+        assert!(blocked, "{}: the older page queued on the placeholder", star.name());
+    }
+}
