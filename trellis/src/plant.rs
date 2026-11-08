@@ -418,7 +418,9 @@ pub enum Plant {
     /// there.
     ///
     /// Pinned by `join_star_root`'s
-    /// `a_root_moving_every_key_races_a_change_of_its_new_key_at_the_middle_position`.
+    /// `a_root_moving_every_key_races_a_change_of_its_new_key_at_the_middle_position`
+    /// and `join_star_n4`'s `f14a_a_root_moving_every_key_races_a_change_of_its_new_key_at_each_position`
+    /// and `a_root_rederive_whose_key_moved_at_the_middle_position_retries`.
     StarRootSkipJMiddle,
     /// #1464 (`star_late_skip_last`): a root writer of a star 1-1 `JOIN`
     /// leaves the last position out of its late-key retry: an `R` entry's
@@ -447,7 +449,9 @@ pub enum Plant {
     /// Pinned by `join_star_joined`'s `cx_f1a_…` to `cx_f1f_…` and
     /// `cx_f6e_…`, and by `join_star_crossing`'s
     /// `crossing_mixed_pages_write_per_position_target_batches_without_deadlock`
-    /// (a deadlock).
+    /// (a deadlock); at n = 4, by `join_star_n4`'s
+    /// `f14a_joined_writers_on_the_new_key_at_two_positions_queue_on_the_rows_they_share`,
+    /// `f15a_…` and `f13a_…`.
     StarOwnJOnly,
     /// #1459 Decision item 1, #1464 (`star_r_after_m`): a star's
     /// joined-table writer locks its fan-out rows' `R` entries only after
@@ -472,7 +476,8 @@ pub enum Plant {
     /// a star, when the page would take more than one statement.
     ///
     /// Pinned by `join_star_crossing`'s `cx_f3b_…` (`deadlocks_logged()` is
-    /// empty).
+    /// empty), and at n = 4, where it splits positions 1 and 2 from 3, by
+    /// `join_star_n4`'s `f13a_a_cycle_of_mixed_pages_across_three_positions_queues_without_deadlock`.
     StarRSplit,
     /// #1459's F11, #1464 (`star_recheck_j`): a star's joined-table entry's
     /// held key, or a joined Re-derive's live key, is re-checked against the
@@ -487,7 +492,9 @@ pub enum Plant {
     /// [`Plant::StarRecheckJ`] at a star's last position only.
     ///
     /// Pinned by `join_star_joined`'s `cx_f11a_…` and `ps7_…`, in their
-    /// swapped orientation (the late key at the last position).
+    /// swapped orientation (the late key at the last position), and by
+    /// `join_star_n4`'s `f15a_a_late_m_key_at_the_last_position_…` and
+    /// `a_joined_entry_whose_key_moved_onto_a_root_key_retries_at_each_position`.
     StarRecheckSkipLast,
     /// #1459 Decision item 1, #1464 (`star_chunk_no_r`): a star's fan-out
     /// chunk recomputes its batch without re-taking the batch's `R` entries,

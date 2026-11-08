@@ -68,8 +68,7 @@ const CYCLE: &str = "insert into public.a (id, k1, k2, k3, x, y) values \
                      (3, 3, 3000, 'f3'), (4, 4, 4000, 'f4')";
 
 /// `a` row 1 moves all three keys.
-const MOVE_ALL: Writer =
-    Writer::Change("update public.a set k1 = 2, k2 = 2, k3 = 2 where id = 1");
+const MOVE_ALL: Writer = Writer::Change("update public.a set k1 = 2, k2 = 2, k3 = 2 where id = 1");
 
 /// A change of the joined table at `position`, row 2: on key 2, the new key
 /// of [`MOVE_ALL`]'s row.
@@ -182,11 +181,7 @@ fn late_seed(late: usize) -> String {
 async fn late_m_key(late: usize, third: Option<usize>) {
     for star in N4.stars() {
         let mut d = star::start_seeded(&[star], &late_seed(late)).await;
-        star::write(
-            &d,
-            &format!("update public.b{late} set k = 5 where id = 7"),
-        )
-        .await;
+        star::write(&d, &format!("update public.b{late} set k = 5 where id = 7")).await;
         let p1 = d.seal().await;
         // The move `5 -> 9`, past capture: `P2`'s image carries key 9.
         star::write_uncaptured(

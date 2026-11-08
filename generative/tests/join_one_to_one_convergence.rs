@@ -425,7 +425,8 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
     (
         "star_root_skip_j_middle",
         "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_root's a_root_moving_every_key_races_a_change_of_its_new_key_at_the_middle_position pin it",
+         (the star tier is #1781); join_star_root's a_root_moving_every_key_races_a_change_of_its_new_key_at_the_middle_position, \
+         and join_star_n4's f14a and middle-position Re-derive pins, pin it",
     ),
     (
         "star_late_skip_last",
@@ -441,7 +442,8 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
         "star_own_j_only",
         "it fires only on a star of more than two tables, which this tier never draws \
          (the star tier is #1781); join_star_joined's cx_f1a to cx_f1f and cx_f6e, and \
-         join_star_crossing's per-position target batch pin, pin it",
+         join_star_crossing's per-position target batch pin, and join_star_n4's f14a, f15a \
+         and f13a, pin it",
     ),
     (
         "star_r_after_m",
@@ -457,7 +459,8 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
         "star_r_split",
         "it fires only on a star of more than two tables, which this tier never draws \
          (the star tier is #1781), and fails by deadlock, which the engine retries; \
-         join_star_crossing's cx_f3b pins it",
+         join_star_crossing's cx_f3b and, at n = 4 (positions 1 and 2, then 3), \
+         join_star_n4's f13a pin it",
     ),
     (
         "star_recheck_j",
@@ -467,7 +470,8 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
     (
         "star_recheck_skip_last",
         "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_joined's cx_f11a and ps7 (swapped) pin it",
+         (the star tier is #1781); join_star_joined's cx_f11a and ps7 (swapped), and \
+         join_star_n4's f15a and ps7 at n = 4, pin it",
     ),
     (
         "star_chunk_no_r",
