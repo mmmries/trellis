@@ -23,7 +23,7 @@ use tokio_postgres::types::Type;
 
 use super::ast::TransformDef;
 use super::ddl::{self, DdlError, PrimaryKeyColumn};
-use super::join::Side;
+use super::join::{JOINED, Side};
 
 /// The key `def` declares with `KEY (...)` for the table it reads on
 /// `side` (`None` for a definition that isn't a `JOIN`, whose only table is
@@ -31,7 +31,8 @@ use super::join::Side;
 pub(crate) fn declared_on(def: &TransformDef, side: Option<Side>) -> Option<&[String]> {
     match side {
         None | Some(Side::From) => def.source_key.as_deref(),
-        Some(Side::Joined) => super::join::spec(def).and_then(|join| join.right_key.as_deref()),
+        Some(Side::Joined(position)) => super::join::spec(def)
+            .and_then(|join| super::join::joined(join, position).right_key.as_deref()),
     }
 }
 
@@ -59,7 +60,7 @@ pub(crate) fn declared_by_reader<'a>(
     if source == table {
         declared_on(def, super::join::spec(def).map(|_| Side::From))
     } else if joined == Some(table) {
-        declared_on(def, Some(Side::Joined))
+        declared_on(def, Some(JOINED))
     } else {
         None
     }

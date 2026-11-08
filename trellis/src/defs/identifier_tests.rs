@@ -5,8 +5,8 @@
 //! parses back to the same definition.
 
 use super::ast::{
-    AlterClause, DefinitionRef, Expr, FieldDef, JoinKind, JoinOn, JoinSpec, KeySpace, Predicate,
-    QualifiedColumn, Statement, TransformDef, TransformRef, render_definition_text,
+    AlterClause, DefinitionRef, Expr, FieldDef, JoinKind, JoinOn, JoinSpec, JoinedTable, KeySpace,
+    Predicate, QualifiedColumn, Statement, TransformDef, TransformRef, render_definition_text,
 };
 use super::error::ParseError;
 use super::parse;
@@ -44,12 +44,12 @@ fn unquoted_names_fold_in_every_definition_position() {
     assert_eq!(def.source_key, Some(vec!["id".to_string()]));
     let join = join_of(&def);
     assert_eq!(join.source_alias.as_deref(), Some("o"));
-    assert_eq!(join.right, "items");
-    assert_eq!(join.explicit_right_schema.as_deref(), Some("shop"));
-    assert_eq!(join.right_key, Some(vec!["itemid".to_string()]));
-    assert_eq!(join.right_alias.as_deref(), Some("i"));
+    assert_eq!(join.joins[0].right, "items");
+    assert_eq!(join.joins[0].explicit_right_schema.as_deref(), Some("shop"));
+    assert_eq!(join.joins[0].right_key, Some(vec!["itemid".to_string()]));
+    assert_eq!(join.joins[0].right_alias.as_deref(), Some("i"));
     assert_eq!(
-        join.on,
+        join.joins[0].on,
         [JoinOn {
             lhs: column("orders", "id"),
             rhs: column("items", "orderid"),
@@ -163,7 +163,7 @@ fn quoted_names_are_exact() {
     assert_eq!(def.source_key, Some(vec!["Id".to_string()]));
     let join = join_of(&def);
     assert_eq!(join.source_alias.as_deref(), Some("O"));
-    assert_eq!(join.on[0].lhs, column("Orders", "Id"));
+    assert_eq!(join.joins[0].on[0].lhs, column("Orders", "Id"));
     assert_eq!(join.group_by, [column("Orders", "Region")]);
     assert_eq!(def.fields[0].name, "Total");
 
@@ -183,10 +183,10 @@ fn quoted_names_are_exact() {
 #[test]
 fn a_quoted_alias_matches_only_its_exact_spelling() {
     let def = parse("TRANSFORM t FROM a AS \"O\" JOIN b ON \"O\".k = b.k SELECT 1 AS one").unwrap();
-    assert_eq!(join_of(&def).on[0].lhs, column("a", "k"));
+    assert_eq!(join_of(&def).joins[0].on[0].lhs, column("a", "k"));
     // `o` is not `"O"`: left for the validator, as any unknown qualifier.
     let def = parse("TRANSFORM t FROM a AS \"O\" JOIN b ON o.k = b.k SELECT 1 AS one").unwrap();
-    assert_eq!(join_of(&def).on[0].lhs, column("o", "k"));
+    assert_eq!(join_of(&def).joins[0].on[0].lhs, column("o", "k"));
 }
 
 /// `""` inside a quoted name is one `"`.
@@ -587,15 +587,17 @@ fn definitions_naming(name: &str) -> Vec<TransformDef> {
             )],
         );
         def.key_space = KeySpace::Join(JoinSpec {
-            kind: JoinKind::Left,
             source_alias,
-            right: right.clone(),
-            explicit_right_schema: None,
-            right_key: Some(vec![on_column.clone()]),
-            right_alias,
-            on: vec![JoinOn {
-                lhs: column(&source, &on_column),
-                rhs: column(&right, "zr"),
+            joins: vec![JoinedTable {
+                kind: JoinKind::Left,
+                right: right.clone(),
+                explicit_right_schema: None,
+                right_key: Some(vec![on_column.clone()]),
+                right_alias,
+                on: vec![JoinOn {
+                    lhs: column(&source, &on_column),
+                    rhs: column(&right, "zr"),
+                }],
             }],
             group_by: vec![column(&source, &on_column)],
         });

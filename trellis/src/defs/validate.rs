@@ -16,8 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use super::ast::{
-    Expr, FieldDef, JoinSpec, KeySpace, Predicate, QualifiedColumn, TransformDef, ValueType,
-    render_field_expr,
+    Expr, FieldDef, JoinOn, JoinSpec, KeySpace, Predicate, QualifiedColumn, TransformDef,
+    ValueType, render_field_expr,
 };
 use super::join::Side;
 use super::parser::MAX_EXPRESSION_DEPTH;
@@ -103,6 +103,9 @@ pub enum ValidationError {
     /// The joined table is the `FROM` table. A self-join isn't supported,
     /// even under two aliases: one captured change would feed both sides.
     JoinSelf { table: String },
+    /// A `JOIN` definition joins more tables than this kind of `JOIN`
+    /// admits: an aggregate `JOIN` joins exactly two.
+    JoinTooManyTables,
     /// A `JOIN` definition's column reference names a table that is neither
     /// the `FROM` table nor the joined one.
     JoinUnknownTable { reference: String },
@@ -878,10 +881,10 @@ fn collect_text_columns<'a>(
 pub(crate) fn check_join_collation_reads(
     def: &TransformDef,
     join: &JoinSpec,
-    left: &HashMap<String, JoinColumnInfo>,
-    right: &HashMap<String, JoinColumnInfo>,
+    root: &HashMap<String, JoinColumnInfo>,
+    joined: &[HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
-    let resolve = join_resolver(def, join, left, right);
+    let resolve = join_resolver(def, join, root, joined);
     for read in collation_refusing_function_reads(def) {
         let Some(qualifier) = &read.qualifier else {
             continue;
@@ -1017,6 +1020,10 @@ impl fmt::Display for ValidationError {
                 "'{table}' is joined to itself; a JOIN can't read one table on both sides \
                  (a self-join), even under two aliases, since one captured change would feed \
                  both sides"
+            ),
+            ValidationError::JoinTooManyTables => write!(
+                f,
+                "a JOIN transform joins exactly two tables; a second JOIN is not supported"
             ),
             ValidationError::JoinUnknownTable { reference } => write!(
                 f,
@@ -1926,13 +1933,6 @@ pub struct JoinColumnInfo {
     pub trellis_target: bool,
 }
 
-/// Which table of a `JOIN` a column belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JoinSide {
-    Left,
-    Right,
-}
-
 /// The aggregate families a `JOIN` and a plain aggregate refuse, by name:
 /// `(functions, family)`.
 const DEFERRED_AGGREGATES: &[(&[&str], &str)] = &[
@@ -2179,26 +2179,31 @@ fn written(column: &QualifiedColumn) -> String {
 
 /// The resolver of a `JOIN` definition's qualified columns: the side each
 /// belongs to and its live column, or the refusal naming what didn't resolve.
-/// Shared by both `JOIN` validators.
+/// Shared by both `JOIN` validators. `root` is the `FROM` table's live
+/// columns and `joined` each joined table's, by position.
 pub(crate) fn join_resolver<'a>(
     def: &'a TransformDef,
     join: &'a JoinSpec,
-    left: &'a HashMap<String, JoinColumnInfo>,
-    right: &'a HashMap<String, JoinColumnInfo>,
-) -> impl Fn(&QualifiedColumn) -> Result<(JoinSide, &'a JoinColumnInfo), ValidationError> + 'a {
-    move |column: &QualifiedColumn| -> Result<(JoinSide, &JoinColumnInfo), ValidationError> {
+    root: &'a HashMap<String, JoinColumnInfo>,
+    joined: &'a [HashMap<String, JoinColumnInfo>],
+) -> impl Fn(&QualifiedColumn) -> Result<(Side, &'a JoinColumnInfo), ValidationError> + 'a {
+    move |column: &QualifiedColumn| -> Result<(Side, &JoinColumnInfo), ValidationError> {
         let side = if column.table == def.source {
-            JoinSide::Left
-        } else if column.table == join.right {
-            JoinSide::Right
+            Side::From
+        } else if let Some((position, _)) =
+            super::join::positions(join).find(|(_, table)| column.table == table.right)
+        {
+            Side::Joined(position)
         } else {
             return Err(ValidationError::JoinUnknownTable {
                 reference: written(column),
             });
         };
         let schema_written = match side {
-            JoinSide::Left => def.explicit_source_schema.as_deref(),
-            JoinSide::Right => join.explicit_right_schema.as_deref(),
+            Side::From => def.explicit_source_schema.as_deref(),
+            Side::Joined(position) => super::join::joined(join, position)
+                .explicit_right_schema
+                .as_deref(),
         };
         if let (Some(used), Some(declared)) = (column.schema.as_deref(), schema_written)
             && used != declared
@@ -2207,16 +2212,26 @@ pub(crate) fn join_resolver<'a>(
                 reference: written(column),
             });
         }
-        let columns = match side {
-            JoinSide::Left => left,
-            JoinSide::Right => right,
-        };
+        let columns = side_columns(side, root, joined);
         columns
             .get(&column.column)
             .map(|info| (side, info))
             .ok_or_else(|| ValidationError::JoinUnresolvedColumn {
                 reference: written(column),
             })
+    }
+}
+
+/// `side`'s live columns: `root` for the `FROM` table, else its position's
+/// entry of `joined`.
+fn side_columns<'a>(
+    side: Side,
+    root: &'a HashMap<String, JoinColumnInfo>,
+    joined: &'a [HashMap<String, JoinColumnInfo>],
+) -> &'a HashMap<String, JoinColumnInfo> {
+    match side {
+        Side::From => root,
+        Side::Joined(position) => &joined[position.index()],
     }
 }
 
@@ -2228,25 +2243,40 @@ pub(crate) fn join_resolver<'a>(
 pub(crate) fn validate_join_tables_and_on(
     def: &TransformDef,
     join: &JoinSpec,
-    left: &HashMap<String, JoinColumnInfo>,
-    right: &HashMap<String, JoinColumnInfo>,
+    root: &HashMap<String, JoinColumnInfo>,
+    joined: &[HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
     validate_target_names(def)?;
-    if join.right == def.source {
-        return Err(ValidationError::JoinSelf {
-            table: def.source.clone(),
-        });
-    }
-    // The joined table is a source too: writing the target into it would
-    // feed Trellis's own writes back into capture.
-    if def.target == join.right {
-        return Err(ValidationError::TargetEqualsSource {
-            table: def.target.clone(),
-        });
+    for table in &join.joins {
+        if table.right == def.source {
+            return Err(ValidationError::JoinSelf {
+                table: def.source.clone(),
+            });
+        }
+        // The joined table is a source too: writing the target into it would
+        // feed Trellis's own writes back into capture.
+        if def.target == table.right {
+            return Err(ValidationError::TargetEqualsSource {
+                table: def.target.clone(),
+            });
+        }
     }
 
-    let resolve = join_resolver(def, join, left, right);
+    let resolve = join_resolver(def, join, root, joined);
+    for table in &join.joins {
+        validate_join_on(&table.on, &resolve)?;
+    }
+    Ok(())
+}
 
+/// One joined table's `ON` terms: each an equality between a column of the
+/// `FROM` table and one of the joined table, of one type, modifier and
+/// collation, with a text-stable key type, each pair and each column named
+/// once.
+fn validate_join_on<'a>(
+    on: &'a [JoinOn],
+    resolve: &impl Fn(&QualifiedColumn) -> Result<(Side, &'a JoinColumnInfo), ValidationError>,
+) -> Result<(), ValidationError> {
     let check_key_type = |column: &QualifiedColumn, info: &JoinColumnInfo| {
         if !super::join_key_types::admit_join_key(&info.pg_type, info.is_enum) {
             return Err(ValidationError::JoinUnsupportedKeyType {
@@ -2263,12 +2293,12 @@ pub(crate) fn validate_join_tables_and_on(
         Ok(())
     };
 
-    let mut pairs: HashSet<(&str, &str)> = HashSet::with_capacity(join.on.len());
+    let mut pairs: HashSet<(&str, &str)> = HashSet::with_capacity(on.len());
     // A column named by two terms, each paired with another column, would
     // appear twice in a hidden table and in the target's key.
-    let mut left_columns: HashSet<&str> = HashSet::with_capacity(join.on.len());
-    let mut right_columns: HashSet<&str> = HashSet::with_capacity(join.on.len());
-    for term in &join.on {
+    let mut left_columns: HashSet<&str> = HashSet::with_capacity(on.len());
+    let mut right_columns: HashSet<&str> = HashSet::with_capacity(on.len());
+    for term in on {
         let (lhs_side, lhs) = resolve(&term.lhs)?;
         let (rhs_side, rhs) = resolve(&term.rhs)?;
         if lhs_side == rhs_side {
@@ -2277,8 +2307,8 @@ pub(crate) fn validate_join_tables_and_on(
             });
         }
         let pair = match lhs_side {
-            JoinSide::Left => (term.lhs.column.as_str(), term.rhs.column.as_str()),
-            JoinSide::Right => (term.rhs.column.as_str(), term.lhs.column.as_str()),
+            Side::From => (term.lhs.column.as_str(), term.rhs.column.as_str()),
+            Side::Joined(_) => (term.rhs.column.as_str(), term.lhs.column.as_str()),
         };
         if !pairs.insert(pair) {
             return Err(ValidationError::JoinOnRepeatedPair {
@@ -2286,8 +2316,8 @@ pub(crate) fn validate_join_tables_and_on(
             });
         }
         let (left_column, right_column) = match lhs_side {
-            JoinSide::Left => (&term.lhs, &term.rhs),
-            JoinSide::Right => (&term.rhs, &term.lhs),
+            Side::From => (&term.lhs, &term.rhs),
+            Side::Joined(_) => (&term.rhs, &term.lhs),
         };
         for (seen, column) in [
             (&mut left_columns, left_column),
@@ -2321,7 +2351,7 @@ pub(crate) fn validate_join_tables_and_on(
     }
     // Each side names every `ON` column once (a repeat is refused above), and
     // the hidden tables key and index a side on its `ON` columns.
-    check_index_key_width(|| "each side of ON".to_string(), join.on.len())?;
+    check_index_key_width(|| "each side of ON".to_string(), on.len())?;
 
     Ok(())
 }
@@ -2342,14 +2372,20 @@ pub fn validate_join(
     left: &HashMap<String, JoinColumnInfo>,
     right: &HashMap<String, JoinColumnInfo>,
 ) -> Result<(), ValidationError> {
+    // One joined table's columns are all a caller has today, and an
+    // aggregate JOIN joins exactly two tables.
+    if super::join::spec(def).is_some_and(|join| join.joins.len() > 1) {
+        return Err(ValidationError::JoinTooManyTables);
+    }
+    let joined = std::slice::from_ref(right);
     if let KeySpace::JoinOneToOne(_) = &def.key_space {
-        return super::validate_join_one_to_one::validate(def, left, right);
+        return super::validate_join_one_to_one::validate(def, left, joined);
     }
     let KeySpace::Join(join) = &def.key_space else {
         return Ok(());
     };
-    validate_join_tables_and_on(def, join, left, right)?;
-    let resolve = join_resolver(def, join, left, right);
+    validate_join_tables_and_on(def, join, left, joined)?;
+    let resolve = join_resolver(def, join, left, joined);
 
     let mut key_columns: HashMap<&str, &QualifiedColumn> =
         HashMap::with_capacity(join.group_by.len());
@@ -2385,7 +2421,8 @@ pub fn validate_join(
     check_index_key_width(|| "GROUP BY".to_string(), join.group_by.len())?;
     // A side's hidden partials table is keyed by its `ON` columns, then its
     // `GROUP BY` columns not among them: wider than either clause alone.
-    for (side, table) in [(Side::From, &def.source), (Side::Joined, &join.right)] {
+    for side in super::join::sides(join) {
+        let table = super::join::side_table(def, join, side);
         check_index_key_width(
             || format!("{table}'s key, its ON and GROUP BY columns together,"),
             super::join::side_key_columns(def, side).len(),
@@ -2445,7 +2482,7 @@ pub fn validate_join(
             &resolve,
             None,
             left,
-            right,
+            joined,
             &mut aggregates,
         )?;
         if aggregates == 0 {
@@ -2455,9 +2492,9 @@ pub fn validate_join(
         }
         // The composed field's type, over both tables' columns: each column
         // is renamed apart by side, since the two tables may share names.
-        join_field_value_type(def, field, left, right)?;
+        join_field_value_type(def, field, left, joined)?;
     }
-    check_join_collation_reads(def, join, left, right)?;
+    check_join_collation_reads(def, join, left, joined)?;
     // The target and each hidden table carry columns per field (two per
     // distinct aggregate argument in the partials).
     for (table, columns) in super::join::table_widths(def) {
@@ -2468,7 +2505,7 @@ pub fn validate_join(
 
 /// One column-read side of an aggregate argument, for the mixed-side check.
 type ResolveJoinColumn<'a> =
-    dyn Fn(&QualifiedColumn) -> Result<(JoinSide, &'a JoinColumnInfo), ValidationError> + 'a;
+    dyn Fn(&QualifiedColumn) -> Result<(Side, &'a JoinColumnInfo), ValidationError> + 'a;
 
 /// Walks one `JOIN` field's expression. Outside an aggregate (`in_aggregate`
 /// is `None`) it admits literals, operators and scalar functions over
@@ -2481,9 +2518,9 @@ fn check_join_field_expr<'a>(
     expr: &Expr,
     field: &str,
     resolve: &ResolveJoinColumn<'a>,
-    mut in_aggregate: Option<&mut Vec<JoinSide>>,
-    left: &HashMap<String, JoinColumnInfo>,
-    right: &HashMap<String, JoinColumnInfo>,
+    mut in_aggregate: Option<&mut Vec<Side>>,
+    root: &HashMap<String, JoinColumnInfo>,
+    joined: &[HashMap<String, JoinColumnInfo>],
     aggregates: &mut usize,
 ) -> Result<(), ValidationError> {
     let shape = |detail: &str| ValidationError::JoinFieldShape {
@@ -2527,19 +2564,19 @@ fn check_join_field_expr<'a>(
                 field,
                 resolve,
                 in_aggregate.as_deref_mut(),
-                left,
-                right,
+                root,
+                joined,
                 aggregates,
             )?;
-            check_join_field_expr(rhs, field, resolve, in_aggregate, left, right, aggregates)
+            check_join_field_expr(rhs, field, resolve, in_aggregate, root, joined, aggregates)
         }
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => check_join_field_expr(
             operand,
             field,
             resolve,
             in_aggregate,
-            left,
-            right,
+            root,
+            joined,
             aggregates,
         ),
         Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
@@ -2549,8 +2586,8 @@ fn check_join_field_expr<'a>(
                     field,
                     resolve,
                     in_aggregate.as_deref_mut(),
-                    left,
-                    right,
+                    root,
+                    joined,
                     aggregates,
                 )?;
             }
@@ -2567,8 +2604,8 @@ fn check_join_field_expr<'a>(
                         field,
                         resolve,
                         in_aggregate.as_deref_mut(),
-                        left,
-                        right,
+                        root,
+                        joined,
                         aggregates,
                     )?;
                 }
@@ -2590,8 +2627,8 @@ fn check_join_field_expr<'a>(
                 field,
                 resolve,
                 Some(&mut sides),
-                left,
-                right,
+                root,
+                joined,
                 aggregates,
             )?;
             let side = match sides.first() {
@@ -2608,10 +2645,7 @@ fn check_join_field_expr<'a>(
                 }
                 Some(side) => *side,
             };
-            let columns = match side {
-                JoinSide::Left => left,
-                JoinSide::Right => right,
-            };
+            let columns = side_columns(side, root, joined);
             // The argument's type over its one side, and for a lone column
             // its declared modifier (an expression's `numeric` result has no
             // declared scale).
@@ -2648,18 +2682,24 @@ fn check_join_field_expr<'a>(
 /// by the single-table inference.
 pub(crate) fn rename_join_columns(
     expr: &mut Expr,
-    source: &str,
-    left: &HashMap<String, JoinColumnInfo>,
-    right: &HashMap<String, JoinColumnInfo>,
+    def: &TransformDef,
+    root: &HashMap<String, JoinColumnInfo>,
+    joined: &[HashMap<String, JoinColumnInfo>],
     types: &mut HashMap<String, ValueType>,
 ) {
     match expr {
         Expr::SourceColumn { table, column, .. } => {
-            let (prefix, columns) = if table == source {
-                ("l", left)
-            } else {
-                ("r", right)
+            // A table that is no joined one is the validator's to refuse; it
+            // is typed as the first joined table's here.
+            let side = super::join::side_of_table(def, table).unwrap_or(super::join::JOINED);
+            let prefix = match side {
+                Side::From => "l".to_string(),
+                Side::Joined(position) if position == super::join::Position::FIRST => {
+                    "r".to_string()
+                }
+                Side::Joined(position) => format!("r{}", position.index() + 1),
             };
+            let columns = side_columns(side, root, joined);
             let renamed = format!("{prefix}\u{1}{column}");
             if let Some(info) = columns.get(column.as_str()) {
                 types.insert(renamed.clone(), info.value_type);
@@ -2667,20 +2707,20 @@ pub(crate) fn rename_join_columns(
             *expr = Expr::Column(renamed);
         }
         Expr::BinaryOp { lhs, rhs, .. } => {
-            rename_join_columns(lhs, source, left, right, types);
-            rename_join_columns(rhs, source, left, right, types);
+            rename_join_columns(lhs, def, root, joined, types);
+            rename_join_columns(rhs, def, root, joined, types);
         }
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-            rename_join_columns(operand, source, left, right, types);
+            rename_join_columns(operand, def, root, joined, types);
         }
         Expr::FunctionCall { args, .. } => {
             for arg in args {
-                rename_join_columns(arg, source, left, right, types);
+                rename_join_columns(arg, def, root, joined, types);
             }
         }
         Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
             for child in expr.logic_children_mut() {
-                rename_join_columns(child, source, left, right, types);
+                rename_join_columns(child, def, root, joined, types);
             }
         }
         _ => {}
@@ -2694,12 +2734,12 @@ pub(crate) fn rename_join_columns(
 pub(crate) fn join_field_value_type(
     def: &TransformDef,
     field: &super::ast::FieldDef,
-    left: &HashMap<String, JoinColumnInfo>,
-    right: &HashMap<String, JoinColumnInfo>,
+    root: &HashMap<String, JoinColumnInfo>,
+    joined: &[HashMap<String, JoinColumnInfo>],
 ) -> Result<ValueType, ValidationError> {
     let mut renamed = field.expr.clone();
     let mut types = HashMap::new();
-    rename_join_columns(&mut renamed, &def.source, left, right, &mut types);
+    rename_join_columns(&mut renamed, def, root, joined, &mut types);
     let types_by_field = infer_field_types(
         &TransformDef {
             fields: vec![super::ast::FieldDef {
@@ -8466,7 +8506,7 @@ mod tests {
             panic!("a join without GROUP BY");
         };
         assert_eq!(
-            check_join_collation_reads(&def, join, &left, &right),
+            check_join_collation_reads(&def, join, &left, std::slice::from_ref(&right)),
             Ok(())
         );
         let ci = |info: &mut JoinColumnInfo| {
@@ -8484,14 +8524,24 @@ mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         };
         assert_eq!(
-            refused(check_join_collation_reads(&def, join, &left, &right)),
+            refused(check_join_collation_reads(
+                &def,
+                join,
+                &left,
+                std::slice::from_ref(&right)
+            )),
             ("pos".into(), "STRPOS".into(), "items".into(), "note".into())
         );
         ci(right.get_mut("sku").unwrap());
         ci(left.get_mut("region").unwrap());
         right.remove("note");
         assert_eq!(
-            refused(check_join_collation_reads(&def, join, &left, &right)),
+            refused(check_join_collation_reads(
+                &def,
+                join,
+                &left,
+                std::slice::from_ref(&right)
+            )),
             ("same".into(), "=".into(), "orders".into(), "region".into())
         );
     }
@@ -9178,7 +9228,7 @@ mod tests {
         )
         .unwrap();
         if let KeySpace::Join(spec) = &mut def.key_space {
-            spec.right = "orders".to_string();
+            spec.joins[0].right = "orders".to_string();
         }
         assert!(matches!(
             validate_join(&def, &left, &right),

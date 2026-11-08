@@ -16,7 +16,7 @@ use super::parse;
 fn without_aliases(mut def: TransformDef) -> TransformDef {
     if let KeySpace::Join(join) | KeySpace::JoinOneToOne(join) = &mut def.key_space {
         join.source_alias = None;
-        join.right_alias = None;
+        join.joins[0].right_alias = None;
     }
     def
 }
@@ -104,7 +104,7 @@ fn an_aliased_definition_round_trips_through_its_rendered_text() {
         let rendered = render_definition_text(&def);
         assert_eq!(parse(&rendered).unwrap(), def, "{aliased} -> {rendered}");
         let join = join_of(&def);
-        for alias in [&join.source_alias, &join.right_alias]
+        for alias in [&join.source_alias, &join.joins[0].right_alias]
             .into_iter()
             .flatten()
         {
@@ -136,7 +136,10 @@ fn a_plain_join_renders_as_before() {
     )
     .unwrap();
     let join = join_of(&def);
-    assert_eq!((&join.source_alias, &join.right_alias), (&None, &None));
+    assert_eq!(
+        (&join.source_alias, &join.joins[0].right_alias),
+        (&None, &None)
+    );
     assert_eq!(
         render_definition_text(&def),
         "TRANSFORM t FROM shop.orders LEFT JOIN customers ON shop.orders.cid = customers.id \
@@ -155,7 +158,10 @@ fn a_reserved_word_after_a_table_is_not_an_alias() {
     )
     .unwrap();
     let join = join_of(&def);
-    assert_eq!((&join.source_alias, &join.right_alias), (&None, &None));
+    assert_eq!(
+        (&join.source_alias, &join.joins[0].right_alias),
+        (&None, &None)
+    );
     assert!(def.without_source_index);
     for text in [
         "TRANSFORM t FROM s GROUP BY g SELECT g AS g",
@@ -294,7 +300,7 @@ fn a_schema_qualified_alias_is_left_for_the_validator() {
         }
     );
     assert_eq!(
-        join_of(&def).on[0].lhs,
+        join_of(&def).joins[0].on[0].lhs,
         QualifiedColumn {
             schema: None,
             table: "orders".to_string(),

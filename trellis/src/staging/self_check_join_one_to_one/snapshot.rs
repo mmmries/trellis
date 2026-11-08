@@ -242,7 +242,7 @@ async fn read(
         .collect();
 
     let from_columns = read_columns(&audit.def.def, JoinSide::From);
-    let joined_columns = read_columns(&audit.def.def, JoinSide::Joined);
+    let joined_columns = read_columns(&audit.def.def, spec::JOINED);
     let from_entries = entries(txn, r, &audit.a.key, &from_columns).await?;
     let joined_entries = entries(txn, m, &audit.b.key, &joined_columns).await?;
     let keys = txn

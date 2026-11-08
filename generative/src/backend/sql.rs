@@ -102,12 +102,13 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
             let qualified = |c: &QualifiedColumn| format!("{}.{}", c.table, c.column);
             format!(
                 " {} {} ON {} GROUP BY {}",
-                match join.kind {
+                match join.joins[0].kind {
                     JoinKind::Inner => "INNER JOIN",
                     JoinKind::Left => "LEFT JOIN",
                 },
-                join.right,
-                join.on
+                join.joins[0].right,
+                join.joins[0]
+                    .on
                     .iter()
                     .map(|on| format!("{} = {}", qualified(&on.lhs), qualified(&on.rhs)))
                     .collect::<Vec<_>>()
@@ -124,12 +125,13 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
             let qualified = |c: &QualifiedColumn| format!("{}.{}", c.table, c.column);
             format!(
                 " {} {} ON {}",
-                match join.kind {
+                match join.joins[0].kind {
                     JoinKind::Inner => "INNER JOIN",
                     JoinKind::Left => "LEFT JOIN",
                 },
-                join.right,
-                join.on
+                join.joins[0].right,
+                join.joins[0]
+                    .on
                     .iter()
                     .map(|on| format!("{} = {}", qualified(&on.lhs), qualified(&on.rhs)))
                     .collect::<Vec<_>>()
@@ -186,10 +188,10 @@ pub(super) fn required_source_indexes(def: &TransformDef) -> Vec<(String, Vec<St
             }
             indexes
         }
-        KeySpace::Join(join) => [def.source.as_str(), join.right.as_str()]
+        KeySpace::Join(join) => [def.source.as_str(), join.joins[0].right.as_str()]
             .into_iter()
             .map(|table| {
-                let columns = join
+                let columns = join.joins[0]
                     .on
                     .iter()
                     .filter_map(|term| {

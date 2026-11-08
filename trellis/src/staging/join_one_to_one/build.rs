@@ -40,7 +40,7 @@ use tokio_postgres::Transaction;
 use tokio_postgres::types::ToSql;
 
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::defs::join::Side;
+use crate::defs::join::{JOINED, Side};
 use crate::defs::ledger as schema;
 use crate::metrics::{self, BuildStatement};
 use crate::pool::quote_ident;
@@ -89,7 +89,7 @@ pub(crate) async fn rederive(
         .collect();
     let (a, b) = match side {
         Side::From => (records, Vec::new()),
-        Side::Joined => (Vec::new(), records),
+        Side::Joined(_) => (Vec::new(), records),
     };
     let plan = JoinOneToOnePlan {
         shape: shape.clone(),
@@ -169,7 +169,7 @@ pub(crate) async fn m_batch(
         .map(|row| row.get(0))
         .collect();
     metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
-    rederive(txn, shape, Side::Joined, &keys, false).await?;
+    rederive(txn, shape, JOINED, &keys, false).await?;
     let full = i64::try_from(keys.len()).is_ok_and(|n| n >= limit);
     Ok(if full { keys.last().cloned() } else { None })
 }
@@ -211,7 +211,7 @@ pub(crate) async fn m_null_batch(
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    rederive(txn, shape, Side::Joined, &keys, false).await?;
+    rederive(txn, shape, JOINED, &keys, false).await?;
     let full = i64::try_from(keys.len()).is_ok_and(|n| n >= limit);
     Ok(if full { keys.last().cloned() } else { None })
 }
@@ -274,7 +274,7 @@ pub(crate) async fn m_gone_batch(
         .filter(|key| !present.contains(*key))
         .cloned()
         .collect();
-    rederive(txn, shape, Side::Joined, &gone, false).await?;
+    rederive(txn, shape, JOINED, &gone, false).await?;
     let full = i64::try_from(entries.len()).is_ok_and(|n| n >= limit);
     Ok(if full { entries.last().cloned() } else { None })
 }

@@ -2412,12 +2412,12 @@ async fn join_partitioned_sides(
     client: &impl GenericClient,
     definition: &Definition,
 ) -> Result<Vec<(crate::defs::join::Side, String)>, ChunkQueueError> {
-    use crate::defs::join::Side;
+    use crate::defs::join::{JOINED, Side};
     let mut sides = vec![(Side::From, definition.source_table.clone())];
     sides.extend(
         catalog::join_table_of(client, definition.id)
             .await?
-            .map(|t| (Side::Joined, t)),
+            .map(|t| (JOINED, t)),
     );
     let mut partitioned = Vec::new();
     for (side, table) in sides {
@@ -2481,14 +2481,14 @@ impl JoinStepId {
 /// 1. every unpartitioned side whole, `FROM` first;
 /// 2. each partitioned side, `FROM` first: its leaves, then its remainder.
 pub(crate) fn join_steps(partitioned: &[(crate::defs::join::Side, Vec<u32>)]) -> Vec<JoinStepId> {
-    use crate::defs::join::Side;
+    use crate::defs::join::{JOINED, Side};
     let mut steps = Vec::new();
-    for side in [Side::From, Side::Joined] {
+    for side in [Side::From, JOINED] {
         if !partitioned.iter().any(|(s, _)| *s == side) {
             steps.push(JoinStepId::Whole(side));
         }
     }
-    for side in [Side::From, Side::Joined] {
+    for side in [Side::From, JOINED] {
         let Some((_, leaves)) = partitioned.iter().find(|(s, _)| *s == side) else {
             continue;
         };
@@ -2714,7 +2714,7 @@ enum JoinPiece<'a> {
 fn side_name(side: crate::defs::join::Side) -> &'static str {
     match side {
         crate::defs::join::Side::From => "from",
-        crate::defs::join::Side::Joined => "joined",
+        crate::defs::join::Side::Joined(_) => "joined",
     }
 }
 
@@ -3329,7 +3329,9 @@ mod tests {
     /// starts over.
     #[test]
     fn join_steps_order_and_resume_after_the_cursor() {
-        use crate::defs::join::Side::{From, Joined};
+        use crate::defs::join::Side::From;
+        #[allow(non_upper_case_globals)]
+        const Joined: crate::defs::join::Side = crate::defs::join::JOINED;
         let steps = join_steps(&[(From, vec![11, 12])]);
         assert_eq!(
             steps,

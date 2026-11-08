@@ -590,9 +590,13 @@ impl Trellis {
                     let schema = match &def.key_space {
                         defs::ast::KeySpace::Join(join)
                         | defs::ast::KeySpace::JoinOneToOne(join)
-                            if join.right == *table && def.source != *table =>
+                            if def.source != *table
+                                && join.joins.iter().any(|joined| joined.right == *table) =>
                         {
-                            join.explicit_right_schema.as_deref()
+                            join.joins
+                                .iter()
+                                .find(|joined| joined.right == *table)
+                                .and_then(|joined| joined.explicit_right_schema.as_deref())
                         }
                         _ if def.source == *table => def.explicit_source_schema.as_deref(),
                         _ => None,

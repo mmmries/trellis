@@ -123,8 +123,8 @@ pub(crate) fn load_in(
 fn grammar_1(text: &str) -> Result<TransformDef, ParseError> {
     let mut def = parse_in(text, Identifiers::Exact)?;
     if let KeySpace::Join(join) | KeySpace::JoinOneToOne(join) = &mut def.key_space {
-        for alias in [&mut join.source_alias, &mut join.right_alias]
-            .into_iter()
+        for alias in std::iter::once(&mut join.source_alias)
+            .chain(join.joins.iter_mut().map(|joined| &mut joined.right_alias))
             .flatten()
         {
             alias.make_ascii_lowercase();

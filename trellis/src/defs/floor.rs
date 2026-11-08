@@ -58,8 +58,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use super::ast::{
-    Expr, FieldDef, JoinKind, JoinOn, JoinSpec, KeySpace, Operator, Predicate, TransformDef,
-    ValueType,
+    Expr, FieldDef, JoinKind, JoinOn, JoinSpec, JoinedTable, KeySpace, Operator, Predicate,
+    TransformDef, ValueType,
 };
 
 /// A Trellis release version, `major.minor.patch`, ordered as semver orders
@@ -428,28 +428,33 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
     };
     used.add(Feature::KeySpace(kind));
     if let Some(JoinSpec {
-        kind,
         source_alias,
-        right: _,
-        explicit_right_schema,
-        right_key,
-        right_alias,
-        on,
+        joins,
         group_by: _,
     }) = join
     {
-        if right_key.is_some() {
-            used.add(Feature::TableKey);
+        for JoinedTable {
+            kind,
+            right: _,
+            explicit_right_schema,
+            right_key,
+            right_alias,
+            on,
+        } in joins
+        {
+            if right_key.is_some() {
+                used.add(Feature::TableKey);
+            }
+            used.add(Feature::JoinKind(*kind));
+            if explicit_right_schema.is_some() {
+                used.add(Feature::QualifiedTable);
+            }
+            if source_alias.is_some() || right_alias.is_some() {
+                used.add(Feature::TableAlias);
+            }
+            // An `ON` term is two columns, which every `JOIN` has.
+            for JoinOn { lhs: _, rhs: _ } in on {}
         }
-        used.add(Feature::JoinKind(*kind));
-        if explicit_right_schema.is_some() {
-            used.add(Feature::QualifiedTable);
-        }
-        if source_alias.is_some() || right_alias.is_some() {
-            used.add(Feature::TableAlias);
-        }
-        // An `ON` term is two columns, which every `JOIN` has.
-        for JoinOn { lhs: _, rhs: _ } in on {}
     }
     if source_key.is_some() {
         used.add(Feature::TableKey);
