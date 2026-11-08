@@ -3,16 +3,18 @@
 //!
 //! Such a release admitted a `numeric` sum only over a plain `numeric(p,s)`
 //! column, and kept its sum alone: a hidden table with `__sum_<i>` and no
-//! scale map or special-value counts. Every value of the column has scale
-//! `s`, so a finite stored sum with a count above 0 has scale `s` too, and
-//! its scale map is `{s: count}`. A `NaN` it summed made the stored sum `NaN`
-//! for good, which no count recovers.
+//! map of exceptions. Every value of the column has scale `s`, so a finite
+//! stored sum with a count above 0 has scale `s` too: with `s` as its
+//! reference scale, its map is empty. A `NaN` it summed made the stored sum
+//! `NaN` for good, which no count recovers.
 //!
 //! At attach ([`super::grammar::pause_unloadable_in`]) each hidden table that
 //! lacks the partials of a `numeric` argument gains them in place
-//! ([`convert_table`]): the four columns, a scale map from each row's count
-//! and its stored sum's scale, and the zero flag and its index over the new
-//! columns. The definition's floor is stamped again, now that its tables have
+//! ([`convert_table`]): the map column, `NULL` in every row, recording as its
+//! reference scale the one the column declares now, and the zero flag and its
+//! index over the new column. Only a row whose stored sum has another scale
+//! (or every row, for a column that declares none now) is written: its map
+//! counts its values at that scale. The definition's floor is stamped again, now that its tables have
 //! a layout an older release can't read (ADR-0024). A definition with a group
 //! whose stored sum is `NaN` is rebuilt in place, which recomputes every
 //! group from its source; one that doesn't apply (paused) rebuilds on its
@@ -92,6 +94,9 @@ pub(crate) struct NumericTable {
     /// `numeric` argument's ([`NUMERIC_PARTS`]), and whether a `SUM` or `AVG`
     /// reads it, so its count is its finite values' count.
     pub(crate) args: Vec<(bool, bool)>,
+    /// Per aggregate argument (in order): its reference scale, the one its
+    /// column declares now (`group_basis::source_scales`).
+    pub(crate) scales: Vec<Option<i32>>,
     /// Its zero flag's column definition over every partial.
     pub(crate) zero: String,
 }
@@ -117,6 +122,13 @@ async fn numeric_tables(
         let numeric = |side| {
             super::join::numeric_arguments(def, side, &sides.from_columns, &sides.joined_columns)
         };
+        let reference = |side| {
+            super::join::reference_scales(def, side, &sides.from_columns, &sides.joined_columns)
+        };
+        let (from_scales, joined_scales) = (
+            reference(super::join::Side::From),
+            reference(super::join::JOINED),
+        );
         let summed = crate::staging::join::plan_for(txn, schema, definition)
             .await
             .map_err(failed)?
@@ -138,23 +150,27 @@ async fn numeric_tables(
             NumericTable {
                 table: super::join::HiddenTable::FromPartials.qualified(schema, definition.id),
                 args: pair(&from, &summed[..fa]),
+                scales: from_scales.clone(),
                 zero: super::join::zero_column(&from),
             },
             NumericTable {
                 table: super::join::HiddenTable::JoinedPartials.qualified(schema, definition.id),
                 args: pair(&joined, &summed[fa..]),
+                scales: joined_scales.clone(),
                 zero: super::join::zero_column(&joined),
             },
             NumericTable {
                 table: super::join::HiddenTable::TargetPartials.qualified(schema, definition.id),
                 args: pair(&all, &summed),
+                scales: [from_scales, joined_scales].concat(),
                 zero: super::join::zero_column(&all),
             },
         ]
     } else if matches!(def.key_space, KeySpace::Aggregate { .. }) {
-        let Some(shape) = group_basis::route(def, &definition.source_columns) else {
+        let Some(mut shape) = group_basis::route(def, &definition.source_columns) else {
             return Ok(Vec::new());
         };
+        shape.declare_scales(txn, &definition.source_table).await?;
         vec![NumericTable {
             table: group_basis::hidden_table_ident(schema, definition.id),
             args: shape
@@ -164,6 +180,11 @@ async fn numeric_tables(
                     let numeric = arg.parts() == NUMERIC_PARTS;
                     (numeric, numeric)
                 })
+                .collect(),
+            scales: shape
+                .arguments()
+                .iter()
+                .map(|arg| arg.reference_scale())
                 .collect(),
             zero: group_basis::hidden_zero_column(&shape),
         }]
@@ -233,25 +254,46 @@ pub(crate) async fn convert_table(
         .await?
         .map(|row| row.get(0));
     let mut alter = vec!["drop column __zero".to_string()];
-    let mut sets = Vec::new();
+    let (mut sets, mut written, mut comments) = (Vec::new(), Vec::new(), Vec::new());
     for &(i, summed) in &lacking {
         for part in &NUMERIC_PARTS[1..] {
             alter.push(format!("add column {}", part.ddl(i)));
         }
+        let scale = table.scales.get(i - 1).copied().flatten();
+        comments.push((i, scale));
         if summed {
+            // A row whose finite values aren't at the reference scale: its
+            // map counts them at its stored sum's.
             let (count, sum) = (format!("__count_{i}"), SumPart::Sum.hidden(i));
+            let off = match scale {
+                Some(s) => {
+                    format!("{count} > 0 and {sum} <> 'NaN'::numeric and scale({sum}) <> {s}")
+                }
+                None => format!("{count} > 0 and {sum} <> 'NaN'::numeric"),
+            };
             sets.push(format!(
-                "{} = case when {count} > 0 and {sum} <> 'NaN'::numeric \
-                      then jsonb_build_object(scale({sum})::text, {count}) else '{{}}'::jsonb end",
+                "{} = case when {off} then jsonb_build_object(scale({sum})::text, {count}) end",
                 SumPart::Scales.hidden(i)
             ));
+            written.push(format!("({off})"));
         }
     }
-    txn.batch_execute(&format!("alter table {t} {}", alter.join(", ")))
-        .await?;
+    txn.batch_execute(&format!(
+        "alter table {t} {};\n{}",
+        alter.join(", "),
+        group_basis::scale_comments_sql(t, &comments)
+    ))
+    .await?;
     if !sets.is_empty() {
-        txn.execute(&format!("update {t} set {}", sets.join(", ")), &[])
-            .await?;
+        txn.execute(
+            &format!(
+                "update {t} set {} where {}",
+                sets.join(", "),
+                written.join(" or ")
+            ),
+            &[],
+        )
+        .await?;
     }
     txn.batch_execute(&format!("alter table {t} add column {}", table.zero))
         .await?;

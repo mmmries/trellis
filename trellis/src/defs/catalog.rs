@@ -3927,7 +3927,10 @@ async fn create_definition_inner(
         "an admitted aggregate the group basis doesn't route: {}",
         def.target
     );
-    if let Some(shape) = shape {
+    if let Some(mut shape) = shape {
+        // Each `numeric` sum's reference scale is the one its column declares
+        // now, recorded with the hidden table.
+        shape.declare_scales(&*txn, &qualified_source).await?;
         txn.batch_execute(&crate::staging::group_basis::hidden_table_ddl(
             pool.schema(),
             id,

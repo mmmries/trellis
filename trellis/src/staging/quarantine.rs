@@ -4560,7 +4560,11 @@ async fn complete_resume(
     // passed its fence before the pause commits first and is overwritten,
     // rather than this `ACCESS EXCLUSIVE` waiting inside the resume while it
     // holds the definition row.
-    if let Some(shape) = super::group_basis::route(&definition.def, &revalidated.source_columns) {
+    if let Some(mut shape) = super::group_basis::route(&definition.def, &revalidated.source_columns)
+    {
+        // The rebuild writes the new table from the source as it is now, so
+        // each `numeric` sum's reference scale is its column's now.
+        shape.declare_scales(txn, &definition.source_table).await?;
         catalog::recreate_group_table(txn, schema, id, &shape).await?;
     }
     // ADR-0024: the rebuild writes this release's layout, so the floor is

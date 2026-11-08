@@ -3050,7 +3050,12 @@ pub(super) async fn compute_page(
                         let mut shape = shape;
                         let identity = {
                             let client = pool.get().await?;
-                            shape.declare_scales(&**client, qualified_source).await?;
+                            shape
+                                .read_scales(
+                                    &**client,
+                                    &super::group_basis::hidden_table_ident(pool.schema(), def.id),
+                                )
+                                .await?;
                             ddl::identity_key_columns(&**client, &def.target_table).await?
                         };
                         entry.insert(super::group_basis::GroupTargetPlan::new(

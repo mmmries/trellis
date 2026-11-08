@@ -658,8 +658,9 @@ pub(crate) fn hidden_tables_ddl(
         let name = table.qualified(catalog_schema, id);
         sql.push_str(&format!(
             "create table {name} ({});\n\
-             create index on {name} ({identity}) where __zero;\n",
-            body.join(", ")
+             create index on {name} ({identity}) where __zero;\n{}",
+            body.join(", "),
+            scale_comments(&name, &numeric, &reference_scales(def, side, from, joined)),
         ));
     }
     // `J`, with each key's count of joined rows.
@@ -692,11 +693,17 @@ pub(crate) fn hidden_tables_ddl(
             .collect();
         let groups = groups.join(", ");
         body.push(format!("unique nulls not distinct ({groups})"));
+        let scales = [
+            reference_scales(def, Side::From, from, joined),
+            reference_scales(def, JOINED, from, joined),
+        ]
+        .concat();
         let name = HiddenTable::TargetPartials.qualified(catalog_schema, id);
         sql.push_str(&format!(
             "create table {name} ({});\n\
-             create index on {name} ({groups}) where __zero;\n",
-            body.join(", ")
+             create index on {name} ({groups}) where __zero;\n{}",
+            body.join(", "),
+            scale_comments(&name, &arguments, &scales),
         ));
     }
     sql.push_str(&lock_row_ddl(
@@ -713,6 +720,48 @@ pub(crate) fn drop_hidden_tables_sql(catalog_schema: &str, id: i64) -> String {
         .map(|table| table.qualified(catalog_schema, id))
         .collect();
     format!("drop table if exists {}", tables.join(", "))
+}
+
+/// The statement recording on the hidden table `table` each `numeric`
+/// argument's reference scale (`crate::staging::group_basis::stored_scales`),
+/// `numeric` and `scales` aligned with the table's arguments.
+fn scale_comments(table: &str, numeric: &[bool], scales: &[Option<i32>]) -> String {
+    let numeric: Vec<(usize, Option<i32>)> = numeric
+        .iter()
+        .zip(scales)
+        .enumerate()
+        .filter(|(_, (numeric, _))| **numeric)
+        .map(|(i, (_, scale))| (i + 1, *scale))
+        .collect();
+    crate::staging::group_basis::scale_comments_sql(table, &numeric)
+}
+
+/// Each of `side`'s aggregate arguments' ([`side_arguments`]) reference
+/// scale, as its column declares it now: for a `numeric` argument that is a
+/// plain column typed `numeric(p,s)`, `s` (0 for a negative `s`), and `None`
+/// for every other argument. A hidden table records it when it is created
+/// (`crate::staging::group_basis`'s "Numeric sums").
+pub(crate) fn reference_scales(
+    def: &TransformDef,
+    side: Side,
+    from: &HashMap<String, JoinColumnInfo>,
+    joined: &HashMap<String, JoinColumnInfo>,
+) -> Vec<Option<i32>> {
+    let columns = match side {
+        Side::From => from,
+        Side::Joined(_) => joined,
+    };
+    side_arguments(def, side)
+        .iter()
+        .map(|arg| {
+            let Expr::SourceColumn { column, .. } = arg else {
+                return None;
+            };
+            let info = columns.get(column)?;
+            (info.value_type == ValueType::Numeric && info.typmod >= 4)
+                .then(|| crate::staging::group_basis::numeric_scale(info.typmod).max(0))
+        })
+        .collect()
 }
 
 /// The value type of `arg`, an aggregate argument over one side's columns.
@@ -913,8 +962,7 @@ mod tests {
         assert!(
             ddl.contains(
                 "__stamp bigint not null default 0, __zero boolean not null generated always as \
-                 (__n = 0 and __count_1 = 0 and __sum_1 = 0 and __scales_1 = '{}'::jsonb \
-                 and __nan_1 = 0 and __pinf_1 = 0 and __ninf_1 = 0) stored, \
+                 (__n = 0 and __count_1 = 0 and __sum_1 = 0 and __scales_1 is null) stored, \
                  unique nulls not distinct (\"id\", \"tenant\", \"region\"));\n\
                  create index on \"trellis\".\"join_7_p\" (\"id\", \"tenant\", \"region\") \
                  where __zero;\n"
@@ -927,16 +975,15 @@ mod tests {
             ddl.contains(
                 "\"join_7_t\" (\"region\" text, \"sku\" text, __n bigint not null default 0, \
                  __count_1 bigint not null default 0, __sum_1 numeric not null default 0, \
-                 __scales_1 jsonb not null default '{}', __nan_1 bigint not null default 0, \
-                 __pinf_1 bigint not null default 0, __ninf_1 bigint not null default 0, \
+                 __scales_1 jsonb, \
                  __count_2 bigint not null default 0, __sum_2 numeric not null default 0, \
                  __count_3 bigint not null default 0, __sum_3 numeric not null default 0, \
                  __zero boolean not null generated always as (__n = 0 and __count_1 = 0 \
-                 and __sum_1 = 0 and __scales_1 = '{}'::jsonb and __nan_1 = 0 and __pinf_1 = 0 \
-                 and __ninf_1 = 0 and __count_2 = 0 and __sum_2 = 0 and __count_3 = 0 \
-                 and __sum_3 = 0) stored, \
+                 and __sum_1 = 0 and __scales_1 is null and __count_2 = 0 and __sum_2 = 0 \
+                 and __count_3 = 0 and __sum_3 = 0) stored, \
                  unique nulls not distinct (\"region\", \"sku\"));\n\
-                 create index on \"trellis\".\"join_7_t\" (\"region\", \"sku\") where __zero;\n"
+                 create index on \"trellis\".\"join_7_t\" (\"region\", \"sku\") where __zero;\n\
+                 comment on column \"trellis\".\"join_7_t\".__scales_1 is 'none';\n"
             ),
             "{ddl}"
         );
@@ -983,9 +1030,9 @@ mod tests {
             ]
         );
         // Spelled out: `P` is 3 key columns (id, tenant, region), the row
-        // count, its one `numeric` argument's count and five sum partials,
+        // count, its one `numeric` argument's count and two sum partials,
         // then basis, stamp and zero flag.
-        assert_eq!(widths[1].1, 3 + 1 + 6 + 3);
+        assert_eq!(widths[1].1, 3 + 1 + 3 + 3);
 
         let target = target_ddl(&def, "\"public\".\"by_region\"", &from, &joined).unwrap();
         assert_eq!(

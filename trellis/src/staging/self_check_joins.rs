@@ -343,25 +343,35 @@ fn summed(def: &TransformDef, args: &[Expr]) -> Vec<bool> {
 }
 
 /// Each argument's sum partials (`group_basis::SumPart`): none for one no
-/// `SUM` or `AVG` reads, all five for a `numeric` one (`numeric`: the
-/// hidden table keeps its scale map, `__scales_<i>`), its sum otherwise.
-fn sum_parts(summed: &[bool], numeric: &HashSet<usize>) -> Vec<&'static [SumPart]> {
+/// `SUM` or `AVG` reads, both for a `numeric` one (`numeric`: the hidden
+/// table keeps its map of exceptions, `__scales_<i>`), its sum otherwise.
+fn sum_parts(summed: &[bool], numeric: &HashMap<usize, Option<i32>>) -> Vec<&'static [SumPart]> {
     summed
         .iter()
         .enumerate()
-        .map(|(i, summed)| group_basis::sum_parts(*summed, numeric.contains(&(i + 1))))
+        .map(|(i, summed)| group_basis::sum_parts(*summed, numeric.contains_key(&(i + 1))))
+        .collect()
+}
+
+/// Each of `count` arguments' reference scale in `numeric`
+/// ([`numeric_arguments`]), `None` for one with none.
+fn reference_scales(count: usize, numeric: &HashMap<usize, Option<i32>>) -> Vec<Option<i32>> {
+    (1..=count)
+        .map(|i| numeric.get(&i).copied().flatten())
         .collect()
 }
 
 /// The arguments (1-based) whose partials in the hidden table `hidden`
-/// (quoted and qualified) keep a scale map: the `numeric` ones.
+/// (quoted and qualified) keep a map of exceptions, the `numeric` ones,
+/// each with its reference scale as the map column records it
+/// (`group_basis::stored_scales`).
 async fn numeric_arguments(
     client: &tokio_postgres::Client,
     hidden: &str,
-) -> Result<HashSet<usize>, SelfCheckError> {
+) -> Result<HashMap<usize, Option<i32>>, SelfCheckError> {
     let rows = client
         .query(
-            "select attname::text from pg_attribute \
+            "select attname::text, col_description(attrelid, attnum) from pg_attribute \
              where attrelid = $1::text::regclass and attnum > 0 and not attisdropped \
                and attname::text like '\\_\\_scales\\_%'",
             &[&hidden],
@@ -369,7 +379,13 @@ async fn numeric_arguments(
         .await?;
     Ok(rows
         .iter()
-        .filter_map(|row| row.get::<_, String>(0)["__scales_".len()..].parse().ok())
+        .filter_map(|row| {
+            let i = row.get::<_, String>(0)["__scales_".len()..].parse().ok()?;
+            let scale = row
+                .get::<_, Option<String>>(1)
+                .and_then(|c| c.parse::<i32>().ok());
+            Some((i, scale))
+        })
         .collect())
 }
 
@@ -487,6 +503,9 @@ struct Audit<'a> {
     /// Each argument's sum partials ([`sum_parts`]).
     from_parts: Vec<&'static [SumPart]>,
     joined_parts: Vec<&'static [SumPart]>,
+    /// Each argument's reference scale ([`numeric_arguments`]).
+    from_scales: Vec<Option<i32>>,
+    joined_scales: Vec<Option<i32>>,
     /// For each of a side's cell columns, the collation an unapplied
     /// change's column is read under to find its cell in `P` or `M`
     /// ([`Basis::collations`]): the hidden copy's, where the source column
@@ -622,9 +641,19 @@ impl Audit<'_> {
         keyset: &Keyset,
         steer: bool,
     ) -> Result<(String, Vec<String>), SelfCheckError> {
-        let (part, args, parts) = match side {
-            JoinSide::From => (Part::From, &self.from_args, &self.from_parts),
-            JoinSide::Joined(_) => (Part::Joined, &self.joined_args, &self.joined_parts),
+        let (part, args, parts, scales) = match side {
+            JoinSide::From => (
+                Part::From,
+                &self.from_args,
+                &self.from_parts,
+                &self.from_scales,
+            ),
+            JoinSide::Joined(_) => (
+                Part::Joined,
+                &self.joined_args,
+                &self.joined_parts,
+                &self.joined_scales,
+            ),
         };
         let key = keyset.columns();
         // A joined row with a `NULL` join-key part joins nothing, and has no
@@ -637,10 +666,12 @@ impl Audit<'_> {
                 .collect(),
         };
         let columns = partial_names(parts);
-        let rendered: Vec<(String, &[SumPart])> = self
+        let rendered: Vec<(String, &[SumPart], Option<i32>)> = self
             .render_args(args, "__s")?
             .into_iter()
             .zip(parts.iter().copied())
+            .zip(scales.iter().copied())
+            .map(|((arg, parts), scale)| (arg, parts, scale))
             .collect();
         let (values, nonzero) = weighted_partials(&rendered);
         let ring = self.ring(side);
@@ -773,10 +804,17 @@ impl Audit<'_> {
             .collect();
         let numeric: Vec<bool> = parts.iter().map(|p| p.len() > 1).collect();
         let columns = partial_names(&parts);
-        let x_columns: Vec<(String, &[SumPart])> = parts
+        let scales: Vec<Option<i32>> = self
+            .from_scales
             .iter()
+            .chain(&self.joined_scales)
+            .copied()
+            .collect();
+        let x_columns: Vec<(String, &[SumPart], Option<i32>)> = parts
+            .iter()
+            .zip(&scales)
             .enumerate()
-            .map(|(i, p)| (format!("__x{}", i + 1), *p))
+            .map(|(i, (p, scale))| (format!("__x{}", i + 1), *p, *scale))
             .collect();
         let (sv, nonzero) = weighted_partials(&x_columns);
         let mut oracle_fields = Vec::with_capacity(fields.len());
@@ -1124,20 +1162,20 @@ async fn build_audit<'a>(
         target: ddl::qualified_target_table_ident(&def.target_table),
         from_parts: Vec::new(),
         joined_parts: Vec::new(),
+        from_scales: Vec::new(),
+        joined_scales: Vec::new(),
         from_args,
         joined_args,
         from_basis: Vec::new(),
         joined_basis: Vec::new(),
     };
     let client = pool.get().await?;
-    audit.from_parts = sum_parts(
-        &summed(&def.def, &audit.from_args),
-        &numeric_arguments(&client, &audit.hidden(Part::From)).await?,
-    );
-    audit.joined_parts = sum_parts(
-        &summed(&def.def, &audit.joined_args),
-        &numeric_arguments(&client, &audit.hidden(Part::Joined)).await?,
-    );
+    let from_numeric = numeric_arguments(&client, &audit.hidden(Part::From)).await?;
+    let joined_numeric = numeric_arguments(&client, &audit.hidden(Part::Joined)).await?;
+    audit.from_parts = sum_parts(&summed(&def.def, &audit.from_args), &from_numeric);
+    audit.joined_parts = sum_parts(&summed(&def.def, &audit.joined_args), &joined_numeric);
+    audit.from_scales = reference_scales(audit.from_args.len(), &from_numeric);
+    audit.joined_scales = reference_scales(audit.joined_args.len(), &joined_numeric);
     for side in [JoinSide::From, spec::JOINED] {
         let (source, part) = match side {
             JoinSide::From => (&audit.from_table, Part::From),
@@ -1537,7 +1575,7 @@ mod tests {
         let joined = spec::side_arguments(&def, spec::JOINED);
         assert_eq!(summed(&def, &from), [false, true]);
         assert_eq!(summed(&def, &joined), [true, false]);
-        let numeric = HashSet::from([3]);
+        let numeric = HashMap::from([(3, Some(2))]);
         assert_eq!(
             partial_names(&sum_parts(&[false, true, true], &numeric)),
             [
@@ -1547,10 +1585,7 @@ mod tests {
                 "__sum_2",
                 "__count_3",
                 "__sum_3",
-                "__scales_3",
-                "__nan_3",
-                "__pinf_3",
-                "__ninf_3"
+                "__scales_3"
             ]
         );
     }

@@ -474,6 +474,7 @@ impl JoinTargetPlan {
                 summed: false,
                 numeric: false,
                 scale: None,
+                scale_read: false,
             })
             .collect();
         let t_groups: Vec<(Side, String)> = join
@@ -790,27 +791,16 @@ impl JoinTargetPlan {
 
     /// Step 4's statement (see the module doc): stages the product's change
     /// per `T` group into `T`'s staging table and adds each key's `ΣΔM.n`
-    /// to `J.matches`. Every read is of rows the page holds locked.
-    ///
-    /// `strict` carries each `numeric` sum with a declared scale
-    /// ([`group_basis::Arg`]'s `scale`) as its count at that scale, a
-    /// `bigint`, in place of its scale map: every map it reads must count
-    /// only that scale, or the statement fails ([`group_basis::strict_count`])
-    /// and the caller runs it again the general way. `T`'s staged maps are
-    /// then derived from its counts ([`group_basis::StagedParts`]), so no map
-    /// is built or merged per term or per group.
-    fn product_sql(&self, strict: bool) -> String {
+    /// to `J.matches`. Every read is of rows the page holds locked. A
+    /// `numeric` sum's maps of exceptions are `NULL` while they count
+    /// nothing, the common case, and a product or difference of `NULL` maps
+    /// is `NULL` with no map built ([`SumPart::times`], [`SumPart::sub`]).
+    fn product_sql(&self) -> String {
         let p = self.from.plan.hidden();
         let m = self.joined.plan.hidden();
         // Each side's change per cell: its apply's and its recompute's, for
         // a cell both wrote, summed.
         let (dp, dm) = ("__dp", "__dm");
-        // The declared scale a strict statement carries argument `arg`'s
-        // `part` at, as a count.
-        let strict_at = |arg: &group_basis::Arg, part: SumPart| {
-            arg.scale
-                .filter(|_| strict && part == SumPart::Scales && arg.numeric && arg.summed)
-        };
         let summed = |name: &str, side: &SidePlan| {
             let keys = quoted(&side.plan.shape.group_cols).join(", ");
             let mut columns = vec![keys.clone(), "sum(__dn)::bigint as __dn".to_string()];
@@ -819,13 +809,7 @@ impl JoinTargetPlan {
                 columns.push(format!("sum(__dc{i})::bigint as __dc{i}"));
                 for part in arg.parts() {
                     let delta = part.name("__d", i);
-                    let total = match strict_at(arg, *part) {
-                        Some(s) => format!(
-                            "coalesce(sum({}), 0)::bigint",
-                            group_basis::strict_count(&delta, s)
-                        ),
-                        None => part.total(&delta, None, arg.scale),
-                    };
+                    let total = part.total(&delta, None, arg.scale);
                     columns.push(format!("{total} as {delta}"));
                 }
             }
@@ -879,13 +863,10 @@ impl JoinTargetPlan {
             for (i, arg) in p_args.iter().chain(&m_args).enumerate() {
                 columns.push(format!("({})::bigint as __c{}", counts[i], i + 1));
                 for sum_part in arg.parts() {
-                    let sql_type = match strict_at(arg, *sum_part) {
-                        Some(_) => "bigint",
-                        None => sum_part.sql_type(),
-                    };
                     columns.push(format!(
-                        "({})::{sql_type} as {}",
+                        "({})::{} as {}",
                         part(i + 1, *sum_part),
+                        sum_part.sql_type(),
                         sum_part.name("__", i + 1)
                     ));
                 }
@@ -903,35 +884,10 @@ impl JoinTargetPlan {
                 m_args[i - 1 - fa].scale
             }
         };
-        // `T`'s argument `i` (1-based).
-        let arg_of = |i: usize| {
-            if i <= fa {
-                &p_args[i - 1]
-            } else {
-                &m_args[i - 1 - fa]
-            }
-        };
-        // A strict statement's count at the declared scale of `T`'s argument
-        // `i`'s `part`, when it carries it as one.
-        let strict_of = |i: usize, part: SumPart| strict_at(arg_of(i), part);
-        // A hidden partial `column` of `T`'s argument `i`, as the statement
-        // carries it.
-        let held = |i: usize, part: SumPart, column: String| match strict_of(i, part) {
-            Some(s) => group_basis::strict_count(&column, s),
-            None => column,
-        };
-        let zero = |i: usize, part: SumPart| match strict_of(i, part) {
-            Some(_) => "0::bigint".to_string(),
-            None => part.zero().to_string(),
-        };
-        let times = |i: usize, part: SumPart, a: &str, n: &str| match strict_of(i, part) {
-            Some(_) => format!("({a} * ({n})::bigint)"),
-            None => part.times(a, n, scale_of(i)),
-        };
-        let sub = |i: usize, part: SumPart, a: &str, b: &str| match strict_of(i, part) {
-            Some(_) => format!("({a} - {b})"),
-            None => part.sub(a, b, scale_of(i)),
-        };
+        let held = |_: usize, _: SumPart, column: String| column;
+        let zero = |_: usize, part: SumPart| part.zero().to_string();
+        let times = |i: usize, part: SumPart, a: &str, n: &str| part.times(a, n, scale_of(i));
+        let sub = |i: usize, part: SumPart, a: &str, b: &str| part.sub(a, b, scale_of(i));
         let p_old = |i: usize, part: SumPart| {
             sub(
                 i,
@@ -1054,10 +1010,7 @@ impl JoinTargetPlan {
                     let i = i + 1;
                     p_old_nonzero.push(format!("{} <> 0", p_old_c(i)));
                     for sum_part in arg.parts() {
-                        p_old_nonzero.push(match strict_of(i, *sum_part) {
-                            Some(_) => format!("{} <> 0", p_old(i, *sum_part)),
-                            None => sum_part.nonzero(&p_old(i, *sum_part)),
-                        });
+                        p_old_nonzero.push(sum_part.nonzero(&p_old(i, *sum_part)));
                     }
                 }
                 terms.push(format!(
@@ -1126,15 +1079,9 @@ impl JoinTargetPlan {
             nonzero.push(format!("sum(__c{i}) <> 0"));
             for part in arg.parts() {
                 let staged = part.name("__", i);
-                if strict_at(arg, *part).is_some() {
-                    // `T`'s apply derives the map from the counts.
-                    nonzero.push(format!("coalesce(sum({staged}), 0) <> 0"));
-                    sums.push(group_basis::NO_SCALES.to_string());
-                } else {
-                    let total = part.total(&staged, None, arg.scale);
-                    nonzero.push(part.nonzero(&total));
-                    sums.push(total);
-                }
+                let total = part.total(&staged, None, arg.scale);
+                nonzero.push(part.nonzero(&total));
+                sums.push(total);
                 insert_cols.push(staged);
             }
         }
@@ -1491,24 +1438,20 @@ async fn write_locked(
     // 4. The product into `T`'s staging, and `J.matches`. With nested
     // loops left on: its joins look up the other side's cells of a key
     // through the cell identity's index.
-    // Strictly first, then, if a map counts a scale other than its declared
-    // one, the general way ([`JoinTargetPlan::product_sql`]).
-    let products = [plan.product_sql(true), plan.product_sql(false)];
+    let product = plan.product_sql();
     // The planted bug's partials from before the `J` locks, with the page's
     // own changes added, read in place of each side's.
     #[cfg(any(test, feature = "test-util"))]
-    let products = if before_j {
+    let product = if before_j {
         let (build_stale, count_changed) = plan.planted_stale_sides_sql();
         txn.batch_execute(&build_stale).await?;
         let changed: i64 = txn.query_one(&count_changed, &[]).await?.get(0);
         crate::plant::fires(crate::plant::Plant::JoinOtherSideBeforeJ, changed > 0);
-        products.map(|product| {
-            product
-                .replace(plan.from.plan.hidden(), PLANTED_STALE[0])
-                .replace(plan.joined.plan.hidden(), PLANTED_STALE[1])
-        })
+        product
+            .replace(plan.from.plan.hidden(), PLANTED_STALE[0])
+            .replace(plan.joined.plan.hidden(), PLANTED_STALE[1])
     } else {
-        products
+        product
     };
     // Planted bug: count the pages whose product the dropped flip
     // changes. See `crate::plant`.
@@ -1520,14 +1463,8 @@ async fn write_locked(
     if bulk {
         txn.batch_execute(group_basis::BULK_PLAN_SETTINGS).await?;
     }
-    let declared = group_basis::StagedParts::declared(&plan.t.shape);
-    if declared == group_basis::StagedParts::default() {
-        plan.t.set_staged_parts(None);
-        txn.batch_execute(&products[1]).await?;
-    } else {
-        let held = group_basis::strictly_or_generally(txn, &products[0], &products[1]).await?;
-        plan.t.set_staged_parts(held.then_some(declared));
-    }
+    plan.t.set_staged_parts(None);
+    txn.batch_execute(&product).await?;
     if bulk {
         txn.batch_execute(group_basis::BULK_PLAN_RESET).await?;
     }
@@ -1673,17 +1610,15 @@ pub(crate) async fn plan_for(
         identity,
         source_pks,
     )?;
-    // Each sum's declared scale, by the column of its side (`T`'s
-    // arguments are `P`'s then `M`'s).
-    let mut scales =
-        group_basis::declared_scales(client, &definition.source_table, &plan.from.plan.shape.args)
-            .await?;
-    let joined_scales =
-        group_basis::declared_scales(client, &joined.0, &plan.joined.plan.shape.args).await?;
-    plan.from.plan.shape.set_scales(&scales);
-    plan.joined.plan.shape.set_scales(&joined_scales);
-    scales.extend(joined_scales);
-    plan.t.shape.set_scales(&scales);
+    // Each sum's reference scale, as each hidden table records it.
+    for (shape, table) in [
+        (&mut plan.from.plan.shape, HiddenTable::FromPartials),
+        (&mut plan.joined.plan.shape, HiddenTable::JoinedPartials),
+        (&mut plan.t.shape, HiddenTable::TargetPartials),
+    ] {
+        let name = format!("{catalog_schema}.{}", table.name(definition.id));
+        shape.read_scales(client, &name).await?;
+    }
     Ok(plan)
 }
 
