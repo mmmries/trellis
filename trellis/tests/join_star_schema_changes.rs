@@ -5,15 +5,21 @@
 //! `capture_failure` naming the table at that position and its column, as at
 //! position 1:
 //!
-//! - its unique key on that position's `ON` columns dropped (#1536's check,
-//!   at every position), and `RESUME` refused until the key is back;
+//! - its unique key on that position's `ON` columns dropped, or left
+//!   `INVALID` (#1536's check, at every position, against that position's
+//!   own `ON` columns), and `RESUME` refused until the key is back; the
+//!   swaps and maintenance that keep a key in place pause nothing, and the
+//!   pass's memo never hides a drop;
 //! - a column the star reads there renamed or dropped;
 //! - a column a field reads there widened, and `RESUME` re-types the target;
 //! - its `ON` column retyped on one side, `RESUME` refused until the pair
 //!   matches again;
-//! - the table renamed away, or attached as a partition.
+//! - the table renamed away, or attached as a partition;
+//! - its primary key redefined, or the root's, and `RESUME` re-records or
+//!   re-keys;
+//! - a value of an enum read only there relabelled.
 //!
-//! A star's apply and build are not built yet (#1773, #1774), so every test
+//! The checks read the catalog and the pause state only, so every test
 //! defines the star, leaves its build unstarted, and drives the staging
 //! worker's pass by hand: the checks read the catalog and the pause state
 //! only. Nothing polls or sleeps. The development knob is process-wide, so
@@ -475,7 +481,7 @@ async fn position_2_s_table_renamed_away_or_attached_as_a_partition_pauses_the_t
         .rows("select source_table, kind from capture_failures")
         .await;
     assert_eq!(failure, [format!("({b},disruption)")]);
-    write(&d, &format!("alter table public.b2_x rename to b2")).await;
+    write(&d, "alter table public.b2_x rename to b2").await;
     resume(&d, &star.name()).await;
     pass(&mut d).await;
     assert_unpaused(&d, &target, "the resume after the rename").await;
