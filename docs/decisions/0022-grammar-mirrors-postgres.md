@@ -21,9 +21,10 @@ This ADR settles what the expression grammar may accept and how it may change:
 Postgres is the oracle for every expression's syntax and meaning, and Trellis
 may refuse more than Postgres does but never less. The statement language
 around the expressions (`TRANSFORM`, `FROM`, `GROUP BY`, `SELECT ... AS`,
-`ALTER TRANSFORM` and the rest) is Trellis's own and out of scope; so is how a
-stored definition keeps its meaning across releases, which is
-[ADR-0018](0018-grammar-versioning.md)'s.
+`ALTER TRANSFORM` and the rest) is Trellis's own and out of scope, except that
+its names follow the identifier rule below, since each one names a table or
+column the user checks the target against; so is how a stored definition keeps
+its meaning across releases, which is [ADR-0018](0018-grammar-versioning.md)'s.
 
 ## Decisions
 
@@ -62,13 +63,36 @@ Each rule the expression grammar has is the rule Postgres's `scan.l` and
   don't chain (`a < b < c` is refused), `NOT` binds looser than the comparisons
   and `IS`, and `AT TIME ZONE` binds tighter than `*` and looser than prefix
   `-`.
-- **Keywords and identifiers.** A bare identifier in expression position is a
+- **Identifiers.** An unquoted identifier folds to lower case (ASCII; a
+  non-ASCII character is refused), and a quoted identifier `"..."` is exact,
+  with `""` standing for `"`, as in Postgres. This holds in every name
+  position: columns, tables and schemas in `TRANSFORM`, `FROM`, `JOIN` and
+  qualifiers, `KEY (...)`, `GROUP BY`, `AS` labels, table aliases, and the
+  target an addressing statement (`PAUSE`, `RESUME`, `DROP`, `ALTER
+  TRANSFORM`) names. So `SUM(Total)` reads `total`, and `SUM("Total")` reads
+  `"Total"`. A name over 63 bytes, after folding and unescaping, is refused in
+  every position: Postgres truncates one, and two long names sharing a prefix
+  would silently become one. `""` (zero length) is refused as Postgres refuses
+  it, and so are `U&"..."` and a quoted name holding a `.`, which Trellis's
+  `<schema>.<table>` addressing can't tell apart. Rendering quotes every name
+  that isn't `[a-z_][a-z0-9_]*` or is a reserved word, so a rendered
+  definition parses back to the same tree. A reference that finds nothing
+  while a name differing from it only in case exists is refused naming the
+  quoted spelling.
+- **Keywords.** A bare identifier in expression position is a
   name Postgres itself accepts as an unquoted column name. The words
   `pg_get_keywords()` reports with category `R` (reserved) or `T` (reserved as a
   type or function name) are not: Trellis refuses a bare identifier equal to one
-  of them, by name, since it has no quoted identifiers. The remedy is the one
-  Postgres offers without quotes: a source column qualified with its table
-  (`orders.order`), or renaming the column or field. `NOT` and `CASE` are keywords before every operand the grammar
+  of them, by name. The remedy is Postgres's: the quoted name (`"order"`), or
+  the column qualified with its table (`orders.order`). A quoted name is never
+  a keyword, a reserved word or a function or type name: a quoted name before
+  `(` or a string, or as a `CAST` target, is refused, since Postgres looks it up
+  exactly (`"int4"` is a type there, `"INT4"` and `"integer"` are not). An
+  unquoted table name, or a `GROUP BY`, `KEY (...)` or `JOIN` qualifier name,
+  equal to one of these words is refused too (`FROM user` and `GROUP BY
+  current_user` read the `current_user` function in Postgres, and `FROM order`
+  is a syntax error); `FROM "user"` names the table.
+  `NOT` and `CASE` are keywords before every operand the grammar
   has, `-` included: `not - 1` is `NOT (-1)`, as in Postgres. The refusal covers
   `not AS c`, `not + 1`, `case * b`, `end + 1` and `and + 1`, which Postgres
   reads differently or rejects. `true`, `false` and `null` are the literals,
@@ -189,9 +213,11 @@ Postgres.
 ## Consequences
 
 - The grammar is stricter than Postgres in places a SQL user will notice: the
-  refusals in the transforms table, and no quoted identifiers, so a column whose
-  name Postgres reserves is read only qualified with its table, and a field
-  whose label Postgres reserves can't be read by another field.
+  refusals in the transforms table, names over 63 bytes, and the quoted forms
+  above.
+- A name with upper-case letters is written quoted, as in psql: `"createdAt"`
+  for a column an ORM created that way, `"OrderTotals"` to address a target
+  created with that spelling.
 - The oracle is every supported Postgres version, PostgreSQL 15 or later. Where
   majors differ (PostgreSQL 16 and later read `1_000` as 1000 and `0x1F` as
   31; 15 rejects both as trailing junk), Trellis accepts only what every

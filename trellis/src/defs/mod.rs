@@ -32,6 +32,7 @@ pub mod adopt;
 pub mod alias_readers;
 pub mod ast;
 pub mod backfill;
+pub(crate) mod case_hint;
 pub mod catalog;
 pub mod chunk_queue;
 pub(crate) mod copies;
@@ -133,6 +134,8 @@ mod arithmetic_tests;
 mod date_tests;
 #[cfg(test)]
 mod floor_manifest;
+#[cfg(test)]
+mod identifier_tests;
 #[cfg(test)]
 mod literal_tests;
 #[cfg(test)]
@@ -684,7 +687,7 @@ mod tests {
                 expected,
                 found,
             } => {
-                assert_eq!(name, "octet_length");
+                assert_eq!(name, "OCTET_LENGTH");
                 assert_eq!(expected, 1);
                 assert_eq!(found, 2);
             }
@@ -1260,7 +1263,7 @@ mod statement_grammar_tests {
                 panic!("expected an ordinary unexpected-token error for {text:?}, got {err:?}");
             };
             assert_eq!(expected, "'TRANSFORM'");
-            assert_eq!(found, "identifier 'RELATIONSHIP'");
+            assert_eq!(found, "identifier 'relationship'");
             assert_eq!(statement_kind(text).unwrap_err(), err);
         }
     }

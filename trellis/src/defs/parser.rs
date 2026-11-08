@@ -38,7 +38,7 @@ use super::ast::{
     TransformRef,
 };
 use super::error::ParseError;
-use super::lexer::{Token, lex};
+use super::lexer::{Identifiers, Token, lex_in};
 use super::registry::{
     AGGREGATE_FUNCTIONS, NON_IMMUTABLE_NAMES, cast_target, function_overloads, is_reserved_word,
     lookup_aggregate_function, lookup_operator, null_cast_target, operator_spec,
@@ -102,18 +102,13 @@ const STATEMENT_KEYWORDS: &str = "a statement keyword: TRANSFORM, PAUSE, RESUME,
 /// `TransformDef`-typed so callers that re-parse persisted text (the catalog)
 /// don't need to unwrap a statement-kind enum.
 pub fn parse(input: &str) -> Result<TransformDef, ParseError> {
-    let tokens = lex(input)?;
-    Parser {
-        tokens,
-        pos: 0,
-        nest: 0,
-        last_height: 0,
-        is_aggregate: false,
-        source: None,
-        source_alias: None,
-        joined: None,
-    }
-    .parse_transform_def()
+    parse_in(input, Identifiers::Folded)
+}
+
+/// [`parse`], reading identifiers as `identifiers` says: how a grammar
+/// version's text is read ([`super::grammar::load_in`]).
+pub(crate) fn parse_in(input: &str, identifiers: Identifiers) -> Result<TransformDef, ParseError> {
+    Parser::new(lex_in(input, identifiers)?, identifiers).parse_transform_def()
 }
 
 /// Parses **any** statement in this grammar into a [`Statement`] — the one
@@ -152,18 +147,7 @@ pub fn parse(input: &str) -> Result<TransformDef, ParseError> {
 /// of (`catalog::definition_by_target`), where unwrapping a [`Statement`]
 /// would be pure ceremony.
 pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
-    let tokens = lex(input)?;
-    Parser {
-        tokens,
-        pos: 0,
-        nest: 0,
-        last_height: 0,
-        is_aggregate: false,
-        source: None,
-        source_alias: None,
-        joined: None,
-    }
-    .parse_statement()
+    Parser::new(lex_in(input, Identifiers::Folded)?, Identifiers::Folded).parse_statement()
 }
 
 /// Which form the statement `input` is, decided by parsing all of it with
@@ -209,7 +193,8 @@ impl Verb {
 /// hides its table's name: a qualifier naming an aliased side's table, with
 /// or without its schema, is refused, naming the alias to write. Any other
 /// qualifier is left as written for the validator to check.
-fn resolve_aliases(def: &mut TransformDef) -> Result<(), ParseError> {
+fn resolve_aliases(def: &mut TransformDef, identifiers: Identifiers) -> Result<(), ParseError> {
+    let same = |a: &str, b: &str| same_name(identifiers, a, b);
     let (KeySpace::Join(join) | KeySpace::JoinOneToOne(join)) = &mut def.key_space else {
         return Ok(());
     };
@@ -225,13 +210,13 @@ fn resolve_aliases(def: &mut TransformDef) -> Result<(), ParseError> {
     }
     let resolve = |schema: &mut Option<String>, table: &mut String, column: &str| {
         for (side_table, alias) in &sides {
-            if schema.is_none() && table.eq_ignore_ascii_case(alias) {
+            if schema.is_none() && same(table, alias) {
                 *table = side_table.clone();
                 return Ok(());
             }
         }
         for (side_table, alias) in &sides {
-            if table.eq_ignore_ascii_case(side_table) {
+            if same(table, side_table) {
                 return Err(ParseError::AliasedTableName {
                     reference: super::ast::qualified_column_text(schema.as_deref(), table, column),
                     alias: alias.clone(),
@@ -252,6 +237,17 @@ fn resolve_aliases(def: &mut TransformDef) -> Result<(), ParseError> {
         resolve_expr_aliases(&mut field.expr, &resolve)?;
     }
     Ok(())
+}
+
+/// Whether two names an alias check compares are the same name. Grammar 2
+/// folds every unquoted name in the lexer, so names compare exactly, as
+/// Postgres compares them. Grammar 1 kept a name's case but folded an
+/// alias, so an alias matched a qualifier in any case there.
+fn same_name(identifiers: Identifiers, a: &str, b: &str) -> bool {
+    match identifiers {
+        Identifiers::Exact => a.eq_ignore_ascii_case(b),
+        Identifiers::Folded => a == b,
+    }
 }
 
 /// Applies `resolve` to every qualified column of `expr`.
@@ -320,9 +316,25 @@ struct Parser {
     /// The `JOIN` table's bare name, once [`Self::parse_join_clause`] has
     /// parsed it.
     joined: Option<String>,
+    /// How the grammar version being read reads identifiers.
+    identifiers: Identifiers,
 }
 
 impl Parser {
+    fn new(tokens: Vec<Token>, identifiers: Identifiers) -> Self {
+        Parser {
+            tokens,
+            pos: 0,
+            nest: 0,
+            last_height: 0,
+            is_aggregate: false,
+            source: None,
+            source_alias: None,
+            joined: None,
+            identifiers,
+        }
+    }
+
     fn peek(&self) -> &Token {
         &self.tokens[self.pos]
     }
@@ -349,8 +361,49 @@ impl Parser {
     }
 
     fn expect_ident(&mut self) -> Result<String, ParseError> {
+        self.expect_name().map(|(name, _)| name)
+    }
+
+    /// A column or qualifier name in the statement language (`GROUP BY`,
+    /// `KEY (...)`, a `JOIN`'s `ON` and `GROUP BY` heads), where Postgres
+    /// takes a column reference or a column list: an unquoted word Postgres
+    /// reserves is refused there, as Postgres refuses it, and the quoted
+    /// spelling is the name. Grammar 1 had no such check.
+    fn expect_column_name(&mut self) -> Result<String, ParseError> {
+        let (name, quoted) = self.expect_name()?;
+        self.refuse_reserved_name(name, quoted)
+    }
+
+    /// `name` back, unless it is an unquoted word Postgres reserves read
+    /// under grammar 2 ([`Self::expect_column_name`]).
+    fn refuse_reserved_name(&self, name: String, quoted: bool) -> Result<String, ParseError> {
+        if !quoted && self.identifiers == Identifiers::Folded && is_reserved_word(&name) {
+            return Err(ParseError::ReservedWord { name });
+        }
+        Ok(name)
+    }
+
+    /// A `CAST` target's type name: an unquoted word. A quoted one is
+    /// refused: Postgres looks it up exactly in `pg_type`, so `"int4"` is a
+    /// type there and `"INT4"`, `"integer"` and `"bigint"` are not, while
+    /// this grammar matches its type names in any case and by their SQL
+    /// spellings.
+    fn expect_type_name(&mut self) -> Result<String, ParseError> {
+        match self.expect_name()? {
+            (name, false) => Ok(name),
+            (name, true) => Err(ParseError::UnsupportedQuotedIdentifier {
+                name,
+                detail: "a type name is written unquoted, as in CAST(x AS int4)".to_string(),
+            }),
+        }
+    }
+
+    /// A name, unquoted or quoted, and whether it was quoted: a quoted name
+    /// is never a keyword or a reserved word.
+    fn expect_name(&mut self) -> Result<(String, bool), ParseError> {
         match self.advance() {
-            Token::Ident(s) => Ok(s),
+            Token::Ident(s) => Ok((s, false)),
+            Token::QuotedIdent(s) => Ok((s, true)),
             Token::Eof => Err(ParseError::UnexpectedEof {
                 expected: "an identifier".to_string(),
             }),
@@ -425,8 +478,16 @@ impl Parser {
     /// after the `TRANSFORM`/`FROM`/`JOIN` keyword, before `SELECT`'s
     /// field-expression list is reached, so the two never compete for the
     /// same tokens.
+    ///
+    /// An unquoted first part Postgres reserves (`FROM user`, `FROM order`)
+    /// is refused, as Postgres reads it as something else or not at all; the
+    /// quoted spelling names the table. A part after the `.` is a label, as
+    /// in Postgres (`public.order`). Grammar 1 had no such check.
     fn parse_table_ref(&mut self) -> Result<(String, Option<String>), ParseError> {
-        let first = self.expect_ident()?;
+        let (first, quoted) = self.expect_name()?;
+        if !quoted && self.identifiers == Identifiers::Folded && is_reserved_word(&first) {
+            return Err(ParseError::ReservedTableName { name: first });
+        }
         if !self.peek_is_symbol('.') {
             return Ok((first, None));
         }
@@ -630,7 +691,7 @@ impl Parser {
             without_source_index,
             adopt_target,
         };
-        resolve_aliases(&mut def)?;
+        resolve_aliases(&mut def, self.identifiers)?;
         Ok(def)
     }
 
@@ -646,10 +707,10 @@ impl Parser {
         }
         self.advance();
         self.advance();
-        let mut columns = vec![self.expect_ident()?];
+        let mut columns = vec![self.expect_column_name()?];
         while self.peek_is_symbol(',') {
             self.advance();
-            columns.push(self.expect_ident()?);
+            columns.push(self.expect_column_name()?);
         }
         self.expect_symbol(')')?;
         if let Some(repeated) = columns
@@ -677,8 +738,8 @@ impl Parser {
     fn parse_table_alias(&mut self) -> Result<Option<String>, ParseError> {
         if self.peek_is_keyword("AS") {
             self.advance();
-            let alias = self.expect_ident()?;
-            if is_reserved_word(&alias) {
+            let (alias, quoted) = self.expect_name()?;
+            if !quoted && is_reserved_word(&alias) {
                 return Err(ParseError::TableAlias {
                     detail: format!(
                         "'{alias}' is a word Postgres reserves, so it can't name a table"
@@ -693,6 +754,11 @@ impl Parser {
                 if !is_reserved_word(word) && !word.eq_ignore_ascii_case("WITHOUT") =>
             {
                 let alias = word.clone();
+                self.advance();
+                Ok(Some(alias))
+            }
+            Token::QuotedIdent(alias) => {
+                let alias = alias.clone();
                 self.advance();
                 Ok(Some(alias))
             }
@@ -962,7 +1028,7 @@ impl Parser {
         ];
         for (alias, other, what) in clashes {
             if let Some(alias) = alias
-                && alias.eq_ignore_ascii_case(other)
+                && same_name(self.identifiers, alias, other)
             {
                 return Err(ParseError::TableAlias {
                     alias: alias.to_string(),
@@ -1004,7 +1070,8 @@ impl Parser {
             ),
         };
         let first = match self.advance() {
-            Token::Ident(first) => first,
+            Token::Ident(first) => self.refuse_reserved_name(first, false)?,
+            Token::QuotedIdent(first) => first,
             other => return Err(refuse(other.describe())),
         };
         if !self.peek_is_symbol('.') {
@@ -1033,7 +1100,7 @@ impl Parser {
     /// never a field, so the qualifier changes nothing and isn't kept. Any other head
     /// is refused ([`ParseError::GroupByKeyNotFromSource`]).
     fn parse_group_by_key(&mut self) -> Result<String, ParseError> {
-        let first = self.expect_ident()?;
+        let first = self.expect_column_name()?;
         if self.peek_is_symbol('.') {
             self.advance();
             let column = self.expect_ident()?;
@@ -1262,7 +1329,10 @@ impl Parser {
     fn peek_prefix_keyword(&self, keyword: &str) -> bool {
         self.peek_is_keyword(keyword)
             && match self.peek_at(1) {
-                Token::Number(_) | Token::String(_) | Token::Symbol('(' | '-') => true,
+                Token::Number(_)
+                | Token::String(_)
+                | Token::QuotedIdent(_)
+                | Token::Symbol('(' | '-') => true,
                 Token::Ident(word) => !CONTINUATION_KEYWORDS
                     .iter()
                     .any(|kw| word.eq_ignore_ascii_case(kw)),
@@ -1397,6 +1467,32 @@ impl Parser {
             }
             Token::Number(n) => Ok(Expr::NumberLiteral(n)),
             Token::String(s) => Ok(Expr::StringLiteral(s)),
+            // A quoted name is a column, or a qualified column's head: never
+            // a keyword, a literal or a function.
+            Token::QuotedIdent(name) => {
+                // Postgres reads `"lower"(x)` as a call and `"date" '…'` as
+                // a typed literal, looking the quoted name up exactly; this
+                // grammar spells functions and types unquoted.
+                let refused = match self.peek() {
+                    Token::Symbol('(') => {
+                        Some("a function name is written unquoted, as in lower(x)")
+                    }
+                    Token::String(_) => {
+                        Some("a type name is written unquoted, as in date '2024-01-31'")
+                    }
+                    _ => None,
+                };
+                if let Some(detail) = refused {
+                    return Err(ParseError::UnsupportedQuotedIdentifier {
+                        name,
+                        detail: detail.to_string(),
+                    });
+                }
+                if self.peek_is_symbol('.') {
+                    return self.parse_dotted_reference(name);
+                }
+                Ok(Expr::Column(name))
+            }
             Token::Ident(name) => {
                 let upper = name.to_ascii_uppercase();
 
@@ -1416,7 +1512,7 @@ impl Parser {
                 }
 
                 if NON_IMMUTABLE_NAMES.contains(&upper.as_str()) {
-                    return Err(ParseError::NonImmutableConstruct { name });
+                    return Err(ParseError::NonImmutableConstruct { name: upper });
                 }
 
                 // A typed literal's `<type> '<text>'` spelling.
@@ -1460,8 +1556,7 @@ impl Parser {
                 }
 
                 // A reserved word is not a column name: Postgres needs it
-                // quoted, and this grammar has no quoted identifiers
-                // (ADR-0022). Before `(` it is a construct or function name
+                // quoted (ADR-0022). Before `(` it is a construct or function name
                 // (`left(...)`), after a `.` it is a label (read by
                 // `parse_dotted_reference`), neither of which reaches here.
                 if is_reserved_word(&upper) && !self.peek_is_symbol('(') {
@@ -1504,7 +1599,7 @@ impl Parser {
                     if AGGREGATE_FUNCTIONS.contains(&upper.as_str()) {
                         if !self.is_aggregate {
                             return Err(ParseError::UnsupportedKeySpace {
-                                construct: format!("{name}(...)"),
+                                construct: format!("{upper}(...)"),
                                 detail: "aggregate functions require an aggregate key-space \
                                     (GROUP BY)"
                                     .to_string(),
@@ -1553,7 +1648,7 @@ impl Parser {
                             let args = self.parse_call_args()?;
                             if args.len() != 1 {
                                 return Err(ParseError::FunctionArityMismatch {
-                                    name,
+                                    name: upper,
                                     expected: 1,
                                     found: args.len(),
                                 });
@@ -1566,7 +1661,7 @@ impl Parser {
                         let args = self.parse_call_args()?;
                         if args.len() != spec.arg_types.len() {
                             return Err(ParseError::FunctionArityMismatch {
-                                name,
+                                name: upper,
                                 expected: spec.arg_types.len(),
                                 found: args.len(),
                             });
@@ -1601,7 +1696,7 @@ impl Parser {
                         .collect();
                     let Some(&widest) = arities.iter().max() else {
                         self.skip_balanced_parens()?;
-                        return Err(ParseError::UnsupportedFunction { name });
+                        return Err(ParseError::UnsupportedFunction { name: upper });
                     };
 
                     let mut args = self.parse_call_args()?;
@@ -1614,7 +1709,7 @@ impl Parser {
                     }
                     if !arities.contains(&args.len()) {
                         return Err(ParseError::FunctionArityMismatch {
-                            name,
+                            name: upper,
                             expected: if args.len() < widest {
                                 *arities.iter().min().unwrap_or(&widest)
                             } else {
@@ -1679,7 +1774,10 @@ impl Parser {
     fn case_follows(&self) -> bool {
         self.peek_is_keyword("WHEN")
             || match self.peek() {
-                Token::Number(_) | Token::String(_) | Token::Symbol('(' | '-') => true,
+                Token::Number(_)
+                | Token::String(_)
+                | Token::QuotedIdent(_)
+                | Token::Symbol('(' | '-') => true,
                 Token::Ident(word) => !CONTINUATION_KEYWORDS
                     .iter()
                     .any(|kw| word.eq_ignore_ascii_case(kw)),
@@ -1735,7 +1833,7 @@ impl Parser {
         if !matches!(self.peek(), Token::String(_)) {
             let operand = self.parse_expr()?;
             self.expect_keyword("AS")?;
-            let type_name = self.expect_ident()?;
+            let type_name = self.expect_type_name()?;
             let keyword = self.take_type_keyword(&type_name.to_ascii_uppercase());
             // `CAST(NULL AS <type>)` converts no value, so it may name any
             // type the grammar has a value of.
@@ -1768,7 +1866,7 @@ impl Parser {
             unreachable!("peeked a string literal");
         };
         self.expect_keyword("AS")?;
-        let type_name = self.expect_ident()?;
+        let type_name = self.expect_type_name()?;
         // `CAST('1.5' AS double precision)` — see `take_type_keyword`.
         let keyword = self.take_type_keyword(&type_name.to_ascii_uppercase());
         self.expect_symbol(')')?;

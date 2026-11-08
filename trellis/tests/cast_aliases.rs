@@ -87,7 +87,7 @@ async fn cast_aliases_are_typed_canonically_stored_canonically_and_leave_columns
     );
     // Narrowing through an alias is refused like the canonical spelling.
     let alias = refusal("TRANSFORM bad FROM s SELECT CAST(int8 AS INT2) AS x").await;
-    assert!(alias.contains("INT2"), "{alias}");
+    assert!(alias.contains("int2"), "{alias}");
     let narrowing = refusal("TRANSFORM bad FROM s SELECT CAST(decimal AS Int) AS x").await;
     let canonical = refusal("TRANSFORM bad FROM s SELECT CAST(decimal AS integer) AS x").await;
     assert_eq!(narrowing, canonical);

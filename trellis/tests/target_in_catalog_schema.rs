@@ -245,9 +245,9 @@ async fn definition_count(db: &TestDatabase, catalog_schema: &str) -> i64 {
         .get(0)
 }
 
-/// Schema names compare exactly, as Postgres stores them: the grammar keeps
-/// an identifier's case, and the DDL quotes it, so `Cat_Mixed` and
-/// `cat_mixed` are two schemas, only the first of them a catalog.
+/// Schema names compare exactly, as Postgres stores them: a quoted name keeps
+/// its case, and the DDL quotes it, so `"Cat_Mixed"` and `cat_mixed` are two
+/// schemas, only the first of them a catalog.
 #[tokio::test]
 async fn a_catalog_schema_is_matched_by_its_exact_mixed_case_name() {
     let cluster = TestCluster::start();
@@ -268,13 +268,13 @@ async fn a_catalog_schema_is_matched_by_its_exact_mixed_case_name() {
 
     let (_, schema, own, _) = refusal(
         trellis
-            .apply("TRANSFORM Cat_Mixed.mc_own FROM cat_src SELECT v AS v")
+            .apply("TRANSFORM \"Cat_Mixed\".mc_own FROM cat_src SELECT v AS v")
             .await,
     );
     assert_eq!((schema.as_str(), own), ("Cat_Mixed", true));
     let (_, schema, own, _) = refusal(
         trellis
-            .apply("TRANSFORM Other_Mixed.mc_other FROM cat_src SELECT v AS v")
+            .apply("TRANSFORM \"Other_Mixed\".mc_other FROM cat_src SELECT v AS v")
             .await,
     );
     assert_eq!((schema.as_str(), own), ("Other_Mixed", false));

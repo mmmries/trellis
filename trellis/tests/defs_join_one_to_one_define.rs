@@ -1622,7 +1622,7 @@ async fn a_qualified_read_of_a_reserved_word_column_is_copied_under_its_name() {
 
     let definition = install_definition(
         &db.pool,
-        "TRANSFORM both FROM orders LEFT JOIN customers ON orders.cust = customers.id \
+        "TRANSFORM \"both\" FROM orders LEFT JOIN customers ON orders.cust = customers.id \
          SELECT orders.order AS order, customers.group AS group",
         &HashMap::new(),
         "public",

@@ -110,7 +110,7 @@ async fn naming_a_reserved_word_column_in_an_expression_is_refused_at_define() {
         assert!(
             text.contains("reserved word")
                 && text.contains("qualified with its table")
-                && text.contains("rename the column"),
+                && text.contains("write it quoted"),
             "{expr}: {text}"
         );
     }

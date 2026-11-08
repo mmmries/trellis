@@ -80,7 +80,7 @@ async fn a_qualified_passthrough_copies_a_reserved_word_column_in_a_one_to_one_t
     install(
         &db,
         "TRANSFORM qp_copy FROM qp_src SELECT qp_src.order AS order, \
-         public.qp_src.group AS group, qp_src.Mixed AS Mixed, qp_src.amt AS amt, \
+         public.qp_src.group AS group, qp_src.\"Mixed\" AS \"Mixed\", qp_src.amt AS amt, \
          qp_src.val AS val",
     )
     .await;

@@ -55,10 +55,11 @@ would break a stored definition, which is stored as text and re-parsed.
   alias when it has one (`FROM <table> [AS] <alias>`, `JOIN <table> [AS]
   <alias>`), and by its bare table name otherwise. As in Postgres, an alias
   hides its table's name: a column qualified with an aliased side's table
-  name is refused, naming the alias. An alias is an unquoted identifier,
-  folded to lower case as Postgres folds it; a word Postgres reserves, a name
-  the other side already goes by, and an alias on a single-table definition
-  are refused. The parser resolves each alias to its side's table once, so
+  name is refused, naming the alias. An alias follows the rule every name does
+  ([ADR-0022](0022-grammar-mirrors-postgres.md)): unquoted, it folds to lower
+  case; quoted, it is exact. An unquoted word Postgres reserves, a name the
+  other side already goes by, and an alias on a single-table definition are
+  refused. The parser resolves each alias to its side's table once, so
   validation, hidden state, the catalog, capture and every rendered query
   work in tables and never see an alias; a stored definition keeps its
   aliases in its text, which renders them with `AS`. A dotted name whose head

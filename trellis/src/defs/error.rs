@@ -119,6 +119,23 @@ pub enum ParseError {
         address: String,
         detail: String,
     },
+    /// A double-quoted identifier was opened but never closed.
+    UnterminatedQuotedIdentifier,
+    /// `""`, which Postgres refuses as a zero-length delimited identifier.
+    ZeroLengthQuotedIdentifier,
+    /// `U&"..."`, Postgres's Unicode-escape identifier, which this grammar
+    /// doesn't read.
+    UnicodeEscapeIdentifier,
+    /// A quoted identifier this grammar refuses although Postgres takes it:
+    /// `name` as written, `detail` says why.
+    UnsupportedQuotedIdentifier { name: String, detail: String },
+    /// A name over Postgres's 63 bytes, after folding and unescaping.
+    /// Postgres would truncate it to `truncated`; Trellis refuses it.
+    NameTooLong { name: String, truncated: String },
+    /// An unquoted table name equal to a word Postgres reserves (`FROM
+    /// user`, `FROM order`), which Postgres reads as something else or
+    /// refuses. The quoted spelling names the table.
+    ReservedTableName { name: String },
     /// A stored definition was written under a grammar version older than the
     /// oldest this binary reads (ADR-0018). The fix is to drop the transform
     /// and define it again.
@@ -279,11 +296,40 @@ impl fmt::Display for ParseError {
                 write!(
                     f,
                     "'{name}' is a reserved word in Postgres, so it can't be a column name \
-                     without quotes, and this grammar has no quoted identifiers: read a \
-                     source column of that name qualified with its table \
-                     (`<table>.{lower}`), as Postgres allows, or rename the column or field"
+                     without quotes: write it quoted (\"{lower}\"), or qualified with its \
+                     table (`<table>.{lower}`), as Postgres allows"
                 )
             }
+            ParseError::UnterminatedQuotedIdentifier => {
+                write!(f, "unterminated quoted identifier in transform definition")
+            }
+            ParseError::ZeroLengthQuotedIdentifier => write!(
+                f,
+                "zero-length quoted identifier \"\": a quoted name needs at least one character"
+            ),
+            ParseError::UnicodeEscapeIdentifier => write!(
+                f,
+                "the Unicode-escape identifier U&\"...\" is not supported: write the name \
+                 quoted with its ASCII characters (\"name\")"
+            ),
+            ParseError::UnsupportedQuotedIdentifier { name, detail } => {
+                write!(f, "quoted identifier \"{name}\" is not supported: {detail}")
+            }
+            ParseError::NameTooLong { name, truncated } => write!(
+                f,
+                "the name '{name}' is {} bytes, and Postgres names are at most {} bytes: \
+                 Postgres would truncate it to '{truncated}', and Trellis refuses it rather \
+                 than truncate; use a shorter name",
+                name.len(),
+                super::lexer::MAX_NAME_BYTES
+            ),
+            ParseError::ReservedTableName { name } => write!(
+                f,
+                "'{name}' is a word Postgres reserves, so it can't name a table without \
+                 quotes (Postgres reads FROM user as the current_user function, and refuses \
+                 FROM order): write the table's name quoted, as the catalog spells it \
+                 (\"{name}\", or \"User\" for a table created as \"User\")"
+            ),
             ParseError::SplitOperator { found, joined } => write!(
                 f,
                 "'{found}' is not an operator: the characters of a two-character operator must be adjacent, as in Postgres; write '{joined}'"

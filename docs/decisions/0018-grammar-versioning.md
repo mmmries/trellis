@@ -42,6 +42,18 @@ statement.
 Because only a write stamps it, reading a definition can never move it to rules
 it wasn't written under.
 
+### Text is stamped with the oldest version that reads it the same
+
+The version stamped is not always the current one: it is the oldest version in
+the binary's support window whose reading of the text equals the current
+reading, the same tree after that version's compatibility rule. A definition
+whose text an older grammar reads identically can then still be run by a
+release that reads only that older grammar, so a definition's grammar version,
+like its floor ([ADR-0024](0024-compatibility-floors-and-rollback.md)), comes
+from what it uses, not from the release that wrote it. A definition that uses
+a newer grammar's syntax, or that the older grammar would read differently,
+gets the newer version.
+
 ### A change in meaning bumps the version; additive syntax and refusals don't
 
 A change bumps the version when some text the current version accepts stays
@@ -142,21 +154,28 @@ decided with that change.
 
 ## Example
 
-Suppose a grammar read a bare name that names both a source column and a field
-as the field, so that
+Grammar 1 kept an unquoted name's case and had no quoted identifiers, so
 
 ```text
-TRANSFORM t FROM public.src GROUP BY grp
-SELECT grp AS grp, (grp + 1) AS val, SUM(val) AS total
+TRANSFORM cust_totals FROM invoices GROUP BY customer_id WITHOUT SOURCE INDEX
+SELECT SUM(Amount) AS total
 ```
 
-means `SUM(grp + 1)`. Changing that grammar to refuse such a name, and to read a
-qualified `src.val` as the source column, changes what accepted text means, so
-it bumps the version. The older version's compatibility rule translates the bare
-name into the field's expression, so every stored definition keeps meaning
-`SUM(grp + 1)`, and a rewrite renders that tree as `SUM(grp + 1)`, which loads
-to the same tree. (Grammar 1 already reads names the new way; see
-[Calculated Fields](../transforms.md#calculated-fields).)
+read the column `"Amount"`. Grammar 2 reads identifiers as Postgres does
+([ADR-0022](0022-grammar-mirrors-postgres.md)): the same text reads `amount`.
+Accepted text now resolves differently, so this is a bump. Without a
+compatibility rule, a stored definition over a table midway through a rename
+(`"Amount"` beside a new `amount` of the same type) would load, validate and
+resume cleanly while its target mixed the two columns.
+
+Grammar 1's compatibility rule reads its text as if every name were quoted:
+lexing without folding gives the tree grammar 1 gave, whose names are the
+catalog's exact names. The one name grammar 1 folded, a table alias, is
+lower-cased. So every stored grammar-1 definition keeps reading `"Amount"`, and
+none pauses. A rewrite or `ALTER TRANSFORM` renders that tree in grammar 2 as
+`SUM("Amount")`, which loads to the same tree. Text with no quoted name and no
+upper-case letter in a name, such as `SUM(amount)`, reads the same in both, so
+it is stamped grammar 1 whichever release writes it.
 
 ## Consequences
 
@@ -167,8 +186,8 @@ to the same tree. (Grammar 1 already reads names the new way; see
   the refused form pauses at the upgrade until its operator redefines it.
 - Upgrades may skip one major. Skipping more without rewriting in between pauses
   the definitions written before the window.
-- A rollback across a grammar change pauses the definitions written in the
-  newer grammar rather than running them re-interpreted, and the rest keep
-  running ([ADR-0024](0024-compatibility-floors-and-rollback.md)). An older
+- A rollback across a grammar change pauses the definitions whose text only
+  the newer grammar reads that way rather than running them re-interpreted,
+  and the rest keep running ([ADR-0024](0024-compatibility-floors-and-rollback.md)). An older
   binary never runs beside a newer one
   ([ADR-0023](0023-version-handover.md)).

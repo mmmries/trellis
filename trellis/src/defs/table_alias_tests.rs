@@ -188,12 +188,12 @@ fn a_reserved_word_is_refused_as_an_alias() {
         let (alias, detail) = alias_refusal(&format!(
             "TRANSFORM t FROM a AS {word} JOIN b ON a.k = b.k SELECT a.x AS x"
         ));
-        assert_eq!(alias, word);
+        assert_eq!(alias, word.to_ascii_lowercase());
         assert!(detail.contains("reserves"), "{detail}");
         let (alias, _) = alias_refusal(&format!(
             "TRANSFORM t FROM a JOIN b AS {word} ON a.k = b.k SELECT a.x AS x"
         ));
-        assert_eq!(alias, word);
+        assert_eq!(alias, word.to_ascii_lowercase());
     }
 }
 
@@ -221,7 +221,7 @@ fn an_alias_naming_the_other_side_is_refused() {
         ),
         (
             "TRANSFORM t FROM a JOIN b AS A ON a.k = b.k SELECT 1 AS one",
-            "A",
+            "a",
         ),
     ] {
         let (alias, detail) = alias_refusal(text);
@@ -243,7 +243,7 @@ fn a_table_name_after_its_side_was_aliased_is_refused() {
         ),
         (
             "TRANSFORM t FROM orders o JOIN c ON o.k = c.k GROUP BY Orders.g SELECT COUNT(*) AS n",
-            "Orders.g",
+            "orders.g",
         ),
         (
             "TRANSFORM t FROM orders o JOIN c ON o.k = c.k SELECT COALESCE(1, orders.x) AS x",

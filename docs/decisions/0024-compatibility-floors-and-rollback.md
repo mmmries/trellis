@@ -226,6 +226,10 @@ cost doesn't depend on table size.
 
   Text an older release would read differently is a change in meaning,
   which bumps the grammar version ([ADR-0018](0018-grammar-versioning.md)).
+  The grammar version follows the same principle as the floor: a definition
+  is stamped with the oldest version that reads its text the same, so one
+  whose text an older grammar reads identically isn't held from an older
+  release by the grammar version alone.
 
 `status()` reports the floor, and a schema dump carries it with each
 definition ([ADR-0025](0025-schema-dumps-restore-definitions.md)).

@@ -445,3 +445,73 @@ async fn a_released_join_over_a_deferrable_key_and_a_table_with_none_takes_both(
     assert_eq!(statuses(&d).await, ["(public.j,live)"]);
     assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
 }
+
+/// A released definition whose `AS` label is over 63 bytes: grammar 1 kept
+/// it, and Postgres truncated the target column it named. Writing its key
+/// into its text would store text the current grammar refuses, which no
+/// load could read back, so it is paused instead, its text left as it was.
+/// A sibling definition over the same table is still keyed and keeps
+/// running.
+#[tokio::test]
+async fn a_released_definition_with_a_label_over_63_bytes_pauses_rather_than_storing_unreadable_text()
+ {
+    let short = "l".repeat(63);
+    let long = "l".repeat(70);
+    let installed = format!("TRANSFORM s_long FROM public.s SELECT v AS {short}");
+    let mut d = Driver::start(
+        "create table public.s (id integer not null, v integer, primary key (id)); \
+         create unique index s_id on public.s (id)",
+        &[("id", int4()), ("v", int4())],
+        &[ONE, &installed],
+        &["public.s"],
+    )
+    .await;
+    exec(&d, "insert into public.s values (1, 10), (2, 20)").await;
+    d.settle().await;
+
+    // What 0.1.0 left: the label as written, under grammar 1, and the
+    // source's primary key dropped, with no key records.
+    let released = format!("TRANSFORM s_long FROM public.s SELECT v AS {long}");
+    d.ctl
+        .execute(
+            "update transform_definitions set definition_text = $1, grammar_version = 1 \
+             where target_table = 'public.s_long'",
+            &[&released],
+        )
+        .await
+        .expect("store the released text");
+    exec(&d, "alter table public.s drop constraint s_pkey").await;
+    d.ctl
+        .batch_execute("delete from definition_keys")
+        .await
+        .expect("a catalog from before the record");
+    let config = trellis::Config::from_dsn(d.db.dsn().to_string()).expect("config");
+    trellis::migrate::migrate_with_pool(d.pool(), &config)
+        .await
+        .expect("attach");
+
+    assert_eq!(
+        d.rows("select definition_text, grammar_version from transform_definitions order by id")
+            .await,
+        [
+            "(\"TRANSFORM s_one FROM public.s KEY (id) SELECT v AS v\",1)".to_string(),
+            format!("(\"{released}\",1)"),
+        ]
+    );
+    assert_eq!(
+        statuses(&d).await,
+        ["(public.s_one,live)", "(public.s_long,paused)"]
+    );
+    let reasons = d.rows("select error from capture_failures").await;
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("at most 63 bytes")
+            && reasons[0].contains("drop the transform and define it again"),
+        "{}",
+        reasons[0]
+    );
+    // Every definition still loads, and the sibling follows its source.
+    exec(&d, "insert into public.s values (3, 30)").await;
+    settle(&mut d).await;
+    assert_eq!(d.rows(ONE_ACTUAL).await, d.rows(ONE_EXPECTED).await);
+}
