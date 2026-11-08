@@ -1185,7 +1185,7 @@ async fn declare_released_keys(
                 unkeyed_reason(target, table, &indexes),
             )));
         }
-        if keys_target_by_source(def) && side != Some(JOINED) {
+        if keys_target_by_source(def) && !matches!(side, Some(Side::Joined(_))) {
             let built_on = primary_key_names(txn, target).await?;
             let mut chosen_set = chosen.clone();
             chosen_set.sort();
