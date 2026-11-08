@@ -392,6 +392,46 @@ pub enum Plant {
     /// Pinned by `staging::join_one_to_one`'s unit test
     /// `u1_the_j_statements_are_one_insert_and_one_lock_sorted_by_position_and_key`.
     StarJUnsorted,
+    /// #1464 (`star_root_skip_j_last`): a root writer of a star 1-1 `JOIN`
+    /// (an `a` page, Re-derive or build chunk's page) leaves its keys at the
+    /// last position out of `J` (but those a joined change of the page holds
+    /// too), so a writer of that position's joined table on the new key, or
+    /// the key `R` holds, runs beside it and one of them recomputes the row
+    /// from a stale `M`. Fires only on a star.
+    ///
+    /// Pinned by `join_star_root`'s
+    /// `ps1a_a_root_moving_both_keys_races_a_change_of_its_new_key_at_the_last_position`,
+    /// `ps2_…`, `ps5_…` and `cx_f2e_…`.
+    StarRootSkipJLast,
+    /// #1464 (`star_root_skip_j_first`): [`Plant::StarRootSkipJLast`] at the
+    /// first position. Fires only on a star.
+    ///
+    /// Pinned by `join_star_root`'s
+    /// `ps1b_a_root_moving_both_keys_races_a_change_of_its_new_key_at_the_first_position`.
+    StarRootSkipJFirst,
+    /// #1464 (`star_root_skip_j_middle`): [`Plant::StarRootSkipJLast`] at a
+    /// middle position, of a star of three or more joined tables. Fires only
+    /// there.
+    ///
+    /// Pinned by `join_star_root`'s
+    /// `a_root_moving_every_key_races_a_change_of_its_new_key_at_the_middle_position`.
+    StarRootSkipJMiddle,
+    /// #1464 (`star_late_skip_last`): a root writer of a star 1-1 `JOIN`
+    /// leaves the last position out of its late-key retry: an `R` entry's
+    /// held key, or a Re-derive's live key, there that isn't in the page's
+    /// `J` set doesn't roll the page back, so the page reads that position's
+    /// `M` on a key it holds no `J` row for. Fires only on a star, when that
+    /// key is the only one that moved.
+    ///
+    /// Pinned by `join_star_root`'s
+    /// `ps4a_a_root_rederive_whose_key_moved_at_the_last_position_retries`.
+    StarLateSkipLast,
+    /// #1464 (`star_late_skip_first`): [`Plant::StarLateSkipLast`] at the
+    /// first position.
+    ///
+    /// Pinned by `join_star_root`'s
+    /// `ps4b_a_root_rederive_whose_key_moved_at_the_first_position_retries`.
+    StarLateSkipFirst,
     /// ADR-0002 "Multi-hop" (#1482's `token_early`): a drain page reads the
     /// target-mutation seam's write token when it begins
     /// (`staging::target_mutations`), before its row locks, rather than after
@@ -547,6 +587,11 @@ impl Plant {
         Plant::Join1FanOutHeldRow,
         Plant::Join1ReleaseNoRederive,
         Plant::StarJUnsorted,
+        Plant::StarRootSkipJLast,
+        Plant::StarRootSkipJFirst,
+        Plant::StarRootSkipJMiddle,
+        Plant::StarLateSkipLast,
+        Plant::StarLateSkipFirst,
         Plant::SeamTokenEarly,
         Plant::SeamImagelessRow,
         Plant::GbxProbeNoXbasis,
@@ -600,6 +645,11 @@ impl Plant {
             Plant::Join1FanOutHeldRow => "join1_fan_out_held_row",
             Plant::Join1ReleaseNoRederive => "join1_release_no_rederive",
             Plant::StarJUnsorted => "star_j_unsorted",
+            Plant::StarRootSkipJLast => "star_root_skip_j_last",
+            Plant::StarRootSkipJFirst => "star_root_skip_j_first",
+            Plant::StarRootSkipJMiddle => "star_root_skip_j_middle",
+            Plant::StarLateSkipLast => "star_late_skip_last",
+            Plant::StarLateSkipFirst => "star_late_skip_first",
             Plant::SeamTokenEarly => "seam_token_early",
             Plant::SeamImagelessRow => "seam_imageless_row",
             Plant::GbxProbeNoXbasis => "gbx_probe_no_xbasis",

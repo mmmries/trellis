@@ -321,6 +321,10 @@ struct Parser {
     identifiers: Identifiers,
 }
 
+/// The keywords a `JOIN` clause starts with, the refused kinds included so
+/// each is refused by name.
+const JOIN_STARTS: [&str; 7] = ["JOIN", "LEFT", "INNER", "RIGHT", "FULL", "CROSS", "NATURAL"];
+
 impl Parser {
     fn new(tokens: Vec<Token>, identifiers: Identifiers) -> Self {
         Parser {
@@ -845,10 +849,7 @@ impl Parser {
     /// [`KeySpace::Join`] (ADR-0019), or the same without `GROUP BY` ->
     /// [`KeySpace::JoinOneToOne`] (ADR-0021).
     fn parse_key_space_clause(&mut self) -> Result<KeySpace, ParseError> {
-        if ["JOIN", "LEFT", "INNER", "RIGHT", "FULL", "CROSS", "NATURAL"]
-            .iter()
-            .any(|kw| self.peek_is_keyword(kw))
-        {
+        if JOIN_STARTS.iter().any(|kw| self.peek_is_keyword(kw)) {
             let (spec, grouped) = self.parse_join_clause()?;
             return Ok(if grouped {
                 KeySpace::Join(spec)
@@ -891,13 +892,65 @@ impl Parser {
         Ok(KeySpace::OneToOne)
     }
 
-    /// Parses `[LEFT [OUTER]|INNER] JOIN <other> ON <term> [AND <term>...]
-    /// GROUP BY <column>[, <column>...]`, every column written
-    /// `<table>.<column>`. Only inner and left equi-joins are admitted, and a
-    /// `JOIN` always aggregates, so `GROUP BY` is required. The shape of the
-    /// result (`ON` terms across the two tables, column types, aggregates) is
-    /// the validator's to check.
+    /// Parses one or more `[LEFT [OUTER]|INNER] JOIN <other> ON <term> [AND
+    /// <term>...]`, then an optional `GROUP BY <column>[, <column>...]`, every
+    /// column written `<table>.<column>`. Only inner and left equi-joins are
+    /// admitted; with a `GROUP BY` the `JOIN` aggregates, without one it is a
+    /// 1-1 `JOIN`. The shape of the result (how many tables, which tables
+    /// each `ON` reads, column types, aggregates) is the validator's to check.
     fn parse_join_clause(&mut self) -> Result<(JoinSpec, bool), ParseError> {
+        // Chained `JOIN`s read left to right, as Postgres reads them with no
+        // parentheses: each joins one more table to the tables before it.
+        // How many, and which tables an `ON` may read, are the validator's
+        // (the star knob gates at define, not here, so a stored star still
+        // loads with the knob off).
+        let mut joins = vec![self.parse_one_join(&[])?];
+        while JOIN_STARTS.iter().any(|kw| self.peek_is_keyword(kw)) {
+            let joined = self.parse_one_join(&joins)?;
+            joins.push(joined);
+        }
+        if self.peek_is_symbol(',') {
+            return Err(ParseError::UnsupportedKeySpace {
+                construct: "comma join".to_string(),
+                detail: "write every join as `[LEFT|INNER] JOIN b ON a.x = b.y`".to_string(),
+            });
+        }
+
+        if !self.peek_is_keyword("GROUP") {
+            // No `GROUP BY`: a 1-1 JOIN (ADR-0021). Whether it is admitted is
+            // the validator's to say (it is gated at define, not here, so a
+            // stored definition still loads with the gate off).
+            return Ok((
+                JoinSpec {
+                    source_alias: self.source_alias.clone(),
+                    joins,
+                    group_by: Vec::new(),
+                },
+                false,
+            ));
+        }
+        self.advance();
+        self.expect_keyword("BY")?;
+        let mut group_by = vec![self.parse_join_column("JOIN GROUP BY")?];
+        while self.peek_is_symbol(',') {
+            self.advance();
+            group_by.push(self.parse_join_column("JOIN GROUP BY")?);
+        }
+        self.is_aggregate = true;
+        Ok((
+            JoinSpec {
+                source_alias: self.source_alias.clone(),
+                joins,
+                group_by,
+            },
+            true,
+        ))
+    }
+
+    /// One `[LEFT [OUTER]|INNER] JOIN <table> [KEY (...)] [[AS] <alias>] ON
+    /// <term> [AND <term>...]` of a [`JoinSpec`]; `earlier` are the tables
+    /// already joined, in the order written.
+    fn parse_one_join(&mut self, earlier: &[JoinedTable]) -> Result<JoinedTable, ParseError> {
         let unsupported = |construct: &str, detail: &str| ParseError::UnsupportedKeySpace {
             construct: construct.to_string(),
             detail: detail.to_string(),
@@ -915,7 +968,7 @@ impl Parser {
             .into_iter()
             .find(|kw| self.peek_is_keyword(kw))
         {
-            let detail = if kw == "RIGHT" {
+            let detail = if kw == "RIGHT" && earlier.is_empty() {
                 "only INNER and LEFT joins are supported: swap the two tables and use LEFT JOIN"
             } else {
                 "only INNER and LEFT joins are supported (docs/transforms.md, \"Supported \
@@ -926,6 +979,14 @@ impl Parser {
             JoinKind::Inner
         };
         self.expect_keyword("JOIN")?;
+        // `LATERAL` is a reserved word in Postgres, and in grammar 2, which
+        // would refuse it as a table name below: named here instead.
+        if self.identifiers == Identifiers::Folded && self.peek_is_keyword("LATERAL") {
+            return Err(unsupported(
+                "JOIN LATERAL",
+                "a JOIN reads tables, not a subquery or a function's rows",
+            ));
+        }
         let (right, explicit_right_schema) = self.parse_table_ref()?;
         if self.source.as_deref() == Some(right.as_str()) {
             return Err(unsupported(
@@ -937,9 +998,19 @@ impl Parser {
                 ),
             ));
         }
+        if earlier.iter().any(|other| other.right == right) {
+            return Err(unsupported(
+                "JOIN",
+                &format!(
+                    "'{right}' is joined twice: a JOIN reads each table once, even under two \
+                     aliases, since one captured change would feed two positions; nor two \
+                     tables that share a bare name"
+                ),
+            ));
+        }
         let right_key = self.parse_table_key()?;
         let right_alias = self.parse_table_alias()?;
-        self.check_aliases(&[], &right, right_alias.as_deref())?;
+        self.check_aliases(earlier, &right, right_alias.as_deref())?;
         if self.peek_is_keyword("USING") {
             return Err(unsupported(
                 "JOIN USING",
@@ -960,54 +1031,14 @@ impl Parser {
                 "ON admits only equalities joined by AND, not OR",
             ));
         }
-        if ["JOIN", "LEFT", "INNER", "RIGHT", "FULL", "CROSS", "NATURAL"]
-            .iter()
-            .any(|kw| self.peek_is_keyword(kw))
-        {
-            return Err(unsupported(
-                "JOIN",
-                "a JOIN transform joins exactly two tables; a second JOIN is not supported",
-            ));
-        }
-
-        let joined = JoinedTable {
+        Ok(JoinedTable {
             kind,
             right,
             explicit_right_schema,
             right_key,
             right_alias,
             on,
-        };
-
-        if !self.peek_is_keyword("GROUP") {
-            // No `GROUP BY`: a 1-1 JOIN (ADR-0021). Whether it is admitted is
-            // the validator's to say (it is gated at define, not here, so a
-            // stored definition still loads with the gate off).
-            return Ok((
-                JoinSpec {
-                    source_alias: self.source_alias.clone(),
-                    joins: vec![joined],
-                    group_by: Vec::new(),
-                },
-                false,
-            ));
-        }
-        self.advance();
-        self.expect_keyword("BY")?;
-        let mut group_by = vec![self.parse_join_column("JOIN GROUP BY")?];
-        while self.peek_is_symbol(',') {
-            self.advance();
-            group_by.push(self.parse_join_column("JOIN GROUP BY")?);
-        }
-        self.is_aggregate = true;
-        Ok((
-            JoinSpec {
-                source_alias: self.source_alias.clone(),
-                joins: vec![joined],
-                group_by,
-            },
-            true,
-        ))
+        })
     }
 
     /// Refuses a `JOIN`'s aliases that would leave a qualifier naming both

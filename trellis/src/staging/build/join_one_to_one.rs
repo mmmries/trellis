@@ -32,7 +32,7 @@ use tokio_postgres::{IsolationLevel, Transaction};
 
 use crate::defs::chunk_queue::UnknownCursorTag;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::defs::join::Side;
+use crate::defs::join::{Position, Side};
 use crate::staging::join_one_to_one::build as steps;
 use crate::staging::join_one_to_one::{JoinShape, plan_for};
 use crate::staging::join_one_to_one_status::OneToOneBuildStep;
@@ -103,23 +103,33 @@ async fn begin(client: &mut tokio_postgres::Client) -> Result<Transaction<'_>, C
 /// of the `M` pass, which is idempotent. A tag not in [`PLAN_TAGS`] was
 /// written by a newer release, and reads as [`UnknownCursorTag`], never as
 /// another stage (ADR-0024 rule 6).
+///
+/// A star runs the `M` pass of each position in turn: the three walks of
+/// the joined table at a position are tagged with their letter alone at
+/// position 1 and with the position's number after it from position 2
+/// (`b2`, `n2`, `g2`), which only a star writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PlanStage {
-    /// `b`'s rows in its primary-key order, under the collations the job
-    /// records with the cursor (`backfill_chunks.key_collations`).
-    B(Option<String>),
-    /// `b`'s keys with a `NULL` part, in their text's byte order.
-    BNulls(Option<String>),
-    /// `M`'s live entries, in key order: those whose `b` row is gone.
-    Gone(Option<String>),
+    /// The rows of the joined table at the position in its primary-key
+    /// order, under the collations the job records with the cursor
+    /// (`backfill_chunks.key_collations`).
+    B(Position, Option<String>),
+    /// That table's keys with a `NULL` part, in their text's byte order.
+    BNulls(Position, Option<String>),
+    /// The position's `M`'s live entries, in key order: those whose row is
+    /// gone.
+    Gone(Position, Option<String>),
     /// The walk of `a`'s primary key (the parent module's `run_plan`).
     Walk(Option<String>),
 }
 
 /// Every tag a 1-1 `JOIN`'s plan job cursor carries ([`PlanStage`]). Writing
 /// a new one raises the definition floor of the definitions it is written
-/// for (ADR-0024 rule 6).
-pub(crate) const PLAN_TAGS: [&str; 4] = ["b", "n", "g", "a"];
+/// for (ADR-0024 rule 6). The numbered ones are a star's, whose floor is its
+/// own feature's.
+pub(crate) const PLAN_TAGS: [&str; 13] = [
+    "b", "n", "g", "a", "b2", "n2", "g2", "b3", "n3", "g3", "b4", "n4", "g4",
+];
 
 /// Every tag a 1-1 `JOIN`'s sweep job cursor carries ([`Stage`]), under the
 /// same rule as [`PLAN_TAGS`].
@@ -144,27 +154,59 @@ pub(crate) const TAG_PATTERN: &str = "'^' || chr(1) || '([^:]*)'";
 impl PlanStage {
     pub(super) fn parse(stored: Option<&str>) -> Result<Self, UnknownCursorTag> {
         let Some((tag, key)) = stored.and_then(tag) else {
-            return Ok(PlanStage::B(None));
+            return Ok(PlanStage::B(Position::FIRST, None));
         };
-        match tag {
-            "b" => Ok(PlanStage::B(key)),
-            "n" => Ok(PlanStage::BNulls(key)),
-            "g" => Ok(PlanStage::Gone(key)),
-            "a" => Ok(PlanStage::Walk(key)),
-            _ => Err(UnknownCursorTag(tag.to_string())),
+        if tag == "a" {
+            return Ok(PlanStage::Walk(key));
+        }
+        let unknown = || UnknownCursorTag(tag.to_string());
+        let mut chars = tag.chars();
+        let letter = chars.next().ok_or_else(unknown)?;
+        let number = chars.as_str();
+        // Position 1 carries no number; a number is 2 and on.
+        let position = if number.is_empty() {
+            Position::FIRST
+        } else {
+            number
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 1)
+                .and_then(Position::from_number)
+                .ok_or_else(unknown)?
+        };
+        match letter {
+            'b' => Ok(PlanStage::B(position, key)),
+            'n' => Ok(PlanStage::BNulls(position, key)),
+            'g' => Ok(PlanStage::Gone(position, key)),
+            _ => Err(unknown()),
         }
     }
 
     pub(super) fn encode(&self) -> String {
-        let (tag, key) = match self {
-            PlanStage::B(key) => ('b', key),
-            PlanStage::BNulls(key) => ('n', key),
-            PlanStage::Gone(key) => ('g', key),
-            PlanStage::Walk(key) => ('a', key),
+        let (letter, position, key) = match self {
+            PlanStage::B(position, key) => ('b', Some(*position), key),
+            PlanStage::BNulls(position, key) => ('n', Some(*position), key),
+            PlanStage::Gone(position, key) => ('g', Some(*position), key),
+            PlanStage::Walk(key) => ('a', None, key),
+        };
+        let number = match position {
+            Some(position) if position != Position::FIRST => position.number().to_string(),
+            _ => String::new(),
         };
         match key {
-            Some(key) => format!("\u{1}{tag}:{key}"),
-            None => format!("\u{1}{tag}"),
+            Some(key) => format!("\u{1}{letter}{number}:{key}"),
+            None => format!("\u{1}{letter}{number}"),
+        }
+    }
+
+    /// The position whose `M` pass this stage is in; `None` for the walk of
+    /// `a`.
+    fn position(&self) -> Option<Position> {
+        match self {
+            PlanStage::B(position, _)
+            | PlanStage::BNulls(position, _)
+            | PlanStage::Gone(position, _) => Some(*position),
+            PlanStage::Walk(_) => None,
         }
     }
 }
@@ -173,9 +215,9 @@ impl PlanStage {
 /// or `None` for a cursor a newer release wrote.
 pub(crate) fn plan_step(cursor: Option<&str>) -> Option<OneToOneBuildStep> {
     Some(match PlanStage::parse(cursor).ok()? {
-        PlanStage::B(_) => OneToOneBuildStep::JoinedRows,
-        PlanStage::BNulls(_) => OneToOneBuildStep::JoinedNullKeys,
-        PlanStage::Gone(_) => OneToOneBuildStep::JoinedGone,
+        PlanStage::B(..) => OneToOneBuildStep::JoinedRows,
+        PlanStage::BNulls(..) => OneToOneBuildStep::JoinedNullKeys,
+        PlanStage::Gone(..) => OneToOneBuildStep::JoinedGone,
         PlanStage::Walk(_) => OneToOneBuildStep::PlanningChunks,
     })
 }
@@ -209,18 +251,24 @@ pub(super) async fn build_m(
 ) -> Result<bool, ChunkQueueError> {
     let plan = JoinPlan::load(pool, definition, None).await?;
     let shape = plan.shape;
-    // `b`'s key once for the whole pass, under the collations its walk began
-    // with, so every batch walks it in one order.
-    let mut m_pk = ddl::source_primary_key(pool, shape.joined_table())
-        .await
-        .map_err(build_error)?;
-    if matches!(stage, PlanStage::B(Some(_))) {
-        ddl::pin_key_collations(&mut m_pk, recorded);
-    }
-    let collations = ddl::key_collations(&m_pk);
     let limit = options.chunk_rows.max(1);
     let mut client = pool.get().await?;
-    while !matches!(stage, PlanStage::Walk(_)) {
+    // The joined table's key once for each position's pass, under the
+    // collations its walk began with, so every batch walks it in one order.
+    let mut walking: Option<Position> = None;
+    let mut m_pk: Vec<PrimaryKeyColumn> = Vec::new();
+    let mut collations = Vec::new();
+    while let Some(position) = stage.position() {
+        if walking != Some(position) {
+            m_pk = ddl::source_primary_key(pool, shape.joined_at(position).table())
+                .await
+                .map_err(build_error)?;
+            if walking.is_none() && matches!(stage, PlanStage::B(_, Some(_))) {
+                ddl::pin_key_collations(&mut m_pk, recorded);
+            }
+            collations = ddl::key_collations(&m_pk);
+            walking = Some(position);
+        }
         let txn = begin(&mut client).await?;
         if !fence.hold(&txn).await? {
             txn.rollback().await?;
@@ -228,7 +276,7 @@ pub(super) async fn build_m(
         }
         let next = under_chunk_lock_timeout(&txn, m_pass_batch(&txn, &shape, &m_pk, &stage, limit))
             .await?;
-        let walking_b = matches!(next, PlanStage::B(_));
+        let walking_b = matches!(next, PlanStage::B(..));
         txn.execute(
             "update backfill_chunks set lo = $2, key_collations = $3 where id = $1",
             &[&chunk_id, &next.encode(), &walking_b.then_some(&collations)],
@@ -253,38 +301,46 @@ async fn m_pass_batch(
     stage: &PlanStage,
     limit: i64,
 ) -> Result<PlanStage, ChunkQueueError> {
+    // After a position's last walk, the next position's first, or the walk
+    // of `a` after the last position's.
+    let after_gone = |position: Position| match shape.at(Position::of_index(position.index() + 1)) {
+        Some(next) => PlanStage::B(next.position, None),
+        None => PlanStage::Walk(None),
+    };
     Ok(match stage {
-        PlanStage::B(after) => {
-            match steps::m_batch(txn, shape, m_pk, after.as_deref(), limit)
+        PlanStage::B(position, after) => {
+            match steps::m_batch(txn, shape, *position, m_pk, after.as_deref(), limit)
                 .await
                 .map_err(build_error)?
             {
-                Some(key) => PlanStage::B(Some(key)),
-                None => PlanStage::BNulls(None),
+                Some(key) => PlanStage::B(*position, Some(key)),
+                None => PlanStage::BNulls(*position, None),
             }
         }
-        PlanStage::BNulls(after) => {
-            match steps::m_null_batch(txn, shape, m_pk, after.as_deref(), limit)
+        PlanStage::BNulls(position, after) => {
+            match steps::m_null_batch(txn, shape, *position, m_pk, after.as_deref(), limit)
                 .await
                 .map_err(build_error)?
             {
-                Some(key) => PlanStage::BNulls(Some(key)),
-                None => PlanStage::Gone(None),
+                Some(key) => PlanStage::BNulls(*position, Some(key)),
+                None => PlanStage::Gone(*position, None),
             }
         }
         // Planted bug: the `M` pass walks only `b`, not `M`'s entries
         // whose `b` row is gone. See `crate::plant`.
         #[cfg(any(test, feature = "test-util"))]
-        PlanStage::Gone(_) if crate::plant::fires(crate::plant::Plant::Join1MPassBOnly, true) => {
-            PlanStage::Walk(None)
+        PlanStage::Gone(position, _)
+            if crate::plant::fires(crate::plant::Plant::Join1MPassBOnly, true) =>
+        {
+            after_gone(*position)
         }
-        PlanStage::Gone(after) => {
-            match steps::m_gone_batch(txn, shape, m_pk, after.as_deref(), limit)
+        PlanStage::Gone(position, after) => {
+            match steps::m_gone_batch(txn, shape, *position, m_pk, after.as_deref(), limit)
                 .await
                 .map_err(build_error)?
             {
-                Some(key) => PlanStage::Gone(Some(key)),
-                None => PlanStage::Walk(None),
+                Some(key) => PlanStage::Gone(*position, Some(key)),
+                None => after_gone(*position),
             }
         }
         PlanStage::Walk(_) => unreachable!("the pass ends at the walk of `a`"),
@@ -488,9 +544,17 @@ async fn sweep_batch_steps(
 #[cfg(test)]
 mod tests {
     use super::{
-        OneToOneBuildStep, OrphanCursor, PLAN_TAGS, PlanStage, SWEEP_TAGS, Stage, UnknownCursorTag,
-        plan_step, sweep_step,
+        OneToOneBuildStep, OrphanCursor, PLAN_TAGS, PlanStage, Position, SWEEP_TAGS, Stage,
+        UnknownCursorTag, plan_step, sweep_step,
     };
+
+    fn second() -> Position {
+        Position::from_number(2).expect("position 2")
+    }
+
+    fn last() -> Position {
+        Position::every().last().expect("a last position")
+    }
 
     /// Each stored cursor names the step `status()` reports, and no cursor
     /// names the first of a job.
@@ -498,14 +562,22 @@ mod tests {
     fn a_stored_cursor_names_the_step_status_reports() {
         for (stage, step) in [
             (
-                PlanStage::B(Some("1".into())),
+                PlanStage::B(Position::FIRST, Some("1".into())),
                 OneToOneBuildStep::JoinedRows,
             ),
-            (PlanStage::BNulls(None), OneToOneBuildStep::JoinedNullKeys),
             (
-                PlanStage::Gone(Some("2".into())),
+                PlanStage::B(second(), Some("1".into())),
+                OneToOneBuildStep::JoinedRows,
+            ),
+            (
+                PlanStage::BNulls(Position::FIRST, None),
+                OneToOneBuildStep::JoinedNullKeys,
+            ),
+            (
+                PlanStage::Gone(Position::FIRST, Some("2".into())),
                 OneToOneBuildStep::JoinedGone,
             ),
+            (PlanStage::Gone(last(), None), OneToOneBuildStep::JoinedGone),
             (PlanStage::Walk(None), OneToOneBuildStep::PlanningChunks),
             (
                 PlanStage::Walk(Some("a9".into())),
@@ -559,21 +631,30 @@ mod tests {
     fn a_plan_cursor_round_trips() {
         for key in [None, Some(""), Some("42"), Some("\u{1}a:7"), Some("a:b")] {
             let key = key.map(str::to_string);
-            for stage in [
-                PlanStage::B(key.clone()),
-                PlanStage::BNulls(key.clone()),
-                PlanStage::Gone(key.clone()),
-                PlanStage::Walk(key.clone()),
-            ] {
-                assert_eq!(
-                    PlanStage::parse(Some(&stage.encode())),
-                    Ok(stage),
-                    "{key:?}"
-                );
+            for position in Position::every() {
+                for stage in [
+                    PlanStage::B(position, key.clone()),
+                    PlanStage::BNulls(position, key.clone()),
+                    PlanStage::Gone(position, key.clone()),
+                    PlanStage::Walk(key.clone()),
+                ] {
+                    assert_eq!(
+                        PlanStage::parse(Some(&stage.encode())),
+                        Ok(stage),
+                        "{key:?}"
+                    );
+                }
             }
         }
-        assert_eq!(PlanStage::parse(None), Ok(PlanStage::B(None)));
-        assert_eq!(PlanStage::parse(Some("a07")), Ok(PlanStage::B(None)));
+        let start = Ok(PlanStage::B(Position::FIRST, None));
+        assert_eq!(PlanStage::parse(None), start);
+        assert_eq!(PlanStage::parse(Some("a07")), start);
+        // Position 1's tags carry no number: the two-table JOIN's cursors.
+        assert_eq!(
+            PlanStage::B(Position::FIRST, Some("7".into())).encode(),
+            "\u{1}b:7"
+        );
+        assert_eq!(PlanStage::Gone(second(), None).encode(), "\u{1}g2");
     }
 
     /// A tag this release doesn't know, in either job's cursor, is
@@ -592,6 +673,10 @@ mod tests {
             ("\u{1}bx:3", "bx"),
             ("\u{1}", ""),
             ("\u{1}r:3", "r"),
+            // Position 1 is never numbered, and no star has a fifth.
+            ("\u{1}b1:3", "b1"),
+            ("\u{1}g5", "g5"),
+            ("\u{1}a2", "a2"),
         ] {
             assert_eq!(PlanStage::parse(Some(stored)), unknown(tag), "{stored:?}");
             assert_eq!(plan_step(Some(stored)), None, "{stored:?}");
@@ -601,14 +686,24 @@ mod tests {
             assert_eq!(sweep_step(Some(stored)), None, "{stored:?}");
         }
         // Each known tag is what its stage writes.
-        for stage in [
-            PlanStage::B(None),
-            PlanStage::BNulls(None),
-            PlanStage::Gone(None),
-            PlanStage::Walk(Some("7".into())),
-        ] {
-            let tag = super::tag(&stage.encode()).expect("tagged").0.to_string();
-            assert!(PLAN_TAGS.contains(&tag.as_str()), "{stage:?}");
+        let mut written = Vec::new();
+        for position in Position::every() {
+            for stage in [
+                PlanStage::B(position, None),
+                PlanStage::BNulls(position, None),
+                PlanStage::Gone(position, None),
+                PlanStage::Walk(Some("7".into())),
+            ] {
+                let tag = super::tag(&stage.encode()).expect("tagged").0.to_string();
+                assert!(PLAN_TAGS.contains(&tag.as_str()), "{stage:?}");
+                written.push(tag);
+            }
+        }
+        for tag in PLAN_TAGS {
+            assert!(
+                written.iter().any(|w| w == tag),
+                "{tag} is written by no stage"
+            );
         }
         for stage in [
             Stage::Stale(None),

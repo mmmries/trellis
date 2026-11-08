@@ -103,8 +103,8 @@ pub enum ValidationError {
     /// The joined table is the `FROM` table. A self-join isn't supported,
     /// even under two aliases: one captured change would feed both sides.
     JoinSelf { table: String },
-    /// A `JOIN` definition joins more tables than this kind of `JOIN`
-    /// admits: an aggregate `JOIN` joins exactly two.
+    /// An aggregate `JOIN` joins more than one table to its `FROM` table:
+    /// it joins exactly two.
     JoinTooManyTables,
     /// A `JOIN` definition's column reference names a table that is neither
     /// the `FROM` table nor the joined one.
@@ -180,6 +180,20 @@ pub enum ValidationError {
     OneToOneJoinKeyNotUnique { table: String, columns: Vec<String> },
     /// A construct a 1-1 `JOIN` doesn't take, with the remedy.
     OneToOneJoinUnsupported { what: String, remedy: String },
+    /// A 1-1 `JOIN` of more tables than a star admits: `tables` counts the
+    /// `FROM` table and every joined one (#1459's cap).
+    StarJoinTooManyTables { tables: usize },
+    /// A 1-1 `JOIN` of more than two tables (a star) was defined while the
+    /// development knob that admits it is off.
+    StarJoinDisabled { tables: usize },
+    /// An `ON` term of the table joined as `table` reads `other`, another
+    /// joined table: each `ON` reads only the `FROM` table and the table it
+    /// joins (a star, not a snowflake).
+    JoinOnReadsAnotherJoinedTable {
+        table: String,
+        term: String,
+        other: String,
+    },
     /// An aggregate in a deferred family (`MIN`/`MAX` in a `JOIN`,
     /// `bool_*`/`bit_*`, float or `interval` `SUM`/`AVG`,
     /// `array_agg`/`string_agg`/`jsonb_agg`). Only the aggregates the group
@@ -882,7 +896,7 @@ pub(crate) fn check_join_collation_reads(
     def: &TransformDef,
     join: &JoinSpec,
     root: &HashMap<String, JoinColumnInfo>,
-    joined: &[HashMap<String, JoinColumnInfo>],
+    joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
     let resolve = join_resolver(def, join, root, joined);
     for read in collation_refusing_function_reads(def) {
@@ -1141,6 +1155,25 @@ impl fmt::Display for ValidationError {
             ValidationError::OneToOneJoinUnsupported { what, remedy } => {
                 write!(f, "a 1-1 JOIN doesn't take {what}: {remedy}")
             }
+            ValidationError::StarJoinTooManyTables { tables } => write!(
+                f,
+                "this JOIN reads {tables} tables; a 1-1 JOIN reads at most {} (the FROM table \
+                 and {} joined tables)",
+                super::join::MAX_POSITIONS + 1,
+                super::join::MAX_POSITIONS
+            ),
+            ValidationError::StarJoinDisabled { tables } => write!(
+                f,
+                "this JOIN reads {tables} tables; a 1-1 JOIN of more than two tables is not \
+                 available yet (a JOIN reads the FROM table and one joined table)"
+            ),
+            ValidationError::JoinOnReadsAnotherJoinedTable { table, term, other } => write!(
+                f,
+                "'{term}' in the ON of '{table}' reads '{other}', another joined table: each \
+                 JOIN's ON reads only the FROM table and the table it joins (every joined \
+                 table joins the FROM table directly, a star; joining one joined table to \
+                 another, a snowflake, is not supported)"
+            ),
             ValidationError::DeferredAggregate { function, family } => write!(
                 f,
                 "{function} is not supported: {family} is not an aggregate Trellis maintains; \
@@ -2185,7 +2218,7 @@ pub(crate) fn join_resolver<'a>(
     def: &'a TransformDef,
     join: &'a JoinSpec,
     root: &'a HashMap<String, JoinColumnInfo>,
-    joined: &'a [HashMap<String, JoinColumnInfo>],
+    joined: &'a [&'a HashMap<String, JoinColumnInfo>],
 ) -> impl Fn(&QualifiedColumn) -> Result<(Side, &'a JoinColumnInfo), ValidationError> + 'a {
     move |column: &QualifiedColumn| -> Result<(Side, &JoinColumnInfo), ValidationError> {
         let side = if column.table == def.source {
@@ -2227,11 +2260,11 @@ pub(crate) fn join_resolver<'a>(
 fn side_columns<'a>(
     side: Side,
     root: &'a HashMap<String, JoinColumnInfo>,
-    joined: &'a [HashMap<String, JoinColumnInfo>],
+    joined: &'a [&'a HashMap<String, JoinColumnInfo>],
 ) -> &'a HashMap<String, JoinColumnInfo> {
     match side {
         Side::From => root,
-        Side::Joined(position) => &joined[position.index()],
+        Side::Joined(position) => joined[position.index()],
     }
 }
 
@@ -2244,7 +2277,7 @@ pub(crate) fn validate_join_tables_and_on(
     def: &TransformDef,
     join: &JoinSpec,
     root: &HashMap<String, JoinColumnInfo>,
-    joined: &[HashMap<String, JoinColumnInfo>],
+    joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
     validate_target_names(def)?;
     for table in &join.joins {
@@ -2263,17 +2296,20 @@ pub(crate) fn validate_join_tables_and_on(
     }
 
     let resolve = join_resolver(def, join, root, joined);
-    for table in &join.joins {
-        validate_join_on(&table.on, &resolve)?;
+    for (position, table) in super::join::positions(join) {
+        validate_join_on(def, join, position, &table.on, &resolve)?;
     }
     Ok(())
 }
 
-/// One joined table's `ON` terms: each an equality between a column of the
-/// `FROM` table and one of the joined table, of one type, modifier and
-/// collation, with a text-stable key type, each pair and each column named
-/// once.
+/// The `ON` terms of the table joined at `position`: each an equality
+/// between a column of the `FROM` table and one of that table (never of
+/// another joined table), of one type, modifier and collation, with a
+/// text-stable key type, each pair and each column named once.
 fn validate_join_on<'a>(
+    def: &TransformDef,
+    join: &JoinSpec,
+    position: super::join::Position,
     on: &'a [JoinOn],
     resolve: &impl Fn(&QualifiedColumn) -> Result<(Side, &'a JoinColumnInfo), ValidationError>,
 ) -> Result<(), ValidationError> {
@@ -2304,6 +2340,17 @@ fn validate_join_on<'a>(
         if lhs_side == rhs_side {
             return Err(ValidationError::JoinOnSameSide {
                 term: format!("{} = {}", written(&term.lhs), written(&term.rhs)),
+            });
+        }
+        // A star: every term pairs the `FROM` table with this position's.
+        if let Some(other) = [lhs_side, rhs_side]
+            .into_iter()
+            .find(|side| !matches!(side, Side::From) && *side != Side::Joined(position))
+        {
+            return Err(ValidationError::JoinOnReadsAnotherJoinedTable {
+                table: super::join::joined(join, position).right.clone(),
+                term: format!("{} = {}", written(&term.lhs), written(&term.rhs)),
+                other: super::join::side_table(def, join, other).to_string(),
             });
         }
         let pair = match lhs_side {
@@ -2356,34 +2403,35 @@ fn validate_join_on<'a>(
     Ok(())
 }
 
-/// Validates a [`KeySpace::Join`] definition against the live columns of its
-/// two tables (`left` is the `FROM` table, `right` the joined one).
+/// Validates a [`KeySpace::Join`] or [`KeySpace::JoinOneToOne`] definition
+/// against the live columns of its tables (`left` is the `FROM` table's,
+/// `joined` each joined table's, by position: one per `JOIN` written).
 ///
-/// The join is admitted when: the tables differ; every column is qualified
-/// and exists; each `ON` term is an equality between one column of each
-/// table, of one type, modifier and collation (the join-key rules); every `GROUP BY` key, from either table, is an admitted key type;
-/// and each field is a key passthrough or composes admitted aggregates
-/// (`COUNT(*)`, and `COUNT`/`SUM`/`AVG` of a column or an expression over
-/// one table's columns, per [`check_aggregate_admitted`]) with literals,
-/// operators and scalar functions. An argument reading
-/// both tables is refused as [`ValidationError::JoinMixedSideArgument`].
+/// An aggregate join is admitted when: it joins one table; the tables differ;
+/// every column is qualified and exists; each `ON` term is an equality between
+/// one column of each table, of one type, modifier and collation (the
+/// join-key rules); every `GROUP BY` key, from either table, is an admitted
+/// key type; and each field is a key passthrough or composes admitted
+/// aggregates (`COUNT(*)`, and `COUNT`/`SUM`/`AVG` of a column or an
+/// expression over one table's columns, per [`check_aggregate_admitted`])
+/// with literals, operators and scalar functions. An argument reading both
+/// tables is refused as [`ValidationError::JoinMixedSideArgument`]. A 1-1
+/// join is [`super::validate_join_one_to_one::validate`]'s.
 pub fn validate_join(
     def: &TransformDef,
     left: &HashMap<String, JoinColumnInfo>,
-    right: &HashMap<String, JoinColumnInfo>,
+    joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
-    // One joined table's columns are all a caller has today, and an
-    // aggregate JOIN joins exactly two tables.
-    if super::join::spec(def).is_some_and(|join| join.joins.len() > 1) {
-        return Err(ValidationError::JoinTooManyTables);
-    }
-    let joined = std::slice::from_ref(right);
     if let KeySpace::JoinOneToOne(_) = &def.key_space {
         return super::validate_join_one_to_one::validate(def, left, joined);
     }
     let KeySpace::Join(join) = &def.key_space else {
         return Ok(());
     };
+    // An aggregate JOIN joins exactly two tables (ADR-0019).
+    if join.joins.len() > 1 {
+        return Err(ValidationError::JoinTooManyTables);
+    }
     validate_join_tables_and_on(def, join, left, joined)?;
     let resolve = join_resolver(def, join, left, joined);
 
@@ -2520,7 +2568,7 @@ fn check_join_field_expr<'a>(
     resolve: &ResolveJoinColumn<'a>,
     mut in_aggregate: Option<&mut Vec<Side>>,
     root: &HashMap<String, JoinColumnInfo>,
-    joined: &[HashMap<String, JoinColumnInfo>],
+    joined: &[&HashMap<String, JoinColumnInfo>],
     aggregates: &mut usize,
 ) -> Result<(), ValidationError> {
     let shape = |detail: &str| ValidationError::JoinFieldShape {
@@ -2684,7 +2732,7 @@ pub(crate) fn rename_join_columns(
     expr: &mut Expr,
     def: &TransformDef,
     root: &HashMap<String, JoinColumnInfo>,
-    joined: &[HashMap<String, JoinColumnInfo>],
+    joined: &[&HashMap<String, JoinColumnInfo>],
     types: &mut HashMap<String, ValueType>,
 ) {
     match expr {
@@ -2738,7 +2786,7 @@ pub(crate) fn join_field_value_type(
     def: &TransformDef,
     field: &super::ast::FieldDef,
     root: &HashMap<String, JoinColumnInfo>,
-    joined: &[HashMap<String, JoinColumnInfo>],
+    joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<ValueType, ValidationError> {
     let mut renamed = field.expr.clone();
     let mut types = HashMap::new();
@@ -3615,7 +3663,7 @@ pub(crate) fn infer_expr_type(
         &HashMap::new(),
         &mut HashMap::new(),
         &mut HashSet::new(),
-        true,
+        Reach::Planned,
     )
 }
 
@@ -3647,7 +3695,7 @@ fn infer_field(
             fields_by_name,
             types,
             in_progress,
-            true,
+            Reach::Planned,
         )
     };
     in_progress.remove(&field.name);
@@ -3689,6 +3737,67 @@ fn is_null_literal(
     false
 }
 
+/// How Postgres treats an expression [`infer_expr`] types, for the refusals
+/// that follow what it does with a constant.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// The planner may drop it unevaluated (`COALESCE(5, 2147483647 + 1)`),
+    /// so nothing in it raises.
+    Skipped,
+    /// The planner simplifies it, so a constant in it that raises does, and
+    /// the rows evaluate what remains.
+    Planned,
+    /// The planner simplifies it, then replaces the strict operator or
+    /// function around it by `NULL`, because another input is the `NULL`
+    /// constant (`(na / 0) + NULL`): a constant in it that raises still
+    /// does, but what only the rows would evaluate never runs.
+    PlanOnly,
+}
+
+impl Reach {
+    /// Whether the planner simplifies it, so a constant in it that raises
+    /// does.
+    fn folds(self) -> bool {
+        self != Reach::Skipped
+    }
+
+    /// `self` for a part the planner reaches, `Skipped` for one it drops.
+    fn when(self, reached: bool) -> Reach {
+        if reached { self } else { Reach::Skipped }
+    }
+
+    /// The reach of a strict operator's or function's input when another
+    /// input folds to the `NULL` constant: the planner replaces the call by
+    /// `NULL`, after it simplified this input.
+    fn beside_null(self, null_input: bool) -> Reach {
+        if null_input && self == Reach::Planned {
+            Reach::PlanOnly
+        } else {
+            self
+        }
+    }
+}
+
+/// Whether `expr` folds to the `NULL` constant (see [`fold_constant`]).
+fn folds_to_null<'f>(
+    expr: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
+) -> bool {
+    matches!(
+        fold_constant(
+            expr,
+            field_name,
+            source_columns,
+            fields_by_name,
+            &mut HashMap::new(),
+            0,
+        ),
+        Some(Constant::Null)
+    )
+}
+
 /// [`infer_expr`] for an operand whose context types a `NULL` literal (an
 /// operator's other operand, a `CASE`'s other results, a `COALESCE`'s or
 /// `NULLIF`'s other arguments, `boolean` under logic): `None` for one, as
@@ -3701,7 +3810,7 @@ fn infer_operand(
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
-    folded: bool,
+    folded: Reach,
 ) -> Result<Option<ValueType>, ValidationError> {
     if is_null_literal(expr, field_name, source_columns, fields_by_name) {
         return Ok(None);
@@ -4793,6 +4902,7 @@ impl ConstOp {
 fn check_constant_op<'f>(
     expr: &Expr,
     op: ConstOp,
+    reach: Reach,
     operands: &[&Expr],
     operand_types: &[ValueType],
     result: ValueType,
@@ -4835,8 +4945,25 @@ fn check_constant_op<'f>(
     // (`float8div` checks the dividend first), so only that constant is
     // spared.
     let nan_dividend = matches!(folded.first(), Some(Some(Constant::Float(v, _))) if v.is_nan());
+    // A dividend that reads a column is divided by zero only when the rows
+    // run, which they do not under a strict call the planner replaces by
+    // `NULL` (`(na / 0) + NULL`); a constant one divides at plan time.
+    let runs_only_in_rows = reach == Reach::PlanOnly
+        && operands.first().is_some_and(|dividend| {
+            folding(
+                dividend,
+                field_name,
+                source_columns,
+                fields_by_name,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                0,
+            )
+            .is_variable()
+        });
     if matches!(op, ConstOp::Divide | ConstOp::Modulo)
         && !nan_dividend
+        && !runs_only_in_rows
         && folded
             .get(1)
             .is_some_and(|c| c.as_ref().is_some_and(Constant::is_zero))
@@ -4957,9 +5084,9 @@ fn infer_case(
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
-    folded: bool,
+    folded: Reach,
 ) -> Result<ValueType, ValidationError> {
-    let mut reached = folded;
+    let mut reached = folded.folds();
     // Each result with whether the planner simplifies it.
     let mut results: Vec<(&Expr, bool)> = Vec::with_capacity(branches.len() + 1);
     let mut common: Option<ValueType> = None;
@@ -4988,7 +5115,7 @@ fn infer_case(
             fields_by_name,
             types,
             in_progress,
-            reached,
+            folded.when(reached),
         )?
         .unwrap_or(ValueType::Boolean);
         if condition_t != ValueType::Boolean {
@@ -5012,7 +5139,7 @@ fn infer_case(
             fields_by_name,
             types,
             in_progress,
-            result_reached,
+            folded.when(result_reached),
         )? {
             unify(result_t)?;
         }
@@ -5029,7 +5156,7 @@ fn infer_case(
             fields_by_name,
             types,
             in_progress,
-            reached,
+            folded.when(reached),
         )? {
             unify(otherwise_t)?;
         }
@@ -5080,7 +5207,7 @@ fn comparison_type(
     lhs_t: ValueType,
     rhs_t: ValueType,
     field_name: &str,
-    folded: bool,
+    folded: Reach,
 ) -> Result<ValueType, ValidationError> {
     if let Some(result) = super::registry::comparison_result_type(op, lhs_t, rhs_t) {
         return Ok(result);
@@ -5096,7 +5223,7 @@ fn comparison_type(
             // Postgres raises `22003` at plan time for a literal outside
             // `double precision`'s range; refuse it at define instead of
             // failing every row.
-            if folded {
+            if folded.folds() {
                 crate::float::literal_to_f64(text).map_err(|_| {
                     ValidationError::FloatComparisonLiteralOutOfRange {
                         field: field_name.to_string(),
@@ -5152,7 +5279,7 @@ fn infer_expr(
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
-    folded: bool,
+    folded: Reach,
 ) -> Result<ValueType, ValidationError> {
     match expr {
         Expr::Column(name) => {
@@ -5233,7 +5360,7 @@ fn infer_expr(
             let mut operands = Vec::new();
             flatten_logic(expr, *op, &mut operands);
             let decides = matches!(op, super::ast::Operator::Or);
-            let mut evaluated = folded;
+            let mut evaluated = folded.folds();
             for operand in operands {
                 // A `NULL` operand is a `boolean` one.
                 let operand_t = infer_operand(
@@ -5243,7 +5370,7 @@ fn infer_expr(
                     fields_by_name,
                     types,
                     in_progress,
-                    evaluated,
+                    folded.when(evaluated),
                 )?
                 .unwrap_or(ValueType::Boolean);
                 if operand_t != ValueType::Boolean {
@@ -5318,7 +5445,16 @@ fn infer_expr(
         ),
         Expr::FunctionCall { name, args } if name == "NULLIF" && args.len() == 2 => {
             let mut arg_types = [None; 2];
-            for (slot, arg) in arg_types.iter_mut().zip(args) {
+            // `NULLIF(NULL, x)` is `NULL` whatever `x` reads; `NULLIF(x,
+            // NULL)` is `x`.
+            let second = folded.beside_null(folds_to_null(
+                &args[0],
+                field_name,
+                source_columns,
+                fields_by_name,
+            ));
+            for (slot, (arg, reach)) in arg_types.iter_mut().zip(args.iter().zip([folded, second]))
+            {
                 *slot = infer_operand(
                     arg,
                     field_name,
@@ -5326,7 +5462,7 @@ fn infer_expr(
                     fields_by_name,
                     types,
                     in_progress,
-                    folded,
+                    reach,
                 )?;
             }
             // Postgres resolves `NULLIF` as the `=` over its arguments: a
@@ -5378,6 +5514,21 @@ fn infer_expr(
             )
         }
         Expr::BinaryOp { op, lhs, rhs } => {
+            // A strict operator with a `NULL` constant operand is `NULL`
+            // once the planner has simplified the operands; `IS [NOT]
+            // DISTINCT FROM` takes `NULL` as a value.
+            let operands = if folded == Reach::Planned
+                && !matches!(
+                    op,
+                    super::ast::Operator::IsDistinctFrom | super::ast::Operator::IsNotDistinctFrom
+                ) {
+                folded.beside_null(
+                    folds_to_null(lhs, field_name, source_columns, fields_by_name)
+                        || folds_to_null(rhs, field_name, source_columns, fields_by_name),
+                )
+            } else {
+                folded
+            };
             let lhs_t = infer_operand(
                 lhs,
                 field_name,
@@ -5385,7 +5536,7 @@ fn infer_expr(
                 fields_by_name,
                 types,
                 in_progress,
-                folded,
+                operands,
             )?;
             let rhs_t = infer_operand(
                 rhs,
@@ -5394,7 +5545,7 @@ fn infer_expr(
                 fields_by_name,
                 types,
                 in_progress,
-                folded,
+                operands,
             )?;
             infer_binary_op(
                 expr,
@@ -5429,10 +5580,11 @@ fn infer_expr(
                     found: operand_t,
                 }
             })?;
-            if folded {
+            if folded.folds() {
                 check_constant_op(
                     expr,
                     ConstOp::Negate,
+                    folded,
                     &[operand],
                     &[operand_t],
                     result,
@@ -5481,7 +5633,7 @@ fn infer_expr(
                         },
                     }
                 })?;
-            if folded
+            if folded.folds()
                 && operand_t == DATE_TYPE
                 && let Some(Constant::Date(days)) = fold_constant(
                     operand,
@@ -5508,7 +5660,7 @@ fn infer_expr(
             // them raises.
             // An argument that may be a constant this check cannot compute
             // may stop it, so nothing after one is refused.
-            let planned = if folded {
+            let planned = if folded.folds() {
                 let (mut memo, mut fold_memo) = (HashMap::new(), HashMap::new());
                 args.iter()
                     .position(|arg| {
@@ -5539,7 +5691,7 @@ fn infer_expr(
                     fields_by_name,
                     types,
                     in_progress,
-                    i < planned,
+                    folded.when(i < planned),
                 )?
                 else {
                     continue;
@@ -5674,12 +5826,29 @@ fn infer_expr(
                         fields_by_name,
                         types,
                         in_progress,
-                        folded,
+                        Reach::Planned,
                     )?;
                 }
                 return Ok(spec.return_type);
             }
             let mut arg_types: Vec<ValueType> = Vec::with_capacity(args.len());
+            // A scalar function is strict: a `NULL` constant argument makes
+            // the call `NULL` once the planner has simplified the arguments.
+            // An aggregate's argument is computed for each row by the
+            // statements that maintain the aggregate, apart from the
+            // expression around the call (`staging::group_basis`,
+            // `staging::join`), so whatever Postgres would drop around it,
+            // the argument is evaluated.
+            let arg_reach = if is_aggregate {
+                Reach::Planned
+            } else if folded != Reach::Planned {
+                folded
+            } else {
+                folded.beside_null(
+                    args.iter()
+                        .any(|arg| folds_to_null(arg, field_name, source_columns, fields_by_name)),
+                )
+            };
             for (i, (arg, expected)) in args.iter().zip(spec.arg_types).enumerate() {
                 let arg_t = infer_expr(
                     arg,
@@ -5688,7 +5857,7 @@ fn infer_expr(
                     fields_by_name,
                     types,
                     in_progress,
-                    folded,
+                    arg_reach,
                 )?;
                 // A `Numeric`-declared *aggregate* argument now
                 // means "any exact-numeric type" — `SUM`/`AVG`/`MIN`/`MAX`
@@ -5792,7 +5961,7 @@ fn infer_binary_op(
     field_name: &str,
     source_columns: &HashMap<String, ValueType>,
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
-    folded: bool,
+    folded: Reach,
 ) -> Result<ValueType, ValidationError> {
     let null_operand = lhs_t.is_none() || rhs_t.is_none();
     let (lhs_t, rhs_t) = resolve_null_operands(op, lhs_t, rhs_t, field_name)?;
@@ -5807,10 +5976,13 @@ fn infer_binary_op(
         if op == super::ast::Operator::AtTimeZone {
             check_utc_zone(rhs, field_name)?;
         }
-        if folded && let Some(kind) = ConstOp::of_operator(op) {
+        if folded.folds()
+            && let Some(kind) = ConstOp::of_operator(op)
+        {
             check_constant_op(
                 expr,
                 kind,
+                folded,
                 &[lhs, rhs],
                 &[lhs_t, rhs_t],
                 result,
@@ -6064,7 +6236,7 @@ fn infer_date_part_call(
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
-    folded: bool,
+    folded: Reach,
 ) -> Result<ValueType, ValidationError> {
     let extract = name == "EXTRACT";
     let construct: &'static str = if extract { "EXTRACT" } else { "DATE_TRUNC" };
@@ -6191,7 +6363,7 @@ fn infer_overloaded_call(
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
-    folded: bool,
+    folded: Reach,
 ) -> Result<ValueType, ValidationError> {
     let Expr::FunctionCall { name, args } = expr else {
         unreachable!("only a call is typed here");
@@ -6252,10 +6424,11 @@ fn infer_overloaded_call(
             reason,
         });
     };
-    if folded && name == "ABS" {
+    if folded.folds() && name == "ABS" {
         check_constant_op(
             expr,
             ConstOp::Abs,
+            folded,
             &[&args[0]],
             &arg_types[..1],
             spec.return_type,
@@ -8711,7 +8884,7 @@ mod tests {
             panic!("a join without GROUP BY");
         };
         assert_eq!(
-            check_join_collation_reads(&def, join, &left, std::slice::from_ref(&right)),
+            check_join_collation_reads(&def, join, &left, &[&right]),
             Ok(())
         );
         let ci = |info: &mut JoinColumnInfo| {
@@ -8729,24 +8902,14 @@ mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         };
         assert_eq!(
-            refused(check_join_collation_reads(
-                &def,
-                join,
-                &left,
-                std::slice::from_ref(&right)
-            )),
+            refused(check_join_collation_reads(&def, join, &left, &[&right])),
             ("pos".into(), "STRPOS".into(), "items".into(), "note".into())
         );
         ci(right.get_mut("sku").unwrap());
         ci(left.get_mut("region").unwrap());
         right.remove("note");
         assert_eq!(
-            refused(check_join_collation_reads(
-                &def,
-                join,
-                &left,
-                std::slice::from_ref(&right)
-            )),
+            refused(check_join_collation_reads(&def, join, &left, &[&right])),
             ("same".into(), "=".into(), "orders".into(), "region".into())
         );
     }
@@ -8795,7 +8958,7 @@ mod tests {
 
     fn check_text(text: &str) -> Result<(), ValidationError> {
         let (left, right) = tables();
-        validate_join(&parse_text(text).unwrap(), &left, &right)
+        validate_join(&parse_text(text).unwrap(), &left, &[&right])
     }
 
     #[test]
@@ -9243,7 +9406,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            validate_join(&def, &left, &right),
+            validate_join(&def, &left, &[&right]),
             Err(ValidationError::UnconstrainedNumericAggregate { .. })
         ));
     }
@@ -9261,7 +9424,7 @@ mod tests {
              GROUP BY orders.region SELECT SUM(orders.whole) AS v, AVG(orders.total) AS w",
         )
         .unwrap();
-        validate_join(&def, &left, &right).unwrap();
+        validate_join(&def, &left, &[&right]).unwrap();
     }
 
     #[test]
@@ -9336,7 +9499,7 @@ mod tests {
                  GROUP BY orders.region SELECT COUNT(*) AS n",
             )
             .unwrap();
-            validate_join(&def, &left, &right)
+            validate_join(&def, &left, &[&right])
         };
         let v50 = ("character varying(50)", 1043, 54);
         let v255 = ("character varying(255)", 1043, 259);
@@ -9388,7 +9551,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            validate_join(&def, &left, &right),
+            validate_join(&def, &left, &[&right]),
             Err(ValidationError::JoinNondeterministicCollation { .. })
         ));
     }
@@ -9419,7 +9582,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            validate_join(&def, &left, &right),
+            validate_join(&def, &left, &[&right]),
             Err(ValidationError::GroupByKeysShareTargetColumn { .. })
         ));
     }
@@ -9436,45 +9599,31 @@ mod tests {
             spec.joins[0].right = "orders".to_string();
         }
         assert!(matches!(
-            validate_join(&def, &left, &right),
+            validate_join(&def, &left, &[&right]),
             Err(ValidationError::JoinSelf { .. })
         ));
     }
 
-    /// A second joined table, which only a hand-built tree has (the parser
-    /// refuses it with the same words), is refused first, for both kinds of
-    /// `JOIN`, even when another check would also refuse it.
+    /// An aggregate `JOIN` of a second joined table parses, and is refused
+    /// first, even when another check would also refuse it (#1457 step 7
+    /// admits more).
     #[test]
-    fn join_refuses_a_second_joined_table_built_by_hand() {
+    fn an_aggregate_join_refuses_a_second_joined_table() {
         let (left, right) = tables();
-        for text in [
+        let def = parse_text(
             "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             JOIN shipments ON items.id = shipments.item_id \
              GROUP BY orders.region SELECT COUNT(*) AS n",
-            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
-             SELECT orders.id AS id",
-        ] {
-            let mut def = parse_text(text).unwrap();
-            let (KeySpace::Join(spec) | KeySpace::JoinOneToOne(spec)) = &mut def.key_space else {
-                panic!("a JOIN");
-            };
-            let mut second = spec.joins[0].clone();
-            // A self-join too, which alone would be refused as such.
-            second.right = "orders".to_string();
-            spec.joins.push(second);
-            assert_eq!(
-                validate_join(&def, &left, &right),
-                Err(ValidationError::JoinTooManyTables),
-                "{text}"
-            );
-        }
-        let parsed = parse_text(
-            "TRANSFORM t FROM a JOIN b ON a.k = b.k JOIN c ON a.k = c.k \
-             GROUP BY a.g SELECT COUNT(*) AS n",
         )
-        .unwrap_err()
-        .to_string();
-        let refused = ValidationError::JoinTooManyTables.to_string();
-        assert!(parsed.contains(&refused), "{parsed} / {refused}");
+        .unwrap();
+        assert_eq!(
+            validate_join(&def, &left, &[&right, &right]),
+            Err(ValidationError::JoinTooManyTables)
+        );
+        assert_eq!(
+            ValidationError::JoinTooManyTables.to_string(),
+            "a JOIN transform joins exactly two tables; a second JOIN is not supported"
+        );
     }
 
     #[test]
