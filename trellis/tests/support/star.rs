@@ -494,6 +494,26 @@ pub async fn family_seeded(
     }
 }
 
+/// [`family_seeded`] over [`start`]'s seed: `a_rows` and `b_rows` at
+/// `shape.at`, the idle positions filled.
+pub async fn family_seeded_at(
+    shape: Shape,
+    a_rows: &str,
+    b_rows: &str,
+    first: Writer,
+    second: Writer,
+) {
+    for star in shape.stars() {
+        for flip in [false, true] {
+            let mut d = start(&[star], a_rows, b_rows).await;
+            let one = first.seal(&mut d).await;
+            let two = second.seal(&mut d).await;
+            let (x, y) = if flip { (two, one) } else { (one, two) };
+            race(&mut d, star, x, y).await;
+        }
+    }
+}
+
 type Setup = (String, Vec<String>, Vec<(String, ValueType)>, Vec<String>);
 
 fn setup(stars: &[Star], a_rows: &str, b_rows: &str) -> Setup {
