@@ -919,6 +919,49 @@ fn moved_key(shape: &JoinShape, side: Side, parts: &[Option<String>], k: &PageKe
     true
 }
 
+/// Whether a key of `side`'s row is outside the set the page holds it
+/// under, so the page rolls back and retries: a `FROM` row's against K
+/// (`k`, [`moved_key`]); a joined table's (F11, #1459) against the page's
+/// fan-out keys at its position (`fan_k`), the keys whose `R` entries the
+/// page locked, not K. A key K holds only for a root item of the page
+/// would let the page recompute rows on it without their `R` entries.
+fn key_moved(
+    shape: &JoinShape,
+    side: Side,
+    parts: &[Option<String>],
+    k: &PageKeys,
+    fan_k: &PageKeys,
+) -> bool {
+    let Side::Joined(position) = side else {
+        return moved_key(shape, side, parts, k);
+    };
+    if !moved_key(shape, side, parts, fan_k) {
+        return false;
+    }
+    // Planted bugs: a star's joined-table re-check is against the page's
+    // whole `J` set (`star_recheck_j`), or is at its last position
+    // (`star_recheck_skip_last`). See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    if shape.is_star() {
+        let planted = match crate::plant::armed() {
+            Some(plant @ crate::plant::Plant::StarRecheckJ) => Some(plant),
+            Some(plant @ crate::plant::Plant::StarRecheckSkipLast)
+                if shape.positions.last().map(|p| p.position) == Some(position) =>
+            {
+                Some(plant)
+            }
+            _ => None,
+        };
+        if let Some(plant) = planted
+            && crate::plant::fires(plant, !moved_key(shape, side, parts, k))
+        {
+            return false;
+        }
+    }
+    let _ = position;
+    true
+}
+
 /// Settles one page of `plan` in `txn` (the module doc). Returns how many
 /// target rows it wrote and deleted.
 pub(crate) async fn apply_page(
@@ -1085,27 +1128,78 @@ pub(crate) async fn apply_page(
         lock_keys(txn, shape, &locked).await?;
     }
 
-    // 4. The `R` entries, then each position's `M` entries in position
-    // order.
-    let (a_inserted, _) = lock_side(txn, shape, Side::From, &a, seg_seq, predicate, &k).await?;
+    // 4. The `R` entries, the root's and every position's fan-out rows in
+    // one statement (the R-entry rule), then each position's `M` entries in
+    // position order. A joined change's fan-out keys are its keys in K, and
+    // the budget picks those the page recomputes itself, whose rows it locks.
+    let fan_k: PageKeys = joined_k;
+    let inline = if plan.fan_out {
+        fan_out::budget(txn, shape, &fan_k).await?
+    } else {
+        shape.empty_keys()
+    };
+    let (r_lock, late_r) = fan_lock_groups(shape, &inline, !a.is_empty());
+    let (a_inserted, _) = lock_side(
+        txn,
+        shape,
+        Side::From,
+        &a,
+        seg_seq,
+        predicate,
+        (&k, &fan_k),
+        &r_lock,
+    )
+    .await?;
     let mut b_locked = Vec::with_capacity(b.len());
     for (side, i) in shape
         .positions
         .iter()
         .map(|p| (Side::Joined(p.position), p.position.index()))
     {
-        b_locked.push(lock_side(txn, shape, side, &b[i], seg_seq, predicate, &k).await?);
+        b_locked.push(
+            lock_side(
+                txn,
+                shape,
+                side,
+                &b[i],
+                seg_seq,
+                predicate,
+                (&k, &fan_k),
+                &[],
+            )
+            .await?,
+        );
     }
 
     // 5. The Re-derive reads, one statement per side.
-    let a_read = rederive_read(txn, shape, Side::From, &shape.pk, &a_rederive, &k, seg_seq).await?;
+    let a_read = rederive_read(
+        txn,
+        shape,
+        Side::From,
+        &shape.pk,
+        &a_rederive,
+        (&k, &fan_k),
+        seg_seq,
+    )
+    .await?;
     let mut b_read = Vec::with_capacity(b.len());
     for (side, i) in shape
         .positions
         .iter()
         .map(|p| (Side::Joined(p.position), p.position.index()))
     {
-        b_read.push(rederive_read(txn, shape, side, &m_pk[i], &b_rederive[i], &k, seg_seq).await?);
+        b_read.push(
+            rederive_read(
+                txn,
+                shape,
+                side,
+                &m_pk[i],
+                &b_rederive[i],
+                (&k, &fan_k),
+                seg_seq,
+            )
+            .await?,
+        );
     }
 
     // 6. I2, then each side's copied columns.
@@ -1153,12 +1247,32 @@ pub(crate) async fn apply_page(
         } else {
             BTreeSet::new()
         };
-        let (fanned, fan_deleted, entries) =
-            fan_out(txn, plan, p, &fan_keys, &fanned_out, seg_seq, mutations).await?;
+        let (fanned, fan_deleted, entries) = fan_out(
+            txn,
+            plan,
+            p,
+            &fan_keys,
+            &inline[i],
+            &fanned_out,
+            seg_seq,
+            mutations,
+        )
+        .await?;
         fanned_out.extend(entries);
         written += fanned;
         deleted += fan_deleted;
+        // Test-only pause point. See `super::interleave`.
+        #[cfg(any(test, feature = "test-util"))]
+        if !fan_keys.is_empty() {
+            super::interleave::pause_at(
+                txn,
+                super::interleave::PausePoint::AfterJoin1PositionFanOut,
+                &shape.target,
+            )
+            .await?;
+        }
     }
+    lock_fan_rows(txn, shape, &late_r).await?;
     if late_j {
         lock_keys(txn, shape, &locked).await?;
     }
@@ -1199,6 +1313,135 @@ fn root_skip_j(
     }
     let _ = (shape, root_k, joined_k);
     k.clone()
+}
+
+/// The R-entry rule's lock of the fan-out rows on `keys` (each position's,
+/// index 0 is position 1): a predicate over `R` as `l` that matches every
+/// entry on one of them, its parameters bound from `$first`, and those
+/// parameters. `None` when no position has a key.
+fn fan_lock<'a>(
+    shape: &JoinShape,
+    keys: &'a PageKeys,
+    first: usize,
+) -> Option<(String, Vec<Vec<&'a str>>)> {
+    let mut terms = Vec::new();
+    let mut params: Vec<Vec<&str>> = Vec::new();
+    for (at, keys) in shape.positions.iter().zip(keys) {
+        if keys.is_empty() {
+            continue;
+        }
+        let n = at.key.len();
+        let from = first + params.len();
+        let arrays: Vec<String> = (0..n).map(|i| format!("${}::text[]", from + i)).collect();
+        let names: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
+        let alias = format!("u{}", at.position.number());
+        let casts: Vec<String> = at
+            .key
+            .iter()
+            .enumerate()
+            .map(|(i, c)| cast_to(c, &format!("{alias}.c{i}")))
+            .collect();
+        let columns: Vec<String> = at
+            .key
+            .iter()
+            .map(|c| format!("l.{}", quote_ident(&c.name)))
+            .collect();
+        terms.push(format!(
+            "({}) in (select {} from unnest({}) as {alias}({}))",
+            columns.join(", "),
+            casts.join(", "),
+            arrays.join(", "),
+            names.join(", ")
+        ));
+        params.extend(key_arrays(n, keys));
+    }
+    (!terms.is_empty()).then(|| (terms.join(" or "), params))
+}
+
+/// Locks the `R` entries on `keys` ([`fan_lock`]) `FOR UPDATE`, sorted, in
+/// one statement of their own: under a planted bug only, since the R-entry
+/// rule locks them with the page's root entries ([`lock_side`]).
+async fn lock_fan_rows(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    keys: &PageKeys,
+) -> Result<(), ApplyError> {
+    let Some((predicate, params)) = fan_lock(shape, keys, 1) else {
+        return Ok(());
+    };
+    let params: Vec<&(dyn ToSql + Sync)> = params.iter().map(|c| c as _).collect();
+    super::ledger::query_by_entry_key(
+        txn,
+        &format!(
+            "select 1 from {r} l where {predicate} order by l.{key} for update of l",
+            r = shape.r.ident,
+            key = quote_ident(schema::KEY_COLUMN),
+        ),
+        &params,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The R-entry rule's lock statements of a page's fan-out rows on `inline`
+/// (#1459 Decision item 1): one set, locked with the page's root entries
+/// (`root`: whether it has any) in one statement. Planted bugs change it;
+/// the second part is the rows a planted bug locks only after the page's
+/// writes. See `crate::plant`.
+fn fan_lock_groups(shape: &JoinShape, inline: &PageKeys, root: bool) -> (Vec<PageKeys>, PageKeys) {
+    #[cfg(any(test, feature = "test-util"))]
+    if shape.is_star() {
+        use crate::plant::{Plant, armed, fires};
+        let any = inline.iter().any(|keys| !keys.is_empty());
+        let last = inline.len() - 1;
+        match armed() {
+            // A joined-table writer locks its own `J` but not the `R`
+            // entries it recomputes.
+            Some(plant @ Plant::StarOwnJOnly) if fires(plant, any) => {
+                return (vec![shape.empty_keys()], shape.empty_keys());
+            }
+            // The `R` entries are locked only after the page read `M`.
+            Some(plant @ Plant::StarRAfterM) if fires(plant, any) => {
+                return (vec![shape.empty_keys()], inline.clone());
+            }
+            // The last position's writer doesn't lock them.
+            Some(plant @ Plant::StarLastNoR) if fires(plant, !inline[last].is_empty()) => {
+                let mut keys = inline.clone();
+                keys[last].clear();
+                return (vec![keys], shape.empty_keys());
+            }
+            // One statement per position, or at three or more positions
+            // two: positions 1 and 2, then the rest.
+            Some(plant @ Plant::StarRSplit) => {
+                let bounds: Vec<std::ops::Range<usize>> = if inline.len() >= 3 {
+                    vec![0..2, 2..inline.len()]
+                } else {
+                    (0..inline.len()).map(|i| i..i + 1).collect()
+                };
+                let groups: Vec<PageKeys> = bounds
+                    .iter()
+                    .map(|range| {
+                        let mut keys = shape.empty_keys();
+                        for i in range.clone() {
+                            keys[i] = inline[i].clone();
+                        }
+                        keys
+                    })
+                    .collect();
+                let statements = groups
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, keys)| (*i == 0 && root) || keys.iter().any(|k| !k.is_empty()))
+                    .count();
+                if fires(plant, statements > 1) {
+                    return (groups, shape.empty_keys());
+                }
+            }
+            _ => {}
+        }
+    }
+    let _ = root;
+    (vec![inline.clone()], shape.empty_keys())
 }
 
 /// Locks the definitions' rows of `plans` (one page's) before the page's
@@ -1691,8 +1934,14 @@ async fn lock_keys(
 
 /// Step 4 for one side: `records`' placeholders and sorted entry lock
 /// ([`super::one_to_one_ledger::lock_entries`], I5), then the check that each
-/// held key is in `k` ([`check_held_keys`]). Returns the keys whose entry it
-/// inserted, and the key each entry held under the lock.
+/// held key is in the page's set ([`check_held_keys`]). Returns the keys
+/// whose entry it inserted, and the key each entry held under the lock.
+///
+/// On the `FROM` side, `fan` are the R-entry rule's fan-out rows
+/// ([`fan_lock`]): the first set's are locked in the one statement with
+/// `records`' entries, and only a planted bug splits off the others, each
+/// locked in a statement of its own after it.
+#[allow(clippy::too_many_arguments)]
 async fn lock_side(
     txn: &Transaction<'_>,
     shape: &JoinShape,
@@ -1700,9 +1949,11 @@ async fn lock_side(
     records: &BTreeMap<&str, &Record>,
     seg_seq: i64,
     predicate: bool,
-    k: &PageKeys,
+    (k, fan_k): (&PageKeys, &PageKeys),
+    fan: &[PageKeys],
 ) -> Result<(ledger::Inserted, HashMap<String, KeyText>), ApplyError> {
-    if records.is_empty() {
+    let first = fan.first().and_then(|keys| fan_lock(shape, keys, 2));
+    if records.is_empty() && fan.iter().all(|keys| keys.iter().all(BTreeSet::is_empty)) {
         return Ok((ledger::Inserted::default(), HashMap::new()));
     }
     let to_lock: Vec<EntryChange<'_>> = records
@@ -1716,14 +1967,47 @@ async fn lock_side(
     // Planted bug: the page doesn't lock the entries it reads. See
     // `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
-    let skip_lock = crate::plant::fires(crate::plant::Plant::Join1NoEntryLock, true);
+    let skip_lock = crate::plant::fires(crate::plant::Plant::Join1NoEntryLock, !records.is_empty());
     #[cfg(not(any(test, feature = "test-util")))]
     let skip_lock = false;
     let ledger = shape.ledger(side);
-    let inserted =
-        ledger::lock_entries(txn, ledger, &to_lock, seg_seq, predicate, skip_lock).await?;
+    let also = first.as_ref().map(|(predicate, params)| ledger::AlsoLock {
+        predicate: predicate.clone(),
+        params: params.iter().map(|c| c as &(dyn ToSql + Sync)).collect(),
+    });
+    let inserted = if to_lock.is_empty() && also.is_none() {
+        ledger::Inserted::default()
+    } else {
+        ledger::lock_entries(
+            txn,
+            ledger,
+            &to_lock,
+            seg_seq,
+            predicate,
+            skip_lock,
+            also.as_ref(),
+        )
+        .await?
+    };
+    // Test-only pause point. See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    if side == Side::From {
+        super::interleave::pause_at(
+            txn,
+            super::interleave::PausePoint::AfterJoin1RLock,
+            &shape.target,
+        )
+        .await?;
+    }
+    for keys in fan.iter().skip(1) {
+        lock_fan_rows(txn, shape, keys).await?;
+    }
     let keys: Vec<&str> = records.keys().copied().collect();
-    let held = check_held_keys(txn, shape, side, &keys, k).await?;
+    let held = if keys.is_empty() {
+        HashMap::new()
+    } else {
+        check_held_keys(txn, shape, side, &keys, (k, fan_k)).await?
+    };
     // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
@@ -1739,15 +2023,17 @@ async fn lock_side(
 }
 
 /// Checks that the key each `keys` entry of `side`'s ledger holds at every
-/// position, now that the page has locked them, is in `k`: one outside it
-/// moved after `k` was read. Returns each entry's held key, for a joined
-/// side (none for a `NULL` part; a `FROM` entry's keys are only checked).
+/// position, now that the page has locked them, is in the page's set
+/// ([`key_moved`]: K, `k`, for `FROM` entries, the fan-out keys `fan_k` for
+/// a joined table's): one outside it moved after the set was read. Returns
+/// each entry's held key, for a joined side (none for a `NULL` part; a
+/// `FROM` entry's keys are only checked).
 async fn check_held_keys(
     txn: &Transaction<'_>,
     shape: &JoinShape,
     side: Side,
     keys: &[&str],
-    k: &PageKeys,
+    (k, fan_k): (&PageKeys, &PageKeys),
 ) -> Result<HashMap<String, KeyText>, ApplyError> {
     let n = shape.side_key(side).len();
     let rows = super::ledger::query_by_entry_key(
@@ -1782,7 +2068,11 @@ async fn check_held_keys(
     let skip = crate::plant::fires(crate::plant::Plant::Join1NoRecheck, !rows.is_empty());
     #[cfg(not(any(test, feature = "test-util")))]
     let skip = false;
-    if !skip && parts.iter().any(|key| moved_key(shape, side, key, k)) {
+    if !skip
+        && parts
+            .iter()
+            .any(|key| key_moved(shape, side, key, k, fan_k))
+    {
         #[cfg(any(test, feature = "test-util"))]
         super::interleave::note_join_key_moved();
         return Err(ApplyError::JoinKeyMoved {
@@ -1814,7 +2104,7 @@ async fn rederive_read(
     side: Side,
     pk: &[PrimaryKeyColumn],
     keys: &[String],
-    k: &PageKeys,
+    k: (&PageKeys, &PageKeys),
     seg_seq: i64,
 ) -> Result<Rederived, ApplyError> {
     if keys.is_empty() {
@@ -1887,7 +2177,7 @@ fn check_read_keys(
     shape: &JoinShape,
     side: Side,
     rows: &HashMap<String, String>,
-    k: &PageKeys,
+    (k, fan_k): (&PageKeys, &PageKeys),
 ) -> Result<(), ApplyError> {
     let names = shape.side_key(side);
     for doc in rows.values() {
@@ -1899,7 +2189,7 @@ fn check_read_keys(
             .iter()
             .map(|name| value.get(name).and_then(|v| v.as_str()).map(str::to_string))
             .collect();
-        if moved_key(shape, side, &key, k) {
+        if key_moved(shape, side, &key, k, fan_k) {
             #[cfg(any(test, feature = "test-util"))]
             super::interleave::note_join_key_moved();
             return Err(ApplyError::JoinKeyMoved {
@@ -2156,11 +2446,13 @@ async fn write_a_changes(
 /// ([`fan_out::split`]); a key it recomputes whole loses the marker an
 /// earlier page left it. Returns the rows written and deleted, and the `R`
 /// entries it wrote.
+#[allow(clippy::too_many_arguments)]
 async fn fan_out(
     txn: &Transaction<'_>,
     plan: &JoinOneToOnePlan,
     at: &JoinedPosition,
     keys: &BTreeSet<KeyText>,
+    inline: &BTreeSet<KeyText>,
     written: &HashSet<String>,
     seg_seq: i64,
     mutations: &mut TargetMutations,
@@ -2169,7 +2461,7 @@ async fn fan_out(
         return Ok((0, 0, Vec::new()));
     }
     let shape = &*plan.shape;
-    let inline = fan_out::split(txn, plan, at, keys, seg_seq).await?;
+    let inline = fan_out::split(txn, plan, at, keys, inline, seg_seq).await?;
     let entries: Vec<String> = live_entries_on(txn, shape, at, &inline)
         .await?
         .into_iter()

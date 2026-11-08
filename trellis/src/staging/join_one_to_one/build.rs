@@ -397,9 +397,10 @@ pub(crate) async fn run_chunk(
         .filter(|(key, _)| !inserted.contains(**key))
         .map(|(key, record)| (*key, *record))
         .collect();
-    let (placeholders, _) = lock_side(txn, shape, Side::From, &remaining, 0, true, &k).await?;
+    let (placeholders, _) =
+        lock_side(txn, shape, Side::From, &remaining, 0, true, (&k, &k), &[]).await?;
     let rederived: Vec<String> = remaining.keys().map(|key| key.to_string()).collect();
-    let read = rederive_read(txn, shape, Side::From, &shape.pk, &rederived, &k, 0).await?;
+    let read = rederive_read(txn, shape, Side::From, &shape.pk, &rederived, (&k, &k), 0).await?;
     let changed = update_side(
         txn,
         shape,

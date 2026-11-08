@@ -780,6 +780,7 @@ async fn lock_chunk_entries(
             0,
             true,
             skip_lock,
+            None,
         )
         .await?;
         Ok::<_, ApplyError>(())

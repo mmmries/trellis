@@ -121,6 +121,13 @@ impl LedgerRef {
     }
 }
 
+/// More entries for [`lock_entries`]'s lock statement: `predicate`, over
+/// the ledger as `l`, with its parameters from `$2`.
+pub(crate) struct AlsoLock<'a> {
+    pub predicate: String,
+    pub params: Vec<&'a (dyn tokio_postgres::types::ToSql + Sync)>,
+}
+
 /// The keys [`lock_entries`] inserted an entry for.
 #[derive(Debug, Default)]
 pub(crate) struct Inserted {
@@ -144,6 +151,10 @@ pub(crate) struct Inserted {
 /// [`update_entries`]. `skip_lock` is the `chunk_without_entry_lock`
 /// plant's (a build chunk's only): the existing entries are read
 /// without the lock.
+///
+/// `also` adds more entries to the same sorted lock statement: those its
+/// predicate matches (a 1-1 `JOIN` page's fan-out rows, the R-entry rule,
+/// `super::join_one_to_one`), which `skip_lock` doesn't leave out.
 pub(crate) async fn lock_entries(
     txn: &Transaction<'_>,
     ledger: &LedgerRef,
@@ -151,6 +162,7 @@ pub(crate) async fn lock_entries(
     seg_seq: i64,
     predicate: bool,
     skip_lock: bool,
+    also: Option<&AlsoLock<'_>>,
 ) -> Result<Inserted, ApplyError> {
     let ledger_sql = &ledger.ident;
     let q = |c: &str| quote_ident(c);
@@ -181,7 +193,7 @@ pub(crate) async fn lock_entries(
         crate::plant::fires(crate::plant::Plant::Join1NoPlaceholder, ledger.hidden);
     #[cfg(not(any(test, feature = "test-util")))]
     let no_placeholders = false;
-    let rows = if no_placeholders {
+    let rows = if no_placeholders || keys.is_empty() {
         Vec::new()
     } else {
         txn.query(
@@ -226,7 +238,27 @@ pub(crate) async fn lock_entries(
         .copied()
         .filter(|k| !inserted.keys.contains(*k))
         .collect();
-    if !existing.is_empty() && !skip_lock {
+    let existing: Vec<&str> = if skip_lock { Vec::new() } else { existing };
+    if let Some(also) = also {
+        let sql = format!(
+            "select l.{key_col} = any($1::text[]) from {ledger_sql} l \
+             where l.{key_col} = any($1::text[]) or ({}) \
+             order by l.{key_col} for update of l",
+            also.predicate
+        );
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&existing];
+        params.extend(also.params.iter().copied());
+        let locked = super::ledger::query_by_entry_key(txn, &sql, &params)
+            .await?
+            .iter()
+            .filter(|row| row.get::<_, bool>(0))
+            .count();
+        if locked < existing.len() && !no_placeholders {
+            return Err(ApplyError::LedgerEntryCollected {
+                target: ledger.label.clone(),
+            });
+        }
+    } else if !existing.is_empty() {
         let locked = super::ledger::query_by_entry_key(
             txn,
             &super::ledger::lock_statement(ledger_sql),
