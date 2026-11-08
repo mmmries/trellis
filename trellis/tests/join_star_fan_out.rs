@@ -13,7 +13,9 @@
 //! asymmetric family runs in both orientations.
 //!
 //! - **CX F10a**: a chunk at one position against a page at the other on
-//!   the chunk's row, either one frozen first.
+//!   the chunk's row, either one frozen first; and the page holding the
+//!   row after the chunk's walk, which ends with the key's death count, not
+//!   the oracle (the row is held).
 //! - **CX F10c**: chunks at both positions on one row.
 //! - **PX8, PX9**: a held row and the fan-out at position 2.
 //! - **XT2**: a `TRUNCATE` against a pending marker at another position.
@@ -249,6 +251,51 @@ async fn cx_f10c_chunks_at_two_positions_on_one_row_queue_on_its_r_entry() {
             blocked,
             "{name}: the chunk at position 2 ran without queueing on row 1's R entry"
         );
+    }
+}
+
+/// F10a with a hold, page first: a change of `b1`'s row 1 leaves key 1 (rows
+/// 1 and 4) to chunks at position 1. A page changing `b2`'s row 1 fans out to
+/// row 1 in the page, whose `total` overflows, so it holds row 1; it is
+/// frozen at its commit holding row 1's `R` entry. The chunk walks row 1
+/// before the hold commits and queues on that entry. Once it holds the
+/// entry it leaves the row out, as it is held: recomputing it would fail
+/// again and hold it a second time, charging the key's death twice.
+#[tokio::test]
+async fn cx_f10a_a_chunk_leaves_out_a_row_a_page_at_the_other_position_held_after_its_walk() {
+    let _serial = star::serial().await;
+    let _chunked = chunked();
+    for star in N3.stars() {
+        let name = star.name();
+        let seed = "insert into public.a (id, k1, k2, x, y) values \
+                    (1, 1, 1, 2147482000, 'a1'), (4, 1, 5, 0, 'a4'); \
+                    insert into public.b1 values (1, 1, 10, 'b1'); \
+                    insert into public.b2 values (1, 1, 100, 'e1'), (5, 5, 500, 'e5')";
+        let mut d = star::start_seeded(&[star], seed).await;
+        step(&mut d, "update public.b1 set w = 11 where id = 1").await;
+        assert_eq!(markers(&d, star).await, ["(1,{1},)"], "{name}");
+        star::write(&d, "update public.b2 set w = 2000 where id = 1").await;
+        let batch = d.seal().await;
+        let target = star.target();
+        let mut page = d
+            .drain_frozen(batch, "page", &[(PausePoint::BeforeCommit, &target)])
+            .await;
+        let reached = page.reached(PausePoint::BeforeCommit).await;
+        let running = chunk(&d, star, &[]).await;
+        d.wait_blocked_behind(reached.backend_pid).await;
+        d.release(&mut page, PausePoint::BeforeCommit).await;
+        page.finish().await;
+        assert_eq!(
+            running.finish().await,
+            OneToOneJoinFanOutStep::Chunk,
+            "{name}"
+        );
+        assert_eq!(
+            d.rows("select key, deaths from key_deaths").await,
+            ["(1,1)"],
+            "{name}: the chunk held row 1 again"
+        );
+        assert_clean(&d, &name);
     }
 }
 

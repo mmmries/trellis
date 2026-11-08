@@ -672,8 +672,8 @@ async fn chunk_in(
     let rows = chunk_rows();
     let entries = walk(txn, shape, at, key, cursor.as_deref(), rows + 1).await?;
     let next = (entries.len() > rows).then(|| entries[rows - 1].clone());
-    let batch = &entries[..entries.len().min(rows)];
-    lock_batch(txn, shape, batch).await?;
+    let batch = lock_batch(txn, shape, &entries[..entries.len().min(rows)]).await?;
+    let batch = &batch[..];
     // Test-only pause point. See `super::super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::super::interleave::pause_at(
@@ -750,12 +750,16 @@ async fn chunk_in(
 /// change between the chunk's read of that `M` and its write of the row,
 /// and the chunk would write the row from the older entry. The batch's
 /// entries can't leave the key or change while the chunk holds its `J` row,
-/// so the walk's read stands.
+/// so the walk's read of them stands. Returns the batch less its rows held in
+/// quarantine: such a writer may have held a row of the batch after the
+/// walk, in its fan-out, and the chunk would hold it again, charging its
+/// death and its fields' failures twice. No row of the batch is held once
+/// the chunk holds its entry.
 async fn lock_batch(
     txn: &Transaction<'_>,
     shape: &JoinShape,
     batch: &[String],
-) -> Result<(), ApplyError> {
+) -> Result<Vec<String>, ApplyError> {
     // Planted bug: a star's chunk recomputes its batch without re-taking its
     // `R` entries. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
@@ -763,10 +767,10 @@ async fn lock_batch(
         crate::plant::Plant::StarChunkNoR,
         shape.is_star() && !batch.is_empty(),
     ) {
-        return Ok(());
+        return Ok(batch.to_vec());
     }
     if batch.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let keys: Vec<&str> = batch.iter().map(String::as_str).collect();
     super::super::ledger::query_by_entry_key(
@@ -775,7 +779,24 @@ async fn lock_batch(
         &[&keys],
     )
     .await?;
-    Ok(())
+    // Only a star's writer at another position can hold a row of the batch
+    // after the walk: at one position, `J` orders every writer of the key.
+    if !shape.is_star() {
+        return Ok(batch.to_vec());
+    }
+    let not_held = super::not_held_filter(txn, shape, 2, 3).await?;
+    let rows = super::super::ledger::query_by_entry_key(
+        txn,
+        &format!(
+            "select r.{entry} from {r} r where r.{entry} = any($1::text[]){not_held} \
+             order by r.{entry}",
+            entry = quote_ident(schema::KEY_COLUMN),
+            r = shape.r.ident,
+        ),
+        &[&keys, &shape.id, &shape.source_table],
+    )
+    .await?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 
 /// Up to `limit` keys of the live `R` entries on `key` at `at` after
