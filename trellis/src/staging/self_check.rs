@@ -717,7 +717,7 @@ async fn read_group_shape(
     shape
         .read_scales(
             &**client,
-            &super::group_basis::hidden_table_ident(pool.schema(), def.id),
+            &super::group_basis::hidden_table_qualified(pool.schema(), def.id),
         )
         .await?;
     Ok(Some(shape))

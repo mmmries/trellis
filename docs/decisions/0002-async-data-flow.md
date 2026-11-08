@@ -562,12 +562,22 @@ reason.
 - **Must:** a `SUM` or `AVG` over a `numeric` argument (a column with or
   without a declared scale, a `numeric` column of a Trellis target, or an
   expression whose result is `numeric`) keeps, per group, on the group's
-  hidden row: the sum of its finite values; a map from each display scale
-  (`scale(x)`, 0 to 16383; no value has a negative scale) to its count of
-  finite non-null values, with no zero entry; and its counts of `NaN`,
-  `Infinity` and `-Infinity`. A `numeric(p,s)` argument keeps the same
-  partials, whose map has the one scale `s`; an integer argument keeps its
-  sum alone.
+  hidden row: the sum of its finite values, and one map of exceptions that
+  counts every non-null value *except* the finite ones at the argument's
+  reference scale: a key per display scale (`scale(x)`, 0 to 16383; no
+  value has a negative scale) and one per special value (`NaN`, `Infinity`,
+  `-Infinity`), each to its count, with no zero entry. An empty map is
+  stored as `NULL`. The count of finite values at the reference scale is the
+  non-null count less the map's counts. An integer argument keeps its sum
+  alone.
+- **Must:** the reference scale is the scale the argument's column declares
+  (`numeric(p,s)`'s `s`, a negative `s` as 0) when the hidden table is
+  created, recorded with the table and read back by every statement, so a
+  later change of the column's type never changes what a stored map means.
+  An argument with no declared scale (an unconstrained column, an
+  expression) has none, and its map counts every value. So a
+  `numeric(p,s)` argument's map stays `NULL` while its values are finite:
+  no page, build, recompute or product builds, merges or writes one.
 - **Must:** every partial operation keeps all of them: a page's deltas
   carry each side's scale and special-value class inside the side sums it
   computes; a build, a locked recompute and a partition correction count
@@ -582,19 +592,19 @@ reason.
   value divided by the non-null count as `numeric`, as Postgres's
   `numeric_div` does. Through a build and through pages alike, the sum and
   the average then carry exactly the scale and value Postgres would show.
-- **Must:** every `numeric` argument has this one layout. A column that
-  declares a scale `s` (read from its type when a statement is planned) is a
-  hint the statements specialise for, never a different layout: a page
-  whose values are all finite at `s` is staged with no scale map, its apply
-  deriving the map's change from the counts; a `JOIN` product and a `JOIN`
-  build's grouping carry each map as its count at `s`. A map or a row at
-  another scale, which a change of the column's type can leave behind, fails
-  the specialised statement, which then runs the general way in the same
-  transaction, so the hint never changes a result.
+- **Must:** every `numeric` argument has this one layout; only the
+  reference scale differs. The visible `SUM` of a group whose map is `NULL`
+  is its finite sum at the reference scale, read without the map. A page
+  whose values are all finite at the reference scale stages a `NULL` map,
+  and its apply leaves every row's map as it is. A build's grouping of such
+  rows counts them with no array aggregate; one that meets a value off the
+  reference scale fails and runs again the general way in the same
+  transaction, so the specialisation never changes a result.
 - **Must:** a retype of an argument column after define goes through the
   capture pass's re-validation like any other. A `numeric(p,s)` column
-  re-typed to an unconstrained `numeric` keeps every value's text, and the
-  partials are already the same, so nothing pauses or rebuilds. A change
+  re-typed to an unconstrained `numeric` keeps every value's text, and its
+  stored maps keep their reference scale, so nothing pauses or rebuilds:
+  values at other scales are counted in the map from then on. A change
   between two declared scales re-renders values, so its readers rebuild.
 
 ### Apply sums sides per group and transaction

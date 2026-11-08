@@ -2015,8 +2015,8 @@ pub(crate) fn check_aggregate_admitted(
             match arg.value_type {
                 ValueType::Integer(_) => admitted(AggregateAdmissionRule::SumAvgInteger),
                 ValueType::Numeric => {
-                    // Its partials keep scale and special-value counts, a
-                    // layout of their own.
+                    // Its partials keep a map of exceptions, a layout of
+                    // their own.
                     super::floor::record(super::floor::Feature::Layout(
                         super::floor::Layout::NumericSums,
                     ));

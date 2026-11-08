@@ -128,7 +128,8 @@ one never reads a source table. Postgres displays a `numeric` sum at the scale
 of the most precise value in the group, and a special value (`NaN`,
 `±Infinity`) can't be subtracted back out of a running sum, so a `numeric`
 argument's sum is of its finite values, beside a count per display scale and
-counts of `NaN`, `Infinity` and `-Infinity`
+counts of `NaN`, `Infinity` and `-Infinity`, kept as one map that leaves out
+the finite values at the column's declared scale
 ([ADR-0002](0002-async-data-flow.md#numeric-sums-count-their-scales-and-special-values)).
 Every one of those is a count or a sum, so the product below multiplies it by
 the other side's row count like any other partial, and the target shows the
@@ -143,7 +144,7 @@ of the last:
 
 - **`P(ga, k)`**: `a GROUP BY (a's group columns, join key)`, with `a`'s
   partials: the row count `n`, and a non-null count and a sum per aggregated
-  column of `a` (with a `numeric` column's scale and special-value counts).
+  column of `a` (with a `numeric` column's map of exceptions).
 - **`M(k, gb)`**: the same for `b`, keyed by `(join key, b's group columns)`.
 - **`J(k)`**: one row per join key, the lock for that key, holding
   `matches = Σ M.n` over the key.

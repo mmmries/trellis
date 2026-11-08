@@ -876,7 +876,7 @@ impl JoinTargetPlan {
         // `P_old` of cell `p`, given its delta row `d` (left joined).
         let p_old_n = "(p.__n - coalesce(d.__dn, 0))".to_string();
         let p_old_c = |i: usize| format!("(p.__count_{i} - coalesce(d.__dc{i}, 0))");
-        // The declared scale of `T`'s argument `i` (1-based).
+        // The reference scale of `T`'s argument `i` (1-based).
         let scale_of = |i: usize| {
             if i <= fa {
                 p_args[i - 1].scale

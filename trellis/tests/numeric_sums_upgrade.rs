@@ -1,8 +1,8 @@
 //! A 0.1.0 definition's `numeric(p,s)` `SUM`/`AVG` on upgrade (#1120 rule 5,
 //! `trellis::defs::numeric_sums`): its hidden table held the sum alone,
 //! possibly `NaN` for good after a `NaN` came and went. The attach gives it
-//! the scale map and the special-value counts in place, from each group's
-//! count and its stored sum's scale, re-stamps the definition's floor, and
+//! an empty map of exceptions in place, under its column's scale as the
+//! reference, re-stamps the definition's floor, and
 //! rebuilds a definition holding a `NaN` sum. The 0.1.0 layout is made here
 //! by hand from a definition this release wrote: the columns this release
 //! added dropped, and the zero flag as 0.1.0 computed it.
@@ -118,8 +118,8 @@ async fn id_of(raw: &Client, target: &str) -> i64 {
 }
 
 /// Turns the hidden table `table`, over one `numeric(p,s)` sum, back into
-/// 0.1.0's: no scale map or special-value counts, and the zero flag (and its
-/// index) over the count, the argument's count and its sum.
+/// 0.1.0's: no map of exceptions, and the zero flag (and its index) over
+/// the count, the argument's count and its sum.
 async fn table_to_0_1_0(raw: &Client, table: &str) {
     let index: String = raw
         .query_one(
@@ -131,8 +131,7 @@ async fn table_to_0_1_0(raw: &Client, table: &str) {
         .expect("the zero-group index")
         .get(0);
     raw.batch_execute(&format!(
-        "alter table {table} drop column __zero, drop column __scales_1, \
-             drop column __nan_1, drop column __pinf_1, drop column __ninf_1; \
+        "alter table {table} drop column __zero, drop column __scales_1; \
          alter table {table} add column __zero boolean not null generated always as \
              (__n = 0 and __count_1 = 0 and __sum_1 = 0) stored; \
          {index}"
@@ -174,8 +173,8 @@ fn exact(target: &str, source: &str) -> (String, String) {
 /// Every target of the test, with its source.
 const TARGETS: [(&str, &str); 3] = [("fin", "s"), ("poi", "p"), ("jn", "s")];
 
-/// A finite 0.1.0 sum gains `{s: count}` and no special values, and stays
-/// exact; a 0.1.0 sum stuck at `NaN` after its `NaN` left is rebuilt from
+/// A finite 0.1.0 sum gains an empty (`NULL`) map of exceptions under its
+/// column's scale as the reference, and stays exact; a 0.1.0 sum stuck at `NaN` after its `NaN` left is rebuilt from
 /// its source. Both are stamped with the new layout's floor, and their
 /// pages after the upgrade follow Postgres's text, `NaN` in and out.
 #[tokio::test]
@@ -252,9 +251,11 @@ async fn a_0_1_0_numeric_sum_is_converted_in_place_and_a_nan_one_rebuilt() {
     let maps: Vec<String> = raw
         .query(
             &format!(
-                "select format('%s %s %s %s %s %s', g, __scales_1, __nan_1, __pinf_1, \
-                        __ninf_1, __zero) \
-                 from {DEFAULT_SCHEMA}.agg_{fin} order by g"
+                "select format('%s %s %s %s', g, coalesce(__scales_1::text, 'null'), __zero, \
+                        col_description(attrelid, attnum)) \
+                 from {DEFAULT_SCHEMA}.agg_{fin}, pg_attribute \
+                 where attrelid = '{DEFAULT_SCHEMA}.agg_{fin}'::regclass \
+                   and attname = '__scales_1' order by g"
             ),
             &[],
         )
@@ -263,19 +264,12 @@ async fn a_0_1_0_numeric_sum_is_converted_in_place_and_a_nan_one_rebuilt() {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(
-        maps,
-        [
-            "1 {\"2\": 2} 0 0 0 f",
-            "2 {\"2\": 1} 0 0 0 f",
-            "3 {} 0 0 0 f"
-        ]
-    );
+    assert_eq!(maps, ["1 null f 2", "2 null f 2", "3 null f 2"]);
     let joined: Vec<String> = raw
         .query(
             &format!(
-                "select format('%s %s', r, __scales_1) from {DEFAULT_SCHEMA}.join_{jn}_t \
-                 order by r"
+                "select format('%s %s', r, coalesce(__scales_1::text, 'null')) \
+                 from {DEFAULT_SCHEMA}.join_{jn}_t order by r"
             ),
             &[],
         )
@@ -284,7 +278,7 @@ async fn a_0_1_0_numeric_sum_is_converted_in_place_and_a_nan_one_rebuilt() {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(joined, ["a {\"2\": 3}", "b {\"2\": 2}"]);
+    assert_eq!(joined, ["a null", "b null"]);
     for target in ["fin", "poi", "jn"] {
         let floor: String = raw
             .query_one(

@@ -3053,7 +3053,10 @@ pub(super) async fn compute_page(
                             shape
                                 .read_scales(
                                     &**client,
-                                    &super::group_basis::hidden_table_ident(pool.schema(), def.id),
+                                    &super::group_basis::hidden_table_qualified(
+                                        pool.schema(),
+                                        def.id,
+                                    ),
                                 )
                                 .await?;
                             ddl::identity_key_columns(&**client, &def.target_table).await?

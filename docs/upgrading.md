@@ -87,12 +87,12 @@ or `DROP TRANSFORM` and define it again with a `KEY (…)` over a unique index
 that isn't deferrable.
 
 A `SUM` or `AVG` an earlier release kept over a `numeric(p,s)` column held its
-sum alone. This release keeps, per group, the sum of the finite values, a count
-per display scale and counts of `NaN`, `Infinity` and `-Infinity`, for every
-`numeric` argument ([type support](type-support.md#numeric-and-floating-point)).
-At the takeover each such definition's hidden tables gain them in place: every
-value of the column has scale `s`, so a group's scale count is its count of
-values at `s`, and its special-value counts are 0. The definition then carries
+sum alone. This release keeps, per group, the sum of the finite values and a
+map counting every value that isn't finite at the column's declared scale:
+values at other scales, `NaN`, `Infinity` and `-Infinity`
+([type support](type-support.md#numeric-and-floating-point)). At the takeover
+each such definition's hidden tables gain the map in place, empty in every
+row: every value of the column has scale `s`. The definition then carries
 the new layout's floor (0.2.0), so a release before it refuses to run it
 ([Rolling back](#rolling-back)). Those releases left a group's sum at `NaN` for
 good once a `NaN` had been summed into it, even after the `NaN` left. A

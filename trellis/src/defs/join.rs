@@ -496,7 +496,7 @@ pub(crate) fn lock_row_ddl(lock: &str) -> String {
 /// The partial columns of a hidden table: the row count, then per
 /// aggregate argument a non-null count and its sum's partials
 /// (`crate::staging::group_basis::SumPart`): a `numeric` argument's
-/// (`numeric`, one flag per argument) keep all five, any other's its sum.
+/// (`numeric`, one flag per argument) keep both, any other's its sum.
 fn partial_columns(numeric: &[bool]) -> Vec<String> {
     let mut columns = vec!["__n bigint not null default 0".to_string()];
     for (i, numeric) in numeric.iter().enumerate() {
@@ -551,7 +551,7 @@ fn target_partials_tail(numeric: &[bool]) -> Vec<String> {
 }
 
 /// Whether each of `side`'s aggregate arguments ([`side_arguments`]) is
-/// `numeric`, so its partials keep scale and special-value counts.
+/// `numeric`, so its partials keep a map of exceptions.
 pub(crate) fn numeric_arguments(
     def: &TransformDef,
     side: Side,

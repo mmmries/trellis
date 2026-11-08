@@ -107,7 +107,7 @@ ALTER TABLE orders ALTER COLUMN amount TYPE integer USING amount * 10;
 -- outgrows:
 ALTER TABLE orders ALTER COLUMN price TYPE numeric(12,2) USING price * 10;
 -- The same to an unconstrained numeric: a SUM or AVG over it keeps
--- running, as its partials don't depend on a declared scale.
+-- running, as its partials count values at any scale.
 ALTER TABLE orders ALTER COLUMN price TYPE numeric USING price * 10;
 ```
 

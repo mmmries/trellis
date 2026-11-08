@@ -747,6 +747,13 @@ pub(crate) fn hidden_table_name_sql(id: &str) -> String {
 
 /// The hidden table of definition `id`, quoted and qualified by the catalog
 /// schema `schema`.
+/// The hidden table of definition `id` in the catalog schema `schema`,
+/// qualified and unquoted, as a catalog lookup takes it
+/// (`ddl::regclass_arg`).
+pub(crate) fn hidden_table_qualified(schema: &str, id: i64) -> String {
+    format!("{schema}.{}", hidden_table_name(id))
+}
+
 pub(crate) fn hidden_table_ident(schema: &str, id: i64) -> String {
     format!(
         "{}.{}",
@@ -1457,9 +1464,9 @@ pub(crate) async fn source_scales(
 }
 
 /// The reference scale of each of the `count` arguments whose partials the
-/// hidden table `table` (a name `to_regclass` resolves) keeps, as its map
-/// columns' comments record it ([`scale_comment`]): by 1-based argument,
-/// `None` for an argument with no map or no reference scale.
+/// hidden table `table` (qualified and unquoted, `ddl::regclass_arg`) keeps,
+/// as its map columns' comments record it ([`scale_comment`]): by 1-based
+/// argument, `None` for an argument with no map or no reference scale.
 pub(crate) async fn stored_scales(
     client: &impl tokio_postgres::GenericClient,
     table: &str,
@@ -1470,21 +1477,21 @@ pub(crate) async fn stored_scales(
             "select a.attname::text, pg_catalog.col_description(a.attrelid, a.attnum) \
              from pg_catalog.pg_attribute a \
              where a.attrelid = pg_catalog.to_regclass($1) \
-               and a.attnum > 0 and not a.attisdropped \
-               and a.attname::text like '\\_\\_scales\\_%'",
+               and a.attnum > 0 and not a.attisdropped",
             &[&ddl::regclass_arg(table)],
         )
         .await?;
+    // A table the name doesn't find (one quoted twice) would read as one
+    // with no `numeric` sum.
+    debug_assert!(!rows.is_empty(), "no hidden table {table}");
     let mut scales = vec![None; count];
     for row in rows {
         let name: String = row.get(0);
         let comment: Option<String> = row.get(1);
-        if let (Ok(i), Some(Ok(s))) = (
-            name["__scales_".len()..].parse::<usize>(),
-            comment.map(|c| c.parse::<i32>()),
-        ) && (1..=count).contains(&i)
+        if let Some(Ok(i)) = name.strip_prefix("__scales_").map(str::parse::<usize>)
+            && (1..=count).contains(&i)
         {
-            scales[i - 1] = Some(s);
+            scales[i - 1] = comment.and_then(|c| c.parse::<i32>().ok());
         }
     }
     Ok(scales)
@@ -2292,13 +2299,9 @@ impl GroupTargetPlan {
     /// A `Recompute`'s prior-image hint names a group to recompute
     /// ([`Self::recomputed`]). Returns the number of ring rows it can't
     /// apply as deltas; when there are any it stages nothing.
-    ///
-    /// `strict` stages each `numeric` sum with a declared scale
-    /// ([`Arg::scale`]) as if every value had it: no scale map, no
-    /// special-value counts, and a `NULL` map marking a staged row with a
-    /// value that is special or at another scale. [`stage_sides`] then stages
-    /// the page again the general way. A strict statement has no array
-    /// aggregate, so Postgres can hash its groups.
+    /// Its last column is, per `numeric` sum ([`Self::staged_flags`]),
+    /// whether every staged map of exceptions is `NULL`
+    /// ([`StagedParts::free`]).
     fn stage_sql(&self) -> String {
         let cols = quoted(&self.shape.group_cols).join(", ");
         let mut values = self.group_values();
@@ -3728,16 +3731,18 @@ impl GroupTargetPlan {
     /// `__rc<i>` and its sum's partials (`__r<stem><i>`), then per extreme
     /// its `__r<stem><i>`.
     ///
-    /// With a `numeric` sum, the rows are first grouped by the groups and
-    /// each such argument's `scale(x)` as well, then by the groups alone:
-    /// each scale's count comes from a group of its own, so the second step
-    /// folds one row per scale into the map, never one per source row.
+    /// With a `numeric` sum and no reference scale, the rows are first
+    /// grouped by the groups and each such argument's exception key
+    /// ([`exception_key`]) as well, then by the groups alone: each key's
+    /// count comes from a group of its own, so the second step folds one row
+    /// per key into the map, never one per source row.
     ///
-    /// `strict` counts a `numeric` sum with a declared scale ([`Arg::scale`])
-    /// as if every finite value had it, with no array aggregate (which
-    /// would keep Postgres from hashing the groups), and fails with
-    /// [`OFF_SCALE`] on a group with a finite value at another: its caller
-    /// runs the statement again without it ([`strictly_or_generally`]).
+    /// `strict` reads a `numeric` sum with a reference scale
+    /// ([`Arg::scale`]) as if every value were finite at it, a `NULL` map
+    /// with no array aggregate (which would keep Postgres from hashing the
+    /// groups), and fails with [`OFF_SCALE`] on a group with any other
+    /// value: its caller runs the statement again without it
+    /// ([`strictly_or_generally`]).
     fn fresh_select(&self, values: &[String], from: &str, strict: bool) -> String {
         let args = &self.shape.args;
         let scaled: Vec<usize> = (0..args.len())
@@ -3813,7 +3818,7 @@ impl GroupTargetPlan {
             inner.push(format!("{} as __g{}", exception_key(&args[i].sql), i + 1));
         }
         let keys = inner.len();
-        // The scale maps the scale keys fold are computed by the outer step
+        // The maps the exception keys fold are computed by the outer step
         // alone.
         let keyed: Vec<String> = scaled
             .iter()
@@ -4730,7 +4735,7 @@ async fn plan_of(
         return Ok(None);
     };
     shape
-        .read_scales(txn, &hidden_table_ident(catalog_schema, definition.id))
+        .read_scales(txn, &hidden_table_qualified(catalog_schema, definition.id))
         .await?;
     let source_pk = ddl::source_primary_key_in_txn(txn, &definition.source_table).await?;
     let identity = ddl::identity_key_columns(txn, &definition.target_table).await?;
@@ -4959,7 +4964,7 @@ pub(crate) async fn rebuild_definition(
         return Ok(None);
     };
     shape
-        .read_scales(txn, &hidden_table_ident(catalog_schema, definition.id))
+        .read_scales(txn, &hidden_table_qualified(catalog_schema, definition.id))
         .await?;
     let source_pk = ddl::source_primary_key_in_txn(txn, &definition.source_table).await?;
     let identity = ddl::identity_key_columns(txn, &definition.target_table).await?;
@@ -5138,7 +5143,10 @@ pub async fn explain_apply(pool: &crate::pool::Pool, target: &str) -> Result<Str
     };
     let mut client = pool.get().await?;
     shape
-        .read_scales(&**client, &hidden_table_ident(pool.schema(), definition.id))
+        .read_scales(
+            &**client,
+            &hidden_table_qualified(pool.schema(), definition.id),
+        )
         .await?;
     let identity = ddl::identity_key_columns(&**client, &definition.target_table).await?;
     let plan = GroupTargetPlan::new(
@@ -5194,7 +5202,10 @@ pub async fn explain_whole_source_reads(
     };
     let mut client = pool.get().await?;
     shape
-        .read_scales(&**client, &hidden_table_ident(pool.schema(), definition.id))
+        .read_scales(
+            &**client,
+            &hidden_table_qualified(pool.schema(), definition.id),
+        )
         .await?;
     let identity = ddl::identity_key_columns(&**client, &definition.target_table).await?;
     let plan = GroupTargetPlan::new(
@@ -5257,7 +5268,10 @@ pub async fn explain_probe(pool: &crate::pool::Pool, target: &str) -> Result<Str
     }
     let mut client = pool.get().await?;
     shape
-        .read_scales(&**client, &hidden_table_ident(pool.schema(), definition.id))
+        .read_scales(
+            &**client,
+            &hidden_table_qualified(pool.schema(), definition.id),
+        )
         .await?;
     let identity = ddl::identity_key_columns(&**client, &definition.target_table).await?;
     let plan = GroupTargetPlan::new(

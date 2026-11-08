@@ -435,17 +435,18 @@ async fn a_sum_stored_as_nan_is_reported_and_a_rebuild_repairs_it() {
         ))),
         "{found:?}"
     );
-    // A wrong count of `NaN`s is reported on its own column.
+    // A wrong count of `NaN`s is reported on the map of exceptions.
     d.ctl
         .batch_execute(&format!(
-            "update {hidden} set __sum_1 = __sum_1 - 1, __nan_1 = 2 where g = 1"
+            "update {hidden} set __sum_1 = __sum_1 - 1, __scales_1 = '{{\"NaN\": 2}}' where g = 1"
         ))
         .await
         .expect("plant a wrong NaN count");
     let found = self_check(&d, "agg").await;
     assert!(
         found.iter().any(|f| f.contains(&format!(
-            "agg_{id}.__nan_1\", persisted: Some(\"2\"), recomputed: Some(\"1\")"
+            "agg_{id}.__scales_1\", persisted: Some(\"{{\\\"NaN\\\": 2}}\"), \
+             recomputed: Some(\"{{\\\"NaN\\\": 1}}\")"
         ))),
         "{found:?}"
     );

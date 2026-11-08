@@ -330,8 +330,8 @@ async fn a_build_then_pages() {
     .await;
 }
 
-/// A corrupted scale count or special-value count is reported on its own
-/// hidden column.
+/// A corrupted scale count or special-value count is reported on the map of
+/// exceptions.
 #[tokio::test]
 async fn self_check_reports_a_wrong_scale_or_special_count() {
     let mut d = start_agg().await;
@@ -350,17 +350,17 @@ async fn self_check_reports_a_wrong_scale_or_special_count() {
         .expect("id")
         .get(0);
     let hidden = format!("{DEFAULT_SCHEMA}.agg_{id}");
-    for (corrupt, column, persisted, recomputed) in [
-        (
-            "__scales_1 = '{\"1\": 1, \"3\": 2}'",
-            "__scales_1",
-            "{\\\"1\\\": 1, \\\"3\\\": 2}",
-            "{\\\"1\\\": 1, \\\"3\\\": 1}",
-        ),
-        ("__pinf_1 = 0", "__pinf_1", "0", "1"),
-        ("__ninf_1 = 1", "__ninf_1", "1", "0"),
-        ("__nan_1 = 3", "__nan_1", "3", "0"),
+    let right = r#"{"1": 1, "3": 1, "Infinity": 1}"#;
+    for wrong in [
+        r#"{"1": 1, "3": 2, "Infinity": 1}"#,
+        r#"{"1": 1, "3": 1}"#,
+        r#"{"1": 1, "3": 1, "Infinity": 1, "-Infinity": 1}"#,
+        r#"{"1": 1, "3": 1, "NaN": 3, "Infinity": 1}"#,
     ] {
+        let corrupt = format!("__scales_1 = '{wrong}'");
+        let column = "__scales_1";
+        let persisted = wrong.replace('"', "\\\"");
+        let recomputed = right.replace('"', "\\\"");
         d.ctl
             .batch_execute(&format!(
                 "begin; \
@@ -368,7 +368,7 @@ async fn self_check_reports_a_wrong_scale_or_special_count() {
                  update {hidden} set {corrupt} where g = 1; commit"
             ))
             .await
-            .expect(corrupt);
+            .expect(&corrupt);
         let found = self_check(&d, "agg").await;
         let wanted = format!(
             "agg_{id}.{column}\", persisted: Some(\"{persisted}\"), \
@@ -379,13 +379,9 @@ async fn self_check_reports_a_wrong_scale_or_special_count() {
             "{wanted} in {found:?}"
         );
         // Put the right count back.
-        let right = match column {
-            "__scales_1" => "'{\"1\": 1, \"3\": 1}'::jsonb".to_string(),
-            _ => recomputed.to_string(),
-        };
         d.ctl
             .batch_execute(&format!(
-                "update {hidden} set {column} = {right} where g = 1"
+                "update {hidden} set {column} = '{right}' where g = 1"
             ))
             .await
             .expect("repair");
@@ -549,8 +545,9 @@ async fn a_join_build_then_pages() {
     .await;
 }
 
-/// [`JOIN_DDL`] with `o.x` a `numeric(10,2)`, which declares its scale: the
-/// statements specialise for it (strict stages, builds and products).
+/// [`JOIN_DDL`] with `o.x` a `numeric(10,2)`, which declares its scale: its
+/// maps of exceptions stay `NULL` while its values are finite, and a build
+/// reads it strictly.
 const DECLARED_JOIN_DDL: &str = "create table public.o (id integer primary key, k integer, x numeric(10,2)); \
      create table public.c (id integer primary key, k integer, region text); \
      create index on public.o (k); create index on public.c (k)";
@@ -600,12 +597,12 @@ async fn a_declared_scale_build_then_pages() {
     .await;
 }
 
-/// A declared scale is only a hint: a `JOIN` cell whose map counts another
-/// scale (here written by hand, as a change of the column's type could leave
-/// one behind) makes the strict product refuse, and the page's product runs
-/// the general way, carrying the other scale into `T`.
+/// A `JOIN` cell whose map of exceptions counts a value at another scale
+/// (here written by hand, as a change of the column's type could leave one
+/// behind) carries it into `T` times its match count, beside the `NULL` maps
+/// of the cells with none.
 #[tokio::test]
-async fn a_map_off_its_declared_scale_is_multiplied_the_general_way() {
+async fn a_map_of_exceptions_is_multiplied_into_t() {
     let mut d = Driver::start(
         &format!(
             "{DECLARED_JOIN_DDL}; \
@@ -633,10 +630,10 @@ async fn a_map_off_its_declared_scale_is_multiplied_the_general_way() {
     );
     d.ctl
         .batch_execute(&format!(
-            "update {p} set __scales_1 = '{{\"2\": 1, \"5\": 1}}' where k = 1"
+            "update {p} set __scales_1 = '{{\"5\": 1}}' where k = 1"
         ))
         .await
-        .expect("a map off its declared scale");
+        .expect("a map of exceptions");
     // A second match for key 1: `T` gains `P_old ⊗ ΔM`, read from the cell.
     step(&mut d, "insert into public.c values (2, 1, 'a')").await;
     let scales: String = d
@@ -648,7 +645,6 @@ async fn a_map_off_its_declared_scale_is_multiplied_the_general_way() {
         .await
         .expect("T's map")
         .get(0);
-    // The build's `{"2": 2}`, plus the hand-written cell times its new
-    // match. A strict product would have derived `{"2": 4}` from the counts.
-    assert_eq!(scales, "{\"2\": 3, \"5\": 1}");
+    // The build's `NULL`, plus the hand-written cell times its new match.
+    assert_eq!(scales, "{\"5\": 1}");
 }

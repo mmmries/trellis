@@ -239,7 +239,9 @@ none (`numeric(p,s)` refuses `Infinity` and `-Infinity` but admits `NaN`).
 A running sum can do neither: it keeps the widest scale it ever held, and
 can't subtract a special value back out. So the group's hidden row keeps the
 finite values' sum, a count of values per display scale, and counts of
-`NaN`, `Infinity` and `-Infinity`
+`NaN`, `Infinity` and `-Infinity`, in one map that leaves out the finite
+values at the column's declared scale, so a `numeric(p,s)` column's map
+stays empty while its values are finite
 ([ADR-0002](decisions/0002-async-data-flow.md#numeric-sums-count-their-scales-and-special-values)).
 Checked in `trellis/tests/group_basis_numeric_scales.rs` and
 `trellis/tests/group_basis_numeric_nan.rs`.
