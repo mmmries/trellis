@@ -582,6 +582,15 @@ reason.
   value divided by the non-null count as `numeric`, as Postgres's
   `numeric_div` does. Through a build and through pages alike, the sum and
   the average then carry exactly the scale and value Postgres would show.
+- **Must:** every `numeric` argument has this one layout. A column that
+  declares a scale `s` (read from its type when a statement is planned) is a
+  hint the statements specialise for, never a different layout: a page
+  whose values are all finite at `s` is staged with no scale map, its apply
+  deriving the map's change from the counts; a `JOIN` product and a `JOIN`
+  build's grouping carry each map as its count at `s`. A map or a row at
+  another scale, which a change of the column's type can leave behind, fails
+  the specialised statement, which then runs the general way in the same
+  transaction, so the hint never changes a result.
 - **Must:** a retype of an argument column after define goes through the
   capture pass's re-validation like any other. A `numeric(p,s)` column
   re-typed to an unconstrained `numeric` keeps every value's text, and the

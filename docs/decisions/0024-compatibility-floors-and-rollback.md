@@ -133,7 +133,11 @@ space (1-1, aggregate, `JOIN`, 1-1 `JOIN`) and `JOIN` kind; the options
 (`WITHOUT SOURCE INDEX`, a schema-qualified table, the predicate); a
 partitioned table on either side; and the hidden-table layout and
 per-definition catalog state this release writes for the definition's key
-space. A definition's floor is the latest of these over everything it uses.
+space, and for what it aggregates where that changes the layout (the
+partials of a `numeric` `SUM` or `AVG`). A definition's floor is the latest
+of these over everything it uses. A release that converts a stored
+definition's hidden tables to a newer layout at attach stamps its floor
+again in the same transaction.
 The declarations are exhaustive matches over the parsed tree's node kinds
 and over the features, or a field of a function's, literal's or cast's
 registry entry, so a new one doesn't compile without its release. A layout
