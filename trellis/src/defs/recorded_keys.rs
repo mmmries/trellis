@@ -549,7 +549,7 @@ async fn tables_of(
     if let Some(joined) = super::catalog::join_table_of(client, definition.id).await? {
         tables.push((
             joined,
-            super::source_key::declared_on(&definition.def, Some(super::join::Side::Joined))
+            super::source_key::declared_on(&definition.def, Some(super::join::JOINED))
                 .map(<[String]>::to_vec),
         ));
     }
@@ -1141,10 +1141,10 @@ async fn declare_released_keys(
     joined: Option<&str>,
     target: &str,
 ) -> Result<Option<(String, String)>, CatalogError> {
-    use super::join::Side;
+    use super::join::{JOINED, Side};
     let join = super::join::spec(def).is_some();
     let sides = std::iter::once((source, join.then_some(Side::From)))
-        .chain(joined.map(|table| (table, Some(Side::Joined))));
+        .chain(joined.map(|table| (table, Some(JOINED))));
     let mut declared = Vec::new();
     for (table, side) in sides {
         if super::source_key::declared_on(def, side).is_some()
@@ -1185,7 +1185,7 @@ async fn declare_released_keys(
                 unkeyed_reason(target, table, &indexes),
             )));
         }
-        if keys_target_by_source(def) && side != Some(Side::Joined) {
+        if keys_target_by_source(def) && !matches!(side, Some(Side::Joined(_))) {
             let built_on = primary_key_names(txn, target).await?;
             let mut chosen_set = chosen.clone();
             chosen_set.sort();
@@ -1206,19 +1206,34 @@ async fn declare_released_keys(
     for (side, key) in declared {
         match side {
             None | Some(Side::From) => def.source_key = Some(key),
-            Some(Side::Joined) => {
+            Some(Side::Joined(position)) => {
                 if let super::ast::KeySpace::Join(join) | super::ast::KeySpace::JoinOneToOne(join) =
                     &mut def.key_space
                 {
-                    join.right_key = Some(key);
+                    join.joins[position.index()].right_key = Some(key);
                 }
             }
         }
     }
-    let text = super::ast::render_definition_text(def);
+    // The rendered text is in the current grammar, stamped as ADR-0018 says.
+    // A name the current grammar refuses (a grammar-1 label over 63 bytes)
+    // leaves no text to store, so the definition pauses instead.
+    let (text, grammar_version) = match super::grammar::rewrite(def) {
+        Ok(rewritten) => rewritten,
+        Err(err) => {
+            return Ok(Some((
+                source.to_string(),
+                format!(
+                    "{target} must name its key as KEY (...), and its text can't be written \
+                     in this release's grammar: {err}; drop the transform and define it again"
+                ),
+            )));
+        }
+    };
     txn.execute(
-        "update transform_definitions set definition_text = $2 where id = $1",
-        &[&id, &text],
+        "update transform_definitions set definition_text = $2, grammar_version = $3 \
+         where id = $1",
+        &[&id, &text, &grammar_version],
     )
     .await?;
     crate::instance_log::info!(

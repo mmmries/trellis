@@ -125,7 +125,7 @@ impl OneToOneCoverage {
             let trellis::dev::defs::ast::KeySpace::JoinOneToOne(join) = &def.key_space else {
                 unreachable!("the 1-1 JOIN tier draws only 1-1 JOIN definitions");
             };
-            let on: Vec<String> = join
+            let on: Vec<String> = join.joins[0]
                 .on
                 .iter()
                 .map(|on| {
@@ -135,7 +135,7 @@ impl OneToOneCoverage {
                     )
                 })
                 .collect();
-            let shape = format!("{:?}/{}", join.kind, on.join("&"));
+            let shape = format!("{:?}/{}", join.joins[0].kind, on.join("&"));
             *self.definitions.entry(shape).or_insert(0) += 1;
         }
         for op in &case.program.ops {
@@ -412,6 +412,13 @@ proptest! {
 /// burst settles. The deterministic pin named in `trellis/src/plant.rs` gates
 /// each. Rates are of the 24 cases of seeds 1 to 4 (six cases each).
 const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
+    (
+        "star_j_unsorted",
+        "it leaves the J statements unsorted, which only changes the order two pages queue \
+         on J rows in: a deadlock, which the engine retries, never a wrong row; the unit \
+         test u1_the_j_statements_are_one_insert_and_one_lock_sorted_by_position_and_key \
+         pins it",
+    ),
     (
         "join1_fan_out_held_row",
         "it needs a row held in quarantine (a field that fails on it), and the tier draws \

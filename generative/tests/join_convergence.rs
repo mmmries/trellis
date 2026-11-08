@@ -146,8 +146,8 @@ impl JoinCoverage {
                 .collect();
             let shape = format!(
                 "{:?}/{}-column key/{}",
-                join.kind,
-                join.on.len(),
+                join.joins[0].kind,
+                join.joins[0].on.len(),
                 groups.join("+")
             );
             *self.definitions.entry(shape).or_insert(0) += 1;

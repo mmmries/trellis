@@ -52,7 +52,7 @@ use tokio_postgres::IsolationLevel;
 use tokio_postgres::Transaction;
 use tokio_postgres::types::{PgLsn, ToSql};
 
-use crate::defs::join::Side;
+use crate::defs::join::{Position, Side};
 use crate::defs::ledger as schema;
 use crate::defs::model::StoredStatus;
 use crate::pool::{Pool, quote_ident};
@@ -60,7 +60,7 @@ use crate::pool::{Pool, quote_ident};
 use super::super::apply::ApplyError;
 use super::super::join::{LockRowMode, lock_row_sql};
 use super::super::target_mutations::TargetMutations;
-use super::{JoinOneToOnePlan, JoinShape, KeyText, cast_to, held};
+use super::{JoinOneToOnePlan, JoinShape, JoinedPosition, KeyText, cast_to, held};
 
 /// The most `R` entries one transaction of a fan-out recomputes when
 /// nothing has set [`set_chunk_rows`]: the model's chunk (#1375 Y5), and one
@@ -104,21 +104,36 @@ fn key_array_sql(n: usize, first_param: usize) -> String {
     format!("array[{}]::text[]", parts.join(", "))
 }
 
-/// `(alias.k1, ..) = (cast($first), ..)`: the key columns of `alias` (`R`
-/// or `J`) against one key's texts, bound from parameter `$first_param`.
-fn key_match_sql(shape: &JoinShape, alias: &str, first_param: usize) -> String {
-    let columns: Vec<String> = shape
-        .key
+/// `(alias.k1, ..) = (cast($first), ..)`: `a`'s join key columns at `at` in
+/// `R`, or `J`'s group of them (`j`), of `alias` against one key's texts,
+/// bound from parameter `$first_param`. In `J` the match is of the
+/// position's rows, through its partial index.
+fn key_match_sql(at: &JoinedPosition, alias: &str, j: bool, first_param: usize) -> String {
+    let names: Vec<&str> = if j {
+        at.j_key.iter().map(String::as_str).collect()
+    } else {
+        at.key.iter().map(|c| c.name.as_str()).collect()
+    };
+    let columns: Vec<String> = names
         .iter()
-        .map(|c| format!("{alias}.{}", quote_ident(&c.name)))
+        .map(|name| format!("{alias}.{}", quote_ident(name)))
         .collect();
-    let values: Vec<String> = shape
+    let position = if j {
+        format!("{alias}.position = {} and ", at.position.number())
+    } else {
+        String::new()
+    };
+    let values: Vec<String> = at
         .key
         .iter()
         .enumerate()
         .map(|(i, c)| cast_to(c, &format!("${}::text", first_param + i)))
         .collect();
-    format!("({}) = ({})", columns.join(", "), values.join(", "))
+    format!(
+        "{position}({}) = ({})",
+        columns.join(", "),
+        values.join(", ")
+    )
 }
 
 /// A page's split of its fan-out `keys` (the module doc): returns the keys it
@@ -133,19 +148,22 @@ pub(super) async fn split(
     seg_seq: i64,
 ) -> Result<BTreeSet<KeyText>, ApplyError> {
     let shape = &*plan.shape;
+    // A page's fan-out is of the first position's `M`: the only one a
+    // two-table JOIN has.
+    let at = shape.first();
     let keys: Vec<&KeyText> = keys.iter().collect();
     let mut remaining = chunk_rows();
     let mut inline: BTreeSet<KeyText> = BTreeSet::new();
     let mut pending: BTreeSet<KeyText> = BTreeSet::new();
-    let mut at = 0;
-    while at < keys.len() {
-        let group = &keys[at..(at + COUNT_GROUP).min(keys.len())];
-        at += group.len();
+    let mut next = 0;
+    while next < keys.len() {
+        let group = &keys[next..(next + COUNT_GROUP).min(keys.len())];
+        next += group.len();
         if remaining == 0 {
             pending.extend(group.iter().map(|k| (*k).clone()));
             continue;
         }
-        let counts = capped_counts(txn, shape, group, remaining + 1).await?;
+        let counts = capped_counts(txn, shape, at, group, remaining + 1).await?;
         for (key, count) in group.iter().zip(counts) {
             if count <= remaining {
                 remaining -= count;
@@ -155,31 +173,33 @@ pub(super) async fn split(
             }
         }
     }
-    clear(txn, shape, &inline).await?;
-    mark(txn, shape, &pending, seg_seq, &plan.held_origin).await?;
+    clear(txn, shape, at, &inline).await?;
+    mark(txn, shape, at, &pending, seg_seq, &plan.held_origin).await?;
     Ok(inline)
 }
 
-/// The number of `R` entries on each of `keys`, each stopping at `cap`.
+/// The number of `R` entries on each of `keys` at `at`, each stopping at
+/// `cap`.
 async fn capped_counts(
     txn: &Transaction<'_>,
     shape: &JoinShape,
+    at: &JoinedPosition,
     keys: &[&KeyText],
     cap: usize,
 ) -> Result<Vec<usize>, ApplyError> {
-    let n = shape.key.len();
+    let n = at.key.len();
     let columns: Vec<Vec<&str>> = (0..n)
         .map(|i| keys.iter().map(|key| key[i].as_str()).collect())
         .collect();
     let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
     let arrays: Vec<String> = (1..=n).map(|i| format!("${i}::text[]")).collect();
     let names: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
-    let qualified: Vec<String> = shape
+    let qualified: Vec<String> = at
         .key
         .iter()
         .map(|c| format!("r.{}", quote_ident(&c.name)))
         .collect();
-    let casts: Vec<String> = shape
+    let casts: Vec<String> = at
         .key
         .iter()
         .enumerate()
@@ -207,10 +227,10 @@ async fn capped_counts(
         .collect())
 }
 
-/// `keys` as one text array per key column, then the definition id: the
-/// parameters of [`clear`] and [`mark`].
-fn marker_keys(shape: &JoinShape, keys: &BTreeSet<KeyText>) -> Vec<Vec<String>> {
-    (0..shape.key.len())
+/// `keys` as one text array per key column of `at`: the parameters of
+/// [`clear`] and [`mark`] after the definition id.
+fn marker_keys(at: &JoinedPosition, keys: &BTreeSet<KeyText>) -> Vec<Vec<String>> {
+    (0..at.key.len())
         .map(|i| keys.iter().map(|key| key[i].clone()).collect())
         .collect()
 }
@@ -227,23 +247,26 @@ fn marker_unnest(n: usize) -> (String, String) {
     )
 }
 
-/// Deletes the markers of `keys`: a page recomputed each of them whole.
+/// Deletes the markers of `keys` at `at`: a page recomputed each of them
+/// whole.
 async fn clear(
     txn: &Transaction<'_>,
     shape: &JoinShape,
+    at: &JoinedPosition,
     keys: &BTreeSet<KeyText>,
 ) -> Result<(), ApplyError> {
     if keys.is_empty() {
         return Ok(());
     }
-    let columns = marker_keys(shape, keys);
+    let columns = marker_keys(at, keys);
     let mut params: Vec<&(dyn ToSql + Sync)> = vec![&shape.id];
     params.extend(columns.iter().map(|c| c as &(dyn ToSql + Sync)));
-    let (unnest, key) = marker_unnest(shape.key.len());
+    let (unnest, key) = marker_unnest(at.key.len());
     txn.execute(
         &format!(
             "delete from join1_fan_out p using {unnest} \
-             where p.transform_id = $1 and p.join_key = {key}"
+             where p.transform_id = $1 and p.position = {position} and p.join_key = {key}",
+            position = at.position.number(),
         ),
         &params,
     )
@@ -251,11 +274,13 @@ async fn clear(
     Ok(())
 }
 
-/// Writes a marker at its key's start for each of `keys`, in key order, or
-/// sets the one a key has back to its start, merging `origin` into it.
+/// Writes a marker at its key's start for each of `keys` at `at`, in key
+/// order, or sets the one a key has back to its start, merging `origin` into
+/// it.
 async fn mark(
     txn: &Transaction<'_>,
     shape: &JoinShape,
+    at: &JoinedPosition,
     keys: &BTreeSet<KeyText>,
     seg_seq: i64,
     origin: &held::HeldOrigin,
@@ -263,8 +288,8 @@ async fn mark(
     if keys.is_empty() {
         return Ok(());
     }
-    let n = shape.key.len();
-    let columns = marker_keys(shape, keys);
+    let n = at.key.len();
+    let columns = marker_keys(at, keys);
     let (origin_lsn, src_changed, hop_gen) = origin.parts();
     let mut params: Vec<&(dyn ToSql + Sync)> = vec![&shape.id];
     params.extend(columns.iter().map(|c| c as &(dyn ToSql + Sync)));
@@ -279,11 +304,11 @@ async fn mark(
     txn.execute(
         &format!(
             "insert into join1_fan_out as f \
-                 (transform_id, join_key, seg_seq, origin_lsn, src_changed, hop_gen) \
-             select $1::bigint, {key}, ${p}::bigint, ${}::pg_lsn, ${}::timestamptz, \
-                    ${}::integer \
-             from {unnest} order by 2 \
-             on conflict (transform_id, join_key) do update set \
+                 (transform_id, position, join_key, seg_seq, origin_lsn, src_changed, hop_gen) \
+             select $1::bigint, {position}::smallint, {key}, ${p}::bigint, ${}::pg_lsn, \
+                    ${}::timestamptz, ${}::integer \
+             from {unnest} order by 3 \
+             on conflict (transform_id, position, join_key) do update set \
                  gen = f.gen + 1, \
                  cursor = null, \
                  seg_seq = excluded.seg_seq, \
@@ -294,6 +319,7 @@ async fn mark(
             p + 1,
             p + 2,
             p + 3,
+            position = at.position.number(),
         ),
         &params,
     )
@@ -351,7 +377,10 @@ async fn load(pool: &Pool, id: i64) -> Result<Option<Loaded>, ApplyError> {
     };
     // The versions first: a definition change after them misses the fence
     // the chunk then holds, rather than run on a shape it doesn't hold.
-    let mut tables = vec![definition.source_table.clone(), join.right.clone()];
+    let mut tables = vec![
+        definition.source_table.clone(),
+        crate::defs::join::first_joined(join).right.clone(),
+    ];
     tables.sort();
     tables.dedup();
     let mut versions = Vec::with_capacity(tables.len());
@@ -385,37 +414,44 @@ async fn load(pool: &Pool, id: i64) -> Result<Option<Loaded>, ApplyError> {
 /// looks again at its poll floor. Run by a drain worker as build work, after
 /// its segments.
 pub async fn step(pool: &Pool) -> Result<FanOutStep, ApplyError> {
-    let candidates: Vec<(i64, Vec<String>)> = {
+    let candidates: Vec<(i64, i16, Vec<String>)> = {
         let client = pool.get().await?;
         let dispatchable = StoredStatus::dispatchable();
         client
             .query(
-                "select p.transform_id, p.join_key from join1_fan_out p \
+                "select p.transform_id, p.position, p.join_key from join1_fan_out p \
                  join transform_definitions d on d.id = p.transform_id \
                  where d.status = any($1) \
-                 order by p.transform_id, p.join_key limit $2",
+                 order by p.transform_id, p.position, p.join_key limit $2",
                 &[&dispatchable, &CANDIDATES],
             )
             .await?
             .iter()
-            .map(|row| (row.get(0), row.get(1)))
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
             .collect()
     };
     if candidates.is_empty() {
         return Ok(FanOutStep::Idle);
     }
     let mut shapes: HashMap<i64, Option<Loaded>> = HashMap::new();
-    for (id, key) in &candidates {
+    for (id, position, key) in &candidates {
         if !shapes.contains_key(id) {
             shapes.insert(*id, load(pool, *id).await?);
         }
         let Some(loaded) = shapes.get(id).and_then(Option::as_ref) else {
             continue;
         };
-        if key.len() != loaded.shape.key.len() {
+        let Some(at) = usize::try_from(*position)
+            .ok()
+            .and_then(Position::from_number)
+            .and_then(|position| loaded.shape.at(position))
+        else {
+            continue;
+        };
+        if key.len() != at.key.len() {
             continue;
         }
-        match run_chunk(pool, loaded, key).await? {
+        match run_chunk(pool, loaded, at, key).await? {
             Chunk::Locked => continue,
             Chunk::Ran => return Ok(FanOutStep::Chunk),
             Chunk::Stale => return Ok(FanOutStep::Waiting),
@@ -436,10 +472,15 @@ enum Chunk {
     Stale,
 }
 
-/// One chunk of the marker of `key` (its columns' texts) for `loaded`'s
-/// definition, in its own transaction (the module doc). A held `J` row is
-/// skipped, not waited for.
-async fn run_chunk(pool: &Pool, loaded: &Loaded, key: &[String]) -> Result<Chunk, ApplyError> {
+/// One chunk of the marker of `key` (its columns' texts) at `at` for
+/// `loaded`'s definition, in its own transaction (the module doc). A held `J`
+/// row is skipped, not waited for.
+async fn run_chunk(
+    pool: &Pool,
+    loaded: &Loaded,
+    at: &JoinedPosition,
+    key: &[String],
+) -> Result<Chunk, ApplyError> {
     let shape = &*loaded.shape;
     let held = held::Held::default();
     {
@@ -451,7 +492,7 @@ async fn run_chunk(pool: &Pool, loaded: &Loaded, key: &[String]) -> Result<Chunk
             .start()
             .await?;
         crate::locks::set_local_lock_timeout(&txn, super::super::build::CHUNK_LOCK_TIMEOUT).await?;
-        match chunk_in(&txn, loaded, key, &held).await {
+        match chunk_in(&txn, loaded, at, key, &held).await {
             Ok(Chunk::Ran) => txn.commit().await?,
             Ok(other) => {
                 txn.rollback().await?;
@@ -501,6 +542,7 @@ async fn run_chunk(pool: &Pool, loaded: &Loaded, key: &[String]) -> Result<Chunk
 async fn chunk_in(
     txn: &Transaction<'_>,
     loaded: &Loaded,
+    at: &JoinedPosition,
     key: &[String],
     held: &held::Held,
 ) -> Result<Chunk, ApplyError> {
@@ -530,7 +572,8 @@ async fn chunk_in(
     }
     txn.execute(&lock_row_sql(&shape.lock, LockRowMode::Share), &[])
         .await?;
-    let n = shape.key.len();
+    let n = at.key.len();
+    let position = at.position.number();
     let key_params: Vec<&(dyn ToSql + Sync)> =
         key.iter().map(|k| k as &(dyn ToSql + Sync)).collect();
     let locked = txn
@@ -538,7 +581,7 @@ async fn chunk_in(
             &format!(
                 "select 1 from {j} j where {matches} for update skip locked",
                 j = shape.j,
-                matches = key_match_sql(shape, "j", 1),
+                matches = key_match_sql(at, "j", true, 1),
             ),
             &key_params,
         )
@@ -554,7 +597,8 @@ async fn chunk_in(
         .query_opt(
             &format!(
                 "select cursor, seg_seq, origin_lsn, src_changed, hop_gen from join1_fan_out \
-                 where transform_id = $1 and join_key = {} for update",
+                 where transform_id = $1 and position = {position} and join_key = {} \
+                 for update",
                 key_array_sql(n, 2),
             ),
             &params,
@@ -580,7 +624,7 @@ async fn chunk_in(
     .await?;
 
     let rows = chunk_rows();
-    let entries = walk(txn, shape, key, cursor.as_deref(), rows + 1).await?;
+    let entries = walk(txn, shape, at, key, cursor.as_deref(), rows + 1).await?;
     let next = (entries.len() > rows).then(|| entries[rows - 1].clone());
     let batch = &entries[..entries.len().min(rows)];
     let mut mutations = TargetMutations::new();
@@ -593,7 +637,7 @@ async fn chunk_in(
             txn.execute(
                 &format!(
                     "update join1_fan_out set cursor = ${} \
-                     where transform_id = $1 and join_key = {}",
+                     where transform_id = $1 and position = {position} and join_key = {}",
                     n_params + 1,
                     key_array_sql(n, 2),
                 ),
@@ -604,7 +648,8 @@ async fn chunk_in(
         None => {
             txn.execute(
                 &format!(
-                    "delete from join1_fan_out where transform_id = $1 and join_key = {}",
+                    "delete from join1_fan_out \
+                     where transform_id = $1 and position = {position} and join_key = {}",
                     key_array_sql(n, 2),
                 ),
                 &params,
@@ -632,17 +677,18 @@ async fn chunk_in(
     Ok(Chunk::Ran)
 }
 
-/// Up to `limit` keys of the live `R` entries on `key` after `cursor`, in key
-/// order, but those of the rows held in quarantine: an index range of `R`'s
-/// `(join key, entry key)` index.
+/// Up to `limit` keys of the live `R` entries on `key` at `at` after
+/// `cursor`, in key order, but those of the rows held in quarantine: an index
+/// range of `R`'s `(join key, entry key)` index of the position.
 async fn walk(
     txn: &Transaction<'_>,
     shape: &JoinShape,
+    at: &JoinedPosition,
     key: &[String],
     cursor: Option<&str>,
     limit: usize,
 ) -> Result<Vec<String>, ApplyError> {
-    let n = shape.key.len();
+    let n = at.key.len();
     let mut params: Vec<&(dyn ToSql + Sync)> =
         key.iter().map(|k| k as &(dyn ToSql + Sync)).collect();
     params.push(&shape.id);
@@ -667,7 +713,7 @@ async fn walk(
              order by r.{entry} limit {limit}",
             entry = quote_ident(schema::KEY_COLUMN),
             r = shape.r.ident,
-            matches = key_match_sql(shape, "r", 1),
+            matches = key_match_sql(at, "r", false, 1),
             tomb = quote_ident(schema::TOMBSTONE_COLUMN),
         ),
         &params,

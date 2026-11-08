@@ -123,7 +123,7 @@ async fn numeric_tables(
             .summed_arguments();
         let (from, joined) = (
             numeric(super::join::Side::From),
-            numeric(super::join::Side::Joined),
+            numeric(super::join::JOINED),
         );
         let fa = from.len();
         let pair = |numeric: &[bool], summed: &[bool]| -> Vec<(bool, bool)> {

@@ -480,23 +480,33 @@ impl Trellis {
         self.call(async {
             let statement = defs::parse_statement(statement_text)?;
             self.state_changing(async {
+                self.refuse_address_in_another_case(&statement).await?;
                 match statement {
                     defs::Statement::DefineTransform(parsed) => {
-                        let source_columns = self.source_columns(&parsed).await?;
-                        // Hands the *text* on rather than the `TransformDef` just
-                        // parsed: `install_definition` persists `definition_text` as
-                        // the definition's own record of itself (every later re-parse
-                        // reads it back), so the text is the input it needs, not a
-                        // redundant re-derivation of it.
-                        let definition = defs::install_definition(
-                            &self.pool,
-                            statement_text,
-                            &source_columns,
-                            self.config.target_schema(),
-                        )
-                        .await
-                        .map_err(TrellisError::Catalog)?;
-                        Ok(Applied::TransformDefined(definition.target_table))
+                        let defined = async {
+                            let source_columns = self.source_columns(&parsed).await?;
+                            // Hands the *text* on rather than the `TransformDef`
+                            // just parsed: `install_definition` persists
+                            // `definition_text` as the definition's own record
+                            // of itself (every later re-parse reads it back), so
+                            // the text is the input it needs, not a redundant
+                            // re-derivation of it.
+                            defs::install_definition(
+                                &self.pool,
+                                statement_text,
+                                &source_columns,
+                                self.config.target_schema(),
+                            )
+                            .await
+                            .map_err(TrellisError::Catalog)
+                        }
+                        .await;
+                        match defined {
+                            Ok(definition) => {
+                                Ok(Applied::TransformDefined(definition.target_table))
+                            }
+                            Err(err) => Err(self.with_case_hint(&parsed, err).await),
+                        }
                     }
                     defs::Statement::Pause(reference) => self.apply_pause(reference).await,
                     defs::Statement::Resume(reference) => self.apply_resume(reference).await,
@@ -507,6 +517,136 @@ impl Trellis {
             .await
         })
         .await
+    }
+
+    /// Refuses a `PAUSE`, `RESUME`, `DROP` or `ALTER TRANSFORM` whose
+    /// address names no transform while one differing from it only in case
+    /// exists (#1508): the address folded to lower case, and the statement
+    /// acts only on the exact name, so it names the quoted spelling instead
+    /// of acting on nothing (a `DROP` would otherwise succeed as a drop of
+    /// nothing).
+    async fn refuse_address_in_another_case(
+        &self,
+        statement: &defs::Statement,
+    ) -> Result<(), TrellisError> {
+        let names = match statement {
+            defs::Statement::DefineTransform(_) => return Ok(()),
+            defs::Statement::Pause(reference) | defs::Statement::Resume(reference) => {
+                let mut names = vec![reference.target.clone()];
+                names.extend(
+                    reference
+                        .column
+                        .as_ref()
+                        .map(|column| format!("{}.{column}", reference.target)),
+                );
+                names
+            }
+            defs::Statement::Drop(defs::DefinitionRef::Transform(target)) => vec![target.clone()],
+            defs::Statement::AlterTransform(alter) => vec![alter.target.clone()],
+        };
+        let client = self.pool.get().await?;
+        for name in &names {
+            if defs::catalog::bare_target_name(&**client, name)
+                .await
+                .map_err(TrellisError::Catalog)?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
+        for name in &names {
+            if let Some(found) = defs::case_hint::transform(&**client, name).await? {
+                return Err(TrellisError::Catalog(CatalogError::NameCaseMismatch {
+                    error: format!("no transform named '{name}' is registered"),
+                    code: ErrorCode::NotFound,
+                    found,
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// `err`, a define of `def` refused for a table, schema or column that
+    /// isn't there, with the case hint when a name differing from it only
+    /// in case is ([`defs::case_hint`]). Any other error as it is.
+    async fn with_case_hint(
+        &self,
+        def: &defs::ast::TransformDef,
+        err: TrellisError,
+    ) -> TrellisError {
+        use defs::validate::ValidationError;
+        let schemas = defs::catalog::bare_name_schemas(&self.pool);
+        let catalog = match &err {
+            TrellisError::Catalog(catalog) => Some(catalog),
+            _ => None,
+        };
+        let found = async {
+            let client = self.pool.get().await.ok()?;
+            let client = &**client;
+            match (&err, catalog) {
+                (TrellisError::SourceTableNotFound(table), _)
+                | (_, Some(CatalogError::SourceTableNotFound(table))) => {
+                    // The schema the definition named the table in, if any.
+                    let schema = match &def.key_space {
+                        defs::ast::KeySpace::Join(join)
+                        | defs::ast::KeySpace::JoinOneToOne(join)
+                            if def.source != *table
+                                && join.joins.iter().any(|joined| joined.right == *table) =>
+                        {
+                            join.joins
+                                .iter()
+                                .find(|joined| joined.right == *table)
+                                .and_then(|joined| joined.explicit_right_schema.as_deref())
+                        }
+                        _ if def.source == *table => def.explicit_source_schema.as_deref(),
+                        _ => None,
+                    };
+                    defs::case_hint::table(client, &schemas, schema, table)
+                        .await
+                        .ok()?
+                }
+                (
+                    _,
+                    Some(CatalogError::Validate(ValidationError::QualifiedSourceTableNotFound {
+                        schema,
+                        table,
+                    })),
+                ) => defs::case_hint::table(client, &schemas, Some(schema), table)
+                    .await
+                    .ok()?,
+                (
+                    _,
+                    Some(CatalogError::Validate(ValidationError::UnresolvedColumn {
+                        column, ..
+                    })),
+                ) => defs::case_hint::column(client, &schemas, def, column)
+                    .await
+                    .ok()?,
+                (
+                    _,
+                    Some(CatalogError::Validate(ValidationError::JoinUnresolvedColumn {
+                        reference,
+                    })),
+                ) => {
+                    let column = reference
+                        .rsplit_once('.')
+                        .map_or(reference.as_str(), |(_, c)| c);
+                    defs::case_hint::column(client, &schemas, def, column)
+                        .await
+                        .ok()?
+                }
+                _ => None,
+            }
+        }
+        .await;
+        match found {
+            Some(found) => TrellisError::Catalog(CatalogError::NameCaseMismatch {
+                error: err.to_string(),
+                code: err.code(),
+                found,
+            }),
+            None => err,
+        }
     }
 
     /// ADR-0023, rule 6: a state-changing call refuses while a process of

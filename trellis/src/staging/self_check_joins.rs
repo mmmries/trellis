@@ -177,13 +177,7 @@ fn join_of(def: &TransformDef) -> &crate::defs::ast::JoinSpec {
 
 /// The side `table`, a bare table name as written in the definition, is.
 fn side_of(def: &TransformDef, table: &str) -> Option<JoinSide> {
-    if table == def.source {
-        Some(JoinSide::From)
-    } else if table == join_of(def).right {
-        Some(JoinSide::Joined)
-    } else {
-        None
-    }
+    spec::side_of_written(def, join_of(def), table)
 }
 
 /// Renders a `JOIN` field expression, or an aggregate's argument, as SQL
@@ -200,7 +194,7 @@ pub(super) fn render(
         Expr::SourceColumn { table, column, .. } => {
             let alias = match side_of(def, table) {
                 Some(JoinSide::From) => from,
-                Some(JoinSide::Joined) => joined,
+                Some(JoinSide::Joined(_)) => joined,
                 None => return Err(format!("reads '{table}.{column}', which is neither table")),
             };
             format!("{alias}.{}", quote_ident(column))
@@ -299,7 +293,7 @@ fn value_fields(def: &TransformDef) -> Vec<&crate::defs::ast::FieldDef> {
 pub(super) fn check_renders(def: &Definition) -> Result<(), SelfCheckError> {
     let args: Vec<Expr> = spec::side_arguments(&def.def, JoinSide::From)
         .into_iter()
-        .chain(spec::side_arguments(&def.def, JoinSide::Joined))
+        .chain(spec::side_arguments(&def.def, spec::JOINED))
         .collect();
     for field in value_fields(&def.def) {
         render(&def.def, &field.expr, "a", "b")
@@ -547,7 +541,7 @@ impl Audit<'_> {
                 transform_id: self.id,
                 tag: "a",
             },
-            JoinSide::Joined => Ring {
+            JoinSide::Joined(_) => Ring {
                 src_table: self.joined_src,
                 source_row: self.joined_table.clone(),
                 source_pk: &self.joined_pk,
@@ -564,19 +558,19 @@ impl Audit<'_> {
     fn ring_reads(&self, side: JoinSide, ring: &Ring<'_>, late_probe: bool) -> (String, String) {
         let hidden = self.hidden(match side {
             JoinSide::From => Part::From,
-            JoinSide::Joined => Part::Joined,
+            JoinSide::Joined(_) => Part::Joined,
         });
         let cells = spec::side_key_columns(self.def, side);
         let filter: String = match side {
             JoinSide::From => String::new(),
-            JoinSide::Joined => spec::join_key(self.def, side)
+            JoinSide::Joined(_) => spec::join_key(self.def, side)
                 .iter()
                 .map(|c| format!(" and r.{} is not null", quote_ident(c)))
                 .collect(),
         };
         let collations = match side {
             JoinSide::From => &self.from_basis,
-            JoinSide::Joined => &self.joined_basis,
+            JoinSide::Joined(_) => &self.joined_basis,
         };
         let lands = Lands {
             floor_key: &hidden,
@@ -630,14 +624,14 @@ impl Audit<'_> {
     ) -> Result<(String, Vec<String>), SelfCheckError> {
         let (part, args, parts) = match side {
             JoinSide::From => (Part::From, &self.from_args, &self.from_parts),
-            JoinSide::Joined => (Part::Joined, &self.joined_args, &self.joined_parts),
+            JoinSide::Joined(_) => (Part::Joined, &self.joined_args, &self.joined_parts),
         };
         let key = keyset.columns();
         // A joined row with a `NULL` join-key part joins nothing, and has no
         // `M` cell.
         let source_where: String = match side {
             JoinSide::From => String::new(),
-            JoinSide::Joined => spec::join_key(self.def, side)
+            JoinSide::Joined(_) => spec::join_key(self.def, side)
                 .iter()
                 .map(|c| format!(" and __s.{} is not null", quote_ident(c)))
                 .collect(),
@@ -674,7 +668,7 @@ impl Audit<'_> {
     /// table's weighted row count for it, read under `J`'s column names.
     fn matches_page(&self, keyset: &Keyset, steer: bool) -> String {
         let j_cols = spec::join_key(self.def, JoinSide::From);
-        let joined_cols = spec::join_key(self.def, JoinSide::Joined);
+        let joined_cols = spec::join_key(self.def, spec::JOINED);
         let renamed = |alias: &str| {
             joined_cols
                 .iter()
@@ -688,8 +682,8 @@ impl Audit<'_> {
             .map(|c| format!(" and __s.{} is not null", quote_ident(c)))
             .collect();
         let key = keyset.columns();
-        let ring = self.ring(JoinSide::Joined);
-        let (ctes, weighted) = self.ring_reads(JoinSide::Joined, &ring, true);
+        let ring = self.ring(spec::JOINED);
+        let (ctes, weighted) = self.ring_reads(spec::JOINED, &ring, true);
         let reads = RingReads {
             ctes,
             uncertain: Self::uncertain_keys(&ring, key, Some(&renamed("__r"))),
@@ -731,7 +725,7 @@ impl Audit<'_> {
     ) -> Result<(String, Vec<String>), SelfCheckError> {
         let join = join_of(self.def);
         let alias = |table: &str| match side_of(self.def, table) {
-            Some(JoinSide::Joined) => "__b",
+            Some(JoinSide::Joined(_)) => "__b",
             _ => "__a",
         };
         let identity = keyset.columns();
@@ -794,7 +788,7 @@ impl Audit<'_> {
                     .map_err(|d| self.unsupported(d))?
             ));
         }
-        let on: Vec<String> = join
+        let on: Vec<String> = spec::first_joined(join)
             .on
             .iter()
             .zip(on_collations)
@@ -829,11 +823,11 @@ impl Audit<'_> {
             .iter()
             .map(|key| format!("__g.{}", quote_ident(&key.column)))
             .collect();
-        let (ra, rb) = (self.ring(JoinSide::From), self.ring(JoinSide::Joined));
+        let (ra, rb) = (self.ring(JoinSide::From), self.ring(spec::JOINED));
         // Every weighted row is read, some twice, so each image is probed
         // once, in the CTEs.
         let (mut ctes, wa) = self.ring_reads(JoinSide::From, &ra, false);
-        let (ctes_b, wb) = self.ring_reads(JoinSide::Joined, &rb, false);
+        let (ctes_b, wb) = self.ring_reads(spec::JOINED, &rb, false);
         ctes.push_str(&ctes_b);
         let mut pairs = format!(
             "select __g.*, __a.{WEIGHT} * __b.{WEIGHT} as {WEIGHT}{xs} \
@@ -842,11 +836,11 @@ impl Audit<'_> {
             on = on.join(" and "),
             groups = groups.join(", "),
         );
-        if join.kind == JoinKind::Left {
+        if spec::first_joined(join).kind == JoinKind::Left {
             // Each joined key's rows' weight in all: a `FROM` row whose key's
             // is 0 (or that has a `NULL` key part) is unmatched.
             let a_cols = spec::join_key(self.def, JoinSide::From);
-            let b_cols = spec::join_key(self.def, JoinSide::Joined);
+            let b_cols = spec::join_key(self.def, spec::JOINED);
             let b_list: Vec<String> = b_cols
                 .iter()
                 .map(|c| format!("__b.{}", quote_ident(c)))
@@ -1114,7 +1108,7 @@ async fn build_audit<'a>(
     joined: &'a String,
 ) -> Result<Audit<'a>, SelfCheckError> {
     let from_args = spec::side_arguments(&def.def, JoinSide::From);
-    let joined_args = spec::side_arguments(&def.def, JoinSide::Joined);
+    let joined_args = spec::side_arguments(&def.def, spec::JOINED);
     let from_pk = ddl::source_primary_key(pool, &def.source_table).await?;
     let joined_pk = ddl::source_primary_key(pool, joined).await?;
     let mut audit = Audit {
@@ -1144,17 +1138,17 @@ async fn build_audit<'a>(
         &summed(&def.def, &audit.joined_args),
         &numeric_arguments(&client, &audit.hidden(Part::Joined)).await?,
     );
-    for side in [JoinSide::From, JoinSide::Joined] {
+    for side in [JoinSide::From, spec::JOINED] {
         let (source, part) = match side {
             JoinSide::From => (&audit.from_table, Part::From),
-            JoinSide::Joined => (&audit.joined_table, Part::Joined),
+            JoinSide::Joined(_) => (&audit.joined_table, Part::Joined),
         };
         let cells = spec::side_key_columns(audit.def, side);
         let collations =
             recollated_pairs(&client, (source, &cells), (&audit.hidden(part), &cells)).await?;
         match side {
             JoinSide::From => audit.from_basis = collations,
-            JoinSide::Joined => audit.joined_basis = collations,
+            JoinSide::Joined(_) => audit.joined_basis = collations,
         }
     }
     Ok(audit)
@@ -1171,10 +1165,7 @@ impl Audit<'_> {
         recollated_pairs(
             client,
             (&self.from_table, &spec::join_key(self.def, JoinSide::From)),
-            (
-                &self.joined_table,
-                &spec::join_key(self.def, JoinSide::Joined),
-            ),
+            (&self.joined_table, &spec::join_key(self.def, spec::JOINED)),
         )
         .await
     }
@@ -1209,7 +1200,7 @@ impl Audit<'_> {
             Part::From | Part::Joined | Part::Matches => {
                 let names = match part {
                     Part::From => spec::side_key_columns(&def.def, JoinSide::From),
-                    Part::Joined => spec::side_key_columns(&def.def, JoinSide::Joined),
+                    Part::Joined => spec::side_key_columns(&def.def, spec::JOINED),
                     _ => spec::join_key(&def.def, JoinSide::From),
                 };
                 Keyset::resolve_columns(client, &audit.hidden(part), &names).await?
@@ -1226,7 +1217,7 @@ impl Audit<'_> {
                 crate::defs::source_index::has_index(client, audit.from_src, &key).await?
             }
             Part::Joined | Part::Matches => {
-                let key = spec::join_key(&def.def, JoinSide::Joined);
+                let key = spec::join_key(&def.def, spec::JOINED);
                 crate::defs::source_index::has_index(client, audit.joined_src, &key).await?
             }
         };
@@ -1237,7 +1228,7 @@ impl Audit<'_> {
                 audit.target_page(&keyset, &fields, &field_types, &on_collations)?
             }
             Part::From => audit.side_page(JoinSide::From, &keyset, steer)?,
-            Part::Joined => audit.side_page(JoinSide::Joined, &keyset, steer)?,
+            Part::Joined => audit.side_page(spec::JOINED, &keyset, steer)?,
             Part::Matches => (
                 audit.matches_page(&keyset, steer),
                 vec!["__matches".to_string()],
@@ -1543,7 +1534,7 @@ mod tests {
         )
         .unwrap();
         let from = spec::side_arguments(&def, JoinSide::From);
-        let joined = spec::side_arguments(&def, JoinSide::Joined);
+        let joined = spec::side_arguments(&def, spec::JOINED);
         assert_eq!(summed(&def, &from), [false, true]);
         assert_eq!(summed(&def, &joined), [true, false]);
         let numeric = HashSet::from([3]);

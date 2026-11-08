@@ -32,6 +32,7 @@ pub mod adopt;
 pub mod alias_readers;
 pub mod ast;
 pub mod backfill;
+pub(crate) mod case_hint;
 pub mod catalog;
 pub mod chunk_queue;
 pub(crate) mod copies;
@@ -103,8 +104,8 @@ pub use oracle::{render_aggregate_select_sql, render_expr_sql, render_one_to_one
 // feature (ADR-0012; see `Cargo.toml`). Not part of `dev`.
 #[cfg(any(test, feature = "internals"))]
 pub use ast::{
-    Expr, FieldDef, JoinKind, JoinOn, JoinSpec, KeySpace, Operator, Predicate, QualifiedColumn,
-    TransformDef,
+    Expr, FieldDef, JoinKind, JoinOn, JoinSpec, JoinedTable, KeySpace, Operator, Predicate,
+    QualifiedColumn, TransformDef,
 };
 #[cfg(any(test, feature = "internals"))]
 pub use backfill::BackfillError;
@@ -134,6 +135,8 @@ mod arithmetic_tests;
 mod date_tests;
 #[cfg(test)]
 mod floor_manifest;
+#[cfg(test)]
+mod identifier_tests;
 #[cfg(test)]
 mod literal_tests;
 #[cfg(test)]
@@ -363,11 +366,11 @@ mod tests {
         let KeySpace::Join(spec) = &def.key_space else {
             panic!("expected a join");
         };
-        assert_eq!(spec.kind, ast::JoinKind::Inner);
-        assert_eq!(spec.right, "items");
-        assert_eq!(spec.on.len(), 1);
-        assert_eq!(spec.on[0].lhs.table, "orders");
-        assert_eq!(spec.on[0].rhs.column, "order_id");
+        assert_eq!(spec.joins[0].kind, ast::JoinKind::Inner);
+        assert_eq!(spec.joins[0].right, "items");
+        assert_eq!(spec.joins[0].on.len(), 1);
+        assert_eq!(spec.joins[0].on[0].lhs.table, "orders");
+        assert_eq!(spec.joins[0].on[0].rhs.column, "order_id");
         assert_eq!(spec.group_by.len(), 2);
         assert_eq!(spec.group_by[1].table, "items");
         assert_eq!(
@@ -389,7 +392,8 @@ mod tests {
             join_spec(&format!(
                 "TRANSFORM t FROM a {head} b ON a.k = b.k GROUP BY a.g SELECT COUNT(*) AS n"
             ))
-            .kind
+            .joins[0]
+                .kind
         };
         assert_eq!(kind("JOIN"), ast::JoinKind::Inner);
         assert_eq!(kind("INNER JOIN"), ast::JoinKind::Inner);
@@ -403,9 +407,9 @@ mod tests {
             "TRANSFORM t FROM a JOIN s.b ON b.k2 = a.k2 AND a.k = b.k \
              GROUP BY a.g SELECT COUNT(*) AS n",
         );
-        assert_eq!(spec.explicit_right_schema.as_deref(), Some("s"));
-        assert_eq!(spec.on.len(), 2);
-        assert_eq!(spec.on[0].lhs.table, "b");
+        assert_eq!(spec.joins[0].explicit_right_schema.as_deref(), Some("s"));
+        assert_eq!(spec.joins[0].on.len(), 2);
+        assert_eq!(spec.joins[0].on[0].lhs.table, "b");
     }
 
     #[test]
@@ -453,9 +457,9 @@ mod tests {
         let KeySpace::JoinOneToOne(spec) = &def.key_space else {
             panic!("expected a 1-1 JOIN, got {:?}", def.key_space);
         };
-        assert_eq!(spec.kind, ast::JoinKind::Left);
-        assert_eq!(spec.right, "other");
-        assert_eq!(spec.on.len(), 2);
+        assert_eq!(spec.joins[0].kind, ast::JoinKind::Left);
+        assert_eq!(spec.joins[0].right, "other");
+        assert_eq!(spec.joins[0].on.len(), 2);
         assert!(spec.group_by.is_empty());
         let rendered = ast::render_definition_text(&def);
         assert!(!rendered.contains("GROUP BY"), "{rendered}");
@@ -685,7 +689,7 @@ mod tests {
                 expected,
                 found,
             } => {
-                assert_eq!(name, "octet_length");
+                assert_eq!(name, "OCTET_LENGTH");
                 assert_eq!(expected, 1);
                 assert_eq!(found, 2);
             }
@@ -1261,7 +1265,7 @@ mod statement_grammar_tests {
                 panic!("expected an ordinary unexpected-token error for {text:?}, got {err:?}");
             };
             assert_eq!(expected, "'TRANSFORM'");
-            assert_eq!(found, "identifier 'RELATIONSHIP'");
+            assert_eq!(found, "identifier 'relationship'");
             assert_eq!(statement_kind(text).unwrap_err(), err);
         }
     }

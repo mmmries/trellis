@@ -1061,8 +1061,8 @@ impl ManualBackend {
     /// a `JOIN`'s joined table.
     fn upstreams_of(&self, def: &TransformDef) -> Vec<TransformDef> {
         let right = match &def.key_space {
-            KeySpace::Join(join) => Some(join.right.as_str()),
-            KeySpace::JoinOneToOne(join) => Some(join.right.as_str()),
+            KeySpace::Join(join) => Some(join.joins[0].right.as_str()),
+            KeySpace::JoinOneToOne(join) => Some(join.joins[0].right.as_str()),
             _ => None,
         };
         self.defs

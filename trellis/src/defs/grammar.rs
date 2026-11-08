@@ -9,15 +9,25 @@
 //! Nothing after it sees a version.
 
 use super::ParseError;
-use super::ast::TransformDef;
+use super::ast::{KeySpace, TransformDef};
 use super::floor::Floors;
-use super::parser::parse;
+use super::lexer::Identifiers;
+use super::parser::parse_in;
 
-/// The grammar version this binary writes. Grammar 1 is the grammar when the
-/// marker was introduced. A change that keeps some accepted text accepted but
-/// makes it parse, resolve or evaluate differently bumps it; one that refuses
-/// text Postgres rejects or reads differently doesn't (ADR-0018).
-pub const CURRENT_GRAMMAR_VERSION: i32 = 1;
+/// The newest grammar version this binary reads. A change that keeps some
+/// accepted text accepted but makes it parse, resolve or evaluate
+/// differently bumps it; one that refuses text Postgres rejects or reads
+/// differently doesn't (ADR-0018).
+///
+/// - Grammar 1 is the grammar when the marker was introduced: an unquoted
+///   name keeps its case, and there are no quoted identifiers.
+/// - Grammar 2 reads identifiers as Postgres does: an unquoted name folds to
+///   lower case and a quoted one is exact. Grammar 1's compatibility rule
+///   reads its text as if every name were quoted ([`load_in`]).
+///
+/// Text is stamped with the oldest version that reads it the same
+/// ([`stamp_in`]), not always with this one.
+pub const CURRENT_GRAMMAR_VERSION: i32 = 2;
 
 /// The oldest grammar version this binary reads. A version below it is outside
 /// the support window. Each bump ships the previous version's compatibility
@@ -93,13 +103,72 @@ pub(crate) fn load_in(
     current: i32,
 ) -> Result<TransformDef, ParseError> {
     match standing_in(stored, oldest, current) {
-        Standing::Current => parse(text),
-        // No compatibility rule exists yet: only grammar 1 does, and it is the
-        // current one. A bump adds a dispatch on `stored` here.
-        Standing::Older => parse(text),
+        Standing::Current => parse_in(text, Identifiers::Folded),
+        Standing::Older => match stored {
+            1 => grammar_1(text),
+            // Only grammar 1 has a compatibility rule; a test's window may
+            // name versions this binary never had.
+            _ => parse_in(text, Identifiers::Folded),
+        },
         Standing::TooOld => Err(ParseError::GrammarVersionTooOld { stored, oldest }),
         Standing::TooNew => Err(ParseError::GrammarVersionTooNew { stored, current }),
     }
+}
+
+/// Grammar 1's compatibility rule: its text read as if every name were
+/// quoted. Lexing without folding gives the tree grammar 1 gave, whose names
+/// are the catalog's exact names, which mean the same in grammar 2. The one
+/// name grammar 1 folded is a table alias, compared in any case there: it is
+/// lower-cased, the name grammar 2 gives it.
+fn grammar_1(text: &str) -> Result<TransformDef, ParseError> {
+    let mut def = parse_in(text, Identifiers::Exact)?;
+    if let KeySpace::Join(join) | KeySpace::JoinOneToOne(join) = &mut def.key_space {
+        for alias in std::iter::once(&mut join.source_alias)
+            .chain(join.joins.iter_mut().map(|joined| &mut joined.right_alias))
+            .flatten()
+        {
+            alias.make_ascii_lowercase();
+        }
+    }
+    Ok(def)
+}
+
+/// The grammar version to stamp on `text` as it is written (define,
+/// `ALTER TRANSFORM`, a rewrite): the oldest version in this binary's window
+/// that reads it as the current one does (ADR-0018). Text with no quoted
+/// identifier and no upper-case letter in a name reads the same in grammar 1,
+/// so a release that only reads grammar 1 can still run it.
+pub(crate) fn stamp(text: &str) -> i32 {
+    stamp_in(
+        text,
+        OLDEST_SUPPORTED_GRAMMAR_VERSION,
+        CURRENT_GRAMMAR_VERSION,
+    )
+}
+
+/// `def` as the text a rewrite stores (`ALTER TRANSFORM`, a recorded key):
+/// rendered in the current grammar, with the version [`stamp`] gives it. A
+/// tree read from older text can hold a name the current grammar refuses (a
+/// grammar-1 `AS` label over 63 bytes), whose rendering no load would read
+/// back, so that is refused with the current grammar's error rather than
+/// stored.
+pub(crate) fn rewrite(def: &TransformDef) -> Result<(String, i32), ParseError> {
+    let text = super::ast::render_definition_text(def);
+    parse_in(&text, Identifiers::Folded)?;
+    let version = stamp(&text);
+    Ok((text, version))
+}
+
+/// [`stamp`] against the window `oldest..=current`. Text the current version
+/// refuses gets the current version: nothing stores it ([`rewrite`] refuses
+/// it).
+pub(crate) fn stamp_in(text: &str, oldest: i32, current: i32) -> i32 {
+    let Ok(reading) = load_in(text, current, oldest, current) else {
+        return current;
+    };
+    (oldest..current)
+        .find(|&version| load_in(text, version, oldest, current).as_ref() == Ok(&reading))
+        .unwrap_or(current)
 }
 
 /// The attach-time check (ADR-0018, ADR-0024 rule 3) against the grammar
@@ -331,6 +400,8 @@ pub(crate) async fn check_stored_versions_dry_run(
 mod tests {
     use super::*;
 
+    use super::super::parser::parse;
+
     const TEXT: &str = "TRANSFORM t FROM public.src SELECT id AS id";
 
     #[test]
@@ -380,6 +451,115 @@ mod tests {
             }
         );
         assert!(load(TEXT, CURRENT_GRAMMAR_VERSION + 1).is_err());
+    }
+
+    /// Grammar 1's compatibility rule reads its text as if every name were
+    /// quoted: the same tree grammar 1 gave, which grammar 2 spells with
+    /// quotes. Grammar 2 reads the same text folded.
+    #[test]
+    fn grammar_1_text_reads_as_if_every_name_were_quoted() {
+        for (grammar_1, grammar_2) in [
+            (
+                "TRANSFORM cust_totals FROM invoices GROUP BY customer_id \
+                 WITHOUT SOURCE INDEX SELECT SUM(Amount) AS total",
+                "TRANSFORM cust_totals FROM invoices GROUP BY customer_id \
+                 WITHOUT SOURCE INDEX SELECT SUM(\"Amount\") AS total",
+            ),
+            (
+                "TRANSFORM OrderTotals FROM Shop.Orders GROUP BY OrderId \
+                 WITHOUT SOURCE INDEX SELECT SUM(Qty) AS Total",
+                "TRANSFORM \"OrderTotals\" FROM \"Shop\".\"Orders\" GROUP BY \"OrderId\" \
+                 WITHOUT SOURCE INDEX SELECT SUM(\"Qty\") AS \"Total\"",
+            ),
+            // `FROM User` read a table named `User` in grammar 1.
+            (
+                "TRANSFORM t FROM User SELECT Id AS Id",
+                "TRANSFORM t FROM \"User\" SELECT \"Id\" AS \"Id\"",
+            ),
+            // An alias folded in grammar 1 too: it is lower-cased.
+            (
+                "TRANSFORM t FROM Orders AS O JOIN items AS I ON o.Id = i.order_id \
+                 GROUP BY O.Region SELECT COUNT(*) AS n",
+                "TRANSFORM t FROM \"Orders\" AS o JOIN items AS i ON o.\"Id\" = i.order_id \
+                 GROUP BY o.\"Region\" SELECT COUNT(*) AS n",
+            ),
+        ] {
+            let loaded = load_in(grammar_1, 1, 1, 2).unwrap();
+            assert_eq!(loaded, parse(grammar_2).unwrap(), "{grammar_1}");
+            // Rewriting it renders the same tree in grammar 2.
+            let rendered = super::super::ast::render_definition_text(&loaded);
+            assert_eq!(parse(&rendered).unwrap(), loaded, "{rendered}");
+            assert_ne!(
+                load_in(grammar_1, 2, 1, 2).ok(),
+                Some(loaded),
+                "grammar 2 folds {grammar_1}"
+            );
+        }
+        // Grammar 1 had no quoted identifiers.
+        assert!(load_in("TRANSFORM t FROM s SELECT \"a\" AS a", 1, 1, 2).is_err());
+    }
+
+    /// Text is stamped with the oldest version that reads it as the current
+    /// one does: grammar 1 for text with no quoted name and no upper-case
+    /// letter in a name, whatever the case of its keywords and functions.
+    #[test]
+    fn text_is_stamped_with_the_oldest_grammar_that_reads_it_the_same() {
+        for (text, stamped) in [
+            ("TRANSFORM t FROM s SELECT a + a AS x", 1),
+            ("transform t from public.s group by g select sum(a) as x", 1),
+            (
+                "TRANSFORM t FROM s AS o JOIN b ON o.k = b.k GROUP BY o.g SELECT COUNT(*) AS n",
+                1,
+            ),
+            // An upper-case alias reads the same in both.
+            (
+                "TRANSFORM t FROM s AS O JOIN b ON o.k = b.k GROUP BY O.g SELECT COUNT(*) AS n",
+                1,
+            ),
+            ("TRANSFORM t FROM s SELECT Amount AS x", 2),
+            ("TRANSFORM T FROM s SELECT a AS x", 2),
+            ("TRANSFORM t FROM Shop.s SELECT a AS x", 2),
+            (
+                "TRANSFORM t FROM s GROUP BY OrderId SELECT COUNT(*) AS n",
+                2,
+            ),
+            ("TRANSFORM t FROM s SELECT a AS Total", 2),
+            ("TRANSFORM t FROM s KEY (Id) SELECT a AS x", 2),
+            ("TRANSFORM t FROM s SELECT \"a\" AS x", 2),
+            ("TRANSFORM t FROM s SELECT \"Amount\" AS x", 2),
+            // Refused text gets the current version; nothing stores it.
+            ("TRANSFORM t FROM order SELECT a AS x", 2),
+        ] {
+            assert_eq!(stamp_in(text, 1, 2), stamped, "{text}");
+        }
+        assert_eq!(stamp("TRANSFORM t FROM s SELECT a AS x"), 1);
+        // A window holding only the current version stamps it.
+        assert_eq!(stamp_in("TRANSFORM t FROM s SELECT a AS x", 2, 2), 2);
+    }
+
+    /// A rewrite stores the tree's current rendering, stamped; a tree from
+    /// grammar-1 text holding a name the current grammar refuses (a label
+    /// over 63 bytes, which grammar 1 kept) is refused rather than stored as
+    /// text no load reads back.
+    #[test]
+    fn a_rewrite_refuses_text_the_current_grammar_cant_read_back() {
+        let def = load_in("TRANSFORM t FROM s SELECT Amount AS total", 1, 1, 2).unwrap();
+        assert_eq!(
+            rewrite(&def).unwrap(),
+            (
+                "TRANSFORM t FROM s SELECT \"Amount\" AS total".to_string(),
+                2
+            )
+        );
+        let def = load_in("TRANSFORM t FROM s SELECT a AS total", 1, 1, 2).unwrap();
+        assert_eq!(rewrite(&def).unwrap().1, 1);
+        let long = "L".repeat(70);
+        let def = load_in(&format!("TRANSFORM t FROM s SELECT a AS {long}"), 1, 1, 2).unwrap();
+        assert!(
+            matches!(rewrite(&def), Err(ParseError::NameTooLong { name, .. }) if name == long),
+            "{:?}",
+            rewrite(&def)
+        );
     }
 
     /// A definition this binary can't run loads as nothing, and its text is

@@ -130,10 +130,12 @@ use tokio_postgres::types::{PgLsn, ToSql};
 pub(crate) mod build;
 pub(crate) mod fan_out;
 pub(crate) mod held;
+#[cfg(test)]
+mod j_tests;
 
 use crate::defs::ast::{Expr, JoinKind, TransformDef};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::defs::join::{self as spec, Side};
+use crate::defs::join::{self as spec, JOINED, Position, Side};
 use crate::defs::join_one_to_one::HiddenTable;
 use crate::defs::ledger as schema;
 use crate::defs::model::Definition;
@@ -142,7 +144,7 @@ use crate::pool::{Pool, quote_ident, quote_literal};
 
 use super::apply::ApplyError;
 use super::fold::FoldedChange;
-use super::join::{self as spec_join, LockRowMode, Truncate, lock_row_sql};
+use super::join::{LockRowMode, Truncate, lock_row_sql};
 use super::one_to_one_ledger::{self as ledger, EntryChange, LedgerRef};
 use super::one_to_one_render::{ImageColumn, OneToOneRender};
 use super::target_mutations::TargetMutations;
@@ -152,7 +154,7 @@ const WRITE_BATCH: usize = 10_000;
 
 /// A definition's static shape: the hidden tables, the join key, the columns
 /// each hidden ledger holds and the fields rendered over a row of `R` and the
-/// newest live row of `M`.
+/// newest live row of each position's `M`.
 #[derive(Debug, Clone)]
 pub(crate) struct JoinShape {
     /// The definition's id: the key of its `transform_definitions` row.
@@ -161,24 +163,18 @@ pub(crate) struct JoinShape {
     pub(crate) target: String,
     /// The `FROM` table, qualified.
     source_table: String,
-    /// The joined table, qualified.
-    joined_table: String,
-    left: bool,
+    /// Each joined table, in position order: one for a two-table JOIN.
+    positions: Vec<JoinedPosition>,
     pk: Vec<PrimaryKeyColumn>,
     r: LedgerRef,
-    m: LedgerRef,
     j: String,
     lock: String,
-    /// `a`'s join key columns in `ON` order, at the collation `R` and `J`
-    /// hold them under ([`under_hidden_collations`]).
+    /// `a`'s join key columns, every position's in position order, at the
+    /// collation `R` and `J` hold them under ([`under_hidden_collations`]).
     key: Vec<ImageColumn>,
-    /// `b`'s join key column names in `ON` order.
-    m_key: Vec<String>,
     /// The columns `R` holds besides its ledger: the key, then the `a`
     /// columns the fields read, at `R`'s collations.
     r_columns: Vec<ImageColumn>,
-    /// The columns `M` holds besides its ledger, at `M`'s collations.
-    m_columns: Vec<ImageColumn>,
     /// Each written field's name and its SQL over the lateral row `s`.
     fields: Vec<(String, String)>,
     /// The columns of `s`: the SQL over `r` and `b`, and the name `fields`
@@ -186,11 +182,37 @@ pub(crate) struct JoinShape {
     s_columns: Vec<(String, String)>,
 }
 
+/// One joined table of a [`JoinShape`]: its `M`, and its group of `J`.
+#[derive(Debug, Clone)]
+pub(crate) struct JoinedPosition {
+    pub(crate) position: Position,
+    /// The joined table, qualified.
+    table: String,
+    left: bool,
+    m: LedgerRef,
+    /// `a`'s join key columns at this position, in `ON` order, at `R`'s
+    /// collation: the types `J`'s group holds them as.
+    key: Vec<ImageColumn>,
+    /// `J`'s columns of this position's group, for `key`
+    /// ([`crate::defs::join_one_to_one::j_column`]).
+    j_key: Vec<String>,
+    /// The joined table's join key column names in `ON` order.
+    m_key: Vec<String>,
+    /// The columns `M` holds besides its ledger, at `M`'s collations.
+    m_columns: Vec<ImageColumn>,
+}
+
+/// One position's keys in a page's `J` statements ([`j_statements`]).
+pub(crate) struct PositionKeys<'a> {
+    pub(crate) position: &'a JoinedPosition,
+    pub(crate) keys: &'a BTreeSet<KeyText>,
+}
+
 /// What a field reads of one side, and the SQL name `s` gives it.
 fn s_name(side: Side, column: &str) -> String {
     let alias = match side {
         Side::From => "a",
-        Side::Joined => "b",
+        Side::Joined(_) => "b",
     };
     format!("{alias}.{column}")
 }
@@ -299,6 +321,18 @@ impl JoinShape {
     ) -> Result<Self, ApplyError> {
         let def = &definition.def;
         let target = definition.target_table.clone();
+        let join = spec::spec(def).ok_or_else(|| ApplyError::GroupBasisUnsupported {
+            target: target.clone(),
+            what: "a 1-1 JOIN with no joined table",
+        })?;
+        // A star's apply isn't built yet: it halts the transform rather than
+        // run as a two-table JOIN. Define refuses one today (`JoinTooManyTables`).
+        if join.joins.len() > 1 {
+            return Err(ApplyError::GroupBasisUnsupported {
+                target,
+                what: "a 1-1 JOIN of more than two tables, whose apply is not built yet",
+            });
+        }
         let (joined, a_columns, b_columns) = {
             let client = pool.get().await?;
             let joined = crate::defs::catalog::join_table_of(&**client, definition.id)
@@ -320,8 +354,12 @@ impl JoinShape {
                 |table: HiddenTable| format!("{schema_name}.{}", table.name(definition.id));
             let a =
                 under_hidden_collations(&**client, a, &hidden(HiddenTable::FromEntries)).await?;
-            let b =
-                under_hidden_collations(&**client, b, &hidden(HiddenTable::JoinedEntries)).await?;
+            let b = under_hidden_collations(
+                &**client,
+                b,
+                &hidden(HiddenTable::JoinedEntries(Position::FIRST)),
+            )
+            .await?;
             (joined, a, b)
         };
         let by_name = |columns: &[ImageColumn], names: &[String]| -> Vec<ImageColumn> {
@@ -330,14 +368,17 @@ impl JoinShape {
                 .filter_map(|n| columns.iter().find(|c| &c.name == n).cloned())
                 .collect()
         };
-        let key_names = spec::join_key(def, Side::From);
-        let m_key = spec::join_key(def, Side::Joined);
-        let key = by_name(&a_columns, &key_names);
+        let key = by_name(&a_columns, &spec::join_key(def, Side::From));
         let read = |side: Side, columns: &[ImageColumn]| -> Vec<ImageColumn> {
-            // The key first, then the rest in column order.
+            // The key first, then the rest in column order, each once.
             let wanted = spec::side_columns(def, side);
             let key_of_side = spec::join_key(def, side);
-            let mut out = by_name(columns, &key_of_side);
+            let mut out: Vec<ImageColumn> = Vec::new();
+            for column in by_name(columns, &key_of_side) {
+                if !out.iter().any(|o| o.name == column.name) {
+                    out.push(column);
+                }
+            }
             out.extend(
                 columns
                     .iter()
@@ -347,7 +388,31 @@ impl JoinShape {
             out
         };
         let r_columns = read(Side::From, &a_columns);
-        let m_columns = read(Side::Joined, &b_columns);
+        let schema_name = pool.schema();
+        let positions = spec::positions(join)
+            .map(|(position, joined_table)| {
+                let side = Side::Joined(position);
+                let root_key = spec::from_key_at(def, position);
+                JoinedPosition {
+                    position,
+                    table: joined.clone(),
+                    left: joined_table.kind == JoinKind::Left,
+                    m: LedgerRef::hidden(
+                        schema_name,
+                        definition.id,
+                        HiddenTable::JoinedEntries(position),
+                        &target,
+                    ),
+                    key: by_name(&a_columns, &root_key),
+                    j_key: root_key
+                        .iter()
+                        .map(|c| crate::defs::join_one_to_one::j_column(position, c))
+                        .collect(),
+                    m_key: spec::join_key(def, side),
+                    m_columns: read(side, &b_columns),
+                }
+            })
+            .collect();
 
         let mut reads: BTreeSet<(Side, String)> = BTreeSet::new();
         let mut fields = Vec::with_capacity(def.fields.len());
@@ -363,7 +428,7 @@ impl JoinShape {
             .map(|(side, column)| {
                 let alias = match side {
                     Side::From => "r",
-                    Side::Joined => "b",
+                    Side::Joined(_) => "b",
                 };
                 (
                     s_name(*side, column),
@@ -371,13 +436,10 @@ impl JoinShape {
                 )
             })
             .collect();
-        let left = matches!(spec::spec(def).map(|s| s.kind), Some(JoinKind::Left));
-        let schema_name = pool.schema();
         Ok(JoinShape {
             id: definition.id,
             source_table: definition.source_table.clone(),
-            joined_table: joined,
-            left,
+            positions,
             pk,
             r: LedgerRef::hidden(
                 schema_name,
@@ -385,18 +447,10 @@ impl JoinShape {
                 HiddenTable::FromEntries,
                 &target,
             ),
-            m: LedgerRef::hidden(
-                schema_name,
-                definition.id,
-                HiddenTable::JoinedEntries,
-                &target,
-            ),
             j: HiddenTable::Keys.qualified(schema_name, definition.id),
             lock: HiddenTable::TruncateLock.qualified(schema_name, definition.id),
             key,
-            m_key,
             r_columns,
-            m_columns,
             fields,
             s_columns,
             target,
@@ -408,9 +462,21 @@ impl JoinShape {
         &self.source_table
     }
 
-    /// The joined table, qualified.
+    /// The first joined table: the only one a two-table JOIN has, which is
+    /// every shape [`Self::load`] gives. Code that reads it still assumes one
+    /// joined table.
+    pub(crate) fn first(&self) -> &JoinedPosition {
+        &self.positions[0]
+    }
+
+    /// The joined table at `position`, if the shape has one there.
+    pub(crate) fn at(&self, position: Position) -> Option<&JoinedPosition> {
+        self.positions.get(position.index())
+    }
+
+    /// The first joined table, qualified.
     pub(crate) fn joined_table(&self) -> &str {
-        &self.joined_table
+        &self.first().table
     }
 
     /// `R`, qualified and quoted.
@@ -422,15 +488,20 @@ impl JoinShape {
     fn table(&self, side: Side) -> &str {
         match side {
             Side::From => &self.source_table,
-            Side::Joined => &self.joined_table,
+            Side::Joined(position) => &self.joined(position).table,
         }
     }
 
-    /// `side`'s hidden ledger: `R` or `M`.
+    /// The joined table at `position`, which every side a page names has.
+    fn joined(&self, position: Position) -> &JoinedPosition {
+        &self.positions[position.index()]
+    }
+
+    /// `side`'s hidden ledger: `R` or the position's `M`.
     fn ledger(&self, side: Side) -> &LedgerRef {
         match side {
             Side::From => &self.r,
-            Side::Joined => &self.m,
+            Side::Joined(position) => &self.joined(position).m,
         }
     }
 
@@ -438,7 +509,7 @@ impl JoinShape {
     fn side_key(&self, side: Side) -> Vec<String> {
         match side {
             Side::From => self.key.iter().map(|c| c.name.clone()).collect(),
-            Side::Joined => self.m_key.clone(),
+            Side::Joined(position) => self.joined(position).m_key.clone(),
         }
     }
 
@@ -446,7 +517,7 @@ impl JoinShape {
     fn side_columns(&self, side: Side) -> &[ImageColumn] {
         match side {
             Side::From => &self.r_columns,
-            Side::Joined => &self.m_columns,
+            Side::Joined(position) => &self.joined(position).m_columns,
         }
     }
 
@@ -474,9 +545,10 @@ impl JoinShape {
     /// order, and the later of its two changes recomputes the key.
     fn joined_sql(&self, from: &str) -> String {
         let on: Vec<String> = self
+            .first()
             .m_key
             .iter()
-            .zip(&self.key)
+            .zip(&self.first().key)
             .map(|(m, r)| format!("m.{} = r.{}", quote_ident(m), quote_ident(&r.name)))
             .collect();
         let s = if self.s_columns.is_empty() {
@@ -496,7 +568,7 @@ impl JoinShape {
                                          m.{key} collate \"C\" desc \
                                 limit 1) b on true \
              cross join lateral {s}",
-            m = self.m.ident,
+            m = self.first().m.ident,
             on = on.join(" and "),
             tomb = quote_ident(schema::TOMBSTONE_COLUMN),
             applied = quote_ident(schema::APPLIED_LSN_COLUMN),
@@ -508,18 +580,19 @@ impl JoinShape {
     /// `INNER` join a live `M` entry on its key.
     fn has_target_row_sql(&self) -> String {
         let alive = format!("not r.{}", quote_ident(schema::TOMBSTONE_COLUMN));
-        if self.left {
+        if self.first().left {
             return alive;
         }
         let on: Vec<String> = self
+            .first()
             .m_key
             .iter()
-            .zip(&self.key)
+            .zip(&self.first().key)
             .map(|(m, r)| format!("m.{} = r.{}", quote_ident(m), quote_ident(&r.name)))
             .collect();
         format!(
             "{alive} and exists (select 1 from {m} m where {on} and not m.{tomb})",
-            m = self.m.ident,
+            m = self.first().m.ident,
             on = on.join(" and "),
             tomb = quote_ident(schema::TOMBSTONE_COLUMN),
         )
@@ -626,7 +699,7 @@ impl JoinOneToOnePlan {
                     .add(change);
                 self.a.push(record);
             }
-            Side::Joined => {
+            Side::Joined(_) => {
                 self.held_origin.add(change);
                 self.b.push(record);
             }
@@ -647,7 +720,7 @@ pub(crate) async fn plan_for(
 ) -> Result<JoinOneToOnePlan, ApplyError> {
     let pk = match side {
         Side::From => pk,
-        Side::Joined => ddl::source_primary_key(pool, &definition.source_table).await?,
+        Side::Joined(_) => ddl::source_primary_key(pool, &definition.source_table).await?,
     };
     let paused = super::quarantine::paused_columns_for(pool, &definition.def).await?;
     Ok(JoinOneToOnePlan::new(
@@ -743,7 +816,7 @@ pub(crate) async fn apply_page(
     let m_pk = if b_rederive.is_empty() {
         Vec::new()
     } else {
-        ddl::source_primary_key_in_txn(txn, &shape.joined_table).await?
+        ddl::source_primary_key_in_txn(txn, &shape.first().table).await?
     };
 
     // 2. The lock row, a truncate's clear, then K over both sides' keys. A
@@ -790,8 +863,8 @@ pub(crate) async fn apply_page(
         k.extend(key_set(txn, shape, Side::From, &a, &live).await?);
     }
     if !b.is_empty() {
-        let live = live_keys(txn, shape, Side::Joined, &m_pk, &b_rederive).await?;
-        k.extend(key_set(txn, shape, Side::Joined, &b, &live).await?);
+        let live = live_keys(txn, shape, JOINED, &m_pk, &b_rederive).await?;
+        k.extend(key_set(txn, shape, JOINED, &b, &live).await?);
     }
     // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
@@ -815,26 +888,16 @@ pub(crate) async fn apply_page(
 
     // 4. The `R` entries, then the `M` entries.
     let (a_inserted, _) = lock_side(txn, shape, Side::From, &a, seg_seq, predicate, &k).await?;
-    let (b_inserted, b_held) =
-        lock_side(txn, shape, Side::Joined, &b, seg_seq, predicate, &k).await?;
+    let (b_inserted, b_held) = lock_side(txn, shape, JOINED, &b, seg_seq, predicate, &k).await?;
 
     // 5. The Re-derive reads, one statement per side.
     let a_read = rederive_read(txn, shape, Side::From, &shape.pk, &a_rederive, &k, seg_seq).await?;
-    let b_read = rederive_read(txn, shape, Side::Joined, &m_pk, &b_rederive, &k, seg_seq).await?;
+    let b_read = rederive_read(txn, shape, JOINED, &m_pk, &b_rederive, &k, seg_seq).await?;
 
     // 6. I2, then each side's copied columns.
     let a_changed =
         update_side(txn, shape, Side::From, &a, &a_inserted, &a_read, predicate).await?;
-    let b_changed = update_side(
-        txn,
-        shape,
-        Side::Joined,
-        &b,
-        &b_inserted,
-        &b_read,
-        predicate,
-    )
-    .await?;
+    let b_changed = update_side(txn, shape, JOINED, &b, &b_inserted, &b_read, predicate).await?;
 
     // 7. Recompute and write: the `a` changes' rows, then the fan-out.
     // Test-only pause point. See `super::interleave`.
@@ -931,7 +994,7 @@ async fn truncate_sides(
     truncate: &Truncate,
     mutations: &mut TargetMutations,
 ) -> Result<usize, ApplyError> {
-    for (side, lsn) in [(Side::From, truncate.from), (Side::Joined, truncate.joined)] {
+    for (side, lsn) in [(Side::From, truncate.from), (JOINED, truncate.joined)] {
         let Some(lsn) = lsn else { continue };
         let ledger = shape.ledger(side);
         // Planted bugs: the entries stay, or the floor doesn't rise. See
@@ -941,7 +1004,7 @@ async fn truncate_sides(
             crate::plant::fires(
                 match side {
                     Side::From => crate::plant::Plant::Join1TruncateKeepsR,
-                    Side::Joined => crate::plant::Plant::Join1TruncateKeepsM,
+                    Side::Joined(_) => crate::plant::Plant::Join1TruncateKeepsM,
                 },
                 true,
             ),
@@ -1064,7 +1127,7 @@ async fn key_set(
     let old_images: Vec<Option<&str>> = records
         .values()
         .map(|r| match side {
-            Side::Joined if !only_new => r.old_image.as_deref(),
+            Side::Joined(_) if !only_new => r.old_image.as_deref(),
             _ => None,
         })
         .collect();
@@ -1157,33 +1220,161 @@ fn key_unnest(shape: &JoinShape) -> (String, Vec<String>) {
     (unnest, casts)
 }
 
-/// Inserts K into `J` sorted and locks it, in one sorted statement each:
-/// ADR-0021's insert-then-lock, which is exact because `J` rows are never
-/// deleted.
+/// A page's two `J` statements over the keys of some positions, and their
+/// parameters ([`j_statements`]).
+#[derive(Debug)]
+pub(crate) struct JStatements<'a> {
+    /// The insert of every key: one statement for the page.
+    pub(crate) insert: String,
+    /// The lock of every key's row: one statement for the page.
+    pub(crate) lock: String,
+    /// One text array per key column, position by position: `$1` and on.
+    pub(crate) params: Vec<Vec<&'a str>>,
+}
+
+/// `J`'s insert-then-lock over `groups`, each a position's keys in position
+/// order (ADR-0021, #1765): one `INSERT … ON CONFLICT DO NOTHING` with no
+/// conflict target, so every position's partial unique index is an arbiter,
+/// sorted by `(position, key)`; then one `FOR UPDATE` over every position's
+/// rows sorted the same way. Each key text is cast to its column's type at
+/// `R`'s collation, so keys equal by value meet on one row. In the lock, each
+/// position's rows are found by `position = i` and its group's columns,
+/// through that position's partial index, and the rows of every position are
+/// then locked in one sorted pass. A group with no keys takes no part, and
+/// `None` is returned when no group has any. Insert-then-lock is exact
+/// because `J` rows are never deleted.
+pub(crate) fn j_statements<'a>(j: &str, groups: &[PositionKeys<'a>]) -> Option<JStatements<'a>> {
+    let groups: Vec<&PositionKeys<'a>> = groups.iter().filter(|g| !g.keys.is_empty()).collect();
+    if groups.is_empty() {
+        return None;
+    }
+    let mut params: Vec<Vec<&'a str>> = Vec::new();
+    // Each group's `unnest` of its parameters as `u(c0, ..)`, and its key
+    // texts cast to `J`'s types.
+    let mut unnests = Vec::with_capacity(groups.len());
+    for group in &groups {
+        let n = group.position.key.len();
+        let first = params.len() + 1;
+        params.extend(key_arrays(n, group.keys));
+        let arrays: Vec<String> = (0..n).map(|i| format!("${}::text[]", first + i)).collect();
+        let names: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
+        let casts: Vec<String> = group
+            .position
+            .key
+            .iter()
+            .enumerate()
+            .map(|(i, c)| cast_to(c, &format!("u.c{i}")))
+            .collect();
+        unnests.push((
+            format!("unnest({}) as u({})", arrays.join(", "), names.join(", ")),
+            casts,
+        ));
+    }
+    let group_columns = |group: &PositionKeys<'_>| -> Vec<String> {
+        group
+            .position
+            .j_key
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect()
+    };
+    let mut columns = vec!["position".to_string()];
+    for group in &groups {
+        columns.extend(group_columns(group));
+    }
+    // Planted bug: the `J` statements run unsorted. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let unsorted = crate::plant::fires(
+        crate::plant::Plant::StarJUnsorted,
+        groups.len() > 1 || params.first().is_some_and(|keys| keys.len() > 1),
+    );
+    #[cfg(not(any(test, feature = "test-util")))]
+    let unsorted = false;
+
+    // The insert: one arm per group, its own columns cast and every other
+    // group's `NULL` at its type.
+    let arms: Vec<String> = groups
+        .iter()
+        .zip(&unnests)
+        .map(|(group, (unnest, casts))| {
+            let mut values = vec![format!("{}::smallint", group.position.position.number())];
+            for other in &groups {
+                if other.position.position == group.position.position {
+                    values.extend(casts.iter().cloned());
+                } else {
+                    values.extend(other.position.key.iter().map(|c| cast_to(c, "null")));
+                }
+            }
+            format!("select {} from {unnest}", values.join(", "))
+        })
+        .collect();
+    let ordinals: Vec<String> = (1..=columns.len()).map(|i| i.to_string()).collect();
+    let insert_order = if unsorted {
+        String::new()
+    } else {
+        format!(" order by {}", ordinals.join(", "))
+    };
+    let insert = format!(
+        "insert into {j} ({cols}) select k.* from ({arms}) k{insert_order} on conflict do nothing",
+        cols = columns.join(", "),
+        arms = arms.join(" union all "),
+    );
+
+    // The lock: each group's rows through its partial index, then every
+    // row in one sorted pass.
+    let finds: Vec<String> = groups
+        .iter()
+        .zip(&unnests)
+        .map(|(group, (unnest, casts))| {
+            let qualified: Vec<String> = group_columns(group)
+                .iter()
+                .map(|c| format!("g.{c}"))
+                .collect();
+            format!(
+                "select g.ctid from {j} g where g.position = {} and ({}) in (select {} from {unnest})",
+                group.position.position.number(),
+                qualified.join(", "),
+                casts.join(", "),
+            )
+        })
+        .collect();
+    let lock_order = if unsorted {
+        String::new()
+    } else {
+        let qualified: Vec<String> = columns.iter().map(|c| format!("j.{c}")).collect();
+        format!(" order by {}", qualified.join(", "))
+    };
+    let lock = format!(
+        "select 1 from {j} j where j.ctid = any(array({finds})){lock_order} for update of j",
+        finds = finds.join(" union all "),
+    );
+    Some(JStatements {
+        insert,
+        lock,
+        params,
+    })
+}
+
+/// Inserts K into `J` and locks it ([`j_statements`]): K holds the keys of
+/// the first position, the only one a two-table JOIN has.
 async fn lock_keys(
     txn: &Transaction<'_>,
     shape: &JoinShape,
     k: &BTreeSet<KeyText>,
 ) -> Result<(), ApplyError> {
-    let n = shape.key.len();
-    let columns = key_arrays(n, k);
-    let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
-    let names: Vec<String> = shape.key.iter().map(|c| quote_ident(&c.name)).collect();
-    let (unnest, casts) = key_unnest(shape);
-    let casts = casts.join(", ");
-    let ordinals: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
-    if !k.is_empty() {
-        txn.execute(
-            &spec_join::j_insert_statement(
-                &shape.j,
-                &names.join(", "),
-                &casts,
-                &unnest,
-                &ordinals.join(", "),
-            ),
-            &params,
-        )
-        .await?;
+    let statements = j_statements(
+        &shape.j,
+        &[PositionKeys {
+            position: shape.first(),
+            keys: k,
+        }],
+    );
+    let params: Vec<&(dyn ToSql + Sync)> = statements
+        .iter()
+        .flat_map(|s| s.params.iter().map(|c| c as &(dyn ToSql + Sync)))
+        .collect();
+    if let Some(statements) = &statements {
+        txn.execute(&statements.insert, &params).await?;
     }
     // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
@@ -1195,15 +1386,13 @@ async fn lock_keys(
     .await?;
     // Planted bug: the page doesn't lock `J`. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
-    let skip = crate::plant::fires(crate::plant::Plant::Join1NoJLock, !k.is_empty());
+    let skip = crate::plant::fires(crate::plant::Plant::Join1NoJLock, statements.is_some());
     #[cfg(not(any(test, feature = "test-util")))]
     let skip = false;
-    if !k.is_empty() && !skip {
-        txn.execute(
-            &spec_join::j_lock_statement(&shape.j, &names, &casts, &unnest),
-            &params,
-        )
-        .await?;
+    if let Some(statements) = &statements
+        && !skip
+    {
+        txn.execute(&statements.lock, &params).await?;
     }
     // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
@@ -1257,7 +1446,7 @@ async fn lock_side(
         txn,
         match side {
             Side::From => super::interleave::PausePoint::AfterJoin1REntryLock,
-            Side::Joined => super::interleave::PausePoint::AfterJoin1MEntryLock,
+            Side::Joined(_) => super::interleave::PausePoint::AfterJoin1MEntryLock,
         },
         &ledger.label,
     )
@@ -1355,7 +1544,7 @@ async fn rederive_read(
     // `M`'s.
     let label = match side {
         Side::From => shape.target.as_str(),
-        Side::Joined => shape.m.label.as_str(),
+        Side::Joined(_) => shape.first().m.label.as_str(),
     };
     let read = ledger::read_rows(txn, label, shape.table(side), pk, &names, &refs).await?;
     // Planted bugs: the page doesn't check the keys its read of one side
@@ -1364,7 +1553,7 @@ async fn rederive_read(
     let unchecked = crate::plant::fires(
         match side {
             Side::From => crate::plant::Plant::Join1RdNoKey,
-            Side::Joined => crate::plant::Plant::Join1BrdNoKey,
+            Side::Joined(_) => crate::plant::Plant::Join1BrdNoKey,
         },
         true,
     );
@@ -1585,8 +1774,8 @@ async fn fan_out_keys(
         txn,
         &format!(
             "select {texts} from {m} l where l.{key} = any($1::text[]) and not l.{tomb}",
-            texts = shape.key_texts(Side::Joined, "l").join(", "),
-            m = shape.m.ident,
+            texts = shape.key_texts(JOINED, "l").join(", "),
+            m = shape.first().m.ident,
             key = quote_ident(schema::KEY_COLUMN),
             tomb = quote_ident(schema::TOMBSTONE_COLUMN),
         ),
@@ -1827,14 +2016,14 @@ async fn write_fan_out(
                 let (written, deleted, rows) = fan_out_failure(
                     txn,
                     shape,
-                    Side::Joined,
+                    JOINED,
                     &entries,
                     WriteOrigin::All(origin),
                     mutations,
                 )
                 .await?;
                 let parked: Vec<_> = rows.iter().map(|row| (row, origin)).collect();
-                held::hold(txn, shape, seg_seq, Side::Joined, &parked).await?;
+                held::hold(txn, shape, seg_seq, JOINED, &parked).await?;
                 held.record(rows);
                 txn.batch_execute("release savepoint join1_fan_out").await?;
                 return Ok((written, deleted));
@@ -1867,7 +2056,7 @@ async fn fan_out_failure(
 ) -> Result<(usize, usize, Vec<held::HeldRow>), ApplyError> {
     let written_entries = match side {
         Side::From => Entries::Changed,
-        Side::Joined => Entries::FanOut,
+        Side::Joined(_) => Entries::FanOut,
     };
     let mut failing: Vec<(&str, String, Option<String>)> = Vec::new();
     let (mut written, mut deleted) = (0, 0);
@@ -1945,10 +2134,11 @@ async fn fan_out_failure(
         named.join(", ")
     };
     let reason = match side {
-        Side::Joined => format!(
+        Side::Joined(_) => format!(
             "a change of {} whose fan-out fails on more rows of {} than {MAX_FAN_OUT_PROBES} \
              attempts to isolate them name: {named}, and maybe more",
-            shape.joined_table, shape.source_table,
+            shape.first().table,
+            shape.source_table,
         ),
         Side::From => format!(
             "changes of {} that fail on more of its rows than {MAX_FAN_OUT_PROBES} attempts \
@@ -2025,7 +2215,7 @@ impl Entries {
     /// join an entry has one only while a live `M` entry is on its key, and a
     /// fan-out of a `b` delete is what removes them.
     fn may_delete(self, shape: &JoinShape) -> bool {
-        self == Entries::Changed || !shape.left
+        self == Entries::Changed || !shape.first().left
     }
 }
 
@@ -2315,7 +2505,7 @@ pub async fn diverging_keys(pool: &Pool, target_table: &str) -> Result<Vec<Strin
     let on: Vec<String> = shape
         .key
         .iter()
-        .zip(&shape.m_key)
+        .zip(&shape.first().m_key)
         .map(|(a, b)| format!("r.{} = b.{}", quote_ident(&a.name), quote_ident(b)))
         .collect();
     let expected: Vec<String> = shape
@@ -2365,8 +2555,8 @@ pub async fn diverging_keys(pool: &Pool, target_table: &str) -> Result<Vec<Strin
         comma = if expected.is_empty() { "" } else { ", " },
         fields = expected.join(", "),
         a = ddl::qualified_source_table(&shape.source_table),
-        b = ddl::qualified_source_table(&shape.joined_table),
-        kind = if shape.left { "left" } else { "inner" },
+        b = ddl::qualified_source_table(&shape.first().table),
+        kind = if shape.first().left { "left" } else { "inner" },
         on = on.join(" and "),
         t_key = ddl::pk_key_sql_expr(&shape.pk, Some("t")),
         t_comma = if names.is_empty() { "" } else { ", " },

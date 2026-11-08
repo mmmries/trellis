@@ -570,7 +570,7 @@ async fn column_types(pool: &Pool, table: &str) -> Result<HashMap<String, String
 /// The join's `JoinKind` of `def`.
 fn join_kind(def: &TransformDef) -> JoinKind {
     spec::spec(def)
-        .map(|join| join.kind)
+        .map(|join| spec::first_joined(join).kind)
         .expect("a 1-1 JOIN definition has a join")
 }
 
@@ -614,10 +614,10 @@ async fn build<'a>(
         "a",
     );
     let b = side(
-        JoinSide::Joined,
+        spec::JOINED,
         &joined,
         b_pk,
-        HiddenTable::JoinedEntries,
+        crate::defs::join_one_to_one::M,
         "b",
     );
     let types = column_types(pool, &def.target_table).await?;

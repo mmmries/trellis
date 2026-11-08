@@ -217,7 +217,7 @@ running for a manual step.
 
 | Step | What it checks | How |
 |---|---|---|
-| `migrations` | A database the old build created opens under the candidate: no checksum mismatch, the old build's history rows unchanged, and only the candidate's new migrations added. The old tag's migration files are byte-identical at the candidate; a file the candidate adds (for `0.2.0`, `V9__worker_versions.sql` to `V18__capture_failure_reasons_recheck_index.sql`) is reported as `INFO`, since it changes the upgrade path and rules out downgrade, and the release notes say so. A changed or removed file of the old tag fails. Control: with one stored checksum altered the candidate refuses. | Script |
+| `migrations` | A database the old build created opens under the candidate: no checksum mismatch, the old build's history rows unchanged, and only the candidate's new migrations added. The old tag's migration files are byte-identical at the candidate; a file the candidate adds (for `0.2.0`, `V9__worker_versions.sql` to `V19__join1_fan_out_position.sql`) is reported as `INFO`, since it changes the upgrade path and rules out downgrade, and the release notes say so. A changed or removed file of the old tag fails. Control: with one stored checksum altered the candidate refuses. | Script |
 | `definitions` | One of each shape the release supports, built under the old build with writers running and undrained ring segments in flight: a plain 1-1, a chained 1-1, a 1-1 with a paused column, a group-basis aggregate, an aggregate over a `JOIN` (inner and `LEFT`), an aggregate and a `JOIN` over a hash-partitioned source, a 1-1 with a held key, and a paused transform. Under the candidate each resumes, converges and has a clean `self_check`; the held key and the pauses are unchanged; nothing else pauses. A plain recompute of two targets in SQL cross-checks `self_check`. | Script |
 | `grammar` | A definition the old build accepted and the candidate refuses pauses with a reason that names the remedy, not an error loop and not silent staleness, and the remedy works: a bare reserved word as a column name, and an expression nested over 100 levels (as a chain and as parentheses). Sources the candidate keys differently ([upgrading](upgrading.md#upgrading)): a key with `INCLUDE` columns, a deferrable primary key, and a primary key dropped after define with a unique index left over a nullable column each pause naming the remedy, and the remedy (`RESUME`; recreating the key not deferrable, then `RESUME`; adding a primary key, then `RESUME`) brings each back with a clean `self_check`. A primary key dropped after define with a unique index left over its columns keeps running, with `KEY (…)` written into the stored definition. | Script, plus the manual cases below |
 | `inflight` | Upgrading while a definition is mid-build, mid-rebuild (a `RESUME`), waiting for capture, paused, or holding a key: each continues to `live`, or stays as it was. A held key stands for quarantine: the script does not trip the whole-definition fuse, so no definition is `quarantined` at the upgrade. | Script |
@@ -310,9 +310,23 @@ For each release, the notes carry:
   release accepted and this one refuses pauses on upgrade, with its reason in
   `capture_failure`; the notes list each case, with the remedy (`DROP
   TRANSFORM`, then define it again in the current grammar). For `0.2.0`: a bare
-  reserved word as a column name (`SELECT order AS o`; write `table.order`),
-  and an expression nested over 100 levels (split it into calculated fields).
-  Add every case from the manual refusal check.
+  reserved word as a column name (`SELECT order AS o`; write `"order"` or
+  `table.order`), and an expression nested over 100 levels (split it into
+  calculated fields). Add every case from the manual refusal check.
+- **What new text means differently.** A grammar version bump keeps every
+  stored definition's meaning, but the same text written after the upgrade
+  reads the new way. For `0.2.0` (grammar 2,
+  [ADR-0018](decisions/0018-grammar-versioning.md)): an unquoted name folds to
+  lower case and a quoted name is exact, as in Postgres, so `SUM(Total)` reads
+  `total`, and a column, table or target created with upper-case letters is
+  written quoted (`SUM("Total")`). Scripts and migrations addressing a target
+  `0.1.x` created with a mixed-case name must quote it: `PAUSE TRANSFORM
+  "OrderTotals"`, `DROP TRANSFORM "OrderTotals"`. The unquoted spelling is
+  refused naming the quoted one, so it never acts on another target. Stored
+  `0.1.x` definitions keep reading their names as written, and `ALTER
+  TRANSFORM` stores them quoted. Names over 63 bytes, unquoted reserved table
+  names (`FROM user`) and the quoted forms the transforms table lists are
+  refused in new text.
 - **Definitions that pause because the new version keys a table
   differently,** each with its remedy, from [upgrading](upgrading.md#upgrading).
   For `0.2.0`: a source whose key has `INCLUDE` columns (`RESUME` re-keys and
@@ -329,7 +343,7 @@ For each release, the notes carry:
   has an answer. For `0.2.0`: an in-flight 1-1 rebuild sweep whose cursor
   began with U+0001 restarts from the start.
 - **The upgrade procedure,** from [upgrading](upgrading.md#upgrading), and
-  whether the release adds a migration (`0.2.0` adds V9 to V18, and `0.1.0`'s
+  whether the release adds a migration (`0.2.0` adds V9 to V19, and `0.1.0`'s
   `migrate` refuses a database `0.2.0` has migrated). Stop every process of
   the old release before starting a release of the same line that carries no
   migration (`0.1.0` to `0.1.1`): releases before `0.2.0` have no version

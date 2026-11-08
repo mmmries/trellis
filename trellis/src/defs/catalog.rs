@@ -91,15 +91,12 @@ use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
 
 use super::adopt::TargetTableDdl;
-use super::ast::{
-    AlterClause, AlterTransform, Expr, FieldDef, KeySpace, TransformDef, ValueType,
-    render_definition_text,
-};
+use super::ast::{AlterClause, AlterTransform, Expr, FieldDef, KeySpace, TransformDef, ValueType};
 use super::backfill::BackfillError;
 use super::ddl::{self, DdlError};
 use super::error::ParseError;
 use super::floor::Floors;
-use super::grammar::{self, CURRENT_GRAMMAR_VERSION};
+use super::grammar;
 #[cfg(any(test, feature = "internals"))]
 use super::model::SchemaEdge;
 use super::model::{Definition, EdgeKind, NodeKind, SchemaNode, StoredStatus, TransformStatus};
@@ -426,6 +423,17 @@ pub enum CatalogError {
     /// `super::lifecycle::drop_transform`'s doc comment for why the two
     /// differ.
     TransformNotFound { transform: String },
+    /// A name that found nothing (a transform an addressing statement
+    /// named, or a table, schema or column a definition reads) while a name
+    /// differing from it only in case exists (#1508). An unquoted name folds
+    /// to lower case, so the other one is written quoted. `error` is the
+    /// miss as it would otherwise be reported, with its `code`, and `found`
+    /// the quoted spelling of the match.
+    NameCaseMismatch {
+        error: String,
+        code: ErrorCode,
+        found: String,
+    },
     /// `super::lifecycle::drop_transform` was asked to drop a definition
     /// that is not frozen (ADR-0014). There is no direct
     /// live-to-gone edge in the lifecycle: quiescing through a pause is a
@@ -581,6 +589,7 @@ impl CatalogError {
             CatalogError::Ddl(err) => err.code(),
             CatalogError::DirectBackfill(err) => err.code(),
             CatalogError::TransformNotFound { .. } => ErrorCode::NotFound,
+            CatalogError::NameCaseMismatch { code, .. } => *code,
             // Both are "the world isn't in the state this operation needs",
             // not a rejection of the request's own shape — the same category
             // `ApplyError::TransformNotPaused` reports for its own
@@ -903,6 +912,11 @@ impl fmt::Display for CatalogError {
             CatalogError::TransformNotFound { transform } => {
                 write!(f, "no transform named '{transform}' is registered")
             }
+            CatalogError::NameCaseMismatch { error, found, .. } => write!(
+                f,
+                "{error}; did you mean {found}? An unquoted name folds to lower case, so a \
+                 name with upper-case letters is written quoted, as {found}"
+            ),
             CatalogError::TransformNotPaused { transform, status } => write!(
                 f,
                 "'{transform}' is {}, not paused; a definition must be paused before it can \
@@ -1007,6 +1021,7 @@ impl std::error::Error for CatalogError {
             CatalogError::Ddl(err) => Some(err),
             CatalogError::DirectBackfill(err) => Some(err),
             CatalogError::TransformNotFound { .. } => None,
+            CatalogError::NameCaseMismatch { .. } => None,
             CatalogError::TransformNotPaused { .. } => None,
             CatalogError::AboveRunningRelease { .. } => None,
             CatalogError::CannotRun { .. } => None,
@@ -2471,17 +2486,15 @@ pub async fn alter_transform(
             .await?
     };
 
-    let new_text = render_definition_text(&merged);
+    // The text the edit stores, refused (rolling the edit back) if the
+    // current grammar can't read it back: a field kept from grammar-1 text
+    // can carry a label over 63 bytes (ADR-0018, ADR-0022).
+    let (new_text, new_grammar_version) = grammar::rewrite(&merged)?;
     txn.execute(
         "update transform_definitions \
          set definition_text = $1, definition_version = $2, grammar_version = $4 \
          where id = $3",
-        &[
-            &new_text,
-            &new_version,
-            &current.id,
-            &CURRENT_GRAMMAR_VERSION,
-        ],
+        &[&new_text, &new_version, &current.id, &new_grammar_version],
     )
     .await?;
     // ADR-0024: the edited tree's floor, which can be lower than before.
@@ -3426,6 +3439,7 @@ async fn create_definition_inner(
     // transaction, for the catalog row and the hidden tables.
     let join_sides = match super::join::spec(&def) {
         Some(join) => {
+            let join = super::join::first_joined(join);
             let joined = match &join.explicit_right_schema {
                 Some(schema) => {
                     confirm_qualified_source(&*txn, schema, &join.right).await?;
@@ -3852,7 +3866,7 @@ async fn create_definition_inner(
                 &type_keys,
                 &type_vals,
                 &status_text,
-                &restoring.map_or(CURRENT_GRAMMAR_VERSION, |r| r.grammar_version),
+                &restoring.map_or_else(|| grammar::stamp(source_text), |r| r.grammar_version),
                 &join_table,
                 &join_keys,
                 &join_vals,
@@ -3885,7 +3899,7 @@ async fn create_definition_inner(
                 id,
                 &def,
                 &sides.from_columns,
-                &sides.joined_columns,
+                &[&sides.joined_columns],
             )
         } else {
             super::join::hidden_tables_ddl(
@@ -4676,6 +4690,7 @@ impl JoinSides {
         let Some(join) = super::join::spec(def) else {
             panic!("JoinSides::resolve called on a definition that isn't a JOIN");
         };
+        let join = super::join::first_joined(join);
         let from = resolve_source_for_install(pool, def).await?;
         let joined = match &join.explicit_right_schema {
             Some(schema) => {
@@ -5055,7 +5070,7 @@ pub(crate) async fn validate_live_join_schema(
 ) -> Result<(), CatalogError> {
     for (side, which) in [
         (&sides.from, super::join::Side::From),
-        (&sides.joined, super::join::Side::Joined),
+        (&sides.joined, super::join::JOINED),
     ] {
         let declared = super::source_key::declared_on(def, Some(which));
         let key = super::source_key::admitted_key(txn, side, declared)
@@ -5386,7 +5401,7 @@ pub(crate) async fn recreate_hidden_tables(
                 id,
                 def,
                 &sides.from_columns,
-                &sides.joined_columns,
+                &[&sides.joined_columns],
             ),
         )
     } else {
@@ -5783,7 +5798,7 @@ fn reject_virtual_join_reads(def: &TransformDef, sides: &JoinSides) -> Result<()
     )?;
     reject_virtual_generated_reads(
         def,
-        Some(super::join::Side::Joined),
+        Some(super::join::JOINED),
         &sides.joined,
         &sides.joined_virtual,
     )
@@ -7397,7 +7412,7 @@ async fn column_dependents_via(
         if super::join::spec(&def).is_some() {
             for (side, table) in [
                 (super::join::Side::From, Some(&qualified_source)),
-                (super::join::Side::Joined, joined.as_ref()),
+                (super::join::JOINED, joined.as_ref()),
             ] {
                 if table != Some(&qualified_upstream) {
                     continue;
@@ -8417,6 +8432,7 @@ mod table_not_accessible_tests {
 /// parsing it.
 #[cfg(test)]
 mod grammar_window_tests {
+    use super::grammar::CURRENT_GRAMMAR_VERSION;
     use super::*;
 
     /// Text no grammar reads: a scan that parsed it would fail.
@@ -8801,7 +8817,7 @@ mod virtual_generated_tests {
     //! columns.
 
     use super::*;
-    use crate::defs::join::Side;
+    use crate::defs::join::{JOINED, Side};
 
     fn def(text: &str) -> TransformDef {
         parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}"))
@@ -8858,7 +8874,7 @@ mod virtual_generated_tests {
             "TRANSFORM j FROM a LEFT JOIN bv ON a.k = bv.k SELECT a.r AS r, bv.g AS bg",
         ] {
             assert_eq!(
-                refused(text, Some(Side::Joined), "public.bv").as_deref(),
+                refused(text, Some(JOINED), "public.bv").as_deref(),
                 Some("g"),
                 "{text}"
             );
@@ -8885,7 +8901,7 @@ mod virtual_generated_tests {
         }
         let text = "TRANSFORM j FROM a JOIN bv ON a.k = bv.k GROUP BY a.grp \
                     SELECT a.grp AS grp, SUM(bv.img) AS total";
-        assert_eq!(refused(text, Some(Side::Joined), "public.bv"), None);
+        assert_eq!(refused(text, Some(JOINED), "public.bv"), None);
         // No virtual column at all: nothing to refuse.
         assert!(
             reject_virtual_generated_reads(

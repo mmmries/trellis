@@ -40,7 +40,7 @@ use tokio_postgres::Transaction;
 use tokio_postgres::types::ToSql;
 
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::defs::join::Side;
+use crate::defs::join::{JOINED, Side};
 use crate::defs::ledger as schema;
 use crate::metrics::{self, BuildStatement};
 use crate::pool::quote_ident;
@@ -89,7 +89,7 @@ pub(crate) async fn rederive(
         .collect();
     let (a, b) = match side {
         Side::From => (records, Vec::new()),
-        Side::Joined => (Vec::new(), records),
+        Side::Joined(_) => (Vec::new(), records),
     };
     let plan = JoinOneToOnePlan {
         shape: shape.clone(),
@@ -136,7 +136,7 @@ pub(crate) async fn m_batch(
         .map(|(ident, c)| c.ordered(ident))
         .collect();
     let decoded: Vec<String> = match after {
-        Some(after) => ddl::split_pk_key(m_pk, &shape.joined_table, after)?
+        Some(after) => ddl::split_pk_key(m_pk, &shape.first().table, after)?
             .into_iter()
             .map(|part| part.map(|c| c.into_owned()).unwrap_or_default())
             .collect(),
@@ -158,7 +158,7 @@ pub(crate) async fn m_batch(
             &format!(
                 "select ({k}) from {b} t where {not_null}{after_cmp} order by {order} limit $1",
                 k = ddl::pk_key_sql_expr(m_pk, Some("t")),
-                b = ddl::qualified_source_table(&shape.joined_table),
+                b = ddl::qualified_source_table(&shape.first().table),
                 not_null = not_null.join(" and "),
                 order = order.join(", "),
             ),
@@ -169,7 +169,7 @@ pub(crate) async fn m_batch(
         .map(|row| row.get(0))
         .collect();
     metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
-    rederive(txn, shape, Side::Joined, &keys, false).await?;
+    rederive(txn, shape, JOINED, &keys, false).await?;
     let full = i64::try_from(keys.len()).is_ok_and(|n| n >= limit);
     Ok(if full { keys.last().cloned() } else { None })
 }
@@ -202,7 +202,7 @@ pub(crate) async fn m_null_batch(
                 "select k from (select ({k}) as k from {b} t where {nullable}) n \
                  where $2::text is null or k > $2 collate \"C\" \
                  order by k collate \"C\" limit $1",
-                b = ddl::qualified_source_table(&shape.joined_table),
+                b = ddl::qualified_source_table(&shape.first().table),
                 nullable = nullable.join(" or "),
             ),
             &[&limit, &after],
@@ -211,7 +211,7 @@ pub(crate) async fn m_null_batch(
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    rederive(txn, shape, Side::Joined, &keys, false).await?;
+    rederive(txn, shape, JOINED, &keys, false).await?;
     let full = i64::try_from(keys.len()).is_ok_and(|n| n >= limit);
     Ok(if full { keys.last().cloned() } else { None })
 }
@@ -240,7 +240,7 @@ pub(crate) async fn m_gone_batch(
             &format!(
                 "select l.{key} from {m} l where not l.{tombstone} {after} \
                  order by l.{key} limit $1",
-                m = shape.m.ident,
+                m = shape.first().m.ident,
                 after = if after.is_some() {
                     format!("and l.{key} > $2")
                 } else {
@@ -257,7 +257,7 @@ pub(crate) async fn m_gone_batch(
     let present: HashSet<String> = if refs.is_empty() {
         HashSet::new()
     } else {
-        let probe = super::super::apply::live_rows_query(&shape.joined_table, m_pk, &[], &refs)?;
+        let probe = super::super::apply::live_rows_query(&shape.first().table, m_pk, &[], &refs)?;
         super::super::ledger::query_by_entry_key(
             txn,
             &format!("select m.k from ({}) m", probe.docs),
@@ -274,7 +274,7 @@ pub(crate) async fn m_gone_batch(
         .filter(|key| !present.contains(*key))
         .cloned()
         .collect();
-    rederive(txn, shape, Side::Joined, &gone, false).await?;
+    rederive(txn, shape, JOINED, &gone, false).await?;
     let full = i64::try_from(entries.len()).is_ok_and(|n| n >= limit);
     Ok(if full { entries.last().cloned() } else { None })
 }

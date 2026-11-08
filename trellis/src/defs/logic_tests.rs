@@ -470,11 +470,17 @@ fn a_column_name_or_unreserved_keyword_is_still_a_column() {
     }
 }
 
-/// A reserved word's refusal names the qualified-name remedy.
+/// A reserved word's refusal names the quoted and qualified remedies, and
+/// the quoted spelling reads the column.
 #[test]
 fn a_reserved_word_refusal_names_the_remedy() {
     let err = parse_text("order").unwrap_err();
-    assert!(err.to_string().contains("rename the column"), "{err}");
+    assert!(
+        err.to_string().contains("write it quoted (\"order\")"),
+        "{err}"
+    );
+    let def = parse_text("\"order\"").unwrap();
+    assert_eq!(def.fields[0].expr, Expr::Column("order".to_string()));
 }
 
 #[test]
@@ -1236,6 +1242,33 @@ fn nullif_beside_a_null_constant_folds_whatever_the_other_argument_reads() {
         "2147483647 + NULLIF(NULLIF(1, i4), NULL)",
         "CASE WHEN NULLIF(CAST(NULL AS integer), i4) IS NULL THEN 0 ELSE 2147483647 + 1 END",
         "COALESCE(NULLIF(1, NULLIF(CAST(NULL AS integer), i4)), 2147483647 + 1)",
+    ] {
+        assert_type(text, I4);
+    }
+}
+
+/// `AT TIME ZONE` is strict like the arithmetic operators: the planner folds
+/// it to `NULL` when its input is the `NULL` constant, so a guard over it is
+/// decided and define refuses the overflow the planner still reaches (#1785).
+/// Each case is checked against Postgres.
+#[test]
+fn at_time_zone_over_a_null_constant_folds_to_null() {
+    for text in [
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS NOT DISTINCT FROM \
+         TIMESTAMP '2024-02-29 12:00:00' THEN 0 ELSE 2147483647 + 1 END",
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS NULL \
+         THEN 2147483647 + 1 END",
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS DISTINCT FROM NULL \
+         THEN 0 ELSE 2147483647 + 1 END",
+    ] {
+        assert_refused(text, "out of range");
+    }
+    // The guard selects the branch without the overflow.
+    for text in [
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS NULL \
+         THEN 0 ELSE 2147483647 + 1 END",
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS NOT NULL \
+         THEN 2147483647 + 1 END",
     ] {
         assert_type(text, I4);
     }

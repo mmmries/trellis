@@ -416,8 +416,10 @@ fn drop_uncaptured_rereads(mut plan: ConcurrentPlan, program: &Program) -> Concu
     let reads = |def: &TransformDef, table: &str| {
         def.source == table
             || match &def.key_space {
-                trellis::dev::defs::ast::KeySpace::Join(join) => join.right == table,
-                trellis::dev::defs::ast::KeySpace::JoinOneToOne(join) => join.right == table,
+                trellis::dev::defs::ast::KeySpace::Join(join) => join.joins[0].right == table,
+                trellis::dev::defs::ast::KeySpace::JoinOneToOne(join) => {
+                    join.joins[0].right == table
+                }
                 _ => false,
             }
     };

@@ -953,7 +953,7 @@ async fn a_one_to_one_join_pauses_resumes_revalidates_and_drops_with_its_hidden_
     // A resume drops and recreates the hidden tables: whatever was in them
     // is gone.
     raw.batch_execute(&format!(
-        "insert into {DEFAULT_SCHEMA}.join1_{id}_j (cust) values (1);
+        "insert into {DEFAULT_SCHEMA}.join1_{id}_j (position, p1_cust) values (1, 1);
          insert into {DEFAULT_SCHEMA}.join1_{id}_r (__from_key, cust) values ('1', 1)"
     ))
     .await
@@ -1622,7 +1622,7 @@ async fn a_qualified_read_of_a_reserved_word_column_is_copied_under_its_name() {
 
     let definition = install_definition(
         &db.pool,
-        "TRANSFORM both FROM orders LEFT JOIN customers ON orders.cust = customers.id \
+        "TRANSFORM \"both\" FROM orders LEFT JOIN customers ON orders.cust = customers.id \
          SELECT orders.order AS order, customers.group AS group",
         &HashMap::new(),
         "public",

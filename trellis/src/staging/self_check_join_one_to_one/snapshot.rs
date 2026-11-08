@@ -221,7 +221,8 @@ async fn read(
         .await?;
     let markers = txn
         .query(
-            "select join_key, cursor from join1_fan_out where transform_id = $1",
+            "select join_key, cursor from join1_fan_out \
+             where transform_id = $1 and position = 1",
             &[&id],
         )
         .await?
@@ -242,14 +243,21 @@ async fn read(
         .collect();
 
     let from_columns = read_columns(&audit.def.def, JoinSide::From);
-    let joined_columns = read_columns(&audit.def.def, JoinSide::Joined);
+    let joined_columns = read_columns(&audit.def.def, spec::JOINED);
     let from_entries = entries(txn, r, &audit.a.key, &from_columns).await?;
     let joined_entries = entries(txn, m, &audit.b.key, &joined_columns).await?;
+    // The snapshot is of the two-table JOIN: `J`'s rows at position 1.
+    let position = spec::Position::FIRST;
+    let j_columns: Vec<String> = spec::from_key_at(&audit.def.def, position)
+        .iter()
+        .map(|c| crate::defs::join_one_to_one::j_column(position, c))
+        .collect();
     let keys = txn
         .query(
             &format!(
-                "select {} from {j} j",
-                texts("j", &spec::join_key(&audit.def.def, JoinSide::From))
+                "select {} from {j} j where j.position = {}",
+                texts("j", &j_columns),
+                position.number()
             ),
             &[],
         )

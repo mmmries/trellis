@@ -145,7 +145,8 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::Join1TruncateNoRebuild
         | Plant::Join1TruncateDefAfterLock
         | Plant::Join1FanOutHeldRow
-        | Plant::Join1ReleaseNoRederive => PlantPath::OneToOneJoin,
+        | Plant::Join1ReleaseNoRederive
+        | Plant::StarJUnsorted => PlantPath::OneToOneJoin,
         Plant::SeamTokenEarly | Plant::SeamImagelessRow => PlantPath::Chain,
         Plant::GbxProbeNoXbasis
         | Plant::GbxSharedBasis

@@ -19,7 +19,7 @@ use crate::capture::{CaptureError, partitions};
 use crate::defs::ast::TransformDef;
 use crate::defs::chunk_queue::{KIND_PLAN, KIND_SWEEP};
 use crate::defs::ddl::regclass_arg;
-use crate::defs::join::{self as spec, HiddenTable, Side};
+use crate::defs::join::{self as spec, HiddenTable, JOINED, Side};
 use crate::defs::model::StoredStatus;
 
 /// `P` is reported once its estimated rows reach this share of the fact
@@ -37,7 +37,8 @@ pub(crate) const PARTIALS_WARNING_MIN_FACT_ROWS: i64 = 1000;
 pub struct HiddenTableSize {
     /// Which table: `P` (the `FROM` side's partials), `M` (the joined
     /// side's), `J` (the matches per join key) or `T` (the target's
-    /// partials).
+    /// partials); of a 1-1 `JOIN`, `R`, `M` (`M2` and on at the positions
+    /// after the first) or `J`.
     pub table: &'static str,
     /// The table's name in the catalog schema.
     pub name: String,
@@ -230,7 +231,7 @@ async fn building(
     };
     let cursor: Option<String> = job.get(0);
     let mut sides = vec![(Side::From, source_table)];
-    sides.extend(join_table.map(|t| (Side::Joined, t)));
+    sides.extend(join_table.map(|t| (JOINED, t)));
     let mut partitioned = Vec::new();
     for (side, table) in sides {
         if !build::builds_per_leaf(client, table).await? {
@@ -286,7 +287,7 @@ async fn building(
 fn public_side(side: Side) -> JoinSide {
     match side {
         Side::From => JoinSide::From,
-        Side::Joined => JoinSide::Joined,
+        Side::Joined(_) => JoinSide::Joined,
     }
 }
 

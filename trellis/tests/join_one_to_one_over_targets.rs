@@ -1525,7 +1525,7 @@ impl PinBWriter {
         client
             .batch_execute(&format!(
                 "begin; \
-                 select 1 from {schema}.join1_{id}_j where k = {key} for update; \
+                 select 1 from {schema}.join1_{id}_j where position = 1 and p1_k = {key} for update; \
                  update public.b set w = {w} where k = {key}; \
                  update {schema}.join1_{id}_m set w = {w} where k = {key}; \
                  update {} t set total = a.x + {w} from public.ta a \

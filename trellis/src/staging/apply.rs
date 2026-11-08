@@ -2992,7 +2992,7 @@ pub(super) async fn compute_page(
                 let side = if canonical_of(qualified_source) == canonical_of(&def.source_table) {
                     crate::defs::join::Side::From
                 } else {
-                    crate::defs::join::Side::Joined
+                    crate::defs::join::JOINED
                 };
                 let target_plan = match join_targets.entry(def.def.target.clone()) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -3021,7 +3021,7 @@ pub(super) async fn compute_page(
                 let side = if canonical_of(qualified_source) == canonical_of(&def.source_table) {
                     crate::defs::join::Side::From
                 } else {
-                    crate::defs::join::Side::Joined
+                    crate::defs::join::JOINED
                 };
                 let target_plan = match join1_targets.entry(def.def.target.clone()) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),

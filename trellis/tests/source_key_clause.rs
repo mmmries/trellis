@@ -438,7 +438,7 @@ async fn define_refuses_a_key_it_cannot_key_by() {
             "write KEY (k) after it here, not KEY (j)",
         ),
         (
-            "TRANSFORM both_join FROM public.other JOIN public.both KEY (j) ON other.bk = both.k \
+            "TRANSFORM both_join FROM public.other JOIN public.both KEY (j) ON other.bk = \"both\".k \
              GROUP BY other.id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
             "write KEY (k) after it here, not KEY (j)",
         ),
@@ -460,7 +460,7 @@ async fn define_refuses_a_key_it_cannot_key_by() {
     );
     trellis
         .apply(
-            "TRANSFORM both_join FROM public.other JOIN public.both KEY (k) ON other.bk = both.k \
+            "TRANSFORM both_join FROM public.other JOIN public.both KEY (k) ON other.bk = \"both\".k \
              GROUP BY other.id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
         )
         .await

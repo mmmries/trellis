@@ -258,7 +258,7 @@ async fn join_copies(
     source: &str,
     target: &str,
 ) -> Result<Vec<TypedCopy>, tokio_postgres::Error> {
-    use super::join::{HiddenTable, Side};
+    use super::join::{HiddenTable, JOINED, Side};
     let Some(row) = client
         .query_opt(
             "select id, join_table from transform_definitions \
@@ -272,7 +272,7 @@ async fn join_copies(
     let (id, joined): (i64, String) = (row.get(0), row.get(1));
     let side_table = |side: Side| match side {
         Side::From => source.to_string(),
-        Side::Joined => joined.clone(),
+        Side::Joined(_) => joined.clone(),
     };
     let hidden = |table: HiddenTable| {
         let name = table.name(id);
@@ -315,7 +315,7 @@ async fn join_copies(
     }
     for (side, table) in [
         (Side::From, HiddenTable::FromPartials),
-        (Side::Joined, HiddenTable::JoinedPartials),
+        (JOINED, HiddenTable::JoinedPartials),
     ] {
         for column in super::join::side_key_columns(def, side) {
             push(CopyKind::JoinHidden, hidden(table), side, &column);
@@ -404,7 +404,7 @@ async fn join_one_to_one_copies(
     let (id, joined): (i64, String) = (row.get(0), row.get(1));
     let side_table = |side: Side| match side {
         Side::From => source.to_string(),
-        Side::Joined => joined.clone(),
+        Side::Joined(_) => joined.clone(),
     };
     let hidden = |table: HiddenTable| {
         (
@@ -433,22 +433,33 @@ async fn join_one_to_one_copies(
             &key.name,
         ));
     }
+    // `R`, and the `M` of each position whose table the catalog records:
+    // the first's (`join_table`).
     for (side, table) in [
         (Side::From, HiddenTable::FromEntries),
-        (Side::Joined, HiddenTable::JoinedEntries),
+        (super::join::JOINED, super::join_one_to_one::M),
     ] {
         for column in super::join_one_to_one::read_columns(def, side) {
             copies.push(copy(CopyKind::JoinHidden, hidden(table), side, &column));
         }
     }
-    // `J` is typed from the `FROM` side's join key, as its DDL is.
-    for column in super::join::join_key(def, Side::From) {
-        copies.push(copy(
-            CopyKind::JoinHidden,
-            hidden(HiddenTable::Keys),
-            Side::From,
-            &column,
-        ));
+    // `J` is typed from the `FROM` side's join key at each position, a
+    // group of columns per position, as its DDL is.
+    for (position, _) in super::join::spec(def)
+        .into_iter()
+        .flat_map(super::join::positions)
+    {
+        for column in super::join::from_key_at(def, position) {
+            copies.push(TypedCopy {
+                column: super::join_one_to_one::j_column(position, &column),
+                ..copy(
+                    CopyKind::JoinHidden,
+                    hidden(HiddenTable::Keys),
+                    Side::From,
+                    &column,
+                )
+            });
+        }
     }
     let sides =
         match super::catalog::JoinSides::read(client, source.to_string(), joined.clone()).await {
@@ -462,7 +473,7 @@ async fn join_one_to_one_copies(
         if let (Expr::SourceColumn { .. }, [(side, column)]) = (&field.expr, reads.as_slice()) {
             let columns = match side {
                 Side::From => &sides.from_columns,
-                Side::Joined => &sides.joined_columns,
+                Side::Joined(_) => &sides.joined_columns,
             };
             if columns.contains_key(column) {
                 copies.push(TypedCopy {
@@ -507,7 +518,7 @@ async fn join_one_to_one_copies(
 fn reads_live(reads: &[(super::join::Side, String)], sides: &super::catalog::JoinSides) -> bool {
     reads.iter().all(|(side, column)| match side {
         super::join::Side::From => sides.from_columns.contains_key(column),
-        super::join::Side::Joined => sides.joined_columns.contains_key(column),
+        super::join::Side::Joined(_) => sides.joined_columns.contains_key(column),
     })
 }
 
@@ -535,7 +546,7 @@ pub(crate) fn inputs(
         names.push(super::ddl::regclass_arg(joined));
         if super::join::is_one_to_one(def) {
             names.extend(
-                super::join_one_to_one::HiddenTable::ALL
+                super::join_one_to_one::HiddenTable::all(def)
                     .iter()
                     .map(|table| table.qualified(schema, id)),
             );
