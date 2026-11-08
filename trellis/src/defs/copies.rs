@@ -466,18 +466,18 @@ async fn join_one_to_one_copies(
     for field in &def.fields {
         let reads: Vec<(Side, String)> = super::join::expr_columns(def, &field.expr);
         // A bare column of either table is a copy of it.
-        if let (Expr::SourceColumn { .. }, [(side, column)]) = (&field.expr, reads.as_slice()) {
-            if sides.columns(*side).contains_key(column) {
-                copies.push(TypedCopy {
-                    kind: CopyKind::Passthrough,
-                    table: target_table.0.clone(),
-                    table_name: target_table.1.clone(),
-                    column: field.name.clone(),
-                    reads: vec![(side_table(*side), column.clone())],
-                    inferred: None,
-                });
-                continue;
-            }
+        if let (Expr::SourceColumn { .. }, [(side, column)]) = (&field.expr, reads.as_slice())
+            && sides.columns(*side).contains_key(column)
+        {
+            copies.push(TypedCopy {
+                kind: CopyKind::Passthrough,
+                table: target_table.0.clone(),
+                table_name: target_table.1.clone(),
+                column: field.name.clone(),
+                reads: vec![(side_table(*side), column.clone())],
+                inferred: None,
+            });
+            continue;
         }
         if reads.is_empty() || !reads_live(&reads, &sides) {
             continue;
