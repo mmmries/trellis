@@ -219,13 +219,13 @@ const DRAINED_PREFIX_SQL: &str = "\
 
 /// Every ledger table there is, schema-qualified and quoted: a
 /// definition's `<target>__ledger`, where it exists, with the definition's
-/// id, and a 1-1 `JOIN`'s hidden ledgers `R` and `M`
-/// ([`crate::defs::join_one_to_one::HiddenTable::LEDGERS`], in the catalog schema, as
+/// id, and a 1-1 `JOIN`'s hidden ledgers `R` and each position's `M`
+/// ([`crate::defs::join_one_to_one::HiddenTable::every_ledger`], in the catalog schema, as
 /// [`hidden_tables_sql`] finds the other hidden tables). An aggregate
 /// target's, a 1-1 target's and a hidden ledger carry the same
 /// ordering-state columns, so [`collect_tombstones`] collects them alike.
 fn ledger_tables_sql() -> String {
-    let names = HiddenTable::LEDGERS
+    let names = HiddenTable::every_ledger()
         .iter()
         .map(|table| table.name_sql("d.id"))
         .collect::<Vec<_>>()
@@ -698,13 +698,16 @@ fn is_lock_not_available(err: &tokio_postgres::Error) -> bool {
 mod ledger_tables_tests {
     use super::ledger_tables_sql;
 
-    /// The 1-1 `JOIN` arm names its two hidden ledgers by
-    /// `HiddenTable::name_sql`, which renders them as the catalog creates them.
+    /// The 1-1 `JOIN` arm names its hidden ledgers, `R` and the `M` of
+    /// every position up to the cap, by `HiddenTable::name_sql`, which
+    /// renders them as the catalog creates them.
     #[test]
     fn ledger_tables_sql_names_the_hidden_ledgers() {
         assert!(ledger_tables_sql().contains(
-            "c.relname in ( ('join1_' || d.id || '_r'), ('join1_' || d.id || '_m')) \
+            "c.relname in ( ('join1_' || d.id || '_r'), ('join1_' || d.id || '_m'), \
+             ('join1_' || d.id || '_m2'), ('join1_' || d.id || '_m3'), \
+             ('join1_' || d.id || '_m4')) \
              and c.relnamespace"
-        ));
+        ), "{}", ledger_tables_sql());
     }
 }

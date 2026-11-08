@@ -613,7 +613,7 @@ async fn build<'a>(
         HiddenTable::FromEntries,
         "a",
     );
-    let b = side(spec::JOINED, &joined, b_pk, HiddenTable::JoinedEntries, "b");
+    let b = side(spec::JOINED, &joined, b_pk, crate::defs::join_one_to_one::M, "b");
     let types = column_types(pool, &def.target_table).await?;
     let mut fields = Vec::new();
     for f in def.def.fields.iter().filter(|f| !paused.contains(&f.name)) {

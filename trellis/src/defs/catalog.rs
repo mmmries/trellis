@@ -3899,7 +3899,7 @@ async fn create_definition_inner(
                 id,
                 &def,
                 &sides.from_columns,
-                &sides.joined_columns,
+                &[&sides.joined_columns],
             )
         } else {
             super::join::hidden_tables_ddl(
@@ -5402,7 +5402,7 @@ pub(crate) async fn recreate_hidden_tables(
                 id,
                 def,
                 &sides.from_columns,
-                &sides.joined_columns,
+                &[&sides.joined_columns],
             ),
         )
     } else {

@@ -76,7 +76,25 @@ impl Position {
     pub(crate) fn index(self) -> usize {
         self.0 - 1
     }
+
+    /// The position numbered `number`, if a `JOIN` may have one there.
+    pub(crate) fn from_number(number: usize) -> Option<Self> {
+        (1..=MAX_POSITIONS).contains(&number).then_some(Self(number))
+    }
+
+    /// This position's number: 1 for the first joined table.
+    pub(crate) fn number(self) -> usize {
+        self.0
+    }
+
+    /// Every position a `JOIN` may have, in order: 1 to [`MAX_POSITIONS`].
+    pub(crate) fn every() -> impl Iterator<Item = Self> {
+        (1..=MAX_POSITIONS).map(Self)
+    }
 }
+
+/// The most joined tables a `JOIN` may have: a star of 5 tables (#1459).
+pub(crate) const MAX_POSITIONS: usize = 4;
 
 /// The first joined table's side: the only one a two-table JOIN has. Code
 /// that names it rather than a [`Position`] still assumes one joined table.
@@ -173,6 +191,25 @@ pub(crate) fn join_key(def: &TransformDef, side: Side) -> Vec<String> {
             [&term.lhs, &term.rhs]
                 .into_iter()
                 .find(|c| side_of_written(def, join, &c.table) == Some(side))
+                .map(|c| c.column.clone())
+        })
+        .collect()
+}
+
+/// The `FROM` table's columns in the `ON` of `position`, in `ON` order: its
+/// join key at that position. [`join_key`] of [`Side::From`] is these, over
+/// every position in order.
+pub(crate) fn from_key_at(def: &TransformDef, position: Position) -> Vec<String> {
+    let Some(join) = spec(def) else {
+        return Vec::new();
+    };
+    joined(join, position)
+        .on
+        .iter()
+        .filter_map(|term| {
+            [&term.lhs, &term.rhs]
+                .into_iter()
+                .find(|c| side_of_written(def, join, &c.table) == Some(Side::From))
                 .map(|c| c.column.clone())
         })
         .collect()
