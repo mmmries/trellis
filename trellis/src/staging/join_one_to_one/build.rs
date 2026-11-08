@@ -33,14 +33,14 @@
 //!   keys and the Re-derive read's keys must each be in K (#1375 C10).
 //! - **A sweep page** ([`rederive`]): a page of `a` Re-derives.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
 use tokio_postgres::Transaction;
 use tokio_postgres::types::ToSql;
 
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::defs::join::{JOINED, Side};
+use crate::defs::join::{Position, Side};
 use crate::defs::ledger as schema;
 use crate::metrics::{self, BuildStatement};
 use crate::pool::quote_ident;
@@ -48,8 +48,8 @@ use crate::pool::quote_ident;
 use super::super::apply::ApplyError;
 use super::super::target_mutations::TargetMutations;
 use super::{
-    Entries, JoinOneToOnePlan, JoinShape, KeyText, Record, WriteOrigin, apply_page, fold, held,
-    key_of, key_set, lock_keys, lock_side, rederive_read, update_side, write_target,
+    Entries, JoinOneToOnePlan, JoinShape, PageKeys, Record, WriteOrigin, apply_page, fold, held,
+    key_parts, key_set, lock_keys, lock_side, moved_key, rederive_read, update_side, write_target,
 };
 
 /// What one build chunk did.
@@ -87,9 +87,13 @@ pub(crate) async fn rederive(
             old_image: None,
         })
         .collect();
-    let (a, b) = match side {
-        Side::From => (records, Vec::new()),
-        Side::Joined(_) => (Vec::new(), records),
+    let mut b = vec![Vec::new(); shape.positions().len()];
+    let a = match side {
+        Side::From => records,
+        Side::Joined(position) => {
+            b[position.index()] = records;
+            Vec::new()
+        }
     };
     let plan = JoinOneToOnePlan {
         shape: shape.clone(),
@@ -121,10 +125,12 @@ pub(crate) async fn rederive(
 pub(crate) async fn m_batch(
     txn: &Transaction<'_>,
     shape: &std::sync::Arc<JoinShape>,
+    position: Position,
     m_pk: &[PrimaryKeyColumn],
     after: Option<&str>,
     limit: i64,
 ) -> Result<Option<String>, ApplyError> {
+    let table = shape.joined_at(position).table();
     let idents: Vec<String> = m_pk
         .iter()
         .map(|c| format!("t.{}", quote_ident(&c.name)))
@@ -136,7 +142,7 @@ pub(crate) async fn m_batch(
         .map(|(ident, c)| c.ordered(ident))
         .collect();
     let decoded: Vec<String> = match after {
-        Some(after) => ddl::split_pk_key(m_pk, &shape.first().table, after)?
+        Some(after) => ddl::split_pk_key(m_pk, table, after)?
             .into_iter()
             .map(|part| part.map(|c| c.into_owned()).unwrap_or_default())
             .collect(),
@@ -158,7 +164,7 @@ pub(crate) async fn m_batch(
             &format!(
                 "select ({k}) from {b} t where {not_null}{after_cmp} order by {order} limit $1",
                 k = ddl::pk_key_sql_expr(m_pk, Some("t")),
-                b = ddl::qualified_source_table(&shape.first().table),
+                b = ddl::qualified_source_table(table),
                 not_null = not_null.join(" and "),
                 order = order.join(", "),
             ),
@@ -169,7 +175,7 @@ pub(crate) async fn m_batch(
         .map(|row| row.get(0))
         .collect();
     metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
-    rederive(txn, shape, JOINED, &keys, false).await?;
+    rederive(txn, shape, Side::Joined(position), &keys, false).await?;
     let full = i64::try_from(keys.len()).is_ok_and(|n| n >= limit);
     Ok(if full { keys.last().cloned() } else { None })
 }
@@ -183,6 +189,7 @@ pub(crate) async fn m_batch(
 pub(crate) async fn m_null_batch(
     txn: &Transaction<'_>,
     shape: &std::sync::Arc<JoinShape>,
+    position: Position,
     m_pk: &[PrimaryKeyColumn],
     after: Option<&str>,
     limit: i64,
@@ -202,7 +209,7 @@ pub(crate) async fn m_null_batch(
                 "select k from (select ({k}) as k from {b} t where {nullable}) n \
                  where $2::text is null or k > $2 collate \"C\" \
                  order by k collate \"C\" limit $1",
-                b = ddl::qualified_source_table(&shape.first().table),
+                b = ddl::qualified_source_table(shape.joined_at(position).table()),
                 nullable = nullable.join(" or "),
             ),
             &[&limit, &after],
@@ -211,7 +218,7 @@ pub(crate) async fn m_null_batch(
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    rederive(txn, shape, JOINED, &keys, false).await?;
+    rederive(txn, shape, Side::Joined(position), &keys, false).await?;
     let full = i64::try_from(keys.len()).is_ok_and(|n| n >= limit);
     Ok(if full { keys.last().cloned() } else { None })
 }
@@ -228,6 +235,7 @@ pub(crate) async fn m_null_batch(
 pub(crate) async fn m_gone_batch(
     txn: &Transaction<'_>,
     shape: &std::sync::Arc<JoinShape>,
+    position: Position,
     m_pk: &[PrimaryKeyColumn],
     after: Option<&str>,
     limit: i64,
@@ -240,7 +248,7 @@ pub(crate) async fn m_gone_batch(
             &format!(
                 "select l.{key} from {m} l where not l.{tombstone} {after} \
                  order by l.{key} limit $1",
-                m = shape.first().m.ident,
+                m = shape.joined_at(position).m_ident(),
                 after = if after.is_some() {
                     format!("and l.{key} > $2")
                 } else {
@@ -257,7 +265,12 @@ pub(crate) async fn m_gone_batch(
     let present: HashSet<String> = if refs.is_empty() {
         HashSet::new()
     } else {
-        let probe = super::super::apply::live_rows_query(&shape.first().table, m_pk, &[], &refs)?;
+        let probe = super::super::apply::live_rows_query(
+            shape.joined_at(position).table(),
+            m_pk,
+            &[],
+            &refs,
+        )?;
         super::super::ledger::query_by_entry_key(
             txn,
             &format!("select m.k from ({}) m", probe.docs),
@@ -274,7 +287,7 @@ pub(crate) async fn m_gone_batch(
         .filter(|key| !present.contains(*key))
         .cloned()
         .collect();
-    rederive(txn, shape, JOINED, &gone, false).await?;
+    rederive(txn, shape, Side::Joined(position), &gone, false).await?;
     let full = i64::try_from(entries.len()).is_ok_and(|n| n >= limit);
     Ok(if full { entries.last().cloned() } else { None })
 }
@@ -353,10 +366,8 @@ pub(crate) async fn run_chunk(
             old_image: None,
         })
         .collect();
-    let live: Vec<KeyText> = rows
-        .iter()
-        .filter_map(|row| key_of(row, 1, arity))
-        .collect();
+    let live: Vec<Vec<Option<String>>> =
+        rows.iter().map(|row| key_parts(row, 1, arity)).collect();
     let records = fold(&records);
 
     // 2. The lock row, K, then `J`.
@@ -365,7 +376,8 @@ pub(crate) async fn run_chunk(
         &[],
     )
     .await?;
-    let k = key_set(txn, shape, Side::From, &records, &live).await?;
+    let mut k = shape.empty_keys();
+    key_set(txn, shape, Side::From, &records, &live, &mut k).await?;
     // Test-only pause point. See `super::super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::super::interleave::pause_at(
@@ -450,7 +462,7 @@ async fn insert_from_read(
     range: &str,
     bounds: &[&(dyn ToSql + Sync)],
     keys: &[&str],
-    k: &BTreeSet<KeyText>,
+    k: &PageKeys,
 ) -> Result<HashSet<String>, ApplyError> {
     let key = quote_ident(schema::KEY_COLUMN);
     let basis = quote_ident(schema::BASIS_COLUMN);
@@ -495,8 +507,7 @@ async fn insert_from_read(
     if !unchecked
         && rows
             .iter()
-            .filter_map(|row| key_of(row, 1, arity))
-            .any(|key| !k.contains(&key))
+            .any(|row| moved_key(shape, Side::From, &key_parts(row, 1, arity), k))
     {
         #[cfg(any(test, feature = "test-util"))]
         super::super::interleave::note_join_key_moved();

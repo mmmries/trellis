@@ -144,13 +144,11 @@ fn key_match_sql(at: &JoinedPosition, alias: &str, j: bool, first_param: usize) 
 pub(super) async fn split(
     txn: &Transaction<'_>,
     plan: &JoinOneToOnePlan,
+    at: &JoinedPosition,
     keys: &BTreeSet<KeyText>,
     seg_seq: i64,
 ) -> Result<BTreeSet<KeyText>, ApplyError> {
     let shape = &*plan.shape;
-    // A page's fan-out is of the first position's `M`: the only one a
-    // two-table JOIN has.
-    let at = shape.first();
     let keys: Vec<&KeyText> = keys.iter().collect();
     let mut remaining = chunk_rows();
     let mut inline: BTreeSet<KeyText> = BTreeSet::new();
@@ -628,7 +626,7 @@ async fn chunk_in(
     let next = (entries.len() > rows).then(|| entries[rows - 1].clone());
     let batch = &entries[..entries.len().min(rows)];
     let mut mutations = TargetMutations::new();
-    super::write_fan_out(txn, shape, batch, &origin, seg_seq, &mut mutations, held).await?;
+    super::write_fan_out(txn, shape, at, batch, &origin, seg_seq, &mut mutations, held).await?;
     let n_params = n + 1;
     match &next {
         Some(next) => {
