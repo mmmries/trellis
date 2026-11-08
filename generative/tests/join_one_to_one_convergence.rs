@@ -461,6 +461,31 @@ proptest! {
 /// each. Rates are of the 24 cases of seeds 1 to 4 (six cases each).
 const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
     (
+        "star_root_skip_j_last",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781); join_star_root's ps1a, ps2, ps5 and cx_f2e pin it",
+    ),
+    (
+        "star_root_skip_j_first",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781); join_star_root's ps1b and cx_f2e pin it",
+    ),
+    (
+        "star_root_skip_j_middle",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781); join_star_root's a_root_moving_every_key_races_a_change_of_its_new_key_at_the_middle_position pin it",
+    ),
+    (
+        "star_late_skip_last",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781); join_star_root's ps4a pin it",
+    ),
+    (
+        "star_late_skip_first",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781); join_star_root's ps4b pin it",
+    ),
+    (
         "star_j_unsorted",
         "it leaves the J statements unsorted, which only changes the order two pages queue \
          on J rows in: a deadlock, which the engine retries, never a wrong row; the unit \

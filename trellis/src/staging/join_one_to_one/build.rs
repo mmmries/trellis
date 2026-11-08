@@ -366,8 +366,7 @@ pub(crate) async fn run_chunk(
             old_image: None,
         })
         .collect();
-    let live: Vec<Vec<Option<String>>> =
-        rows.iter().map(|row| key_parts(row, 1, arity)).collect();
+    let live: Vec<Vec<Option<String>>> = rows.iter().map(|row| key_parts(row, 1, arity)).collect();
     let records = fold(&records);
 
     // 2. The lock row, K, then `J`.

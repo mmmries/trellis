@@ -626,7 +626,17 @@ async fn chunk_in(
     let next = (entries.len() > rows).then(|| entries[rows - 1].clone());
     let batch = &entries[..entries.len().min(rows)];
     let mut mutations = TargetMutations::new();
-    super::write_fan_out(txn, shape, at, batch, &origin, seg_seq, &mut mutations, held).await?;
+    super::write_fan_out(
+        txn,
+        shape,
+        at,
+        batch,
+        &origin,
+        seg_seq,
+        &mut mutations,
+        held,
+    )
+    .await?;
     let n_params = n + 1;
     match &next {
         Some(next) => {
