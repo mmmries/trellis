@@ -77,8 +77,7 @@ pub fn definable(shape: Shape) -> bool {
 }
 
 /// Whether `shape`'s pins can run in this process: it is [`definable`].
-/// A star's build and its root and joined apply run (#1773); its joined
-/// tables' writers take the R-entry rule only from #1774.
+/// A star's build and its root and joined apply run (#1773, #1774).
 pub fn runnable(shape: Shape) -> bool {
     definable(shape)
 }
@@ -86,6 +85,13 @@ pub fn runnable(shape: Shape) -> bool {
 /// Whether `shape`'s pins that `TRUNCATE` a joined table can run: a star's
 /// page halts on one ("whose apply is not built yet") until #1776.
 pub fn truncate_runnable(shape: Shape) -> bool {
+    definable(shape) && shape.positions == 1
+}
+
+/// Whether `shape`'s pins whose fan-out goes past one chunk can run: a
+/// star's page halts on one (its chunks don't take the R-entry rule) until
+/// #1775.
+pub fn chunked_fan_out_runnable(shape: Shape) -> bool {
     definable(shape) && shape.positions == 1
 }
 

@@ -40,16 +40,30 @@
 //!    this [`join1_m_before_j`].
 //! 4. **Entries.** The `R` placeholders and entry lock, then `M`'s
 //!    ([`super::one_to_one_ledger::lock_entries`], I5)
-//!    [`join1_no_placeholder`, `join1_no_entry_lock`]. After each, every
-//!    held key, at every position, is checked against K: one outside it
+//!    [`join1_no_placeholder`, `join1_no_entry_lock`]. The `R` statement
+//!    also locks the entries of every row the page's joined changes fan
+//!    out to: the R-entry rule (#1459). A joined change's fan-out keys are
+//!    its keys in K (new, old and the key `M` holds), and of their rows
+//!    the page locks those it recomputes itself, within the fan-out budget
+//!    (one per page, summed over positions, [`fan_out::budget`]). Root
+//!    entries and fan-out rows of every position are locked in **one**
+//!    sorted statement: split per position, two pages fanning out at
+//!    crossing positions deadlock [`star_r_split`]. Nothing reads `M`
+//!    before it [`star_own_j_only`, `star_r_after_m`, `star_last_no_r`].
+//!    After each lock, every held key is checked: a root entry's at every
+//!    position against K, a joined entry's against the page's fan-out keys
+//!    at its position, not K (F11): a key K holds only for a root item
+//!    would let the page recompute rows on it without their `R` entries
+//!    [`star_recheck_j`, `star_recheck_skip_last`]. One outside its set
 //!    moved after K was read, so the page rolls back with
 //!    [`ApplyError::JoinKeyMoved`] and retries [`join1_no_recheck`,
 //!    `star_late_skip_*`]. The entry lock also orders the writers of a
 //!    `NULL`-keyed row, which has no `J` row.
 //! 5. **Re-derive read.** For each side, one statement reads its Re-derive
 //!    rows live and `pg_current_snapshot()`, which becomes those entries'
-//!    basis [`join1_snapshot_after_read`]. A key it reads outside K (the row
-//!    moved after the unlocked read) rolls the page back the same way
+//!    basis [`join1_snapshot_after_read`]. A key it reads outside its set
+//!    (K, or a joined row's fan-out keys; the row moved after the unlocked
+//!    read) rolls the page back the same way
 //!    [`join1_rd_no_key`, `join1_brd_no_key`]: taking that key's `J` late
 //!    would break the lock order. A `b` Re-derive's entry fans out like a
 //!    `b` change's.
@@ -66,29 +80,37 @@
 //!    ([`write_a_changes`]). Then the fan-out of each position in position
 //!    order ([`fan_out`]): every other live `R` entry on a key a changed `M` entry
 //!    held before the page or holds after it is recomputed the same way, in
-//!    sorted keyset batches of 10k, one statement each, for the keys whose
-//!    entries fit one chunk between them; every other key is left to the
-//!    chunks of its pending marker ([`fan_out`]'s module), which the page
-//!    writes. Fields are rendered SQL, never evaluated in Rust. A
+//!    sorted keyset batches of 10k, one statement each, a position's
+//!    batches apart from the next's (#1464 Q2: the `R` entries order every
+//!    writer of a row), for the keys within the budget; every other key is
+//!    left to the chunks of its pending marker ([`fan_out`]'s module), which
+//!    the page writes. A star's page halts there instead, until its chunks
+//!    take the R-entry rule (#1775). Fields are rendered SQL, never
+//!    evaluated in Rust. A
 //!    field that fails on a row of either write holds that row of `a` in
 //!    quarantine on this first failure, once a bisection under savepoints
 //!    has named the rows and fields, and the rest of the page commits
 //!    ([`held`]); a row held already is left out of the fan-out.
 //!
-//! The lock order is the lock row, `J` sorted, `R` entries sorted, `M`
-//! entries sorted, then target rows, sorted within each statement. A page
+//! The lock order is the lock row, `J` sorted, `R` entries (the root's and
+//! the fan-out rows) sorted in one statement, `M` entries sorted, then
+//! target rows, sorted within each statement. A page
 //! that may hold rows of `a` in quarantine (one with `a` records, or whose
 //! fan-out may hold rows) takes its definition's row `FOR KEY SHARE` before
 //! the lock row ([`lock_definitions`]), as a rebuild's start takes it before
 //! the lock row. The
 //! target rows are not locked ahead across statements, and need not be: each
 //! one is written only by a page that holds `J` for the key its `R` entry
-//! has. An `a` page holds `J` for every key its entries hold (the held-key
-//! check), and a `b` page reads the entries it fans out to after locking
-//! their key, which no writer of an entry can leave or reach without the
-//! same lock. So two pages that write one target row queue on a `J` row
-//! before either locks it, whatever order their statements take, and a chunk
-//! of a pending fan-out takes the same `J` row.
+//! has, or that row's `R` entry. An `a` page holds `J` for every key its
+//! entries hold at every position (the held-key check), and a `b` page reads
+//! the entries it fans out to after locking their key, which no writer of an
+//! entry can leave or reach without the same lock, and locks those entries.
+//! Two writers of one row share a lock that orders them: two root writers
+//! `J` and `R`, a root writer and a joined one `J` at that position, and
+//! writers at two positions the row's `R` entry. So they queue before
+//! either locks the target row, whatever order their statements take, and a
+//! chunk of a pending fan-out takes the same `J` row (at one position, where
+//! `J` alone orders it).
 //!
 //! **Readers.** Every write of the target is recorded in the seam
 //! (`super::target_mutations`) when something reads the target: a page's
