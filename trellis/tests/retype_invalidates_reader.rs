@@ -252,7 +252,11 @@ async fn a_resume_that_retypes_a_column_pauses_the_readers_define_would_refuse()
     assert_eq!(column_type(&raw, "public.sums", "total").await, "numeric");
     for reader in ["sums", "cnt", "c"] {
         let reported = trellis.status(reader).await.expect("status").expect(reader);
-        assert_eq!(reported.status, TransformStatus::Live, "{reader}: {reported:?}");
+        assert_eq!(
+            reported.status,
+            TransformStatus::Live,
+            "{reader}: {reported:?}"
+        );
     }
     trellis.shutdown().await.expect("shutdown");
 }
@@ -527,7 +531,11 @@ async fn a_source_retype_to_unscaled_numeric_keeps_its_sum_readers_exact() {
         .expect("the value leaves");
     drain_to_quiescence(&db.pool, &mut raw).await;
     for reader in ["agg", "j"] {
-        assert_eq!(status(&raw, reader).await, TransformStatus::Live, "{reader}");
+        assert_eq!(
+            status(&raw, reader).await,
+            TransformStatus::Live,
+            "{reader}"
+        );
         assert_sums_exact(&raw, reader, "public.src", "price").await;
     }
     trellis.shutdown().await.expect("shutdown");

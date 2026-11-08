@@ -127,7 +127,11 @@ async fn numeric_tables(
         );
         let fa = from.len();
         let pair = |numeric: &[bool], summed: &[bool]| -> Vec<(bool, bool)> {
-            numeric.iter().copied().zip(summed.iter().copied()).collect()
+            numeric
+                .iter()
+                .copied()
+                .zip(summed.iter().copied())
+                .collect()
         };
         let all = [from.clone(), joined.clone()].concat();
         vec![
@@ -210,7 +214,10 @@ pub(crate) async fn convert_table(
         .collect();
     let nan: bool = txn
         .query_one(
-            &format!("select exists (select 1 from {t} where {})", nan.join(" or ")),
+            &format!(
+                "select exists (select 1 from {t} where {})",
+                nan.join(" or ")
+            ),
             &[],
         )
         .await?

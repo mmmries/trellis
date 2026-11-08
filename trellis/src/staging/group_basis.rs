@@ -2283,7 +2283,10 @@ impl GroupTargetPlan {
             flags = if flags.is_empty() {
                 "null::boolean[]".to_string()
             } else {
-                format!("(select array[{}]::boolean[] from staged)", flags.join(", "))
+                format!(
+                    "(select array[{}]::boolean[] from staged)",
+                    flags.join(", ")
+                )
             },
         )
     }
@@ -2520,7 +2523,11 @@ impl GroupTargetPlan {
         condition: Option<&str>,
     ) -> String {
         let arg = &self.shape.args[i - 1];
-        let zero = |part: SumPart| staged_parts.as_ref().is_some_and(|p| p.zero.contains(&(i, part)));
+        let zero = |part: SumPart| {
+            staged_parts
+                .as_ref()
+                .is_some_and(|p| p.zero.contains(&(i, part)))
+        };
         if zero(part) {
             return part.zero().to_string();
         }
@@ -2568,14 +2575,19 @@ impl GroupTargetPlan {
                 // ([`Self::staged_total`]) is never read per transaction.
                 let derived = *part == SumPart::Scales
                     && arg.scale.is_some()
-                    && staged_parts.as_ref().is_some_and(|p| p.uniform.contains(&i));
+                    && staged_parts
+                        .as_ref()
+                        .is_some_and(|p| p.uniform.contains(&i));
                 if derived {
                     sums.push(format!("{NO_SCALES} as {staged}"));
                 } else {
                     sums.push(format!("{total} as {staged}"));
                 }
                 totals.push(format!("{total} as {staged}"));
-                if staged_parts.as_ref().is_some_and(|p| p.zero.contains(&(i, *part))) {
+                if staged_parts
+                    .as_ref()
+                    .is_some_and(|p| p.zero.contains(&(i, *part)))
+                {
                     // Every staged side holds 0 of it: the row keeps its value.
                 } else {
                     sets.push(format!(
