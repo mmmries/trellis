@@ -2520,7 +2520,7 @@ pub fn validate_join(
     check_join_collation_reads(def, join, left, joined)?;
     // The target and each hidden table carry columns per field (two per
     // distinct aggregate argument in the partials).
-    for (table, columns) in super::join::table_widths(def, left, right) {
+    for (table, columns) in super::join::table_widths(def, left, joined[0]) {
         check_table_width(|| table, columns)?;
     }
     Ok(())
