@@ -3893,7 +3893,7 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
         .get(0);
     let Some((id, status)) = lock_frozen(
         &txn,
-        "split_part(target_table, '.', 2)",
+        "split_part(d.target_table, '.', 2)",
         &target,
         &fenced_source,
     )
@@ -3962,7 +3962,7 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
 }
 
 /// The first steps of a resume of the definition sourced from
-/// `fenced_source` and found by `column = value`: bumps the source's version
+/// `fenced_source` and found by `column = value` (`column` an expression over the definition row `d`): bumps the source's version
 /// fence, then locks the definition's row and reads its id and status.
 /// `None` if it's gone, or was dropped and defined again on another source.
 ///
@@ -3986,7 +3986,7 @@ async fn lock_frozen(
     let joined = catalog::joined_tables_array_sql("d");
     let fenced_join: Vec<String> = txn
         .query_opt(
-            &format!("select {joined} from transform_definitions d where d.{column} = $1"),
+            &format!("select {joined} from transform_definitions d where {column} = $1"),
             &[value],
         )
         .await?
@@ -4003,7 +4003,7 @@ async fn lock_frozen(
         .query_opt(
             &format!(
                 "select d.id, d.source_table, d.status, {joined} from transform_definitions d \
-                 where d.{column} = $1 for update of d"
+                 where {column} = $1 for update of d"
             ),
             &[value],
         )
@@ -4901,7 +4901,7 @@ async fn resume_caused_definition(
     };
     let source_table: String = row.get(0);
     let target: String = row.get(1);
-    let Some((_, status)) = lock_frozen(&txn, "id", &id, &source_table).await? else {
+    let Some((_, status)) = lock_frozen(&txn, "d.id", &id, &source_table).await? else {
         return Ok(());
     };
     // Re-read under the lock: an operator's `RESUME` that committed first
@@ -5262,7 +5262,7 @@ async fn finish_requested_resume(
     }
 
     let txn = client.transaction().await?;
-    let Some((locked, status)) = lock_frozen(&txn, "id", &id, &source_table).await? else {
+    let Some((locked, status)) = lock_frozen(&txn, "d.id", &id, &source_table).await? else {
         return Ok(());
     };
     let requested: bool = txn
@@ -5556,7 +5556,10 @@ async fn record_transient_retry(
     retry: &TransientRetry<'_>,
 ) -> Result<(), ApplyError> {
     let txn = client.transaction().await?;
-    if lock_frozen(&txn, "id", &id, source_table).await?.is_none() {
+    if lock_frozen(&txn, "d.id", &id, source_table)
+        .await?
+        .is_none()
+    {
         return Ok(());
     }
     let cancels: Option<i32> = if retry.timeout_cancel {
@@ -5654,7 +5657,10 @@ async fn rewrite_waiting(
     error: &str,
 ) -> Result<(), ApplyError> {
     let txn = client.transaction().await?;
-    if lock_frozen(&txn, "id", &id, source_table).await?.is_none() {
+    if lock_frozen(&txn, "d.id", &id, source_table)
+        .await?
+        .is_none()
+    {
         return Ok(());
     }
     let requested: bool = txn
@@ -5686,7 +5692,10 @@ async fn end_request(
     error: &str,
 ) -> Result<(), ApplyError> {
     let txn = client.transaction().await?;
-    if lock_frozen(&txn, "id", &id, source_table).await?.is_none() {
+    if lock_frozen(&txn, "d.id", &id, source_table)
+        .await?
+        .is_none()
+    {
         return Ok(());
     }
     let ended = txn

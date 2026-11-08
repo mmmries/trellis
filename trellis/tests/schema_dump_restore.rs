@@ -599,6 +599,93 @@ async fn a_row_this_release_cannot_run_is_stored_paused() {
     );
 }
 
+/// A queue that carries a definition's joined tables after the first
+/// (`later_join_tables`, #1770): a row this release can't run is stored
+/// paused with every joined table, its fence and its edge, and the dump of
+/// the loaded database writes the same list again. A dump with no such
+/// definition keeps the shape without the column.
+#[tokio::test]
+async fn a_queue_with_later_joined_tables_round_trips_them() {
+    let cluster = TestCluster::start();
+    let (loaded, _) = load_edited_keeping_the_appendix(&cluster, |sql| {
+        assert!(
+            !sql.contains("later_join_tables"),
+            "a dump of definitions that join one table each keeps the shape without the column"
+        );
+        sql.lines()
+            .map(|line| {
+                if line.starts_with("create table \"trellis\".restore_queue") {
+                    line.replace(
+                        "floor_version text not null);",
+                        "floor_version text not null, later_join_tables text[] not null);",
+                    )
+                } else if line.contains("'public.oc'") {
+                    line.replace(", '0.2.0');", ", '9.9.9', array['public.r']::text[]);")
+                } else if line.starts_with("insert into \"trellis\".restore_queue") {
+                    line.replace(");", ", array[]::text[]);")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    })
+    .await;
+    let after = connect_raw(loaded.dsn()).await;
+    let config = Config::from_dsn(loaded.dsn().to_string())
+        .expect("dsn")
+        .with_binary_version("0.2.0");
+    let t = facade_with(config).await;
+    t.migrate().await.expect("migrate restores the queue");
+    assert_eq!(
+        rows_json(
+            &after,
+            "select jsonb_build_array(d.status, d.join_table, j.position, j.table_name, j.columns) \
+             from trellis.transform_definitions d \
+             join trellis.definition_join_tables j on j.transform_id = d.id \
+             where d.target_table = 'public.oc'",
+        )
+        .await,
+        [r#"["paused", "public.cats", 2, "public.r", {}]"#],
+    );
+    assert_eq!(
+        count(
+            &after,
+            "select count(*) from trellis.schema_edges e \
+             join trellis.schema_nodes f on f.id = e.from_node_id \
+             join trellis.schema_nodes t on t.id = e.to_node_id \
+             where t.table_name = 'public.oc' and e.kind = 'join' \
+               and f.table_name in ('public.cats', 'public.r')",
+        )
+        .await,
+        2,
+        "a join edge from each joined table"
+    );
+    assert_eq!(
+        count(
+            &after,
+            "select count(*) from trellis.source_table_versions where source_table = 'public.r'",
+        )
+        .await,
+        1,
+        "the later joined table has its fence"
+    );
+    let appendix = t.schema_dump().await.expect("schema dump").appendix;
+    assert!(
+        appendix.contains("floor_version text not null, later_join_tables text[] not null);"),
+        "{appendix}"
+    );
+    assert!(
+        appendix.contains("'9.9.9', array['public.r']::text[]);"),
+        "{appendix}"
+    );
+    assert!(
+        appendix.contains("'public.o1', null,") && appendix.contains(", array[]::text[]);"),
+        "{appendix}"
+    );
+}
+
 /// A dump whose every row has a floor above the loading release: each is
 /// stored paused, and a release that meets the floor rebuilds each on
 /// `RESUME` but a 1-1 definition, which has no ledger and refuses

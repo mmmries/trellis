@@ -1248,6 +1248,29 @@ mod tests {
     }
 
     #[test]
+    fn a_definition_s_joined_tables_are_named_in_order() {
+        assert_eq!(joined_with(&[]), "");
+        assert_eq!(joined_with(&["s.b"]), " joined with s.b");
+        assert_eq!(joined_with(&["s.b", "s.c"]), " joined with s.b and s.c");
+        assert_eq!(
+            joined_with(&["s.b", "s.c", "s.d"]),
+            " joined with s.b, s.c and s.d"
+        );
+    }
+
+    /// A reader of any joined table, not only the first, is restored after
+    /// the definition that targets it.
+    #[test]
+    fn a_reader_of_a_later_joined_table_is_restored_after_its_upstream() {
+        let order = restore_order(vec![
+            recorded_joining(1, "s.x", "s.v", vec!["s.y", "s.u"]),
+            recorded(2, "s.z", "s.u", None),
+        ]);
+        let ids: Vec<i64> = order.iter().map(|d| d.id).collect();
+        assert_eq!(ids, [2, 1]);
+    }
+
+    #[test]
     fn a_reader_is_restored_after_its_upstream() {
         // `c` was altered to read `d`'s target, which was defined after it;
         // `e` joins `b`'s target.

@@ -672,4 +672,109 @@ mod tests {
             .await;
         assert!(refused.is_err(), "a floor is a release: {refused:?}");
     }
+
+    /// #1770: the migration that adds `definition_join_tables` leaves a
+    /// JOIN definition stored before it as it was, and every reader of the
+    /// joined tables reads its `join_table` as position 1 and nothing after
+    /// it. It raises no floor.
+    #[tokio::test]
+    async fn the_joined_tables_migration_reads_an_existing_join_as_position_one() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let config = Config::from_dsn(db.dsn().to_string()).expect("dsn");
+        let pool = Pool::new(&config).expect("pool");
+        let mut client = pool.connect_unpooled().await.expect("connect");
+        identity::prepare_attach(&mut client, &config)
+            .await
+            .expect("prepare");
+        let migrations = Migrations::embedded();
+        let joined_migration = migrations
+            .list
+            .iter()
+            .find(|migration| migration.name() == "definition_join_tables")
+            .expect("the joined tables migration")
+            .version();
+        run_up_to(&mut client, &migrations, joined_migration - 1)
+            .await
+            .expect("migrate to before");
+        let floor_before: String = client
+            .query_one("select version from catalog_floor", &[])
+            .await
+            .expect("floor")
+            .get(0);
+        let stored = "insert into source_table_versions (source_table, version) \
+             values ('public.a', 1), ('public.s', 1); \
+             insert into transform_definitions \
+             (target_table, source_table, source_version, definition_text, status, \
+              join_table, join_columns) \
+             values ('public.v', 'public.a', 1, \
+                     'TRANSFORM v FROM a JOIN b ON a.k = b.k SELECT b.x AS x', 'live', \
+                     'public.b', '{\"x\": \"text\"}'), \
+                    ('public.t', 'public.s', 1, 'TRANSFORM t FROM s SELECT a AS a', 'live', \
+                     null, null)";
+        client
+            .batch_execute(stored)
+            .await
+            .expect("definitions stored before the migration");
+        let row_before: String = client
+            .query_one(
+                "select row_to_json(d)::text from transform_definitions d where target_table = 'public.v'",
+                &[],
+            )
+            .await
+            .expect("row")
+            .get(0);
+
+        run_up_to_latest(&mut client, &migrations)
+            .await
+            .expect("migrate");
+
+        let row_after: String = client
+            .query_one(
+                "select row_to_json(d)::text from transform_definitions d where target_table = 'public.v'",
+                &[],
+            )
+            .await
+            .expect("row")
+            .get(0);
+        assert_eq!(row_after, row_before, "the definition row is unchanged");
+        let ids: Vec<i64> = client
+            .query("select id from transform_definitions order by id", &[])
+            .await
+            .expect("ids")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let joined = crate::defs::catalog::joined_tables_of(&client, ids[0])
+            .await
+            .expect("joined tables");
+        assert_eq!(joined, ["public.b"]);
+        let sides = crate::defs::catalog::join_sides_of(&client, ids[0])
+            .await
+            .expect("join sides");
+        assert_eq!(sides.len(), 1);
+        assert_eq!(sides[0].0, "public.b");
+        assert_eq!(sides[0].1.len(), 1, "{:?}", sides[0].1);
+        assert!(
+            crate::defs::catalog::joined_tables_of(&client, ids[1])
+                .await
+                .expect("joined tables")
+                .is_empty()
+        );
+        let floor_after: String = client
+            .query_one("select version from catalog_floor", &[])
+            .await
+            .expect("floor")
+            .get(0);
+        assert_eq!(floor_after, floor_before, "the migration raises no floor");
+        // Position 1 is the definition row's own: a row for it is refused.
+        let refused = client
+            .execute(
+                "insert into definition_join_tables (transform_id, position, table_name, columns) \
+                 values ($1, 1, 'public.c', '{}')",
+                &[&ids[0]],
+            )
+            .await;
+        assert!(refused.is_err(), "{refused:?}");
+    }
 }
