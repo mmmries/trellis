@@ -79,7 +79,9 @@ impl Position {
 
     /// The position numbered `number`, if a `JOIN` may have one there.
     pub(crate) fn from_number(number: usize) -> Option<Self> {
-        (1..=MAX_POSITIONS).contains(&number).then_some(Self(number))
+        (1..=MAX_POSITIONS)
+            .contains(&number)
+            .then_some(Self(number))
     }
 
     /// This position's number: 1 for the first joined table.

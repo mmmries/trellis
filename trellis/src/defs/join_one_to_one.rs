@@ -547,14 +547,19 @@ mod tests {
     #[test]
     fn hidden_tables_are_named_by_definition_id_apart_from_an_aggregate_joins() {
         assert_eq!(HiddenTable::FromEntries.name(7), "join1_7_r");
-        assert_eq!(HiddenTable::JoinedEntries.name(7), "join1_7_m");
+        assert_eq!(M.name(7), "join1_7_m");
+        assert_eq!(
+            HiddenTable::JoinedEntries(Position::from_number(3).unwrap()).name(7),
+            "join1_7_m3"
+        );
         assert_eq!(HiddenTable::Keys.name(7), "join1_7_j");
         assert_eq!(HiddenTable::TruncateLock.name(7), "join1_7_l");
         assert_eq!(
             HiddenTable::FromEntries.qualified("trellis", 7),
             "\"trellis\".\"join1_7_r\""
         );
-        for table in HiddenTable::ALL {
+        let def = parse(DEF).unwrap();
+        for table in HiddenTable::all(&def) {
             assert!(
                 !crate::defs::join::HiddenTable::ALL
                     .iter()
@@ -564,7 +569,8 @@ mod tests {
         assert_eq!(
             drop_hidden_tables_sql("trellis", 7),
             "drop table if exists \"trellis\".\"join1_7_r\", \"trellis\".\"join1_7_m\", \
-             \"trellis\".\"join1_7_j\", \"trellis\".\"join1_7_l\"; \
+             \"trellis\".\"join1_7_m2\", \"trellis\".\"join1_7_m3\", \
+             \"trellis\".\"join1_7_m4\", \"trellis\".\"join1_7_j\", \"trellis\".\"join1_7_l\"; \
              delete from \"trellis\".join1_fan_out where transform_id = 7"
         );
     }
@@ -576,7 +582,11 @@ mod tests {
         let def = parse(DEF).unwrap();
         let (from, joined) = sides();
         let created = crate::defs::ddl::declared_column_counts(&hidden_tables_ddl(
-            "trellis", 7, &def, &from, &joined,
+            "trellis",
+            7,
+            &def,
+            &from,
+            &[&joined],
         ));
         let created = |name: &str| {
             created
@@ -607,7 +617,7 @@ mod tests {
     fn the_hidden_tables_ddl_holds_the_ledger_the_join_key_and_the_columns_read() {
         let def = parse(DEF).unwrap();
         let (from, joined) = sides();
-        let ddl = hidden_tables_ddl("trellis", 7, &def, &from, &joined);
+        let ddl = hidden_tables_ddl("trellis", 7, &def, &from, &[&joined]);
         // `R`: the ledger, the join key in `ON` order, then what the fields
         // read of `a`; both indexes the ledger's collection needs.
         assert!(
@@ -632,14 +642,19 @@ mod tests {
             ),
             "{ddl}"
         );
-        // `J`: one row per join key, with no match count.
+        // `J`: one row per `(position, join key)`, with no match count; the
+        // two-table JOIN's is position 1 with one group.
         assert!(
             ddl.contains(
-                "create table \"trellis\".\"join1_7_j\" (\"cust\" integer, \"tenant\" integer, \
-                 primary key (\"cust\", \"tenant\"));\n"
+                "create table \"trellis\".\"join1_7_j\" (position smallint not null \
+                 check (position between 1 and 1), \"p1_cust\" integer, \"p1_tenant\" integer, \
+                 check (position <> 1 or (\"p1_cust\" is not null and \"p1_tenant\" is not null)));\n\
+                 create unique index on \"trellis\".\"join1_7_j\" (\"p1_cust\", \"p1_tenant\") \
+                 where position = 1;\n"
             ),
             "{ddl}"
         );
+        assert!(!ddl.contains("primary key (\"p1_"), "{ddl}");
         assert!(
             ddl.contains("\"join1_7_l\" (id boolean primary key default true check (id))"),
             "{ddl}"

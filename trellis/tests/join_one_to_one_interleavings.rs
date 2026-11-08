@@ -248,7 +248,9 @@ async fn the_build_fills_the_target_r_m_and_j_from_the_live_tables() {
     assert_eq!(m.len(), 3, "{m:?}");
     // `J` holds the non-null keys of both sides.
     let j = d
-        .rows(&format!("select k from {schema}.join1_{id}_j order by 1"))
+        .rows(&format!(
+            "select p1_k from {schema}.join1_{id}_j order by 1"
+        ))
         .await;
     assert_eq!(j, ["(10)", "(20)", "(30)", "(40)"]);
 }
@@ -317,7 +319,7 @@ impl BWriter {
         client.batch_execute("begin").await.expect("begin");
         client
             .batch_execute(&format!(
-                "select 1 from {schema}.join1_{id}_j where k = {key} for update; \
+                "select 1 from {schema}.join1_{id}_j where position = 1 and p1_k = {key} for update; \
                  update public.b set w = {w} where k = {key}; \
                  update {schema}.join1_{id}_m set w = {w} where k = {key}; \
                  update {} t set total = a.x + {w} from public.a a \
@@ -2044,7 +2046,9 @@ async fn a_truncate_of_a_empties_r_and_the_target_and_later_inserts_apply() {
         let id = definition_id(&d, kind.target()).await;
         let schema = trellis::config::DEFAULT_SCHEMA;
         let j_before = d
-            .rows(&format!("select k from {schema}.join1_{id}_j order by 1"))
+            .rows(&format!(
+                "select p1_k from {schema}.join1_{id}_j order by 1"
+            ))
             .await;
         step(&mut d, "truncate public.a").await;
         assert_eq!(
@@ -2066,8 +2070,10 @@ async fn a_truncate_of_a_empties_r_and_the_target_and_later_inserts_apply() {
             "{kind:?}: M is untouched"
         );
         assert_eq!(
-            d.rows(&format!("select k from {schema}.join1_{id}_j order by 1"))
-                .await,
+            d.rows(&format!(
+                "select p1_k from {schema}.join1_{id}_j order by 1"
+            ))
+            .await,
             j_before,
             "{kind:?}: J keeps its rows"
         );

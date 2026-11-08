@@ -130,6 +130,8 @@ use tokio_postgres::types::{PgLsn, ToSql};
 pub(crate) mod build;
 pub(crate) mod fan_out;
 pub(crate) mod held;
+#[cfg(test)]
+mod j_tests;
 
 use crate::defs::ast::{Expr, JoinKind, TransformDef};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
@@ -352,9 +354,11 @@ impl JoinShape {
                 |table: HiddenTable| format!("{schema_name}.{}", table.name(definition.id));
             let a =
                 under_hidden_collations(&**client, a, &hidden(HiddenTable::FromEntries)).await?;
-            let b = under_hidden_collations(&**client, b, &hidden(HiddenTable::JoinedEntries(
-                Position::FIRST,
-            )))
+            let b = under_hidden_collations(
+                &**client,
+                b,
+                &hidden(HiddenTable::JoinedEntries(Position::FIRST)),
+            )
             .await?;
             (joined, a, b)
         };
@@ -2133,7 +2137,8 @@ async fn fan_out_failure(
         Side::Joined(_) => format!(
             "a change of {} whose fan-out fails on more rows of {} than {MAX_FAN_OUT_PROBES} \
              attempts to isolate them name: {named}, and maybe more",
-            shape.first().table, shape.source_table,
+            shape.first().table,
+            shape.source_table,
         ),
         Side::From => format!(
             "changes of {} that fail on more of its rows than {MAX_FAN_OUT_PROBES} attempts \

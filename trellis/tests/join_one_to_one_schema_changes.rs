@@ -539,9 +539,10 @@ async fn an_on_column_retyped_on_one_side_pauses_until_the_pair_matches_again() 
             )
             .await;
             resume(&d, kind.name()).await;
-            for part in ["r", "m", "j"] {
+            // `J`'s column for `a.k` at position 1 is `p1_k`.
+            for (part, column) in [("r", "k"), ("m", "k"), ("j", "p1_k")] {
                 assert_eq!(
-                    hidden_type(&d, &target, part, "k").await,
+                    hidden_type(&d, &target, part, column).await,
                     "bigint",
                     "{kind:?}: {part} is created again at the pair's new type"
                 );
@@ -585,8 +586,8 @@ async fn an_on_pair_widened_on_both_sides_pauses_and_resume_creates_j_again() {
         assert!(error.contains("join1_"), "{kind:?}: {error}");
         resume(&d, kind.name()).await;
         assert_eq!(status(&d, &target).await, "waiting_to_backfill");
-        for part in ["r", "m", "j"] {
-            assert_eq!(hidden_type(&d, &target, part, "k").await, "bigint");
+        for (part, column) in [("r", "k"), ("m", "k"), ("j", "p1_k")] {
+            assert_eq!(hidden_type(&d, &target, part, column).await, "bigint");
         }
         assert_exact(&mut d, kind, "the resume").await;
         step(

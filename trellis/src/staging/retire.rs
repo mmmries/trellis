@@ -703,11 +703,15 @@ mod ledger_tables_tests {
     /// renders them as the catalog creates them.
     #[test]
     fn ledger_tables_sql_names_the_hidden_ledgers() {
-        assert!(ledger_tables_sql().contains(
-            "c.relname in ( ('join1_' || d.id || '_r'), ('join1_' || d.id || '_m'), \
+        assert!(
+            ledger_tables_sql().contains(
+                "c.relname in ( ('join1_' || d.id || '_r'), ('join1_' || d.id || '_m'), \
              ('join1_' || d.id || '_m2'), ('join1_' || d.id || '_m3'), \
              ('join1_' || d.id || '_m4')) \
              and c.relnamespace"
-        ), "{}", ledger_tables_sql());
+            ),
+            "{}",
+            ledger_tables_sql()
+        );
     }
 }
