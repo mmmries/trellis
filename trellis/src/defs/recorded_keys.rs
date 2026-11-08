@@ -1215,13 +1215,25 @@ async fn declare_released_keys(
             }
         }
     }
-    // The rendered text is in the current grammar, so its version is
-    // stamped with it (ADR-0018).
-    let text = super::ast::render_definition_text(def);
+    // The rendered text is in the current grammar, stamped as ADR-0018 says.
+    // A name the current grammar refuses (a grammar-1 label over 63 bytes)
+    // leaves no text to store, so the definition pauses instead.
+    let (text, grammar_version) = match super::grammar::rewrite(def) {
+        Ok(rewritten) => rewritten,
+        Err(err) => {
+            return Ok(Some((
+                source.to_string(),
+                format!(
+                    "{target} must name its key as KEY (...), and its text can't be written \
+                     in this release's grammar: {err}; drop the transform and define it again"
+                ),
+            )));
+        }
+    };
     txn.execute(
         "update transform_definitions set definition_text = $2, grammar_version = $3 \
          where id = $1",
-        &[&id, &text, &super::grammar::stamp(&text)],
+        &[&id, &text, &grammar_version],
     )
     .await?;
     crate::instance_log::info!(

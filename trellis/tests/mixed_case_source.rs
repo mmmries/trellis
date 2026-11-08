@@ -322,3 +322,133 @@ async fn grammar_1_definitions_keep_reading_the_names_they_read_beside_lower_cas
     );
     assert_eq!(version, trellis::defs::grammar::CURRENT_GRAMMAR_VERSION);
 }
+
+/// The silent case grammar 1's compatibility rule exists for: a grammar-1
+/// definition whose only upper-case name is a column beside a lower-case
+/// twin of the same type. Folding it would still load, validate and run,
+/// reading `amount` instead of `"Amount"`, and nothing would pause; the rule
+/// keeps it reading `"Amount"`.
+#[tokio::test]
+async fn a_grammar_1_column_beside_a_lower_case_twin_keeps_reading_it_without_pausing() {
+    let (cluster, db, raw) = trigger_pipeline::database().await;
+    raw.batch_execute(
+        "create table public.invoices (id bigint primary key, customer_id bigint, \
+             \"Amount\" bigint, amount bigint); \
+         insert into public.invoices values (1, 10, 5, 500), (2, 10, 7, 700), (3, 20, 1, 100)",
+    )
+    .await
+    .expect("seed the twins");
+    let int8 = ValueType::Integer(trellis::integer::IntWidth::Int8);
+    let columns: HashMap<String, ValueType> = ["id", "customer_id", "Amount", "amount"]
+        .into_iter()
+        .map(|n| (n.to_string(), int8))
+        .collect();
+    install_definition(
+        &db.pool,
+        "TRANSFORM cust_totals FROM invoices GROUP BY customer_id \
+         WITHOUT SOURCE INDEX SELECT SUM(\"Amount\") AS total",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("install");
+    store_as_grammar_1(
+        &raw,
+        "public.cust_totals",
+        "TRANSFORM cust_totals FROM invoices GROUP BY customer_id \
+         WITHOUT SOURCE INDEX SELECT SUM(Amount) AS total",
+    )
+    .await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
+
+    let config = trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    trellis::migrate::migrate_with_pool(&db.pool, &config)
+        .await
+        .expect("attach");
+    let mut pipeline = Pipeline::attach(cluster, db, raw, &["public.invoices"]).await;
+    const TOTALS: &str = "select customer_id::text, total::text from cust_totals";
+    assert_eq!(
+        pipeline.rows(TOTALS).await,
+        rows(&[("10", "12"), ("20", "1")])
+    );
+    pipeline
+        .raw
+        .batch_execute(
+            "update public.invoices set \"Amount\" = 50 where id = 1; \
+             update public.invoices set amount = 9999 where id = 2; \
+             insert into public.invoices values (4, 20, 3, 300)",
+        )
+        .await
+        .expect("write the source");
+    pipeline.drain().await;
+    assert_eq!(
+        pipeline.rows(TOTALS).await,
+        rows(&[("10", "57"), ("20", "4")]),
+        "the totals follow \"Amount\", never its twin amount"
+    );
+    let status: String = pipeline
+        .raw
+        .query_one(
+            "select status from transform_definitions where target_table = 'public.cust_totals'",
+            &[],
+        )
+        .await
+        .expect("read the status")
+        .get(0);
+    assert_ne!(status, "paused", "nothing pauses");
+}
+
+/// An `ALTER TRANSFORM` of a grammar-1 definition that keeps a label over
+/// 63 bytes (Postgres truncated the target column it named) is refused: its
+/// rewritten text is text the current grammar refuses, which no load could
+/// read back. The stored text is left as it was.
+#[tokio::test]
+async fn an_alter_that_would_store_a_grammar_1_label_over_63_bytes_is_refused() {
+    let (cluster, db, raw) = trigger_pipeline::database().await;
+    raw.batch_execute(TWINS_DDL).await.expect("seed the source");
+    let int8 = ValueType::Integer(trellis::integer::IntWidth::Int8);
+    let columns: HashMap<String, ValueType> = ["id", "OrderId", "Amount", "amount"]
+        .into_iter()
+        .map(|n| (n.to_string(), int8))
+        .collect();
+    let short = "l".repeat(63);
+    let long = "l".repeat(70);
+    install_definition(
+        &db.pool,
+        &format!("TRANSFORM long_copy FROM \"Shop\".\"Orders\" SELECT \"Amount\" AS {short}"),
+        &columns,
+        "public",
+    )
+    .await
+    .expect("install");
+    let released = format!("TRANSFORM long_copy FROM Shop.Orders SELECT Amount AS {long}");
+    store_as_grammar_1(&raw, "public.long_copy", &released).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
+    let config = trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    trellis::migrate::migrate_with_pool(&db.pool, &config)
+        .await
+        .expect("attach");
+    let pipeline = Pipeline::attach(cluster, db, raw, &["Shop.Orders"]).await;
+
+    let trellis = trellis::Trellis::connect(config, trellis::TrellisOptions::default())
+        .await
+        .expect("connect");
+    let err = trellis
+        .apply("ALTER TRANSFORM long_copy ADD \"Amount\" + 1 AS nxt")
+        .await
+        .expect_err("the rewrite would hold a name over 63 bytes");
+    assert!(err.to_string().contains("at most 63 bytes"), "{err}");
+    let row = pipeline
+        .raw
+        .query_one(
+            "select definition_text, grammar_version from transform_definitions \
+             where target_table = 'public.long_copy'",
+            &[],
+        )
+        .await
+        .expect("read the text");
+    assert_eq!(
+        (row.get::<_, String>(0), row.get::<_, i32>(1)),
+        (released, 1)
+    );
+}

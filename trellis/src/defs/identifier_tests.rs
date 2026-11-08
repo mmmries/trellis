@@ -257,6 +257,26 @@ fn refused_quoted_forms() {
     }
     // `U` alone is a name, and `u &` an operator after it, as in Postgres.
     assert!(parse("TRANSFORM t FROM s SELECT U AS x").is_ok());
+    // A quoted function or type name: Postgres looks it up exactly, so
+    // `"int4"` is a type there but `"INT4"`, `"integer"` and `"bigint"` are
+    // not, and this grammar spells both unquoted.
+    for (expr, name) in [
+        ("CAST(a AS \"int4\")", "int4"),
+        ("CAST(a AS \"INT4\")", "INT4"),
+        ("CAST(a AS \"integer\")", "integer"),
+        ("CAST(NULL AS \"bigint\")", "bigint"),
+        ("CAST('1' AS \"numeric\")", "numeric"),
+        ("\"lower\"(t)", "lower"),
+        ("\"SUM\"(a)", "SUM"),
+        ("\"date\" '2024-01-31'", "date"),
+    ] {
+        let err = field(expr);
+        assert!(
+            matches!(&err, ParseError::UnsupportedQuotedIdentifier { name: n, .. } if n == name),
+            "{expr}: {err:?}"
+        );
+        assert!(err.to_string().contains("written unquoted"), "{err}");
+    }
 }
 
 /// An unquoted table name Postgres reserves is refused where a table is
@@ -290,6 +310,68 @@ fn reserved_table_names_are_refused_unquoted() {
     ] {
         assert!(parse(text).is_ok(), "{text}");
     }
+}
+
+/// An unquoted word Postgres reserves is refused where the statement
+/// language takes a column (`GROUP BY`, `KEY (...)`, a `JOIN`'s `ON` and
+/// `GROUP BY` heads), as Postgres refuses `GROUP BY order` and reads
+/// `GROUP BY current_user` as a function; the quoted spelling is the name.
+/// Grammar-1 text keeps reading it as the column it named.
+#[test]
+fn reserved_column_names_are_refused_unquoted_in_the_statement_language() {
+    for (refused, quoted) in [
+        (
+            "TRANSFORM t FROM s GROUP BY order SELECT COUNT(*) AS n",
+            "TRANSFORM t FROM s GROUP BY \"order\" SELECT COUNT(*) AS n",
+        ),
+        (
+            "TRANSFORM t FROM s GROUP BY current_user SELECT COUNT(*) AS n",
+            "TRANSFORM t FROM s GROUP BY \"current_user\" SELECT COUNT(*) AS n",
+        ),
+        (
+            "TRANSFORM t FROM s GROUP BY left.g SELECT COUNT(*) AS n",
+            "TRANSFORM t FROM \"left\" GROUP BY \"left\".g SELECT COUNT(*) AS n",
+        ),
+        (
+            "TRANSFORM t FROM s KEY (id, select) SELECT a AS a",
+            "TRANSFORM t FROM s KEY (id, \"select\") SELECT a AS a",
+        ),
+        (
+            "TRANSFORM t FROM s JOIN \"order\" ON s.k = order.k GROUP BY s.g SELECT COUNT(*) AS n",
+            "TRANSFORM t FROM s JOIN \"order\" ON s.k = \"order\".k GROUP BY s.g \
+             SELECT COUNT(*) AS n",
+        ),
+        (
+            "TRANSFORM t FROM s JOIN b ON s.k = b.k GROUP BY table.g SELECT COUNT(*) AS n",
+            "TRANSFORM t FROM \"table\" JOIN b ON \"table\".k = b.k GROUP BY \"table\".g \
+             SELECT COUNT(*) AS n",
+        ),
+    ] {
+        let err = parse(refused).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::ReservedWord { .. }),
+            "{refused}: {err:?}"
+        );
+        assert!(err.to_string().contains("quoted"), "{err}");
+        if let Err(err) = parse(quoted) {
+            panic!("{quoted}: {err}");
+        }
+    }
+    // A label after a `.` is any word, as in Postgres.
+    assert!(parse("TRANSFORM t FROM s GROUP BY s.order SELECT COUNT(*) AS n").is_ok());
+    let stored = super::grammar::load_in(
+        "TRANSFORM t FROM s GROUP BY order SELECT COUNT(*) AS n",
+        1,
+        1,
+        2,
+    )
+    .unwrap();
+    assert_eq!(
+        stored.key_space,
+        KeySpace::Aggregate {
+            group_by: vec!["order".to_string()]
+        }
+    );
 }
 
 /// Every name position, with `{n}` where the name goes.

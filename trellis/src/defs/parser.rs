@@ -364,6 +364,40 @@ impl Parser {
         self.expect_name().map(|(name, _)| name)
     }
 
+    /// A column or qualifier name in the statement language (`GROUP BY`,
+    /// `KEY (...)`, a `JOIN`'s `ON` and `GROUP BY` heads), where Postgres
+    /// takes a column reference or a column list: an unquoted word Postgres
+    /// reserves is refused there, as Postgres refuses it, and the quoted
+    /// spelling is the name. Grammar 1 had no such check.
+    fn expect_column_name(&mut self) -> Result<String, ParseError> {
+        let (name, quoted) = self.expect_name()?;
+        self.refuse_reserved_name(name, quoted)
+    }
+
+    /// `name` back, unless it is an unquoted word Postgres reserves read
+    /// under grammar 2 ([`Self::expect_column_name`]).
+    fn refuse_reserved_name(&self, name: String, quoted: bool) -> Result<String, ParseError> {
+        if !quoted && self.identifiers == Identifiers::Folded && is_reserved_word(&name) {
+            return Err(ParseError::ReservedWord { name });
+        }
+        Ok(name)
+    }
+
+    /// A `CAST` target's type name: an unquoted word. A quoted one is
+    /// refused: Postgres looks it up exactly in `pg_type`, so `"int4"` is a
+    /// type there and `"INT4"`, `"integer"` and `"bigint"` are not, while
+    /// this grammar matches its type names in any case and by their SQL
+    /// spellings.
+    fn expect_type_name(&mut self) -> Result<String, ParseError> {
+        match self.expect_name()? {
+            (name, false) => Ok(name),
+            (name, true) => Err(ParseError::UnsupportedQuotedIdentifier {
+                name,
+                detail: "a type name is written unquoted, as in CAST(x AS int4)".to_string(),
+            }),
+        }
+    }
+
     /// A name, unquoted or quoted, and whether it was quoted: a quoted name
     /// is never a keyword or a reserved word.
     fn expect_name(&mut self) -> Result<(String, bool), ParseError> {
@@ -673,10 +707,10 @@ impl Parser {
         }
         self.advance();
         self.advance();
-        let mut columns = vec![self.expect_ident()?];
+        let mut columns = vec![self.expect_column_name()?];
         while self.peek_is_symbol(',') {
             self.advance();
-            columns.push(self.expect_ident()?);
+            columns.push(self.expect_column_name()?);
         }
         self.expect_symbol(')')?;
         if let Some(repeated) = columns
@@ -1036,7 +1070,8 @@ impl Parser {
             ),
         };
         let first = match self.advance() {
-            Token::Ident(first) | Token::QuotedIdent(first) => first,
+            Token::Ident(first) => self.refuse_reserved_name(first, false)?,
+            Token::QuotedIdent(first) => first,
             other => return Err(refuse(other.describe())),
         };
         if !self.peek_is_symbol('.') {
@@ -1065,7 +1100,7 @@ impl Parser {
     /// never a field, so the qualifier changes nothing and isn't kept. Any other head
     /// is refused ([`ParseError::GroupByKeyNotFromSource`]).
     fn parse_group_by_key(&mut self) -> Result<String, ParseError> {
-        let first = self.expect_ident()?;
+        let first = self.expect_column_name()?;
         if self.peek_is_symbol('.') {
             self.advance();
             let column = self.expect_ident()?;
@@ -1435,6 +1470,24 @@ impl Parser {
             // A quoted name is a column, or a qualified column's head: never
             // a keyword, a literal or a function.
             Token::QuotedIdent(name) => {
+                // Postgres reads `"lower"(x)` as a call and `"date" '…'` as
+                // a typed literal, looking the quoted name up exactly; this
+                // grammar spells functions and types unquoted.
+                let refused = match self.peek() {
+                    Token::Symbol('(') => {
+                        Some("a function name is written unquoted, as in lower(x)")
+                    }
+                    Token::String(_) => {
+                        Some("a type name is written unquoted, as in date '2024-01-31'")
+                    }
+                    _ => None,
+                };
+                if let Some(detail) = refused {
+                    return Err(ParseError::UnsupportedQuotedIdentifier {
+                        name,
+                        detail: detail.to_string(),
+                    });
+                }
                 if self.peek_is_symbol('.') {
                     return self.parse_dotted_reference(name);
                 }
@@ -1780,7 +1833,7 @@ impl Parser {
         if !matches!(self.peek(), Token::String(_)) {
             let operand = self.parse_expr()?;
             self.expect_keyword("AS")?;
-            let type_name = self.expect_ident()?;
+            let type_name = self.expect_type_name()?;
             let keyword = self.take_type_keyword(&type_name.to_ascii_uppercase());
             // `CAST(NULL AS <type>)` converts no value, so it may name any
             // type the grammar has a value of.
@@ -1813,7 +1866,7 @@ impl Parser {
             unreachable!("peeked a string literal");
         };
         self.expect_keyword("AS")?;
-        let type_name = self.expect_ident()?;
+        let type_name = self.expect_type_name()?;
         // `CAST('1.5' AS double precision)` — see `take_type_keyword`.
         let keyword = self.take_type_keyword(&type_name.to_ascii_uppercase());
         self.expect_symbol(')')?;

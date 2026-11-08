@@ -146,8 +146,22 @@ pub(crate) fn stamp(text: &str) -> i32 {
     )
 }
 
+/// `def` as the text a rewrite stores (`ALTER TRANSFORM`, a recorded key):
+/// rendered in the current grammar, with the version [`stamp`] gives it. A
+/// tree read from older text can hold a name the current grammar refuses (a
+/// grammar-1 `AS` label over 63 bytes), whose rendering no load would read
+/// back, so that is refused with the current grammar's error rather than
+/// stored.
+pub(crate) fn rewrite(def: &TransformDef) -> Result<(String, i32), ParseError> {
+    let text = super::ast::render_definition_text(def);
+    parse_in(&text, Identifiers::Folded)?;
+    let version = stamp(&text);
+    Ok((text, version))
+}
+
 /// [`stamp`] against the window `oldest..=current`. Text the current version
-/// refuses gets the current version: nothing stores it.
+/// refuses gets the current version: nothing stores it ([`rewrite`] refuses
+/// it).
 pub(crate) fn stamp_in(text: &str, oldest: i32, current: i32) -> i32 {
     let Ok(reading) = load_in(text, current, oldest, current) else {
         return current;
@@ -518,6 +532,31 @@ mod tests {
         assert_eq!(stamp("TRANSFORM t FROM s SELECT a AS x"), 1);
         // A window holding only the current version stamps it.
         assert_eq!(stamp_in("TRANSFORM t FROM s SELECT a AS x", 2, 2), 2);
+    }
+
+    /// A rewrite stores the tree's current rendering, stamped; a tree from
+    /// grammar-1 text holding a name the current grammar refuses (a label
+    /// over 63 bytes, which grammar 1 kept) is refused rather than stored as
+    /// text no load reads back.
+    #[test]
+    fn a_rewrite_refuses_text_the_current_grammar_cant_read_back() {
+        let def = load_in("TRANSFORM t FROM s SELECT Amount AS total", 1, 1, 2).unwrap();
+        assert_eq!(
+            rewrite(&def).unwrap(),
+            (
+                "TRANSFORM t FROM s SELECT \"Amount\" AS total".to_string(),
+                2
+            )
+        );
+        let def = load_in("TRANSFORM t FROM s SELECT a AS total", 1, 1, 2).unwrap();
+        assert_eq!(rewrite(&def).unwrap().1, 1);
+        let long = "L".repeat(70);
+        let def = load_in(&format!("TRANSFORM t FROM s SELECT a AS {long}"), 1, 1, 2).unwrap();
+        assert!(
+            matches!(rewrite(&def), Err(ParseError::NameTooLong { name, .. }) if name == long),
+            "{:?}",
+            rewrite(&def)
+        );
     }
 
     /// A definition this binary can't run loads as nothing, and its text is

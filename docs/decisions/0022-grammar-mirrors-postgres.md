@@ -85,9 +85,13 @@ Each rule the expression grammar has is the rule Postgres's `scan.l` and
   type or function name) are not: Trellis refuses a bare identifier equal to one
   of them, by name. The remedy is Postgres's: the quoted name (`"order"`), or
   the column qualified with its table (`orders.order`). A quoted name is never
-  a keyword or a reserved word. An unquoted table name equal to one of these
-  words is refused too (`FROM user` reads the `current_user` function in
-  Postgres, and `FROM order` is a syntax error); `FROM "user"` names the table.
+  a keyword, a reserved word or a function or type name: a quoted name before
+  `(` or a string, or as a `CAST` target, is refused, since Postgres looks it up
+  exactly (`"int4"` is a type there, `"INT4"` and `"integer"` are not). An
+  unquoted table name, or a `GROUP BY`, `KEY (...)` or `JOIN` qualifier name,
+  equal to one of these words is refused too (`FROM user` and `GROUP BY
+  current_user` read the `current_user` function in Postgres, and `FROM order`
+  is a syntax error); `FROM "user"` names the table.
   `NOT` and `CASE` are keywords before every operand the grammar
   has, `-` included: `not - 1` is `NOT (-1)`, as in Postgres. The refusal covers
   `not AS c`, `not + 1`, `case * b`, `end + 1` and `and + 1`, which Postgres

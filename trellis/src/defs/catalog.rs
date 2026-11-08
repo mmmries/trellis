@@ -91,10 +91,7 @@ use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
 
 use super::adopt::TargetTableDdl;
-use super::ast::{
-    AlterClause, AlterTransform, Expr, FieldDef, KeySpace, TransformDef, ValueType,
-    render_definition_text,
-};
+use super::ast::{AlterClause, AlterTransform, Expr, FieldDef, KeySpace, TransformDef, ValueType};
 use super::backfill::BackfillError;
 use super::ddl::{self, DdlError};
 use super::error::ParseError;
@@ -2118,6 +2115,10 @@ pub async fn alter_transform(
         fields,
         ..current.def.clone()
     };
+    // The text the edit stores, refused here if the current grammar can't
+    // read it back: a field kept from grammar-1 text can carry a label over
+    // 63 bytes (ADR-0018, ADR-0022).
+    let (new_text, new_grammar_version) = grammar::rewrite(&merged)?;
 
     // The fields the edit's field build rewrites: each added or altered one,
     // and every field that reads one of them by alias, directly
@@ -2485,17 +2486,11 @@ pub async fn alter_transform(
             .await?
     };
 
-    let new_text = render_definition_text(&merged);
     txn.execute(
         "update transform_definitions \
          set definition_text = $1, definition_version = $2, grammar_version = $4 \
          where id = $3",
-        &[
-            &new_text,
-            &new_version,
-            &current.id,
-            &grammar::stamp(&new_text),
-        ],
+        &[&new_text, &new_version, &current.id, &new_grammar_version],
     )
     .await?;
     // ADR-0024: the edited tree's floor, which can be lower than before.
