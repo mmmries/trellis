@@ -2075,9 +2075,9 @@ fn reads_both(copy: &copies::TypedCopy) -> bool {
 
 /// The source columns, as `(qualified table, column)`, that `states`' copies
 /// read and whose value type is no longer the one `reader`'s definition
-/// recorded for them (`transform_definitions.source_columns` and
-/// `join_columns`, as define or the last resume recorded): a column that
-/// widened, as opposed to one whose modifier alone changed, which is no
+/// recorded for them (`transform_definitions.source_columns`, and each
+/// joined table's columns, as define or the last resume recorded): a column
+/// that widened, as opposed to one whose modifier alone changed, which is no
 /// change of value type. A column with no recorded type, or none live, is not
 /// counted.
 async fn changed_inputs(
@@ -2090,7 +2090,7 @@ async fn changed_inputs(
         reader.source.clone(),
         crate::defs::catalog::source_columns_in(client, reader.id).await?,
     );
-    if let Some((joined, columns)) = crate::defs::catalog::join_side_of(client, reader.id).await? {
+    for (joined, columns) in crate::defs::catalog::join_sides_of(client, reader.id).await? {
         recorded.insert(joined, columns);
     }
     let mut live: HashMap<String, HashMap<String, crate::defs::ValueType>> = HashMap::new();

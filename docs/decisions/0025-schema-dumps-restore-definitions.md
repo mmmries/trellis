@@ -63,10 +63,10 @@ The one other shape is a dump with a definition that joins more than one
 table ([ADR-0021](0021-one-to-one-join-transforms.md)): its queue has one
 more column, last, `later_join_tables`, the qualified joined tables after
 the first, by position, and every row fills it. A dump without such a
-definition has the columns above alone, so its file is the same either way,
-and a release that reads only them refuses the longer queue rather than
-restore a definition over one of its joined tables. Every release since
-reads both shapes.
+definition has the columns above alone, so a release that reads only them
+loads it, and refuses the longer queue rather than restore a definition
+without its later joined tables. A release that writes the column reads
+both shapes.
 
 ## `migrate` restores the queue
 
