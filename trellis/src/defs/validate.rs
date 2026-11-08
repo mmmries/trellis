@@ -103,8 +103,8 @@ pub enum ValidationError {
     /// The joined table is the `FROM` table. A self-join isn't supported,
     /// even under two aliases: one captured change would feed both sides.
     JoinSelf { table: String },
-    /// A `JOIN` definition joins more tables than this kind of `JOIN`
-    /// admits: an aggregate `JOIN` joins exactly two.
+    /// An aggregate `JOIN` joins more than one table to its `FROM` table:
+    /// it joins exactly two.
     JoinTooManyTables,
     /// A `JOIN` definition's column reference names a table that is neither
     /// the `FROM` table nor the joined one.
@@ -180,6 +180,20 @@ pub enum ValidationError {
     OneToOneJoinKeyNotUnique { table: String, columns: Vec<String> },
     /// A construct a 1-1 `JOIN` doesn't take, with the remedy.
     OneToOneJoinUnsupported { what: String, remedy: String },
+    /// A 1-1 `JOIN` of more tables than a star admits: `tables` counts the
+    /// `FROM` table and every joined one (#1459's cap).
+    StarJoinTooManyTables { tables: usize },
+    /// A 1-1 `JOIN` of more than two tables (a star) was defined while the
+    /// development knob that admits it is off.
+    StarJoinDisabled { tables: usize },
+    /// An `ON` term of the table joined as `table` reads `other`, another
+    /// joined table: each `ON` reads only the `FROM` table and the table it
+    /// joins (a star, not a snowflake).
+    JoinOnReadsAnotherJoinedTable {
+        table: String,
+        term: String,
+        other: String,
+    },
     /// An aggregate in a deferred family (`MIN`/`MAX` in a `JOIN`,
     /// `bool_*`/`bit_*`, float or `interval` `SUM`/`AVG`,
     /// `array_agg`/`string_agg`/`jsonb_agg`). Only the aggregates the group
@@ -882,7 +896,7 @@ pub(crate) fn check_join_collation_reads(
     def: &TransformDef,
     join: &JoinSpec,
     root: &HashMap<String, JoinColumnInfo>,
-    joined: &[HashMap<String, JoinColumnInfo>],
+    joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
     let resolve = join_resolver(def, join, root, joined);
     for read in collation_refusing_function_reads(def) {
@@ -1141,6 +1155,25 @@ impl fmt::Display for ValidationError {
             ValidationError::OneToOneJoinUnsupported { what, remedy } => {
                 write!(f, "a 1-1 JOIN doesn't take {what}: {remedy}")
             }
+            ValidationError::StarJoinTooManyTables { tables } => write!(
+                f,
+                "this JOIN reads {tables} tables; a 1-1 JOIN reads at most {} (the FROM table \
+                 and {} joined tables)",
+                super::join::MAX_POSITIONS + 1,
+                super::join::MAX_POSITIONS
+            ),
+            ValidationError::StarJoinDisabled { tables } => write!(
+                f,
+                "this JOIN reads {tables} tables; a 1-1 JOIN of more than two tables is not \
+                 available yet (a JOIN reads the FROM table and one joined table)"
+            ),
+            ValidationError::JoinOnReadsAnotherJoinedTable { table, term, other } => write!(
+                f,
+                "'{term}' in the ON of '{table}' reads '{other}', another joined table: each \
+                 JOIN's ON reads only the FROM table and the table it joins (every joined \
+                 table joins the FROM table directly, a star; joining one joined table to \
+                 another, a snowflake, is not supported)"
+            ),
             ValidationError::DeferredAggregate { function, family } => write!(
                 f,
                 "{function} is not supported: {family} is not an aggregate Trellis maintains; \
@@ -2185,7 +2218,7 @@ pub(crate) fn join_resolver<'a>(
     def: &'a TransformDef,
     join: &'a JoinSpec,
     root: &'a HashMap<String, JoinColumnInfo>,
-    joined: &'a [HashMap<String, JoinColumnInfo>],
+    joined: &'a [&'a HashMap<String, JoinColumnInfo>],
 ) -> impl Fn(&QualifiedColumn) -> Result<(Side, &'a JoinColumnInfo), ValidationError> + 'a {
     move |column: &QualifiedColumn| -> Result<(Side, &JoinColumnInfo), ValidationError> {
         let side = if column.table == def.source {
@@ -2227,11 +2260,11 @@ pub(crate) fn join_resolver<'a>(
 fn side_columns<'a>(
     side: Side,
     root: &'a HashMap<String, JoinColumnInfo>,
-    joined: &'a [HashMap<String, JoinColumnInfo>],
+    joined: &'a [&'a HashMap<String, JoinColumnInfo>],
 ) -> &'a HashMap<String, JoinColumnInfo> {
     match side {
         Side::From => root,
-        Side::Joined(position) => &joined[position.index()],
+        Side::Joined(position) => joined[position.index()],
     }
 }
 
@@ -2244,7 +2277,7 @@ pub(crate) fn validate_join_tables_and_on(
     def: &TransformDef,
     join: &JoinSpec,
     root: &HashMap<String, JoinColumnInfo>,
-    joined: &[HashMap<String, JoinColumnInfo>],
+    joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
     validate_target_names(def)?;
     for table in &join.joins {
@@ -2263,17 +2296,20 @@ pub(crate) fn validate_join_tables_and_on(
     }
 
     let resolve = join_resolver(def, join, root, joined);
-    for table in &join.joins {
-        validate_join_on(&table.on, &resolve)?;
+    for (position, table) in super::join::positions(join) {
+        validate_join_on(def, join, position, &table.on, &resolve)?;
     }
     Ok(())
 }
 
-/// One joined table's `ON` terms: each an equality between a column of the
-/// `FROM` table and one of the joined table, of one type, modifier and
-/// collation, with a text-stable key type, each pair and each column named
-/// once.
+/// The `ON` terms of the table joined at `position`: each an equality
+/// between a column of the `FROM` table and one of that table (never of
+/// another joined table), of one type, modifier and collation, with a
+/// text-stable key type, each pair and each column named once.
 fn validate_join_on<'a>(
+    def: &TransformDef,
+    join: &JoinSpec,
+    position: super::join::Position,
     on: &'a [JoinOn],
     resolve: &impl Fn(&QualifiedColumn) -> Result<(Side, &'a JoinColumnInfo), ValidationError>,
 ) -> Result<(), ValidationError> {
@@ -2304,6 +2340,17 @@ fn validate_join_on<'a>(
         if lhs_side == rhs_side {
             return Err(ValidationError::JoinOnSameSide {
                 term: format!("{} = {}", written(&term.lhs), written(&term.rhs)),
+            });
+        }
+        // A star: every term pairs the `FROM` table with this position's.
+        if let Some(other) = [lhs_side, rhs_side]
+            .into_iter()
+            .find(|side| !matches!(side, Side::From) && *side != Side::Joined(position))
+        {
+            return Err(ValidationError::JoinOnReadsAnotherJoinedTable {
+                table: super::join::joined(join, position).right.clone(),
+                term: format!("{} = {}", written(&term.lhs), written(&term.rhs)),
+                other: super::join::side_table(def, join, other).to_string(),
             });
         }
         let pair = match lhs_side {
@@ -2356,34 +2403,35 @@ fn validate_join_on<'a>(
     Ok(())
 }
 
-/// Validates a [`KeySpace::Join`] definition against the live columns of its
-/// two tables (`left` is the `FROM` table, `right` the joined one).
+/// Validates a [`KeySpace::Join`] or [`KeySpace::JoinOneToOne`] definition
+/// against the live columns of its tables (`left` is the `FROM` table's,
+/// `joined` each joined table's, by position: one per `JOIN` written).
 ///
-/// The join is admitted when: the tables differ; every column is qualified
-/// and exists; each `ON` term is an equality between one column of each
-/// table, of one type, modifier and collation (the join-key rules); every `GROUP BY` key, from either table, is an admitted key type;
-/// and each field is a key passthrough or composes admitted aggregates
-/// (`COUNT(*)`, and `COUNT`/`SUM`/`AVG` of a column or an expression over
-/// one table's columns, per [`check_aggregate_admitted`]) with literals,
-/// operators and scalar functions. An argument reading
-/// both tables is refused as [`ValidationError::JoinMixedSideArgument`].
+/// An aggregate join is admitted when: it joins one table; the tables differ;
+/// every column is qualified and exists; each `ON` term is an equality between
+/// one column of each table, of one type, modifier and collation (the
+/// join-key rules); every `GROUP BY` key, from either table, is an admitted
+/// key type; and each field is a key passthrough or composes admitted
+/// aggregates (`COUNT(*)`, and `COUNT`/`SUM`/`AVG` of a column or an
+/// expression over one table's columns, per [`check_aggregate_admitted`])
+/// with literals, operators and scalar functions. An argument reading both
+/// tables is refused as [`ValidationError::JoinMixedSideArgument`]. A 1-1
+/// join is [`super::validate_join_one_to_one::validate`]'s.
 pub fn validate_join(
     def: &TransformDef,
     left: &HashMap<String, JoinColumnInfo>,
-    right: &HashMap<String, JoinColumnInfo>,
+    joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
-    // One joined table's columns are all a caller has today, and an
-    // aggregate JOIN joins exactly two tables.
-    if super::join::spec(def).is_some_and(|join| join.joins.len() > 1) {
-        return Err(ValidationError::JoinTooManyTables);
-    }
-    let joined = std::slice::from_ref(right);
     if let KeySpace::JoinOneToOne(_) = &def.key_space {
         return super::validate_join_one_to_one::validate(def, left, joined);
     }
     let KeySpace::Join(join) = &def.key_space else {
         return Ok(());
     };
+    // An aggregate JOIN joins exactly two tables (ADR-0019).
+    if join.joins.len() > 1 {
+        return Err(ValidationError::JoinTooManyTables);
+    }
     validate_join_tables_and_on(def, join, left, joined)?;
     let resolve = join_resolver(def, join, left, joined);
 
@@ -2520,7 +2568,7 @@ fn check_join_field_expr<'a>(
     resolve: &ResolveJoinColumn<'a>,
     mut in_aggregate: Option<&mut Vec<Side>>,
     root: &HashMap<String, JoinColumnInfo>,
-    joined: &[HashMap<String, JoinColumnInfo>],
+    joined: &[&HashMap<String, JoinColumnInfo>],
     aggregates: &mut usize,
 ) -> Result<(), ValidationError> {
     let shape = |detail: &str| ValidationError::JoinFieldShape {
@@ -2684,7 +2732,7 @@ pub(crate) fn rename_join_columns(
     expr: &mut Expr,
     def: &TransformDef,
     root: &HashMap<String, JoinColumnInfo>,
-    joined: &[HashMap<String, JoinColumnInfo>],
+    joined: &[&HashMap<String, JoinColumnInfo>],
     types: &mut HashMap<String, ValueType>,
 ) {
     match expr {
@@ -2738,7 +2786,7 @@ pub(crate) fn join_field_value_type(
     def: &TransformDef,
     field: &super::ast::FieldDef,
     root: &HashMap<String, JoinColumnInfo>,
-    joined: &[HashMap<String, JoinColumnInfo>],
+    joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<ValueType, ValidationError> {
     let mut renamed = field.expr.clone();
     let mut types = HashMap::new();
@@ -8510,7 +8558,7 @@ mod tests {
             panic!("a join without GROUP BY");
         };
         assert_eq!(
-            check_join_collation_reads(&def, join, &left, std::slice::from_ref(&right)),
+            check_join_collation_reads(&def, join, &left, &[&right]),
             Ok(())
         );
         let ci = |info: &mut JoinColumnInfo| {
@@ -8528,24 +8576,14 @@ mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         };
         assert_eq!(
-            refused(check_join_collation_reads(
-                &def,
-                join,
-                &left,
-                std::slice::from_ref(&right)
-            )),
+            refused(check_join_collation_reads(&def, join, &left, &[&right])),
             ("pos".into(), "STRPOS".into(), "items".into(), "note".into())
         );
         ci(right.get_mut("sku").unwrap());
         ci(left.get_mut("region").unwrap());
         right.remove("note");
         assert_eq!(
-            refused(check_join_collation_reads(
-                &def,
-                join,
-                &left,
-                std::slice::from_ref(&right)
-            )),
+            refused(check_join_collation_reads(&def, join, &left, &[&right])),
             ("same".into(), "=".into(), "orders".into(), "region".into())
         );
     }
@@ -8594,7 +8632,7 @@ mod tests {
 
     fn check_text(text: &str) -> Result<(), ValidationError> {
         let (left, right) = tables();
-        validate_join(&parse_text(text).unwrap(), &left, &right)
+        validate_join(&parse_text(text).unwrap(), &left, &[&right])
     }
 
     #[test]
@@ -9042,7 +9080,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            validate_join(&def, &left, &right),
+            validate_join(&def, &left, &[&right]),
             Err(ValidationError::UnconstrainedNumericAggregate { .. })
         ));
     }
@@ -9060,7 +9098,7 @@ mod tests {
              GROUP BY orders.region SELECT SUM(orders.whole) AS v, AVG(orders.total) AS w",
         )
         .unwrap();
-        validate_join(&def, &left, &right).unwrap();
+        validate_join(&def, &left, &[&right]).unwrap();
     }
 
     #[test]
@@ -9135,7 +9173,7 @@ mod tests {
                  GROUP BY orders.region SELECT COUNT(*) AS n",
             )
             .unwrap();
-            validate_join(&def, &left, &right)
+            validate_join(&def, &left, &[&right])
         };
         let v50 = ("character varying(50)", 1043, 54);
         let v255 = ("character varying(255)", 1043, 259);
@@ -9187,7 +9225,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            validate_join(&def, &left, &right),
+            validate_join(&def, &left, &[&right]),
             Err(ValidationError::JoinNondeterministicCollation { .. })
         ));
     }
@@ -9218,7 +9256,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            validate_join(&def, &left, &right),
+            validate_join(&def, &left, &[&right]),
             Err(ValidationError::GroupByKeysShareTargetColumn { .. })
         ));
     }
@@ -9235,45 +9273,31 @@ mod tests {
             spec.joins[0].right = "orders".to_string();
         }
         assert!(matches!(
-            validate_join(&def, &left, &right),
+            validate_join(&def, &left, &[&right]),
             Err(ValidationError::JoinSelf { .. })
         ));
     }
 
-    /// A second joined table, which only a hand-built tree has (the parser
-    /// refuses it with the same words), is refused first, for both kinds of
-    /// `JOIN`, even when another check would also refuse it.
+    /// An aggregate `JOIN` of a second joined table parses, and is refused
+    /// first, even when another check would also refuse it (#1457 step 7
+    /// admits more).
     #[test]
-    fn join_refuses_a_second_joined_table_built_by_hand() {
+    fn an_aggregate_join_refuses_a_second_joined_table() {
         let (left, right) = tables();
-        for text in [
+        let def = parse_text(
             "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             JOIN shipments ON items.id = shipments.item_id \
              GROUP BY orders.region SELECT COUNT(*) AS n",
-            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
-             SELECT orders.id AS id",
-        ] {
-            let mut def = parse_text(text).unwrap();
-            let (KeySpace::Join(spec) | KeySpace::JoinOneToOne(spec)) = &mut def.key_space else {
-                panic!("a JOIN");
-            };
-            let mut second = spec.joins[0].clone();
-            // A self-join too, which alone would be refused as such.
-            second.right = "orders".to_string();
-            spec.joins.push(second);
-            assert_eq!(
-                validate_join(&def, &left, &right),
-                Err(ValidationError::JoinTooManyTables),
-                "{text}"
-            );
-        }
-        let parsed = parse_text(
-            "TRANSFORM t FROM a JOIN b ON a.k = b.k JOIN c ON a.k = c.k \
-             GROUP BY a.g SELECT COUNT(*) AS n",
         )
-        .unwrap_err()
-        .to_string();
-        let refused = ValidationError::JoinTooManyTables.to_string();
-        assert!(parsed.contains(&refused), "{parsed} / {refused}");
+        .unwrap();
+        assert_eq!(
+            validate_join(&def, &left, &[&right, &right]),
+            Err(ValidationError::JoinTooManyTables)
+        );
+        assert_eq!(
+            ValidationError::JoinTooManyTables.to_string(),
+            "a JOIN transform joins exactly two tables; a second JOIN is not supported"
+        );
     }
 
     #[test]

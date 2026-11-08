@@ -4,10 +4,12 @@
 //! - The fixture's generated text: the two-table shape's definition and
 //!   oracle, and the DDL, seed and oracle of every shape up to the cap, run on
 //!   a plain Postgres database with no transform defined.
+//! - Every star shape up to the cap defines with the development knob on,
+//!   and its build refuses, naming why, until its apply is built.
 //! - Pins written once against "the joined table at `at`" and run at every
-//!   shape this process can define ([`star::runnable`]): the two-table JOIN
-//!   always, a star of three tables (its last position) only with the
-//!   development knob on.
+//!   shape this process can run ([`star::runnable`]): the two-table JOIN
+//!   always, a star of three tables (its last position) once its apply is
+//!   built, with the development knob on.
 //!   - the build, then changes of `a` and of the table at `at`;
 //!   - F3 (#1371): an `a` move racing an update of its new key, a family;
 //!   - M (#1375): two crossing mixed pages, a race;
@@ -28,7 +30,7 @@ mod star;
 use star::{Kind, Shape, Star};
 use trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows;
 use trellis::staging::OneToOneJoinFanOutStep;
-use trellis::staging::build::Step;
+use trellis::staging::build::{self, Step};
 use trellis::staging::interleave::PausePoint;
 
 /// The shapes the per-position pins run at: the two-table JOIN, and the last
@@ -48,7 +50,10 @@ fn shapes() -> Vec<Shape> {
         .filter(|shape| {
             let runs = star::runnable(*shape);
             if !runs {
-                eprintln!("{shape:?} skipped: {} is off", star::STAR_KNOB);
+                eprintln!(
+                    "{shape:?} skipped: {} is off, or a star's apply is not built yet",
+                    star::STAR_KNOB
+                );
             }
             runs
         })
@@ -190,6 +195,48 @@ async fn every_shapes_tables_and_oracle_run_on_postgres() {
             }
         }
     }
+}
+
+/// Every star shape up to the cap (3 to 5 tables) defines with the knob
+/// on, and its build step fails, naming why, rather than build it as a
+/// two-table JOIN: a star's apply and build are not built yet (#1773,
+/// #1777). The definition stays `backfilling`, its build job holding the
+/// reason.
+#[tokio::test]
+async fn every_star_defines_and_its_build_refuses_until_it_is_built() {
+    let _serial = star::serial().await;
+    let was = star::star_join_enabled();
+    trellis::dev::defs::set_star_join(true);
+    for positions in 2..=star::MAX_POSITIONS {
+        let shape = Shape::new(positions, positions);
+        let stars = shape.stars();
+        let d = star::start_unbuilt(&stars[..1], A_ROWS, B_ROWS).await;
+        // The plan job, then the chunk that fails.
+        for _ in 0..4 {
+            match build::work_once(d.pool(), "w", &star::build_options(1000)).await {
+                Ok(step) if step.progressed() => {}
+                _ => break,
+            }
+        }
+        let row = d
+            .user()
+            .await
+            .query_one(
+                "select (select status from trellis.transform_definitions), \
+                        (select string_agg(last_error, '; ') from trellis.backfill_chunks)",
+                &[],
+            )
+            .await
+            .expect("read the build's state");
+        let (status, error): (String, Option<String>) = (row.get(0), row.get(1));
+        assert_eq!(status, "backfilling", "{shape:?}");
+        let error = error.unwrap_or_default();
+        assert!(
+            error.contains("a 1-1 JOIN of more than two tables, whose apply is not built yet"),
+            "{shape:?}: {error}"
+        );
+    }
+    trellis::dev::defs::set_star_join(was);
 }
 
 // --------------------------------------------------------------------- pins

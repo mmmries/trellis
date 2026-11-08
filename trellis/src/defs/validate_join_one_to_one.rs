@@ -30,13 +30,26 @@ use super::validate::{
 pub fn validate(
     def: &TransformDef,
     root: &HashMap<String, JoinColumnInfo>,
-    joined: &[HashMap<String, JoinColumnInfo>],
+    joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
     let KeySpace::JoinOneToOne(join) = &def.key_space else {
         return Ok(());
     };
+    let tables = join.joins.len() + 1;
+    if join.joins.len() > super::join::MAX_POSITIONS {
+        return Err(ValidationError::StarJoinTooManyTables { tables });
+    }
+    if join.joins.len() > 1 && !super::join_one_to_one::star_enabled() {
+        return Err(ValidationError::StarJoinDisabled { tables });
+    }
+    assert_eq!(
+        joined.len(),
+        join.joins.len(),
+        "a 1-1 JOIN is validated against every joined table's columns"
+    );
     validate_join_tables_and_on(def, join, root, joined)?;
     let resolve = join_resolver(def, join, root, joined);
+    check_key_column_names(def, join)?;
 
     // The hidden tables copy these columns beside their ledger columns.
     for side in super::join::sides(join) {
@@ -86,6 +99,50 @@ pub fn validate(
         super::validate::check_table_width(|| table, columns)?;
     }
     Ok(())
+}
+
+/// `J` names its key column for each `FROM` column a position's `ON` reads
+/// `p<position>_<column>`, cut at Postgres's 63 bytes
+/// ([`super::join_one_to_one::j_column`]): two such columns of one position
+/// whose names share their first 60 bytes would be one column of `J`.
+fn check_key_column_names(
+    def: &TransformDef,
+    join: &super::ast::JoinSpec,
+) -> Result<(), ValidationError> {
+    for (position, table) in super::join::positions(join) {
+        let mut seen: HashMap<String, String> = HashMap::new();
+        for term in &table.on {
+            let column = if term.lhs.table == def.source {
+                &term.lhs.column
+            } else {
+                &term.rhs.column
+            };
+            let name = super::join_one_to_one::j_column(position, column);
+            if let Some(earlier) = seen.insert(name, column.clone())
+                && earlier != *column
+            {
+                return Err(ValidationError::OneToOneJoinUnsupported {
+                    what: format!(
+                        "the columns '{earlier}' and '{column}' of {} in the ON of '{}', whose \
+                         names share their first {} bytes",
+                        def.source,
+                        table.right,
+                        crate::defs::lexer::MAX_NAME_BYTES - position_prefix_len(position)
+                    ),
+                    remedy: "Trellis keeps a key column for each, named after that many bytes \
+                             of its name; join on columns whose names differ sooner, or rename \
+                             one"
+                    .to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The bytes `J`'s `p<position>_` prefix takes.
+fn position_prefix_len(position: super::join::Position) -> usize {
+    format!("p{}_", position.number()).len()
 }
 
 /// Walks one field's expression: every column is qualified and resolves, and
@@ -200,7 +257,7 @@ mod tests {
         ))
         .unwrap();
         let (from, joined) = sides();
-        validate_join(&def, &from, &joined)
+        validate_join(&def, &from, &[&joined])
     }
 
     /// A 1-1 `JOIN` is admitted with no setting: the development knob that
@@ -215,7 +272,7 @@ mod tests {
         )
         .unwrap();
         let (from, joined) = sides();
-        assert_eq!(validate_join(&def, &from, &joined), Ok(()));
+        assert_eq!(validate_join(&def, &from, &[&joined]), Ok(()));
     }
 
     /// Runs [`a_one_to_one_join_is_admitted_with_no_knob`] in a child process
@@ -252,7 +309,7 @@ mod tests {
                 "TRANSFORM v FROM orders LEFT JOIN customers ON {on} SELECT customers.name AS n"
             ))
             .unwrap();
-            validate_join(&def, &from, &joined)
+            validate_join(&def, &from, &[&joined])
         };
         // The joined side's column repeated.
         assert_eq!(
@@ -339,13 +396,161 @@ mod tests {
         )
         .unwrap();
         let (from, mut joined) = sides();
-        assert_eq!(validate_join(&def, &from, &joined), Ok(()));
+        assert_eq!(validate_join(&def, &from, &[&joined]), Ok(()));
         joined.get_mut("name").unwrap().collation_deterministic = false;
         joined.get_mut("name").unwrap().collation = Some("ci".to_string());
         assert!(matches!(
-            validate_join(&def, &from, &joined),
+            validate_join(&def, &from, &[&joined]),
             Err(ValidationError::NondeterministicCollationTextFunction(refused))
                 if refused.field == "pos" && refused.table == "customers"
         ));
+    }
+
+    /// Tests that set the star knob take this, so they don't see each
+    /// other's.
+    static STAR_KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A star of `n` tables (`orders` and `c2`..`c<n>`), each joined on
+    /// `orders.cust`, selecting a column of each, validated with the knob
+    /// set to `knob`.
+    fn star(n: usize, knob: bool) -> Result<(), ValidationError> {
+        star_text(&star_def(n), n, knob)
+    }
+
+    fn star_def(n: usize) -> String {
+        let joins: Vec<String> = (2..=n)
+            .map(|i| format!("LEFT JOIN c{i} ON orders.cust = c{i}.id"))
+            .collect();
+        let fields: Vec<String> = (2..=n).map(|i| format!("c{i}.name AS n{i}")).collect();
+        format!(
+            "TRANSFORM v FROM orders {} SELECT {}",
+            joins.join(" "),
+            fields.join(", ")
+        )
+    }
+
+    fn star_text(text: &str, n: usize, knob: bool) -> Result<(), ValidationError> {
+        let _lock = STAR_KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let def = parse(text).unwrap();
+        let (from, joined) = sides();
+        let joined: Vec<&HashMap<String, JoinColumnInfo>> = (2..=n).map(|_| &joined).collect();
+        crate::defs::join_one_to_one::set_star_enabled(knob);
+        let result = validate_join(&def, &from, &joined);
+        crate::defs::join_one_to_one::set_star_enabled(false);
+        result
+    }
+
+    /// The star knob gates at validate: with it off a star of any size is
+    /// refused by name, and the two-table JOIN is admitted either way.
+    #[test]
+    fn the_star_knob_gates_a_star_at_validate() {
+        for n in 3..=5 {
+            assert_eq!(
+                star(n, false),
+                Err(ValidationError::StarJoinDisabled { tables: n })
+            );
+            assert_eq!(star(n, true), Ok(()), "{n} tables");
+        }
+        assert_eq!(star(2, false), Ok(()));
+        assert!(
+            ValidationError::StarJoinDisabled { tables: 3 }
+                .to_string()
+                .contains("more than two tables is not available yet")
+        );
+    }
+
+    /// U2 (#1464): define refuses 6 tables by name and accepts 5.
+    #[test]
+    fn u2_a_star_of_six_tables_is_refused_and_five_admitted() {
+        assert_eq!(star(5, true), Ok(()));
+        let refused = star(6, true);
+        assert_eq!(
+            refused,
+            Err(ValidationError::StarJoinTooManyTables { tables: 6 })
+        );
+        let text = refused.unwrap_err().to_string();
+        assert!(text.contains("reads 6 tables"), "{text}");
+        assert!(text.contains("at most 5"), "{text}");
+        // Refused at the cap whatever the knob says.
+        assert_eq!(
+            star(7, false),
+            Err(ValidationError::StarJoinTooManyTables { tables: 7 })
+        );
+    }
+
+    /// A snowflake (an `ON` reading another joined table, earlier or later)
+    /// and an `ON` reading the root and two joined tables are refused by
+    /// name, naming the other table.
+    #[test]
+    fn an_on_reading_another_joined_table_is_refused() {
+        let refused = |on3: &str, other: &str| {
+            let text = format!(
+                "TRANSFORM v FROM orders JOIN c2 ON orders.cust = c2.id \
+                 JOIN c3 ON {on3} SELECT c2.name AS a, c3.name AS b"
+            );
+            match star_text(&text, 3, true) {
+                Err(ValidationError::JoinOnReadsAnotherJoinedTable {
+                    table,
+                    other: found,
+                    ..
+                }) => {
+                    assert_eq!(table, "c3", "{on3}");
+                    assert_eq!(found, other, "{on3}");
+                }
+                other => panic!("{on3}: {other:?}"),
+            }
+        };
+        // A snowflake: c3 joins c2, not the FROM table.
+        refused("c2.id = c3.id", "c2");
+        // The root and two joined tables.
+        refused("orders.cust = c3.id AND c2.id = c3.id", "c2");
+        refused("orders.cust = c3.id AND orders.cust = c2.id", "c2");
+        // The first position's ON reads a later table, which Postgres
+        // refuses too.
+        let text = "TRANSFORM v FROM orders JOIN c2 ON orders.cust = c3.id \
+                    JOIN c3 ON orders.cust = c3.id SELECT c2.name AS a";
+        assert!(matches!(
+            star_text(text, 3, true),
+            Err(ValidationError::JoinOnReadsAnotherJoinedTable { .. })
+        ));
+        let message = ValidationError::JoinOnReadsAnotherJoinedTable {
+            table: "c3".to_string(),
+            term: "c2.id = c3.id".to_string(),
+            other: "c2".to_string(),
+        }
+        .to_string();
+        assert!(message.contains("snowflake"), "{message}");
+    }
+
+    /// Two `ON` columns of the `FROM` table at one position whose names
+    /// share their first 60 bytes would be one column of `J` once cut, at
+    /// any position the two-table JOIN's included; they are refused, and a
+    /// pair that differs within the first 60 bytes is admitted.
+    #[test]
+    fn on_columns_whose_key_column_names_collide_are_refused() {
+        let long = |tail: &str| format!("{}{tail}", "k".repeat(60));
+        let int = || info("integer", ValueType::Integer(IntWidth::Int4));
+        let check = |x: &str, y: &str| {
+            let (mut from, mut joined) = sides();
+            from.insert(x.to_string(), int());
+            from.insert(y.to_string(), int());
+            joined.insert("other".to_string(), int());
+            let def = parse(&format!(
+                "TRANSFORM v FROM orders JOIN customers \
+                 ON orders.{x} = customers.id AND orders.{y} = customers.other \
+                 SELECT customers.name AS who"
+            ))
+            .unwrap();
+            validate_join(&def, &from, &[&joined])
+        };
+        // 61 and 62 bytes, the first 60 shared: both cut to `p1_` + 60.
+        let refused = check(&long("a"), &long("bb"));
+        match &refused {
+            Err(ValidationError::OneToOneJoinUnsupported { what, .. }) => {
+                assert!(what.contains("first 60 bytes"), "{what}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(check(&long(""), &format!("{}j", "k".repeat(59))), Ok(()));
     }
 }

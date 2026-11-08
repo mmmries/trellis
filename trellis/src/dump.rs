@@ -193,6 +193,9 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     // the lock table.
     ("join1_<id>_r", Class::Runtime),
     ("join1_<id>_m", Class::Runtime),
+    ("join1_<id>_m2", Class::Runtime),
+    ("join1_<id>_m3", Class::Runtime),
+    ("join1_<id>_m4", Class::Runtime),
     ("join1_<id>_j", Class::Runtime),
     (
         "join1_<id>_l",

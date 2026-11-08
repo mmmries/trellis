@@ -356,7 +356,7 @@ pub struct JoinSpec {
     /// as written.
     pub source_alias: Option<String>,
     /// The joined tables, in the order their `JOIN`s were written. At least
-    /// one; the parser admits exactly one today.
+    /// one; how many a definition may have is the validator's.
     pub joins: Vec<JoinedTable>,
     /// The `GROUP BY` keys in the order written; at least one for an
     /// aggregate JOIN, none for a 1-1 JOIN.
