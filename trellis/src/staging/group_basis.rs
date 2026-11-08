@@ -405,7 +405,7 @@ impl Extreme {
 
 /// One distinct aggregate argument.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct Arg {
+pub(crate) struct Arg {
     /// The argument over the image populated as the source's row type `s`.
     pub(super) sql: String,
     /// The argument, for the audit to render on its own
@@ -449,6 +449,11 @@ impl GroupShape {
     /// table's column of that name.
     pub(crate) fn group_columns(&self) -> &[String] {
         &self.group_cols
+    }
+
+    /// The distinct aggregate arguments, each with its partials.
+    pub(crate) fn arguments(&self) -> &[Arg] {
+        &self.args
     }
 
     /// Each `GROUP BY` column's type in the target and hidden table, in
@@ -739,7 +744,7 @@ pub(crate) fn hidden_table_ident(schema: &str, id: i64) -> String {
 /// "Numeric sums" in the module doc). An integer argument keeps its sum
 /// alone ([`INTEGER_PARTS`]); a `numeric` one keeps all five
 /// ([`NUMERIC_PARTS`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SumPart {
     /// The sum of the finite values, as `numeric`.
     Sum,
@@ -1188,6 +1193,14 @@ fn hidden_table_columns(shape: &GroupShape) -> Vec<String> {
     columns
 }
 
+/// The zero flag's column definition of the hidden table of `shape`, over
+/// every partial (see "Zero groups" in the module doc).
+pub(crate) fn hidden_zero_column(shape: &GroupShape) -> String {
+    hidden_table_columns(shape)
+        .pop()
+        .expect("the zero flag is the last column")
+}
+
 /// How many columns the hidden table of `shape` has.
 pub(crate) fn hidden_table_width(shape: &GroupShape) -> usize {
     hidden_table_columns(shape).len()
@@ -1533,6 +1546,45 @@ pub(crate) struct GroupTargetPlan {
     /// The collations of the group columns in each population; empty for a
     /// plain aggregate ([`GroupCollations`]).
     collations: GroupCollations,
+    /// What the page's staged sides hold of each numeric sum's partials, as
+    /// [`stage_sides`] found it ([`StagedParts`]).
+    staged_parts: StagedSummary,
+}
+
+/// What a page's staged sides hold of each `numeric` sum's partials, read
+/// as it stages them ([`stage_sides`]), so its apply sums only what it
+/// staged ([`GroupTargetPlan::staged_total`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct StagedParts {
+    /// The (1-based argument, partial) pairs every staged side holds 0 of:
+    /// the special-value counts of a page with no `NaN` or infinity.
+    zero: std::collections::HashSet<(usize, SumPart)>,
+    /// The arguments with a declared scale ([`Arg::scale`]) whose staged
+    /// scale maps count no other scale: their map's total is their count of
+    /// finite values at that scale.
+    uniform: std::collections::HashSet<usize>,
+}
+
+/// A plan's [`StagedParts`], `None` until a [`stage_sides`] reads them:
+/// a staging table filled any other way (a `JOIN`'s product into `T`) is
+/// summed in full.
+#[derive(Debug, Default)]
+struct StagedSummary(std::sync::Mutex<Option<StagedParts>>);
+
+impl Clone for StagedSummary {
+    fn clone(&self) -> Self {
+        Self(std::sync::Mutex::new(self.get()))
+    }
+}
+
+impl StagedSummary {
+    fn get(&self) -> Option<StagedParts> {
+        self.0.lock().expect("the staged parts").clone()
+    }
+
+    fn set(&self, parts: Option<StagedParts>) {
+        *self.0.lock().expect("the staged parts") = parts;
+    }
 }
 
 /// The columns of a plan's staging table, as DDL.
@@ -1643,6 +1695,7 @@ impl GroupTargetPlan {
             floor_key: Some(target.to_string()),
             stage_filter: String::new(),
             collations: GroupCollations::default(),
+            staged_parts: StagedSummary::default(),
         }
     }
 
@@ -1700,6 +1753,7 @@ impl GroupTargetPlan {
             floor_key,
             stage_filter,
             collations: GroupCollations::default(),
+            staged_parts: StagedSummary::default(),
         }
     }
 
@@ -2156,6 +2210,21 @@ impl GroupTargetPlan {
             sums.push(format!("{agg}({a}) filter (where __sgn = 1)"));
             sums.push(format!("{agg}({a}) filter (where __sgn = -1)"));
         }
+        // What the staged sides hold of each numeric sum's partials
+        // ([`Self::staged_flags`]).
+        let mut returned = vec!["__n".to_string()];
+        let mut flags = Vec::new();
+        for (i, part) in self.staged_flags() {
+            let arg = &self.shape.args[i - 1];
+            let column = part.unwrap_or(SumPart::Scales).name("__", i);
+            returned.push(column.clone());
+            flags.push(match (part, arg.scale) {
+                (Some(_), _) => format!("coalesce(bool_and({column} = 0), true)"),
+                (None, Some(s)) => format!("coalesce(bool_and({}), true)", only_scale(&column, s)),
+                (None, None) => unreachable!("a scale flag without a declared scale"),
+            });
+        }
+        let returned = returned.join(", ");
         // A `JOIN`'s `T` has no `Recompute` rows ([`Self::push`]) and no
         // recompute table. Where the populated source row `s` is in scope a
         // column is read through its relation's alias (`raw.r`): the row's
@@ -2200,8 +2269,9 @@ impl GroupTargetPlan {
                  select {cols}, __txid, __lsn, {sums} from ev \
                  where (select __bad from bad) = 0 \
                  group by {cols}, __txid, __lsn{scale_keys} \
+                 returning {returned} \
              ) \
-             select __bad from bad",
+             select __bad, {flags} from bad",
             sides = Self::sides_sql(),
             values = values.join(", "),
             src = self.source_row,
@@ -2209,7 +2279,33 @@ impl GroupTargetPlan {
             sums = sums.join(", "),
             hinted = hinted,
             filter = self.stage_filter,
+            returned = returned,
+            flags = if flags.is_empty() {
+                "null::boolean[]".to_string()
+            } else {
+                format!("(select array[{}]::boolean[] from staged)", flags.join(", "))
+            },
         )
+    }
+
+    /// What [`Self::stage_sql`]'s flags say ([`StagedParts`]), in the order
+    /// it lists them: per `numeric` sum, whether every staged side holds 0
+    /// `NaN`s, `Infinity`s and `-Infinity`s, then, under a declared scale,
+    /// whether every staged map counts only that scale.
+    fn staged_flags(&self) -> Vec<(usize, Option<SumPart>)> {
+        let mut flags = Vec::new();
+        for (i, arg) in self.shape.args.iter().enumerate() {
+            if arg.parts() != NUMERIC_PARTS {
+                continue;
+            }
+            for part in [SumPart::NaN, SumPart::PosInf, SumPart::NegInf] {
+                flags.push((i + 1, Some(part)));
+            }
+            if arg.scale.is_some() {
+                flags.push((i + 1, None));
+            }
+        }
+        flags
     }
 
     /// Step 1's statement ([`lock_groups`]): inserts every group the staged
@@ -2410,9 +2506,48 @@ impl GroupTargetPlan {
         }
     }
 
+    /// The total of partial `part` of argument `i` (1-based) over the staged
+    /// sides (those meeting `condition`, if any), each named as the staging
+    /// table names it. A partial every staged side holds 0 of is its zero,
+    /// and the scale map of an argument whose staged maps count only its
+    /// declared scale ([`StagedParts::uniform`]) is its count of finite
+    /// values at that scale: no map is read.
+    fn staged_total(
+        &self,
+        staged_parts: &Option<StagedParts>,
+        i: usize,
+        part: SumPart,
+        condition: Option<&str>,
+    ) -> String {
+        let arg = &self.shape.args[i - 1];
+        let zero = |part: SumPart| staged_parts.as_ref().is_some_and(|p| p.zero.contains(&(i, part)));
+        if zero(part) {
+            return part.zero().to_string();
+        }
+        if let (SumPart::Scales, Some(s), Some(parts)) = (part, arg.scale, staged_parts)
+            && parts.uniform.contains(&i)
+        {
+            let filter = condition
+                .map(|c| format!(" filter (where {c})"))
+                .unwrap_or_default();
+            let mut finite = format!("coalesce(sum(__c{i}){filter}, 0)");
+            for special in [SumPart::NaN, SumPart::PosInf, SumPart::NegInf] {
+                if !zero(special) {
+                    finite.push_str(&format!(
+                        " - coalesce(sum({}){filter}, 0)",
+                        special.name("__", i)
+                    ));
+                }
+            }
+            return single_scale(s, &format!("({finite})::bigint"));
+        }
+        part.total(&part.name("__", i), condition, arg.scale)
+    }
+
     fn apply_sql_with(&self, tail: &str) -> String {
         let cols = quoted(&self.shape.group_cols);
         let args = &self.shape.args;
+        let staged_parts = self.staged_parts.get();
         // The per-(group, transaction) sums of each partial.
         let mut sums = vec!["sum(__n)::bigint as __n".to_string()];
         let mut totals = vec!["sum(__n)::bigint as __n".to_string()];
@@ -2428,19 +2563,27 @@ impl GroupTargetPlan {
             returning.push(format!("t.__c{i} as __dc{i}, u.__count_{i} as __nc{i}"));
             for part in arg.parts() {
                 let (staged, hidden) = (part.name("__", i), part.hidden(i));
-                sums.push(format!(
-                    "{} as {staged}",
-                    part.total(&staged, None, arg.scale)
-                ));
-                totals.push(format!(
-                    "{} as {staged}",
-                    part.total(&staged, None, arg.scale)
-                ));
-                sets.push(format!(
-                    "{hidden} = {}",
-                    part.add(&format!("u.{hidden}"), &format!("t.{staged}"), arg.scale)
-                ));
-                nonzero.push(part.nonzero(&format!("t.{staged}")));
+                let total = self.staged_total(&staged_parts, i, *part, None);
+                // A map the next step derives from the counts
+                // ([`Self::staged_total`]) is never read per transaction.
+                let derived = *part == SumPart::Scales
+                    && arg.scale.is_some()
+                    && staged_parts.as_ref().is_some_and(|p| p.uniform.contains(&i));
+                if derived {
+                    sums.push(format!("{NO_SCALES} as {staged}"));
+                } else {
+                    sums.push(format!("{total} as {staged}"));
+                }
+                totals.push(format!("{total} as {staged}"));
+                if staged_parts.as_ref().is_some_and(|p| p.zero.contains(&(i, *part))) {
+                    // Every staged side holds 0 of it: the row keeps its value.
+                } else {
+                    sets.push(format!(
+                        "{hidden} = {}",
+                        part.add(&format!("u.{hidden}"), &format!("t.{staged}"), arg.scale)
+                    ));
+                    nonzero.push(part.nonzero(&format!("t.{staged}")));
+                }
                 returning.push(format!(
                     "t.{staged} as {}, u.{hidden} as {}",
                     part.name("__d", i),
@@ -2511,6 +2654,7 @@ impl GroupTargetPlan {
         returning: &[String],
         unseen: &str,
     ) -> String {
+        let staged_parts = self.staged_parts.get();
         let mut sums = sums.to_vec();
         let mut totals =
             vec!["coalesce(sum(__n) filter (where __ok), 0)::bigint as __n".to_string()];
@@ -2523,7 +2667,7 @@ impl GroupTargetPlan {
                 let staged = part.name("__", i);
                 totals.push(format!(
                     "{} as {staged}",
-                    part.total(&staged, Some("__ok"), arg.scale)
+                    self.staged_total(&staged_parts, i, *part, Some("__ok"))
                 ));
             }
         }
@@ -4052,10 +4196,22 @@ pub(super) async fn stage_sides(
     plan: &GroupTargetPlan,
 ) -> Result<(), ApplyError> {
     txn.batch_execute(&plan.working_ddl()).await?;
-    let bad: i64 = txn
-        .query_one(&plan.stage_sql(), &[&plan.sides])
-        .await?
-        .get(0);
+    let row = txn.query_one(&plan.stage_sql(), &[&plan.sides]).await?;
+    let bad: i64 = row.get(0);
+    let flags: Vec<bool> = row.get::<_, Option<Vec<bool>>>(1).unwrap_or_default();
+    let mut parts = StagedParts::default();
+    for ((i, part), set) in plan.staged_flags().into_iter().zip(flags) {
+        match (part, set) {
+            (Some(part), true) => {
+                parts.zero.insert((i, part));
+            }
+            (None, true) => {
+                parts.uniform.insert(i);
+            }
+            (_, false) => {}
+        }
+    }
+    plan.staged_parts.set(Some(parts));
     if bad > 0 {
         return Err(plan.unsupported(
             "a ring row without the images its change needs (an image-less delete or \

@@ -5,11 +5,15 @@
 //!
 //! The re-type is the one a source's `integer` column moved to an unscaled
 //! `numeric` makes. Trellis's copy of it becomes an unconstrained `numeric`,
-//! which a group-basis `SUM`/`AVG` or a `JOIN`'s define refuses over a column
-//! of a table Trellis creates (ADR-0020). The
-//! readers are group-basis aggregates. Every step is a bounded, explicit pass or drain; nothing
-//! polls for convergence. The one wait, in the lock-order test, is for
-//! a backend to block on a lock.
+//! which a `date + p` define refuses (`date + numeric` is no operator). A
+//! `SUM` over it is admitted: its aggregate is paused for its outgrown
+//! `bigint` total and resumed once the copy is re-typed, and its sums stay
+//! Postgres's. A source `numeric(p,s)` column re-typed to an unconstrained
+//! `numeric` keeps every value's text, so its `SUM` readers neither pause nor
+//! rebuild, and go on summing its new scales exactly. The readers are
+//! group-basis aggregates. Every step is a bounded, explicit pass or drain;
+//! nothing polls for convergence. The one wait, in the lock-order test, is
+//! for a backend to block on a lock.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -126,33 +130,38 @@ async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool, targets: &[&st
     panic!("{targets:?} did not all go live within 8 pass/drain rounds");
 }
 
-/// `public.src (id, g, price int)`, empty, with `t` a passthrough of `price` as `p` and these readers of
-/// `t.p`, all live:
+/// `public.src (id, g, price int, d date)`, with `t` a passthrough of
+/// `price` as `p` and of `d`, and these readers of `t.p`, all live:
 ///
-/// - `roll`: `SUM(p)` per `g` (valid over an integer, refused over a numeric with no scale);
+/// - `roll`: `COUNT(d + p)` per `g` (valid over an integer, refused over a
+///   `numeric`: `date + numeric` is no operator);
+/// - `sums`: `SUM(p)` and `AVG(p)` per `g` (valid over both);
 /// - `cnt`: `COUNT(p)` per `g` (valid over any type);
 /// - `c`: a 1-1 passthrough of `p` (valid).
 async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trellis {
     raw.batch_execute(
-        "create table public.src (id int primary key, g int, price int); \
-        ",
+        "create table public.src (id int primary key, g int, price int, d date); \
+         insert into public.src values (1, 1, 3, '2026-01-01'), (2, 1, 4, '2026-01-02')",
     )
     .await
     .expect("tables");
     let trellis = definer(dsn).await;
     trellis
-        .apply("TRANSFORM t FROM public.src SELECT g AS g, price AS p")
+        .apply("TRANSFORM t FROM public.src SELECT g AS g, price AS p, d AS d")
         .await
         .expect("define t");
     bring_live(raw, pool, &["t"]).await;
     for text in [
-        "TRANSFORM roll FROM public.t GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(p) AS total, COUNT(*) AS n",
+        "TRANSFORM roll FROM public.t GROUP BY g WITHOUT SOURCE INDEX \
+         SELECT COUNT(d + p) AS dates, COUNT(*) AS n",
+        "TRANSFORM sums FROM public.t GROUP BY g WITHOUT SOURCE INDEX \
+         SELECT SUM(p) AS total, AVG(p) AS mean",
         "TRANSFORM cnt FROM public.t GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(p) AS c",
         "TRANSFORM c FROM public.t SELECT p AS q",
     ] {
         trellis.apply(text).await.expect(text);
     }
-    bring_live(raw, pool, &["t", "roll", "cnt", "c"]).await;
+    bring_live(raw, pool, &["t", "roll", "sums", "cnt", "c"]).await;
     trellis
 }
 
@@ -167,9 +176,41 @@ async fn column_type(raw: &Client, table: &str, column: &str) -> String {
     .get(0)
 }
 
+/// Every row of `sql`, each column as text.
+async fn rows(raw: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
+    raw.query(sql, &[])
+        .await
+        .unwrap_or_else(|err| panic!("{sql}: {err}"))
+        .iter()
+        .map(|row| (0..row.len()).map(|i| row.get(i)).collect())
+        .collect()
+}
+
+/// `sums`' rows beside Postgres's own `sum()` and `avg()` over `table`'s
+/// `column`, as text.
+async fn assert_sums_exact(raw: &Client, target: &str, table: &str, column: &str) {
+    assert_eq!(
+        rows(
+            raw,
+            &format!("select g::text, total::text, mean::text from public.{target} order by g")
+        )
+        .await,
+        rows(
+            raw,
+            &format!(
+                "select g::text, sum({column})::text, avg({column})::text from {table} \
+                 group by g order by g"
+            )
+        )
+        .await,
+        "{target} over {table}.{column}"
+    );
+}
+
 /// A `RESUME` that re-types `t.p` pauses `roll`, with
 /// define's refusal as the reason naming the re-type, and its own
-/// `RESUME` refuses. `cnt` and `c` stay valid and are not paused by it.
+/// `RESUME` refuses. `sums` goes on, its sums Postgres's over the
+/// re-typed column, and `cnt` and `c` stay valid and are not paused by it.
 #[tokio::test]
 async fn a_resume_that_retypes_a_column_pauses_the_readers_define_would_refuse() {
     let cluster = TestCluster::start();
@@ -191,11 +232,6 @@ async fn a_resume_that_retypes_a_column_pauses_the_readers_define_would_refuse()
         let reported = trellis.status(reader).await.expect("status").expect(reader);
         assert_eq!(reported.status, TransformStatus::Paused, "{reader}");
         let error = reported.capture_failure.expect("a reason").error;
-        assert!(error.contains("no declared scale"), "{reader}: {error}");
-        assert!(
-            error.contains("a table Trellis creates"),
-            "{reader} reads a target's column: the chained refusal: {error}"
-        );
         assert!(
             error.contains("from integer to numeric"),
             "{reader} names the upstream re-type: {error}"
@@ -207,15 +243,16 @@ async fn a_resume_that_retypes_a_column_pauses_the_readers_define_would_refuse()
             other => panic!("the resume of {reader} should be refused: {other:?}"),
         }
     }
-    for reader in ["cnt", "c"] {
+    // `sums` follows the copy to `numeric` and sums its new scales.
+    raw.batch_execute("insert into public.src values (3, 1, 0.125, '2026-01-03')")
+        .await
+        .expect("a value at a new scale");
+    bring_live(&mut raw, &db.pool, &["t", "sums", "cnt", "c"]).await;
+    assert_sums_exact(&raw, "sums", "public.t", "p").await;
+    assert_eq!(column_type(&raw, "public.sums", "total").await, "numeric");
+    for reader in ["sums", "cnt", "c"] {
         let reported = trellis.status(reader).await.expect("status").expect(reader);
-        assert!(
-            reported
-                .capture_failure
-                .as_ref()
-                .is_none_or(|f| !f.error.contains("no declared scale")),
-            "{reader} isn't paused for a refusal: {reported:?}"
-        );
+        assert_eq!(reported.status, TransformStatus::Live, "{reader}: {reported:?}");
     }
     trellis.shutdown().await.expect("shutdown");
 }
@@ -364,35 +401,40 @@ async fn resume_retype_against_a_reader_row_holder(stall: Duration, expect_retry
 
 /// The same down a chain `t -> c -> roll2`: `t`'s resume re-types `t.p`,
 /// which pauses `c` (its copy of `p` is outgrown); `c`'s chained
-/// resume re-types `c.q`, which pauses `roll2`, a `SUM(q)` define would now
-/// refuse. `c` goes live again.
+/// resume re-types `c.q`, which pauses `roll2`, a `COUNT(d + q)` define
+/// would now refuse. `c` goes live again, and so does `sums2`, a `SUM(q)`,
+/// its sums Postgres's over the re-typed `c.q`.
 #[tokio::test]
 async fn a_chained_resume_retype_pauses_the_reader_define_would_refuse() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
-    raw.batch_execute("create table public.src (id int primary key, g int, price int)")
-        .await
-        .expect("tables");
+    raw.batch_execute(
+        "create table public.src (id int primary key, g int, price int, d date); \
+         insert into public.src values (1, 1, 3, '2026-01-01')",
+    )
+    .await
+    .expect("tables");
     let trellis = definer(db.dsn()).await;
     trellis
-        .apply("TRANSFORM t FROM public.src SELECT g AS g, price AS p")
+        .apply("TRANSFORM t FROM public.src SELECT g AS g, price AS p, d AS d")
         .await
         .expect("define t");
     bring_live(&mut raw, &db.pool, &["t"]).await;
     trellis
-        .apply("TRANSFORM c FROM public.t SELECT g AS g, p AS q")
+        .apply("TRANSFORM c FROM public.t SELECT g AS g, p AS q, d AS d")
         .await
         .expect("define c");
     bring_live(&mut raw, &db.pool, &["t", "c"]).await;
-    trellis
-        .apply(
-            "TRANSFORM roll2 FROM public.c GROUP BY g WITHOUT SOURCE INDEX \
-             SELECT SUM(q) AS total",
-        )
-        .await
-        .expect("define roll2");
-    bring_live(&mut raw, &db.pool, &["t", "c", "roll2"]).await;
+    for text in [
+        "TRANSFORM roll2 FROM public.c GROUP BY g WITHOUT SOURCE INDEX \
+         SELECT COUNT(d + q) AS dates",
+        "TRANSFORM sums2 FROM public.c GROUP BY g WITHOUT SOURCE INDEX \
+         SELECT SUM(q) AS total, AVG(q) AS mean",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(&mut raw, &db.pool, &["t", "c", "roll2", "sums2"]).await;
 
     raw.batch_execute("alter table public.src alter column price type numeric")
         .await
@@ -410,31 +452,35 @@ async fn a_chained_resume_retype_pauses_the_reader_define_would_refuse() {
         .expect("roll2");
     assert_eq!(reported.status, TransformStatus::Paused);
     let error = reported.capture_failure.expect("a reason").error;
-    assert!(error.contains("no declared scale"), "{error}");
-    assert!(
-        error.contains("a table Trellis creates"),
-        "the chained refusal: {error}"
-    );
     assert!(
         error.contains("public.c.q from integer to numeric"),
         "{error}"
     );
+    raw.batch_execute("insert into public.src values (2, 1, 2.50, '2026-01-02')")
+        .await
+        .expect("a value at a new scale");
+    bring_live(&mut raw, &db.pool, &["t", "c", "sums2"]).await;
+    assert_sums_exact(&raw, "sums2", "public.c", "q").await;
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// The captured-source path: a source column a group-basis `SUM` and a
-/// `JOIN`'s `SUM` read is re-typed to an unconstrained `numeric`, and the
-/// capture pass's re-validation pauses both with define's refusal.
-/// For the plain aggregate only `revalidate`'s
-/// group-basis check refuses.
+/// The captured-source path, and the Decision's retype: a source
+/// `numeric(10,2)` column a group-basis `SUM`/`AVG` and a `JOIN`'s `SUM`
+/// read is re-typed to an unconstrained `numeric`. Every value keeps its
+/// text and the partials already count the scale `2` (one layout for every
+/// `numeric`), so the capture pass neither pauses nor rebuilds either; then
+/// a value at scale 5 enters and leaves, and the sums follow Postgres's text
+/// both ways.
 #[tokio::test]
-async fn a_source_retype_to_unscaled_numeric_pauses_its_sum_readers() {
+async fn a_source_retype_to_unscaled_numeric_keeps_its_sum_readers_exact() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table public.src (id int primary key, g int, price numeric(10,2)); \
-         create table public.o (id int primary key, g int)",
+         create table public.o (id int primary key, g int); \
+         insert into public.src values (1, 1, 1.25), (2, 1, 2.50); \
+         insert into public.o values (1, 1)",
     )
     .await
     .expect("tables");
@@ -442,14 +488,15 @@ async fn a_source_retype_to_unscaled_numeric_pauses_its_sum_readers() {
     trellis
         .apply(
             "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX \
-             SELECT SUM(price) AS total",
+             SELECT SUM(price) AS total, AVG(price) AS mean",
         )
         .await
         .expect("define agg");
     trellis
         .apply(
             "TRANSFORM j FROM public.src JOIN public.o ON src.g = o.g GROUP BY src.g \
-             WITHOUT SOURCE INDEX SELECT src.g AS g, SUM(src.price) AS s",
+             WITHOUT SOURCE INDEX SELECT src.g AS g, SUM(src.price) AS total, \
+             AVG(src.price) AS mean",
         )
         .await
         .expect("define j");
@@ -459,49 +506,29 @@ async fn a_source_retype_to_unscaled_numeric_pauses_its_sum_readers() {
         .await
         .expect("widen the source");
     full_pass(&mut raw, &db.pool).await;
-
     for reader in ["agg", "j"] {
         let reported = trellis.status(reader).await.expect("status").expect(reader);
-        assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
-        let error = reported.capture_failure.expect("a reason").error;
-        assert!(error.contains("no declared scale"), "{reader}: {error}");
-        assert!(
-            !error.contains("a table Trellis creates"),
-            "{reader} reads a source: not the chained refusal: {error}"
+        assert_eq!(
+            reported.status,
+            TransformStatus::Live,
+            "{reader} neither pauses nor rebuilds: {reported:?}"
         );
+        assert_sums_exact(&raw, reader, "public.src", "price").await;
     }
-    trellis.shutdown().await.expect("shutdown");
-}
-
-/// The narrowed R1 after an unscaled re-type: the paused reader's
-/// `RESUME` refuses with define's refusal while the column has no scale.
-#[tokio::test]
-async fn a_resume_refuses_a_sum_over_a_column_re_typed_to_unscaled_numeric() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
-    raw.batch_execute("create table public.src (id int primary key, g int, price numeric(10,2))")
+    raw.batch_execute("insert into public.src values (3, 1, 1.12345)")
         .await
-        .expect("table");
-    let trellis = definer(db.dsn()).await;
-    trellis
-        .apply(
-            "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX \
-             SELECT SUM(price) AS total",
-        )
+        .expect("a value at scale 5");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    for reader in ["agg", "j"] {
+        assert_sums_exact(&raw, reader, "public.src", "price").await;
+    }
+    raw.batch_execute("delete from public.src where id = 3")
         .await
-        .expect("define agg");
-    bring_live(&mut raw, &db.pool, &["agg"]).await;
-
-    raw.batch_execute("alter table public.src alter column price type numeric")
-        .await
-        .expect("widen the source");
-    full_pass(&mut raw, &db.pool).await;
-    assert_eq!(status(&raw, "agg").await, TransformStatus::Paused);
-
-    match trellis.apply("RESUME TRANSFORM agg").await {
-        Err(err) => assert!(err.to_string().contains("no declared scale"), "{err}"),
-        Ok(applied) => panic!("the resume should be refused: {applied:?}"),
+        .expect("the value leaves");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    for reader in ["agg", "j"] {
+        assert_eq!(status(&raw, reader).await, TransformStatus::Live, "{reader}");
+        assert_sums_exact(&raw, reader, "public.src", "price").await;
     }
     trellis.shutdown().await.expect("shutdown");
 }

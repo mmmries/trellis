@@ -411,7 +411,7 @@ fn partial_columns(numeric: &[bool]) -> Vec<String> {
 /// Stored and generated, so every writer keeps it current; the tombstone
 /// pass collects zero rows through a partial index `where __zero` on the
 /// table's identity.
-fn zero_column(numeric: &[bool]) -> String {
+pub(crate) fn zero_column(numeric: &[bool]) -> String {
     let mut zero = vec!["__n = 0".to_string()];
     for (i, numeric) in numeric.iter().enumerate() {
         let i = i + 1;

@@ -638,6 +638,12 @@ impl JoinTargetPlan {
         })
     }
 
+    /// Whether a `SUM` or `AVG` reads each of `T`'s arguments: the `FROM`
+    /// side's, then the joined side's.
+    pub(crate) fn summed_arguments(&self) -> Vec<bool> {
+        self.t.shape.args.iter().map(|arg| arg.summed).collect()
+    }
+
     fn side_mut(&mut self, side: Side) -> &mut SidePlan {
         match side {
             Side::From => &mut self.from,

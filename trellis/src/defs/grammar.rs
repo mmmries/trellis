@@ -167,6 +167,9 @@ pub(crate) async fn pause_unloadable_in(
     paused += super::recorded_keys::backfill_in(txn, floors, oldest, current)
         .await
         .map_err(incompatible)?;
+    // The numeric partials of each `SUM`/`AVG` an earlier release stored
+    // its sum alone for.
+    super::numeric_sums::convert_in(txn, floors).await?;
     Ok((paused, unrunnable))
 }
 
