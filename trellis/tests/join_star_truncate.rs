@@ -610,3 +610,87 @@ async fn cx_f5d_a_root_insert_races_a_change_of_its_key_while_the_truncates_rebu
         after_a_truncate(orientation, false).await;
     }
 }
+
+// ------------------------------------------------- several tables, several stars
+
+/// One page truncating every table of the star, with every kind tuple's
+/// star defined over the same tables: each star's `R` and both `M`s are
+/// emptied, its target is empty, and it starts one rebuild (a plan job and a
+/// sweep job); refilled, every star matches the live join.
+#[tokio::test]
+async fn a_truncate_of_every_table_of_several_stars_empties_each_and_starts_one_rebuild_each() {
+    let _serial = star::serial().await;
+    knob();
+    let stars = N3.stars();
+    let mut d = star::start_seeded(&stars, SEED).await;
+    star::step(&mut d, "truncate public.a, public.b1, public.b2").await;
+    for star in &stars {
+        let name = star.name();
+        let r = star::r_table(&d, *star).await;
+        assert_eq!(
+            count(&d, &format!("select count(*) from {r}")).await,
+            "(0)",
+            "{name} R"
+        );
+        for p in N3.all() {
+            let m = star::m_table(&d, *star, p).await;
+            assert_eq!(
+                count(&d, &format!("select count(*) from {m}")).await,
+                "(0)",
+                "{name} M{p}"
+            );
+        }
+        assert_eq!(
+            count(&d, &format!("select count(*) from {}", star.target())).await,
+            "(0)",
+            "{name} target"
+        );
+        assert_eq!(
+            build_state(&d, *star).await,
+            ("backfilling".to_string(), 2),
+            "{name}"
+        );
+    }
+    star::step(
+        &mut d,
+        "insert into public.b1 values (1, 1, 10, 'b1'); \
+        insert into public.a (id, k1, k2, x, y) values (1, 1, 1, 7, 'a1'), (2, 3, 1, 8, 'a2'); \
+        insert into public.b2 values (1, 1, 100, 'e1')",
+    )
+    .await;
+    star::assert_rebuilt(&mut d, &stars).await;
+}
+
+/// A `TRUNCATE` (and refill, in one transaction) of the table at position 2
+/// that another transform reads as its `FROM`: that transform's target is
+/// cleared and refilled, and the star rebuilds to the live join.
+#[tokio::test]
+async fn a_truncate_of_a_joined_table_another_transform_reads_settles_both() {
+    let _serial = star::serial().await;
+    knob();
+    let star = N3.stars()[0];
+    let ddl = format!("{}; {SEED}", N3.ddl());
+    let def = star.definition();
+    let defs = [
+        def.as_str(),
+        "TRANSFORM b2copy FROM public.b2 SELECT w AS ww",
+    ];
+    let mut columns = N3.columns();
+    columns.push((
+        "w".to_string(),
+        trellis::defs::ast::ValueType::Integer(trellis::integer::IntWidth::Int4),
+    ));
+    let columns: Vec<(&str, _)> = columns.iter().map(|(c, t)| (c.as_str(), *t)).collect();
+    let tables = N3.tables();
+    let tables: Vec<&str> = tables.iter().map(String::as_str).collect();
+    let mut d = Driver::start(&ddl, &columns, &defs, &tables).await;
+    assert_eq!(count(&d, "select count(*) from public.b2copy").await, "(4)");
+    star::step(
+        &mut d,
+        "begin; truncate public.b2; insert into public.b2 values (7, 1, 700, 'e7'); commit",
+    )
+    .await;
+    assert_eq!(count(&d, "select count(*) from public.b2copy").await, "(1)");
+    star::assert_rebuilt(&mut d, &[star]).await;
+    assert_eq!(count(&d, "select count(*) from public.b2copy").await, "(1)");
+}
