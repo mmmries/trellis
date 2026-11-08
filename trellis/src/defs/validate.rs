@@ -186,7 +186,7 @@ pub enum ValidationError {
         family: &'static str,
     },
     /// `SUM`/`AVG` over a column whose type is not an integer or a
-    /// `numeric(p,s)`.
+    /// `numeric`.
     UnsupportedAggregateArgument {
         function: String,
         column: String,
@@ -1130,7 +1130,7 @@ impl fmt::Display for ValidationError {
                 f,
                 "{function} is not supported: {family} is not an aggregate Trellis maintains; \
                  the supported aggregates are COUNT(*), COUNT(col), SUM/AVG over \
-                 smallint, integer, bigint or numeric(p,s), and, in a GROUP BY without a \
+                 smallint, integer, bigint or numeric, and, in a GROUP BY without a \
                  JOIN, MIN/MAX of a number, date or time column (see \"Supported sources and \
                  targets\" in docs/transforms.md)"
             ),
@@ -1141,7 +1141,7 @@ impl fmt::Display for ValidationError {
             } => write!(
                 f,
                 "{function}({column}) is over {pg_type}; SUM and AVG are supported over \
-                 smallint, integer, bigint and numeric(p,s) only"
+                 smallint, integer, bigint and numeric only"
             ),
             ValidationError::UnsupportedExtremeArgument {
                 function,
@@ -1956,8 +1956,9 @@ pub(crate) enum AggregateScope {
 
 /// The per-family refusal of aggregates outside the admitted set: whether `function` (an
 /// uppercased aggregate name) over `arg` is in the admitted set, `COUNT(*)`,
-/// `COUNT(col)`, `SUM`/`AVG` over `smallint`/`integer`/`bigint`/
-/// `numeric(p,s)`, and in a plain aggregate (`scope`) `MIN`/`MAX` of a
+/// `COUNT(col)`, `SUM`/`AVG` over `smallint`/`integer`/`bigint`/`numeric`
+/// (with or without a declared scale), and in a plain aggregate (`scope`)
+/// `MIN`/`MAX` of a
 /// plain source column of a type `registry::extreme_type_admitted` admits,
 /// or else a named refusal. `arg` is `None` for `COUNT(*)` and for the
 /// family check made before the argument is typed.
@@ -2050,7 +2051,8 @@ pub(crate) fn check_aggregate_admitted(
 /// ([`check_aggregate_admitted`]): the group basis keeps every aggregate
 /// definition, and has nothing for the rest. `columns` are the source's live
 /// columns, whose declared modifier tells a `numeric(p,s)` argument from an
-/// unconstrained one; an expression's `numeric` result has no declared scale.
+/// unconstrained one (admitted by different rules); an expression's
+/// `numeric` result has no declared scale.
 ///
 /// Any other key space passes.
 pub(crate) fn validate_aggregate_admitted(

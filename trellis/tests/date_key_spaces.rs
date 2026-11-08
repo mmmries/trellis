@@ -286,11 +286,10 @@ async fn an_aggregate_argument_and_composed_field_compute_dates() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// An `EXTRACT` is an unconstrained `numeric`, so summing it is refused for
-/// its undeclared scale; counting it, and summing an integer date difference,
-/// define.
+/// An `EXTRACT` is an unconstrained `numeric`; summing it, counting it,
+/// and summing an integer date difference all define (#1120).
 #[tokio::test]
-async fn summing_an_extract_is_refused_for_its_scale_and_counting_it_defines() {
+async fn summing_or_counting_an_extract_defines() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -301,15 +300,17 @@ async fn summing_an_extract_is_refused_for_its_scale_and_counting_it_defines() {
     )
     .await
     .expect("connect");
-    for formula in ["SUM(EXTRACT(year FROM d))", "AVG(EXTRACT(dow FROM d))"] {
-        let err = definer
+    for (n, formula) in ["SUM(EXTRACT(year FROM d))", "AVG(EXTRACT(dow FROM d))"]
+        .iter()
+        .enumerate()
+    {
+        definer
             .apply(&format!(
-                "TRANSFORM bad FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, {formula} AS v"
+                "TRANSFORM extract{n} FROM s GROUP BY g WITHOUT SOURCE INDEX \
+                 SELECT g AS g, {formula} AS v"
             ))
             .await
-            .expect_err(formula)
-            .to_string();
-        assert!(err.contains("no declared scale"), "{formula}: {err}");
+            .unwrap_or_else(|e| panic!("{formula}: {e}"));
     }
     definer
         .apply(
