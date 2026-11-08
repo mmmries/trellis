@@ -17,7 +17,10 @@
 //!   different positions share no `J` row; only the row's `R` entry orders
 //!   them.
 //! - **CX F4a–F4c**: a `b1` unique-key hand-off applied out of order, against
-//!   a change of `b2` and a root insert on the key.
+//!   a change of `b2` and a root insert on the key. The ring holds two
+//!   undrained batches, so the hand-off's first half is written past capture
+//!   and repaired by a Re-derive after the race, and F4c's third page runs
+//!   after the other two.
 //! - **CX F6e**: a Re-derive of a `b1` row whose key moved after its unlocked
 //!   read, against a change of `b2` on a row of its new key.
 //! - **CX F9c**: a root row moving to `NULL` at one position, against a page
@@ -55,6 +58,7 @@ async fn cx_f1a_value_changes_at_two_positions_meet_at_one_root_row() {
         &[],
         Writer::Change("update public.b1 set w = 11 where id = 1"),
         Writer::Change("update public.b2 set w = 101 where id = 1"),
+        None,
         SYM,
     )
     .await;
@@ -73,6 +77,7 @@ async fn cx_f1b_an_insert_at_one_position_meets_a_change_at_the_other() {
         &[],
         Writer::Change("insert into public.b1 values (4, 4, 40, 'b4')"),
         Writer::Change("update public.b2 set w = 401 where id = 4"),
+        None,
         SYM,
     )
     .await;
@@ -89,6 +94,7 @@ async fn cx_f1c_a_delete_at_one_position_meets_a_change_at_the_other() {
         &[],
         Writer::Change("delete from public.b1 where id = 1"),
         Writer::Change("update public.b2 set w = 101 where id = 1"),
+        None,
         ASYM,
     )
     .await;
@@ -105,6 +111,7 @@ async fn cx_f1d_moves_off_at_two_positions_meet_at_one_root_row() {
         &[],
         Writer::Change("update public.b1 set k = 5 where id = 1"),
         Writer::Change("update public.b2 set k = 6 where id = 1"),
+        None,
         SYM,
     )
     .await;
@@ -121,6 +128,7 @@ async fn cx_f1e_a_change_at_one_position_meets_an_insert_at_the_other() {
         &[],
         Writer::Change("update public.b1 set w = 11 where id = 1"),
         Writer::Change("insert into public.b2 values (5, 5, 500, 'e5')"),
+        None,
         SYM,
     )
     .await;
@@ -137,6 +145,7 @@ async fn cx_f1f_a_move_onto_a_key_meets_a_change_at_the_other_position() {
         &[],
         Writer::Change("update public.b1 set k = 4 where id = 3"),
         Writer::Change("update public.b2 set w = 401 where id = 4"),
+        None,
         ASYM,
     )
     .await;
@@ -144,11 +153,16 @@ async fn cx_f1f_a_move_onto_a_key_meets_a_change_at_the_other_position() {
 
 // ---------------------------------------------------------------- CX F4
 
-/// The first half of F4's hand-off: `b1` row 1 leaves key 1. Sealed first,
-/// drained after the pins' pages: the second half applies out of order.
-const LEAVE: &str = "update public.b1 set k = 6 where id = 1";
+/// The first half of F4's hand-off: `b1` row 1 leaves key 1. Written past
+/// capture, so `M` still holds it on key 1 while the second half applies
+/// (out of order), and repaired by a Re-derive of the row after the race.
+const LEAVE: (&str, &str) = ("public.b1", "update public.b1 set k = 6 where id = 1");
+/// The Re-derive that applies [`LEAVE`] after the race.
+const LEAVE_AFTER: Writer = Writer::Rederive("public.b1", &["1"]);
 /// The second half: `b1` row 5 takes key 1.
 const TAKE: &str = "insert into public.b1 values (5, 1, 50, 'b5')";
+/// An `a` insert on `(1, 1)`.
+const A5: &str = "insert into public.a (id, k1, k2, x, y) values (5, 1, 1, 5, 'a5')";
 
 /// F4a: the take ‖ a page with a `b2` change on key 1 and an `a` insert on
 /// `(1, 1)`, before the leave applies (`join1_m_before_j`,
@@ -165,69 +179,57 @@ async fn cx_f4a_a_hand_off_out_of_order_races_a_change_and_a_root_insert() {
             "update public.b2 set w = 101 where id = 1; \
              insert into public.a (id, k1, k2, x, y) values (5, 1, 1, 5, 'a5')",
         ),
+        Some(LEAVE_AFTER),
         ASYM,
     )
     .await;
 }
 
-/// F4b: the take ‖ a page with the leave and a `b2` change on key 1, then
-/// an `a` insert on `(1, 1)` drained after them.
+/// F4b: the take ‖ a page with the leave and a `b2` change on key 1, then an
+/// `a` insert on `(1, 1)` after them.
 #[tokio::test]
 async fn cx_f4b_a_hand_off_out_of_order_races_its_first_half_and_a_change() {
+    let _serial = star::serial().await;
+    knob();
+    star_cx::family(
+        SEED,
+        &[],
+        Writer::Change(
+            "update public.b1 set k = 6 where id = 1; update public.b2 set w = 101 where id = 1",
+        ),
+        Writer::Change(TAKE),
+        Some(Writer::Change(A5)),
+        ASYM,
+    )
+    .await;
+}
+
+/// F4c: the take ‖ a `b2` change on key 1, each its own page, then an `a`
+/// insert on `(1, 1)` in a third page after them (the ring holds two
+/// undrained batches, so not three in flight), then the leave.
+#[tokio::test]
+async fn cx_f4c_a_hand_off_out_of_order_races_a_change_then_a_root_insert() {
     let _serial = star::serial().await;
     knob();
     for orientation in ASYM {
         for star in N3.stars() {
             for flip in [false, true] {
                 let mut d = star::start_seeded(&[star], &orientation.sql(SEED)).await;
-                let first = orientation
-                    .writer(Writer::Change(
-                        "update public.b1 set k = 6 where id = 1; \
-                         update public.b2 set w = 101 where id = 1",
-                    ))
-                    .seal(&mut d)
+                star::write_uncaptured(&d, &orientation.sql(LEAVE.0), &orientation.sql(LEAVE.1))
                     .await;
                 let take = orientation.writer(Writer::Change(TAKE)).seal(&mut d).await;
-                let insert = star_cx::seal_tail(
-                    &mut d,
-                    &["insert into public.a (id, k1, k2, x, y) values (5, 1, 1, 5, 'a5')"],
-                    *orientation,
-                )
-                .await;
-                let (x, y) = if flip { (first, take) } else { (take, first) };
+                let change = orientation
+                    .writer(Writer::Change("update public.b2 set w = 101 where id = 1"))
+                    .seal(&mut d)
+                    .await;
+                let (x, y) = if flip { (change, take) } else { (take, change) };
                 star_cx::race_at(&mut d, star, x, y, PausePoint::BeforeCommit, false).await;
-                star_cx::drain_tail(&mut d, insert).await;
+                let insert = orientation.writer(Writer::Change(A5)).seal(&mut d).await;
+                d.drain(insert, "insert").await;
+                let leave = orientation.writer(LEAVE_AFTER).seal(&mut d).await;
+                d.drain(leave, "leave").await;
                 star::assert_oracle(&mut d, &[star]).await;
             }
-        }
-    }
-}
-
-/// F4c: the take, a `b2` change on key 1 and an `a` insert on `(1, 1)`, in
-/// three pages: the take frozen at its commit while both others queue on it,
-/// then the leave.
-#[tokio::test]
-async fn cx_f4c_a_hand_off_out_of_order_races_a_change_and_a_root_insert_in_three_pages() {
-    let _serial = star::serial().await;
-    knob();
-    for orientation in ASYM {
-        for star in N3.stars() {
-            let mut d = star::start_seeded(&[star], &orientation.sql(SEED)).await;
-            let leave = star_cx::seal_tail(&mut d, &[LEAVE], *orientation).await;
-            let take = orientation.writer(Writer::Change(TAKE)).seal(&mut d).await;
-            let change = orientation
-                .writer(Writer::Change("update public.b2 set w = 101 where id = 1"))
-                .seal(&mut d)
-                .await;
-            let insert = orientation
-                .writer(Writer::Change(
-                    "insert into public.a (id, k1, k2, x, y) values (5, 1, 1, 5, 'a5')",
-                ))
-                .seal(&mut d)
-                .await;
-            star_cx::race3(&mut d, star, take, change, insert).await;
-            star_cx::drain_tail(&mut d, leave).await;
-            star::assert_oracle(&mut d, &[star]).await;
         }
     }
 }
@@ -317,6 +319,7 @@ async fn cx_f9c_a_root_row_moving_to_null_races_a_page_of_both_joined_tables() {
         Writer::Change(
             "update public.b1 set w = 11 where id = 1; update public.b2 set w = 101 where id = 1",
         ),
+        None,
         ASYM,
     )
     .await;
@@ -325,7 +328,7 @@ async fn cx_f9c_a_root_row_moving_to_null_races_a_page_of_both_joined_tables() {
 // ---------------------------------------------------------------- F11
 
 /// #1459's F11 shape: `b1` row 7 moves `71 → 5` (its own page, `P1`), then
-/// `5 → 9` (left for the settle), then changes value at 9 in a mixed page
+/// `5 → 9` (past capture), then changes value at 9 in a mixed page
 /// (`P2`) with a change of `a` row 7, which is on key 5 at position 1. `P2`
 /// reads its key set while `M` still holds 71, so its fan-out keys at
 /// position 1 are 71 and 9, and it locks key 5 only for its root item. `P1`
@@ -345,8 +348,13 @@ async fn late_m_key(third: bool) {
             let o = |sql: &str| orientation.sql(sql);
             star::write(&d, &o("update public.b1 set k = 5 where id = 7")).await;
             let p1 = d.seal().await;
-            star::write(&d, &o("update public.b1 set k = 9 where id = 7")).await;
-            let between = d.seal().await;
+            // The move `5 → 9`, past capture: `P2`'s image carries key 9.
+            star::write_uncaptured(
+                &d,
+                &o("public.b1"),
+                &o("update public.b1 set k = 9 where id = 7"),
+            )
+            .await;
             star::write(
                 &d,
                 &o("update public.b1 set w = 77 where id = 7; \
@@ -354,8 +362,6 @@ async fn late_m_key(third: bool) {
             )
             .await;
             let p2 = d.seal().await;
-            star::write(&d, &o("update public.b2 set w = 301 where id = 3")).await;
-            let p3 = d.seal().await;
             let target = star.target();
             let name = format!("{} {orientation:?}", star.name());
             let mut mixed = d
@@ -363,6 +369,8 @@ async fn late_m_key(third: bool) {
                 .await;
             mixed.reached(PausePoint::BeforeJoin1Lock).await;
             d.drain(p1, "move").await;
+            star::write(&d, &o("update public.b2 set w = 301 where id = 3")).await;
+            let p3 = d.seal().await;
             let moves = trellis::dev::interleave::join_key_moves();
             let (blocked, result) = if third {
                 let mut held = d
@@ -382,7 +390,6 @@ async fn late_m_key(third: bool) {
                 panic!("{name}: the mixed page failed: {err}");
             }
             let retried = trellis::dev::interleave::join_key_moves() - moves;
-            d.drain(between, "between").await;
             if !third {
                 d.drain(p3, "third").await;
             }

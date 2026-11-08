@@ -105,48 +105,42 @@ impl Orientation {
 }
 
 /// A two-writer family over `seed` in each of `orientations`, on every
-/// star of [`N3`]: `tail`, captured and sealed before the writers, drains
-/// only after them (an out-of-order apply); each writer in its own batch,
-/// either one's page frozen at its commit while the other queues
-/// ([`star::race`]).
+/// star of [`N3`]: the uncaptured `pre` writes `(table, sql)` first, then
+/// each writer in its own batch, either one's page frozen at its commit
+/// while the other queues ([`race_at`]), then `after` in a batch of its own.
+///
+/// The ring holds two undrained batches at a time (`retire` needs a
+/// segment's successor drained), so a change a family applies out of order
+/// is written uncaptured in `pre` and repaired by a Re-derive in `after`.
 pub async fn family(
     seed: &str,
-    tail: &[&str],
+    pre: &[(&str, &str)],
     first: Writer,
     second: Writer,
+    after: Option<Writer>,
     orientations: &[Orientation],
 ) {
     for orientation in orientations {
         let (first, second) = (orientation.writer(first), orientation.writer(second));
+        let after = after.map(|w| orientation.writer(w));
         for star in N3.stars() {
             for flip in [false, true] {
                 let mut d = star::start_seeded(&[star], &orientation.sql(seed)).await;
-                let tail = seal_tail(&mut d, tail, *orientation).await;
+                for (table, sql) in pre {
+                    star::write_uncaptured(&d, &orientation.sql(table), &orientation.sql(sql))
+                        .await;
+                }
                 let one = first.seal(&mut d).await;
                 let two = second.seal(&mut d).await;
                 let (x, y) = if flip { (two, one) } else { (one, two) };
-                race_at(&mut d, star, x, y, PausePoint::BeforeCommit, true).await;
-                drain_tail(&mut d, tail).await;
+                race_at(&mut d, star, x, y, PausePoint::BeforeCommit, false).await;
+                if let Some(after) = after {
+                    let batch = after.seal(&mut d).await;
+                    d.drain(batch, "after").await;
+                }
                 star::assert_oracle(&mut d, &[star]).await;
             }
         }
-    }
-}
-
-/// Writes `tail` (captured) and seals it, if any.
-pub async fn seal_tail(d: &mut Driver, tail: &[&str], orientation: Orientation) -> Option<i64> {
-    if tail.is_empty() {
-        return None;
-    }
-    for sql in tail {
-        star::write(d, &orientation.sql(sql)).await;
-    }
-    Some(d.seal().await)
-}
-
-pub async fn drain_tail(d: &mut Driver, tail: Option<i64>) {
-    if let Some(batch) = tail {
-        d.drain(batch, "tail").await;
     }
 }
 
@@ -192,38 +186,5 @@ pub async fn race_at(
     assert!(
         blocked,
         "{name}: the second page ran without queueing on the first's lock at {point:?}"
-    );
-}
-
-/// Three pages: `first` frozen at its commit while `second` and `third` both
-/// queue on locks it holds; then all three finish. Nothing deadlocks; the
-/// oracle is the caller's.
-pub async fn race3(d: &mut Driver, star: Star, first: i64, second: i64, third: i64) {
-    let target = star.target();
-    let name = star.name();
-    let mut held = d
-        .drain_frozen(first, "first", &[(PausePoint::BeforeCommit, &target)])
-        .await;
-    let reached = held.reached(PausePoint::BeforeCommit).await;
-    let two = d.drain_frozen(second, "second", &[]).await;
-    let two_blocked = star::queued_or_finished(d, reached.backend_pid, &two).await;
-    let three = d.drain_frozen(third, "third", &[]).await;
-    let three_blocked = star::queued_or_finished(d, reached.backend_pid, &three).await;
-    d.release(&mut held, PausePoint::BeforeCommit).await;
-    held.finish().await;
-    let results = [two.finish_result().await, three.finish_result().await];
-    let deadlocks = d.deadlocks_logged();
-    assert!(deadlocks.is_empty(), "{name}: {deadlocks:?}");
-    for result in results {
-        if let Err(err) = result {
-            panic!("{name}: a page failed: {err}");
-        }
-    }
-    d.settle().await;
-    star::assert_star(d, star).await;
-    assert!(
-        two_blocked && three_blocked,
-        "{name}: a page ran without queueing on the first's locks \
-         (second {two_blocked}, third {three_blocked})"
     );
 }
