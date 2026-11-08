@@ -548,3 +548,107 @@ async fn a_join_build_then_pages() {
     )
     .await;
 }
+
+/// [`JOIN_DDL`] with `o.x` a `numeric(10,2)`, which declares its scale: the
+/// statements specialise for it (strict stages, builds and products).
+const DECLARED_JOIN_DDL: &str = "create table public.o (id integer primary key, k integer, x numeric(10,2)); \
+     create table public.c (id integer primary key, k integer, region text); \
+     create index on public.o (k); create index on public.c (k)";
+
+/// A `JOIN` and an aggregate over a `numeric(10,2)` argument, built over rows
+/// already there (a `NaN` among them), then pages, `NaN` in and out: as text,
+/// Postgres's at every step. A page or build with a `NaN` can't be staged
+/// strictly and is staged again the general way.
+#[tokio::test]
+async fn a_declared_scale_build_then_pages() {
+    const AGG_O: &str = "TRANSFORM ao FROM public.o GROUP BY k WITHOUT SOURCE INDEX \
+                         SELECT k AS k, SUM(x) AS total, AVG(x) AS mean, COUNT(x) AS cx";
+    const AGG_O_ROWS: &str = "select k, total::text, mean::text, cx from public.ao";
+    const AGG_O_EXPECTED: &str =
+        "select k, sum(x)::text, avg(x)::text, count(x) from public.o group by k";
+    let mut d = Driver::start(
+        &format!(
+            "{DECLARED_JOIN_DDL}; \
+             insert into public.c values (1, 1, 'a'), (2, 2, 'b'), (3, 1, 'b'); \
+             insert into public.o values (1, 1, 1.5), (2, 1, 2), (3, 2, 'NaN'), \
+                                         (4, 9, 7.25), (5, 2, 0.1)"
+        ),
+        &[("id", int4()), ("k", int4()), ("x", ValueType::Numeric)],
+        &[INNER, LEFT, AGG_O],
+        &["public.o", "public.c"],
+    )
+    .await;
+    run(
+        &mut d,
+        &[
+            "select 1",
+            "insert into public.o values (6, 1, 3.33), (7, 2, null)",
+            "delete from public.o where id = 3",
+            "insert into public.c values (4, 9, 'a')",
+            "update public.o set x = 'NaN' where id = 1",
+            "update public.o set x = 0.01 where id = 1",
+            "delete from public.c where id = 1",
+            "update public.o set k = 9 where id in (2, 6)",
+            "delete from public.o where id in (4, 5)",
+        ],
+        &[
+            ("ij", INNER_ROWS, INNER_EXPECTED),
+            ("lj", LEFT_ROWS, LEFT_EXPECTED),
+            ("ao", AGG_O_ROWS, AGG_O_EXPECTED),
+        ],
+    )
+    .await;
+}
+
+/// A declared scale is only a hint: a `JOIN` cell whose map counts another
+/// scale (here written by hand, as a change of the column's type could leave
+/// one behind) makes the strict product refuse, and the page's product runs
+/// the general way, carrying the other scale into `T`.
+#[tokio::test]
+async fn a_map_off_its_declared_scale_is_multiplied_the_general_way() {
+    let mut d = Driver::start(
+        &format!(
+            "{DECLARED_JOIN_DDL}; \
+             insert into public.c values (1, 1, 'a'); \
+             insert into public.o values (1, 1, 1.5), (2, 1, 2)"
+        ),
+        &[("id", int4()), ("k", int4()), ("x", ValueType::Numeric)],
+        &[INNER],
+        &["public.o", "public.c"],
+    )
+    .await;
+    step(&mut d, "select 1").await;
+    let id: i64 = d
+        .ctl
+        .query_one(
+            "select id from transform_definitions where target_table = 'public.ij'",
+            &[],
+        )
+        .await
+        .expect("id")
+        .get(0);
+    let (p, t) = (
+        format!("{DEFAULT_SCHEMA}.join_{id}_p"),
+        format!("{DEFAULT_SCHEMA}.join_{id}_t"),
+    );
+    d.ctl
+        .batch_execute(&format!(
+            "update {p} set __scales_1 = '{{\"2\": 1, \"5\": 1}}' where k = 1"
+        ))
+        .await
+        .expect("a map off its declared scale");
+    // A second match for key 1: `T` gains `P_old ⊗ ΔM`, read from the cell.
+    step(&mut d, "insert into public.c values (2, 1, 'a')").await;
+    let scales: String = d
+        .ctl
+        .query_one(
+            &format!("select __scales_1::text from {t} where region = 'a'"),
+            &[],
+        )
+        .await
+        .expect("T's map")
+        .get(0);
+    // The build's `{"2": 2}`, plus the hand-written cell times its new
+    // match. A strict product would have derived `{"2": 4}` from the counts.
+    assert_eq!(scales, "{\"2\": 3, \"5\": 1}");
+}

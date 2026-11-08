@@ -774,7 +774,7 @@ pub(crate) const NUMERIC_PARTS: &[SumPart] = &[
 ];
 
 /// The empty scale map.
-const NO_SCALES: &str = "'{}'::jsonb";
+pub(super) const NO_SCALES: &str = "'{}'::jsonb";
 
 impl SumPart {
     /// The stem of its working columns: `<prefix><stem><i>`, so `__ds1`,
@@ -988,9 +988,119 @@ impl SumPart {
     }
 }
 
+/// The text of the error a strict statement raises on reading a scale map
+/// that counts a scale other than the declared one ([`strict_count`]): the
+/// caller rolls the statement back and runs it the general way
+/// ([`is_off_scale`]).
+pub(super) const OFF_SCALE: &str = "trellis: a scale map off its declared scale";
+
+/// The scale map `map`'s count at its declared scale `s`, for a strict
+/// statement, which carries a map counting only `s` as that count: an error
+/// carrying [`OFF_SCALE`] when `map` counts another scale. The error's
+/// expression reads `map`, so Postgres can't fold it while planning.
+pub(super) fn strict_count(map: &str, s: i32) -> String {
+    format!(
+        "(case when {only} then {count} \
+               else ('{OFF_SCALE} ' || ({map})::text)::bigint end)",
+        only = only_scale(map, s),
+        count = scale_count(map, s),
+    )
+}
+
+/// Whether `error` is a strict statement's refusal of a map at another
+/// scale ([`strict_count`]).
+pub(super) fn is_off_scale(error: &tokio_postgres::Error) -> bool {
+    error
+        .as_db_error()
+        .is_some_and(|e| e.message().contains(OFF_SCALE))
+}
+
+/// Runs `strict`, a strict statement ([`strict_count`]), under a savepoint,
+/// and on its refusal of a map at another scale rolls it back and runs
+/// `general` instead. Returns whether the strict statement held.
+pub(super) async fn strictly_or_generally(
+    txn: &Transaction<'_>,
+    strict: &str,
+    general: &str,
+) -> Result<bool, ApplyError> {
+    txn.batch_execute("savepoint trellis_strict").await?;
+    match txn.batch_execute(strict).await {
+        Ok(()) => {
+            txn.batch_execute("release savepoint trellis_strict")
+                .await?;
+            Ok(true)
+        }
+        Err(e) if is_off_scale(&e) => {
+            txn.batch_execute(
+                "rollback to savepoint trellis_strict; release savepoint trellis_strict",
+            )
+            .await?;
+            txn.batch_execute(general).await?;
+            Ok(false)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A strict stage's scale map of the rows' values `x` (an aggregate over
+/// them, [`GroupTargetPlan::stage_sql`]): empty, the apply deriving it from
+/// the counts, when every value is `NULL` or finite at the declared scale
+/// `s`; `NULL`, marking the page for the general stage, otherwise.
+fn strict_stage_scales(x: &str, s: i32) -> String {
+    format!(
+        "(case when bool_and(coalesce(scale(({x})) = {s}, ({x}) is null)) then {NO_SCALES} end)"
+    )
+}
+
+/// A strict build's scale map of the rows' values `x` (an aggregate over
+/// them, [`GroupTargetPlan::fresh_select`]): their count at the declared
+/// scale `s`, failing with [`OFF_SCALE`] when a finite value has another.
+fn strict_build_scales(x: &str, s: i32) -> String {
+    let scale = format!("scale(({x}))");
+    format!(
+        "(case when bool_and({scale} = {s}) is not false then {single} \
+               else to_jsonb(('{OFF_SCALE} ' || count(*)::text)::bigint) end)",
+        single = single_scale(s, &format!("count(*) filter (where {scale} = {s})")),
+    )
+}
+
+/// The scale map `map` plus `change` values at its declared scale `s`
+/// (a `bigint`), for an apply that derives a page's change from the counts
+/// ([`GroupTargetPlan::derived_map`]): `map` itself when `change` is 0, the
+/// single count rebuilt while `map` counts no other scale, and the general
+/// sum otherwise.
+fn derived_add(map: &str, change: &str, s: i32) -> String {
+    format!(
+        "(case when {change} = 0 then {map} \
+               when {only} then {rebuilt} \
+               else {general} end)",
+        only = only_scale(map, s),
+        rebuilt = single_scale(s, &format!("{} + {change}", scale_count(map, s))),
+        general = scales_add(map, &single_scale(s, change), "1"),
+    )
+}
+
+/// The display scale of the scale map `new` less `change` values at its
+/// declared scale `s`, the prior image's map of a derived apply
+/// ([`derived_add`]), without building that map while `new` counts no other
+/// scale. It is `s` for an empty prior map too, which shows no finite sum.
+fn derived_prior_scale(new: &str, change: &str, s: i32) -> String {
+    format!(
+        "(case when {} then {s} else {} end)",
+        only_scale(new, s),
+        max_scale(&scales_add(new, &single_scale(s, change), "-1"))
+    )
+}
+
 /// The scale map `{"<s>": <count>}`, or the empty map when `count` is 0.
+/// `count` is read twice: a `CASE` costs less than `jsonb_strip_nulls`,
+/// which rebuilds the object, and an aggregate repeated in one select list is
+/// computed once.
 fn single_scale(s: i32, count: &str) -> String {
-    format!("jsonb_strip_nulls(jsonb_build_object('{s}', nullif({count}, 0)))")
+    format!(
+        "(case when coalesce(({count}), 0) = 0 then {NO_SCALES} \
+               else jsonb_build_object('{s}', {count}) end)"
+    )
 }
 
 /// Whether the scale map `map` counts no scale but `s`.
@@ -1008,7 +1118,8 @@ fn scale_count(map: &str, s: i32) -> String {
 fn scales_add_at(a: &str, b: &str, sign: &str, scale: Option<i32>) -> String {
     match scale {
         Some(s) => format!(
-            "(case when {only_a} and {only_b} then {single} else {general} end)",
+            "(case when coalesce({b}, {NO_SCALES}) = {NO_SCALES} then coalesce({a}, {NO_SCALES}) \
+                   when {only_a} and {only_b} then {single} else {general} end)",
             only_a = only_scale(a, s),
             only_b = only_scale(b, s),
             single = single_scale(
@@ -1116,9 +1227,12 @@ fn max_scale(map: &str) -> String {
 ///
 /// Under a declared `scale` ([`Arg::scale`]) the largest scale is that one
 /// whenever the map counts no other, without reading the map's keys.
+/// `display`, when given, is the display scale itself, which a caller that
+/// knows it without the map passes ([`GroupTargetPlan::visible_tail_sql`]).
 pub(crate) fn sum_value(
     numeric: bool,
     scale: Option<i32>,
+    display: Option<&str>,
     part: &dyn Fn(SumPart) -> String,
 ) -> String {
     if !numeric {
@@ -1135,8 +1249,9 @@ pub(crate) fn sum_value(
                when {ninf} > 0 then '-Infinity'::numeric \
                else round({sum}, {scale}) end)",
         sum = part(SumPart::Sum),
-        scale = match scale {
-            Some(s) => {
+        scale = match (display, scale) {
+            (Some(display), _) => display.to_string(),
+            (None, Some(s)) => {
                 let map = part(SumPart::Scales);
                 format!(
                     "(case when {} and {} > 0 then {s} else {} end)",
@@ -1145,7 +1260,7 @@ pub(crate) fn sum_value(
                     max_scale(&map)
                 )
             }
-            None => max_scale(&part(SumPart::Scales)),
+            (None, None) => max_scale(&part(SumPart::Scales)),
         },
     )
 }
@@ -1565,6 +1680,22 @@ pub(super) struct StagedParts {
     uniform: std::collections::HashSet<usize>,
 }
 
+impl StagedParts {
+    /// What a strict `JOIN` product stages into `T` (`super::join`): every
+    /// `numeric` sum with a declared scale counts only it.
+    pub(super) fn declared(shape: &GroupShape) -> Self {
+        Self {
+            zero: Default::default(),
+            uniform: (1..=shape.args.len())
+                .filter(|&i| {
+                    let arg = &shape.args[i - 1];
+                    arg.scale.is_some() && arg.parts() == NUMERIC_PARTS
+                })
+                .collect(),
+        }
+    }
+}
+
 /// A plan's [`StagedParts`], `None` until a [`stage_sides`] reads them:
 /// a staging table filled any other way (a `JOIN`'s product into `T`) is
 /// summed in full.
@@ -1759,6 +1890,12 @@ impl GroupTargetPlan {
 
     /// This plan with the collations of its group columns
     /// ([`GroupCollations`]).
+    /// Sets what its staging table holds ([`StagedParts`]), for a writer
+    /// other than [`stage_sides`]: `None` for maps of any scales.
+    pub(super) fn set_staged_parts(&self, parts: Option<StagedParts>) {
+        self.staged_parts.set(parts);
+    }
+
     pub(super) fn with_collations(mut self, collations: GroupCollations) -> Self {
         self.collations = collations;
         self
@@ -2174,7 +2311,14 @@ impl GroupTargetPlan {
     /// A `Recompute`'s prior-image hint names a group to recompute
     /// ([`Self::recomputed`]). Returns the number of ring rows it can't
     /// apply as deltas; when there are any it stages nothing.
-    fn stage_sql(&self) -> String {
+    ///
+    /// `strict` stages each `numeric` sum with a declared scale
+    /// ([`Arg::scale`]) as if every value had it: no scale map, no
+    /// special-value counts, and a `NULL` map marking a staged row with a
+    /// value that is special or at another scale. [`stage_sides`] then stages
+    /// the page again the general way. A strict statement has no array
+    /// aggregate, so Postgres can hash its groups.
+    fn stage_sql(&self, strict: bool) -> String {
         let cols = quoted(&self.shape.group_cols).join(", ");
         let mut values = self.group_values();
         values.push("sd.__txid".to_string());
@@ -2192,8 +2336,15 @@ impl GroupTargetPlan {
             let count = format!("sum(__sgn * (__a{i} is not null)::int)::bigint");
             sums.push(count.clone());
             for part in arg.parts() {
-                sums.push(match part {
-                    SumPart::Scales if arg.scale.is_none() => {
+                sums.push(match (part, arg.scale) {
+                    (SumPart::Scales, Some(s)) if strict => {
+                        strict_stage_scales(&format!("__a{i}"), s)
+                    }
+                    (SumPart::Sum, Some(_)) if strict => {
+                        format!("coalesce(sum(__sgn * __a{i}), 0)")
+                    }
+                    (_, Some(_)) if strict => part.zero().to_string(),
+                    (SumPart::Scales, None) => {
                         scale_keys.push_str(&format!(", scale(__a{i})"));
                         format!(
                             "(case when scale(__a{i}) is null or {count} = 0 then {NO_SCALES} \
@@ -2219,7 +2370,11 @@ impl GroupTargetPlan {
             let column = part.unwrap_or(SumPart::Scales).name("__", i);
             returned.push(column.clone());
             flags.push(match (part, arg.scale) {
+                (Some(_), Some(_)) if strict => "true".to_string(),
                 (Some(_), _) => format!("coalesce(bool_and({column} = 0), true)"),
+                (None, Some(_)) if strict => {
+                    format!("coalesce(bool_and({column} is not null), true)")
+                }
                 (None, Some(s)) => format!("coalesce(bool_and({}), true)", only_scale(&column, s)),
                 (None, None) => unreachable!("a scale flag without a declared scale"),
             });
@@ -2375,9 +2530,17 @@ impl GroupTargetPlan {
         n: &str,
         count: &dyn Fn(usize) -> String,
         sum: &dyn Fn(usize, SumPart) -> String,
+        display: &dyn Fn(usize) -> Option<String>,
         extreme: &dyn Fn(&Extreme) -> String,
     ) -> String {
-        let value = |i: usize| sum_value(args[i].numeric, args[i].scale, &|part| sum(i + 1, part));
+        let value = |i: usize| {
+            sum_value(
+                args[i].numeric,
+                args[i].scale,
+                display(i + 1).as_deref(),
+                &|part| sum(i + 1, part),
+            )
+        };
         match agg {
             Agg::Extreme { max, arg, pg_type } => extreme(&Extreme {
                 max: *max,
@@ -2401,13 +2564,15 @@ impl GroupTargetPlan {
 
     /// A lateral subquery computing every field over partials named by
     /// `n`, `count`, `sum` and `extreme`, as columns `<prefix>0`,
-    /// `<prefix>1`, ….
+    /// `<prefix>1`, …. `display` gives a `numeric` sum's display scale where
+    /// the caller knows it without its map ([`sum_value`]).
     fn fields_lateral(
         &self,
         prefix: &str,
         n: &str,
         count: &dyn Fn(usize) -> String,
         sum: &dyn Fn(usize, SumPart) -> String,
+        display: &dyn Fn(usize) -> Option<String>,
         extreme: &dyn Fn(&Extreme) -> String,
     ) -> String {
         let aggs: Vec<String> = self
@@ -2418,7 +2583,7 @@ impl GroupTargetPlan {
             .map(|(k, agg)| {
                 format!(
                     "{} as {}",
-                    Self::agg_sql(agg, &self.shape.args, n, count, sum, extreme),
+                    Self::agg_sql(agg, &self.shape.args, n, count, sum, display, extreme),
                     quote_ident(&placeholder(k))
                 )
             })
@@ -2551,6 +2716,37 @@ impl GroupTargetPlan {
         part.total(&part.name("__", i), condition, arg.scale)
     }
 
+    /// The declared scale of argument `i` (1-based) when every staged map
+    /// counts only it ([`StagedParts::uniform`]): its apply derives the map's
+    /// change from the counts ([`Self::finite_change`]) and reads no staged
+    /// map.
+    fn derived_map(&self, staged_parts: &Option<StagedParts>, i: usize) -> Option<i32> {
+        let arg = &self.shape.args[i - 1];
+        arg.scale.filter(|_| {
+            arg.parts() == NUMERIC_PARTS
+                && staged_parts
+                    .as_ref()
+                    .is_some_and(|p| p.uniform.contains(&i))
+        })
+    }
+
+    /// The change in argument `i`'s (1-based) count of finite values, from
+    /// its count's and its special-value counts' changes named under
+    /// `prefix` (`t.__` for `t.__c1`, `t.__nan1`, …), less the specials no
+    /// staged side holds.
+    fn finite_change(&self, staged_parts: &Option<StagedParts>, prefix: &str, i: usize) -> String {
+        let mut finite = format!("{prefix}c{i}");
+        for special in [SumPart::NaN, SumPart::PosInf, SumPart::NegInf] {
+            if !staged_parts
+                .as_ref()
+                .is_some_and(|p| p.zero.contains(&(i, special)))
+            {
+                finite.push_str(&format!(" - {}", special.name(prefix, i)));
+            }
+        }
+        format!("({finite})")
+    }
+
     fn apply_sql_with(&self, tail: &str) -> String {
         let cols = quoted(&self.shape.group_cols);
         let args = &self.shape.args;
@@ -2570,19 +2766,38 @@ impl GroupTargetPlan {
             returning.push(format!("t.__c{i} as __dc{i}, u.__count_{i} as __nc{i}"));
             for part in arg.parts() {
                 let (staged, hidden) = (part.name("__", i), part.hidden(i));
-                let total = self.staged_total(&staged_parts, i, *part, None);
-                // A map the next step derives from the counts
-                // ([`Self::staged_total`]) is never read per transaction.
-                let derived = *part == SumPart::Scales
-                    && arg.scale.is_some()
-                    && staged_parts
-                        .as_ref()
-                        .is_some_and(|p| p.uniform.contains(&i));
-                if derived {
+                let derived = match part {
+                    SumPart::Scales => self.derived_map(&staged_parts, i),
+                    _ => None,
+                };
+                if let Some(s) = derived {
+                    // A map derived from the counts ([`Self::derived_map`]):
+                    // no staged map is read or summed, and the hidden map
+                    // is rebuilt from its count at `s` while it counts no
+                    // other scale, and kept while the finite count doesn't
+                    // change.
+                    let change = self.finite_change(&staged_parts, "t.__", i);
                     sums.push(format!("{NO_SCALES} as {staged}"));
-                } else {
-                    sums.push(format!("{total} as {staged}"));
+                    totals.push(format!("{NO_SCALES} as {staged}"));
+                    sets.push(format!(
+                        "{hidden} = {}",
+                        derived_add(&format!("u.{hidden}"), &change, s)
+                    ));
+                    // A `JOIN` side's deltas table takes the change's map.
+                    let delta = if matches!(self.writer, Writer::JoinPartials { .. }) {
+                        single_scale(s, &change)
+                    } else {
+                        NO_SCALES.to_string()
+                    };
+                    returning.push(format!(
+                        "{delta} as {}, u.{hidden} as {}",
+                        part.name("__d", i),
+                        part.name("__n", i)
+                    ));
+                    continue;
                 }
+                let total = self.staged_total(&staged_parts, i, *part, None);
+                sums.push(format!("{total} as {staged}"));
                 totals.push(format!("{total} as {staged}"));
                 if staged_parts
                     .as_ref()
@@ -2677,10 +2892,14 @@ impl GroupTargetPlan {
             ));
             for part in arg.parts() {
                 let staged = part.name("__", i);
-                totals.push(format!(
-                    "{} as {staged}",
-                    self.staged_total(&staged_parts, i, *part, Some("__ok"))
-                ));
+                // A derived map ([`Self::derived_map`]) is read from the counts.
+                let total =
+                    if *part == SumPart::Scales && self.derived_map(&staged_parts, i).is_some() {
+                        NO_SCALES.to_string()
+                    } else {
+                        self.staged_total(&staged_parts, i, *part, Some("__ok"))
+                    };
+                totals.push(format!("{total} as {staged}"));
             }
         }
         let mut sets = sets.to_vec();
@@ -3180,7 +3399,7 @@ impl GroupTargetPlan {
                      cross join lateral ({fresh}) as a \
                  )",
                 old_names = old_names.join(", "),
-                fresh = self.fresh_select(&[], &format!("({})", self.probe_rows_sql())),
+                fresh = self.fresh_select(&[], &format!("({})", self.probe_rows_sql()), false),
             ),
             Some(node) => {
                 // The node's group columns at the hidden table's types, as
@@ -3195,7 +3414,7 @@ impl GroupTargetPlan {
                          cross join lateral {lookup_hidden} as h(__hc, {old_names}) \
                          left join n on {matched} \
                      )",
-                    fresh = self.fresh_select(&self.group_values(), node),
+                    fresh = self.fresh_select(&self.group_values(), node, false),
                     zeroed = zeroed.join(", "),
                     old_names = old_names.join(", "),
                 )
@@ -3235,7 +3454,7 @@ impl GroupTargetPlan {
     /// statement's snapshot and the newest segment's `seg_seq`. A `create …
     /// as select` reads in parallel where Postgres can; the data-modifying
     /// write that follows can't.
-    fn join_group_sql(&self, node: &str, grouped: &str) -> String {
+    fn join_group_sql(&self, node: &str, grouped: &str, strict: bool) -> String {
         let cols = quoted(&self.shape.group_cols);
         let mut nulls = vec!["null".to_string(); cols.len() + 1];
         for arg in &self.shape.args {
@@ -3252,7 +3471,7 @@ impl GroupTargetPlan {
              select true, pg_catalog.pg_current_snapshot(), \
                     coalesce((select max(seg_seq) from segments), 0), {nulls}",
             table = grouped.trim_start_matches("pg_temp."),
-            fresh = self.fresh_select(&self.group_values(), node),
+            fresh = self.fresh_select(&self.group_values(), node, strict),
             nulls = nulls.join(", "),
         )
     }
@@ -3571,7 +3790,7 @@ impl GroupTargetPlan {
                          cross join lateral {lookup_hidden} as h(__hc) \
                          left join a on {matched} \
                      )",
-                    fresh = self.fresh_select(&self.group_values(), from),
+                    fresh = self.fresh_select(&self.group_values(), from, false),
                     kept = kept.join(", "),
                 )
             }
@@ -3585,7 +3804,7 @@ impl GroupTargetPlan {
                      cross join lateral ({fresh}) as a \
                  )",
                 kept = kept.join(", "),
-                fresh = self.fresh_select(&[], &format!("({})", self.probe_rows_sql())),
+                fresh = self.fresh_select(&[], &format!("({})", self.probe_rows_sql()), false),
             ),
         };
         #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
@@ -3625,7 +3844,7 @@ impl GroupTargetPlan {
             "create temporary table {early} on commit drop as \
              with snap as materialized ({SNAPSHOT_AND_STAMP}) \
              select snap.*, a.* from snap left join ({fresh}) as a on true",
-            fresh = self.fresh_select(&self.group_values(), &self.source_row),
+            fresh = self.fresh_select(&self.group_values(), &self.source_row, false),
         )
     }
 
@@ -3640,7 +3859,13 @@ impl GroupTargetPlan {
     /// each such argument's `scale(x)` as well, then by the groups alone:
     /// each scale's count comes from a group of its own, so the second step
     /// folds one row per scale into the map, never one per source row.
-    fn fresh_select(&self, values: &[String], from: &str) -> String {
+    ///
+    /// `strict` counts a `numeric` sum with a declared scale ([`Arg::scale`])
+    /// as if every finite value had it, with no array aggregate (which
+    /// would keep Postgres from hashing the groups), and fails with
+    /// [`OFF_SCALE`] on a group with a finite value at another: its caller
+    /// runs the statement again without it ([`strictly_or_generally`]).
+    fn fresh_select(&self, values: &[String], from: &str, strict: bool) -> String {
         let args = &self.shape.args;
         let scaled: Vec<usize> = (0..args.len())
             .filter(|&i| args[i].scale.is_none() && args[i].parts().contains(&SumPart::Scales))
@@ -3672,11 +3897,11 @@ impl GroupTargetPlan {
                     ),
                     _ => part.total(&name, None, arg.scale),
                 };
-                partials.push((
-                    name,
-                    part.of_rows(&arg.sql, arg.numeric, "1", arg.scale),
-                    fold,
-                ));
+                let agg = match (part, arg.scale) {
+                    (SumPart::Scales, Some(s)) if strict => strict_build_scales(&arg.sql, s),
+                    _ => part.of_rows(&arg.sql, arg.numeric, "1", arg.scale),
+                };
+                partials.push((name, agg, fold));
             }
         }
         for x in self.shape.extremes() {
@@ -3781,6 +4006,7 @@ impl GroupTargetPlan {
             "up.__nn",
             &|i| format!("up.__nc{i}"),
             &|i, part| part.name("up.__n", i),
+            &|_| None,
             &|x| x.named("up.__n"),
         );
         let nf: Vec<String> = (0..field_count).map(|j| format!("nv.__nf{j}")).collect();
@@ -3985,18 +4211,39 @@ impl GroupTargetPlan {
             "up.__nn",
             &|i| format!("up.__nc{i}"),
             &|i, part| part.name("up.__n", i),
+            &|_| None,
             &|x| x.named("up.__n"),
         );
+        // The prior image's partials are the new ones less the change. A
+        // map the apply derived from the counts ([`Self::derived_map`]) has
+        // no change map in `up`: its change counts only the declared scale,
+        // so the prior map shows that scale wherever the new one counts no
+        // other, and is rebuilt only where it does.
+        let staged_parts = self.staged_parts.get();
         let prior_fields = self.fields_lateral(
             "__pf",
             "(up.__nn - up.__dn)",
             &|i| format!("(up.__nc{i} - up.__dc{i})"),
-            &|i, part| {
-                part.sub(
+            &|i, part| match (part, self.derived_map(&staged_parts, i)) {
+                (SumPart::Scales, Some(s)) => SumPart::Scales.sub(
+                    &part.name("up.__n", i),
+                    &single_scale(s, &self.finite_change(&staged_parts, "up.__d", i)),
+                    Some(s),
+                ),
+                _ => part.sub(
                     &part.name("up.__n", i),
                     &part.name("up.__d", i),
                     self.shape.args[i - 1].scale,
-                )
+                ),
+            },
+            &|i| {
+                self.derived_map(&staged_parts, i).map(|s| {
+                    derived_prior_scale(
+                        &SumPart::Scales.name("up.__n", i),
+                        &self.finite_change(&staged_parts, "up.__d", i),
+                        s,
+                    )
+                })
             },
             &|x| x.named("up.__o"),
         );
@@ -4208,7 +4455,41 @@ pub(super) async fn stage_sides(
     plan: &GroupTargetPlan,
 ) -> Result<(), ApplyError> {
     txn.batch_execute(&plan.working_ddl()).await?;
-    let row = txn.query_one(&plan.stage_sql(), &[&plan.sides]).await?;
+    // A page whose `numeric` sums with a declared scale hold only values at
+    // it, the common case, stages them strictly; one that holds any other
+    // is staged again the general way ([`GroupTargetPlan::stage_sql`]).
+    let flagged = plan.staged_flags();
+    let strict = flagged.iter().any(|(_, part)| part.is_none());
+    let mut row = None;
+    if strict {
+        txn.batch_execute("savepoint trellis_strict_stage").await?;
+        let strict_row = txn.query_one(&plan.stage_sql(true), &[&plan.sides]).await?;
+        let flags: Vec<bool> = strict_row
+            .get::<_, Option<Vec<bool>>>(1)
+            .unwrap_or_default();
+        let held = flagged
+            .iter()
+            .zip(&flags)
+            .all(|((_, part), set)| part.is_some() || *set);
+        if held {
+            txn.batch_execute("release savepoint trellis_strict_stage")
+                .await?;
+            row = Some(strict_row);
+        } else {
+            txn.batch_execute(
+                "rollback to savepoint trellis_strict_stage; \
+                 release savepoint trellis_strict_stage",
+            )
+            .await?;
+        }
+    }
+    let row = match row {
+        Some(row) => row,
+        None => {
+            txn.query_one(&plan.stage_sql(false), &[&plan.sides])
+                .await?
+        }
+    };
     let bad: i64 = row.get(0);
     let flags: Vec<bool> = row.get::<_, Option<Vec<bool>>>(1).unwrap_or_default();
     let mut parts = StagedParts::default();
@@ -4520,8 +4801,19 @@ pub(super) async fn write_join_build_cells(
     let Writer::JoinPartials { deltas } = &plan.writer else {
         return Err(plan.unsupported("a JOIN build's cell write on a structure with no cells"));
     };
-    txn.batch_execute(&plan.join_group_sql(node, grouped))
-        .await?;
+    // Strictly where a sum declares its scale, then, should a group hold a
+    // value at another, the general way ([`GroupTargetPlan::fresh_select`]).
+    let general = plan.join_group_sql(node, grouped, false);
+    if plan
+        .shape
+        .args
+        .iter()
+        .any(|a| a.scale.is_some() && a.parts() == NUMERIC_PARTS)
+    {
+        strictly_or_generally(txn, &plan.join_group_sql(node, grouped, true), &general).await?;
+    } else {
+        txn.batch_execute(&general).await?;
+    }
     analyze(txn, &[grouped]).await?;
     let [fill, write] = plan.join_build_sql(grouped, cells, deltas);
     txn.batch_execute(BULK_PLAN_SETTINGS).await?;
@@ -5713,7 +6005,7 @@ mod tests {
         ))
         .await
         .expect("working tables");
-        txn.batch_execute(&plan.join_group_sql("public.s", grouped))
+        txn.batch_execute(&plan.join_group_sql("public.s", grouped, false))
             .await
             .expect("group");
         analyze(&txn, &[&plan.recomputed, grouped])
@@ -6093,7 +6385,7 @@ mod tests {
                 );
             }
             let value = |scale| {
-                sum_value(true, scale, &|p| match p {
+                sum_value(true, scale, None, &|p| match p {
                     SumPart::Sum => "1.123456".to_string(),
                     SumPart::Scales => a.to_string(),
                     _ => "0".to_string(),
@@ -6139,6 +6431,121 @@ mod tests {
                     text(count(None)).await,
                     "{rows} {w}"
                 );
+            }
+        }
+        // A derived apply's map and prior display scale, against the general
+        // map arithmetic, for every map and change.
+        for a in maps {
+            for change in ["0", "1", "-1", "3"] {
+                let general = part.add(a, &single_scale(2, change), None);
+                assert_eq!(
+                    text(derived_add(a, change, 2)).await,
+                    text(general.clone()).await,
+                    "{a} + {change}"
+                );
+                // The prior map is `a` less `change`; its display scale
+                // matters only while it counts a finite value, and only a
+                // map of positive counts is a group's (a transient negative
+                // count leaves no visible row).
+                let prior = part.sub(a, &single_scale(2, change), None);
+                let shown = format!(
+                    "{prior} <> {NO_SCALES} and \
+                     (select bool_and(value::bigint > 0) from jsonb_each_text({prior}))"
+                );
+                if text(shown).await.as_deref() == Some("true") {
+                    assert_eq!(
+                        text(derived_prior_scale(a, change, 2)).await,
+                        text(max_scale(&prior)).await,
+                        "{a} - {change}"
+                    );
+                }
+            }
+        }
+        // Mutation check: these inputs tell a wrong specialisation apart. A
+        // derived add that rebuilt the declared scale's count without asking
+        // whether the map counts another would drop the other scale.
+        let mutated = |a: &str| single_scale(2, &format!("{} + 1", scale_count(a, 2)));
+        let mut caught = false;
+        for a in maps {
+            caught |= text(mutated(a)).await != text(derived_add(a, "1", 2)).await;
+        }
+        assert!(caught, "no map tells the mutated derived add apart");
+        // A strict read counts a map's declared scale, and refuses a map
+        // that counts another with an error the caller recognises. The map
+        // is a column, as in the statements, so the refusal is no constant
+        // Postgres would fold while planning.
+        for a in maps {
+            let read = client
+                .query_one(
+                    &format!(
+                        "select ({})::text from (select {a} as m) as v",
+                        strict_count("v.m", 2)
+                    ),
+                    &[],
+                )
+                .await;
+            let only = text(only_scale(a, 2)).await.as_deref() == Some("true");
+            match read {
+                Ok(row) => {
+                    assert!(only, "{a} read strictly");
+                    assert_eq!(
+                        row.get::<_, Option<String>>(0),
+                        text(scale_count(a, 2)).await,
+                        "{a}"
+                    );
+                }
+                Err(e) => assert!(!only && is_off_scale(&e), "{a}: {e}"),
+            }
+        }
+        // A strict stage marks the rows it can't stage strictly, and a
+        // strict build refuses them; over rows it can, each counts what the
+        // general count does.
+        for rows in [
+            "values (1.25::numeric, 1), (2.50, -1), (null, 1)",
+            "values (1.25::numeric, 1), (2.5, 1)",
+            "values (1.25::numeric, 1), ('NaN', 1)",
+            "values (null::numeric, 1)",
+        ] {
+            let staged = text(format!(
+                "select {} from ({rows}) as v(x, w)",
+                strict_stage_scales("x", 2)
+            ))
+            .await;
+            let general = text(format!(
+                "select {} from ({rows}) as v(x, w)",
+                part.of_rows("x", true, "1", None)
+            ))
+            .await;
+            let finite = text(format!(
+                "select {} from ({rows}) as v(x, w)",
+                single_scale(2, "count(*) filter (where scale(x) is not null)")
+            ))
+            .await;
+            match staged.as_deref() {
+                Some("{}") => assert_eq!(general, finite, "{rows}: staged strictly"),
+                _ => assert_eq!(
+                    text(format!(
+                        "select bool_or(x is not null and scale(x) is distinct from 2) \
+                         from ({rows}) as v(x, w)"
+                    ))
+                    .await
+                    .as_deref(),
+                    Some("true"),
+                    "{rows}: staged the general way"
+                ),
+            }
+            let built = client
+                .query_one(
+                    &format!(
+                        "select ({})::text from ({rows}) as v(x, w)",
+                        strict_build_scales("x", 2)
+                    ),
+                    &[],
+                )
+                .await;
+            match built {
+                Ok(row) => assert_eq!(row.get::<_, Option<String>>(0), general, "{rows}"),
+                Err(e) => assert!(is_off_scale(&e), "{rows}: {e}"),
             }
         }
         client
