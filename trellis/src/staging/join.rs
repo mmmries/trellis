@@ -740,7 +740,7 @@ impl JoinTargetPlan {
                 let staged = part.name("__", i);
                 insert_cols.push(staged.clone());
                 if from {
-                    let total = part.total(&part.hidden(i), "");
+                    let total = part.total(&part.hidden(i), None);
                     sums.push(format!("{total} as {staged}"));
                     nonzero.push(part.nonzero(&total));
                     select.push(format!("q.{staged}"));
@@ -798,7 +798,7 @@ impl JoinTargetPlan {
                 columns.push(format!("sum(__dc{i})::bigint as __dc{i}"));
                 for part in arg.parts() {
                     let delta = part.name("__d", i);
-                    columns.push(format!("{} as {delta}", part.total(&delta, "")));
+                    columns.push(format!("{} as {delta}", part.total(&delta, None)));
                 }
             }
             format!(
@@ -1036,7 +1036,7 @@ impl JoinTargetPlan {
             nonzero.push(format!("sum(__c{i}) <> 0"));
             for part in arg.parts() {
                 let staged = part.name("__", i);
-                let total = part.total(&staged, "");
+                let total = part.total(&staged, None);
                 nonzero.push(part.nonzero(&total));
                 sums.push(total);
                 insert_cols.push(staged);
@@ -1155,7 +1155,7 @@ impl JoinTargetPlan {
                 .iter()
                 .map(|c| {
                     if c.starts_with("__scales_") {
-                        format!("{} as {c}", SumPart::Scales.total(c, ""))
+                        format!("{} as {c}", SumPart::Scales.total(c, None))
                     } else {
                         format!("sum({c}) as {c}")
                     }

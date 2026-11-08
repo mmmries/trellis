@@ -49,12 +49,11 @@
 //!
 //! A plain aggregate (every `GROUP BY` key a source column) whose every value field
 //! composes the admitted aggregates (`COUNT(*)`, `COUNT(x)`, `SUM`/`AVG` over
-//! an integer argument or a `numeric` column, and `MIN`/`MAX` over a plain
-//! source column of an ordered type with no collation, "Extremes" below) with
+//! an integer or `numeric` argument, and `MIN`/`MAX` over a plain source
+//! column of an ordered type with no collation, "Extremes" below) with
 //! literals, operators, functions and its `GROUP BY` keys. A `SUM`/`AVG`
-//! argument may be an expression over the row (`SUM(a + b)`); a `numeric` one
-//! must be a column, whose declared scale define checks. Define refuses any
-//! other aggregate by family.
+//! argument may be an expression over the row (`SUM(a + b)`). Define refuses
+//! any other aggregate by family.
 //!
 //! # Where its state lives
 //!
@@ -65,11 +64,37 @@
 //! `agg_<id>`, beside a `JOIN`'s `join_<id>_*` tables): the row count
 //! `__n`, and per distinct aggregate argument `i` (1-based, in
 //! [`distinct_arguments`]' order) its non-null count `__count_<i>` and,
-//! when a `SUM` or `AVG` reads it, its sum `__sum_<i>` as `numeric`, which
-//! counts a `numeric` argument's `NaN`s apart from its finite values
-//! ([`NAN_WEIGHT`]: a `NaN` can't be subtracted back out of a sum). A group
-//! row is visible in the target only while `__n > 0`; a zero group stays in
-//! the hidden table until the GC collects it (below).
+//! when a `SUM` or `AVG` reads it, its sum `__sum_<i>` as `numeric`, with a
+//! `numeric` argument's scale and special-value counts beside it ("Numeric
+//! sums" below). A group row is visible in the target only while `__n > 0`;
+//! a zero group stays in the hidden table until the GC collects it (below).
+//!
+//! # Numeric sums
+//!
+//! Postgres shows `sum(numeric)` at the largest display scale among the
+//! group's current finite values (`sum({1.5, 2.000})` is `3.500`, and `1.5`
+//! once `2.000` leaves), which a running sum can't follow: it keeps every
+//! scale it ever held. `avg(numeric)` takes its result scale from the sum's,
+//! so a leftover scale changes its value too. And no running sum can take a
+//! special value back out: `NaN − NaN` is `NaN`, `Infinity − Infinity` is
+//! `NaN`, and so is `NaN × 0` in a `JOIN` product. So a `numeric` argument
+//! keeps [`NUMERIC_PARTS`] ([`SumPart`]): `__sum_<i>`, the sum of its finite
+//! values only; `__scales_<i>`, a `jsonb` object from each display scale
+//! (`scale(x)`, 0 to 16383) to its count of finite values, with no zero
+//! entry; and `__nan_<i>`, `__pinf_<i>` and `__ninf_<i>`, the counts of
+//! `NaN`, `Infinity` and `-Infinity`. Every one is a sum or a count, so
+//! every partial operation keeps it as it keeps a sum: a page's sides carry
+//! each value's scale and class ([`SumPart::of_rows`]), an absolute write
+//! counts them from the source, a `JOIN` product multiplies each by the
+//! match count ([`SumPart::times`]), and a group is zero only when they are
+//! all zero. The visible `SUM` ([`sum_value`]) is `NaN` while it counts a
+//! `NaN` or both infinities, the infinity while it counts one, and otherwise
+//! the finite sum rounded to the largest scale it counts a value of, which
+//! is exactly Postgres's; the `AVG` divides that by the count. A
+//! `numeric(p,s)` argument keeps the same partials (its map has the one
+//! scale `s`); an integer argument keeps its sum alone ([`INTEGER_PARTS`]).
+//! The maps are merged in SQL with no function of Trellis's own, so the
+//! catalog needs none.
 //!
 //! # Zero groups
 //!
@@ -851,11 +876,21 @@ impl SumPart {
     }
 
     /// The total of this partial's values `value` over the rows of an
-    /// aggregate (`filter`, ` filter (where …)` or empty, picks the rows):
-    /// its zero over no rows.
-    pub(crate) fn total(self, value: &str, filter: &str) -> String {
+    /// aggregate (those meeting `condition`, if any): its zero over no rows.
+    /// A scale map folds only the maps that aren't empty, so one change's
+    /// map, the common case, is taken as it is.
+    pub(crate) fn total(self, value: &str, condition: Option<&str>) -> String {
+        let filter = condition
+            .map(|c| format!(" filter (where {c})"))
+            .unwrap_or_default();
         match self {
-            SumPart::Scales => scales_sum(&format!("array_agg({value}){filter}")),
+            SumPart::Scales => {
+                let only = match condition {
+                    Some(c) => format!("{value} <> {NO_SCALES} and ({c})"),
+                    None => format!("{value} <> {NO_SCALES}"),
+                };
+                scales_sum(&format!("array_agg({value}) filter (where {only})"))
+            }
             SumPart::Sum => format!("coalesce(sum({value}){filter}, 0)"),
             _ => format!("coalesce(sum({value}){filter}, 0)::bigint"),
         }
@@ -928,7 +963,8 @@ pub(crate) fn scales_of(keys: &str, weights: Option<&str>) -> String {
 /// skipped), zeros dropped. A single map is itself.
 pub(crate) fn scales_sum(maps: &str) -> String {
     format!(
-        "(select case when cardinality(__m) = 1 then coalesce(__m[1], {NO_SCALES}) else ( \
+        "(select case when __m is null then {NO_SCALES} \
+                      when cardinality(__m) = 1 then coalesce(__m[1], {NO_SCALES}) else ( \
              select coalesce(jsonb_object_agg(__sk, __sc), {NO_SCALES}) from ( \
                  select __e.key as __sk, sum(__e.value::bigint)::bigint as __sc \
                  from unnest(__m) as __u(__j) cross join lateral jsonb_each_text(__u.__j) as __e \
@@ -994,22 +1030,6 @@ pub(crate) fn sum_value(numeric: bool, part: &dyn Fn(SumPart) -> String) -> Stri
         sum = part(SumPart::Sum),
         scale = max_scale(&part(SumPart::Scales)),
     )
-}
-
-/// An absolute write's aggregates of argument `arg` (`i`, 1-based) over
-/// the rows `s` it reads: each of its partials ([`SumPart::of_rows`]),
-/// named `__r<stem><i>`.
-fn fresh_parts(arg: &Arg, i: usize) -> Vec<String> {
-    arg.parts()
-        .iter()
-        .map(|part| {
-            format!(
-                "{} as {}",
-                part.of_rows(&arg.sql, arg.numeric, "1"),
-                part.name("__r", i)
-            )
-        })
-        .collect()
 }
 
 /// The columns of the hidden table `shape` gives a definition, in order:
@@ -1927,12 +1947,26 @@ impl GroupTargetPlan {
         values.push("sd.__lsn".to_string());
         values.push("sd.__sgn".to_string());
         let mut sums = vec!["sum(__sgn)::bigint".to_string()];
+        // A `numeric` sum's scale is a grouping key too, so each staged row
+        // holds one scale, and its map is that scale's signed count: no
+        // per-row map to fold.
+        let mut scale_keys = String::new();
         for (i, arg) in self.shape.args.iter().enumerate() {
             let i = i + 1;
             values.push(format!("{} as __a{i}", arg.sql));
-            sums.push(format!("sum(__sgn * (__a{i} is not null)::int)::bigint"));
+            let count = format!("sum(__sgn * (__a{i} is not null)::int)::bigint");
+            sums.push(count.clone());
             for part in arg.parts() {
-                sums.push(part.of_rows(&format!("__a{i}"), arg.numeric, "__sgn"));
+                sums.push(match part {
+                    SumPart::Scales => {
+                        scale_keys.push_str(&format!(", scale(__a{i})"));
+                        format!(
+                            "(case when scale(__a{i}) is null or {count} = 0 then {NO_SCALES} \
+                                   else jsonb_build_object(scale(__a{i})::text, {count}) end)"
+                        )
+                    }
+                    _ => part.of_rows(&format!("__a{i}"), arg.numeric, "__sgn"),
+                });
             }
         }
         for extreme in self.shape.extremes() {
@@ -1984,7 +2018,7 @@ impl GroupTargetPlan {
                  insert into {staged} \
                  select {cols}, __txid, __lsn, {sums} from ev \
                  where (select __bad from bad) = 0 \
-                 group by {cols}, __txid, __lsn \
+                 group by {cols}, __txid, __lsn{scale_keys} \
              ) \
              select __bad from bad",
             sides = Self::sides_sql(),
@@ -2213,8 +2247,8 @@ impl GroupTargetPlan {
             returning.push(format!("t.__c{i} as __dc{i}, u.__count_{i} as __nc{i}"));
             for part in arg.parts() {
                 let (staged, hidden) = (part.name("__", i), part.hidden(i));
-                sums.push(format!("{} as {staged}", part.total(&staged, "")));
-                totals.push(format!("{} as {staged}", part.total(&staged, "")));
+                sums.push(format!("{} as {staged}", part.total(&staged, None)));
+                totals.push(format!("{} as {staged}", part.total(&staged, None)));
                 sets.push(format!(
                     "{hidden} = {}",
                     part.add(&format!("u.{hidden}"), &format!("t.{staged}"))
@@ -2300,10 +2334,7 @@ impl GroupTargetPlan {
             ));
             for part in arg.parts() {
                 let staged = part.name("__", i);
-                totals.push(format!(
-                    "{} as {staged}",
-                    part.total(&staged, " filter (where __ok)")
-                ));
+                totals.push(format!("{} as {staged}", part.total(&staged, Some("__ok"))));
             }
         }
         let mut sets = sets.to_vec();
@@ -2724,7 +2755,6 @@ impl GroupTargetPlan {
         let args = &self.shape.args;
         let mut old = vec!["x.__n".to_string()];
         let mut old_names = vec!["__on".to_string()];
-        let mut fresh = vec!["count(*)::bigint as __rn".to_string()];
         // The scan form's partials, `NULL` for a group the node has no row of.
         let mut zeroed = vec!["coalesce(n.__rn, 0) as __rn".to_string()];
         let mut sets = vec!["__n = r.__rn".to_string()];
@@ -2736,16 +2766,11 @@ impl GroupTargetPlan {
             let i = i + 1;
             old.push(format!("x.__count_{i}"));
             old_names.push(format!("__oc{i}"));
-            fresh.push(format!(
-                "(count(*) filter (where ({}) is not null))::bigint as __rc{i}",
-                arg.sql
-            ));
             sets.push(format!("__count_{i} = r.__rc{i}"));
             zeroed.push(format!("coalesce(n.__rc{i}, 0) as __rc{i}"));
             returning.push(format!(
                 "u.__count_{i} - r.__oc{i} as __dc{i}, u.__count_{i} as __nc{i}"
             ));
-            fresh.extend(fresh_parts(arg, i));
             for part in arg.parts() {
                 let (hidden, held, read) =
                     (part.hidden(i), part.name("__o", i), part.name("__r", i));
@@ -2778,11 +2803,6 @@ impl GroupTargetPlan {
             let (column, fresh_name) = (x.column(), x.named("__r"));
             old.push(format!("x.{column}"));
             old_names.push(x.named("__o"));
-            fresh.push(format!(
-                "{}({}) as {fresh_name}",
-                x.aggregate(),
-                self.shape.args[x.arg].sql
-            ));
             zeroed.push(format!("n.{fresh_name} as {fresh_name}"));
             if !keep {
                 sets.push(format!("{column} = r.{fresh_name}"));
@@ -2811,11 +2831,10 @@ impl GroupTargetPlan {
                 "r as ( \
                      select h.*, a.* from rg \
                      cross join lateral {lookup_hidden} as h(__hc, {old_names}) \
-                     cross join lateral (select {fresh} from ({probe}) as s) as a \
+                     cross join lateral ({fresh}) as a \
                  )",
                 old_names = old_names.join(", "),
-                fresh = fresh.join(", "),
-                probe = self.probe_rows_sql(),
+                fresh = self.fresh_select(&[], &format!("({})", self.probe_rows_sql())),
             ),
             Some(node) => {
                 // The node's group columns at the hidden table's types, as
@@ -2823,19 +2842,14 @@ impl GroupTargetPlan {
                 // the same (a `varchar` source column against a `text`
                 // group column has no `=`).
                 let matched = self.group_match("n", "rg");
-                let positions: Vec<String> = (1..=cols.len()).map(|p| p.to_string()).collect();
                 format!(
-                    "n as materialized ( \
-                         select {values}, {fresh} from {node} s group by {positions} \
-                     ), \
+                    "n as materialized ({fresh}), \
                      r as ( \
                          select h.*, {zeroed} from rg \
                          cross join lateral {lookup_hidden} as h(__hc, {old_names}) \
                          left join n on {matched} \
                      )",
-                    values = self.group_values().join(", "),
-                    fresh = fresh.join(", "),
-                    positions = positions.join(", "),
+                    fresh = self.fresh_select(&self.group_values(), node),
                     zeroed = zeroed.join(", "),
                     old_names = old_names.join(", "),
                 )
@@ -2877,33 +2891,22 @@ impl GroupTargetPlan {
     /// write that follows can't.
     fn join_group_sql(&self, node: &str, grouped: &str) -> String {
         let cols = quoted(&self.shape.group_cols);
-        let mut fresh = vec!["count(*)::bigint as __rn".to_string()];
         let mut nulls = vec!["null".to_string(); cols.len() + 1];
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            let i = i + 1;
-            fresh.push(format!(
-                "(count(*) filter (where ({}) is not null))::bigint as __rc{i}",
-                arg.sql
-            ));
+        for arg in &self.shape.args {
             nulls.push("null".to_string());
-            fresh.extend(fresh_parts(arg, i));
             for part in arg.parts() {
                 nulls.push(format!("null::{}", part.sql_type()));
             }
         }
-        let positions: Vec<String> = (4..4 + cols.len()).map(|p| p.to_string()).collect();
         format!(
             "create temp table {table} on commit drop as \
-             select false as __meta, null::pg_snapshot as __snap, null::bigint as __seg, \
-                    {values}, {fresh} \
-             from {node} s group by {positions} \
+             select false as __meta, null::pg_snapshot as __snap, null::bigint as __seg, f.* \
+             from ({fresh}) as f \
              union all \
              select true, pg_catalog.pg_current_snapshot(), \
                     coalesce((select max(seg_seq) from segments), 0), {nulls}",
             table = grouped.trim_start_matches("pg_temp."),
-            values = self.group_values().join(", "),
-            fresh = fresh.join(", "),
-            positions = positions.join(", "),
+            fresh = self.fresh_select(&self.group_values(), node),
             nulls = nulls.join(", "),
         )
     }
@@ -3154,20 +3157,14 @@ impl GroupTargetPlan {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
         let args = &self.shape.args;
-        let mut fresh = vec!["count(*)::bigint as __rn".to_string()];
         let mut kept = vec!["coalesce(a.__rn, 0) as __rn".to_string()];
         let mut sets = vec!["__n = r.__rn".to_string()];
         let mut returning = vec!["u.__n as __nn".to_string()];
         for (i, arg) in args.iter().enumerate() {
             let i = i + 1;
-            fresh.push(format!(
-                "(count(*) filter (where ({}) is not null))::bigint as __rc{i}",
-                arg.sql
-            ));
             kept.push(format!("coalesce(a.__rc{i}, 0) as __rc{i}"));
             sets.push(format!("__count_{i} = r.__rc{i}"));
             returning.push(format!("u.__count_{i} as __nc{i}"));
-            fresh.extend(fresh_parts(arg, i));
             for part in arg.parts() {
                 let (hidden, read) = (part.hidden(i), part.name("__r", i));
                 kept.push(format!("coalesce(a.{read}, {}) as {read}", part.zero()));
@@ -3190,11 +3187,6 @@ impl GroupTargetPlan {
             );
         for x in &extremes {
             let (column, fresh_name) = (x.column(), x.named("__r"));
-            fresh.push(format!(
-                "{}({}) as {fresh_name}",
-                x.aggregate(),
-                self.shape.args[x.arg].sql
-            ));
             kept.push(format!("a.{fresh_name} as {fresh_name}"));
             if !keep {
                 sets.push(format!("{column} = r.{fresh_name}"));
@@ -3204,7 +3196,6 @@ impl GroupTargetPlan {
         if !extremes.is_empty() && !keep {
             xsets = ", __xbasis = snap.__snap, __xstamp = snap.__seg".to_string();
         }
-        let positions: Vec<String> = (1..=cols.len()).map(|p| p.to_string()).collect();
         let matched = self.group_match("a", "rg");
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
         let lookup_hidden =
@@ -3228,17 +3219,13 @@ impl GroupTargetPlan {
                     _ => self.source_row.as_str(),
                 };
                 format!(
-                    "a as ( \
-                         select {values}, {fresh} from {from} s group by {positions} \
-                     ), \
+                    "a as ({fresh}), \
                      r as ( \
                          select h.__hc, {kept} from rg \
                          cross join lateral {lookup_hidden} as h(__hc) \
                          left join a on {matched} \
                      )",
-                    values = self.group_values().join(", "),
-                    fresh = fresh.join(", "),
-                    positions = positions.join(", "),
+                    fresh = self.fresh_select(&self.group_values(), from),
                     kept = kept.join(", "),
                 )
             }
@@ -3249,11 +3236,10 @@ impl GroupTargetPlan {
                 "r as ( \
                      select h.__hc, {kept} from rg \
                      cross join lateral {lookup_hidden} as h(__hc) \
-                     cross join lateral (select {fresh} from ({probe}) as s) as a \
+                     cross join lateral ({fresh}) as a \
                  )",
                 kept = kept.join(", "),
-                fresh = fresh.join(", "),
-                probe = self.probe_rows_sql(),
+                fresh = self.fresh_select(&[], &format!("({})", self.probe_rows_sql())),
             ),
         };
         #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
@@ -3289,35 +3275,118 @@ impl GroupTargetPlan {
     /// when the source is empty).
     #[cfg(any(test, feature = "test-util"))]
     fn planted_early_read_sql(&self, early: &str) -> String {
-        let cols = quoted(&self.shape.group_cols);
-        let mut fresh = vec!["count(*)::bigint as __rn".to_string()];
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            let i = i + 1;
-            fresh.push(format!(
-                "(count(*) filter (where ({}) is not null))::bigint as __rc{i}",
-                arg.sql
-            ));
-            fresh.extend(fresh_parts(arg, i));
-        }
-        for x in self.shape.extremes() {
-            fresh.push(format!(
-                "{}({}) as {}",
-                x.aggregate(),
-                self.shape.args[x.arg].sql,
-                x.named("__r")
-            ));
-        }
-        let positions: Vec<String> = (1..=cols.len()).map(|p| p.to_string()).collect();
         format!(
             "create temporary table {early} on commit drop as \
              with snap as materialized ({SNAPSHOT_AND_STAMP}) \
-             select snap.*, a.* from snap left join ( \
-                 select {values}, {fresh} from {src} s group by {positions} \
-             ) as a on true",
-            values = self.group_values().join(", "),
-            fresh = fresh.join(", "),
-            positions = positions.join(", "),
-            src = self.source_row,
+             select snap.*, a.* from snap left join ({fresh}) as a on true",
+            fresh = self.fresh_select(&self.group_values(), &self.source_row),
+        )
+    }
+
+    /// An absolute write's read of the rows of `from` (a `FROM` item, read
+    /// as `s`): `select <values>, <partials>`, one row per group of
+    /// `values` (each `… as <group column>`), or one row over every row when
+    /// `values` is empty. The partials are named `__rn`, then per argument
+    /// `__rc<i>` and its sum's partials (`__r<stem><i>`), then per extreme
+    /// its `__r<stem><i>`.
+    ///
+    /// With a `numeric` sum, the rows are first grouped by the groups and
+    /// each such argument's `scale(x)` as well, then by the groups alone:
+    /// each scale's count comes from a group of its own, so the second step
+    /// folds one row per scale into the map, never one per source row.
+    fn fresh_select(&self, values: &[String], from: &str) -> String {
+        let args = &self.shape.args;
+        let scaled: Vec<usize> = (0..args.len())
+            .filter(|&i| args[i].parts().contains(&SumPart::Scales))
+            .collect();
+        // Each partial: its name, its aggregate over the rows, and, when the
+        // rows are grouped by scale first, how the second step folds it.
+        let mut partials: Vec<(String, String, String)> = vec![(
+            "__rn".to_string(),
+            "count(*)::bigint".to_string(),
+            "coalesce(sum(__rn), 0)::bigint".to_string(),
+        )];
+        for (i, arg) in args.iter().enumerate() {
+            let i = i + 1;
+            let count = format!("__rc{i}");
+            partials.push((
+                count.clone(),
+                format!(
+                    "(count(*) filter (where ({}) is not null))::bigint",
+                    arg.sql
+                ),
+                format!("coalesce(sum({count}), 0)::bigint"),
+            ));
+            for part in arg.parts() {
+                let name = part.name("__r", i);
+                let fold = match part {
+                    SumPart::Scales => scales_of(
+                        &format!("array_agg(__g{i})"),
+                        Some(&format!("array_agg({count})")),
+                    ),
+                    _ => part.total(&name, None),
+                };
+                partials.push((name, part.of_rows(&arg.sql, arg.numeric, "1"), fold));
+            }
+        }
+        for x in self.shape.extremes() {
+            let name = x.named("__r");
+            let fold = format!("{}({name})", x.aggregate());
+            partials.push((
+                name,
+                format!("{}({})", x.aggregate(), args[x.arg].sql),
+                fold,
+            ));
+        }
+        let positions = |n: usize| -> String {
+            if n == 0 {
+                String::new()
+            } else {
+                let p: Vec<String> = (1..=n).map(|p| p.to_string()).collect();
+                format!(" group by {}", p.join(", "))
+            }
+        };
+        let lead =
+            |columns: &[String]| -> String { columns.iter().map(|c| format!("{c}, ")).collect() };
+        if scaled.is_empty() {
+            let list: Vec<String> = partials
+                .iter()
+                .map(|(name, agg, _)| format!("{agg} as {name}"))
+                .collect();
+            return format!(
+                "select {}{} from {from} s{}",
+                lead(values),
+                list.join(", "),
+                positions(values.len())
+            );
+        }
+        let mut inner: Vec<String> = values.to_vec();
+        for &i in &scaled {
+            inner.push(format!("scale(({})) as __g{}", args[i].sql, i + 1));
+        }
+        let keys = inner.len();
+        for (name, agg, _) in &partials {
+            if !name.starts_with("__rk") {
+                inner.push(format!("{agg} as {name}"));
+            }
+        }
+        let groups = quoted(&self.shape.group_cols);
+        let groups: &[String] = if values.is_empty() { &[] } else { &groups };
+        let outer: Vec<String> = partials
+            .iter()
+            .map(|(name, _, fold)| format!("{fold} as {name}"))
+            .collect();
+        format!(
+            "select {}{} from (select {} from {from} s{}) as s{}",
+            lead(groups),
+            outer.join(", "),
+            inner.join(", "),
+            positions(keys),
+            if groups.is_empty() {
+                String::new()
+            } else {
+                format!(" group by {}", groups.join(", "))
+            }
         )
     }
 
