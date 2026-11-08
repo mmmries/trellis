@@ -1,39 +1,49 @@
 //! A 1-1 `JOIN`'s fan-out in chunks (ADR-0021): the target rows of `a` a
-//! `b` change recomputes, past what one transaction should hold.
+//! joined table's change recomputes, past what one transaction should hold.
 //!
-//! A `b` change recomputes every `a` row on its join key while it holds the
-//! key's `J` row, and an `a` change on the key waits for that lock. So no
+//! A change of the table at position `i` recomputes every `a` row on its
+//! join key there while it holds the key's `J` row and the rows' `R`
+//! entries, and an `a` change on the key waits for that `J` row. So no
 //! transaction recomputes more than one chunk of rows ([`chunk_rows`]):
 //!
-//! - **The page** ([`split`]) recomputes the keys whose rows fit one chunk
-//!   between them, and writes a pending marker in `join1_fan_out` for each
-//!   other key: `(key, gen, cursor)`, with the cursor at the key's start and
-//!   the origin of the page's `b` changes. A key it recomputes whole has its
-//!   marker deleted. A later page on a pending key sets its cursor back to
-//!   the start, since every row of the key now joins the newer `b` row, and
-//!   merges the origins, earliest first.
+//! - **The page** ([`budget`], then [`split`] per position) recomputes the
+//!   keys whose rows fit one chunk between them, one budget for the page
+//!   summed over its positions, and writes a pending marker in
+//!   `join1_fan_out` for each other key: `(position, key, gen, cursor)`,
+//!   with the cursor at the key's start and the origin of the page's joined
+//!   changes. A key it recomputes whole has its marker deleted. A later page
+//!   on a pending key sets its cursor back to the start, since every row of
+//!   the key now joins the newer row, and merges the origins, earliest
+//!   first.
 //! - **A chunk** ([`step`]), one transaction run by a drain worker as build
-//!   work, takes the key's `J` row and its marker, recomputes the next
-//!   chunk of live `R` entries after the cursor in key order, and advances
-//!   the cursor, or deletes the marker after the key's last entry. A chunk
-//!   that dies changes nothing, and the next one starts where the last
-//!   commit left the cursor.
+//!   work, takes the key's `J` row and its marker, walks the next chunk of
+//!   live `R` entries after the cursor in key order (a range of `R`'s index
+//!   on the position's join key), locks those entries, recomputes their
+//!   rows and advances the cursor, or deletes the marker after the key's
+//!   last entry. A chunk that dies changes nothing, and the next one starts
+//!   where the last commit left the cursor.
 //!
-//! Each recompute reads `R` and the newest live `M` entry under the key's
-//! `J` lock, so it is exact whatever ran on the key between two chunks: an
-//! `a` change writes its own row from the same state, and a row that leaves
-//! the key, or joins it behind the cursor, has been written by its own page.
-//! A row behind the cursor was recomputed with `M` as it is, since a newer
-//! `b` change would have reset the cursor.
+//! Each recompute reads `R` and the newest live `M` entry at every position
+//! under the key's `J` lock and the batch's `R` entries, so it is exact
+//! whatever ran between two chunks: an `a` change writes its own row from
+//! the same state, a row that leaves the key, or joins it behind the
+//! cursor, has been written by its own page, and a writer at another
+//! position on one of the batch's rows holds that row's `R` entry from its
+//! `J` lock to its commit, so the chunk reads its `M` change or the writer
+//! reads the chunk's row. A row behind the cursor was recomputed with `M`
+//! as it is, since a newer change of the key's row would have reset the
+//! cursor.
 //!
-//! The lock order is the page's: the version fences, the definition's row
-//! `FOR KEY SHARE` (a chunk may hold a row in quarantine, as a page's fan-out
-//! may), the pair's lock row `FOR SHARE`, the key's `J` row, its marker, then
-//! the target rows. A page writes its markers after its `J` lock, in key
-//! order. So a `TRUNCATE`'s page, which holds the lock row `FOR UPDATE`,
-//! orders against a chunk as against a page, and deletes the definition's
-//! markers ([`clear_all`]): a `TRUNCATE` of `b` starts a rebuild, which
-//! recomputes every row, and one of `a` leaves no row to recompute.
+//! The lock order is the page's: the version fences of every table, the
+//! definition's row `FOR KEY SHARE` (a chunk may hold a row in quarantine,
+//! as a page's fan-out may), the pair's lock row `FOR SHARE`, the key's `J`
+//! row, its marker, the batch's `R` entries (`FOR UPDATE`, sorted), and only
+//! then any `M` and the target rows. A page writes its markers after its
+//! `J` lock, in key order. So a `TRUNCATE`'s page, which holds the lock row
+//! `FOR UPDATE`, orders against a chunk as against a page, and deletes the
+//! definition's markers at every position ([`clear_all`]): a `TRUNCATE` of
+//! a joined table starts a rebuild, which recomputes every row, and one of
+//! `a` leaves no row to recompute.
 //!
 //! A marker holds back every watermark token at or past its origin, as a
 //! parked row does (`super::super::converge`'s fifth condition), so a read
@@ -171,8 +181,7 @@ pub(super) async fn budget(
 /// A page's split of its fan-out `keys` at `at` (the module doc): returns
 /// those within `inline` ([`budget`]), which it recomputes itself, and
 /// deletes their markers; writes a marker for every other key, or resets the
-/// one it has. A star's page halts instead of writing one: its chunks don't
-/// take the R-entry rule yet (#1775).
+/// one it has.
 pub(super) async fn split(
     txn: &Transaction<'_>,
     plan: &JoinOneToOnePlan,
@@ -184,16 +193,6 @@ pub(super) async fn split(
     let shape = &*plan.shape;
     let (inline, pending): (BTreeSet<KeyText>, BTreeSet<KeyText>) =
         keys.iter().cloned().partition(|key| inline.contains(key));
-    if shape.is_star() && !pending.is_empty() {
-        return Err(ApplyError::JoinOneToOneHalt {
-            target: shape.target.clone(),
-            reason: format!(
-                "a fan-out past one chunk ({} rows) of a 1-1 JOIN of more than two tables, \
-                 whose chunked fan-out is not built yet",
-                chunk_rows()
-            ),
-        });
-    }
     clear(txn, shape, at, &inline).await?;
     mark(txn, shape, at, &pending, seg_seq, &plan.held_origin).await?;
     Ok(inline)
@@ -348,9 +347,37 @@ async fn mark(
     Ok(())
 }
 
-/// Deletes every marker of `shape`'s definition: a `TRUNCATE` of either side
-/// (the module doc), in its page, under the lock row held `FOR UPDATE`.
-pub(super) async fn clear_all(txn: &Transaction<'_>, shape: &JoinShape) -> Result<(), ApplyError> {
+/// Deletes every marker of `shape`'s definition, at every position: a
+/// `TRUNCATE` of any of its tables (the module doc), in its page, under the
+/// lock row held `FOR UPDATE`. `truncated` names the joined positions the
+/// page truncates (none for a `TRUNCATE` of the root alone); a truncate of
+/// one position drops the markers of every other one too, since its rebuild
+/// recomputes every row whatever position a marker named.
+pub(super) async fn clear_all(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    truncated: &[Position],
+) -> Result<(), ApplyError> {
+    // Planted bug: a star's truncate deletes only the markers of the
+    // positions it truncates. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    if crate::plant::fires(
+        crate::plant::Plant::StarTruncateKeepsOtherMarkers,
+        shape.is_star(),
+    ) {
+        let positions: Vec<i16> = truncated
+            .iter()
+            .map(|p| i16::try_from(p.number()).expect("a position fits a smallint"))
+            .collect();
+        txn.execute(
+            "delete from join1_fan_out where transform_id = $1 and position = any($2)",
+            &[&shape.id, &positions],
+        )
+        .await?;
+        return Ok(());
+    }
+    #[cfg(not(any(test, feature = "test-util")))]
+    let _ = truncated;
     txn.execute(
         "delete from join1_fan_out where transform_id = $1",
         &[&shape.id],
@@ -378,8 +405,8 @@ impl FanOutStep {
     }
 }
 
-/// A definition's shape for its chunks, and the version of each of its two
-/// tables it was read at.
+/// A definition's shape for its chunks, and the version of each of its
+/// tables (the root and every joined table) it was read at.
 struct Loaded {
     shape: Arc<JoinShape>,
     versions: Vec<(String, Option<i64>)>,
@@ -398,10 +425,8 @@ async fn load(pool: &Pool, id: i64) -> Result<Option<Loaded>, ApplyError> {
     };
     // The versions first: a definition change after them misses the fence
     // the chunk then holds, rather than run on a shape it doesn't hold.
-    let mut tables = vec![
-        definition.source_table.clone(),
-        crate::defs::join::first_joined(join).right.clone(),
-    ];
+    let mut tables = vec![definition.source_table.clone()];
+    tables.extend(crate::defs::join::positions(join).map(|(_, table)| table.right.clone()));
     tables.sort();
     tables.dedup();
     let mut versions = Vec::with_capacity(tables.len());
@@ -648,6 +673,15 @@ async fn chunk_in(
     let entries = walk(txn, shape, at, key, cursor.as_deref(), rows + 1).await?;
     let next = (entries.len() > rows).then(|| entries[rows - 1].clone());
     let batch = &entries[..entries.len().min(rows)];
+    lock_batch(txn, shape, batch).await?;
+    // Test-only pause point. See `super::super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::super::interleave::pause_at(
+        txn,
+        super::super::interleave::PausePoint::AfterJoin1FanOutRLock,
+        &shape.target,
+    )
+    .await?;
     let mut mutations = TargetMutations::new();
     super::write_fan_out(
         txn,
@@ -706,6 +740,42 @@ async fn chunk_in(
         "1-1 JOIN fan-out chunk recomputed its rows"
     );
     Ok(Chunk::Ran)
+}
+
+/// Locks the `R` entries of a chunk's `batch` (sorted entry keys) `FOR
+/// UPDATE`, in key order, in one statement: the R-entry rule (#1459
+/// Decision item 1). The chunk holds `J` for its own key only, so a writer at
+/// another position on one of the batch's rows, which holds that row's `R`
+/// entry from its own `J` lock to its commit, would otherwise commit its `M`
+/// change between the chunk's read of that `M` and its write of the row,
+/// and the chunk would write the row from the older entry. The batch's
+/// entries can't leave the key or change while the chunk holds its `J` row,
+/// so the walk's read stands.
+async fn lock_batch(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    batch: &[String],
+) -> Result<(), ApplyError> {
+    // Planted bug: a star's chunk recomputes its batch without re-taking its
+    // `R` entries. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    if crate::plant::fires(
+        crate::plant::Plant::StarChunkNoR,
+        shape.is_star() && !batch.is_empty(),
+    ) {
+        return Ok(());
+    }
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let keys: Vec<&str> = batch.iter().map(String::as_str).collect();
+    super::super::ledger::query_by_entry_key(
+        txn,
+        &super::super::ledger::lock_statement(&shape.r.ident),
+        &[&keys],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Up to `limit` keys of the live `R` entries on `key` at `at` after

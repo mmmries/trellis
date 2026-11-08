@@ -71,8 +71,9 @@
 //! its target write and fan-out, `AfterJoin1PositionFanOut` after each
 //! position's fan-out, and `BeforeCommit`. A chunk of its pending fan-out
 //! (`super::join_one_to_one::fan_out`) fires `AfterJoin1FanOutLock` once it
-//! holds its key's `J` row and marker, and `BeforeJoin1FanOutCommit` after
-//! its last write.
+//! holds its key's `J` row and marker, `AfterJoin1FanOutRLock` once it has
+//! locked its batch's `R` entries, and `BeforeJoin1FanOutCommit` after its
+//! last write.
 //!
 //! A 1-1 build chunk (`super::build::one_to_one::run_chunk`) fires
 //! `AfterPlaceholders` and `AfterEntryLock` around its entry lock, and
@@ -299,6 +300,9 @@ pub enum PausePoint {
     /// (`super::join_one_to_one::fan_out`) took its key's `J` row and its
     /// pending marker, before it reads `R`.
     AfterJoin1FanOutLock,
+    /// On a 1-1 `JOIN` target, after a fan-out chunk locked the `R` entries
+    /// of its batch (the R-entry rule), before it reads any `M`.
+    AfterJoin1FanOutRLock,
     /// On a 1-1 `JOIN` target, after a fan-out chunk wrote its rows and moved
     /// its key's marker on (or deleted it), before it commits.
     BeforeJoin1FanOutCommit,

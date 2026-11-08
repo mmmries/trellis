@@ -361,6 +361,7 @@ pub mod fixtures {
     #[allow(non_snake_case)]
     pub fn FanOutWarning() -> FanOutWarning {
         FanOutWarning {
+            position: 1,
             key: String::new(),
             rows: 0,
             threshold: 0,

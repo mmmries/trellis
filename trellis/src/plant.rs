@@ -514,6 +514,23 @@ pub enum Plant {
     /// Pinned by `join_star_joined`'s `cx_f11a_…` and `ps7_…`, in their
     /// swapped orientation (the late key at the last position).
     StarRecheckSkipLast,
+    /// #1459 Decision item 1, #1464 (`star_chunk_no_r`): a star's fan-out
+    /// chunk recomputes its batch without re-taking the batch's `R` entries,
+    /// holding `J` for its own key only. A writer at another position on one
+    /// of the batch's rows commits its `M` change between the chunk's read
+    /// of that `M` and its write of the row, and the chunk writes the row
+    /// from the older entry. Fires only on a star, when the chunk has a
+    /// batch.
+    ///
+    /// Pinned by `join_star_fan_out`'s `cx_f10a_…` (a lost update) and
+    /// `cx_f10c_…` (a chunk at the other position doesn't queue).
+    StarChunkNoR,
+    /// #1464's XT2 (`star_truncate_keeps_other_markers`): a star's
+    /// `TRUNCATE` deletes the pending fan-out markers of the positions it
+    /// truncates only, not those of every position. Fires only on a star.
+    ///
+    /// Pinned by `join_star_fan_out`'s `xt2_…` pins.
+    StarTruncateKeepsOtherMarkers,
     /// ADR-0002 "Multi-hop" (#1482's `token_early`): a drain page reads the
     /// target-mutation seam's write token when it begins
     /// (`staging::target_mutations`), before its row locks, rather than after
@@ -680,6 +697,8 @@ impl Plant {
         Plant::StarRSplit,
         Plant::StarRecheckJ,
         Plant::StarRecheckSkipLast,
+        Plant::StarChunkNoR,
+        Plant::StarTruncateKeepsOtherMarkers,
         Plant::SeamTokenEarly,
         Plant::SeamImagelessRow,
         Plant::GbxProbeNoXbasis,
@@ -744,6 +763,8 @@ impl Plant {
             Plant::StarRSplit => "star_r_split",
             Plant::StarRecheckJ => "star_recheck_j",
             Plant::StarRecheckSkipLast => "star_recheck_skip_last",
+            Plant::StarChunkNoR => "star_chunk_no_r",
+            Plant::StarTruncateKeepsOtherMarkers => "star_truncate_keeps_other_markers",
             Plant::SeamTokenEarly => "seam_token_early",
             Plant::SeamImagelessRow => "seam_imageless_row",
             Plant::GbxProbeNoXbasis => "gbx_probe_no_xbasis",

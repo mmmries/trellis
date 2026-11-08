@@ -153,6 +153,8 @@ pub struct PlainPartialsWarning {
 /// A [`FanOutWarning`] flattened to plain data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainFanOutWarning {
+    /// The joined position whose join key this is, from 1.
+    pub position: usize,
     /// The join key's text: its columns' values, joined by `,`.
     pub key: String,
     /// The live `R` entries on the key.
@@ -494,6 +496,7 @@ impl From<&PartialsWarning> for PlainPartialsWarning {
 impl From<&FanOutWarning> for PlainFanOutWarning {
     fn from(warning: &FanOutWarning) -> Self {
         PlainFanOutWarning {
+            position: warning.position,
             key: warning.key.clone(),
             rows: warning.rows,
             threshold: warning.threshold,
@@ -533,9 +536,9 @@ impl From<&JoinBuildStep> for PlainJoinBuildStep {
                 }
             }
             JoinBuildStep::OneToOne(step) => match step {
-                OneToOneBuildStep::JoinedRows => kind("joined_rows"),
-                OneToOneBuildStep::JoinedNullKeys => kind("joined_null_keys"),
-                OneToOneBuildStep::JoinedGone => kind("joined_gone"),
+                OneToOneBuildStep::JoinedRows { .. } => kind("joined_rows"),
+                OneToOneBuildStep::JoinedNullKeys { .. } => kind("joined_null_keys"),
+                OneToOneBuildStep::JoinedGone { .. } => kind("joined_gone"),
                 OneToOneBuildStep::PlanningChunks => kind("planning_chunks"),
                 OneToOneBuildStep::Chunks { remaining } => PlainJoinBuildStep {
                     remaining: Some(*remaining),
@@ -1182,6 +1185,7 @@ mod tests {
                     fact_rows: 7_000_000_019,
                 }),
                 fan_out_warning: Some(PlainFanOutWarning {
+                    position: 1,
                     key: "42,eu".to_string(),
                     rows: 3_000_000_023,
                     threshold: 250_000,
@@ -1242,9 +1246,12 @@ mod tests {
             ("side", Some("joined"), Some("unroutable"), None, None)
         );
         for (one_to_one, word) in [
-            (OneToOneBuildStep::JoinedRows, "joined_rows"),
-            (OneToOneBuildStep::JoinedNullKeys, "joined_null_keys"),
-            (OneToOneBuildStep::JoinedGone, "joined_gone"),
+            (OneToOneBuildStep::JoinedRows { position: 1 }, "joined_rows"),
+            (
+                OneToOneBuildStep::JoinedNullKeys { position: 1 },
+                "joined_null_keys",
+            ),
+            (OneToOneBuildStep::JoinedGone { position: 1 }, "joined_gone"),
             (OneToOneBuildStep::PlanningChunks, "planning_chunks"),
             (OneToOneBuildStep::SweepStale, "sweep_stale"),
             (OneToOneBuildStep::SweepOrphans, "sweep_orphans"),
@@ -1283,9 +1290,9 @@ mod tests {
                 side: JoinSide::Joined,
                 part: JoinSidePart::Unroutable,
             },
-            JoinBuildStep::OneToOne(OneToOneBuildStep::JoinedRows),
-            JoinBuildStep::OneToOne(OneToOneBuildStep::JoinedNullKeys),
-            JoinBuildStep::OneToOne(OneToOneBuildStep::JoinedGone),
+            JoinBuildStep::OneToOne(OneToOneBuildStep::JoinedRows { position: 1 }),
+            JoinBuildStep::OneToOne(OneToOneBuildStep::JoinedNullKeys { position: 1 }),
+            JoinBuildStep::OneToOne(OneToOneBuildStep::JoinedGone { position: 1 }),
             JoinBuildStep::OneToOne(OneToOneBuildStep::PlanningChunks),
             JoinBuildStep::OneToOne(OneToOneBuildStep::Chunks { remaining: 1 }),
             JoinBuildStep::OneToOne(OneToOneBuildStep::SweepStale),
