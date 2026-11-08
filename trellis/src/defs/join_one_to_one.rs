@@ -132,9 +132,19 @@ impl HiddenTable {
 
 /// The name of `J`'s column for the `FROM` table's join key column `column`
 /// at `position`: each position has its own group of key columns in the one
-/// `J` (ADR-0021), `NULL` on every other position's rows.
+/// `J` (ADR-0021), `NULL` on every other position's rows. A name over
+/// [`MAX_NAME_BYTES`](crate::defs::lexer::MAX_NAME_BYTES) is cut there, at a
+/// character boundary, as Postgres cuts it when it creates the column, so a
+/// lookup of the column by name in the catalog (copy re-typing,
+/// `crate::defs::copies`) finds it.
 pub(crate) fn j_column(position: Position, column: &str) -> String {
-    format!("p{}_{column}", position.number())
+    let mut name = format!("p{}_{column}", position.number());
+    let mut end = crate::defs::lexer::MAX_NAME_BYTES.min(name.len());
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name.truncate(end);
+    name
 }
 
 /// The columns `side`'s ledger table copies from its source, in order: the
@@ -573,6 +583,22 @@ mod tests {
              \"trellis\".\"join1_7_m4\", \"trellis\".\"join1_7_j\", \"trellis\".\"join1_7_l\"; \
              delete from \"trellis\".join1_fan_out where transform_id = 7"
         );
+    }
+
+    /// `J`'s column for a join key column is `p<i>_<column>`, cut as
+    /// Postgres cuts an identifier: at 63 bytes, on a character boundary.
+    #[test]
+    fn a_j_column_name_is_cut_where_postgres_cuts_it() {
+        let first = Position::FIRST;
+        assert_eq!(j_column(first, "cust"), "p1_cust");
+        // 60 bytes fit beside `p1_`; 61 are cut to 63.
+        let fits = "a".repeat(60);
+        assert_eq!(j_column(first, &fits), format!("p1_{fits}"));
+        let long = "b".repeat(63);
+        assert_eq!(j_column(first, &long), format!("p1_{}", "b".repeat(60)));
+        // `é` is two bytes: one that would straddle byte 63 is dropped whole.
+        let wide = format!("{}é", "c".repeat(59));
+        assert_eq!(j_column(first, &wide), format!("p1_{}", "c".repeat(59)));
     }
 
     /// The widths a definition is checked against are the widths of the
