@@ -151,31 +151,9 @@ impl Part {
 
     /// The part `tag` names, at any position a `JOIN` may have.
     fn of_tag(tag: &str) -> Option<Part> {
-        match tag {
-            "t" => return Some(Part::Target),
-            "r" => return Some(Part::From),
-            "ro" => return Some(Part::FromOrphans),
-            _ => {}
-        }
-        // `mo` before `m`, which it starts with.
-        let parts: [(&str, fn(Position) -> Part); 3] = [
-            ("mo", Part::JoinedOrphans),
-            ("m", Part::Joined),
-            ("d", Part::Duplicates),
-        ];
-        let (rest, part) = parts
-            .iter()
-            .find_map(|(base, part)| tag.strip_prefix(base).map(|rest| (rest, part)))?;
-        let position = if rest.is_empty() {
-            Position::FIRST
-        } else {
-            // Position 1 is tagged bare, never `m1`, and a number is digits.
-            if !rest.bytes().all(|b| b.is_ascii_digit()) || rest.starts_with('0') {
-                return None;
-            }
-            Position::from_number(rest.parse().ok()?).filter(|p| *p != Position::FIRST)?
-        };
-        Some(part(position))
+        Self::walk(spec::MAX_POSITIONS)
+            .into_iter()
+            .find(|part| part.tag() == tag)
     }
 
     /// The part after this one in the walk of a `JOIN` of `positions` joined
