@@ -543,8 +543,9 @@ async fn a_source_retype_to_unscaled_numeric_keeps_its_sum_readers_exact() {
 
 /// The narrowed R1 for a change between two declared scales: a `SUM`
 /// over `numeric(10,2)` re-typed to `numeric(12,4)` pauses nothing, and the
-/// capture pass rebuilds the aggregate on its own, whose total is still the
-/// source's sum.
+/// capture pass rebuilds the aggregate on its own, whose total and average
+/// are Postgres's text over the re-scaled values (`3.7500`, equal to the
+/// `3.75` the target held).
 #[tokio::test]
 async fn a_scale_change_between_two_declared_scales_rebuilds_the_sum_reader() {
     let cluster = TestCluster::start();
@@ -560,7 +561,7 @@ async fn a_scale_change_between_two_declared_scales_rebuilds_the_sum_reader() {
     trellis
         .apply(
             "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX \
-             SELECT SUM(price) AS total",
+             SELECT SUM(price) AS total, AVG(price) AS mean",
         )
         .await
         .expect("define agg");
@@ -571,12 +572,7 @@ async fn a_scale_change_between_two_declared_scales_rebuilds_the_sum_reader() {
         .expect("re-scale the source");
     bring_live(&mut raw, &db.pool, &["agg"]).await;
     assert_eq!(status(&raw, "agg").await, TransformStatus::Live);
-    let total: String = raw
-        .query_one("select total::text from public.agg where g = 1", &[])
-        .await
-        .expect("read the total")
-        .get(0);
-    assert_eq!(total, "3.75");
+    assert_sums_exact(&raw, "agg", "public.src", "price").await;
     trellis.shutdown().await.expect("shutdown");
 }
 

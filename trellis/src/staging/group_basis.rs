@@ -3868,6 +3868,37 @@ impl GroupTargetPlan {
         )
     }
 
+    /// What a visible row's change test compares of its fields, `values`
+    /// (one per field, in order): each value, and beside a `numeric` field's
+    /// its display scale, since `=` holds between `1.5` and `1.500` but
+    /// Postgres's `sum()` shows the scale ("Numeric sums" in the module doc).
+    /// A field that reads a `MIN` or `MAX` is one of the equal values, as
+    /// Postgres's own is, so its scale is not compared.
+    fn shown(&self, values: &[String]) -> Vec<String> {
+        let extremes: Vec<String> = self
+            .shape
+            .aggs
+            .iter()
+            .enumerate()
+            .filter(|(_, agg)| matches!(agg, Agg::Extreme { .. }))
+            .map(|(k, _)| quote_ident(&placeholder(k)))
+            .collect();
+        let mut shown = Vec::with_capacity(values.len());
+        for (value, (_, pg_type, expr)) in values.iter().zip(&self.shape.fields) {
+            shown.push(value.clone());
+            if pg_type == "numeric" && !extremes.is_empty() {
+                let sql = render_expr_sql(expr);
+                if extremes.iter().any(|x| sql.contains(x.as_str())) {
+                    continue;
+                }
+            }
+            if pg_type == "numeric" {
+                shown.push(format!("scale({value})"));
+            }
+        }
+        shown
+    }
+
     /// The end of [`Self::rebuild_sql`] and [`Self::compare_held_sql`], after
     /// their `up` CTE, which returns each group's columns and its partials'
     /// values (`__nn`, `__nc<i>`, `__ns<i>`): the visible row each group's
@@ -3917,8 +3948,8 @@ impl GroupTargetPlan {
         } else {
             format!(
                 "({}) is not distinct from ({})",
-                nf.join(", "),
-                held.join(", ")
+                self.shown(&nf).join(", "),
+                self.shown(&held).join(", ")
             )
         };
         let field_updates: Vec<String> = field_names
@@ -4214,12 +4245,12 @@ impl GroupTargetPlan {
             nf_cols = if nf.is_empty() {
                 "true".to_string()
             } else {
-                nf.join(", ")
+                self.shown(&nf).join(", ")
             },
             pf_cols = if pf.is_empty() {
                 "true".to_string()
             } else {
-                pf.join(", ")
+                self.shown(&pf).join(", ")
             },
             target = self.target_ident,
             field_list = field_names

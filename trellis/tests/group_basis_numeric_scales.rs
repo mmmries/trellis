@@ -692,3 +692,249 @@ async fn a_map_of_exceptions_is_multiplied_into_t() {
         Vec::<String>::new()
     );
 }
+
+/// A deterministic xorshift draw, so a failing seed replays.
+struct Draw(u64);
+
+impl Draw {
+    fn next(&mut self, n: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 % n as u64) as usize
+    }
+
+    fn pick<'a>(&mut self, from: &[&'a str]) -> &'a str {
+        from[self.next(from.len())]
+    }
+}
+
+/// Random pages of inserts, updates and deletes, a few per page, over a
+/// pool of adversarial `numeric` values per column: an unconstrained one
+/// (scales 0 to 300, `NaN`, both infinities, huge and tiny), a
+/// `numeric(8,3)`, a `numeric(4,-2)` (negative scale: its values have scale
+/// 0) and a `numeric(3,5)` (scale above precision), with a nullable group
+/// key. After every page each target matches Postgres's text, and
+/// `self_check` finds nothing.
+#[tokio::test]
+async fn random_pages_over_adversarial_values_match_postgres() {
+    const XS: &[&str] = &[
+        "1.5",
+        "2.000",
+        "0",
+        "0.00000",
+        "-3.25",
+        "'NaN'",
+        "'Infinity'",
+        "'-Infinity'",
+        "null",
+        "1e-30",
+        "123456789012345678901234567890.1",
+        "round(1, 300)",
+        "-7",
+        "0.1",
+    ];
+    const YS: &[&str] = &["1.5", "-2", "'NaN'", "null", "12345.678", "0"];
+    const ZS: &[&str] = &["1200", "-300", "'NaN'", "null", "9900", "0"];
+    const WS: &[&str] = &["0.00123", "-0.00999", "'NaN'", "null", "0"];
+    const GS: &[&str] = &["1", "2", "3", "null"];
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, x numeric, \
+                                  y numeric(8,3), z numeric(4,-2), w numeric(3,5)); \
+         create index on public.src (g)",
+        &[
+            ("id", int4()),
+            ("g", int4()),
+            ("x", ValueType::Numeric),
+            ("y", ValueType::Numeric),
+            ("z", ValueType::Numeric),
+            ("w", ValueType::Numeric),
+        ],
+        &[
+            "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX \
+           SELECT g AS g, SUM(x) AS sx, AVG(x) AS ax, SUM(y) AS sy, AVG(y) AS ay, \
+                  SUM(z) AS sz, AVG(z) AS az, SUM(w) AS sw, AVG(w) AS aw, COUNT(*) AS n",
+        ],
+        &["public.src"],
+    )
+    .await;
+    let rows = "select g, sx::text, ax::text, sy::text, ay::text, sz::text, az::text, \
+                       sw::text, aw::text, n from public.agg";
+    let expected = "select g, sum(x)::text, avg(x)::text, sum(y)::text, avg(y)::text, \
+                           sum(z)::text, avg(z)::text, sum(w)::text, avg(w)::text, count(*) \
+                    from public.src group by g";
+    let mut draw = Draw(0x9e37_79b9_7f4a_7c15);
+    let mut live: Vec<u32> = Vec::new();
+    let mut next_id = 1;
+    let mut failures = Vec::new();
+    for _ in 0..30 {
+        let mut sql = Vec::new();
+        for _ in 0..1 + draw.next(4) {
+            let op = if live.is_empty() { 0 } else { draw.next(3) };
+            match op {
+                0 => {
+                    sql.push(format!(
+                        "insert into public.src values ({next_id}, {}, {}, {}, {}, {})",
+                        draw.pick(GS),
+                        draw.pick(XS),
+                        draw.pick(YS),
+                        draw.pick(ZS),
+                        draw.pick(WS)
+                    ));
+                    live.push(next_id);
+                    next_id += 1;
+                }
+                1 => {
+                    let id = live[draw.next(live.len())];
+                    sql.push(format!(
+                        "update public.src set g = {}, x = {}, y = {}, z = {}, w = {} \
+                         where id = {id}",
+                        draw.pick(GS),
+                        draw.pick(XS),
+                        draw.pick(YS),
+                        draw.pick(ZS),
+                        draw.pick(WS)
+                    ));
+                }
+                _ => {
+                    let id = live.remove(draw.next(live.len()));
+                    sql.push(format!("delete from public.src where id = {id}"));
+                }
+            }
+        }
+        let sql = sql.join("; ");
+        step(&mut d, &sql).await;
+        check(&d, &sql, &[("agg", rows, expected)], &mut failures).await;
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// [`random_pages_over_adversarial_values_match_postgres`] on an inner and a
+/// `LEFT JOIN`: both sides change at random, so matches arrive and leave
+/// (and the `LEFT JOIN`'s `NULL` region group takes the unmatched), with the
+/// summed side's values adversarial.
+#[tokio::test]
+async fn random_join_pages_over_adversarial_values_match_postgres() {
+    const XS: &[&str] = &[
+        "1.5",
+        "2.000",
+        "0.00000",
+        "-3.25",
+        "'NaN'",
+        "'Infinity'",
+        "'-Infinity'",
+        "null",
+        "1e-30",
+        "round(1, 300)",
+        "-7",
+    ];
+    const KS: &[&str] = &["1", "2", "3", "null"];
+    const RS: &[&str] = &["'a'", "'b'", "null"];
+    let mut d = Driver::start(
+        JOIN_DDL,
+        &[("id", int4()), ("k", int4()), ("x", ValueType::Numeric)],
+        &[INNER, LEFT],
+        &["public.o", "public.c"],
+    )
+    .await;
+    let mut draw = Draw(0x2545_f491_4f6c_dd1d);
+    let (mut live_o, mut live_c): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    let mut next_id = 1;
+    let mut failures = Vec::new();
+    for _ in 0..30 {
+        let mut sql = Vec::new();
+        for _ in 0..1 + draw.next(4) {
+            let on_o = draw.next(3) != 0;
+            let live = if on_o { &mut live_o } else { &mut live_c };
+            let op = if live.is_empty() { 0 } else { draw.next(3) };
+            let row = |draw: &mut Draw| {
+                if on_o {
+                    format!("{}, {}", draw.pick(KS), draw.pick(XS))
+                } else {
+                    format!("{}, {}", draw.pick(KS), draw.pick(RS))
+                }
+            };
+            let table = if on_o { "public.o" } else { "public.c" };
+            match op {
+                0 => {
+                    sql.push(format!(
+                        "insert into {table} values ({next_id}, {})",
+                        row(&mut draw)
+                    ));
+                    live.push(next_id);
+                    next_id += 1;
+                }
+                1 => {
+                    let id = live[draw.next(live.len())];
+                    let cols = if on_o { "(k, x)" } else { "(k, region)" };
+                    sql.push(format!(
+                        "update {table} set {cols} = ({}) where id = {id}",
+                        row(&mut draw)
+                    ));
+                }
+                _ => {
+                    let id = live.remove(draw.next(live.len()));
+                    sql.push(format!("delete from {table} where id = {id}"));
+                }
+            }
+        }
+        let sql = sql.join("; ");
+        step(&mut d, &sql).await;
+        check(
+            &d,
+            &sql,
+            &[
+                ("ij", INNER_ROWS, INNER_EXPECTED),
+                ("lj", LEFT_ROWS, LEFT_EXPECTED),
+            ],
+            &mut failures,
+        )
+        .await;
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A change that moves a group's sum to another display scale and leaves
+/// every field equal by `=` (`0` re-written as `0.000` beside `1.5`): the
+/// visible `SUM` and `AVG` still take Postgres's text.
+#[tokio::test]
+async fn a_change_of_scale_alone_rewrites_the_sum() {
+    let mut d = start_agg().await;
+    run(
+        &mut d,
+        &[
+            "insert into public.src values (1, 1, 1.5), (2, 1, 0.000)",
+            "update public.src set x = 0 where id = 2",
+            "update public.src set x = 0.0000000 where id = 2",
+        ],
+        &[("agg", AGG_ROWS, AGG_EXPECTED)],
+    )
+    .await;
+}
+
+/// [`a_change_of_scale_alone_rewrites_the_sum`] on an inner and a `LEFT
+/// JOIN`, matched and not.
+#[tokio::test]
+async fn a_change_of_scale_alone_rewrites_a_join_sum() {
+    let mut d = Driver::start(
+        JOIN_DDL,
+        &[("id", int4()), ("k", int4()), ("x", ValueType::Numeric)],
+        &[INNER, LEFT],
+        &["public.o", "public.c"],
+    )
+    .await;
+    run(
+        &mut d,
+        &[
+            "insert into public.c values (1, 1, 'a'); \
+             insert into public.o values (1, 1, 1.5), (2, 1, 0.000), (3, 9, 2.5)",
+            "update public.o set x = 0 where id = 2",
+            "update public.o set x = 2.50000 where id = 3",
+        ],
+        &[
+            ("ij", INNER_ROWS, INNER_EXPECTED),
+            ("lj", LEFT_ROWS, LEFT_EXPECTED),
+        ],
+    )
+    .await;
+}
