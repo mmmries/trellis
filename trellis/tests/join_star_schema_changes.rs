@@ -267,8 +267,10 @@ async fn a_lost_unique_key_at_position_2_pauses_naming_it() {
 
 /// Replacing position 2's unique key the way that keeps one in place at
 /// every moment pauses nothing, with a pass between every two statements, as
-/// at position 1: a create-first swap, a swap in one transaction, and the
-/// index promoted to a constraint.
+/// at position 1: a create-first swap, a swap in one transaction, the index
+/// promoted to a constraint, and the maintenance that rewrites it in place
+/// (`REINDEX` in both forms, `VACUUM FULL`, `CLUSTER`): #1536's study's
+/// routine rows, at position 2.
 #[tokio::test]
 async fn swaps_that_keep_position_2_s_key_in_place_pause_nothing() {
     let _knob = knob().await;
@@ -280,11 +282,73 @@ async fn swaps_that_keep_position_2_s_key_in_place_pause_nothing() {
         "begin; drop index public.b2_code_unique; \
          create unique index b2_code_unique on public.b2 (code); commit",
         "alter table public.b2 add constraint b2_code_c unique using index b2_code_unique",
+        "reindex index public.b2_code_c",
+        "reindex table concurrently public.b2",
+        "vacuum full public.b2",
+        "cluster public.b2 using b2_code_c",
     ] {
         write(&d, statement).await;
         pass(&mut d).await;
         assert_unpaused(&d, "public.v", statement).await;
     }
+}
+
+/// An `INVALID` unique index left by a failed `CREATE UNIQUE INDEX
+/// CONCURRENTLY` (over a duplicate written while the old one was gone) as
+/// position 2's only key is no key: the pass pauses the transform naming
+/// `b2` and `code`.
+#[tokio::test]
+async fn an_invalid_unique_index_as_position_2_s_only_key_pauses_the_transform() {
+    let _knob = knob().await;
+    let mut d = start_keyed().await;
+    write(
+        &d,
+        "drop index public.b2_code_unique; insert into public.b2 values (3, 100, 30)",
+    )
+    .await;
+    d.user()
+        .await
+        .batch_execute("create unique index concurrently b2_code_unique on public.b2 (code)")
+        .await
+        .expect_err("code = 100 is duplicated");
+    pass(&mut d).await;
+    paused_for(&d, "public.v", "public.b2", &["code"]).await;
+}
+
+/// The pass skips position 2's key query while `b2`'s fingerprint is the one
+/// its last check found the key at, and a drop with no other change between
+/// two passes still forces the check, which pauses the transform.
+#[tokio::test]
+async fn a_drop_at_position_2_between_two_passes_with_no_other_change_is_detected() {
+    let _knob = knob().await;
+    let mut d = start_keyed().await;
+    let id: i64 = d
+        .ctl
+        .query_one(
+            "select id from transform_definitions where target_table = 'public.v'",
+            &[],
+        )
+        .await
+        .expect("the definition")
+        .get(0);
+    let database: String = d
+        .ctl
+        .query_one("select current_database()::text", &[])
+        .await
+        .expect("the database")
+        .get(0);
+    let checks = || trellis::staging::unique_key_checks(&database, DEFAULT_SCHEMA, id);
+    pass(&mut d).await;
+    let checked = checks();
+    assert!(checked >= 2, "the first pass checks both positions' keys");
+    pass(&mut d).await;
+    pass(&mut d).await;
+    assert_eq!(checks(), checked, "skipped while b1 and b2 are unchanged");
+
+    write(&d, "drop index public.b2_code_unique").await;
+    pass(&mut d).await;
+    assert_eq!(checks(), checked + 1, "the drop forces b2's check alone");
+    paused_for(&d, "public.v", "public.b2", &["code"]).await;
 }
 
 // --------------------------------------------- columns of position 2's table
