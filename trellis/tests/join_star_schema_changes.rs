@@ -437,3 +437,111 @@ async fn position_2_s_table_renamed_away_or_attached_as_a_partition_pauses_the_t
     pass(&mut d).await;
     assert_unpaused(&d, &target, "the resume once detached").await;
 }
+
+// ------------------------------------------------------------- keys redefined
+
+/// The primary key of the table at position 2 redefined (`(id)` to
+/// `(id, tag)`) pauses the transform naming `b2`. `RESUME` records `b2`'s
+/// new key as the one it keys `b2` by, and goes through.
+#[tokio::test]
+async fn position_2_s_primary_key_redefined_pauses_and_resume_records_the_new_key() {
+    let _knob = knob().await;
+    let (mut d, star) = start().await;
+    let target = star.target();
+    let b = SHAPE.b();
+    pass(&mut d).await;
+
+    write(
+        &d,
+        &format!("alter table {b} drop constraint b2_pkey, add primary key (id, tag)"),
+    )
+    .await;
+    pass(&mut d).await;
+    assert_eq!(status(&d, &target).await, "paused");
+    let failure = d.rows("select source_table from capture_failures").await;
+    assert_eq!(failure, [format!("({b})")]);
+    resume(&d, &star.name()).await;
+    pass(&mut d).await;
+    assert_unpaused(&d, &target, "the resume").await;
+    let id = star::definition_id(&d, star).await;
+    let recorded = d
+        .rows(&format!(
+            "select column_name from definition_key_types \
+             where transform_id = {id} and table_name = '{b}' order by 1"
+        ))
+        .await;
+    assert_eq!(recorded, ["(id)", "(k)", "(tag)"], "{b}'s key types");
+}
+
+/// The root's primary key redefined (`(id)` to `(id, x)`) pauses the star,
+/// and `RESUME` re-keys its target to the new key (#1746) and goes through.
+#[tokio::test]
+async fn the_root_s_primary_key_redefined_and_resume_re_keys_the_target() {
+    let _knob = knob().await;
+    let (mut d, star) = start().await;
+    let target = star.target();
+    pass(&mut d).await;
+
+    write(
+        &d,
+        "alter table public.a drop constraint a_pkey, add primary key (id, x)",
+    )
+    .await;
+    pass(&mut d).await;
+    assert_eq!(status(&d, &target).await, "paused");
+    resume(&d, &star.name()).await;
+    pass(&mut d).await;
+    assert_unpaused(&d, &target, "the resume").await;
+    let key = d
+        .rows(&format!(
+            "select a.attname::text from pg_catalog.pg_index i \
+             cross join lateral unnest(i.indkey::int2[]) with ordinality k(n, o) \
+             join pg_catalog.pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.n \
+             where i.indrelid = '{target}'::regclass and i.indisprimary order by k.o"
+        ))
+        .await;
+    assert_eq!(key, ["(id)", "(x)"], "{target}'s key");
+}
+
+// ------------------------------------------------------- an enum at position 2
+
+/// A value of an enum the star reads only at position 2 (`b2.tone`)
+/// relabelled: the pass pauses the transform with the relabel's reason, as
+/// for the joined table at position 1 (the column's token sits in
+/// `definition_join_tables`, not `join_columns`).
+#[tokio::test]
+async fn an_enum_value_read_at_position_2_relabelled_pauses_the_transform() {
+    let _knob = knob().await;
+    let int4 = ValueType::Integer(IntWidth::Int4);
+    let mut d = Driver::start_unbuilt(
+        &[],
+        "create type public.tone as enum ('calm', 'brisk'); \
+         create table public.a (id integer primary key, k1 integer, k2 integer, x integer); \
+         create table public.b1 (id integer primary key, k integer, w integer); \
+         create unique index on public.b1 (k); \
+         create table public.b2 (id integer primary key, code integer, tone public.tone); \
+         create unique index on public.b2 (code); \
+         insert into public.b1 values (1, 10, 1); \
+         insert into public.b2 values (1, 100, 'calm'), (2, 200, 'brisk'); \
+         insert into public.a values (1, 10, 100, 5), (2, 20, 200, 6)",
+        &[("id", int4), ("k1", int4), ("k2", int4), ("x", int4)],
+        &["TRANSFORM v FROM public.a \
+           LEFT JOIN public.b1 ON a.k1 = b1.k \
+           LEFT JOIN public.b2 ON a.k2 = b2.code \
+           SELECT a.x + COALESCE(b1.w, 0) AS total, b2.tone AS tone"],
+        &["public.a", "public.b1", "public.b2"],
+    )
+    .await;
+    pass(&mut d).await;
+    assert_unpaused(&d, "public.v", "the first pass").await;
+
+    write(&d, "alter type public.tone rename value 'calm' to 'cool'").await;
+    pass(&mut d).await;
+    assert_eq!(status(&d, "public.v").await, "paused");
+    let failures = failures(&d).await;
+    assert!(
+        failures.len() == 1
+            && failures[0].contains("enum value 'calm' of type public.tone was renamed to 'cool'"),
+        "{failures:?}"
+    );
+}
