@@ -1274,6 +1274,77 @@ fn at_time_zone_over_a_null_constant_folds_to_null() {
     }
 }
 
+/// A `CASE`, `COALESCE` or cast that resolves to a float type casts the
+/// result it picks to that type, so a wide exact literal rounds before the
+/// surrounding arithmetic runs: the divisor below is exactly zero to Postgres,
+/// which raises at plan time, though the literals differ as exact numbers
+/// (#1802). Each case is checked against Postgres 15 to 18.
+#[test]
+fn a_constant_divisor_that_is_zero_in_the_resolved_float_type_is_refused() {
+    for text in [
+        // `-9223372036854775809` rounds to `-9223372036854775808` as `float8`.
+        "1 / (CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE -9223372036854775809 END \
+         - NULLIF(-9223372036854775808, 2147483648))",
+        "1 / (COALESCE(NULL, -9223372036854775809, DOUBLE PRECISION '0') \
+         - NULLIF(-9223372036854775808, 2147483648))",
+        "1 / NULLIF(-9223372036854775809 - CASE WHEN FALSE THEN DOUBLE PRECISION '0' \
+         ELSE -9223372036854775808 END, 5)",
+        "1 / (CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE -9223372036854775809 END \
+         - CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE -9223372036854775808 END)",
+        "1 / (CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE 9007199254740993 END \
+         - 9007199254740992)",
+        "1 / (CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE 9007199254740993 END \
+         - 9007199254740992.0)",
+        // `real` rounds `16777217` to `16777216`.
+        "1 / (CASE WHEN FALSE THEN REAL '0' ELSE 16777217 END - 16777216)",
+        "1 / (CASE WHEN FALSE THEN REAL '0' ELSE 16777217 END - REAL '1.6777216e+07')",
+        "1 / (COALESCE(NULL, 16777217, REAL '0') - 16777216)",
+        // A column of the float type resolves the `CASE` as well.
+        "1 / (CASE WHEN FALSE THEN f8 ELSE -9223372036854775809 END \
+         - NULLIF(-9223372036854775808, 2147483648))",
+        "1 / (CASE WHEN FALSE THEN f4 ELSE 16777217 END - 16777216)",
+        "1 / (CASE WHEN 1 = 1 THEN -9223372036854775809 ELSE f8 END - -9223372036854775808)",
+        // Through a function, a negation and a calculated field.
+        "1 / (ABS(CASE WHEN FALSE THEN f8 ELSE -9223372036854775809 END) - 9223372036854775808)",
+        "1 / (-CASE WHEN FALSE THEN f8 ELSE 9223372036854775809 END - -9223372036854775808)",
+        "CASE WHEN FALSE THEN f8 ELSE -9223372036854775809 END AS g, 1 / (g - -9223372036854775808)",
+    ] {
+        assert_refused(text, "divides by the constant zero");
+    }
+    // `%` has no float operand, so the float divisor is refused for that.
+    assert_refused(
+        "5 % (CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE 2 END)",
+        "modulo",
+    );
+    // The same values do not collapse where the result stays exact, where
+    // the float is not the resolved type, or where the values differ.
+    for (text, expected) in [
+        (
+            "COALESCE(DOUBLE PRECISION '0', -9223372036854775809) AS g, 1 / (g - -9223372036854775808)",
+            F8,
+        ),
+        (
+            "1 / (CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE -9223372036854775809 END \
+             - 9223372036854775807)",
+            F8,
+        ),
+        (
+            "1 / (CASE WHEN FALSE THEN REAL '0' ELSE 16777218 END - 16777216)",
+            F8,
+        ),
+        (
+            "1 / (CASE WHEN f8 > 0 THEN f8 ELSE -9223372036854775809 END - -9223372036854775808)",
+            F8,
+        ),
+        (
+            "1 / (CASE WHEN FALSE THEN 0 ELSE -9223372036854775809 END - -9223372036854775808)",
+            N,
+        ),
+    ] {
+        assert_type(text, expected);
+    }
+}
+
 /// A guard is classified at any height the parser admits: a constant one
 /// nested near the limit still leaves what it guards unchecked.
 #[test]
