@@ -84,9 +84,7 @@
 //!    batches apart from the next's (#1464 Q2: the `R` entries order every
 //!    writer of a row), for the keys within the budget; every other key is
 //!    left to the chunks of its pending marker ([`fan_out`]'s module), which
-//!    the page writes. A star's page halts there instead, until its chunks
-//!    take the R-entry rule (#1775). Fields are rendered SQL, never
-//!    evaluated in Rust. A
+//!    the page writes. Fields are rendered SQL, never evaluated in Rust. A
 //!    field that fails on a row of either write holds that row of `a` in
 //!    quarantine on this first failure, once a bisection under savepoints
 //!    has named the rows and fields, and the rest of the page commits
@@ -1569,7 +1567,8 @@ async fn truncate_sides(
     }
     // Every pending fan-out goes: a truncated `b` starts a rebuild, which
     // recomputes every row, and a truncated `a` leaves no row to recompute.
-    fan_out::clear_all(txn, shape).await?;
+    let truncated: Vec<Position> = truncate.joined.map(|_| Position::FIRST).into_iter().collect();
+    fan_out::clear_all(txn, shape, &truncated).await?;
     if truncate.from.is_none() {
         return Ok(0);
     }

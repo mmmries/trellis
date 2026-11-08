@@ -470,6 +470,16 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
          (the star tier is #1781); join_star_joined's cx_f11a and ps7 (swapped) pin it",
     ),
     (
+        "star_chunk_no_r",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781); join_star_fan_out's cx_f10a and cx_f10c pin it",
+    ),
+    (
+        "star_truncate_keeps_other_markers",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781); join_star_fan_out's xt2 pins pin it",
+    ),
+    (
         "star_j_unsorted",
         "it leaves the J statements unsorted, which only changes the order two pages queue \
          on J rows in: a deadlock, which the engine retries, never a wrong row; the unit \

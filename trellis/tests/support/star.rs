@@ -88,13 +88,6 @@ pub fn truncate_runnable(shape: Shape) -> bool {
     definable(shape) && shape.positions == 1
 }
 
-/// Whether `shape`'s pins whose fan-out goes past one chunk can run: a
-/// star's page halts on one (its chunks don't take the R-entry rule) until
-/// #1775.
-pub fn chunked_fan_out_runnable(shape: Shape) -> bool {
-    definable(shape) && shape.positions == 1
-}
-
 /// One position's join kind: `LEFT` keeps an `a` row with no match there,
 /// `INNER` drops it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
