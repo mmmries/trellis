@@ -1247,7 +1247,9 @@ fn parse_for_define(
 pub(crate) struct Unparsed<'a> {
     pub(crate) source_table: &'a str,
     pub(crate) target_table: &'a str,
-    pub(crate) join_table: Option<&'a str>,
+    /// Its joined tables, by position: empty for a definition that isn't a
+    /// `JOIN`.
+    pub(crate) joined: Vec<&'a str>,
     pub(crate) definition_text: &'a str,
     pub(crate) grammar_version: i32,
     pub(crate) floor_version: &'a str,
@@ -1291,7 +1293,7 @@ pub(crate) async fn store_unrunnable(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
     let mut version = 1;
-    for table in std::iter::once(unparsed.source_table).chain(unparsed.join_table) {
+    for table in std::iter::once(unparsed.source_table).chain(unparsed.joined.iter().copied()) {
         let bumped: i64 = txn
             .query_one(
                 "insert into source_table_versions (source_table, version) values ($1, 1) \
@@ -1309,7 +1311,7 @@ pub(crate) async fn store_unrunnable(
     let source_node = resolve_node_in_txn(&txn, unparsed.source_table, NodeKind::Source).await?;
     let target_node = resolve_node_in_txn(&txn, unparsed.target_table, NodeKind::Target).await?;
     persist_edge_in_txn(&txn, source_node.id, target_node.id, EdgeKind::Source).await?;
-    if let Some(joined) = unparsed.join_table {
+    for joined in &unparsed.joined {
         let joined_node = resolve_node_in_txn(&txn, joined, NodeKind::Source).await?;
         persist_edge_in_txn(&txn, joined_node.id, target_node.id, EdgeKind::Join).await?;
     }
@@ -1328,12 +1330,20 @@ pub(crate) async fn store_unrunnable(
                 &unparsed.definition_text,
                 &StoredStatus::WaitingToBackfill.as_str(),
                 &unparsed.grammar_version,
-                &unparsed.join_table,
+                &unparsed.joined.first().copied(),
                 &unparsed.floor_version,
             ],
         )
         .await?
         .get(0);
+    // Its later joined tables, with no column types, as position 1 has none.
+    let further: Vec<(&str, HashMap<String, ValueType>)> = unparsed
+        .joined
+        .iter()
+        .skip(1)
+        .map(|table| (*table, HashMap::new()))
+        .collect();
+    insert_further_joined(&*txn, id, &further).await?;
     match held {
         Held::Unrunnable(reason) => {
             super::lifecycle::pause_for_unrunnable(&txn, id, unparsed.source_table, reason).await?
@@ -1582,8 +1592,11 @@ pub(crate) async fn applying_readers(
 ) -> Result<Vec<i64>, CatalogError> {
     let rows = client
         .query(
-            "select id, source_table, join_table \
-             from transform_definitions where status = any($1) order by id",
+            &format!(
+                "select d.id, d.source_table, {} \
+                 from transform_definitions d where d.status = any($1) order by d.id",
+                joined_tables_array_sql("d")
+            ),
             &[&StoredStatus::applying()],
         )
         .await?;
@@ -1618,8 +1631,11 @@ pub(crate) async fn has_unfrozen_reader(
 ) -> Result<bool, CatalogError> {
     let rows = client
         .query(
-            "select source_table, join_table \
-             from transform_definitions where status = any($1) order by id",
+            &format!(
+                "select d.source_table, {} \
+                 from transform_definitions d where d.status = any($1) order by d.id",
+                joined_tables_array_sql("d")
+            ),
             &[&StoredStatus::dispatchable()],
         )
         .await?;
@@ -1638,7 +1654,7 @@ pub(crate) async fn has_unfrozen_reader(
 /// deduplicated: its source (`qualified_source`, the persisted
 /// `transform_definitions.source_table`) and a `JOIN`'s joined table
 /// (`joined`, the persisted `join_table`).
-fn tables_read_by(qualified_source: String, joined: Option<String>) -> Vec<String> {
+fn tables_read_by(qualified_source: String, joined: Vec<String>) -> Vec<String> {
     let mut tables = vec![qualified_source];
     tables.extend(joined);
     tables.sort_unstable();
@@ -1716,8 +1732,11 @@ pub(crate) async fn reported_statuses_ignoring_column_pauses(
 async fn status_nodes(client: &impl GenericClient) -> Result<Vec<StatusNode>, CatalogError> {
     let rows = client
         .query(
-            "select id, target_table, source_table, status, join_table \
-             from transform_definitions order by id",
+            &format!(
+                "select d.id, d.target_table, d.source_table, d.status, {} \
+                 from transform_definitions d order by d.id",
+                joined_tables_array_sql("d")
+            ),
             &[],
         )
         .await?;
@@ -5236,8 +5255,11 @@ async fn reject_target_name_with_readers(
 ) -> Result<(), CatalogError> {
     let readers: Vec<String> = client
         .query(
-            "select split_part(target_table, '.', 2) from transform_definitions \
-             where source_table = $1 or join_table = $1 order by id",
+            &format!(
+                "select split_part(target_table, '.', 2) from transform_definitions \
+                 where {} order by id",
+                reads_table_sql("transform_definitions", "$1")
+            ),
             &[&target],
         )
         .await?
@@ -6960,7 +6982,7 @@ pub(crate) async fn forget_unread_capture_records(
 
 /// A CTE, `reachable`, of every table a definition `anchor_filter` (a
 /// predicate over `transform_definitions`) keeps reads: its `source_table`
-/// and a `JOIN`'s `join_table`. Shared by [`all_source_tables`] and
+/// and each of a `JOIN`'s joined tables. Shared by [`all_source_tables`] and
 /// [`table_has_reader`] so the two can't disagree about which tables a
 /// definition reads.
 fn reachable_tables_cte(anchor_filter: &str) -> String {
@@ -6970,6 +6992,10 @@ fn reachable_tables_cte(anchor_filter: &str) -> String {
             union
             select distinct join_table from transform_definitions
             where join_table is not null and {anchor_filter}
+            union
+            select distinct j.table_name from definition_join_tables j
+            join transform_definitions on transform_definitions.id = j.transform_id
+            where {anchor_filter}
          )"
     )
 }
@@ -7166,9 +7192,10 @@ pub(crate) async fn refuse_unrunnable(
         .query_opt(
             &format!(
                 "select d.target_table, d.grammar_version, d.floor_version, {}, \
-                        d.source_table, d.join_table \
+                        d.source_table, {} \
                  from transform_definitions d where {}",
                 super::floor::unknown_value_sql("d"),
+                joined_tables_array_sql("d"),
                 target_match_sql("d.target_table", 1)
             ),
             &[&name],
@@ -7187,9 +7214,9 @@ pub(crate) async fn refuse_unrunnable(
         // a shape this one can't read (the capture pass pauses its readers
         // for it, `capture::partitions`).
         let source: String = row.get(4);
-        let join: Option<String> = row.get(5);
+        let joined: Vec<String> = row.get(5);
         let tables: Vec<&str> = std::iter::once(source.as_str())
-            .chain(join.as_deref())
+            .chain(joined.iter().map(String::as_str))
             .collect();
         unrunnable = crate::capture::partitions::unreadable_record(client, &tables).await?;
     }
@@ -7593,9 +7620,12 @@ async fn column_dependents_via(
             // instead would split that bookkeeping across two spellings of
             // the same transform depending on whether a row was reached
             // directly or via cascade.
-            "select split_part(target_table, '.', 2), definition_text, source_table, \
-                    target_table, grammar_version, join_table, floor_version \
-             from transform_definitions",
+            &format!(
+                "select split_part(d.target_table, '.', 2), d.definition_text, d.source_table, \
+                        d.target_table, d.grammar_version, {}, d.floor_version \
+                 from transform_definitions d",
+                joined_tables_array_sql("d")
+            ),
             &[],
         )
         .await?;
@@ -7618,10 +7648,10 @@ async fn column_dependents_via(
         let text: String = row.get(1);
         // The definition's qualified source, which it reads directly.
         let qualified_source: String = row.get(2);
-        // A `JOIN`'s joined table, which it reads directly too.
-        let joined: Option<String> = row.get(5);
-        let reads_upstream = qualified_source == qualified_upstream
-            || joined.as_deref() == Some(qualified_upstream.as_str());
+        // A `JOIN`'s joined tables, which it reads directly too.
+        let joined: Vec<String> = row.get(5);
+        let reads_upstream =
+            qualified_source == qualified_upstream || joined.contains(&qualified_upstream);
         // A definition this release can't run (ADR-0024 rule 3) is never
         // parsed, so which columns it reads can't be known here. It is
         // paused, so no cascade reaches it, and it is no cause of another's
@@ -7658,11 +7688,16 @@ async fn column_dependents_via(
         // whichever side is the upstream table: in a field, or in its `ON` or `GROUP BY`
         // (named by that column, which a `GROUP BY` key's target column is).
         if super::join::spec(&def).is_some() {
-            for (side, table) in [
-                (super::join::Side::From, Some(&qualified_source)),
-                (super::join::JOINED, joined.as_ref()),
-            ] {
-                if table != Some(&qualified_upstream) {
+            let joined = joined.iter().enumerate().map(|(index, table)| {
+                (
+                    super::join::Side::Joined(super::join::Position::of_index(index)),
+                    table,
+                )
+            });
+            for (side, table) in
+                std::iter::once((super::join::Side::From, &qualified_source)).chain(joined)
+            {
+                if table != &qualified_upstream {
                     continue;
                 }
                 let mut named = false;

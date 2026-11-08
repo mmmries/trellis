@@ -180,19 +180,20 @@ struct ImageFeed {
 
 /// Whether an applying definition that needs exact images reads `$1` (see
 /// the module doc's "The image feed"): a `JOIN` transform (aggregate or 1-1,
-/// where a `b` change needs the old join key) with the table on
-/// either side, or an aggregate on the group basis, which is the one kind of
+/// where a joined table's change needs the old join key) with the table
+/// on any side, or an aggregate on the group basis, which is the one kind of
 /// definition with a hidden table named by its id in the catalog's schema
 /// (`super::group_basis::hidden_table_name`).
 fn image_readers_sql() -> String {
     format!(
         "select exists (select 1 from transform_definitions d \
-             where (d.source_table = $1 or d.join_table = $1) and {} \
+             where {} and {} \
                and (d.join_table is not null or exists ( \
                    select 1 from pg_catalog.pg_class c \
                    where c.relname = {} \
                      and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
                                            where oid = 'transform_definitions'::regclass))))",
+        crate::defs::catalog::reads_table_sql("d", "$1"),
         crate::defs::model::applying_sql("d"),
         super::group_basis::hidden_table_name_sql("d.id"),
     )
@@ -301,7 +302,8 @@ impl TargetMutations {
                 .query_one(
                     &format!(
                         "select exists (select 1 from transform_definitions \
-                         where (source_table = $1 or join_table = $1) and {}), ({})",
+                         where {} and {}), ({})",
+                        crate::defs::catalog::reads_table_sql("transform_definitions", "$1"),
                         crate::defs::model::APPLYING_SQL,
                         image_readers_sql(),
                     ),
