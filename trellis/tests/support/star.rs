@@ -25,7 +25,8 @@
 //! A shape of more than one position defines a star, which define admits
 //! only behind the development knob [`STAR_KNOB`] until the knob is removed
 //! ([`definable`]); [`runnable`] says whether a shape's pins can run in this
-//! process, which a star's can't until its apply is built.
+//! process, and [`truncate_runnable`] whether its truncate pins can, which a
+//! star's can't until a truncate of its joined tables is built.
 //!
 //! A binary using this module also declares `support/drain_driver.rs` as
 //! `mod drain_driver` at its root.
@@ -75,11 +76,16 @@ pub fn definable(shape: Shape) -> bool {
     shape.positions == 1 || star_join_enabled()
 }
 
-/// Whether `shape`'s pins can run in this process: it is [`definable`], and
-/// its apply is built. A star defines with the knob on, then halts at its
-/// first page or build ("whose apply is not built yet") until the root and
-/// joined apply land (#1773, #1774), so only the two-table JOIN runs.
+/// Whether `shape`'s pins can run in this process: it is [`definable`].
+/// A star's build and its root and joined apply run (#1773); its joined
+/// tables' writers take the R-entry rule only from #1774.
 pub fn runnable(shape: Shape) -> bool {
+    definable(shape)
+}
+
+/// Whether `shape`'s pins that `TRUNCATE` a joined table can run: a star's
+/// page halts on one ("whose apply is not built yet") until #1776.
+pub fn truncate_runnable(shape: Shape) -> bool {
     definable(shape) && shape.positions == 1
 }
 
@@ -395,6 +401,117 @@ pub async fn start_unbuilt(stars: &[Star], a_rows: &str, b_rows: &str) -> Driver
     let definitions: Vec<&str> = definitions.iter().map(String::as_str).collect();
     let tables: Vec<&str> = tables.iter().map(String::as_str).collect();
     Driver::start_unbuilt(&[], &ddl, &columns, &definitions, &tables).await
+}
+
+/// A database with the tables of `stars`' shape seeded by `seed` alone (no
+/// idle rows: the test writes every table's rows), each of `stars` defined
+/// and built, and every table captured. For cross-position pins, whose
+/// writers touch more than one position.
+pub async fn start_seeded(stars: &[Star], seed: &str) -> Driver {
+    let shape = stars.first().expect("a star to define").shape;
+    assert!(definable(shape), "{shape:?}: set {STAR_KNOB}");
+    let ddl = format!("{}; {seed}", shape.ddl());
+    let definitions: Vec<String> = stars.iter().map(|s| s.definition()).collect();
+    let definitions: Vec<&str> = definitions.iter().map(String::as_str).collect();
+    let columns = shape.columns();
+    let columns: Vec<(&str, ValueType)> = columns.iter().map(|(c, t)| (c.as_str(), *t)).collect();
+    let tables = shape.tables();
+    let tables: Vec<&str> = tables.iter().map(String::as_str).collect();
+    Driver::start(&ddl, &columns, &definitions, &tables).await
+}
+
+/// Runs `sql` on `table` with its capture triggers disabled, in one
+/// transaction: a change no entry will ever hear about. (Capture triggers
+/// are `ENABLE ALWAYS`, so `session_replication_role = replica` doesn't skip
+/// them.)
+pub async fn write_uncaptured(d: &Driver, table: &str, sql: &str) {
+    let toggle = |action: &str| {
+        format!(
+            "do $$ declare t text; begin \
+                 for t in select tgname from pg_trigger \
+                          where tgrelid = '{table}'::regclass and not tgisinternal loop \
+                     execute format('alter table {table} {action} trigger %I', t); \
+                 end loop; \
+             end $$;"
+        )
+    };
+    d.ctl
+        .batch_execute(&format!(
+            "begin; {} {sql}; {} commit;",
+            toggle("disable"),
+            toggle("enable always")
+        ))
+        .await
+        .expect("write past capture");
+}
+
+/// One writer of a pin: a captured change, a Re-derive of a table's keys,
+/// or both in one page.
+#[derive(Debug, Clone, Copy)]
+pub enum Writer {
+    Change(&'static str),
+    Rederive(&'static str, &'static [&'static str]),
+    Both(&'static str, &'static [&'static str], &'static str),
+}
+
+impl Writer {
+    /// Writes this writer's changes and seals them into a batch.
+    pub async fn seal(self, d: &mut Driver) -> i64 {
+        match self {
+            Writer::Change(sql) => write(d, sql).await,
+            Writer::Rederive(table, keys) => d.stage_recomputes(table, keys).await,
+            Writer::Both(table, keys, sql) => {
+                write(d, sql).await;
+                d.stage_recomputes(table, keys).await;
+            }
+        }
+        d.seal().await
+    }
+}
+
+/// A two-writer family on every star of `shape` over `seed`
+/// ([`start_seeded`]), after the uncaptured `pre` writes `(table, sql)`:
+/// each writer in its own batch, either one's page frozen at its commit
+/// while the other queues ([`race`]).
+pub async fn family_seeded(
+    shape: Shape,
+    seed: &str,
+    pre: &[(&str, &str)],
+    first: Writer,
+    second: Writer,
+) {
+    for star in shape.stars() {
+        for flip in [false, true] {
+            let mut d = start_seeded(&[star], seed).await;
+            for (table, sql) in pre {
+                write_uncaptured(&d, table, sql).await;
+            }
+            let one = first.seal(&mut d).await;
+            let two = second.seal(&mut d).await;
+            let (x, y) = if flip { (two, one) } else { (one, two) };
+            race(&mut d, star, x, y).await;
+        }
+    }
+}
+
+/// [`family_seeded`] over [`start`]'s seed: `a_rows` and `b_rows` at
+/// `shape.at`, the idle positions filled.
+pub async fn family_seeded_at(
+    shape: Shape,
+    a_rows: &str,
+    b_rows: &str,
+    first: Writer,
+    second: Writer,
+) {
+    for star in shape.stars() {
+        for flip in [false, true] {
+            let mut d = start(&[star], a_rows, b_rows).await;
+            let one = first.seal(&mut d).await;
+            let two = second.seal(&mut d).await;
+            let (x, y) = if flip { (two, one) } else { (one, two) };
+            race(&mut d, star, x, y).await;
+        }
+    }
 }
 
 type Setup = (String, Vec<String>, Vec<(String, ValueType)>, Vec<String>);

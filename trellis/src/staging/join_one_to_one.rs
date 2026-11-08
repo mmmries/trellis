@@ -8,6 +8,13 @@
 //! row per join key; and the pair's truncate lock row. Neither side reads the
 //! other's source, only its copy under `J`.
 //!
+//! A star (more than one joined table, behind the development knob until it
+//! ships) is the same path indexed by position: an `M` per joined table,
+//! `J`'s rows per position, and `a`'s key one per position. The two-table
+//! JOIN is its one-position case. Each joined table's change is of its own
+//! position; a key, and K below, is per position, and a step over `M` runs
+//! for each position in position order.
+//!
 //! # One page ([`apply_page`])
 //!
 //! A page carries changes and Re-derives of either side, in one transaction
@@ -23,18 +30,21 @@
 //!    or `M`) holds for each id, and the live key of each Re-derive row (read
 //!    unlocked from its table, which keeps the retry below rare); for the `b`
 //!    side also each change's old key from its first change's pre-image
-//!    [`join1_old_key_unlocked`]. A key with a `NULL` part is left out: it
-//!    matches nothing and takes no `J` row.
-//! 3. **`J`.** K, both sides' keys together, inserted sorted `on conflict do
-//!    nothing`, then locked `FOR UPDATE` in one sorted statement
-//!    [`join1_no_j_lock`]. Nothing reads `M`, or `R` for a fan-out, before
+//!    [`join1_old_key_unlocked`]. An `a` row's keys are one per position, so
+//!    a root writer's K holds its new key and the key `R` holds at every
+//!    position [`star_root_skip_j_*`]. A key with a `NULL` part is left out
+//!    at its position: it matches nothing there and takes no `J` row.
+//! 3. **`J`.** K, every side's keys together, inserted sorted `on conflict
+//!    do nothing`, then locked `FOR UPDATE` in one statement sorted by
+//!    `(position, key)` [`join1_no_j_lock`, `star_j_unsorted`]. Nothing reads `M`, or `R` for a fan-out, before
 //!    this [`join1_m_before_j`].
 //! 4. **Entries.** The `R` placeholders and entry lock, then `M`'s
 //!    ([`super::one_to_one_ledger::lock_entries`], I5)
 //!    [`join1_no_placeholder`, `join1_no_entry_lock`]. After each, every
-//!    held key is checked against K: one outside it moved after K was read,
-//!    so the page rolls back with [`ApplyError::JoinKeyMoved`] and retries
-//!    [`join1_no_recheck`]. The entry lock also orders the writers of a
+//!    held key, at every position, is checked against K: one outside it
+//!    moved after K was read, so the page rolls back with
+//!    [`ApplyError::JoinKeyMoved`] and retries [`join1_no_recheck`,
+//!    `star_late_skip_*`]. The entry lock also orders the writers of a
 //!    `NULL`-keyed row, which has no `J` row.
 //! 5. **Re-derive read.** For each side, one statement reads its Re-derive
 //!    rows live and `pg_current_snapshot()`, which becomes those entries'
@@ -50,10 +60,11 @@
 //!    columns are written for the entries that changed; a row that is gone
 //!    has its key cleared, so it matches nothing.
 //! 7. **Recompute and write.** Each changed `a` row's target row is rendered
-//!    from `R` and the newest live `M` entry on its key (`LEFT JOIN
-//!    LATERAL`); a row that no longer exists, or an `INNER` row with no
-//!    match, is deleted ([`write_a_changes`]). Then the fan-out
-//!    ([`fan_out`]): every other live `R` entry on a key a changed `M` entry
+//!    from `R` and, at each position, the newest live `M` entry on its key
+//!    there (a `LEFT JOIN LATERAL` per position); a row that no longer
+//!    exists, or one with no match at an `INNER` position, is deleted
+//!    ([`write_a_changes`]). Then the fan-out of each position in position
+//!    order ([`fan_out`]): every other live `R` entry on a key a changed `M` entry
 //!    held before the page or holds after it is recomputed the same way, in
 //!    sorted keyset batches of 10k, one statement each, for the keys whose
 //!    entries fit one chunk between them; every other key is left to the
@@ -202,17 +213,40 @@ pub(crate) struct JoinedPosition {
     m_columns: Vec<ImageColumn>,
 }
 
+impl JoinedPosition {
+    /// The joined table, qualified.
+    pub(crate) fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// This position's `M`, qualified and quoted.
+    pub(crate) fn m_ident(&self) -> &str {
+        &self.m.ident
+    }
+}
+
 /// One position's keys in a page's `J` statements ([`j_statements`]).
 pub(crate) struct PositionKeys<'a> {
     pub(crate) position: &'a JoinedPosition,
     pub(crate) keys: &'a BTreeSet<KeyText>,
 }
 
+/// The alias of the newest live `M` entry of the joined table at
+/// `position` in a recompute ([`JoinShape::joined_sql`]): `b` at position
+/// 1, `b2` and on after it, as `M`'s own names run.
+fn b_alias(position: Position) -> String {
+    if position == Position::FIRST {
+        "b".to_string()
+    } else {
+        format!("b{}", position.number())
+    }
+}
+
 /// What a field reads of one side, and the SQL name `s` gives it.
 fn s_name(side: Side, column: &str) -> String {
     let alias = match side {
-        Side::From => "a",
-        Side::Joined(_) => "b",
+        Side::From => "a".to_string(),
+        Side::Joined(position) => b_alias(position),
     };
     format!("{alias}.{column}")
 }
@@ -334,25 +368,17 @@ impl JoinShape {
                        (TRELLIS_DEV_STAR_JOIN is off)",
             });
         }
-        // A star's apply isn't built yet: it halts the transform rather than
-        // run as a two-table JOIN.
-        if join.joins.len() > 1 {
-            return Err(ApplyError::GroupBasisUnsupported {
-                target,
-                what: "a 1-1 JOIN of more than two tables, whose apply is not built yet",
-            });
-        }
-        let (joined, a_columns, b_columns) = {
+        let (tables, a_columns, b_columns) = {
             let client = pool.get().await?;
-            let joined = crate::defs::catalog::join_table_of(&**client, definition.id)
-                .await?
-                .ok_or_else(|| ApplyError::GroupBasisUnsupported {
-                    target: target.clone(),
-                    what: "a 1-1 JOIN with no joined table",
-                })?;
+            let tables = crate::defs::catalog::joined_tables_of(&**client, definition.id).await?;
+            if tables.len() != join.joins.len() {
+                return Err(ApplyError::GroupBasisUnsupported {
+                    target,
+                    what: "a 1-1 JOIN whose catalog doesn't record every joined table",
+                });
+            }
             let a = super::one_to_one_render::image_columns(&**client, &definition.source_table)
                 .await?;
-            let b = super::one_to_one_render::image_columns(&**client, &joined).await?;
             // The hidden tables keep the collations their columns were
             // created with, and a source column can be re-collated since
             // (between deterministic collations, which pauses nothing). Every
@@ -363,13 +389,19 @@ impl JoinShape {
                 |table: HiddenTable| format!("{schema_name}.{}", table.name(definition.id));
             let a =
                 under_hidden_collations(&**client, a, &hidden(HiddenTable::FromEntries)).await?;
-            let b = under_hidden_collations(
-                &**client,
-                b,
-                &hidden(HiddenTable::JoinedEntries(Position::FIRST)),
-            )
-            .await?;
-            (joined, a, b)
+            let mut b = Vec::with_capacity(tables.len());
+            for (index, table) in tables.iter().enumerate() {
+                let columns = super::one_to_one_render::image_columns(&**client, table).await?;
+                b.push(
+                    under_hidden_collations(
+                        &**client,
+                        columns,
+                        &hidden(HiddenTable::JoinedEntries(Position::of_index(index))),
+                    )
+                    .await?,
+                );
+            }
+            (tables, a, b)
         };
         let by_name = |columns: &[ImageColumn], names: &[String]| -> Vec<ImageColumn> {
             names
@@ -404,7 +436,7 @@ impl JoinShape {
                 let root_key = spec::from_key_at(def, position);
                 JoinedPosition {
                     position,
-                    table: joined.clone(),
+                    table: tables[position.index()].clone(),
                     left: joined_table.kind == JoinKind::Left,
                     m: LedgerRef::hidden(
                         schema_name,
@@ -418,7 +450,7 @@ impl JoinShape {
                         .map(|c| crate::defs::join_one_to_one::j_column(position, c))
                         .collect(),
                     m_key: spec::join_key(def, side),
-                    m_columns: read(side, &b_columns),
+                    m_columns: read(side, &b_columns[position.index()]),
                 }
             })
             .collect();
@@ -436,8 +468,8 @@ impl JoinShape {
             .iter()
             .map(|(side, column)| {
                 let alias = match side {
-                    Side::From => "r",
-                    Side::Joined(_) => "b",
+                    Side::From => "r".to_string(),
+                    Side::Joined(position) => b_alias(*position),
                 };
                 (
                     s_name(*side, column),
@@ -471,11 +503,14 @@ impl JoinShape {
         &self.source_table
     }
 
-    /// The first joined table: the only one a two-table JOIN has, which is
-    /// every shape [`Self::load`] gives. Code that reads it still assumes one
-    /// joined table.
-    pub(crate) fn first(&self) -> &JoinedPosition {
-        &self.positions[0]
+    /// Every joined table, in position order.
+    pub(crate) fn positions(&self) -> &[JoinedPosition] {
+        &self.positions
+    }
+
+    /// Whether the shape is a star: more than one joined table.
+    pub(crate) fn is_star(&self) -> bool {
+        self.positions.len() > 1
     }
 
     /// The joined table at `position`, if the shape has one there.
@@ -483,9 +518,9 @@ impl JoinShape {
         self.positions.get(position.index())
     }
 
-    /// The first joined table, qualified.
-    pub(crate) fn joined_table(&self) -> &str {
-        &self.first().table
+    /// The joined table at `position`, which the shape has.
+    pub(crate) fn joined_at(&self, position: Position) -> &JoinedPosition {
+        self.joined(position)
     }
 
     /// `R`, qualified and quoted.
@@ -506,6 +541,18 @@ impl JoinShape {
         &self.positions[position.index()]
     }
 
+    /// The side of the qualified `table`: the `FROM` table's, or a joined
+    /// table's.
+    pub(crate) fn side_of(&self, table: &str) -> Option<Side> {
+        if table == self.source_table {
+            return Some(Side::From);
+        }
+        self.positions
+            .iter()
+            .find(|p| p.table == table)
+            .map(|p| Side::Joined(p.position))
+    }
+
     /// `side`'s hidden ledger: `R` or the position's `M`.
     fn ledger(&self, side: Side) -> &LedgerRef {
         match side {
@@ -514,11 +561,21 @@ impl JoinShape {
         }
     }
 
-    /// `side`'s join key column names, in `ON` order.
+    /// `side`'s join key column names, in `ON` order: the `FROM` side's
+    /// every position's, in position order.
     fn side_key(&self, side: Side) -> Vec<String> {
         match side {
             Side::From => self.key.iter().map(|c| c.name.clone()).collect(),
             Side::Joined(position) => self.joined(position).m_key.clone(),
+        }
+    }
+
+    /// The `J` types of `side`'s join key columns ([`Self::side_key`]): `a`'s
+    /// key columns, at `R`'s collation.
+    fn side_key_types(&self, side: Side) -> &[ImageColumn] {
+        match side {
+            Side::From => &self.key,
+            Side::Joined(position) => &self.joined(position).key,
         }
     }
 
@@ -533,7 +590,7 @@ impl JoinShape {
     /// The text of each join key column of `side`'s ledger row `alias`, cast
     /// to `J`'s type first, so both sides' keys compare as `K`'s texts do.
     fn key_texts(&self, side: Side, alias: &str) -> Vec<String> {
-        self.key
+        self.side_key_types(side)
             .iter()
             .zip(self.side_key(side))
             .map(|(c, name)| {
@@ -545,21 +602,50 @@ impl JoinShape {
             .collect()
     }
 
-    /// The row of `R`'s entry `r` and the newest live `M` entry on its key
-    /// `b` (a `LEFT JOIN LATERAL`), and the lateral row `s` the fields read.
-    /// `from` is the relation that supplies `r`. Newest is by applied
-    /// position, an entry no Apply has written (a build's or a Re-derive's)
-    /// last, then by `b`'s key, as the #1375 model reads it. Two live entries
-    /// share a key only while a hand-off between `b` rows is applied out of
-    /// order, and the later of its two changes recomputes the key.
-    fn joined_sql(&self, from: &str) -> String {
-        let on: Vec<String> = self
-            .first()
-            .m_key
+    /// Splits the key texts of a `side` row ([`Self::side_key`] order, a part
+    /// `None` for `NULL`) into the position each key is of: the `FROM` side's
+    /// into one per position, a joined side's into its own. A key with a
+    /// `NULL` part matches nothing and is left out.
+    fn split_key(&self, side: Side, parts: &[Option<String>]) -> Vec<(Position, KeyText)> {
+        let whole = |p: Position, parts: &[Option<String>]| -> Option<(Position, KeyText)> {
+            let key: Option<KeyText> = parts.iter().cloned().collect();
+            key.map(|key| (p, key))
+        };
+        match side {
+            Side::Joined(position) => whole(position, parts).into_iter().collect(),
+            Side::From => {
+                let mut out = Vec::with_capacity(self.positions.len());
+                let mut at = 0;
+                for p in &self.positions {
+                    let n = p.key.len();
+                    out.extend(whole(p.position, &parts[at..at + n]));
+                    at += n;
+                }
+                out
+            }
+        }
+    }
+
+    /// The `on` of `r`'s key at `position` with that position's `M` as `m`.
+    fn m_on(&self, position: Position) -> String {
+        let p = self.joined(position);
+        p.m_key
             .iter()
-            .zip(&self.first().key)
+            .zip(&p.key)
             .map(|(m, r)| format!("m.{} = r.{}", quote_ident(m), quote_ident(&r.name)))
-            .collect();
+            .collect::<Vec<_>>()
+            .join(" and ")
+    }
+
+    /// The row of `R`'s entry `r` and, at each position, the newest live `M`
+    /// entry on its key there (a `LEFT JOIN LATERAL` per position, aliased
+    /// [`b_alias`]), and the lateral row `s` the fields read. `from` is the
+    /// relation that supplies `r`. Newest is by applied position, an entry no
+    /// Apply has written (a build's or a Re-derive's) last, then by `b`'s
+    /// key, as the #1375 model reads it. Two live entries share a key only
+    /// while a hand-off between `b` rows is applied out of order, and the
+    /// later of its two changes recomputes the key.
+    fn joined_sql(&self, from: &str) -> String {
         let s = if self.s_columns.is_empty() {
             "(select 1 as __none) s".to_string()
         } else {
@@ -570,41 +656,51 @@ impl JoinShape {
                 .collect();
             format!("(select {}) s", cols.join(", "))
         };
-        format!(
-            "{from} \
-             left join lateral (select m.* from {m} m where {on} and not m.{tomb} \
-                                order by m.{applied} desc nulls last, \
-                                         m.{key} collate \"C\" desc \
-                                limit 1) b on true \
-             cross join lateral {s}",
-            m = self.first().m.ident,
-            on = on.join(" and "),
-            tomb = quote_ident(schema::TOMBSTONE_COLUMN),
-            applied = quote_ident(schema::APPLIED_LSN_COLUMN),
-            key = quote_ident(schema::KEY_COLUMN),
-        )
+        let laterals: Vec<String> = self
+            .positions
+            .iter()
+            .map(|p| {
+                format!(
+                    "left join lateral (select m.* from {m} m where {on} and not m.{tomb} \
+                                        order by m.{applied} desc nulls last, \
+                                                 m.{key} collate \"C\" desc \
+                                        limit 1) {b} on true",
+                    m = p.m.ident,
+                    on = self.m_on(p.position),
+                    tomb = quote_ident(schema::TOMBSTONE_COLUMN),
+                    applied = quote_ident(schema::APPLIED_LSN_COLUMN),
+                    key = quote_ident(schema::KEY_COLUMN),
+                    b = b_alias(p.position),
+                )
+            })
+            .collect();
+        format!("{from} {} cross join lateral {s}", laterals.join(" "))
     }
 
-    /// Whether the `r` row has a target row: not a tombstone, and for an
-    /// `INNER` join a live `M` entry on its key.
+    /// Whether the `r` row has a target row: not a tombstone, and for each
+    /// `INNER` position a live `M` entry on its key there.
     fn has_target_row_sql(&self) -> String {
-        let alive = format!("not r.{}", quote_ident(schema::TOMBSTONE_COLUMN));
-        if self.first().left {
-            return alive;
+        let mut terms = vec![format!("not r.{}", quote_ident(schema::TOMBSTONE_COLUMN))];
+        for p in self.positions.iter().filter(|p| !p.left) {
+            terms.push(format!(
+                "exists (select 1 from {m} m where {on} and not m.{tomb})",
+                m = p.m.ident,
+                on = self.m_on(p.position),
+                tomb = quote_ident(schema::TOMBSTONE_COLUMN),
+            ));
         }
-        let on: Vec<String> = self
-            .first()
-            .m_key
-            .iter()
-            .zip(&self.first().key)
-            .map(|(m, r)| format!("m.{} = r.{}", quote_ident(m), quote_ident(&r.name)))
-            .collect();
-        format!(
-            "{alive} and exists (select 1 from {m} m where {on} and not m.{tomb})",
-            m = self.first().m.ident,
-            on = on.join(" and "),
-            tomb = quote_ident(schema::TOMBSTONE_COLUMN),
-        )
+        terms.join(" and ")
+    }
+
+    /// An empty key set, one empty set per position.
+    fn empty_keys(&self) -> PageKeys {
+        vec![BTreeSet::new(); self.positions.len()]
+    }
+
+    /// Whether some position is `INNER`, so a live `R` entry may have no
+    /// target row.
+    fn any_inner(&self) -> bool {
+        self.positions.iter().any(|p| !p.left)
     }
 }
 
@@ -635,7 +731,8 @@ impl Record {
 pub(crate) struct JoinOneToOnePlan {
     pub(crate) shape: std::sync::Arc<JoinShape>,
     a: Vec<Record>,
-    b: Vec<Record>,
+    /// The changes of each joined table, by position (index 0 is position 1).
+    b: Vec<Vec<Record>>,
     /// The page's `TRUNCATE` of either side, which it settles before its
     /// changes (the module doc).
     truncate: Option<Truncate>,
@@ -663,10 +760,11 @@ pub(crate) struct JoinOneToOnePlan {
 
 impl JoinOneToOnePlan {
     pub(crate) fn new(shape: JoinShape) -> Self {
+        let positions = shape.positions.len();
         Self {
             shape: std::sync::Arc::new(shape),
             a: Vec::new(),
-            b: Vec::new(),
+            b: vec![Vec::new(); positions],
             truncate: None,
             fan_out: true,
             held_origin: held::HeldOrigin::default(),
@@ -708,9 +806,9 @@ impl JoinOneToOnePlan {
                     .add(change);
                 self.a.push(record);
             }
-            Side::Joined(_) => {
+            Side::Joined(position) => {
                 self.held_origin.add(change);
-                self.b.push(record);
+                self.b[position.index()].push(record);
             }
         }
         Ok(())
@@ -744,6 +842,11 @@ type KeyText = Vec<String>;
 /// The key texts of `rows`' columns from `first`, `None` for a row with a
 /// `NULL` part.
 fn key_of(row: &tokio_postgres::Row, first: usize, n: usize) -> Option<KeyText> {
+    key_parts(row, first, n).into_iter().collect()
+}
+
+/// The key texts of `rows`' columns from `first`, each `None` for `NULL`.
+fn key_parts(row: &tokio_postgres::Row, first: usize, n: usize) -> Vec<Option<String>> {
     (first..first + n)
         .map(|i| row.get::<_, Option<String>>(i))
         .collect()
@@ -771,6 +874,51 @@ fn fold(records: &[Record]) -> BTreeMap<&str, &Record> {
     by_key
 }
 
+/// A page's key set K, one set per position (index 0 is position 1): each
+/// position's keys the page locks in `J`.
+pub(crate) type PageKeys = Vec<BTreeSet<KeyText>>;
+
+/// Adds `key` of `side`'s row ([`JoinShape::split_key`]) to `k`.
+fn add_keys(shape: &JoinShape, side: Side, parts: &[Option<String>], k: &mut PageKeys) {
+    for (position, key) in shape.split_key(side, parts) {
+        k[position.index()].insert(key);
+    }
+}
+
+/// Whether a key of `side`'s row ([`JoinShape::split_key`]) isn't in `k`:
+/// one that moved after `k` was read, so the page rolls back and retries
+/// with it (the late-key retry, at every position).
+fn moved_key(shape: &JoinShape, side: Side, parts: &[Option<String>], k: &PageKeys) -> bool {
+    let missing: Vec<Position> = shape
+        .split_key(side, parts)
+        .into_iter()
+        .filter(|(position, key)| !k[position.index()].contains(key))
+        .map(|(position, _)| position)
+        .collect();
+    if missing.is_empty() {
+        return false;
+    }
+    // Planted bugs: the late-key retry skips one position of a star's root
+    // row, the last (`star_late_skip_last`) or the first
+    // (`star_late_skip_first`). See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    if side == Side::From && shape.is_star() {
+        let at = match crate::plant::armed() {
+            Some(plant @ crate::plant::Plant::StarLateSkipLast) => {
+                shape.positions.last().map(|p| (plant, p.position))
+            }
+            Some(plant @ crate::plant::Plant::StarLateSkipFirst) => Some((plant, Position::FIRST)),
+            _ => None,
+        };
+        if let Some((plant, at)) = at
+            && crate::plant::fires(plant, missing == [at])
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Settles one page of `plan` in `txn` (the module doc). Returns how many
 /// target rows it wrote and deleted.
 pub(crate) async fn apply_page(
@@ -781,25 +929,42 @@ pub(crate) async fn apply_page(
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
     let shape = &*plan.shape;
+    if shape.is_star() && plan.truncates_b() {
+        return Err(ApplyError::JoinOneToOneHalt {
+            target: shape.target.clone(),
+            reason: "a TRUNCATE of a joined table of a 1-1 JOIN of more than two tables, \
+                     whose apply is not built yet"
+                .to_string(),
+        });
+    }
 
     // 1. Fold.
-    let rederived: (Vec<Record>, Vec<Record>);
-    let (a_records, b_records): (&[Record], &[Record]) =
-        if plan.a.iter().chain(&plan.b).any(|r| r.apply.is_some())
-            && super::ledger::page_may_predate_build(txn, &shape.r, first_seg).await?
-        {
-            rederived = (
-                plan.a.iter().map(Record::rederive).collect(),
-                plan.b.iter().map(Record::rederive).collect(),
-            );
-            (&rederived.0, &rederived.1)
-        } else {
-            (&plan.a, &plan.b)
-        };
+    let predates = plan
+        .a
+        .iter()
+        .chain(plan.b.iter().flatten())
+        .any(|r| r.apply.is_some())
+        && super::ledger::page_may_predate_build(txn, &shape.r, first_seg).await?;
+    let rederived: (Vec<Record>, Vec<Vec<Record>>) = if predates {
+        (
+            plan.a.iter().map(Record::rederive).collect(),
+            plan.b
+                .iter()
+                .map(|b| b.iter().map(Record::rederive).collect())
+                .collect(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let (a_records, b_records): (&[Record], &[Vec<Record>]) = if predates {
+        (&rederived.0, &rederived.1)
+    } else {
+        (&plan.a, &plan.b)
+    };
     let a = fold(a_records);
-    let b = fold(b_records);
+    let b: Vec<BTreeMap<&str, &Record>> = b_records.iter().map(|b| fold(b)).collect();
     let truncate = plan.truncate.as_ref();
-    if a.is_empty() && b.is_empty() && truncate.is_none() {
+    if a.is_empty() && b.iter().all(BTreeMap::is_empty) && truncate.is_none() {
         return Ok((0, 0));
     }
     // Planted bug: apply every change without ADR-0002's I2. See
@@ -807,7 +972,9 @@ pub(crate) async fn apply_page(
     #[cfg(any(test, feature = "test-util"))]
     let predicate = !crate::plant::fires(
         crate::plant::Plant::StaleOneToOneWrite,
-        a.values().chain(b.values()).any(|r| r.apply.is_some()),
+        a.values()
+            .chain(b.iter().flat_map(BTreeMap::values))
+            .any(|r| r.apply.is_some()),
     );
     #[cfg(not(any(test, feature = "test-util")))]
     let predicate = true;
@@ -820,15 +987,26 @@ pub(crate) async fn apply_page(
             .collect()
     };
     let a_rederive = rederive_keys(&a);
-    let b_rederive = rederive_keys(&b);
-    // `b`'s primary key, which a `b` Re-derive reads its rows by.
-    let m_pk = if b_rederive.is_empty() {
-        Vec::new()
-    } else {
-        ddl::source_primary_key_in_txn(txn, &shape.first().table).await?
+    let b_rederive: Vec<Vec<String>> = b.iter().map(rederive_keys).collect();
+    // Each joined table's primary key, which its Re-derives read its rows
+    // by.
+    let mut m_pk: Vec<Vec<PrimaryKeyColumn>> = Vec::with_capacity(b.len());
+    for (p, keys) in shape.positions.iter().zip(&b_rederive) {
+        m_pk.push(if keys.is_empty() {
+            Vec::new()
+        } else {
+            ddl::source_primary_key_in_txn(txn, &p.table).await?
+        });
+    }
+    let joined_sides = || {
+        shape
+            .positions
+            .iter()
+            .map(|p| (Side::Joined(p.position), p.position.index()))
+            .filter(|(_, i)| !b[*i].is_empty())
     };
 
-    // 2. The lock row, a truncate's clear, then K over both sides' keys. A
+    // 2. The lock row, a truncate's clear, then K over every side's keys. A
     // page that truncates `b` holds its definition's row already: the caller
     // takes it before any lock row ([`lock_definitions`]).
     // Planted bug: the definition's row comes after the lock row. See
@@ -866,15 +1044,23 @@ pub(crate) async fn apply_page(
         Some(truncate) => truncate_sides(txn, shape, truncate, mutations).await?,
         None => 0,
     };
-    let mut k: BTreeSet<KeyText> = BTreeSet::new();
+    // The root's keys and the joined tables' apart, so a planted bug can
+    // leave out the root's alone ([`lock_keys`]).
+    let mut root_k = shape.empty_keys();
     if !a.is_empty() {
         let live = live_keys(txn, shape, Side::From, &shape.pk, &a_rederive).await?;
-        k.extend(key_set(txn, shape, Side::From, &a, &live).await?);
+        key_set(txn, shape, Side::From, &a, &live, &mut root_k).await?;
     }
-    if !b.is_empty() {
-        let live = live_keys(txn, shape, JOINED, &m_pk, &b_rederive).await?;
-        k.extend(key_set(txn, shape, JOINED, &b, &live).await?);
+    let mut joined_k = shape.empty_keys();
+    for (side, i) in joined_sides() {
+        let live = live_keys(txn, shape, side, &m_pk[i], &b_rederive[i]).await?;
+        key_set(txn, shape, side, &b[i], &live, &mut joined_k).await?;
     }
+    let k: PageKeys = root_k
+        .iter()
+        .zip(&joined_k)
+        .map(|(r, j)| r.union(j).cloned().collect())
+        .collect();
     // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
@@ -884,31 +1070,69 @@ pub(crate) async fn apply_page(
     )
     .await?;
 
-    // 3. `J`, one sorted statement over both sides' keys.
+    // 3. `J`, one sorted statement over every position's keys.
+    let locked = root_skip_j(shape, &k, &root_k, &joined_k);
     // Planted bug: the page reads `M` and `R` before it locks `J`. See
     // `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
-    let late_j = crate::plant::fires(crate::plant::Plant::Join1MBeforeJ, !k.is_empty());
+    let late_j = crate::plant::fires(
+        crate::plant::Plant::Join1MBeforeJ,
+        locked.iter().any(|k| !k.is_empty()),
+    );
     #[cfg(not(any(test, feature = "test-util")))]
     let late_j = false;
     if !late_j {
-        lock_keys(txn, shape, &k).await?;
+        lock_keys(txn, shape, &locked).await?;
     }
 
-    // 4. The `R` entries, then the `M` entries.
+    // 4. The `R` entries, then each position's `M` entries in position
+    // order.
     let (a_inserted, _) = lock_side(txn, shape, Side::From, &a, seg_seq, predicate, &k).await?;
-    let (b_inserted, b_held) = lock_side(txn, shape, JOINED, &b, seg_seq, predicate, &k).await?;
+    let mut b_locked = Vec::with_capacity(b.len());
+    for (side, i) in shape
+        .positions
+        .iter()
+        .map(|p| (Side::Joined(p.position), p.position.index()))
+    {
+        b_locked.push(lock_side(txn, shape, side, &b[i], seg_seq, predicate, &k).await?);
+    }
 
     // 5. The Re-derive reads, one statement per side.
     let a_read = rederive_read(txn, shape, Side::From, &shape.pk, &a_rederive, &k, seg_seq).await?;
-    let b_read = rederive_read(txn, shape, JOINED, &m_pk, &b_rederive, &k, seg_seq).await?;
+    let mut b_read = Vec::with_capacity(b.len());
+    for (side, i) in shape
+        .positions
+        .iter()
+        .map(|p| (Side::Joined(p.position), p.position.index()))
+    {
+        b_read.push(rederive_read(txn, shape, side, &m_pk[i], &b_rederive[i], &k, seg_seq).await?);
+    }
 
     // 6. I2, then each side's copied columns.
     let a_changed =
         update_side(txn, shape, Side::From, &a, &a_inserted, &a_read, predicate).await?;
-    let b_changed = update_side(txn, shape, JOINED, &b, &b_inserted, &b_read, predicate).await?;
+    let mut b_changed = Vec::with_capacity(b.len());
+    for (side, i) in shape
+        .positions
+        .iter()
+        .map(|p| (Side::Joined(p.position), p.position.index()))
+    {
+        b_changed.push(
+            update_side(
+                txn,
+                shape,
+                side,
+                &b[i],
+                &b_locked[i].0,
+                &b_read[i],
+                predicate,
+            )
+            .await?,
+        );
+    }
 
-    // 7. Recompute and write: the `a` changes' rows, then the fan-out.
+    // 7. Recompute and write: the `a` changes' rows, then the fan-out of
+    // each position in position order.
     // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
@@ -919,18 +1143,62 @@ pub(crate) async fn apply_page(
     .await?;
     let mut changed_keys: Vec<&str> = a_changed.iter().map(String::as_str).collect();
     changed_keys.sort_unstable();
-    let (written, deleted) = write_a_changes(txn, plan, &changed_keys, seg_seq, mutations).await?;
-    let fan_keys = if plan.fan_out {
-        fan_out_keys(txn, shape, &b_changed, &b_held).await?
-    } else {
-        BTreeSet::new()
-    };
-    let (fanned, fan_deleted) =
-        fan_out(txn, plan, &fan_keys, &a_changed, seg_seq, mutations).await?;
-    if late_j {
-        lock_keys(txn, shape, &k).await?;
+    let (mut written, mut deleted) =
+        write_a_changes(txn, plan, &changed_keys, seg_seq, mutations).await?;
+    let mut fanned_out: HashSet<String> = a_changed.clone();
+    for p in &shape.positions {
+        let i = p.position.index();
+        let fan_keys = if plan.fan_out {
+            fan_out_keys(txn, shape, p, &b_changed[i], &b_locked[i].1).await?
+        } else {
+            BTreeSet::new()
+        };
+        let (fanned, fan_deleted, entries) =
+            fan_out(txn, plan, p, &fan_keys, &fanned_out, seg_seq, mutations).await?;
+        fanned_out.extend(entries);
+        written += fanned;
+        deleted += fan_deleted;
     }
-    Ok((written + fanned, deleted + fan_deleted + cleared))
+    if late_j {
+        lock_keys(txn, shape, &locked).await?;
+    }
+    Ok((written, deleted + cleared))
+}
+
+/// The keys a page locks in `J`: `k`, but under a planted bug, a star's
+/// root keys at one position that no joined change of the page holds too
+/// (`root_k` and `joined_k`, the two parts of `k`). See `crate::plant`.
+fn root_skip_j(
+    shape: &JoinShape,
+    k: &PageKeys,
+    root_k: &PageKeys,
+    joined_k: &PageKeys,
+) -> PageKeys {
+    #[cfg(any(test, feature = "test-util"))]
+    if shape.is_star() {
+        let at = match crate::plant::armed() {
+            Some(plant @ crate::plant::Plant::StarRootSkipJLast) => {
+                Some((plant, shape.positions.len() - 1))
+            }
+            Some(plant @ crate::plant::Plant::StarRootSkipJFirst) => Some((plant, 0)),
+            // The middle position of a star of three or more joined tables.
+            Some(plant @ crate::plant::Plant::StarRootSkipJMiddle) if shape.positions.len() > 2 => {
+                Some((plant, shape.positions.len() / 2))
+            }
+            _ => None,
+        };
+        if let Some((plant, i)) = at {
+            let root_only: BTreeSet<KeyText> =
+                root_k[i].difference(&joined_k[i]).cloned().collect();
+            if crate::plant::fires(plant, !root_only.is_empty()) {
+                let mut locked = k.clone();
+                locked[i] = joined_k[i].clone();
+                return locked;
+            }
+        }
+    }
+    let _ = (shape, root_k, joined_k);
+    k.clone()
 }
 
 /// Locks the definitions' rows of `plans` (one page's) before the page's
@@ -956,7 +1224,8 @@ pub(crate) async fn lock_definitions<'a>(
     let mut locks: BTreeMap<i64, bool> = BTreeMap::new();
     for plan in plans {
         let truncates = plan.truncates_b();
-        let may_hold = (plan.holds_a && !plan.a.is_empty()) || (plan.fan_out && !plan.b.is_empty());
+        let may_hold = (plan.holds_a && !plan.a.is_empty())
+            || (plan.fan_out && plan.b.iter().any(|b| !b.is_empty()));
         if truncates || may_hold {
             *locks.entry(plan.shape.id).or_default() |= truncates;
         }
@@ -1081,14 +1350,14 @@ pub(crate) async fn start_rebuilds(txn: &Transaction<'_>, ids: &[i64]) -> Result
 
 /// The live join key of each of `keys`' rows of `side`'s table (whose
 /// primary key is `pk`), read unlocked: the Re-derives' part of K. A key is
-/// its columns' text; a row with a `NULL` part, or no row, contributes none.
+/// its columns' text, `None` for a `NULL` part; no row contributes none.
 async fn live_keys(
     txn: &Transaction<'_>,
     shape: &JoinShape,
     side: Side,
     pk: &[PrimaryKeyColumn],
     keys: &[String],
-) -> Result<Vec<KeyText>, ApplyError> {
+) -> Result<Vec<Vec<Option<String>>>, ApplyError> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -1103,22 +1372,25 @@ async fn live_keys(
     let rows = super::ledger::query_by_entry_key(txn, &sql, &query.params()).await?;
     Ok(rows
         .iter()
-        .filter_map(|row| key_of(row, 0, names.len()))
+        .map(|row| key_parts(row, 0, names.len()))
         .collect())
 }
 
-/// `side`'s part of K: every image's new key, for a `b` change also its old
-/// key from its first change's pre-image, the key the side's entry holds for
-/// each of `records`, and the `live` keys, as the sorted set of their texts.
-/// Each key is cast to `J`'s types. A key with a `NULL` part is left out.
+/// `side`'s part of K, added to `k`: every image's new key, for a `b` change
+/// also its old key from its first change's pre-image, the key the side's
+/// entry holds for each of `records`, and the `live` keys, as the sorted set
+/// of their texts at each position ([`JoinShape::split_key`]). Each key is
+/// cast to `J`'s types. A key with a `NULL` part is left out.
 async fn key_set(
     txn: &Transaction<'_>,
     shape: &JoinShape,
     side: Side,
     records: &BTreeMap<&str, &Record>,
-    live: &[KeyText],
-) -> Result<BTreeSet<KeyText>, ApplyError> {
-    let n = shape.key.len();
+    live: &[Vec<Option<String>>],
+    k: &mut PageKeys,
+) -> Result<(), ApplyError> {
+    let types = shape.side_key_types(side);
+    let n = types.len();
     let names = shape.side_key(side);
     // Planted bug: only the changes' new keys are locked. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
@@ -1140,14 +1412,13 @@ async fn key_set(
             _ => None,
         })
         .collect();
-    let live_columns: Vec<Vec<&str>> = (0..n)
-        .map(|i| live.iter().map(|k| k[i].as_str()).collect())
+    let live_columns: Vec<Vec<Option<&str>>> = (0..n)
+        .map(|i| live.iter().map(|k| k[i].as_deref()).collect())
         .collect();
     let aliases =
         |prefix: &str| -> Vec<String> { (0..n).map(|i| format!("{prefix}{i}")).collect() };
     let typed = |expr: &dyn Fn(usize, &str) -> String| -> Vec<String> {
-        shape
-            .key
+        types
             .iter()
             .zip(&names)
             .enumerate()
@@ -1159,6 +1430,8 @@ async fn key_set(
     let from_live = typed(&|i, _| format!("lv.c{i}"));
     let live_arrays: Vec<String> = (0..n).map(|i| format!("${}::text[]", 4 + i)).collect();
     let texts: Vec<String> = aliases("k").iter().map(|k| format!("{k}::text")).collect();
+    // A key with a `NULL` part is left out at its position: a `FROM` row's
+    // keys at the other positions still count ([`JoinShape::split_key`]).
     let present: Vec<String> = aliases("k")
         .iter()
         .map(|k| format!("{k} is not null"))
@@ -1188,7 +1461,7 @@ async fn key_set(
         live_arrays = live_arrays.join(", "),
         live_names = aliases("c").join(", "),
         texts = texts.join(", "),
-        present = present.join(" and "),
+        present = present.join(" or "),
         ledger = shape.ledger(side).ident,
         key = quote_ident(schema::KEY_COLUMN),
     );
@@ -1197,7 +1470,10 @@ async fn key_set(
         params.push(column);
     }
     let rows = super::ledger::query_by_entry_key(txn, &sql, &params).await?;
-    Ok(rows.iter().filter_map(|row| key_of(row, 0, n)).collect())
+    for row in &rows {
+        add_keys(shape, side, &key_parts(row, 0, n), k);
+    }
+    Ok(())
 }
 
 /// `keys` as one text array per key column, for [`key_unnest`].
@@ -1208,9 +1484,9 @@ fn key_arrays(n: usize, keys: &BTreeSet<KeyText>) -> Vec<Vec<&str>> {
 }
 
 /// The `unnest` of [`key_arrays`] bound from parameter `$1` as `u(c0, ..)`,
-/// and each column cast to its `J` type.
-fn key_unnest(shape: &JoinShape) -> (String, Vec<String>) {
-    let n = shape.key.len();
+/// and each column cast to its `J` type, `key`'s.
+fn key_unnest(key: &[ImageColumn]) -> (String, Vec<String>) {
+    let n = key.len();
     let arrays: Vec<String> = (0..n).map(|i| format!("${}::text[]", i + 1)).collect();
     let unnest = format!(
         "unnest({}) as u({})",
@@ -1220,8 +1496,7 @@ fn key_unnest(shape: &JoinShape) -> (String, Vec<String>) {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let casts = shape
-        .key
+    let casts = key
         .iter()
         .enumerate()
         .map(|(i, c)| cast_to(c, &format!("u.c{i}")))
@@ -1364,20 +1639,20 @@ pub(crate) fn j_statements<'a>(j: &str, groups: &[PositionKeys<'a>]) -> Option<J
     })
 }
 
-/// Inserts K into `J` and locks it ([`j_statements`]): K holds the keys of
-/// the first position, the only one a two-table JOIN has.
+/// Inserts K into `J` and locks it, every position's keys in one sorted
+/// statement each ([`j_statements`]).
 async fn lock_keys(
     txn: &Transaction<'_>,
     shape: &JoinShape,
-    k: &BTreeSet<KeyText>,
+    k: &PageKeys,
 ) -> Result<(), ApplyError> {
-    let statements = j_statements(
-        &shape.j,
-        &[PositionKeys {
-            position: shape.first(),
-            keys: k,
-        }],
-    );
+    let groups: Vec<PositionKeys<'_>> = shape
+        .positions
+        .iter()
+        .zip(k)
+        .map(|(position, keys)| PositionKeys { position, keys })
+        .collect();
+    let statements = j_statements(&shape.j, &groups);
     let params: Vec<&(dyn ToSql + Sync)> = statements
         .iter()
         .flat_map(|s| s.params.iter().map(|c| c as &(dyn ToSql + Sync)))
@@ -1425,7 +1700,7 @@ async fn lock_side(
     records: &BTreeMap<&str, &Record>,
     seg_seq: i64,
     predicate: bool,
-    k: &BTreeSet<KeyText>,
+    k: &PageKeys,
 ) -> Result<(ledger::Inserted, HashMap<String, KeyText>), ApplyError> {
     if records.is_empty() {
         return Ok((ledger::Inserted::default(), HashMap::new()));
@@ -1463,17 +1738,18 @@ async fn lock_side(
     Ok((inserted, held))
 }
 
-/// Checks that the key each `keys` entry of `side`'s ledger holds, now that
-/// the page has locked them, is in `k`: one outside it moved after `k` was
-/// read. Returns each entry's held key (none for a `NULL` part).
+/// Checks that the key each `keys` entry of `side`'s ledger holds at every
+/// position, now that the page has locked them, is in `k`: one outside it
+/// moved after `k` was read. Returns each entry's held key, for a joined
+/// side (none for a `NULL` part; a `FROM` entry's keys are only checked).
 async fn check_held_keys(
     txn: &Transaction<'_>,
     shape: &JoinShape,
     side: Side,
     keys: &[&str],
-    k: &BTreeSet<KeyText>,
+    k: &PageKeys,
 ) -> Result<HashMap<String, KeyText>, ApplyError> {
-    let n = shape.key.len();
+    let n = shape.side_key(side).len();
     let rows = super::ledger::query_by_entry_key(
         txn,
         &format!(
@@ -1485,10 +1761,14 @@ async fn check_held_keys(
         &[&keys],
     )
     .await?;
-    let held: HashMap<String, KeyText> = rows
-        .iter()
-        .filter_map(|row| Some((row.get::<_, String>(0), key_of(row, 1, n)?)))
-        .collect();
+    let parts: Vec<Vec<Option<String>>> = rows.iter().map(|row| key_parts(row, 1, n)).collect();
+    let held: HashMap<String, KeyText> = match side {
+        Side::From => HashMap::new(),
+        Side::Joined(_) => rows
+            .iter()
+            .filter_map(|row| Some((row.get::<_, String>(0), key_of(row, 1, n)?)))
+            .collect(),
+    };
     // Test-only: a key that moves on every attempt. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     if side == Side::From && super::interleave::take_forced_join_key_move() {
@@ -1502,7 +1782,7 @@ async fn check_held_keys(
     let skip = crate::plant::fires(crate::plant::Plant::Join1NoRecheck, !rows.is_empty());
     #[cfg(not(any(test, feature = "test-util")))]
     let skip = false;
-    if !skip && held.values().any(|key| !k.contains(key)) {
+    if !skip && parts.iter().any(|key| moved_key(shape, side, key, k)) {
         #[cfg(any(test, feature = "test-util"))]
         super::interleave::note_join_key_moved();
         return Err(ApplyError::JoinKeyMoved {
@@ -1534,7 +1814,7 @@ async fn rederive_read(
     side: Side,
     pk: &[PrimaryKeyColumn],
     keys: &[String],
-    k: &BTreeSet<KeyText>,
+    k: &PageKeys,
     seg_seq: i64,
 ) -> Result<Rederived, ApplyError> {
     if keys.is_empty() {
@@ -1553,7 +1833,7 @@ async fn rederive_read(
     // `M`'s.
     let label = match side {
         Side::From => shape.target.as_str(),
-        Side::Joined(_) => shape.first().m.label.as_str(),
+        Side::Joined(position) => shape.joined(position).m.label.as_str(),
     };
     let read = ledger::read_rows(txn, label, shape.table(side), pk, &names, &refs).await?;
     // Planted bugs: the page doesn't check the keys its read of one side
@@ -1607,7 +1887,7 @@ fn check_read_keys(
     shape: &JoinShape,
     side: Side,
     rows: &HashMap<String, String>,
-    k: &BTreeSet<KeyText>,
+    k: &PageKeys,
 ) -> Result<(), ApplyError> {
     let names = shape.side_key(side);
     for doc in rows.values() {
@@ -1615,13 +1895,11 @@ fn check_read_keys(
             serde_json::from_str(doc).map_err(|_| ApplyError::JoinKeyMoved {
                 target: shape.target.clone(),
             })?;
-        let key: Option<KeyText> = names
+        let key: Vec<Option<String>> = names
             .iter()
             .map(|name| value.get(name).and_then(|v| v.as_str()).map(str::to_string))
             .collect();
-        if let Some(key) = key
-            && !k.contains(&key)
-        {
+        if moved_key(shape, side, &key, k) {
             #[cfg(any(test, feature = "test-util"))]
             super::interleave::note_join_key_moved();
             return Err(ApplyError::JoinKeyMoved {
@@ -1761,12 +2039,14 @@ async fn write_entries(
     Ok(())
 }
 
-/// The keys a page's `b` changes fan out on: each changed `M` entry's key
-/// before the page (`held`, read under its entry lock) and after it (read
-/// back from `M`). Every one is in K, so the page holds its `J` lock.
+/// The keys at position `at` a page's changes of its joined table fan out
+/// on: each changed `M` entry's key before the page (`held`, read under its
+/// entry lock) and after it (read back from `M`). Every one is in K, so the
+/// page holds its `J` lock.
 async fn fan_out_keys(
     txn: &Transaction<'_>,
     shape: &JoinShape,
+    at: &JoinedPosition,
     changed: &HashSet<String>,
     held: &HashMap<String, KeyText>,
 ) -> Result<BTreeSet<KeyText>, ApplyError> {
@@ -1783,18 +2063,15 @@ async fn fan_out_keys(
         txn,
         &format!(
             "select {texts} from {m} l where l.{key} = any($1::text[]) and not l.{tomb}",
-            texts = shape.key_texts(JOINED, "l").join(", "),
-            m = shape.first().m.ident,
+            texts = shape.key_texts(Side::Joined(at.position), "l").join(", "),
+            m = at.m.ident,
             key = quote_ident(schema::KEY_COLUMN),
             tomb = quote_ident(schema::TOMBSTONE_COLUMN),
         ),
         &[&changed],
     )
     .await?;
-    keys.extend(
-        rows.iter()
-            .filter_map(|row| key_of(row, 0, shape.key.len())),
-    );
+    keys.extend(rows.iter().filter_map(|row| key_of(row, 0, at.key.len())));
     Ok(keys)
 }
 
@@ -1864,9 +2141,10 @@ async fn write_a_changes(
     }
 }
 
-/// Step 7's fan-out (the module doc): the target row of every live `R` entry
-/// on `keys` is recomputed from `R` and the newest live `M` entry on its key,
-/// but the `written` ones, which the page's `a` changes wrote already, and
+/// Step 7's fan-out (the module doc) of the changes of the joined table at
+/// `at`: the target row of every live `R` entry on `keys` there is
+/// recomputed from `R` and the newest live `M` entry at each position, but
+/// the `written` ones, which the page's `a` changes wrote already, and
 /// those of the `a` rows the definition holds in quarantine, which stay as
 /// they are until their release re-derives them ([`held`]). The page holds
 /// `J` for each of `keys` (they are in K), and every writer of an `R` entry
@@ -1876,51 +2154,56 @@ async fn write_a_changes(
 /// The page recomputes the keys whose rows fit one chunk's budget itself, and
 /// leaves every other key to its chunks under a pending marker it writes
 /// ([`fan_out::split`]); a key it recomputes whole loses the marker an
-/// earlier page left it.
+/// earlier page left it. Returns the rows written and deleted, and the `R`
+/// entries it wrote.
 async fn fan_out(
     txn: &Transaction<'_>,
     plan: &JoinOneToOnePlan,
+    at: &JoinedPosition,
     keys: &BTreeSet<KeyText>,
     written: &HashSet<String>,
     seg_seq: i64,
     mutations: &mut TargetMutations,
-) -> Result<(usize, usize), ApplyError> {
+) -> Result<(usize, usize, Vec<String>), ApplyError> {
     if keys.is_empty() {
-        return Ok((0, 0));
+        return Ok((0, 0, Vec::new()));
     }
     let shape = &*plan.shape;
-    let inline = fan_out::split(txn, plan, keys, seg_seq).await?;
-    let entries: Vec<String> = live_entries_on(txn, shape, &inline)
+    let inline = fan_out::split(txn, plan, at, keys, seg_seq).await?;
+    let entries: Vec<String> = live_entries_on(txn, shape, at, &inline)
         .await?
         .into_iter()
         .filter(|key| !written.contains(key))
         .collect();
-    write_fan_out(
+    let (w, d) = write_fan_out(
         txn,
         shape,
+        at,
         &entries,
         &plan.held_origin,
         seg_seq,
         mutations,
         &plan.held,
     )
-    .await
+    .await?;
+    Ok((w, d, entries))
 }
 
-/// The keys of the live `R` entries on `keys`, sorted, but those of the `a`
-/// rows the definition holds in quarantine.
+/// The keys of the live `R` entries on `keys` at position `at`, sorted, but
+/// those of the `a` rows the definition holds in quarantine.
 async fn live_entries_on(
     txn: &Transaction<'_>,
     shape: &JoinShape,
+    at: &JoinedPosition,
     keys: &BTreeSet<KeyText>,
 ) -> Result<Vec<String>, ApplyError> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let columns = key_arrays(shape.key.len(), keys);
+    let columns = key_arrays(at.key.len(), keys);
     let mut params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
-    let (unnest, casts) = key_unnest(shape);
-    let qualified: Vec<String> = shape
+    let (unnest, casts) = key_unnest(&at.key);
+    let qualified: Vec<String> = at
         .key
         .iter()
         .map(|c| format!("r.{}", quote_ident(&c.name)))
@@ -1989,9 +2272,11 @@ async fn not_held_filter(
 /// while every other row is written, so the `b` change commits and `M`
 /// advances. A bisection that can't name every failing row within
 /// [`MAX_FAN_OUT_PROBES`] attempts halts the transform.
+#[allow(clippy::too_many_arguments)]
 async fn write_fan_out(
     txn: &Transaction<'_>,
     shape: &JoinShape,
+    at: &JoinedPosition,
     entries: &[String],
     origin: &held::HeldOrigin,
     seg_seq: i64,
@@ -2025,14 +2310,14 @@ async fn write_fan_out(
                 let (written, deleted, rows) = fan_out_failure(
                     txn,
                     shape,
-                    JOINED,
+                    Side::Joined(at.position),
                     &entries,
                     WriteOrigin::All(origin),
                     mutations,
                 )
                 .await?;
                 let parked: Vec<_> = rows.iter().map(|row| (row, origin)).collect();
-                held::hold(txn, shape, seg_seq, JOINED, &parked).await?;
+                held::hold(txn, shape, seg_seq, Side::Joined(at.position), &parked).await?;
                 held.record(rows);
                 txn.batch_execute("release savepoint join1_fan_out").await?;
                 return Ok((written, deleted));
@@ -2146,7 +2431,7 @@ async fn fan_out_failure(
         Side::Joined(_) => format!(
             "a change of {} whose fan-out fails on more rows of {} than {MAX_FAN_OUT_PROBES} \
              attempts to isolate them name: {named}, and maybe more",
-            shape.first().table,
+            shape.table(side),
             shape.source_table,
         ),
         Side::From => format!(
@@ -2224,7 +2509,7 @@ impl Entries {
     /// join an entry has one only while a live `M` entry is on its key, and a
     /// fan-out of a `b` delete is what removes them.
     fn may_delete(self, shape: &JoinShape) -> bool {
-        self == Entries::Changed || !shape.first().left
+        self == Entries::Changed || shape.any_inner()
     }
 }
 
@@ -2511,11 +2796,26 @@ pub async fn diverging_keys(pool: &Pool, target_table: &str) -> Result<Vec<Strin
     let client = pool.get().await?;
     let target_types =
         super::one_to_one_render::image_columns(&**client, &definition.target_table).await?;
-    let on: Vec<String> = shape
-        .key
+    // One join per position, each aliased as the recompute's lateral row
+    // ([`b_alias`]), so the fields' `s` reads them as it reads those.
+    let joins: Vec<String> = shape
+        .positions
         .iter()
-        .zip(&shape.first().m_key)
-        .map(|(a, b)| format!("r.{} = b.{}", quote_ident(&a.name), quote_ident(b)))
+        .map(|p| {
+            let alias = b_alias(p.position);
+            let on: Vec<String> = p
+                .key
+                .iter()
+                .zip(&p.m_key)
+                .map(|(a, b)| format!("r.{} = {alias}.{}", quote_ident(&a.name), quote_ident(b)))
+                .collect();
+            format!(
+                "{kind} join {table} {alias} on {on}",
+                kind = if p.left { "left" } else { "inner" },
+                table = ddl::qualified_source_table(&p.table),
+                on = on.join(" and "),
+            )
+        })
         .collect();
     let expected: Vec<String> = shape
         .fields
@@ -2553,7 +2853,7 @@ pub async fn diverging_keys(pool: &Pool, target_table: &str) -> Result<Vec<Strin
     let sql = format!(
         "with expected as ( \
              select {a_key} as k{comma}{fields} \
-             from {a} r {kind} join {b} b on {on} cross join lateral {s} \
+             from {a} r {joins} cross join lateral {s} \
          ), actual as ( \
              select {t_key} as k{t_comma}{t_fields} from {target} t \
          ) \
@@ -2564,9 +2864,7 @@ pub async fn diverging_keys(pool: &Pool, target_table: &str) -> Result<Vec<Strin
         comma = if expected.is_empty() { "" } else { ", " },
         fields = expected.join(", "),
         a = ddl::qualified_source_table(&shape.source_table),
-        b = ddl::qualified_source_table(&shape.first().table),
-        kind = if shape.first().left { "left" } else { "inner" },
-        on = on.join(" and "),
+        joins = joins.join(" "),
         t_key = ddl::pk_key_sql_expr(&shape.pk, Some("t")),
         t_comma = if names.is_empty() { "" } else { ", " },
         t_fields = names

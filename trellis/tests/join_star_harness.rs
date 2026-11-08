@@ -4,12 +4,12 @@
 //! - The fixture's generated text: the two-table shape's definition and
 //!   oracle, and the DDL, seed and oracle of every shape up to the cap, run on
 //!   a plain Postgres database with no transform defined.
-//! - Every star shape up to the cap defines with the development knob on,
-//!   and its build refuses, naming why, until its apply is built.
+//! - Every star shape up to the cap defines with the development knob on
+//!   and builds, at its first and last position.
 //! - Pins written once against "the joined table at `at`" and run at every
 //!   shape this process can run ([`star::runnable`]): the two-table JOIN
-//!   always, a star of three tables (its last position) once its apply is
-//!   built, with the development knob on.
+//!   and a star of three tables at its last position, with the development
+//!   knob on.
 //!   - the build, then changes of `a` and of the table at `at`;
 //!   - F3 (#1371): an `a` move racing an update of its new key, a family;
 //!   - M (#1375): two crossing mixed pages, a race;
@@ -43,8 +43,10 @@ const SHAPES: [Shape; 2] = [
     },
 ];
 
-/// [`SHAPES`] this process can define; a skipped shape says so.
+/// [`SHAPES`] this process can define, with the development knob on (this
+/// binary's pins all run a star); a skipped shape says so.
 fn shapes() -> Vec<Shape> {
+    trellis::dev::defs::set_star_join(true);
     SHAPES
         .into_iter()
         .filter(|shape| {
@@ -197,44 +199,30 @@ async fn every_shapes_tables_and_oracle_run_on_postgres() {
     }
 }
 
-/// Every star shape up to the cap (3 to 5 tables) defines with the knob
-/// on, and its build step fails, naming why, rather than build it as a
-/// two-table JOIN: a star's apply and build are not built yet (#1773,
-/// #1777). The definition stays `backfilling`, its build job holding the
-/// reason.
+/// Every star shape up to the cap (3 to 5 tables), at its first and last
+/// position, defines with the knob on and builds: the `M` pass of every
+/// position, in small batches so each position's pass takes several, then
+/// the chunks of `a` and the sweep. The target, `R` and every `M` equal the
+/// live tables, and a root change then applies.
 #[tokio::test]
-async fn every_star_defines_and_its_build_refuses_until_it_is_built() {
+async fn every_star_builds_every_position() {
     let _serial = star::serial().await;
     let was = star::star_join_enabled();
     trellis::dev::defs::set_star_join(true);
     for positions in 2..=star::MAX_POSITIONS {
-        let shape = Shape::new(positions, positions);
-        let stars = shape.stars();
-        let d = star::start_unbuilt(&stars[..1], A_ROWS, B_ROWS).await;
-        // The plan job, then the chunk that fails.
-        for _ in 0..4 {
-            match build::work_once(d.pool(), "w", &star::build_options(1000)).await {
-                Ok(step) if step.progressed() => {}
-                _ => break,
-            }
-        }
-        let row = d
-            .user()
-            .await
-            .query_one(
-                "select (select status from trellis.transform_definitions), \
-                        (select string_agg(last_error, '; ') from trellis.backfill_chunks)",
-                &[],
+        for at in [1, positions] {
+            let shape = Shape::new(positions, at);
+            let stars = shape.stars();
+            let mut d = star::start_unbuilt(&stars, A_ROWS, B_ROWS).await;
+            build::settle_builds_with(d.pool(), 7).await;
+            star::assert_oracle(&mut d, &stars).await;
+            star::step(
+                &mut d,
+                &shape.sql("update public.a set {k} = 20, x = 9 where id = 1"),
             )
-            .await
-            .expect("read the build's state");
-        let (status, error): (String, Option<String>) = (row.get(0), row.get(1));
-        assert_eq!(status, "backfilling", "{shape:?}");
-        let error = error.unwrap_or_default();
-        assert!(
-            error.contains("a 1-1 JOIN of more than two tables, whose apply is not built yet"),
-            "{shape:?}: {error}"
-        );
+            .await;
+            star::assert_oracle(&mut d, &stars).await;
+        }
     }
     trellis::dev::defs::set_star_join(was);
 }
@@ -327,7 +315,7 @@ async fn m_two_crossing_mixed_pages_queue_on_j_without_deadlock() {
 #[tokio::test]
 async fn t1_t2_a_truncate_races_a_page_of_the_other_side() {
     let _serial = star::serial().await;
-    for shape in shapes() {
+    for shape in shapes().into_iter().filter(|s| star::truncate_runnable(*s)) {
         for (name, x, y) in [
             (
                 "t1 truncate a vs b",

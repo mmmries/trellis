@@ -3029,6 +3029,24 @@ pub(super) async fn compute_page(
                         super::join_one_to_one::plan_for(pool, def, side, pk.clone()).await?,
                     ),
                 };
+                // A joined table's changes go to its own position. A star's
+                // that names no position halts rather than land on position
+                // 1; a two-table JOIN has only that one.
+                let side = match side {
+                    crate::defs::join::Side::From => side,
+                    crate::defs::join::Side::Joined(_) => target_plan
+                        .shape
+                        .side_of(&canonical_of(qualified_source))
+                        .or_else(|| crate::defs::join::side_of_table(&def.def, qualified_source))
+                        .or_else(|| (!target_plan.shape.is_star()).then_some(side))
+                        .ok_or_else(|| ApplyError::JoinOneToOneHalt {
+                            target: def.target_table.clone(),
+                            reason: format!(
+                                "a change of {qualified_source}, which is no table of the \
+                                 1-1 JOIN"
+                            ),
+                        })?,
+                };
                 for change in changes.iter() {
                     target_plan.push(side, change)?;
                     buffer_transform_apply_metrics(
