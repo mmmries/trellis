@@ -171,6 +171,10 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         Plant::ScExtremesUnderBasis
         | Plant::ScExtremesUncompared
         | Plant::ScExtremeGroupsUncompared => PlantPath::SelfCheckExtremes,
+        Plant::StarFenceFirstOnly
+        | Plant::StarHeldOriginFirstOnly
+        | Plant::StarDefLockFirstOnly
+        | Plant::StarReadsFirstOnly => PlantPath::OneToOneJoin,
     }
 }
 

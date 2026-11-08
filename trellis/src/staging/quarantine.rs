@@ -2616,10 +2616,11 @@ async fn trip_column_fuse(
 
 /// The sources whose version fences a `column_status` pause of `transform`
 /// bumps ([`bump_pause_fence`]), in name order: its definition's, when it is
-/// a 1-1 definition, and both tables of a 1-1 `JOIN`, whose pages of either
-/// side write its fields, since only those plans hold a paused column out of
-/// their writes (`super::apply::compute`, `super::join_one_to_one::plan_for`).
-/// None for an aggregate's column, or a target no definition has.
+/// a 1-1 definition, and every table of a 1-1 `JOIN` (the `FROM` table and
+/// the joined table at each position), whose pages of any of them write its
+/// fields, since only those plans hold a paused column out of their writes
+/// (`super::apply::compute`, `super::join_one_to_one::plan_for`). None for an
+/// aggregate's column, or a target no definition has.
 async fn pause_fence(pool: &Pool, transform: &str) -> Result<Vec<String>, ApplyError> {
     let Some(def) = catalog::definition_by_target(pool, transform).await? else {
         return Ok(Vec::new());
@@ -2629,6 +2630,7 @@ async fn pause_fence(pool: &Pool, transform: &str) -> Result<Vec<String>, ApplyE
         KeySpace::JoinOneToOne(_) => {
             let client = pool.get().await?;
             let joined = catalog::joined_tables_of(&**client, def.id).await?;
+            let joined = star_fence_planted(joined);
             std::iter::once(def.source_table).chain(joined).collect()
         }
         _ => Vec::new(),
@@ -2636,6 +2638,17 @@ async fn pause_fence(pool: &Pool, transform: &str) -> Result<Vec<String>, ApplyE
     sources.sort();
     sources.dedup();
     Ok(sources)
+}
+
+/// `joined`, a definition's joined tables by position, as a fence over them
+/// takes them: all of them, or with the `star_fence_first_only` plant armed,
+/// only the first. See `crate::plant`.
+fn star_fence_planted(joined: Vec<String>) -> Vec<String> {
+    #[cfg(any(test, feature = "test-util"))]
+    if crate::plant::fires(crate::plant::Plant::StarFenceFirstOnly, joined.len() > 1) {
+        return joined.into_iter().take(1).collect();
+    }
+    joined
 }
 
 /// Bumps each of `sources`' version fences (`super::build::bump_version_fence`),
@@ -3975,8 +3988,9 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
 /// fence, and holding the definition row meanwhile could close a cycle
 /// through one queued on a transaction that wants it.
 ///
-/// A `JOIN` reads two tables, and a page of either may judge it, so
-/// its joined table's fence is bumped too, the two in table-name order.
+/// A `JOIN` reads more than one table, and a page of any may judge it, so
+/// the fence of its joined table at every position is bumped too, all in
+/// table-name order.
 async fn lock_frozen(
     txn: &Transaction<'_>,
     column: &str,
@@ -3992,8 +4006,9 @@ async fn lock_frozen(
         .await?
         .map(|row| row.get(0))
         .unwrap_or_default();
+    let bumped = star_fence_planted(fenced_join.clone());
     let mut fenced: Vec<&str> = std::iter::once(fenced_source)
-        .chain(fenced_join.iter().map(String::as_str))
+        .chain(bumped.iter().map(String::as_str))
         .collect();
     fenced.sort_unstable();
     for table in fenced {

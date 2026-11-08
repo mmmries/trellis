@@ -510,6 +510,30 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
          it fired in 9 of 24 cases and was caught in none; \
          `join_one_to_one_interleavings` pins it",
     ),
+    (
+        "star_fence_first_only",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781), and only on a column pause or a resume; \
+         join_star_quarantine's column-pause pin pins it",
+    ),
+    (
+        "star_held_origin_first_only",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781), and needs a held row; join_star_quarantine's \
+         held-origin pin pins it",
+    ),
+    (
+        "star_def_lock_first_only",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781), and fails by deadlock with a rebuild's start; \
+         join_star_quarantine's rebuild-start pin pins it",
+    ),
+    (
+        "star_reads_first_only",
+        "it fires only on a star joining a target at a later position, which this tier \
+         never draws (the star tier is #1781); join_star_quarantine's target-at-a-position \
+         pin pins it",
+    ),
 ];
 
 /// Plants the tier draws the shape of but catches rarely or not at all. Each
