@@ -175,7 +175,8 @@ use crate::pool::quote_ident;
 use super::apply::ApplyError;
 use super::fold::{FoldedChange, earliest_origin};
 use super::group_basis::{
-    self, Arg, ColumnCollations, GroupCollations, GroupShape, GroupTargetPlan, SumPart, Writer,
+    self, Arg, ColumnCollations, GroupCollations, GroupShape, GroupTargetPlan, NO_SCALES, SumPart,
+    Writer,
 };
 use super::target_mutations::TargetMutations;
 
@@ -209,6 +210,14 @@ struct SidePlan {
 }
 
 impl SidePlan {
+    /// Whether no row of this side's deltas holds a map of argument `i`
+    /// (1-based): the page recomputes none of its cells, and every map its
+    /// apply staged is `NULL` ([`GroupTargetPlan::staged_map_free`]), so
+    /// every delta its apply recorded is too.
+    fn delta_map_free(&self, i: usize) -> bool {
+        !self.recompute && !self.plan.sides.is_empty() && self.plan.staged_map_free(i)
+    }
+
     /// Whether this side writes its cells: it has sides to apply or cells
     /// to recompute.
     fn writes(&self) -> bool {
@@ -809,7 +818,14 @@ impl JoinTargetPlan {
                 columns.push(format!("sum(__dc{i})::bigint as __dc{i}"));
                 for part in arg.parts() {
                     let delta = part.name("__d", i);
-                    let total = part.total(&delta, None, arg.scale);
+                    // A map no delta holds is `NULL`, with no array
+                    // aggregate: its state would also make Postgres size the
+                    // hash table for a large state per cell, and spill.
+                    let total = if *part == SumPart::Scales && side.delta_map_free(i) {
+                        NO_SCALES.to_string()
+                    } else {
+                        part.total(&delta, None, arg.scale)
+                    };
                     columns.push(format!("{total} as {delta}"));
                 }
             }
@@ -885,6 +901,23 @@ impl JoinTargetPlan {
             }
         };
         let held = |_: usize, _: SumPart, column: String| column;
+        // A cell's delta of partial `part` of the side's argument `i`
+        // (1-based), through `alias`: a map no delta holds
+        // ([`SidePlan::delta_map_free`]) is `NULL`, so every product and
+        // difference of it folds away when the statement is planned.
+        let from_free: Vec<bool> = (1..=fa).map(|i| self.from.delta_map_free(i)).collect();
+        let joined_free: Vec<bool> = (1..=m_args.len())
+            .map(|j| self.joined.delta_map_free(j))
+            .collect();
+        let delta = |free: &[bool], alias: &str, i: usize, part: SumPart| {
+            if part == SumPart::Scales && free[i - 1] {
+                NO_SCALES.to_string()
+            } else {
+                format!("{alias}.{}", part.name("__d", i))
+            }
+        };
+        let d_delta = |i: usize, part: SumPart| delta(&from_free, "d", i, part);
+        let e_delta = |j: usize, part: SumPart| delta(&joined_free, "e", j, part);
         let zero = |_: usize, part: SumPart| part.zero().to_string();
         let times = |i: usize, part: SumPart, a: &str, n: &str| part.times(a, n, scale_of(i));
         let sub = |i: usize, part: SumPart, a: &str, b: &str| part.sub(a, b, scale_of(i));
@@ -893,7 +926,7 @@ impl JoinTargetPlan {
                 i,
                 part,
                 &held(i, part, format!("p.{}", part.hidden(i))),
-                &format!("coalesce(d.{}, {})", part.name("__d", i), zero(i, part)),
+                &format!("coalesce({}, {})", d_delta(i, part), zero(i, part)),
             )
         };
         // The argument `i` of `T` (1-based) as the `i - fa`-th of `M`.
@@ -910,7 +943,7 @@ impl JoinTargetPlan {
             }
             let part = |i: usize, part: SumPart| {
                 if i <= fa {
-                    times(i, part, &format!("d.{}", part.name("__d", i)), "m.__n")
+                    times(i, part, &d_delta(i, part), "m.__n")
                 } else {
                     times(
                         i,
@@ -939,12 +972,7 @@ impl JoinTargetPlan {
                 if i <= fa {
                     times(i, part, &p_old(i, part), "e.__dn")
                 } else {
-                    times(
-                        i,
-                        part,
-                        &format!("e.{}", part.name("__d", m_index(i))),
-                        &p_old_n,
-                    )
+                    times(i, part, &e_delta(m_index(i), part), &p_old_n)
                 }
             };
             terms.push(format!(
@@ -966,7 +994,7 @@ impl JoinTargetPlan {
                 zero_b(&mut counts);
                 let part = |i: usize, part: SumPart| {
                     if i <= fa {
-                        format!("d.{}", part.name("__d", i))
+                        d_delta(i, part)
                     } else {
                         zero(i, part)
                     }
@@ -1067,37 +1095,84 @@ impl JoinTargetPlan {
                 k_x = key_eq("k", &jc, "x", &jc),
             ));
         }
+        // `T`'s staged rows: the terms summed per `T` group. The maps are
+        // summed apart, over the terms that hold one, and joined back to
+        // their groups: an array aggregate in the one `GROUP BY` would make
+        // Postgres size its hash table for a large state per group, and
+        // spill, even when no term holds a map (the common page).
         let t_cols = quoted(&self.t.shape.group_cols);
         let mut insert_cols = t_cols.clone();
         insert_cols.extend(["__txid", "__lsn", "__n"].map(String::from));
-        let mut sums = vec!["sum(__n)::bigint".to_string()];
+        let mut sums = vec!["sum(__n)::bigint as __n".to_string()];
+        let mut values = vec!["a.__n".to_string()];
         let mut nonzero = vec!["sum(__n) <> 0".to_string()];
+        let mut maps = Vec::new();
+        let mut map_values = Vec::new();
+        let mut holds = Vec::new();
+        let mut flags = Vec::new();
         for (i, arg) in p_args.iter().chain(&m_args).enumerate() {
             let i = i + 1;
             insert_cols.push(format!("__c{i}"));
-            sums.push(format!("sum(__c{i})::bigint"));
+            sums.push(format!("sum(__c{i})::bigint as __c{i}"));
+            values.push(format!("a.__c{i}"));
             nonzero.push(format!("sum(__c{i}) <> 0"));
             for part in arg.parts() {
                 let staged = part.name("__", i);
                 let total = part.total(&staged, None, arg.scale);
-                nonzero.push(part.nonzero(&total));
-                sums.push(total);
-                insert_cols.push(staged);
+                insert_cols.push(staged.clone());
+                if *part == SumPart::Scales {
+                    maps.push(format!("{total} as {staged}"));
+                    values.push(format!("km.{staged}"));
+                    map_values.push(format!("km.{staged} is not null"));
+                    holds.push(format!("{staged} is not null"));
+                    flags.push(format!("coalesce(bool_and(km.{staged} is null), true)"));
+                } else {
+                    nonzero.push(part.nonzero(&total));
+                    sums.push(format!("{total} as {staged}"));
+                    values.push(format!("a.{staged}"));
+                }
             }
         }
         ctes.push(format!("terms as ({})", terms.join(" union all ")));
+        let t_select =
+            |a: &str| -> Vec<String> { t_cols.iter().map(|c| format!("{a}.{c}")).collect() };
+        let (km_cte, km_join, km_kept) = if maps.is_empty() {
+            (String::new(), String::new(), String::new())
+        } else {
+            (
+                format!(
+                    "km as (select {t_cols}, {maps} from terms where {held} group by {t_cols}), ",
+                    t_cols = t_cols.join(", "),
+                    maps = maps.join(", "),
+                    held = holds.join(" or "),
+                ),
+                format!(" left join km on {}", self.t.group_match("a", "km")),
+                format!(" or {}", map_values.join(" or ")),
+            )
+        };
         ctes.push(format!(
-            "staged as ( \
+            "{km_cte}staged as ( \
                  insert into {t_staged} ({insert_cols}) \
-                 select {t_cols}, pg_current_xact_id(), '0/0'::pg_lsn, {sums} from terms \
-                 group by {t_cols} having {nonzero} \
+                 select {a_cols}, pg_current_xact_id(), '0/0'::pg_lsn, {values} from ( \
+                     select {t_cols}, {sums}, ({nonzero}) as __nz from terms group by {t_cols} \
+                 ) a{km_join} \
+                 where a.__nz{km_kept} \
              )",
             t_staged = self.t.staged(),
             insert_cols = insert_cols.join(", "),
+            a_cols = t_select("a").join(", "),
             t_cols = t_cols.join(", "),
+            values = values.join(", "),
             sums = sums.join(", "),
             nonzero = nonzero.join(" or "),
         ));
+        // Whether every map staged into `T` is `NULL`, per `numeric` sum
+        // ([`group_basis::StagedParts`]): then `T`'s apply reads none.
+        let returned = if flags.is_empty() {
+            "null::boolean[]".to_string()
+        } else {
+            format!("(select array[{}]::boolean[] from km)", flags.join(", "))
+        };
         let mj_as: Vec<String> = mj
             .iter()
             .zip(&jc)
@@ -1114,7 +1189,7 @@ impl JoinTargetPlan {
             mj = mj.join(", "),
             j_x = key_eq("j", &jc, "x", &jc),
         ));
-        format!("with {} select 1", ctes.join(", "))
+        format!("with {} select {returned}", ctes.join(", "))
     }
 }
 
@@ -1463,8 +1538,14 @@ async fn write_locked(
     if bulk {
         txn.batch_execute(group_basis::BULK_PLAN_SETTINGS).await?;
     }
-    plan.t.set_staged_parts(None);
-    txn.batch_execute(&product).await?;
+    let flags: Option<Vec<bool>> = txn.query_one(&product, &[]).await?.get(0);
+    // What the product staged into `T` ([`group_basis::StagedParts`]), when
+    // it is all `T`'s staging holds: a truncate's refill stages too, and a
+    // build's write reads its staging its own way.
+    let staged_parts = (plan.truncate.is_none() && !build).then(|| {
+        group_basis::StagedParts::from_flags(plan.t.staged_flags(), flags.unwrap_or_default())
+    });
+    plan.t.set_staged_parts(staged_parts);
     if bulk {
         txn.batch_execute(group_basis::BULK_PLAN_RESET).await?;
     }

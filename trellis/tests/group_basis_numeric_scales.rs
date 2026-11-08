@@ -597,17 +597,29 @@ async fn a_declared_scale_build_then_pages() {
     .await;
 }
 
+/// Each `T` group's map of exceptions of `t`, as `region=map` (or `NULL`).
+async fn t_maps(d: &Driver, t: &str) -> Vec<String> {
+    let query = format!(
+        "select region || '=' || coalesce(__scales_1::text, 'NULL') from {t} order by region"
+    );
+    let rows = d.ctl.query(&query, &[]).await.expect("T's maps");
+    rows.iter().map(|r| r.get(0)).collect()
+}
+
 /// A `JOIN` cell whose map of exceptions counts a value at another scale
 /// (here written by hand, as a change of the column's type could leave one
 /// behind) carries it into `T` times its match count, beside the `NULL` maps
-/// of the cells with none.
+/// of the cells with none, on a page that changes both kinds of `T` group.
+/// The pages after it mix the two again: values finite at the reference
+/// scale (no delta holds a map, and the product stages one only for the
+/// group whose cell has one), then a `NaN` in and out.
 #[tokio::test]
 async fn a_map_of_exceptions_is_multiplied_into_t() {
     let mut d = Driver::start(
         &format!(
             "{DECLARED_JOIN_DDL}; \
-             insert into public.c values (1, 1, 'a'); \
-             insert into public.o values (1, 1, 1.5), (2, 1, 2)"
+             insert into public.c values (1, 1, 'a'), (3, 2, 'b'); \
+             insert into public.o values (1, 1, 1.5), (2, 1, 2), (3, 2, 0.25)"
         ),
         &[("id", int4()), ("k", int4()), ("x", ValueType::Numeric)],
         &[INNER],
@@ -634,17 +646,49 @@ async fn a_map_of_exceptions_is_multiplied_into_t() {
         ))
         .await
         .expect("a map of exceptions");
-    // A second match for key 1: `T` gains `P_old ⊗ ΔM`, read from the cell.
-    step(&mut d, "insert into public.c values (2, 1, 'a')").await;
-    let scales: String = d
-        .ctl
-        .query_one(
-            &format!("select __scales_1::text from {t} where region = 'a'"),
-            &[],
-        )
-        .await
-        .expect("T's map")
-        .get(0);
-    // The build's `NULL`, plus the hand-written cell times its new match.
-    assert_eq!(scales, "{\"5\": 1}");
+    // A second match for keys 1 and 2: `T` gains `P_old ⊗ ΔM`, read from
+    // each cell: `{"5": 1}` for `a` (the build's `NULL` plus the cell's map
+    // times its new match), still `NULL` for `b`.
+    step(
+        &mut d,
+        "insert into public.c values (2, 1, 'a'), (4, 2, 'b')",
+    )
+    .await;
+    assert_eq!(t_maps(&d, &t).await, ["a={\"5\": 1}", "b=NULL"]);
+    // `b`'s sums stay Postgres's: the map only `a` holds never reaches it.
+    let b_rows = format!("select * from ({INNER_ROWS}) r where region = 'b'");
+    let b_expected = format!("select * from ({INNER_EXPECTED}) e where region = 'b'");
+    assert_eq!(
+        difference(&d, &b_rows, &b_expected).await,
+        Vec::<String>::new()
+    );
+    // Values finite at the reference scale on both keys: no delta holds a
+    // map, and `a` keeps the one its cell carried in.
+    step(
+        &mut d,
+        "insert into public.o values (4, 2, 3.5), (5, 1, 4.25)",
+    )
+    .await;
+    assert_eq!(t_maps(&d, &t).await, ["a={\"5\": 1}", "b=NULL"]);
+    assert_eq!(
+        difference(&d, &b_rows, &b_expected).await,
+        Vec::<String>::new()
+    );
+    // A `NaN` on key 2, matched twice, beside a finite value on key 1.
+    step(
+        &mut d,
+        "insert into public.o values (6, 2, 'NaN'), (7, 1, 0.5)",
+    )
+    .await;
+    assert_eq!(t_maps(&d, &t).await, ["a={\"5\": 1}", "b={\"NaN\": 2}"]);
+    assert_eq!(
+        difference(&d, &b_rows, &b_expected).await,
+        Vec::<String>::new()
+    );
+    step(&mut d, "delete from public.o where id = 6").await;
+    assert_eq!(t_maps(&d, &t).await, ["a={\"5\": 1}", "b=NULL"]);
+    assert_eq!(
+        difference(&d, &b_rows, &b_expected).await,
+        Vec::<String>::new()
+    );
 }

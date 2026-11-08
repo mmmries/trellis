@@ -116,14 +116,25 @@ async fn numeric_tables(
         else {
             return Ok(Vec::new());
         };
-        let sides = super::catalog::JoinSides::read(txn, definition.source_table.clone(), vec![joined])
-            .await
-            .map_err(failed)?;
+        let sides =
+            super::catalog::JoinSides::read(txn, definition.source_table.clone(), vec![joined])
+                .await
+                .map_err(failed)?;
         let numeric = |side| {
-            super::join::numeric_arguments(def, side, &sides.from_columns, &sides.first_joined().columns)
+            super::join::numeric_arguments(
+                def,
+                side,
+                &sides.from_columns,
+                &sides.first_joined().columns,
+            )
         };
         let reference = |side| {
-            super::join::reference_scales(def, side, &sides.from_columns, &sides.first_joined().columns)
+            super::join::reference_scales(
+                def,
+                side,
+                &sides.from_columns,
+                &sides.first_joined().columns,
+            )
         };
         let (from_scales, joined_scales) = (
             reference(super::join::Side::From),

@@ -1683,9 +1683,22 @@ pub(super) struct StagedParts {
     free: std::collections::HashSet<usize>,
 }
 
-/// A plan's [`StagedParts`], `None` until a [`stage_sides`] reads them:
-/// a staging table filled any other way (a `JOIN`'s product into `T`) is
-/// summed in full.
+impl StagedParts {
+    /// The parts of `flags`, one per argument of `args` (1-based), each
+    /// whether every staged map of that argument is `NULL`.
+    pub(super) fn from_flags(args: Vec<usize>, flags: Vec<bool>) -> Self {
+        let free = args
+            .into_iter()
+            .zip(flags)
+            .filter_map(|(i, free)| free.then_some(i))
+            .collect();
+        Self { free }
+    }
+}
+
+/// A plan's [`StagedParts`], `None` until its writer reads them: a
+/// [`stage_sides`], or a `JOIN`'s product into `T`. `None` sums the staged
+/// maps in full.
 #[derive(Debug, Default)]
 struct StagedSummary(std::sync::Mutex<Option<StagedParts>>);
 
@@ -2426,7 +2439,7 @@ impl GroupTargetPlan {
 
     /// The (1-based) arguments [`Self::stage_sql`]'s flags are of
     /// ([`StagedParts`]), in its order: each `numeric` sum.
-    fn staged_flags(&self) -> Vec<usize> {
+    pub(super) fn staged_flags(&self) -> Vec<usize> {
         (1..=self.shape.args.len())
             .filter(|&i| self.shape.args[i - 1].parts() == NUMERIC_PARTS)
             .collect()
@@ -2655,6 +2668,12 @@ impl GroupTargetPlan {
     /// ([`StagedParts::free`]): its apply reads, sums and writes no map.
     fn map_free(&self, staged_parts: &Option<StagedParts>, i: usize) -> bool {
         staged_parts.as_ref().is_some_and(|p| p.free.contains(&i))
+    }
+
+    /// Whether every map its staging table holds of argument `i` (1-based)
+    /// is `NULL`, as its writer last found it ([`StagedParts::free`]).
+    pub(super) fn staged_map_free(&self, i: usize) -> bool {
+        self.map_free(&self.staged_parts.get(), i)
     }
 
     fn apply_sql_with(&self, tail: &str) -> String {
@@ -4321,13 +4340,8 @@ pub(super) async fn stage_sides(
     let row = txn.query_one(&plan.stage_sql(), &[&plan.sides]).await?;
     let bad: i64 = row.get(0);
     let flags: Vec<bool> = row.get::<_, Option<Vec<bool>>>(1).unwrap_or_default();
-    let mut parts = StagedParts::default();
-    for (i, free) in plan.staged_flags().into_iter().zip(flags) {
-        if free {
-            parts.free.insert(i);
-        }
-    }
-    plan.staged_parts.set(Some(parts));
+    plan.staged_parts
+        .set(Some(StagedParts::from_flags(plan.staged_flags(), flags)));
     if bad > 0 {
         return Err(plan.unsupported(
             "a ring row without the images its change needs (an image-less delete or \
@@ -6352,6 +6366,49 @@ mod tests {
                 Err(e) => assert!(general.is_some() && is_off_scale(&e), "{set:?}: {e}"),
             }
         }
+        // A `JOIN` product's fast paths: a delta map no delta holds is the
+        // literal `NULL`, which multiplies to `NULL` and subtracts to the
+        // map it is taken from, as a `NULL` column does.
+        for a in sets {
+            let ma = format!("({})", of(a, Some(2)));
+            for n in ["0", "1", "2", "-1"] {
+                assert_eq!(text(part.times(NO_SCALES, n, Some(2))).await, None);
+            }
+            let nothing = format!("coalesce({NO_SCALES}, {NO_SCALES})");
+            assert_eq!(
+                text(part.sub(&ma, &nothing, Some(2))).await,
+                text(ma.clone()).await,
+                "{a:?} - NULL"
+            );
+        }
+        // `T`'s maps summed apart, over only the terms that hold one, and
+        // joined back to their groups, are the totals over every term; a
+        // fast path that judged a group by its first term alone is caught.
+        let terms = "(values (1, null::jsonb), (1, '{\"3\": 1}'), (2, null), (2, null), \
+                     (3, '{\"NaN\": 1}'), (3, '{\"NaN\": -1}'), (4, '{\"5\": 2}'), (4, null), \
+                     (5, '{\"3\": 1}'), (5, '{\"3\": 2}')) as v(g, m)";
+        let listed =
+            |select: String| format!("select array_agg(r order by g)::text from ({select}) r");
+        let general = text(listed(format!(
+            "select g, {} as m from {terms} group by g",
+            part.total("m", None, Some(2))
+        )))
+        .await;
+        let split = text(listed(format!(
+            "select a.g, km.m from (select g from {terms} group by g) a \
+             left join (select g, {} as m from {terms} where m is not null group by g) km \
+             on array[a.g] = array[km.g]",
+            part.total("m", None, Some(2))
+        )))
+        .await;
+        assert_eq!(split, general);
+        let first_term = text(listed(format!(
+            "select g, case when (array_agg(m))[1] is null then {NO_SCALES} else {} end as m \
+             from {terms} group by g",
+            part.total("m", None, Some(2))
+        )))
+        .await;
+        assert_ne!(first_term, general, "a first-term fast path goes unnoticed");
         // Define reads the scale a column declares, and the hidden table
         // records it for every plan to read back.
         client
