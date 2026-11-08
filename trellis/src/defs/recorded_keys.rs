@@ -1215,10 +1215,13 @@ async fn declare_released_keys(
             }
         }
     }
+    // The rendered text is in the current grammar, so its version is
+    // stamped with it (ADR-0018).
     let text = super::ast::render_definition_text(def);
     txn.execute(
-        "update transform_definitions set definition_text = $2 where id = $1",
-        &[&id, &text],
+        "update transform_definitions set definition_text = $2, grammar_version = $3 \
+         where id = $1",
+        &[&id, &text, &super::grammar::stamp(&text)],
     )
     .await?;
     crate::instance_log::info!(

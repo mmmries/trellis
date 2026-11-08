@@ -470,11 +470,17 @@ fn a_column_name_or_unreserved_keyword_is_still_a_column() {
     }
 }
 
-/// A reserved word's refusal names the qualified-name remedy.
+/// A reserved word's refusal names the quoted and qualified remedies, and
+/// the quoted spelling reads the column.
 #[test]
 fn a_reserved_word_refusal_names_the_remedy() {
     let err = parse_text("order").unwrap_err();
-    assert!(err.to_string().contains("rename the column"), "{err}");
+    assert!(
+        err.to_string().contains("write it quoted (\"order\")"),
+        "{err}"
+    );
+    let def = parse_text("\"order\"").unwrap();
+    assert_eq!(def.fields[0].expr, Expr::Column("order".to_string()));
 }
 
 #[test]

@@ -252,7 +252,7 @@ async fn a_dropped_column_of_a_field_over_both_tables_pauses_naming_it() {
             ("x", ValueType::Integer(IntWidth::Int4)),
         ],
         &[
-            "TRANSFORM both FROM public.a LEFT JOIN public.b ON a.k = b.k GROUP BY a.g \
+            "TRANSFORM \"both\" FROM public.a LEFT JOIN public.b ON a.k = b.k GROUP BY a.g \
            WITHOUT SOURCE INDEX SELECT a.g AS g, SUM(a.x) + SUM(b.y) AS s",
         ],
         &["public.a", "public.b"],
@@ -294,7 +294,7 @@ async fn a_widened_column_of_a_field_over_both_tables_is_reported_against_its_ta
                 ("x", ValueType::Integer(IntWidth::Int4)),
             ],
             &[
-                "TRANSFORM both FROM public.a LEFT JOIN public.b ON a.k = b.k GROUP BY a.g \
+                "TRANSFORM \"both\" FROM public.a LEFT JOIN public.b ON a.k = b.k GROUP BY a.g \
                WITHOUT SOURCE INDEX SELECT a.g AS g, SUM(a.x) + SUM(b.y) AS s",
             ],
             &["public.a", "public.b"],

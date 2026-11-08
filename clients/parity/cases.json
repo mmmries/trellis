@@ -429,6 +429,19 @@
     },
     {"op": "status", "args": ["parity_scratch"], "expect": null},
 
+    {
+      "about": "Identifiers as Postgres reads them: a quoted name is exact and never a keyword, so a mixed-case target and a reserved word as a label are spelled quoted.",
+      "op": "define",
+      "args": ["TRANSFORM \"ParityQuoted\" FROM parity_items SELECT price AS \"Price\", price AS \"order\""],
+      "expect": {"eq": "public.ParityQuoted"}
+    },
+    {"about": "An unquoted name folds to lower case: the address finds no parity_quoted, and is refused naming the quoted spelling rather than dropping nothing.", "op": "apply", "args": ["DROP TRANSFORM ParityQuoted"], "expect": {"error": "not_found"}},
+    {"op": "apply", "args": ["PAUSE TRANSFORM \"ParityQuoted\""], "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}}}},
+    {"op": "apply", "args": ["DROP TRANSFORM \"ParityQuoted\""], "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}}}},
+    {"op": "status", "args": ["ParityQuoted"], "expect": null},
+    {"about": "A table name Postgres reserves is written quoted; unquoted it is refused.", "op": "apply", "args": ["TRANSFORM parity_reserved FROM order SELECT price AS price"], "expect": {"error": "parse"}},
+    {"about": "A zero-length quoted name is refused, as Postgres refuses it.", "op": "apply", "args": ["TRANSFORM parity_empty FROM parity_items SELECT \"\" AS price"], "expect": {"error": "parse"}},
+
     {"about": "A self_check returns its job at once; a drain worker runs it, and the report is read back by the job's id once the state is done.", "op": "self_check", "args": ["parity_prices"], "opts": {"timeout_ms": 30000, "mode": {"$word": "strict"}}, "save": "check_1", "expect": {"record": "SelfCheckJob", "fields": {"id": "integer", "target": {"eq": "parity_prices"}, "mode": {"word": "strict"}}}},
     {"op": "self_check_job", "args": [{"$ref": "check_1.id"}], "until": {"record": "SelfCheckJob", "fields": {"id": {"ref": "check_1.id"}, "state": {"word": "done"}, "rows_compared": {"eq": 5}, "error": null, "report": {"record": "SelfCheckReport", "fields": {"target": {"eq": "parity_prices"}, "outcome": {"word": "converged"}, "status": null, "divergences": {"list": []}, "rows_compared": {"eq": 5}, "truncated": {"eq": false}, "drain_failures": {"list": []}}}}}, "waiting_for": "the self_check job to finish"},
     {"about": "A target row edited behind Trellis's back is a cell divergence, its values as Postgres renders them.", "op": "sql", "args": ["update parity_prices set price = 999 where id = 1"]},

@@ -28,29 +28,39 @@ fn cols(names: &[&str]) -> HashMap<String, ValueType> {
         .collect()
 }
 
+/// Define stamps the oldest grammar version that reads the text as the
+/// current one does (ADR-0018): grammar 1 for text with no quoted name and
+/// no upper-case letter in a name, the current one otherwise.
 #[tokio::test]
-async fn definitions_are_stamped_with_the_current_grammar() {
+async fn definitions_are_stamped_with_the_oldest_grammar_that_reads_them_the_same() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
-    raw.batch_execute("create table s (id bigint primary key, a numeric)")
+    raw.batch_execute("create table s (id bigint primary key, a numeric, \"B\" numeric)")
         .await
         .unwrap();
-    install_definition(
-        &db.pool,
-        "TRANSFORM t FROM s SELECT a + a AS x",
-        &cols(&["a"]),
-        "public",
-    )
-    .await
-    .expect("define");
-
-    let v: i32 = raw
-        .query_one("select grammar_version from transform_definitions", &[])
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(v, CURRENT_GRAMMAR_VERSION);
+    for (text, target, stamped) in [
+        ("TRANSFORM t FROM s SELECT a + a AS x", "public.t", 1),
+        (
+            "TRANSFORM \"T2\" FROM s SELECT \"B\" AS x",
+            "public.T2",
+            CURRENT_GRAMMAR_VERSION,
+        ),
+        ("TRANSFORM T3 FROM S SELECT A AS X", "public.t3", 2),
+    ] {
+        install_definition(&db.pool, text, &cols(&["a", "B"]), "public")
+            .await
+            .unwrap_or_else(|e| panic!("define {text}: {e}"));
+        let v: i32 = raw
+            .query_one(
+                "select grammar_version from transform_definitions where target_table = $1",
+                &[&target],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(v, stamped, "{text}");
+    }
 }
 
 /// A definition written under a newer grammar is one this binary can't run

@@ -739,7 +739,7 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
         KeySpace::OneToOne => {}
         KeySpace::Aggregate { group_by } => {
             out.push_str(" GROUP BY ");
-            out.push_str(&group_by.join(", "));
+            out.push_str(&quote_names(group_by));
         }
         KeySpace::Join(join) | KeySpace::JoinOneToOne(join) => {
             let qualified = |column: &QualifiedColumn| {
@@ -776,7 +776,13 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
     let fields: Vec<String> = def
         .fields
         .iter()
-        .map(|field| format!("{} AS {}", render_expr(&field.expr, &aliases), field.name))
+        .map(|field| {
+            format!(
+                "{} AS {}",
+                render_expr(&field.expr, &aliases),
+                quote_name(&field.name)
+            )
+        })
         .collect();
     out.push_str(&fields.join(", "));
 
@@ -789,19 +795,60 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
     out
 }
 
+/// `name` as definition text: bare when the grammar reads the bare word as
+/// this name, else quoted, with each `"` doubled (ADR-0022). Bare only for
+/// `[a-z_][a-z0-9_]*` that is no word Postgres reserves and none this grammar
+/// refuses as a column (`now`); everything else is quoted, so the rendered
+/// text parses back to the same name in every position.
+pub(crate) fn quote_name(name: &str) -> std::borrow::Cow<'_, str> {
+    let mut chars = name.chars();
+    let plain = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    let upper = name.to_ascii_uppercase();
+    if plain
+        && !super::registry::is_reserved_word(name)
+        && !super::registry::NON_IMMUTABLE_NAMES.contains(&upper.as_str())
+    {
+        std::borrow::Cow::Borrowed(name)
+    } else {
+        std::borrow::Cow::Owned(format!("\"{}\"", name.replace('"', "\"\"")))
+    }
+}
+
+/// `names`, each [`quote_name`]d, joined by `, `.
+fn quote_names(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| quote_name(name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `<schema>.<table>.<column>` (or `<table>.<column>`) as definition text,
+/// each part [`quote_name`]d.
+fn render_qualified_column(schema: Option<&str>, table: &str, column: &str) -> String {
+    let (table, column) = (quote_name(table), quote_name(column));
+    match schema {
+        Some(schema) => format!("{}.{table}.{column}", quote_name(schema)),
+        None => format!("{table}.{column}"),
+    }
+}
+
 fn render_table_ref(out: &mut String, table: &str, explicit_schema: Option<&str>) {
     if let Some(schema) = explicit_schema {
-        out.push_str(schema);
+        out.push_str(&quote_name(schema));
         out.push('.');
     }
-    out.push_str(table);
+    out.push_str(&quote_name(table));
 }
 
 /// ` KEY (<column>, ...)`, a table's declared key, or nothing.
 fn render_key(out: &mut String, key: Option<&[String]>) {
     if let Some(key) = key {
         out.push_str(" KEY (");
-        out.push_str(&key.join(", "));
+        out.push_str(&quote_names(key));
         out.push(')');
     }
 }
@@ -810,7 +857,7 @@ fn render_key(out: &mut String, key: Option<&[String]>) {
 fn render_alias(out: &mut String, alias: Option<&str>) {
     if let Some(alias) = alias {
         out.push_str(" AS ");
-        out.push_str(alias);
+        out.push_str(&quote_name(alias));
     }
 }
 
@@ -838,8 +885,10 @@ impl<'a> Aliases<'a> {
     /// qualifier as [`qualified_column_text`] writes it.
     fn qualified(&self, schema: Option<&str>, table: &str, column: &str) -> String {
         match self.0.iter().find(|(aliased, _)| *aliased == table) {
-            Some((_, alias)) if schema.is_none() => format!("{alias}.{column}"),
-            _ => qualified_column_text(schema, table, column),
+            Some((_, alias)) if schema.is_none() => {
+                format!("{}.{}", quote_name(alias), quote_name(column))
+            }
+            _ => render_qualified_column(schema, table, column),
         }
     }
 }
@@ -853,7 +902,7 @@ pub(crate) fn render_field_expr(expr: &Expr) -> String {
 fn render_expr(expr: &Expr, aliases: &Aliases<'_>) -> String {
     let render_field_expr = |expr: &Expr| render_expr(expr, aliases);
     match expr {
-        Expr::Column(name) => name.clone(),
+        Expr::Column(name) => quote_name(name).into_owned(),
         Expr::NumberLiteral(text) => text.clone(),
         Expr::StringLiteral(text) => format!("'{}'", text.replace('\'', "''")),
         Expr::BooleanLiteral(true) => "TRUE".to_string(),

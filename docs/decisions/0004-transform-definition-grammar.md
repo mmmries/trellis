@@ -89,13 +89,15 @@ operators only after a complete operand, `END` only closes a `CASE`, and
 `EXTRACT` is a keyword only before a `(`; elsewhere that word is a
 column name. `NOT` and `CASE` are keywords wherever an operand follows them (a
 name other than `AS`, `IS`, `AND`, `OR`, `WHEN`, `THEN`, `ELSE` or `END`, a
-number, a string, a `(` or a `-`), so `NOT -x > 0` is `NOT ((-x) > 0)`. A bare
+number, a string, a `(` or a `-`), so `NOT -x > 0` is `NOT ((-x) > 0)`. Names
+follow Postgres: an unquoted name folds to lower case, a quoted name
+(`"OrderTotals"`, `"a""b"`) is exact, and a name over 63 bytes is refused
+([ADR-0022](0022-grammar-mirrors-postgres.md)). A bare
 identifier is never a word Postgres reserves (`not`, `case`, `end`, `order`,
-`user`...): the grammar has no quoted identifiers, so such a source
-column is read qualified with its table (`orders.order`), as Postgres allows,
-and the refusal says so ([ADR-0022](0022-grammar-mirrors-postgres.md)).
-`orders.order AS order` passes that column through, as `order AS order`
-would. `AT TIME ZONE`
+`user`...): such a column is written quoted (`"order"`) or qualified with its
+table (`orders.order`), as Postgres allows, and the refusal says so. A quoted
+name is never a keyword. `"order" AS "order"` passes that column through, and
+so does `orders.order AS order`. `AT TIME ZONE`
 binds tighter than `*` and looser than prefix `-`. Values
 carry a Postgres type (the ones [type support](../type-support.md) lists), and
 every operator/function's argument and return types are type-checked at

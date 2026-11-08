@@ -346,14 +346,14 @@ async fn pause_write_resume(
 ) {
     for t in transforms {
         operator
-            .apply(&format!("PAUSE TRANSFORM {t}"))
+            .apply(&format!("PAUSE TRANSFORM \"{t}\""))
             .await
             .expect("pause");
     }
     client.batch_execute(gap).await.expect("write while paused");
     for t in transforms {
         operator
-            .apply(&format!("RESUME TRANSFORM {t}"))
+            .apply(&format!("RESUME TRANSFORM \"{t}\""))
             .await
             .expect("resume");
     }
@@ -612,8 +612,8 @@ async fn resume_leaves_a_live_sibling_on_the_same_source_alone() {
     operator.shutdown().await.expect("shut down");
 }
 
-/// Mixed-case target names (the lexer keeps an identifier's case, and the
-/// target is created quoted). The sweep must find their keys, not
+/// Mixed-case target names (written quoted, and the target is created
+/// quoted). The sweep must find their keys, not
 /// case-fold the name and skip the target as if it were gone.
 #[tokio::test]
 async fn resume_drops_orphans_from_mixed_case_targets() {
@@ -625,8 +625,8 @@ async fn resume_drops_orphans_from_mixed_case_targets() {
     apply_all(
         &operator,
         &[
-            "TRANSFORM OrderDoubles FROM orders SELECT a + a AS x",
-            "TRANSFORM OrderRollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
+            "TRANSFORM \"OrderDoubles\" FROM orders SELECT a + a AS x",
+            "TRANSFORM \"OrderRollup\" FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
         ],
     )
     .await;

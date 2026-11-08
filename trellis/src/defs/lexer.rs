@@ -7,7 +7,12 @@ use super::error::ParseError;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
+    /// An unquoted identifier or keyword. Under [`Identifiers::Folded`] it
+    /// is folded to lower case, as Postgres folds it.
     Ident(String),
+    /// A double-quoted identifier's name, exactly as written (`""` resolved
+    /// to `"`). Never a keyword or a reserved word (ADR-0022).
+    QuotedIdent(String),
     Number(String),
     /// A single-quoted string literal's decoded contents (quotes stripped,
     /// `''` escapes resolved to a literal `'`), per SQL's spelling.
@@ -25,6 +30,7 @@ impl Token {
     pub fn describe(&self) -> String {
         match self {
             Token::Ident(s) => format!("identifier '{s}'"),
+            Token::QuotedIdent(s) => format!("quoted identifier \"{}\"", s.replace('"', "\"\"")),
             Token::Number(s) => format!("number '{s}'"),
             Token::String(s) => format!("string '{s}'"),
             Token::Symbol(c) => format!("'{c}'"),
@@ -32,6 +38,86 @@ impl Token {
             Token::Eof => "end of input".to_string(),
         }
     }
+}
+
+/// How a grammar version reads identifiers (ADR-0018, ADR-0022).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Identifiers {
+    /// Grammar 1: an unquoted identifier keeps its case, as if every name
+    /// were quoted, and there are no quoted identifiers. Only stored text
+    /// written under grammar 1 is read this way.
+    Exact,
+    /// Grammar 2 and later, as Postgres reads them: an unquoted identifier
+    /// folds to lower case, a quoted one is exact, and a name over
+    /// [`MAX_NAME_BYTES`] is refused.
+    Folded,
+}
+
+/// The longest name Postgres keeps, in bytes (`NAMEDATALEN - 1`). Postgres
+/// truncates a longer one; Trellis refuses it, so two long names that share
+/// a prefix never become one.
+pub const MAX_NAME_BYTES: usize = 63;
+
+/// Refuses `name` if it is longer than [`MAX_NAME_BYTES`].
+fn check_name_length(name: &str) -> Result<(), ParseError> {
+    if name.len() <= MAX_NAME_BYTES {
+        return Ok(());
+    }
+    let mut end = MAX_NAME_BYTES;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    Err(ParseError::NameTooLong {
+        name: name.to_string(),
+        truncated: name[..end].to_string(),
+    })
+}
+
+/// The double-quoted identifier opening at `chars[start]` (a `"`): its name
+/// and the index just past its closing quote. `""` inside it is a `"`, as
+/// in Postgres. A zero-length name is refused as Postgres refuses it, and
+/// so are a `.` (Trellis addresses a table by its `<schema>.<table>` text,
+/// which such a name would make ambiguous) and a non-ASCII character, which
+/// no unquoted name can hold either.
+fn scan_quoted_ident(chars: &[char], start: usize) -> Result<(String, usize), ParseError> {
+    let mut name = String::new();
+    let mut i = start + 1;
+    loop {
+        match chars.get(i) {
+            Some('"') if chars.get(i + 1) == Some(&'"') => {
+                name.push('"');
+                i += 2;
+            }
+            Some('"') => {
+                i += 1;
+                break;
+            }
+            Some(ch) => {
+                name.push(*ch);
+                i += 1;
+            }
+            None => return Err(ParseError::UnterminatedQuotedIdentifier),
+        }
+    }
+    if name.is_empty() {
+        return Err(ParseError::ZeroLengthQuotedIdentifier);
+    }
+    let refuse = |detail: &str| {
+        Err(ParseError::UnsupportedQuotedIdentifier {
+            name: name.clone(),
+            detail: detail.to_string(),
+        })
+    };
+    if name.contains('.') {
+        return refuse(
+            "a name holding a '.' is not supported, since Trellis addresses a table as \
+             '<schema>.<table>'; rename it",
+        );
+    }
+    if !name.is_ascii() || name.contains('\0') {
+        return refuse("a name may hold only ASCII characters other than NUL");
+    }
+    Ok((name, i))
 }
 
 const SYMBOLS: &[char] = &[
@@ -160,7 +246,9 @@ fn scan_number(chars: &[char], start: usize) -> (usize, NumberShape) {
     )
 }
 
-pub fn lex(input: &str) -> Result<Vec<Token>, ParseError> {
+/// Lexes `input`, reading identifiers as `identifiers` says.
+pub(crate) fn lex_in(input: &str, identifiers: Identifiers) -> Result<Vec<Token>, ParseError> {
+    let folded = identifiers == Identifiers::Folded;
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
@@ -178,7 +266,27 @@ pub fn lex(input: &str) -> Result<Vec<Token>, ParseError> {
             while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
-            tokens.push(Token::Ident(chars[start..i].iter().collect()));
+            let mut name: String = chars[start..i].iter().collect();
+            if folded {
+                // Postgres's Unicode-escape spelling, `U&"d\0061t\+000061"`.
+                if name.eq_ignore_ascii_case("u")
+                    && chars.get(i) == Some(&'&')
+                    && chars.get(i + 1) == Some(&'"')
+                {
+                    return Err(ParseError::UnicodeEscapeIdentifier);
+                }
+                name.make_ascii_lowercase();
+                check_name_length(&name)?;
+            }
+            tokens.push(Token::Ident(name));
+            continue;
+        }
+
+        if c == '"' && folded {
+            let (name, end) = scan_quoted_ident(&chars, i)?;
+            check_name_length(&name)?;
+            tokens.push(Token::QuotedIdent(name));
+            i = end;
             continue;
         }
 

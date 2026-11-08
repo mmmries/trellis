@@ -303,9 +303,23 @@ For each release, the notes carry:
   release accepted and this one refuses pauses on upgrade, with its reason in
   `capture_failure`; the notes list each case, with the remedy (`DROP
   TRANSFORM`, then define it again in the current grammar). For `0.2.0`: a bare
-  reserved word as a column name (`SELECT order AS o`; write `table.order`),
-  and an expression nested over 100 levels (split it into calculated fields).
-  Add every case from the manual refusal check.
+  reserved word as a column name (`SELECT order AS o`; write `"order"` or
+  `table.order`), and an expression nested over 100 levels (split it into
+  calculated fields). Add every case from the manual refusal check.
+- **What new text means differently.** A grammar version bump keeps every
+  stored definition's meaning, but the same text written after the upgrade
+  reads the new way. For `0.2.0` (grammar 2,
+  [ADR-0018](decisions/0018-grammar-versioning.md)): an unquoted name folds to
+  lower case and a quoted name is exact, as in Postgres, so `SUM(Total)` reads
+  `total`, and a column, table or target created with upper-case letters is
+  written quoted (`SUM("Total")`). Scripts and migrations addressing a target
+  `0.1.x` created with a mixed-case name must quote it: `PAUSE TRANSFORM
+  "OrderTotals"`, `DROP TRANSFORM "OrderTotals"`. The unquoted spelling is
+  refused naming the quoted one, so it never acts on another target. Stored
+  `0.1.x` definitions keep reading their names as written, and `ALTER
+  TRANSFORM` stores them quoted. Names over 63 bytes, unquoted reserved table
+  names (`FROM user`) and the quoted forms the transforms table lists are
+  refused in new text.
 - **The upgrade procedure,** from [upgrading](upgrading.md#upgrading), and
   whether the release adds a migration (`0.2.0` adds V9 to V17, and `0.1.0`'s
   `migrate` refuses a database `0.2.0` has migrated).
