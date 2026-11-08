@@ -1308,9 +1308,42 @@ fn a_constant_divisor_that_is_zero_in_the_resolved_float_type_is_refused() {
         "1 / (ABS(CASE WHEN FALSE THEN f8 ELSE -9223372036854775809 END) - 9223372036854775808)",
         "1 / (-CASE WHEN FALSE THEN f8 ELSE 9223372036854775809 END - -9223372036854775808)",
         "CASE WHEN FALSE THEN f8 ELSE -9223372036854775809 END AS g, 1 / (g - -9223372036854775808)",
+        // A `NULL` cast to a float types the whole as well.
+        "1 / (CASE WHEN FALSE THEN CAST(NULL AS double precision) ELSE 9007199254740993 END \
+         - 9007199254740992)",
+        "1 / (COALESCE(NULL, 16777217, CAST(NULL AS real)) - 16777216)",
     ] {
         assert_refused(text, "divides by the constant zero");
     }
+    // So does an aggregate over a float: `SUM`, `MIN` and `MAX` of a `real`
+    // are `real`, `AVG` is `double precision`.
+    for text in [
+        "SUM(f8) / (CASE WHEN FALSE THEN SUM(f4) ELSE 16777217 END - 16777216)",
+        "SUM(f8) / (CASE WHEN FALSE THEN MIN(f4) ELSE 16777217 END - 16777216)",
+        "SUM(f8) / (COALESCE(NULL, 16777217, MAX(f4)) - 16777216)",
+        "SUM(f8) / (CASE WHEN FALSE THEN AVG(f4) ELSE 9007199254740993 END - 9007199254740992)",
+        "SUM(f8) / (CASE WHEN FALSE THEN -SUM(f4) + 1 ELSE 9007199254740993 END \
+         - 9007199254740992)",
+    ] {
+        let def = parse(&format!(
+            "TRANSFORM t FROM s GROUP BY i4 SELECT {text} AS x"
+        ))
+        .unwrap_or_else(|e| panic!("`{text}` should parse: {e}"));
+        assert!(
+            matches!(
+                validate(&def, &columns()),
+                Err(ValidationError::ConstantDivisorZero { .. })
+            ),
+            "`{text}` should be refused"
+        );
+    }
+    // `AVG` of an exact value is `numeric`, so its `CASE` stays exact.
+    let def = parse(
+        "TRANSFORM t FROM s GROUP BY i4 SELECT SUM(f8) / (CASE WHEN FALSE THEN AVG(i4) \
+         ELSE 9007199254740993 END - 9007199254740992) AS x",
+    )
+    .expect("parses");
+    validate(&def, &columns()).expect("an exact `CASE` divides by one");
     // `%` has no float operand, so the float divisor is refused for that.
     assert_refused(
         "5 % (CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE 2 END)",
@@ -1340,6 +1373,11 @@ fn a_constant_divisor_that_is_zero_in_the_resolved_float_type_is_refused() {
             "1 / (CASE WHEN FALSE THEN 0 ELSE -9223372036854775809 END - -9223372036854775808)",
             N,
         ),
+        (
+            "1 / (CASE WHEN FALSE THEN 1.5 ELSE 9007199254740993 END - 9007199254740992)",
+            N,
+        ),
+        ("1 / (COALESCE(NULL, 16777217, n) - 16777216)", N),
     ] {
         assert_type(text, expected);
     }

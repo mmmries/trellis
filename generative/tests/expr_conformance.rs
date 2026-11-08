@@ -743,6 +743,9 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "1 / (CASE WHEN FALSE THEN f4a ELSE 16777217 END - 16777216)",
         "1 / ABS(CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE 9007199254740993 END \
          - 9007199254740992)",
+        "1 / (CASE WHEN FALSE THEN CAST(NULL AS double precision) ELSE 9007199254740993 END \
+         - 9007199254740992)",
+        "1 / (COALESCE(NULL, 16777217, CAST(NULL AS real)) - 16777216)",
         // The same values stay exact where nothing resolves the `CASE` to a
         // float, so `%` (which has no float operand) still divides by zero.
         "5 % (CASE WHEN FALSE THEN 0 ELSE 9007199254740993 END - 9007199254740993)",
@@ -815,6 +818,8 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
          <> 9007199254740992 THEN 2147483647 + 1 ELSE 1 END",
         "CASE WHEN COALESCE(NULL, 9007199254740993, DOUBLE PRECISION '0') \
          = 9007199254740992 THEN 1 ELSE 2147483647 + 1 END",
+        "CASE WHEN COALESCE(16777217, CAST(NULL AS real)) <> 16777216 \
+         THEN 2147483647 + 1 ELSE 1 END",
         // A float divisor that really is nonzero.
         "1 / (COALESCE(DOUBLE PRECISION '0', -9223372036854775809) \
          - NULLIF(-9223372036854775808, 2147483648))",
@@ -824,6 +829,9 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "1 / (CASE WHEN i4a > 0 THEN f8a ELSE -9223372036854775809 END \
          - -9223372036854775808)",
         "1 / (CASE WHEN FALSE THEN 0 ELSE -9223372036854775809 END - -9223372036854775808)",
+        // A `numeric` result keeps the `CASE` exact.
+        "1 / (CASE WHEN FALSE THEN 1.5 ELSE 9007199254740993 END - 9007199254740992)",
+        "1 / (COALESCE(NULL, 16777217, na) - 16777216)",
         // A runtime divisor is left to the rows.
         "CASE WHEN i4a > 0 THEN na / i4a END",
         "i4a <> 0 AND na / i4a > 1",

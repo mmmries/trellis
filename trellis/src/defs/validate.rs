@@ -4313,10 +4313,11 @@ fn in_resolved_float_type(
 /// The float type `expr` certainly has, as [`infer_expr`] would type it, or
 /// `None` when it is not a float (or this walk cannot tell, which leaves a
 /// constant as the exact value it was before). It reads the types of
-/// literals, columns and calculated fields, and applies the rules for
-/// arithmetic (a float beside an exact operand is `double precision`), for
-/// `CASE` and `COALESCE` (a float result wins and the exact ones follow it),
-/// for `NULLIF` (its first argument) and for the numeric functions.
+/// literals, `CAST(NULL AS <float>)`, columns and calculated fields, and
+/// applies the rules for arithmetic (a float beside an exact operand is
+/// `double precision`), for `CASE` and `COALESCE` (a float result wins and the
+/// exact ones follow it), for `NULLIF` (its first argument), for the numeric
+/// functions and for the aggregates.
 fn float_width<'f>(
     expr: &Expr,
     field_name: &str,
@@ -4342,6 +4343,11 @@ fn float_width<'f>(
     match expr {
         Expr::TypedLiteral {
             value_type: ValueType::Float(width),
+            ..
+        } => Some(*width),
+        // `CAST(NULL AS real)` is the one cast to a float the grammar admits.
+        Expr::Cast {
+            target: ValueType::Float(width),
             ..
         } => Some(*width),
         Expr::SourceColumn { column, .. } => match source_columns.get(column) {
@@ -4397,6 +4403,17 @@ fn float_width<'f>(
         }
         Expr::FunctionCall { name, args } if name == "NULLIF" && args.len() == 2 => {
             width_of(&args[0])
+        }
+        // An aggregate over a float: `MIN`, `MAX` and `SUM` keep its type,
+        // `AVG` is `double precision`. Over an exact value none is a float.
+        Expr::FunctionCall { name, args }
+            if super::registry::lookup_aggregate_function(name).is_some() =>
+        {
+            let width = width_of(args.first()?)?;
+            match super::registry::aggregate_result_type(name, ValueType::Float(width))? {
+                ValueType::Float(width) => Some(width),
+                _ => None,
+            }
         }
         // A numeric function over a float is its float overload's result
         // (`CEIL` takes `double precision`, so a `real` widens to it).
