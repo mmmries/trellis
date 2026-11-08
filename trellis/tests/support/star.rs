@@ -23,8 +23,9 @@
 //! (`one_to_one_join_diverging_keys`) is clean.
 //!
 //! A shape of more than one position defines a star, which define admits
-//! only behind the development knob [`STAR_KNOB`] until the knob is removed;
-//! [`runnable`] says whether a shape can run in this process.
+//! only behind the development knob [`STAR_KNOB`] until the knob is removed
+//! ([`definable`]); [`runnable`] says whether a shape's pins can run in this
+//! process, which a star's can't until its apply is built.
 //!
 //! A binary using this module also declares `support/drain_driver.rs` as
 //! `mod drain_driver` at its root.
@@ -61,18 +62,25 @@ pub async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
     SERIAL.lock().await
 }
 
-/// Whether [`STAR_KNOB`] is on in this process.
+/// Whether [`STAR_KNOB`] is on in this process: the engine's own reading
+/// (on unless `""`, `0`, `off` or `false`), or a test's
+/// `trellis::dev::defs::set_star_join`.
 pub fn star_join_enabled() -> bool {
-    std::env::var(STAR_KNOB).is_ok_and(|v| {
-        let v = v.trim().to_ascii_lowercase();
-        !matches!(v.as_str(), "" | "0" | "off" | "false")
-    })
+    trellis::dev::defs::star_join_enabled()
 }
 
 /// Whether `shape` can be defined in this process: the two-table JOIN
 /// always, a star only with [`STAR_KNOB`] on.
-pub fn runnable(shape: Shape) -> bool {
+pub fn definable(shape: Shape) -> bool {
     shape.positions == 1 || star_join_enabled()
+}
+
+/// Whether `shape`'s pins can run in this process: it is [`definable`], and
+/// its apply is built. A star defines with the knob on, then halts at its
+/// first page or build ("whose apply is not built yet") until the root and
+/// joined apply land (#1773, #1774), so only the two-table JOIN runs.
+pub fn runnable(shape: Shape) -> bool {
+    definable(shape) && shape.positions == 1
 }
 
 /// One position's join kind: `LEFT` keeps an `a` row with no match there,
@@ -398,8 +406,8 @@ fn setup(stars: &[Star], a_rows: &str, b_rows: &str) -> Setup {
         "one shape per database: {stars:?}"
     );
     assert!(
-        runnable(shape),
-        "{shape:?} defines a star: set {STAR_KNOB}, or skip it with `runnable`"
+        definable(shape),
+        "{shape:?} defines a star: set {STAR_KNOB}, or skip it with `definable`"
     );
     let ddl = format!("{}; {}", shape.ddl(), shape.seed(a_rows, b_rows));
     let definitions = stars.iter().map(|s| s.definition()).collect();

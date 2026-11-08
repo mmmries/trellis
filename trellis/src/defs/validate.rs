@@ -9278,40 +9278,26 @@ mod tests {
         ));
     }
 
-    /// A second joined table, which only a hand-built tree has (the parser
-    /// refuses it with the same words), is refused first, for both kinds of
-    /// `JOIN`, even when another check would also refuse it.
+    /// An aggregate `JOIN` of a second joined table parses, and is refused
+    /// first, even when another check would also refuse it (#1457 step 7
+    /// admits more).
     #[test]
-    fn join_refuses_a_second_joined_table_built_by_hand() {
+    fn an_aggregate_join_refuses_a_second_joined_table() {
         let (left, right) = tables();
-        for text in [
+        let def = parse_text(
             "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             JOIN shipments ON items.id = shipments.item_id \
              GROUP BY orders.region SELECT COUNT(*) AS n",
-            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
-             SELECT orders.id AS id",
-        ] {
-            let mut def = parse_text(text).unwrap();
-            let (KeySpace::Join(spec) | KeySpace::JoinOneToOne(spec)) = &mut def.key_space else {
-                panic!("a JOIN");
-            };
-            let mut second = spec.joins[0].clone();
-            // A self-join too, which alone would be refused as such.
-            second.right = "orders".to_string();
-            spec.joins.push(second);
-            assert_eq!(
-                validate_join(&def, &left, &[&right]),
-                Err(ValidationError::JoinTooManyTables),
-                "{text}"
-            );
-        }
-        let parsed = parse_text(
-            "TRANSFORM t FROM a JOIN b ON a.k = b.k JOIN c ON a.k = c.k \
-             GROUP BY a.g SELECT COUNT(*) AS n",
         )
-        .unwrap_err()
-        .to_string();
-        let refused = ValidationError::JoinTooManyTables.to_string();
-        assert!(parsed.contains(&refused), "{parsed} / {refused}");
+        .unwrap();
+        assert_eq!(
+            validate_join(&def, &left, &[&right, &right]),
+            Err(ValidationError::JoinTooManyTables)
+        );
+        assert_eq!(
+            ValidationError::JoinTooManyTables.to_string(),
+            "a JOIN transform joins exactly two tables; a second JOIN is not supported"
+        );
     }
 
     #[test]

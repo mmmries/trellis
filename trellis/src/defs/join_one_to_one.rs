@@ -659,6 +659,18 @@ mod tests {
         );
     }
 
+    /// The star knob's variable reads on unless it is `""`, `0`, `off` or
+    /// `false` (the harness's `star_join_enabled` reads it alike).
+    #[test]
+    fn the_star_knob_variable_is_on_unless_it_says_off() {
+        for on in ["1", "on", "true", "yes", " ON "] {
+            assert!(knob_value_is_on(on), "{on:?}");
+        }
+        for off in ["", "0", "off", "false", " Off ", "FALSE"] {
+            assert!(!knob_value_is_on(off), "{off:?}");
+        }
+    }
+
     /// `J`'s column for a join key column is `p<i>_<column>`, cut as
     /// Postgres cuts an identifier: at 63 bytes, on a character boundary.
     #[test]

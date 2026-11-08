@@ -325,8 +325,17 @@ impl JoinShape {
             target: target.clone(),
             what: "a 1-1 JOIN with no joined table",
         })?;
+        // A star (more than one joined table) defines only with the dev knob
+        // on; one stored while it was on halts in a process where it is off.
+        if join.joins.len() > 1 && !crate::defs::join_one_to_one::star_enabled() {
+            return Err(ApplyError::GroupBasisUnsupported {
+                target,
+                what: "a 1-1 JOIN of more than two tables, which this process doesn't admit \
+                       (TRELLIS_DEV_STAR_JOIN is off)",
+            });
+        }
         // A star's apply isn't built yet: it halts the transform rather than
-        // run as a two-table JOIN. Define refuses one today (`JoinTooManyTables`).
+        // run as a two-table JOIN.
         if join.joins.len() > 1 {
             return Err(ApplyError::GroupBasisUnsupported {
                 target,
