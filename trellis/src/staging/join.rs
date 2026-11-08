@@ -160,14 +160,14 @@
 //! current row's, through steps 2 to 5 above, in the release's own
 //! transaction.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use tokio_postgres::Transaction;
 use tokio_postgres::types::PgLsn;
 
 use crate::defs::ast::{Expr, KeySpace, TransformDef, ValueType};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::defs::join::{self as spec, HiddenTable, JOINED, Side};
+use crate::defs::join::{self as spec, HiddenTable, JOINED, Position, Side};
 use crate::defs::model::Definition;
 use crate::defs::oracle::render_qualified_expr_sql;
 use crate::pool::quote_ident;
@@ -238,14 +238,18 @@ impl SidePlan {
     }
 }
 
-/// A page's `TRUNCATE` of one side or both, as either kind of `JOIN` records
-/// it ([`JoinTargetPlan::truncate`],
-/// `super::join_one_to_one::JoinOneToOnePlan::truncate`).
+/// A page's `TRUNCATE` of any of a `JOIN`'s tables, as either kind of `JOIN`
+/// records it ([`JoinTargetPlan::truncate`],
+/// `super::join_one_to_one::JoinOneToOnePlan::truncate`). The aggregate
+/// `JOIN` has one joined position, so its `joined` holds at most
+/// [`Position::FIRST`] ([`Self::joined_floor`]).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Truncate {
-    /// Each side's truncate's `lsn`: the floor it raises.
+    /// The `FROM` table's truncate's `lsn`: the floor it raises.
     pub(crate) from: Option<PgLsn>,
-    pub(crate) joined: Option<PgLsn>,
+    /// Each truncated joined position's truncate's `lsn`: the floor it
+    /// raises on that position's ledger.
+    pub(crate) joined: BTreeMap<Position, PgLsn>,
     pub(crate) hop_gen: i32,
     pub(crate) src_changed: Option<std::time::SystemTime>,
     pub(crate) origin_lsn: Option<PgLsn>,
@@ -271,11 +275,24 @@ impl Truncate {
         truncate.src_changed =
             super::apply::earliest_src_changed(truncate.src_changed, change.src_changed);
         truncate.origin_lsn = earliest_origin(truncate.origin_lsn, change.origin_lsn);
-        let floor = match side {
-            Side::From => &mut truncate.from,
-            Side::Joined(_) => &mut truncate.joined,
-        };
-        *floor = Some(floor.map_or(lsn, |f| f.max(lsn)));
+        match side {
+            Side::From => truncate.from = Some(truncate.from.map_or(lsn, |f| f.max(lsn))),
+            Side::Joined(position) => {
+                let floor = truncate.joined.entry(position).or_insert(lsn);
+                *floor = (*floor).max(lsn);
+            }
+        }
+    }
+
+    /// Whether the page truncates any joined table.
+    pub(crate) fn truncates_joined(&self) -> bool {
+        !self.joined.is_empty()
+    }
+
+    /// The floor a `TRUNCATE` of the aggregate `JOIN`'s one joined table
+    /// raises, if the page has one.
+    pub(crate) fn joined_floor(&self) -> Option<PgLsn> {
+        self.joined.values().copied().max()
     }
 }
 
@@ -1442,14 +1459,17 @@ async fn clear(
     truncate: &Truncate,
     mutations: &mut TargetMutations,
 ) -> Result<usize, ApplyError> {
-    for (side, lsn) in [(&plan.from, truncate.from), (&plan.joined, truncate.joined)] {
+    for (side, lsn) in [
+        (&plan.from, truncate.from),
+        (&plan.joined, truncate.joined_floor()),
+    ] {
         if let Some(lsn) = lsn {
             let hidden = side.plan.hidden();
             txn.batch_execute(&format!("delete from {hidden}")).await?;
             super::ledger::raise_truncate_floor(txn, hidden, lsn).await?;
         }
     }
-    if truncate.joined.is_some() {
+    if truncate.truncates_joined() {
         txn.batch_execute(&format!(
             "update {} set __matches = 0 where __matches <> 0",
             plan.j_ident
@@ -1468,7 +1488,7 @@ async fn clear(
         mutations,
     )
     .await?;
-    if truncate.joined.is_some() && plan.left {
+    if truncate.truncates_joined() && plan.left {
         txn.execute(&plan.refill_sql(), &[]).await?;
     }
     Ok(deleted)

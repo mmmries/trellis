@@ -52,10 +52,7 @@ fn shapes() -> Vec<Shape> {
         .filter(|shape| {
             let runs = star::runnable(*shape);
             if !runs {
-                eprintln!(
-                    "{shape:?} skipped: {} is off, or a star's apply is not built yet",
-                    star::STAR_KNOB
-                );
+                eprintln!("{shape:?} skipped: {} is off", star::STAR_KNOB);
             }
             runs
         })
@@ -315,7 +312,7 @@ async fn m_two_crossing_mixed_pages_queue_on_j_without_deadlock() {
 #[tokio::test]
 async fn t1_t2_a_truncate_races_a_page_of_the_other_side() {
     let _serial = star::serial().await;
-    for shape in shapes().into_iter().filter(|s| star::truncate_runnable(*s)) {
+    for shape in shapes() {
         for (name, x, y) in [
             (
                 "t1 truncate a vs b",
