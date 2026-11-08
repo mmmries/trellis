@@ -1123,7 +1123,7 @@ async fn key_set(
     let old_images: Vec<Option<&str>> = records
         .values()
         .map(|r| match side {
-            JOINED if !only_new => r.old_image.as_deref(),
+            Side::Joined(_) if !only_new => r.old_image.as_deref(),
             _ => None,
         })
         .collect();

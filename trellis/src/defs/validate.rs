@@ -2689,9 +2689,12 @@ pub(crate) fn rename_join_columns(
 ) {
     match expr {
         Expr::SourceColumn { table, column, .. } => {
-            // A table that is no joined one is the validator's to refuse; it
-            // is typed as the first joined table's here.
-            let side = super::join::side_of_table(def, table).unwrap_or(super::join::JOINED);
+            // Matched on the bare name as written. A table that is no
+            // joined one is the validator's to refuse; it is typed as the
+            // first joined table's here.
+            let side = super::join::spec(def)
+                .and_then(|join| super::join::side_of_written(def, join, table))
+                .unwrap_or(super::join::JOINED);
             let prefix = match side {
                 Side::From => "l".to_string(),
                 Side::Joined(position) if position == super::join::Position::FIRST => {
@@ -9235,6 +9238,42 @@ mod tests {
             validate_join(&def, &left, &right),
             Err(ValidationError::JoinSelf { .. })
         ));
+    }
+
+    /// A second joined table, which only a hand-built tree has (the parser
+    /// refuses it with the same words), is refused first, for both kinds of
+    /// `JOIN`, even when another check would also refuse it.
+    #[test]
+    fn join_refuses_a_second_joined_table_built_by_hand() {
+        let (left, right) = tables();
+        for text in [
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT COUNT(*) AS n",
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             SELECT orders.id AS id",
+        ] {
+            let mut def = parse_text(text).unwrap();
+            let (KeySpace::Join(spec) | KeySpace::JoinOneToOne(spec)) = &mut def.key_space else {
+                panic!("a JOIN");
+            };
+            let mut second = spec.joins[0].clone();
+            // A self-join too, which alone would be refused as such.
+            second.right = "orders".to_string();
+            spec.joins.push(second);
+            assert_eq!(
+                validate_join(&def, &left, &right),
+                Err(ValidationError::JoinTooManyTables),
+                "{text}"
+            );
+        }
+        let parsed = parse_text(
+            "TRANSFORM t FROM a JOIN b ON a.k = b.k JOIN c ON a.k = c.k \
+             GROUP BY a.g SELECT COUNT(*) AS n",
+        )
+        .unwrap_err()
+        .to_string();
+        let refused = ValidationError::JoinTooManyTables.to_string();
+        assert!(parsed.contains(&refused), "{parsed} / {refused}");
     }
 
     #[test]
