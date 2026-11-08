@@ -500,14 +500,101 @@ mod tests {
         assert!(detail.contains("swap the two tables"), "{detail}");
     }
 
+    /// Chained `JOIN`s parse, left to right, for either kind of `JOIN`: how
+    /// many tables and which an `ON` reads are the validator's, so a stored
+    /// star loads whatever the knob says.
     #[test]
-    fn rejects_a_second_join() {
-        let (construct, detail) = refusal(
-            "TRANSFORM t FROM a JOIN b ON a.k = b.k LEFT JOIN c ON b.j = c.j \
-             GROUP BY a.g SELECT COUNT(*) AS n",
-        );
-        assert_eq!(construct, "JOIN");
-        assert!(detail.contains("exactly two tables"), "{detail}");
+    fn chained_joins_parse_in_the_order_written() {
+        for (text, grouped) in [
+            (
+                "TRANSFORM t FROM a JOIN b ON a.k = b.k LEFT JOIN c ON b.j = c.j \
+                 GROUP BY a.g SELECT COUNT(*) AS n",
+                true,
+            ),
+            (
+                "TRANSFORM t FROM a JOIN b ON a.k = b.k LEFT OUTER JOIN c ON a.j = c.j \
+                 INNER JOIN d ON a.i = d.i JOIN e ON a.h = e.h JOIN f ON a.f = f.f \
+                 SELECT b.x AS x",
+                false,
+            ),
+        ] {
+            let def = parse(text).unwrap();
+            let join = join::spec(&def).unwrap();
+            assert_eq!(join::is_grouped(&def), grouped, "{text}");
+            let tables: Vec<(&str, JoinKind)> = join
+                .joins
+                .iter()
+                .map(|j| (j.right.as_str(), j.kind))
+                .collect();
+            assert_eq!(tables[0], ("b", JoinKind::Inner));
+            assert_eq!(tables[1], ("c", JoinKind::Left));
+            if !grouped {
+                assert_eq!(tables.len(), 5);
+                assert_eq!(tables[2], ("d", JoinKind::Inner));
+            }
+        }
+    }
+
+    /// A star renders back to text that parses to the same definition, with
+    /// and without aliases, keys and schemas, in the order written.
+    #[test]
+    fn a_star_round_trips_through_its_rendered_text() {
+        for text in [
+            "TRANSFORM t FROM a LEFT JOIN b ON a.k = b.id INNER JOIN c ON a.j = c.id \
+             JOIN d ON a.i = d.id AND a.h = d.h SELECT b.x AS x, c.y AS y, d.z AS z",
+            "TRANSFORM t FROM public.a AS f LEFT JOIN b KEY (id) AS bb ON f.k = bb.id \
+             JOIN s2.c cc ON f.j = cc.id LEFT JOIN d ON f.i = d.id \
+             LEFT JOIN e AS ee ON ee.id = f.g SELECT bb.x AS x, COALESCE(cc.y, ee.w) AS y, d.z AS z",
+        ] {
+            let def = parse(text).unwrap();
+            let rendered = ast::render_definition_text(&def);
+            assert_eq!(parse(&rendered).unwrap(), def, "{rendered}");
+            assert_eq!(
+                ast::render_definition_text(&parse(&rendered).unwrap()),
+                rendered
+            );
+        }
+    }
+
+    /// Every chained `JOIN` is held to the one-`JOIN` refusals: the kinds
+    /// other than `INNER` and `LEFT`, `USING`, `NATURAL`, `LATERAL`, a comma
+    /// join, and a table read twice (as the `FROM` table or joined twice,
+    /// under any alias).
+    #[test]
+    fn a_chained_join_is_held_to_every_one_join_refusal() {
+        let head = "TRANSFORM t FROM a JOIN b ON a.k = b.k";
+        for (rest, construct, words) in [
+            (
+                "RIGHT JOIN c ON a.j = c.j",
+                "RIGHT JOIN",
+                "only INNER and LEFT",
+            ),
+            (
+                "FULL JOIN c ON a.j = c.j",
+                "FULL JOIN",
+                "only INNER and LEFT",
+            ),
+            ("CROSS JOIN c", "CROSS JOIN", "only INNER and LEFT"),
+            ("NATURAL JOIN c", "NATURAL JOIN", "only INNER and LEFT"),
+            (
+                "JOIN LATERAL c ON a.j = c.j",
+                "JOIN LATERAL",
+                "not a subquery",
+            ),
+            ("JOIN c USING (j)", "JOIN USING", "ON"),
+            (", c", "comma join", "JOIN b ON"),
+            ("JOIN b AS b2 ON a.j = b2.j", "JOIN", "joined twice"),
+            ("JOIN a AS a2 ON a.j = a2.j", "JOIN", "self-join"),
+        ] {
+            let (found, detail) = refusal(&format!("{head} {rest} SELECT b.x AS x"));
+            assert_eq!(found, construct, "{rest}: {detail}");
+            assert!(detail.contains(words), "{rest}: {detail}");
+        }
+        // An alias of a later table may not take an earlier one's name.
+        assert!(matches!(
+            parse(&format!("{head} JOIN c AS b ON a.j = b.j SELECT b.x AS x")),
+            Err(ParseError::TableAlias { .. })
+        ));
     }
 
     #[test]

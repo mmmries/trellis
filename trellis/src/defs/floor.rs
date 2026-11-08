@@ -234,6 +234,10 @@ pub enum Feature {
     TableKey,
     /// A table it reads is partitioned (ADR-0017).
     PartitionedSource,
+    /// A `JOIN` of more than one joined table: a 1-1 `JOIN` star (ADR-0021).
+    /// A release before it would read such a definition over its first
+    /// joined table alone.
+    StarJoin,
     /// An expression node of this kind.
     Expr(ExprNode),
     /// An operator.
@@ -295,6 +299,8 @@ impl Feature {
             Feature::TableAlias => Some(BASELINE),
             // Arrives in 0.2.0, the release floors arrive in.
             Feature::TableKey => Some(BASELINE),
+            // Arrives in 0.2.0, the release floors arrive in.
+            Feature::StarJoin => Some(BASELINE),
             Feature::Predicate(kind) => Some(match kind {
                 PredicateKind::True => BASELINE,
             }),
@@ -442,6 +448,9 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
         group_by: _,
     }) = join
     {
+        if joins.len() > 1 {
+            used.add(Feature::StarJoin);
+        }
         for JoinedTable {
             kind,
             right: _,
@@ -633,7 +642,7 @@ pub(crate) fn collect<T>(validate: impl FnOnce() -> T) -> (T, Vec<Feature>) {
 pub(crate) fn validated_features(
     def: &TransformDef,
     from: &std::collections::HashMap<String, super::validate::JoinColumnInfo>,
-    joined: Option<&std::collections::HashMap<String, super::validate::JoinColumnInfo>>,
+    joined: Option<&[&std::collections::HashMap<String, super::validate::JoinColumnInfo>]>,
 ) -> Result<Vec<Feature>, super::validate::ValidationError> {
     let (result, used) = collect(|| match joined {
         Some(joined) => super::validate::validate_join(def, from, joined),
@@ -1009,7 +1018,7 @@ pub(crate) fn on_retype(
     def: &TransformDef,
     partitioned: bool,
     from: &std::collections::HashMap<String, super::validate::JoinColumnInfo>,
-    joined: Option<&std::collections::HashMap<String, super::validate::JoinColumnInfo>>,
+    joined: Option<&[&std::collections::HashMap<String, super::validate::JoinColumnInfo>]>,
     keys: &[Feature],
 ) -> OnRetype {
     match validated_features(def, from, joined) {
@@ -1060,8 +1069,7 @@ pub(crate) async fn live_key_features(
 }
 
 /// [`on_retype`] over the live columns of `source` and each of `joined`, by
-/// position, the tables `def` reads. The validation reads the columns of
-/// position 1 alone, as [`super::validate::validate_join`] does.
+/// position, the tables `def` reads.
 pub(crate) async fn on_live_retype(
     client: &impl tokio_postgres::GenericClient,
     floors: &Floors,
@@ -1074,24 +1082,24 @@ pub(crate) async fn on_live_retype(
         .collect();
     let partitioned = any_partitioned(client, &tables).await?;
     let from = super::catalog::column_infos(client, source).await?;
-    let joined_columns = match joined.first() {
-        Some(joined) => Some(super::catalog::column_infos(client, joined).await?),
-        None => None,
-    };
+    let mut joined_maps = Vec::with_capacity(joined.len());
+    for table in joined {
+        joined_maps.push(super::catalog::column_infos(client, table).await?);
+    }
+    let joined_refs: Vec<_> = joined_maps.iter().collect();
+    let joined_columns = (!joined_refs.is_empty()).then_some(joined_refs.as_slice());
     let Some(keys) = live_key_features(client, &tables).await? else {
-        return Ok(
-            match validated_features(def, &from, joined_columns.as_ref()) {
-                Ok(_) => OnRetype::Restamp(floors.of(def, partitioned, None)),
-                Err(refusal) => OnRetype::Pause(refusal),
-            },
-        );
+        return Ok(match validated_features(def, &from, joined_columns) {
+            Ok(_) => OnRetype::Restamp(floors.of(def, partitioned, None)),
+            Err(refusal) => OnRetype::Pause(refusal),
+        });
     };
     Ok(on_retype(
         floors,
         def,
         partitioned,
         &from,
-        joined_columns.as_ref(),
+        joined_columns,
         &keys,
     ))
 }
@@ -1237,6 +1245,26 @@ mod tests {
             ),
             "0.2.0"
         );
+    }
+
+    /// More than one joined table is a feature of its own: a release that
+    /// predates the star would read such a definition over its first joined
+    /// table alone, so a star carries its release and the two-table JOIN
+    /// doesn't.
+    #[test]
+    fn a_star_join_carries_its_release() {
+        let later = floors("0.5.0", &[("StarJoin", "0.3.0")]);
+        let star = "TRANSFORM t FROM s JOIN u ON s.k = u.k LEFT JOIN w ON s.j = w.j \
+                    SELECT u.x AS x, w.y AS y";
+        assert_eq!(floor_of(&later, star), "0.3.0");
+        assert_eq!(
+            floor_of(
+                &later,
+                "TRANSFORM t FROM s JOIN u ON s.k = u.k SELECT u.x AS x"
+            ),
+            "0.2.0"
+        );
+        assert_eq!(floor_of(&floors("0.2.0", &[]), star), "0.2.0");
     }
 
     /// A table alias is a feature of its own: a `JOIN` that aliases either
@@ -1881,7 +1909,7 @@ mod tests {
         };
         let left = side(&[("k", k), ("g", g)]);
         let right = side(&[("k", k)]);
-        let validated = validated_features(&def, &left, Some(&right)).ok()?;
+        let validated = validated_features(&def, &left, Some(&[&right])).ok()?;
         Some(floors.of(&def, false, Some(&validated)).to_string())
     }
 

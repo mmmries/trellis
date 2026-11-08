@@ -449,6 +449,7 @@ fn features() -> Vec<Feature> {
         Feature::PartitionedSource,
         Feature::TableAlias,
         Feature::TableKey,
+        Feature::StarJoin,
     ];
     features.extend(every(&units, |f| match f {
         Feature::QualifiedTable => 0,
@@ -457,6 +458,7 @@ fn features() -> Vec<Feature> {
         Feature::PartitionedSource => 3,
         Feature::TableAlias => 4,
         Feature::TableKey => 5,
+        Feature::StarJoin => 6,
         // Listed above or below.
         Feature::KeySpace(_)
         | Feature::JoinKind(_)

@@ -406,10 +406,16 @@ async fn join_one_to_one_copies(
     else {
         return Ok(Vec::new());
     };
-    let (id, joined): (i64, String) = (row.get(0), row.get(1));
+    let id: i64 = row.get(0);
+    // Every joined table, by position.
+    let joined: Vec<String> = match super::catalog::joined_tables_of(client, id).await {
+        Ok(joined) => joined,
+        Err(super::catalog::CatalogError::Db(err)) => return Err(err),
+        Err(_) => return Ok(Vec::new()),
+    };
     let side_table = |side: Side| match side {
         Side::From => source.to_string(),
-        Side::Joined(_) => joined.clone(),
+        Side::Joined(position) => joined.get(position.index()).cloned().unwrap_or_default(),
     };
     let hidden = |table: HiddenTable| {
         (
@@ -438,12 +444,14 @@ async fn join_one_to_one_copies(
             &key.name,
         ));
     }
-    // `R`, and the `M` of each position whose table the catalog records:
-    // the first's (`join_table`).
-    for (side, table) in [
-        (Side::From, HiddenTable::FromEntries),
-        (super::join::JOINED, super::join_one_to_one::M),
-    ] {
+    // `R`, and the `M` of each position.
+    let ledgers = std::iter::once((Side::From, HiddenTable::FromEntries)).chain(
+        super::join::spec(def)
+            .into_iter()
+            .flat_map(super::join::positions)
+            .map(|(position, _)| (Side::Joined(position), HiddenTable::JoinedEntries(position))),
+    );
+    for (side, table) in ledgers {
         for column in super::join_one_to_one::read_columns(def, side) {
             copies.push(copy(CopyKind::JoinHidden, hidden(table), side, &column));
         }
@@ -467,9 +475,7 @@ async fn join_one_to_one_copies(
         }
     }
     let sides =
-        match super::catalog::JoinSides::read(client, source.to_string(), vec![joined.clone()])
-            .await
-        {
+        match super::catalog::JoinSides::read(client, source.to_string(), joined.clone()).await {
             Ok(sides) => sides,
             Err(super::catalog::CatalogError::Db(err)) => return Err(err),
             Err(_) => return Ok(copies),
@@ -493,14 +499,17 @@ async fn join_one_to_one_copies(
         if reads.is_empty() || !reads_live(&reads, &sides) {
             continue;
         }
-        let Ok(inferred) = super::join::field_pg_type(
+        // A 1-1 JOIN's field calls no aggregate: its type is its inference's
+        // over every table's columns.
+        let Ok(value_type) = super::validate::join_field_value_type(
             def,
             field,
             &sides.from_columns,
-            &sides.first_joined().columns,
+            &sides.joined_column_maps(),
         ) else {
             continue;
         };
+        let inferred = super::ddl::pg_type_name(value_type).into_owned();
         copies.push(TypedCopy {
             kind: CopyKind::Field,
             table: target_table.0.clone(),

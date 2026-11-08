@@ -1509,7 +1509,7 @@ pub(crate) async fn install_definition_restoring(
                 &qualified_target_ident,
                 &pk,
                 &sides.from_columns,
-                &sides.first_joined().columns,
+                &sides.joined_column_maps(),
             )?
         }
         KeySpace::OneToOne => {
@@ -3485,18 +3485,14 @@ async fn create_definition_inner(
                 joined.push(qualified);
             }
             let sides = JoinSides::read(&*txn, qualified_source.clone(), joined).await?;
-            super::validate::validate_join(
-                &def,
-                &sides.from_columns,
-                &sides.first_joined().columns,
-            )?;
+            super::validate::validate_join(&def, &sides.from_columns, &sides.joined_column_maps())?;
             reject_virtual_join_reads(&def, &sides)?;
             if super::join::is_one_to_one(&def) {
                 super::join_one_to_one::check_define(
                     &*txn,
                     pool.floors(),
                     &def,
-                    &sides.first_joined().table,
+                    &sides.joined_tables().collect::<Vec<_>>(),
                 )
                 .await?;
             }
@@ -4695,7 +4691,7 @@ async fn validate_for_define(
 ) -> Result<(), CatalogError> {
     if let KeySpace::Join(_) | KeySpace::JoinOneToOne(_) = &def.key_space {
         let sides = JoinSides::resolve(pool, def).await?;
-        super::validate::validate_join(def, &sides.from_columns, &sides.first_joined().columns)?;
+        super::validate::validate_join(def, &sides.from_columns, &sides.joined_column_maps())?;
         reject_virtual_join_reads(def, &sides)?;
         if super::join::is_one_to_one(def) {
             let client = pool.get().await?;
@@ -4703,7 +4699,7 @@ async fn validate_for_define(
                 &**client,
                 pool.floors(),
                 def,
-                &sides.first_joined().table,
+                &sides.joined_tables().collect::<Vec<_>>(),
             )
             .await?;
         }
@@ -5455,7 +5451,7 @@ async fn revalidate_join(
     super::validate::validate_join(
         &definition.def,
         &sides.from_columns,
-        &sides.first_joined().columns,
+        &sides.joined_column_maps(),
     )?;
     reject_virtual_join_reads(&definition.def, &sides)?;
     validate_live_join_schema(
@@ -5474,7 +5470,7 @@ async fn revalidate_join(
             txn,
             floors,
             &definition.def,
-            &sides.first_joined().table,
+            &sides.joined_tables().collect::<Vec<_>>(),
         )
         .await?;
         let target_key: Vec<String> = ddl::identity_key_columns(txn, &definition.target_table)

@@ -814,8 +814,7 @@ pub(crate) fn field_pg_type(
             _ => {}
         }
     }
-    let value_type =
-        super::validate::join_field_value_type(def, field, from, std::slice::from_ref(joined))?;
+    let value_type = super::validate::join_field_value_type(def, field, from, &[joined])?;
     Ok(super::ddl::pg_type_name(value_type).into_owned())
 }
 

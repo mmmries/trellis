@@ -730,6 +730,24 @@ async fn every_trellis_table_is_classified() {
     let mut raw = connect_raw(db.dsn()).await;
     let t = facade(db.dsn()).await;
     define_and_build(&t, &mut raw).await;
+    // A star of five tables owns every position's `M`. Defined last, and
+    // unbuilt: only its tables are read here.
+    trellis::dev::defs::set_star_join(true);
+    raw.batch_execute(
+        "create table public.d2 (id bigint primary key, x text); \
+         create table public.d3 (id bigint primary key, x text); \
+         create table public.d4 (id bigint primary key, x text)",
+    )
+    .await
+    .expect("star tables");
+    t.apply(
+        "TRANSFORM star FROM orders JOIN cats ON orders.cat_id = cats.id \
+         LEFT JOIN d2 ON orders.g = d2.id LEFT JOIN d3 ON orders.a = d3.id \
+         LEFT JOIN d4 ON orders.id = d4.id \
+         SELECT cats.name AS who, d2.x AS x2, d3.x AS x3, d4.x AS x4",
+    )
+    .await
+    .expect("star");
     let actual = schema_tables(&raw).await;
 
     let unclassified: Vec<&String> = actual
