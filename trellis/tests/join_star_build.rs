@@ -599,12 +599,7 @@ async fn px3_the_m_pass_tombstones_the_m_entries_at_position_2_of_rows_gone_befo
              insert into public.b2 values (8, 0, 800, 'k8')",
         )
         .await;
-        star::write_uncaptured(
-            &d,
-            "public.a",
-            "update public.a set k2 = 30 where id = 1",
-        )
-        .await;
+        star::write_uncaptured(&d, "public.a", "update public.a set k2 = 30 where id = 1").await;
         trellis(&d)
             .await
             .request_backfill("public.b2")
@@ -801,10 +796,7 @@ async fn a_row_keyed_by_null_at_position_2_is_read_by_its_m_pass() {
                  {word} JOIN public.agg ON a.k = agg.g \
                  SELECT a.x + COALESCE(c.w, 0) + COALESCE(agg.n, 0) AS total"
             ),
-            &HashMap::from([(
-                "total".to_string(),
-                ValueType::Integer(IntWidth::Int8),
-            )]),
+            &HashMap::from([("total".to_string(), ValueType::Integer(IntWidth::Int8))]),
             "public",
         )
         .await
