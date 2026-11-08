@@ -147,14 +147,16 @@ columns' types' equality (the page's dense rank, see
 [A walk pages by the key's own columns](#a-walk-pages-by-the-keys-own-columns)), and compares a visible field whose
 text differs by its type's `=`. A field of a type with no `=` is compared as
 text; no group key is one, since `GROUP BY` needs `=`. The partials compare as
-values: counts as integers, a sum without trailing zeros. Text identity is no
+values: counts as integers, a sum without trailing zeros, and a `numeric`
+argument's scale map and `NaN`, `Infinity` and `-Infinity` counts against
+the source's `scale(x)` per scale and its special values counted apart. Text identity is no
 yardstick for these shapes: `GROUP BY` merges equal values with different
 texts, so a fresh recompute doesn't give text identity either, and a rebuild
 doesn't rewrite a key whose text alone changed.
 
 A sum or average kept from partials carries exactly the scale Postgres's own
 `sum()` and `avg()` show
-([ADR-0002](0002-async-data-flow.md#numeric-arguments-declare-their-scale)).
+([ADR-0002](0002-async-data-flow.md#numeric-sums-count-their-scales-and-special-values)).
 `SUM`/`AVG` over `real` or `interval` is refused at define. A `MIN` or `MAX`
 column is compared by its type's `=`: over a float, an `interval` or an
 unconstrained `numeric` the target holds one of the equal values (`1.0` or

@@ -5258,9 +5258,8 @@ pub(crate) async fn revalidate_keyed(
             });
         }
     }
-    // The aggregates define refuses by family (a
-    // `SUM`/`AVG` over a numeric that lost its declared scale, or over a
-    // column re-typed to a float), which define makes once the table exists.
+    // The aggregates define refuses by family (a `SUM`/`AVG` over a column
+    // re-typed to a float), which define makes once the table exists.
     check_aggregate_admitted(txn, &definition.def, source).await?;
     reject_row_security(
         txn,

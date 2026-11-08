@@ -234,8 +234,8 @@ another reason, by the operator or by quarantine, and the pass leaves it alone.
 
 A resume that re-types a column of a definition's target also re-validates, in the
 same transaction, every definition that reads that column, with define's whole
-validation against the schema as the re-type leaves it (a group-basis `SUM` over a
-column that is no longer `numeric(p,s)`, a `JOIN` key pair that no longer matches). A
+validation against the schema as the re-type leaves it (a `MIN` over a column that is
+no longer of an ordered type, a `JOIN` key pair that no longer matches). A
 reader define would now refuse is paused there, with the refusal and the upstream
 re-type as its `capture_failure` and no cause: its own `RESUME` re-validates and
 refuses until the operator redefines it. A reader that stays valid is untouched by this
