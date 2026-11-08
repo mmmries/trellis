@@ -276,6 +276,19 @@ async fn run(cell: Cell) {
     trellis::dev::defs::set_star_join(was);
 }
 
+/// The root's `ON` column for position 2 re-collated, `b2`'s left alone:
+/// `R` and `J`'s position-2 column hold its keys under the collation they
+/// were created with.
+#[tokio::test]
+async fn the_root_s_on_column_for_position_2_re_collated() {
+    run(Cell {
+        name: "a.kt icu then POSIX",
+        recollate: vec![alter("a", "kt", "POSIX")],
+        realign: vec![alter("b2", "kt", "POSIX")],
+    })
+    .await;
+}
+
 /// Position 2's joined table's `ON` column re-collated, `a`'s left alone:
 /// its keys sit in `M2` and `J` under the collation they were created with.
 #[tokio::test]
