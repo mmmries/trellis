@@ -385,12 +385,27 @@ fn format_join(join: &JoinStatus) -> String {
     }
     if let Some(w) = &join.fan_out_warning {
         out.push_str(&format!(
-            "    warning: {} rows of the FROM table share join key {}, past the {}: one \
+            "    warning: {} rows of the FROM table share join key {}{}, past the {}: one \
              change of its JOIN row takes seconds to rewrite them all\n",
-            w.rows, w.key, w.threshold
+            w.rows,
+            w.key,
+            match w.position {
+                1 => String::new(),
+                n => format!(" at joined position {n}"),
+            },
+            w.threshold
         ));
     }
     out
+}
+
+/// The `M` of a 1-1 `JOIN`'s joined `position`, as `status()` labels it in
+/// `hidden_tables`: `M` at position 1, `M2` and on after it.
+fn m_label(position: usize) -> String {
+    match position {
+        1 => "M".to_string(),
+        n => format!("M{n}"),
+    }
 }
 
 /// The step a `JOIN` build runs now or next ([`JoinStatus::building`]).
@@ -399,11 +414,16 @@ fn format_join_step(step: &JoinBuildStep) -> String {
         JoinBuildStep::Whole => "both sides in one transaction".to_string(),
         JoinBuildStep::Final => "final step (T and the target)".to_string(),
         JoinBuildStep::OneToOne(step) => match step {
-            OneToOneBuildStep::JoinedRows => "M pass: the JOIN side's rows".to_string(),
-            OneToOneBuildStep::JoinedNullKeys => {
-                "M pass: the JOIN side's rows keyed with a NULL part".to_string()
+            OneToOneBuildStep::JoinedRows { position } => {
+                format!("{} pass: the JOIN side's rows", m_label(*position))
             }
-            OneToOneBuildStep::JoinedGone => "M pass: entries of rows that are gone".to_string(),
+            OneToOneBuildStep::JoinedNullKeys { position } => format!(
+                "{} pass: the JOIN side's rows keyed with a NULL part",
+                m_label(*position)
+            ),
+            OneToOneBuildStep::JoinedGone { position } => {
+                format!("{} pass: entries of rows that are gone", m_label(*position))
+            }
             OneToOneBuildStep::PlanningChunks => "planning the FROM side's chunks".to_string(),
             OneToOneBuildStep::Chunks { remaining } => {
                 format!("FROM side chunks, {remaining} to run")
@@ -559,6 +579,25 @@ mod tests {
             format_join(&join),
             "    warning: 120000 rows of the FROM table share join key 30, past the 100000: \
              one change of its JOIN row takes seconds to rewrite them all\n"
+        );
+        join.fan_out_warning = Some(trellis::fixture!(FanOutWarning {
+            position: 2,
+            key: "30".to_string(),
+            rows: 120_000,
+            threshold: 100_000,
+        }));
+        assert_eq!(
+            format_join(&join),
+            "    warning: 120000 rows of the FROM table share join key 30 at joined position 2, \
+             past the 100000: one change of its JOIN row takes seconds to rewrite them all\n"
+        );
+        join.building = Some(JoinBuildStep::OneToOne(OneToOneBuildStep::JoinedRows {
+            position: 2,
+        }));
+        assert!(
+            format_join(&join).starts_with("    join build M2 pass: the JOIN side's rows\n"),
+            "{}",
+            format_join(&join)
         );
     }
 

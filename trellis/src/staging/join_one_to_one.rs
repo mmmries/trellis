@@ -1567,7 +1567,11 @@ async fn truncate_sides(
     }
     // Every pending fan-out goes: a truncated `b` starts a rebuild, which
     // recomputes every row, and a truncated `a` leaves no row to recompute.
-    let truncated: Vec<Position> = truncate.joined.map(|_| Position::FIRST).into_iter().collect();
+    let truncated: Vec<Position> = truncate
+        .joined
+        .map(|_| Position::FIRST)
+        .into_iter()
+        .collect();
     fan_out::clear_all(txn, shape, &truncated).await?;
     if truncate.from.is_none() {
         return Ok(0);
