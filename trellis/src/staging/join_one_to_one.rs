@@ -326,7 +326,7 @@ impl JoinShape {
             what: "a 1-1 JOIN with no joined table",
         })?;
         // A star's apply isn't built yet: it halts the transform rather than
-        // run as a two-table JOIN. Define admits one only behind the dev knob.
+        // run as a two-table JOIN. Define refuses one today (`JoinTooManyTables`).
         if join.joins.len() > 1 {
             return Err(ApplyError::GroupBasisUnsupported {
                 target,
