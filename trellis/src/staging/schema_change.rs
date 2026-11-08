@@ -1756,7 +1756,7 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
 
 /// `(transform_id, tbl, col, kind, was, now)`, one row for each column a
 /// definition reads whose recorded type is one enum and whose live type is
-/// another: `kind` `source` or `join` for a column of its
+/// another: `kind` `source`, `join` (position 1) or `joined` (a later position) for a column of its
 /// `source_columns` or `join_columns` whose token (`enum:schema.typname`)
 /// names another type than the column's, `key` for a key column whose
 /// `definition_key_types` OID is an enum's and isn't the column's. `was`
@@ -1775,7 +1775,11 @@ const RETYPED_ENUM_COLUMNS: &str = "\
         from pg_catalog.jsonb_each_text(d.source_columns) e \
         union all \
         select d.join_table, e.key, 'join', e.value \
-        from pg_catalog.jsonb_each_text(coalesce(d.join_columns, '{}'::jsonb)) e) c \
+        from pg_catalog.jsonb_each_text(coalesce(d.join_columns, '{}'::jsonb)) e \
+        union all \
+        select j.table_name, e.key, 'joined', e.value from definition_join_tables j \
+        cross join lateral pg_catalog.jsonb_each_text(j.columns) e \
+        where j.transform_id = d.id) c \
     join pg_catalog.pg_attribute a \
       on a.attrelid = pg_catalog.to_regclass( \
              pg_catalog.quote_ident(pg_catalog.split_part(c.tbl, '.', 1)) || '.' || \
@@ -1851,6 +1855,16 @@ async fn rerecord_retyped_enums(
                                                              pg_catalog.to_jsonb($3::text)) \
                      where id = $1",
                     &[&c.id, &c.column, &token],
+                )
+                .await?;
+            }
+            "joined" => {
+                txn.execute(
+                    "update definition_join_tables \
+                     set columns = pg_catalog.jsonb_set(columns, array[$2], \
+                                                        pg_catalog.to_jsonb($3::text)) \
+                     where transform_id = $1 and table_name = $4",
+                    &[&c.id, &c.column, &token, &c.table],
                 )
                 .await?;
             }

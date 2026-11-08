@@ -582,6 +582,15 @@ pub(crate) async fn follow_renamed_types(client: &mut Client) -> Result<(), Capt
             )
             .await?;
             txn.execute(
+                &format!(
+                    "update definition_join_tables j set columns = {} \
+                     where j.transform_id = any($1)",
+                    rename("j.table_name", "j.columns"),
+                ),
+                &[&owners, &old_token, &new_token, oid],
+            )
+            .await?;
+            txn.execute(
                 "update definition_key_types set type_name = $2 \
                  where transform_id = any($1) and type_oid = $3",
                 &[&owners, new, oid],
