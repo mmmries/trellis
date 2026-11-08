@@ -357,6 +357,116 @@ async fn a_drop_at_position_2_between_two_passes_with_no_other_change_is_detecte
     paused_for(&d, "public.v", "public.b2", &["code"]).await;
 }
 
+/// One table at different positions of two stars, on different `ON` columns
+/// (`b2` at position 2 of `v1` on `code`, at position 3 of `v2` on `alt`),
+/// and the root of a third transform (`v3`): each definition is checked at
+/// its own position against its own `ON` columns. `b2`'s key on `alt`
+/// dropped pauses `v2` alone; its key on `code` replaced by a partial unique
+/// index (built first, so a unique index on `code` exists at every moment)
+/// pauses `v1` alone, as define refuses a partial index as the key; the
+/// transform `b2` is the root of pauses neither time.
+#[tokio::test]
+async fn one_table_at_two_positions_of_two_stars_is_checked_per_definition() {
+    let _knob = knob().await;
+    let int4 = ValueType::Integer(IntWidth::Int4);
+    let mut d = Driver::start_unbuilt(
+        &[],
+        "create table public.a (id integer primary key, k1 integer, k2 integer, x integer); \
+         create table public.c (id integer primary key, k1 integer, k2 integer, k3 integer, \
+             x integer); \
+         create table public.b1 (id integer primary key, k integer, w integer); \
+         create unique index b1_k_unique on public.b1 (k); \
+         create table public.b3 (id integer primary key, k integer, w integer); \
+         create unique index b3_k_unique on public.b3 (k); \
+         create table public.b2 (id integer primary key, code integer, alt integer, \
+             w integer); \
+         create unique index b2_code_unique on public.b2 (code); \
+         create unique index b2_alt_unique on public.b2 (alt); \
+         create index on public.a (k1); create index on public.a (k2); \
+         create index on public.c (k1); create index on public.c (k2); \
+         create index on public.c (k3); \
+         insert into public.b1 values (1, 10, 1); insert into public.b3 values (1, 30, 3); \
+         insert into public.b2 values (1, 100, 1000, 30); \
+         insert into public.a values (1, 10, 100, 5); \
+         insert into public.c values (1, 10, 1000, 30, 6)",
+        &[
+            ("id", int4),
+            ("k1", int4),
+            ("k2", int4),
+            ("k3", int4),
+            ("x", int4),
+            ("code", int4),
+            ("alt", int4),
+            ("w", int4),
+        ],
+        &[
+            "TRANSFORM v1 FROM public.a \
+             LEFT JOIN public.b1 ON a.k1 = b1.k \
+             LEFT JOIN public.b2 ON a.k2 = b2.code \
+             SELECT a.x + COALESCE(b1.w, 0) + COALESCE(b2.w, 0) AS total",
+            "TRANSFORM v2 FROM public.c \
+             LEFT JOIN public.b1 ON c.k1 = b1.k \
+             LEFT JOIN public.b3 ON c.k3 = b3.k \
+             LEFT JOIN public.b2 ON c.k2 = b2.alt \
+             SELECT c.x + COALESCE(b2.w, 0) AS total",
+            "TRANSFORM v3 FROM public.b2 LEFT JOIN public.b3 ON b2.w = b3.k \
+             SELECT b2.code + COALESCE(b3.w, 0) AS total",
+        ],
+        &[
+            "public.a",
+            "public.c",
+            "public.b1",
+            "public.b2",
+            "public.b3",
+        ],
+    )
+    .await;
+    pass(&mut d).await;
+    pass(&mut d).await;
+    for target in ["public.v1", "public.v2", "public.v3"] {
+        assert_unpaused(&d, target, "two passes over intact keys").await;
+    }
+
+    write(&d, "drop index public.b2_alt_unique").await;
+    pass(&mut d).await;
+    let error = paused_for(&d, "public.v2", "public.b2", &["alt"]).await;
+    assert!(
+        error.starts_with("the unique key on the ON columns of public.b2 (alt) is gone"),
+        "{error}"
+    );
+    for target in ["public.v1", "public.v3"] {
+        assert_ne!(
+            status(&d, target).await,
+            "paused",
+            "{target} after alt's drop"
+        );
+    }
+
+    write(
+        &d,
+        "create unique index b2_code_partial on public.b2 (code) where code > 0",
+    )
+    .await;
+    pass(&mut d).await;
+    assert_ne!(
+        status(&d, "public.v1").await,
+        "paused",
+        "a partial index added"
+    );
+    write(&d, "drop index public.b2_code_unique").await;
+    pass(&mut d).await;
+    let error = paused_for(&d, "public.v1", "public.b2", &["code"]).await;
+    assert!(
+        error.starts_with("the unique key on the ON columns of public.b2 (code) is gone"),
+        "{error}"
+    );
+    assert_ne!(
+        status(&d, "public.v3").await,
+        "paused",
+        "the root's transform"
+    );
+}
+
 // --------------------------------------------- columns of position 2's table
 
 /// A column the star reads at position 2 renamed (`b2.w`) or dropped
@@ -582,8 +692,64 @@ async fn the_root_s_primary_key_redefined_and_resume_re_keys_the_target() {
 #[tokio::test]
 async fn an_enum_value_read_at_position_2_relabelled_pauses_the_transform() {
     let _knob = knob().await;
+    let mut d = start_enum().await;
+    pass(&mut d).await;
+    assert_unpaused(&d, "public.v", "the first pass").await;
+
+    write(&d, "alter type public.tone rename value 'calm' to 'cool'").await;
+    pass(&mut d).await;
+    assert_eq!(status(&d, "public.v").await, "paused");
+    let failures = failures(&d).await;
+    assert!(
+        failures.len() == 1
+            && failures[0].contains("enum value 'calm' of type public.tone was renamed to 'cool'"),
+        "{failures:?}"
+    );
+}
+
+/// The column of an enum the star reads only at position 2 (`b2.tone`)
+/// re-typed to another enum: the pass pauses the transform with the re-type's
+/// reason, found through the column's token in `definition_join_tables`, and
+/// records the new type there, as for the joined table at position 1.
+#[tokio::test]
+async fn an_enum_column_read_at_position_2_re_typed_to_another_enum_pauses_the_transform() {
+    let _knob = knob().await;
+    let mut d = start_enum().await;
+    pass(&mut d).await;
+    assert_unpaused(&d, "public.v", "the first pass").await;
+
+    write(
+        &d,
+        "create type public.mood as enum ('fast', 'slow'); \
+         alter table public.b2 alter column tone type public.mood using \
+         (case tone::text when 'brisk' then 'fast' else 'slow' end)::public.mood",
+    )
+    .await;
+    pass(&mut d).await;
+    assert_eq!(status(&d, "public.v").await, "paused");
+    let failures = failures(&d).await;
+    assert!(
+        failures.len() == 1
+            && failures[0].contains(
+                "of public.b2, which this definition reads, changed type from enum public.tone \
+                 to enum public.mood"
+            ),
+        "{failures:?}"
+    );
+    assert_eq!(
+        d.rows(
+            "select columns->>'tone' from definition_join_tables where table_name = 'public.b2'"
+        )
+        .await,
+        ["(enum:public.mood)"]
+    );
+}
+
+/// A star whose position 2 (`b2`) is the only table with an enum column the
+/// star reads (`b2.tone`), defined, its build not run.
+async fn start_enum() -> Driver {
     let int4 = ValueType::Integer(IntWidth::Int4);
-    let mut d = Driver::start_unbuilt(
+    Driver::start_unbuilt(
         &[],
         "create type public.tone as enum ('calm', 'brisk'); \
          create table public.a (id integer primary key, k1 integer, k2 integer, x integer); \
@@ -601,17 +767,5 @@ async fn an_enum_value_read_at_position_2_relabelled_pauses_the_transform() {
            SELECT a.x + COALESCE(b1.w, 0) AS total, b2.tone AS tone"],
         &["public.a", "public.b1", "public.b2"],
     )
-    .await;
-    pass(&mut d).await;
-    assert_unpaused(&d, "public.v", "the first pass").await;
-
-    write(&d, "alter type public.tone rename value 'calm' to 'cool'").await;
-    pass(&mut d).await;
-    assert_eq!(status(&d, "public.v").await, "paused");
-    let failures = failures(&d).await;
-    assert!(
-        failures.len() == 1
-            && failures[0].contains("enum value 'calm' of type public.tone was renamed to 'cool'"),
-        "{failures:?}"
-    );
+    .await
 }
