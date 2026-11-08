@@ -589,8 +589,8 @@ async fn upsert(
 /// Records, for definition `id`, the OID of every user-defined type it names
 /// beside the name it persists for it (`definition_types`, ADR-0020): each
 /// key column's type that isn't builtin (`definition_key_types`), and each
-/// enum token (`enum:schema.typname`) in its `source_columns` and
-/// `join_columns`, by the OID of the type its column has, while that type
+/// enum token (`enum:schema.typname`) in its `source_columns`,
+/// `join_columns` and `definition_join_tables.columns`, by the OID of the type its column has, while that type
 /// still has the name the token gives. A type already recorded keeps its
 /// row; with `replace`, the definition's rows are deleted first (a resume,
 /// which records every type from the live columns). Then the values of
@@ -631,7 +631,11 @@ pub(crate) async fn record_types(
                  from pg_catalog.jsonb_each_text(d.source_columns) e \
                  union all \
                  select d.join_table, e.key, e.value \
-                 from pg_catalog.jsonb_each_text(coalesce(d.join_columns, '{}'::jsonb)) e) e \
+                 from pg_catalog.jsonb_each_text(coalesce(d.join_columns, '{}'::jsonb)) e \
+                 union all \
+                 select j.table_name, e.key, e.value from definition_join_tables j \
+                 cross join lateral pg_catalog.jsonb_each_text(j.columns) e \
+                 where j.transform_id = d.id) e \
              join pg_catalog.pg_attribute a \
                on a.attrelid = pg_catalog.to_regclass( \
                       pg_catalog.quote_ident(pg_catalog.split_part(e.tbl, '.', 1)) || '.' || \
@@ -650,7 +654,8 @@ pub(crate) async fn record_types(
 
 /// `(transform_id, type_oid)`, one row for each enum type each definition
 /// reads now, by the live type of every column it reads: its
-/// `source_columns` on its source, its `join_columns` on its joined table,
+/// `source_columns` on its source, its `join_columns` on its joined table
+/// at position 1 and `definition_join_tables.columns` on each later one,
 /// and its key columns (`definition_key_types`), the source's row-identity
 /// key among them. A SQL subquery.
 ///
@@ -667,6 +672,10 @@ pub(crate) const READ_ENUM_TYPES: &str = "\
         union all \
         select d.join_table, e.col \
         from pg_catalog.jsonb_object_keys(coalesce(d.join_columns, '{}'::jsonb)) as e(col) \
+        union all \
+        select j.table_name, e.col from definition_join_tables j \
+        cross join lateral pg_catalog.jsonb_object_keys(j.columns) as e(col) \
+        where j.transform_id = d.id \
         union all \
         select k.table_name, k.column_name from definition_key_types k \
         where k.transform_id = d.id) c \
@@ -710,8 +719,8 @@ pub(crate) async fn record_enum_values(
 
 /// Records the live type of every key column definition `id` uses
 /// ([`key_uses`]): on its qualified `source`, keyed by the source's
-/// row-identity key, and on a JOIN's qualified `joined`
-/// table, keyed by its own; then the OID of every type the definition names ([`record_types`]), so
+/// row-identity key, and on each of a JOIN's qualified `joined`
+/// tables, by position, keyed by its own; then the OID of every type the definition names ([`record_types`]), so
 /// its `source_columns` and `join_columns` must already be written.
 /// Define calls it with nothing recorded yet; a
 /// resume with `replace`, which deletes what was recorded first, so the
@@ -722,7 +731,7 @@ pub(crate) async fn record_definition(
     id: i64,
     def: &TransformDef,
     source: &str,
-    joined: Option<&str>,
+    joined: &[&str],
     replace: bool,
 ) -> Result<(), tokio_postgres::Error> {
     let mut tables: Vec<&str> = vec![source];

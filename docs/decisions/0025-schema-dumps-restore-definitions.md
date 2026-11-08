@@ -37,7 +37,7 @@ After the dump comes an appendix that creates a restore queue in the Trellis
 schema and inserts one row per definition, one row per line. The rows are
 ordered so each reader comes after its upstream, and otherwise in the order
 the definitions were made. A row records the qualified source, target and
-`JOIN` table, the text as written, its `grammar_version`
+first `JOIN` table, the text as written, its `grammar_version`
 ([ADR-0018](0018-grammar-versioning.md)) and its floor
 ([ADR-0024](0024-compatibility-floors-and-rollback.md)). It records no ids,
 OIDs, timestamps or runtime state. The same definitions give the same file,
@@ -59,6 +59,15 @@ reads the queue's columns as they are, and refuses a queue of any other shape.
 Anything a later release needs to say about a definition goes into its floor,
 so an older release never ignores a field it doesn't know (ADR-0024).
 
+The one other shape is a dump with a definition that joins more than one
+table ([ADR-0021](0021-one-to-one-join-transforms.md)): its queue has one
+more column, last, `later_join_tables`, the qualified joined tables after
+the first, by position, and every row fills it. A dump without such a
+definition has the columns above alone, so a release that reads only them
+loads it, and refuses the longer queue rather than restore a definition
+without its later joined tables. A release that writes the column reads
+both shapes.
+
 ## `migrate` restores the queue
 
 `migrate` runs Trellis's migrations, then restores each queued row in order
@@ -70,7 +79,7 @@ refusal beside a live process of another version applies to it.
 - A row the loading release can run is defined at its recorded grammar
   version, into the target the dump created, through the opt-in define into
   an existing empty target. The text is resolved first and must name the
-  recorded source, target and `JOIN` table. A changed `target_schema`
+  recorded source, target and `JOIN` tables. A changed `target_schema`
   setting would resolve a bare name elsewhere, and that refuses rather than
   define a transform of other tables. Defining stamps the floor again.
 - A row the loading release can't run is stored paused, without being

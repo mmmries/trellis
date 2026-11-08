@@ -715,8 +715,11 @@ async fn read_snapshot(
     let catalog = load_catalog_for(&txn, floors).await?;
     let rows = txn
         .query(
-            "select id, source_table, join_table \
-             from transform_definitions where status = $1 order by id",
+            &format!(
+                "select d.id, d.source_table, {} \
+                 from transform_definitions d where d.status = $1 order by d.id",
+                crate::defs::catalog::joined_tables_array_sql("d")
+            ),
             &[&StoredStatus::WaitingToBackfill.as_str()],
         )
         .await?;
@@ -729,8 +732,8 @@ async fn read_snapshot(
     txn.commit().await?;
     let mut waiting = Vec::with_capacity(rows.len());
     for row in rows {
-        // A JOIN's joined table is read like its source.
-        let others: BTreeSet<String> = row.get::<_, Option<String>>(2).into_iter().collect();
+        // A JOIN's joined tables are read like its source.
+        let others: BTreeSet<String> = row.get::<_, Vec<String>>(2).into_iter().collect();
         waiting.push((row.get(0), row.get(1), others));
     }
     Ok(Snapshot {

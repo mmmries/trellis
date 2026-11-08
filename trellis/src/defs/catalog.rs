@@ -1247,7 +1247,9 @@ fn parse_for_define(
 pub(crate) struct Unparsed<'a> {
     pub(crate) source_table: &'a str,
     pub(crate) target_table: &'a str,
-    pub(crate) join_table: Option<&'a str>,
+    /// Its joined tables, by position: empty for a definition that isn't a
+    /// `JOIN`.
+    pub(crate) joined: Vec<&'a str>,
     pub(crate) definition_text: &'a str,
     pub(crate) grammar_version: i32,
     pub(crate) floor_version: &'a str,
@@ -1291,7 +1293,7 @@ pub(crate) async fn store_unrunnable(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
     let mut version = 1;
-    for table in std::iter::once(unparsed.source_table).chain(unparsed.join_table) {
+    for table in std::iter::once(unparsed.source_table).chain(unparsed.joined.iter().copied()) {
         let bumped: i64 = txn
             .query_one(
                 "insert into source_table_versions (source_table, version) values ($1, 1) \
@@ -1309,7 +1311,7 @@ pub(crate) async fn store_unrunnable(
     let source_node = resolve_node_in_txn(&txn, unparsed.source_table, NodeKind::Source).await?;
     let target_node = resolve_node_in_txn(&txn, unparsed.target_table, NodeKind::Target).await?;
     persist_edge_in_txn(&txn, source_node.id, target_node.id, EdgeKind::Source).await?;
-    if let Some(joined) = unparsed.join_table {
+    for joined in &unparsed.joined {
         let joined_node = resolve_node_in_txn(&txn, joined, NodeKind::Source).await?;
         persist_edge_in_txn(&txn, joined_node.id, target_node.id, EdgeKind::Join).await?;
     }
@@ -1328,12 +1330,20 @@ pub(crate) async fn store_unrunnable(
                 &unparsed.definition_text,
                 &StoredStatus::WaitingToBackfill.as_str(),
                 &unparsed.grammar_version,
-                &unparsed.join_table,
+                &unparsed.joined.first().copied(),
                 &unparsed.floor_version,
             ],
         )
         .await?
         .get(0);
+    // Its later joined tables, with no column types, as position 1 has none.
+    let further: Vec<(&str, HashMap<String, ValueType>)> = unparsed
+        .joined
+        .iter()
+        .skip(1)
+        .map(|table| (*table, HashMap::new()))
+        .collect();
+    insert_further_joined(&*txn, id, &further).await?;
     match held {
         Held::Unrunnable(reason) => {
             super::lifecycle::pause_for_unrunnable(&txn, id, unparsed.source_table, reason).await?
@@ -1459,15 +1469,17 @@ pub(crate) async fn install_definition_restoring(
             // the declared columns; its hidden tables are created with the
             // definition row, named by its id.
             let sides = JoinSides::resolve(pool, &def).await?;
-            reject_non_live_upstream(&**pool.get().await?, &sides.joined, restore).await?;
-            for side in [&sides.from, &sides.joined] {
+            for joined in sides.joined_tables() {
+                reject_non_live_upstream(&**pool.get().await?, joined, restore).await?;
+            }
+            for side in sides.tables() {
                 reject_unkeyed_source(&**pool.get().await?, side, &def).await?;
             }
             super::join::target_ddl(
                 &def,
                 &qualified_target_ident,
                 &sides.from_columns,
-                &sides.joined_columns,
+                &sides.first_joined().columns,
             )?
         }
         KeySpace::JoinOneToOne(_) => {
@@ -1475,8 +1487,10 @@ pub(crate) async fn install_definition_restoring(
             // `b` is held to the source rules too. Hidden tables are created
             // with the definition row, as an aggregate JOIN's are.
             let sides = JoinSides::resolve(pool, &def).await?;
-            reject_non_live_upstream(&**pool.get().await?, &sides.joined, restore).await?;
-            for side in [&sides.from, &sides.joined] {
+            for joined in sides.joined_tables() {
+                reject_non_live_upstream(&**pool.get().await?, joined, restore).await?;
+            }
+            for side in sides.tables() {
                 reject_unkeyed_source(&**pool.get().await?, side, &def).await?;
             }
             let pk = super::source_key::admitted_key(
@@ -1495,7 +1509,7 @@ pub(crate) async fn install_definition_restoring(
                 &qualified_target_ident,
                 &pk,
                 &sides.from_columns,
-                &sides.joined_columns,
+                &sides.first_joined().columns,
             )?
         }
         KeySpace::OneToOne => {
@@ -1578,8 +1592,11 @@ pub(crate) async fn applying_readers(
 ) -> Result<Vec<i64>, CatalogError> {
     let rows = client
         .query(
-            "select id, source_table, join_table \
-             from transform_definitions where status = any($1) order by id",
+            &format!(
+                "select d.id, d.source_table, {} \
+                 from transform_definitions d where d.status = any($1) order by d.id",
+                joined_tables_array_sql("d")
+            ),
             &[&StoredStatus::applying()],
         )
         .await?;
@@ -1614,8 +1631,11 @@ pub(crate) async fn has_unfrozen_reader(
 ) -> Result<bool, CatalogError> {
     let rows = client
         .query(
-            "select source_table, join_table \
-             from transform_definitions where status = any($1) order by id",
+            &format!(
+                "select d.source_table, {} \
+                 from transform_definitions d where d.status = any($1) order by d.id",
+                joined_tables_array_sql("d")
+            ),
             &[&StoredStatus::dispatchable()],
         )
         .await?;
@@ -1634,7 +1654,7 @@ pub(crate) async fn has_unfrozen_reader(
 /// deduplicated: its source (`qualified_source`, the persisted
 /// `transform_definitions.source_table`) and a `JOIN`'s joined table
 /// (`joined`, the persisted `join_table`).
-fn tables_read_by(qualified_source: String, joined: Option<String>) -> Vec<String> {
+fn tables_read_by(qualified_source: String, joined: Vec<String>) -> Vec<String> {
     let mut tables = vec![qualified_source];
     tables.extend(joined);
     tables.sort_unstable();
@@ -1712,8 +1732,11 @@ pub(crate) async fn reported_statuses_ignoring_column_pauses(
 async fn status_nodes(client: &impl GenericClient) -> Result<Vec<StatusNode>, CatalogError> {
     let rows = client
         .query(
-            "select id, target_table, source_table, status, join_table \
-             from transform_definitions order by id",
+            &format!(
+                "select d.id, d.target_table, d.source_table, d.status, {} \
+                 from transform_definitions d order by d.id",
+                joined_tables_array_sql("d")
+            ),
             &[],
         )
         .await?;
@@ -3439,28 +3462,43 @@ async fn create_definition_inner(
     // transaction, for the catalog row and the hidden tables.
     let join_sides = match super::join::spec(&def) {
         Some(join) => {
-            let join = super::join::first_joined(join);
-            let joined = match &join.explicit_right_schema {
-                Some(schema) => {
-                    confirm_qualified_source(&*txn, schema, &join.right).await?;
-                    crate::intake::qualify(schema, &join.right)?
-                }
-                None => match resolve_graph_identity_in_txn(&txn, &bare_schemas, &join.right).await
-                {
-                    Err(err @ CatalogError::SourceTableNotFound(_)) => {
-                        reject_inaccessible_table(&*txn, &bare_schemas, &join.right).await?;
-                        return Err(err);
+            let mut joined = Vec::with_capacity(join.joins.len());
+            for table in &join.joins {
+                let qualified = match &table.explicit_right_schema {
+                    Some(schema) => {
+                        confirm_qualified_source(&*txn, schema, &table.right).await?;
+                        crate::intake::qualify(schema, &table.right)?
                     }
-                    result => result?,
-                },
-            };
-            reject_non_live_upstream(&*txn, &joined, restoring.is_some()).await?;
+                    None => {
+                        match resolve_graph_identity_in_txn(&txn, &bare_schemas, &table.right).await
+                        {
+                            Err(err @ CatalogError::SourceTableNotFound(_)) => {
+                                reject_inaccessible_table(&*txn, &bare_schemas, &table.right)
+                                    .await?;
+                                return Err(err);
+                            }
+                            result => result?,
+                        }
+                    }
+                };
+                reject_non_live_upstream(&*txn, &qualified, restoring.is_some()).await?;
+                joined.push(qualified);
+            }
             let sides = JoinSides::read(&*txn, qualified_source.clone(), joined).await?;
-            super::validate::validate_join(&def, &sides.from_columns, &sides.joined_columns)?;
+            super::validate::validate_join(
+                &def,
+                &sides.from_columns,
+                &sides.first_joined().columns,
+            )?;
             reject_virtual_join_reads(&def, &sides)?;
             if super::join::is_one_to_one(&def) {
-                super::join_one_to_one::check_define(&*txn, pool.floors(), &def, &sides.joined)
-                    .await?;
+                super::join_one_to_one::check_define(
+                    &*txn,
+                    pool.floors(),
+                    &def,
+                    &sides.first_joined().table,
+                )
+                .await?;
             }
             Some(sides)
         }
@@ -3489,7 +3527,9 @@ async fn create_definition_inner(
             &def,
             source_columns,
             &qualified_source,
-            join_sides.as_ref().map(|sides| sides.joined.as_str()),
+            join_sides
+                .as_ref()
+                .map(|sides| sides.first_joined().table.as_str()),
         )
         .await?;
         if !missing.is_empty() {
@@ -3609,8 +3649,8 @@ async fn create_definition_inner(
     // source that's another definition's not-yet-built target passes here
     // (`to_regclass` finds no table) and is reported by the checks below.
     let mut read_tables = vec![side_read_table(&*txn, &qualified_source).await?];
-    if let Some(sides) = &join_sides {
-        read_tables.push(side_read_table(&*txn, &sides.joined).await?);
+    for joined in join_sides.iter().flat_map(JoinSides::joined_tables) {
+        read_tables.push(side_read_table(&*txn, joined).await?);
     }
     reject_row_security(&*txn, pool.schema(), &read_tables).await?;
 
@@ -3654,12 +3694,12 @@ async fn create_definition_inner(
     // matching on `transform_definitions.source_table` string equality.
     persist_edge_in_txn(&txn, source_node.id, target_node.id, EdgeKind::Source).await?;
 
-    // A JOIN's joined table is a `Join` edge into the target, checked
-    // for a cycle on its own. Self-joins are refused, so it never collides
-    // with the `Source` edge.
-    if let Some(sides) = &join_sides {
-        let joined_node = resolve_node_in_txn(&txn, &sides.joined, NodeKind::Source).await?;
-        reject_if_table_cycle(&txn, &sides.joined, &qualified_target).await?;
+    // Each of a JOIN's joined tables is a `Join` edge into the target,
+    // checked for a cycle on its own. Self-joins are refused, so none
+    // collides with the `Source` edge.
+    for joined in join_sides.iter().flat_map(JoinSides::joined_tables) {
+        let joined_node = resolve_node_in_txn(&txn, joined, NodeKind::Source).await?;
+        reject_if_table_cycle(&txn, joined, &qualified_target).await?;
         persist_edge_in_txn(&txn, joined_node.id, target_node.id, EdgeKind::Join).await?;
     }
 
@@ -3825,13 +3865,21 @@ async fn create_definition_inner(
     // `Some`): the insert failure has already aborted this transaction, so
     // there's no further query available in it to look up what was won
     // against.
-    // A JOIN's joined table and its column types beside the source's.
-    let joined_types = join_sides.as_ref().map(JoinSides::joined_value_types);
-    let (join_keys, join_vals) = joined_types
+    // A JOIN's joined table at position 1 and its column types beside the
+    // source's; each later position is a row of `definition_join_tables`.
+    let joined_types = join_sides
         .as_ref()
+        .map(JoinSides::joined_value_types)
+        .unwrap_or_default();
+    let (join_keys, join_vals) = joined_types
+        .first()
         .map(encode_type_map)
         .unwrap_or_default();
-    let join_table = join_sides.as_ref().map(|sides| sides.joined.as_str());
+    let joined_tables: Vec<&str> = join_sides
+        .iter()
+        .flat_map(JoinSides::joined_tables)
+        .collect();
+    let join_table = joined_tables.first().copied();
     // The key of each table it keys by, which every later read of their
     // identities keeps to (#1719): first, so the floor's key types, the
     // recorded key types and everything after read a declared `KEY`
@@ -3840,15 +3888,21 @@ async fn create_definition_inner(
         &*txn,
         &def,
         &qualified_source,
-        join_table,
+        &joined_tables,
         &qualified_target,
     )
     .await?;
     // ADR-0024: the oldest release that can run what this define writes,
     // over the column types it was just validated against.
-    let floor = super::floor::of_live(&*txn, pool.floors(), &def, &qualified_source, join_table)
-        .await?
-        .to_string();
+    let floor = super::floor::of_live(
+        &*txn,
+        pool.floors(),
+        &def,
+        &qualified_source,
+        &joined_tables,
+    )
+    .await?
+    .to_string();
     let id: i64 = match txn
         .query_one(
             "insert into transform_definitions
@@ -3888,7 +3942,14 @@ async fn create_definition_inner(
     // The type of each key column now, the one the target and
     // ledger are built from, for the staging worker's
     // capture pass to compare against (`super::key_types`).
-    super::key_types::record_definition(&*txn, id, &def, &qualified_source, join_table, false)
+    let further: Vec<(&str, HashMap<String, ValueType>)> = joined_tables
+        .iter()
+        .copied()
+        .zip(joined_types.iter().cloned())
+        .skip(1)
+        .collect();
+    insert_further_joined(&*txn, id, &further).await?;
+    super::key_types::record_definition(&*txn, id, &def, &qualified_source, &joined_tables, false)
         .await?;
     // A JOIN's hidden tables, in the catalog schema,
     // named by this definition's id, created empty with its row.
@@ -3899,7 +3960,7 @@ async fn create_definition_inner(
                 id,
                 &def,
                 &sides.from_columns,
-                &[&sides.joined_columns],
+                &sides.joined_column_maps(),
             )
         } else {
             super::join::hidden_tables_ddl(
@@ -3907,7 +3968,7 @@ async fn create_definition_inner(
                 id,
                 &def,
                 &sides.from_columns,
-                &sides.joined_columns,
+                &sides.first_joined().columns,
             )
         };
         txn.batch_execute(&ddl).await?;
@@ -4125,8 +4186,9 @@ pub(crate) struct CaptureReaderRow {
     pub refresh_stamp: Option<String>,
     /// The qualified `target_table`.
     pub target: String,
-    /// A `JOIN`'s qualified joined table.
-    pub join: Option<String>,
+    /// A `JOIN`'s qualified joined tables, by position; empty for any
+    /// other definition.
+    pub joined: Vec<String>,
 }
 
 /// Every registered definition ([`CaptureReaderRow`]).
@@ -4148,11 +4210,14 @@ pub(crate) async fn capture_readers(
 ) -> Result<Vec<CaptureReaderRow>, CatalogError> {
     client
         .query_typed(
-            "select d.id, d.source_table, d.definition_text, \
+            &format!(
+                "select d.id, d.source_table, d.definition_text, \
                     exists (select 1 from capture_failures f where f.transform_id = d.id), \
-                    d.target_table, d.grammar_version, d.join_table, d.floor_version, \
+                    d.target_table, d.grammar_version, {}, d.floor_version, \
                     (select f.refresh_stamp from capture_failures f where f.transform_id = d.id) \
              from transform_definitions d order by d.id",
+                joined_tables_array_sql("d")
+            ),
             &[],
         )
         .await?
@@ -4166,7 +4231,7 @@ pub(crate) async fn capture_readers(
                     capture_failed: row.get(3),
                     refresh_stamp: row.get(8),
                     target: row.get(4),
-                    join: row.get(6),
+                    joined: row.get(6),
                 })),
                 Ok(None) | Err(ParseError::GrammarVersionTooOld { .. }) => None,
                 // Stored text this release refuses: attaching paused it with a
@@ -4630,12 +4695,17 @@ async fn validate_for_define(
 ) -> Result<(), CatalogError> {
     if let KeySpace::Join(_) | KeySpace::JoinOneToOne(_) = &def.key_space {
         let sides = JoinSides::resolve(pool, def).await?;
-        super::validate::validate_join(def, &sides.from_columns, &sides.joined_columns)?;
+        super::validate::validate_join(def, &sides.from_columns, &sides.first_joined().columns)?;
         reject_virtual_join_reads(def, &sides)?;
         if super::join::is_one_to_one(def) {
             let client = pool.get().await?;
-            super::join_one_to_one::check_define(&**client, pool.floors(), def, &sides.joined)
-                .await?;
+            super::join_one_to_one::check_define(
+                &**client,
+                pool.floors(),
+                def,
+                &sides.first_joined().table,
+            )
+            .await?;
         }
         return Ok(());
     }
@@ -4669,76 +4739,138 @@ async fn validate_for_define(
     }
 }
 
-/// The two tables of a `JOIN` definition, resolved to their
-/// qualified identities, with their live columns as
+/// The tables of a `JOIN` definition, resolved to their qualified
+/// identities, with their live columns as
 /// [`super::validate::validate_join`] reads them.
 #[derive(Debug, Clone)]
 pub(crate) struct JoinSides {
     /// The `FROM` table.
     pub from: String,
-    /// The joined table.
-    pub joined: String,
     pub from_columns: HashMap<String, super::validate::JoinColumnInfo>,
-    pub joined_columns: HashMap<String, super::validate::JoinColumnInfo>,
-    /// Each table's virtual generated columns, from the same reads.
+    /// The `FROM` table's virtual generated columns, from the same read.
     pub from_virtual: VirtualColumns,
-    pub joined_virtual: VirtualColumns,
+    /// Every joined table, by position: index 0 is position 1. Never empty.
+    pub joined: Vec<JoinedSide>,
+}
+
+/// One joined table of a [`JoinSides`].
+#[derive(Debug, Clone)]
+pub(crate) struct JoinedSide {
+    /// The qualified table.
+    pub table: String,
+    pub columns: HashMap<String, super::validate::JoinColumnInfo>,
+    /// Its virtual generated columns, from the same read.
+    pub virtual_columns: VirtualColumns,
+}
+
+impl JoinedSide {
+    /// Its column types, as `transform_definitions.join_columns` (position
+    /// 1) and `definition_join_tables.columns` record them.
+    pub(crate) fn value_types(&self) -> HashMap<String, ValueType> {
+        self.columns
+            .iter()
+            .map(|(name, info)| (name.clone(), info.value_type))
+            .collect()
+    }
 }
 
 impl JoinSides {
-    /// Resolves both tables of `def` the way a `FROM` resolves (an explicit
+    /// Resolves every table of `def` the way a `FROM` resolves (an explicit
     /// schema is confirmed, a bare name walks `search_path`) and reads their
     /// columns.
     async fn resolve(pool: &Pool, def: &TransformDef) -> Result<JoinSides, CatalogError> {
         let Some(join) = super::join::spec(def) else {
             panic!("JoinSides::resolve called on a definition that isn't a JOIN");
         };
-        let join = super::join::first_joined(join);
         let from = resolve_source_for_install(pool, def).await?;
-        let joined = match &join.explicit_right_schema {
-            Some(schema) => {
-                confirm_qualified_source(&**pool.get().await?, schema, &join.right).await?;
-                crate::intake::qualify(schema, &join.right)?
-            }
-            None => resolve_graph_identity(pool, &join.right).await?,
-        };
+        let mut joined = Vec::with_capacity(join.joins.len());
+        for table in &join.joins {
+            joined.push(match &table.explicit_right_schema {
+                Some(schema) => {
+                    confirm_qualified_source(&**pool.get().await?, schema, &table.right).await?;
+                    crate::intake::qualify(schema, &table.right)?
+                }
+                None => resolve_graph_identity(pool, &table.right).await?,
+            });
+        }
         let client = pool.get().await?;
         JoinSides::read(&**client, from, joined).await
     }
 
-    /// Reads the live columns of the already-qualified `from` and `joined`.
+    /// Reads the live columns of the already-qualified `from` and each of
+    /// `joined`, by position.
     pub(crate) async fn read(
         client: &impl GenericClient,
         from: String,
-        joined: String,
+        joined: Vec<String>,
     ) -> Result<JoinSides, CatalogError> {
+        assert!(!joined.is_empty(), "a JOIN joins at least one table");
         let (from_columns, from_virtual) = join_columns_of(client, &from).await?;
-        let (joined_columns, joined_virtual) = join_columns_of(client, &joined).await?;
+        let mut sides = Vec::with_capacity(joined.len());
+        for table in joined {
+            let (columns, virtual_columns) = join_columns_of(client, &table).await?;
+            sides.push(JoinedSide {
+                table,
+                columns,
+                virtual_columns,
+            });
+        }
         Ok(JoinSides {
             from,
-            joined,
             from_columns,
-            joined_columns,
             from_virtual,
-            joined_virtual,
+            joined: sides,
         })
     }
 
-    /// The two tables in table-name order: the order define and a resume
+    /// The joined table at position 1. A two-table marker, like
+    /// [`super::join::first_joined`]: a caller that handles every joined
+    /// table iterates [`JoinSides::joined`].
+    pub(crate) fn first_joined(&self) -> &JoinedSide {
+        &self.joined[0]
+    }
+
+    /// The live columns of `side`'s table.
+    pub(crate) fn columns(
+        &self,
+        side: super::join::Side,
+    ) -> &HashMap<String, super::validate::JoinColumnInfo> {
+        match side {
+            super::join::Side::From => &self.from_columns,
+            super::join::Side::Joined(position) => &self.joined[position.index()].columns,
+        }
+    }
+
+    /// Each joined table's live columns, by position.
+    pub(crate) fn joined_column_maps(
+        &self,
+    ) -> Vec<&HashMap<String, super::validate::JoinColumnInfo>> {
+        self.joined.iter().map(|side| &side.columns).collect()
+    }
+
+    /// Every joined table's qualified name, by position.
+    pub(crate) fn joined_tables(&self) -> impl Iterator<Item = &str> {
+        self.joined.iter().map(|side| side.table.as_str())
+    }
+
+    /// Every table, the `FROM` table first, then each joined table by
+    /// position.
+    pub(crate) fn tables(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.from.as_str()).chain(self.joined_tables())
+    }
+
+    /// Every table in table-name order: the order define and a resume
     /// bump their version fences in.
-    fn tables_in_order(&self) -> [&str; 2] {
-        let mut tables = [self.from.as_str(), self.joined.as_str()];
+    fn tables_in_order(&self) -> Vec<&str> {
+        let mut tables: Vec<&str> = self.tables().collect();
         tables.sort_unstable();
         tables
     }
 
-    /// The joined side's column types, as `transform_definitions.join_columns`
-    /// records them.
-    pub(crate) fn joined_value_types(&self) -> HashMap<String, ValueType> {
-        self.joined_columns
-            .iter()
-            .map(|(name, info)| (name.clone(), info.value_type))
-            .collect()
+    /// Each joined table's column types by position, as
+    /// [`record_join_columns`] records them.
+    pub(crate) fn joined_value_types(&self) -> Vec<HashMap<String, ValueType>> {
+        self.joined.iter().map(JoinedSide::value_types).collect()
     }
 }
 
@@ -5071,10 +5203,15 @@ pub(crate) async fn validate_live_join_schema(
     sides: &JoinSides,
     this: Option<&str>,
 ) -> Result<(), CatalogError> {
-    for (side, which) in [
-        (&sides.from, super::join::Side::From),
-        (&sides.joined, super::join::JOINED),
-    ] {
+    let joined = sides.joined.iter().enumerate().map(|(index, side)| {
+        (
+            side.table.as_str(),
+            super::join::Side::Joined(super::join::Position::of_index(index)),
+        )
+    });
+    for (side, which) in
+        std::iter::once((sides.from.as_str(), super::join::Side::From)).chain(joined)
+    {
         let declared = super::source_key::declared_on(def, Some(which));
         let key = super::source_key::admitted_key(txn, side, declared)
             .await
@@ -5086,13 +5223,13 @@ pub(crate) async fn validate_live_join_schema(
         assert_deterministic_definition_keys(txn, def, side, &key).await?;
         reject_unkeyed_source(txn, side, def).await?;
     }
-    let read_tables = vec![
-        side_read_table(txn, &sides.from).await?,
-        side_read_table(txn, &sides.joined).await?,
-    ];
+    let mut read_tables = Vec::with_capacity(1 + sides.joined.len());
+    for table in sides.tables() {
+        read_tables.push(side_read_table(txn, table).await?);
+    }
     assert_regexp_patterns_accepted(txn, def, None).await?;
     reject_row_security(txn, schema, &read_tables).await?;
-    reject_subscribed(txn, &[sides.from.as_str(), sides.joined.as_str()]).await
+    reject_subscribed(txn, &sides.tables().collect::<Vec<_>>()).await
 }
 
 /// A table a definition reads (its source, or a side of a `JOIN`) with the
@@ -5128,8 +5265,11 @@ async fn reject_target_name_with_readers(
 ) -> Result<(), CatalogError> {
     let readers: Vec<String> = client
         .query(
-            "select split_part(target_table, '.', 2) from transform_definitions \
-             where source_table = $1 or join_table = $1 order by id",
+            &format!(
+                "select split_part(target_table, '.', 2) from transform_definitions \
+                 where {} order by id",
+                reads_table_sql("transform_definitions", "$1")
+            ),
             &[&target],
         )
         .await?
@@ -5236,8 +5376,8 @@ pub(crate) async fn revalidate_keyed(
     if check_keys {
         super::recorded_keys::check(txn, definition).await?;
     }
-    let joined = join_table_of(txn, definition.id).await?;
-    if let Some(joined) = joined {
+    let joined = joined_tables_of(txn, definition.id).await?;
+    if !joined.is_empty() {
         return revalidate_join(txn, schema, floors, definition, joined).await;
     }
     let (source_columns, virtual_columns) = live_source_columns_and_virtual(txn, source).await?;
@@ -5302,18 +5442,21 @@ async fn revalidate_join(
     schema: &str,
     floors: &Floors,
     definition: &Definition,
-    joined: String,
+    joined: Vec<String>,
 ) -> Result<Revalidated, CatalogError> {
     let sides = JoinSides::read(txn, definition.source_table.clone(), joined).await?;
-    for (table, columns) in [
-        (&sides.from, &sides.from_columns),
-        (&sides.joined, &sides.joined_columns),
-    ] {
+    let columns = std::iter::once((&sides.from, &sides.from_columns))
+        .chain(sides.joined.iter().map(|side| (&side.table, &side.columns)));
+    for (table, columns) in columns {
         if columns.is_empty() {
             return Err(CatalogError::SourceTableNotFound(table.clone()));
         }
     }
-    super::validate::validate_join(&definition.def, &sides.from_columns, &sides.joined_columns)?;
+    super::validate::validate_join(
+        &definition.def,
+        &sides.from_columns,
+        &sides.first_joined().columns,
+    )?;
     reject_virtual_join_reads(&definition.def, &sides)?;
     validate_live_join_schema(
         txn,
@@ -5327,7 +5470,13 @@ async fn revalidate_join(
         // The joined table's `ON` columns are still unique, and the target
         // is still keyed by `a`'s key; a changed key's only repair is to
         // drop and define again, as for a 1-1 target.
-        super::join_one_to_one::check_define(txn, floors, &definition.def, &sides.joined).await?;
+        super::join_one_to_one::check_define(
+            txn,
+            floors,
+            &definition.def,
+            &sides.first_joined().table,
+        )
+        .await?;
         let target_key: Vec<String> = ddl::identity_key_columns(txn, &definition.target_table)
             .await?
             .into_iter()
@@ -5404,7 +5553,7 @@ pub(crate) async fn recreate_hidden_tables(
                 id,
                 def,
                 &sides.from_columns,
-                &[&sides.joined_columns],
+                &sides.joined_column_maps(),
             ),
         )
     } else {
@@ -5415,7 +5564,7 @@ pub(crate) async fn recreate_hidden_tables(
                 id,
                 def,
                 &sides.from_columns,
-                &sides.joined_columns,
+                &sides.first_joined().columns,
             ),
         )
     };
@@ -5423,8 +5572,51 @@ pub(crate) async fn recreate_hidden_tables(
     Ok(())
 }
 
-/// The qualified joined table of definition `id`, a `JOIN`; `None`
-/// for any other definition, or an id with no row.
+/// Every joined table of every `JOIN` definition, by position, as one
+/// relation (`transform_id`, `position`, `table_name`, `columns`): position
+/// 1 is `transform_definitions.join_table` and `join_columns`, and each
+/// later position a row of `definition_join_tables` (migration V20).
+pub(crate) const JOINED_TABLES_SQL: &str = "(select id as transform_id, 1::smallint as position, \
+     join_table as table_name, join_columns as columns from transform_definitions \
+     where join_table is not null \
+     union all select transform_id, position, table_name, columns from definition_join_tables)";
+
+/// SQL that is true when the definition row `d` (an alias, or
+/// `transform_definitions`) joins `table`, an SQL expression, at a position
+/// past the first. With `{d}.join_table = {table}`, it covers every joined
+/// table: [`reads_table_sql`].
+pub(crate) fn joins_further_sql(d: &str, table: &str) -> String {
+    format!(
+        "exists (select from definition_join_tables j \
+         where j.transform_id = {d}.id and j.table_name = {table})"
+    )
+}
+
+/// SQL that is true when the definition row `d` (an alias, or
+/// `transform_definitions`) reads `table`, an SQL expression: as its source,
+/// or as a joined table at any position.
+pub(crate) fn reads_table_sql(d: &str, table: &str) -> String {
+    format!(
+        "({d}.source_table = {table} or {d}.join_table = {table} or {})",
+        joins_further_sql(d, table)
+    )
+}
+
+/// A `text[]` of the definition row `d`'s joined tables, by position:
+/// empty for a definition that isn't a `JOIN`.
+pub(crate) fn joined_tables_array_sql(d: &str) -> String {
+    format!(
+        "array(select j.table_name from \
+         (select 1 as position, {d}.join_table as table_name where {d}.join_table is not null \
+          union all select f.position, f.table_name from definition_join_tables f \
+          where f.transform_id = {d}.id) j order by j.position)"
+    )
+}
+
+/// The qualified joined table at position 1 of definition `id`, a `JOIN`;
+/// `None` for any other definition, or an id with no row. A two-table
+/// marker: a caller that handles every joined table reads
+/// [`joined_tables_of`].
 pub(crate) async fn join_table_of(
     client: &impl GenericClient,
     id: i64,
@@ -5438,30 +5630,64 @@ pub(crate) async fn join_table_of(
         .and_then(|row| row.get(0)))
 }
 
-/// The qualified joined table of `JOIN` definition `id` and its column
-/// types as define or the last resume recorded them; `None` for any
-/// other definition, or an id with no row.
+/// Every qualified joined table of definition `id`, by position (index 0
+/// is position 1); empty for a definition that isn't a `JOIN`, or an id
+/// with no row.
+pub(crate) async fn joined_tables_of(
+    client: &impl GenericClient,
+    id: i64,
+) -> Result<Vec<String>, CatalogError> {
+    Ok(client
+        .query(
+            &format!(
+                "select j.table_name from {JOINED_TABLES_SQL} j \
+                 where j.transform_id = $1 order by j.position"
+            ),
+            &[&id],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect())
+}
+
+/// The qualified joined table at position 1 of `JOIN` definition `id` and
+/// its column types as define or the last resume recorded them; `None` for
+/// any other definition, or an id with no row. A two-table marker: a
+/// caller that handles every joined table reads [`join_sides_of`].
 pub(crate) async fn join_side_of(
     client: &impl GenericClient,
     id: i64,
 ) -> Result<Option<(String, HashMap<String, ValueType>)>, CatalogError> {
+    Ok(join_sides_of(client, id).await?.into_iter().next())
+}
+
+/// Every joined table of `JOIN` definition `id`, by position, with its
+/// column types as define or the last resume recorded them; empty for any
+/// other definition, or an id with no row.
+pub(crate) async fn join_sides_of(
+    client: &impl GenericClient,
+    id: i64,
+) -> Result<Vec<(String, HashMap<String, ValueType>)>, CatalogError> {
     let rows = client
         .query(
-            "select d.join_table, e.key, e.value from transform_definitions d \
-             left join lateral jsonb_each_text(d.join_columns) e on true \
-             where d.id = $1 and d.join_table is not null",
+            &format!(
+                "select j.position, j.table_name, e.key, e.value from {JOINED_TABLES_SQL} j \
+                 left join lateral jsonb_each_text(j.columns) e on true \
+                 where j.transform_id = $1 order by j.position"
+            ),
             &[&id],
         )
         .await?;
-    let Some(first) = rows.first() else {
-        return Ok(None);
-    };
-    let table: String = first.get(0);
-    let mut columns = HashMap::with_capacity(rows.len());
+    let mut sides: Vec<(i16, String, HashMap<String, ValueType>)> = Vec::new();
     for row in &rows {
+        let position: i16 = row.get(0);
+        if sides.last().is_none_or(|(last, _, _)| *last != position) {
+            sides.push((position, row.get(1), HashMap::new()));
+        }
         let (Some(key), Some(value)) = (
-            row.get::<_, Option<String>>(1),
             row.get::<_, Option<String>>(2),
+            row.get::<_, Option<String>>(3),
         ) else {
             continue;
         };
@@ -5471,26 +5697,68 @@ pub(crate) async fn join_side_of(
                 text: value,
             });
         };
-        columns.insert(key, value_type);
+        if let Some((_, _, columns)) = sides.last_mut() {
+            columns.insert(key, value_type);
+        }
     }
-    Ok(Some((table, columns)))
+    Ok(sides
+        .into_iter()
+        .map(|(_, table, columns)| (table, columns))
+        .collect())
 }
 
-/// Persists `columns` as `JOIN` definition `id`'s joined-table column types,
-/// as a resume reads them, beside [`record_source_columns`].
+/// Writes the joined tables of `JOIN` definition `id` past the first, by
+/// position from 2, with their column types: `joined[0]` is position 2.
+/// Position 1 is the definition row's own `join_table` and `join_columns`.
+pub(crate) async fn insert_further_joined(
+    client: &impl GenericClient,
+    id: i64,
+    joined: &[(&str, HashMap<String, ValueType>)],
+) -> Result<(), CatalogError> {
+    for (index, (table, columns)) in joined.iter().enumerate() {
+        let position = i16::try_from(index + 2).expect("a JOIN joins few tables");
+        let (keys, vals) = encode_type_map(columns);
+        client
+            .execute(
+                "insert into definition_join_tables (transform_id, position, table_name, columns) \
+                 values ($1, $2, $3, jsonb_object($4::text[], $5::text[]))",
+                &[&id, &position, table, &keys, &vals],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// Persists `columns` as `JOIN` definition `id`'s joined-table column types
+/// by position (`columns[0]` is position 1), as a resume reads them, beside
+/// [`record_source_columns`].
 pub(crate) async fn record_join_columns(
     client: &impl GenericClient,
     id: i64,
-    columns: &HashMap<String, ValueType>,
+    columns: &[HashMap<String, ValueType>],
 ) -> Result<(), CatalogError> {
-    let (keys, vals) = encode_type_map(columns);
-    client
-        .execute(
-            "update transform_definitions \
-             set join_columns = jsonb_object($2::text[], $3::text[]) where id = $1",
-            &[&id, &keys, &vals],
-        )
-        .await?;
+    for (index, columns) in columns.iter().enumerate() {
+        let (keys, vals) = encode_type_map(columns);
+        if index == 0 {
+            client
+                .execute(
+                    "update transform_definitions \
+                     set join_columns = jsonb_object($2::text[], $3::text[]) where id = $1",
+                    &[&id, &keys, &vals],
+                )
+                .await?;
+        } else {
+            let position = i16::try_from(index + 1).expect("a JOIN joins few tables");
+            client
+                .execute(
+                    "update definition_join_tables \
+                     set columns = jsonb_object($3::text[], $4::text[]) \
+                     where transform_id = $1 and position = $2",
+                    &[&id, &position, &keys, &vals],
+                )
+                .await?;
+        }
+    }
     Ok(())
 }
 
@@ -5557,7 +5825,10 @@ async fn check_source_index(
         &definition.def,
         &revalidated.source_columns,
         &definition.source_table,
-        revalidated.join.as_ref().map(|sides| sides.joined.as_str()),
+        revalidated
+            .join
+            .as_ref()
+            .map(|sides| sides.first_joined().table.as_str()),
     )
     .await?;
     if missing.is_empty() {
@@ -5790,8 +6061,8 @@ pub(crate) fn reject_virtual_generated_reads(
     }
 }
 
-/// [`reject_virtual_generated_reads`] over both tables of a `JOIN`
-/// definition, `FROM` first.
+/// [`reject_virtual_generated_reads`] over every table of a `JOIN`
+/// definition, `FROM` first, then each joined table by position.
 fn reject_virtual_join_reads(def: &TransformDef, sides: &JoinSides) -> Result<(), CatalogError> {
     reject_virtual_generated_reads(
         def,
@@ -5799,12 +6070,17 @@ fn reject_virtual_join_reads(def: &TransformDef, sides: &JoinSides) -> Result<()
         &sides.from,
         &sides.from_virtual,
     )?;
-    reject_virtual_generated_reads(
-        def,
-        Some(super::join::JOINED),
-        &sides.joined,
-        &sides.joined_virtual,
-    )
+    for (index, side) in sides.joined.iter().enumerate() {
+        reject_virtual_generated_reads(
+            def,
+            Some(super::join::Side::Joined(super::join::Position::of_index(
+                index,
+            ))),
+            &side.table,
+            &side.virtual_columns,
+        )?;
+    }
+    Ok(())
 }
 
 /// The first sentence of both define's refusal of a virtual generated
@@ -6715,7 +6991,7 @@ pub(crate) async fn forget_unread_capture_records(
 
 /// A CTE, `reachable`, of every table a definition `anchor_filter` (a
 /// predicate over `transform_definitions`) keeps reads: its `source_table`
-/// and a `JOIN`'s `join_table`. Shared by [`all_source_tables`] and
+/// and each of a `JOIN`'s joined tables. Shared by [`all_source_tables`] and
 /// [`table_has_reader`] so the two can't disagree about which tables a
 /// definition reads.
 fn reachable_tables_cte(anchor_filter: &str) -> String {
@@ -6725,6 +7001,10 @@ fn reachable_tables_cte(anchor_filter: &str) -> String {
             union
             select distinct join_table from transform_definitions
             where join_table is not null and {anchor_filter}
+            union
+            select distinct j.table_name from definition_join_tables j
+            join transform_definitions on transform_definitions.id = j.transform_id
+            where {anchor_filter}
          )"
     )
 }
@@ -6921,9 +7201,10 @@ pub(crate) async fn refuse_unrunnable(
         .query_opt(
             &format!(
                 "select d.target_table, d.grammar_version, d.floor_version, {}, \
-                        d.source_table, d.join_table \
+                        d.source_table, {} \
                  from transform_definitions d where {}",
                 super::floor::unknown_value_sql("d"),
+                joined_tables_array_sql("d"),
                 target_match_sql("d.target_table", 1)
             ),
             &[&name],
@@ -6942,9 +7223,9 @@ pub(crate) async fn refuse_unrunnable(
         // a shape this one can't read (the capture pass pauses its readers
         // for it, `capture::partitions`).
         let source: String = row.get(4);
-        let join: Option<String> = row.get(5);
+        let joined: Vec<String> = row.get(5);
         let tables: Vec<&str> = std::iter::once(source.as_str())
-            .chain(join.as_deref())
+            .chain(joined.iter().map(String::as_str))
             .collect();
         unrunnable = crate::capture::partitions::unreadable_record(client, &tables).await?;
     }
@@ -7348,9 +7629,12 @@ async fn column_dependents_via(
             // instead would split that bookkeeping across two spellings of
             // the same transform depending on whether a row was reached
             // directly or via cascade.
-            "select split_part(target_table, '.', 2), definition_text, source_table, \
-                    target_table, grammar_version, join_table, floor_version \
-             from transform_definitions",
+            &format!(
+                "select split_part(d.target_table, '.', 2), d.definition_text, d.source_table, \
+                        d.target_table, d.grammar_version, {}, d.floor_version \
+                 from transform_definitions d",
+                joined_tables_array_sql("d")
+            ),
             &[],
         )
         .await?;
@@ -7373,10 +7657,10 @@ async fn column_dependents_via(
         let text: String = row.get(1);
         // The definition's qualified source, which it reads directly.
         let qualified_source: String = row.get(2);
-        // A `JOIN`'s joined table, which it reads directly too.
-        let joined: Option<String> = row.get(5);
-        let reads_upstream = qualified_source == qualified_upstream
-            || joined.as_deref() == Some(qualified_upstream.as_str());
+        // A `JOIN`'s joined tables, which it reads directly too.
+        let joined: Vec<String> = row.get(5);
+        let reads_upstream =
+            qualified_source == qualified_upstream || joined.contains(&qualified_upstream);
         // A definition this release can't run (ADR-0024 rule 3) is never
         // parsed, so which columns it reads can't be known here. It is
         // paused, so no cascade reaches it, and it is no cause of another's
@@ -7413,11 +7697,16 @@ async fn column_dependents_via(
         // whichever side is the upstream table: in a field, or in its `ON` or `GROUP BY`
         // (named by that column, which a `GROUP BY` key's target column is).
         if super::join::spec(&def).is_some() {
-            for (side, table) in [
-                (super::join::Side::From, Some(&qualified_source)),
-                (super::join::JOINED, joined.as_ref()),
-            ] {
-                if table != Some(&qualified_upstream) {
+            let joined = joined.iter().enumerate().map(|(index, table)| {
+                (
+                    super::join::Side::Joined(super::join::Position::of_index(index)),
+                    table,
+                )
+            });
+            for (side, table) in
+                std::iter::once((super::join::Side::From, &qualified_source)).chain(joined)
+            {
+                if table != &qualified_upstream {
                     continue;
                 }
                 let mut named = false;

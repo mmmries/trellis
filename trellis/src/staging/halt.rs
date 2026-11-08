@@ -266,7 +266,7 @@ async fn refusals(
             .filter(|r| unfrozen.contains(&r.id))
     };
     let read: BTreeSet<String> = live()
-        .flat_map(|r| std::iter::once(r.source.clone()).chain(r.join.clone()))
+        .flat_map(|r| std::iter::once(r.source.clone()).chain(r.joined.iter().cloned()))
         .collect();
     let written: BTreeSet<String> = live().map(|r| r.target.clone()).collect();
 
@@ -420,7 +420,7 @@ mod tests {
                     capture_failed: false,
                     refresh_stamp: None,
                     target: target.to_string(),
-                    join: None,
+                    joined: Vec::new(),
                 })
                 .collect(),
         }

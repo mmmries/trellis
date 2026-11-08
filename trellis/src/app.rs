@@ -1099,7 +1099,7 @@ impl Trellis {
                 .query_opt(
                     &format!(
                         "select d.status, d.id, d.source_table, d.definition_text, d.grammar_version, \
-                            d.join_table, d.floor_version, \
+                            d.join_table, {joined} as joined_tables, d.floor_version, \
                             {CHUNK_FAILURE_COLUMNS}, \
                             cf.source_table as capture_table, cf.columns as capture_columns, \
                             cf.error as capture_error, cf.detected_at as capture_detected_at, \
@@ -1127,6 +1127,7 @@ impl Trellis {
                      where {matches}",
                         due = quarantine::retry_due_sql(2, 3),
                         matches = defs::catalog::target_match_sql("d.target_table", 1),
+                        joined = defs::catalog::joined_tables_array_sql("d"),
                     ),
                     &[
                         &target_table,
@@ -1171,7 +1172,7 @@ impl Trellis {
                         crate::staging::holdup::for_definition(
                             &*txn,
                             row.get("source_table"),
-                            row.get::<_, Option<&str>>("join_table"),
+                            &row.get::<_, Vec<String>>("joined_tables"),
                         )
                         .await?;
                 }
@@ -1310,15 +1311,18 @@ impl Trellis {
     ) -> Result<(Option<CaptureWait>, Option<CaptureFailure>), TrellisError> {
         let rows = client
             .query(
-                "select h.table_name, h.since, h.operation, h.lock_mode, h.observed_at, \
+                &format!(
+                    "select h.table_name, h.since, h.operation, h.lock_mode, h.observed_at, \
                         h.blockers, h.error, h.columns \
                  from capture_holdups h \
                  join (select $1::text as t, 0::bigint as ord \
                        union all \
-                       select join_table, 0 from transform_definitions \
-                       where id = $2 and join_table is not null) read \
+                       select j.table_name, 0 from {} j \
+                       where j.transform_id = $2) read \
                    on read.t = h.table_name \
                  order by read.ord, read.t",
+                    crate::defs::catalog::JOINED_TABLES_SQL
+                ),
                 &[&source_table, &definition_id],
             )
             .await?;

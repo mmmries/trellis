@@ -380,8 +380,8 @@ async fn read_tables(
     def: &Definition,
 ) -> Result<Vec<(String, bool)>, CatalogError> {
     let mut tables = BTreeSet::from([def.source_table.clone()]);
-    // A `JOIN` reads its joined table as it reads its `FROM`.
-    tables.extend(catalog::join_table_of(client, def.id).await?);
+    // A `JOIN` reads its joined tables as it reads its `FROM`.
+    tables.extend(catalog::joined_tables_of(client, def.id).await?);
     let tables: Vec<String> = tables.into_iter().collect();
     let seam_fed: BTreeSet<String> = client
         .query(
