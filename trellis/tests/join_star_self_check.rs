@@ -17,7 +17,8 @@
 //! - **O1** (#1464's metamorphic check): a star and the same star with its
 //!   `JOIN` clauses permuted reach the same target under the same writes.
 //! - **The snapshot**: a star's reads every position, its `J` rows filtered
-//!   by position, and the two-table read refuses a star.
+//!   and fan-out markers filtered by position, and the two-table read
+//!   refuses a star.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -29,7 +30,7 @@ use star::{Kind, Shape, Star};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::dev::staging::one_to_one_join_snapshot::{hidden_snapshot, star_snapshot};
-use trellis::staging::self_check::Divergence;
+use trellis::staging::self_check::{Divergence, SelfCheckScope, compare_page};
 
 /// Turns the development knob on: every pin here defines a star.
 fn knob() {
@@ -484,4 +485,67 @@ async fn a_star_s_snapshot_reads_every_position() {
     };
     assert!(has(1, "4"), "position 1 keeps key 4");
     assert!(!has(2, "4"), "position 2 lost key 4");
+    // A fan-out marker at position 2 is read at position 2 alone. Nothing
+    // steps the driver after it, so no chunk takes it.
+    d.ctl
+        .batch_execute(&format!(
+            "insert into {DEFAULT_SCHEMA}.join1_fan_out \
+                 (transform_id, position, join_key, seg_seq) \
+             values ({id}, 2, array['4'], 0)"
+        ))
+        .await
+        .expect("plant a marker");
+    let s = star_snapshot(d.pool(), &star.target())
+        .await
+        .expect("a snapshot")
+        .expect("not skipped");
+    assert!(s.positions[0].markers.is_empty(), "{:?}", s.positions[0]);
+    let markers: Vec<&Vec<String>> = s.positions[1].markers.iter().map(|m| &m.join_key).collect();
+    assert_eq!(markers, [&vec!["4".to_string()]]);
+}
+
+/// Every page of one comparison of `star`'s target, with no wait and no
+/// re-check: the divergences, and whether a page couldn't vouch for every
+/// key.
+async fn compare_walk(d: &Driver, star: Star) -> (Vec<Divergence>, bool) {
+    let mut after = None;
+    let (mut found, mut all) = (Vec::new(), false);
+    loop {
+        let page = compare_page(d.pool(), &star.target(), SelfCheckScope { after, limit: 4 })
+            .await
+            .expect("a page of the comparison");
+        found.extend(page.divergences);
+        all |= page.uncertain_all;
+        after = page.next_after;
+        if after.is_none() {
+            return (found, all);
+        }
+    }
+}
+
+/// A change the ring can't vouch for (an image-less `Recompute`) on the
+/// table at any position touches every `a` row on its key, so the target's
+/// pages can't vouch for any key: as a two-table `JOIN`'s `b` ring does, at
+/// every position of the star.
+#[tokio::test]
+async fn an_uncertain_key_at_any_position_leaves_every_key_uncertain() {
+    let _serial = star::serial().await;
+    knob();
+    let star = N4.stars()[0];
+    for p in N4.all() {
+        let d = star::start_seeded(&[star], &seed(N4)).await;
+        let (found, all) = compare_walk(&d, star).await;
+        assert_eq!(
+            (found, all),
+            (Vec::new(), false),
+            "position {p}, nothing pending"
+        );
+        d.stage_recomputes(&N4.b_at(p), &["3"]).await;
+        let (found, all) = compare_walk(&d, star).await;
+        assert_eq!(found, Vec::new(), "position {p}");
+        assert!(
+            all,
+            "position {p}: an image-less change at b{p} leaves every key uncertain"
+        );
+    }
 }

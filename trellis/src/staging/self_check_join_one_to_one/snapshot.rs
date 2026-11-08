@@ -588,7 +588,7 @@ async fn position_view(
 
 /// Every entry of the ledger `ledger`, with its join key at each of `keys`'s
 /// positions (an `R` entry's, one per position; an `M` entry's, its own
-/// alone). Each [`HiddenEntry::join_key`] is the first of them.
+/// alone). Each [`HiddenEntry::join_key`] is all of them, in position order.
 async fn entries(
     txn: &tokio_postgres::Transaction<'_>,
     ledger: &str,
