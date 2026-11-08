@@ -949,7 +949,10 @@ pub(crate) async fn restore_queued(
         .map_err(|err| catalog(crate::defs::CatalogError::from(err)))?;
         let resolved_source = resolve(def.explicit_source_schema.as_deref(), &def.source).await?;
         let resolved_join = match crate::defs::join::spec(&def) {
-            Some(join) => Some(resolve(join.explicit_right_schema.as_deref(), &join.right).await?),
+            Some(join) => {
+                let joined = crate::defs::join::first_joined(join);
+                Some(resolve(joined.explicit_right_schema.as_deref(), &joined.right).await?)
+            }
             None => None,
         };
         let recorded = (

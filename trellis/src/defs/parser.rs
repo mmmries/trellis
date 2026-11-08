@@ -34,8 +34,8 @@
 
 use super::ast::{
     AlterClause, AlterTransform, DefinitionRef, Expr, FieldDef, JoinKind, JoinOn, JoinSpec,
-    KeySpace, Operator, Predicate, QualifiedColumn, Statement, StatementKind, TransformDef,
-    TransformRef,
+    JoinedTable, KeySpace, Operator, Predicate, QualifiedColumn, Statement, StatementKind,
+    TransformDef, TransformRef,
 };
 use super::error::ParseError;
 use super::lexer::{Identifiers, Token, lex_in};
@@ -198,13 +198,14 @@ fn resolve_aliases(def: &mut TransformDef, identifiers: Identifiers) -> Result<(
     let (KeySpace::Join(join) | KeySpace::JoinOneToOne(join)) = &mut def.key_space else {
         return Ok(());
     };
-    let sides: Vec<(String, String)> = [
-        (&def.source, &join.source_alias),
-        (&join.right, &join.right_alias),
-    ]
-    .into_iter()
-    .filter_map(|(table, alias)| Some((table.clone(), alias.clone()?)))
-    .collect();
+    let sides: Vec<(String, String)> = std::iter::once((&def.source, &join.source_alias))
+        .chain(
+            join.joins
+                .iter()
+                .map(|joined| (&joined.right, &joined.right_alias)),
+        )
+        .filter_map(|(table, alias)| Some((table.clone(), alias.clone()?)))
+        .collect();
     if sides.is_empty() {
         return Ok(());
     }
@@ -225,7 +226,7 @@ fn resolve_aliases(def: &mut TransformDef, identifiers: Identifiers) -> Result<(
         }
         Ok(())
     };
-    for term in &mut join.on {
+    for term in join.joins.iter_mut().flat_map(|joined| &mut joined.on) {
         for column in [&mut term.lhs, &mut term.rhs] {
             resolve(&mut column.schema, &mut column.table, &column.column)?;
         }
@@ -938,7 +939,7 @@ impl Parser {
         }
         let right_key = self.parse_table_key()?;
         let right_alias = self.parse_table_alias()?;
-        self.check_aliases(&right, right_alias.as_deref())?;
+        self.check_aliases(&[], &right, right_alias.as_deref())?;
         if self.peek_is_keyword("USING") {
             return Err(unsupported(
                 "JOIN USING",
@@ -969,19 +970,23 @@ impl Parser {
             ));
         }
 
+        let joined = JoinedTable {
+            kind,
+            right,
+            explicit_right_schema,
+            right_key,
+            right_alias,
+            on,
+        };
+
         if !self.peek_is_keyword("GROUP") {
             // No `GROUP BY`: a 1-1 JOIN (ADR-0021). Whether it is admitted is
             // the validator's to say (it is gated at define, not here, so a
             // stored definition still loads with the gate off).
             return Ok((
                 JoinSpec {
-                    kind,
                     source_alias: self.source_alias.clone(),
-                    right,
-                    explicit_right_schema,
-                    right_key,
-                    right_alias,
-                    on,
+                    joins: vec![joined],
                     group_by: Vec::new(),
                 },
                 false,
@@ -997,13 +1002,8 @@ impl Parser {
         self.is_aggregate = true;
         Ok((
             JoinSpec {
-                kind,
                 source_alias: self.source_alias.clone(),
-                right,
-                explicit_right_schema,
-                right_key,
-                right_alias,
-                on,
+                joins: vec![joined],
                 group_by,
             },
             true,
@@ -1014,10 +1014,19 @@ impl Parser {
     /// sides: an alias equal to the other side's alias or to the other
     /// table's bare name. Postgres folds an unquoted name to lower case, so
     /// `X` and `x` are the same name here as there.
-    fn check_aliases(&self, right: &str, right_alias: Option<&str>) -> Result<(), ParseError> {
+    ///
+    /// `earlier` are the tables already joined, in the order written: the
+    /// joined table is checked against the `FROM` table and every one of
+    /// them, so every pair of tables is checked once its later table is read.
+    fn check_aliases(
+        &self,
+        earlier: &[JoinedTable],
+        right: &str,
+        right_alias: Option<&str>,
+    ) -> Result<(), ParseError> {
         let source = self.source.as_deref().unwrap_or_default();
         let source_alias = self.source_alias.as_deref();
-        let clashes = [
+        let mut clashes = vec![
             (source_alias, right, "the joined table's name"),
             (right_alias, source, "the FROM table's name"),
             (
@@ -1026,6 +1035,22 @@ impl Parser {
                 "the FROM table's alias",
             ),
         ];
+        for other in earlier {
+            let other_alias = other.right_alias.as_deref();
+            clashes.extend([
+                (other_alias, right, "the joined table's name"),
+                (
+                    right_alias,
+                    other.right.as_str(),
+                    "an earlier joined table's name",
+                ),
+                (
+                    right_alias,
+                    other_alias.unwrap_or_default(),
+                    "an earlier joined table's alias",
+                ),
+            ]);
+        }
         for (alias, other, what) in clashes {
             if let Some(alias) = alias
                 && same_name(self.identifiers, alias, other)

@@ -52,7 +52,7 @@ use tokio_postgres::GenericClient;
 use super::ast::ValueType;
 use super::ast::{KeySpace, TransformDef};
 use super::ddl::regclass_arg;
-use super::join::{self, Side};
+use super::join::{self, JOINED, Side};
 use crate::pool::quote_ident;
 
 /// The part of a definition that needs a source index. In a self-join both
@@ -343,7 +343,7 @@ pub(crate) fn required(
         }
         KeySpace::Join(_) => [
             (Side::From, IndexRole::JoinFrom, Some(source_table)),
-            (Side::Joined, IndexRole::JoinJoined, join_table),
+            (JOINED, IndexRole::JoinJoined, join_table),
         ]
         .into_iter()
         .filter_map(|(side, role, table)| {

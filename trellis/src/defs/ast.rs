@@ -339,21 +339,35 @@ pub struct JoinOn {
     pub rhs: QualifiedColumn,
 }
 
-/// The `JOIN` half of a [`KeySpace::Join`] definition. The `FROM` table is
-/// [`TransformDef::source`]; this is the other table, how it joins, and the
-/// `GROUP BY` keys, each of which may come from either table.
+/// The `JOIN` half of a [`KeySpace::Join`] or [`KeySpace::JoinOneToOne`]
+/// definition. The `FROM` table is [`TransformDef::source`]; [`Self::joins`]
+/// are the other tables, in the order written, each with how it joins, and
+/// [`Self::group_by`] the `GROUP BY` keys, each of which may come from any
+/// table.
 ///
 /// Every qualifier in the tree ([`QualifiedColumn::table`],
-/// [`Expr::SourceColumn`]'s `table`) names its side by the side's bare table
-/// name, even where the text wrote the side's alias: the parser resolves each
-/// alias to its table once, so nothing past it sees an alias. The aliases are
-/// kept only so [`render_definition_text`] writes them back.
+/// [`Expr::SourceColumn`]'s `table`) names its table by its bare name, even
+/// where the text wrote the table's alias: the parser resolves each alias to
+/// its table once, so nothing past it sees an alias. The aliases are kept
+/// only so [`render_definition_text`] writes them back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinSpec {
-    pub kind: JoinKind,
     /// The alias the `FROM` table was given (`FROM <table> [AS] <alias>`),
     /// as written.
     pub source_alias: Option<String>,
+    /// The joined tables, in the order their `JOIN`s were written. At least
+    /// one; the parser admits exactly one today.
+    pub joins: Vec<JoinedTable>,
+    /// The `GROUP BY` keys in the order written; at least one for an
+    /// aggregate JOIN, none for a 1-1 JOIN.
+    pub group_by: Vec<QualifiedColumn>,
+}
+
+/// One `[LEFT|INNER] JOIN <table> [KEY (...)] [[AS] <alias>] ON ...` of a
+/// [`JoinSpec`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinedTable {
+    pub kind: JoinKind,
     /// The joined table's bare name.
     pub right: String,
     /// `Some(schema)` when the joined table was written `<schema>.<table>`;
@@ -367,8 +381,6 @@ pub struct JoinSpec {
     pub right_alias: Option<String>,
     /// The `ON` terms, joined by `AND`. At least one.
     pub on: Vec<JoinOn>,
-    /// The `GROUP BY` keys in the order written; at least one.
-    pub group_by: Vec<QualifiedColumn>,
 }
 
 /// Whether `name` is one of `group_by`'s keys' target column names — the
@@ -746,20 +758,26 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
                 aliases.qualified(column.schema.as_deref(), &column.table, &column.column)
             };
             render_alias(&mut out, join.source_alias.as_deref());
-            out.push_str(match join.kind {
-                JoinKind::Inner => " INNER JOIN ",
-                JoinKind::Left => " LEFT JOIN ",
-            });
-            render_table_ref(&mut out, &join.right, join.explicit_right_schema.as_deref());
-            render_key(&mut out, join.right_key.as_deref());
-            render_alias(&mut out, join.right_alias.as_deref());
-            out.push_str(" ON ");
-            let terms: Vec<String> = join
-                .on
-                .iter()
-                .map(|term| format!("{} = {}", qualified(&term.lhs), qualified(&term.rhs)))
-                .collect();
-            out.push_str(&terms.join(" AND "));
+            for joined in &join.joins {
+                out.push_str(match joined.kind {
+                    JoinKind::Inner => " INNER JOIN ",
+                    JoinKind::Left => " LEFT JOIN ",
+                });
+                render_table_ref(
+                    &mut out,
+                    &joined.right,
+                    joined.explicit_right_schema.as_deref(),
+                );
+                render_key(&mut out, joined.right_key.as_deref());
+                render_alias(&mut out, joined.right_alias.as_deref());
+                out.push_str(" ON ");
+                let terms: Vec<String> = joined
+                    .on
+                    .iter()
+                    .map(|term| format!("{} = {}", qualified(&term.lhs), qualified(&term.rhs)))
+                    .collect();
+                out.push_str(&terms.join(" AND "));
+            }
             if matches!(def.key_space, KeySpace::Join(_)) {
                 out.push_str(" GROUP BY ");
                 let keys: Vec<String> = join.group_by.iter().map(qualified).collect();
@@ -873,8 +891,10 @@ impl<'a> Aliases<'a> {
             if let Some(alias) = &join.source_alias {
                 aliases.push((def.source.as_str(), alias.as_str()));
             }
-            if let Some(alias) = &join.right_alias {
-                aliases.push((join.right.as_str(), alias.as_str()));
+            for joined in &join.joins {
+                if let Some(alias) = &joined.right_alias {
+                    aliases.push((joined.right.as_str(), alias.as_str()));
+                }
             }
         }
         Self(aliases)

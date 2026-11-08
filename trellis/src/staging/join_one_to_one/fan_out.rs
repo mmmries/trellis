@@ -351,7 +351,10 @@ async fn load(pool: &Pool, id: i64) -> Result<Option<Loaded>, ApplyError> {
     };
     // The versions first: a definition change after them misses the fence
     // the chunk then holds, rather than run on a shape it doesn't hold.
-    let mut tables = vec![definition.source_table.clone(), join.right.clone()];
+    let mut tables = vec![
+        definition.source_table.clone(),
+        crate::defs::join::first_joined(join).right.clone(),
+    ];
     tables.sort();
     tables.dedup();
     let mut versions = Vec::with_capacity(tables.len());

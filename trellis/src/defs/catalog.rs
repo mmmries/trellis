@@ -3439,6 +3439,7 @@ async fn create_definition_inner(
     // transaction, for the catalog row and the hidden tables.
     let join_sides = match super::join::spec(&def) {
         Some(join) => {
+            let join = super::join::first_joined(join);
             let joined = match &join.explicit_right_schema {
                 Some(schema) => {
                     confirm_qualified_source(&*txn, schema, &join.right).await?;
@@ -4689,6 +4690,7 @@ impl JoinSides {
         let Some(join) = super::join::spec(def) else {
             panic!("JoinSides::resolve called on a definition that isn't a JOIN");
         };
+        let join = super::join::first_joined(join);
         let from = resolve_source_for_install(pool, def).await?;
         let joined = match &join.explicit_right_schema {
             Some(schema) => {
@@ -5068,7 +5070,7 @@ pub(crate) async fn validate_live_join_schema(
 ) -> Result<(), CatalogError> {
     for (side, which) in [
         (&sides.from, super::join::Side::From),
-        (&sides.joined, super::join::Side::Joined),
+        (&sides.joined, super::join::JOINED),
     ] {
         let declared = super::source_key::declared_on(def, Some(which));
         let key = super::source_key::admitted_key(txn, side, declared)
@@ -5797,7 +5799,7 @@ fn reject_virtual_join_reads(def: &TransformDef, sides: &JoinSides) -> Result<()
     )?;
     reject_virtual_generated_reads(
         def,
-        Some(super::join::Side::Joined),
+        Some(super::join::JOINED),
         &sides.joined,
         &sides.joined_virtual,
     )
@@ -7411,7 +7413,7 @@ async fn column_dependents_via(
         if super::join::spec(&def).is_some() {
             for (side, table) in [
                 (super::join::Side::From, Some(&qualified_source)),
-                (super::join::Side::Joined, joined.as_ref()),
+                (super::join::JOINED, joined.as_ref()),
             ] {
                 if table != Some(&qualified_upstream) {
                     continue;
@@ -8816,7 +8818,7 @@ mod virtual_generated_tests {
     //! columns.
 
     use super::*;
-    use crate::defs::join::Side;
+    use crate::defs::join::{JOINED, Side};
 
     fn def(text: &str) -> TransformDef {
         parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}"))
@@ -8873,7 +8875,7 @@ mod virtual_generated_tests {
             "TRANSFORM j FROM a LEFT JOIN bv ON a.k = bv.k SELECT a.r AS r, bv.g AS bg",
         ] {
             assert_eq!(
-                refused(text, Some(Side::Joined), "public.bv").as_deref(),
+                refused(text, Some(JOINED), "public.bv").as_deref(),
                 Some("g"),
                 "{text}"
             );
@@ -8900,7 +8902,7 @@ mod virtual_generated_tests {
         }
         let text = "TRANSFORM j FROM a JOIN bv ON a.k = bv.k GROUP BY a.grp \
                     SELECT a.grp AS grp, SUM(bv.img) AS total";
-        assert_eq!(refused(text, Some(Side::Joined), "public.bv"), None);
+        assert_eq!(refused(text, Some(JOINED), "public.bv"), None);
         // No virtual column at all: nothing to refuse.
         assert!(
             reject_virtual_generated_reads(

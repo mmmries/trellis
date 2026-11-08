@@ -93,7 +93,12 @@ pub(crate) async fn column(
 ) -> Result<Option<String>, tokio_postgres::Error> {
     let mut tables = vec![(def.explicit_source_schema.as_deref(), def.source.as_str())];
     if let KeySpace::Join(join) | KeySpace::JoinOneToOne(join) = &def.key_space {
-        tables.push((join.explicit_right_schema.as_deref(), join.right.as_str()));
+        for joined in &join.joins {
+            tables.push((
+                joined.explicit_right_schema.as_deref(),
+                joined.right.as_str(),
+            ));
+        }
     }
     for (schema, table) in tables {
         let row = client

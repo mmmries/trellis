@@ -41,7 +41,9 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use super::ast::{Expr, JoinSpec, KeySpace, QualifiedColumn, TransformDef, ValueType};
+use super::ast::{
+    Expr, JoinOn, JoinSpec, JoinedTable, KeySpace, QualifiedColumn, TransformDef, ValueType,
+};
 use super::validate::{JoinColumnInfo, ValidationError};
 use crate::integer::IntWidth;
 use crate::pool::quote_ident;
@@ -51,8 +53,66 @@ use crate::pool::quote_ident;
 pub(crate) enum Side {
     /// The `FROM` table.
     From,
-    /// The `JOIN` table.
-    Joined,
+    /// A `JOIN` table, by its position.
+    Joined(Position),
+}
+
+/// A joined table's position in its [`JoinSpec::joins`]: 1 for the first
+/// `JOIN` written, counting up in the order written. The `FROM` table has
+/// none ([`Side::From`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct Position(usize);
+
+impl Position {
+    /// The first joined table's position, the only one a two-table JOIN has.
+    pub(crate) const FIRST: Self = Self(1);
+
+    /// The position of `joins[index]`.
+    pub(crate) fn of_index(index: usize) -> Self {
+        Self(index + 1)
+    }
+
+    /// This position's index into [`JoinSpec::joins`].
+    pub(crate) fn index(self) -> usize {
+        self.0 - 1
+    }
+}
+
+/// The first joined table's side: the only one a two-table JOIN has. Code
+/// that names it rather than a [`Position`] still assumes one joined table.
+pub(crate) const JOINED: Side = Side::Joined(Position::FIRST);
+
+/// The joined table at `position` of `join`.
+pub(crate) fn joined(join: &JoinSpec, position: Position) -> &JoinedTable {
+    &join.joins[position.index()]
+}
+
+/// The first joined table of `join`: the only one a two-table JOIN has. Code
+/// that reads it still assumes one joined table.
+pub(crate) fn first_joined(join: &JoinSpec) -> &JoinedTable {
+    joined(join, Position::FIRST)
+}
+
+/// Every joined table of `join` with its position, in the order written.
+pub(crate) fn positions(join: &JoinSpec) -> impl Iterator<Item = (Position, &JoinedTable)> {
+    join.joins
+        .iter()
+        .enumerate()
+        .map(|(index, joined)| (Position::of_index(index), joined))
+}
+
+/// Every side of `join`: the `FROM` table's, then each joined table's in
+/// position order.
+pub(crate) fn sides(join: &JoinSpec) -> impl Iterator<Item = Side> + '_ {
+    std::iter::once(Side::From).chain(positions(join).map(|(position, _)| Side::Joined(position)))
+}
+
+/// The bare name of `side`'s table.
+pub(crate) fn side_table<'a>(def: &'a TransformDef, join: &'a JoinSpec, side: Side) -> &'a str {
+    match side {
+        Side::From => &def.source,
+        Side::Joined(position) => &joined(join, position).right,
+    }
 }
 
 /// `def`'s [`JoinSpec`], if it is a `JOIN` definition of either kind: an
@@ -78,14 +138,13 @@ pub(crate) fn is_one_to_one(def: &TransformDef) -> bool {
 }
 
 /// The side a column written `<table>.<column>` belongs to, by `table`.
-fn side_of_written(def: &TransformDef, join: &JoinSpec, table: &str) -> Option<Side> {
+pub(crate) fn side_of_written(def: &TransformDef, join: &JoinSpec, table: &str) -> Option<Side> {
     if table == def.source {
-        Some(Side::From)
-    } else if table == join.right {
-        Some(Side::Joined)
-    } else {
-        None
+        return Some(Side::From);
     }
+    positions(join)
+        .find(|(_, joined)| joined.right == table)
+        .map(|(position, _)| Side::Joined(position))
 }
 
 /// The side the qualified `table` (`schema.table`) is of `def`, matched on
@@ -97,13 +156,19 @@ pub(crate) fn side_of_table(def: &TransformDef, table: &str) -> Option<Side> {
     side_of_written(def, join, bare)
 }
 
-/// `side`'s columns in the `ON` clause, in `ON` order: its join key.
+/// `side`'s columns in the `ON` clauses, in `ON` order: its join key. A
+/// joined side's are those of its own `ON`; the `FROM` side's are those of
+/// every `ON`, in position order.
 pub(crate) fn join_key(def: &TransformDef, side: Side) -> Vec<String> {
     let Some(join) = spec(def) else {
         return Vec::new();
     };
-    join.on
-        .iter()
+    let terms: Vec<&JoinOn> = match side {
+        Side::From => join.joins.iter().flat_map(|joined| &joined.on).collect(),
+        Side::Joined(position) => joined(join, position).on.iter().collect(),
+    };
+    terms
+        .into_iter()
         .filter_map(|term| {
             [&term.lhs, &term.rhs]
                 .into_iter()
@@ -303,7 +368,7 @@ impl HiddenTable {
     pub(crate) fn partials(side: Side) -> Self {
         match side {
             Side::From => HiddenTable::FromPartials,
-            Side::Joined => HiddenTable::JoinedPartials,
+            Side::Joined(_) => HiddenTable::JoinedPartials,
         }
     }
 
@@ -460,14 +525,17 @@ pub(crate) fn table_widths(def: &TransformDef) -> Vec<(String, usize)> {
         "the target table".to_string(),
         join.group_by.len() + non_key_fields(def, join).count(),
     )];
-    for (side, table) in [(Side::From, &def.source), (Side::Joined, &join.right)] {
+    for (side, table) in [
+        (Side::From, &def.source),
+        (JOINED, &first_joined(join).right),
+    ] {
         widths.push((
             format!("{table}'s hidden partials table"),
             side_key_columns(def, side).len()
                 + side_partials_tail(side_arguments(def, side).len()).len(),
         ));
     }
-    let arguments = side_arguments(def, Side::From).len() + side_arguments(def, Side::Joined).len();
+    let arguments = side_arguments(def, Side::From).len() + side_arguments(def, JOINED).len();
     widths.push((
         "the hidden table of the JOIN's group partials".to_string(),
         join.group_by.len() + target_partials_tail(arguments).len(),
@@ -503,7 +571,7 @@ pub(crate) fn hidden_tables_ddl(
     let mut sql = String::new();
     for (table, side, columns) in [
         (HiddenTable::FromPartials, Side::From, from),
-        (HiddenTable::JoinedPartials, Side::Joined, joined),
+        (HiddenTable::JoinedPartials, JOINED, joined),
     ] {
         let keys = side_key_columns(def, side);
         let arguments = side_arguments(def, side).len();
@@ -534,12 +602,11 @@ pub(crate) fn hidden_tables_ddl(
             .group_by
             .iter()
             .map(|key| match side_of_written(def, join, &key.table) {
-                Some(Side::Joined) => typed_column(joined, &key.column),
+                Some(Side::Joined(_)) => typed_column(joined, &key.column),
                 _ => typed_column(from, &key.column),
             })
             .collect();
-        let arguments =
-            side_arguments(def, Side::From).len() + side_arguments(def, Side::Joined).len();
+        let arguments = side_arguments(def, Side::From).len() + side_arguments(def, JOINED).len();
         body.extend(target_partials_tail(arguments));
         let groups: Vec<String> = join
             .group_by
@@ -588,7 +655,7 @@ fn argument_type(
     }
     let columns = match side {
         Side::From => from,
-        Side::Joined => joined,
+        Side::Joined(_) => joined,
     };
     let types: HashMap<String, ValueType> = columns
         .iter()
@@ -621,7 +688,8 @@ pub(crate) fn field_pg_type(
             _ => {}
         }
     }
-    let value_type = super::validate::join_field_value_type(def, field, from, joined)?;
+    let value_type =
+        super::validate::join_field_value_type(def, field, from, std::slice::from_ref(joined))?;
     Ok(super::ddl::pg_type_name(value_type).into_owned())
 }
 
@@ -643,7 +711,7 @@ pub(crate) fn target_ddl(
     let mut keys = Vec::with_capacity(join.group_by.len());
     for key in &join.group_by {
         let side_columns = match side_of_written(def, join, &key.table) {
-            Some(Side::Joined) => joined,
+            Some(Side::Joined(_)) => joined,
             _ => from,
         };
         // With its collation, as the hidden tables carry it, so the two
@@ -697,7 +765,7 @@ mod tests {
     fn sides_are_found_by_bare_name() {
         let def = parse(DEF).unwrap();
         assert_eq!(side_of_table(&def, "public.orders"), Some(Side::From));
-        assert_eq!(side_of_table(&def, "shop.items"), Some(Side::Joined));
+        assert_eq!(side_of_table(&def, "shop.items"), Some(JOINED));
         assert_eq!(side_of_table(&def, "public.other"), None);
         let plain = parse("TRANSFORM t FROM orders SELECT id AS id").unwrap();
         assert_eq!(side_of_table(&plain, "public.orders"), None);
@@ -707,18 +775,18 @@ mod tests {
     fn each_side_reads_its_key_group_and_argument_columns() {
         let def = parse(DEF).unwrap();
         assert_eq!(join_key(&def, Side::From), ["id", "tenant"]);
-        assert_eq!(join_key(&def, Side::Joined), ["order_id", "tenant"]);
+        assert_eq!(join_key(&def, JOINED), ["order_id", "tenant"]);
         assert_eq!(
             side_columns(&def, Side::From),
             BTreeSet::from(["id", "tenant", "region", "total"].map(String::from))
         );
         assert_eq!(
-            side_columns(&def, Side::Joined),
+            side_columns(&def, JOINED),
             BTreeSet::from(["order_id", "tenant", "sku", "qty"].map(String::from))
         );
         // `items.qty` serves `SUM` and `COUNT`; `items.qty + 1` is a second
         // argument.
-        assert_eq!(side_arguments(&def, Side::Joined).len(), 2);
+        assert_eq!(side_arguments(&def, JOINED).len(), 2);
         assert_eq!(side_arguments(&def, Side::From).len(), 1);
     }
 
@@ -858,14 +926,14 @@ mod tests {
         assert!(is_one_to_one(&def) && !is_grouped(&def));
         assert!(spec(&def).is_some_and(|join| join.group_by.is_empty()));
         assert_eq!(side_of_table(&def, "public.orders"), Some(Side::From));
-        assert_eq!(side_of_table(&def, "shop.items"), Some(Side::Joined));
-        assert_eq!(join_key(&def, Side::Joined), ["order_id"]);
+        assert_eq!(side_of_table(&def, "shop.items"), Some(JOINED));
+        assert_eq!(join_key(&def, JOINED), ["order_id"]);
         assert_eq!(
             side_columns(&def, Side::From),
             BTreeSet::from(["id", "total"].map(String::from))
         );
         assert_eq!(
-            side_columns(&def, Side::Joined),
+            side_columns(&def, JOINED),
             BTreeSet::from(["order_id", "sku"].map(String::from))
         );
         let grouped = parse(DEF).unwrap();

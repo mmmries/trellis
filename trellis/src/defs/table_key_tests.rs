@@ -9,7 +9,7 @@ use super::parse;
 
 fn right_key(def: &TransformDef) -> Option<Vec<String>> {
     match &def.key_space {
-        KeySpace::Join(join) | KeySpace::JoinOneToOne(join) => join.right_key.clone(),
+        KeySpace::Join(join) | KeySpace::JoinOneToOne(join) => join.joins[0].right_key.clone(),
         other => panic!("expected a JOIN, got {other:?}"),
     }
 }

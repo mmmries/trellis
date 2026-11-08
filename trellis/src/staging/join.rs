@@ -167,7 +167,7 @@ use tokio_postgres::types::PgLsn;
 
 use crate::defs::ast::{Expr, KeySpace, TransformDef, ValueType};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::defs::join::{self as spec, HiddenTable, Side};
+use crate::defs::join::{self as spec, HiddenTable, JOINED, Side};
 use crate::defs::model::Definition;
 use crate::defs::oracle::render_qualified_expr_sql;
 use crate::pool::quote_ident;
@@ -273,7 +273,7 @@ impl Truncate {
         truncate.origin_lsn = earliest_origin(truncate.origin_lsn, change.origin_lsn);
         let floor = match side {
             Side::From => &mut truncate.from,
-            Side::Joined => &mut truncate.joined,
+            Side::Joined(_) => &mut truncate.joined,
         };
         *floor = Some(floor.map_or(lsn, |f| f.max(lsn)));
     }
@@ -446,12 +446,12 @@ impl JoinTargetPlan {
         let Some(join) = spec::spec(def) else {
             return Err(unsupported("a definition that isn't a JOIN"));
         };
-        let left = join.kind == crate::defs::ast::JoinKind::Left;
+        let left = spec::first_joined(join).kind == crate::defs::ast::JoinKind::Left;
         let arguments = |side| spec::side_arguments(def, side);
-        let (from_args, joined_args) = (arguments(Side::From), arguments(Side::Joined));
+        let (from_args, joined_args) = (arguments(Side::From), arguments(JOINED));
         let types_of = |side| match side {
             Side::From => &definition.source_columns,
-            Side::Joined => &joined.1,
+            Side::Joined(_) => &joined.1,
         };
         // The side an aggregate's argument reads (define refuses one that
         // reads both, or neither).
@@ -459,7 +459,7 @@ impl JoinTargetPlan {
             if from_args.contains(arg) {
                 Some(Side::From)
             } else if joined_args.contains(arg) {
-                Some(Side::Joined)
+                Some(JOINED)
             } else {
                 None
             }
@@ -482,7 +482,7 @@ impl JoinTargetPlan {
                 let side = if key.table == def.source {
                     Side::From
                 } else {
-                    Side::Joined
+                    JOINED
                 };
                 (side, key.column.clone())
             })
@@ -502,7 +502,7 @@ impl JoinTargetPlan {
         };
         let arg_of = |arg: &Expr| match side_of(arg)? {
             Side::From => from_args.iter().position(|a| a == arg),
-            Side::Joined => joined_args
+            Side::Joined(_) => joined_args
                 .iter()
                 .position(|a| a == arg)
                 .map(|i| i + from_args.len()),
@@ -524,14 +524,14 @@ impl JoinTargetPlan {
             |side: Side, table: HiddenTable, source: &str, pk: Vec<PrimaryKeyColumn>, tag: &str| {
                 let args: Vec<Arg> = match side {
                     Side::From => t_shape.args[..from_args.len()].to_vec(),
-                    Side::Joined => t_shape.args[from_args.len()..].to_vec(),
+                    Side::Joined(_) => t_shape.args[from_args.len()..].to_vec(),
                 };
                 let key_cols = spec::side_key_columns(def, side);
                 let join_cols = spec::join_key(def, side);
                 // A joined row with a `NULL` key part joins nothing: no `M` cell.
                 let stage_filter = match side {
                     Side::From => String::new(),
-                    Side::Joined => join_cols
+                    Side::Joined(_) => join_cols
                         .iter()
                         .map(|c| format!(" and s.{} is not null", quote_ident(c)))
                         .collect(),
@@ -541,7 +541,7 @@ impl JoinTargetPlan {
                     &key_cols,
                     Some(match side {
                         Side::From => &collations.from,
-                        Side::Joined => &collations.joined,
+                        Side::Joined(_) => &collations.joined,
                     }),
                     collations.hidden(table),
                     None,
@@ -600,7 +600,7 @@ impl JoinTargetPlan {
             "p",
         );
         let joined_plan = side_plan(
-            Side::Joined,
+            JOINED,
             HiddenTable::JoinedPartials,
             &joined.0,
             joined_pk,
@@ -642,7 +642,7 @@ impl JoinTargetPlan {
     fn side_mut(&mut self, side: Side) -> &mut SidePlan {
         match side {
             Side::From => &mut self.from,
-            Side::Joined => &mut self.joined,
+            Side::Joined(_) => &mut self.joined,
         }
     }
 
@@ -714,7 +714,7 @@ impl JoinTargetPlan {
             .iter()
             .map(|(side, c)| match side {
                 Side::From => format!("q.{}", quote_ident(c)),
-                Side::Joined => "null".to_string(),
+                Side::Joined(_) => "null".to_string(),
             })
             .collect();
         let mut insert_cols = quoted(&self.t.shape.group_cols);
@@ -836,8 +836,8 @@ impl JoinTargetPlan {
                     let c = quote_ident(c);
                     match (side, b) {
                         (Side::From, _) => format!("{a}.{c} as {c}"),
-                        (Side::Joined, Some(b)) => format!("{b}.{c} as {c}"),
-                        (Side::Joined, None) => format!("null as {c}"),
+                        (Side::Joined(_), Some(b)) => format!("{b}.{c} as {c}"),
+                        (Side::Joined(_), None) => format!("null as {c}"),
                     }
                 })
                 .collect();
@@ -1570,7 +1570,7 @@ pub(crate) async fn release(
     create_working_tables(txn, &plan).await?;
     let side_plan = match side {
         Side::From => &plan.from,
-        Side::Joined => &plan.joined,
+        Side::Joined(_) => &plan.joined,
     };
     group_basis::name_groups(txn, &side_plan.plan, cells, &[key.to_string()]).await?;
     let mut mutations = TargetMutations::new();
@@ -1608,7 +1608,7 @@ pub(crate) async fn recompute_routed(
     create_working_tables(txn, &plan).await?;
     let side_plan = match side {
         Side::From => &plan.from,
-        Side::Joined => &plan.joined,
+        Side::Joined(_) => &plan.joined,
     };
     group_basis::name_groups(txn, &side_plan.plan, cells, &[]).await?;
     let mut mutations = TargetMutations::new();

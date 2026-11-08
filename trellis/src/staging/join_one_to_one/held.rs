@@ -242,7 +242,7 @@ pub(super) async fn hold(
     let hop_gens: Vec<i32> = rows.iter().map(|(_, o)| o.hop_gen).collect();
     for (row, _) in &rows {
         match side {
-            Side::Joined => crate::instance_log::warn!(
+            Side::Joined(_) => crate::instance_log::warn!(
                 transform = %shape.target,
                 src_table = %shape.source_table,
                 key = %row.key,

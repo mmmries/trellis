@@ -13,12 +13,13 @@ use std::collections::{HashMap, HashSet};
 use super::ast::{Expr, KeySpace, QualifiedColumn, TransformDef};
 use super::join::Side;
 use super::validate::{
-    JoinColumnInfo, JoinSide, RESERVED_COLUMN_PREFIX, ValidationError, is_deferred_aggregate_name,
+    JoinColumnInfo, RESERVED_COLUMN_PREFIX, ValidationError, is_deferred_aggregate_name,
     join_field_value_type, join_resolver, validate_join_tables_and_on,
 };
 
 /// Validates a [`KeySpace::JoinOneToOne`] definition against the live columns
-/// of its two tables (`left` is the `FROM` table, `right` the joined one).
+/// of its tables (`root` is the `FROM` table's, `joined` each joined table's,
+/// by position).
 ///
 /// Admitted when the tables differ; every column is
 /// qualified and exists; each `ON` term is an equality between one column of
@@ -28,17 +29,17 @@ use super::validate::{
 /// no aggregate call, that types.
 pub fn validate(
     def: &TransformDef,
-    left: &HashMap<String, JoinColumnInfo>,
-    right: &HashMap<String, JoinColumnInfo>,
+    root: &HashMap<String, JoinColumnInfo>,
+    joined: &[HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
     let KeySpace::JoinOneToOne(join) = &def.key_space else {
         return Ok(());
     };
-    validate_join_tables_and_on(def, join, left, right)?;
-    let resolve = join_resolver(def, join, left, right);
+    validate_join_tables_and_on(def, join, root, joined)?;
+    let resolve = join_resolver(def, join, root, joined);
 
     // The hidden tables copy these columns beside their ledger columns.
-    for side in [Side::From, Side::Joined] {
+    for side in super::join::sides(join) {
         for column in super::join::side_columns(def, side) {
             if column.starts_with(RESERVED_COLUMN_PREFIX) {
                 return Err(ValidationError::OneToOneJoinUnsupported {
@@ -63,21 +64,23 @@ pub fn validate(
         check_field_expr(&field.expr, &field.name, &resolve)?;
         // The field's type over both tables' columns, as define gives its
         // target column.
-        join_field_value_type(def, field, left, right)?;
+        join_field_value_type(def, field, root, joined)?;
     }
-    super::validate::check_join_collation_reads(def, join, left, right)?;
+    super::validate::check_join_collation_reads(def, join, root, joined)?;
     // `R`'s join-key index ends with the entry key, which a fan-out chunk
     // walks a key's entries by: one column past the `ON` columns.
-    super::validate::check_index_key_width(
-        || {
-            format!(
-                "each side of ON plus the row key of {}, which a 1-1 JOIN's hidden ledger \
-                 indexes together,",
-                def.source
-            )
-        },
-        join.on.len() + 1,
-    )?;
+    for table in &join.joins {
+        super::validate::check_index_key_width(
+            || {
+                format!(
+                    "each side of ON plus the row key of {}, which a 1-1 JOIN's hidden ledger \
+                     indexes together,",
+                    def.source
+                )
+            },
+            table.on.len() + 1,
+        )?;
+    }
     // A ledger copies every column its side's fields read beside its own.
     for (table, columns) in super::join_one_to_one::ledger_widths(def) {
         super::validate::check_table_width(|| table, columns)?;
@@ -91,7 +94,7 @@ pub fn validate(
 fn check_field_expr<'a>(
     expr: &Expr,
     field: &str,
-    resolve: &impl Fn(&QualifiedColumn) -> Result<(JoinSide, &'a JoinColumnInfo), ValidationError>,
+    resolve: &impl Fn(&QualifiedColumn) -> Result<(Side, &'a JoinColumnInfo), ValidationError>,
 ) -> Result<(), ValidationError> {
     match expr {
         Expr::Column(column) => Err(ValidationError::JoinUnqualifiedColumn {

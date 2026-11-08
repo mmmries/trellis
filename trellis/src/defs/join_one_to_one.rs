@@ -36,7 +36,7 @@ use tokio_postgres::GenericClient;
 use super::ast::{Expr, FieldDef, TransformDef};
 use super::ddl::PrimaryKeyColumn;
 use super::join::{
-    Side, column_type, join_key, keys_table_ddl, lock_row_ddl, side_columns, typed_column,
+    JOINED, Side, column_type, join_key, keys_table_ddl, lock_row_ddl, side_columns, typed_column,
 };
 use super::validate::{JoinColumnInfo, ValidationError};
 use crate::pool::quote_ident;
@@ -130,8 +130,8 @@ pub(crate) fn ledger_widths(def: &TransformDef) -> Vec<(String, usize)> {
     let Some(join) = super::join::spec(def) else {
         return Vec::new();
     };
-    [(Side::From, &def.source), (Side::Joined, &join.right)]
-        .into_iter()
+    super::join::sides(join)
+        .map(|side| (side, super::join::side_table(def, join, side)))
         .map(|(side, table)| {
             (
                 format!("{table}'s hidden ledger table"),
@@ -154,7 +154,7 @@ pub(crate) fn hidden_tables_ddl(
     let mut sql = String::new();
     for (table, side, columns) in [
         (HiddenTable::FromEntries, Side::From, from),
-        (HiddenTable::JoinedEntries, Side::Joined, joined),
+        (HiddenTable::JoinedEntries, JOINED, joined),
     ] {
         let name = table.qualified(catalog_schema, id);
         let key = join_key(def, side);
@@ -307,7 +307,7 @@ pub(crate) async fn joined_key_is_unique(
 
 /// The joined table's `ON` columns of `def`, in `ON` order.
 pub(crate) fn joined_on_columns(def: &TransformDef) -> Vec<String> {
-    join_key(def, Side::Joined)
+    join_key(def, JOINED)
 }
 
 /// The key space of the definition whose target is `qualified_table`, if one

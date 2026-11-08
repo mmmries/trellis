@@ -133,7 +133,7 @@ pub(crate) mod held;
 
 use crate::defs::ast::{Expr, JoinKind, TransformDef};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::defs::join::{self as spec, Side};
+use crate::defs::join::{self as spec, JOINED, Side};
 use crate::defs::join_one_to_one::HiddenTable;
 use crate::defs::ledger as schema;
 use crate::defs::model::Definition;
@@ -190,7 +190,7 @@ pub(crate) struct JoinShape {
 fn s_name(side: Side, column: &str) -> String {
     let alias = match side {
         Side::From => "a",
-        Side::Joined => "b",
+        Side::Joined(_) => "b",
     };
     format!("{alias}.{column}")
 }
@@ -331,7 +331,7 @@ impl JoinShape {
                 .collect()
         };
         let key_names = spec::join_key(def, Side::From);
-        let m_key = spec::join_key(def, Side::Joined);
+        let m_key = spec::join_key(def, JOINED);
         let key = by_name(&a_columns, &key_names);
         let read = |side: Side, columns: &[ImageColumn]| -> Vec<ImageColumn> {
             // The key first, then the rest in column order.
@@ -347,7 +347,7 @@ impl JoinShape {
             out
         };
         let r_columns = read(Side::From, &a_columns);
-        let m_columns = read(Side::Joined, &b_columns);
+        let m_columns = read(JOINED, &b_columns);
 
         let mut reads: BTreeSet<(Side, String)> = BTreeSet::new();
         let mut fields = Vec::with_capacity(def.fields.len());
@@ -363,7 +363,7 @@ impl JoinShape {
             .map(|(side, column)| {
                 let alias = match side {
                     Side::From => "r",
-                    Side::Joined => "b",
+                    Side::Joined(_) => "b",
                 };
                 (
                     s_name(*side, column),
@@ -371,7 +371,10 @@ impl JoinShape {
                 )
             })
             .collect();
-        let left = matches!(spec::spec(def).map(|s| s.kind), Some(JoinKind::Left));
+        let left = matches!(
+            spec::spec(def).map(|s| spec::first_joined(s).kind),
+            Some(JoinKind::Left)
+        );
         let schema_name = pool.schema();
         Ok(JoinShape {
             id: definition.id,
@@ -422,7 +425,7 @@ impl JoinShape {
     fn table(&self, side: Side) -> &str {
         match side {
             Side::From => &self.source_table,
-            Side::Joined => &self.joined_table,
+            Side::Joined(_) => &self.joined_table,
         }
     }
 
@@ -430,7 +433,7 @@ impl JoinShape {
     fn ledger(&self, side: Side) -> &LedgerRef {
         match side {
             Side::From => &self.r,
-            Side::Joined => &self.m,
+            Side::Joined(_) => &self.m,
         }
     }
 
@@ -438,7 +441,7 @@ impl JoinShape {
     fn side_key(&self, side: Side) -> Vec<String> {
         match side {
             Side::From => self.key.iter().map(|c| c.name.clone()).collect(),
-            Side::Joined => self.m_key.clone(),
+            Side::Joined(_) => self.m_key.clone(),
         }
     }
 
@@ -446,7 +449,7 @@ impl JoinShape {
     fn side_columns(&self, side: Side) -> &[ImageColumn] {
         match side {
             Side::From => &self.r_columns,
-            Side::Joined => &self.m_columns,
+            Side::Joined(_) => &self.m_columns,
         }
     }
 
@@ -626,7 +629,7 @@ impl JoinOneToOnePlan {
                     .add(change);
                 self.a.push(record);
             }
-            Side::Joined => {
+            Side::Joined(_) => {
                 self.held_origin.add(change);
                 self.b.push(record);
             }
@@ -647,7 +650,7 @@ pub(crate) async fn plan_for(
 ) -> Result<JoinOneToOnePlan, ApplyError> {
     let pk = match side {
         Side::From => pk,
-        Side::Joined => ddl::source_primary_key(pool, &definition.source_table).await?,
+        Side::Joined(_) => ddl::source_primary_key(pool, &definition.source_table).await?,
     };
     let paused = super::quarantine::paused_columns_for(pool, &definition.def).await?;
     Ok(JoinOneToOnePlan::new(
@@ -790,8 +793,8 @@ pub(crate) async fn apply_page(
         k.extend(key_set(txn, shape, Side::From, &a, &live).await?);
     }
     if !b.is_empty() {
-        let live = live_keys(txn, shape, Side::Joined, &m_pk, &b_rederive).await?;
-        k.extend(key_set(txn, shape, Side::Joined, &b, &live).await?);
+        let live = live_keys(txn, shape, JOINED, &m_pk, &b_rederive).await?;
+        k.extend(key_set(txn, shape, JOINED, &b, &live).await?);
     }
     // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
@@ -815,26 +818,16 @@ pub(crate) async fn apply_page(
 
     // 4. The `R` entries, then the `M` entries.
     let (a_inserted, _) = lock_side(txn, shape, Side::From, &a, seg_seq, predicate, &k).await?;
-    let (b_inserted, b_held) =
-        lock_side(txn, shape, Side::Joined, &b, seg_seq, predicate, &k).await?;
+    let (b_inserted, b_held) = lock_side(txn, shape, JOINED, &b, seg_seq, predicate, &k).await?;
 
     // 5. The Re-derive reads, one statement per side.
     let a_read = rederive_read(txn, shape, Side::From, &shape.pk, &a_rederive, &k, seg_seq).await?;
-    let b_read = rederive_read(txn, shape, Side::Joined, &m_pk, &b_rederive, &k, seg_seq).await?;
+    let b_read = rederive_read(txn, shape, JOINED, &m_pk, &b_rederive, &k, seg_seq).await?;
 
     // 6. I2, then each side's copied columns.
     let a_changed =
         update_side(txn, shape, Side::From, &a, &a_inserted, &a_read, predicate).await?;
-    let b_changed = update_side(
-        txn,
-        shape,
-        Side::Joined,
-        &b,
-        &b_inserted,
-        &b_read,
-        predicate,
-    )
-    .await?;
+    let b_changed = update_side(txn, shape, JOINED, &b, &b_inserted, &b_read, predicate).await?;
 
     // 7. Recompute and write: the `a` changes' rows, then the fan-out.
     // Test-only pause point. See `super::interleave`.
@@ -931,7 +924,7 @@ async fn truncate_sides(
     truncate: &Truncate,
     mutations: &mut TargetMutations,
 ) -> Result<usize, ApplyError> {
-    for (side, lsn) in [(Side::From, truncate.from), (Side::Joined, truncate.joined)] {
+    for (side, lsn) in [(Side::From, truncate.from), (JOINED, truncate.joined)] {
         let Some(lsn) = lsn else { continue };
         let ledger = shape.ledger(side);
         // Planted bugs: the entries stay, or the floor doesn't rise. See
@@ -941,7 +934,7 @@ async fn truncate_sides(
             crate::plant::fires(
                 match side {
                     Side::From => crate::plant::Plant::Join1TruncateKeepsR,
-                    Side::Joined => crate::plant::Plant::Join1TruncateKeepsM,
+                    Side::Joined(_) => crate::plant::Plant::Join1TruncateKeepsM,
                 },
                 true,
             ),
@@ -1064,7 +1057,7 @@ async fn key_set(
     let old_images: Vec<Option<&str>> = records
         .values()
         .map(|r| match side {
-            Side::Joined if !only_new => r.old_image.as_deref(),
+            Side::Joined(_) if !only_new => r.old_image.as_deref(),
             _ => None,
         })
         .collect();
@@ -1257,7 +1250,7 @@ async fn lock_side(
         txn,
         match side {
             Side::From => super::interleave::PausePoint::AfterJoin1REntryLock,
-            Side::Joined => super::interleave::PausePoint::AfterJoin1MEntryLock,
+            Side::Joined(_) => super::interleave::PausePoint::AfterJoin1MEntryLock,
         },
         &ledger.label,
     )
@@ -1355,7 +1348,7 @@ async fn rederive_read(
     // `M`'s.
     let label = match side {
         Side::From => shape.target.as_str(),
-        Side::Joined => shape.m.label.as_str(),
+        Side::Joined(_) => shape.m.label.as_str(),
     };
     let read = ledger::read_rows(txn, label, shape.table(side), pk, &names, &refs).await?;
     // Planted bugs: the page doesn't check the keys its read of one side
@@ -1364,7 +1357,7 @@ async fn rederive_read(
     let unchecked = crate::plant::fires(
         match side {
             Side::From => crate::plant::Plant::Join1RdNoKey,
-            Side::Joined => crate::plant::Plant::Join1BrdNoKey,
+            Side::Joined(_) => crate::plant::Plant::Join1BrdNoKey,
         },
         true,
     );
@@ -1585,7 +1578,7 @@ async fn fan_out_keys(
         txn,
         &format!(
             "select {texts} from {m} l where l.{key} = any($1::text[]) and not l.{tomb}",
-            texts = shape.key_texts(Side::Joined, "l").join(", "),
+            texts = shape.key_texts(JOINED, "l").join(", "),
             m = shape.m.ident,
             key = quote_ident(schema::KEY_COLUMN),
             tomb = quote_ident(schema::TOMBSTONE_COLUMN),
@@ -1827,14 +1820,14 @@ async fn write_fan_out(
                 let (written, deleted, rows) = fan_out_failure(
                     txn,
                     shape,
-                    Side::Joined,
+                    JOINED,
                     &entries,
                     WriteOrigin::All(origin),
                     mutations,
                 )
                 .await?;
                 let parked: Vec<_> = rows.iter().map(|row| (row, origin)).collect();
-                held::hold(txn, shape, seg_seq, Side::Joined, &parked).await?;
+                held::hold(txn, shape, seg_seq, JOINED, &parked).await?;
                 held.record(rows);
                 txn.batch_execute("release savepoint join1_fan_out").await?;
                 return Ok((written, deleted));
@@ -1867,7 +1860,7 @@ async fn fan_out_failure(
 ) -> Result<(usize, usize, Vec<held::HeldRow>), ApplyError> {
     let written_entries = match side {
         Side::From => Entries::Changed,
-        Side::Joined => Entries::FanOut,
+        Side::Joined(_) => Entries::FanOut,
     };
     let mut failing: Vec<(&str, String, Option<String>)> = Vec::new();
     let (mut written, mut deleted) = (0, 0);
@@ -1945,7 +1938,7 @@ async fn fan_out_failure(
         named.join(", ")
     };
     let reason = match side {
-        Side::Joined => format!(
+        Side::Joined(_) => format!(
             "a change of {} whose fan-out fails on more rows of {} than {MAX_FAN_OUT_PROBES} \
              attempts to isolate them name: {named}, and maybe more",
             shape.joined_table, shape.source_table,

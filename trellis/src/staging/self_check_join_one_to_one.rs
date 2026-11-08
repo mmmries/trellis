@@ -570,7 +570,7 @@ async fn column_types(pool: &Pool, table: &str) -> Result<HashMap<String, String
 /// The join's `JoinKind` of `def`.
 fn join_kind(def: &TransformDef) -> JoinKind {
     spec::spec(def)
-        .map(|join| join.kind)
+        .map(|join| spec::first_joined(join).kind)
         .expect("a 1-1 JOIN definition has a join")
 }
 
@@ -613,13 +613,7 @@ async fn build<'a>(
         HiddenTable::FromEntries,
         "a",
     );
-    let b = side(
-        JoinSide::Joined,
-        &joined,
-        b_pk,
-        HiddenTable::JoinedEntries,
-        "b",
-    );
+    let b = side(spec::JOINED, &joined, b_pk, HiddenTable::JoinedEntries, "b");
     let types = column_types(pool, &def.target_table).await?;
     let mut fields = Vec::new();
     for f in def.def.fields.iter().filter(|f| !paused.contains(&f.name)) {

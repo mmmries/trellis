@@ -125,7 +125,7 @@ impl OneToOneCoverage {
             let trellis::dev::defs::ast::KeySpace::JoinOneToOne(join) = &def.key_space else {
                 unreachable!("the 1-1 JOIN tier draws only 1-1 JOIN definitions");
             };
-            let on: Vec<String> = join
+            let on: Vec<String> = join.joins[0]
                 .on
                 .iter()
                 .map(|on| {
@@ -135,7 +135,7 @@ impl OneToOneCoverage {
                     )
                 })
                 .collect();
-            let shape = format!("{:?}/{}", join.kind, on.join("&"));
+            let shape = format!("{:?}/{}", join.joins[0].kind, on.join("&"));
             *self.definitions.entry(shape).or_insert(0) += 1;
         }
         for op in &case.program.ops {

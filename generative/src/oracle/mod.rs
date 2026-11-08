@@ -581,9 +581,9 @@ async fn as_persisted(
     }
     if let (KeySpace::Join(join) | KeySpace::JoinOneToOne(join), Some(joined)) =
         (&mut def.key_space, row.get::<_, Option<&str>>(1))
-        && join.explicit_right_schema.is_none()
+        && join.joins[0].explicit_right_schema.is_none()
     {
-        join.explicit_right_schema = schema_of(joined);
+        join.joins[0].explicit_right_schema = schema_of(joined);
     }
     Ok(def)
 }
@@ -1016,7 +1016,7 @@ fn render_join_select_over(
             quote_ident(&field.name)
         ));
     }
-    let on: Vec<String> = join
+    let on: Vec<String> = join.joins[0]
         .on
         .iter()
         .map(|on| {
@@ -1036,11 +1036,14 @@ fn render_join_select_over(
         "select {} from {} {} {} on {} group by {}",
         select.join(", "),
         relation(&def.source, def.explicit_source_schema.as_deref()),
-        match join.kind {
+        match join.joins[0].kind {
             trellis::dev::defs::ast::JoinKind::Inner => "join",
             trellis::dev::defs::ast::JoinKind::Left => "left join",
         },
-        relation(&join.right, join.explicit_right_schema.as_deref()),
+        relation(
+            &join.joins[0].right,
+            join.joins[0].explicit_right_schema.as_deref()
+        ),
         on.join(" and "),
         group_by.join(", ")
     )
@@ -1082,7 +1085,7 @@ fn render_join_one_to_one_select_over(
             quote_ident(&field.name)
         ));
     }
-    let on: Vec<String> = join
+    let on: Vec<String> = join.joins[0]
         .on
         .iter()
         .map(|on| {
@@ -1097,11 +1100,14 @@ fn render_join_one_to_one_select_over(
         "select {} from {} {} {} on {}",
         select.join(", "),
         relation(&def.source, def.explicit_source_schema.as_deref()),
-        match join.kind {
+        match join.joins[0].kind {
             trellis::dev::defs::ast::JoinKind::Inner => "join",
             trellis::dev::defs::ast::JoinKind::Left => "left join",
         },
-        relation(&join.right, join.explicit_right_schema.as_deref()),
+        relation(
+            &join.joins[0].right,
+            join.joins[0].explicit_right_schema.as_deref()
+        ),
         on.join(" and "),
     )
 }

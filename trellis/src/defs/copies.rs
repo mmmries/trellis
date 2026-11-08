@@ -258,7 +258,7 @@ async fn join_copies(
     source: &str,
     target: &str,
 ) -> Result<Vec<TypedCopy>, tokio_postgres::Error> {
-    use super::join::{HiddenTable, Side};
+    use super::join::{HiddenTable, JOINED, Side};
     let Some(row) = client
         .query_opt(
             "select id, join_table from transform_definitions \
@@ -272,7 +272,7 @@ async fn join_copies(
     let (id, joined): (i64, String) = (row.get(0), row.get(1));
     let side_table = |side: Side| match side {
         Side::From => source.to_string(),
-        Side::Joined => joined.clone(),
+        Side::Joined(_) => joined.clone(),
     };
     let hidden = |table: HiddenTable| {
         let name = table.name(id);
@@ -315,7 +315,7 @@ async fn join_copies(
     }
     for (side, table) in [
         (Side::From, HiddenTable::FromPartials),
-        (Side::Joined, HiddenTable::JoinedPartials),
+        (JOINED, HiddenTable::JoinedPartials),
     ] {
         for column in super::join::side_key_columns(def, side) {
             push(CopyKind::JoinHidden, hidden(table), side, &column);
@@ -404,7 +404,7 @@ async fn join_one_to_one_copies(
     let (id, joined): (i64, String) = (row.get(0), row.get(1));
     let side_table = |side: Side| match side {
         Side::From => source.to_string(),
-        Side::Joined => joined.clone(),
+        Side::Joined(_) => joined.clone(),
     };
     let hidden = |table: HiddenTable| {
         (
@@ -435,7 +435,7 @@ async fn join_one_to_one_copies(
     }
     for (side, table) in [
         (Side::From, HiddenTable::FromEntries),
-        (Side::Joined, HiddenTable::JoinedEntries),
+        (super::join::JOINED, HiddenTable::JoinedEntries),
     ] {
         for column in super::join_one_to_one::read_columns(def, side) {
             copies.push(copy(CopyKind::JoinHidden, hidden(table), side, &column));
@@ -462,7 +462,7 @@ async fn join_one_to_one_copies(
         if let (Expr::SourceColumn { .. }, [(side, column)]) = (&field.expr, reads.as_slice()) {
             let columns = match side {
                 Side::From => &sides.from_columns,
-                Side::Joined => &sides.joined_columns,
+                Side::Joined(_) => &sides.joined_columns,
             };
             if columns.contains_key(column) {
                 copies.push(TypedCopy {
@@ -507,7 +507,7 @@ async fn join_one_to_one_copies(
 fn reads_live(reads: &[(super::join::Side, String)], sides: &super::catalog::JoinSides) -> bool {
     reads.iter().all(|(side, column)| match side {
         super::join::Side::From => sides.from_columns.contains_key(column),
-        super::join::Side::Joined => sides.joined_columns.contains_key(column),
+        super::join::Side::Joined(_) => sides.joined_columns.contains_key(column),
     })
 }
 
