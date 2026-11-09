@@ -56,7 +56,7 @@ describes is gone.
   title; an ADR has no caveat list or limitations section. Define-time
   refusals are listed in the
   [Supported sources and targets](../transforms.md#supported-sources-and-targets)
-  table; an ADR may decide to refuse, and the table is the reference.
+  section; an ADR may decide to refuse, and that section is the reference.
 
 ## More Information
 

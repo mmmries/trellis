@@ -20,73 +20,91 @@ is checked for a transform's source, for each table a `JOIN` reads, and (where
 noted) for its target. Trellis never adds
 a key, index or policy itself.
 
-| Condition | Refused at define | If it appears after define | Remedy |
-|---|---|---|---|
-| A partition (a leaf or a middle) named as a source, a partitioned root that is itself a partition, or a table in an inheritance hierarchy. A partitioned root is checked by the rows below. A source with no primary key is the key row below. | Yes. A statement trigger fires only for the table a statement names, so capture would miss writes made through the rest of the hierarchy. | A table that joins a hierarchy after define (`ATTACH PARTITION`, `INHERIT`, a child created `INHERITS` it, or the table dropped and recreated as a partition or an inheritance child) pauses every transform that reads it on the staging worker's next reconcile pass, with the reason in `status()`'s `capture_failure`, and gets no capture installed. `self_check` reports a `capture` divergence. Writes made through the hierarchy before that pass are missed, or, on an inheritance parent, a child's rows are staged as the parent's own; the resume's rebuild re-reads the table and repairs both. A dropped key leaves the table uncapturable: `status()` shows a capture holdup, and the transforms that read it pause with the reason when the table's next change is applied. A retyped key pauses them too (see the key rows below). | Use a plain table. After a later change, undo it (`DETACH PARTITION`, `NO INHERIT`, or recreate the table as a plain table), then `RESUME`, which refuses while the table is still in a hierarchy. |
-| A source table or a `JOIN`'s joined table that is dropped, renamed away, moved to another schema, swapped for another table or replaced by a view after define, or whose capture triggers or functions are disabled, dropped, recreated or replaced outside Trellis | n/a (a definition can't name a table that isn't there) | Pauses every transform that reads the table on the staging worker's next reconcile pass, with a `capture_failure` of kind `disruption` naming what it found and saying that changes made meanwhile may be missing, so correctness can't be guaranteed. Nothing is reinstalled or rebuilt until a `RESUME`. A partitioned source's root and every node of its tree are checked, and the finding names the node; a root dropped and recreated (empty or with leaves), swapped by renames or renamed away is a disruption too, while partition maintenance (an attach, detach, new leaf, dropped leaf, `DEFAULT` or `HASH` re-split) is none. A plain table dropped and created again as a partitioned one, or the reverse, is a disruption as well. | Put the table back (or finish the swap) and `RESUME`, which refuses while the table is missing, re-validates the definition against the table now at that name, reinstalls capture and rebuilds from that table. A table created again with another primary key (a plain table converted to a partitioned one widens it by the partition key) is rebuilt the same way: what Trellis stored or staged under the old key is discarded, not read against the new one. A 1-1 transform's target is keyed by its source's key, so its resume first re-keys the target in place to the new key, or refuses, as the key row below describes. Plan a scripted `RESUME` after a swap or a bulk load with triggers disabled (the Ruby and Elixir clients have a test helper for fixture loads: [embedding](embedding.md)). |
-| A partitioned root ([0017](decisions/0017-partitioned-sources.md); `RANGE`, `LIST` or `HASH`, any depth, with or without a `DEFAULT`) as an aggregate's `FROM` whose `GROUP BY` omits a partition-key column at any level, or as either table of a `JOIN` whose `GROUP BY` columns and `ON` columns from that table omit one | Yes, naming the column. With every partition-key column in the group key, each group lives in exactly one partition, so a change to the tree touches only the groups routing to one node. | A sub-level added later whose partition key the group key (a `JOIN` table's `GROUP BY` and `ON` columns) doesn't hold pauses every transform that reads the source on the staging worker's next reconcile pass, with the column in `status()`'s `capture_failure`. `RESUME` refuses until the tree complies, then rebuilds. | Add the named column to the `GROUP BY`, or join on it. After a later change, detach the sub-level, then `RESUME`. |
-| A partitioned root whose key level is an expression (no column to route by), whose partition-key column has a type other than `smallint`, `integer`, `bigint`, `numeric`, `text`, `varchar`, `uuid`, `date`, `timestamp`, `timestamptz` or `boolean`, a non-default operator class or a nondeterministic collation | Yes, naming the table and the column (for an expression, its key position). Trellis routes a group to its partition by evaluating the recorded bound over the group key, and it checks that only for these keys. | A sub-level added later with such a key pauses every transform that reads the source, as the row above describes. | Partition by a plain column of a listed type with the type's default operator class and a deterministic collation. After a later change, detach the sub-level, then `RESUME`. |
-| A partitioned root with more than 1,000 leaves, or on PostgreSQL before 15 | Yes, stating the limit. No build statement prunes, so each one plans, locks and opens every leaf, and the default lock table runs out for one statement at about 5,500 leaves with the default `max_locks_per_transaction`. | A tree that grows past 1,000 leaves pauses every transform that reads it on the staging worker's next reconcile pass, with a `capture_failure` naming the limit. `RESUME` refuses until the tree has 1,000 or fewer. | Merge partitions to 1,000 or fewer leaves, or upgrade the server. |
-| An expression nested more than 100 levels deep: a chain of more than 100 operands joined by operators, or nested parentheses or calls to the same depth. A flat list of many columns, as `COALESCE` arguments or terms of one sum, is not deep. | Yes (`ExpressionTooDeep`), for `CREATE`, `ALTER TRANSFORM` and a `JOIN`'s fields alike. Every pass that walks an expression recurses once per level, so the bound keeps a long expression from overflowing the stack. | n/a (the definition is stored only once it passes) | Split the expression into calculated fields that read each other. Fields that read each other are bounded by the next row. |
-| Calculated fields that read each other so many times, or so deeply, that inlining them into one expression yields more than a build can render (a chain of fields that each read the previous one more than once), or an expression that is more than 100 levels high once the fields it reads are inlined (each read of another field costs at least one level) | Yes (`FieldExpansionTooLarge`). Every build reads each field as one self-contained expression. | n/a (the fields are fixed at define; an `ALTER TRANSFORM` is checked the same way) | Shorten the chain, or read the source columns in the later fields. |
-| A partitioned root as a 1-1 transform's `FROM` | Yes. A 1-1 target over a partitioned source would need its own partitioning, and partitioned targets are not supported. | A 1-1 transform's source dropped and created again as a partitioned table pauses the readers the same way, and its `RESUME` refuses as define does. | Aggregate over the partitioned table instead, or use a plain table. |
-| A partitioned root of a servable shape (every row above passes) | No. Capture covers every node of the tree. The reconcile pass queues a correction for each partition attached, detached, dropped or truncated, and for groups in a target that route to no partition, and an aggregate recomputes the groups that route to the partition while it reports `backfilling`. A `JOIN` with the partitioned table on either side recomputes that side's partials that route to the partition, and carries the change into its target, while it reports `backfilling`. | After a dump and restore of the database, the next reconcile pass pauses every definition, those that read a partitioned source among them, with a `capture_failure` naming the restore, and runs no correction queued before it. A `pg_upgrade`, or the root dropped and recreated or swapped in by renames, is no restore. | After a restore, `RESUME`, which rebuilds. |
-| An aggregate target, or a 1-1 target over one, used as a source (it has no primary key: its identity is a `UNIQUE NULLS NOT DISTINCT` constraint) | Yes, for another Trellis instance, unless the definition names that constraint's columns with `KEY (…)` (the key row below): to that instance it is a table with no primary key. Inside the owning instance it can be chained off, because writes to a target reach its readers in the writing transaction, never through capture triggers, and it is keyed by its group key. | n/a | Chain within the instance ([instance-identity](instance-identity.md)), group over a 1-1 transform, or name the group key with `KEY (…)`. |
-| The key a transform keys each table by: its source's and a `JOIN`'s joined table's primary key, or the key its definition names with `KEY (…)` directly after the table (`FROM orders KEY (customer_id, id)`, `JOIN b KEY (…) ON`); for another transform's target, the key Trellis gave that target; and its own target's key (a 1-1 target's is its source's key, an aggregate's or `JOIN`'s its `UNIQUE NULLS NOT DISTINCT` group key). A source with no primary key and no `KEY`, a source or joined table whose primary key is deferrable (`DEFERRABLE`, initially immediate or deferred) and no `KEY`, a `KEY` no index backs, a `KEY` on another transform's target, and a key other than the one the table's other transforms use | Yes: `NoPrimaryKey` (naming `KEY (…)` and `ADD PRIMARY KEY` as remedies), `DeferrablePrimaryKey` (naming the key and the one-statement recreation), `KeyNotBacked`, `KeyOnTrellisTarget` and `KeyDiffersFromReaders` (naming the key to write). Trellis never keys a table by a unique index it picked itself, nor by a deferrable key, primary or not: one can hold duplicate keys inside a transaction. A `KEY` needs a unique index whose key columns are exactly its columns, in any order (an `INCLUDE` column is not a key column), valid, not deferrable, not partial, over no expression, each column under its type's default operator class and its own collation, with every column `NOT NULL` or the index `NULLS NOT DISTINCT`; any such index backs it, so a nullable key works through `KEY` on a `NULLS NOT DISTINCT` index. Its column types are held to the key-type allowlist as a primary key's are. A partitioned table's unique index must hold its partition key, so its `KEY` names those columns too. A table is keyed one way for every transform that reads it, as its `FROM` or joined table alike: a second definition over a `KEY` table repeats the `KEY`, and one over a table its other transforms key by its primary key writes none. Trellis records one key per table, the first time a transform keys by it, and keys the table by the primary key or unique index over exactly those columns for every transform that reads or writes it, in the key's own column order. A unique index or constraint added to the table later, one an adopted target (`ADOPT EXISTING TABLE`) already had, one a dump restore creates before the key (it creates constraints in name order), and the key rebuilt by `REINDEX CONCURRENTLY` change nothing. The record belongs to the table it was taken from: a table dropped and created again is keyed by its own key, whatever transforms of the old one remain. | A source's primary key redefined in place, or the table created again with another one, pauses the transforms that key it by its primary key (the rows above). `RESUME` of an aggregate or `JOIN` takes the table's primary key now as its key, for every transform that reads the table, and rebuilds; with no primary key it refuses rather than take another unique index. A 1-1 transform's target is keyed by its source's key (a 1-1 `JOIN`'s, by its `FROM` table's): its `RESUME` re-validates it as define would and, where define would accept it, re-keys the target in place to the new key under the rebuild's lock. A new key column the transform doesn't select is added as a key column, copied as define copies one (its type with no modifier, and its collation), which empties the target until the rebuild; a former key column it doesn't create is dropped, and the rows the narrower key repeats are deleted until the rebuild writes them again (on a plain 1-1 transform, `ALTER TRANSFORM … ADD <column> AS <column>` once it is live adds it back as a field); and the primary key is replaced (`DROP CONSTRAINT …, ADD PRIMARY KEY (…)`), keeping the table, your indexes and grants. The pause message says which columns `RESUME` will add and drop. The target's new key is recorded, which pauses the transforms reading the target, and their own `RESUME` follows these rules over it. It refuses, naming the conflict, while define would refuse the transform (over a partitioned source, say), when a new key column's name is taken by a column of the target that isn't a copy of it (a field of that name, or a column you added), and when a view, index or foreign key of yours depends on a column it would drop or on the key constraint it replaces. A primary key made deferrable after define (dropped and added again `DEFERRABLE`) halts every transform reading the table on the next drain of a change to it, with a `capture_failure` naming the key and the remedy, unless a unique index that isn't deferrable is over exactly its columns, which the drain then keys the table by; `RESUME` refuses as define does either way. A table its transforms key by `KEY` is keyed by it whatever its primary key does: a primary key added, redefined, made deferrable or dropped pauses nothing. Its backing index may be replaced by an equivalent one at any time (build the new one before dropping the old): `REINDEX CONCURRENTLY`, a rename, pg_repack and `ADD PRIMARY KEY USING INDEX` change nothing. With none left valid (dropped, a failed build's invalid index, or a partitioned root's index left invalid), the staging worker's next reconcile pass pauses every transform reading the table, with no grace and whether or not a write arrived, naming the table, the key and a ready-to-run `create unique index`; a swap that drops the old index first pauses when a pass runs between the two. A partitioned root's index stays invalid after a leaf's index is repaired until `ALTER INDEX … ATTACH PARTITION` runs again for that leaf, and the message says so. `RESUME` and a rebuild refuse until an index backs the key again, naming the table, the key and the unique indexes it has. A target, its own or one it reads, left with no valid, non-partial, non-deferrable unique index over its key (dropped, or never created by a restore): `RESUME` and a rebuild refuse, naming the table, the key and the unique indexes it has, and Trellis never keys the table by another index. | Name the key with `KEY (…)`, backed by a unique index over exactly those columns, or add a primary key (`ALTER TABLE … ADD PRIMARY KEY`, or `ADD PRIMARY KEY USING INDEX` over an existing unique index); write the key the message names. Recreate a deferrable primary key not deferrable in one statement (`ALTER TABLE … DROP CONSTRAINT …, ADD PRIMARY KEY (…)`: Postgres can't change it in place), then `RESUME`, or name a `KEY (…)` over a unique index that isn't deferrable. For an aggregate or `JOIN`, `RESUME`, after adding a primary key if the table has none. For a 1-1 transform, `RESUME`; when it refuses, drop the object it names, drop or rename your column it names, or, for a field of the new key column's name, restore the key, resume and rename the field with `ALTER TRANSFORM`; or `DROP TRANSFORM` and define it again. For a `KEY`, create a unique index backing it again (on a partitioned table, re-run `ALTER INDEX … ATTACH PARTITION` for a repaired leaf's index), then `RESUME`. For a target, create a unique index over exactly its key columns again (`UNIQUE NULLS NOT DISTINCT` if one can be `NULL`), then `RESUME`; or `DROP TRANSFORM` and define it again. |
-| Row-level security that applies to a role Trellis runs as on a source or on a target. Policies apply to a role when RLS is enabled and the role neither owns the table (directly or through membership) nor has `BYPASSRLS`, or owns it and the table is `FORCE ROW LEVEL SECURITY`. A superuser is exempt. Every Trellis connection runs with `row_security = off`, so a read or write the policies would filter fails rather than skipping rows. | Yes, checked for the role that owns the ring, and for the defining role on a table that is another transform's target. A `MIN`/`MAX` aggregate's source is also checked for the ring's owner's `SELECT` (`ExtremeSourceNotReadable`), at define and on a whole-transform `RESUME`: a drain, which logs in as that role or a member of it, re-reads a group's extreme from the source when the current one is deleted. | For the ring's owner, the staging worker's reconcile pass pauses every transform that reads the table (or, for a target, the transform that writes it), with the reason in `status()`'s `capture_failure`, and `self_check` reports a `capture` divergence. For a role a drain logs in as, its refused read or write pauses the same transforms, and everything downstream of them, with `capture_failure` of kind `halt`. A refused build chunk pauses its transform after its charged retries, with the error on `backfill_failure`. On a partitioned source, define and the pass check the root only: a policy on a partition below it reaches none of the reads that follow writes, which all go through the root, but the correction of that partition after a `TRUNCATE` of it, an attach of it with rows, or direct writes into it as a new leaf reads the partition itself, is refused, and pauses the transform after its charged retries the same way. The refusals that only log or retry: [observability — A halting failure](observability.md#a-halting-failure). | Give the role `BYPASSRLS` (not inherited), or make it the table's owner without `FORCE ROW LEVEL SECURITY`; then `RESUME`. For a `MIN`/`MAX` source, `GRANT SELECT` on it to the ring's owner. |
-| A table a logical-replication subscription in the same database replicates into | Yes, in any sync state, including a disabled subscription. The subscription's apply worker fires only row-level triggers, so its changes never reach capture. Publishing a table to another database is fine. | Paused and reported as for RLS on the ring's owner. | Remove the table from the publication and `ALTER SUBSCRIPTION … REFRESH PUBLICATION`, or drop the subscription; then `RESUME`. |
-| A column a definition reads that is a virtual generated column (`GENERATED ALWAYS AS (…) VIRTUAL`, PostgreSQL 18): a 1-1 field, a `GROUP BY` key, an aggregate's argument, or a `JOIN`'s `ON` column or field on either table | Yes (`VirtualGeneratedColumn`), for the definition, an `ALTER TRANSFORM` that adds such a field, and a `RESUME`, naming the table, the column and its expression. A statement trigger's transition table holds no value for a virtual column, so capture can't image it. A definition on the same table that doesn't read the column is unaffected. | A read column dropped and added again as virtual, or another column renamed onto its name, pauses its readers on the staging worker's next reconcile pass, with the table, the column and its expression in `status()`'s `capture_failure`; the pass after that stops imaging the column. Until the first pass, the application's inserts and deletes on the table fail (`unexpected virtual generated column reference`), and an update stages the column as `NULL`, or stages nothing when no other column capture reads changed, so the readers' targets miss its new values; the rebuild on `RESUME` repairs them. A virtual column renamed onto the name and back before a pass pauses nothing ([known correctness gaps](known-correctness-gaps.md#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass)). Definitions that don't read the column keep running. | Write the expression in the definition in place of the column where the grammar covers it (in a 1-1 transform, under a field name no source column has), or make the column `STORED`. After a later change, make the column `STORED` and `RESUME`, which refuses while it is still virtual, or drop the transform and define it again with the expression. |
-| A nondeterministic collation (an ICU collation with `deterministic = false`) on a key column: a source primary key, a `GROUP BY` key or a `JOIN`'s `ON` column. Also on a column passed to `STRPOS` or `REGEXP_COUNT`, or compared as text (`=`, `<>`, `!=`, `IS [NOT] DISTINCT FROM`, `NULLIF`), directly or through `COALESCE`, a `CASE` result or another field. | Yes, for the definition (a `JOIN` checks the column of whichever table the read names), a `RESUME` and an `ALTER TRANSFORM` that adds or alters such a field. Trellis matches keys by exact text; such a collation's `=` would fold keys it keeps apart. `CHAR_LENGTH`, `OCTET_LENGTH` and `IS [NOT] NULL` accept any column. Such a collation's `=` would call two different texts equal, which Trellis compares exactly. | On a key column, the staging worker pauses every transform that keys by it, with the reason in `status()`'s `capture_failure`, and `RESUME` refuses until it's deterministic again. On a column only a text function reads, Postgres refuses the function, so each changed row's write fails: its key is held for the transform, and the transform is quarantined once its held keys reach the fuse threshold. | Keep the column's collation deterministic ([type-support](type-support.md#collation)). |
-| A `REGEXP_COUNT` pattern that isn't a string literal, or that Postgres rejects (`(?P<n>a)`, `a++`, `\pL`) | Yes (`NonLiteralRegexPattern`; `InvalidRegexPattern` for a pattern Postgres rejects, carrying the server's message). Postgres alone judges the pattern: define, `ALTER TRANSFORM` and `RESUME` probe each literal with `regexp_count('', pattern)` and refuse on `invalid_regular_expression`. Back-references, lookahead and `\m`/`\M` are admitted. | Only a Postgres upgrade that changes the verdict: each changed row's write then fails with `invalid_regular_expression` and is quarantined like any row Postgres can't compute, and a `RESUME` probes again and refuses with the server's message. | Write a pattern Postgres's `regexp_count` accepts. |
-| A comparison (`=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`, `IS [NOT] DISTINCT FROM`, and `NULLIF`'s `=`) with a float (`real`, `double precision`) on one side and an exact numeric (`smallint`, `integer`, `bigint` or `numeric`) column, calculated field or expression on the other, including a calculated field or `COALESCE` that is a float. A bare number literal against a float is admitted (below), so `f > 0.5` and `f = 1` define | Yes (`MixedFloatExactComparison`), naming the field and both operand types, for the definition and an `ALTER TRANSFORM`. Postgres casts the exact side to `double precision`, so the comparison inherits float rounding (`0.1::numeric + 0.2 = 0.3::float8` is false). A float against a float and an exact numeric against an exact numeric are admitted; `+` admits the mix. A bare literal outside `double precision`'s range (`22003` in Postgres) is refused too (`FloatComparisonLiteralOutOfRange`). | A column retyped into the other family (`integer` → `double precision`) pauses the transform on the staging worker's next capture pass, with the reason in `status()`'s `capture_failure`, and `RESUME` refuses while the mix remains (the row on a widened column below). | Compare values of one family: rewrite so both sides are floats or both are exact. A bare number literal is cast to `double precision` and a `real` operand widens to it, as in Postgres, so `r > 0.1` over `r = 0.1::real` is true; write `f > REAL '0.1'` to compare as `real`. |
-| A constant Postgres folds at plan time that fails for every row: a `CASE` result, `AND`/`OR` operand or `NULLIF` argument that is one of the constants below, wherever the rest of the expression reads columns (`CASE WHEN x > 0 THEN 1.5 / 0 END` fails every row, even those where `x > 0` is false); a `COALESCE` whose result is a float (`real` or `double precision`) with a constant argument outside that float's range, such as `COALESCE(real_col, 1000000000000000000000000000000000000000)`; a `+`, `-` or `*` of two integer constants whose result does not fit `integer` or `bigint`, such as `2147483647 + 1` or `2147483647 * 2`; prefix `-` or `ABS` of the smallest integer (`-(-2147483647 - 1)`, `ABS(-2147483648)`); a `+`, `-`, `*` or `/` of two float constants that overflows the float, or that underflows to zero from nonzero operands (`DOUBLE PRECISION '1e-200' * DOUBLE PRECISION '1e-200'`); or an exact constant beside a float that is outside `double precision`; a `date` constant plus or minus an integer constant that leaves `date`'s range (4714-11-24 BC to 5874897-12-31), such as `DATE '2024-01-01' + 2147483647`; or a constant `date` past 294276-12-31 cast to `timestamp`. A constant is a number literal, a `REAL`, `DOUBLE PRECISION` or `DATE` typed literal, or a `+`, `-`, `*`, `/`, `%`, prefix `-`, `ABS`, `CAST` (a widening or to the operand's own type) or calculated field made only of constants, or a `COALESCE` led by a constant (whatever follows it), wherever it appears (an aggregate's argument, a `JOIN` field, a `COALESCE` argument). A constant beside only exact `COALESCE` arguments unifies upward and is never out of range, and `numeric` arithmetic does not overflow. Postgres never evaluates a `COALESCE` argument after a constant one, a `CASE` result after a condition that is constant true or in a branch whose condition is constant false or `NULL`, or an `AND` operand after a constant false (an `OR` operand after a constant true), so `COALESCE(5, 2147483647 + 1)`, `CASE WHEN 1 = 1 THEN 1 ELSE 1.5 / 0 END` and `1 = 2 AND 1.5 / 0 = 1` define; an aggregate's argument is refused all the same (`COALESCE(5, SUM(2147483647 + 1))`), because Trellis computes it for every row apart from the expression around the call. Define folds `TRUE`, `FALSE`, `NULL` and comparisons of number, float, text, `date`, `timestamp`, `time` and `timetz` constants, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `CASE`, `NULLIF` and `COALESCE` over them, and a comparison (other than `IS [NOT] DISTINCT FROM`), arithmetic operator or function call with a `NULL` constant operand is `NULL` whatever its other operands read, as the planner folds it (`CASE WHEN x > NULLIF(1, 1) THEN 2147483647 + 1 END` defines), and a `NULLIF` with a `NULL` constant argument is its first argument whatever the other reads (`NULLIF(NULL, x)` is `NULL` and `NULLIF(a, NULL)` is `a`, so `2147483647 + NULLIF(1, NULLIF(CAST(NULL AS integer), x))` is refused); where the planner may fold a `CASE` condition, `AND`/`OR` operand or `COALESCE` argument to a value define cannot tell, it refuses nothing after it (`COALESCE(NULLIF(STRPOS('', ''), NULL), 2147483647 + 1)` and `CASE WHEN STRPOS('a', 'a') = 2 AND x > 0 THEN 2147483647 + 1 END` define). A `NULLIF` whose first argument is such a value is treated as reading its other argument, though the planner folds it to `NULL` when that value is, so define may refuse a guarded constant Postgres drops (`CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), x) IS NOT NULL THEN 2147483647 + 1 END` is refused, and plans to `NULL` in Postgres). An expression that reads a column is not a constant: `int_col + 2147483647` defines and fails only for the rows it overflows, which are quarantined. A function call over constants other than `ABS` (`CHAR_LENGTH('abc')`, `CEIL(DOUBLE PRECISION '1e+308') * 10`, `DATE_TRUNC('millennium', CAST(DATE '0001-01-01' - 1721426 AS timestamp))`) is folded by Postgres too, but define has no value for it, so the failing expression around it, or a `CASE` result, `AND`/`OR` operand or `COALESCE` argument it may select, defines and every page fails ([#1446](https://github.com/salesforce-misc/trellis/issues/1446)) | Yes (`CoalesceLiteralOutOfRange` for the `COALESCE`, `CaseLiteralOutOfRange` for a `CASE` of a float type, `ConstantOutOfRange` for the arithmetic or cast), naming the field, the expression as written and the type, for the definition and an `ALTER TRANSFORM`. | A column retyped so a constant falls out of range (`double precision` → `real` under a `COALESCE`, `numeric` → `double precision` beside a huge constant) pauses the transform on the staging worker's next capture pass, with the reason in `status()`'s `capture_failure`, and `RESUME` refuses while define would refuse the definition. | Use a constant within the type's range, or a column. |
-| A constant zero divisor of `/` or `%`: a literal (`n / 0`, `n / 0.0`), a float zero (`f / REAL '0'`, `-0` included) or a constant that folds to zero (`n / (1 - 1)`, `i % (2 - 2)`), whatever the dividend. A `CASE` or `COALESCE` that resolves to a float casts the result it picks to that float, so a wide integer literal in it rounds first: `CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE -9223372036854775809 END - -9223372036854775808` is exactly zero. A `NaN` float constant divided by zero is `NaN` in Postgres and defines. Postgres raises `22012` for every row that has a dividend, or at plan time when the dividend is a constant too, so no row could be written. A divisor that reads a column defines, and `x / col` fails only for the rows where `col` is zero, which are quarantined. Postgres evaluates a `COALESCE` argument only for the rows the earlier ones leave `NULL`, a `CASE` result only where its condition holds and an `AND`/`OR` operand only where the earlier ones allow, but a zero divisor under one is refused too, unless a constant before it ends the `COALESCE`, `CASE`, `AND` or `OR`, or the column-reading dividend sits in a strict operator or function call that has a `NULL` constant input (`(n / 0) + NULL`), which Postgres replaces by `NULL` without dividing (a constant dividend still divides at plan time). Neither spares a division in an aggregate's argument (`COALESCE(5, SUM(n / 0))`, `SUM(n / 0) + NULL`), which Trellis computes for every row apart from the expression around the call | Yes (`ConstantDivisorZero`), naming the field and the division as written, for the definition and an `ALTER TRANSFORM`. | n/a: a constant does not change. | Use a nonzero divisor, or a column. |
-| A comparison between two different temporal types (`date` and `timestamp`, `timestamp` and `timestamptz`, `time` and `timetz`). Same-type comparisons of `date`, `timestamp`, `timestamptz`, `time` and `timetz` are admitted, as are `boolean` and `uuid` against their own type and exact numerics against each other | Yes (`MixedTemporalComparison`), naming both types, for the definition and an `ALTER TRANSFORM`. Postgres converts one side first, and a conversion to or from `timestamptz` depends on the session's time zone. | A column retyped to another temporal type pauses the transform, as in the rows above. | Cast one side so both are one type, or compare two columns of one type. |
-| `<`, `<=`, `>`, `>=` over `text`. `=`, `<>`, `!=` and `IS [NOT] DISTINCT FROM` over text are admitted (under a deterministic collation, row above) | Yes (`TextOrderingComparison`). The order of text depends on the collation, which Trellis does not evaluate. | A column retyped to `text` pauses the transform, as in the rows above. | Order by a non-text value, or compare `CHAR_LENGTH` of the text. |
-| A comparison or `NULLIF` between types no family covers: `text` with a number, `boolean` with a number, `uuid` with `text`, and every type outside the families (`bytea`, `jsonb`, `interval`, enums, `inet` and the rest) | Yes (`ComparisonTypeMismatch`), naming the operator and both types. | A column retyped into a type outside the family pauses the transform, as in the rows above. | Compare two values of one family; `IS NULL` takes any type. |
-| Comparisons that chain: `a < b < c`, `a = b = c`, `a < b = c`, and `IS DISTINCT FROM` followed by another `IS` form. Postgres reads these as a syntax error | Yes (`NonAssociativeComparison`, a parse error). | n/a | Join them with `AND` (`a < b AND b < c`) or add parentheses. |
-| `IS TRUE`, `IS NOT TRUE`, `IS FALSE`, `IS NOT FALSE`, `IS UNKNOWN`, `IS NOT UNKNOWN`; the simple `CASE <operand> WHEN <value> THEN ...` | Yes (`UnsupportedIsForm`, `SimpleCaseUnsupported`, parse errors). Only `IS [NOT] NULL` and `IS [NOT] DISTINCT FROM` are admitted, and only the searched `CASE`. | n/a | `x IS NOT DISTINCT FROM TRUE` is `x IS TRUE` (likewise `FALSE`, and `IS DISTINCT FROM` for the `NOT` forms), and `x IS NULL` is `x IS UNKNOWN`; write `CASE WHEN <operand> = <value> THEN ...`. |
-| A `NULL` literal its context gives no type: both operands of an arithmetic operator (`NULL + NULL`), the operand of prefix `-` or of `AT TIME ZONE`, an operand beside a type that no operator define admits takes on both sides (`date_col + NULL`, which Postgres finds ambiguous; `ts_col - NULL`, which it reads as the `interval`-producing `timestamp - timestamp`), or an argument of a function or aggregate (`abs(NULL)`, `SUM(NULL)`, `COUNT(NULL)`), directly or through a field that is only `NULL`. Postgres finds some of these ambiguous and types the rest by its function-candidate rules (`abs(NULL)` is `double precision`), which define does not model. | Yes (`UntypedNull`), naming the field and the construct, for the definition and an `ALTER TRANSFORM`. | n/a: a literal does not change. | Write `CAST(NULL AS <type>)` with the type you mean (`abs(CAST(NULL AS integer))`). |
-| A `CASE` condition that is not a `boolean`, or `CASE` results that Postgres cannot unify the way `COALESCE` does (`CASE WHEN c THEN 1 ELSE 'x' END`). Results unify to a common type: two integers the wider, an exact numeric with a float the float, otherwise `numeric`, so `CASE WHEN c THEN 1 ELSE 2.5 END` is `numeric` and `real` with `numeric` is `real` | Yes (`CaseConditionNotBoolean`, `CaseResultTypeMismatch`), for the definition and an `ALTER TRANSFORM`. | A column retyped so the results no longer unify pauses the transform, as in the rows above. | Make the results one type, with `CAST` where an integer meets a float. |
-| `NULLIF(a, b)` where Postgres casts `a` to compare it, so the result is not `a`'s type: an integer `a` with a `numeric` `b` (the result is `numeric`), and an exact `a` with a float `b` (the result is `double precision`). `NULLIF(a, b)` otherwise has `a`'s type, for any pair `=` admits, and `x / NULLIF(y, 0)` guards a division | Yes (`NullIfFirstArgumentCast`), naming both types and the type Postgres gives. | A column retyped into such a pair pauses the transform, as in the rows above. | `NULLIF(CAST(a AS numeric), b)`, or write the float first. |
-| An expression whose calculated fields inline to more than 100,000 nodes in total, a very wide `CASE` included (each `WHEN x = 1 THEN 1` branch is four nodes, so about 25,000 of them) | Yes (`FieldExpansionTooLarge`). | n/a | Shorten the expression or split it into calculated fields. |
-| `/` between two integers (`smallint`, `integer`, `bigint`), such as `qty / 2` | Yes (`IntegerDivision`), naming both operand types. Postgres truncates an integer quotient (`7 / 2` is `3`), which reads as a rounding rule a `numeric` quotient does not have. `numeric / integer`, `integer / numeric`, `numeric / numeric` and every float quotient are admitted. | A column retyped from `numeric` to an integer type pauses the transform on the staging worker's next capture pass, with the reason in `status()`'s `capture_failure`, and `RESUME` refuses while define would refuse the definition. | Divide as `numeric`: `CAST(qty AS numeric) / 2`. |
-| `%` with a float operand (`real`, `double precision`). `%` takes integers and `numeric`: two integers give the wider width, anything with a `numeric` gives `numeric`, and the sign follows the dividend (`-7 % 2` is `-1`) | Yes (`FloatModulo`). Postgres has no float modulo. | A column retyped into a float pauses the transform, as in the row above. | Use `numeric` operands. |
-| An argument to `ABS`, `CEIL`, `FLOOR`, `ROUND` or `TRUNC` that the function does not admit. `ABS` takes an integer, `numeric` or float and returns its type. `CEIL`, `FLOOR` and `TRUNC` take `numeric` or `double precision`. `ROUND(a)`, `ROUND(a, n)` and `TRUNC(a, n)` take a `numeric` `a` and an `n` that is an integer literal (negative allowed, `ROUND(a, -2)`), and return `numeric`. Refused: an integer argument (it is already whole, and Postgres would cast it to `double precision` and change the result's type), a `real` argument to `CEIL`, `FLOOR` or `TRUNC` (promoted to `double precision`), a float argument to `ROUND` (a float rounds half to even, `numeric` half away from zero, so one name would carry two rules), a scale that is a column or an expression | Yes (`NumericFunctionArgument` with the reason, `ScaleNotIntegerLiteral`, or `FunctionArgTypeMismatch` for a non-numeric argument), naming the field and the function, for the definition and an `ALTER TRANSFORM`. | A column retyped into a refused type pauses the transform, as in the rows above. | Use the integer itself; use a `numeric` value, or `CAST(qty AS numeric)` for an integer one; write the scale as a literal. |
-| A `CAST(<expr> AS <type>)` that is not an exact conversion that reads no setting: an integer to the same or a wider integer (`CAST(smallint_col AS integer)`, `AS bigint`, `CAST(bigint_col AS bigint)`), any integer to `numeric`, a `date` to `timestamp`, and a cast to the operand's own type (an integer to its own width, `numeric` to `numeric`, `timestamp` to `timestamp`; Postgres runs it as the identity, so `numeric(12, 2)` `1.50` stays `1.50` and a `timestamp(3)` keeps its fractional digits) are admitted. Refused: a narrowing (`bigint` to `integer`), a cast from a float or a non-numeric type, a cast to or from a float, a `timestamptz` to `timestamp` (it converts through the session `TimeZone`), any other target spelling (`smallint`, `text`, `real`, `int2`, `dec`, `timestamptz`, `date`), and a modifier (`numeric(10, 2)`, `decimal(10, 2)`: it rounds and can overflow; `timestamp(3)`). The accepted target spellings are `integer` (or `int`, `int4`), `bigint` (or `int8`), `numeric` (or `decimal`) and `timestamp`, in any case, in the target position only: a column named `int` is still a column. A `date` past 294276-12-31 is a value `timestamp` cannot hold: its row raises `22008` and is quarantined. An alias is typed and checked as its canonical target (`CAST(bigint_col AS int)` narrows, so it is refused), and `ALTER TRANSFORM` shows the canonical spelling | Yes (`UnsupportedCast` naming both types for an operand that does not convert; `TemporalOperand` for a `timestamptz`, with `AT TIME ZONE 'UTC'` as the remedy; `UnsupportedCastTarget` for a target or a modifier the grammar has no spelling for), for the definition and an `ALTER TRANSFORM`. The cast of a quoted literal (`CAST('1.5' AS real)`) is a typed literal, with its own rules. | A column retyped so its cast no longer converts (`integer` → `numeric` under `CAST(c AS bigint)`) pauses the transform, as in the rows above. So does a widening that makes it a narrowing (`smallint` → `bigint` under `CAST(c AS integer)`): the `capture_failure` names the column, both types and the refusal, and `RESUME` refuses until the definition is altered to one that validates or the column is changed back. A retype that makes a cast an identity (`integer` → `bigint` under `CAST(c AS bigint)`) pauses nothing. | Widen the column instead, or compute in `numeric`; for a `timestamptz`, `tz AT TIME ZONE 'UTC'`. |
-| `+` or `-` over a date or time operand other than `date ± integer`, `integer + date` and `date - date`: a `date` with a `bigint`, `numeric` or float (`d + n`), `date + date`, a number minus a date, a difference of two timestamps or of a date and a timestamp (`ts2 - ts1`, `tz2 - tz1`), any operand of type `interval`, and a number added to a `timestamp`, `timestamptz`, `time` or `timetz`. `date ± integer` takes a `smallint` or an `integer` count of days | Yes (`TemporalOperand`), naming the operator, the operand type and the reason, for the definition and an `ALTER TRANSFORM`. Postgres has no `date + bigint` or `date + numeric`. A difference of timestamps is an `interval`, which has no literal and whose month part makes a result depend on the date it is added to (`'2024-01-31' + 1 month - 1 month` is not `'2024-01-31'`), so nothing here produces or consumes one. | A column retyped into an unadmitted pair (`integer` → `bigint` beside a `date`) pauses the transform, as in the rows above. | Use an `integer` or `smallint` day count. For a duration, `EXTRACT(EPOCH FROM b) - EXTRACT(EPOCH FROM a)` is exact `numeric` seconds. |
-| `DATE_TRUNC` of a `date` or a `timestamptz`, or `EXTRACT` of a `timestamptz`, `time`, `interval` or any type but `date` and `timestamp`; `date_part` | Yes (`TemporalOperand` for the first two; `date_part` is an unsupported function). `DATE_TRUNC('month', d)` resolves to the `timestamptz` overload, which is `STABLE` and returns `timestamptz`; both functions on a `timestamptz` read the session `TimeZone`; `date_part` returns `double precision`. `EXTRACT` returns an unconstrained `numeric`, which `SUM`, `AVG` and `COUNT` take; grouping by a bucket goes through a chain (a 1-1 transform computes `DATE_TRUNC('month', ts) AS bucket`, an aggregate over that target uses `GROUP BY bucket`), define. | A column retyped into a refused type pauses the transform, as in the rows above. | `DATE_TRUNC('month', CAST(d AS timestamp))`; `DATE_TRUNC('day', tz AT TIME ZONE 'UTC')`; `EXTRACT(hour FROM tz AT TIME ZONE 'UTC')`; `EXTRACT` for `date_part`. |
-| A `DATE_TRUNC` unit or an `EXTRACT` field that is not admitted, or that is not a literal. Units: `microseconds`, `milliseconds`, `second`, `minute`, `hour`, `day`, `week` (truncates to Monday), `month`, `quarter`, `year`, `decade`, `century`, `millennium`, in any case. Fields of a `date`: `year`, `quarter`, `month`, `week`, `day`, `dow`, `isodow`, `doy`, `isoyear`, `decade`, `century`, `millennium`, `epoch`; a `timestamp` also has `hour`, `minute`, `second`, `milliseconds`, `microseconds`. Refused: `EXTRACT(hour FROM <date>)`, `julian`, the `timezone` fields, abbreviations and plurals (`y`, `days`, `mon`) and a unit given as a column | Yes (`TemporalLiteral`), naming the construct, the text and what is admitted. A field Postgres lacks for the type raises in it; `julian` counts from a different origin for each type; the others have one spelling here. | A column retyped does not change a literal. | Use a listed spelling. |
-| `AT TIME ZONE` with a zone other than the string literal `'UTC'` (`'America/New_York'`, `'utc'`, `'+05:00'`, a column), or over anything but a `timestamptz`: a `timestamp` gives a `timestamptz`, and a `date` converts through the session `TimeZone` | Yes (`TemporalLiteral` for the zone, `TemporalOperand` for the operand). Another zone's offsets come from the time zone database, which a release changes under past results, and `AT TIME ZONE` on a `timestamp` produces a `timestamptz`, which nothing here needs. `'UTC'` is parsed under `timezone_abbreviations`, which Trellis's sessions pin to `Default`. | A column retyped to another type pauses the transform, as in the rows above. | Convert in the source, or `CAST(d AS timestamp)` for a date. |
-| A key column (a source key, a `GROUP BY` key or a `JOIN`'s `ON` column) retyped so that the values Trellis stored render differently: `timestamp` ↔ `timestamptz`, `date` → `timestamp`, `text` → `uuid` or `integer`, `varchar` → `character(n)`, or a narrower `numeric` scale, temporal precision or `varchar(n)` (the rewrite rounds, or strips trailing spaces) | n/a: define sees one type. | An `ALTER COLUMN … TYPE` rewrites the table without firing a trigger. The staging worker pauses every transform keyed by the column, with the old and new type in `capture_failure`. | `RESUME`: it re-types Trellis's copies of the column and rebuilds from the source. Or drop and define again. |
-| A column Trellis creates a column from with its type, widened. Those columns are a 1-1 target's key, passthrough and calculated columns, an aggregate's `GROUP BY` key (copied into its target and its hidden table) and its field columns, a `JOIN`'s `GROUP BY` keys and `ON` columns (copied into its target and its hidden tables, each with its type, no modifier, and collation) and its field columns, and a 1-1 `JOIN`'s key, field columns and the columns of its hidden `R`, `M` and `J`. Widenings are `integer` → `bigint` (and `smallint` up), an integer → `numeric` (unless every value of the `numeric` fits the integer), `real` → `double precision`. A wider modifier is no widening: a copy has none ([ADR-0020](decisions/0020-type-identity.md)). | n/a: each column takes its type from the source at define, or when an `ALTER TRANSFORM … ADD` adds it. A column Trellis creates has the source column's type with no modifier (a 1-1 key column and a `JOIN`'s `GROUP BY` and `ON` columns also keep its collation; any other takes the database default), so a change of a modifier (a string bound, a `numeric` precision, a temporal precision, a move to `text`) changes nothing there. | A widening of a modifier that changes only the catalog needs no re-type, no pause and no rebuild. Otherwise the column keeps its type, so a value it can't hold would fail its write. The staging worker pauses every transform that owns a column the type define would give it now outgrew (a 1-1 target's copy of `qty` after `qty` goes `integer` → `bigint`), naming the source column and each of those columns. A narrowing pauses nothing here, except a `varchar(n)` key's (the row above). A narrowing, a field's move to another type family (`integer` → `double precision`), or any other change that isn't a pure widening, rebuilds the table's readers on its own, and pauses a transform define would now refuse, or one that evaluates the column as another type ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-column-changed-or-rewritten-without-a-trigger)). | `RESUME`: the staging worker `ALTER`s each column whose type differs from the one define would give it now, under `ACCESS EXCLUSIVE` (a table rewrite for `integer` → `bigint`; reads of the target wait), then rebuilds. A `JOIN`'s or a 1-1 `JOIN`'s hidden tables are created again at the new types instead. Or drop and define again. |
-| Two `GROUP BY` keys that share a target column name (a key listed twice, or a `JOIN`'s `orders.region` and `customers.region`); keys can't be aliased | Yes (`GroupByKeysShareTargetColumn`). Each key becomes a target column named after its bare column name. | n/a | List a key once. For a `JOIN`, join a 1-1 transform's target that selects one side's column under another name (`region AS customer_region`). |
-| A key of more than 32 columns: a `GROUP BY` of more than 32 columns, or a `JOIN` side whose `ON` columns and `GROUP BY` columns not among them together number more than 32 (a 1-1 `JOIN` has no `GROUP BY`, so its `ON` alone, which may number at most 31: its hidden `R` indexes them followed by the row's key, which a `b` change's chunks walk). Postgres caps an index at 32 columns (`INDEX_MAX_KEYS`) and Trellis keys the target and a `JOIN`'s hidden tables on these columns. | Yes (`IndexKeyTooWide`, naming the clause and the limit). A source key is at most 32 columns too, so a 1-1 target's key never exceeds it. | n/a | Group by or join on fewer columns. |
-| A table of more than 1,600 columns, Postgres's cap on one table (`MaxHeapAttributeNumber`). Trellis creates a target with a column per key and field, and hidden tables whose width follows the fields too: an aggregate's hidden table has its `GROUP BY` columns, a column counting each distinct argument, a column summing each one a `SUM` or `AVG` reads, and a column for each distinct `MIN` or `MAX` call (with two more for their basis and stamp when there is one); a `JOIN`'s hidden partials tables do the same, per side and for the groups; a 1-1 `JOIN`'s ledger for a side has a column for every column that side's fields read. So about 800 distinct summed aggregate arguments overflow a hidden table that their target fits in. | Yes (`TableTooWide`, naming the table's role and the limit), for the definition, `RESUME` and an `ALTER TRANSFORM … ADD`. An `ALTER TRANSFORM` counts the columns earlier edits dropped from the target, and the column a `DROP z, ADD … AS z` replaces, since Postgres keeps counting a dropped column until the table is created again. An aggregate meets smaller limits first, which define does not refuse: from about 270 distinct summed arguments the statements that build and apply it exceed Postgres's 1,664-entry target list, so its build pauses or its changed groups are quarantined, with Postgres's error ([#1518](https://github.com/salesforce-misc/trellis/issues/1518)), and from about 500 a hidden table's row can outgrow a heap page ([#1516](https://github.com/salesforce-misc/trellis/issues/1516)). | n/a: the tables are created with the definition, and only an `ALTER TRANSFORM … ADD` of a 1-1 transform adds a column. | Define fewer fields, or fewer distinct aggregate arguments. If dropped fields filled the limit, drop the transform and define it again. |
-| A field named after a 1-1 source key column or a 1-1 `JOIN`'s `a` key column (`id AS id`), or any field or `GROUP BY` column whose name starts with `__` | Yes. The target already carries the key columns, and `__` names are reserved for Trellis's hidden columns. `id AS order_id` is an ordinary column. | n/a | Rename the field. |
-| An aggregate whose argument names another aggregate field when no source column has that name (`SUM(val) AS total, SUM(total)`), directly or through a field that reads one | Yes (`AggregateOfAggregateField`). The argument would nest one aggregate in another, which no build can run. | n/a | Aggregate the source column instead (`SUM(val)`). |
-| A bare name that could mean a source column or a field: the name of a source column and of a field whose expression is not just that column, read by another field (`(grp + 1) AS val, SUM(val) AS total`). An aggregate field's name inside another aggregate's argument is not ambiguous: it is the source column ([Calculated Fields](#calculated-fields)). | Yes (`AmbiguousColumnReference`), naming both meanings. `val AS val` (or `src.val AS val`) passes the column through, so reading `val` elsewhere is not ambiguous. | A source column added later under the name of a field: nothing is detected, and the transform keeps reading the field. An `ALTER TRANSFORM` that adds a field of that name is refused, as define would. `RESUME` re-validates and refuses what define would: in an aggregate target, a field another field reads by that name, and in a 1-1 target, any field of that name. | At define, write `src.val` or `public.src.val` to read the source column, or rename the field and read it by its new name. After a later column, rename or drop that column and `RESUME`, or drop the transform and define it again. |
-| An unquoted name that Postgres reserves in an expression, a `GROUP BY` or `KEY (…)` column, or a `JOIN`'s `ON` and `GROUP BY` qualifier: any word `pg_get_keywords()` marks reserved (`R`) or reserved as a type or function name (`T`), such as `order`, `user`, `end`, `not`, `from`, `left`, `case`, `and`, `is`. Postgres needs such a column quoted. `GROUP BY current_user` reads the function in Postgres, and `GROUP BY order` is a syntax error there. A quoted name (`"order"`), a name after a `.` (`t.order`), the label after `AS` (`val AS limit`) and a call (`left(x, 2)`) are not bare names and are fine; a non-reserved keyword (`extract`, `position`, `values`, `between`, `coalesce`, `nullif`, `char`) is still a column. | Yes (`ReservedWord`), for the definition and an `ALTER TRANSFORM`, naming the word and the quoted spelling. A source table with a column of that name defines; an expression reads it quoted or qualified. | Adding or renaming a column to a reserved word needs quotes in Postgres; it is a rename like any other. A transform that reads the old name pauses, and one that doesn't read the column is unaffected. | Quote it (`"order"`, and `"order" AS "order"` copies it under its own name), or qualify it with its table (`orders.order`). |
-| An unquoted table name that Postgres reserves (`R` or `T`, as in the row above), as the target, the `FROM` table or the `JOIN` table: `FROM user` reads the `current_user` function in Postgres, and `FROM order` is a syntax error there. A schema-qualified name's table part (`public.order`) is fine, as in Postgres | Yes (`ReservedTableName`, a parse error), naming the word. | n/a: a table name does not change under a stored definition's text. | Quote the table's name as the catalog spells it (`FROM "User"`, `FROM "order"`). |
-| A name over 63 bytes, after folding to lower case and unescaping `""`, in any position (a table, schema, column, `KEY` or `GROUP BY` column, `AS` label, alias or addressed transform). Postgres truncates such a name, so two long names sharing their first 63 bytes would be one | Yes (`NameTooLong`, a parse error), naming the name and the 63-byte name Postgres would truncate it to. | A definition 0.1.x stored with a longer `AS` label (Postgres truncated its target column) keeps running, but its text can't be written in the current grammar: an `ALTER TRANSFORM` of it is refused (`NameTooLong`), and the upgrade that writes a `KEY (…)` into it pauses it instead. | Use a name of 63 bytes or fewer. Drop such a stored definition and define it again. |
-| A quoted name that is zero-length (`""`, which Postgres refuses too), the Unicode-escape spelling `U&"…"`, a quoted name holding a `.` or a non-ASCII character, or a quoted function or type name (`"lower"(x)`, `CAST(x AS "int4")`, `"date" '2024-01-31'`), which Postgres accepts. Postgres looks a quoted function or type name up exactly, so `"int4"` is a type there and `"INT4"` and `"integer"` are not. Trellis addresses a table by its `<schema>.<table>` text, which a `.` inside a name would make ambiguous | Yes (`ZeroLengthQuotedIdentifier`, `UnicodeEscapeIdentifier`, `UnsupportedQuotedIdentifier`, parse errors). | n/a | Rename the table or column, or write the name with its ASCII characters. Write function and type names unquoted (`lower(x)`, `CAST(x AS int4)`). |
-| A qualified name that doesn't name the `FROM` table: a two-part name whose head is another table (`product.cost`), or a three-part name whose schema isn't the `FROM` table's. A `JOIN`'s are in the `JOIN` rows below. | Yes (`QualifiedColumnNotFromSource`; a `GROUP BY` key is a parse error, `GroupByKeyNotFromSource`). `ALTER TRANSFORM` refuses it in an added or altered field. | n/a | Name the `FROM` table, or read the second table with a `JOIN`. |
-| A `GROUP BY` aggregate or a `JOIN` whose source lacks the index its `self_check` walk pages by: for an aggregate, a valid, non-partial btree index on the plain source columns whose leading columns are the `GROUP BY` columns, in `GROUP BY` order; for a `JOIN`, on each side, one whose leading columns are that side's `ON` columns in `ON` order. A primary key or unique constraint that leads with them counts; an expression or partial index, one under a non-default operator class such as `text_pattern_ops`, or one whose leading columns are not all ascending with `NULLS LAST` (the default) or all `DESC` with `NULLS FIRST` (the `DESC` default, read backward), such as `(a, b DESC)`, doesn't. A 1-1 target needs nothing (its walk pages by the primary key), and a `JOIN`'s `T` part, with group columns from both tables, is served by no one table's index and needs none | Yes (`SourceIndexMissing`), naming the table, the columns, the part of the definition that needs the index (the `GROUP BY` columns, or a `JOIN`'s `ON` columns on its from or joined side) and a ready-to-run `create index`. `WITHOUT SOURCE INDEX` after the `GROUP BY` or `JOIN` clause (`TRANSFORM t FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT …`) opts out for that definition, except one with a `MIN` or `MAX` field, which needs more (the `MIN`/`MAX` row below). Builds need no index. | Dropping or invalidating the index later pauses nothing, since it affects speed, never correctness. `status()` reports it in `source_index_gaps` (an opted-out definition's gap is listed too), `self_check` refuses to walk a definition that did not opt out, and a whole-transform `RESUME` refuses with the define message. An opted-out definition's `self_check` still runs, scanning the source once per page. | Create the index the message names; or define it `WITHOUT SOURCE INDEX`. |
-| A `JOIN` transform (`FROM a [LEFT\|INNER] JOIN b ON … GROUP BY … SELECT …`) that passes the checks in the rows below | No. Define registers it and creates its target, and Trellis builds it from both tables. Each table is held to the rows above, as a `FROM` is. Either table may be another transform's target, read through that target's change feed; the build first waits out the transactions that began before it ([data flow](data-flow.md#the-re-derive-build), [ADR-0019](decisions/0019-join-transforms.md#a-side-may-be-another-transforms-target-through-the-target-change-feed)). | A column the transform reads from either table dropped or renamed, or a key column of either (its primary key, an `ON` or a `GROUP BY` column) retyped as the key rows above describe, pauses the whole transform on the staging worker's next pass, naming that table and column in `status()`'s `capture_failure`, and so does a column of either table retyped to a type the transform evaluates differently. A widening of a column it copies is handled as the widening row above describes. Either table dropped or renamed pauses it, as the row for a dropped source describes. `RESUME` checks both tables and refuses, naming the table, while define would refuse the transform. | After a later change, undo it, then `RESUME`. |
-| A `JOIN`, with or without a `GROUP BY` (one without is a 1-1 `JOIN`, the next row), that is `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `LATERAL`, `USING` or a comma join; joins a table to itself (even under two aliases: one captured change would feed both sides), or two tables with the same bare name (`shop.orders JOIN archive.orders`); gives a table an alias that is a word Postgres reserves (`AS left`), that the other table goes by (its alias or bare name), or that a single-table definition gives its `FROM` table; reads an aliased table's column through the table's name (`orders.total` after `orders AS o`); joins one table twice, under any alias; with a `GROUP BY`, joins a third table; has an `ON` that is anything but equalities between a column of each table joined by `AND` (`OR`, `<`, a literal, an expression, two columns of one table, a column pair repeated, a column named by two terms); reads a column without its table (`SUM(qty)`, `GROUP BY region`) or through a table that is neither side; or, with a `GROUP BY`, has an aggregate whose argument reads both tables (`SUM(orders.x + items.y)`), or a field that is neither a `GROUP BY` key selected on its own nor a composition of aggregates (a column outside an aggregate, a nested aggregate, no aggregate at all) | Yes (parse error, `TableAlias` or `AliasedTableName` for an alias, or `JoinTooManyTables`, `JoinSelf`, `JoinOnSameSide`, `JoinOnRepeatedPair`, `JoinOnRepeatedColumn`, `JoinUnqualifiedColumn`, `JoinUnknownTable`, `JoinUnresolvedColumn`, `JoinMixedSideArgument`, `JoinFieldShape`). Only `INNER` and `LEFT` equi-joins of different tables are admitted, two tables with a `GROUP BY` (a 1-1 `JOIN` may read more, the row after next), with every column written `<table>.<column>`, or `<alias>.<column>` for a table given an alias. A field is a `GROUP BY` key from either table, or composes aggregates with literals, operators and functions (`COALESCE(SUM(items.qty), 0)`); each aggregate is `COUNT(*)`, or `COUNT`/`SUM`/`AVG` of a column or an expression over one table's columns (`SUM(items.qty + 1)`). Each argument is kept as a running total on its own table, so one reading both tables has no such total. | n/a | Rewrite the definition in the admitted shape. For `RIGHT JOIN`, swap the two tables and use `LEFT JOIN`. Qualify an aliased table's columns with its alias. |
-| A 1-1 `JOIN` (`FROM a [LEFT\|INNER] JOIN b ON … SELECT …`, no `GROUP BY`, [ADR-0021](decisions/0021-one-to-one-join-transforms.md), [1-1 JOIN](#1-1-join)): one whose `b` `ON` columns are not unique, that has an aggregate field, that reads a column that starts with `__`, whose side is partitioned, whose `ON` names one column in two terms, whose `ON` reads two columns of `a` whose names share their first 60 bytes, or whose `b` is another transform's 1-1 target joined on columns that leave out part of that target's primary key | Yes (`OneToOneJoinKeyNotUnique`, `OneToOneJoinAggregate`, `OneToOneJoinUnsupported`, `PartitionedSource`, `JoinOnRepeatedColumn`; a `WITHOUT SOURCE INDEX` is a parse error). `b`'s `ON` columns must contain a unique key of `b`: its primary key, a unique constraint or a non-partial unique index on plain columns (deferrable, or with `INCLUDE` columns, is fine for this check), or the group key of an aggregate or `JOIN` target. `b`'s row-identity key, its primary key or `KEY`, is a separate rule: it must not be deferrable (the key row above), even when a deferrable key is what makes its `ON` columns unique. When `b` is another transform's 1-1 target, its `ON` columns must also include every column of its primary key, so a unique index added to the target never admits a join on another column: Trellis orders changes per primary-key value only, so only the primary key is unique at every instant while the upstream drains. An `a` that is a 1-1 target may be joined on any columns. A field is any expression over `<table>.<column>` columns of either table. The target is keyed by `a`'s primary key. The joined table needs no source index. Trellis builds the target in chunks of `a`'s primary key, keeps it readable across a `RESUME`, and applies changes, Re-derives and `TRUNCATE`s of either table. A `TRUNCATE` of `a` empties the target; one of `b` starts a rebuild of it, so the transform reads `backfilling`, and a row keeps the `b` columns it held (an `INNER` row stays) until the rebuild reaches it. A `b` that is another transform's target is never truncated: a `TRUNCATE` of that transform's source reaches the `JOIN` as a delete of every row of `b`, a change of `b` like any other. A page whose changes of either table, or a chunk of a `b` change's fan-out, fail on more rows of `a` than its bisection can name, pauses the transform, and everything downstream of it, with a `capture_failure` of kind `halt`. A row of `a` a page fails to write, for its own change or a change of `b`, is otherwise held in quarantine on its first failure, and the page applies every other change. | As for a `JOIN` (the row above): a column the transform reads from either table dropped or renamed, a key column of either (`a`'s primary key, an `ON` column) retyped as the key rows above describe, or a column retyped to a type the transform evaluates differently, pauses the whole transform, naming that table and column in `status()`'s `capture_failure`. A widening of a column it copies (`a`'s key, a field, `R`, `M` and `J`) is handled as the widening row above describes; a field over both tables is reported against the table whose column widened, naming every column it is typed from. Either table dropped, renamed or joining a hierarchy pauses it, as for a source. `b`'s unique key on its `ON` columns dropped, or left `INVALID` by a failed build, pauses the whole transform on the staging worker's next pass, naming `b` and its `ON` columns, whether or not a duplicate arrived; a duplicate Postgres admits past a deferrable key under `session_replication_role = replica`, which leaves the key valid, pauses nothing ([known correctness gaps](known-correctness-gaps.md#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)). `RESUME` refuses a `b` whose `ON` columns are no longer unique, naming the table, and re-keys the target to a changed key of `a` as for a 1-1 transform (the key row above). | Join `b` on a unique key (a 1-1 target's, on columns that include its primary key, or join the table that transform reads), and give an aggregate a `GROUP BY`. Rename a column of `a` whose name's first 60 bytes another `ON` column of `a` shares. After a later change, undo it, then `RESUME`; a widening needs only the `RESUME`. For `b`'s unique key, restore the key, then `RESUME` ([recommendations](recommendations.md#keep-the-indexes-a-definition-relies-on)). |
-| A 1-1 `JOIN` of more than two tables, a star (`FROM a JOIN b1 ON … LEFT JOIN b2 ON … SELECT …`): one defined while the development knob `TRELLIS_DEV_STAR_JOIN` is off; one of more than 5 tables (`a` and 4 joined tables); one where a joined table's `ON` reads a joined table other than its own (a snowflake, `JOIN b2 ON b1.id = b2.id`, or an `ON` that reads `a` and two joined tables) | Yes (`StarJoinDisabled`, `StarJoinTooManyTables`, `JoinOnReadsAnotherJoinedTable`). The joins read left to right, as Postgres reads them without parentheses; each joined table is joined to `a` directly, and every rule of the row above holds at each position: its `ON` columns contain a unique key of its table (the refusal names that table), a joined 1-1 target is joined on columns that include its primary key, no table is partitioned, no two `ON` columns of `a` share their first 60 bytes, and every refusal of the `JOIN` rows above (the kinds other than `INNER` and `LEFT`, `LATERAL`, `USING`, a comma join, a table read twice) holds at every position. A star builds and applies its changes and a `TRUNCATE` of any of its tables, and leaves a fan-out past one chunk to chunks at any position; loading one in a process with the knob off halts it. | A schema change of a joined table at any position is handled as the row above describes for `b`, naming that table and its column: its unique key on its own `ON` columns dropped or left `INVALID`, a column the star reads there dropped, renamed or retyped, a widening, the table dropped, renamed or joining a hierarchy, or a value of an enum read there relabelled, pauses the whole transform. `RESUME` re-validates every position as define does, refusing a position whose `ON` columns are no longer unique or whose `ON` pair no longer has one type and collation, and re-keys the target to a changed key of `a`. A star defined while the knob was on is refused at `RESUME` once it is off. | Define it with the knob on, at most 5 tables, each joined to `a` on a unique key of its own. Join a snowflake's outer table through a transform of its own and join that target. |
-| A `JOIN` whose `ON` columns differ in type or collation, are off the join-key allowlist, or have a nondeterministic collation; or a `GROUP BY` key of a type that can't be one | Yes (`JoinKeyTypeMismatch`, `JoinUnsupportedKeyType`, `JoinNondeterministicCollation`, `UnsupportedGroupByKeyType`). Each `ON` column's type must be on the join-key allowlist in [type-support.md](type-support.md) (a domain never is), with a deterministic collation. The two columns of each pair need the same type and the same collation, because Trellis never casts a join key. A type modifier never counts, and `text` and `varchar` are one type: `varchar(10)` pairs with `varchar(50)`, `text` or a Trellis target's copy, and `timestamp(0)` with `timestamp(3)`, while `integer` against `bigint` is refused. A `GROUP BY` key follows the `GROUP BY` key rules. | An `ON` column retyped to another type (`integer` to `bigint`) so its pair no longer matches, or onto a refused type or a nondeterministic collation, pauses the whole transform on the staging worker's next pass, naming that table and column in `status()`'s `capture_failure`. A change of one column's modifier leaves the pair matching, so a widening pauses nothing; a change that re-renders the keys Trellis stored (a narrower bound or precision) pauses the transform, and `RESUME` rebuilds it. A change between deterministic collations pauses nothing (byte equality is unchanged), but `RESUME` refuses the pair until the collations match too. | Alter one column to match the other, then `RESUME`. |
-| `MIN` or `MAX` in a plain aggregate (`GROUP BY` over one table) whose argument is not a plain source column (`MAX(a + b)`, a cast, a calculated field), is of a type other than `smallint`, `integer`, `bigint`, `numeric`, `real`, `double precision`, `date`, `time`, `timestamp`, `timestamptz`, `interval` and `oid` (`text` among them, until collation is settled), or is a column of another transform's target; a definition with such a field declared `WITHOUT SOURCE INDEX`; or one whose source lacks, for each argument, a valid, non-partial btree index whose leading columns are the `GROUP BY` columns in order, then the argument (under the index rules of the source-index row above) | Yes (`ExtremeOfExpression`, `UnsupportedExtremeArgument`, `ChainedExtreme`, `ExtremesWithoutSourceIndex`, `ExtremeIndexMissing`), naming the call and, for an index, the table, the columns and a ready-to-run `create index`, one per argument, which also serves as the `GROUP BY` index. A group keeps each extreme, and a deletion or update that removes it re-reads the group's next one from the source after the group's lock, as one endpoint of that index ([type support](type-support.md#min-and-max)). Without the index each re-read scans the group, and with no `GROUP BY` index either the whole source, once per group: a page can then outrun `statement_timeout` and retry forever, so `WITHOUT SOURCE INDEX` doesn't apply. Another transform's target has no such index, and building one is a long `CREATE INDEX` on a table Trellis owns. | A whole-transform `RESUME` refuses with define's message while a probe index is missing or invalid, and refuses the other conditions as define does. A probe index dropped or invalidated while the transform runs leaves the target exact: `status()` lists it in `extreme_index_gaps`, and each re-read scans its group. Once no valid probe index has existed on any of the staging worker's passes for 5 minutes (wall-clock time, a fixed constant; a pass that finds one resets it, and a restart or a new leader starts it again), the pass pauses the transform, with a `capture_failure` naming the table, the columns and a ready-to-run `create index` (for a partitioned source, also to re-run `ALTER INDEX … ATTACH PARTITION` after repairing a leaf's index, whose repair alone leaves the root's index invalid). An equivalent index built before the old one is dropped, `REINDEX CONCURRENTLY` and a rename pause nothing; a rebuild that drops the old index first and takes longer than 5 minutes pauses ([recommendations](recommendations.md#keep-the-indexes-a-definition-relies-on)). An argument re-typed to a refused type pauses the transform, as the retype rows above describe. | Create the index the message names; drop `WITHOUT SOURCE INDEX`; take `MIN`/`MAX` of a plain column (a stored generated column for an expression), in the transform that reads the source. After a pause, create the index the message names, then `RESUME`. |
-| `MIN` or `MAX` in a `JOIN` transform | Yes (`DeferredAggregate`, family `MIN/MAX`). A `JOIN` target's extreme is the extreme of each joined key's extreme over the keys that still match, each of them a re-read of the fact side, which Trellis doesn't model. | n/a | Take the `MIN`/`MAX` in a plain aggregate over one table. |
-| `bool_and`, `bool_or`, `bit_and` or `bit_or` in an aggregate or a `JOIN` transform | Yes (`DeferredAggregate`, family `bool_and/bool_or/bit_and/bit_or`). | n/a | Not supported yet: [#1118](https://github.com/salesforce-misc/trellis/issues/1118). |
-| `SUM` or `AVG` over a float (`real`, `double precision`), an `interval`, or any type but `smallint`, `integer`, `bigint` and `numeric`, in an aggregate or a `JOIN` transform | Yes (`DeferredAggregate`, family `float and interval SUM/AVG`, for a float or an `interval`; another type is refused naming its type). A running float sum drifts from Postgres's, which adds the group's values in scan order. | The argument column re-typed to a float (`integer` → `double precision`) pauses the transform on the staging worker's next pass, naming the column in `status()`'s `capture_failure`; `RESUME` refuses with define's error until the type is admitted again. | Sum an integer or `numeric` column. Not supported yet: [#1119](https://github.com/salesforce-misc/trellis/issues/1119). |
-| `array_agg`, `string_agg` or `jsonb_agg` in an aggregate or a `JOIN` transform | Yes (`DeferredAggregate`, family `array_agg/string_agg/jsonb_agg`). | n/a | Not supported yet: [#1040](https://github.com/salesforce-misc/trellis/issues/1040). |
-| A `WHERE` other than `TRUE` | Yes (parse error). Partial data is not supported ([#804](https://github.com/salesforce-misc/trellis/issues/804)). | n/a | None. |
-| Chaining off a transform that is not `live` (`TransformNotLive`) | Yes. | n/a | Wait for the upstream to go `live`, then define. |
-| A target whose name is taken: a relation of any kind already exists in the target schema under the target's name or the name of a table Trellis keeps beside it (`<target>__ledger`). That includes another definition's target, in this instance or in another instance sharing the target schema. | Yes (`TargetTableExists`, a `conflict` error). Trellis writes only to target tables it creates, or to an empty table it adopts on request, and `DROP TRANSFORM` drops the target, so it never takes over an existing relation unasked. With `ADOPT EXISTING TABLE` after the target (`TRANSFORM t ADOPT EXISTING TABLE FROM s …`), define builds into the existing table instead, if it is a plain, empty table shaped exactly as define would create it: the same columns in the same order, each with the type (no modifier), collation and nullability define gives it, and the key define creates (the primary key, or an aggregate's or `JOIN`'s `UNIQUE NULLS NOT DISTINCT` group key, not deferrable and with no `INCLUDE` columns). Define records that key, so a unique constraint the table already has never keys it instead (the key row above). It may carry anything a user may add to any target (indexes, unique or not; constraints; triggers; rules; foreign keys, its own or another table's referencing it; grants; comments; row security policies, subject to the row-security row above; extended statistics; publications; views over it; storage parameters; a replica identity), with the outcomes [any target has](#target-tables-are-trellis-owned). Anything else refuses with `TargetNotAdoptable`, its message naming the property by code: `missing` (no such table, a `not_found` error), `not_a_table`, `partitioned`, `partition`, `inheritance`, `typed_table`, `unlogged`, `extension_member`, `access_method`, `not_empty`, `not_owner` (the defining role is neither its owner nor a member that inherits the owner's privileges, so it couldn't alter or drop it later), `privilege` (it lacks `SELECT`, `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` on it), `missing_column`, `extra_column`, `column_order`, `column_type`, `column_collation`, `column_nullability`, `column_default`, `generated_column`, `identity_column`, `key`, `owned_sequence`, and `unrecognized` for any constraint or object depending on the table the check doesn't know, so a new Postgres feature refuses until Trellis learns it (all `validation` errors). The emptiness and shape are checked under a lock that keeps writes and DDL out until define commits. Another definition's target in the same instance refuses with `TargetTableExists`, empty or not; another instance's empty target can't be told from a user's table, so don't adopt one (both instances would write it). The ledger (`<target>__ledger`) and hidden tables are always created by define: one whose name is taken refuses as without the opt-in. | n/a: an adopted target is an ordinary one after define; rows written into it by hand afterwards are the [known correctness gap](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema) any target has. | Choose another target name, give the instance its own target schema ([instance-identity](instance-identity.md)), or drop or rename the existing relation. To adopt a table, make it match: the message names the first difference (empty it, fix the column, `ALTER TABLE … OWNER TO` the defining role or grant it membership in the owner `WITH INHERIT TRUE`, grant the missing privilege). |
-| A target, of any kind, that would take the name of a table another transform reads as its `FROM` or joined table: one dropped or renamed away since that transform was defined (while the table is still there, its name is taken: `TargetTableExists`), or one `ADOPT EXISTING TABLE` would adopt | Yes (`TargetNameHasReaders`), naming every such transform, whatever its status, a paused one included. The reader would otherwise go on reading the new target through its change feed and keep the rows it derived from the table that had the name, since the staging worker's pass treats a name that is a target's as fed by that target, not by capture. | n/a: once the target exists, a new reader of its name is a chain, and the target can't be dropped while one reads it (`DependentsBlockDrop`). | `DROP TRANSFORM` each reader the message names (pause it first if it is running), then define the target; or give the target another name. |
-| A target in a Trellis catalog schema: `TRANSFORM <schema>.<target>` naming this instance's catalog schema, or a schema holding another instance's `trellis_instance` table (matched by schema name exactly as written, and by a table of that name, even one the role can't read). The target and its ledger would live there, and the other instance's uninstall (`drop schema … cascade`) would drop them. | Yes (`TargetInCatalogSchema`, a `validation` error), before anything is created. An unqualified target takes `Config::target_schema`, which an attach already refuses to be either ([instance-identity](instance-identity.md#a-catalog-schema-that-belongs-to-another-instance)). | A target schema that gains a `trellis_instance` table after define (another instance attached to it) pauses nothing, and the transform keeps running. `RESUME` re-validates and refuses with the same error, leaving the transform paused. | Put the target in an ordinary schema (`TRANSFORM reporting.t`). After define, `DROP TRANSFORM` it (paused) and define it again in an ordinary schema: removing the other instance's catalog from the schema would drop the target with it. |
+| Condition | Refused at define | After define |
+|---|---|---|
+| **Source tables and partitioning** | | |
+| [A partition, a partitioned root below another, or an inheritance table](#a-partition-a-partitioned-root-below-another-or-an-inheritance-table) | Yes | Pauses readers; `RESUME` refuses until undone |
+| [A source dropped, renamed, swapped, or its capture disrupted](#a-source-dropped-renamed-swapped-or-its-capture-disrupted) | n/a | Pauses readers (`disruption`) |
+| [A partitioned root whose partition key the group key omits](#a-partitioned-root-whose-partition-key-the-group-key-omits) | Yes | Pauses readers |
+| [A partitioned root with an unsupported partition key](#a-partitioned-root-with-an-unsupported-partition-key) | Yes | Pauses readers |
+| [A partitioned root with more than 1,000 leaves](#a-partitioned-root-with-more-than-1000-leaves) | Yes | Pauses readers |
+| [A partitioned root as a 1-1 transform's source](#a-partitioned-root-as-a-1-1-transforms-source) | Yes | Pauses readers; `RESUME` refuses |
+| [A partitioned root of a servable shape](#a-partitioned-root-of-a-servable-shape) | No | A restore pauses every definition |
+| **Source keys** | | |
+| [An aggregate target used as another instance's source](#an-aggregate-target-used-as-another-instances-source) | Yes | n/a |
+| [The key a transform keys each table by](#the-key-a-transform-keys-each-table-by) | Yes (`NoPrimaryKey`, `DeferrablePrimaryKey`, `KeyNotBacked`, …) | Pauses or halts readers; `RESUME` re-keys or refuses |
+| **Row-level security and replication** | | |
+| [Row-level security on a role Trellis runs as](#row-level-security-on-a-role-trellis-runs-as) | Yes (`ExtremeSourceNotReadable`) | Pauses readers |
+| [A table a logical-replication subscription replicates into](#a-table-a-logical-replication-subscription-replicates-into) | Yes | Pauses readers |
+| **Generated columns, collations and patterns** | | |
+| [A virtual generated column a definition reads](#a-virtual-generated-column-a-definition-reads) | Yes (`VirtualGeneratedColumn`) | Pauses readers |
+| [A nondeterministic collation on a key or compared column](#a-nondeterministic-collation-on-a-key-or-compared-column) | Yes | Pauses readers, or holds keys |
+| [A `REGEXP_COUNT` pattern that isn't a literal or that Postgres rejects](#a-regexp_count-pattern-that-isnt-a-literal-or-that-postgres-rejects) | Yes (`NonLiteralRegexPattern`, `InvalidRegexPattern`) | Rows quarantined after a Postgres upgrade |
+| **Constants** | | |
+| [A constant that fails for every row](#a-constant-that-fails-for-every-row) | Yes (`CoalesceLiteralOutOfRange`, `CaseLiteralOutOfRange`, `ConstantOutOfRange`) | A retype pauses the transform |
+| [A constant zero divisor](#a-constant-zero-divisor) | Yes (`ConstantDivisorZero`) | n/a |
+| **Comparisons** | | |
+| [A float compared with an exact numeric](#a-float-compared-with-an-exact-numeric) | Yes (`MixedFloatExactComparison`, `FloatComparisonLiteralOutOfRange`) | A retype pauses the transform |
+| [A comparison between two temporal types](#a-comparison-between-two-temporal-types) | Yes (`MixedTemporalComparison`) | A retype pauses the transform |
+| [An ordering comparison over `text`](#an-ordering-comparison-over-text) | Yes (`TextOrderingComparison`) | A retype pauses the transform |
+| [A comparison between types no family covers](#a-comparison-between-types-no-family-covers) | Yes (`ComparisonTypeMismatch`) | A retype pauses the transform |
+| [Chained comparisons](#chained-comparisons) | Yes (`NonAssociativeComparison`) | n/a |
+| **Grammar forms and typing** | | |
+| [`IS TRUE` forms and the simple `CASE`](#is-true-forms-and-the-simple-case) | Yes (`UnsupportedIsForm`, `SimpleCaseUnsupported`) | n/a |
+| [An untyped `NULL` literal](#an-untyped-null-literal) | Yes (`UntypedNull`) | n/a |
+| [A non-boolean `CASE` condition or `CASE` results that don't unify](#a-non-boolean-case-condition-or-case-results-that-dont-unify) | Yes (`CaseConditionNotBoolean`, `CaseResultTypeMismatch`) | A retype pauses the transform |
+| [A `NULLIF` that casts its first argument](#a-nullif-that-casts-its-first-argument) | Yes (`NullIfFirstArgumentCast`) | A retype pauses the transform |
+| **Expression size** | | |
+| [An expression nested more than 100 levels deep](#an-expression-nested-more-than-100-levels-deep) | Yes (`ExpressionTooDeep`) | n/a |
+| [Calculated fields that inline too large or too deep](#calculated-fields-that-inline-too-large-or-too-deep) | Yes (`FieldExpansionTooLarge`) | n/a |
+| [An expression that inlines to more than 100,000 nodes](#an-expression-that-inlines-to-more-than-100000-nodes) | Yes (`FieldExpansionTooLarge`) | n/a |
+| **Arithmetic, functions and casts** | | |
+| [Integer division](#integer-division) | Yes (`IntegerDivision`) | A retype pauses the transform |
+| [Modulo with a float operand](#modulo-with-a-float-operand) | Yes (`FloatModulo`) | A retype pauses the transform |
+| [An argument `ABS`, `CEIL`, `FLOOR`, `ROUND` or `TRUNC` does not admit](#an-argument-abs-ceil-floor-round-or-trunc-does-not-admit) | Yes (`NumericFunctionArgument`, `ScaleNotIntegerLiteral`, `FunctionArgTypeMismatch`) | A retype pauses the transform |
+| [A `CAST` that is not an exact conversion](#a-cast-that-is-not-an-exact-conversion) | Yes (`UnsupportedCast`, `TemporalOperand`, `UnsupportedCastTarget`) | A retype pauses the transform |
+| **Dates and times** | | |
+| [Date and time arithmetic](#date-and-time-arithmetic) | Yes (`TemporalOperand`) | A retype pauses the transform |
+| [`DATE_TRUNC` or `EXTRACT` of an unadmitted type, and `date_part`](#date_trunc-or-extract-of-an-unadmitted-type-and-date_part) | Yes (`TemporalOperand`) | A retype pauses the transform |
+| [A `DATE_TRUNC` unit or `EXTRACT` field that is not admitted](#a-date_trunc-unit-or-extract-field-that-is-not-admitted) | Yes (`TemporalLiteral`) | Unaffected |
+| [`AT TIME ZONE` other than `'UTC'` over a `timestamptz`](#at-time-zone-other-than-utc-over-a-timestamptz) | Yes (`TemporalLiteral`, `TemporalOperand`) | A retype pauses the transform |
+| **Retyped and widened columns** | | |
+| [A key column retyped so stored values render differently](#a-key-column-retyped-so-stored-values-render-differently) | n/a | Pauses readers; `RESUME` re-types |
+| [A column Trellis copies, widened](#a-column-trellis-copies-widened) | n/a | Pauses readers whose copy it outgrows |
+| **Target columns and widths** | | |
+| [Two `GROUP BY` keys that share a target column name](#two-group-by-keys-that-share-a-target-column-name) | Yes (`GroupByKeysShareTargetColumn`) | n/a |
+| [A key of more than 32 columns](#a-key-of-more-than-32-columns) | Yes (`IndexKeyTooWide`) | n/a |
+| [A table of more than 1,600 columns](#a-table-of-more-than-1600-columns) | Yes (`TableTooWide`) | n/a |
+| **Field, column and table names** | | |
+| [A field named after a key column or starting with `__`](#a-field-named-after-a-key-column-or-starting-with-__) | Yes | n/a |
+| [An aggregate over another aggregate field](#an-aggregate-over-another-aggregate-field) | Yes (`AggregateOfAggregateField`) | n/a |
+| [A bare name that could mean a source column or a field](#a-bare-name-that-could-mean-a-source-column-or-a-field) | Yes (`AmbiguousColumnReference`) | Not detected |
+| [An unquoted reserved word as a name](#an-unquoted-reserved-word-as-a-name) | Yes (`ReservedWord`) | A rename pauses readers |
+| [An unquoted reserved table name](#an-unquoted-reserved-table-name) | Yes (`ReservedTableName`) | n/a |
+| [A name over 63 bytes](#a-name-over-63-bytes) | Yes (`NameTooLong`) | A stored 0.1.x definition keeps running |
+| [An unsupported quoted name](#an-unsupported-quoted-name) | Yes (`ZeroLengthQuotedIdentifier`, `UnicodeEscapeIdentifier`, `UnsupportedQuotedIdentifier`) | n/a |
+| [A qualified name that doesn't name the `FROM` table](#a-qualified-name-that-doesnt-name-the-from-table) | Yes (`QualifiedColumnNotFromSource`, `GroupByKeyNotFromSource`) | n/a |
+| **Source indexes** | | |
+| [A source without the index its `self_check` walk pages by](#a-source-without-the-index-its-self_check-walk-pages-by) | Yes (`SourceIndexMissing`) | Reported; pauses nothing |
+| **`JOIN` transforms** | | |
+| [A `JOIN` transform that passes the checks below](#a-join-transform-that-passes-the-checks-below) | No | A schema change pauses it |
+| [An unsupported `JOIN` shape](#an-unsupported-join-shape) | Yes (`TableAlias`, `AliasedTableName`, `JoinTooManyTables`, …) | n/a |
+| [A 1-1 `JOIN`](#a-1-1-join) | Yes (`OneToOneJoinKeyNotUnique`, `OneToOneJoinAggregate`, `OneToOneJoinUnsupported`, …) | A schema change pauses it |
+| [1-1 `JOIN` of more than two tables (star)](#1-1-join-of-more-than-two-tables-star) | Yes (`StarJoinDisabled`, `StarJoinTooManyTables`, `JoinOnReadsAnotherJoinedTable`) | A schema change pauses it |
+| [`JOIN` key columns that differ or can't be keys](#join-key-columns-that-differ-or-cant-be-keys) | Yes (`JoinKeyTypeMismatch`, `JoinUnsupportedKeyType`, `JoinNondeterministicCollation`, …) | Pauses the transform |
+| **Aggregate functions** | | |
+| [`MIN` or `MAX` in a plain aggregate](#min-or-max-in-a-plain-aggregate) | Yes (`ExtremeOfExpression`, `UnsupportedExtremeArgument`, `ChainedExtreme`, …) | `RESUME` refuses; a missing index pauses after 5 minutes |
+| [`MIN` or `MAX` in a `JOIN` transform](#min-or-max-in-a-join-transform) | Yes (`DeferredAggregate`) | n/a |
+| [`bool_and`, `bool_or`, `bit_and` or `bit_or`](#bool_and-bool_or-bit_and-or-bit_or) | Yes (`DeferredAggregate`) | n/a |
+| [`SUM` or `AVG` over an unsupported type](#sum-or-avg-over-an-unsupported-type) | Yes (`DeferredAggregate`) | A retype pauses the transform |
+| [`array_agg`, `string_agg` or `jsonb_agg`](#array_agg-string_agg-or-jsonb_agg) | Yes (`DeferredAggregate`) | n/a |
+| **Filters and chaining** | | |
+| [A `WHERE` other than `TRUE`](#a-where-other-than-true) | Yes (parse error) | n/a |
+| [Chaining off a transform that is not `live`](#chaining-off-a-transform-that-is-not-live) | Yes (`TransformNotLive`) | n/a |
+| **Target names** | | |
+| [A target whose name is taken](#a-target-whose-name-is-taken) | Yes (`TargetTableExists`, `TargetNotAdoptable`) | n/a |
+| [A target that would take a read table's name](#a-target-that-would-take-a-read-tables-name) | Yes (`TargetNameHasReaders`) | n/a |
+| [A target in a Trellis catalog schema](#a-target-in-a-trellis-catalog-schema) | Yes (`TargetInCatalogSchema`) | Pauses nothing |
 
 A refusal after define is a pause, not a loss: `RESUME` rebuilds the target from
 source once the condition is fixed ([Status](#status)). `status()`'s
@@ -107,12 +125,1774 @@ TRANSFORM` and defining again ([recommendations](recommendations.md#statement_ti
 source can drift after define are in
 [known correctness gaps](known-correctness-gaps.md).
 
-Other writers are not affected by the subscription rule: a session with
+Other writers are not affected by the [subscription
+rule](#a-table-a-logical-replication-subscription-replicates-into): a session with
 `session_replication_role = replica` fires the capture triggers, which are
 `ENABLE ALWAYS` ([stage 1](staging-and-claiming/01-capture-by-triggers.md)).
 Changing a source key's collation to another deterministic one is safe, though
 the rest of any build then scans the source and `self_check` reads the source
 by scan rather than by index (it pages under the target key's collation).
+
+### Source tables and partitioning
+
+#### A partition, a partitioned root below another, or an inheritance table
+
+**Condition:** A partition (a leaf or a middle) named as a source, a
+partitioned root that is itself a partition, or a table in an inheritance
+hierarchy. A partitioned root is checked by the rows below. A source with no
+primary key is the [key row](#the-key-a-transform-keys-each-table-by) below.
+
+**Refused at define:** Yes. A statement trigger fires only for the table a
+statement names, so capture would miss writes made through the rest of the
+hierarchy.
+
+**If it appears after define:** A table that joins a hierarchy after define
+(`ATTACH PARTITION`, `INHERIT`, a child created `INHERITS` it, or the table
+dropped and recreated as a partition or an inheritance child) pauses every
+transform that reads it on the staging worker's next reconcile pass, with the
+reason in `status()`'s `capture_failure`, and gets no capture installed.
+`self_check` reports a `capture` divergence.
+
+Writes made through the hierarchy before that pass are missed, or, on an
+inheritance parent, a child's rows are staged as the parent's own; the resume's
+rebuild re-reads the table and repairs both. A dropped key leaves the table
+uncapturable: `status()` shows a capture holdup, and the transforms that read
+it pause with the reason when the table's next change is applied. A retyped key
+pauses them too (see the [key rows](#the-key-a-transform-keys-each-table-by)
+below).
+
+**Remedy:** Use a plain table. After a later change, undo it
+(`DETACH PARTITION`, `NO INHERIT`, or recreate the table as a plain table),
+then `RESUME`, which refuses while the table is still in a hierarchy.
+
+#### A source dropped, renamed, swapped, or its capture disrupted
+
+**Condition:** A source table or a `JOIN`'s joined table that is dropped,
+renamed away, moved to another schema, swapped for another table or replaced by
+a view after define, or whose capture triggers or functions are disabled,
+dropped, recreated or replaced outside Trellis.
+
+**Refused at define:** n/a (a definition can't name a table that isn't there).
+
+**If it appears after define:** Pauses every transform that reads the table on
+the staging worker's next reconcile pass, with a `capture_failure` of kind
+`disruption` naming what it found and saying that changes made meanwhile may be
+missing, so correctness can't be guaranteed. Nothing is reinstalled or rebuilt
+until a `RESUME`.
+
+A partitioned source's root and every node of its tree are checked, and the
+finding names the node; a root dropped and recreated (empty or with leaves),
+swapped by renames or renamed away is a disruption too, while partition
+maintenance (an attach, detach, new leaf, dropped leaf, `DEFAULT` or `HASH`
+re-split) is none. A plain table dropped and created again as a partitioned
+one, or the reverse, is a disruption as well.
+
+**Remedy:** Put the table back (or finish the swap) and `RESUME`, which refuses
+while the table is missing, re-validates the definition against the table now
+at that name, reinstalls capture and rebuilds from that table. A table created
+again with another primary key (a plain table converted to a partitioned one
+widens it by the partition key) is rebuilt the same way: what Trellis stored or
+staged under the old key is discarded, not read against the new one.
+
+A 1-1 transform's target is keyed by its source's key, so its resume first
+re-keys the target in place to the new key, or refuses, as the [key
+row](#the-key-a-transform-keys-each-table-by) below describes. Plan a scripted
+`RESUME` after a swap or a bulk load with triggers disabled (the Ruby and
+Elixir clients have a test helper for fixture loads:
+[embedding](embedding.md)).
+
+#### A partitioned root whose partition key the group key omits
+
+**Condition:** A partitioned root
+([0017](decisions/0017-partitioned-sources.md); `RANGE`, `LIST` or `HASH`, any
+depth, with or without a `DEFAULT`) as an aggregate's `FROM` whose `GROUP BY`
+omits a partition-key column at any level, or as either table of a `JOIN` whose
+`GROUP BY` columns and `ON` columns from that table omit one.
+
+**Refused at define:** Yes, naming the column. With every partition-key column
+in the group key, each group lives in exactly one partition, so a change to the
+tree touches only the groups routing to one node.
+
+**If it appears after define:** A sub-level added later whose partition key the
+group key (a `JOIN` table's `GROUP BY` and `ON` columns) doesn't hold pauses
+every transform that reads the source on the staging worker's next reconcile
+pass, with the column in `status()`'s `capture_failure`. `RESUME` refuses until
+the tree complies, then rebuilds.
+
+**Remedy:** Add the named column to the `GROUP BY`, or join on it. After a
+later change, detach the sub-level, then `RESUME`.
+
+#### A partitioned root with an unsupported partition key
+
+**Condition:** A partitioned root whose key level is an expression (no column
+to route by), whose partition-key column has a type other than `smallint`,
+`integer`, `bigint`, `numeric`, `text`, `varchar`, `uuid`, `date`, `timestamp`,
+`timestamptz` or `boolean`, a non-default operator class or a nondeterministic
+collation.
+
+**Refused at define:** Yes, naming the table and the column (for an expression,
+its key position). Trellis routes a group to its partition by evaluating the
+recorded bound over the group key, and it checks that only for these keys.
+
+**If it appears after define:** A sub-level added later with such a key pauses
+every transform that reads the source, as the row above describes.
+
+**Remedy:** Partition by a plain column of a listed type with the type's
+default operator class and a deterministic collation. After a later change,
+detach the sub-level, then `RESUME`.
+
+#### A partitioned root with more than 1,000 leaves
+
+**Condition:** A partitioned root with more than 1,000 leaves, or on PostgreSQL
+before 15.
+
+**Refused at define:** Yes, stating the limit. No build statement prunes, so
+each one plans, locks and opens every leaf, and the default lock table runs out
+for one statement at about 5,500 leaves with the default
+`max_locks_per_transaction`.
+
+**If it appears after define:** A tree that grows past 1,000 leaves pauses
+every transform that reads it on the staging worker's next reconcile pass, with
+a `capture_failure` naming the limit. `RESUME` refuses until the tree has 1,000
+or fewer.
+
+**Remedy:** Merge partitions to 1,000 or fewer leaves, or upgrade the server.
+
+#### A partitioned root as a 1-1 transform's source
+
+**Condition:** A partitioned root as a 1-1 transform's `FROM`.
+
+**Refused at define:** Yes. A 1-1 target over a partitioned source would need
+its own partitioning, and partitioned targets are not supported.
+
+**If it appears after define:** A 1-1 transform's source dropped and created
+again as a partitioned table pauses the readers the same way, and its `RESUME`
+refuses as define does.
+
+**Remedy:** Aggregate over the partitioned table instead, or use a plain table.
+
+#### A partitioned root of a servable shape
+
+**Condition:** A partitioned root of a servable shape (every row above passes).
+
+**Refused at define:** No. Capture covers every node of the tree. The reconcile
+pass queues a correction for each partition attached, detached, dropped or
+truncated, and for groups in a target that route to no partition, and an
+aggregate recomputes the groups that route to the partition while it reports
+`backfilling`. A `JOIN` with the partitioned table on either side recomputes
+that side's partials that route to the partition, and carries the change into
+its target, while it reports `backfilling`.
+
+**If it appears after define:** After a dump and restore of the database, the
+next reconcile pass pauses every definition, those that read a partitioned
+source among them, with a `capture_failure` naming the restore, and runs no
+correction queued before it. A `pg_upgrade`, or the root dropped and recreated
+or swapped in by renames, is no restore.
+
+**Remedy:** After a restore, `RESUME`, which rebuilds.
+
+### Source keys
+
+#### An aggregate target used as another instance's source
+
+**Condition:** An aggregate target, or a 1-1 target over one, used as a source
+(it has no primary key: its identity is a `UNIQUE NULLS NOT DISTINCT`
+constraint).
+
+**Refused at define:** Yes, for another Trellis instance, unless the definition
+names that constraint's columns with `KEY (…)` (the [key
+row](#the-key-a-transform-keys-each-table-by) below): to that instance it is a
+table with no primary key. Inside the owning instance it can be chained off,
+because writes to a target reach its readers in the writing transaction, never
+through capture triggers, and it is keyed by its group key.
+
+**If it appears after define:** n/a.
+
+**Remedy:** Chain within the instance
+([instance-identity](instance-identity.md)), group over a 1-1 transform, or
+name the group key with `KEY (…)`.
+
+#### The key a transform keys each table by
+
+**Condition:** The key a transform keys each table by: its source's and a
+`JOIN`'s joined table's primary key, or the key its definition names with
+`KEY (…)` directly after the table (`FROM orders KEY (customer_id, id)`,
+`JOIN b KEY (…) ON`); for another transform's target, the key Trellis gave that
+target; and its own target's key (a 1-1 target's is its source's key, an
+aggregate's or `JOIN`'s its `UNIQUE NULLS NOT DISTINCT` group key).
+
+A source with no primary key and no `KEY`, a source or joined table whose
+primary key is deferrable (`DEFERRABLE`, initially immediate or deferred) and
+no `KEY`, a `KEY` no index backs, a `KEY` on another transform's target, and a
+key other than the one the table's other transforms use.
+
+**Refused at define:** Yes: `NoPrimaryKey` (naming `KEY (…)` and
+`ADD PRIMARY KEY` as remedies), `DeferrablePrimaryKey` (naming the key and the
+one-statement recreation), `KeyNotBacked`, `KeyOnTrellisTarget` and
+`KeyDiffersFromReaders` (naming the key to write). Trellis never keys a table
+by a unique index it picked itself, nor by a deferrable key, primary or not:
+one can hold duplicate keys inside a transaction.
+
+A `KEY` needs a unique index whose key columns are exactly its columns, in any
+order (an `INCLUDE` column is not a key column), valid, not deferrable, not
+partial, over no expression, each column under its type's default operator
+class and its own collation, with every column `NOT NULL` or the index
+`NULLS NOT DISTINCT`; any such index backs it, so a nullable key works through
+`KEY` on a `NULLS NOT DISTINCT` index. Its column types are held to the
+key-type allowlist as a primary key's are.
+
+A partitioned table's unique index must hold its partition key, so its `KEY`
+names those columns too. A table is keyed one way for every transform that
+reads it, as its `FROM` or joined table alike: a second definition over a `KEY`
+table repeats the `KEY`, and one over a table its other transforms key by its
+primary key writes none.
+
+Trellis records one key per table, the first time a transform keys by it, and
+keys the table by the primary key or unique index over exactly those columns
+for every transform that reads or writes it, in the key's own column order. A
+unique index or constraint added to the table later, one an adopted target
+(`ADOPT EXISTING TABLE`) already had, one a dump restore creates before the key
+(it creates constraints in name order), and the key rebuilt by
+`REINDEX CONCURRENTLY` change nothing.
+
+The record belongs to the table it was taken from: a table dropped and created
+again is keyed by its own key, whatever transforms of the old one remain.
+
+**If it appears after define:** A source's primary key redefined in place, or
+the table created again with another one, pauses the transforms that key it by
+its primary key (the rows above). `RESUME` of an aggregate or `JOIN` takes the
+table's primary key now as its key, for every transform that reads the table,
+and rebuilds; with no primary key it refuses rather than take another unique
+index.
+
+A 1-1 transform's target is keyed by its source's key (a 1-1 `JOIN`'s, by its
+`FROM` table's): its `RESUME` re-validates it as define would and, where define
+would accept it, re-keys the target in place to the new key under the rebuild's
+lock.
+
+A new key column the transform doesn't select is added as a key column, copied
+as define copies one (its type with no modifier, and its collation), which
+empties the target until the rebuild; a former key column it doesn't create is
+dropped, and the rows the narrower key repeats are deleted until the rebuild
+writes them again (on a plain 1-1 transform,
+`ALTER TRANSFORM … ADD <column> AS <column>` once it is live adds it back as a
+field); and the primary key is replaced
+(`DROP CONSTRAINT …, ADD PRIMARY KEY (…)`), keeping the table, your indexes and
+grants.
+
+The pause message says which columns `RESUME` will add and drop. The target's
+new key is recorded, which pauses the transforms reading the target, and their
+own `RESUME` follows these rules over it.
+
+It refuses, naming the conflict, while define would refuse the transform (over
+a partitioned source, say), when a new key column's name is taken by a column
+of the target that isn't a copy of it (a field of that name, or a column you
+added), and when a view, index or foreign key of yours depends on a column it
+would drop or on the key constraint it replaces.
+
+A primary key made deferrable after define (dropped and added again
+`DEFERRABLE`) halts every transform reading the table on the next drain of a
+change to it, with a `capture_failure` naming the key and the remedy, unless a
+unique index that isn't deferrable is over exactly its columns, which the drain
+then keys the table by; `RESUME` refuses as define does either way.
+
+A table its transforms key by `KEY` is keyed by it whatever its primary key
+does: a primary key added, redefined, made deferrable or dropped pauses
+nothing. Its backing index may be replaced by an equivalent one at any time
+(build the new one before dropping the old): `REINDEX CONCURRENTLY`, a rename,
+pg_repack and `ADD PRIMARY KEY USING INDEX` change nothing.
+
+With none left valid (dropped, a failed build's invalid index, or a partitioned
+root's index left invalid), the staging worker's next reconcile pass pauses
+every transform reading the table, with no grace and whether or not a write
+arrived, naming the table, the key and a ready-to-run `create unique index`; a
+swap that drops the old index first pauses when a pass runs between the two.
+
+A partitioned root's index stays invalid after a leaf's index is repaired until
+`ALTER INDEX … ATTACH PARTITION` runs again for that leaf, and the message says
+so. `RESUME` and a rebuild refuse until an index backs the key again, naming
+the table, the key and the unique indexes it has.
+
+A target, its own or one it reads, left with no valid, non-partial,
+non-deferrable unique index over its key (dropped, or never created by a
+restore): `RESUME` and a rebuild refuse, naming the table, the key and the
+unique indexes it has, and Trellis never keys the table by another index.
+
+**Remedy:** Name the key with `KEY (…)`, backed by a unique index over exactly
+those columns, or add a primary key (`ALTER TABLE … ADD PRIMARY KEY`, or
+`ADD PRIMARY KEY USING INDEX` over an existing unique index); write the key the
+message names. Recreate a deferrable primary key not deferrable in one
+statement (`ALTER TABLE … DROP CONSTRAINT …, ADD PRIMARY KEY (…)`: Postgres
+can't change it in place), then `RESUME`, or name a `KEY (…)` over a unique
+index that isn't deferrable.
+
+For an aggregate or `JOIN`, `RESUME`, after adding a primary key if the table
+has none. For a 1-1 transform, `RESUME`; when it refuses, drop the object it
+names, drop or rename your column it names, or, for a field of the new key
+column's name, restore the key, resume and rename the field with
+`ALTER TRANSFORM`; or `DROP TRANSFORM` and define it again. For a `KEY`, create
+a unique index backing it again (on a partitioned table, re-run
+`ALTER INDEX … ATTACH PARTITION` for a repaired leaf's index), then `RESUME`.
+
+For a target, create a unique index over exactly its key columns again
+(`UNIQUE NULLS NOT DISTINCT` if one can be `NULL`), then `RESUME`; or
+`DROP TRANSFORM` and define it again.
+
+### Row-level security and replication
+
+#### Row-level security on a role Trellis runs as
+
+**Condition:** Row-level security that applies to a role Trellis runs as on a
+source or on a target. Policies apply to a role when RLS is enabled and the
+role neither owns the table (directly or through membership) nor has
+`BYPASSRLS`, or owns it and the table is `FORCE ROW LEVEL SECURITY`. A
+superuser is exempt. Every Trellis connection runs with `row_security = off`,
+so a read or write the policies would filter fails rather than skipping rows.
+
+**Refused at define:** Yes, checked for the role that owns the ring, and for
+the defining role on a table that is another transform's target. A `MIN`/`MAX`
+aggregate's source is also checked for the ring's owner's `SELECT`
+(`ExtremeSourceNotReadable`), at define and on a whole-transform `RESUME`: a
+drain, which logs in as that role or a member of it, re-reads a group's extreme
+from the source when the current one is deleted.
+
+**If it appears after define:** For the ring's owner, the staging worker's
+reconcile pass pauses every transform that reads the table (or, for a target,
+the transform that writes it), with the reason in `status()`'s
+`capture_failure`, and `self_check` reports a `capture` divergence. For a role
+a drain logs in as, its refused read or write pauses the same transforms, and
+everything downstream of them, with `capture_failure` of kind `halt`. A refused
+build chunk pauses its transform after its charged retries, with the error on
+`backfill_failure`.
+
+On a partitioned source, define and the pass check the root only: a policy on a
+partition below it reaches none of the reads that follow writes, which all go
+through the root, but the correction of that partition after a `TRUNCATE` of
+it, an attach of it with rows, or direct writes into it as a new leaf reads the
+partition itself, is refused, and pauses the transform after its charged
+retries the same way. The refusals that only log or retry: [observability — A
+halting failure](observability.md#a-halting-failure).
+
+**Remedy:** Give the role `BYPASSRLS` (not inherited), or make it the table's
+owner without `FORCE ROW LEVEL SECURITY`; then `RESUME`. For a `MIN`/`MAX`
+source, `GRANT SELECT` on it to the ring's owner.
+
+#### A table a logical-replication subscription replicates into
+
+**Condition:** A table a logical-replication subscription in the same database
+replicates into.
+
+**Refused at define:** Yes, in any sync state, including a disabled
+subscription. The subscription's apply worker fires only row-level triggers, so
+its changes never reach capture. Publishing a table to another database is
+fine.
+
+**If it appears after define:** Paused and reported as for RLS on the ring's
+owner.
+
+**Remedy:** Remove the table from the publication and
+`ALTER SUBSCRIPTION … REFRESH PUBLICATION`, or drop the subscription; then
+`RESUME`.
+
+### Generated columns, collations and patterns
+
+#### A virtual generated column a definition reads
+
+**Condition:** A column a definition reads that is a virtual generated column
+(`GENERATED ALWAYS AS (…) VIRTUAL`, PostgreSQL 18): a 1-1 field, a `GROUP BY`
+key, an aggregate's argument, or a `JOIN`'s `ON` column or field on either
+table.
+
+**Refused at define:** Yes (`VirtualGeneratedColumn`), for the definition, an
+`ALTER TRANSFORM` that adds such a field, and a `RESUME`, naming the table, the
+column and its expression. A statement trigger's transition table holds no
+value for a virtual column, so capture can't image it. A definition on the same
+table that doesn't read the column is unaffected.
+
+**If it appears after define:** A read column dropped and added again as
+virtual, or another column renamed onto its name, pauses its readers on the
+staging worker's next reconcile pass, with the table, the column and its
+expression in `status()`'s `capture_failure`; the pass after that stops imaging
+the column.
+
+Until the first pass, the application's inserts and deletes on the table fail
+(`unexpected virtual generated column reference`), and an update stages the
+column as `NULL`, or stages nothing when no other column capture reads changed,
+so the readers' targets miss its new values; the rebuild on `RESUME` repairs
+them. A virtual column renamed onto the name and back before a pass pauses
+nothing ([known correctness
+gaps](known-correctness-gaps.md#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass)).
+
+Definitions that don't read the column keep running.
+
+**Remedy:** Write the expression in the definition in place of the column where
+the grammar covers it (in a 1-1 transform, under a field name no source column
+has), or make the column `STORED`. After a later change, make the column
+`STORED` and `RESUME`, which refuses while it is still virtual, or drop the
+transform and define it again with the expression.
+
+#### A nondeterministic collation on a key or compared column
+
+**Condition:** A nondeterministic collation (an ICU collation with
+`deterministic = false`) on a key column: a source primary key, a `GROUP BY`
+key or a `JOIN`'s `ON` column. Also on a column passed to `STRPOS` or
+`REGEXP_COUNT`, or compared as text (`=`, `<>`, `!=`, `IS [NOT] DISTINCT FROM`,
+`NULLIF`), directly or through `COALESCE`, a `CASE` result or another field.
+
+**Refused at define:** Yes, for the definition (a `JOIN` checks the column of
+whichever table the read names), a `RESUME` and an `ALTER TRANSFORM` that adds
+or alters such a field. Trellis matches keys by exact text; such a collation's
+`=` would fold keys it keeps apart. `CHAR_LENGTH`, `OCTET_LENGTH` and
+`IS [NOT] NULL` accept any column. Such a collation's `=` would call two
+different texts equal, which Trellis compares exactly.
+
+**If it appears after define:** On a key column, the staging worker pauses
+every transform that keys by it, with the reason in `status()`'s
+`capture_failure`, and `RESUME` refuses until it's deterministic again. On a
+column only a text function reads, Postgres refuses the function, so each
+changed row's write fails: its key is held for the transform, and the transform
+is quarantined once its held keys reach the fuse threshold.
+
+**Remedy:** Keep the column's collation deterministic
+([type-support](type-support.md#collation)).
+
+#### A `REGEXP_COUNT` pattern that isn't a literal or that Postgres rejects
+
+**Condition:** A `REGEXP_COUNT` pattern that isn't a string literal, or that
+Postgres rejects (`(?P<n>a)`, `a++`, `\pL`).
+
+**Refused at define:** Yes (`NonLiteralRegexPattern`; `InvalidRegexPattern` for
+a pattern Postgres rejects, carrying the server's message). Postgres alone
+judges the pattern: define, `ALTER TRANSFORM` and `RESUME` probe each literal
+with `regexp_count('', pattern)` and refuse on `invalid_regular_expression`.
+Back-references, lookahead and `\m`/`\M` are admitted.
+
+**If it appears after define:** Only a Postgres upgrade that changes the
+verdict: each changed row's write then fails with `invalid_regular_expression`
+and is quarantined like any row Postgres can't compute, and a `RESUME` probes
+again and refuses with the server's message.
+
+**Remedy:** Write a pattern Postgres's `regexp_count` accepts.
+
+### Constants
+
+#### A constant that fails for every row
+
+**Condition:** A constant Postgres folds at plan time that fails for every row:
+
+* a `CASE` result, `AND`/`OR` operand or `NULLIF` argument that is one of the
+  constants below, wherever the rest of the expression reads columns
+  (`CASE WHEN x > 0 THEN 1.5 / 0 END` fails every row, even those where `x > 0`
+  is false);
+* a `COALESCE` whose result is a float (`real` or `double precision`) with a
+  constant argument outside that float's range, such as
+  `COALESCE(real_col, 1000000000000000000000000000000000000000)`;
+* a `+`, `-` or `*` of two integer constants whose result does not fit
+  `integer` or `bigint`, such as `2147483647 + 1` or `2147483647 * 2`;
+* prefix `-` or `ABS` of the smallest integer (`-(-2147483647 - 1)`,
+  `ABS(-2147483648)`);
+* a `+`, `-`, `*` or `/` of two float constants that overflows the float, or
+  that underflows to zero from nonzero operands
+  (`DOUBLE PRECISION '1e-200' * DOUBLE PRECISION '1e-200'`);
+* or an exact constant beside a float that is outside `double precision`;
+* a `date` constant plus or minus an integer constant that leaves `date`'s
+  range (4714-11-24 BC to 5874897-12-31), such as
+  `DATE '2024-01-01' + 2147483647`;
+* or a constant `date` past 294276-12-31 cast to `timestamp`.
+
+A constant is a number literal, a `REAL`, `DOUBLE PRECISION` or `DATE` typed
+literal, or a `+`, `-`, `*`, `/`, `%`, prefix `-`, `ABS`, `CAST` (a widening or
+to the operand's own type) or calculated field made only of constants, or a
+`COALESCE` led by a constant (whatever follows it), wherever it appears (an
+aggregate's argument, a `JOIN` field, a `COALESCE` argument). A constant beside
+only exact `COALESCE` arguments unifies upward and is never out of range, and
+`numeric` arithmetic does not overflow.
+
+Postgres never evaluates a `COALESCE` argument after a constant one, a `CASE`
+result after a condition that is constant true or in a branch whose condition
+is constant false or `NULL`, or an `AND` operand after a constant false (an
+`OR` operand after a constant true), so `COALESCE(5, 2147483647 + 1)`,
+`CASE WHEN 1 = 1 THEN 1 ELSE 1.5 / 0 END` and `1 = 2 AND 1.5 / 0 = 1` define;
+an aggregate's argument is refused all the same
+(`COALESCE(5, SUM(2147483647 + 1))`), because Trellis computes it for every row
+apart from the expression around the call.
+
+Define folds `TRUE`, `FALSE`, `NULL` and comparisons of number, float, text,
+`date`, `timestamp`, `time` and `timetz` constants, `AND`, `OR`, `NOT`,
+`IS [NOT] NULL`, `CASE`, `NULLIF` and `COALESCE` over them, and a comparison
+(other than `IS [NOT] DISTINCT FROM`), arithmetic operator or function call
+with a `NULL` constant operand is `NULL` whatever its other operands read, as
+the planner folds it (`CASE WHEN x > NULLIF(1, 1) THEN 2147483647 + 1 END`
+defines), and a `NULLIF` with a `NULL` constant argument is its first argument
+whatever the other reads (`NULLIF(NULL, x)` is `NULL` and `NULLIF(a, NULL)` is
+`a`, so `2147483647 + NULLIF(1, NULLIF(CAST(NULL AS integer), x))` is refused);
+where the planner may fold a `CASE` condition, `AND`/`OR` operand or `COALESCE`
+argument to a value define cannot tell, it refuses nothing after it
+(`COALESCE(NULLIF(STRPOS('', ''), NULL), 2147483647 + 1)` and
+`CASE WHEN STRPOS('a', 'a') = 2 AND x > 0 THEN 2147483647 + 1 END` define).
+
+A `NULLIF` whose first argument is such a value is treated as reading its other
+argument, though the planner folds it to `NULL` when that value is, so define
+may refuse a guarded constant Postgres drops
+(`CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), x) IS NOT NULL THEN 2147483647 + 1 END`
+is refused, and plans to `NULL` in Postgres). An expression that reads a column
+is not a constant: `int_col + 2147483647` defines and fails only for the rows
+it overflows, which are quarantined.
+
+A function call over constants other than `ABS` (`CHAR_LENGTH('abc')`,
+`CEIL(DOUBLE PRECISION '1e+308') * 10`,
+`DATE_TRUNC('millennium', CAST(DATE '0001-01-01' - 1721426 AS timestamp))`) is
+folded by Postgres too, but define has no value for it, so the failing
+expression around it, or a `CASE` result, `AND`/`OR` operand or `COALESCE`
+argument it may select, defines and every page fails
+([#1446](https://github.com/salesforce-misc/trellis/issues/1446)).
+
+**Refused at define:** Yes (`CoalesceLiteralOutOfRange` for the `COALESCE`,
+`CaseLiteralOutOfRange` for a `CASE` of a float type, `ConstantOutOfRange` for
+the arithmetic or cast), naming the field, the expression as written and the
+type, for the definition and an `ALTER TRANSFORM`.
+
+**If it appears after define:** A column retyped so a constant falls out of
+range (`double precision` → `real` under a `COALESCE`, `numeric` →
+`double precision` beside a huge constant) pauses the transform on the staging
+worker's next capture pass, with the reason in `status()`'s `capture_failure`,
+and `RESUME` refuses while define would refuse the definition.
+
+**Remedy:** Use a constant within the type's range, or a column.
+
+#### A constant zero divisor
+
+**Condition:** A constant zero divisor of `/` or `%`: a literal (`n / 0`,
+`n / 0.0`), a float zero (`f / REAL '0'`, `-0` included) or a constant that
+folds to zero (`n / (1 - 1)`, `i % (2 - 2)`), whatever the dividend. A `CASE`
+or `COALESCE` that resolves to a float casts the result it picks to that float,
+so a wide integer literal in it rounds first:
+`CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE -9223372036854775809 END - -9223372036854775808`
+is exactly zero.
+
+A `NaN` float constant divided by zero is `NaN` in Postgres and defines.
+Postgres raises `22012` for every row that has a dividend, or at plan time when
+the dividend is a constant too, so no row could be written. A divisor that
+reads a column defines, and `x / col` fails only for the rows where `col` is
+zero, which are quarantined.
+
+Postgres evaluates a `COALESCE` argument only for the rows the earlier ones
+leave `NULL`, a `CASE` result only where its condition holds and an `AND`/`OR`
+operand only where the earlier ones allow, but a zero divisor under one is
+refused too, unless a constant before it ends the `COALESCE`, `CASE`, `AND` or
+`OR`, or the column-reading dividend sits in a strict operator or function call
+that has a `NULL` constant input (`(n / 0) + NULL`), which Postgres replaces by
+`NULL` without dividing (a constant dividend still divides at plan time).
+
+Neither spares a division in an aggregate's argument
+(`COALESCE(5, SUM(n / 0))`, `SUM(n / 0) + NULL`), which Trellis computes for
+every row apart from the expression around the call.
+
+**Refused at define:** Yes (`ConstantDivisorZero`), naming the field and the
+division as written, for the definition and an `ALTER TRANSFORM`.
+
+**If it appears after define:** n/a: a constant does not change.
+
+**Remedy:** Use a nonzero divisor, or a column.
+
+### Comparisons
+
+#### A float compared with an exact numeric
+
+**Condition:** A comparison (`=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`,
+`IS [NOT] DISTINCT FROM`, and `NULLIF`'s `=`) with a float (`real`,
+`double precision`) on one side and an exact numeric (`smallint`, `integer`,
+`bigint` or `numeric`) column, calculated field or expression on the other,
+including a calculated field or `COALESCE` that is a float. A bare number
+literal against a float is admitted (below), so `f > 0.5` and `f = 1` define.
+
+**Refused at define:** Yes (`MixedFloatExactComparison`), naming the field and
+both operand types, for the definition and an `ALTER TRANSFORM`. Postgres casts
+the exact side to `double precision`, so the comparison inherits float rounding
+(`0.1::numeric + 0.2 = 0.3::float8` is false). A float against a float and an
+exact numeric against an exact numeric are admitted; `+` admits the mix. A bare
+literal outside `double precision`'s range (`22003` in Postgres) is refused too
+(`FloatComparisonLiteralOutOfRange`).
+
+**If it appears after define:** A column retyped into the other family
+(`integer` → `double precision`) pauses the transform on the staging worker's
+next capture pass, with the reason in `status()`'s `capture_failure`, and
+`RESUME` refuses while the mix remains (the [row on a widened
+column](#a-column-trellis-copies-widened) below).
+
+**Remedy:** Compare values of one family: rewrite so both sides are floats or
+both are exact. A bare number literal is cast to `double precision` and a
+`real` operand widens to it, as in Postgres, so `r > 0.1` over `r = 0.1::real`
+is true; write `f > REAL '0.1'` to compare as `real`.
+
+#### A comparison between two temporal types
+
+**Condition:** A comparison between two different temporal types (`date` and
+`timestamp`, `timestamp` and `timestamptz`, `time` and `timetz`). Same-type
+comparisons of `date`, `timestamp`, `timestamptz`, `time` and `timetz` are
+admitted, as are `boolean` and `uuid` against their own type and exact numerics
+against each other.
+
+**Refused at define:** Yes (`MixedTemporalComparison`), naming both types, for
+the definition and an `ALTER TRANSFORM`. Postgres converts one side first, and
+a conversion to or from `timestamptz` depends on the session's time zone.
+
+**If it appears after define:** A column retyped to another temporal type
+pauses the transform, as in the rows above.
+
+**Remedy:** Cast one side so both are one type, or compare two columns of one
+type.
+
+#### An ordering comparison over `text`
+
+**Condition:** `<`, `<=`, `>`, `>=` over `text`. `=`, `<>`, `!=` and
+`IS [NOT] DISTINCT FROM` over text are admitted (under a deterministic
+collation, [row above](#a-nondeterministic-collation-on-a-key-or-compared-column)).
+
+**Refused at define:** Yes (`TextOrderingComparison`). The order of text
+depends on the collation, which Trellis does not evaluate.
+
+**If it appears after define:** A column retyped to `text` pauses the
+transform, as in the rows above.
+
+**Remedy:** Order by a non-text value, or compare `CHAR_LENGTH` of the text.
+
+#### A comparison between types no family covers
+
+**Condition:** A comparison or `NULLIF` between types no family covers: `text`
+with a number, `boolean` with a number, `uuid` with `text`, and every type
+outside the families (`bytea`, `jsonb`, `interval`, enums, `inet` and the
+rest).
+
+**Refused at define:** Yes (`ComparisonTypeMismatch`), naming the operator and
+both types.
+
+**If it appears after define:** A column retyped into a type outside the family
+pauses the transform, as in the rows above.
+
+**Remedy:** Compare two values of one family; `IS NULL` takes any type.
+
+#### Chained comparisons
+
+**Condition:** Comparisons that chain: `a < b < c`, `a = b = c`, `a < b = c`,
+and `IS DISTINCT FROM` followed by another `IS` form. Postgres reads these as a
+syntax error.
+
+**Refused at define:** Yes (`NonAssociativeComparison`, a parse error).
+
+**If it appears after define:** n/a.
+
+**Remedy:** Join them with `AND` (`a < b AND b < c`) or add parentheses.
+
+### Grammar forms and typing
+
+#### `IS TRUE` forms and the simple `CASE`
+
+**Condition:** `IS TRUE`, `IS NOT TRUE`, `IS FALSE`, `IS NOT FALSE`,
+`IS UNKNOWN`, `IS NOT UNKNOWN`; the simple
+`CASE <operand> WHEN <value> THEN ...`.
+
+**Refused at define:** Yes (`UnsupportedIsForm`, `SimpleCaseUnsupported`, parse
+errors). Only `IS [NOT] NULL` and `IS [NOT] DISTINCT FROM` are admitted, and
+only the searched `CASE`.
+
+**If it appears after define:** n/a.
+
+**Remedy:** `x IS NOT DISTINCT FROM TRUE` is `x IS TRUE` (likewise `FALSE`, and
+`IS DISTINCT FROM` for the `NOT` forms), and `x IS NULL` is `x IS UNKNOWN`;
+write `CASE WHEN <operand> = <value> THEN ...`.
+
+#### An untyped `NULL` literal
+
+**Condition:** A `NULL` literal its context gives no type: both operands of an
+arithmetic operator (`NULL + NULL`), the operand of prefix `-` or of
+`AT TIME ZONE`, an operand beside a type that no operator define admits takes
+on both sides (`date_col + NULL`, which Postgres finds ambiguous;
+`ts_col - NULL`, which it reads as the `interval`-producing
+`timestamp - timestamp`), or an argument of a function or aggregate
+(`abs(NULL)`, `SUM(NULL)`, `COUNT(NULL)`), directly or through a field that is
+only `NULL`.
+
+Postgres finds some of these ambiguous and types the rest by its
+function-candidate rules (`abs(NULL)` is `double precision`), which define does
+not model.
+
+**Refused at define:** Yes (`UntypedNull`), naming the field and the construct,
+for the definition and an `ALTER TRANSFORM`.
+
+**If it appears after define:** n/a: a literal does not change.
+
+**Remedy:** Write `CAST(NULL AS <type>)` with the type you mean
+(`abs(CAST(NULL AS integer))`).
+
+#### A non-boolean `CASE` condition or `CASE` results that don't unify
+
+**Condition:** A `CASE` condition that is not a `boolean`, or `CASE` results
+that Postgres cannot unify the way `COALESCE` does
+(`CASE WHEN c THEN 1 ELSE 'x' END`). Results unify to a common type: two
+integers the wider, an exact numeric with a float the float, otherwise
+`numeric`, so `CASE WHEN c THEN 1 ELSE 2.5 END` is `numeric` and `real` with
+`numeric` is `real`.
+
+**Refused at define:** Yes (`CaseConditionNotBoolean`,
+`CaseResultTypeMismatch`), for the definition and an `ALTER TRANSFORM`.
+
+**If it appears after define:** A column retyped so the results no longer unify
+pauses the transform, as in the rows above.
+
+**Remedy:** Make the results one type, with `CAST` where an integer meets a
+float.
+
+#### A `NULLIF` that casts its first argument
+
+**Condition:** `NULLIF(a, b)` where Postgres casts `a` to compare it, so the
+result is not `a`'s type: an integer `a` with a `numeric` `b` (the result is
+`numeric`), and an exact `a` with a float `b` (the result is
+`double precision`). `NULLIF(a, b)` otherwise has `a`'s type, for any pair `=`
+admits, and `x / NULLIF(y, 0)` guards a division.
+
+**Refused at define:** Yes (`NullIfFirstArgumentCast`), naming both types and
+the type Postgres gives.
+
+**If it appears after define:** A column retyped into such a pair pauses the
+transform, as in the rows above.
+
+**Remedy:** `NULLIF(CAST(a AS numeric), b)`, or write the float first.
+
+### Expression size
+
+#### An expression nested more than 100 levels deep
+
+**Condition:** An expression nested more than 100 levels deep: a chain of more
+than 100 operands joined by operators, or nested parentheses or calls to the
+same depth. A flat list of many columns, as `COALESCE` arguments or terms of
+one sum, is not deep.
+
+**Refused at define:** Yes (`ExpressionTooDeep`), for `CREATE`,
+`ALTER TRANSFORM` and a `JOIN`'s fields alike. Every pass that walks an
+expression recurses once per level, so the bound keeps a long expression from
+overflowing the stack.
+
+**If it appears after define:** n/a (the definition is stored only once it
+passes).
+
+**Remedy:** Split the expression into calculated fields that read each other.
+Fields that read each other are bounded by the next row.
+
+#### Calculated fields that inline too large or too deep
+
+**Condition:** Calculated fields that read each other so many times, or so
+deeply, that inlining them into one expression yields more than a build can
+render (a chain of fields that each read the previous one more than once), or
+an expression that is more than 100 levels high once the fields it reads are
+inlined (each read of another field costs at least one level).
+
+**Refused at define:** Yes (`FieldExpansionTooLarge`). Every build reads each
+field as one self-contained expression.
+
+**If it appears after define:** n/a (the fields are fixed at define; an
+`ALTER TRANSFORM` is checked the same way).
+
+**Remedy:** Shorten the chain, or read the source columns in the later fields.
+
+#### An expression that inlines to more than 100,000 nodes
+
+**Condition:** An expression whose calculated fields inline to more than
+100,000 nodes in total, a very wide `CASE` included (each `WHEN x = 1 THEN 1`
+branch is four nodes, so about 25,000 of them).
+
+**Refused at define:** Yes (`FieldExpansionTooLarge`).
+
+**If it appears after define:** n/a.
+
+**Remedy:** Shorten the expression or split it into calculated fields.
+
+### Arithmetic, functions and casts
+
+#### Integer division
+
+**Condition:** `/` between two integers (`smallint`, `integer`, `bigint`), such
+as `qty / 2`.
+
+**Refused at define:** Yes (`IntegerDivision`), naming both operand types.
+Postgres truncates an integer quotient (`7 / 2` is `3`), which reads as a
+rounding rule a `numeric` quotient does not have. `numeric / integer`,
+`integer / numeric`, `numeric / numeric` and every float quotient are admitted.
+
+**If it appears after define:** A column retyped from `numeric` to an integer
+type pauses the transform on the staging worker's next capture pass, with the
+reason in `status()`'s `capture_failure`, and `RESUME` refuses while define
+would refuse the definition.
+
+**Remedy:** Divide as `numeric`: `CAST(qty AS numeric) / 2`.
+
+#### Modulo with a float operand
+
+**Condition:** `%` with a float operand (`real`, `double precision`). `%` takes
+integers and `numeric`: two integers give the wider width, anything with a
+`numeric` gives `numeric`, and the sign follows the dividend (`-7 % 2` is
+`-1`).
+
+**Refused at define:** Yes (`FloatModulo`). Postgres has no float modulo.
+
+**If it appears after define:** A column retyped into a float pauses the
+transform, as in the row above.
+
+**Remedy:** Use `numeric` operands.
+
+#### An argument `ABS`, `CEIL`, `FLOOR`, `ROUND` or `TRUNC` does not admit
+
+**Condition:** An argument to `ABS`, `CEIL`, `FLOOR`, `ROUND` or `TRUNC` that
+the function does not admit. `ABS` takes an integer, `numeric` or float and
+returns its type. `CEIL`, `FLOOR` and `TRUNC` take `numeric` or
+`double precision`. `ROUND(a)`, `ROUND(a, n)` and `TRUNC(a, n)` take a
+`numeric` `a` and an `n` that is an integer literal (negative allowed,
+`ROUND(a, -2)`), and return `numeric`.
+
+Refused: an integer argument (it is already whole, and Postgres would cast it
+to `double precision` and change the result's type), a `real` argument to
+`CEIL`, `FLOOR` or `TRUNC` (promoted to `double precision`), a float argument
+to `ROUND` (a float rounds half to even, `numeric` half away from zero, so one
+name would carry two rules), a scale that is a column or an expression.
+
+**Refused at define:** Yes (`NumericFunctionArgument` with the reason,
+`ScaleNotIntegerLiteral`, or `FunctionArgTypeMismatch` for a non-numeric
+argument), naming the field and the function, for the definition and an
+`ALTER TRANSFORM`.
+
+**If it appears after define:** A column retyped into a refused type pauses the
+transform, as in the rows above.
+
+**Remedy:** Use the integer itself; use a `numeric` value, or
+`CAST(qty AS numeric)` for an integer one; write the scale as a literal.
+
+#### A `CAST` that is not an exact conversion
+
+**Condition:** A `CAST(<expr> AS <type>)` that is not an exact conversion that
+reads no setting: an integer to the same or a wider integer
+(`CAST(smallint_col AS integer)`, `AS bigint`, `CAST(bigint_col AS bigint)`),
+any integer to `numeric`, a `date` to `timestamp`, and a cast to the operand's
+own type (an integer to its own width, `numeric` to `numeric`, `timestamp` to
+`timestamp`; Postgres runs it as the identity, so `numeric(12, 2)` `1.50` stays
+`1.50` and a `timestamp(3)` keeps its fractional digits) are admitted.
+
+Refused: a narrowing (`bigint` to `integer`), a cast from a float or a
+non-numeric type, a cast to or from a float, a `timestamptz` to `timestamp` (it
+converts through the session `TimeZone`), any other target spelling
+(`smallint`, `text`, `real`, `int2`, `dec`, `timestamptz`, `date`), and a
+modifier (`numeric(10, 2)`, `decimal(10, 2)`: it rounds and can overflow;
+`timestamp(3)`).
+
+The accepted target spellings are `integer` (or `int`, `int4`), `bigint` (or
+`int8`), `numeric` (or `decimal`) and `timestamp`, in any case, in the target
+position only: a column named `int` is still a column. A `date` past
+294276-12-31 is a value `timestamp` cannot hold: its row raises `22008` and is
+quarantined. An alias is typed and checked as its canonical target
+(`CAST(bigint_col AS int)` narrows, so it is refused), and `ALTER TRANSFORM`
+shows the canonical spelling.
+
+**Refused at define:** Yes (`UnsupportedCast` naming both types for an operand
+that does not convert; `TemporalOperand` for a `timestamptz`, with
+`AT TIME ZONE 'UTC'` as the remedy; `UnsupportedCastTarget` for a target or a
+modifier the grammar has no spelling for), for the definition and an
+`ALTER TRANSFORM`. The cast of a quoted literal (`CAST('1.5' AS real)`) is a
+typed literal, with its own rules.
+
+**If it appears after define:** A column retyped so its cast no longer converts
+(`integer` → `numeric` under `CAST(c AS bigint)`) pauses the transform, as in
+the rows above. So does a widening that makes it a narrowing (`smallint` →
+`bigint` under `CAST(c AS integer)`): the `capture_failure` names the column,
+both types and the refusal, and `RESUME` refuses until the definition is
+altered to one that validates or the column is changed back. A retype that
+makes a cast an identity (`integer` → `bigint` under `CAST(c AS bigint)`)
+pauses nothing.
+
+**Remedy:** Widen the column instead, or compute in `numeric`; for a
+`timestamptz`, `tz AT TIME ZONE 'UTC'`.
+
+### Dates and times
+
+#### Date and time arithmetic
+
+**Condition:** `+` or `-` over a date or time operand other than
+`date ± integer`, `integer + date` and `date - date`: a `date` with a `bigint`,
+`numeric` or float (`d + n`), `date + date`, a number minus a date, a
+difference of two timestamps or of a date and a timestamp (`ts2 - ts1`,
+`tz2 - tz1`), any operand of type `interval`, and a number added to a
+`timestamp`, `timestamptz`, `time` or `timetz`. `date ± integer` takes a
+`smallint` or an `integer` count of days.
+
+**Refused at define:** Yes (`TemporalOperand`), naming the operator, the
+operand type and the reason, for the definition and an `ALTER TRANSFORM`.
+Postgres has no `date + bigint` or `date + numeric`. A difference of timestamps
+is an `interval`, which has no literal and whose month part makes a result
+depend on the date it is added to (`'2024-01-31' + 1 month - 1 month` is not
+`'2024-01-31'`), so nothing here produces or consumes one.
+
+**If it appears after define:** A column retyped into an unadmitted pair
+(`integer` → `bigint` beside a `date`) pauses the transform, as in the rows
+above.
+
+**Remedy:** Use an `integer` or `smallint` day count. For a duration,
+`EXTRACT(EPOCH FROM b) - EXTRACT(EPOCH FROM a)` is exact `numeric` seconds.
+
+#### `DATE_TRUNC` or `EXTRACT` of an unadmitted type, and `date_part`
+
+**Condition:** `DATE_TRUNC` of a `date` or a `timestamptz`, or `EXTRACT` of a
+`timestamptz`, `time`, `interval` or any type but `date` and `timestamp`;
+`date_part`.
+
+**Refused at define:** Yes (`TemporalOperand` for the first two; `date_part` is
+an unsupported function). `DATE_TRUNC('month', d)` resolves to the
+`timestamptz` overload, which is `STABLE` and returns `timestamptz`; both
+functions on a `timestamptz` read the session `TimeZone`; `date_part` returns
+`double precision`.
+
+`EXTRACT` returns an unconstrained `numeric`, which `SUM`, `AVG` and `COUNT`
+take; grouping by a bucket goes through a chain (a 1-1 transform computes
+`DATE_TRUNC('month', ts) AS bucket`, an aggregate over that target uses
+`GROUP BY bucket`), define.
+
+**If it appears after define:** A column retyped into a refused type pauses the
+transform, as in the rows above.
+
+**Remedy:** `DATE_TRUNC('month', CAST(d AS timestamp))`;
+`DATE_TRUNC('day', tz AT TIME ZONE 'UTC')`;
+`EXTRACT(hour FROM tz AT TIME ZONE 'UTC')`; `EXTRACT` for `date_part`.
+
+#### A `DATE_TRUNC` unit or `EXTRACT` field that is not admitted
+
+**Condition:** A `DATE_TRUNC` unit or an `EXTRACT` field that is not admitted,
+or that is not a literal. Units: `microseconds`, `milliseconds`, `second`,
+`minute`, `hour`, `day`, `week` (truncates to Monday), `month`, `quarter`,
+`year`, `decade`, `century`, `millennium`, in any case. Fields of a `date`:
+`year`, `quarter`, `month`, `week`, `day`, `dow`, `isodow`, `doy`, `isoyear`,
+`decade`, `century`, `millennium`, `epoch`; a `timestamp` also has `hour`,
+`minute`, `second`, `milliseconds`, `microseconds`.
+
+Refused: `EXTRACT(hour FROM <date>)`, `julian`, the `timezone` fields,
+abbreviations and plurals (`y`, `days`, `mon`) and a unit given as a column.
+
+**Refused at define:** Yes (`TemporalLiteral`), naming the construct, the text
+and what is admitted. A field Postgres lacks for the type raises in it;
+`julian` counts from a different origin for each type; the others have one
+spelling here.
+
+**If it appears after define:** A column retyped does not change a literal.
+
+**Remedy:** Use a listed spelling.
+
+#### `AT TIME ZONE` other than `'UTC'` over a `timestamptz`
+
+**Condition:** `AT TIME ZONE` with a zone other than the string literal `'UTC'`
+(`'America/New_York'`, `'utc'`, `'+05:00'`, a column), or over anything but a
+`timestamptz`: a `timestamp` gives a `timestamptz`, and a `date` converts
+through the session `TimeZone`.
+
+**Refused at define:** Yes (`TemporalLiteral` for the zone, `TemporalOperand`
+for the operand). Another zone's offsets come from the time zone database,
+which a release changes under past results, and `AT TIME ZONE` on a `timestamp`
+produces a `timestamptz`, which nothing here needs. `'UTC'` is parsed under
+`timezone_abbreviations`, which Trellis's sessions pin to `Default`.
+
+**If it appears after define:** A column retyped to another type pauses the
+transform, as in the rows above.
+
+**Remedy:** Convert in the source, or `CAST(d AS timestamp)` for a date.
+
+### Retyped and widened columns
+
+#### A key column retyped so stored values render differently
+
+**Condition:** A key column (a source key, a `GROUP BY` key or a `JOIN`'s `ON`
+column) retyped so that the values Trellis stored render differently:
+`timestamp` ↔ `timestamptz`, `date` → `timestamp`, `text` → `uuid` or
+`integer`, `varchar` → `character(n)`, or a narrower `numeric` scale, temporal
+precision or `varchar(n)` (the rewrite rounds, or strips trailing spaces).
+
+**Refused at define:** n/a: define sees one type.
+
+**If it appears after define:** An `ALTER COLUMN … TYPE` rewrites the table
+without firing a trigger. The staging worker pauses every transform keyed by
+the column, with the old and new type in `capture_failure`.
+
+**Remedy:** `RESUME`: it re-types Trellis's copies of the column and rebuilds
+from the source. Or drop and define again.
+
+#### A column Trellis copies, widened
+
+**Condition:** A column Trellis creates a column from with its type, widened.
+Those columns are a 1-1 target's key, passthrough and calculated columns, an
+aggregate's `GROUP BY` key (copied into its target and its hidden table) and
+its field columns, a `JOIN`'s `GROUP BY` keys and `ON` columns (copied into its
+target and its hidden tables, each with its type, no modifier, and collation)
+and its field columns, and a 1-1 `JOIN`'s key, field columns and the columns of
+its hidden `R`, `M` and `J`.
+
+Widenings are `integer` → `bigint` (and `smallint` up), an integer → `numeric`
+(unless every value of the `numeric` fits the integer), `real` →
+`double precision`. A wider modifier is no widening: a copy has none
+([ADR-0020](decisions/0020-type-identity.md)).
+
+**Refused at define:** n/a: each column takes its type from the source at
+define, or when an `ALTER TRANSFORM … ADD` adds it. A column Trellis creates
+has the source column's type with no modifier (a 1-1 key column and a `JOIN`'s
+`GROUP BY` and `ON` columns also keep its collation; any other takes the
+database default), so a change of a modifier (a string bound, a `numeric`
+precision, a temporal precision, a move to `text`) changes nothing there.
+
+**If it appears after define:** A widening of a modifier that changes only the
+catalog needs no re-type, no pause and no rebuild. Otherwise the column keeps
+its type, so a value it can't hold would fail its write. The staging worker
+pauses every transform that owns a column the type define would give it now
+outgrew (a 1-1 target's copy of `qty` after `qty` goes `integer` → `bigint`),
+naming the source column and each of those columns. A narrowing pauses nothing
+here, except a `varchar(n)` key's (the row above).
+
+A narrowing, a field's move to another type family (`integer` →
+`double precision`), or any other change that isn't a pure widening, rebuilds
+the table's readers on its own, and pauses a transform define would now refuse,
+or one that evaluates the column as another type ([capture by
+triggers](staging-and-claiming/01-capture-by-triggers.md#a-column-changed-or-rewritten-without-a-trigger)).
+
+**Remedy:** `RESUME`: the staging worker `ALTER`s each column whose type
+differs from the one define would give it now, under `ACCESS EXCLUSIVE` (a
+table rewrite for `integer` → `bigint`; reads of the target wait), then
+rebuilds. A `JOIN`'s or a 1-1 `JOIN`'s hidden tables are created again at the
+new types instead. Or drop and define again.
+
+### Target columns and widths
+
+#### Two `GROUP BY` keys that share a target column name
+
+**Condition:** Two `GROUP BY` keys that share a target column name (a key
+listed twice, or a `JOIN`'s `orders.region` and `customers.region`); keys can't
+be aliased.
+
+**Refused at define:** Yes (`GroupByKeysShareTargetColumn`). Each key becomes a
+target column named after its bare column name.
+
+**If it appears after define:** n/a.
+
+**Remedy:** List a key once. For a `JOIN`, join a 1-1 transform's target that
+selects one side's column under another name (`region AS customer_region`).
+
+#### A key of more than 32 columns
+
+**Condition:** A key of more than 32 columns: a `GROUP BY` of more than 32
+columns, or a `JOIN` side whose `ON` columns and `GROUP BY` columns not among
+them together number more than 32 (a 1-1 `JOIN` has no `GROUP BY`, so its `ON`
+alone, which may number at most 31: its hidden `R` indexes them followed by the
+row's key, which a `b` change's chunks walk). Postgres caps an index at 32
+columns (`INDEX_MAX_KEYS`) and Trellis keys the target and a `JOIN`'s hidden
+tables on these columns.
+
+**Refused at define:** Yes (`IndexKeyTooWide`, naming the clause and the
+limit). A source key is at most 32 columns too, so a 1-1 target's key never
+exceeds it.
+
+**If it appears after define:** n/a.
+
+**Remedy:** Group by or join on fewer columns.
+
+#### A table of more than 1,600 columns
+
+**Condition:** A table of more than 1,600 columns, Postgres's cap on one table
+(`MaxHeapAttributeNumber`).
+
+Trellis creates a target with a column per key and field, and hidden tables
+whose width follows the fields too: an aggregate's hidden table has its
+`GROUP BY` columns, a column counting each distinct argument, a column summing
+each one a `SUM` or `AVG` reads, and a column for each distinct `MIN` or `MAX`
+call (with two more for their basis and stamp when there is one); a `JOIN`'s
+hidden partials tables do the same, per side and for the groups; a 1-1 `JOIN`'s
+ledger for a side has a column for every column that side's fields read.
+
+So about 800 distinct summed aggregate arguments overflow a hidden table that
+their target fits in.
+
+**Refused at define:** Yes (`TableTooWide`, naming the table's role and the
+limit), for the definition, `RESUME` and an `ALTER TRANSFORM … ADD`. An
+`ALTER TRANSFORM` counts the columns earlier edits dropped from the target, and
+the column a `DROP z, ADD … AS z` replaces, since Postgres keeps counting a
+dropped column until the table is created again.
+
+An aggregate meets smaller limits first, which define does not refuse: from
+about 270 distinct summed arguments the statements that build and apply it
+exceed Postgres's 1,664-entry target list, so its build pauses or its changed
+groups are quarantined, with Postgres's error
+([#1518](https://github.com/salesforce-misc/trellis/issues/1518)), and from
+about 500 a hidden table's row can outgrow a heap page
+([#1516](https://github.com/salesforce-misc/trellis/issues/1516)).
+
+**If it appears after define:** n/a: the tables are created with the
+definition, and only an `ALTER TRANSFORM … ADD` of a 1-1 transform adds a
+column.
+
+**Remedy:** Define fewer fields, or fewer distinct aggregate arguments. If
+dropped fields filled the limit, drop the transform and define it again.
+
+### Field, column and table names
+
+#### A field named after a key column or starting with `__`
+
+**Condition:** A field named after a 1-1 source key column or a 1-1 `JOIN`'s
+`a` key column (`id AS id`), or any field or `GROUP BY` column whose name
+starts with `__`.
+
+**Refused at define:** Yes. The target already carries the key columns, and
+`__` names are reserved for Trellis's hidden columns. `id AS order_id` is an
+ordinary column.
+
+**If it appears after define:** n/a.
+
+**Remedy:** Rename the field.
+
+#### An aggregate over another aggregate field
+
+**Condition:** An aggregate whose argument names another aggregate field when
+no source column has that name (`SUM(val) AS total, SUM(total)`), directly or
+through a field that reads one.
+
+**Refused at define:** Yes (`AggregateOfAggregateField`). The argument would
+nest one aggregate in another, which no build can run.
+
+**If it appears after define:** n/a.
+
+**Remedy:** Aggregate the source column instead (`SUM(val)`).
+
+#### A bare name that could mean a source column or a field
+
+**Condition:** A bare name that could mean a source column or a field: the name
+of a source column and of a field whose expression is not just that column,
+read by another field (`(grp + 1) AS val, SUM(val) AS total`). An aggregate
+field's name inside another aggregate's argument is not ambiguous: it is the
+source column ([Calculated Fields](#calculated-fields)).
+
+**Refused at define:** Yes (`AmbiguousColumnReference`), naming both meanings.
+`val AS val` (or `src.val AS val`) passes the column through, so reading `val`
+elsewhere is not ambiguous.
+
+**If it appears after define:** A source column added later under the name of a
+field: nothing is detected, and the transform keeps reading the field. An
+`ALTER TRANSFORM` that adds a field of that name is refused, as define would.
+`RESUME` re-validates and refuses what define would: in an aggregate target, a
+field another field reads by that name, and in a 1-1 target, any field of that
+name.
+
+**Remedy:** At define, write `src.val` or `public.src.val` to read the source
+column, or rename the field and read it by its new name. After a later column,
+rename or drop that column and `RESUME`, or drop the transform and define it
+again.
+
+#### An unquoted reserved word as a name
+
+**Condition:** An unquoted name that Postgres reserves in an expression, a
+`GROUP BY` or `KEY (…)` column, or a `JOIN`'s `ON` and `GROUP BY` qualifier:
+any word `pg_get_keywords()` marks reserved (`R`) or reserved as a type or
+function name (`T`), such as `order`, `user`, `end`, `not`, `from`, `left`,
+`case`, `and`, `is`. Postgres needs such a column quoted.
+`GROUP BY current_user` reads the function in Postgres, and `GROUP BY order` is
+a syntax error there.
+
+A quoted name (`"order"`), a name after a `.` (`t.order`), the label after `AS`
+(`val AS limit`) and a call (`left(x, 2)`) are not bare names and are fine; a
+non-reserved keyword (`extract`, `position`, `values`, `between`, `coalesce`,
+`nullif`, `char`) is still a column.
+
+**Refused at define:** Yes (`ReservedWord`), for the definition and an
+`ALTER TRANSFORM`, naming the word and the quoted spelling. A source table with
+a column of that name defines; an expression reads it quoted or qualified.
+
+**If it appears after define:** Adding or renaming a column to a reserved word
+needs quotes in Postgres; it is a rename like any other. A transform that reads
+the old name pauses, and one that doesn't read the column is unaffected.
+
+**Remedy:** Quote it (`"order"`, and `"order" AS "order"` copies it under its
+own name), or qualify it with its table (`orders.order`).
+
+#### An unquoted reserved table name
+
+**Condition:** An unquoted table name that Postgres reserves (`R` or `T`, as in
+the row above), as the target, the `FROM` table or the `JOIN` table:
+`FROM user` reads the `current_user` function in Postgres, and `FROM order` is
+a syntax error there. A schema-qualified name's table part (`public.order`) is
+fine, as in Postgres.
+
+**Refused at define:** Yes (`ReservedTableName`, a parse error), naming the
+word.
+
+**If it appears after define:** n/a: a table name does not change under a
+stored definition's text.
+
+**Remedy:** Quote the table's name as the catalog spells it (`FROM "User"`,
+`FROM "order"`).
+
+#### A name over 63 bytes
+
+**Condition:** A name over 63 bytes, after folding to lower case and unescaping
+`""`, in any position (a table, schema, column, `KEY` or `GROUP BY` column,
+`AS` label, alias or addressed transform). Postgres truncates such a name, so
+two long names sharing their first 63 bytes would be one.
+
+**Refused at define:** Yes (`NameTooLong`, a parse error), naming the name and
+the 63-byte name Postgres would truncate it to.
+
+**If it appears after define:** A definition 0.1.x stored with a longer `AS`
+label (Postgres truncated its target column) keeps running, but its text can't
+be written in the current grammar: an `ALTER TRANSFORM` of it is refused
+(`NameTooLong`), and the upgrade that writes a `KEY (…)` into it pauses it
+instead.
+
+**Remedy:** Use a name of 63 bytes or fewer. Drop such a stored definition and
+define it again.
+
+#### An unsupported quoted name
+
+**Condition:** A quoted name that is zero-length (`""`, which Postgres refuses
+too), the Unicode-escape spelling `U&"…"`, a quoted name holding a `.` or a
+non-ASCII character, or a quoted function or type name (`"lower"(x)`,
+`CAST(x AS "int4")`, `"date" '2024-01-31'`), which Postgres accepts. Postgres
+looks a quoted function or type name up exactly, so `"int4"` is a type there
+and `"INT4"` and `"integer"` are not. Trellis addresses a table by its
+`<schema>.<table>` text, which a `.` inside a name would make ambiguous.
+
+**Refused at define:** Yes (`ZeroLengthQuotedIdentifier`,
+`UnicodeEscapeIdentifier`, `UnsupportedQuotedIdentifier`, parse errors).
+
+**If it appears after define:** n/a.
+
+**Remedy:** Rename the table or column, or write the name with its ASCII
+characters. Write function and type names unquoted (`lower(x)`,
+`CAST(x AS int4)`).
+
+#### A qualified name that doesn't name the `FROM` table
+
+**Condition:** A qualified name that doesn't name the `FROM` table: a two-part
+name whose head is another table (`product.cost`), or a three-part name whose
+schema isn't the `FROM` table's. A `JOIN`'s are in the `JOIN` rows below.
+
+**Refused at define:** Yes (`QualifiedColumnNotFromSource`; a `GROUP BY` key is
+a parse error, `GroupByKeyNotFromSource`). `ALTER TRANSFORM` refuses it in an
+added or altered field.
+
+**If it appears after define:** n/a.
+
+**Remedy:** Name the `FROM` table, or read the second table with a `JOIN`.
+
+### Source indexes
+
+#### A source without the index its `self_check` walk pages by
+
+**Condition:** A `GROUP BY` aggregate or a `JOIN` whose source lacks the index
+its `self_check` walk pages by: for an aggregate, a valid, non-partial btree
+index on the plain source columns whose leading columns are the `GROUP BY`
+columns, in `GROUP BY` order; for a `JOIN`, on each side, one whose leading
+columns are that side's `ON` columns in `ON` order.
+
+A primary key or unique constraint that leads with them counts; an expression
+or partial index, one under a non-default operator class such as
+`text_pattern_ops`, or one whose leading columns are not all ascending with
+`NULLS LAST` (the default) or all `DESC` with `NULLS FIRST` (the `DESC`
+default, read backward), such as `(a, b DESC)`, doesn't.
+
+A 1-1 target needs nothing (its walk pages by the primary key), and a `JOIN`'s
+`T` part, with group columns from both tables, is served by no one table's
+index and needs none.
+
+**Refused at define:** Yes (`SourceIndexMissing`), naming the table, the
+columns, the part of the definition that needs the index (the `GROUP BY`
+columns, or a `JOIN`'s `ON` columns on its from or joined side) and a
+ready-to-run `create index`. `WITHOUT SOURCE INDEX` after the `GROUP BY` or
+`JOIN` clause (`TRANSFORM t FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT …`)
+opts out for that definition, except one with a `MIN` or `MAX` field, which
+needs more (the [`MIN`/`MAX` row](#min-or-max-in-a-plain-aggregate) below).
+Builds need no index.
+
+**If it appears after define:** Dropping or invalidating the index later pauses
+nothing, since it affects speed, never correctness. `status()` reports it in
+`source_index_gaps` (an opted-out definition's gap is listed too), `self_check`
+refuses to walk a definition that did not opt out, and a whole-transform
+`RESUME` refuses with the define message. An opted-out definition's
+`self_check` still runs, scanning the source once per page.
+
+**Remedy:** Create the index the message names; or define it
+`WITHOUT SOURCE INDEX`.
+
+### `JOIN` transforms
+
+#### A `JOIN` transform that passes the checks below
+
+**Condition:** A `JOIN` transform
+(`FROM a [LEFT|INNER] JOIN b ON … GROUP BY … SELECT …`) that passes the checks
+in the rows below.
+
+**Refused at define:** No. Define registers it and creates its target, and
+Trellis builds it from both tables. Each table is held to the rows above, as a
+`FROM` is. Either table may be another transform's target, read through that
+target's change feed; the build first waits out the transactions that began
+before it ([data flow](data-flow.md#the-re-derive-build),
+[ADR-0019](decisions/0019-join-transforms.md#a-side-may-be-another-transforms-target-through-the-target-change-feed)).
+
+**If it appears after define:** A column the transform reads from either table
+dropped or renamed, or a key column of either (its primary key, an `ON` or a
+`GROUP BY` column) retyped as the key rows above describe, pauses the whole
+transform on the staging worker's next pass, naming that table and column in
+`status()`'s `capture_failure`, and so does a column of either table retyped to
+a type the transform evaluates differently. A widening of a column it copies is
+handled as the [widening row](#a-column-trellis-copies-widened) above
+describes.
+
+Either table dropped or renamed pauses it, as the [row for a dropped
+source](#a-source-dropped-renamed-swapped-or-its-capture-disrupted) describes.
+`RESUME` checks both tables and refuses, naming the table, while define would
+refuse the transform.
+
+**Remedy:** After a later change, undo it, then `RESUME`.
+
+#### An unsupported `JOIN` shape
+
+**Condition:** A `JOIN`, with or without a `GROUP BY` (one without is a 1-1
+`JOIN`, the [next row](#a-1-1-join)), that is `RIGHT`, `FULL`, `CROSS`,
+`NATURAL`, `LATERAL`, `USING` or a comma join; joins a table to itself (even
+under two aliases: one captured change would feed both sides), or two tables
+with the same bare name (`shop.orders JOIN archive.orders`); gives a table an
+alias that is a word Postgres reserves (`AS left`), that the other table goes
+by (its alias or bare name), or that a single-table definition gives its `FROM`
+table; reads an aliased table's column through the table's name (`orders.total`
+after `orders AS o`); joins one table twice, under any alias; with a
+`GROUP BY`, joins a third table; has an `ON` that is anything but equalities
+between a column of each table joined by `AND` (`OR`, `<`, a literal, an
+expression, two columns of one table, a column pair repeated, a column named by
+two terms); reads a column without its table (`SUM(qty)`, `GROUP BY region`) or
+through a table that is neither side; or, with a `GROUP BY`, has an aggregate
+whose argument reads both tables (`SUM(orders.x + items.y)`), or a field that
+is neither a `GROUP BY` key selected on its own nor a composition of aggregates
+(a column outside an aggregate, a nested aggregate, no aggregate at all).
+
+**Refused at define:** Yes (parse error, `TableAlias` or `AliasedTableName` for
+an alias, or `JoinTooManyTables`, `JoinSelf`, `JoinOnSameSide`,
+`JoinOnRepeatedPair`, `JoinOnRepeatedColumn`, `JoinUnqualifiedColumn`,
+`JoinUnknownTable`, `JoinUnresolvedColumn`, `JoinMixedSideArgument`,
+`JoinFieldShape`).
+
+Only `INNER` and `LEFT` equi-joins of different tables are admitted, two tables
+with a `GROUP BY` (a 1-1 `JOIN` may read more, the [row after
+next](#1-1-join-of-more-than-two-tables-star)), with every column written
+`<table>.<column>`, or `<alias>.<column>` for a table given an alias.
+
+A field is a `GROUP BY` key from either table, or composes aggregates with
+literals, operators and functions (`COALESCE(SUM(items.qty), 0)`); each
+aggregate is `COUNT(*)`, or `COUNT`/`SUM`/`AVG` of a column or an expression
+over one table's columns (`SUM(items.qty + 1)`). Each argument is kept as a
+running total on its own table, so one reading both tables has no such total.
+
+**If it appears after define:** n/a.
+
+**Remedy:** Rewrite the definition in the admitted shape. For `RIGHT JOIN`,
+swap the two tables and use `LEFT JOIN`. Qualify an aliased table's columns
+with its alias.
+
+#### A 1-1 `JOIN`
+
+**Condition:** A 1-1 `JOIN` (`FROM a [LEFT|INNER] JOIN b ON … SELECT …`, no
+`GROUP BY`, [ADR-0021](decisions/0021-one-to-one-join-transforms.md), [1-1
+JOIN](#1-1-join)): one whose `b` `ON` columns are not unique, that has an
+aggregate field, that reads a column that starts with `__`, whose side is
+partitioned, whose `ON` names one column in two terms, whose `ON` reads two
+columns of `a` whose names share their first 60 bytes, or whose `b` is another
+transform's 1-1 target joined on columns that leave out part of that target's
+primary key.
+
+**Refused at define:** Yes (`OneToOneJoinKeyNotUnique`,
+`OneToOneJoinAggregate`, `OneToOneJoinUnsupported`, `PartitionedSource`,
+`JoinOnRepeatedColumn`; a `WITHOUT SOURCE INDEX` is a parse error). `b`'s `ON`
+columns must contain a unique key of `b`: its primary key, a unique constraint
+or a non-partial unique index on plain columns (deferrable, or with `INCLUDE`
+columns, is fine for this check), or the group key of an aggregate or `JOIN`
+target.
+
+`b`'s row-identity key, its primary key or `KEY`, is a separate rule: it must
+not be deferrable (the [key row](#the-key-a-transform-keys-each-table-by)
+above), even when a deferrable key is what makes its `ON` columns unique.
+
+When `b` is another transform's 1-1 target, its `ON` columns must also include
+every column of its primary key, so a unique index added to the target never
+admits a join on another column: Trellis orders changes per primary-key value
+only, so only the primary key is unique at every instant while the upstream
+drains. An `a` that is a 1-1 target may be joined on any columns. A field is
+any expression over `<table>.<column>` columns of either table. The target is
+keyed by `a`'s primary key.
+
+The joined table needs no source index. Trellis builds the target in chunks of
+`a`'s primary key, keeps it readable across a `RESUME`, and applies changes,
+Re-derives and `TRUNCATE`s of either table. A `TRUNCATE` of `a` empties the
+target; one of `b` starts a rebuild of it, so the transform reads
+`backfilling`, and a row keeps the `b` columns it held (an `INNER` row stays)
+until the rebuild reaches it.
+
+A `b` that is another transform's target is never truncated: a `TRUNCATE` of
+that transform's source reaches the `JOIN` as a delete of every row of `b`, a
+change of `b` like any other. A page whose changes of either table, or a chunk
+of a `b` change's fan-out, fail on more rows of `a` than its bisection can
+name, pauses the transform, and everything downstream of it, with a
+`capture_failure` of kind `halt`.
+
+A row of `a` a page fails to write, for its own change or a change of `b`, is
+otherwise held in quarantine on its first failure, and the page applies every
+other change.
+
+**If it appears after define:** As for a `JOIN` (the [row
+above](#a-join-transform-that-passes-the-checks-below)): a column the transform
+reads from either table dropped or renamed, a key column of either (`a`'s
+primary key, an `ON` column) retyped as the key rows above describe, or a
+column retyped to a type the transform evaluates differently, pauses the whole
+transform, naming that table and column in `status()`'s `capture_failure`.
+
+A widening of a column it copies (`a`'s key, a field, `R`, `M` and `J`) is
+handled as the [widening row](#a-column-trellis-copies-widened) above
+describes; a field over both tables is reported against the table whose column
+widened, naming every column it is typed from. Either table dropped, renamed or
+joining a hierarchy pauses it, as for a source.
+
+`b`'s unique key on its `ON` columns dropped, or left `INVALID` by a failed
+build, pauses the whole transform on the staging worker's next pass, naming `b`
+and its `ON` columns, whether or not a duplicate arrived; a duplicate Postgres
+admits past a deferrable key under `session_replication_role = replica`, which
+leaves the key valid, pauses nothing ([known correctness
+gaps](known-correctness-gaps.md#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)).
+
+`RESUME` refuses a `b` whose `ON` columns are no longer unique, naming the
+table, and re-keys the target to a changed key of `a` as for a 1-1 transform
+(the [key row](#the-key-a-transform-keys-each-table-by) above).
+
+**Remedy:** Join `b` on a unique key (a 1-1 target's, on columns that include
+its primary key, or join the table that transform reads), and give an aggregate
+a `GROUP BY`. Rename a column of `a` whose name's first 60 bytes another `ON`
+column of `a` shares. After a later change, undo it, then `RESUME`; a widening
+needs only the `RESUME`. For `b`'s unique key, restore the key, then `RESUME`
+([recommendations](recommendations.md#keep-the-indexes-a-definition-relies-on)).
+
+#### 1-1 `JOIN` of more than two tables (star)
+
+**Condition:** A 1-1 `JOIN` of more than two tables, a star
+(`FROM a JOIN b1 ON … LEFT JOIN b2 ON … SELECT …`): one defined while the
+development knob `TRELLIS_DEV_STAR_JOIN` is off; one of more than 5 tables (`a`
+and 4 joined tables); one where a joined table's `ON` reads a joined table
+other than its own (a snowflake, `JOIN b2 ON b1.id = b2.id`, or an `ON` that
+reads `a` and two joined tables).
+
+**Refused at define:** Yes (`StarJoinDisabled`, `StarJoinTooManyTables`,
+`JoinOnReadsAnotherJoinedTable`).
+
+The joins read left to right, as Postgres reads them without parentheses; each
+joined table is joined to `a` directly, and every rule of the [row
+above](#a-1-1-join) holds at each position: its `ON` columns contain a unique
+key of its table (the refusal names that table), a joined 1-1 target is joined
+on columns that include its primary key, no table is partitioned, no two `ON`
+columns of `a` share their first 60 bytes, and every refusal of the `JOIN` rows
+above (the kinds other than `INNER` and `LEFT`, `LATERAL`, `USING`, a comma
+join, a table read twice) holds at every position.
+
+A star builds and applies its changes and a `TRUNCATE` of any of its tables,
+and leaves a fan-out past one chunk to chunks at any position; loading one in a
+process with the knob off halts it.
+
+**If it appears after define:** A schema change of a joined table at any
+position is handled as the [row above](#a-1-1-join) describes for `b`, naming
+that table and its column: its unique key on its own `ON` columns dropped or
+left `INVALID`, a column the star reads there dropped, renamed or retyped, a
+widening, the table dropped, renamed or joining a hierarchy, or a value of an
+enum read there relabelled, pauses the whole transform.
+
+`RESUME` re-validates every position as define does, refusing a position whose
+`ON` columns are no longer unique or whose `ON` pair no longer has one type and
+collation, and re-keys the target to a changed key of `a`. A star defined while
+the knob was on is refused at `RESUME` once it is off.
+
+**Remedy:** Define it with the knob on, at most 5 tables, each joined to `a` on
+a unique key of its own. Join a snowflake's outer table through a transform of
+its own and join that target.
+
+#### `JOIN` key columns that differ or can't be keys
+
+**Condition:** A `JOIN` whose `ON` columns differ in type or collation, are off
+the join-key allowlist, or have a nondeterministic collation; or a `GROUP BY`
+key of a type that can't be one.
+
+**Refused at define:** Yes (`JoinKeyTypeMismatch`, `JoinUnsupportedKeyType`,
+`JoinNondeterministicCollation`, `UnsupportedGroupByKeyType`). Each `ON`
+column's type must be on the join-key allowlist in
+[type-support.md](type-support.md) (a domain never is), with a deterministic
+collation. The two columns of each pair need the same type and the same
+collation, because Trellis never casts a join key.
+
+A type modifier never counts, and `text` and `varchar` are one type:
+`varchar(10)` pairs with `varchar(50)`, `text` or a Trellis target's copy, and
+`timestamp(0)` with `timestamp(3)`, while `integer` against `bigint` is
+refused. A `GROUP BY` key follows the `GROUP BY` key rules.
+
+**If it appears after define:** An `ON` column retyped to another type
+(`integer` to `bigint`) so its pair no longer matches, or onto a refused type
+or a nondeterministic collation, pauses the whole transform on the staging
+worker's next pass, naming that table and column in `status()`'s
+`capture_failure`. A change of one column's modifier leaves the pair matching,
+so a widening pauses nothing; a change that re-renders the keys Trellis stored
+(a narrower bound or precision) pauses the transform, and `RESUME` rebuilds it.
+
+A change between deterministic collations pauses nothing (byte equality is
+unchanged), but `RESUME` refuses the pair until the collations match too.
+
+**Remedy:** Alter one column to match the other, then `RESUME`.
+
+### Aggregate functions
+
+#### `MIN` or `MAX` in a plain aggregate
+
+**Condition:** `MIN` or `MAX` in a plain aggregate (`GROUP BY` over one table)
+whose argument is not a plain source column (`MAX(a + b)`, a cast, a calculated
+field), is of a type other than `smallint`, `integer`, `bigint`, `numeric`,
+`real`, `double precision`, `date`, `time`, `timestamp`, `timestamptz`,
+`interval` and `oid` (`text` among them, until collation is settled), or is a
+column of another transform's target; a definition with such a field declared
+`WITHOUT SOURCE INDEX`; or one whose source lacks, for each argument, a valid,
+non-partial btree index whose leading columns are the `GROUP BY` columns in
+order, then the argument (under the index rules of the [source-index
+row](#a-source-without-the-index-its-self_check-walk-pages-by) above).
+
+**Refused at define:** Yes (`ExtremeOfExpression`,
+`UnsupportedExtremeArgument`, `ChainedExtreme`, `ExtremesWithoutSourceIndex`,
+`ExtremeIndexMissing`), naming the call and, for an index, the table, the
+columns and a ready-to-run `create index`, one per argument, which also serves
+as the `GROUP BY` index. A group keeps each extreme, and a deletion or update
+that removes it re-reads the group's next one from the source after the group's
+lock, as one endpoint of that index ([type
+support](type-support.md#min-and-max)).
+
+Without the index each re-read scans the group, and with no `GROUP BY` index
+either the whole source, once per group: a page can then outrun
+`statement_timeout` and retry forever, so `WITHOUT SOURCE INDEX` doesn't apply.
+Another transform's target has no such index, and building one is a long
+`CREATE INDEX` on a table Trellis owns.
+
+**If it appears after define:** A whole-transform `RESUME` refuses with
+define's message while a probe index is missing or invalid, and refuses the
+other conditions as define does. A probe index dropped or invalidated while the
+transform runs leaves the target exact: `status()` lists it in
+`extreme_index_gaps`, and each re-read scans its group.
+
+Once no valid probe index has existed on any of the staging worker's passes for
+5 minutes (wall-clock time, a fixed constant; a pass that finds one resets it,
+and a restart or a new leader starts it again), the pass pauses the transform,
+with a `capture_failure` naming the table, the columns and a ready-to-run
+`create index` (for a partitioned source, also to re-run
+`ALTER INDEX … ATTACH PARTITION` after repairing a leaf's index, whose repair
+alone leaves the root's index invalid).
+
+An equivalent index built before the old one is dropped, `REINDEX CONCURRENTLY`
+and a rename pause nothing; a rebuild that drops the old index first and takes
+longer than 5 minutes pauses
+([recommendations](recommendations.md#keep-the-indexes-a-definition-relies-on)).
+An argument re-typed to a refused type pauses the transform, as the retype rows
+above describe.
+
+**Remedy:** Create the index the message names; drop `WITHOUT SOURCE INDEX`;
+take `MIN`/`MAX` of a plain column (a stored generated column for an
+expression), in the transform that reads the source. After a pause, create the
+index the message names, then `RESUME`.
+
+#### `MIN` or `MAX` in a `JOIN` transform
+
+**Condition:** `MIN` or `MAX` in a `JOIN` transform.
+
+**Refused at define:** Yes (`DeferredAggregate`, family `MIN/MAX`). A `JOIN`
+target's extreme is the extreme of each joined key's extreme over the keys that
+still match, each of them a re-read of the fact side, which Trellis doesn't
+model.
+
+**If it appears after define:** n/a.
+
+**Remedy:** Take the `MIN`/`MAX` in a plain aggregate over one table.
+
+#### `bool_and`, `bool_or`, `bit_and` or `bit_or`
+
+**Condition:** `bool_and`, `bool_or`, `bit_and` or `bit_or` in an aggregate or
+a `JOIN` transform.
+
+**Refused at define:** Yes (`DeferredAggregate`, family
+`bool_and/bool_or/bit_and/bit_or`).
+
+**If it appears after define:** n/a.
+
+**Remedy:** Not supported yet:
+[#1118](https://github.com/salesforce-misc/trellis/issues/1118).
+
+#### `SUM` or `AVG` over an unsupported type
+
+**Condition:** `SUM` or `AVG` over a float (`real`, `double precision`), an
+`interval`, or any type but `smallint`, `integer`, `bigint` and `numeric`, in
+an aggregate or a `JOIN` transform.
+
+**Refused at define:** Yes (`DeferredAggregate`, family
+`float and interval SUM/AVG`, for a float or an `interval`; another type is
+refused naming its type). A running float sum drifts from Postgres's, which
+adds the group's values in scan order.
+
+**If it appears after define:** The argument column re-typed to a float
+(`integer` → `double precision`) pauses the transform on the staging worker's
+next pass, naming the column in `status()`'s `capture_failure`; `RESUME`
+refuses with define's error until the type is admitted again.
+
+**Remedy:** Sum an integer or `numeric` column. Not supported yet:
+[#1119](https://github.com/salesforce-misc/trellis/issues/1119).
+
+#### `array_agg`, `string_agg` or `jsonb_agg`
+
+**Condition:** `array_agg`, `string_agg` or `jsonb_agg` in an aggregate or a
+`JOIN` transform.
+
+**Refused at define:** Yes (`DeferredAggregate`, family
+`array_agg/string_agg/jsonb_agg`).
+
+**If it appears after define:** n/a.
+
+**Remedy:** Not supported yet:
+[#1040](https://github.com/salesforce-misc/trellis/issues/1040).
+
+### Filters and chaining
+
+#### A `WHERE` other than `TRUE`
+
+**Condition:** A `WHERE` other than `TRUE`.
+
+**Refused at define:** Yes (parse error). Partial data is not supported
+([#804](https://github.com/salesforce-misc/trellis/issues/804)).
+
+**If it appears after define:** n/a.
+
+**Remedy:** None.
+
+#### Chaining off a transform that is not `live`
+
+**Condition:** Chaining off a transform that is not `live`
+(`TransformNotLive`).
+
+**Refused at define:** Yes.
+
+**If it appears after define:** n/a.
+
+**Remedy:** Wait for the upstream to go `live`, then define.
+
+### Target names
+
+#### A target whose name is taken
+
+**Condition:** A target whose name is taken: a relation of any kind already
+exists in the target schema under the target's name or the name of a table
+Trellis keeps beside it (`<target>__ledger`). That includes another
+definition's target, in this instance or in another instance sharing the target
+schema.
+
+**Refused at define:** Yes (`TargetTableExists`, a `conflict` error). Trellis
+writes only to target tables it creates, or to an empty table it adopts on
+request, and `DROP TRANSFORM` drops the target, so it never takes over an
+existing relation unasked.
+
+With `ADOPT EXISTING TABLE` after the target
+(`TRANSFORM t ADOPT EXISTING TABLE FROM s …`), define builds into the existing
+table instead, if it is a plain, empty table shaped exactly as define would
+create it: the same columns in the same order, each with the type (no
+modifier), collation and nullability define gives it, and the key define
+creates (the primary key, or an aggregate's or `JOIN`'s
+`UNIQUE NULLS NOT DISTINCT` group key, not deferrable and with no `INCLUDE`
+columns).
+
+Define records that key, so a unique constraint the table already has never
+keys it instead (the [key row](#the-key-a-transform-keys-each-table-by) above).
+
+It may carry anything a user may add to any target (indexes, unique or not;
+constraints; triggers; rules; foreign keys, its own or another table's
+referencing it; grants; comments; row security policies, subject to the
+[row-security row](#row-level-security-on-a-role-trellis-runs-as) above;
+extended statistics; publications; views over it; storage parameters; a replica
+identity), with the outcomes [any target
+has](#target-tables-are-trellis-owned).
+
+Anything else refuses with `TargetNotAdoptable`, its message naming the
+property by code: `missing` (no such table, a `not_found` error),
+`not_a_table`, `partitioned`, `partition`, `inheritance`, `typed_table`,
+`unlogged`, `extension_member`, `access_method`, `not_empty`, `not_owner` (the
+defining role is neither its owner nor a member that inherits the owner's
+privileges, so it couldn't alter or drop it later), `privilege` (it lacks
+`SELECT`, `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` on it), `missing_column`,
+`extra_column`, `column_order`, `column_type`, `column_collation`,
+`column_nullability`, `column_default`, `generated_column`, `identity_column`,
+`key`, `owned_sequence`, and `unrecognized` for any constraint or object
+depending on the table the check doesn't know, so a new Postgres feature
+refuses until Trellis learns it (all `validation` errors).
+
+The emptiness and shape are checked under a lock that keeps writes and DDL out
+until define commits. Another definition's target in the same instance refuses
+with `TargetTableExists`, empty or not; another instance's empty target can't
+be told from a user's table, so don't adopt one (both instances would write
+it). The ledger (`<target>__ledger`) and hidden tables are always created by
+define: one whose name is taken refuses as without the opt-in.
+
+**If it appears after define:** n/a: an adopted target is an ordinary one after
+define; rows written into it by hand afterwards are the [known correctness
+gap](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema)
+any target has.
+
+**Remedy:** Choose another target name, give the instance its own target schema
+([instance-identity](instance-identity.md)), or drop or rename the existing
+relation. To adopt a table, make it match: the message names the first
+difference (empty it, fix the column, `ALTER TABLE … OWNER TO` the defining
+role or grant it membership in the owner `WITH INHERIT TRUE`, grant the missing
+privilege).
+
+#### A target that would take a read table's name
+
+**Condition:** A target, of any kind, that would take the name of a table
+another transform reads as its `FROM` or joined table: one dropped or renamed
+away since that transform was defined (while the table is still there, its name
+is taken: `TargetTableExists`), or one `ADOPT EXISTING TABLE` would adopt.
+
+**Refused at define:** Yes (`TargetNameHasReaders`), naming every such
+transform, whatever its status, a paused one included. The reader would
+otherwise go on reading the new target through its change feed and keep the
+rows it derived from the table that had the name, since the staging worker's
+pass treats a name that is a target's as fed by that target, not by capture.
+
+**If it appears after define:** n/a: once the target exists, a new reader of
+its name is a chain, and the target can't be dropped while one reads it
+(`DependentsBlockDrop`).
+
+**Remedy:** `DROP TRANSFORM` each reader the message names (pause it first if
+it is running), then define the target; or give the target another name.
+
+#### A target in a Trellis catalog schema
+
+**Condition:** A target in a Trellis catalog schema:
+`TRANSFORM <schema>.<target>` naming this instance's catalog schema, or a
+schema holding another instance's `trellis_instance` table (matched by schema
+name exactly as written, and by a table of that name, even one the role can't
+read). The target and its ledger would live there, and the other instance's
+uninstall (`drop schema … cascade`) would drop them.
+
+**Refused at define:** Yes (`TargetInCatalogSchema`, a `validation` error),
+before anything is created. An unqualified target takes
+`Config::target_schema`, which an attach already refuses to be either
+([instance-identity](instance-identity.md#a-catalog-schema-that-belongs-to-another-instance)).
+
+**If it appears after define:** A target schema that gains a `trellis_instance`
+table after define (another instance attached to it) pauses nothing, and the
+transform keeps running. `RESUME` re-validates and refuses with the same error,
+leaving the transform paused.
+
+**Remedy:** Put the target in an ordinary schema (`TRANSFORM reporting.t`).
+After define, `DROP TRANSFORM` it (paused) and define it again in an ordinary
+schema: removing the other instance's catalog from the schema would drop the
+target with it.
 
 ### Partitioned sources
 
@@ -740,7 +2520,7 @@ names the columns Trellis keys that table by, in the order written, instead of
 its primary key. A table with no primary key needs one. Every key space takes
 it, on either table of a `JOIN`. The key must be backed by a unique index over
 exactly those columns, and every transform reading the table names the same
-key (the key row of [Supported sources and targets](#supported-sources-and-targets)).
+key (the [key row](#the-key-a-transform-keys-each-table-by) of Supported sources and targets).
 The rendered definition, and so a schema dump, carries it. A definition that
 writes it carries the release that added it as its [floor](#floors).
 

@@ -67,7 +67,7 @@ define doesn't, where the only repair is to `DROP TRANSFORM` and define again:
 
 A 1-1 definition whose source key changed while it was paused has its target
 re-keyed in place to the new key first, or the resume refuses naming what
-blocks it ([the key row](transforms.md#supported-sources-and-targets)).
+blocks it ([the key row](transforms.md#the-key-a-transform-keys-each-table-by)).
 
 A `JOIN` has no ledger. Its resume drops and recreates its hidden tables
 instead, keeps the target, and rebuilds both sides and the target's groups
