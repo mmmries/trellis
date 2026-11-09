@@ -1558,11 +1558,18 @@ impl Parser {
                 // Postgres's three constant keywords. They are reserved, so
                 // never a column; what follows one is read as after any
                 // operand (`null(1)` is refused, as Postgres refuses it).
-                match upper.as_str() {
-                    "TRUE" => return Ok(Expr::BooleanLiteral(true)),
-                    "FALSE" => return Ok(Expr::BooleanLiteral(false)),
-                    "NULL" => return Ok(Expr::Null),
-                    _ => {}
+                // Grammar 1 read each as a name, as if quoted, like every
+                // other name (ADR-0018): it had no such literals, so stored
+                // grammar-1 text naming one reads that column or field.
+                let constant_is_a_name = self.identifiers == Identifiers::Exact
+                    && matches!(upper.as_str(), "TRUE" | "FALSE" | "NULL");
+                if !constant_is_a_name {
+                    match upper.as_str() {
+                        "TRUE" => return Ok(Expr::BooleanLiteral(true)),
+                        "FALSE" => return Ok(Expr::BooleanLiteral(false)),
+                        "NULL" => return Ok(Expr::Null),
+                        _ => {}
+                    }
                 }
 
                 if NON_IMMUTABLE_NAMES.contains(&upper.as_str()) {
@@ -1613,7 +1620,7 @@ impl Parser {
                 // quoted (ADR-0022). Before `(` it is a construct or function name
                 // (`left(...)`), after a `.` it is a label (read by
                 // `parse_dotted_reference`), neither of which reaches here.
-                if is_reserved_word(&upper) && !self.peek_is_symbol('(') {
+                if is_reserved_word(&upper) && !constant_is_a_name && !self.peek_is_symbol('(') {
                     return Err(ParseError::ReservedWord { name });
                 }
 

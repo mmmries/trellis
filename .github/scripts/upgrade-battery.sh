@@ -422,7 +422,7 @@ mkdir -p "$work/cluster-a"
 start_cluster "$work/cluster-a" "$port"
 pg_major=$("$pg_bin/psql" -X -At -h 127.0.0.1 -p "$port" -U postgres -d postgres -c "show server_version_num")
 [ "$pg_major" -ge 150000 ] || die "PostgreSQL 15 or later is required (partitioned sources); this is $pg_major"
-for d in shapes inflight ctl mixed clients keys; do sql "$port" postgres -c "create database $d"; done
+for d in shapes inflight ctl mixed clients keys consts; do sql "$port" postgres -c "create database $d"; done
 
 # ---------------------------------------------------------------- prep: shapes
 say "building the $old_tag databases"
@@ -597,6 +597,32 @@ EOF
   stop_run old-keys
 fi
 
+# consts: columns named null and false, which a release before 0.2.0 read
+# bare as names. The candidate reads a bare null/false as a literal in new text
+# and must keep reading the column in these stored definitions (ADR-0018).
+consts_defs="cn_copy cn_coalesce cf_copy"
+consts_diff() { # the rows where a target differs from Postgres's reading of the column
+  scalar "$port" consts "select (select count(*) from ((select id, \"null\" from c except select id, x from cn_copy) union all (select id, x from cn_copy except select id, \"null\" from c)) d)
+    + (select count(*) from ((select id, coalesce(\"null\", a) from c except select id, x from cn_coalesce) union all (select id, x from cn_coalesce except select id, coalesce(\"null\", a) from c)) d)
+    + (select count(*) from ((select id, \"false\" from c except select id, x from cf_copy) union all (select id, x from cf_copy except select id, \"false\" from c)) d)"
+}
+consts_converged() { [ "$(consts_diff 2>/dev/null)" = 0 ]; }
+if want grammar; then
+  sql "$port" consts <<'EOF2'
+create table c(id bigint primary key, a bigint, "null" bigint, "false" boolean);
+insert into c select g, g, case when g % 4 = 0 then null else 10 * g end, g % 2 = 0 from generate_series(1,200) g;
+EOF2
+  seed_rows=$((seed_rows + 200))
+  apply_old consts 'TRANSFORM cn_copy FROM c SELECT null AS x'
+  apply_old consts 'TRANSFORM cn_coalesce FROM c SELECT COALESCE(null, a) AS x'
+  apply_old consts 'TRANSFORM cf_copy FROM c SELECT false AS x'
+  run_bg old-consts "$port" consts "$old_bin"
+  # shellcheck disable=SC2086
+  WAIT=120 wait_all "$port" consts "$old_bin" live $consts_defs || die "the consts definitions did not go live (see $logs/run-old-consts.log)"
+  wait_for 60 "$old_tag's consts targets to equal the columns" consts_converged || die "$old_tag's consts targets do not read the columns: $(consts_diff) rows differ"
+  stop_run old-consts
+fi
+
 # clients: built and run by the old CLI only, for the manual client step; the
 # candidate never opens it, so the old client opens it first.
 if want clients; then
@@ -616,6 +642,7 @@ stop_run old-shapes
 run_bg new-shapes "$port" shapes "$candidate_bin"
 run_bg new-inflight "$port" inflight "$candidate_bin"
 ! want grammar || run_bg new-keys "$port" keys "$candidate_bin"
+! want grammar || run_bg new-consts "$port" consts "$candidate_bin"
 sleep 8
 stop_writers
 live_shapes=$shapes_expected_live
@@ -800,6 +827,44 @@ keys_grammar() {
   stop_run new-keys
 }
 
+# consts_grammar: the consts database (prep: consts). Each definition reading a
+# column named null or false bare keeps reading the column after changes,
+# compared against Postgres, not only self_check; the same text defined now
+# reads the literal and is stamped grammar 2.
+consts_grammar() {
+  local p=$port d=consts diff v
+  # shellcheck disable=SC2086
+  if ! WAIT=120 wait_all "$p" "$d" "$candidate_bin" live $consts_defs; then
+    record FAIL grammar "the consts definitions are not live:$(missing_status "$p" "$d" "$candidate_bin" live $consts_defs)"
+    stop_run new-consts
+    return
+  fi
+  sql "$p" "$d" -c "update c set \"null\" = \"null\" + 1, a = a + 1, \"false\" = not \"false\" where id <= 50" \
+    -c "update c set \"null\" = null where id between 51 and 60" \
+    -c "insert into c select g, g, 10 * g, g % 3 = 0 from generate_series(201, 250) g"
+  if wait_for 60 "the consts targets to equal the columns" consts_converged; then
+    record PASS grammar "stored null AS x, COALESCE(null, a) AS x and false AS x keep reading the columns named null and false, compared against Postgres"
+  else
+    diff=$(consts_diff)
+    record FAIL grammar "a stored definition reading a column named null or false bare reads something else: $diff rows differ from Postgres"
+  fi
+  # shellcheck disable=SC2086
+  check_self "$p" "$d" grammar $consts_defs
+  if trellis "$p" "$d" "$candidate_bin" apply 'TRANSFORM cn_fresh FROM c SELECT COALESCE(null, a) AS x' >/dev/null 2>&1 &&
+    WAIT=120 wait_all "$p" "$d" "$candidate_bin" live cn_fresh; then
+    v=$(scalar "$p" "$d" "select grammar_version from trellis.transform_definitions where target_table = 'public.cn_fresh'")
+    diff=$(scalar "$p" "$d" "select count(*) from ((select id, a from c except select id, x from cn_fresh) union all (select id, x from cn_fresh except select id, a from c)) d")
+    if [ "$v" = 2 ] && [ "$diff" = 0 ]; then
+      record PASS grammar "COALESCE(null, a) defined now reads the literal, stamped grammar 2"
+    else
+      record FAIL grammar "COALESCE(null, a) defined now: grammar_version $v, $diff rows differ from a"
+    fi
+  else
+    record FAIL grammar "COALESCE(null, a) defined now did not go live: $(status_of "$p" "$d" "$candidate_bin" cn_fresh)"
+  fi
+  stop_run new-consts
+}
+
 if want grammar; then
   say "3. definitions the candidate refuses that $old_tag accepted"
   for n in ledger_copy deep deep2; do
@@ -828,6 +893,7 @@ if want grammar; then
     record FAIL grammar "the remedy did not apply: $rem"
   fi
   keys_grammar
+  consts_grammar
   record MANUAL grammar "not exercised: an index over more than 32 key columns, a table over 1600 columns ($old_tag cannot build either here), and any refusal added after this script; see the runbook"
 else
   record SKIP grammar "not selected"

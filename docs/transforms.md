@@ -2642,10 +2642,14 @@ attaches, its `capture_failure` naming the refusal, until you drop it and
 define it again; the other transforms keep running. A stored definition
 can be rewritten to the current version without a rebuild. Text is stamped
 with the oldest version that reads it the same, so a definition with no
-quoted name and no upper-case letter in a name is grammar 1 whichever release
-wrote it. Grammar 2 reads [names](#names) as Postgres does; a grammar-1
-definition, written by 0.1.x, keeps its names' case, as if each were quoted,
-and `ALTER TRANSFORM` stores it quoted (`SUM("Amount")`). The rules are in
+quoted name, no upper-case letter in a name and no `TRUE`, `FALSE` or `NULL`
+literal is grammar 1 whichever release wrote it. Grammar 2 reads
+[names](#names) as Postgres does; a grammar-1 definition, written by 0.1.x,
+keeps its names' case, as if each were quoted, and `ALTER TRANSFORM` stores it
+quoted (`SUM("Amount")`). Grammar 1 had no `TRUE`, `FALSE` or `NULL` literal:
+a bare one, in any case, named a column or calculated field, and a grammar-1
+definition keeps reading that name (`COALESCE(null, a)` reads the column
+`"null"`). The rules are in
 [0018-grammar-versioning](decisions/0018-grammar-versioning.md).
 
 ## Floors
