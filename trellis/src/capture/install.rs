@@ -888,6 +888,24 @@ fn function_names(table: &str) -> Result<Vec<String>, CaptureError> {
         .collect()
 }
 
+/// Whether `table` has any of its own capture functions: a captured root's
+/// tree, or a plain captured table, rather than a table detached from one.
+async fn has_functions(
+    client: &impl GenericClient,
+    schema: &str,
+    table: &str,
+) -> Result<bool, CaptureError> {
+    Ok(client
+        .query_one(
+            "select exists (select 1 from pg_catalog.pg_proc p \
+             where p.proname = any($2) and p.pronamespace = ( \
+                 select oid from pg_catalog.pg_namespace where nspname = $1))",
+            &[&schema, &function_names(table)?],
+        )
+        .await?
+        .get(0))
+}
+
 fn trigger_names(schema: &str) -> Vec<String> {
     CaptureEvent::ALL
         .into_iter()
@@ -1215,6 +1233,13 @@ async fn attempt(
         locks::set_local_lock_timeout(&txn, lock_timeout).await?;
         txn.batch_execute(&op.lock_statement()?).await?;
     }
+    // An uninstall of a table with no capture functions of its own: one
+    // detached from a captured root's tree, still carrying that root's
+    // triggers on its nodes.
+    let detached = match op {
+        Op::Uninstall { table, .. } if locks => !has_functions(&txn, schema, table).await?,
+        _ => false,
+    };
     // The pass lists the tables to uninstall when it starts
     // (`reconcile::installed_tables`). A leaf detached from a captured root
     // is one of them, and may be attached to the root again before this
@@ -1222,9 +1247,11 @@ async fn attempt(
     // would look to the next pass like a disruption of a recorded node. So the
     // list is read again under the lock, which an `ATTACH` of the table (or
     // of any table above a node of it) waits for, and a table no longer on
-    // it is left as it is.
+    // it is left as it is. A table with functions of its own is a captured
+    // root, which the list always holds, so only a detached one is looked
+    // for: the read is no cost per node of a large root's uninstall.
     if let Op::Uninstall { table, .. } = op
-        && locks
+        && detached
         && !super::reconcile::installed_tables(&txn, schema)
             .await?
             .contains(table)
@@ -1261,11 +1288,21 @@ async fn attempt(
                     }
                 }
             }
-            for node in nodes {
-                statements.extend(sql::drop_node_trigger_statements(schema, &node)?);
+            for node in &nodes {
+                statements.extend(sql::drop_node_trigger_statements(schema, node)?);
             }
             if !matches!(scope, Scope::Node(_)) {
                 statements.extend(sql::uninstall_statements(schema, table, table_exists)?);
+                if table_exists {
+                    nodes.push(table.to_string());
+                }
+            }
+            // Whichever root's record names these as its nodes, Trellis is
+            // dropping their triggers (`triggers::forget_as_nodes`). One node
+            // of a captured root's tree is forgotten from its root's record
+            // below.
+            if detached || !matches!(scope, Scope::Node(_)) {
+                super::triggers::forget_as_nodes(&txn, &nodes).await?;
             }
             statements
         }
