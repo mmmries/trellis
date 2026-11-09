@@ -34,6 +34,7 @@ pub const SCENARIOS: &[&str] = &[
     "self-check-walk",
     "one-to-one-apply",
     "one-to-one-join-fan-out",
+    "one-to-one-join-root",
     "one-to-one-join-poison",
     "one-to-one-join-seam",
 ];
@@ -314,6 +315,10 @@ fn join_tuning(args: &[String]) -> EngineTuning {
 /// rows), `--poison-rows` (100,000), `--timeout-secs` (3,600) and `--statements`
 /// (print the busiest statements; for a `--reps 1 --probe-reps 0` run),
 /// `--background-rows` (1,000 rows of `a` off the hot key) and `--analyze-hidden`.
+/// `--joined` (1 to 4 joined tables beside the root, 1) shapes the star,
+/// `--fan-out-position` (1) is the joined table the fan-out updates, and
+/// `one-to-one-join-root` takes `--root-rows` (200,000) and `--commit-rows`
+/// (1,000).
 fn one_to_one_join_config(args: &[String]) -> one_to_one_join::OneToOneJoin {
     let list = |name: &str, default: &[i64]| -> Vec<i64> {
         number_list(args, name).map_or_else(
@@ -334,7 +339,12 @@ fn one_to_one_join_config(args: &[String]) -> one_to_one_join::OneToOneJoin {
         background_rows: number(args, "--background-rows")
             .map_or(one_to_one_join::BACKGROUND_ROWS, |v| v as i64),
         analyze_hidden: args.iter().any(|a| a == "--analyze-hidden"),
+        joined: count("--joined", 1),
+        position: count("--fan-out-position", 1),
+        root_rows: number(args, "--root-rows").map_or(200_000, |v| v as i64),
+        commit_rows: number(args, "--commit-rows").map_or(1_000, |v| v as i64),
     };
+    cfg.validate();
     assert!(cfg.reps >= 1, "--reps must be at least 1");
     assert!(
         cfg.fan_outs.iter().all(|f| *f >= 2),
@@ -656,6 +666,13 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             let cfg = one_to_one_join_config(args);
             let tuning = join_tuning(args);
             let results = runtime().block_on(one_to_one_join::run_fan_outs(&cfg, &tuning));
+            Some(results.iter().all(|r| r.landed && r.oracle_mismatches == 0))
+        }
+
+        "one-to-one-join-root" => {
+            let cfg = one_to_one_join_config(args);
+            let tuning = join_tuning(args);
+            let results = runtime().block_on(one_to_one_join::run_roots(&cfg, &tuning));
             Some(results.iter().all(|r| r.landed && r.oracle_mismatches == 0))
         }
 
@@ -1074,6 +1091,32 @@ mod tests {
             one_to_one_join::BACKGROUND_ROWS,
             "the hot key is the only large group unless asked"
         );
+    }
+
+    #[test]
+    fn one_to_one_join_is_the_two_table_shape_unless_told() {
+        let cfg = one_to_one_join_config(&argv(&["one-to-one-join-root"]));
+        assert_eq!((cfg.joined, cfg.position), (1, 1));
+        assert_eq!((cfg.root_rows, cfg.commit_rows), (200_000, 1_000));
+        let cfg = one_to_one_join_config(&argv(&[
+            "one-to-one-join-fan-out",
+            "--joined",
+            "4",
+            "--fan-out-position",
+            "4",
+            "--root-rows",
+            "5000",
+            "--commit-rows",
+            "500",
+        ]));
+        assert_eq!((cfg.joined, cfg.position), (4, 4));
+        assert_eq!((cfg.root_rows, cfg.commit_rows), (5_000, 500));
+    }
+
+    #[test]
+    #[should_panic(expected = "--joined must be 1 to 4")]
+    fn a_star_of_more_than_five_tables_is_refused() {
+        one_to_one_join_config(&argv(&["one-to-one-join-fan-out", "--joined", "5"]));
     }
 
     #[test]
