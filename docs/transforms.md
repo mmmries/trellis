@@ -125,7 +125,8 @@ TRANSFORM` and defining again ([recommendations](recommendations.md#statement_ti
 source can drift after define are in
 [known correctness gaps](known-correctness-gaps.md).
 
-Other writers are not affected by the subscription rule: a session with
+Other writers are not affected by the [subscription
+rule](#a-table-a-logical-replication-subscription-replicates-into): a session with
 `session_replication_role = replica` fires the capture triggers, which are
 `ENABLE ALWAYS` ([stage 1](staging-and-claiming/01-capture-by-triggers.md)).
 Changing a source key's collation to another deterministic one is safe, though
@@ -746,7 +747,7 @@ type.
 
 **Condition:** `<`, `<=`, `>`, `>=` over `text`. `=`, `<>`, `!=` and
 `IS [NOT] DISTINCT FROM` over text are admitted (under a deterministic
-collation, row above).
+collation, [row above](#a-nondeterministic-collation-on-a-key-or-compared-column)).
 
 **Refused at define:** Yes (`TextOrderingComparison`). The order of text
 depends on the collation, which Trellis does not evaluate.
@@ -2519,7 +2520,7 @@ names the columns Trellis keys that table by, in the order written, instead of
 its primary key. A table with no primary key needs one. Every key space takes
 it, on either table of a `JOIN`. The key must be backed by a unique index over
 exactly those columns, and every transform reading the table names the same
-key (the key row of [Supported sources and targets](#supported-sources-and-targets)).
+key (the [key row](#the-key-a-transform-keys-each-table-by) of Supported sources and targets).
 The rendered definition, and so a schema dump, carries it. A definition that
 writes it carries the release that added it as its [floor](#floors).
 
