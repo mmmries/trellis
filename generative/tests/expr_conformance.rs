@@ -833,6 +833,11 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
          = 9007199254740992 THEN 1 ELSE 2147483647 + 1 END",
         "CASE WHEN COALESCE(16777217, CAST(NULL AS real)) <> 16777216 \
          THEN 2147483647 + 1 ELSE 1 END",
+        // A `NULL` operand and `NULLIF(NULL, x)` keep the float's own type.
+        "CASE WHEN COALESCE(CAST(NULL AS real) + NULL, 16777217) = 16777216 \
+         THEN 0 ELSE 2147483647 + 1 END",
+        "CASE WHEN COALESCE(NULLIF(NULL, DOUBLE PRECISION '0'), 9007199254740993) \
+         = 9007199254740992 THEN 0 ELSE 2147483647 + 1 END",
         // A float divisor that really is nonzero.
         "1 / (COALESCE(DOUBLE PRECISION '0', -9223372036854775809) \
          - NULLIF(-9223372036854775808, 2147483648))",

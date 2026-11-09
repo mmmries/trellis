@@ -1386,6 +1386,18 @@ fn a_constant_divisor_that_is_zero_in_the_resolved_float_type_is_refused() {
             N,
         ),
         ("1 / (COALESCE(NULL, 16777217, n) - 16777216)", N),
+        // A guard over the same types is decided as Postgres decides it, so
+        // the overflow it guards is dropped, not refused.
+        (
+            "CASE WHEN COALESCE(CAST(NULL AS real) + NULL, 16777217) = 16777216 \
+             THEN 0 ELSE 2147483647 + 1 END",
+            I4,
+        ),
+        (
+            "CASE WHEN COALESCE(NULLIF(NULL, DOUBLE PRECISION '0'), 9007199254740993) \
+             = 9007199254740992 THEN 0 ELSE 2147483647 + 1 END",
+            I4,
+        ),
     ] {
         assert_type(text, expected);
     }
