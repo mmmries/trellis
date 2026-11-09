@@ -322,3 +322,139 @@ async fn a_0_1_0_numeric_sum_is_converted_in_place_and_a_nan_one_rebuilt() {
     self_check_clean(&trellis, &["fin", "poi", "jn"]).await;
     trellis.shutdown().await.expect("shutdown");
 }
+
+/// Gives the hidden `table` 0.1.1's encoding of a `NaN` before it takes
+/// 0.1.0's layout ([`table_to_0_1_0`]): 0.1.1 counted each `NaN` its sum
+/// summed by adding `10^2100` to `__sum_1` (a `JOIN` product times its
+/// matches), where this release counts it in the map of exceptions.
+async fn table_to_0_1_1(raw: &Client, table: &str) {
+    raw.batch_execute(&format!(
+        "update {table} set __sum_1 = __sum_1 + 1e2100 * (__scales_1->>'NaN')::numeric \
+         where __scales_1 ? 'NaN'"
+    ))
+    .await
+    .expect("0.1.1's NaN weight");
+    table_to_0_1_0(raw, table).await;
+}
+
+/// A 0.1.1 definition's `numeric(p,s)` sum holding a `NaN` (#1827): 0.1.1
+/// added `10^2100` per `NaN` to the stored sum and read it as `NaN` from
+/// half of that. This release counts a `NaN` in the map of exceptions
+/// instead, so the attach rebuilds such a definition as it does a 0.1.0
+/// one stuck at `NaN`; left as stored, the sum would read as a 2,100-digit
+/// number once its group changed, and stay off by `10^2100` after the
+/// `NaN` left. Every page after the upgrade follows Postgres's text.
+#[tokio::test]
+async fn a_0_1_1_nan_weighted_numeric_sum_is_rebuilt() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    raw.batch_execute(
+        "create table public.w (id integer primary key, g integer, v numeric(10,2)); \
+         insert into public.w values (1, 1, 1.25), (2, 1, 'NaN'), (3, 2, 2.50), \
+             (4, 3, 3.75), (5, 3, 'NaN'), (6, 3, 'NaN'), (7, 4, null); \
+         create table public.d (id integer primary key, g integer, r text); \
+         insert into public.d values (1, 1, 'a'), (2, 3, 'a'), (3, 3, 'b'), (4, 2, 'b')",
+    )
+    .await
+    .expect("sources");
+    let trellis = running(&db).await;
+    trellis
+        .apply(
+            "TRANSFORM wt FROM public.w GROUP BY g WITHOUT SOURCE INDEX \
+             SELECT g AS g, SUM(v) AS t, AVG(v) AS a, COUNT(v) AS c",
+        )
+        .await
+        .expect("define");
+    trellis
+        .apply(
+            "TRANSFORM wj FROM public.w JOIN public.d ON w.g = d.g GROUP BY d.r \
+             WITHOUT SOURCE INDEX SELECT d.r AS r, SUM(w.v) AS t, AVG(w.v) AS a, \
+             COUNT(w.v) AS c",
+        )
+        .await
+        .expect("define the JOIN");
+    wait_for(&trellis, &["wt", "wj"], TransformStatus::Live).await;
+    converge(&trellis).await;
+    trellis.shutdown().await.expect("shutdown");
+
+    let (wt, wj) = (id_of(&raw, "wt").await, id_of(&raw, "wj").await);
+    let tables = [
+        format!("{DEFAULT_SCHEMA}.agg_{wt}"),
+        format!("{DEFAULT_SCHEMA}.join_{wj}_p"),
+        format!("{DEFAULT_SCHEMA}.join_{wj}_t"),
+    ];
+    for table in &tables {
+        table_to_0_1_1(&raw, table).await;
+    }
+    for id in [wt, wj] {
+        raw.execute(
+            "update transform_definitions set floor_version = '0.1.0' where id = $1",
+            &[&id],
+        )
+        .await
+        .expect("the 0.1.x floor");
+    }
+    // The fixture is 0.1.1's: group 3's sum is `3.75 + 2 × 10^2100`.
+    let weighted: String = raw
+        .query_one(
+            &format!("select __sum_1::text from {DEFAULT_SCHEMA}.agg_{wt} where g = 3"),
+            &[],
+        )
+        .await
+        .expect("the weighted sum")
+        .get(0);
+    assert!(
+        weighted.starts_with('2') && weighted.ends_with("3.75") && weighted.len() > 2100,
+        "{}",
+        &weighted[..20]
+    );
+
+    let upgrade = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("config"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    upgrade.migrate().await.expect("the upgrade's attach");
+    upgrade.shutdown().await.expect("shutdown");
+    let trellis = running(&db).await;
+    wait_for(&trellis, &["wt", "wj"], TransformStatus::Live).await;
+    converge(&trellis).await;
+
+    let pages = [
+        (
+            "select format('%s %s %s %s', g, t, a, c) from public.wt",
+            "select format('%s %s %s %s', g, sum(v), avg(v), count(v)) from public.w group by g",
+        ),
+        (
+            "select format('%s %s %s %s', r, t, a, c) from public.wj",
+            "select format('%s %s %s %s', d.r, sum(w.v), avg(w.v), count(w.v)) \
+             from public.w join public.d on w.g = d.g group by d.r",
+        ),
+    ];
+    let check = async |when: &str| {
+        for (actual, expected) in pages {
+            assert_eq!(
+                difference(&raw, actual, expected).await,
+                Vec::<String>::new(),
+                "{actual} {when}"
+            );
+        }
+    };
+    check("after the upgrade").await;
+    self_check_clean(&trellis, &["wt", "wj"]).await;
+    for step in [
+        "delete from public.w where id = 2",
+        "delete from public.w where id = 5",
+        "update public.w set v = 1.00 where id = 6",
+        "insert into public.w values (8, 2, 'NaN')",
+        "delete from public.w where id = 8; update public.w set v = 0.05 where id = 3",
+    ] {
+        raw.batch_execute(step).await.expect(step);
+        converge(&trellis).await;
+        check(step).await;
+    }
+    self_check_clean(&trellis, &["wt", "wj"]).await;
+    trellis.shutdown().await.expect("shutdown");
+}

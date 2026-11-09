@@ -6,7 +6,10 @@
 //! map of exceptions. Every value of the column has scale `s`, so a finite
 //! stored sum with a count above 0 has scale `s` too: with `s` as its
 //! reference scale, its map is empty. A `NaN` it summed made the stored sum
-//! `NaN` for good, which no count recovers.
+//! `NaN` for good (0.1.0), which no count recovers, or added `10^2100` to
+//! it (0.1.1), which this release's sums never take back out: either way
+//! the stored sum says so ([`counts_nan`]), and no finite sum of a
+//! `numeric(p,s)` column could.
 //!
 //! At attach ([`super::grammar::pause_unloadable_in`]) each hidden table that
 //! lacks the partials of a `numeric` argument gains them in place
@@ -16,7 +19,7 @@
 //! (or every row, for a column that declares none now) is written: its map
 //! counts its values at that scale. The definition's floor is stamped again, now that its tables have
 //! a layout an older release can't read (ADR-0024). A definition with a group
-//! whose stored sum is `NaN` is rebuilt in place, which recomputes every
+//! whose stored sum counts a `NaN` is rebuilt in place, which recomputes every
 //! group from its source; one that doesn't apply (paused) rebuilds on its
 //! resume. A definition whose stored text this release can't read is left
 //! unconverted: the attach pauses it, naming the fix, and its redefine
@@ -25,6 +28,17 @@
 use crate::defs::ast::KeySpace;
 use crate::defs::floor::Floors;
 use crate::staging::group_basis::{self, NUMERIC_PARTS, SumPart};
+
+/// Whether the stored sum `sum` (a column) of a release before the map of
+/// exceptions counts a `NaN`: `NaN` itself (0.1.0), or a magnitude of at
+/// least `5 × 10^2099` (0.1.1, which added `10^2100` per `NaN` and read
+/// the sum as `NaN` from half of that). A `numeric(p,s)` value is below
+/// `10^(p-s)`, at most `10^2000`, so no finite sum of one (under `2^63`
+/// rows, times as many `JOIN` matches) gets near it. `NaN` sorts above
+/// every number, so the comparison alone catches both.
+fn counts_nan(sum: &str) -> String {
+    format!("abs({sum}) >= 5e2099")
+}
 
 /// An error of the conversion, as the attach reports it.
 fn failed(e: impl std::fmt::Display) -> crate::Error {
@@ -215,7 +229,8 @@ async fn numeric_tables(
 
 /// Gives `table` the partials of each `numeric` argument it lacks (see the
 /// module doc), in place. Returns `None` when it lacked none (or doesn't
-/// exist), and otherwise whether a row's stored sum of one of them is `NaN`.
+/// exist), and otherwise whether a row's stored sum of one of them counts a
+/// `NaN` ([`counts_nan`]).
 pub(crate) async fn convert_table(
     txn: &tokio_postgres::Transaction<'_>,
     table: &NumericTable,
@@ -247,7 +262,7 @@ pub(crate) async fn convert_table(
     let t = &table.table;
     let nan: Vec<String> = lacking
         .iter()
-        .map(|(i, _)| format!("{} = 'NaN'::numeric", SumPart::Sum.hidden(*i)))
+        .map(|(i, _)| counts_nan(&SumPart::Sum.hidden(*i)))
         .collect();
     let nan: bool = txn
         .query_one(
@@ -279,13 +294,13 @@ pub(crate) async fn convert_table(
         comments.push((i, scale));
         if summed {
             // A row whose finite values aren't at the reference scale: its
-            // map counts them at its stored sum's.
+            // map counts them at its stored sum's. A row counting a `NaN`
+            // is left alone: its definition is rebuilt.
             let (count, sum) = (format!("__count_{i}"), SumPart::Sum.hidden(i));
+            let finite = format!("not {}", counts_nan(&sum));
             let off = match scale {
-                Some(s) => {
-                    format!("{count} > 0 and {sum} <> 'NaN'::numeric and scale({sum}) <> {s}")
-                }
-                None => format!("{count} > 0 and {sum} <> 'NaN'::numeric"),
+                Some(s) => format!("{count} > 0 and {finite} and scale({sum}) <> {s}"),
+                None => format!("{count} > 0 and {finite}"),
             };
             sets.push(format!(
                 "{} = case when {off} then jsonb_build_object(scale({sum})::text, {count}) end",

@@ -502,7 +502,12 @@ pre_col_paused=$(paused_columns "$port" shapes)
 [ "$pre_col_paused" = 1 ] || die "the column pause was not recorded"
 
 start_writers "$port" shapes
+# NaN in a numeric(p,s) SUM (cust_totals, cust_join): one stays in customer
+# 7's group, one comes and goes in customer 8's. v0.1.0 leaves a sum NaN for
+# good, v0.1.1 adds a weight per NaN; the candidate's takeover rebuilds both.
+sql "$port" shapes -c "insert into orders values (3001, 7, 'NaN', 'nan'), (3002, 8, 'NaN', 'nan')"
 sleep 4
+sql "$port" shapes -c "delete from orders where id = 3002"
 sql "$port" shapes -c "update ledger set n = 1000 where id = 5"
 wait_for 60 "the held key" held_key "$port" shapes || die "the overflowing key was not quarantined"
 
