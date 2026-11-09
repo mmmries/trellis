@@ -149,12 +149,13 @@ zero raises Postgres's SQLSTATE for the row. Define doesn't evaluate
 constants: Postgres's constant folding is its planner's, which changes between
 majors, and Trellis never claims the planner's verdict on a constant. A
 constant that Postgres folds and fails while planning (`2147483647 + 1`) fails
-every row the way any per-row error does: the failing rows are quarantined
-with Postgres's error, and a fuse stops the field or the definition (an
-aggregate's build, which fails whole, pauses the definition). A definition can
-therefore define and then quarantine every row, possibly while it is `live`
-when its source is empty at define; that is a loud stop, never a target that
-silently lacks rows. The one constant Trellis refuses is a `/` or `%` whose
+every row the way any per-row error does, with Postgres's error, and the
+quarantine fuses of [ADR-0003](0003-quarantine-storage-and-api.md) stop it: a
+1-1 applying changes holds its first failing rows, then its column fuse
+pauses the field, so new rows get `NULL` for it while its other fields keep
+updating and the definition stays `live`; a build over existing rows, and a
+`JOIN`, quarantine the definition; an aggregate's build, which fails whole,
+pauses it. The one constant Trellis refuses is a `/` or `%` whose
 divisor is written as a literal zero, which it refuses by its text, wherever
 it sits (below). The conformance harness
 ([generative test suite](../generative-test-suite.md#expression-conformance))

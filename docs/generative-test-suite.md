@@ -241,7 +241,7 @@ Postgres, over a throwaway table of random rows (`NULL`, extremes, `NaN`,
 Postgres folds constants while it plans, and define evaluates none of them
 ([ADR-0022](decisions/0022-grammar-mirrors-postgres.md)): an expression
 Postgres rejects for every row while planning (`2147483647 + 1`) defines, and
-its rows fail at run time and are quarantined. The Value property treats
+its rows fail at run time like any per-row error. The Value property treats
 "admitted, and Postgres raises class 22 on a `WHERE false` probe" as agreement
 (failing while planning), and flags a refusal where Postgres plans the
 expression without error (a false refusal) and an acceptance where Postgres
