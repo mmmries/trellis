@@ -343,16 +343,16 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
     })
 }
 
-/// The targets of `installed`'s two-table 1-1 `JOIN` definitions, which the
-/// in-run invariant samples. A star's is left out: the snapshot read covers
-/// position 1 alone, and `invariant::check_star` takes every position's.
+/// The targets of `installed`'s 1-1 `JOIN` definitions, stars included,
+/// which the in-run invariant samples (its snapshot read covers every
+/// position).
 fn join1_targets(installed: &[TransformDef]) -> Vec<String> {
     installed
         .iter()
         .filter(|def| {
             matches!(
                 &def.key_space,
-                trellis::dev::defs::ast::KeySpace::JoinOneToOne(join) if join.joins.len() == 1
+                trellis::dev::defs::ast::KeySpace::JoinOneToOne(_)
             )
         })
         .map(|def| def.target.clone())
@@ -401,10 +401,10 @@ mod tests {
         OnShape, OneToOneField, OneToOneSpec, StarPosition, one_to_one_definition,
     };
 
-    /// The in-run invariant samples a two-table 1-1 JOIN's target and no
-    /// star's: the snapshot read covers position 1 alone.
+    /// The in-run invariant samples a two-table 1-1 JOIN's target and a
+    /// star's.
     #[test]
-    fn the_sampler_leaves_stars_out() {
+    fn the_sampler_samples_stars() {
         let spec = |more: Vec<StarPosition>| OneToOneSpec {
             left: true,
             on: OnShape::KeyPk,
@@ -421,6 +421,6 @@ mod tests {
                 fields: vec![OneToOneField::BW],
             }]),
         );
-        assert_eq!(super::join1_targets(&[two, star]), ["two"]);
+        assert_eq!(super::join1_targets(&[two, star]), ["two", "star"]);
     }
 }

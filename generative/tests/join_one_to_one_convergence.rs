@@ -455,92 +455,11 @@ proptest! {
     }
 }
 
-/// The `Join1*` plants this tier doesn't gate, each with why: the runner can't
-/// draw the state it needs, or the target it leaves is repaired before a
-/// burst settles. The deterministic pin named in `trellis/src/plant.rs` gates
-/// each. Rates are of the 24 cases of seeds 1 to 4 (six cases each).
+/// The 1-1 `JOIN` plants neither this tier nor the star tier gates, each with
+/// why: the runner can't draw the state it needs, or its only failure is one
+/// the engine repairs. The deterministic pin named in `trellis/src/plant.rs`
+/// gates each. Rates are of the 24 cases of seeds 1 to 4 (six cases each).
 const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
-    (
-        "star_root_skip_j_last",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_root's ps1a, ps2, ps5 and cx_f2e pin it",
-    ),
-    (
-        "star_root_skip_j_first",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_root's ps1b and cx_f2e pin it",
-    ),
-    (
-        "star_root_skip_j_middle",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_root's a_root_moving_every_key_races_a_change_of_its_new_key_at_the_middle_position, \
-         and join_star_n4's f14a and middle-position Re-derive pins, pin it",
-    ),
-    (
-        "star_late_skip_last",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_root's ps4a pin it",
-    ),
-    (
-        "star_late_skip_first",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_root's ps4b pin it",
-    ),
-    (
-        "star_own_j_only",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_joined's cx_f1a to cx_f1f and cx_f6e, and \
-         join_star_crossing's per-position target batch pin, and join_star_n4's f14a, f15a \
-         and f13a, pin it",
-    ),
-    (
-        "star_r_after_m",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_joined's cx_f1a, cx_f1b, cx_f1e and cx_f6e pin it",
-    ),
-    (
-        "star_last_no_r",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_joined's cx_f1a and cx_f1c pin it",
-    ),
-    (
-        "star_r_split",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781), and fails by deadlock, which the engine retries; \
-         join_star_crossing's cx_f3b and, at n = 4 (positions 1 and 2, then 3), \
-         join_star_n4's f13a pin it",
-    ),
-    (
-        "star_recheck_j",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_joined's cx_f11a and ps7 pin it",
-    ),
-    (
-        "star_recheck_skip_last",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_joined's cx_f11a and ps7 (swapped), and \
-         join_star_n4's f15a and ps7 at n = 4, pin it",
-    ),
-    (
-        "star_chunk_no_r",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_fan_out's cx_f10a and cx_f10c pin it",
-    ),
-    (
-        "star_truncate_keeps_other_markers",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_fan_out's xt2 pins pin it",
-    ),
-    (
-        "star_chunk_skip_j_last",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_build's ps6a pins it",
-    ),
-    (
-        "star_chunk_skip_j_first",
-        "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781); join_star_build's ps6b pins it",
-    ),
     (
         "star_j_unsorted",
         "it leaves the J statements unsorted, which only changes the order two pages queue \
@@ -572,29 +491,147 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
          it fired in 9 of 24 cases and was caught in none; \
          `join_one_to_one_interleavings` pins it",
     ),
+];
+
+/// The plants this (two-table) tier leaves out on top of
+/// [`ONE_TO_ONE_NOT_GATED`]: each fires only on a star of more than two
+/// tables. The star tier ([`star_sweep_tier`]) runs every one it can reach.
+const TWO_TABLE_NOT_GATED: &[(&str, &str)] = &[
+    (
+        "star_root_skip_j_last",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier runs it); join_star_root's ps1a, ps2, ps5 and cx_f2e pin it",
+    ),
+    (
+        "star_root_skip_j_first",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier runs it); join_star_root's ps1b and cx_f2e pin it",
+    ),
+    (
+        "star_root_skip_j_middle",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier runs it); join_star_root's a_root_moving_every_key_races_a_change_of_its_new_key_at_the_middle_position, \
+         and join_star_n4's f14a and middle-position Re-derive pins, pin it",
+    ),
+    (
+        "star_late_skip_last",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier runs it); join_star_root's ps4a pin it",
+    ),
+    (
+        "star_late_skip_first",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier runs it); join_star_root's ps4b pin it",
+    ),
+    (
+        "star_own_j_only",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier runs it); join_star_joined's cx_f1a to cx_f1f and cx_f6e, and \
+         join_star_crossing's per-position target batch pin, and join_star_n4's f14a, f15a \
+         and f13a, pin it",
+    ),
+    (
+        "star_r_after_m",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier runs it); join_star_joined's cx_f1a, cx_f1b, cx_f1e and cx_f6e pin it",
+    ),
+    (
+        "star_last_no_r",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier runs it); join_star_joined's cx_f1a and cx_f1c pin it",
+    ),
+    (
+        "star_r_split",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier leaves it out too), and fails by deadlock, which the engine retries; \
+         join_star_crossing's cx_f3b and, at n = 4 (positions 1 and 2, then 3), \
+         join_star_n4's f13a pin it",
+    ),
+    (
+        "star_recheck_j",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier runs it); join_star_joined's cx_f11a and ps7 pin it",
+    ),
+    (
+        "star_recheck_skip_last",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier runs it); join_star_joined's cx_f11a and ps7 (swapped), and \
+         join_star_n4's f15a and ps7 at n = 4, pin it",
+    ),
+    (
+        "star_chunk_no_r",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier runs it); join_star_fan_out's cx_f10a and cx_f10c pin it",
+    ),
+    (
+        "star_truncate_keeps_other_markers",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier runs it); join_star_fan_out's xt2 pins pin it",
+    ),
+    (
+        "star_chunk_skip_j_last",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier runs it); join_star_build's ps6a pins it",
+    ),
+    (
+        "star_chunk_skip_j_first",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier runs it); join_star_build's ps6b pins it",
+    ),
     (
         "star_fence_first_only",
         "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781), and only on a column pause or a resume; \
+         (the star tier runs it), and only on a column pause or a resume; \
          join_star_quarantine's column-pause pin pins it",
     ),
     (
         "star_held_origin_first_only",
         "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781), and needs a held row; join_star_quarantine's \
+         (the star tier leaves it out too), and needs a held row; join_star_quarantine's \
          held-origin pin pins it",
     ),
     (
         "star_def_lock_first_only",
         "it fires only on a star of more than two tables, which this tier never draws \
-         (the star tier is #1781), and fails by deadlock with a rebuild's start; \
+         (the star tier leaves it out too), and fails by deadlock with a rebuild's start; \
          join_star_quarantine's rebuild-start pin pins it",
     ),
     (
         "star_reads_first_only",
         "it fires only on a star joining a target at a later position, which this tier \
-         never draws (the star tier is #1781); join_star_quarantine's target-at-a-position \
+         never draws (the star tier leaves it out too); join_star_quarantine's target-at-a-position \
          pin pins it",
+    ),
+];
+
+/// The `star_*` plants the star tier leaves out on top of
+/// [`ONE_TO_ONE_NOT_GATED`], each with why. Its runner is the two-table
+/// tier's: it draws no held row and no definition reading another's target,
+/// and it checks rows, so a plant whose only failure is a deadlock the engine
+/// retries is out of its reach.
+const STAR_NOT_GATED: &[(&str, &str)] = &[
+    (
+        "star_r_split",
+        "it splits a star page's R locks into statements, which only changes the order \
+         two pages queue on R entries in: a deadlock, which the engine retries, never a \
+         wrong row; join_star_crossing's cx_f3b and join_star_n4's f13a pin it",
+    ),
+    (
+        "star_held_origin_first_only",
+        "it needs a row a later position's fan-out holds in quarantine, and the tier draws \
+         no value that makes a field fail; join_star_quarantine's held-origin pin pins it",
+    ),
+    (
+        "star_def_lock_first_only",
+        "it needs a fan-out at a later position that holds a row in quarantine, which the \
+         tier never draws, and then fails by deadlock with a rebuild's start, which the \
+         engine retries; join_star_quarantine's rebuild-start pin pins it",
+    ),
+    (
+        "star_reads_first_only",
+        "it needs a star joining another definition's target at a later position, which \
+         only a chained-reader draw would give and the star tier never draws; \
+         join_star_quarantine's target-at-a-position pin pins it",
     ),
 ];
 
@@ -679,26 +716,28 @@ const ONE_TO_ONE_KNOWN_MISSES: &[&str] = &[
 /// about one case in five or more (of 48: `join1_no_placeholder` 46,
 /// `join1_old_key_unlocked` 44, `join1_no_orphan_pass` 24,
 /// `join1_truncate_keeps_r` 10, `join1_m_before_j` 9), runs and reports
-/// [`ONE_TO_ONE_KNOWN_MISSES`], and leaves out [`ONE_TO_ONE_NOT_GATED`] and
-/// every plant of another path.
+/// [`ONE_TO_ONE_KNOWN_MISSES`], and leaves out [`ONE_TO_ONE_NOT_GATED`],
+/// [`TWO_TABLE_NOT_GATED`] and every plant of another path.
 fn one_to_one_sweep_tier() -> SweepTier {
     sweep_tier(
         generative::baseline_quarantine::JOIN_ONE_TO_ONE_TIER,
         ONE_TO_ONE_KNOWN_MISSES,
+        TWO_TABLE_NOT_GATED,
     )
 }
 
 /// The star tier's sweep (#1781): the 1-1 `JOIN` plants over
-/// [`star_case_strategy`]'s cases, each plant on any position. It leaves out
-/// [`ONE_TO_ONE_NOT_GATED`] for the reasons listed there: the star tier runs
-/// the same runner, which draws no held row, no uncaptured write and no
-/// page claimed out of order, and `star_j_unsorted`'s failure is a deadlock
-/// the engine retries. Until the reach sweep measures the star tier, its
-/// known misses are [`STAR_KNOWN_MISSES`].
+/// [`star_case_strategy`]'s cases, each plant on any position. It runs
+/// every `Join1*` and `star_*` plant but [`ONE_TO_ONE_NOT_GATED`] (the star
+/// tier runs the same runner, which draws no held row, no uncaptured write
+/// and no page claimed out of order, and `star_j_unsorted`'s failure is a
+/// deadlock the engine retries) and [`STAR_NOT_GATED`], and reports
+/// [`STAR_KNOWN_MISSES`].
 fn star_sweep_tier() -> SweepTier {
     sweep_tier(
         generative::baseline_quarantine::JOIN_STAR_TIER,
         STAR_KNOWN_MISSES,
+        STAR_NOT_GATED,
     )
 }
 
@@ -711,11 +750,16 @@ fn star_sweep_tier() -> SweepTier {
 const STAR_KNOWN_MISSES: &[&str] = ONE_TO_ONE_KNOWN_MISSES;
 
 /// A 1-1 `JOIN` sweep tier named `name`: it gates every 1-1 `JOIN` plant but
-/// `known_misses` and [`ONE_TO_ONE_NOT_GATED`], and leaves out every plant of
-/// another path.
-fn sweep_tier(name: &'static str, known_misses: &'static [&'static str]) -> SweepTier {
+/// `known_misses`, [`ONE_TO_ONE_NOT_GATED`] and the tier's `own_not_gated`,
+/// and leaves out every plant of another path.
+fn sweep_tier(
+    name: &'static str,
+    known_misses: &'static [&'static str],
+    own_not_gated: &'static [(&'static str, &'static str)],
+) -> SweepTier {
     use generative::plant_sweep::{PlantPath, not_on_path};
     let mut not_gated: Vec<(&'static str, &'static str)> = ONE_TO_ONE_NOT_GATED.to_vec();
+    not_gated.extend_from_slice(own_not_gated);
     not_gated.extend(not_on_path(
         &[PlantPath::OneToOne, PlantPath::GroupBasis],
         "it breaks a 1-1 or plain group-basis aggregate path, and the 1-1 JOIN tier \
@@ -819,42 +863,67 @@ fn star_join_planted_bugs_are_caught() {
     );
 }
 
-/// The tier runs every 1-1 `JOIN` plant but the ones it lists as not gated
-/// with a reason, and nothing else; its known misses are 1-1 `JOIN` plants it
-/// runs. The star tier's lists are the same.
+/// Each 1-1 `JOIN` tier, the two-table one and the star one, runs every 1-1
+/// `JOIN` plant but the ones it lists as not gated with a reason, and
+/// nothing else; its known misses are 1-1 `JOIN` plants it runs. The
+/// two-table tier leaves out exactly the plants that fire only on a star,
+/// and the star tier runs every `star_*` plant but the ones it lists.
 #[test]
 fn the_one_to_one_join_tier_runs_every_one_to_one_join_plant() {
     use generative::plant_sweep::{PlantPath, plant_path};
     use trellis::dev::plant::Plant;
     let star = star_sweep_tier();
     let tier = one_to_one_sweep_tier();
-    assert_eq!(star.not_gated, tier.not_gated);
     assert_eq!(star.name, "join_star");
-    for name in star.known_misses {
-        let plant = Plant::from_name(name).unwrap_or_else(|| panic!("{name} names no plant"));
-        assert_eq!(plant_path(plant), PlantPath::OneToOneJoin, "{name}");
+    for (tier, own) in [(&tier, TWO_TABLE_NOT_GATED), (&star, STAR_NOT_GATED)] {
+        for plant in Plant::ALL {
+            let name = plant.name();
+            let gated = !tier.not_gated.iter().any(|(not, _)| *not == name);
+            let exception = ONE_TO_ONE_NOT_GATED
+                .iter()
+                .chain(own)
+                .any(|(not, _)| *not == name);
+            assert_eq!(
+                gated,
+                plant_path(*plant) == PlantPath::OneToOneJoin && !exception,
+                "{}: {name}",
+                tier.name
+            );
+        }
+        for name in tier.known_misses {
+            let plant = Plant::from_name(name).unwrap_or_else(|| panic!("{name} names no plant"));
+            assert_eq!(plant_path(plant), PlantPath::OneToOneJoin, "{name}");
+            assert!(
+                !tier.not_gated.iter().any(|(not, _)| not == name),
+                "{}: {name} is both a known miss and not gated",
+                tier.name
+            );
+        }
+        for (name, _) in ONE_TO_ONE_NOT_GATED.iter().chain(own) {
+            let plant = Plant::from_name(name).unwrap_or_else(|| panic!("{name} names no plant"));
+            assert_eq!(plant_path(plant), PlantPath::OneToOneJoin, "{name}");
+            assert!(
+                !own.iter().any(|(own, _)| own == name)
+                    || !ONE_TO_ONE_NOT_GATED.iter().any(|(not, _)| not == name),
+                "{name} is listed twice"
+            );
+        }
     }
-    for plant in Plant::ALL {
-        let name = plant.name();
-        let gated = !tier.not_gated.iter().any(|(not, _)| *not == name);
-        let own_exception = ONE_TO_ONE_NOT_GATED.iter().any(|(not, _)| *not == name);
-        assert_eq!(
-            gated,
-            plant_path(*plant) == PlantPath::OneToOneJoin && !own_exception,
-            "{name}"
-        );
-    }
-    for name in tier.known_misses {
-        let plant = Plant::from_name(name).unwrap_or_else(|| panic!("{name} names no plant"));
-        assert_eq!(plant_path(plant), PlantPath::OneToOneJoin, "{name}");
-        assert!(
-            !tier.not_gated.iter().any(|(not, _)| not == name),
-            "{name} is both a known miss and not gated"
-        );
-    }
-    for (name, _) in ONE_TO_ONE_NOT_GATED {
-        let plant = Plant::from_name(name).unwrap_or_else(|| panic!("{name} names no plant"));
-        assert_eq!(plant_path(plant), PlantPath::OneToOneJoin, "{name}");
+    // The two-table tier leaves out every plant that fires only on a star,
+    // and nothing else of its own.
+    let star_only: Vec<&str> = Plant::ALL
+        .iter()
+        .map(|p| p.name())
+        .filter(|name| name.starts_with("star_"))
+        .filter(|name| !ONE_TO_ONE_NOT_GATED.iter().any(|(not, _)| not == name))
+        .collect();
+    let mut two: Vec<&str> = TWO_TABLE_NOT_GATED.iter().map(|(n, _)| *n).collect();
+    two.sort_unstable();
+    let mut want = star_only.clone();
+    want.sort_unstable();
+    assert_eq!(two, want);
+    for (name, _) in STAR_NOT_GATED {
+        assert!(name.starts_with("star_"), "{name}");
     }
 }
 
