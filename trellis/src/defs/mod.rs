@@ -136,6 +136,8 @@ mod date_tests;
 #[cfg(test)]
 mod floor_manifest;
 #[cfg(test)]
+mod fold_verdict_tests;
+#[cfg(test)]
 mod identifier_tests;
 #[cfg(test)]
 mod literal_tests;
