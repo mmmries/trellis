@@ -1510,6 +1510,12 @@ async fn composed_fields_expression_arguments_and_numeric_scale() {
                                      (4, null, 1, 3)",
         "insert into public.c values (1, 'emea', 3), (2, 'apac', null)",
         "delete from public.o where id = 2",
+        // A page mixing a `NaN` and values at the declared scale, one of
+        // values at the scale only while the `NaN` stays, and its delete.
+        "insert into public.o values (5, 1, 1, 'NaN'), (6, 2, 2, 0.75)",
+        "update public.o set amount = 1.25 where id = 6; \
+         insert into public.o values (7, 2, 1, 2)",
+        "delete from public.o where id = 5",
         "update public.c set region = 'apac' where id = 1",
         "update public.o set amount = 3 where id = 1; delete from public.c where id = 2",
         "delete from public.o where cid = 1",
@@ -2843,6 +2849,7 @@ async fn a_truncate_of_the_joined_side_refills_typed_unmatched_groups() {
         "insert into public.c values (1, 'x', 1, '2026-01-01 00:00+00', 9.99, 7), \
                                      (2, 'x', 1, '2026-02-01 00:00+00', 1.10, 8), \
                                      (3, 'y', 2, '2026-03-01 00:00+00', null, 9)",
+        "insert into public.o values (8, 'y', 2, 'apac', 'NaN'), (9, 'x', 1, 'emea', 0.5)",
         "truncate public.c",
         "insert into public.c values (4, 'y', 2, '2026-04-01 00:00+00', 5.00, 1)",
         "begin; truncate public.c; \

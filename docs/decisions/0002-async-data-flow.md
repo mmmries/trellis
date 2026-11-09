@@ -33,7 +33,7 @@ commit's, and that identity is what makes every derived write orderable.
 1-1 target keeps a slim ledger with one entry per source row: the ring
 position last applied to the row and the snapshot it was last derived under.
 An aggregate target keeps the same ordering state once per *group*, beside
-hidden per-group partials (a row count, non-null counts and `numeric` sums)
+hidden per-group partials (a row count, non-null counts and sums)
 that every admitted aggregate is a function of. Every write that derives a
 value from a *read* rather than from carried images locks the entry or group
 first and reads in the same statement as its snapshot; every change is
@@ -419,8 +419,8 @@ R4 restates I4, R7 is I5, and R9 is the truncate barrier.
 - **Must:** a plain aggregate, or a JOIN transform
   ([ADR-0019](0019-join-transforms.md)), admits exactly these aggregates:
   - `COUNT(*)` and `COUNT(col)`;
-  - `SUM(col)` and `AVG(col)`, where `col` is `int2`, `int4`, `int8`, or
-    `numeric(p,s)` with a declared scale (next section);
+  - `SUM(col)` and `AVG(col)`, where `col` is `int2`, `int4`, `int8` or
+    `numeric`, with or without a declared scale (next section);
   - on a plain aggregate only, `MIN(col)` and `MAX(col)`, kept by recompute
     on retract under rules Rx1 to Rx8
     ([`MIN` and `MAX` recompute on retract](#min-and-max-recompute-on-retract)).
@@ -438,14 +438,15 @@ R4 restates I4, R7 is I5, and R9 is the truncate barrier.
   `sum(int2|int4)` is `bigint`, `sum(int8|numeric)` is `numeric`, and `avg`
   is `numeric`.
 - **Must:** every admitted aggregate but `MIN` and `MAX` is a function of
-  three per-group partials: the row count, each argument's non-null count,
-  and each `SUM` or `AVG` argument's sum, kept as `numeric` whatever the
+  per-group partials: the row count, each argument's non-null count, and
+  each `SUM` or `AVG` argument's sum, kept as `numeric` whatever the
   argument type so a sum (or, on a JOIN, a product of a sum and a count)
-  never overflows where Postgres's own `sum()` wouldn't.
+  never overflows where Postgres's own `sum()` wouldn't. A `numeric`
+  argument's sum is of its finite values only, beside a count per display
+  scale and counts of `NaN`, `Infinity` and `-Infinity` (next section).
 - **Must:** every other aggregate is refused at define, named by family:
   `MIN`/`MAX` on a JOIN; `bool_and`/`bool_or` and `bit_and`/`bit_or`;
-  `SUM`/`AVG` over a float, `interval`, unconstrained `numeric` or any other
-  type; and `array_agg`, `string_agg` and `jsonb_agg`. The
+  `SUM`/`AVG` over a float, `interval` or any other type; and `array_agg`, `string_agg` and `jsonb_agg`. The
   [Supported sources and targets](../transforms.md#supported-sources-and-targets)
   table is the reference. Each can be added later, through hidden counters,
   a value-count table or a recompute, without changing what is admitted
@@ -544,37 +545,67 @@ otherwise walks the dead index entries at the extreme's end. I measured 7–9
 ms per probe after 111k deletes, repeated on every probe while an older
 snapshot is open.
 
-### `numeric` arguments declare their scale
+### `numeric` sums count their scales and special values
 
-Postgres shows `sum(numeric)` with as many decimal places as the most
-precise value currently in the group. A running sum keeps the widest scale
-it ever held: after `0.125` leaves `{1.5, 0.125}` the group reads `1.500`
-where `sum()` over the source prints `1.5` (I ran it on Postgres 15 and 18).
-Postgres stores every value of a `numeric(p,s)` column with exactly `s`
-places, so over such a column the mismatch can't arise.
+Postgres shows `sum(numeric)` at the largest display scale among the
+group's current finite values: `sum({1.5, 2.000})` is `3.500`, and `1.5`
+once `2.000` leaves. A running sum keeps the widest scale it ever held, and
+`avg(numeric)` divides the sum with a result scale taken from the sum's, so
+a leftover scale changes the average's value, not only its text (I ran it on
+Postgres 17 and 18). `NaN`, and `Infinity` and `-Infinity` together, make
+`sum()` and `avg()` `NaN`; one infinity alone is that infinity. No running
+sum can take a special value back out: `NaN − NaN` is `NaN`, `Infinity −
+Infinity` is `NaN`, and so is `NaN × 0` in a JOIN product. Postgres's own
+aggregate state counts `NaN`, `Infinity` and `-Infinity` apart for the same
+reason.
 
-- **Must:** `SUM` and `AVG` admit a `numeric` argument only when its column
-  declares a scale. The running sum, every JOIN product and the average
-  then carry exactly the scale Postgres would show, through a build and
-  through pages alike. `COUNT(col)` over any `numeric`, and `numeric` as a
-  `GROUP BY` or join key, are unaffected.
-- **Must:** a retype of an argument column after define (a new scale, or
-  unconstrained `numeric`) pauses the definition through the schema-change
-  check that compares a definition's columns with the live schema. A resume
-  re-validates: it refuses unconstrained `numeric`, and rebuilds at a new
-  scale.
-- **Must:** a `numeric(p,s)` column admits `NaN`, which no running sum can
-  subtract back out (`NaN − NaN` is `NaN`, and so is `NaN × 0` in a JOIN
-  product). A sum partial counts its `NaN`s apart from its finite values,
-  so every rule above holds for them: the visible `SUM` and `AVG` are `NaN`
-  exactly while the count is above zero, a JOIN product multiplies the count
-  by the match count, and a group whose rows all left is zero and collected.
-  The count lives in the sum's own column, as a multiple of a weight beyond
-  any finite sum of a `numeric(p,s)` column, so a definition's hidden
-  layout doesn't change.
-
-Keeping a counter per scale would make unconstrained `numeric` exact too; it
-is additive, so it can come later without changing this rule.
+- **Must:** a `SUM` or `AVG` over a `numeric` argument (a column with or
+  without a declared scale, a `numeric` column of a Trellis target, or an
+  expression whose result is `numeric`) keeps, per group, on the group's
+  hidden row: the sum of its finite values, and one map of exceptions that
+  counts every non-null value *except* the finite ones at the argument's
+  reference scale: a key per display scale (`scale(x)`, 0 to 16383; no
+  value has a negative scale) and one per special value (`NaN`, `Infinity`,
+  `-Infinity`), each to its count, with no zero entry. An empty map is
+  stored as `NULL`. The count of finite values at the reference scale is the
+  non-null count less the map's counts. An integer argument keeps its sum
+  alone.
+- **Must:** the reference scale is the scale the argument's column declares
+  (`numeric(p,s)`'s `s`, a negative `s` as 0) when the hidden table is
+  created, recorded with the table and read back by every statement, so a
+  later change of the column's type never changes what a stored map means.
+  An argument with no declared scale (an unconstrained column, an
+  expression) has none, and its map counts every value. So a
+  `numeric(p,s)` argument's map stays `NULL` while its values are finite:
+  no page, build, recompute or product builds, merges or writes one.
+- **Must:** every partial operation keeps all of them: a page's deltas
+  carry each side's scale and special-value class inside the side sums it
+  computes; a build, a locked recompute and a partition correction count
+  them from the source; a JOIN product multiplies every count, special ones
+  included, by the match count (`max(n, 1)` for `LEFT`), as it does a sum;
+  and a group is zero, and collected, only when they are all zero.
+- **Must:** the visible `SUM` is `NULL` while the non-null count is 0;
+  `NaN` while the `NaN` count is above 0 or both infinity counts are; the
+  infinity while one infinity count is; and otherwise the finite sum
+  rounded to the largest scale whose count is above 0, which is exact:
+  that is how many places the true sum has. The visible `AVG` is that
+  value divided by the non-null count as `numeric`, as Postgres's
+  `numeric_div` does. Through a build and through pages alike, the sum and
+  the average then carry exactly the scale and value Postgres would show.
+- **Must:** every `numeric` argument has this one layout; only the
+  reference scale differs. The visible `SUM` of a group whose map is `NULL`
+  is its finite sum at the reference scale, read without the map. A page
+  whose values are all finite at the reference scale stages a `NULL` map,
+  and its apply leaves every row's map as it is. A build's grouping of such
+  rows counts them with no array aggregate; one that meets a value off the
+  reference scale fails and runs again the general way in the same
+  transaction, so the specialisation never changes a result.
+- **Must:** a retype of an argument column after define goes through the
+  capture pass's re-validation like any other. A `numeric(p,s)` column
+  re-typed to an unconstrained `numeric` keeps every value's text, and its
+  stored maps keep their reference scale, so nothing pauses or rebuilds:
+  values at other scales are counted in the map from then on. A change
+  between two declared scales re-renders values, so its readers rebuild.
 
 ### Apply sums sides per group and transaction
 
@@ -1272,10 +1303,9 @@ Each alternative below is recorded with the number that rejected it.
   negative; the group basis can show impossible combinations between pages
   ([Readers](#readers-see-a-group-only-while-its-row-count-is-above-0)).
 - **The aggregate surface is narrow.** `COUNT`, `SUM`/`AVG` over
-  integers and `numeric(p,s)`, and on a plain aggregate `MIN`/`MAX` over a
+  integers and `numeric`, and on a plain aggregate `MIN`/`MAX` over a
   plain column with its index; every other aggregate is refused at define,
-  and a definition using one doesn't work until its family is added. A
-  plain `numeric` column must declare a scale to be summed.
+  and a definition using one doesn't work until its family is added.
 - **`MIN`/`MAX` read the source on the hot path.** A page that retracts a
   group's extreme holds that group's lock across an index probe of the
   source, the drain role needs `SELECT` on the source without row-level

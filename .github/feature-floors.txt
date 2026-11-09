@@ -44,6 +44,7 @@ feature Layout(GroupBasis) 0.2.0
 feature Layout(GroupBasisExtremes) 0.2.0
 feature Layout(Join) 0.2.0
 feature Layout(JoinOneToOne) 0.2.0
+feature Layout(NumericSums) 0.2.0
 feature QualifiedTable 0.2.0
 feature WithoutSourceIndex 0.2.0
 feature AdoptTarget 0.2.0
@@ -152,6 +153,7 @@ feature TypeRule(Aggregate(Extreme)) 0.2.0
 feature TypeRule(AggregateAdmission(Count)) 0.2.0
 feature TypeRule(AggregateAdmission(SumAvgInteger)) 0.2.0
 feature TypeRule(AggregateAdmission(SumAvgScaledNumeric)) 0.2.0
+feature TypeRule(AggregateAdmission(SumAvgNumeric)) 0.2.0
 feature TypeRule(AggregateAdmission(Extreme)) 0.2.0
 feature TypeRule(GroupByKey(Integer)) 0.2.0
 feature TypeRule(GroupByKey(Numeric)) 0.2.0
@@ -729,6 +731,7 @@ admit unify(Other(TextArray), Other(TextArray)) = Some(Other(TextArray)) by Unif
 admit unify(Other(Enum("enum:public.e")), Other(Enum("enum:public.e"))) = Some(Other(Enum("enum:public.e"))) by Unify(Same) 0.2.0
 admit unify(Other(Unrecognized), Other(Unrecognized)) = Some(Other(Unrecognized)) by Unify(Same) 0.2.0
 admit aggregate(SUM, Numeric) = Some(Numeric) by Aggregate(SumWideExact) 0.2.0
+admit aggregate_admitted(SUM, Numeric typmod -1) = Ok(()) by AggregateAdmission(SumAvgNumeric) 0.2.0
 admit aggregate_admitted(SUM, Numeric typmod 786438) = Ok(()) by AggregateAdmission(SumAvgScaledNumeric) 0.2.0
 admit aggregate(SUM, Integer(Int2)) = Some(Integer(Int8)) by Aggregate(SumNarrowInteger) 0.2.0
 admit aggregate_admitted(SUM, Integer(Int2) typmod -1) = Ok(()) by AggregateAdmission(SumAvgInteger) 0.2.0
@@ -808,6 +811,7 @@ admit aggregate_admitted(COUNT, Other(Enum("enum:public.e")) typmod 786438) = Ok
 admit aggregate_admitted(COUNT, Other(Unrecognized) typmod -1) = Ok(()) by AggregateAdmission(Count) 0.2.0
 admit aggregate_admitted(COUNT, Other(Unrecognized) typmod 786438) = Ok(()) by AggregateAdmission(Count) 0.2.0
 admit aggregate(AVG, Numeric) = Some(Numeric) by Aggregate(AvgExact) 0.2.0
+admit aggregate_admitted(AVG, Numeric typmod -1) = Ok(()) by AggregateAdmission(SumAvgNumeric) 0.2.0
 admit aggregate_admitted(AVG, Numeric typmod 786438) = Ok(()) by AggregateAdmission(SumAvgScaledNumeric) 0.2.0
 admit aggregate(AVG, Integer(Int2)) = Some(Numeric) by Aggregate(AvgExact) 0.2.0
 admit aggregate_admitted(AVG, Integer(Int2) typmod -1) = Ok(()) by AggregateAdmission(SumAvgInteger) 0.2.0

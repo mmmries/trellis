@@ -3984,7 +3984,10 @@ async fn create_definition_inner(
         "an admitted aggregate the group basis doesn't route: {}",
         def.target
     );
-    if let Some(shape) = shape {
+    if let Some(mut shape) = shape {
+        // Each `numeric` sum's reference scale is the one its column declares
+        // now, recorded with the hidden table.
+        shape.declare_scales(&*txn, &qualified_source).await?;
         txn.batch_execute(&crate::staging::group_basis::hidden_table_ddl(
             pool.schema(),
             id,
@@ -5409,9 +5412,8 @@ pub(crate) async fn revalidate_keyed(
             });
         }
     }
-    // The aggregates define refuses by family (a
-    // `SUM`/`AVG` over a numeric that lost its declared scale, or over a
-    // column re-typed to a float), which define makes once the table exists.
+    // The aggregates define refuses by family (a `SUM`/`AVG` over a column
+    // re-typed to a float), which define makes once the table exists.
     check_aggregate_admitted(txn, &definition.def, source).await?;
     reject_row_security(
         txn,

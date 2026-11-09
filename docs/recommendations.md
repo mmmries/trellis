@@ -242,8 +242,9 @@ has the details):
   On a partitioned table, a root index whose leaf index was repaired stays
   invalid until `ALTER INDEX … ATTACH PARTITION` is run again for that leaf.
   `RESUME` refuses until an index backs the key, then rebuilds.
-* **The unique key on a 1-1 `JOIN`'s `b` `ON` columns:** the staging worker's
-  next reconcile pass pauses the transform, naming `b` and its `ON` columns,
+* **The unique key on a 1-1 `JOIN`'s `b` `ON` columns** (in a star, on each
+  joined table's own `ON` columns): the staging worker's next reconcile pass
+  pauses the whole transform, naming that table and its `ON` columns,
   whether or not a duplicate arrived. So does a swap that drops the old index
   before it creates the new one, when a pass runs between the two, which is
   likely on a large table or beside a long-running transaction. `RESUME`

@@ -183,7 +183,7 @@ shape:
 * `GROUP BY <col1>[, <col2>...]` (at most 32 columns, Postgres's cap on an
   index key) produces a `KeySpace::Aggregate` whose
   calculated fields may reference a grouping column directly or wrap any other
-  column in `SUM` or `AVG` (over an integer or `numeric(p,s)`), or in `MIN` or
+  column in `SUM` or `AVG` (over an integer or `numeric`), or in `MIN` or
   `MAX` (over a number, date or time column; see `docs/type-support.md`),
   resolved against a separate aggregate-function registry. The grammar also
   parses `bool_*`, `bit_*`, `array_agg`, `string_agg` and `jsonb_agg`, and

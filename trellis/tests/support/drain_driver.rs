@@ -220,7 +220,19 @@ impl Driver {
             .await
             .expect("read statuses")
             .get(0);
-        assert_eq!(not_live, 0, "every definition is live before the scenario");
+        if not_live != 0 {
+            let why = driver
+                .rows(
+                    "select d.target_table, d.status, f.error, \
+                            (select string_agg(b.last_error, '; ') from backfill_chunks b \
+                             where b.definition_id = d.id) \
+                     from transform_definitions d \
+                     left join capture_failures f on f.transform_id = d.id \
+                     where d.status <> 'live'",
+                )
+                .await;
+            panic!("every definition is live before the scenario: {why:?}");
+        }
         driver
     }
 

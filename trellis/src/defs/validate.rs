@@ -202,16 +202,8 @@ pub enum ValidationError {
         function: String,
         family: &'static str,
     },
-    /// `SUM`/`AVG` over an unconstrained `numeric` column, whose display
-    /// scale a running sum can't track.
-    UnconstrainedNumericAggregate { function: String, column: String },
-    /// `SUM`/`AVG` over a `numeric` column of a table Trellis creates (a
-    /// target): Trellis creates its columns with no type modifier, so the
-    /// column has no declared scale whatever the scale of the column it
-    /// copies (ADR-0020, #1120).
-    ChainedNumericAggregate { function: String, column: String },
     /// `SUM`/`AVG` over a column whose type is not an integer or a
-    /// `numeric(p,s)`.
+    /// `numeric`.
     UnsupportedAggregateArgument {
         function: String,
         column: String,
@@ -1178,27 +1170,9 @@ impl fmt::Display for ValidationError {
                 f,
                 "{function} is not supported: {family} is not an aggregate Trellis maintains; \
                  the supported aggregates are COUNT(*), COUNT(col), SUM/AVG over \
-                 smallint, integer, bigint or numeric(p,s), and, in a GROUP BY without a \
+                 smallint, integer, bigint or numeric, and, in a GROUP BY without a \
                  JOIN, MIN/MAX of a number, date or time column (see \"Supported sources and \
                  targets\" in docs/transforms.md)"
-            ),
-            ValidationError::UnconstrainedNumericAggregate { function, column } => write!(
-                f,
-                "{function}({column}) is over a numeric with no declared scale, which is not \
-                 supported: Postgres shows a sum with as many decimal places as the most \
-                 precise value in the group, which a running sum can't track (see \"Supported \
-                 sources and targets\" in docs/transforms.md). Sum a numeric(p,s) column \
-                 directly (ALTER TABLE ... ALTER COLUMN ... TYPE numeric(p,s)); an expression \
-                 over numeric (arithmetic, a CASE) has no declared scale: Postgres drops the \
-                 column's modifier there, and a branch such as ELSE 0 would mix scales"
-            ),
-            ValidationError::ChainedNumericAggregate { function, column } => write!(
-                f,
-                "{function}({column}) is over a numeric column of a table Trellis creates, \
-                 which has no declared scale: Trellis creates its columns with no type \
-                 modifier, so a chained SUM/AVG over one is not supported (see \"Supported \
-                 sources and targets\" in docs/transforms.md). Sum the source's numeric(p,s) \
-                 column in the transform that reads the source"
             ),
             ValidationError::UnsupportedAggregateArgument {
                 function,
@@ -1207,7 +1181,7 @@ impl fmt::Display for ValidationError {
             } => write!(
                 f,
                 "{function}({column}) is over {pg_type}; SUM and AVG are supported over \
-                 smallint, integer, bigint and numeric(p,s) only"
+                 smallint, integer, bigint and numeric only"
             ),
             ValidationError::UnsupportedExtremeArgument {
                 function,
@@ -2015,8 +1989,9 @@ pub(crate) enum AggregateScope {
 
 /// The per-family refusal of aggregates outside the admitted set: whether `function` (an
 /// uppercased aggregate name) over `arg` is in the admitted set, `COUNT(*)`,
-/// `COUNT(col)`, `SUM`/`AVG` over `smallint`/`integer`/`bigint`/
-/// `numeric(p,s)`, and in a plain aggregate (`scope`) `MIN`/`MAX` of a
+/// `COUNT(col)`, `SUM`/`AVG` over `smallint`/`integer`/`bigint`/`numeric`
+/// (with or without a declared scale), and in a plain aggregate (`scope`)
+/// `MIN`/`MAX` of a
 /// plain source column of a type `registry::extreme_type_admitted` admits,
 /// or else a named refusal. `arg` is `None` for `COUNT(*)` and for the
 /// family check made before the argument is typed.
@@ -2072,19 +2047,18 @@ pub(crate) fn check_aggregate_admitted(
             let Some(arg) = arg else { return Ok(()) };
             match arg.value_type {
                 ValueType::Integer(_) => admitted(AggregateAdmissionRule::SumAvgInteger),
-                ValueType::Numeric if arg.typmod != -1 => {
-                    admitted(AggregateAdmissionRule::SumAvgScaledNumeric)
-                }
-                ValueType::Numeric if arg.trellis_target => {
-                    Err(ValidationError::ChainedNumericAggregate {
-                        function,
-                        column: arg.column.to_string(),
+                ValueType::Numeric => {
+                    // Its partials keep a map of exceptions, a layout of
+                    // their own.
+                    super::floor::record(super::floor::Feature::Layout(
+                        super::floor::Layout::NumericSums,
+                    ));
+                    admitted(if arg.typmod != -1 {
+                        AggregateAdmissionRule::SumAvgScaledNumeric
+                    } else {
+                        AggregateAdmissionRule::SumAvgNumeric
                     })
                 }
-                ValueType::Numeric => Err(ValidationError::UnconstrainedNumericAggregate {
-                    function,
-                    column: arg.column.to_string(),
-                }),
                 ValueType::Float(_) | ValueType::Other(PgType::Interval) => {
                     Err(ValidationError::DeferredAggregate {
                         function,
@@ -2110,7 +2084,8 @@ pub(crate) fn check_aggregate_admitted(
 /// ([`check_aggregate_admitted`]): the group basis keeps every aggregate
 /// definition, and has nothing for the rest. `columns` are the source's live
 /// columns, whose declared modifier tells a `numeric(p,s)` argument from an
-/// unconstrained one; an expression's `numeric` result has no declared scale.
+/// unconstrained one (admitted by different rules); an expression's
+/// `numeric` result has no declared scale.
 ///
 /// Any other key space passes.
 pub(crate) fn validate_aggregate_admitted(
@@ -2545,7 +2520,7 @@ pub fn validate_join(
     check_join_collation_reads(def, join, left, joined)?;
     // The target and each hidden table carry columns per field (two per
     // distinct aggregate argument in the partials).
-    for (table, columns) in super::join::table_widths(def) {
+    for (table, columns) in super::join::table_widths(def, left, joined[0]) {
         check_table_width(|| table, columns)?;
     }
     Ok(())
@@ -4198,22 +4173,41 @@ fn fold_constant<'f>(
             let is_null = matches!(recurse(expr, field_name)?, Constant::Null);
             Some(Constant::Bool(is_null != *negated))
         }
-        // A `NULL` condition selects nothing, like a false one.
+        // A `NULL` condition selects nothing, like a false one. The result
+        // is cast to the type of the whole `CASE`, which every result decides.
         Expr::Case {
             branches,
             otherwise,
         } => {
+            let mut picked = None;
             for (condition, result) in branches {
                 match recurse(condition, field_name)? {
-                    Constant::Bool(true) => return recurse(result, field_name),
+                    Constant::Bool(true) => {
+                        picked = Some(recurse(result, field_name)?);
+                        break;
+                    }
                     Constant::Bool(false) | Constant::Null => {}
                     _ => return None,
                 }
             }
-            match otherwise {
-                Some(otherwise) => recurse(otherwise, field_name),
-                None => Some(Constant::Null),
-            }
+            let picked = match (picked, otherwise) {
+                (Some(picked), _) => picked,
+                (None, Some(otherwise)) => recurse(otherwise, field_name)?,
+                (None, None) => Constant::Null,
+            };
+            let results: Vec<&Expr> = branches
+                .iter()
+                .map(|(_, result)| result)
+                .chain(otherwise.as_deref())
+                .collect();
+            in_resolved_float_type(
+                picked,
+                &results,
+                field_name,
+                source_columns,
+                fields_by_name,
+                depth,
+            )
         }
         // A `NULL` argument is never equal to the other, so the planner
         // replaces the call by its first argument, whatever the other reads:
@@ -4292,15 +4286,28 @@ fn fold_constant<'f>(
                 | Constant::Timestamp(_) => None,
             }
         }
-        // The first argument that is not `NULL` is the result.
+        // The first argument that is not `NULL` is the result, cast to the
+        // type of the whole `COALESCE`, which every argument decides.
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            let mut picked = Constant::Null;
             for arg in args {
                 match recurse(arg, field_name)? {
                     Constant::Null => {}
-                    value => return Some(value),
+                    value => {
+                        picked = value;
+                        break;
+                    }
                 }
             }
-            Some(Constant::Null)
+            let results: Vec<&Expr> = args.iter().collect();
+            in_resolved_float_type(
+                picked,
+                &results,
+                field_name,
+                source_columns,
+                fields_by_name,
+                depth,
+            )
         }
         // Every other function is strict: a `NULL` argument makes the call
         // `NULL` whatever its other arguments read or fold to. A call over
@@ -4335,6 +4342,175 @@ fn fold_constant<'f>(
             );
             memo.insert(calc_field.name.as_str(), folded.clone());
             folded
+        }
+        _ => None,
+    }
+}
+
+/// What a `CASE` or `COALESCE` makes of the constant it picks. Postgres casts
+/// each result to the type of the whole, so when that type is a float the
+/// result is that float, however it was written: `CASE WHEN false THEN
+/// DOUBLE PRECISION '0' ELSE -9223372036854775809 END` is the `float8`
+/// `-9223372036854775808`, not the exact number beside it, and a sum or a
+/// divisor computed from it follows the float. `results` are every result
+/// of the node, the unselected ones included, since they type it. `None`
+/// where the cast raises (a literal out of the float's range, which
+/// [`infer_case`] and `COALESCE`'s inference refuse).
+fn in_resolved_float_type(
+    value: Constant,
+    results: &[&Expr],
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+    depth: usize,
+) -> Option<Constant> {
+    if !matches!(value, Constant::Exact(_) | Constant::Float(..)) {
+        return Some(value);
+    }
+    let mut memo = HashMap::new();
+    let width = results
+        .iter()
+        .filter_map(|result| {
+            float_width(
+                result,
+                field_name,
+                source_columns,
+                fields_by_name,
+                &mut memo,
+                depth,
+            )
+        })
+        .reduce(crate::float::FloatWidth::wider);
+    let Some(width) = width else {
+        return Some(value);
+    };
+    match value {
+        Constant::Exact(n) => crate::float::literal_to_width(&n.to_string(), width)
+            .ok()
+            .map(|v| Constant::Float(v, width)),
+        // A `real` widens to `double precision` exactly.
+        Constant::Float(v, own) => Some(Constant::Float(v, own.wider(width))),
+        _ => unreachable!("only an exact or float value reaches here"),
+    }
+}
+
+/// The float type `expr` certainly has, as [`infer_expr`] would type it, or
+/// `None` when it is not a float (or this walk cannot tell, which leaves a
+/// constant as the exact value it was before). It reads the types of
+/// literals, `CAST(NULL AS <float>)`, columns and calculated fields, and
+/// applies the rules for arithmetic (a float beside an exact operand is
+/// `double precision`), for `CASE` and `COALESCE` (a float result wins and the
+/// exact ones follow it), for `NULLIF` (its first argument), for the numeric
+/// functions and for the aggregates.
+fn float_width<'f>(
+    expr: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
+    memo: &mut HashMap<&'f str, Option<crate::float::FloatWidth>>,
+    depth: usize,
+) -> Option<crate::float::FloatWidth> {
+    use crate::float::FloatWidth;
+    if depth > fields_by_name.len() + MAX_EXPRESSION_DEPTH {
+        return None;
+    }
+    let mut width_of = |expr: &Expr| {
+        float_width(
+            expr,
+            field_name,
+            source_columns,
+            fields_by_name,
+            memo,
+            depth + 1,
+        )
+    };
+    match expr {
+        Expr::TypedLiteral {
+            value_type: ValueType::Float(width),
+            ..
+        } => Some(*width),
+        // `CAST(NULL AS real)` is the one cast to a float the grammar admits.
+        Expr::Cast {
+            target: ValueType::Float(width),
+            ..
+        } => Some(*width),
+        Expr::SourceColumn { column, .. } => match source_columns.get(column) {
+            Some(ValueType::Float(width)) => Some(*width),
+            _ => None,
+        },
+        Expr::Column(name) => {
+            let is_self_passthrough = name == field_name && source_columns.contains_key(name);
+            match fields_by_name
+                .get(name.as_str())
+                .filter(|_| !is_self_passthrough)
+            {
+                Some(calc_field) => {
+                    if let Some(found) = memo.get(calc_field.name.as_str()) {
+                        return *found;
+                    }
+                    let found = float_width(
+                        &calc_field.expr,
+                        &calc_field.name,
+                        source_columns,
+                        fields_by_name,
+                        memo,
+                        depth + 1,
+                    );
+                    memo.insert(calc_field.name.as_str(), found);
+                    found
+                }
+                None => match source_columns.get(name) {
+                    Some(ValueType::Float(width)) => Some(*width),
+                    _ => None,
+                },
+            }
+        }
+        Expr::Negate(operand) => width_of(operand),
+        Expr::BinaryOp { op, lhs, rhs } if ConstOp::of_operator(*op).is_some() => {
+            match (width_of(lhs), width_of(rhs)) {
+                (Some(a), Some(b)) => Some(a.wider(b)),
+                (Some(_), None) | (None, Some(_)) => Some(FloatWidth::Float8),
+                (None, None) => None,
+            }
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => branches
+            .iter()
+            .map(|(_, result)| result)
+            .chain(otherwise.as_deref())
+            .filter_map(width_of)
+            .reduce(FloatWidth::wider),
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            args.iter().filter_map(width_of).reduce(FloatWidth::wider)
+        }
+        Expr::FunctionCall { name, args } if name == "NULLIF" && args.len() == 2 => {
+            width_of(&args[0])
+        }
+        // An aggregate over a float: `MIN`, `MAX` and `SUM` keep its type,
+        // `AVG` is `double precision`. Over an exact value none is a float.
+        Expr::FunctionCall { name, args }
+            if super::registry::lookup_aggregate_function(name).is_some() =>
+        {
+            let width = width_of(args.first()?)?;
+            match super::registry::aggregate_result_type(name, ValueType::Float(width))? {
+                ValueType::Float(width) => Some(width),
+                _ => None,
+            }
+        }
+        // A numeric function over a float is its float overload's result
+        // (`CEIL` takes `double precision`, so a `real` widens to it).
+        Expr::FunctionCall { name, args } if args.len() == 1 => {
+            let width = width_of(&args[0])?;
+            let overload = super::registry::resolve_function(name, &[ValueType::Float(width)])
+                .or_else(|| {
+                    super::registry::resolve_function(name, &[ValueType::Float(FloatWidth::Float8)])
+                })?;
+            match overload.return_type {
+                ValueType::Float(width) => Some(width),
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -8850,37 +9026,44 @@ mod tests {
         }
     }
 
-    /// ADR-0020, rule 7: a `numeric` column of a table Trellis creates has no
-    /// declared scale whatever the column it copies had, so a chained `SUM` or
-    /// `AVG` over it gets its own named refusal; the same column of a source
-    /// keeps the plain one.
+    /// `SUM`/`AVG` over a `numeric` with no declared scale (a source's
+    /// unconstrained column, a Trellis target's column) is admitted (#1120):
+    /// its partials keep a count per scale, recorded as the layout they
+    /// need, and by its own admission rule, apart from a declared scale's.
     #[test]
-    fn a_chained_sum_over_a_trellis_targets_numeric_is_a_named_refusal() {
-        let arg = |trellis_target| AggregateArg {
+    fn a_sum_over_a_numeric_with_no_declared_scale_is_admitted() {
+        use super::super::floor::{Feature, Layout, collect};
+        use super::super::registry::{AggregateAdmissionRule, TypeRule};
+        let arg = |trellis_target, typmod| AggregateArg {
             column: "p",
             value_type: ValueType::Numeric,
             pg_type: "numeric",
-            typmod: -1,
+            typmod,
             trellis_target,
             expression: false,
         };
+        let rule = |r| Feature::TypeRule(TypeRule::AggregateAdmission(r));
         for function in ["SUM", "AVG"] {
-            assert!(matches!(
-                check_aggregate_admitted(function, AggregateScope::Plain, Some(&arg(true))),
-                Err(ValidationError::ChainedNumericAggregate { .. })
-            ));
-            assert!(matches!(
-                check_aggregate_admitted(function, AggregateScope::Plain, Some(&arg(false))),
-                Err(ValidationError::UnconstrainedNumericAggregate { .. })
-            ));
+            for (target, typmod, admitted) in [
+                (true, -1, AggregateAdmissionRule::SumAvgNumeric),
+                (false, -1, AggregateAdmissionRule::SumAvgNumeric),
+                (false, 655366, AggregateAdmissionRule::SumAvgScaledNumeric),
+            ] {
+                let (result, used) = collect(|| {
+                    check_aggregate_admitted(
+                        function,
+                        AggregateScope::Plain,
+                        Some(&arg(target, typmod)),
+                    )
+                });
+                assert_eq!(result, Ok(()), "{function} {target} {typmod}");
+                assert!(used.contains(&rule(admitted)), "{used:?}");
+                assert!(
+                    used.contains(&Feature::Layout(Layout::NumericSums)),
+                    "{used:?}"
+                );
+            }
         }
-        let message = check_aggregate_admitted("SUM", AggregateScope::Plain, Some(&arg(true)))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            message.contains("docs/transforms.md") && message.contains("no declared scale"),
-            "{message}"
-        );
     }
 
     /// `MIN`/`MAX` in a plain aggregate (#1117 rule 3, #1681): typed as its
@@ -9108,12 +9291,14 @@ mod tests {
                 other => panic!("{call}: expected DeferredAggregate, got {other:?}"),
             }
         }
+        // A `numeric` with no declared scale is admitted (#1120): an
+        // unconstrained column, and any expression whose result is
+        // `numeric`.
         for call in [
             "SUM(price)",
             "AVG(price)",
             "SUM(cost + 1)",
             "AVG(cost + qty)",
-            // Arithmetic over a `numeric` still has no declared scale.
             "SUM(cost * 2)",
             "AVG(cost - 1)",
             "SUM(-cost)",
@@ -9123,17 +9308,13 @@ mod tests {
             "SUM(ABS(cost))",
             "SUM(ROUND(cost, 2))",
             "SUM(CAST(qty AS numeric))",
-            // A cast to its own type drops `cost`'s modifier, as in Postgres
-            // (`cost::numeric` is an unconstrained `numeric`).
             "SUM(CAST(cost AS numeric))",
             "AVG(CAST(cost AS decimal))",
+            "SUM(CASE WHEN qty > 1 THEN cost ELSE 0 END)",
         ] {
-            let err = check(&format!("{call} AS v")).unwrap_err();
-            assert!(
-                matches!(err, ValidationError::UnconstrainedNumericAggregate { .. }),
-                "{call}: {err:?}"
-            );
-            assert!(err.to_string().contains("numeric(p,s)"), "{call}: {err}");
+            if let Err(err) = check(&format!("{call} AS v")) {
+                panic!("{call}: {err:?}");
+            }
         }
         for fields in [
             "COUNT(*) AS n, COUNT(note) AS notes, COUNT(price) AS priced",
@@ -9183,15 +9364,10 @@ mod tests {
     }
 
     #[test]
-    fn join_refuses_sum_and_avg_over_unconstrained_numeric_on_either_side() {
+    fn join_admits_sum_and_avg_over_unconstrained_numeric_on_either_side() {
         for call in ["SUM(items.price)", "AVG(items.price)"] {
-            assert!(
-                matches!(
-                    check(&format!("orders.region AS region, {call} AS v")),
-                    Err(ValidationError::UnconstrainedNumericAggregate { .. })
-                ),
-                "{call}"
-            );
+            check(&format!("orders.region AS region, {call} AS v"))
+                .unwrap_or_else(|err| panic!("{call}: {err:?}"));
         }
         // The same on the FROM side.
         let (mut left, right) = tables();
@@ -9204,10 +9380,7 @@ mod tests {
              GROUP BY orders.region SELECT SUM(orders.loose) AS v",
         )
         .unwrap();
-        assert!(matches!(
-            validate_join(&def, &left, &[&right]),
-            Err(ValidationError::UnconstrainedNumericAggregate { .. })
-        ));
+        assert_eq!(validate_join(&def, &left, &[&right]), Ok(()));
     }
 
     #[test]
@@ -9672,15 +9845,10 @@ mod tests {
                 "{select}"
             );
         }
-        // A numeric argument has no declared scale, whatever is done to it.
+        // An expression over a numeric is admitted (#1120).
         for select in ["SUM(orders.total * 2) AS v", "SUM(-orders.total) AS v"] {
-            assert!(
-                matches!(
-                    check(&format!("orders.region AS region, {select}")),
-                    Err(ValidationError::UnconstrainedNumericAggregate { .. })
-                ),
-                "{select}"
-            );
+            check(&format!("orders.region AS region, {select}"))
+                .unwrap_or_else(|err| panic!("{select}: {err:?}"));
         }
     }
 
@@ -9703,11 +9871,8 @@ mod tests {
     #[test]
     fn join_refuses_bad_expression_arguments_and_compositions() {
         let refused = |select: &str| check(&format!("orders.region AS region, {select}"));
-        // An expression over numeric has no declared scale.
-        assert!(matches!(
-            refused("SUM(orders.total + 1) AS v"),
-            Err(ValidationError::UnconstrainedNumericAggregate { .. })
-        ));
+        // An expression over numeric is admitted (#1120).
+        assert_eq!(refused("SUM(orders.total + 1) AS v"), Ok(()));
         // A deferred aggregate is refused inside a composition too.
         assert!(matches!(
             refused("COALESCE(MIN(items.qty), 0) AS v"),

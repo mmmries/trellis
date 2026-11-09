@@ -106,6 +106,9 @@ ALTER TABLE orders ALTER COLUMN amount TYPE integer USING amount * 10;
 -- A widening that changes values, of a column no copy Trellis keeps
 -- outgrows:
 ALTER TABLE orders ALTER COLUMN price TYPE numeric(12,2) USING price * 10;
+-- The same to an unconstrained numeric: a SUM or AVG over it keeps
+-- running, as its partials count values at any scale.
+ALTER TABLE orders ALTER COLUMN price TYPE numeric USING price * 10;
 ```
 
 or a same-type `USING` rewrite of a column that has:

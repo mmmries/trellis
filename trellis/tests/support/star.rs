@@ -19,8 +19,9 @@
 //!
 //! Every scenario ends with [`assert_oracle`]: the target equals the full
 //! multi-join query, `EXCEPT ALL` both ways; `R` equals `a` and each `M_p`
-//! equals `b{p}`; and at one position the engine's own self_check
-//! (`one_to_one_join_diverging_keys`) is clean.
+//! equals `b{p}`; the engine's test-only oracle
+//! (`one_to_one_join_diverging_keys`) is clean; and so is a walk of the
+//! engine's `self_check` ([`self_check`]), every part at every position.
 //!
 //! A shape of more than one position defines a star, which define admits
 //! only behind the development knob [`STAR_KNOB`] until the knob is removed
@@ -40,6 +41,9 @@ use trellis::integer::IntWidth;
 use trellis::staging::ApplyError;
 use trellis::staging::build::{self, Step, WorkerOptions};
 use trellis::staging::interleave::PausePoint;
+use trellis::staging::self_check::{
+    Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page,
+};
 
 /// The development knob that admits a star of more than two tables at
 /// define. Set to anything but `""`, `0`, `off` or `false`, it is on.
@@ -588,7 +592,8 @@ pub async fn m_label(d: &Driver, star: Star, p: usize) -> String {
 
 /// Asserts `star`'s target equals the live multi-join (`EXCEPT ALL` both
 /// ways), `R` holds exactly `a`'s live rows with their keys, and each `M_p`
-/// exactly `b{p}`'s. At one position, the engine's self_check is clean too.
+/// exactly `b{p}`'s. The engine's test-only oracle and a walk of its
+/// `self_check` find nothing too.
 pub async fn assert_star(d: &Driver, star: Star) {
     let (actual, expected) = (star.actual(), star.expected());
     let extra = d.rows(&format!("({actual}) except all ({expected})")).await;
@@ -599,16 +604,20 @@ pub async fn assert_star(d: &Driver, star: Star) {
          rows only in the join {missing:?}",
         star.name()
     );
-    if star.shape.positions == 1 {
-        let diverging = trellis::staging::one_to_one_join_diverging_keys(d.pool(), &star.target())
-            .await
-            .expect("self_check");
-        assert!(
-            diverging.is_empty(),
-            "{} diverges at {diverging:?}",
-            star.name()
-        );
-    }
+    let diverging = trellis::staging::one_to_one_join_diverging_keys(d.pool(), &star.target())
+        .await
+        .expect("the oracle");
+    assert!(
+        diverging.is_empty(),
+        "{} diverges at {diverging:?}",
+        star.name()
+    );
+    let found = self_check(d, &star.target(), SELF_CHECK_PAGE).await;
+    assert!(
+        found.is_empty(),
+        "{} self_check finds {found:?}",
+        star.name()
+    );
     let keys: Vec<String> = star.shape.all().map(|p| format!("k{p}")).collect();
     let keys = keys.join(", ");
     let r = r_table(d, star).await;
@@ -646,6 +655,39 @@ pub async fn assert_star(d: &Driver, star: Star) {
             "{} M at position {p} (left) differs from b{p} (right)",
             star.name()
         );
+    }
+}
+
+/// The page size [`assert_star`]'s `self_check` walk takes: every part of a
+/// fixture's tables in a page or two.
+const SELF_CHECK_PAGE: i64 = 1000;
+
+/// Every divergence a walk of the engine's `self_check` of `target` finds,
+/// `limit` keys a page, in `Standard` mode (a key a ring can't vouch for is
+/// re-checked after a fresh wait), sorted.
+pub async fn self_check(d: &Driver, target: &str, limit: i64) -> Vec<Divergence> {
+    let mut after = None;
+    let mut found = Vec::new();
+    loop {
+        let page = check_page(
+            d.pool(),
+            target,
+            SelfCheckScope { after, limit },
+            SelfCheckMode::Standard,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("a page of the self_check");
+        match page.outcome {
+            SelfCheckOutcome::Converged => {}
+            SelfCheckOutcome::Diverged(mut divergences) => found.append(&mut divergences),
+            other => panic!("{target}: unexpected self_check outcome {other:?}"),
+        }
+        after = page.next_after;
+        if after.is_none() {
+            found.sort_by_key(|d| format!("{d:?}"));
+            return found;
+        }
     }
 }
 
