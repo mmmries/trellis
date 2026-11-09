@@ -655,6 +655,20 @@ mod tests {
                 "TRANSFORM t FROM s SELECT s.null AS x",
                 "TRANSFORM t FROM s SELECT s.\"null\" AS x",
             ),
+            // A GROUP BY key, a JOIN column and a field label, each of
+            // which v0.1.0 read as the column or field `null`.
+            (
+                "TRANSFORM t FROM s GROUP BY null WITHOUT SOURCE INDEX \
+                 SELECT null AS k, COUNT(*) AS null",
+                "TRANSFORM t FROM s GROUP BY \"null\" WITHOUT SOURCE INDEX \
+                 SELECT \"null\" AS k, COUNT(*) AS \"null\"",
+            ),
+            (
+                "TRANSFORM t FROM s JOIN u ON s.null = u.null GROUP BY s.g \
+                 SELECT s.g AS g, SUM(s.NULL) AS x",
+                "TRANSFORM t FROM s JOIN u ON s.\"null\" = u.\"null\" GROUP BY s.g \
+                 SELECT s.g AS g, SUM(s.\"NULL\") AS x",
+            ),
             // A keyword use of NULL is still the keyword.
             (
                 "TRANSFORM t FROM s SELECT null IS NULL AS x, a IS NOT NULL AS y",
