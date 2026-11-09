@@ -698,6 +698,72 @@ async fn a_reattach_detected_after_the_enumeration_queues_its_own_entry() {
     fx.assert_right("re-attach after the enumeration").await;
 }
 
+/// A leaf detached when a pass starts and attached again, under another
+/// bound, before the pass ends (#1812). The pass lists the detached leaf
+/// among the tables to uninstall when it starts, and reads the tree, with the
+/// leaf back in it, after; its uninstall must leave the leaf's triggers,
+/// which are the root's capture again. Dropped, the next pass found a
+/// recorded node without its triggers and paused the definition as a
+/// disruption, its target still holding the leaf's row in its old group.
+#[tokio::test]
+async fn a_leaf_attached_again_during_the_pass_that_lists_it_detached_keeps_its_capture() {
+    let mut fx = Fx::start(
+        &format!(
+            "{} create table public.items_p0 partition of public.items for values in (0); \
+             create table public.items_p1 partition of public.items for values in (1);",
+            head("list")
+        ),
+        "insert into public.items values (1, 0, 10), (2, 1, 20)",
+    )
+    .await;
+    // Uncaptured: the leaf is out of the tree.
+    fx.exec(
+        "alter table public.items detach partition public.items_p0; \
+         update public.items_p0 set g = 2 where id = 1",
+    )
+    .await;
+    let point = PausePoint::BeforeFingerprintRead;
+    let dsn = fx.d.db.dsn().to_string();
+    let mut pass =
+        fx.d.run_frozen(&[(point, SOURCE)], move |pool| async move {
+            let mut client = drain_driver::connect(&dsn).await;
+            let desired = trellis::defs::tables_to_capture(&pool)
+                .await
+                .expect("tables to capture");
+            Ok(trellis::capture::reconcile::reconcile(
+                &mut client,
+                DEFAULT_SCHEMA,
+                &desired,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect("pass"))
+        })
+        .await;
+    // The pass has listed the installed tables, the detached leaf among
+    // them, and not yet read the tree.
+    pass.reached(point).await;
+    fx.exec("alter table public.items attach partition public.items_p0 for values in (2)")
+        .await;
+    fx.d.release(&mut pass, point).await;
+    let outcome = pass.finish().await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    let triggers: i64 =
+        fx.d.ctl
+            .query_one(
+                "select count(*) from pg_trigger \
+             where tgrelid = 'public.items_p0'::regclass and not tgisinternal",
+                &[],
+            )
+            .await
+            .expect("the leaf's triggers")
+            .get(0);
+    assert_eq!(triggers, 5, "the attached leaf keeps its capture triggers");
+    fx.correct().await;
+    fx.correct().await;
+    fx.assert_right("re-attached during the pass").await;
+}
+
 /// X12-7e: writes into the leaf land while its correction holds the
 /// recomputed groups: one committed before the recompute's snapshot is
 /// counted by it and refused by its basis; one after it applies.

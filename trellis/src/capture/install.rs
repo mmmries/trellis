@@ -946,7 +946,10 @@ pub async fn narrow(
 /// from its tree that still carries its triggers, lose theirs too (see
 /// "Partitioned tables"). A table the application already dropped takes its
 /// triggers with it, so only the functions go. Lands `false`, having done
-/// nothing, when nothing is installed.
+/// nothing, when nothing is installed, or when the table is no longer one
+/// the pass would uninstall: a leaf the pass listed while it was detached
+/// from a captured root, and that was attached to it again before the
+/// uninstall took its lock, keeps the triggers the root's capture needs.
 pub async fn uninstall(
     client: &mut Client,
     schema: &str,
@@ -962,8 +965,8 @@ pub async fn uninstall(
             nodes.push(bearer);
         }
     }
-    if nodes.len() < SINGLE_TRANSACTION_TABLES {
-        return Ok(run(
+    let progress = if nodes.len() < SINGLE_TRANSACTION_TABLES {
+        run(
             client,
             schema,
             Op::Uninstall {
@@ -973,24 +976,32 @@ pub async fn uninstall(
             deadline,
         )
         .await?
-        .map(|()| true));
-    }
-    // The tables under the root first and the root last, so an interrupted
-    // uninstall still finds the root's triggers and resumes.
-    for node in nodes.iter().rev() {
-        let op = Op::Uninstall {
-            table,
-            scope: Scope::Node(node),
-        };
-        if let waiting @ Progress::Waiting(_) = run(client, schema, op, deadline).await? {
-            return Ok(waiting.map(|()| true));
+    } else {
+        // The tables under the root first and the root last, so an
+        // interrupted uninstall still finds the root's triggers and resumes.
+        for node in nodes.iter().rev() {
+            let op = Op::Uninstall {
+                table,
+                scope: Scope::Node(node),
+            };
+            if let waiting @ Progress::Waiting(_) = run(client, schema, op, deadline).await? {
+                return Ok(waiting.map(|()| true));
+            }
         }
-    }
-    let root = Op::Uninstall {
-        table,
-        scope: Scope::Root,
+        let root = Op::Uninstall {
+            table,
+            scope: Scope::Root,
+        };
+        run(client, schema, root, deadline).await?
     };
-    Ok(run(client, schema, root, deadline).await?.map(|()| true))
+    match progress {
+        // An attempt that found the table back in a captured tree left it
+        // as it was (`attempt`).
+        Progress::Done(()) => Ok(Progress::Done(
+            installed(&*client, schema, table).await? == Installed::Absent,
+        )),
+        waiting @ Progress::Waiting(_) => Ok(waiting.map(|()| true)),
+    }
 }
 
 /// Which tables of a partition tree one attempt covers.
@@ -1203,6 +1214,23 @@ async fn attempt(
         // wait longer than the attempt's timeout.
         locks::set_local_lock_timeout(&txn, lock_timeout).await?;
         txn.batch_execute(&op.lock_statement()?).await?;
+    }
+    // The pass lists the tables to uninstall when it starts
+    // (`reconcile::installed_tables`). A leaf detached from a captured root
+    // is one of them, and may be attached to the root again before this
+    // attempt: its triggers are the root's capture again, and dropping them
+    // would look to the next pass like a disruption of a recorded node. So the
+    // list is read again under the lock, which an `ATTACH` of the table (or
+    // of any table above a node of it) waits for, and a table no longer on
+    // it is left as it is.
+    if let Op::Uninstall { table, .. } = op
+        && locks
+        && !super::reconcile::installed_tables(&txn, schema)
+            .await?
+            .contains(table)
+    {
+        txn.rollback().await?;
+        return Ok(());
     }
     let gate: PgLsn = txn
         .query_one("select pg_catalog.pg_current_wal_insert_lsn()", &[])
