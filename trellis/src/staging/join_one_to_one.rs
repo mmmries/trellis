@@ -2353,8 +2353,12 @@ async fn write_entries(
         .await?;
     }
     if !gone.is_empty() {
-        let sets: Vec<String> = shape
-            .side_key(side)
+        // A star's positions may join on one root column, which `R`'s key
+        // then holds once per position: clear each column once.
+        let mut names = shape.side_key(side);
+        let mut seen = std::collections::HashSet::new();
+        names.retain(|c| seen.insert(c.clone()));
+        let sets: Vec<String> = names
             .iter()
             .map(|c| format!("{} = null", quote_ident(c)))
             .collect();

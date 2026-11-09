@@ -279,7 +279,7 @@ pub(super) async fn dump_state(raw: &tokio_postgres::Client, token: Option<PgLsn
             )
         })
         .collect();
-    let fixed: [(&str, &str); 13] = [
+    let fixed: [(&str, &str); 14] = [
         (
             "segment_pointer",
             "select active_seq, ring_slot from segment_pointer",
@@ -315,6 +315,11 @@ pub(super) async fn dump_state(raw: &tokio_postgres::Client, token: Option<PgLsn
             "poison_held",
             "select transform_id, count(*), count(*) filter (where origin_lsn is null) as no_origin \
                from poison_held group by 1 order by 1",
+        ),
+        (
+            "poison",
+            "select transform_id, src_table, key, sqlstate, retry_attempts, \
+                    left(last_error, 200) from poison order by 1, 2, 3 limit 20",
         ),
         (
             "join1_fan_out",
