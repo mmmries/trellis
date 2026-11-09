@@ -46,7 +46,7 @@ use tokio_postgres::GenericClient;
 use super::ast::{Expr, FieldDef, TransformDef};
 use super::ddl::PrimaryKeyColumn;
 use super::join::{
-    JOINED, Position, Side, column_type, join_key, lock_row_ddl, side_columns, typed_column,
+    Position, Side, column_type, join_key, lock_row_ddl, side_columns, typed_column,
 };
 use super::validate::{JoinColumnInfo, ValidationError};
 use crate::pool::quote_ident;
@@ -457,19 +457,6 @@ pub(crate) async fn unique_keys_of(
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 
-/// Whether `joined` (qualified), `def`'s first joined table, has a unique
-/// key within its `ON` columns: [`joined_key_is_unique_at`] at position 1,
-/// for the staging worker's capture pass
-/// (`staging::schema_change::pause_joins_without_unique_key`), which checks
-/// the first joined table only.
-pub(crate) async fn joined_key_is_unique(
-    client: &impl GenericClient,
-    def: &TransformDef,
-    joined: &str,
-) -> Result<bool, tokio_postgres::Error> {
-    joined_key_is_unique_at(client, def, Position::FIRST, joined).await
-}
-
 /// Whether `joined` (qualified), the table `def` joins at `position`, has a
 /// unique key within that position's `ON` columns ([`unique_keys_of`],
 /// [`key_is_unique`]): the rule define and `RESUME` hold a 1-1 `JOIN` to
@@ -487,9 +474,9 @@ pub(crate) async fn joined_key_is_unique_at(
     ))
 }
 
-/// The first joined table's `ON` columns of `def`, in `ON` order.
-pub(crate) fn joined_on_columns(def: &TransformDef) -> Vec<String> {
-    join_key(def, JOINED)
+/// The `ON` columns of `def`'s joined table at `position`, in `ON` order.
+pub(crate) fn joined_on_columns_at(def: &TransformDef, position: Position) -> Vec<String> {
+    join_key(def, Side::Joined(position))
 }
 
 /// The key space of the definition whose target is `qualified_table`, if one
@@ -878,7 +865,7 @@ mod tests {
         ] {
             let def = joined(on);
             assert_eq!(
-                joined_key_is_unique(&client, &def, "public.b")
+                joined_key_is_unique_at(&client, &def, Position::FIRST, "public.b")
                     .await
                     .expect("read the keys"),
                 unique,
@@ -886,9 +873,14 @@ mod tests {
             );
         }
         assert!(
-            !joined_key_is_unique(&client, &joined("a.k = b.bid"), "public.nope")
-                .await
-                .expect("read the keys"),
+            !joined_key_is_unique_at(
+                &client,
+                &joined("a.k = b.bid"),
+                Position::FIRST,
+                "public.nope"
+            )
+            .await
+            .expect("read the keys"),
             "a table that doesn't exist has no key"
         );
     }
