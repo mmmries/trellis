@@ -457,6 +457,7 @@ create table orders(id bigint primary key, customer_id bigint not null, amount n
 create index on orders(customer_id);
 create table ledger(id bigint primary key, "order" bigint not null, n bigint not null);
 create table nan_orders(id bigint primary key, customer_id bigint not null, amount numeric(12,2) not null, note text);
+create index on nan_orders(customer_id);
 create table events(id bigint not null, tenant bigint not null, v bigint not null, primary key (id, tenant)) partition by hash (tenant);
 create table events_0 partition of events for values with (modulus 4, remainder 0);
 create table events_1 partition of events for values with (modulus 4, remainder 1);
