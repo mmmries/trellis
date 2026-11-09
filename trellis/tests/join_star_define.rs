@@ -1,12 +1,11 @@
 //! Define of a star 1-1 JOIN (more than one joined table, ADR-0021, #1460
-//! sub-step 3.6), behind the development knob `TRELLIS_DEV_STAR_JOIN`: what
-//! define creates and `DROP` takes for a star, the refusals by name (the cap
-//! of 5 tables, a table read twice, a snowflake, a partitioned table, a
-//! position whose `ON` columns aren't unique, an aggregate JOIN of more than
-//! one joined table), and the knob's gate at define and `RESUME`.
+//! sub-step 3.6): what define creates and `DROP` takes for a star, the
+//! refusals by name (the cap of 5 tables, a table read twice, a snowflake, a
+//! partitioned table, a position whose `ON` columns aren't unique, an
+//! aggregate JOIN of more than one joined table), and that a star defines and
+//! resumes with nothing set.
 //!
-//! The knob is process-wide, so every test here takes [`serial`] and sets it.
-//! No staging worker runs: a star's apply is not built yet.
+//! No staging worker runs: these pins are of define, not of apply.
 
 use std::collections::HashMap;
 
@@ -14,17 +13,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{CatalogError, ValidationError, install_definition};
-use trellis::dev::defs::set_star_join;
 use trellis::{Applied, Config, Trellis, TrellisOptions};
-
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Takes the binary's knob lock and sets the knob to `on`.
-async fn serial(on: bool) -> tokio::sync::MutexGuard<'static, ()> {
-    let guard = SERIAL.lock().await;
-    set_star_join(on);
-    guard
-}
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -166,7 +155,6 @@ fn star(target: &str, joined: usize) -> String {
 /// hidden table and the joined tables' rows.
 #[tokio::test]
 async fn u2_a_star_of_five_defines_and_drops_every_hidden_table_and_six_are_refused() {
-    let _knob = serial(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -236,7 +224,6 @@ async fn u2_a_star_of_five_defines_and_drops_every_hidden_table_and_six_are_refu
 /// Every refusal of a star's shape, by name, each leaving nothing behind.
 #[tokio::test]
 async fn a_stars_shape_refusals_are_named() {
-    let _knob = serial(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -398,48 +385,21 @@ async fn a_stars_shape_refusals_are_named() {
     }
 }
 
-/// The knob gates at define and at `RESUME`, never at load: with it off a
-/// star is refused by name, and a star defined while it was on is refused at
-/// its `RESUME` once it is off, and resumes again once it is back on.
+/// A star defines, pauses and resumes with nothing set: the development
+/// knob that once gated it at define and `RESUME` is gone.
 #[tokio::test]
-async fn the_knob_gates_a_star_at_define_and_resume() {
-    let _knob = serial(false).await;
+async fn a_star_defines_and_resumes_with_nothing_set() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
     let trellis = define_only(db.dsn()).await;
 
-    let err = define_err(&db.pool, &star("v", 2)).await;
-    assert!(
-        matches!(
-            err,
-            CatalogError::Validate(ValidationError::StarJoinDisabled { tables: 3 })
-        ),
-        "{err:?}"
-    );
-    assert_nothing_left(&raw, "the star with the knob off").await;
-    // The two-table JOIN doesn't need it.
-    trellis
-        .apply(&star("two", 1))
-        .await
-        .expect("a two-table JOIN defines with the knob off");
-
-    set_star_join(true);
     trellis.apply(&star("v", 2)).await.expect("define the star");
     trellis.apply("PAUSE TRANSFORM v").await.expect("pause");
-    set_star_join(false);
-    // The stored star still loads: status reads it.
     assert!(trellis.status("v").await.expect("status").is_some());
-    let err = trellis
-        .apply("RESUME TRANSFORM v")
-        .await
-        .expect_err("the resume revalidates with the knob off");
-    assert!(err.to_string().contains("not available yet"), "{err}");
-    set_star_join(true);
     trellis
         .apply("RESUME TRANSFORM v")
         .await
-        .expect("resumes with the knob on");
-    set_star_join(false);
+        .expect("the resume revalidates the star and admits it");
 }

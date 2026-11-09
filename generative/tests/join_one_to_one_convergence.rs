@@ -895,7 +895,7 @@ fn one_to_one_join_planted_bugs_are_caught() {
 /// `GENERATIVE_PLANTS`, and while `star_tier_enabled` is off. Run it with:
 ///
 /// ```text
-/// TRELLIS_DEV_STAR_JOIN=1 GENERATIVE_PLANTS=all cargo test -p generative \
+/// GENERATIVE_PLANTS=all cargo test -p generative \
 ///     --test join_one_to_one_convergence star_join_planted_bugs_are_caught \
 ///     -- --ignored --nocapture
 /// ```

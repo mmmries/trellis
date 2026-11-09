@@ -22,8 +22,8 @@
 //! The checks read the catalog and the pause state only, so every test
 //! defines the star, leaves its build unstarted, and drives the staging
 //! worker's pass by hand: the checks read the catalog and the pause state
-//! only. Nothing polls or sleeps. The development knob is process-wide, so
-//! every test takes the harness's lock and sets it.
+//! only. Nothing polls or sleeps. Every test takes the harness's lock
+//! ([`star::serial`]), as the binary's other star pins do.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -42,28 +42,6 @@ const SHAPE: Shape = Shape {
     positions: 2,
     at: 2,
 };
-
-/// Takes the binary's lock and turns the knob on, for the guard's life.
-struct Knob {
-    _serial: tokio::sync::MutexGuard<'static, ()>,
-    was: bool,
-}
-
-impl Drop for Knob {
-    fn drop(&mut self) {
-        trellis::dev::defs::set_star_join(self.was);
-    }
-}
-
-async fn knob() -> Knob {
-    let serial = star::serial().await;
-    let was = star::star_join_enabled();
-    trellis::dev::defs::set_star_join(true);
-    Knob {
-        _serial: serial,
-        was,
-    }
-}
 
 /// `a` rows `(id, k, x, y)` with `k` at position 2: two match `b2`, one
 /// doesn't.
@@ -235,7 +213,7 @@ async fn start_keyed() -> Driver {
 /// `b1` and `k`.
 #[tokio::test]
 async fn a_lost_unique_key_at_position_2_pauses_naming_it() {
-    let _knob = knob().await;
+    let _serial = star::serial().await;
     let mut d = start_keyed().await;
     let target = "public.v";
     pass(&mut d).await;
@@ -279,7 +257,7 @@ async fn a_lost_unique_key_at_position_2_pauses_naming_it() {
 /// routine rows, at position 2.
 #[tokio::test]
 async fn swaps_that_keep_position_2_s_key_in_place_pause_nothing() {
-    let _knob = knob().await;
+    let _serial = star::serial().await;
     let mut d = start_keyed().await;
     for statement in [
         "create unique index concurrently b2_code_new on public.b2 (code)",
@@ -305,7 +283,7 @@ async fn swaps_that_keep_position_2_s_key_in_place_pause_nothing() {
 /// `b2` and `code`.
 #[tokio::test]
 async fn an_invalid_unique_index_as_position_2_s_only_key_pauses_the_transform() {
-    let _knob = knob().await;
+    let _serial = star::serial().await;
     let mut d = start_keyed().await;
     write(
         &d,
@@ -326,7 +304,7 @@ async fn an_invalid_unique_index_as_position_2_s_only_key_pauses_the_transform()
 /// two passes still forces the check, which pauses the transform.
 #[tokio::test]
 async fn a_drop_at_position_2_between_two_passes_with_no_other_change_is_detected() {
-    let _knob = knob().await;
+    let _serial = star::serial().await;
     let mut d = start_keyed().await;
     let id: i64 = d
         .ctl
@@ -367,7 +345,7 @@ async fn a_drop_at_position_2_between_two_passes_with_no_other_change_is_detecte
 /// transform `b2` is the root of pauses neither time.
 #[tokio::test]
 async fn one_table_at_two_positions_of_two_stars_is_checked_per_definition() {
-    let _knob = knob().await;
+    let _serial = star::serial().await;
     let int4 = ValueType::Integer(IntWidth::Int4);
     let mut d = Driver::start_unbuilt(
         &[],
@@ -474,7 +452,7 @@ async fn one_table_at_two_positions_of_two_stars_is_checked_per_definition() {
 /// back, `RESUME` goes through.
 #[tokio::test]
 async fn a_column_read_at_position_2_renamed_or_dropped_pauses_naming_it() {
-    let _knob = knob().await;
+    let _serial = star::serial().await;
     let (mut d, star) = start().await;
     let target = star.target();
     let b = SHAPE.b();
@@ -513,7 +491,7 @@ async fn a_column_read_at_position_2_renamed_or_dropped_pauses_naming_it() {
 /// next pass does, and `M2`'s copy of `w` with it.
 #[tokio::test]
 async fn a_widened_column_read_at_position_2_pauses_and_resume_re_types_the_target() {
-    let _knob = knob().await;
+    let _serial = star::serial().await;
     let (mut d, star) = start().await;
     let target = star.target();
     let b = SHAPE.b();
@@ -539,7 +517,7 @@ async fn a_widened_column_read_at_position_2_pauses_and_resume_re_types_the_targ
 /// position at the pair's new type.
 #[tokio::test]
 async fn an_on_column_retyped_at_position_2_pauses_until_the_pair_matches_again() {
-    let _knob = knob().await;
+    let _serial = star::serial().await;
     let (mut d, star) = start().await;
     let target = star.target();
     let b = SHAPE.b();
@@ -578,7 +556,7 @@ async fn an_on_column_retyped_at_position_2_pauses_until_the_pair_matches_again(
 /// refused until it is detached.
 #[tokio::test]
 async fn position_2_s_table_renamed_away_or_attached_as_a_partition_pauses_the_transform() {
-    let _knob = knob().await;
+    let _serial = star::serial().await;
     let (mut d, star) = start().await;
     let target = star.target();
     let b = SHAPE.b();
@@ -625,7 +603,7 @@ async fn position_2_s_table_renamed_away_or_attached_as_a_partition_pauses_the_t
 /// new key as the one it keys `b2` by, and goes through.
 #[tokio::test]
 async fn position_2_s_primary_key_redefined_pauses_and_resume_records_the_new_key() {
-    let _knob = knob().await;
+    let _serial = star::serial().await;
     let (mut d, star) = start().await;
     let target = star.target();
     let b = SHAPE.b();
@@ -657,7 +635,7 @@ async fn position_2_s_primary_key_redefined_pauses_and_resume_records_the_new_ke
 /// and `RESUME` re-keys its target to the new key (#1746) and goes through.
 #[tokio::test]
 async fn the_root_s_primary_key_redefined_and_resume_re_keys_the_target() {
-    let _knob = knob().await;
+    let _serial = star::serial().await;
     let (mut d, star) = start().await;
     let target = star.target();
     pass(&mut d).await;
@@ -691,7 +669,7 @@ async fn the_root_s_primary_key_redefined_and_resume_re_keys_the_target() {
 /// `definition_join_tables`, not `join_columns`).
 #[tokio::test]
 async fn an_enum_value_read_at_position_2_relabelled_pauses_the_transform() {
-    let _knob = knob().await;
+    let _serial = star::serial().await;
     let mut d = start_enum().await;
     pass(&mut d).await;
     assert_unpaused(&d, "public.v", "the first pass").await;
@@ -713,7 +691,7 @@ async fn an_enum_value_read_at_position_2_relabelled_pauses_the_transform() {
 /// records the new type there, as for the joined table at position 1.
 #[tokio::test]
 async fn an_enum_column_read_at_position_2_re_typed_to_another_enum_pauses_the_transform() {
-    let _knob = knob().await;
+    let _serial = star::serial().await;
     let mut d = start_enum().await;
     pass(&mut d).await;
     assert_unpaused(&d, "public.v", "the first pass").await;

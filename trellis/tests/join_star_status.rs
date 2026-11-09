@@ -1,7 +1,8 @@
 //! `Trellis::status` of a star 1-1 `JOIN` (#1775, #1460 sub-step 3.9):
 //! `hidden_tables` lists `R`, each position's `M` and `J`, and the fan-out
-//! warning samples `R`'s index at each position and names the position and
-//! the join key of the largest group past the threshold. It is the only
+//! warnings sample `R`'s index at each position and name, for each position
+//! whose largest group passes the threshold, the position and that group's
+//! join key, in position order. They are the only
 //! runtime signal of a lookup table joined at any position (#1766's
 //! Decision). The two-table `JOIN` is the one-position case.
 //!
@@ -47,7 +48,6 @@ async fn join_status(d: &Driver, star: Star) -> JoinStatus {
 /// The shapes these tests run: the two-table `JOIN`, both positions of
 /// three tables, and the last of five.
 fn shapes() -> Vec<Shape> {
-    trellis::dev::defs::set_star_join(true);
     vec![
         Shape::TWO,
         Shape::new(2, 1),
@@ -73,27 +73,47 @@ async fn a_per_position_warning_names_its_position_and_key() {
         let name = format!("{shape:?}");
         let d = star::start(&[star], A_ROWS, B_ROWS).await;
         set_one_to_one_join_fan_out_warning_rows(3);
-        assert_eq!(
-            join_status(&d, star).await.fan_out_warning,
-            None,
-            "{name}: 3 is not past 3"
-        );
+        assert_eq!(warned(&d, star).await, [], "{name}: 3 is not past 3");
         set_one_to_one_join_fan_out_warning_rows(2);
-        let warning = join_status(&d, star)
-            .await
-            .fan_out_warning
-            .unwrap_or_else(|| panic!("{name}: key 10 holds 3 rows"));
         assert_eq!(
-            (
-                warning.position,
-                warning.key.as_str(),
-                warning.rows,
-                warning.threshold
-            ),
-            (shape.at, "10", 3, 2),
-            "{name}"
+            warned(&d, star).await,
+            [(shape.at, "10".to_string(), 3, 2)],
+            "{name}: key 10 holds 3 rows, and no other position has a group"
         );
     }
+}
+
+/// Each warning's position, key, rows and threshold, in the order
+/// `status()` lists them.
+async fn warned(d: &Driver, star: Star) -> Vec<(usize, String, i64, i64)> {
+    join_status(d, star)
+        .await
+        .fan_out_warnings
+        .into_iter()
+        .map(|w| (w.position, w.key, w.rows, w.threshold))
+        .collect()
+}
+
+/// Two positions past the threshold each get a warning, in position order,
+/// whichever holds the larger group: ADR-0021's warning is per position.
+#[tokio::test]
+async fn every_position_past_the_threshold_warns() {
+    let _serial = star::serial().await;
+    let _threshold = Threshold;
+    let shape = Shape::new(2, 2);
+    let star = shape.stars()[0];
+    let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+    // Every `a` row onto `b1`'s key 1001: a group of 4 at position 1, past
+    // position 2's group of 3 on key 10.
+    star::step(&mut d, "update public.a set k1 = 1001").await;
+    set_one_to_one_join_fan_out_warning_rows(2);
+    assert_eq!(
+        warned(&d, star).await,
+        [(1, "1001".to_string(), 4, 2), (2, "10".to_string(), 3, 2)]
+    );
+    // Past 3, only position 1's group of 4 warns.
+    set_one_to_one_join_fan_out_warning_rows(3);
+    assert_eq!(warned(&d, star).await, [(1, "1001".to_string(), 4, 3)]);
 }
 
 /// `hidden_tables` lists `R`, then each position's `M` (`M`, `M2`, ...),

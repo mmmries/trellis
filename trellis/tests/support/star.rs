@@ -23,11 +23,6 @@
 //! (`one_to_one_join_diverging_keys`) is clean; and so is a walk of the
 //! engine's `self_check` ([`self_check`]), every part at every position.
 //!
-//! A shape of more than one position defines a star, which define admits
-//! only behind the development knob [`STAR_KNOB`] until the knob is removed
-//! ([`definable`]); [`runnable`] says whether a shape's pins can run in this
-//! process.
-//!
 //! A binary using this module also declares `support/drain_driver.rs` as
 //! `mod drain_driver` at its root.
 
@@ -43,10 +38,6 @@ use trellis::staging::interleave::PausePoint;
 use trellis::staging::self_check::{
     Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page,
 };
-
-/// The development knob that admits a star of more than two tables at
-/// define. Set to anything but `""`, `0`, `off` or `false`, it is on.
-pub const STAR_KNOB: &str = "TRELLIS_DEV_STAR_JOIN";
 
 /// The most joined positions a star may have: 5 tables (#1459's cap).
 pub const MAX_POSITIONS: usize = 4;
@@ -64,26 +55,6 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
     SERIAL.lock().await
-}
-
-/// Whether [`STAR_KNOB`] is on in this process: the engine's own reading
-/// (on unless `""`, `0`, `off` or `false`), or a test's
-/// `trellis::dev::defs::set_star_join`.
-pub fn star_join_enabled() -> bool {
-    trellis::dev::defs::star_join_enabled()
-}
-
-/// Whether `shape` can be defined in this process: the two-table JOIN
-/// always, a star only with [`STAR_KNOB`] on.
-pub fn definable(shape: Shape) -> bool {
-    shape.positions == 1 || star_join_enabled()
-}
-
-/// Whether `shape`'s pins can run in this process: it is [`definable`].
-/// A star's build, its root and joined apply and a `TRUNCATE` of any of its
-/// tables run (#1773, #1774, #1776).
-pub fn runnable(shape: Shape) -> bool {
-    definable(shape)
 }
 
 /// One position's join kind: `LEFT` keeps an `a` row with no match there,
@@ -406,7 +377,6 @@ pub async fn start_unbuilt(stars: &[Star], a_rows: &str, b_rows: &str) -> Driver
 /// writers touch more than one position.
 pub async fn start_seeded(stars: &[Star], seed: &str) -> Driver {
     let shape = stars.first().expect("a star to define").shape;
-    assert!(definable(shape), "{shape:?}: set {STAR_KNOB}");
     let ddl = format!("{}; {seed}", shape.ddl());
     let definitions: Vec<String> = stars.iter().map(|s| s.definition()).collect();
     let definitions: Vec<&str> = definitions.iter().map(String::as_str).collect();
@@ -518,10 +488,6 @@ fn setup(stars: &[Star], a_rows: &str, b_rows: &str) -> Setup {
     assert!(
         stars.iter().all(|s| s.shape == shape),
         "one shape per database: {stars:?}"
-    );
-    assert!(
-        definable(shape),
-        "{shape:?} defines a star: set {STAR_KNOB}, or skip it with `definable`"
     );
     let ddl = format!("{}; {}", shape.ddl(), shape.seed(a_rows, b_rows));
     let definitions = stars.iter().map(|s| s.definition()).collect();

@@ -60,10 +60,6 @@ fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
 }
 
-fn knob() {
-    trellis::dev::defs::set_star_join(true);
-}
-
 /// The all-`LEFT` star of [`SHAPE`].
 fn left() -> Star {
     SHAPE.stars()[0]
@@ -143,7 +139,6 @@ async fn assert_exact(d: &mut Driver, star: Star, step: &str) {
 #[tokio::test]
 async fn a_held_key_at_the_middle_position_is_released_by_a_rederive_and_its_fan_out() {
     let _serial = star::serial().await;
-    knob();
     for star in SHAPE.stars() {
         let name = star.name();
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
@@ -207,7 +202,6 @@ async fn a_held_key_at_the_middle_position_is_released_by_a_rederive_and_its_fan
 #[tokio::test]
 async fn a_row_a_middle_fan_out_holds_is_parked_with_the_changes_origin() {
     let _serial = star::serial().await;
-    knob();
     for star in SHAPE.stars() {
         let name = star.name();
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
@@ -286,7 +280,6 @@ async fn queued_or_finished<T>(d: &Driver, pid: i32, work: &drain_driver::Runnin
 #[tokio::test]
 async fn a_column_pause_waits_for_a_page_of_the_middle_joined_table() {
     let _serial = star::serial().await;
-    knob();
     let star = left();
     let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
     star::write(&d, "update public.b2 set w = 500 where id = 1").await;
@@ -329,7 +322,6 @@ async fn a_column_pause_waits_for_a_page_of_the_middle_joined_table() {
 #[tokio::test]
 async fn a_resume_waits_for_a_page_of_the_middle_joined_table() {
     let _serial = star::serial().await;
-    knob();
     let star = left();
     let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
     let columns: HashMap<String, ValueType> = [("w".to_string(), int4())].into_iter().collect();
@@ -394,7 +386,6 @@ async fn a_resume_waits_for_a_page_of_the_middle_joined_table() {
 #[tokio::test]
 async fn a_middle_fan_out_that_holds_a_row_and_a_rebuild_start_never_deadlock() {
     let _serial = star::serial().await;
-    knob();
     let star = left();
     let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
     seed_key_10(&mut d, &[23]).await;
@@ -460,7 +451,6 @@ async fn assert_reader(d: &Driver, actual: &str, expected: &str, when: &str) {
 #[tokio::test]
 async fn readers_of_a_star_target_converge() {
     let _serial = star::serial().await;
-    knob();
     for star in SHAPE.stars() {
         let name = star.name();
         let target = star.target();
@@ -562,7 +552,6 @@ async fn readers_of_a_star_target_converge() {
 #[tokio::test]
 async fn a_star_with_a_one_to_one_target_at_the_middle_position_converges() {
     let _serial = star::serial().await;
-    knob();
     for word in ["LEFT", "INNER"] {
         let ddl = "create table public.a (id integer primary key, k1 integer, k2 integer, \
                        k3 integer, x integer); \
@@ -710,7 +699,6 @@ async fn expire_claims(d: &Driver, seg_seq: i64) -> u64 {
 #[tokio::test]
 async fn a_middle_fan_out_that_outlives_its_claim_is_applied_once_by_the_next_instance() {
     let _serial = star::serial().await;
-    knob();
     for star in SHAPE.stars() {
         let name = star.name();
         let rows: Vec<String> = (1..=CAP)

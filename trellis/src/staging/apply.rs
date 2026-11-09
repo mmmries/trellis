@@ -162,7 +162,9 @@ pub enum ApplyError {
     /// has a leaf with no usable constraint text; or, on a `JOIN`
     /// (`super::join`), a field build, or a partitioned side whose tree
     /// is not recorded or has a leaf with no usable constraint text; or a
-    /// 1-1 `JOIN` (ADR-0021) whose apply, truncate or build is not built yet.
+    /// 1-1 `JOIN` (ADR-0021) whose stored shape its apply, truncate or build
+    /// can't take (a field build, or a catalog that doesn't record every
+    /// joined table).
     /// Every page of the target would reproduce it, so it halts the target
     /// rather than charging each key a death.
     GroupBasisUnsupported { target: String, what: &'static str },

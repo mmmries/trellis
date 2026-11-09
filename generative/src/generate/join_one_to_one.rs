@@ -87,12 +87,12 @@ pub const MAX_TABLES: usize = 1 + JOINED_TABLES.len();
 /// re-inserted under one id.
 pub const A_IDS: u8 = 64;
 
-/// Whether the star tier runs: the development knob `TRELLIS_DEV_STAR_JOIN`
-/// is on. This is the one gate of the star tier's property, sweep and
-/// metamorphic check; with it off they return at once, and nothing else the
-/// 1-1 JOIN tier draws or checks changes.
+/// Whether the star tier runs: always, since the engine defines and runs a
+/// star with no switch. This is the one gate of the star tier's property,
+/// sweep and metamorphic check; were it off they would return at once, and
+/// nothing else the 1-1 JOIN tier draws or checks would change.
 pub fn star_tier_enabled() -> bool {
-    trellis::dev::defs::star_join_enabled()
+    true
 }
 
 /// The table at `position`: `ja` at 0, then [`JOINED_TABLES`].
@@ -1951,9 +1951,9 @@ mod tests {
         assert_eq!(plain, [8, 9, 10, 11]);
     }
 
-    /// The star tier runs exactly when the development knob is on.
+    /// The star tier is on.
     #[test]
-    fn the_star_tier_follows_the_knob() {
-        assert_eq!(star_tier_enabled(), trellis::dev::defs::star_join_enabled());
+    fn the_star_tier_is_on() {
+        assert!(star_tier_enabled());
     }
 }

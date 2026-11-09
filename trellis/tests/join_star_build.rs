@@ -61,11 +61,6 @@ const A_ROWS: &str = "(1, 10, 1, 'a1'), (2, 20, 2, 'a2'), (3, 30, 3, 'a3'), (4, 
                       (5, 10, 5, 'a5'), (6, 40, 6, 'a6')";
 const B_ROWS: &str = "(1, 10, 100, 'b10'), (2, 20, 200, 'b20'), (3, 30, 300, 'b30')";
 
-/// Turns the development knob on: every pin here defines a star.
-fn knob() {
-    trellis::dev::defs::set_star_join(true);
-}
-
 async fn trellis(d: &Driver) -> Trellis {
     Trellis::connect(
         Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
@@ -242,7 +237,6 @@ async fn step_behind_frozen_page(
 #[tokio::test]
 async fn ppc_a_page_at_position_2_on_a_chunks_key_queues_behind_the_chunk() {
     let _serial = star::serial().await;
-    knob();
     for star in N3.stars() {
         let mut d = star::start_unbuilt(&[star], A_ROWS, B_ROWS).await;
         assert_eq!(
@@ -275,7 +269,6 @@ async fn ppc_a_page_at_position_2_on_a_chunks_key_queues_behind_the_chunk() {
 #[tokio::test]
 async fn ppc_a_chunk_on_a_pages_key_at_position_2_gives_up_and_retries() {
     let _serial = star::serial().await;
-    knob();
     for star in N3.stars() {
         let mut d = star::start_unbuilt(&[star], A_ROWS, B_ROWS).await;
         assert_eq!(
@@ -368,7 +361,6 @@ async fn c10_insert_from_read(shape: Shape) {
 #[tokio::test]
 async fn ps6a_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_at_the_last_position_retries() {
     let _serial = star::serial().await;
-    knob();
     c10_insert_from_read(N3).await;
 }
 
@@ -377,7 +369,6 @@ async fn ps6a_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_at_the_last_pos
 #[tokio::test]
 async fn ps6b_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_at_the_first_position_retries() {
     let _serial = star::serial().await;
-    knob();
     c10_insert_from_read(N3_FIRST).await;
 }
 
@@ -390,7 +381,6 @@ async fn ps6b_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_at_the_first_po
 #[tokio::test]
 async fn ppc_c10_a_chunk_whose_rederived_row_moved_at_position_2_retries() {
     let _serial = star::serial().await;
-    knob();
     for star in N3.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         rebuild_planned(&mut d).await;
@@ -442,7 +432,6 @@ async fn ppc_c10_a_chunk_whose_rederived_row_moved_at_position_2_retries() {
 #[tokio::test]
 async fn ppc_c10_a_chunk_whose_entry_moved_off_its_key_set_at_position_2_retries() {
     let _serial = star::serial().await;
-    knob();
     for star in N3.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         rebuild_planned(&mut d).await;
@@ -518,7 +507,6 @@ async fn ppc_c10_a_chunk_whose_entry_moved_off_its_key_set_at_position_2_retries
 #[tokio::test]
 async fn px1_a_resume_removes_the_rows_of_a_rows_deleted_while_paused() {
     let _serial = star::serial().await;
-    knob();
     for (case, sql) in [
         (
             "mixed",
@@ -547,7 +535,6 @@ async fn px1_a_resume_removes_the_rows_of_a_rows_deleted_while_paused() {
 #[tokio::test]
 async fn px2_a_row_reinserted_after_the_orphan_read_is_kept() {
     let _serial = star::serial().await;
-    knob();
     for star in N3.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         change_while_paused(&mut d, &[star], "delete from public.a where id = 3").await;
@@ -589,7 +576,6 @@ async fn px2_a_row_reinserted_after_the_orphan_read_is_kept() {
 #[tokio::test]
 async fn px3_the_m_pass_tombstones_the_m_entries_at_position_2_of_rows_gone_before_a_rebuild() {
     let _serial = star::serial().await;
-    knob();
     for star in N3.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         star::write_uncaptured(
@@ -667,7 +653,6 @@ const N4_CHANGES: &str = "update public.a set k1 = 2, k2 = 3, k3 = 4 where id = 
 #[tokio::test]
 async fn an_n4_star_builds_resumes_and_rebuilds_with_rows_at_every_position() {
     let _serial = star::serial().await;
-    knob();
     let shape = Shape::new(3, 1);
     let stars = shape.stars();
     let ddl = format!("{}; {N4_SEED}", shape.ddl());
@@ -786,7 +771,6 @@ async fn assert_producer(d: &Driver, kind: &str, step: &str) {
 #[tokio::test]
 async fn a_row_keyed_by_null_at_position_2_is_read_by_its_m_pass() {
     let _serial = star::serial().await;
-    knob();
     let int4 = ValueType::Integer(IntWidth::Int4);
     for (kind, word) in [("left", "LEFT"), ("inner", "INNER")] {
         let mut d = Driver::start(

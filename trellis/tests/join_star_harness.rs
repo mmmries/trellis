@@ -4,12 +4,11 @@
 //! - The fixture's generated text: the two-table shape's definition and
 //!   oracle, and the DDL, seed and oracle of every shape up to the cap, run on
 //!   a plain Postgres database with no transform defined.
-//! - Every star shape up to the cap defines with the development knob on
-//!   and builds, at its first and last position.
+//! - Every star shape up to the cap defines and builds, at its first and
+//!   last position.
 //! - Pins written once against "the joined table at `at`" and run at every
-//!   shape this process can run ([`star::runnable`]): the two-table JOIN
-//!   and a star of three tables at its last position, with the development
-//!   knob on.
+//!   shape of [`SHAPES`]: the two-table JOIN and a star of three tables at
+//!   its last position.
 //!   - the build, then changes of `a` and of the table at `at`;
 //!   - F3 (#1371): an `a` move racing an update of its new key, a family;
 //!   - M (#1375): two crossing mixed pages, a race;
@@ -43,20 +42,9 @@ const SHAPES: [Shape; 2] = [
     },
 ];
 
-/// [`SHAPES`] this process can define, with the development knob on (this
-/// binary's pins all run a star); a skipped shape says so.
+/// The shapes the pins run at: [`SHAPES`].
 fn shapes() -> Vec<Shape> {
-    trellis::dev::defs::set_star_join(true);
-    SHAPES
-        .into_iter()
-        .filter(|shape| {
-            let runs = star::runnable(*shape);
-            if !runs {
-                eprintln!("{shape:?} skipped: {} is off", star::STAR_KNOB);
-            }
-            runs
-        })
-        .collect()
+    SHAPES.to_vec()
 }
 
 const A_ROWS: &str =
@@ -197,15 +185,13 @@ async fn every_shapes_tables_and_oracle_run_on_postgres() {
 }
 
 /// Every star shape up to the cap (3 to 5 tables), at its first and last
-/// position, defines with the knob on and builds: the `M` pass of every
+/// position, defines and builds: the `M` pass of every
 /// position, in small batches so each position's pass takes several, then
 /// the chunks of `a` and the sweep. The target, `R` and every `M` equal the
 /// live tables, and a root change then applies.
 #[tokio::test]
 async fn every_star_builds_every_position() {
     let _serial = star::serial().await;
-    let was = star::star_join_enabled();
-    trellis::dev::defs::set_star_join(true);
     for positions in 2..=star::MAX_POSITIONS {
         for at in [1, positions] {
             let shape = Shape::new(positions, at);
@@ -221,7 +207,6 @@ async fn every_star_builds_every_position() {
             star::assert_oracle(&mut d, &stars).await;
         }
     }
-    trellis::dev::defs::set_star_join(was);
 }
 
 // --------------------------------------------------------------------- pins

@@ -18,8 +18,7 @@
 //! `TRANSFORM` is the left-to-right `LEFT JOIN` chain, its `total` the root's
 //! `x` plus every position's `COALESCE(w, 0)`, and the oracle and the control
 //! join the same tables. `--joined 1` is the two-table shape of every earlier
-//! run, table for table. More than one joined table runs behind the dev knob
-//! `TRELLIS_DEV_STAR_JOIN` (set in-process, until #1784 removes it).
+//! run, table for table.
 //!
 //! `--fan-out-position P` (1 to N, default 1) is the joined table the fan-out
 //! scenario updates: the hot rows of `asrc` hold key 1 in column `k{P}` (and
@@ -235,13 +234,6 @@ impl OneToOneJoin {
         );
     }
 
-    /// Admits a star at define: the dev knob, in this process (#1784 removes it).
-    fn enable_star(&self) {
-        if self.joined > 1 {
-            trellis::dev::defs::set_star_join(true);
-        }
-    }
-
     /// The statement that changes the fan-out's joined row.
     fn update_b(&self) -> String {
         format!(
@@ -373,7 +365,6 @@ struct Fixture {
 
 async fn fixture(cfg: &OneToOneJoin, tuning: &EngineTuning, rows: Rows) -> Fixture {
     cfg.validate();
-    cfg.enable_star();
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;

@@ -156,7 +156,7 @@ async fn status_reports_the_sizes_of_r_m_and_j() {
         ]
     );
     assert_eq!(status.partials_warning, None);
-    assert_eq!(status.fan_out_warning, None);
+    assert_eq!(status.fan_out_warnings, []);
     assert_eq!(status.building, None);
 
     // `J` keeps a row for a key neither table holds any more, and gains one
@@ -173,12 +173,21 @@ async fn status_reports_the_sizes_of_r_m_and_j() {
     assert_eq!(status.building, None);
 }
 
+/// The warning of a two-table JOIN, which has one position, so one warning
+/// at most.
+async fn warning(d: &Driver) -> Option<trellis::FanOutWarning> {
+    let mut warnings = join_status(d).await.fan_out_warnings;
+    assert!(warnings.len() <= 1, "one position: {warnings:?}");
+    let warning = warnings.pop();
+    if let Some(w) = &warning {
+        assert_eq!(w.position, 1, "{w:?}");
+    }
+    warning
+}
+
 /// The warning's key, rows and threshold.
 async fn warned(d: &Driver) -> Option<(String, i64, i64)> {
-    join_status(d)
-        .await
-        .fan_out_warning
-        .map(|w| (w.key, w.rows, w.threshold))
+    warning(d).await.map(|w| (w.key, w.rows, w.threshold))
 }
 
 #[tokio::test]
@@ -191,7 +200,7 @@ async fn a_default_threshold_warns_of_nothing_in_a_small_table() {
         .await
         .expect("status")
         .expect("exists");
-    assert_eq!(status.join.expect("join").fan_out_warning, None);
+    assert_eq!(status.join.expect("join").fan_out_warnings, []);
 }
 
 #[tokio::test]
@@ -200,16 +209,9 @@ async fn status_warns_of_a_join_key_with_more_a_rows_than_the_threshold() {
     let mut d = start(true).await;
     // The largest group holds 3 rows (keys 20 and 40).
     set_one_to_one_join_fan_out_warning_rows(3);
-    assert_eq!(
-        join_status(&d).await.fan_out_warning,
-        None,
-        "3 is not past 3"
-    );
+    assert_eq!(warned(&d).await, None, "3 is not past 3");
     set_one_to_one_join_fan_out_warning_rows(2);
-    let warning = join_status(&d)
-        .await
-        .fan_out_warning
-        .expect("keys 20 and 40 hold 3 rows");
+    let warning = warning(&d).await.expect("keys 20 and 40 hold 3 rows");
     assert_eq!((warning.rows, warning.threshold), (3, 2));
     assert!(warning.key == "20" || warning.key == "40", "{warning:?}");
 
@@ -223,23 +225,19 @@ async fn status_warns_of_a_join_key_with_more_a_rows_than_the_threshold() {
     set_one_to_one_join_fan_out_warning_rows(5);
     assert_eq!(warned(&d).await, Some(("30".to_string(), 6, 5)));
     set_one_to_one_join_fan_out_warning_rows(6);
-    assert_eq!(
-        join_status(&d).await.fan_out_warning,
-        None,
-        "6 is not past 6"
-    );
+    assert_eq!(warned(&d).await, None, "6 is not past 6");
 
     // Rows deleted are tombstones in `R`, and a tombstone is not a row on the
     // key; a row with a `NULL` key is on none.
     set_one_to_one_join_fan_out_warning_rows(3);
     step(&mut d, "delete from public.a where id like 'x%'").await;
-    assert_eq!(join_status(&d).await.fan_out_warning, None);
+    assert_eq!(warned(&d).await, None);
     step(
         &mut d,
         "insert into public.a select 'n' || i, null, i, 'n' from generate_series(1, 9) i",
     )
     .await;
-    assert_eq!(join_status(&d).await.fan_out_warning, None);
+    assert_eq!(warned(&d).await, None);
     set_one_to_one_join_fan_out_warning_rows(0);
 }
 
@@ -265,10 +263,7 @@ async fn a_composite_join_key_is_named_by_all_its_columns() {
     )
     .await;
     set_one_to_one_join_fan_out_warning_rows(2);
-    let warning = join_status(&d)
-        .await
-        .fan_out_warning
-        .expect("3 rows on (1, x)");
+    let warning = warning(&d).await.expect("3 rows on (1, x)");
     assert_eq!(
         (warning.key.as_str(), warning.rows, warning.threshold),
         ("1,x", 3, 2)

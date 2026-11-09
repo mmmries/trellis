@@ -501,8 +501,7 @@ mod tests {
     }
 
     /// Chained `JOIN`s parse, left to right, for either kind of `JOIN`: how
-    /// many tables and which an `ON` reads are the validator's, so a stored
-    /// star loads whatever the knob says.
+    /// many tables and which an `ON` reads are the validator's.
     #[test]
     fn chained_joins_parse_in_the_order_written() {
         for (text, grouped) in [

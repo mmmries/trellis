@@ -265,6 +265,52 @@ How that delta is applied **exactly once** — never twice, never zero times —
 apply and mark-complete in a single transaction, is
 [stage 05](staging-and-claiming/05-apply-and-exactly-once-deltas.md).
 
+### A 1-1 `JOIN`'s hidden state
+
+A 1-1 `JOIN` ([transforms](transforms.md#1-1-join),
+[ADR-0021](decisions/0021-one-to-one-join-transforms.md)) never reads a source
+table while it writes: each page reads Trellis-owned copies of its tables,
+kept in the catalog schema and named by the transform's id. A star of `a` and
+up to four joined tables, numbered by position from 1 in `JOIN` order, keeps:
+
+* **`R`**, one entry per `a` row: the 1-1 ledger's ordering state
+  ([ADR-0002](decisions/0002-async-data-flow.md)), the row's join key at every
+  position and the `a` columns the fields read, with one index per position on
+  that position's join key.
+* **An `M` per position** (`M`, then `M2` to `M4`), one entry per row of the
+  table joined there, keyed by its primary key and indexed on its join key.
+* **`J`**, one table of lock rows, one per `(position, join key)`, and the
+  transform's truncate lock row.
+* **Pending fan-out markers** (`join1_fan_out`), one per position and key whose
+  change reaches more `a` rows than one chunk, until the last chunk commits.
+
+The two-table `JOIN` is the one-position case: the same tables, one `M`.
+
+Every transaction that touches a target row first holds that row's `R`
+entry, so the entry orders every pair of writers of the row whatever
+positions they write. An `a` change locks `J` at every position for its old
+and new keys; a change of the table at position `i` locks `J` at position `i`
+only, then the `R` entries of every row on its keys there, in one statement
+over every position the page touches, before it reads any `M`. A page takes
+its locks in one global order over the union of its keys:
+
+1. the definition rows, in id order: `FOR UPDATE` for a target whose joined
+   table the page truncates, and `FOR KEY SHARE` for one whose page may hold
+   a row in quarantine, so a page queues behind a rebuild's start, which takes
+   them in the same order;
+2. the truncate lock row: `FOR UPDATE` in a page that truncates a table,
+   `FOR SHARE` in any other, which orders a `TRUNCATE a` against the pages in
+   flight;
+3. `J`, in one statement sorted by `(position, key)`;
+4. the `R` entries, in one statement sorted by entry key;
+5. the `M` entries, sorted by `(position, id)`;
+6. the target rows.
+
+Placeholder inserts follow the same order, so no two transactions take two
+rows of `J`, `R` or `M` in opposite orders. Why each rule is needed at every
+position, and the model that checked them, is ADR-0021's
+[lock rules](decisions/0021-one-to-one-join-transforms.md#no-writer-reads-another-tables-source-only-its-copy-under-j-and-the-rows-r-entry).
+
 ## Writing to calculated tables and chaining
 
 Computed results are written to the calculated tables. Those writes are

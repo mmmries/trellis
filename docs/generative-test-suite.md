@@ -569,19 +569,15 @@ beside them run on every `cargo test`.
   `INNER` position matched, and the in-run sampler runs it on every star's
   target, as it does the two-table check, over the engine's
   position-indexed snapshot read.
-  The tier runs only when
-  `join_one_to_one::star_tier_enabled` says so: the development knob
-  `TRELLIS_DEV_STAR_JOIN` is on. With it off its property passes every case
-  without running it and its planted-bug sweep,
-  `star_join_planted_bugs_are_caught`, returns at once, so a green run of
-  either without the knob says nothing about a star; the two-table
-  tiers draw and check exactly what they did without it
+  The star tier's property, sweep and metamorphic check all run behind
+  `join_one_to_one::star_tier_enabled`, which is on; the two-table
+  tiers draw and check exactly what they did without a star
   (`tests/join_star_tier.rs` holds their draws' digests). The same file
   checks, with no engine apply running, that the strategy reaches every
   table count, kind, position, hot-key overlap, mixed page and knob; that the
   oracle is the multi-join over a real Postgres at 3, 4 and 5 tables, against
-  the file's own model of a star, under any `JOIN` order; and that define,
-  with the knob on, admits every drawn star definition. Its planted-bug
+  the file's own model of a star, under any `JOIN` order; and that define
+  admits every drawn star definition. Its planted-bug
   sweep (tier `join_star`) runs every `Join1*` and `star_*` plant but those
   the runner can't reach (a held row, a write past capture, a page the
   barrier never lets drain late, a target at a later position, and the

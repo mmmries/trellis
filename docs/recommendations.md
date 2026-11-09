@@ -229,10 +229,12 @@ Each requirement, and what dropping it does
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)
 has the details):
 
-* **A source's primary key**: the staging worker can no longer capture the
+* **A source's primary key** (of every table a definition reads, each joined
+  table of a 1-1 `JOIN` star included): the staging worker can no longer capture the
   table, and `status()` says so. The transforms that read it pause when
   Trellis next applies a change of it.
-* **The unique index backing a source's `KEY (…)`**: build its replacement
+* **The unique index backing a source's `KEY (…)`** (of any table read, at
+  any position of a star): build its replacement
   before dropping it. Any equivalent index backs the key, so `REINDEX
   CONCURRENTLY`, a rename, pg_repack and `ADD PRIMARY KEY USING INDEX` change
   nothing. With none valid, the staging worker's next reconcile pass pauses
@@ -243,7 +245,7 @@ has the details):
   invalid until `ALTER INDEX … ATTACH PARTITION` is run again for that leaf.
   `RESUME` refuses until an index backs the key, then rebuilds.
 * **The unique key on a 1-1 `JOIN`'s `b` `ON` columns** (in a star, on each
-  joined table's own `ON` columns): the staging worker's next reconcile pass
+  joined table's own `ON` columns, at every position): the staging worker's next reconcile pass
   pauses the whole transform, naming that table and its `ON` columns,
   whether or not a duplicate arrived. So does a swap that drops the old index
   before it creates the new one, when a pass runs between the two, which is
@@ -279,11 +281,25 @@ about 1.8 s of chunks. While the chunks run, root apply proceeds at 0.52 to
 0.59 times its usual rate, and with 8 apply workers the transform is 30 to 38%
 slower than the same transform without the lookup.
 
-`status()` reports a key that fans out widely: `join.fan_out_warning` names the
-key, the number of root rows on it and the threshold, which is 250,000 rows per
+A lookup joined at any position of a 1-1 `JOIN` star
+([transforms](transforms.md#1-1-join)) fans out the same way: one edit rewrites
+every target row on its key at that position.
+
+Each table a star adds raises the cost of a changed row by a small, nearly
+constant amount. Measured on fan-outs of 1,000,000 rows and root passes of
+200,000 rows: a fanned-out row costs about 0.4 µs more per added table (about
+4% of the two-table cost of roughly 11 µs per row) and about 8 bytes of WAL,
+wherever in the star the changed joined table sits; a changed root row costs
+about 4 µs more per added table (about 15% of the two-table cost of roughly
+28 µs per row) and 240 to 370 bytes of WAL. Both costs grow sublinearly with the
+number of tables, and there is no step up at the five-table limit.
+
+`status()` reports a key that fans out widely: `join.fan_out_warnings` has one
+warning per joined position past the threshold, naming the position, the key,
+the number of root rows on it and the threshold, which is 250,000 rows per
 key unless `TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING` sets another
 ([observability](observability.md#transform-status-lifecycle)). `trellis
-status` prints it as a warning line. The warning fires on a key that is already
+status` prints each as a warning line. The warning fires on a key that is already
 large; a lookup under the threshold still costs its fan-out on every edit.
 
 Materializing a join pays on every write to the joined table, and joining at

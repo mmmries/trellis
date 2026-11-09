@@ -102,9 +102,10 @@ Nothing in the binding uses it.
   `Trellis::JoinStatus`): `hidden_tables`, each a `Trellis::HiddenTable` with
   `table`, `name`, `estimated_rows` and `bytes`, the `P`-size warning
   (`partials_warning`, a `Trellis::PartialsWarning`), a 1-1 `JOIN`'s fan-out
-  warning (`fan_out_warning`, a `Trellis::FanOutWarning`) and the step its
-  build runs (`building`, a `Trellis::JoinBuildStep` with `step` and the
-  `side`, `part`, `leaf` or `remaining` its kind of step carries). `join` is
+  warnings (`fan_out_warnings`, one `Trellis::FanOutWarning` per joined
+  position past the threshold, naming its `position`) and the step its build
+  runs (`building`, a `Trellis::JoinBuildStep` with `step` and the `side`,
+  `part`, `leaf`, `remaining` or `position` its kind of step carries). `join` is
   `nil` for any other definition. `status` reports the oldest Trellis release
   that can run a definition (`floor`, `"major.minor.patch"`), which an
   application reads before rolling back to an earlier Trellis release

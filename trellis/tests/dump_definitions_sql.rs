@@ -732,7 +732,6 @@ async fn every_trellis_table_is_classified() {
     define_and_build(&t, &mut raw).await;
     // A star of five tables owns every position's `M`. Defined last, and
     // unbuilt: only its tables are read here.
-    trellis::dev::defs::set_star_join(true);
     raw.batch_execute(
         "create table public.d2 (id bigint primary key, x text); \
          create table public.d3 (id bigint primary key, x text); \

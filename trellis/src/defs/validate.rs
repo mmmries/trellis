@@ -183,9 +183,6 @@ pub enum ValidationError {
     /// A 1-1 `JOIN` of more tables than a star admits: `tables` counts the
     /// `FROM` table and every joined one (#1459's cap).
     StarJoinTooManyTables { tables: usize },
-    /// A 1-1 `JOIN` of more than two tables (a star) was defined while the
-    /// development knob that admits it is off.
-    StarJoinDisabled { tables: usize },
     /// An `ON` term of the table joined as `table` reads `other`, another
     /// joined table: each `ON` reads only the `FROM` table and the table it
     /// joins (a star, not a snowflake).
@@ -1153,11 +1150,6 @@ impl fmt::Display for ValidationError {
                  and {} joined tables)",
                 super::join::MAX_POSITIONS + 1,
                 super::join::MAX_POSITIONS
-            ),
-            ValidationError::StarJoinDisabled { tables } => write!(
-                f,
-                "this JOIN reads {tables} tables; a 1-1 JOIN of more than two tables is not \
-                 available yet (a JOIN reads the FROM table and one joined table)"
             ),
             ValidationError::JoinOnReadsAnotherJoinedTable { table, term, other } => write!(
                 f,

@@ -244,7 +244,7 @@ struct StatusTerm {
 struct JoinStatusTerm {
     hidden_tables: Vec<HiddenTableTerm>,
     partials_warning: Option<PartialsWarningTerm>,
-    fan_out_warning: Option<FanOutWarningTerm>,
+    fan_out_warnings: Vec<FanOutWarningTerm>,
     building: Option<JoinBuildStepTerm>,
 }
 
@@ -257,7 +257,11 @@ impl JoinStatusTerm {
                 .map(HiddenTableTerm::from)
                 .collect(),
             partials_warning: join.partials_warning.map(PartialsWarningTerm::from),
-            fan_out_warning: join.fan_out_warning.map(FanOutWarningTerm::from),
+            fan_out_warnings: join
+                .fan_out_warnings
+                .into_iter()
+                .map(FanOutWarningTerm::from)
+                .collect(),
             building: join
                 .building
                 .map(|step| JoinBuildStepTerm::new(env, step))
@@ -302,9 +306,11 @@ impl From<PlainPartialsWarning> for PartialsWarningTerm {
     }
 }
 
-/// A 1-1 `JOIN`'s very large group on one join key, as `status/2` reports it.
+/// A 1-1 `JOIN`'s very large group on one join key at one joined position,
+/// as `status/2` reports it.
 #[derive(NifMap)]
 struct FanOutWarningTerm {
+    position: usize,
     key: String,
     rows: i64,
     threshold: i64,
@@ -313,6 +319,7 @@ struct FanOutWarningTerm {
 impl From<PlainFanOutWarning> for FanOutWarningTerm {
     fn from(warning: PlainFanOutWarning) -> Self {
         FanOutWarningTerm {
+            position: warning.position,
             key: warning.key,
             rows: warning.rows,
             threshold: warning.threshold,
@@ -331,6 +338,7 @@ struct JoinBuildStepTerm {
     part: Option<Atom>,
     leaf: Option<String>,
     remaining: Option<i64>,
+    position: Option<usize>,
 }
 
 impl JoinBuildStepTerm {
@@ -341,6 +349,7 @@ impl JoinBuildStepTerm {
             part: step.part.map(|word| word_atom(env, word)).transpose()?,
             leaf: step.leaf,
             remaining: step.remaining,
+            position: step.position,
         })
     }
 }

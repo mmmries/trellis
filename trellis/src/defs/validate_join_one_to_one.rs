@@ -39,9 +39,6 @@ pub fn validate(
     if join.joins.len() > super::join::MAX_POSITIONS {
         return Err(ValidationError::StarJoinTooManyTables { tables });
     }
-    if join.joins.len() > 1 && !super::join_one_to_one::star_enabled() {
-        return Err(ValidationError::StarJoinDisabled { tables });
-    }
     assert_eq!(
         joined.len(),
         join.joins.len(),
@@ -260,8 +257,9 @@ mod tests {
         validate_join(&def, &from, &[&joined])
     }
 
-    /// A 1-1 `JOIN` is admitted with no setting: the development knob that
-    /// once gated it is gone, so `TRELLIS_DEV_ONE_TO_ONE_JOIN` set to any
+    /// A 1-1 `JOIN`, a star included, is admitted with no setting: the
+    /// development knobs that once gated them are gone, so
+    /// `TRELLIS_DEV_ONE_TO_ONE_JOIN` or `TRELLIS_DEV_STAR_JOIN` set to any
     /// value, an "off" one included, changes nothing.
     #[test]
     fn a_one_to_one_join_is_admitted_with_no_knob() {
@@ -273,10 +271,17 @@ mod tests {
         .unwrap();
         let (from, joined) = sides();
         assert_eq!(validate_join(&def, &from, &[&joined]), Ok(()));
+        let star = parse(
+            "TRANSFORM v FROM orders JOIN customers ON orders.cust = customers.id \
+             LEFT JOIN regions ON orders.cust = regions.id \
+             SELECT customers.name AS who, regions.name AS region",
+        )
+        .unwrap();
+        assert_eq!(validate_join(&star, &from, &[&joined, &joined]), Ok(()));
     }
 
     /// Runs [`a_one_to_one_join_is_admitted_with_no_knob`] in a child process
-    /// whose environment sets the old knob's variable to each value it read as
+    /// whose environment sets the old knobs' variables to each value they read as
     /// off or on. The child sets it before anything runs, so nothing races
     /// `std::env::set_var` in this process.
     #[test]
@@ -290,12 +295,13 @@ mod tests {
                     "--test-threads=1",
                 ])
                 .env("TRELLIS_DEV_ONE_TO_ONE_JOIN", value)
+                .env("TRELLIS_DEV_STAR_JOIN", value)
                 .output()
                 .expect("run the child test");
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(
                 out.status.success() && stdout.contains("1 passed"),
-                "TRELLIS_DEV_ONE_TO_ONE_JOIN={value}: {stdout}{}",
+                "TRELLIS_DEV_ONE_TO_ONE_JOIN and TRELLIS_DEV_STAR_JOIN={value}: {stdout}{}",
                 String::from_utf8_lossy(&out.stderr)
             );
         }
@@ -406,15 +412,10 @@ mod tests {
         ));
     }
 
-    /// Tests that set the star knob take this, so they don't see each
-    /// other's.
-    static STAR_KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// A star of `n` tables (`orders` and `c2`..`c<n>`), each joined on
-    /// `orders.cust`, selecting a column of each, validated with the knob
-    /// set to `knob`.
-    fn star(n: usize, knob: bool) -> Result<(), ValidationError> {
-        star_text(&star_def(n), n, knob)
+    /// `orders.cust`, selecting a column of each.
+    fn star(n: usize) -> Result<(), ValidationError> {
+        star_text(&star_def(n), n)
     }
 
     fn star_def(n: usize) -> String {
@@ -429,41 +430,27 @@ mod tests {
         )
     }
 
-    fn star_text(text: &str, n: usize, knob: bool) -> Result<(), ValidationError> {
-        let _lock = STAR_KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    fn star_text(text: &str, n: usize) -> Result<(), ValidationError> {
         let def = parse(text).unwrap();
         let (from, joined) = sides();
         let joined: Vec<&HashMap<String, JoinColumnInfo>> = (2..=n).map(|_| &joined).collect();
-        crate::defs::join_one_to_one::set_star_enabled(knob);
-        let result = validate_join(&def, &from, &joined);
-        crate::defs::join_one_to_one::set_star_enabled(false);
-        result
+        validate_join(&def, &from, &joined)
     }
 
-    /// The star knob gates at validate: with it off a star of any size is
-    /// refused by name, and the two-table JOIN is admitted either way.
+    /// A star of 3 to 5 tables validates with nothing set, as the two-table
+    /// JOIN does.
     #[test]
-    fn the_star_knob_gates_a_star_at_validate() {
-        for n in 3..=5 {
-            assert_eq!(
-                star(n, false),
-                Err(ValidationError::StarJoinDisabled { tables: n })
-            );
-            assert_eq!(star(n, true), Ok(()), "{n} tables");
+    fn a_star_validates_with_nothing_set() {
+        for n in 2..=5 {
+            assert_eq!(star(n), Ok(()), "{n} tables");
         }
-        assert_eq!(star(2, false), Ok(()));
-        assert!(
-            ValidationError::StarJoinDisabled { tables: 3 }
-                .to_string()
-                .contains("more than two tables is not available yet")
-        );
     }
 
     /// U2 (#1464): define refuses 6 tables by name and accepts 5.
     #[test]
     fn u2_a_star_of_six_tables_is_refused_and_five_admitted() {
-        assert_eq!(star(5, true), Ok(()));
-        let refused = star(6, true);
+        assert_eq!(star(5), Ok(()));
+        let refused = star(6);
         assert_eq!(
             refused,
             Err(ValidationError::StarJoinTooManyTables { tables: 6 })
@@ -471,9 +458,8 @@ mod tests {
         let text = refused.unwrap_err().to_string();
         assert!(text.contains("reads 6 tables"), "{text}");
         assert!(text.contains("at most 5"), "{text}");
-        // Refused at the cap whatever the knob says.
         assert_eq!(
-            star(7, false),
+            star(7),
             Err(ValidationError::StarJoinTooManyTables { tables: 7 })
         );
     }
@@ -488,7 +474,7 @@ mod tests {
                 "TRANSFORM v FROM orders JOIN c2 ON orders.cust = c2.id \
                  JOIN c3 ON {on3} SELECT c2.name AS a, c3.name AS b"
             );
-            match star_text(&text, 3, true) {
+            match star_text(&text, 3) {
                 Err(ValidationError::JoinOnReadsAnotherJoinedTable {
                     table,
                     other: found,
@@ -510,7 +496,7 @@ mod tests {
         let text = "TRANSFORM v FROM orders JOIN c2 ON orders.cust = c3.id \
                     JOIN c3 ON orders.cust = c3.id SELECT c2.name AS a";
         assert!(matches!(
-            star_text(text, 3, true),
+            star_text(text, 3),
             Err(ValidationError::JoinOnReadsAnotherJoinedTable { .. })
         ));
         let message = ValidationError::JoinOnReadsAnotherJoinedTable {

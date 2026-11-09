@@ -8,12 +8,11 @@
 //! row per join key; and the pair's truncate lock row. Neither side reads the
 //! other's source, only its copy under `J`.
 //!
-//! A star (more than one joined table, behind the development knob until it
-//! ships) is the same path indexed by position: an `M` per joined table,
-//! `J`'s rows per position, and `a`'s key one per position. The two-table
-//! JOIN is its one-position case. Each joined table's change is of its own
-//! position; a key, and K below, is per position, and a step over `M` runs
-//! for each position in position order.
+//! A star (more than one joined table) is the same path indexed by
+//! position: an `M` per joined table, `J`'s rows per position, and `a`'s key
+//! one per position. The two-table JOIN is its one-position case. Each
+//! joined table's change is of its own position; a key, and K below, is per
+//! position, and a step over `M` runs for each position in position order.
 //!
 //! # One page ([`apply_page`])
 //!
@@ -381,15 +380,6 @@ impl JoinShape {
             target: target.clone(),
             what: "a 1-1 JOIN with no joined table",
         })?;
-        // A star (more than one joined table) defines only with the dev knob
-        // on; one stored while it was on halts in a process where it is off.
-        if join.joins.len() > 1 && !crate::defs::join_one_to_one::star_enabled() {
-            return Err(ApplyError::GroupBasisUnsupported {
-                target,
-                what: "a 1-1 JOIN of more than two tables, which this process doesn't admit \
-                       (TRELLIS_DEV_STAR_JOIN is off)",
-            });
-        }
         let (tables, a_columns, b_columns) = {
             let client = pool.get().await?;
             let tables = crate::defs::catalog::joined_tables_of(&**client, definition.id).await?;

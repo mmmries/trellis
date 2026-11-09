@@ -4,7 +4,7 @@
 //! takes seconds to reach them all. It is [`super::join_status`]'s
 //! [`JoinStatus`], filled for a definition with no `P` and `T`: `hidden_tables`
 //! lists `R`, `M` and `J`, `building` names a [`OneToOneBuildStep`] and
-//! `fan_out_warning` is set. Detection only: nothing here changes the
+//! `fan_out_warnings` is filled. Detection only: nothing here changes the
 //! definition's status or repairs anything.
 //!
 //! Sizes and row counts are the planner's estimates, as the aggregate `JOIN`'s
@@ -18,10 +18,10 @@
 //!
 //! A change of a joined table's row rewrites every target row on its key at
 //! its position, in chunks (`super::join_one_to_one::fan_out`), before a
-//! watermark token past it converges (ADR-0021). The warning names the
-//! position and the join key of the largest group of live `R` entries on
-//! one join key when it holds more than [`fan_out_warning_rows`] of them.
-//! Each position is sampled over its own index on `R`. It is the only
+//! watermark token past it converges (ADR-0021). Each position gets a
+//! warning when its largest group of live `R` entries on one join key holds
+//! more than [`fan_out_warning_rows`] of them, naming the position and that
+//! key. Each position is sampled over its own index on `R`. It is the only
 //! runtime signal of a lookup table joined at any position (few keys and
 //! many rows on each), which define admits.
 //!
@@ -105,7 +105,7 @@ const COUNT_CAP_FACTOR: i64 = 10;
 
 /// A join key whose `a` group is large enough that a change of its `b` row
 /// takes seconds to rewrite its target rows; see
-/// [`JoinStatus::fan_out_warning`].
+/// [`JoinStatus::fan_out_warnings`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FanOutWarning {
@@ -175,12 +175,13 @@ pub(crate) async fn for_definition(
             hidden_tables.push(size);
         }
     }
-    let fan_out_warning = fan_out_warning(client, catalog_schema, id, def, &hidden_tables).await?;
+    let fan_out_warnings =
+        fan_out_warnings(client, catalog_schema, id, def, &hidden_tables).await?;
     let building = building(client, id).await?.map(JoinBuildStep::OneToOne);
     Ok(JoinStatus {
         hidden_tables,
         partials_warning: None,
-        fan_out_warning,
+        fan_out_warnings,
         building,
     })
 }
@@ -190,24 +191,22 @@ fn sample_percent(pages: i64) -> f64 {
     (100.0 * SAMPLE_PAGES as f64 / pages.max(1) as f64).min(100.0)
 }
 
-/// The largest group of live `R` entries on one join key at any position,
-/// if it passes the threshold (the module doc). Each position's key is
-/// sampled over its own index on `R`; of the positions whose largest group
-/// passes, the warning names the one with the most rows, the first position
-/// on a tie.
-async fn fan_out_warning(
+/// A warning for each position whose largest group of live `R` entries on
+/// one join key passes the threshold, in position order (the module doc).
+/// Each position's key is sampled over its own index on `R`.
+async fn fan_out_warnings(
     client: &impl GenericClient,
     catalog_schema: &str,
     id: i64,
     def: &TransformDef,
     hidden_tables: &[HiddenTableSize],
-) -> Result<Option<FanOutWarning>, tokio_postgres::Error> {
+) -> Result<Vec<FanOutWarning>, tokio_postgres::Error> {
     // No `R`, or an empty one, has no group.
     if !hidden_tables.iter().any(|t| t.table == "R") {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let Some(join) = spec::spec(def) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let threshold = fan_out_warning_rows();
     let r = HiddenTable::FromEntries.qualified(catalog_schema, id);
@@ -221,9 +220,9 @@ async fn fan_out_warning(
         .await?
         .get(0);
     if pages == 0 {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let mut warning: Option<FanOutWarning> = None;
+    let mut warnings = Vec::new();
     for (position, _) in spec::positions(join) {
         let key = spec::from_key_at(def, position);
         if key.is_empty() {
@@ -232,8 +231,8 @@ async fn fan_out_warning(
         let Some((text, rows)) = largest_group(client, &r, &key, pages, threshold).await? else {
             continue;
         };
-        if rows > threshold && warning.as_ref().is_none_or(|w| rows > w.rows) {
-            warning = Some(FanOutWarning {
+        if rows > threshold {
+            warnings.push(FanOutWarning {
                 position: position.number(),
                 key: text,
                 rows,
@@ -241,7 +240,7 @@ async fn fan_out_warning(
             });
         }
     }
-    Ok(warning)
+    Ok(warnings)
 }
 
 /// The largest group of live entries of `r` (qualified) on one value of its

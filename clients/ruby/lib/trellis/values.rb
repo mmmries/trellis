@@ -171,20 +171,21 @@ module Trellis
   # estimated size of each (hidden_tables, HiddenTables: P, M, J and T, or R, M
   # and J for a 1-1 JOIN, a table that doesn't exist left out), a warning when
   # P has grown close to the fact table's size (partials_warning, a
-  # PartialsWarning), a 1-1 JOIN's warning that one join key holds a very
-  # large group of rows (fan_out_warning, a FanOutWarning) and the step its
-  # build runs now, or runs next while no worker holds its job (building, a
-  # JoinBuildStep). Each warning and building are nil when there is none.
+  # PartialsWarning), a 1-1 JOIN's warnings that one join key holds a very
+  # large group of rows (fan_out_warnings, FanOutWarnings, one per joined
+  # position past the threshold, in position order) and the step its build
+  # runs now, or runs next while no worker holds its job (building, a
+  # JoinBuildStep). partials_warning and building are nil, and
+  # fan_out_warnings is empty, when there is none.
   # Sizes are the planner's estimates, as fresh as the table's last ANALYZE or
   # autovacuum.
-  JoinStatus = Data.define(:hidden_tables, :partials_warning, :fan_out_warning, :building) do
+  JoinStatus = Data.define(:hidden_tables, :partials_warning, :fan_out_warnings, :building) do
     def self.from_native(hash)
       partials_warning = hash.fetch(:partials_warning)
-      fan_out_warning = hash.fetch(:fan_out_warning)
       building = hash.fetch(:building)
       new(hidden_tables: hash.fetch(:hidden_tables).map { |t| HiddenTable.new(**t) },
           partials_warning: partials_warning && PartialsWarning.new(**partials_warning),
-          fan_out_warning: fan_out_warning && FanOutWarning.new(**fan_out_warning),
+          fan_out_warnings: hash.fetch(:fan_out_warnings).map { |w| FanOutWarning.new(**w) },
           building: building && JoinBuildStep.new(**building))
     end
   end
@@ -201,14 +202,16 @@ module Trellis
   # half of the fact table's (fact_rows).
   PartialsWarning = Data.define(:partials_rows, :fact_rows)
 
-  # A 1-1 JOIN has a join key with a very large group of a rows: a change of
-  # its b row rewrites that many target rows, in chunks, before a watermark
-  # token past it converges. It names the join key's text (key, its columns'
+  # A 1-1 JOIN has a join key with a very large group of a rows at one joined
+  # position: a change of that position's row on the key rewrites that many
+  # target rows, in chunks, before a watermark token past it converges. It
+  # names the joined position (position, 1 for the first table joined), the
+  # join key's text (key, its columns'
   # values joined by ","), the group's live rows (rows, exact up to ten times
   # the threshold) and the threshold it passed (threshold). The group is found
   # by sampling, so a group just past the threshold can go unreported until it
   # grows.
-  FanOutWarning = Data.define(:key, :rows, :threshold)
+  FanOutWarning = Data.define(:position, :key, :rows, :threshold)
 
   # The step a JOIN build runs, in a JoinStatus. step is the kind:
   #
@@ -223,15 +226,17 @@ module Trellis
   #   says why).
   # * :final, the step that writes T and the target and completes the build.
   # * A 1-1 JOIN's steps: :joined_rows, :joined_null_keys and :joined_gone for
-  #   the pass over M, :planning_chunks while the plan job walks a's primary
+  #   the pass over the M of the joined position position (1 for the first
+  #   table joined), :planning_chunks while the plan job walks a's primary
   #   key, :chunks while the chunks of that key run (remaining of them are
   #   still to run), and :sweep_stale and :sweep_orphans for the two passes of
   #   the sweep that ends a rebuild in place.
   # * :unknown, a step added since this binding was built; side and part read
   #   :unknown likewise for an unknown side or part.
   #
-  # side, part, leaf and remaining are nil for the steps that don't carry them.
-  JoinBuildStep = Data.define(:step, :side, :part, :leaf, :remaining)
+  # side, part, leaf, remaining and position are nil for the steps that don't
+  # carry them.
+  JoinBuildStep = Data.define(:step, :side, :part, :leaf, :remaining, :position)
 
   # Another Trellis version is live on the instance, so this process changes
   # nothing until it is gone, as Trellis.status reports it: this binary's

@@ -79,8 +79,6 @@ async fn assert_matches(d: &Driver, kinds: [&str; 2], case: &str) {
 #[tokio::test]
 async fn a_star_joining_two_positions_on_one_root_column_applies_root_deletes_and_moves() {
     let _serial = star::serial().await;
-    let was = star::star_join_enabled();
-    trellis::dev::defs::set_star_join(true);
     for kinds in [
         ["LEFT", "LEFT"],
         ["LEFT", "INNER"],
@@ -135,5 +133,4 @@ async fn a_star_joining_two_positions_on_one_root_column_applies_root_deletes_an
             assert_matches(&d, kinds, case).await;
         }
     }
-    trellis::dev::defs::set_star_join(was);
 }

@@ -57,11 +57,6 @@ const CROSS_SEED: &str = "insert into public.a (id, k1, k2, x, y) values \
                           insert into public.b1 values (1, 1, 10, 'b1'), (2, 2, 20, 'b2'); \
                           insert into public.b2 values (1, 1, 100, 'e1'), (2, 2, 200, 'e2')";
 
-/// Turns the development knob on: every pin here defines a star.
-fn knob() {
-    trellis::dev::defs::set_star_join(true);
-}
-
 const MOVE_BOTH: Writer = Writer::Change("update public.a set k1 = 2, k2 = 2 where id = 1");
 
 /// PS1a (F2c): `a` row 1 moves both keys `(1, 1) → (2, 2)` ‖ a change of
@@ -71,7 +66,6 @@ const MOVE_BOTH: Writer = Writer::Change("update public.a set k1 = 2, k2 = 2 whe
 #[tokio::test]
 async fn ps1a_a_root_moving_both_keys_races_a_change_of_its_new_key_at_the_last_position() {
     let _serial = star::serial().await;
-    knob();
     star::family_seeded(
         N3,
         SEED,
@@ -87,7 +81,6 @@ async fn ps1a_a_root_moving_both_keys_races_a_change_of_its_new_key_at_the_last_
 #[tokio::test]
 async fn ps1b_a_root_moving_both_keys_races_a_change_of_its_new_key_at_the_first_position() {
     let _serial = star::serial().await;
-    knob();
     star::family_seeded(
         N3,
         SEED,
@@ -104,7 +97,6 @@ async fn ps1b_a_root_moving_both_keys_races_a_change_of_its_new_key_at_the_first
 #[tokio::test]
 async fn ps2_a_root_moving_both_keys_races_a_change_of_the_key_it_leaves_at_the_last_position() {
     let _serial = star::serial().await;
-    knob();
     star::family_seeded(
         N3,
         SEED,
@@ -173,7 +165,6 @@ async fn late_key_at(position: usize, joined_sql: &str) {
 #[tokio::test]
 async fn ps4a_a_root_rederive_whose_key_moved_at_the_last_position_retries() {
     let _serial = star::serial().await;
-    knob();
     late_key_at(2, "update public.b2 set w = 201 where id = 2").await;
 }
 
@@ -182,7 +173,6 @@ async fn ps4a_a_root_rederive_whose_key_moved_at_the_last_position_retries() {
 #[tokio::test]
 async fn ps4b_a_root_rederive_whose_key_moved_at_the_first_position_retries() {
     let _serial = star::serial().await;
-    knob();
     late_key_at(1, "update public.b1 set w = 21 where id = 2").await;
 }
 
@@ -193,7 +183,6 @@ async fn ps4b_a_root_rederive_whose_key_moved_at_the_first_position_retries() {
 #[tokio::test]
 async fn ps5_a_root_rederive_races_a_change_of_its_moved_key_at_the_last_position() {
     let _serial = star::serial().await;
-    knob();
     star::family_seeded(
         N3,
         SEED,
@@ -211,7 +200,6 @@ async fn ps5_a_root_rederive_races_a_change_of_its_moved_key_at_the_last_positio
 #[tokio::test]
 async fn cx_f2a_a_root_move_races_a_page_on_its_new_key_and_its_old_key() {
     let _serial = star::serial().await;
-    knob();
     star::family_seeded(
         N3,
         SEED,
@@ -229,7 +217,6 @@ async fn cx_f2a_a_root_move_races_a_page_on_its_new_key_and_its_old_key() {
 #[tokio::test]
 async fn cx_f2b_a_root_move_races_a_page_on_its_old_key_and_its_new_key() {
     let _serial = star::serial().await;
-    knob();
     star::family_seeded(
         N3,
         SEED,
@@ -252,7 +239,6 @@ async fn cx_f2b_a_root_move_races_a_page_on_its_old_key_and_its_new_key() {
 #[tokio::test]
 async fn cx_f2e_a_root_move_races_a_change_of_each_new_key() {
     let _serial = star::serial().await;
-    knob();
     let b1 = Writer::Change("update public.b1 set w = 21 where id = 2");
     let b2 = Writer::Change("update public.b2 set w = 201 where id = 2");
     for star in N3.stars() {
@@ -281,7 +267,6 @@ async fn cx_f2e_a_root_move_races_a_change_of_each_new_key() {
 #[tokio::test]
 async fn cx_f3a_crossing_root_moves_of_both_keys_queue_without_deadlock() {
     let _serial = star::serial().await;
-    knob();
     star::family_seeded(
         N3,
         SEED,
@@ -298,7 +283,6 @@ async fn cx_f3a_crossing_root_moves_of_both_keys_queue_without_deadlock() {
 #[tokio::test]
 async fn cx_f3c_crossing_root_moves_of_crossed_keys_queue_without_deadlock() {
     let _serial = star::serial().await;
-    knob();
     star::family_seeded(
         N3,
         CROSS_SEED,
@@ -315,7 +299,6 @@ async fn cx_f3c_crossing_root_moves_of_crossed_keys_queue_without_deadlock() {
 #[tokio::test]
 async fn a_root_moving_every_key_races_a_change_of_its_new_key_at_the_middle_position() {
     let _serial = star::serial().await;
-    knob();
     star::family_seeded(
         Shape {
             positions: 3,
