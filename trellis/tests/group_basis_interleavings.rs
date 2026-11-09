@@ -1295,37 +1295,3 @@ async fn the_evicting_changes_groups_are_held_and_released() {
     assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
     assert_oracle(&mut d).await;
 }
-
-// ------------------------------------------------------------------ refusals
-
-/// Define refuses `SUM` over a `numeric` with no declared scale on the group
-/// basis.
-#[tokio::test]
-async fn define_refuses_an_unconstrained_numeric_sum() {
-    let cluster = testkit::TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = drain_driver::connect(db.dsn()).await;
-    client
-        .batch_execute(
-            "create table public.src (id integer primary key, g integer, m numeric); \
-             create index on public.src (g)",
-        )
-        .await
-        .expect("source");
-    let columns = [
-        ("id".to_string(), int4()),
-        ("g".to_string(), int4()),
-        ("m".to_string(), ValueType::Numeric),
-    ]
-    .into_iter()
-    .collect();
-    let err = trellis::dev::defs::install_definition(
-        &db.pool,
-        "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(m) AS total",
-        &columns,
-        "public",
-    )
-    .await
-    .expect_err("refused");
-    assert!(err.to_string().contains("no declared scale"), "{err}");
-}

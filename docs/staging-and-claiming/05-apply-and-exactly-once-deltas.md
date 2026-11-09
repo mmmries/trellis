@@ -301,7 +301,8 @@ table in the catalog schema, `agg_<id>`, beside the group's basis and stamp.
 The visible target holds only the declared columns, computed from the
 partials whenever the visible row is written. The grammar admits `COUNT(*)`,
 `COUNT(x)`, and `SUM`/`AVG` over `smallint`, `integer`, `bigint` and
-`numeric(p,s)`, because only those can be kept exact from each change alone.
+`numeric`, because only those can be kept exact from each change alone (a
+`numeric` sum with a count per display scale and of each special value).
 An argument may be an expression (`SUM(v + 1)`), evaluated per change over
 the image as the source's row type.
 
@@ -424,7 +425,7 @@ a running sum and count and writes the ratio when it writes the visible row.
 
 **Not every measure is delta-able**; the gate is explicit: only exact,
 invertible folds are maintained by increments. `count(*)`, `count(col)`, and
-`sum`/`avg` over `smallint`, `integer`, `bigint` and `numeric(p,s)` are in.
+`sum`/`avg` over `smallint`, `integer`, `bigint` and `numeric` are in.
 Everything else is refused at define, named by its family
 ([transforms](../transforms.md#supported-sources-and-targets)): `min`/`max` are
 not invertible (removing the current maximum tells you nothing about the next

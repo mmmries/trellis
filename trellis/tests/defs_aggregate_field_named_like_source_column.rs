@@ -196,12 +196,11 @@ async fn a_plain_aggregate_outside_the_admitted_set_is_refused_at_define_by_fami
     columns.insert("n".to_string(), ValueType::Numeric);
     columns.insert("ok".to_string(), ValueType::Boolean);
 
-    for (field, want) in [
-        ("BOOL_AND(ok)", Some("bool_and/bool_or/bit_and/bit_or")),
-        ("ARRAY_AGG(val)", Some("array_agg/string_agg/jsonb_agg")),
-        ("SUM(f)", Some("float and interval SUM/AVG")),
-        ("AVG(f)", Some("float and interval SUM/AVG")),
-        ("SUM(n)", None),
+    for (field, family) in [
+        ("BOOL_AND(ok)", "bool_and/bool_or/bit_and/bit_or"),
+        ("ARRAY_AGG(val)", "array_agg/string_agg/jsonb_agg"),
+        ("SUM(f)", "float and interval SUM/AVG"),
+        ("AVG(f)", "float and interval SUM/AVG"),
     ] {
         let err = install_definition(
             &db.pool,
@@ -214,23 +213,14 @@ async fn a_plain_aggregate_outside_the_admitted_set_is_refused_at_define_by_fami
         )
         .await
         .expect_err(field);
-        match want {
-            Some(family) => assert!(
-                matches!(
-                    &err,
-                    CatalogError::Validate(ValidationError::DeferredAggregate { family: f, .. })
-                        if *f == family
-                ),
-                "{field}: {err:?}"
+        assert!(
+            matches!(
+                &err,
+                CatalogError::Validate(ValidationError::DeferredAggregate { family: f, .. })
+                    if *f == family
             ),
-            None => assert!(
-                matches!(
-                    &err,
-                    CatalogError::Validate(ValidationError::UnconstrainedNumericAggregate { .. })
-                ),
-                "{field}: {err:?}"
-            ),
-        }
+            "{field}: {err:?}"
+        );
         let left: (bool, i64, i64) = {
             let row = client
                 .query_one(

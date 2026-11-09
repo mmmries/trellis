@@ -55,6 +55,7 @@ use crate::capture::CaptureError;
 use crate::capture::columns::{CaptureCatalog, load_catalog_for, read_columns, readers_of};
 use crate::capture::install::{Installed, installed};
 use crate::defs::catalog::CatalogError;
+use crate::defs::join::Position;
 use crate::defs::model::StoredStatus;
 use crate::defs::validate::ValidationError;
 use crate::defs::{copies, key_types};
@@ -550,12 +551,14 @@ fn virtual_column_error(table: &str, column: &str, expression: &str) -> String {
 }
 
 /// The staging worker's capture pass's re-check of the key every 1-1 `JOIN`
-/// rests on: pauses every 1-1 `JOIN` whose joined table is `table`, that
-/// isn't paused for a capture failure yet, and whose `ON` columns no longer
-/// contain a unique key of `table` by define's rule
-/// ([`crate::defs::join_one_to_one::joined_key_is_unique`]: the primary key, a
-/// unique constraint, or a valid, non-partial unique index on plain columns),
-/// recording why in `capture_failures`, with the `ON` columns. Returns
+/// rests on: pauses every 1-1 `JOIN` that joins `table` at some position,
+/// that isn't paused for a capture failure yet, and whose `ON` columns of
+/// `table` at that position no longer contain a unique key of `table` by
+/// define's rule ([`crate::defs::join_one_to_one::joined_key_is_unique_at`]:
+/// the primary key, a unique constraint, or a valid, non-partial unique
+/// index on plain columns), recording why in `capture_failures`, with that
+/// position's `ON` columns. The whole transform pauses, whichever position
+/// lost its key. Returns
 /// whether it paused any, in which case the caller leaves the table for the
 /// next pass.
 ///
@@ -571,8 +574,9 @@ fn virtual_column_error(table: &str, column: &str, expression: &str) -> String {
 /// the rows it rewrites for the target's readers.
 ///
 /// One catalog query per such definition, skipped while `table`'s
-/// fingerprint (`drift`, read before any check) is the one its last check
-/// found the key at ([`drift_memo::key_skippable`]): the fingerprint covers
+/// fingerprint (`drift`, read before any check) and the position's `ON`
+/// columns are the ones its last check found the key at
+/// ([`drift_memo::key_skippable`]): the fingerprint covers
 /// every `pg_index` row's `xmin`, so a drop, a create or a validity change
 /// always forces the check. Reads neither `M` nor `table`'s rows. Runs on
 /// the captured tables only: a joined table that is another definition's
@@ -588,30 +592,37 @@ pub(crate) async fn pause_joins_without_unique_key(
     table: &str,
 ) -> Result<bool, CaptureError> {
     let fingerprint = drift.of(&crate::defs::ddl::regclass_arg(table));
+    // Each 1-1 JOIN with `table` at some position, and that position. Define
+    // refuses a table joined twice, so a definition has `table` at one
+    // position at most.
     let joins: Vec<_> = catalog
         .definitions
         .iter()
-        .filter(|r| {
-            !r.capture_failed
-                && r.joined.iter().any(|joined| joined == table)
-                && crate::defs::join::is_one_to_one(&r.def)
+        .filter(|r| !r.capture_failed && crate::defs::join::is_one_to_one(&r.def))
+        .filter_map(|r| {
+            let index = r.joined.iter().position(|joined| joined == table)?;
+            Some((r, Position::of_index(index)))
         })
         .collect();
-    let ids: Vec<i64> = joins.iter().map(|r| r.id).collect();
+    let ids: Vec<i64> = joins.iter().map(|(r, _)| r.id).collect();
     drift_memo::retain_key_readers(instance, table, &ids);
     let mut gone: Vec<(i64, Vec<String>)> = Vec::new();
-    for reader in joins {
-        let on = crate::defs::join_one_to_one::joined_on_columns(&reader.def);
-        let stamp = fingerprint.map(|f| format!("{f}|{on:?}"));
+    for (reader, position) in joins {
+        let on = crate::defs::join_one_to_one::joined_on_columns_at(&reader.def, position);
+        let stamp = fingerprint.map(|f| format!("{f}|{}|{on:?}", position.number()));
         if stamp
             .as_deref()
             .is_some_and(|stamp| drift_memo::key_skippable(instance, table, reader.id, stamp))
         {
             continue;
         }
-        let unique =
-            crate::defs::join_one_to_one::joined_key_is_unique(&*client, &reader.def, table)
-                .await?;
+        let unique = crate::defs::join_one_to_one::joined_key_is_unique_at(
+            &*client,
+            &reader.def,
+            position,
+            table,
+        )
+        .await?;
         // The stamp was read before the check, so a change that committed
         // since it was read is checked again next pass.
         drift_memo::record_key(instance, table, reader.id, stamp.filter(|_| unique));

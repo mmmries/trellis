@@ -385,7 +385,7 @@ pub(crate) async fn run_chunk(
         &shape.target,
     )
     .await?;
-    lock_keys(txn, shape, &k).await?;
+    lock_keys(txn, shape, &chunk_skip_j(shape, &k)).await?;
 
     // 3. Insert-from-read: the entries of the rows that have none.
     let keys: Vec<&str> = records.keys().copied().collect();
@@ -507,7 +507,7 @@ async fn insert_from_read(
     if !unchecked
         && rows
             .iter()
-            .any(|row| moved_key(shape, Side::From, &key_parts(row, 1, arity), k))
+            .any(|row| chunk_moved_key(shape, &key_parts(row, 1, arity), k))
     {
         #[cfg(any(test, feature = "test-util"))]
         super::super::interleave::note_join_key_moved();
@@ -516,4 +516,58 @@ async fn insert_from_read(
         });
     }
     Ok(rows.iter().map(|row| row.get(0)).collect())
+}
+
+/// The position (its index) a planted `star_chunk_skip_j_last` or
+/// `star_chunk_skip_j_first` leaves out of a star chunk's `J` set and its
+/// insert's late-key check, with the plant. See `crate::plant`.
+#[cfg(any(test, feature = "test-util"))]
+fn chunk_skip(shape: &JoinShape) -> Option<(crate::plant::Plant, usize)> {
+    if !shape.is_star() {
+        return None;
+    }
+    match crate::plant::armed() {
+        Some(plant @ crate::plant::Plant::StarChunkSkipJLast) => {
+            Some((plant, shape.positions.len() - 1))
+        }
+        Some(plant @ crate::plant::Plant::StarChunkSkipJFirst) => Some((plant, 0)),
+        _ => None,
+    }
+}
+
+/// The keys a chunk locks in `J`: `k`, but under a planted bug a star's keys
+/// at one position left out ([`chunk_skip`]).
+fn chunk_skip_j(shape: &JoinShape, k: &PageKeys) -> PageKeys {
+    #[cfg(any(test, feature = "test-util"))]
+    if let Some((plant, i)) = chunk_skip(shape)
+        && crate::plant::fires(plant, !k[i].is_empty())
+    {
+        let mut locked = k.clone();
+        locked[i].clear();
+        return locked;
+    }
+    let _ = shape;
+    k.clone()
+}
+
+/// Whether a key of a row the chunk's insert-from-read found isn't in `k`
+/// ([`moved_key`]), but under a planted bug not when the only such key is at
+/// the position [`chunk_skip`] names.
+fn chunk_moved_key(shape: &JoinShape, parts: &[Option<String>], k: &PageKeys) -> bool {
+    if !moved_key(shape, Side::From, parts, k) {
+        return false;
+    }
+    #[cfg(any(test, feature = "test-util"))]
+    if let Some((plant, i)) = chunk_skip(shape) {
+        let missing: Vec<usize> = shape
+            .split_key(Side::From, parts)
+            .into_iter()
+            .filter(|(position, key)| !k[position.index()].contains(key))
+            .map(|(position, _)| position.index())
+            .collect();
+        if crate::plant::fires(plant, missing == [i]) {
+            return false;
+        }
+    }
+    true
 }
