@@ -10,9 +10,9 @@
 //!
 //! A star (more than one joined table) is the same path indexed by
 //! position: an `M` per joined table, `J`'s rows per position, and `a`'s key
-//! one per position. The two-table JOIN is its one-position case. Each joined table's change is of its own
-//! position; a key, and K below, is per position, and a step over `M` runs
-//! for each position in position order.
+//! one per position. The two-table JOIN is its one-position case. Each
+//! joined table's change is of its own position; a key, and K below, is per
+//! position, and a step over `M` runs for each position in position order.
 //!
 //! # One page ([`apply_page`])
 //!
