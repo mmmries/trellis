@@ -28,7 +28,7 @@
     "JoinStatus": {
       "hidden_tables": {"list_of": {"record": "HiddenTable"}},
       "partials_warning": {"nullable": {"record": "PartialsWarning"}},
-      "fan_out_warning": {"nullable": {"record": "FanOutWarning"}},
+      "fan_out_warnings": {"list_of": {"record": "FanOutWarning"}},
       "building": {"nullable": {"record": "JoinBuildStep"}}
     },
     "HiddenTable": {
@@ -42,6 +42,7 @@
       "fact_rows": "integer"
     },
     "FanOutWarning": {
+      "position": "integer",
       "key": "string",
       "rows": "integer",
       "threshold": "integer"
@@ -51,7 +52,8 @@
       "side": {"nullable": {"word_in": "join_side"}},
       "part": {"nullable": {"word_in": "join_side_part"}},
       "leaf": {"nullable": "string"},
-      "remaining": {"nullable": "integer"}
+      "remaining": {"nullable": "integer"},
+      "position": {"nullable": "integer"}
     },
     "VersionHandover": {
       "this_version": "string",
@@ -322,7 +324,7 @@
         {"record": "HiddenTable", "fields": {"table": {"eq": "T"}, "estimated_rows": {"eq": 0}}}
       ]},
       "partials_warning": null,
-      "fan_out_warning": null,
+      "fan_out_warnings": {"list": []},
       "building": null
     }}}}},
     {"op": "apply", "args": ["TRANSFORM parity_pets_named FROM parity_pets JOIN parity_species ON parity_pets.species_id = parity_species.id SELECT parity_species.name AS name"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
@@ -347,9 +349,9 @@
     {"about": "A staging worker with no drain workers. connect returns once the worker's first capture pass has installed capture on every defined source, so the write below is captured, and nothing drains it.", "op": "connect", "opts": {"url": {"$dsn": {}}, "staging": true, "drain_threads": 0}, "expect": null},
     {"op": "has_live_staging_worker", "until": {"eq": true}, "waiting_for": "a live staging worker"},
     {"op": "has_live_drain_workers", "expect": {"eq": false}},
-    {"about": "The staging worker starts parity_lines_by_bucket's build, and with no drain worker to run it, the step under way stays the first: the FROM side's first leaf, by its recorded name.", "op": "status", "args": ["parity_lines_by_bucket"], "until": {"record": "Status", "fields": {"status": {"word": "backfilling"}, "join": {"record": "JoinStatus", "fields": {"building": {"record": "JoinBuildStep", "fields": {"step": {"word": "side"}, "side": {"word": "from"}, "part": {"word": "leaf"}, "leaf": {"eq": "public.parity_lines_p1"}, "remaining": null}}}}}}, "waiting_for": "parity_lines_by_bucket's build to start"},
+    {"about": "The staging worker starts parity_lines_by_bucket's build, and with no drain worker to run it, the step under way stays the first: the FROM side's first leaf, by its recorded name.", "op": "status", "args": ["parity_lines_by_bucket"], "until": {"record": "Status", "fields": {"status": {"word": "backfilling"}, "join": {"record": "JoinStatus", "fields": {"building": {"record": "JoinBuildStep", "fields": {"step": {"word": "side"}, "side": {"word": "from"}, "part": {"word": "leaf"}, "leaf": {"eq": "public.parity_lines_p1"}, "remaining": null, "position": null}}}}}}, "waiting_for": "parity_lines_by_bucket's build to start"},
     {"about": "The same step against the schema's own shapes, unnarrowed: each word is one of the sets the binding reports.", "op": "status", "args": ["parity_lines_by_bucket"], "expect": {"record": "Status", "fields": {"join": {"record": "JoinStatus", "fields": {"building": {"record": "JoinBuildStep"}}}}}},
-    {"about": "A 1-1 JOIN's build likewise stays at its first step, the pass over b's rows.", "op": "status", "args": ["parity_pets_named"], "until": {"record": "Status", "fields": {"status": {"word": "backfilling"}, "join": {"record": "JoinStatus", "fields": {"building": {"record": "JoinBuildStep", "fields": {"step": {"word": "joined_rows"}, "side": null, "part": null, "leaf": null, "remaining": null}}}}}}, "waiting_for": "parity_pets_named's build to start"},
+    {"about": "A 1-1 JOIN's build likewise stays at its first step, the pass over b's rows.", "op": "status", "args": ["parity_pets_named"], "until": {"record": "Status", "fields": {"status": {"word": "backfilling"}, "join": {"record": "JoinStatus", "fields": {"building": {"record": "JoinBuildStep", "fields": {"step": {"word": "joined_rows"}, "side": null, "part": null, "leaf": null, "remaining": null, "position": {"eq": 1}}}}}}}, "waiting_for": "parity_pets_named's build to start"},
     {"about": "A captured write to a defined source: the token below has work outstanding.", "op": "sql", "args": ["update parity_items set price = 51 where id = 5"]},
     {"op": "watermark_token", "save": "idle_token", "expect": "string"},
     {"about": "Nothing drains the write, so the token can't converge.", "op": "await_converged", "args": [{"$ref": "idle_token"}], "opts": {"timeout_ms": 0}, "expect": {"error": "timeout"}},
@@ -380,7 +382,7 @@
         {"record": "HiddenTable", "fields": {"table": {"eq": "T"}}}
       ]},
       "partials_warning": {"record": "PartialsWarning", "fields": {"partials_rows": {"eq": 1000}, "fact_rows": {"eq": 1200}}},
-      "fan_out_warning": null,
+      "fan_out_warnings": {"list": []},
       "building": null
     }}}}},
     {"op": "status", "args": ["parity_pets_named"], "until": {"record": "Status", "fields": {"status": {"word": "live"}}}, "waiting_for": "parity_pets_named to go live"},
@@ -391,7 +393,7 @@
         {"record": "HiddenTable", "fields": {"table": {"eq": "J"}}}
       ]},
       "partials_warning": null,
-      "fan_out_warning": null,
+      "fan_out_warnings": {"list": []},
       "building": null
     }}}}},
 
@@ -585,14 +587,14 @@
     {
       "about": "A JOIN's status with a fan-out warning, which needs a 1-1 JOIN with a group of rows past the 250,000-row threshold, so a live run can't produce it cheaply (the live steps check the rest as the binding encodes it): two hidden tables, a partials warning, a fan-out warning and a side step on one leaf cross with every sibling number distinct and past 32 bits, so a host that swaps or narrows a field fails.",
       "type": "Status",
-      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "extreme_index_gaps": [], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": null, "version_handover": null, "below_catalog_floor": null, "join": {"hidden_tables": [{"table": "P", "name": "join_7_p", "estimated_rows": 5000000011, "bytes": 9000000017}, {"table": "M", "name": "join_7_m", "estimated_rows": 21, "bytes": 8192}], "partials_warning": {"partials_rows": 6000000013, "fact_rows": 7000000019}, "fan_out_warning": {"key": "42,eu", "rows": 3000000023, "threshold": 250000}, "building": {"step": {"$word": "side"}, "side": {"$word": "joined"}, "part": {"$word": "leaf"}, "leaf": "public.items_p2", "remaining": null}}, "floor": "0.2.0"},
-      "expect": {"record": "Status", "fields": {"status": {"word": "live"}, "join": {"record": "JoinStatus", "fields": {"hidden_tables": {"list": [{"record": "HiddenTable", "fields": {"table": {"eq": "P"}, "name": {"eq": "join_7_p"}, "estimated_rows": {"eq": 5000000011}, "bytes": {"eq": 9000000017}}}, {"record": "HiddenTable", "fields": {"table": {"eq": "M"}, "name": {"eq": "join_7_m"}, "estimated_rows": {"eq": 21}, "bytes": {"eq": 8192}}}]}, "partials_warning": {"record": "PartialsWarning", "fields": {"partials_rows": {"eq": 6000000013}, "fact_rows": {"eq": 7000000019}}}, "fan_out_warning": {"record": "FanOutWarning", "fields": {"key": {"eq": "42,eu"}, "rows": {"eq": 3000000023}, "threshold": {"eq": 250000}}}, "building": {"record": "JoinBuildStep", "fields": {"step": {"word": "side"}, "side": {"word": "joined"}, "part": {"word": "leaf"}, "leaf": {"eq": "public.items_p2"}, "remaining": null}}}}}}
+      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "extreme_index_gaps": [], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": null, "version_handover": null, "below_catalog_floor": null, "join": {"hidden_tables": [{"table": "P", "name": "join_7_p", "estimated_rows": 5000000011, "bytes": 9000000017}, {"table": "M", "name": "join_7_m", "estimated_rows": 21, "bytes": 8192}], "partials_warning": {"partials_rows": 6000000013, "fact_rows": 7000000019}, "fan_out_warnings": [{"position": 1, "key": "42,eu", "rows": 3000000023, "threshold": 250000}, {"position": 3, "key": "7", "rows": 300001, "threshold": 250000}], "building": {"step": {"$word": "side"}, "side": {"$word": "joined"}, "part": {"$word": "leaf"}, "leaf": "public.items_p2", "remaining": null, "position": null}}, "floor": "0.2.0"},
+      "expect": {"record": "Status", "fields": {"status": {"word": "live"}, "join": {"record": "JoinStatus", "fields": {"hidden_tables": {"list": [{"record": "HiddenTable", "fields": {"table": {"eq": "P"}, "name": {"eq": "join_7_p"}, "estimated_rows": {"eq": 5000000011}, "bytes": {"eq": 9000000017}}}, {"record": "HiddenTable", "fields": {"table": {"eq": "M"}, "name": {"eq": "join_7_m"}, "estimated_rows": {"eq": 21}, "bytes": {"eq": 8192}}}]}, "partials_warning": {"record": "PartialsWarning", "fields": {"partials_rows": {"eq": 6000000013}, "fact_rows": {"eq": 7000000019}}}, "fan_out_warnings": {"list": [{"record": "FanOutWarning", "fields": {"position": {"eq": 1}, "key": {"eq": "42,eu"}, "rows": {"eq": 3000000023}, "threshold": {"eq": 250000}}}, {"record": "FanOutWarning", "fields": {"position": {"eq": 3}, "key": {"eq": "7"}, "rows": {"eq": 300001}, "threshold": {"eq": 250000}}}]}, "building": {"record": "JoinBuildStep", "fields": {"step": {"word": "side"}, "side": {"word": "joined"}, "part": {"word": "leaf"}, "leaf": {"eq": "public.items_p2"}, "remaining": null, "position": null}}}}}}
     },
     {
       "about": "A 1-1 JOIN's chunk step in a status, which needs a build stopped between its plan and its chunks, so a live run can't produce it reliably: the chunks still to run cross as an integer past 32 bits, the side, part and leaf are null, and a JOIN with no tables or warnings crosses an empty list and two nulls.",
       "type": "Status",
-      "native": {"status": {"$word": "backfilling"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "extreme_index_gaps": [], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": null, "version_handover": null, "below_catalog_floor": null, "join": {"hidden_tables": [], "partials_warning": null, "fan_out_warning": null, "building": {"step": {"$word": "chunks"}, "side": null, "part": null, "leaf": null, "remaining": 4294967301}}, "floor": "0.2.0"},
-      "expect": {"record": "Status", "fields": {"status": {"word": "backfilling"}, "join": {"record": "JoinStatus", "fields": {"hidden_tables": {"list": []}, "partials_warning": null, "fan_out_warning": null, "building": {"record": "JoinBuildStep", "fields": {"step": {"word": "chunks"}, "side": null, "part": null, "leaf": null, "remaining": {"eq": 4294967301}}}}}}}
+      "native": {"status": {"$word": "backfilling"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "extreme_index_gaps": [], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": null, "version_handover": null, "below_catalog_floor": null, "join": {"hidden_tables": [], "partials_warning": null, "fan_out_warnings": [], "building": {"step": {"$word": "chunks"}, "side": null, "part": null, "leaf": null, "remaining": 4294967301, "position": null}}, "floor": "0.2.0"},
+      "expect": {"record": "Status", "fields": {"status": {"word": "backfilling"}, "join": {"record": "JoinStatus", "fields": {"hidden_tables": {"list": []}, "partials_warning": null, "fan_out_warnings": {"list": []}, "building": {"record": "JoinBuildStep", "fields": {"step": {"word": "chunks"}, "side": null, "part": null, "leaf": null, "remaining": {"eq": 4294967301}, "position": null}}}}}}
     },
     {
       "about": "A job that stopped before the end of the target's keys says so: the outcome is not_caught_up, the report is truncated, and the position it stopped at is a token.",

@@ -70,12 +70,12 @@ pub struct JoinStatus {
     /// `PARTIALS_WARNING_PERCENT` percent of the fact table's. Never set for
     /// a 1-1 `JOIN`.
     pub partials_warning: Option<PartialsWarning>,
-    /// A 1-1 `JOIN`'s largest group of `a` rows on one join key, when it
-    /// passes the threshold: a change of its `b` row rewrites that many target
-    /// rows, in chunks, before a token past it converges. Sampled; see
-    /// [`FanOutWarning`]. Always `None`
-    /// for an aggregate `JOIN`.
-    pub fan_out_warning: Option<FanOutWarning>,
+    /// A 1-1 `JOIN`'s largest group of `a` rows on one join key at each
+    /// joined position, for each position where it passes the threshold, in
+    /// position order: a change of that position's row on the key rewrites
+    /// that many target rows, in chunks, before a token past it converges.
+    /// Sampled; see [`FanOutWarning`]. Always empty for an aggregate `JOIN`.
+    pub fan_out_warnings: Vec<FanOutWarning>,
     /// The step the definition's build runs now, or runs next if no worker
     /// holds its job; `None` when no build is under way or the definition
     /// is paused or quarantined.
@@ -165,7 +165,7 @@ pub(crate) async fn for_definition(
     Ok(Some(JoinStatus {
         hidden_tables,
         partials_warning,
-        fan_out_warning: None,
+        fan_out_warnings: Vec::new(),
         building,
     }))
 }

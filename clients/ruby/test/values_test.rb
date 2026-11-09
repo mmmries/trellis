@@ -239,9 +239,10 @@ class ValuesTest < Minitest::Test
           { table: "M", name: "join_7_m", estimated_rows: 21, bytes: 8192 }
         ],
         partials_warning: { partials_rows: 6_000_000_013, fact_rows: 7_000_000_019 },
-        fan_out_warning: { key: "42,eu", rows: 3_000_000_023, threshold: 250_000 },
+        fan_out_warnings: [{ position: 1, key: "42,eu", rows: 3_000_000_023, threshold: 250_000 },
+                           { position: 3, key: "7", rows: 300_001, threshold: 250_000 }],
         building: { step: :side, side: :joined, part: :leaf, leaf: "public.items_p2",
-                    remaining: nil }
+                    remaining: nil, position: nil }
       },
       floor: "0.2.0"
     )
@@ -253,10 +254,14 @@ class ValuesTest < Minitest::Test
       ],
       partials_warning: Trellis::PartialsWarning.new(partials_rows: 6_000_000_013,
                                                      fact_rows: 7_000_000_019),
-      fan_out_warning: Trellis::FanOutWarning.new(key: "42,eu", rows: 3_000_000_023,
-                                                  threshold: 250_000),
+      fan_out_warnings: [
+        Trellis::FanOutWarning.new(position: 1, key: "42,eu", rows: 3_000_000_023,
+                                   threshold: 250_000),
+        Trellis::FanOutWarning.new(position: 3, key: "7", rows: 300_001, threshold: 250_000)
+      ],
       building: Trellis::JoinBuildStep.new(step: :side, side: :joined, part: :leaf,
-                                           leaf: "public.items_p2", remaining: nil)
+                                           leaf: "public.items_p2", remaining: nil,
+                                           position: nil)
     ), status.join
   end
 
@@ -266,16 +271,24 @@ class ValuesTest < Minitest::Test
       held_keys: nil, drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
       join: {
-        hidden_tables: [], partials_warning: nil, fan_out_warning: nil,
-        building: { step: :chunks, side: nil, part: nil, leaf: nil, remaining: 4_294_967_301 }
+        hidden_tables: [], partials_warning: nil, fan_out_warnings: [],
+        building: { step: :chunks, side: nil, part: nil, leaf: nil, remaining: 4_294_967_301,
+                    position: nil }
       },
       floor: "0.2.0"
     )
     assert_equal Trellis::JoinStatus.new(
-      hidden_tables: [], partials_warning: nil, fan_out_warning: nil,
+      hidden_tables: [], partials_warning: nil, fan_out_warnings: [],
       building: Trellis::JoinBuildStep.new(step: :chunks, side: nil, part: nil, leaf: nil,
-                                           remaining: 4_294_967_301)
+                                           remaining: 4_294_967_301, position: nil)
     ), status.join
+  end
+
+  def test_a_one_to_one_joins_m_pass_step_keeps_its_joined_position
+    step = Trellis::JoinBuildStep.new(**{ step: :joined_null_keys, side: nil, part: nil,
+                                          leaf: nil, remaining: nil, position: 2 })
+    assert_equal 2, step.position
+    assert_equal :joined_null_keys, step.step
   end
 
   def test_a_definitions_floor_keeps_the_release_it_names

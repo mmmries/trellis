@@ -384,7 +384,7 @@ pub mod fixtures {
         JoinStatus {
             hidden_tables: Vec::new(),
             partials_warning: None,
-            fan_out_warning: None,
+            fan_out_warnings: Vec::new(),
             building: None,
         }
     }

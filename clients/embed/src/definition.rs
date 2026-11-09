@@ -120,9 +120,10 @@ pub struct PlainJoinStatus {
     /// Set when `P` has grown close to the fact table's size; see
     /// [`JoinStatus::partials_warning`].
     pub partials_warning: Option<PlainPartialsWarning>,
-    /// Set when a 1-1 `JOIN` has a join key with a very large group of `a`
-    /// rows; see [`JoinStatus::fan_out_warning`].
-    pub fan_out_warning: Option<PlainFanOutWarning>,
+    /// One per joined position of a 1-1 `JOIN` that has a join key with a
+    /// very large group of `a` rows, in position order; see
+    /// [`JoinStatus::fan_out_warnings`].
+    pub fan_out_warnings: Vec<PlainFanOutWarning>,
     /// The step the build runs now, or runs next while no worker holds its
     /// job; `None` when no build is under way.
     pub building: Option<PlainJoinBuildStep>,
@@ -182,6 +183,9 @@ pub struct PlainJoinBuildStep {
     pub leaf: Option<String>,
     /// For a `chunks` step, how many chunks are still to run.
     pub remaining: Option<i64>,
+    /// For a 1-1 `JOIN`'s `joined_rows`, `joined_null_keys` or `joined_gone`
+    /// step, the joined position whose `M` pass it is, from 1.
+    pub position: Option<usize>,
 }
 
 /// Every [`PlainJoinBuildStep::step`] word, for a binding to intern up
@@ -467,7 +471,11 @@ impl From<&JoinStatus> for PlainJoinStatus {
                 .partials_warning
                 .as_ref()
                 .map(PlainPartialsWarning::from),
-            fan_out_warning: join.fan_out_warning.as_ref().map(PlainFanOutWarning::from),
+            fan_out_warnings: join
+                .fan_out_warnings
+                .iter()
+                .map(PlainFanOutWarning::from)
+                .collect(),
             building: join.building.as_ref().map(PlainJoinBuildStep::from),
         }
     }
@@ -510,6 +518,10 @@ impl From<&JoinBuildStep> for PlainJoinBuildStep {
             step,
             ..PlainJoinBuildStep::default()
         };
+        let at = |position, step| PlainJoinBuildStep {
+            position: Some(position),
+            ..kind(step)
+        };
         // The enums are `#[non_exhaustive]`: a variant added later crosses
         // as `unknown` until the binding learns its word.
         match step {
@@ -533,12 +545,13 @@ impl From<&JoinBuildStep> for PlainJoinBuildStep {
                     part: Some(part),
                     leaf,
                     remaining: None,
+                    position: None,
                 }
             }
             JoinBuildStep::OneToOne(step) => match step {
-                OneToOneBuildStep::JoinedRows { .. } => kind("joined_rows"),
-                OneToOneBuildStep::JoinedNullKeys { .. } => kind("joined_null_keys"),
-                OneToOneBuildStep::JoinedGone { .. } => kind("joined_gone"),
+                OneToOneBuildStep::JoinedRows { position } => at(*position, "joined_rows"),
+                OneToOneBuildStep::JoinedNullKeys { position } => at(*position, "joined_null_keys"),
+                OneToOneBuildStep::JoinedGone { position } => at(*position, "joined_gone"),
                 OneToOneBuildStep::PlanningChunks => kind("planning_chunks"),
                 OneToOneBuildStep::Chunks { remaining } => PlainJoinBuildStep {
                     remaining: Some(*remaining),
@@ -1152,11 +1165,19 @@ mod tests {
                     partials_rows: 6_000_000_013,
                     fact_rows: 7_000_000_019,
                 })),
-                fan_out_warning: Some(trellis::fixture!(FanOutWarning {
-                    key: "42,eu".to_string(),
-                    rows: 3_000_000_023,
-                    threshold: 250_000,
-                })),
+                fan_out_warnings: vec![
+                    trellis::fixture!(FanOutWarning {
+                        key: "42,eu".to_string(),
+                        rows: 3_000_000_023,
+                        threshold: 250_000,
+                    }),
+                    trellis::fixture!(FanOutWarning {
+                        position: 3,
+                        key: "7".to_string(),
+                        rows: 300_001,
+                        threshold: 250_000,
+                    }),
+                ],
                 building: Some(JoinBuildStep::Final),
             })),
         });
@@ -1184,12 +1205,20 @@ mod tests {
                     partials_rows: 6_000_000_013,
                     fact_rows: 7_000_000_019,
                 }),
-                fan_out_warning: Some(PlainFanOutWarning {
-                    position: 1,
-                    key: "42,eu".to_string(),
-                    rows: 3_000_000_023,
-                    threshold: 250_000,
-                }),
+                fan_out_warnings: vec![
+                    PlainFanOutWarning {
+                        position: 1,
+                        key: "42,eu".to_string(),
+                        rows: 3_000_000_023,
+                        threshold: 250_000,
+                    },
+                    PlainFanOutWarning {
+                        position: 3,
+                        key: "7".to_string(),
+                        rows: 300_001,
+                        threshold: 250_000,
+                    },
+                ],
                 building: Some(PlainJoinBuildStep {
                     step: "final",
                     ..PlainJoinBuildStep::default()
@@ -1209,8 +1238,10 @@ mod tests {
     fn every_join_build_step_crosses_as_its_word_and_data() {
         let step = |step: JoinBuildStep| PlainJoinBuildStep::from(&step);
         let side = |side, part| step(JoinBuildStep::Side { side, part });
-        let words =
-            |step: PlainJoinBuildStep| (step.step, step.side, step.part, step.leaf, step.remaining);
+        let words = |step: PlainJoinBuildStep| {
+            assert_eq!(step.position, None, "{step:?}");
+            (step.step, step.side, step.part, step.leaf, step.remaining)
+        };
 
         assert_eq!(
             words(step(JoinBuildStep::Whole)),
@@ -1245,13 +1276,35 @@ mod tests {
             words(side(JoinSide::Joined, JoinSidePart::Unroutable)),
             ("side", Some("joined"), Some("unroutable"), None, None)
         );
-        for (one_to_one, word) in [
-            (OneToOneBuildStep::JoinedRows { position: 1 }, "joined_rows"),
+        for (one_to_one, word, position) in [
             (
-                OneToOneBuildStep::JoinedNullKeys { position: 1 },
-                "joined_null_keys",
+                OneToOneBuildStep::JoinedRows { position: 1 },
+                "joined_rows",
+                1,
             ),
-            (OneToOneBuildStep::JoinedGone { position: 1 }, "joined_gone"),
+            (
+                OneToOneBuildStep::JoinedNullKeys { position: 2 },
+                "joined_null_keys",
+                2,
+            ),
+            (
+                OneToOneBuildStep::JoinedGone { position: 4 },
+                "joined_gone",
+                4,
+            ),
+        ] {
+            let plain = step(JoinBuildStep::OneToOne(one_to_one));
+            assert_eq!(
+                (plain.step, plain.position),
+                (word, Some(position)),
+                "{plain:?}"
+            );
+            assert_eq!(
+                (plain.side, plain.part, plain.leaf, plain.remaining),
+                (None, None, None, None)
+            );
+        }
+        for (one_to_one, word) in [
             (OneToOneBuildStep::PlanningChunks, "planning_chunks"),
             (OneToOneBuildStep::SweepStale, "sweep_stale"),
             (OneToOneBuildStep::SweepOrphans, "sweep_orphans"),

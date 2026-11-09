@@ -671,13 +671,13 @@ well, with these differences:
   `Chunks { remaining }` while the chunks of that key run, and `SweepStale` and
   `SweepOrphans` for the two passes of the sweep that ends a rebuild in place. It is read
   from the jobs' cursors as above.
-- `fan_out_warning` is set when the largest group of live `R` entries on one join key
-  holds more rows than the threshold: a change of the joined row on that key rewrites all
-  of them, in chunks of 10,000 rows, before a watermark token past it converges. It names
-  the joined position (1 for the first joined table), the key (`a`'s columns in that
-  position's `ON`, their values joined by `,`), the group's rows and the threshold. With
-  more than one joined table, each position is sampled, and the warning names the
-  position whose group is largest. It is the only runtime sign of a lookup table (few
+- `fan_out_warnings` holds a warning for each joined position whose largest group of live
+  `R` entries on one join key holds more rows than the threshold, in position order: a
+  change of that position's row on the key rewrites all of them, in chunks of 10,000 rows,
+  before a watermark token past it converges. Each names the joined position (1 for the
+  first joined table), the key (`a`'s columns in that position's `ON`, their values joined
+  by `,`), the group's rows and the threshold. Each position is sampled over its own
+  index on `R`. They are the only runtime sign of a lookup table (few
   keys, many rows on each) joined at any position. The group is found
   by sampling `R` (2000 pages of it, all of a smaller `R`) and counting the keys met most
   often over `R`'s index on that position's join key, not from `pg_stats`, which is stale after a build. A

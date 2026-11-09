@@ -982,10 +982,7 @@ fn join_status_hash(ruby: &Ruby, join: PlainJoinStatus) -> Result<RHash, Error> 
         .partials_warning
         .map(|warning| partials_warning_hash(ruby, warning))
         .transpose()?;
-    let fan_out_warning = join
-        .fan_out_warning
-        .map(|warning| fan_out_warning_hash(ruby, warning))
-        .transpose()?;
+    let fan_out_warnings = array(ruby, join.fan_out_warnings, fan_out_warning_hash)?;
     let building = join
         .building
         .map(|step| join_build_step_hash(ruby, step))
@@ -995,7 +992,7 @@ fn join_status_hash(ruby: &Ruby, join: PlainJoinStatus) -> Result<RHash, Error> 
         [
             ("hidden_tables", hidden_tables.as_value()),
             ("partials_warning", ruby.into_value(partials_warning)),
-            ("fan_out_warning", ruby.into_value(fan_out_warning)),
+            ("fan_out_warnings", fan_out_warnings.as_value()),
             ("building", ruby.into_value(building)),
         ],
     )
@@ -1025,11 +1022,12 @@ fn partials_warning_hash(ruby: &Ruby, warning: PlainPartialsWarning) -> Result<R
     )
 }
 
-/// A 1-1 `JOIN`'s very large group on one join key.
+/// A 1-1 `JOIN`'s very large group on one join key at one joined position.
 fn fan_out_warning_hash(ruby: &Ruby, warning: PlainFanOutWarning) -> Result<RHash, Error> {
     record(
         ruby,
         [
+            ("position", ruby.into_value(warning.position)),
             ("key", ruby.into_value(warning.key)),
             ("rows", ruby.into_value(warning.rows)),
             ("threshold", ruby.into_value(warning.threshold)),
@@ -1055,6 +1053,7 @@ fn join_build_step_hash(ruby: &Ruby, step: PlainJoinBuildStep) -> Result<RHash, 
             ),
             ("leaf", ruby.into_value(step.leaf)),
             ("remaining", ruby.into_value(step.remaining)),
+            ("position", ruby.into_value(step.position)),
         ],
     )
 }

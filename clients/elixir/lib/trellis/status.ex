@@ -194,35 +194,37 @@ defmodule Trellis.JoinStatus do
   `Trellis.HiddenTable`: `P`, `M`, `J` and `T`, or `R`, `M` and `J` for a 1-1
   `JOIN`, a table that doesn't exist left out), a warning when `P` has grown
   close to the fact table's size (`partials_warning`, a
-  `Trellis.PartialsWarning`), a 1-1 `JOIN`'s warning that one join key holds
-  a very large group of rows (`fan_out_warning`, a `Trellis.FanOutWarning`)
-  and the step its build runs now, or runs next while no worker holds its job
-  (`building`, a `Trellis.JoinBuildStep`). Each warning and `building` are
-  `nil` when there is none. Sizes are the planner's estimates, as fresh as
+  `Trellis.PartialsWarning`), a 1-1 `JOIN`'s warnings that one join key
+  holds a very large group of rows (`fan_out_warnings`, a list of
+  `Trellis.FanOutWarning`, one per joined position past the threshold, in
+  position order) and the step its build runs now, or runs next while no
+  worker holds its job (`building`, a `Trellis.JoinBuildStep`).
+  `partials_warning` and `building` are `nil`, and `fan_out_warnings` is
+  empty, when there is none. Sizes are the planner's estimates, as fresh as
   the table's last `ANALYZE` or autovacuum.
   """
 
   @type t :: %__MODULE__{
           hidden_tables: [Trellis.HiddenTable.t()],
           partials_warning: Trellis.PartialsWarning.t() | nil,
-          fan_out_warning: Trellis.FanOutWarning.t() | nil,
+          fan_out_warnings: [Trellis.FanOutWarning.t()],
           building: Trellis.JoinBuildStep.t() | nil
         }
 
-  @enforce_keys [:hidden_tables, :partials_warning, :fan_out_warning, :building]
+  @enforce_keys [:hidden_tables, :partials_warning, :fan_out_warnings, :building]
   defstruct @enforce_keys
 
   @doc false
   def from_native(%{
         hidden_tables: hidden_tables,
         partials_warning: partials_warning,
-        fan_out_warning: fan_out_warning,
+        fan_out_warnings: fan_out_warnings,
         building: building
       }) do
     %__MODULE__{
       hidden_tables: Enum.map(hidden_tables, &Trellis.HiddenTable.from_native/1),
       partials_warning: partials_warning && Trellis.PartialsWarning.from_native(partials_warning),
-      fan_out_warning: fan_out_warning && Trellis.FanOutWarning.from_native(fan_out_warning),
+      fan_out_warnings: Enum.map(fan_out_warnings, &Trellis.FanOutWarning.from_native/1),
       building: building && Trellis.JoinBuildStep.from_native(building)
     }
   end
@@ -274,23 +276,30 @@ end
 
 defmodule Trellis.FanOutWarning do
   @moduledoc """
-  A 1-1 `JOIN` has a join key with a very large group of `a` rows: a change
-  of its `b` row rewrites that many target rows, in chunks, before a
-  watermark token past it converges. It names the join key's text (`key`,
+  A 1-1 `JOIN` has a join key with a very large group of `a` rows at one
+  joined position: a change of that position's row on the key rewrites that
+  many target rows, in chunks, before a watermark token past it converges.
+  It names the joined position (`position`, 1 for the first table joined),
+  the join key's text (`key`,
   its columns' values joined by `,`), the group's live rows (`rows`, exact up
   to ten times the threshold) and the threshold it passed (`threshold`). The
   group is found by sampling, so a group just past the threshold can go
   unreported until it grows.
   """
 
-  @type t :: %__MODULE__{key: String.t(), rows: integer(), threshold: integer()}
+  @type t :: %__MODULE__{
+          position: pos_integer(),
+          key: String.t(),
+          rows: integer(),
+          threshold: integer()
+        }
 
-  @enforce_keys [:key, :rows, :threshold]
+  @enforce_keys [:position, :key, :rows, :threshold]
   defstruct @enforce_keys
 
   @doc false
-  def from_native(%{key: key, rows: rows, threshold: threshold}) do
-    %__MODULE__{key: key, rows: rows, threshold: threshold}
+  def from_native(%{position: position, key: key, rows: rows, threshold: threshold}) do
+    %__MODULE__{position: position, key: key, rows: rows, threshold: threshold}
   end
 end
 
@@ -311,7 +320,8 @@ defmodule Trellis.JoinBuildStep do
     * `:final`: the step that writes `T` and the target and completes the
       build.
     * A 1-1 `JOIN`'s steps: `:joined_rows`, `:joined_null_keys` and
-      `:joined_gone` for the pass over `M`, `:planning_chunks` while the plan
+      `:joined_gone` for the pass over the `M` of the joined position
+      `position` (1 for the first table joined), `:planning_chunks` while the plan
       job walks `a`'s primary key, `:chunks` while the chunks of that key run
       (`remaining` of them are still to run), and `:sweep_stale` and
       `:sweep_orphans` for the two passes of the sweep that ends a rebuild in
@@ -319,8 +329,8 @@ defmodule Trellis.JoinBuildStep do
     * `:unknown`: a step added since this binding was built; `side` and
       `part` read `:unknown` likewise for an unknown side or part.
 
-  `side`, `part`, `leaf` and `remaining` are `nil` for the steps that don't
-  carry them.
+  `side`, `part`, `leaf`, `remaining` and `position` are `nil` for the steps
+  that don't carry them.
   """
 
   @type t :: %__MODULE__{
@@ -339,15 +349,30 @@ defmodule Trellis.JoinBuildStep do
           side: :from | :joined | :unknown | nil,
           part: :whole | :leaf | :remainder | :unroutable | :unknown | nil,
           leaf: String.t() | nil,
-          remaining: integer() | nil
+          remaining: integer() | nil,
+          position: pos_integer() | nil
         }
 
-  @enforce_keys [:step, :side, :part, :leaf, :remaining]
+  @enforce_keys [:step, :side, :part, :leaf, :remaining, :position]
   defstruct @enforce_keys
 
   @doc false
-  def from_native(%{step: step, side: side, part: part, leaf: leaf, remaining: remaining}) do
-    %__MODULE__{step: step, side: side, part: part, leaf: leaf, remaining: remaining}
+  def from_native(%{
+        step: step,
+        side: side,
+        part: part,
+        leaf: leaf,
+        remaining: remaining,
+        position: position
+      }) do
+    %__MODULE__{
+      step: step,
+      side: side,
+      part: part,
+      leaf: leaf,
+      remaining: remaining,
+      position: position
+    }
   end
 end
 

@@ -22,7 +22,7 @@
 //! | [`trellis::CorrectingNode`] | fields + queue time | [`PlainCorrectingNode`] |
 //! | [`trellis::OtherVersionLive`] / [`trellis::OtherProcess`] | this version + the other processes by worker id and version + two flags | [`PlainVersionHandover`] / [`PlainOtherProcess`] |
 //! | [`trellis::BelowCatalogFloor`] | the floor + this version | [`PlainBelowCatalogFloor`] |
-//! | [`trellis::JoinStatus`] | hidden table sizes + two warnings + the build step as words and data | [`PlainJoinStatus`] / [`PlainJoinBuildStep`] |
+//! | [`trellis::JoinStatus`] | hidden table sizes + the `P` warning + the fan-out warnings per position + the build step as words and data | [`PlainJoinStatus`] / [`PlainJoinBuildStep`] |
 //! | [`trellis::CaptureFailureKind`] | its `as_str()` word | [`PlainCaptureFailure::kind`] / [`capture_failure_kind_names`] |
 //! | `SystemTime` | epoch microseconds | [`epoch_micros`] / [`system_time_from_epoch_micros`] |
 //! | [`trellis::TransformStatus`] / [`trellis::QuarantineState`] | their `as_str()` word | [`transform_status`] / [`quarantine_state`] |

@@ -383,7 +383,7 @@ fn format_join(join: &JoinStatus) -> String {
             w.partials_rows, w.fact_rows
         ));
     }
-    if let Some(w) = &join.fan_out_warning {
+    for w in &join.fan_out_warnings {
         out.push_str(&format!(
             "    warning: {} rows of the FROM table share join key {}{}, past the {}: one \
              change of its JOIN row takes seconds to rewrite them all\n",
@@ -564,33 +564,36 @@ mod tests {
     }
 
     #[test]
-    fn a_fan_out_warning_names_its_key_and_size() {
+    fn a_fan_out_warning_names_its_key_and_size_one_line_per_position() {
         let mut join = trellis::fixture!(JoinStatus {
             hidden_tables: Vec::new(),
             partials_warning: None,
             building: None,
         });
-        join.fan_out_warning = Some(trellis::fixture!(FanOutWarning {
+        join.fan_out_warnings = vec![trellis::fixture!(FanOutWarning {
             key: "30".to_string(),
             rows: 120_000,
             threshold: 100_000,
-        }));
+        })];
         assert_eq!(
             format_join(&join),
             "    warning: 120000 rows of the FROM table share join key 30, past the 100000: \
              one change of its JOIN row takes seconds to rewrite them all\n"
         );
-        join.fan_out_warning = Some(trellis::fixture!(FanOutWarning {
+        join.fan_out_warnings.push(trellis::fixture!(FanOutWarning {
             position: 2,
-            key: "30".to_string(),
-            rows: 120_000,
+            key: "7".to_string(),
+            rows: 110_000,
             threshold: 100_000,
         }));
         assert_eq!(
             format_join(&join),
-            "    warning: 120000 rows of the FROM table share join key 30 at joined position 2, \
+            "    warning: 120000 rows of the FROM table share join key 30, past the 100000: \
+             one change of its JOIN row takes seconds to rewrite them all\n    \
+             warning: 110000 rows of the FROM table share join key 7 at joined position 2, \
              past the 100000: one change of its JOIN row takes seconds to rewrite them all\n"
         );
+        join.fan_out_warnings.remove(0);
         join.building = Some(JoinBuildStep::OneToOne(OneToOneBuildStep::JoinedRows {
             position: 2,
         }));

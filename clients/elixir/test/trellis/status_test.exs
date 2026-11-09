@@ -366,13 +366,17 @@ defmodule Trellis.StatusTest do
             %{table: "M", name: "join_7_m", estimated_rows: 21, bytes: 8192}
           ],
           partials_warning: %{partials_rows: 6_000_000_013, fact_rows: 7_000_000_019},
-          fan_out_warning: %{key: "42,eu", rows: 3_000_000_023, threshold: 250_000},
+          fan_out_warnings: [
+            %{position: 1, key: "42,eu", rows: 3_000_000_023, threshold: 250_000},
+            %{position: 3, key: "7", rows: 300_001, threshold: 250_000}
+          ],
           building: %{
             step: :side,
             side: :joined,
             part: :leaf,
             leaf: "public.items_p2",
-            remaining: nil
+            remaining: nil,
+            position: nil
           }
         },
         floor: "0.2.0"
@@ -397,17 +401,22 @@ defmodule Trellis.StatusTest do
                partials_rows: 6_000_000_013,
                fact_rows: 7_000_000_019
              },
-             fan_out_warning: %Trellis.FanOutWarning{
-               key: "42,eu",
-               rows: 3_000_000_023,
-               threshold: 250_000
-             },
+             fan_out_warnings: [
+               %Trellis.FanOutWarning{
+                 position: 1,
+                 key: "42,eu",
+                 rows: 3_000_000_023,
+                 threshold: 250_000
+               },
+               %Trellis.FanOutWarning{position: 3, key: "7", rows: 300_001, threshold: 250_000}
+             ],
              building: %Trellis.JoinBuildStep{
                step: :side,
                side: :joined,
                part: :leaf,
                leaf: "public.items_p2",
-               remaining: nil
+               remaining: nil,
+               position: nil
              }
            }
   end
@@ -431,13 +440,14 @@ defmodule Trellis.StatusTest do
         join: %{
           hidden_tables: [],
           partials_warning: nil,
-          fan_out_warning: nil,
+          fan_out_warnings: [],
           building: %{
             step: :chunks,
             side: nil,
             part: nil,
             leaf: nil,
-            remaining: 4_294_967_301
+            remaining: 4_294_967_301,
+            position: nil
           }
         },
         floor: "0.2.0"
@@ -446,14 +456,36 @@ defmodule Trellis.StatusTest do
     assert status.join == %Trellis.JoinStatus{
              hidden_tables: [],
              partials_warning: nil,
-             fan_out_warning: nil,
+             fan_out_warnings: [],
              building: %Trellis.JoinBuildStep{
                step: :chunks,
                side: nil,
                part: nil,
                leaf: nil,
-               remaining: 4_294_967_301
+               remaining: 4_294_967_301,
+               position: nil
              }
+           }
+  end
+
+  test "a 1-1 join's M pass step keeps the joined position it passes over" do
+    step =
+      Trellis.JoinBuildStep.from_native(%{
+        step: :joined_null_keys,
+        side: nil,
+        part: nil,
+        leaf: nil,
+        remaining: nil,
+        position: 2
+      })
+
+    assert step == %Trellis.JoinBuildStep{
+             step: :joined_null_keys,
+             side: nil,
+             part: nil,
+             leaf: nil,
+             remaining: nil,
+             position: 2
            }
   end
 
