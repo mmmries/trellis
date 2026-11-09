@@ -24,7 +24,7 @@ mod star;
 #[path = "support/star_cx.rs"]
 mod star_cx;
 
-use star_cx::{CROSS_SEED, N3, SEED, knob};
+use star_cx::{CROSS_SEED, N3, SEED};
 use trellis::staging::interleave::PausePoint;
 
 /// The points the first page is frozen at.
@@ -61,7 +61,6 @@ async fn crossing(seed: &str, first: &str, second: &str, points: &[PausePoint]) 
 #[tokio::test]
 async fn cx_f3b_crossing_mixed_pages_of_both_joined_tables_queue_without_deadlock() {
     let _serial = star::serial().await;
-    knob();
     crossing(
         CROSS_SEED,
         "update public.b1 set w = 11 where id = 1; update public.b2 set w = 101 where id = 1",
@@ -80,7 +79,6 @@ async fn cx_f3b_crossing_mixed_pages_of_both_joined_tables_queue_without_deadloc
 #[tokio::test]
 async fn crossing_mixed_pages_write_per_position_target_batches_without_deadlock() {
     let _serial = star::serial().await;
-    knob();
     crossing(
         CROSS_SEED,
         "update public.b1 set w = 11 where id = 1; update public.b2 set w = 101 where id = 1",
@@ -96,7 +94,6 @@ async fn crossing_mixed_pages_write_per_position_target_batches_without_deadlock
 #[tokio::test]
 async fn cx_f3d_crossing_a_root_move_and_a_joined_change_queue_without_deadlock() {
     let _serial = star::serial().await;
-    knob();
     crossing(
         CROSS_SEED,
         "update public.a set k1 = 2 where id = 1; update public.b1 set w = 21 where id = 2",
@@ -110,7 +107,6 @@ async fn cx_f3d_crossing_a_root_move_and_a_joined_change_queue_without_deadlock(
 #[tokio::test]
 async fn cx_f7a_mixed_pages_of_all_three_tables_queue_without_deadlock() {
     let _serial = star::serial().await;
-    knob();
     crossing(
         SEED,
         "update public.a set k1 = 2 where id = 1; update public.b1 set w = 21 where id = 2; \
@@ -128,7 +124,6 @@ async fn cx_f7a_mixed_pages_of_all_three_tables_queue_without_deadlock() {
 #[tokio::test]
 async fn cx_f7b_mixed_moves_race_mixed_deletes_and_inserts_without_deadlock() {
     let _serial = star::serial().await;
-    knob();
     crossing(
         SEED,
         "update public.a set k1 = 2, k2 = 2 where id = 1; update public.b1 set k = 7 where id = 1; \

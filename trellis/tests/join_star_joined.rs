@@ -37,7 +37,7 @@ mod star;
 mod star_cx;
 
 use star::Writer;
-use star_cx::{CROSS_SEED, LATE_SEED, N3, Orientation, SEED, knob};
+use star_cx::{CROSS_SEED, LATE_SEED, N3, Orientation, SEED};
 use trellis::staging::interleave::PausePoint;
 
 const SYM: &[Orientation] = &Orientation::ONE;
@@ -52,7 +52,6 @@ const ASYM: &[Orientation] = &Orientation::BOTH;
 #[tokio::test]
 async fn cx_f1a_value_changes_at_two_positions_meet_at_one_root_row() {
     let _serial = star::serial().await;
-    knob();
     star_cx::family(
         SEED,
         &[],
@@ -71,7 +70,6 @@ async fn cx_f1a_value_changes_at_two_positions_meet_at_one_root_row() {
 #[tokio::test]
 async fn cx_f1b_an_insert_at_one_position_meets_a_change_at_the_other() {
     let _serial = star::serial().await;
-    knob();
     star_cx::family(
         SEED,
         &[],
@@ -88,7 +86,6 @@ async fn cx_f1b_an_insert_at_one_position_meets_a_change_at_the_other() {
 #[tokio::test]
 async fn cx_f1c_a_delete_at_one_position_meets_a_change_at_the_other() {
     let _serial = star::serial().await;
-    knob();
     star_cx::family(
         SEED,
         &[],
@@ -105,7 +102,6 @@ async fn cx_f1c_a_delete_at_one_position_meets_a_change_at_the_other() {
 #[tokio::test]
 async fn cx_f1d_moves_off_at_two_positions_meet_at_one_root_row() {
     let _serial = star::serial().await;
-    knob();
     star_cx::family(
         SEED,
         &[],
@@ -122,7 +118,6 @@ async fn cx_f1d_moves_off_at_two_positions_meet_at_one_root_row() {
 #[tokio::test]
 async fn cx_f1e_a_change_at_one_position_meets_an_insert_at_the_other() {
     let _serial = star::serial().await;
-    knob();
     star_cx::family(
         SEED,
         &[],
@@ -139,7 +134,6 @@ async fn cx_f1e_a_change_at_one_position_meets_an_insert_at_the_other() {
 #[tokio::test]
 async fn cx_f1f_a_move_onto_a_key_meets_a_change_at_the_other_position() {
     let _serial = star::serial().await;
-    knob();
     star_cx::family(
         SEED,
         &[],
@@ -170,7 +164,6 @@ const A5: &str = "insert into public.a (id, k1, k2, x, y) values (5, 1, 1, 5, 'a
 #[tokio::test]
 async fn cx_f4a_a_hand_off_out_of_order_races_a_change_and_a_root_insert() {
     let _serial = star::serial().await;
-    knob();
     star_cx::family(
         SEED,
         &[LEAVE],
@@ -190,7 +183,6 @@ async fn cx_f4a_a_hand_off_out_of_order_races_a_change_and_a_root_insert() {
 #[tokio::test]
 async fn cx_f4b_a_hand_off_out_of_order_races_its_first_half_and_a_change() {
     let _serial = star::serial().await;
-    knob();
     star_cx::family(
         SEED,
         &[],
@@ -210,7 +202,6 @@ async fn cx_f4b_a_hand_off_out_of_order_races_its_first_half_and_a_change() {
 #[tokio::test]
 async fn cx_f4c_a_hand_off_out_of_order_races_a_change_then_a_root_insert() {
     let _serial = star::serial().await;
-    knob();
     for orientation in ASYM {
         for star in N3.stars() {
             for flip in [false, true] {
@@ -247,7 +238,6 @@ async fn cx_f4c_a_hand_off_out_of_order_races_a_change_then_a_root_insert() {
 #[tokio::test]
 async fn cx_f6e_a_joined_rederive_whose_row_moved_races_a_change_at_the_other_position() {
     let _serial = star::serial().await;
-    knob();
     for orientation in ASYM {
         for star in N3.stars() {
             let mut d = star::start_seeded(&[star], &orientation.sql(SEED)).await;
@@ -313,7 +303,6 @@ async fn cx_f6e_a_joined_rederive_whose_row_moved_races_a_change_at_the_other_po
 #[tokio::test]
 async fn cx_f9c_a_root_row_moving_to_null_races_a_page_of_both_joined_tables() {
     let _serial = star::serial().await;
-    knob();
     star_cx::family(
         SEED,
         &[],
@@ -413,7 +402,6 @@ async fn late_m_key(third: bool) {
 #[tokio::test]
 async fn cx_f11a_a_joined_entry_whose_key_moved_onto_a_root_key_retries_under_a_third_page() {
     let _serial = star::serial().await;
-    knob();
     late_m_key(true).await;
 }
 
@@ -424,7 +412,6 @@ async fn cx_f11a_a_joined_entry_whose_key_moved_onto_a_root_key_retries_under_a_
 #[tokio::test]
 async fn ps7_a_joined_entry_whose_key_moved_onto_a_root_key_retries() {
     let _serial = star::serial().await;
-    knob();
     late_m_key(false).await;
 }
 
@@ -434,7 +421,6 @@ async fn ps7_a_joined_entry_whose_key_moved_onto_a_root_key_retries() {
 #[tokio::test]
 async fn a_page_of_both_joined_tables_fans_out_at_both_positions() {
     let _serial = star::serial().await;
-    knob();
     let stars = N3.stars();
     let mut d = star::start_seeded(&stars, CROSS_SEED).await;
     star::step(

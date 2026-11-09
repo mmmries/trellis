@@ -35,10 +35,6 @@ const A_ROWS: &str =
     "(1, 10, 1, 'one'), (2, 20, 2, 'two'), (3, 30, 3, 'three'), (4, null, 4, 'four')";
 const B_ROWS: &str = "(1, 10, 100, 'ten'), (2, 20, 200, 'twenty'), (3, 40, 400, 'forty')";
 
-fn knob() {
-    trellis::dev::defs::set_star_join(true);
-}
-
 /// A `'static` copy of `sql` at `at`, for a [`Writer`].
 fn at(sql: &str) -> &'static str {
     Box::leak(AT.sql(sql).into_boxed_str())
@@ -74,7 +70,6 @@ fn joined_total(x: i32, w: i32) -> Option<i32> {
 #[tokio::test]
 async fn r_joined_rederives_race_changes_of_either_side() {
     let _serial = star::serial().await;
-    knob();
     const B1: Writer = Writer::Rederive("public.b2", &["1"]);
     for (first, second) in [
         (
@@ -107,7 +102,6 @@ async fn r_joined_rederives_race_changes_of_either_side() {
 #[tokio::test]
 async fn r18_a_joined_rederive_whose_row_moved_onto_a_held_key_retries() {
     let _serial = star::serial().await;
-    knob();
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         let target = star.target();
@@ -159,7 +153,6 @@ async fn r18_a_joined_rederive_whose_row_moved_onto_a_held_key_retries() {
 #[tokio::test]
 async fn a_joined_change_between_a_joined_rederives_read_and_its_snapshot_is_applied() {
     let _serial = star::serial().await;
-    knob();
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         let label = star::m_label(&d, star, AT.at).await;
@@ -189,7 +182,6 @@ async fn a_joined_change_between_a_joined_rederives_read_and_its_snapshot_is_app
 #[tokio::test]
 async fn r17_a_stale_joined_apply_after_a_joined_rederive_is_refused() {
     let _serial = star::serial().await;
-    knob();
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         star::write(&d, &AT.sql("update {b} set w = 110 where id = 1")).await;
@@ -214,7 +206,6 @@ async fn r17_a_stale_joined_apply_after_a_joined_rederive_is_refused() {
 #[tokio::test]
 async fn f4_a_joined_row_moving_off_a_key_locks_the_key_it_leaves() {
     let _serial = star::serial().await;
-    knob();
     star::family(
         AT,
         A_ROWS,
@@ -231,7 +222,6 @@ async fn f4_a_joined_row_moving_off_a_key_locks_the_key_it_leaves() {
 #[tokio::test]
 async fn f7b_two_hand_off_pages_of_the_joined_table_race() {
     let _serial = star::serial().await;
-    knob();
     star::family_seeded_at(
         AT,
         A_ROWS,
@@ -247,7 +237,6 @@ async fn f7b_two_hand_off_pages_of_the_joined_table_race() {
 #[tokio::test]
 async fn an_older_joined_apply_after_a_newer_one_is_refused() {
     let _serial = star::serial().await;
-    knob();
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         star::write(&d, &AT.sql("update {b} set w = 101 where id = 1")).await;
@@ -268,7 +257,6 @@ async fn an_older_joined_apply_after_a_newer_one_is_refused() {
 #[tokio::test]
 async fn f15_a_new_joined_rows_insert_and_update_applied_out_of_order() {
     let _serial = star::serial().await;
-    knob();
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         let label = star::m_label(&d, star, AT.at).await;

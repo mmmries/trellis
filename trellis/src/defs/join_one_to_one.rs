@@ -27,19 +27,9 @@
 //! Pages of either side's changes, Re-derives and `TRUNCATE`s, the chunks of
 //! a pending fan-out, and the chunked build, run in
 //! `crate::staging::join_one_to_one`.
-//!
-//! **The star knob.** A 1-1 `JOIN` of more than two tables (a star, one
-//! `FROM` table and up to four joined ones) is admitted only while
-//! [`star_enabled`]: `TRELLIS_DEV_STAR_JOIN` set to anything but `""`, `0`,
-//! `off` or `false`, or `trellis::dev::defs::set_star_join(true)` before a
-//! client starts. The gate is at define and `RESUME`
-//! (`super::validate_join_one_to_one`), never at parse, so a star stored
-//! while the knob was on still loads with it off; the staging worker halts
-//! it with the reason instead of running it.
 
 use super::floor::Floors;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 use tokio_postgres::GenericClient;
 
@@ -50,43 +40,6 @@ use super::join::{
 };
 use super::validate::{JoinColumnInfo, ValidationError};
 use crate::pool::quote_ident;
-
-/// The environment variable that turns the star knob on (the module doc)
-/// when nothing has set it.
-pub const STAR_KNOB_ENV: &str = "TRELLIS_DEV_STAR_JOIN";
-
-/// 0: not read yet; 1: off; 2: on.
-static STAR_KNOB: AtomicU8 = AtomicU8::new(0);
-
-/// Whether a 1-1 `JOIN` of more than two tables is admitted (the module
-/// doc). Read from [`STAR_KNOB_ENV`] once, unless [`set_star_enabled`] ran
-/// first.
-pub fn star_enabled() -> bool {
-    match STAR_KNOB.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = std::env::var(STAR_KNOB_ENV).is_ok_and(|v| knob_value_is_on(&v));
-            STAR_KNOB.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// Whether the knob's variable set to `value` turns it on: anything but
-/// `""`, `0`, `off` or `false`, in any case and with surrounding spaces.
-fn knob_value_is_on(value: &str) -> bool {
-    let value = value.trim().to_ascii_lowercase();
-    !matches!(value.as_str(), "" | "0" | "off" | "false")
-}
-
-/// Turns the star knob on or off for this process. Only before any client
-/// starts: the stored definitions and the staging worker read it at their
-/// own pace.
-#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
-pub fn set_star_enabled(on: bool) {
-    STAR_KNOB.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-}
 
 /// One hidden table of a 1-1 `JOIN` definition (this module's doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,18 +597,6 @@ mod tests {
              \"trellis\".\"join1_7_m4\", \"trellis\".\"join1_7_j\", \"trellis\".\"join1_7_l\"; \
              delete from \"trellis\".join1_fan_out where transform_id = 7"
         );
-    }
-
-    /// The star knob's variable reads on unless it is `""`, `0`, `off` or
-    /// `false` (the harness's `star_join_enabled` reads it alike).
-    #[test]
-    fn the_star_knob_variable_is_on_unless_it_says_off() {
-        for on in ["1", "on", "true", "yes", " ON "] {
-            assert!(knob_value_is_on(on), "{on:?}");
-        }
-        for off in ["", "0", "off", "false", " Off ", "FALSE"] {
-            assert!(!knob_value_is_on(off), "{off:?}");
-        }
     }
 
     /// `J`'s column for a join key column is `p<i>_<column>`, cut as

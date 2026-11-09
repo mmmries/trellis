@@ -29,7 +29,7 @@ mod star_cx;
 
 use drain_driver::Driver;
 use star::{Shape, Star};
-use star_cx::{N3, Orientation, SEED, knob};
+use star_cx::{N3, Orientation, SEED};
 use trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows;
 use trellis::staging::OneToOneJoinFanOutStep;
 use trellis::staging::interleave::PausePoint;
@@ -45,9 +45,8 @@ impl Drop for Chunked {
     }
 }
 
-/// Turns the knob on and sets a one-row chunk, until the guard drops.
+/// Sets a one-row chunk, until the guard drops.
 fn chunked() -> Chunked {
-    knob();
     set_one_to_one_join_fan_out_chunk_rows(1);
     Chunked
 }
@@ -386,7 +385,6 @@ async fn hold_23(d: &mut Driver, star: Star) {
 #[tokio::test]
 async fn px8_a_fan_out_at_position_2_leaves_a_held_row_as_it_was() {
     let _serial = star::serial().await;
-    knob();
     for star in AT_2.stars() {
         let name = star.name();
         let mut d = star::start(&[star], HELD_A, HELD_B).await;
@@ -420,7 +418,6 @@ async fn px8_a_fan_out_at_position_2_leaves_a_held_row_as_it_was() {
 #[tokio::test]
 async fn px9_a_release_before_a_pending_fan_out_at_position_2_stays_released() {
     let _serial = star::serial().await;
-    knob();
     for star in AT_2.stars() {
         let name = star.name();
         let mut d = star::start(&[star], HELD_A, HELD_B).await;

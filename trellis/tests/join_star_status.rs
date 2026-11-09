@@ -47,7 +47,6 @@ async fn join_status(d: &Driver, star: Star) -> JoinStatus {
 /// The shapes these tests run: the two-table `JOIN`, both positions of
 /// three tables, and the last of five.
 fn shapes() -> Vec<Shape> {
-    trellis::dev::defs::set_star_join(true);
     vec![
         Shape::TWO,
         Shape::new(2, 1),

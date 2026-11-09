@@ -9,9 +9,8 @@
 //! does, so it is refused while position 2's `ON` pair is left at two
 //! collations, and goes through once the pair is one again.
 //!
-//! Each cell checks the pass and the `RESUME` over a defined star. Where a
-//! star's apply is built ([`star::runnable`]), it also builds the star,
-//! applies changes of `a` and `b2` after the re-collation, rebuilds through
+//! Each cell checks the pass and the `RESUME` over a defined star. It also
+//! builds the star, applies changes of `a` and `b2` after the re-collation, rebuilds through
 //! the `RESUME`, and compares the target with the multi-join over the source
 //! tables, the `ON` text compared by its bytes, after each. Nothing polls or
 //! sleeps: changes are drained until nothing is pending, and builds are
@@ -23,18 +22,11 @@ mod drain_driver;
 mod star;
 
 use drain_driver::Driver;
-use star::Shape;
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
 use trellis::integer::IntWidth;
 use trellis::staging::build::{self, Step};
 use trellis::{Trellis, TrellisOptions};
-
-/// Position 2 of n = 3.
-const SHAPE: Shape = Shape {
-    positions: 2,
-    at: 2,
-};
 
 const ICU: &str = "und-x-icu";
 
@@ -188,30 +180,16 @@ async fn apply_changes(d: &mut Driver, round: i32, case: &str) {
 }
 
 async fn run_cell(cell: &Cell, kind: &str) {
-    let built = star::runnable(SHAPE);
     let case = format!("{} ({kind})", cell.name);
     let case = case.as_str();
-    let mut d = if built {
-        Driver::start(
-            &ddl(),
-            &columns(),
-            &[&definition(kind)],
-            &["public.a", "public.b1", "public.b2"],
-        )
-        .await
-    } else {
-        Driver::start_unbuilt(
-            &[],
-            &ddl(),
-            &columns(),
-            &[&definition(kind)],
-            &["public.a", "public.b1", "public.b2"],
-        )
-        .await
-    };
-    if built {
-        assert_matches(&d, kind, &format!("{case}: built")).await;
-    }
+    let mut d = Driver::start(
+        &ddl(),
+        &columns(),
+        &[&definition(kind)],
+        &["public.a", "public.b1", "public.b2"],
+    )
+    .await;
+    assert_matches(&d, kind, &format!("{case}: built")).await;
     for stmt in &cell.recollate {
         d.ctl
             .batch_execute(stmt)
@@ -220,19 +198,15 @@ async fn run_cell(cell: &Cell, kind: &str) {
     }
     pass(&mut d).await;
     assert_unpaused(&d, &format!("{case}: the pass after the re-collation")).await;
-    if built {
-        apply_changes(&mut d, 1, case).await;
-        assert_matches(&d, kind, &format!("{case}: applied")).await;
-    }
+    apply_changes(&mut d, 1, case).await;
+    assert_matches(&d, kind, &format!("{case}: applied")).await;
 
     let trellis = trellis(&d).await;
     trellis
         .apply("PAUSE TRANSFORM t")
         .await
         .unwrap_or_else(|e| panic!("{case}: pause: {e}"));
-    if built {
-        apply_changes(&mut d, 2, case).await;
-    }
+    apply_changes(&mut d, 2, case).await;
     if !cell.realign.is_empty() {
         let refused = trellis
             .apply("RESUME TRANSFORM t")
@@ -254,26 +228,21 @@ async fn run_cell(cell: &Cell, kind: &str) {
         .unwrap_or_else(|e| panic!("{case}: resume: {e}"));
     pass(&mut d).await;
     assert_unpaused(&d, &format!("{case}: the pass after the resume")).await;
-    if built {
-        trellis::intake::harness::start_registered_builds(d.pool())
-            .await
-            .expect("start the resumed builds");
-        work_to_idle(&d).await;
-        assert_eq!(status(&d).await, "live", "{case}: resumed");
-        assert_matches(&d, kind, &format!("{case}: resumed")).await;
-        apply_changes(&mut d, 3, case).await;
-        assert_matches(&d, kind, &format!("{case}: applied after the resume")).await;
-    }
+    trellis::intake::harness::start_registered_builds(d.pool())
+        .await
+        .expect("start the resumed builds");
+    work_to_idle(&d).await;
+    assert_eq!(status(&d).await, "live", "{case}: resumed");
+    assert_matches(&d, kind, &format!("{case}: resumed")).await;
+    apply_changes(&mut d, 3, case).await;
+    assert_matches(&d, kind, &format!("{case}: applied after the resume")).await;
 }
 
 async fn run(cell: Cell) {
     let _serial = star::serial().await;
-    let was = star::star_join_enabled();
-    trellis::dev::defs::set_star_join(true);
     for kind in ["", "LEFT"] {
         run_cell(&cell, kind).await;
     }
-    trellis::dev::defs::set_star_join(was);
 }
 
 /// The root's `ON` column for position 2 re-collated, `b2`'s left alone:

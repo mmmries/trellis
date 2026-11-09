@@ -84,13 +84,6 @@ pub mod defs {
         set_fan_out_warning_rows as set_one_to_one_join_fan_out_warning_rows,
     };
 
-    /// The star knob (ADR-0021, #1460): a 1-1 JOIN of more than two tables
-    /// defines only while it is on. Tests set it, once, before a client
-    /// starts. It is removed when the star is finished (#1784).
-    pub use crate::defs::join_one_to_one::{
-        STAR_KNOB_ENV, set_star_enabled as set_star_join, star_enabled as star_join_enabled,
-    };
-
     pub use crate::float::FloatWidth;
     pub use crate::integer::IntWidth;
 

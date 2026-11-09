@@ -51,11 +51,6 @@ pub const LATE_SEED: &str = "insert into public.a (id, k1, k2, x, y) values \
                              insert into public.b2 values (1, 1, 100, 'e1'), (2, 2, 200, 'e2'), \
                              (3, 3, 300, 'e3'), (4, 4, 400, 'e4')";
 
-/// Turns the development knob on: every pin here defines a star.
-pub fn knob() {
-    trellis::dev::defs::set_star_join(true);
-}
-
 /// A `'static` copy of `s`, for a [`Writer`]: a test's few bodies.
 pub fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())

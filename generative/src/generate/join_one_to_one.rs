@@ -87,18 +87,17 @@ pub const MAX_TABLES: usize = 1 + JOINED_TABLES.len();
 /// re-inserted under one id.
 pub const A_IDS: u8 = 64;
 
-/// Whether the star tier runs: the development knob `TRELLIS_DEV_STAR_JOIN`
-/// is on, and the engine runs a star's pages and builds. This is the one
+/// Whether the star tier runs: the engine runs a star's pages and builds. This is the one
 /// gate of the star tier's property, sweep and metamorphic check; with it
 /// off they return at once, and nothing else the 1-1 JOIN tier draws or
 /// checks changes.
 ///
-/// A star defines behind the knob, but its first page or build halts
+/// A star defines, but its first page or build halts
 /// ("whose apply is not built yet") until the joined apply lands (#1774,
 /// sub-step 3.8 of #1460), which sets `ENGINE_RUNS_A_STAR` here.
 pub fn star_tier_enabled() -> bool {
     const ENGINE_RUNS_A_STAR: bool = false;
-    ENGINE_RUNS_A_STAR && trellis::dev::defs::star_join_enabled()
+    ENGINE_RUNS_A_STAR
 }
 
 /// The table at `position`: `ja` at 0, then [`JOINED_TABLES`].

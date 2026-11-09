@@ -777,14 +777,13 @@ async fn the_star_oracle_is_the_multi_join_over_drawn_cases() {
     }
 }
 
-/// With the knob on, define admits every drawn star definition: each
+/// Define admits every drawn star definition: each
 /// position's `ON` holds its table's unique key, and no `ON` reads two
 /// joined tables (#1772's refusals). Only define runs: a star's build halts
 /// until its apply is built, and nothing here waits for it.
 #[tokio::test]
 async fn define_admits_every_drawn_star_definition() {
     use generative::backend::{Backend, ManualBackend};
-    trellis::dev::defs::set_star_join(true);
     let cluster = TestCluster::start();
     let strategy = star_case_strategy().boxed();
     let cases: Vec<StarCase> = generative::plant_sweep::seeded_cases(&strategy, 2, 24)

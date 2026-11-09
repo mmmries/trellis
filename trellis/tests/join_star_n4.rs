@@ -33,7 +33,7 @@ mod star;
 mod star_cx;
 
 use star::{Shape, Writer};
-use star_cx::{knob, leak};
+use star_cx::leak;
 use trellis::staging::build::{self, Step};
 use trellis::staging::interleave::PausePoint;
 
@@ -91,7 +91,6 @@ fn new_key_change(position: usize) -> Writer {
 #[tokio::test]
 async fn f14a_a_root_moving_every_key_races_a_change_of_its_new_key_at_each_position() {
     let _serial = star::serial().await;
-    knob();
     for position in POSITIONS {
         star::family_seeded(N4, SEED, &[], MOVE_ALL, new_key_change(position)).await;
     }
@@ -103,7 +102,6 @@ async fn f14a_a_root_moving_every_key_races_a_change_of_its_new_key_at_each_posi
 #[tokio::test]
 async fn f14a_a_root_moving_every_key_races_a_change_of_the_key_it_leaves_at_each_position() {
     let _serial = star::serial().await;
-    knob();
     for position in POSITIONS {
         let leaving = Writer::Change(leak(format!(
             "update public.b{position} set w = {} where id = 1",
@@ -123,7 +121,6 @@ async fn f14a_a_root_moving_every_key_races_a_change_of_the_key_it_leaves_at_eac
 #[tokio::test]
 async fn f14a_joined_writers_on_the_new_key_at_two_positions_queue_on_the_rows_they_share() {
     let _serial = star::serial().await;
-    knob();
     for (x, y) in [(1, 2), (2, 3), (1, 3)] {
         let z = 6 - x - y;
         for star in N4.stars() {
@@ -256,7 +253,6 @@ async fn late_m_key(late: usize, third: Option<usize>) {
 #[tokio::test]
 async fn f15a_a_late_m_key_at_the_last_position_retries_under_a_page_on_another_position() {
     let _serial = star::serial().await;
-    knob();
     for third in [1, 2] {
         late_m_key(3, Some(third)).await;
     }
@@ -267,7 +263,6 @@ async fn f15a_a_late_m_key_at_the_last_position_retries_under_a_page_on_another_
 #[tokio::test]
 async fn f15a_a_late_m_key_at_the_middle_position_retries_under_a_page_on_another_position() {
     let _serial = star::serial().await;
-    knob();
     for third in [1, 3] {
         late_m_key(2, Some(third)).await;
     }
@@ -278,7 +273,6 @@ async fn f15a_a_late_m_key_at_the_middle_position_retries_under_a_page_on_anothe
 #[tokio::test]
 async fn f15a_a_late_m_key_at_the_first_position_retries_under_a_page_on_another_position() {
     let _serial = star::serial().await;
-    knob();
     for third in [2, 3] {
         late_m_key(1, Some(third)).await;
     }
@@ -290,7 +284,6 @@ async fn f15a_a_late_m_key_at_the_first_position_retries_under_a_page_on_another
 #[tokio::test]
 async fn a_joined_entry_whose_key_moved_onto_a_root_key_retries_at_each_position() {
     let _serial = star::serial().await;
-    knob();
     for late in POSITIONS {
         late_m_key(late, None).await;
     }
@@ -351,7 +344,6 @@ async fn rederive_late_key_at(position: usize) {
 #[tokio::test]
 async fn a_root_rederive_whose_key_moved_at_the_first_position_retries_at_n4() {
     let _serial = star::serial().await;
-    knob();
     rederive_late_key_at(1).await;
 }
 
@@ -360,7 +352,6 @@ async fn a_root_rederive_whose_key_moved_at_the_first_position_retries_at_n4() {
 #[tokio::test]
 async fn a_root_rederive_whose_key_moved_at_the_middle_position_retries() {
     let _serial = star::serial().await;
-    knob();
     rederive_late_key_at(2).await;
 }
 
@@ -368,7 +359,6 @@ async fn a_root_rederive_whose_key_moved_at_the_middle_position_retries() {
 #[tokio::test]
 async fn a_root_rederive_whose_key_moved_at_the_last_position_retries_at_n4() {
     let _serial = star::serial().await;
-    knob();
     rederive_late_key_at(3).await;
 }
 
@@ -447,7 +437,6 @@ async fn chunk_late_key(shape: Shape) {
 #[tokio::test]
 async fn a_build_chunk_whose_row_moved_onto_a_key_it_did_not_lock_retries_at_each_position() {
     let _serial = star::serial().await;
-    knob();
     for at in POSITIONS {
         chunk_late_key(Shape::new(3, at)).await;
     }
@@ -477,7 +466,6 @@ const CYCLE_PAGES: [&str; 3] = [
 #[tokio::test]
 async fn f13a_a_cycle_of_mixed_pages_across_three_positions_queues_without_deadlock() {
     let _serial = star::serial().await;
-    knob();
     for (x, y) in [(0, 1), (1, 2), (0, 2)] {
         for star in N4.stars() {
             for flip in [false, true] {
