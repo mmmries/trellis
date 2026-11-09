@@ -14,6 +14,9 @@
 //!   pauses the failing field, and the other fields go on applying;
 //! - a `JOIN` over sources empty at define, on its first rows: the keys are
 //!   quarantined and the transform fuse quarantines the definition;
+//! - later batches, after a first one held keys below every fuse: a 1-1's
+//!   column fuse pauses the field and later rows are written without it; a
+//!   `JOIN`'s transform fuse quarantines it and later rows write nothing;
 //! - an aggregate, with rows or empty at define: its build plans the
 //!   expression whatever the rows, fails whole, and pauses the definition
 //!   with Postgres's error once its charges run out. It never goes `live`, so
@@ -339,5 +342,114 @@ async fn an_aggregate_build_pauses_on_a_constant_postgres_fails_while_planning()
             "{target}: no group was written"
         );
     }
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Inserts source rows `lo..=hi` (and their `other` partners), seals them as
+/// one batch and drains it until it applies.
+async fn batch(d: &mut Driver, lo: i64, hi: i64) {
+    d.user()
+        .await
+        .batch_execute(&format!(
+            "insert into public.other select i, i from generate_series({lo}, {hi}) i; \
+             insert into public.src select i, i % 3, i, i from generate_series({lo}, {hi}) i"
+        ))
+        .await
+        .expect("insert a batch");
+    let sealed = d.seal().await;
+    drain_until_applied(d, sealed).await;
+}
+
+/// Later batches of a 1-1 empty at define, after a first batch of three rows
+/// held its keys (below every fuse's threshold): the second batch takes the
+/// field's failures past the column fuse, which pauses the field, so its rows
+/// and every later one are written without it, `NULL` in the paused column,
+/// while the three held keys stay held. That is the column fuse's design for
+/// any per-field error (ADR-0003): the pause is reported, and `RESUME` of the
+/// column rebuilds it. No batch retries for ever.
+#[tokio::test]
+async fn a_one_to_one_holds_a_first_batch_then_pauses_the_field_for_later_ones() {
+    let mut d = Driver::start(
+        DDL,
+        &columns(),
+        &["TRANSFORM one FROM public.src SELECT v AS v, v + (2147483647 + 1) AS c"],
+        CAPTURED,
+    )
+    .await;
+    batch(&mut d, 1, 3).await;
+    let trellis = facade(&d).await;
+    assert_eq!(status(&trellis, "one").await, TransformStatus::Live);
+    assert_eq!(poison_sqlstates(&d, "one").await, ["22003"]);
+    assert_eq!(d.rows("select count(*) from poison").await, ["(3)"]);
+    assert_eq!(d.rows("select count(*) from public.one").await, ["(0)"]);
+    assert_eq!(
+        d.rows("select count(*) from column_status").await,
+        ["(0)"],
+        "three failing keys are below the column fuse"
+    );
+
+    batch(&mut d, 4, 10).await;
+    let column = trellis
+        .quarantine_status("one.c")
+        .await
+        .expect("the column's quarantine status");
+    assert!(
+        column
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("integer out of range")),
+        "the column fuse paused the field: {column:?}"
+    );
+    assert_eq!(d.rows("select count(*) from poison").await, ["(3)"]);
+    assert_eq!(
+        d.rows("select count(*), count(c) from public.one where v = id")
+            .await,
+        ["(7,0)"],
+        "the second batch is written without the paused field"
+    );
+
+    batch(&mut d, 11, 20).await;
+    assert_eq!(d.rows("select count(*) from poison").await, ["(3)"]);
+    assert_eq!(
+        d.rows("select count(*), count(c) from public.one where v = id")
+            .await,
+        ["(17,0)"],
+        "so is every later one"
+    );
+    assert_eq!(status(&trellis, "one").await, TransformStatus::Live);
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Later batches of a `JOIN` empty at define, after a first batch of three
+/// rows held its keys: the second batch's failing keys take the definition
+/// past the transform fuse, which quarantines it, and a third batch after the
+/// fuse writes nothing and holds no new key (the resume rebuilds from the
+/// source). No batch retries for ever, and no row is written.
+#[tokio::test]
+async fn a_join_holds_a_first_batch_then_quarantines_and_writes_nothing_after() {
+    let mut d = Driver::start(
+        DDL,
+        &columns(),
+        &[
+            "TRANSFORM j FROM public.src JOIN public.other ON other.id = src.id \
+           SELECT src.v + (2147483647 + 1) AS c, other.w AS w",
+        ],
+        CAPTURED,
+    )
+    .await;
+    batch(&mut d, 1, 3).await;
+    let trellis = facade(&d).await;
+    assert_eq!(status(&trellis, "j").await, TransformStatus::Live);
+    assert_eq!(d.rows("select count(*) from poison").await, ["(3)"]);
+
+    batch(&mut d, 4, 10).await;
+    assert_eq!(status(&trellis, "j").await, TransformStatus::Quarantined);
+    assert_eq!(poison_sqlstates(&d, "j").await, ["22003"]);
+    assert_eq!(d.rows("select count(*) from poison").await, ["(10)"]);
+
+    batch(&mut d, 11, 20).await;
+    assert_eq!(status(&trellis, "j").await, TransformStatus::Quarantined);
+    assert_eq!(d.rows("select count(*) from poison").await, ["(10)"]);
+    assert_eq!(d.rows("select count(*) from public.j").await, ["(0)"]);
     trellis.shutdown().await.expect("shutdown");
 }
