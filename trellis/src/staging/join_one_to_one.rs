@@ -126,11 +126,12 @@
 //!
 //! # A `TRUNCATE` ([`truncate_sides`], [`lock_definitions`], [`start_rebuilds`])
 //!
-//! A page that carries a `TRUNCATE` of either side takes the lock row `FOR
-//! UPDATE` instead, so it waits for the pages and chunks in flight and every
-//! other page waits for it, and settles the truncate before its changes: the
-//! side's ledger is emptied and its floor raised, and a `TRUNCATE` of `a`
-//! empties the target, and either deletes the definition's pending fan-outs.
+//! A page that carries a `TRUNCATE` of any of the JOIN's tables takes the
+//! lock row `FOR UPDATE` instead, so it waits for the pages and chunks in
+//! flight and every other page waits for it, and settles the truncate before
+//! its changes: each truncated table's ledger (`R`, or its position's `M`) is
+//! emptied and its floor raised, a `TRUNCATE` of `a` empties the target, and
+//! any deletes the definition's pending fan-outs at every position.
 //! `J` keeps its rows. The ledger is emptied by `DELETE`,
 //! not `TRUNCATE`: a sweep or `M` pass batch reads `R` or `M` before it takes
 //! the lock row, and a `TRUNCATE`'s `ACCESS EXCLUSIVE` lock would wait for
@@ -138,6 +139,7 @@
 //! changes every target row, which one transaction would not hold, so the
 //! page starts a rebuild of the target and the build's chunks rewrite the
 //! rows (a `LEFT` row keeps its old `b` columns until the chunk reaches it).
+//! However many joined tables one page truncates, it starts one rebuild.
 //! It takes the definitions' rows of every target whose `b` it truncates, in
 //! id order, before its first lock row, as a rebuild's start does
 //! (`super::build::start_rebuilds`), and starts the rebuilds after it has
@@ -166,7 +168,7 @@ mod j_tests;
 
 use crate::defs::ast::{Expr, JoinKind, TransformDef};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::defs::join::{self as spec, JOINED, Position, Side};
+use crate::defs::join::{self as spec, Position, Side};
 use crate::defs::join_one_to_one::HiddenTable;
 use crate::defs::ledger as schema;
 use crate::defs::model::Definition;
@@ -753,8 +755,8 @@ pub(crate) struct JoinOneToOnePlan {
     a: Vec<Record>,
     /// The changes of each joined table, by position (index 0 is position 1).
     b: Vec<Vec<Record>>,
-    /// The page's `TRUNCATE` of either side, which it settles before its
-    /// changes (the module doc).
+    /// The page's `TRUNCATE` of any of the JOIN's tables, which it settles
+    /// before its changes (the module doc).
     truncate: Option<Truncate>,
     /// Whether a changed `M` entry fans out to the `R` entries on its keys.
     /// Only the build's `M` pass ([`build::m_batch`],
@@ -794,9 +796,12 @@ impl JoinOneToOnePlan {
         }
     }
 
-    /// Whether the page truncates `b`, so it starts a rebuild of the target.
+    /// Whether the page truncates a joined table, at any position, so it
+    /// starts a rebuild of the target.
     fn truncates_b(&self) -> bool {
-        self.truncate.as_ref().is_some_and(|t| t.joined.is_some())
+        self.truncate
+            .as_ref()
+            .is_some_and(Truncate::truncates_joined)
     }
 
     /// Adds a `TRUNCATE` of the table on `side`, `change`, whose ring `lsn`
@@ -1003,15 +1008,6 @@ pub(crate) async fn apply_page(
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
     let shape = &*plan.shape;
-    if shape.is_star() && plan.truncates_b() {
-        return Err(ApplyError::JoinOneToOneHalt {
-            target: shape.target.clone(),
-            reason: "a TRUNCATE of a joined table of a 1-1 JOIN of more than two tables, \
-                     whose apply is not built yet"
-                .to_string(),
-        });
-    }
-
     // 1. Fold.
     let predates = plan
         .a
@@ -1546,13 +1542,14 @@ pub(crate) async fn lock_definitions<'a>(
     Ok(ids)
 }
 
-/// A page's `TRUNCATE` of one side or both, under the lock row held `FOR
-/// UPDATE`, before the page's changes: each truncated side's ledger is
-/// emptied and its floor raised to the truncate's `lsn`, so a change from
+/// A page's `TRUNCATE` of any of its tables, under the lock row held `FOR
+/// UPDATE`, before the page's changes: each truncated table's ledger (`R`,
+/// or the `M` of its position) is emptied and its floor raised to the truncate's `lsn`, so a change from
 /// before it that still reaches a page is refused (ADR-0002 I2); and a
 /// truncated `a` empties the target, through the seam. `J` keeps its rows,
-/// as it keeps every key either table has held. A truncated `b` leaves the
-/// target to the rebuild [`start_rebuilds`] starts. Returns how many target
+/// as it keeps every key any table has held. A truncated `b`, at any
+/// position, leaves the target to the one rebuild [`start_rebuilds`]
+/// starts, however many positions the page truncates. Returns how many target
 /// rows it deleted.
 async fn truncate_sides(
     txn: &Transaction<'_>,
@@ -1560,8 +1557,17 @@ async fn truncate_sides(
     truncate: &Truncate,
     mutations: &mut TargetMutations,
 ) -> Result<usize, ApplyError> {
-    for (side, lsn) in [(Side::From, truncate.from), (JOINED, truncate.joined)] {
-        let Some(lsn) = lsn else { continue };
+    let sides = truncate
+        .from
+        .map(|lsn| (Side::From, lsn))
+        .into_iter()
+        .chain(
+            truncate
+                .joined
+                .iter()
+                .map(|(position, lsn)| (Side::Joined(*position), *lsn)),
+        );
+    for (side, lsn) in sides {
         let ledger = shape.ledger(side);
         // Planted bugs: the entries stay, or the floor doesn't rise. See
         // `crate::plant`.
@@ -1592,11 +1598,7 @@ async fn truncate_sides(
     }
     // Every pending fan-out goes: a truncated `b` starts a rebuild, which
     // recomputes every row, and a truncated `a` leaves no row to recompute.
-    let truncated: Vec<Position> = truncate
-        .joined
-        .map(|_| Position::FIRST)
-        .into_iter()
-        .collect();
+    let truncated: Vec<Position> = truncate.joined.keys().copied().collect();
     fan_out::clear_all(txn, shape, &truncated).await?;
     if truncate.from.is_none() {
         return Ok(0);

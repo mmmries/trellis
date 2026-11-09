@@ -324,19 +324,13 @@ async fn xt2_a_truncate_of_a_clears_a_pending_marker_at_another_position() {
 }
 
 /// XT2: a `TRUNCATE` of `b1` against a pending marker at position 2 (#1464)
-/// deletes it in its page: the rebuild it starts recomputes every row. Runs
-/// once a star applies a `TRUNCATE` of a joined table
-/// (`star::truncate_runnable`, #1776).
+/// deletes it in its page: the rebuild it starts recomputes every row.
 ///
 /// Pins the `star_truncate_keeps_other_markers` plant.
 #[tokio::test]
 async fn xt2_a_truncate_of_b_clears_a_pending_marker_at_another_position() {
     let _serial = star::serial().await;
     let _chunked = chunked();
-    if !star::truncate_runnable(N3) {
-        eprintln!("{N3:?} skipped: a star's TRUNCATE of a joined table is not built yet");
-        return;
-    }
     for star in N3.stars() {
         let name = star.name();
         let mut d = star::start_seeded(&[star], SHARED_SEED).await;
