@@ -628,19 +628,22 @@ EOF2
   stop_run old-consts
 fi
 
-# checks: definitions the old release accepted that the candidate's define-time
-# checks refuse in fresh text but its parser accepts (docs/upgrading.md). The
-# takeover re-parses stored text and does not run those checks again, so they
-# keep the behaviour they had: the constants stay as the old release left them
-# (every row fails; with enough failing keys the old release quarantines the
-# whole definition), the chains run and equal Postgres. A definition the old release refuses itself is
-# no upgrade case and is left out.
+# checks: definitions the old release accepted that parse under the candidate
+# but fail one of its define-time checks (docs/upgrading.md): a chain of
+# calculated fields too long to inline, which a fresh define refuses. The
+# takeover re-parses stored text and does not run those checks again, so the
+# chains run and equal Postgres. Out-of-range constants, which the candidate
+# defines too and fails at run time, are in the case for the takeover itself: they
+# stay as the old release left them (every row fails; with enough failing keys
+# the old release quarantines the whole definition) and none is paused as a
+# refusal. A definition the old release refuses itself is no upgrade case and
+# is left out.
 checks_consts=""   # the constant definitions the old release accepted
 checks_chains=""   # "<name>:<length>" per accepted chain
 checks_old_refused=""
 checks_defs=""
 checks_pre=""      # checks_snapshot as the old release leaves it
-checks_texts=""    # "<name>|<definition text>" per line, for the fresh-define control
+checks_texts=""    # "<name>|<definition text>" per chain, for the fresh-define control
 checks_literal() { printf '1%0*d.0' "$1" 0; } # a decimal literal: 1, then $1 zeros
 checks_chain_text() { # length: a, then each field reads the one before
   local n=$1 s="a AS f0" i
@@ -676,7 +679,6 @@ EOF3
     "ck_real:SELECT COALESCE(r, $(checks_literal 39)) AS x" "ck_f8:SELECT COALESCE(f, 1$(printf '%0400d' 0).0) AS x"; do
     if apply_old checks "TRANSFORM ${kv%%:*} FROM k ${kv#*:}"; then
       checks_consts="$checks_consts ${kv%%:*}"
-      checks_texts="$checks_texts${kv%%:*}|FROM k ${kv#*:}"$'\n'
     else checks_old_refused="$checks_old_refused ${kv%%:*}"; fi
   done
   for n in 51 120; do
@@ -955,9 +957,8 @@ consts_grammar() {
 }
 
 # checks_grammar: the checks database (prep: checks). The takeover re-parses
-# stored text and does not run the define-time checks again: each definition the
-# old release accepted and a fresh define now refuses keeps its state. The
-# constants keep the status, held keys and target rows the old release left
+# stored text and does not run the define-time checks again: a chain a fresh
+# define refuses keeps running. The constants (which define now) keep the status, held keys and target rows the old release left
 # them with and are not paused as a refusal; the chains stay live and equal
 # Postgres after changes. No remedy is asserted: none is prescribed.
 checks_grammar() {
@@ -975,7 +976,7 @@ checks_grammar() {
     stop_run new-checks
     return
   fi
-  # Control: a fresh define of the same text is refused, so these are the cases.
+  # Control: a fresh define of a chain's text is refused, so the chains are cases of this check.
   while IFS='|' read -r n line; do
     [ -n "$n" ] || continue
     if trellis "$p" "$d" "$candidate_bin" apply "TRANSFORM ${n}_fresh $line" >/dev/null 2>&1; then
