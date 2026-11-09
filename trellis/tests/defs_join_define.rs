@@ -194,18 +194,6 @@ async fn define_validates_a_join_against_both_tables_then_refuses_it() {
     );
     let err = define_err(
         &db.pool,
-        &on("orders.id = items.order_id", "SUM(items.price) AS s"),
-    )
-    .await;
-    assert!(
-        matches!(
-            err,
-            CatalogError::Validate(ValidationError::UnconstrainedNumericAggregate { .. })
-        ),
-        "{err:?}"
-    );
-    let err = define_err(
-        &db.pool,
         &on("orders.id = items.order_id", "MIN(items.qty) AS m"),
     )
     .await;

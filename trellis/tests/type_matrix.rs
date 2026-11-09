@@ -1026,44 +1026,82 @@ async fn a_join_key_keeps_its_collation_from_another_schema() {
 }
 
 /// ADR-0020 rule 7: a 1-1 target's copy of a `numeric(10,2)` column is an
-/// unconstrained `numeric`, so a group-basis aggregate's or a `JOIN`'s `SUM`
-/// over it is refused at define with the chained refusal, which names
-/// #1120; the same `SUM` over the source column is accepted.
+/// unconstrained `numeric`. A group-basis aggregate's or a `JOIN`'s
+/// `SUM`/`AVG` over it (a chained sum, #1120) defines and shows Postgres's
+/// text, the same as over the source column.
 #[tokio::test]
-async fn a_chained_sum_over_a_targets_numeric_copy_is_refused_by_name() {
-    let d = Driver::start(
+async fn a_chained_sum_over_a_targets_numeric_copy_matches_postgres() {
+    let mut d = Driver::start(
         "create table public.t (id integer primary key, g integer, price numeric(10,2)); \
          create table public.o (id integer primary key, g integer); \
          create index on public.o (g)",
         &[("id", int4()), ("g", int4()), ("price", ValueType::Numeric)],
         &["TRANSFORM up FROM public.t SELECT g AS g, price AS p"],
-        &["public.t"],
+        &["public.t", "public.o"],
     )
     .await;
+    d.ctl
+        .batch_execute(
+            "insert into public.o values (1, 1), (2, 2); \
+             insert into public.t values (1, 1, 1.50), (2, 1, 2.25), (3, 2, 10.00), \
+                 (4, 2, null), (5, 3, 7.10)",
+        )
+        .await
+        .expect("seed");
+    d.settle().await;
+    // Define reads the copy's type from the catalog: an unconstrained
+    // `numeric`.
     let trellis = facade(d.db.dsn()).await;
     for chained in [
-        "TRANSFORM agg FROM public.up GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(p) AS s",
+        "TRANSFORM agg FROM public.up GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(p) AS s",
         "TRANSFORM j FROM public.up JOIN public.o ON up.g = o.g GROUP BY up.g \
          WITHOUT SOURCE INDEX SELECT up.g AS g, SUM(up.p) AS s",
         "TRANSFORM javg FROM public.o JOIN public.up ON o.g = up.g GROUP BY o.g \
          WITHOUT SOURCE INDEX SELECT o.g AS g, AVG(up.p) AS s",
     ] {
-        let error = trellis
-            .apply(chained)
-            .await
-            .expect_err("a chained SUM/AVG over a target's numeric")
-            .to_string();
-        assert!(
-            error.contains("docs/transforms.md") && error.contains("a table Trellis creates"),
-            "{chained}: {error}"
-        );
+        trellis.apply(chained).await.expect(chained);
     }
-    trellis
-        .apply(
-            "TRANSFORM direct FROM public.t GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(price) AS s",
+    for _ in 0..4 {
+        pass(&mut d).await;
+        trellis::intake::harness::settle_builds(d.pool()).await;
+        d.settle().await;
+    }
+    for target in ["agg", "j", "javg"] {
+        assert_eq!(status_of(&trellis, target).await, "Live", "{target}");
+    }
+    d.ctl
+        .batch_execute(
+            "update public.t set price = 0.05 where id = 3; delete from public.t where id = 1; \
+             insert into public.t values (6, 1, 3.33)",
         )
         .await
-        .expect("a SUM over the source's numeric(10,2)");
+        .expect("change");
+    d.settle().await;
+    for (target, oracle) in [
+        ("agg", "select g, sum(price)::text from public.t group by g"),
+        (
+            "j",
+            "select t.g, sum(t.price)::text from public.t join public.o on t.g = o.g group by t.g",
+        ),
+        (
+            "javg",
+            "select o.g, avg(t.price)::text from public.o join public.t on o.g = t.g group by o.g",
+        ),
+    ] {
+        assert_eq!(
+            d.rows(&format!(
+                "select g, s::text from public.{target} order by 1"
+            ))
+            .await,
+            d.rows(&format!("{oracle} order by 1")).await,
+            "{target}"
+        );
+        assert_eq!(
+            self_check_of(&trellis, target).await,
+            "Converged",
+            "{target}"
+        );
+    }
     trellis.shutdown().await.expect("shutdown");
 }
 

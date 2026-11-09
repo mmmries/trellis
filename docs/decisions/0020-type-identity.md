@@ -232,9 +232,10 @@ with their text for every value. No modifier changes that property:
 ## No define-time rule depends on a copy's modifier
 
 A rule that needs a modifier reads the root source column's, or refuses. Group
-`SUM`/`AVG` over `numeric` need a declared scale, so that the running sum shows
-the scale Postgres would show. A chained definition reading a Trellis target's
-`numeric` copy, which has no scale, is therefore refused like any unconstrained
+`SUM`/`AVG` over `numeric` need none: their partials count each value's
+display scale ([ADR-0002](0002-async-data-flow.md#numeric-sums-count-their-scales-and-special-values)),
+so a chained definition reading a Trellis target's `numeric` copy, which has no
+scale, shows the scale Postgres would show, as over any unconstrained
 `numeric`.
 
 ## An exception to these rules must prove itself

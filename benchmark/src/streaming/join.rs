@@ -211,6 +211,29 @@ pub struct JoinBench {
     pub build_only: bool,
     /// Rebuild in place after the fresh builds.
     pub rebuild: bool,
+    /// `--numeric`: `x` and `y` are `numeric(20, 2)` instead of `bigint`, so
+    /// every `SUM` keeps a `numeric` argument's partials (#1120).
+    pub numeric: bool,
+}
+
+impl JoinBench {
+    /// The SQL type of `x` and `y`.
+    pub(crate) fn value_type(&self) -> &'static str {
+        if self.numeric {
+            "numeric(20, 2)"
+        } else {
+            "bigint"
+        }
+    }
+
+    /// The value type of `x` and `y`, as a definition reads them.
+    fn value_kind(&self) -> ValueType {
+        if self.numeric {
+            ValueType::Numeric
+        } else {
+            ValueType::Integer(trellis::dev::defs::IntWidth::Int8)
+        }
+    }
 }
 
 impl Default for JoinBench {
@@ -234,6 +257,7 @@ impl Default for JoinBench {
             build_timeout: Duration::from_secs(3_600),
             build_only: false,
             rebuild: false,
+            numeric: false,
         }
     }
 }
@@ -515,25 +539,27 @@ impl VariantDb {
         let seed = if direct {
             Some(build::seed_direct(&db, &raw, variant, cfg, shape).await)
         } else {
-            raw.batch_execute(
-                "create table public.b (id bigint primary key, k int not null unique, gb int, \
-                     y bigint); \
-                 create table public.a (id bigint primary key, day int not null, \
-                     k int not null, x bigint, pad text); \
-                 create index on public.a (k)",
-            )
+            raw.batch_execute(&format!(
+                "create table public.b (id bigint primary key, k int not null unique, \
+                         gb int, y {v}); \
+                     create table public.a (id bigint primary key, day int not null, \
+                         k int not null, x {v}, pad text); \
+                     create index on public.a (k)",
+                v = cfg.value_type()
+            ))
             .await
             .expect("create the tables");
             if variant == Variant::B0 {
                 // J2's B0 table, with its index on `k`: a dimension change
                 // finds a key's facts through it.
-                raw.batch_execute(
+                raw.batch_execute(&format!(
                     "create table public.a0 (id bigint primary key, day int not null, \
-                         k int not null, x bigint, pad text, gb int, y bigint); \
+                         k int not null, x {v}, pad text, gb int, y {v}); \
                      create index on public.a0 (k); \
                      create index on public.a0 (gb); \
                      create index on public.a0 (day, gb)",
-                )
+                    v = cfg.value_type()
+                ))
                 .await
                 .expect("create a0");
             }
@@ -546,7 +572,7 @@ impl VariantDb {
             ("id", int8),
             ("day", int4),
             ("k", int4),
-            ("x", int8),
+            ("x", cfg.value_kind()),
             ("pad", ValueType::Text),
         ]
         .into_iter()
@@ -554,7 +580,7 @@ impl VariantDb {
         .collect();
         if variant == Variant::B0 {
             columns.insert("gb".to_string(), int4);
-            columns.insert("y".to_string(), int8);
+            columns.insert("y".to_string(), cfg.value_kind());
         }
         let mut targets = Vec::new();
         let mut builds = Vec::new();

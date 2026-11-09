@@ -725,6 +725,37 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
          THEN 2147483647 + 1 END",
         "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS DISTINCT FROM NULL \
          THEN 0 ELSE 2147483647 + 1 END",
+        // A `CASE` or `COALESCE` that resolves to a float casts the result it
+        // picks, so a wide exact literal rounds before the arithmetic around
+        // it: these divisors are exactly zero as `float8` or `real` (#1802).
+        "1 / (CASE WHEN (FALSE) THEN (DOUBLE PRECISION '0') ELSE (-9223372036854775809) END \
+         - NULLIF(-9223372036854775808, 2147483648))",
+        "1 / (COALESCE(NULL, -9223372036854775809, DOUBLE PRECISION '0') \
+         - NULLIF(-9223372036854775808, 2147483648))",
+        "1 / NULLIF(-9223372036854775809 - CASE WHEN FALSE THEN DOUBLE PRECISION '0' \
+         ELSE -9223372036854775808 END, 5)",
+        "1 / (CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE 9007199254740993 END \
+         - 9007199254740992)",
+        "1 / (CASE WHEN FALSE THEN REAL '0' ELSE 16777217 END - 16777216)",
+        "1 / (COALESCE(NULL, 16777217, REAL '0') - 16777216)",
+        "1 / (CASE WHEN FALSE THEN f8a ELSE -9223372036854775809 END \
+         - NULLIF(-9223372036854775808, 2147483648))",
+        "1 / (CASE WHEN FALSE THEN f4a ELSE 16777217 END - 16777216)",
+        "1 / ABS(CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE 9007199254740993 END \
+         - 9007199254740992)",
+        "1 / (CASE WHEN FALSE THEN CAST(NULL AS double precision) ELSE 9007199254740993 END \
+         - 9007199254740992)",
+        "1 / (COALESCE(NULL, 16777217, CAST(NULL AS real)) - 16777216)",
+        // The same values stay exact where nothing resolves the `CASE` to a
+        // float, so `%` (which has no float operand) still divides by zero.
+        "5 % (CASE WHEN FALSE THEN 0 ELSE 9007199254740993 END - 9007199254740993)",
+        // The guard folds in the resolved float type (`real` or `float8`),
+        // where the literal rounds to what it is compared with, so the
+        // overflow in the other branch is raised at plan time (#1802).
+        "CASE WHEN (CASE WHEN (FALSE) THEN (REAL '0') ELSE (99999999999999999999) END = 99999999999999999999) \
+         THEN (DATE '2024-02-29') ELSE ((2147483647 * 2) + DATE '2024-02-29') END",
+        "CASE WHEN (CASE WHEN (FALSE) THEN (REAL '0') ELSE (16777217) END = 16777217) \
+         THEN (DATE '2024-02-29') ELSE ((2147483647 * 2) + DATE '2024-02-29') END",
     ];
     for text in refused {
         match check_text(text, None) {
@@ -784,10 +815,40 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
          THEN 0 ELSE 2147483647 + 1 END",
         "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS NOT NULL \
          THEN 2147483647 + 1 END",
+        // The resolved float type makes the values differ or equal as
+        // Postgres compares them (#1802): `9007199254740993` is
+        // `9007199254740992` as a `float8`, so the guards below are decided
+        // the other way from the exact comparison.
+        "CASE WHEN (CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE 9007199254740993 END) \
+         = 9007199254740992 THEN 1 ELSE 2147483647 + 1 END",
+        "CASE WHEN (CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE 9007199254740993 END) \
+         <> 9007199254740992 THEN 2147483647 + 1 ELSE 1 END",
+        "CASE WHEN COALESCE(NULL, 9007199254740993, DOUBLE PRECISION '0') \
+         = 9007199254740992 THEN 1 ELSE 2147483647 + 1 END",
+        "CASE WHEN COALESCE(16777217, CAST(NULL AS real)) <> 16777216 \
+         THEN 2147483647 + 1 ELSE 1 END",
+        // A float divisor that really is nonzero.
+        "1 / (COALESCE(DOUBLE PRECISION '0', -9223372036854775809) \
+         - NULLIF(-9223372036854775808, 2147483648))",
+        "1 / (CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE -9223372036854775809 END \
+         - 9223372036854775807)",
+        "1 / (CASE WHEN FALSE THEN REAL '0' ELSE 16777218 END - 16777216)",
+        "1 / (CASE WHEN i4a > 0 THEN f8a ELSE -9223372036854775809 END \
+         - -9223372036854775808)",
+        "1 / (CASE WHEN FALSE THEN 0 ELSE -9223372036854775809 END - -9223372036854775808)",
+        // A `numeric` result keeps the `CASE` exact.
+        "1 / (CASE WHEN FALSE THEN 1.5 ELSE 9007199254740993 END - 9007199254740992)",
+        "1 / (COALESCE(NULL, 16777217, na) - 16777216)",
         // A runtime divisor is left to the rows.
         "CASE WHEN i4a > 0 THEN na / i4a END",
         "i4a <> 0 AND na / i4a > 1",
         "CASE WHEN ba THEN i4a * i4b END",
+        // The same shapes over `double precision`, where Postgres does not
+        // raise (#1802).
+        "CASE WHEN (CASE WHEN (FALSE) THEN (DOUBLE PRECISION '0') ELSE (99999999999999999999) END = 99999999999999999999) \
+         THEN (DATE '2024-02-29') ELSE ((2147483647 * 2) + DATE '2024-02-29') END",
+        "CASE WHEN (CASE WHEN (FALSE) THEN (DOUBLE PRECISION '0') ELSE (9007199254740993) END = 9007199254740993) \
+         THEN (DATE '2024-02-29') ELSE ((2147483647 * 2) + DATE '2024-02-29') END",
     ];
     for text in dropped {
         match check_text(text, None) {
