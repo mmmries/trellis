@@ -346,19 +346,20 @@ async fn every_pool_wrapper_names_the_servers_reason_once() {
     }
 }
 
-/// `migrate` connects on its own session, outside the pool; a server that
-/// refuses that connection says why there too.
+/// `migrate` takes its attach lock's session from the pool before anything
+/// else; a server that refuses that connection says why there too.
 #[tokio::test]
 async fn a_refused_migrate_connection_names_the_servers_reason() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let config = Config::from_dsn(format!("{} dbname=trellis_no_such_database", db.dsn()))
         .expect("valid DSN and schema");
+    let pool = trellis::Pool::new(&config).expect("pool builds lazily");
 
-    let err = trellis::migrate(&config)
+    let err = trellis::migrate(&pool, &config)
         .await
         .expect_err("the server must refuse the connection");
-    assert!(matches!(err, Error::Connect(_)), "{err:?}");
+    assert!(matches!(err, Error::Connect(_) | Error::Pool(_)), "{err:?}");
     let message = err.to_string();
     assert!(
         message.contains("database \"trellis_no_such_database\" does not exist"),
