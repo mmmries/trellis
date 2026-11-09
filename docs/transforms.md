@@ -1542,11 +1542,11 @@ otherwise held in quarantine on its first failure, and the page applies every
 other change.
 
 **If it appears after define:** As for a `JOIN` (the [row
-above](#an-unsupported-join-shape)): a column the transform reads from either
-table dropped or renamed, a key column of either (`a`'s primary key, an `ON`
-column) retyped as the key rows above describe, or a column retyped to a type
-the transform evaluates differently, pauses the whole transform, naming that
-table and column in `status()`'s `capture_failure`.
+above](#a-join-transform-that-passes-the-checks-below)): a column the transform
+reads from either table dropped or renamed, a key column of either (`a`'s
+primary key, an `ON` column) retyped as the key rows above describe, or a
+column retyped to a type the transform evaluates differently, pauses the whole
+transform, naming that table and column in `status()`'s `capture_failure`.
 
 A widening of a column it copies (`a`'s key, a field, `R`, `M` and `J`) is
 handled as the [widening row](#a-column-trellis-copies-widened) above
