@@ -19,8 +19,9 @@
 //! (or every row, for a column that declares none now) is written: its map
 //! counts its values at that scale. The definition's floor is stamped again, now that its tables have
 //! a layout an older release can't read (ADR-0024). A definition with a group
-//! whose stored sum counts a `NaN` is rebuilt in place, which recomputes every
-//! group from its source; one that doesn't apply (paused) rebuilds on its
+//! whose stored sum counts a `NaN` is rebuilt as a first build would
+//! ([`build_afresh`]): its hidden tables afresh, then every group from its
+//! source; one that doesn't apply (paused) rebuilds the same way on its
 //! resume. A definition whose stored text this release can't read is left
 //! unconverted: the attach pauses it, naming the fix, and its redefine
 //! creates its tables afresh.
@@ -89,20 +90,87 @@ pub(crate) async fn convert_in(
             .map_err(failed)?;
         converted += 1;
         if nan {
-            poisoned.push(id);
+            poisoned.push(definition);
         }
     }
-    if !poisoned.is_empty() {
+    let ids: Vec<i64> = poisoned.iter().map(|d| d.id).collect();
+    if !ids.is_empty() {
         txn.execute(
             "select 1 from transform_definitions where id = any($1) order by id for update",
-            &[&poisoned],
+            &[&ids],
         )
         .await?;
-        let rebuilt = crate::staging::build::rebuildable(txn, &poisoned).await?;
-        crate::staging::build::start_rebuilds(txn, &rebuilt).await?;
-        crate::staging::build::stamp_rebuild_seg(txn, &rebuilt).await?;
+        let rebuilt = crate::staging::build::rebuildable(txn, &ids).await?;
+        for definition in poisoned.iter().filter(|d| rebuilt.contains(&d.id)) {
+            build_afresh(txn, &schema, definition).await?;
+        }
     }
     Ok(converted)
+}
+
+/// Rebuilds `definition`, a definition still applying whose stored sums
+/// count a `NaN`, as a first build would, as its resume does
+/// (`staging::quarantine::resume_transform`): its hidden tables dropped and
+/// created again empty, in this release's layout, and the definition
+/// `waiting_to_backfill`, so the staging worker starts its build, which
+/// writes every group from its source and replaces the visible target's
+/// rows. Not in place: a `JOIN`'s rebuild in place carries each `P` and `M`
+/// cell's change into `T` as a difference, which a stored `NaN` in `T`
+/// absorbs, so `T` would stay `NaN` for good. A plain aggregate takes the
+/// same path, one rule for both.
+async fn build_afresh(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    definition: &crate::defs::model::Definition,
+) -> Result<(), crate::Error> {
+    let id = definition.id;
+    if crate::staging::join::applies(&definition.def) {
+        let Some(joined) = super::catalog::join_table_of(txn, id)
+            .await
+            .map_err(failed)?
+        else {
+            return Ok(());
+        };
+        let sides =
+            super::catalog::JoinSides::read(txn, definition.source_table.clone(), vec![joined])
+                .await
+                .map_err(failed)?;
+        super::catalog::recreate_hidden_tables(txn, schema, id, &definition.def, &sides)
+            .await
+            .map_err(failed)?;
+    } else if let Some(mut shape) = group_basis::route(&definition.def, &definition.source_columns)
+    {
+        shape.declare_scales(txn, &definition.source_table).await?;
+        super::catalog::recreate_group_table(txn, schema, id, &shape)
+            .await
+            .map_err(failed)?;
+    } else {
+        return Ok(());
+    }
+    // As a resume does: a build or rebuild the definition had queued is
+    // superseded (nothing claims one during the attach), and `build = null`
+    // with a new fuse epoch starts it over.
+    txn.execute(
+        "delete from backfill_chunks where definition_id = $1 and not done",
+        &[&id],
+    )
+    .await?;
+    txn.execute(
+        "update transform_definitions \
+         set status = $1, fuse_rearmed_at = now(), build = null where id = $2",
+        &[
+            &crate::defs::model::StoredStatus::WaitingToBackfill.as_str(),
+            &id,
+        ],
+    )
+    .await?;
+    crate::instance_log::info!(
+        definition_id = id,
+        to = %crate::defs::model::StoredStatus::WaitingToBackfill.as_str(),
+        "numeric sums counting a NaN in a release before the map of exceptions; \
+         rebuilding the definition afresh"
+    );
+    Ok(())
 }
 
 /// A hidden table of a definition, with what its partials should be.
