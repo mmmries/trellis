@@ -829,7 +829,18 @@ impl JoinOneToOnePlan {
                 self.a.push(record);
             }
             Side::Joined(position) => {
-                self.held_origin.add(change);
+                // Planted bug: only the first position's changes give the
+                // origin a fan-out's held rows park with. See `crate::plant`.
+                #[cfg(any(test, feature = "test-util"))]
+                let skip = crate::plant::fires(
+                    crate::plant::Plant::StarHeldOriginFirstOnly,
+                    position != Position::FIRST,
+                );
+                #[cfg(not(any(test, feature = "test-util")))]
+                let skip = false;
+                if !skip {
+                    self.held_origin.add(change);
+                }
                 self.b[position.index()].push(record);
             }
         }
@@ -1493,8 +1504,18 @@ pub(crate) async fn lock_definitions<'a>(
     let mut locks: BTreeMap<i64, bool> = BTreeMap::new();
     for plan in plans {
         let truncates = plan.truncates_b();
+        // Planted bug: only the first position's records count as a fan-out
+        // that may hold a row. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let first_only = crate::plant::fires(
+            crate::plant::Plant::StarDefLockFirstOnly,
+            plan.b.iter().skip(1).any(|b| !b.is_empty()),
+        );
+        #[cfg(not(any(test, feature = "test-util")))]
+        let first_only = false;
+        let positions = if first_only { 1 } else { plan.b.len() };
         let may_hold = (plan.holds_a && !plan.a.is_empty())
-            || (plan.fan_out && plan.b.iter().any(|b| !b.is_empty()));
+            || (plan.fan_out && plan.b.iter().take(positions).any(|b| !b.is_empty()));
         if truncates || may_hold {
             *locks.entry(plan.shape.id).or_default() |= truncates;
         }

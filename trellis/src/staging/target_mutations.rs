@@ -183,8 +183,9 @@ struct ImageFeed {
 /// where a joined table's change needs the old join key) with the table
 /// on any side, or an aggregate on the group basis, which is the one kind of
 /// definition with a hidden table named by its id in the catalog's schema
-/// (`super::group_basis::hidden_table_name`).
-fn image_readers_sql() -> String {
+/// (`super::group_basis::hidden_table_name`). `reads` is the predicate that
+/// the definition row reads a table ([`readers_of`]).
+fn image_readers_sql(reads: fn(&str, &str) -> String) -> String {
     format!(
         "select exists (select 1 from transform_definitions d \
              where {} and {} \
@@ -193,10 +194,34 @@ fn image_readers_sql() -> String {
                    where c.relname = {} \
                      and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
                                            where oid = 'transform_definitions'::regclass))))",
-        crate::defs::catalog::reads_table_sql("d", "$1"),
+        reads("d", "$1"),
         crate::defs::model::applying_sql("d"),
         super::group_basis::hidden_table_name_sql("d.id"),
     )
+}
+
+/// Whether an applying definition reads `target` (as its source or a joined
+/// table at any position), and whether one that needs exact images does
+/// ([`image_readers_sql`]); `reads` is the predicate that a definition row
+/// reads a table, [`crate::defs::catalog::reads_table_sql`].
+async fn readers_of(
+    txn: &Transaction<'_>,
+    target: &str,
+    reads: fn(&str, &str) -> String,
+) -> Result<(bool, bool), ApplyError> {
+    let row = txn
+        .query_one(
+            &format!(
+                "select exists (select 1 from transform_definitions \
+                 where {} and {}), ({})",
+                reads("transform_definitions", "$1"),
+                crate::defs::model::APPLYING_SQL,
+                image_readers_sql(reads),
+            ),
+            &[&target],
+        )
+        .await?;
+    Ok((row.get(0), row.get(1)))
 }
 
 /// Resolves the seam's [`ImageFeed`] for `target`, or `None` when its feed
@@ -298,19 +323,26 @@ impl TargetMutations {
             // Mirrors `catalog::dependents_of`'s own status filter: a reader
             // apply doesn't maintain yet is excluded from applies anyway, and
             // its build reads the target after this commit.
-            let readers = txn
-                .query_one(
-                    &format!(
-                        "select exists (select 1 from transform_definitions \
-                         where {} and {}), ({})",
-                        crate::defs::catalog::reads_table_sql("transform_definitions", "$1"),
-                        crate::defs::model::APPLYING_SQL,
-                        image_readers_sql(),
-                    ),
-                    &[&target],
-                )
+            let readers = readers_of(txn, target, crate::defs::catalog::reads_table_sql).await?;
+            // Planted bug: only the source and the first joined table count
+            // as a definition's reads, so a star reading the target at a
+            // later position is no reader. See `crate::plant`.
+            #[cfg(any(test, feature = "test-util"))]
+            let readers = if crate::plant::armed() == Some(crate::plant::Plant::StarReadsFirstOnly)
+            {
+                let first = readers_of(txn, target, |d, table| {
+                    format!("({d}.source_table = {table} or {d}.join_table = {table})")
+                })
                 .await?;
-            let (direct_readers, image_readers): (bool, bool) = (readers.get(0), readers.get(1));
+                if crate::plant::fires(crate::plant::Plant::StarReadsFirstOnly, first != readers) {
+                    first
+                } else {
+                    readers
+                }
+            } else {
+                readers
+            };
+            let (direct_readers, image_readers) = readers;
             let image_feed = resolve_image_feed(txn, target, image_readers).await?;
             let has_readers = direct_readers || image_feed.is_some();
             let image_columns = if has_readers {

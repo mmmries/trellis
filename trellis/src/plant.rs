@@ -622,6 +622,50 @@ pub enum Plant {
     /// Pinned by `group_basis_min_max`'s
     /// `self_check_compares_the_groups_only_the_extremes_have`.
     ScExtremeGroupsUncompared,
+    /// #1780 (`star_fence_first_only`): a column pause or resume of a star
+    /// 1-1 `JOIN` (`staging::quarantine::pause_fence`), and a `RESUME` of the
+    /// whole star (`staging::quarantine::lock_frozen`), bump the version
+    /// fences of the `FROM` table and the first joined table only, not the
+    /// joined table at every position. A page of a later position's table
+    /// that planned the column as live then commits a write of it after the
+    /// pause returns, and one that judged the star frozen commits after the
+    /// resume. Fires only on a star.
+    ///
+    /// Pinned by `join_star_quarantine`'s
+    /// `a_column_pause_waits_for_a_page_of_the_middle_joined_table` and
+    /// `a_resume_waits_for_a_page_of_the_middle_joined_table`.
+    StarFenceFirstOnly,
+    /// #1780 (`star_held_origin_first_only`): a star page's held rows park
+    /// with the origin of its first position's changes only
+    /// (`staging::join_one_to_one`'s `held_origin`), so a row a later
+    /// position's fan-out holds parks with an unknown origin and holds back
+    /// no watermark token that change does. Fires only on a star, for a
+    /// change of a later position.
+    ///
+    /// Pinned by `join_star_quarantine`'s
+    /// `a_row_a_middle_fan_out_holds_is_parked_with_the_changes_origin`.
+    StarHeldOriginFirstOnly,
+    /// #1780 (`star_def_lock_first_only`): a star page judges whether its
+    /// fan-out may hold a row (`staging::join_one_to_one::lock_definitions`)
+    /// from its first position's records only, so a page fanning out at a
+    /// later position takes the definition's row `FOR KEY SHARE` only when it
+    /// holds a row, after its lock row, and closes a cycle with a rebuild's
+    /// start: a deadlock. Fires only on a star page with records past the
+    /// first position.
+    ///
+    /// Pinned by `join_star_quarantine`'s
+    /// `a_middle_fan_out_that_holds_a_row_and_a_rebuild_start_never_deadlock`.
+    StarDefLockFirstOnly,
+    /// #1780 (`star_reads_first_only`): the target-mutation seam
+    /// (`staging::target_mutations`) counts a definition as a reader of a
+    /// target only when it reads it as its source or its first joined
+    /// table, so a star joining the target at a later position is no reader
+    /// and the seam stages nothing for it. Fires only when that changes
+    /// whether the target has readers.
+    ///
+    /// Pinned by `join_star_quarantine`'s
+    /// `a_star_with_a_one_to_one_target_at_the_middle_position_converges`.
+    StarReadsFirstOnly,
 }
 
 impl Plant {
@@ -688,6 +732,10 @@ impl Plant {
         Plant::ScExtremesUnderBasis,
         Plant::ScExtremesUncompared,
         Plant::ScExtremeGroupsUncompared,
+        Plant::StarFenceFirstOnly,
+        Plant::StarHeldOriginFirstOnly,
+        Plant::StarDefLockFirstOnly,
+        Plant::StarReadsFirstOnly,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -754,6 +802,10 @@ impl Plant {
             Plant::ScExtremesUnderBasis => "sc_extremes_under_basis",
             Plant::ScExtremesUncompared => "sc_extremes_uncompared",
             Plant::ScExtremeGroupsUncompared => "sc_extreme_groups_uncompared",
+            Plant::StarFenceFirstOnly => "star_fence_first_only",
+            Plant::StarHeldOriginFirstOnly => "star_held_origin_first_only",
+            Plant::StarDefLockFirstOnly => "star_def_lock_first_only",
+            Plant::StarReadsFirstOnly => "star_reads_first_only",
         }
     }
 
