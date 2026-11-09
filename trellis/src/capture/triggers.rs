@@ -72,7 +72,11 @@
 //! ([`partitions`](super::partitions) owns the tree and its corrections). The
 //! pass forgets the rows of a node that left the tree, installs capture on a
 //! node new to it, which records it, and records a node that comes back
-//! carrying all five triggers `ENABLE ALWAYS` as it finds it. A recorded node
+//! carrying all five triggers `ENABLE ALWAYS` as it finds it. An uninstall
+//! that drops the triggers of a table detached from the tree forgets any row
+//! that still names it as a node ([`forget_as_nodes`]), and leaves a table
+//! attached to a captured root again before it took its lock as it is
+//! (`capture::install`). A recorded node
 //! that is still in the tree and lacks its triggers is a disruption, as is a
 //! root's.
 //!
@@ -227,6 +231,32 @@ pub(crate) async fn forget_node(
     if let Some(oid) = oid_of(client, node).await? {
         forget_nodes(client, table, &[oid]).await?;
     }
+    Ok(())
+}
+
+/// Forgets the trigger record of each of `nodes` (`schema.table` texts) as a
+/// node of whichever partitioned root's tree recorded it: an uninstall is
+/// dropping their triggers. A leaf the pass found in its root's tree, and
+/// that was detached again before the pass's uninstall dropped its triggers,
+/// is one: kept, its record would name triggers Trellis dropped, and once the
+/// leaf is attached again the root's next pass would take that for a
+/// disruption.
+pub(crate) async fn forget_as_nodes(
+    client: &impl GenericClient,
+    nodes: &[String],
+) -> Result<(), tokio_postgres::Error> {
+    let names: Vec<String> = nodes
+        .iter()
+        .map(|node| crate::defs::ddl::regclass_arg(node))
+        .collect();
+    client
+        .execute_typed(
+            "delete from capture_triggers where node_oid <> 0 and node_oid in ( \
+                 select pg_catalog.to_regclass(n)::oid \
+                 from pg_catalog.unnest($1::text[]) n)",
+            &[(&names, Type::TEXT_ARRAY)],
+        )
+        .await?;
     Ok(())
 }
 
