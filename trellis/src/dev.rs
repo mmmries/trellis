@@ -193,7 +193,7 @@ pub mod capture {
 pub mod interleave {
     pub use crate::staging::interleave::{
         PausePoint, PauseScope, Reached, force_join_key_moves, join_key_moves, set_commit_stall,
-        set_group_lock_stall, set_stall, with_scope,
+        set_group_lock_stall, set_lock_step_stall, set_rederived_pages, set_stall, with_scope,
     };
 }
 

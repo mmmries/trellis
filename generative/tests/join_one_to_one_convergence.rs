@@ -409,10 +409,10 @@ fn run_case_with(case: &JoinCase, drain_batch_cap: Option<usize>) -> Result<(), 
 /// and then, when it draws one, its metamorphic twin: the same program with
 /// every definition's `JOIN` clauses permuted, which must converge to its
 /// own oracle (the same rows: `join_star_tier.rs` checks the two oracles
-/// agree). The knobs' shares of stalled lock steps and re-derived pages
-/// await engine hooks that stall or re-derive a share of them; the case's
-/// commit stall bounds every page's.
+/// agree). The knobs' stalled lock steps, re-derived pages and fan-out
+/// chunk hold for both runs ([`StarKnobsGuard`]).
 fn run_star_case(case: &StarCase) -> Result<(), String> {
+    let _knobs = StarKnobsGuard::set(&case.knobs);
     let cap = Some(case.knobs.drain_batch_cap);
     run_case_with(&case.case, cap)?;
     if case.knobs.metamorphic {
@@ -428,6 +428,36 @@ fn run_star_case(case: &StarCase) -> Result<(), String> {
         })?;
     }
     Ok(())
+}
+
+/// Sets a star case's engine knobs (`trellis::dev::interleave`'s lock-step
+/// stall and re-derived share, and the fan-out chunk) for as long as it
+/// lives. They are process-wide, like the commit stall: a star case runs
+/// nothing else meanwhile, and a two-table case under them would still
+/// converge (each changes when things happen, or how a page reads, never
+/// what a correct engine writes).
+struct StarKnobsGuard;
+
+impl StarKnobsGuard {
+    fn set(knobs: &generative::generate::join_one_to_one::StarKnobs) -> Self {
+        trellis::dev::interleave::set_lock_step_stall(
+            Some(knobs.lock_step_stall),
+            knobs.stalled_lock_steps_per_mille,
+        );
+        trellis::dev::interleave::set_rederived_pages(knobs.rederived_pages_per_mille);
+        trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows(
+            knobs.fan_out_chunk_rows.unwrap_or(0),
+        );
+        StarKnobsGuard
+    }
+}
+
+impl Drop for StarKnobsGuard {
+    fn drop(&mut self) {
+        trellis::dev::interleave::set_lock_step_stall(None, 0);
+        trellis::dev::interleave::set_rederived_pages(0);
+        trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows(0);
+    }
 }
 
 proptest! {
@@ -1037,6 +1067,7 @@ fn hand_built_case(with_builds: bool) -> JoinCase {
             columns: i % 16,
             own_keys: [0; 3],
             on_key: false,
+            key_scope: None,
         });
     }
     let action = |kind, target| JoinActionDraw {

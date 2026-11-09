@@ -487,6 +487,12 @@ pub struct OneToOneOpDraw {
     /// (`pick` names one when none does): a mixed page's way to write one
     /// key at every position ([`shape_pages`]).
     pub on_key: bool,
+    /// A star `ja` key update's scope: `None` sets every key column (`k`
+    /// and its pair, and `k2` up to the last position's); `Some(0)` only
+    /// `k` and its pair, and `Some(i)` only `k{i + 1}`, so the row moves at
+    /// one position alone when the others read their own keys. Only the
+    /// star tier draws it; below three tables it is unread.
+    pub key_scope: Option<u8>,
 }
 
 /// The number of join keys a [`KeyShape`] draws over.
@@ -679,9 +685,24 @@ pub fn build_star_program(
                 let row = live[side][at];
                 let mut changes = Vec::new();
                 if draw.columns & 1 != 0 {
-                    let key = key_for(&live[side], Some(row.id));
-                    live[side][at].key = key;
-                    changes.extend(keyed(key));
+                    match draw.key_scope.filter(|_| !joined && tables >= 3) {
+                        None => {
+                            let key = key_for(&live[side], Some(row.id));
+                            live[side][at].key = key;
+                            changes.extend(keyed(key));
+                        }
+                        Some(0) => {
+                            let key = key_for(&live[side], Some(row.id));
+                            live[side][at].key = key;
+                            changes.extend(key_columns(false, key, draw.half_null));
+                        }
+                        Some(scope) => {
+                            let p = 2 + (scope - 1) % (tables as u8 - 2);
+                            let raw = draw.own_keys[usize::from(p) - 2];
+                            changes
+                                .push((own_key_column(p), shape.key(raw).map(|k| k.to_string())));
+                        }
+                    }
                 }
                 if draw.columns & 2 != 0 {
                     changes.push(("t".to_string(), t));
@@ -900,8 +921,12 @@ pub fn place_tail_truncates(
 
 /// The workers a star case drains with (#1464 section 4).
 pub const STAR_WORKERS: usize = 8;
-/// The longest stall a star case's pages take at a lock step.
-pub const STAR_LOCK_STEP_STALL_MS: u64 = 3;
+/// The longest stall a star case's pages take before their commit.
+pub const STAR_COMMIT_STALL_MS: u64 = 3;
+/// The longest stall a star case's pages take at a stalled lock step.
+pub const STAR_LOCK_STEP_STALL_MS: u64 = 12;
+/// The largest fan-out chunk a star case lowers the engine's to, in rows.
+pub const STAR_MAX_FAN_OUT_CHUNK_ROWS: usize = 4;
 /// The share of lock steps a star case stalls at, in thousandths.
 pub const STAR_STALLED_LOCK_STEPS_PER_MILLE: u16 = 300;
 /// The share of pages a star case re-derives, in thousandths.
@@ -916,12 +941,19 @@ pub struct StarKnobs {
     /// The most rows a drain holds (`ManualBackend::set_drain_batch_cap`):
     /// pages of 1 to [`STAR_MAX_PAGE_ROWS`] rows.
     pub drain_batch_cap: usize,
-    /// The longest stall a page takes at a lock step.
+    /// The longest stall a page takes at a stalled lock step
+    /// (`trellis::dev::interleave::set_lock_step_stall`).
     pub lock_step_stall: std::time::Duration,
     /// The share of lock steps that stall, in thousandths.
     pub stalled_lock_steps_per_mille: u16,
-    /// The share of pages re-derived, in thousandths.
+    /// The share of pages re-derived, in thousandths
+    /// (`trellis::dev::interleave::set_rederived_pages`).
     pub rederived_pages_per_mille: u16,
+    /// The engine's fan-out chunk, in rows
+    /// (`trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows`), lowered
+    /// from its default so a hot key's rows take a pending fan-out; `None`
+    /// keeps the default.
+    pub fan_out_chunk_rows: Option<usize>,
     /// The "late" position (#1459's F11 orientation): in a mixed page its
     /// draws come last ([`shape_pages`]).
     pub late_position: u8,
@@ -971,35 +1003,95 @@ pub fn shape_pages(draws: &mut [OneToOneOpDraw], pages: &[PageDraw], tables: usi
             break;
         }
         let end = (start + usize::from(page.rows.max(1))).min(draws.len());
-        let chunk = &mut draws[start..end];
-        let mixed = page.mixed && chunk.len() >= 2;
-        if mixed {
-            let key = chunk[0].key;
-            for (i, draw) in chunk.iter_mut().enumerate() {
-                draw.position = (i % tables) as u8;
-                draw.key = key;
-                draw.on_key = true;
-                // Every write sets the key: an insert or update of `ja`, and
-                // at a joined position an update of the row holding it (an
-                // insert would probe past the key when a row holds it).
-                draw.columns |= 1;
-                if draw.position == 0 {
-                    draw.own_keys = [key; 3];
-                } else if draw.kind == JoinOpKind::Insert {
-                    draw.kind = JoinOpKind::Update;
-                }
+        shape_page(
+            &mut draws[start..end],
+            page.mixed,
+            page.shuffle,
+            tables,
+            late,
+        );
+        start = end;
+    }
+}
+
+/// One page of [`shape_pages`]: `chunk` shuffled, and when `mixed` (and of
+/// two or more draws) spanning the positions on its first draw's key.
+fn shape_page(chunk: &mut [OneToOneOpDraw], mixed: bool, shuffle: u64, tables: usize, late: u8) {
+    let mixed = mixed && chunk.len() >= 2;
+    if mixed {
+        let key = chunk[0].key;
+        for (i, draw) in chunk.iter_mut().enumerate() {
+            draw.position = (i % tables) as u8;
+            draw.key = key;
+            draw.on_key = true;
+            // Every write sets the key: an insert or update of `ja`, and
+            // at a joined position an update of the row holding it (an
+            // insert would probe past the key when a row holds it).
+            draw.columns |= 1;
+            if draw.position == 0 {
+                draw.own_keys = [key; 3];
+                draw.key_scope = None;
+            } else if draw.kind == JoinOpKind::Insert {
+                draw.kind = JoinOpKind::Update;
             }
         }
-        let mut state = page.shuffle;
-        for i in (1..chunk.len()).rev() {
-            let j = (split_mix(&mut state) % (i as u64 + 1)) as usize;
-            chunk.swap(i, j);
+    }
+    let mut state = shuffle;
+    for i in (1..chunk.len()).rev() {
+        let j = (split_mix(&mut state) % (i as u64 + 1)) as usize;
+        chunk.swap(i, j);
+    }
+    if mixed {
+        // Stable: the late position's draws move to the end.
+        chunk.sort_by_key(|draw| draw.position == late);
+    }
+}
+
+/// A burst's closing race (#1817): the last draws of a burst, a mixed page
+/// on a hot key ([`shape_pages`]) of `rows` draws. Nothing later in the
+/// burst rewrites the key, so the check after the burst sees what the race
+/// left, where a mixed page mid-burst is mostly repaired by the burst's
+/// later writes of its hot key before the check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TailRace {
+    /// Its draws: two writes at each position or so.
+    pub rows: u8,
+    /// Its hot key ([`super::join::STAR_HOT_KEYS`]).
+    pub hot_key: u8,
+    /// Seeds its shuffle.
+    pub shuffle: u64,
+}
+
+/// Places `races` at the ends of the bursts of `burst_size` draws, in turn
+/// (#1817): a burst whose turn is a race has its last draws become
+/// [`TailRace`]'s mixed page, written after [`shape_pages`] shaped the
+/// stream; one whose turn is `None` keeps its draws.
+pub fn place_tail_races(
+    draws: &mut [OneToOneOpDraw],
+    burst_size: usize,
+    races: &[Option<TailRace>],
+    tables: usize,
+    late: u8,
+) {
+    if races.is_empty() || burst_size == 0 {
+        return;
+    }
+    let turns = (0..draws.len().div_ceil(burst_size)).zip(races.iter().cycle());
+    for (burst, race) in turns.filter_map(|(burst, race)| Some((burst, (*race)?))) {
+        let end = ((burst + 1) * burst_size).min(draws.len());
+        let rows = usize::from(race.rows).min(end - burst * burst_size);
+        let chunk = &mut draws[end - rows..end];
+        if let Some(first) = chunk.first_mut() {
+            // A raw key below 100 is hot (`KeyShape::Star`).
+            first.key = race.hot_key % super::join::STAR_HOT_KEYS;
         }
-        if mixed {
-            // Stable: the late position's draws move to the end.
-            chunk.sort_by_key(|draw| draw.position == late);
+        // Every draw writes the key: none deletes or truncates.
+        for draw in chunk.iter_mut() {
+            if matches!(draw.kind, JoinOpKind::Delete | JoinOpKind::Truncate) {
+                draw.kind = JoinOpKind::Update;
+            }
         }
-        start = end;
+        shape_page(chunk, true, race.shuffle, tables, late);
     }
 }
 
@@ -1041,8 +1133,7 @@ impl StarCase {
 
 /// A star case: [`build_star_program`] over `tables` tables under
 /// [`KeyShape::Star`], planned as [`one_to_one_case`] plans it, drained by
-/// [`STAR_WORKERS`] workers with a commit stall of up to
-/// [`STAR_LOCK_STEP_STALL_MS`].
+/// [`STAR_WORKERS`] workers with a commit stall of `commit_stall`.
 #[allow(clippy::too_many_arguments)]
 pub fn star_case(
     specs: &[OneToOneSpec],
@@ -1052,6 +1143,7 @@ pub fn star_case(
     burst_size: usize,
     lanes: usize,
     seal_interval_ms: u64,
+    commit_stall: std::time::Duration,
     knobs: StarKnobs,
     join_order: Vec<u8>,
 ) -> StarCase {
@@ -1065,7 +1157,7 @@ pub fn star_case(
         STAR_WORKERS,
         seal_interval_ms,
     );
-    case.plan.commit_stall = Some(knobs.lock_step_stall);
+    case.plan.commit_stall = Some(commit_stall);
     StarCase {
         case,
         tables,
@@ -1187,6 +1279,7 @@ pub(crate) mod strategy {
                         columns,
                         own_keys: [0; 3],
                         on_key: false,
+                        key_scope: None,
                     }
                 },
             )
@@ -1346,19 +1439,40 @@ pub(crate) mod strategy {
     }
 
     /// One star op draw over `tables` tables: two in five on `ja`, the rest
-    /// spread over the positions, and each of `ja`'s own keys equal to `key`
-    /// half the time (a root row hot at two or more positions at once).
+    /// spread over the positions, each of `ja`'s own keys equal to `key`
+    /// half the time (a root row hot at two or more positions at once), and
+    /// one `ja` key update in two moving `k` alone or one own key alone
+    /// ([`OneToOneOpDraw::key_scope`]).
     pub(crate) fn star_draw(tables: usize) -> impl Strategy<Value = OneToOneOpDraw> {
         let own = || prop_oneof![1 => Just(None), 1 => any::<u8>().prop_map(Some)];
         (
             draw(5, true),
             prop_oneof![2 => Just(0u8), 3 => 1u8..tables as u8],
             [own(), own(), own()],
+            prop_oneof![
+                2 => Just(None),
+                1 => Just(Some(0u8)),
+                1 => (1u8..=3).prop_map(Some),
+            ],
         )
-            .prop_map(|(draw, position, own)| OneToOneOpDraw {
+            .prop_map(|(draw, position, own, key_scope)| OneToOneOpDraw {
                 position,
                 own_keys: own.map(|raw| raw.unwrap_or(draw.key)),
+                key_scope,
                 ..draw
+            })
+    }
+
+    fn tail_race(tables: usize) -> impl Strategy<Value = TailRace> {
+        (
+            tables as u8..=(2 * tables) as u8,
+            0u8..super::super::join::STAR_HOT_KEYS,
+            any::<u64>(),
+        )
+            .prop_map(|(rows, hot_key, shuffle)| TailRace {
+                rows,
+                hot_key,
+                shuffle,
             })
     }
 
@@ -1383,11 +1497,15 @@ pub(crate) mod strategy {
     /// which half span the positions on one root key ([`shape_pages`]), with
     /// a drawn "late" position. [`STAR_WORKERS`] workers drain pages of at
     /// most a drawn 1 to 15 rows, sealing every 20 to 200 ms over 2 to 4
-    /// lanes, stalling up to [`STAR_LOCK_STEP_STALL_MS`] before each commit;
-    /// the knobs carry the share of stalled lock steps and re-derived pages.
-    /// Builds, pauses and re-reads are the two-table tier's ([`builds`]), and
-    /// about one op in a hundred is a `TRUNCATE` of any table. One case in
-    /// four also runs its metamorphic twin, under a drawn `JOIN` order.
+    /// lanes, stalling up to [`STAR_COMMIT_STALL_MS`] before each commit;
+    /// the knobs carry the share of lock steps stalled (up to a drawn 1 to
+    /// [`STAR_LOCK_STEP_STALL_MS`]) and of pages re-derived, and in half the
+    /// cases a fan-out chunk of 1 to [`STAR_MAX_FAN_OUT_CHUNK_ROWS`] rows,
+    /// below a hot key's rows. Three bursts in four end in a race
+    /// ([`place_tail_races`]). Builds, pauses and re-reads are the two-table
+    /// tier's ([`builds`]), and about one op in a hundred is a `TRUNCATE` of
+    /// any table. One case in four also runs its metamorphic twin, under a
+    /// drawn `JOIN` order.
     pub fn star_case_strategy() -> impl Strategy<Value = StarCase> {
         (2usize..=MAX_TABLES).prop_flat_map(|tables| {
             let positions = (1..tables as u8).collect::<Vec<u8>>();
@@ -1402,8 +1520,16 @@ pub(crate) mod strategy {
                 2usize..=4,
                 20u64..=200,
                 builds(),
-                0u64..=STAR_LOCK_STEP_STALL_MS,
-                prop_oneof![3 => Just(false), 1 => Just(true)],
+                0u64..=STAR_COMMIT_STALL_MS,
+                (
+                    prop_oneof![3 => Just(false), 1 => Just(true)],
+                    1u64..=STAR_LOCK_STEP_STALL_MS,
+                    proptest::option::of(1usize..=STAR_MAX_FAN_OUT_CHUNK_ROWS),
+                    proptest::collection::vec(
+                        proptest::option::weighted(0.75, tail_race(tables)),
+                        1..=8,
+                    ),
+                ),
             )
                 .prop_map(
                     move |(
@@ -1418,9 +1544,10 @@ pub(crate) mod strategy {
                         seal_interval_ms,
                         builds,
                         stall_ms,
-                        metamorphic,
+                        (metamorphic, lock_step_ms, fan_out_chunk_rows, races),
                     )| {
                         shape_pages(&mut draws, &pages, tables, late_position);
+                        place_tail_races(&mut draws, burst_size, &races, tables, late_position);
                         star_case(
                             &specs,
                             tables,
@@ -1429,11 +1556,13 @@ pub(crate) mod strategy {
                             burst_size,
                             lanes,
                             seal_interval_ms,
+                            std::time::Duration::from_millis(stall_ms),
                             StarKnobs {
                                 drain_batch_cap,
-                                lock_step_stall: std::time::Duration::from_millis(stall_ms),
+                                lock_step_stall: std::time::Duration::from_millis(lock_step_ms),
                                 stalled_lock_steps_per_mille: STAR_STALLED_LOCK_STEPS_PER_MILLE,
                                 rederived_pages_per_mille: STAR_REDERIVED_PAGES_PER_MILLE,
+                                fan_out_chunk_rows,
                                 late_position,
                                 metamorphic,
                             },
@@ -1536,6 +1665,7 @@ mod tests {
             columns: 0,
             own_keys: [0; 3],
             on_key: false,
+            key_scope: None,
         }
     }
 
