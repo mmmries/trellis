@@ -18,7 +18,7 @@ as `trellis/pg`. The module is still `Trellis`.
 
 ```ruby
 # Gemfile
-gem "trellis-pg", "~> 0.1.0"
+gem "trellis-pg", "~> 0.2.0"
 ```
 
 `Bundler.require`, which a Rails app's `config/application.rb` runs,
