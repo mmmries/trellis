@@ -1525,7 +1525,22 @@ async fn write_locked(
         pause!(txn, BetweenJoinSideWrites, &plan.target);
     }
     if bulk {
-        group_basis::analyze(txn, &[&plan.from.deltas, &plan.joined.deltas]).await?;
+        // `J`, `P` and `M` too: the build filled them in this transaction,
+        // so only it can count their rows. An `ANALYZE` from outside, or an
+        // autovacuum mid-build, records them as empty (`reltuples = 0`),
+        // and the product, `J`'s update above all, is planned as a nested
+        // loop over millions of rows (#1839).
+        group_basis::analyze(
+            txn,
+            &[
+                &plan.from.deltas,
+                &plan.joined.deltas,
+                &plan.j_ident,
+                plan.from.plan.hidden(),
+                plan.joined.plan.hidden(),
+            ],
+        )
+        .await?;
     }
     // 4. The product into `T`'s staging, and `J.matches`. With nested
     // loops left on: its joins look up the other side's cells of a key

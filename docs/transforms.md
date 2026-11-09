@@ -41,10 +41,9 @@ a key, index or policy itself.
 | [A nondeterministic collation on a key or compared column](#a-nondeterministic-collation-on-a-key-or-compared-column) | Yes | Pauses readers, or holds keys |
 | [A `REGEXP_COUNT` pattern that isn't a literal or that Postgres rejects](#a-regexp_count-pattern-that-isnt-a-literal-or-that-postgres-rejects) | Yes (`NonLiteralRegexPattern`, `InvalidRegexPattern`) | Rows quarantined after a Postgres upgrade |
 | **Constants** | | |
-| [A constant that fails for every row](#a-constant-that-fails-for-every-row) | Yes (`CoalesceLiteralOutOfRange`, `CaseLiteralOutOfRange`, `ConstantOutOfRange`) | A retype pauses the transform |
-| [A constant zero divisor](#a-constant-zero-divisor) | Yes (`ConstantDivisorZero`) | n/a |
+| [A literal zero divisor](#a-literal-zero-divisor) | Yes (`ConstantDivisorZero`) | n/a |
 | **Comparisons** | | |
-| [A float compared with an exact numeric](#a-float-compared-with-an-exact-numeric) | Yes (`MixedFloatExactComparison`, `FloatComparisonLiteralOutOfRange`) | A retype pauses the transform |
+| [A float compared with an exact numeric](#a-float-compared-with-an-exact-numeric) | Yes (`MixedFloatExactComparison`) | A retype pauses the transform |
 | [A comparison between two temporal types](#a-comparison-between-two-temporal-types) | Yes (`MixedTemporalComparison`) | A retype pauses the transform |
 | [An ordering comparison over `text`](#an-ordering-comparison-over-text) | Yes (`TextOrderingComparison`) | A retype pauses the transform |
 | [A comparison between types no family covers](#a-comparison-between-types-no-family-covers) | Yes (`ComparisonTypeMismatch`) | A retype pauses the transform |
@@ -576,124 +575,29 @@ again and refuses with the server's message.
 
 ### Constants
 
-#### A constant that fails for every row
+#### A literal zero divisor
 
-**Condition:** A constant Postgres folds at plan time that fails for every row:
+**Condition:** A `/` or `%` whose divisor is written as a literal zero: a
+number literal (`n / 0`, `n / 0.0`, `n % -0`) or a float typed literal
+(`f / REAL '0'`, `f / DOUBLE PRECISION '-0'`), under any `CAST` or prefix `-`,
+whatever the dividend and wherever the division sits: in a `CASE` branch no
+row takes, after a constant that ends a `COALESCE`, `AND` or `OR`, beside a
+`NULL` constant that makes Postgres drop the division (`(n / 0) + NULL`), or
+in an aggregate's argument. Postgres raises `22012` for every row that has a
+dividend, so the division is never useful.
 
-* a `CASE` result, `AND`/`OR` operand or `NULLIF` argument that is one of the
-  constants below, wherever the rest of the expression reads columns
-  (`CASE WHEN x > 0 THEN 1.5 / 0 END` fails every row, even those where `x > 0`
-  is false);
-* a `COALESCE` whose result is a float (`real` or `double precision`) with a
-  constant argument outside that float's range, such as
-  `COALESCE(real_col, 1000000000000000000000000000000000000000)`;
-* a `+`, `-` or `*` of two integer constants whose result does not fit
-  `integer` or `bigint`, such as `2147483647 + 1` or `2147483647 * 2`;
-* prefix `-` or `ABS` of the smallest integer (`-(-2147483647 - 1)`,
-  `ABS(-2147483648)`);
-* a `+`, `-`, `*` or `/` of two float constants that overflows the float, or
-  that underflows to zero from nonzero operands
-  (`DOUBLE PRECISION '1e-200' * DOUBLE PRECISION '1e-200'`);
-* or an exact constant beside a float that is outside `double precision`;
-* a `date` constant plus or minus an integer constant that leaves `date`'s
-  range (4714-11-24 BC to 5874897-12-31), such as
-  `DATE '2024-01-01' + 2147483647`;
-* or a constant `date` past 294276-12-31 cast to `timestamp`.
-
-A constant is a number literal, a `REAL`, `DOUBLE PRECISION` or `DATE` typed
-literal, or a `+`, `-`, `*`, `/`, `%`, prefix `-`, `ABS`, `CAST` (a widening or
-to the operand's own type) or calculated field made only of constants, or a
-`COALESCE` led by a constant (whatever follows it), wherever it appears (an
-aggregate's argument, a `JOIN` field, a `COALESCE` argument). A constant beside
-only exact `COALESCE` arguments unifies upward and is never out of range, and
-`numeric` arithmetic does not overflow.
-
-Postgres never evaluates a `COALESCE` argument after a constant one, a `CASE`
-result after a condition that is constant true or in a branch whose condition
-is constant false or `NULL`, or an `AND` operand after a constant false (an
-`OR` operand after a constant true), so `COALESCE(5, 2147483647 + 1)`,
-`CASE WHEN 1 = 1 THEN 1 ELSE 1.5 / 0 END` and `1 = 2 AND 1.5 / 0 = 1` define;
-an aggregate's argument is refused all the same
-(`COALESCE(5, SUM(2147483647 + 1))`), because Trellis computes it for every row
-apart from the expression around the call.
-
-Define folds `TRUE`, `FALSE`, `NULL` and comparisons of number, float, text,
-`date`, `timestamp`, `time` and `timetz` constants, `AND`, `OR`, `NOT`,
-`IS [NOT] NULL`, `CASE`, `NULLIF` and `COALESCE` over them, and a comparison
-(other than `IS [NOT] DISTINCT FROM`), arithmetic operator or function call
-with a `NULL` constant operand is `NULL` whatever its other operands read, as
-the planner folds it (`CASE WHEN x > NULLIF(1, 1) THEN 2147483647 + 1 END`
-defines), and a `NULLIF` with a `NULL` constant argument is its first argument
-whatever the other reads (`NULLIF(NULL, x)` is `NULL` and `NULLIF(a, NULL)` is
-`a`, so `2147483647 + NULLIF(1, NULLIF(CAST(NULL AS integer), x))` is refused);
-where the planner may fold a `CASE` condition, `AND`/`OR` operand or `COALESCE`
-argument to a value define cannot tell, it refuses nothing after it
-(`COALESCE(NULLIF(STRPOS('', ''), NULL), 2147483647 + 1)` and
-`CASE WHEN STRPOS('a', 'a') = 2 AND x > 0 THEN 2147483647 + 1 END` define).
-
-A `NULLIF` whose first argument is such a value is treated as reading its other
-argument, though the planner folds it to `NULL` when that value is, so define
-may refuse a guarded constant Postgres drops
-(`CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), x) IS NOT NULL THEN 2147483647 + 1 END`
-is refused, and plans to `NULL` in Postgres). An expression that reads a column
-is not a constant: `int_col + 2147483647` defines and fails only for the rows
-it overflows, which are quarantined.
-
-A function call over constants other than `ABS` (`CHAR_LENGTH('abc')`,
-`CEIL(DOUBLE PRECISION '1e+308') * 10`,
-`DATE_TRUNC('millennium', CAST(DATE '0001-01-01' - 1721426 AS timestamp))`) is
-folded by Postgres too, but define has no value for it, so the failing
-expression around it, or a `CASE` result, `AND`/`OR` operand or `COALESCE`
-argument it may select, defines and every page fails
-([#1446](https://github.com/salesforce-misc/trellis/issues/1446)).
-
-**Refused at define:** Yes (`CoalesceLiteralOutOfRange` for the `COALESCE`,
-`CaseLiteralOutOfRange` for a `CASE` of a float type, `ConstantOutOfRange` for
-the arithmetic or cast), naming the field, the expression as written and the
-type, for the definition and an `ALTER TRANSFORM`.
-
-**If it appears after define:** A column retyped so a constant falls out of
-range (`double precision` → `real` under a `COALESCE`, `numeric` →
-`double precision` beside a huge constant) pauses the transform on the staging
-worker's next capture pass, with the reason in `status()`'s `capture_failure`,
-and `RESUME` refuses while define would refuse the definition.
-
-**Remedy:** Use a constant within the type's range, or a column.
-
-#### A constant zero divisor
-
-**Condition:** A constant zero divisor of `/` or `%`: a literal (`n / 0`,
-`n / 0.0`), a float zero (`f / REAL '0'`, `-0` included) or a constant that
-folds to zero (`n / (1 - 1)`, `i % (2 - 2)`), whatever the dividend. A `CASE`
-or `COALESCE` that resolves to a float casts the result it picks to that float,
-so a wide integer literal in it rounds first:
-`CASE WHEN FALSE THEN DOUBLE PRECISION '0' ELSE -9223372036854775809 END - -9223372036854775808`
-is exactly zero.
-
-A `NaN` float constant divided by zero is `NaN` in Postgres and defines.
-Postgres raises `22012` for every row that has a dividend, or at plan time when
-the dividend is a constant too, so no row could be written. A divisor that
-reads a column defines, and `x / col` fails only for the rows where `col` is
-zero, which are quarantined.
-
-Postgres evaluates a `COALESCE` argument only for the rows the earlier ones
-leave `NULL`, a `CASE` result only where its condition holds and an `AND`/`OR`
-operand only where the earlier ones allow, but a zero divisor under one is
-refused too, unless a constant before it ends the `COALESCE`, `CASE`, `AND` or
-`OR`, or the column-reading dividend sits in a strict operator or function call
-that has a `NULL` constant input (`(n / 0) + NULL`), which Postgres replaces by
-`NULL` without dividing (a constant dividend still divides at plan time).
-
-Neither spares a division in an aggregate's argument
-(`COALESCE(5, SUM(n / 0))`, `SUM(n / 0) + NULL`), which Trellis computes for
-every row apart from the expression around the call.
+Only the text is read. A divisor that computes to zero (`n / (1 - 1)`,
+`n / COALESCE(0, 1)`, `n / CEIL(0.0)`, a calculated field that is `0`)
+defines, and its rows fail and are quarantined like any other per-row error,
+as `x / col` does for the rows where `col` is zero.
 
 **Refused at define:** Yes (`ConstantDivisorZero`), naming the field and the
 division as written, for the definition and an `ALTER TRANSFORM`.
 
-**If it appears after define:** n/a: a constant does not change.
+**If it appears after define:** n/a: the text does not change.
 
-**Remedy:** Use a nonzero divisor, or a column.
+**Remedy:** Use a nonzero divisor, or a column; `x / NULLIF(col, 0)` gives
+`NULL` where `col` is zero.
 
 ### Comparisons
 
@@ -710,9 +614,7 @@ literal against a float is admitted (below), so `f > 0.5` and `f = 1` define.
 both operand types, for the definition and an `ALTER TRANSFORM`. Postgres casts
 the exact side to `double precision`, so the comparison inherits float rounding
 (`0.1::numeric + 0.2 = 0.3::float8` is false). A float against a float and an
-exact numeric against an exact numeric are admitted; `+` admits the mix. A bare
-literal outside `double precision`'s range (`22003` in Postgres) is refused too
-(`FloatComparisonLiteralOutOfRange`).
+exact numeric against an exact numeric are admitted; `+` admits the mix.
 
 **If it appears after define:** A column retyped into the other family
 (`integer` → `double precision`) pauses the transform on the staging worker's
@@ -2247,7 +2149,7 @@ promises no evaluation order inside `AND` and `OR`, so `y <> 0 AND x / y > 1`
 can still divide by zero; guard a division with `CASE WHEN y <> 0 THEN x / y
 END` or `x / NULLIF(y, 0)`. A failure inside a `CASE` branch is raised only
 for the rows that take the branch, except a constant Postgres folds while
-planning (a `1.5 / 0` in a branch fails every row), which define refuses. In
+planning (a `2147483647 + 1` in a branch fails every row). In
 an aggregate, `COUNT(CASE WHEN c THEN 1 END)` and `SUM(CASE WHEN c THEN qty
 ELSE 0 END)` over an integer define, and so does `SUM(CASE WHEN c THEN amount
 ELSE 0 END)` over a `numeric(10,2)` column, whose sum shows the scale Postgres
@@ -2270,11 +2172,16 @@ operators of one tier group left to right: `a - b * c` is `a - (b * c)`,
 `-a * b` is `(-a) * b`, `a - b - c` is `(a - b) - c`. A minus before a number
 literal is one negative literal, typed by its value as Postgres types it, so
 `-2147483648` is an `integer`. What Postgres would do differently from what a
-reader expects, or fail on every row, is refused at define
+reader expects is refused at define
 ([Supported sources and targets](#supported-sources-and-targets)). A value an
 operation cannot compute for one row (an overflow, a division by zero) raises
 `22003` or `22012` for that row's record, which is quarantined and charged to
-the field.
+the field. Define doesn't evaluate constant expressions as Postgres's planner
+does, so a definition with a constant Postgres fails while planning
+(`2147483647 + 1`, `DATE '2024-01-01' + 2147483647`, a `COALESCE(real_col,
+...)` whose constant is past `real`'s range) is accepted, and its rows fail and are quarantined on their first
+apply or build (an aggregate's build fails whole and pauses the definition,
+naming Postgres's error); only a divisor written as a literal zero is refused.
 
 A formula's dates are Postgres's too. `date + n`, `n + date` and `date - n` add
 or subtract a count of days (a `smallint` or `integer`) and give a `date`;
@@ -2289,7 +2196,7 @@ follow Postgres (`infinity + 1` is `infinity`, `EXTRACT(year FROM 'infinity'::da
 is `Infinity`, `EXTRACT(day FROM ...)` of it is `NULL`), and a row whose date
 leaves the range (`date + n` past 5874897-12-31, two dates one of which is
 infinite, a date past 294276-12-31 cast to `timestamp`) raises `22008` for that
-row's record, which is quarantined; a constant that does is refused at define.
+row's record, which is quarantined; a constant that does fails every row.
 A bucket for an aggregate is computed in a 1-1 transform and grouped by in
 another (`DATE_TRUNC('month', ts) AS bucket`, then `GROUP BY bucket`), since a
 `GROUP BY` key is a column; `EXTRACT` is an unconstrained `numeric`, which an

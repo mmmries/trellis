@@ -57,12 +57,12 @@ pub struct Profile {
     /// it. Off for the end-to-end tiers, whose oracle types an operator from
     /// its operands' own types.
     pub bare_null: bool,
-    /// Draw a tree define refuses for a constant zero divisor
-    /// (`ConstantDivisorZero`: `x / 0`, `x % (0 * 5)`, a divisor a `CASE`
-    /// folds to zero, ...). Off for the end-to-end tiers, whose programs must
-    /// install; the conformance properties draw them, since
-    /// `expr_conformance` checks that define and Postgres both refuse.
-    pub constant_zero_divisor: bool,
+    /// Draw a tree define refuses for a literal zero divisor
+    /// (`ConstantDivisorZero`: `x / 0`, `x % -0`, `x / REAL '0'`). Off for the
+    /// end-to-end tiers, whose programs must install; the conformance
+    /// properties draw them, since `expr_conformance` checks the rule against
+    /// Postgres.
+    pub literal_zero_divisor: bool,
     /// Draw every `/` and `%` divisor as `NULLIF(divisor, 0)`, so a divisor
     /// that is zero for some row (`42 % c1`, a `CASE` that picks `REAL '0'`
     /// on one branch) gives `NULL` instead of raising. On for the end-to-end
@@ -80,7 +80,7 @@ impl Profile {
         magnitude: Magnitude::Extreme,
         mixed_coalesce: true,
         bare_null: true,
-        constant_zero_divisor: true,
+        literal_zero_divisor: true,
         guard_divisors: false,
     };
     /// The end-to-end tiers: small literals and depth 2, so a program the
@@ -90,7 +90,7 @@ impl Profile {
         magnitude: Magnitude::Small,
         mixed_coalesce: false,
         bare_null: false,
-        constant_zero_divisor: false,
+        literal_zero_divisor: false,
         guard_divisors: true,
     };
 }
@@ -351,7 +351,7 @@ fn number_literals(ty: ValueType, magnitude: Magnitude) -> Vec<&'static str> {
 }
 
 /// A number literal wider than `double precision`'s range, drawn against a
-/// float so the `FloatComparisonLiteralOutOfRange` refusal is reached.
+/// float: define admits it, and Postgres fails it while planning.
 const HUGE_NUMBER_LITERAL: &str = concat!(
     "1000000000000000000000000000000000000000000000000000000000000000000000000000000000",
     "0000000000000000000000000000000000000000000000000000000000000000000000000000000000",
@@ -360,16 +360,13 @@ const HUGE_NUMBER_LITERAL: &str = concat!(
     "000000000000000000000000000000000000000000000000000000000000"
 );
 
-/// Whether define refuses `expr` for a constant zero divisor
+/// Whether define refuses `expr` for a literal zero divisor
 /// (`ValidationError::ConstantDivisorZero`), over source `columns`.
 ///
-/// This asks define itself rather than restating its folding (`0 * 5`,
-/// `CAST('0' AS REAL)`, a `CASE` or `COALESCE` that picks a zero, a divisor
-/// folded through a comparison, ...), so the generator is never laxer than
-/// define: whatever define learns to fold, this follows. Only that one
-/// refusal counts; any other refusal is left for the property that draws the
-/// tree to report.
-pub fn has_constant_zero_divisor(expr: &Expr, columns: &[Column]) -> bool {
+/// This asks define itself rather than restating its rule, so the generator
+/// is never laxer than define. Only that one refusal counts; any other
+/// refusal is left for the property that draws the tree to report.
+pub fn define_refuses_zero_divisor(expr: &Expr, columns: &[Column]) -> bool {
     use std::collections::HashMap;
     use trellis::dev::defs::{ValidationError, parse, validate};
 
@@ -1017,7 +1014,7 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
             });
         }
     }
-    // A divisor that is the constant zero.
+    // A divisor written as a literal zero.
     for &ty in &types {
         if !ty.is_numeric_family() {
             continue;
@@ -1029,16 +1026,11 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
             if registry::lookup_operator(op).is_none() {
                 continue;
             }
-            for zero in ["0", "0.0", "(1 - 1)"] {
+            for zero in ["0", "0.0", "-0"] {
                 let text = format!("{col} {op} {zero}");
                 // Only the pairs the registry types are refused for the
                 // zero; the rest are near misses of their own kind.
-                let zero_type = number_literal_type(
-                    zero.trim_matches(['(', ')'])
-                        .split(' ')
-                        .next()
-                        .unwrap_or("0"),
-                );
+                let zero_type = number_literal_type(zero);
                 if registry::operator_result_type(
                     registry::lookup_operator(op).expect("checked"),
                     ty,
@@ -1047,7 +1039,7 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
                 .is_some()
                 {
                     out.push(NearMiss {
-                        kind: "constant-zero-divisor",
+                        kind: "literal-zero-divisor",
                         text,
                         needles: vec!["zero".to_string()],
                     });
@@ -1477,22 +1469,6 @@ fn date_near_misses(columns: &[Column], out: &mut Vec<NearMiss>) {
             &["'-'", "number minus a date"],
         );
     }
-    // A constant date past `date`'s range, folded at plan time.
-    miss(
-        "constant-date-overflow",
-        "DATE '2024-02-29' + 2147483647".to_string(),
-        &["out of range", "date"],
-    );
-    miss(
-        "constant-date-underflow",
-        "DATE '2024-02-29' - 2147483647".to_string(),
-        &["out of range", "date"],
-    );
-    miss(
-        "constant-date-overflow",
-        "2147483647 + DATE '0001-01-01'".to_string(),
-        &["out of range", "date"],
-    );
 }
 
 /// Typed-literal spellings Postgres accepts and define refuses, as
@@ -1879,7 +1855,7 @@ pub mod strategy {
         let columns = columns.to_vec();
         (Union::new(strategies), text_style())
             .prop_filter("a tree define admits", move |(expr, _)| {
-                profile.constant_zero_divisor || !has_constant_zero_divisor(expr, &columns)
+                profile.literal_zero_divisor || !define_refuses_zero_divisor(expr, &columns)
             })
             .prop_map(|(expr, style)| Draw { expr, style })
             .boxed()
@@ -1899,7 +1875,7 @@ pub mod strategy {
             .expr(ty, profile.max_depth)
             .unwrap_or_else(|| panic!("nothing produces {ty} over these columns"))
             .prop_filter("a tree define admits", move |expr| {
-                profile.constant_zero_divisor || !has_constant_zero_divisor(expr, &columns)
+                profile.literal_zero_divisor || !define_refuses_zero_divisor(expr, &columns)
             })
             .boxed()
     }
@@ -2009,11 +1985,12 @@ mod tests {
         }
     }
 
-    /// `has_constant_zero_divisor` flags every spelling of a constant zero
-    /// divisor define refuses, and nothing define admits: a zero dividend or
-    /// operand, a `NULL` divisor, a column divisor.
+    /// `define_refuses_zero_divisor` flags every spelling of a literal zero
+    /// divisor, wherever it sits, and nothing define admits: a zero dividend
+    /// or operand, a divisor that only computes to zero, a `NULL` divisor, a
+    /// column divisor.
     #[test]
-    fn a_constant_zero_divisor_is_recognised_the_way_define_refuses_it() {
+    fn a_literal_zero_divisor_is_recognised_the_way_define_refuses_it() {
         let columns = slot_columns();
         let zero = || number("0");
         let refused = [
@@ -2021,7 +1998,38 @@ mod tests {
             binary(Operator::Divide, float4_literal("0"), float4_literal("0")),
             binary(Operator::Divide, column("$c1"), zero()),
             binary(Operator::Modulo, column("$c1"), zero()),
-            // A divisor that folds to zero.
+            binary(Operator::Divide, column("$c1"), number("-0")),
+            binary(Operator::Divide, column("$c1"), number("0.0")),
+            // In a branch no row reaches: the rule reads only the text.
+            Expr::Case {
+                branches: vec![(
+                    Expr::BinaryOp {
+                        op: Operator::GreaterThan,
+                        lhs: Box::new(column("$c1")),
+                        rhs: Box::new(zero()),
+                    },
+                    number("1"),
+                )],
+                otherwise: Some(Box::new(binary(Operator::Divide, number("1.5"), zero()))),
+            },
+        ];
+        for expr in &refused {
+            assert!(
+                define_refuses_zero_divisor(expr, &columns),
+                "{} should be flagged",
+                render_text(expr, TextStyle::default())
+            );
+        }
+        let admitted = [
+            // Zero as a dividend, an addend, a comparison operand.
+            binary(Operator::Divide, zero(), column("$c1")),
+            binary(Operator::Divide, zero(), number("2")),
+            binary(Operator::Add, column("$c1"), zero()),
+            binary(Operator::Multiply, column("$c1"), zero()),
+            binary(Operator::Modulo, zero(), number("7")),
+            binary(Operator::Divide, column("$c1"), column("$c2")),
+            binary(Operator::Divide, column("$c1"), number("2")),
+            // A divisor that only computes to zero: its rows fail at run time.
             binary(
                 Operator::Divide,
                 column("$c1"),
@@ -2048,35 +2056,6 @@ mod tests {
                     args: vec![zero(), column("$c2")],
                 },
             ),
-            // In a branch no row reaches: the planner folds it anyway.
-            Expr::Case {
-                branches: vec![(
-                    Expr::BinaryOp {
-                        op: Operator::GreaterThan,
-                        lhs: Box::new(column("$c1")),
-                        rhs: Box::new(zero()),
-                    },
-                    number("1"),
-                )],
-                otherwise: Some(Box::new(binary(Operator::Divide, number("1.5"), zero()))),
-            },
-        ];
-        for expr in &refused {
-            assert!(
-                has_constant_zero_divisor(expr, &columns),
-                "{} should be flagged",
-                render_text(expr, TextStyle::default())
-            );
-        }
-        let admitted = [
-            // Zero as a dividend, an addend, a comparison operand.
-            binary(Operator::Divide, zero(), column("$c1")),
-            binary(Operator::Divide, zero(), number("2")),
-            binary(Operator::Add, column("$c1"), zero()),
-            binary(Operator::Multiply, column("$c1"), zero()),
-            binary(Operator::Modulo, zero(), number("7")),
-            binary(Operator::Divide, column("$c1"), column("$c2")),
-            binary(Operator::Divide, column("$c1"), number("2")),
             // `NULLIF(1, 1)` is `NULL`, not zero, and a strict operator by
             // `NULL` is `NULL`.
             binary(
@@ -2091,7 +2070,7 @@ mod tests {
         ];
         for expr in &admitted {
             assert!(
-                !has_constant_zero_divisor(expr, &columns),
+                !define_refuses_zero_divisor(expr, &columns),
                 "{} should be admitted",
                 render_text(expr, TextStyle::default())
             );
@@ -2118,21 +2097,21 @@ mod tests {
     }
 
     /// The end-to-end profile never draws a tree define refuses for a
-    /// constant zero divisor (#1575: `REAL '0' / REAL '0'` failed a property
+    /// literal zero divisor (#1575: `REAL '0' / REAL '0'` failed a property
     /// at install, about 0.1% of derived fields), and still draws zero
     /// elsewhere. The conformance profile still draws one, since
     /// `expr_conformance` checks the refusal.
     #[test]
-    fn the_end_to_end_profile_never_draws_a_constant_zero_divisor() {
+    fn the_end_to_end_profile_never_draws_a_literal_zero_divisor() {
         let columns = slot_columns();
         let end_to_end = draws(Profile::END_TO_END, 50_000);
         let flagged: Vec<String> = end_to_end
             .iter()
-            .filter(|e| has_constant_zero_divisor(e, &columns))
+            .filter(|e| define_refuses_zero_divisor(e, &columns))
             .take(5)
             .map(|e| render_text(e, TextStyle::default()))
             .collect();
-        assert!(flagged.is_empty(), "constant zero divisors: {flagged:?}");
+        assert!(flagged.is_empty(), "literal zero divisors: {flagged:?}");
 
         // Nothing else define refuses either, and no coverage is lost: a
         // literal zero is still drawn as a dividend.
@@ -2175,8 +2154,8 @@ mod tests {
         assert!(
             conformance
                 .iter()
-                .any(|e| has_constant_zero_divisor(e, &columns)),
-            "the conformance profile no longer draws a constant zero divisor"
+                .any(|e| define_refuses_zero_divisor(e, &columns)),
+            "the conformance profile no longer draws a literal zero divisor"
         );
     }
 
