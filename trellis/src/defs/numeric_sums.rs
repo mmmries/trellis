@@ -18,7 +18,9 @@
 //! a layout an older release can't read (ADR-0024). A definition with a group
 //! whose stored sum is `NaN` is rebuilt in place, which recomputes every
 //! group from its source; one that doesn't apply (paused) rebuilds on its
-//! resume.
+//! resume. A definition whose stored text this release can't read is left
+//! unconverted: the attach pauses it, naming the fix, and its redefine
+//! creates its tables afresh.
 
 use crate::defs::ast::KeySpace;
 use crate::defs::floor::Floors;
@@ -52,11 +54,14 @@ pub(crate) async fn convert_in(
         .collect();
     let (mut converted, mut poisoned) = (0, Vec::new());
     for id in ids {
-        let Some(definition) = super::catalog::definition_by_id_in(txn, floors, id)
-            .await
-            .map_err(failed)?
-        else {
-            continue;
+        // A definition this binary can't run or whose stored text it can't
+        // read is paused by the attach's own check, naming the fix, and
+        // never fails the attach; it is left as stored here (a redefine
+        // builds its tables afresh).
+        let definition = match super::catalog::definition_by_id_in(txn, floors, id).await {
+            Ok(Some(definition)) => definition,
+            Ok(None) | Err(super::catalog::CatalogError::Parse(_)) => continue,
+            Err(e) => return Err(failed(e)),
         };
         let mut found = None;
         for table in numeric_tables(txn, &schema, &definition).await? {
