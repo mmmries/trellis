@@ -6,7 +6,10 @@
 //! map of exceptions. Every value of the column has scale `s`, so a finite
 //! stored sum with a count above 0 has scale `s` too: with `s` as its
 //! reference scale, its map is empty. A `NaN` it summed made the stored sum
-//! `NaN` for good, which no count recovers.
+//! `NaN` for good (0.1.0), which no count recovers, or added `10^2100` to
+//! it (0.1.1), which this release's sums never take back out: either way
+//! the stored sum says so ([`counts_nan`]), and no finite sum of a
+//! `numeric(p,s)` column could.
 //!
 //! At attach ([`super::grammar::pause_unloadable_in`]) each hidden table that
 //! lacks the partials of a `numeric` argument gains them in place
@@ -16,8 +19,9 @@
 //! (or every row, for a column that declares none now) is written: its map
 //! counts its values at that scale. The definition's floor is stamped again, now that its tables have
 //! a layout an older release can't read (ADR-0024). A definition with a group
-//! whose stored sum is `NaN` is rebuilt in place, which recomputes every
-//! group from its source; one that doesn't apply (paused) rebuilds on its
+//! whose stored sum counts a `NaN` is rebuilt as a first build would
+//! ([`build_afresh`]): its hidden tables afresh, then every group from its
+//! source; one that doesn't apply (paused) rebuilds the same way on its
 //! resume. A definition whose stored text this release can't read is left
 //! unconverted: the attach pauses it, naming the fix, and its redefine
 //! creates its tables afresh.
@@ -25,6 +29,17 @@
 use crate::defs::ast::KeySpace;
 use crate::defs::floor::Floors;
 use crate::staging::group_basis::{self, NUMERIC_PARTS, SumPart};
+
+/// Whether the stored sum `sum` (a column) of a release before the map of
+/// exceptions counts a `NaN`: `NaN` itself (0.1.0), or a magnitude of at
+/// least `5 × 10^2099` (0.1.1, which added `10^2100` per `NaN` and read
+/// the sum as `NaN` from half of that). A `numeric(p,s)` value is below
+/// `10^(p-s)`, at most `10^2000`, so no finite sum of one (under `2^63`
+/// rows, times as many `JOIN` matches) gets near it. `NaN` sorts above
+/// every number, so the comparison alone catches both.
+fn counts_nan(sum: &str) -> String {
+    format!("abs({sum}) >= 5e2099")
+}
 
 /// An error of the conversion, as the attach reports it.
 fn failed(e: impl std::fmt::Display) -> crate::Error {
@@ -75,20 +90,87 @@ pub(crate) async fn convert_in(
             .map_err(failed)?;
         converted += 1;
         if nan {
-            poisoned.push(id);
+            poisoned.push(definition);
         }
     }
-    if !poisoned.is_empty() {
+    let ids: Vec<i64> = poisoned.iter().map(|d| d.id).collect();
+    if !ids.is_empty() {
         txn.execute(
             "select 1 from transform_definitions where id = any($1) order by id for update",
-            &[&poisoned],
+            &[&ids],
         )
         .await?;
-        let rebuilt = crate::staging::build::rebuildable(txn, &poisoned).await?;
-        crate::staging::build::start_rebuilds(txn, &rebuilt).await?;
-        crate::staging::build::stamp_rebuild_seg(txn, &rebuilt).await?;
+        let rebuilt = crate::staging::build::rebuildable(txn, &ids).await?;
+        for definition in poisoned.iter().filter(|d| rebuilt.contains(&d.id)) {
+            build_afresh(txn, &schema, definition).await?;
+        }
     }
     Ok(converted)
+}
+
+/// Rebuilds `definition`, a definition still applying whose stored sums
+/// count a `NaN`, as a first build would, as its resume does
+/// (`staging::quarantine::resume_transform`): its hidden tables dropped and
+/// created again empty, in this release's layout, and the definition
+/// `waiting_to_backfill`, so the staging worker starts its build, which
+/// writes every group from its source and replaces the visible target's
+/// rows. Not in place: a `JOIN`'s rebuild in place carries each `P` and `M`
+/// cell's change into `T` as a difference, which a stored `NaN` in `T`
+/// absorbs, so `T` would stay `NaN` for good. A plain aggregate takes the
+/// same path, one rule for both.
+async fn build_afresh(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    definition: &crate::defs::model::Definition,
+) -> Result<(), crate::Error> {
+    let id = definition.id;
+    if crate::staging::join::applies(&definition.def) {
+        let Some(joined) = super::catalog::join_table_of(txn, id)
+            .await
+            .map_err(failed)?
+        else {
+            return Ok(());
+        };
+        let sides =
+            super::catalog::JoinSides::read(txn, definition.source_table.clone(), vec![joined])
+                .await
+                .map_err(failed)?;
+        super::catalog::recreate_hidden_tables(txn, schema, id, &definition.def, &sides)
+            .await
+            .map_err(failed)?;
+    } else if let Some(mut shape) = group_basis::route(&definition.def, &definition.source_columns)
+    {
+        shape.declare_scales(txn, &definition.source_table).await?;
+        super::catalog::recreate_group_table(txn, schema, id, &shape)
+            .await
+            .map_err(failed)?;
+    } else {
+        return Ok(());
+    }
+    // As a resume does: a build or rebuild the definition had queued is
+    // superseded (nothing claims one during the attach), and `build = null`
+    // with a new fuse epoch starts it over.
+    txn.execute(
+        "delete from backfill_chunks where definition_id = $1 and not done",
+        &[&id],
+    )
+    .await?;
+    txn.execute(
+        "update transform_definitions \
+         set status = $1, fuse_rearmed_at = now(), build = null where id = $2",
+        &[
+            &crate::defs::model::StoredStatus::WaitingToBackfill.as_str(),
+            &id,
+        ],
+    )
+    .await?;
+    crate::instance_log::info!(
+        definition_id = id,
+        to = %crate::defs::model::StoredStatus::WaitingToBackfill.as_str(),
+        "numeric sums counting a NaN in a release before the map of exceptions; \
+         rebuilding the definition afresh"
+    );
+    Ok(())
 }
 
 /// A hidden table of a definition, with what its partials should be.
@@ -215,7 +297,8 @@ async fn numeric_tables(
 
 /// Gives `table` the partials of each `numeric` argument it lacks (see the
 /// module doc), in place. Returns `None` when it lacked none (or doesn't
-/// exist), and otherwise whether a row's stored sum of one of them is `NaN`.
+/// exist), and otherwise whether a row's stored sum of one of them counts a
+/// `NaN` ([`counts_nan`]).
 pub(crate) async fn convert_table(
     txn: &tokio_postgres::Transaction<'_>,
     table: &NumericTable,
@@ -247,7 +330,7 @@ pub(crate) async fn convert_table(
     let t = &table.table;
     let nan: Vec<String> = lacking
         .iter()
-        .map(|(i, _)| format!("{} = 'NaN'::numeric", SumPart::Sum.hidden(*i)))
+        .map(|(i, _)| counts_nan(&SumPart::Sum.hidden(*i)))
         .collect();
     let nan: bool = txn
         .query_one(
@@ -279,13 +362,13 @@ pub(crate) async fn convert_table(
         comments.push((i, scale));
         if summed {
             // A row whose finite values aren't at the reference scale: its
-            // map counts them at its stored sum's.
+            // map counts them at its stored sum's. A row counting a `NaN`
+            // is left alone: its definition is rebuilt.
             let (count, sum) = (format!("__count_{i}"), SumPart::Sum.hidden(i));
+            let finite = format!("not {}", counts_nan(&sum));
             let off = match scale {
-                Some(s) => {
-                    format!("{count} > 0 and {sum} <> 'NaN'::numeric and scale({sum}) <> {s}")
-                }
-                None => format!("{count} > 0 and {sum} <> 'NaN'::numeric"),
+                Some(s) => format!("{count} > 0 and {finite} and scale({sum}) <> {s}"),
+                None => format!("{count} > 0 and {finite}"),
             };
             sets.push(format!(
                 "{} = case when {off} then jsonb_build_object(scale({sum})::text, {count}) end",

@@ -1312,6 +1312,14 @@ fn a_constant_divisor_that_is_zero_in_the_resolved_float_type_is_refused() {
         "1 / (CASE WHEN FALSE THEN CAST(NULL AS double precision) ELSE 9007199254740993 END \
          - 9007199254740992)",
         "1 / (COALESCE(NULL, 16777217, CAST(NULL AS real)) - 16777216)",
+        // A `NULL` operand takes the other's type, so `real + NULL` is `real`;
+        // `NULLIF(NULL, x)` takes `x`'s type, a float included.
+        "1 / (COALESCE(CAST(NULL AS real) + NULL, 16777217) - 16777216)",
+        "1 / (COALESCE(CAST(NULL AS real) + NULL, 9007199254740993) - 9007199254740992)",
+        "1 / (COALESCE(NULLIF(NULL, REAL '0'), 16777217) - 16777216)",
+        "1 / (COALESCE(NULLIF(NULL, DOUBLE PRECISION '0'), 9007199254740993) - 9007199254740992)",
+        "1 / (COALESCE(NULLIF(NULL, DOUBLE PRECISION '0') * 1, 9007199254740993) \
+         - 9007199254740992)",
     ] {
         assert_refused(text, "divides by the constant zero");
     }
@@ -1378,6 +1386,18 @@ fn a_constant_divisor_that_is_zero_in_the_resolved_float_type_is_refused() {
             N,
         ),
         ("1 / (COALESCE(NULL, 16777217, n) - 16777216)", N),
+        // A guard over the same types is decided as Postgres decides it, so
+        // the overflow it guards is dropped, not refused.
+        (
+            "CASE WHEN COALESCE(CAST(NULL AS real) + NULL, 16777217) = 16777216 \
+             THEN 0 ELSE 2147483647 + 1 END",
+            I4,
+        ),
+        (
+            "CASE WHEN COALESCE(NULLIF(NULL, DOUBLE PRECISION '0'), 9007199254740993) \
+             = 9007199254740992 THEN 0 ELSE 2147483647 + 1 END",
+            I4,
+        ),
     ] {
         assert_type(text, expected);
     }

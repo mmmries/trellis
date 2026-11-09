@@ -22,8 +22,10 @@ use super::parser::parse_in;
 /// - Grammar 1 is the grammar when the marker was introduced: an unquoted
 ///   name keeps its case, and there are no quoted identifiers.
 /// - Grammar 2 reads identifiers as Postgres does: an unquoted name folds to
-///   lower case and a quoted one is exact. Grammar 1's compatibility rule
-///   reads its text as if every name were quoted ([`load_in`]).
+///   lower case and a quoted one is exact, and a bare `TRUE`, `FALSE` or
+///   `NULL` is a literal. Grammar 1's compatibility rule reads its text as if
+///   every name were quoted, a bare `TRUE`, `FALSE` or `NULL` among them
+///   ([`load_in`]).
 ///
 /// Text is stamped with the oldest version that reads it the same
 /// ([`stamp_in`]), not always with this one.
@@ -117,7 +119,9 @@ pub(crate) fn load_in(
 
 /// Grammar 1's compatibility rule: its text read as if every name were
 /// quoted. Lexing without folding gives the tree grammar 1 gave, whose names
-/// are the catalog's exact names, which mean the same in grammar 2. The one
+/// are the catalog's exact names, which mean the same in grammar 2. Grammar 1
+/// had no `TRUE`, `FALSE` or `NULL` literal, so a bare one is a name too (the
+/// parser reads it so under [`Identifiers::Exact`]). The one
 /// name grammar 1 folded is a table alias, compared in any case there: it is
 /// lower-cased, the name grammar 2 gives it.
 fn grammar_1(text: &str) -> Result<TransformDef, ParseError> {
@@ -136,8 +140,9 @@ fn grammar_1(text: &str) -> Result<TransformDef, ParseError> {
 /// The grammar version to stamp on `text` as it is written (define,
 /// `ALTER TRANSFORM`, a rewrite): the oldest version in this binary's window
 /// that reads it as the current one does (ADR-0018). Text with no quoted
-/// identifier and no upper-case letter in a name reads the same in grammar 1,
-/// so a release that only reads grammar 1 can still run it.
+/// identifier, no upper-case letter in a name and no `TRUE`, `FALSE` or
+/// `NULL` literal reads the same in grammar 1, so a release that only reads
+/// grammar 1 can still run it.
 pub(crate) fn stamp(text: &str) -> i32 {
     stamp_in(
         text,
@@ -400,6 +405,7 @@ pub(crate) async fn check_stored_versions_dry_run(
 mod tests {
     use super::*;
 
+    use super::super::ast::Expr;
     use super::super::parser::parse;
 
     const TEXT: &str = "TRANSFORM t FROM public.src SELECT id AS id";
@@ -596,6 +602,130 @@ mod tests {
         assert_eq!(stamp("TRANSFORM t FROM s SELECT a AS x"), 1);
         // A window holding only the current version stamps it.
         assert_eq!(stamp_in("TRANSFORM t FROM s SELECT a AS x", 2, 2), 2);
+    }
+
+    /// Grammar 1 had no `TRUE`, `FALSE` or `NULL` literal: a bare one, in any
+    /// case, was a column or calculated-field name, refused when nothing had
+    /// that name. Its compatibility rule reads it as that name, quoted; the
+    /// same text written now reads the literal, so it is stamped grammar 2,
+    /// and a rewrite of the stored text quotes the name.
+    #[test]
+    fn grammar_1_reads_a_bare_true_false_or_null_as_a_name() {
+        for (stored, quoted) in [
+            (
+                "TRANSFORM t FROM s SELECT null AS x",
+                "TRANSFORM t FROM s SELECT \"null\" AS x",
+            ),
+            (
+                "TRANSFORM t FROM s SELECT NULL AS x",
+                "TRANSFORM t FROM s SELECT \"NULL\" AS x",
+            ),
+            (
+                "TRANSFORM t FROM s SELECT Null AS x",
+                "TRANSFORM t FROM s SELECT \"Null\" AS x",
+            ),
+            (
+                "TRANSFORM t FROM s SELECT COALESCE(null, a) AS x",
+                "TRANSFORM t FROM s SELECT COALESCE(\"null\", a) AS x",
+            ),
+            (
+                "TRANSFORM t FROM s SELECT false AS x",
+                "TRANSFORM t FROM s SELECT \"false\" AS x",
+            ),
+            (
+                "TRANSFORM t FROM s SELECT a AS null, null + 1 AS y",
+                "TRANSFORM t FROM s SELECT a AS \"null\", \"null\" + 1 AS y",
+            ),
+            (
+                "TRANSFORM t FROM s SELECT true AS x, true + 1 AS y",
+                "TRANSFORM t FROM s SELECT \"true\" AS x, \"true\" + 1 AS y",
+            ),
+            (
+                "TRANSFORM t FROM s SELECT TRUE AS x",
+                "TRANSFORM t FROM s SELECT \"TRUE\" AS x",
+            ),
+            (
+                "TRANSFORM t FROM s GROUP BY g WITHOUT SOURCE INDEX \
+                 SELECT SUM(null) AS x, MAX(False) AS y",
+                "TRANSFORM t FROM s GROUP BY g WITHOUT SOURCE INDEX \
+                 SELECT SUM(\"null\") AS x, MAX(\"False\") AS y",
+            ),
+            // Qualified, as grammar 1 read any other name.
+            (
+                "TRANSFORM t FROM s SELECT s.null AS x",
+                "TRANSFORM t FROM s SELECT s.\"null\" AS x",
+            ),
+            // A GROUP BY key, a JOIN column and a field label, each of
+            // which v0.1.0 read as the column or field `null`.
+            (
+                "TRANSFORM t FROM s GROUP BY null WITHOUT SOURCE INDEX \
+                 SELECT null AS k, COUNT(*) AS null",
+                "TRANSFORM t FROM s GROUP BY \"null\" WITHOUT SOURCE INDEX \
+                 SELECT \"null\" AS k, COUNT(*) AS \"null\"",
+            ),
+            (
+                "TRANSFORM t FROM s JOIN u ON s.null = u.null GROUP BY s.g \
+                 SELECT s.g AS g, SUM(s.NULL) AS x",
+                "TRANSFORM t FROM s JOIN u ON s.\"null\" = u.\"null\" GROUP BY s.g \
+                 SELECT s.g AS g, SUM(s.\"NULL\") AS x",
+            ),
+            // A keyword use of NULL is still the keyword.
+            (
+                "TRANSFORM t FROM s SELECT null IS NULL AS x, a IS NOT NULL AS y",
+                "TRANSFORM t FROM s SELECT \"null\" IS NULL AS x, a IS NOT NULL AS y",
+            ),
+            (
+                "TRANSFORM t FROM s SELECT a AS x WHERE TRUE",
+                "TRANSFORM t FROM s SELECT a AS x WHERE TRUE",
+            ),
+        ] {
+            let loaded = load_in(stored, 1, 1, 2).unwrap();
+            assert_eq!(loaded, parse(quoted).unwrap(), "{stored}");
+            // The rewrite quotes the name, and reads back the same.
+            let (text, version) = rewrite(&loaded).unwrap();
+            assert_eq!(parse(&text).unwrap(), loaded, "{text}");
+            assert_eq!(version, stamp_in(&text, 1, 2), "{text}");
+        }
+        // The same text written now reads the literal, and is stamped 2.
+        for (fresh, literal) in [
+            ("TRANSFORM t FROM s SELECT null AS x", Expr::Null),
+            ("TRANSFORM t FROM s SELECT NULL AS x", Expr::Null),
+            ("TRANSFORM t FROM s SELECT Null AS x", Expr::Null),
+            (
+                "TRANSFORM t FROM s SELECT false AS x",
+                Expr::BooleanLiteral(false),
+            ),
+            (
+                "TRANSFORM t FROM s SELECT TRUE AS x",
+                Expr::BooleanLiteral(true),
+            ),
+        ] {
+            assert_eq!(load_in(fresh, 2, 1, 2).unwrap().fields[0].expr, literal);
+            assert_eq!(stamp_in(fresh, 1, 2), 2, "{fresh}");
+        }
+        for (text, stamped) in [
+            ("TRANSFORM t FROM s SELECT COALESCE(null, a) AS x", 2),
+            ("TRANSFORM t FROM s SELECT a AS x, null + 1 AS y", 2),
+            ("TRANSFORM t FROM s SELECT a = true AS x", 2),
+            (
+                "TRANSFORM t FROM s SELECT CASE WHEN a > 0 THEN a ELSE null END AS x",
+                2,
+            ),
+            ("TRANSFORM t FROM s SELECT CAST(NULL AS integer) AS x", 2),
+            // A quoted name is grammar 2 already.
+            ("TRANSFORM t FROM s SELECT \"null\" AS x", 2),
+            // Keyword uses of NULL and TRUE read alike in both.
+            ("TRANSFORM t FROM s SELECT a IS NULL AS x", 1),
+            ("TRANSFORM t FROM s SELECT a IS NOT NULL AS x", 1),
+            ("TRANSFORM t FROM s SELECT NULLIF(a, 0) AS x", 1),
+            ("TRANSFORM t FROM s SELECT a AS x WHERE TRUE", 1),
+            ("TRANSFORM t FROM s SELECT a AS null", 1),
+        ] {
+            assert_eq!(stamp_in(text, 1, 2), stamped, "{text}");
+        }
+        // A grammar-1 name nothing has is refused later, as v0.1.0 refused
+        // it; the parser reads it, it does not refuse it as reserved.
+        assert!(load_in("TRANSFORM t FROM s SELECT null(1) AS x", 1, 1, 2).is_err());
     }
 
     /// A rewrite stores the tree's current rendering, stamped; a tree from

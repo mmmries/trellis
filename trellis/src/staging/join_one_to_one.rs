@@ -230,7 +230,8 @@ pub(crate) struct JoinedPosition {
     j_key: Vec<String>,
     /// The joined table's join key column names in `ON` order.
     m_key: Vec<String>,
-    /// The columns `M` holds besides its ledger, at `M`'s collations.
+    /// The columns `M` holds besides its ledger, at the joined table's own
+    /// collations: `M` only assigns them (`write_entries`).
     m_columns: Vec<ImageColumn>,
 }
 
@@ -391,27 +392,25 @@ impl JoinShape {
             }
             let a = super::one_to_one_render::image_columns(&**client, &definition.source_table)
                 .await?;
-            // The hidden tables keep the collations their columns were
-            // created with, and a source column can be re-collated since
-            // (between deterministic collations, which pauses nothing). Every
-            // cast to and comparison with `R`, `M` and `J` runs under the
-            // hidden column's own collation, so two collations never meet.
+            // `R` and `J` keep the collations their columns were created
+            // with, and a source column can be re-collated since (between
+            // deterministic collations, which pauses nothing). Every cast of
+            // `a`'s key text compared with them runs under the hidden
+            // column's own collation, so two collations never meet.
+            //
+            // A joined table needs no such alignment. `M`'s columns are only
+            // ever assigned from a cast (`write_entries`), which compares
+            // no collation, and the keys of `M` meet `R` and `J` through
+            // `a`'s column types (`JoinedPosition::key`), never through
+            // `M`'s own.
             let schema_name = pool.schema();
             let hidden =
                 |table: HiddenTable| format!("{schema_name}.{}", table.name(definition.id));
             let a =
                 under_hidden_collations(&**client, a, &hidden(HiddenTable::FromEntries)).await?;
             let mut b = Vec::with_capacity(tables.len());
-            for (index, table) in tables.iter().enumerate() {
-                let columns = super::one_to_one_render::image_columns(&**client, table).await?;
-                b.push(
-                    under_hidden_collations(
-                        &**client,
-                        columns,
-                        &hidden(HiddenTable::JoinedEntries(Position::of_index(index))),
-                    )
-                    .await?,
-                );
+            for table in &tables {
+                b.push(super::one_to_one_render::image_columns(&**client, table).await?);
             }
             (tables, a, b)
         };

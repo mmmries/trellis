@@ -644,7 +644,11 @@ detached or dropped is either not in the record or no longer in the tree, and
 the tree's corrections are ADR-0017's. The pass forgets the rows of a node
 that left the tree, installs capture on a new one (recording it in the same
 transaction), and records a node that comes back carrying all five triggers
-`ENABLE ALWAYS` as it finds it. A tree of 100 tables or more installs root
+`ENABLE ALWAYS` as it finds it. A table detached from the tree keeps the
+root's triggers until the pass uninstalls them, which forgets any row that
+still names it as a node; the uninstall reads the list of tables to uninstall
+again under its lock, which an `ATTACH` waits for, and leaves a table that has
+been attached to a captured root since the pass started as it is. A tree of 100 tables or more installs root
 first and then one table per transaction, each recording its own tables, so a
 pass that stops between two of them leaves a record for exactly the tables
 that carry triggers. A node that is still in the tree and lost, disabled or

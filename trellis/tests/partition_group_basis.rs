@@ -698,6 +698,243 @@ async fn a_reattach_detected_after_the_enumeration_queues_its_own_entry() {
     fx.assert_right("re-attach after the enumeration").await;
 }
 
+/// A leaf detached when a pass starts and attached again, under another
+/// bound, before the pass ends (#1812). The pass lists the detached leaf
+/// among the tables to uninstall when it starts, and reads the tree, with the
+/// leaf back in it, after; its uninstall must leave the leaf's triggers,
+/// which are the root's capture again. Dropped, the next pass found a
+/// recorded node without its triggers and paused the definition as a
+/// disruption, its target still holding the leaf's row in its old group.
+#[tokio::test]
+async fn a_leaf_attached_again_during_the_pass_that_lists_it_detached_keeps_its_capture() {
+    let mut fx = Fx::start(
+        &format!(
+            "{} create table public.items_p0 partition of public.items for values in (0); \
+             create table public.items_p1 partition of public.items for values in (1);",
+            head("list")
+        ),
+        "insert into public.items values (1, 0, 10), (2, 1, 20)",
+    )
+    .await;
+    // Uncaptured: the leaf is out of the tree.
+    fx.exec(
+        "alter table public.items detach partition public.items_p0; \
+         update public.items_p0 set g = 2 where id = 1",
+    )
+    .await;
+    let point = PausePoint::BeforeFingerprintRead;
+    let dsn = fx.d.db.dsn().to_string();
+    let mut pass =
+        fx.d.run_frozen(&[(point, SOURCE)], move |pool| async move {
+            let mut client = drain_driver::connect(&dsn).await;
+            let desired = trellis::defs::tables_to_capture(&pool)
+                .await
+                .expect("tables to capture");
+            Ok(trellis::capture::reconcile::reconcile(
+                &mut client,
+                DEFAULT_SCHEMA,
+                &desired,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect("pass"))
+        })
+        .await;
+    // The pass has listed the installed tables, the detached leaf among
+    // them, and not yet read the tree.
+    pass.reached(point).await;
+    fx.exec("alter table public.items attach partition public.items_p0 for values in (2)")
+        .await;
+    fx.d.release(&mut pass, point).await;
+    let outcome = pass.finish().await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    let triggers: i64 =
+        fx.d.ctl
+            .query_one(
+                "select count(*) from pg_trigger \
+             where tgrelid = 'public.items_p0'::regclass and not tgisinternal",
+                &[],
+            )
+            .await
+            .expect("the leaf's triggers")
+            .get(0);
+    assert_eq!(triggers, 5, "the attached leaf keeps its capture triggers");
+    fx.correct().await;
+    fx.correct().await;
+    fx.assert_right("re-attached during the pass").await;
+}
+
+/// As above, but the leaf is detached again after the pass has checked the
+/// tree, with the leaf in it, and before the uninstall: the uninstall drops
+/// the leaf's triggers, and forgets the root's record of them. Kept, that
+/// record named triggers Trellis had dropped, and once the leaf was attached
+/// again the next pass paused the definition as a disruption.
+#[tokio::test]
+async fn a_leaf_detached_again_before_the_uninstall_of_its_pass_is_captured_once_attached() {
+    let mut fx = Fx::start(
+        &format!(
+            "{} create table public.items_p0 partition of public.items for values in (0); \
+             create table public.items_p1 partition of public.items for values in (1);",
+            head("list")
+        ),
+        "insert into public.items values (1, 0, 10), (2, 1, 20)",
+    )
+    .await;
+    fx.exec(
+        "alter table public.items detach partition public.items_p0; \
+         update public.items_p0 set g = 2 where id = 1",
+    )
+    .await;
+    let listed = PausePoint::BeforeFingerprintRead;
+    let checked = PausePoint::AfterSweepCatalogRead;
+    let dsn = fx.d.db.dsn().to_string();
+    let mut pass =
+        fx.d.run_frozen(
+            &[(listed, SOURCE), (checked, SOURCE)],
+            move |pool| async move {
+                let mut client = drain_driver::connect(&dsn).await;
+                let desired = trellis::defs::tables_to_capture(&pool)
+                    .await
+                    .expect("tables to capture");
+                Ok(trellis::capture::reconcile::reconcile(
+                    &mut client,
+                    DEFAULT_SCHEMA,
+                    &desired,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await
+                .expect("pass"))
+            },
+        )
+        .await;
+    // Listed detached; attached before the tree is read and checked.
+    pass.reached(listed).await;
+    fx.exec("alter table public.items attach partition public.items_p0 for values in (2)")
+        .await;
+    fx.d.release(&mut pass, listed).await;
+    // Checked in the tree; detached before the uninstall loop.
+    pass.reached(checked).await;
+    fx.exec("alter table public.items detach partition public.items_p0")
+        .await;
+    fx.d.release(&mut pass, checked).await;
+    let outcome = pass.finish().await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    fx.exec("alter table public.items attach partition public.items_p0 for values in (2)")
+        .await;
+    // The leaf is a recorded node whose triggers Trellis dropped: the pass
+    // reinstalls them and rebuilds the reader, pausing nothing.
+    fx.pass().await;
+    assert_eq!(fx.status().await, "backfilling");
+    fx.d.settle().await;
+    build::settle_builds(fx.d.pool()).await;
+    fx.d.settle().await;
+    fx.assert_right("detached again before the uninstall").await;
+}
+
+/// The uninstall reads the list again under its lock, not before it: an
+/// `ATTACH` of the leaf queued ahead of the uninstall's lock lands between
+/// the two otherwise. A session's lock on the leaf holds both back until the
+/// uninstall's retry is queued behind the `ATTACH`; it then takes its lock
+/// once the leaf is attached, and leaves its triggers.
+#[tokio::test]
+async fn an_attach_queued_ahead_of_the_uninstalls_lock_keeps_the_leafs_capture() {
+    let fx = Fx::start(
+        &format!(
+            "{} create table public.items_p0 partition of public.items for values in (0); \
+             create table public.items_p1 partition of public.items for values in (1);",
+            head("list")
+        ),
+        "insert into public.items values (1, 0, 10), (2, 1, 20)",
+    )
+    .await;
+    fx.exec(
+        "alter table public.items detach partition public.items_p0; \
+         update public.items_p0 set g = 2 where id = 1",
+    )
+    .await;
+    let dsn = fx.d.db.dsn().to_string();
+    let holder = drain_driver::connect(&dsn).await;
+    holder
+        .batch_execute("begin; lock table public.items_p0 in access share mode")
+        .await
+        .expect("hold the leaf");
+    let pool = fx.d.pool().clone();
+    let pass_dsn = dsn.clone();
+    let pass = tokio::spawn(async move {
+        let mut client = drain_driver::connect(&pass_dsn).await;
+        let desired = trellis::defs::tables_to_capture(&pool)
+            .await
+            .expect("tables to capture");
+        trellis::capture::reconcile::reconcile(
+            &mut client,
+            DEFAULT_SCHEMA,
+            &desired,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .await
+        .expect("pass")
+    });
+    // The lock waits on the leaf, by statement, oldest first.
+    let waiters = "select a.query from pg_catalog.pg_locks l \
+                   join pg_catalog.pg_stat_activity a on a.pid = l.pid \
+                   where l.relation = 'public.items_p0'::regclass and not l.granted \
+                   order by l.waitstart";
+    let until = |want: fn(&[String]) -> bool| {
+        let ctl = &fx.d.ctl;
+        async move {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let queue: Vec<String> = ctl
+                    .query(waiters, &[])
+                    .await
+                    .expect("the lock queue")
+                    .iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                if want(&queue) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "lock queue {queue:?}");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    };
+    // The uninstall is retrying its lock on the leaf.
+    until(|q| q.iter().any(|s| s.starts_with("lock table"))).await;
+    let attach_dsn = dsn.clone();
+    let attach = tokio::spawn(async move {
+        drain_driver::connect(&attach_dsn)
+            .await
+            .batch_execute(
+                "alter table public.items attach partition public.items_p0 for values in (2)",
+            )
+            .await
+            .expect("attach");
+    });
+    // A retry of the uninstall's lock queued behind the `ATTACH`.
+    until(|q| {
+        q.iter()
+            .position(|s| s.starts_with("alter table"))
+            .is_some_and(|at| q[at + 1..].iter().any(|s| s.starts_with("lock table")))
+    })
+    .await;
+    holder.batch_execute("rollback").await.expect("release");
+    attach.await.expect("attach");
+    let outcome = pass.await.expect("pass");
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    let triggers: i64 =
+        fx.d.ctl
+            .query_one(
+                "select count(*) from pg_trigger \
+             where tgrelid = 'public.items_p0'::regclass and not tgisinternal",
+                &[],
+            )
+            .await
+            .expect("the leaf's triggers")
+            .get(0);
+    assert_eq!(triggers, 5, "the attached leaf keeps its capture triggers");
+}
+
 /// X12-7e: writes into the leaf land while its correction holds the
 /// recomputed groups: one committed before the recompute's snapshot is
 /// counted by it and refused by its basis; one after it applies.

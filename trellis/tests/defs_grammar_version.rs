@@ -436,3 +436,203 @@ async fn attaching_pauses_a_definition_whose_text_the_grammar_now_refuses() {
         .await
         .expect("DROP doesn't need the text to parse");
 }
+
+/// A stored grammar-1 definition naming a column or field `null`, `false` or
+/// `true` bare reads that name, as v0.1.0 did, not the literal grammar 2
+/// reads (ADR-0018): its target equals Postgres's reading of the column
+/// after changes and after `ALTER TRANSFORM` rewrites it. The same text
+/// defined now reads the literal and is stamped grammar 2.
+#[tokio::test]
+async fn stored_grammar_1_text_reads_a_bare_null_false_or_true_as_a_name() {
+    use trellis::{TransformStatus, Trellis, TrellisOptions};
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.s (id integer primary key, a integer, \"null\" integer, \
+         \"false\" boolean, \"TRUE\" integer); \
+         insert into public.s values (1, 1, 10, true, 100)",
+    )
+    .await
+    .unwrap();
+    let config = Config::from_dsn(db.dsn().to_string()).unwrap();
+    // (target, the text v0.1.0 stored, the same reading spelled in grammar 2,
+    // Postgres's reading of each target column)
+    let stored = [
+        (
+            "tn",
+            "TRANSFORM tn FROM s SELECT null AS x",
+            "TRANSFORM tn FROM s SELECT \"null\" AS x",
+            "select id, \"null\"::text from public.s order by id",
+            "select id, x::text from public.tn order by id",
+        ),
+        (
+            "tc",
+            "TRANSFORM tc FROM s SELECT COALESCE(null, a) AS x",
+            "TRANSFORM tc FROM s SELECT COALESCE(\"null\", a) AS x",
+            "select id, coalesce(\"null\", a)::text from public.s order by id",
+            "select id, x::text from public.tc order by id",
+        ),
+        (
+            "tf",
+            "TRANSFORM tf FROM s SELECT false AS x",
+            "TRANSFORM tf FROM s SELECT \"false\" AS x",
+            "select id, \"false\"::text from public.s order by id",
+            "select id, x::text from public.tf order by id",
+        ),
+        (
+            "tu",
+            "TRANSFORM tu FROM s SELECT TRUE + 1 AS x",
+            "TRANSFORM tu FROM s SELECT \"TRUE\" + 1 AS x",
+            "select id, (\"TRUE\" + 1)::text from public.s order by id",
+            "select id, x::text from public.tu order by id",
+        ),
+        (
+            "tl",
+            "TRANSFORM tl FROM s SELECT a AS true, true + 1 AS y",
+            "TRANSFORM tl FROM s SELECT a AS \"true\", \"true\" + 1 AS y",
+            "select id, (a + 1)::text from public.s order by id",
+            "select id, y::text from public.tl order by id",
+        ),
+    ];
+    let definer = Trellis::connect(config.clone(), TrellisOptions::default())
+        .await
+        .expect("connect");
+    for (_, _, quoted, _, _) in &stored {
+        definer
+            .apply(quoted)
+            .await
+            .unwrap_or_else(|e| panic!("{quoted}: {e}"));
+    }
+    definer.shutdown().await.expect("shutdown definer");
+    // The text and version v0.1.0 stored.
+    for (target, text, _, _, _) in &stored {
+        raw.execute(
+            "update transform_definitions set definition_text = $1, grammar_version = 1 \
+             where target_table = $2",
+            &[text, &format!("public.{target}")],
+        )
+        .await
+        .unwrap();
+    }
+    trellis::migrate::migrate_with_pool(&db.pool, &config)
+        .await
+        .expect("attach");
+    let running = Trellis::connect(
+        config.clone(),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect");
+    raw.batch_execute(
+        "update public.s set \"null\" = 20, a = 2, \"false\" = true, \"TRUE\" = 200 where id = 1; \
+         insert into public.s values (2, 3, 30, true, 300), (3, 4, null, false, 400)",
+    )
+    .await
+    .unwrap();
+
+    let rows = |q: &'static str| {
+        let raw = &raw;
+        async move {
+            raw.query(q, &[])
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| (r.get::<_, i32>(0), r.get::<_, Option<String>>(1)))
+                .collect::<Vec<_>>()
+        }
+    };
+    let live = async |running: &Trellis, name: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while running.status(name).await.unwrap().unwrap().status != TransformStatus::Live {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{name} never went live"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    };
+    let converge = async |running: &Trellis| {
+        let token = running.watermark_token().await.expect("token");
+        running
+            .await_converged(token, std::time::Duration::from_secs(60))
+            .await
+            .expect("converged");
+    };
+    for (target, _, _, _, _) in &stored {
+        live(&running, target).await;
+    }
+    converge(&running).await;
+    for (target, _, _, postgres, read) in &stored {
+        let expected = rows(postgres).await;
+        assert!(expected.iter().any(|(_, v)| v.is_some()), "{target}");
+        assert_eq!(rows(read).await, expected, "{target}");
+    }
+
+    // `ALTER TRANSFORM` rewrites the stored text in grammar 2, quoting the
+    // name, and the target keeps reading the column.
+    running
+        .apply("ALTER TRANSFORM tn ADD a AS b")
+        .await
+        .expect("alter");
+    let (text, version): (String, i32) = {
+        let row = raw
+            .query_one(
+                "select definition_text, grammar_version from transform_definitions \
+                 where target_table = 'public.tn'",
+                &[],
+            )
+            .await
+            .unwrap();
+        (row.get(0), row.get(1))
+    };
+    assert!(text.contains("\"null\" AS x"), "{text}");
+    assert_eq!(version, 2, "{text}");
+    raw.execute("update public.s set \"null\" = 21 where id = 1", &[])
+        .await
+        .unwrap();
+    converge(&running).await;
+    assert_eq!(
+        rows("select id, x::text from public.tn order by id").await,
+        rows("select id, \"null\"::text from public.s order by id").await
+    );
+
+    // The same text defined now reads the literal, stamped grammar 2.
+    for (text, target, read, expected) in [
+        (
+            "TRANSFORM fc FROM s SELECT COALESCE(null, a) AS x",
+            "public.fc",
+            "select id, x::text from public.fc order by id",
+            "select id, a::text from public.s order by id",
+        ),
+        (
+            "TRANSFORM ff FROM s SELECT false AS x",
+            "public.ff",
+            "select id, x::text from public.ff order by id",
+            "select id, false::text from public.s order by id",
+        ),
+    ] {
+        running
+            .apply(text)
+            .await
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+        let v: i32 = raw
+            .query_one(
+                "select grammar_version from transform_definitions where target_table = $1",
+                &[&target],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(v, 2, "{text}");
+        live(&running, target.trim_start_matches("public.")).await;
+        converge(&running).await;
+        assert_eq!(rows(read).await, rows(expected).await, "{text}");
+    }
+    running.shutdown().await.expect("shutdown");
+}

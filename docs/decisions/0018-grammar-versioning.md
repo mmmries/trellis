@@ -173,9 +173,12 @@ lexing without folding gives the tree grammar 1 gave, whose names are the
 catalog's exact names. The one name grammar 1 folded, a table alias, is
 lower-cased. So every stored grammar-1 definition keeps reading `"Amount"`, and
 none pauses. A rewrite or `ALTER TRANSFORM` renders that tree in grammar 2 as
-`SUM("Amount")`, which loads to the same tree. Text with no quoted name and no
-upper-case letter in a name, such as `SUM(amount)`, reads the same in both, so
-it is stamped grammar 1 whichever release writes it.
+`SUM("Amount")`, which loads to the same tree. Grammar 1 had no `TRUE`,
+`FALSE` or `NULL` literal: a bare one, in any case, was a name, so the rule
+reads it as one, quoted (`COALESCE(null, a)` reads the column `"null"`). Text
+with no quoted name, no upper-case letter in a name and no such literal, such
+as `SUM(amount)`, reads the same in both, so it is stamped grammar 1 whichever
+release writes it.
 
 ## Consequences
 
