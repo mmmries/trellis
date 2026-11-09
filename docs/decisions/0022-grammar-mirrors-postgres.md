@@ -115,7 +115,10 @@ Each rule the expression grammar has is the rule Postgres's `scan.l` and
 Text that Postgres rejects as an expression is refused at define, and text
 Trellis accepts parses to the tree Postgres's parser would build. This is a
 statement about every supported Postgres version: text one of them rejects, or
-reads differently, is refused.
+reads differently, is refused. It binds the grammar and the meaning: what
+parses, how it groups, what names and types it resolves to. A constant
+Postgres folds and fails while planning is not a grammar question, and is
+covered below.
 
 ### Settings Postgres reads are pinned, or the construct is refused
 
@@ -141,22 +144,33 @@ refused.
 ### Types, `NULL`s, errors and constant folding follow Postgres, checked against it
 
 A field's declared type is the type `CREATE TABLE AS` gives the expression.
-`NULL` follows Postgres's three-valued logic, an overflow or division by zero
-raises Postgres's SQLSTATE for the row, and a constant that Postgres folds and
-fails while planning is refused at define, since Postgres would fail every row.
-The conformance harness
+`NULL` follows Postgres's three-valued logic, and an overflow or division by
+zero raises Postgres's SQLSTATE for the row. Define doesn't evaluate
+constants: Postgres's constant folding is its planner's, which changes between
+majors, and Trellis never claims the planner's verdict on a constant. A
+constant that Postgres folds and fails while planning (`2147483647 + 1`) fails
+every row the way any per-row error does: the failing rows are quarantined
+with Postgres's error, and a fuse stops the field or the definition (an
+aggregate's build, which fails whole, pauses the definition). A definition can
+therefore define and then quarantine every row, possibly while it is `live`
+when its source is empty at define; that is a loud stop, never a target that
+silently lacks rows. The one constant Trellis refuses is a `/` or `%` whose
+divisor is written as a literal zero, which it refuses by its text, wherever
+it sits (below). The conformance harness
 ([generative test suite](../generative-test-suite.md#expression-conformance))
 checks each of these against a live Postgres: type, value, round trip through
-the parser and renderer, and a near miss for every refusal, so a refusal that
-drifts into acceptance fails a run.
+the parser and renderer, that a constant Postgres fails while planning is a
+data exception and nothing else, and a near miss for every refusal, so a
+refusal that drifts into acceptance fails a run.
 
 ### Trellis may be stricter than Postgres, never looser
 
 Trellis refuses a form Postgres accepts when it can't keep the result exact:
 an `interval`-producing `-`, a `STABLE` overload Postgres picks silently,
 `integer / integer`'s truncation, text ordering under a collation, a relative
-typed literal. Each refusal is named in the error, carries a remedy, and is
-listed in the
+typed literal. It also refuses a `/` or `%` whose divisor is written as a
+literal zero, since every row with a dividend would fail. Each refusal is named
+in the error, carries a remedy, and is listed in the
 [Supported sources and targets](../transforms.md#supported-sources-and-targets)
 section, which is the only reference for them. The narrowing runs one way: a
 refusal can later become an acceptance of Postgres's meaning, but Trellis never

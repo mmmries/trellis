@@ -7161,6 +7161,11 @@ mod tests {
         ] {
             check(select).unwrap();
         }
+        // A literal zero divisor is refused there as anywhere.
+        assert!(matches!(
+            check("orders.region AS region, SUM(CAST(items.qty AS numeric) / 0) AS s"),
+            Err(ValidationError::ConstantDivisorZero { .. })
+        ));
     }
 
     #[test]
