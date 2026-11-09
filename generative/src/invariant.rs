@@ -77,8 +77,9 @@
 //! any position exempts the entries it covers there. A violation about one
 //! position names it. The two-table JOIN is the one-position case: [`check`]
 //! is [`check_star`] over [`StarSnapshot::from`] its snapshot, and names no
-//! position. [`sample`] reads the two-table snapshot; a star's sampling
-//! reads a [`StarSnapshot`] once the snapshot read covers every position.
+//! position. [`sample`] reads every definition, a two-table JOIN's included,
+//! with the engine's position-indexed read
+//! (`one_to_one_join_snapshot::star_snapshot`) and runs [`check_star`] on it.
 //!
 //! Rows of `a` held in quarantine (`poison_held`) are left out of
 //! [`Clause::FromEntry`] and [`Clause::Target`]: a held row keeps the change
@@ -91,7 +92,7 @@ use std::time::Duration;
 
 use trellis::dev::pool::Pool;
 use trellis::dev::staging::one_to_one_join_snapshot::{
-    FanOutMarker, HiddenEntry, HiddenSnapshot, SourceView, TargetRow, hidden_snapshot,
+    self as engine, FanOutMarker, HiddenEntry, HiddenSnapshot, SourceView, TargetRow, star_snapshot,
 };
 
 /// Turns the in-run invariant off (`off`) or sets its sampling interval in
@@ -167,14 +168,14 @@ pub async fn sample(
     target: &str,
     stats: &mut SampleStats,
 ) -> Result<Option<Failure>, String> {
-    let snapshot = hidden_snapshot(pool, target)
+    let snapshot = star_snapshot(pool, target)
         .await
         .map_err(|e| format!("read {target}'s hidden snapshot: {e}"))?;
     let Some(snapshot) = snapshot else {
         stats.skipped += 1;
         return Ok(None);
     };
-    match check(&snapshot) {
+    match check_star(&StarSnapshot::from(snapshot)) {
         Verdict::Skipped(_) => {
             stats.skipped += 1;
             Ok(None)
@@ -358,6 +359,52 @@ impl From<&HiddenSnapshot> for StarSnapshot {
                 .collect(),
             from_applied: s.from_applied.clone(),
             held: s.held.clone(),
+        }
+    }
+}
+
+impl From<engine::StarSnapshot> for StarSnapshot {
+    /// The engine's read of a star (or of a two-table JOIN, at one position),
+    /// as the check takes it.
+    fn from(s: engine::StarSnapshot) -> Self {
+        StarSnapshot {
+            target: s.target,
+            status: s.status,
+            building: s.building,
+            fields: s.fields,
+            from_entries: s
+                .from_entries
+                .into_iter()
+                .map(|e| StarFromEntry {
+                    key: e.key,
+                    join_keys: e.join_keys,
+                    values: e.values,
+                    tombstone: e.tombstone,
+                })
+                .collect(),
+            positions: s
+                .positions
+                .into_iter()
+                .map(|p| StarPositionView {
+                    left: p.left,
+                    joined_entries: p.joined_entries,
+                    keys: p.keys,
+                    joined_applied: p.joined_applied,
+                    markers: p.markers,
+                })
+                .collect(),
+            rows: s.rows,
+            joined_rows: s
+                .joined_rows
+                .into_iter()
+                .map(|j| StarJoinedRow {
+                    key: j.key,
+                    joined: j.joined,
+                    values: j.values,
+                })
+                .collect(),
+            from_applied: s.from_applied,
+            held: s.held,
         }
     }
 }

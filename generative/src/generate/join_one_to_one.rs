@@ -88,17 +88,11 @@ pub const MAX_TABLES: usize = 1 + JOINED_TABLES.len();
 pub const A_IDS: u8 = 64;
 
 /// Whether the star tier runs: the development knob `TRELLIS_DEV_STAR_JOIN`
-/// is on, and the engine runs a star's pages and builds. This is the one
-/// gate of the star tier's property, sweep and metamorphic check; with it
-/// off they return at once, and nothing else the 1-1 JOIN tier draws or
-/// checks changes.
-///
-/// A star defines behind the knob, but its first page or build halts
-/// ("whose apply is not built yet") until the joined apply lands (#1774,
-/// sub-step 3.8 of #1460), which sets `ENGINE_RUNS_A_STAR` here.
+/// is on. This is the one gate of the star tier's property, sweep and
+/// metamorphic check; with it off they return at once, and nothing else the
+/// 1-1 JOIN tier draws or checks changes.
 pub fn star_tier_enabled() -> bool {
-    const ENGINE_RUNS_A_STAR: bool = false;
-    ENGINE_RUNS_A_STAR && trellis::dev::defs::star_join_enabled()
+    trellis::dev::defs::star_join_enabled()
 }
 
 /// The table at `position`: `ja` at 0, then [`JOINED_TABLES`].
@@ -1957,10 +1951,9 @@ mod tests {
         assert_eq!(plain, [8, 9, 10, 11]);
     }
 
-    /// The star tier stays off until the engine runs a star, whatever the
-    /// knob says (sub-step 3.8 of #1460 turns it on, and this test with it).
+    /// The star tier runs exactly when the development knob is on.
     #[test]
-    fn the_star_tier_is_off_until_the_engine_runs_a_star() {
-        assert!(!star_tier_enabled());
+    fn the_star_tier_follows_the_knob() {
+        assert_eq!(star_tier_enabled(), trellis::dev::defs::star_join_enabled());
     }
 }
