@@ -774,10 +774,12 @@ fn star_sweep_tier() -> SweepTier {
     )
 }
 
-/// The star tier's known misses, measured by its reach sweep (#1781: seeds 1
-/// to 4, twelve cases each, with the in-run invariant on; caught and fired
-/// in, of 48). Its deterministic pin, named in `trellis/src/plant.rs`, gates
-/// each. #1817 tracks raising the tier's reach on them.
+/// The star tier's known misses, measured by its reach sweep (seeds 1 to 4,
+/// twelve cases each, with the in-run invariant on; caught and fired in, of
+/// 48). Its deterministic pin, named in `trellis/src/plant.rs`, gates each:
+/// what these plants need is one interleaving of two pages, or of a page
+/// and a source write, inside a window of a few milliseconds, which a pin's
+/// pause point holds open and the tier's timing only hits now and then.
 ///
 /// It gates the plants it catches in about one case in five or more (a
 /// 48-case sweep then misses each with probability below about 1e-4):
@@ -793,22 +795,33 @@ fn star_sweep_tier() -> SweepTier {
 ///   which catches it in 9, in its wide and racing key shapes with bursts of
 ///   several hundred ops; the star tier draws only its narrow star key
 ///   shape, in bursts of 30 to 150 ops).
-/// - `star_own_j_only`: caught 0, fired 36; `star_r_after_m`: caught 0,
-///   fired 34; `star_last_no_r`: caught 0, fired 34. The R-entry rule's
-///   ablations need a root key move and a joined write on its new key to
-///   race inside one page's locks, which the hot keys and mixed pages draw
-///   but don't yet catch.
-/// - `star_truncate_keeps_other_markers`: caught 0, fired 27 (a marker to
-///   keep needs a pending fan-out, and the tier's keys never hold that
-///   many rows).
-/// - `star_fence_first_only`: caught 0, fired 36 (a resume fires it; no
-///   page of a later position is in flight across it).
-/// - Never fired (0 of 48): `star_late_skip_last`, `star_late_skip_first`,
-///   `star_recheck_j` and `star_recheck_skip_last` need a Re-derive whose
-///   row moved after its read, or a joined page holding a key for a root
-///   item only, which wait for the re-derived-pages share
-///   (`StarKnobs::rederived_pages_per_mille`, which no engine hook applies yet); `star_chunk_no_r`
-///   needs a fan-out chunk, which no key of the tier is large enough for.
+/// - The star plants below, measured on #1817's generator (its knobs:
+///   stalled lock steps, re-derived pages, lowered fan-out chunks and
+///   split threshold, paced lanes, one-position key moves and the closing
+///   race of each burst). Each fires, but is caught too rarely to gate:
+/// - `star_own_j_only`: caught 4, fired 40; `star_r_after_m`: caught 1,
+///   fired 40; `star_last_no_r`: caught 2, fired 40. The R-entry rule's
+///   ablations fail only when a joined page at one position starts its
+///   read-and-write of a root row's target inside another position's page's
+///   window between its `M` write and its commit. Split batches drain the
+///   two pages side by side and the stalls widen the window, but the two
+///   workers' pages meet in it only now and then; the in-run invariant
+///   catches the stale row when they do.
+/// - `star_truncate_keeps_other_markers`: caught 0, fired 37 (its pins
+///   keep a marker of another position pending across the truncate and
+///   then let its chunk run; in the tier the kept marker's chunk never
+///   left a wrong row by the check).
+/// - `star_chunk_no_r`: caught 0, fired 12 (a writer at another position
+///   on one of a chunk's batch rows must commit between the chunk's read of
+///   `M` and its write of the row).
+/// - `star_fence_first_only`: caught 0, fired 38 (a resume fires it; a page
+///   of a later position must hold its plan across the resume's fence
+///   bump).
+/// - `star_late_skip_last`: caught 2, fired 2; `star_late_skip_first`:
+///   caught 1, fired 3. A re-derived root row must move at that one
+///   position between the page's unlocked read and its lock, which the
+///   paced writes do within the re-derived page's stall only rarely.
+/// - `star_recheck_j` and `star_recheck_skip_last`: PENDING.
 /// - The two-table tier's other known misses, each caught 0:
 ///   `join1_no_j_lock` (fired 48), `join1_brd_no_key` (48),
 ///   `join1_no_recheck` (48), `join1_vis_only` (48), `join1_chunk_no_key`
