@@ -377,7 +377,7 @@ fn the_star_strategy_draws_one_position_moves_and_tail_races() {
         }
         for burst in case.case.program.ops.chunks(case.case.burst_size) {
             bursts += 1;
-            let tail = &burst[burst.len().saturating_sub(2 * case.tables)..];
+            let tail = &burst[burst.len().saturating_sub(3 * case.tables)..];
             let hot: BTreeSet<(&str, &str)> = tail
                 .iter()
                 .filter_map(|op| {

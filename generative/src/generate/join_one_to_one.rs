@@ -922,7 +922,7 @@ pub fn place_tail_truncates(
 /// The workers a star case drains with (#1464 section 4).
 pub const STAR_WORKERS: usize = 8;
 /// The longest stall a star case's pages take before their commit.
-pub const STAR_COMMIT_STALL_MS: u64 = 3;
+pub const STAR_COMMIT_STALL_MS: u64 = 20;
 /// The longest stall a star case's pages take at a stalled lock step.
 pub const STAR_LOCK_STEP_STALL_MS: u64 = 12;
 /// The largest fan-out chunk a star case lowers the engine's to, in rows.
@@ -1062,14 +1062,18 @@ fn shape_page(chunk: &mut [OneToOneOpDraw], mixed: bool, shuffle: u64, tables: u
     }
 }
 
-/// A burst's closing race (#1817): the last draws of a burst, a mixed page
-/// on a hot key ([`shape_pages`]) of `rows` draws. Nothing later in the
-/// burst rewrites the key, so the check after the burst sees what the race
-/// left, where a mixed page mid-burst is mostly repaired by the burst's
-/// later writes of its hot key before the check.
+/// A burst's closing race (#1817): the last `rows` draws of a burst, on a
+/// hot key. The first of them are a mixed page ([`shape_pages`]), one draw
+/// per table, which puts a root row and a row of each joined table on the
+/// key; the rest change the value of the joined rows holding it, cycling
+/// over the positions, so pages at two positions fan out to the same root
+/// rows with no root write after them to recompute the rows afresh.
+/// Nothing later in the burst rewrites the key, so the check after the
+/// burst sees what the race left, where a mixed page mid-burst is mostly
+/// repaired by the burst's later writes of its hot key before the check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TailRace {
-    /// Its draws: two writes at each position or so.
+    /// Its draws: one per table, then two or so more per joined position.
     pub rows: u8,
     /// Its hot key ([`super::join::STAR_HOT_KEYS`]).
     pub hot_key: u8,
@@ -1096,17 +1100,26 @@ pub fn place_tail_races(
         let end = ((burst + 1) * burst_size).min(draws.len());
         let rows = usize::from(race.rows).min(end - burst * burst_size);
         let chunk = &mut draws[end - rows..end];
-        if let Some(first) = chunk.first_mut() {
-            // A raw key below 100 is hot (`KeyShape::Star`).
-            first.key = race.hot_key % super::join::STAR_HOT_KEYS;
+        // A raw key below 100 is hot (`KeyShape::Star`).
+        let key = race.hot_key % super::join::STAR_HOT_KEYS;
+        let (page, values) = chunk.split_at_mut(tables.min(rows));
+        if let Some(first) = page.first_mut() {
+            first.key = key;
         }
         // Every draw writes the key: none deletes or truncates.
-        for draw in chunk.iter_mut() {
+        for draw in page.iter_mut() {
             if matches!(draw.kind, JoinOpKind::Delete | JoinOpKind::Truncate) {
                 draw.kind = JoinOpKind::Update;
             }
         }
-        shape_page(chunk, true, race.shuffle, tables, late);
+        shape_page(page, true, race.shuffle, tables, late);
+        for (i, draw) in values.iter_mut().enumerate() {
+            draw.position = 1 + (i % (tables - 1)) as u8;
+            draw.key = key;
+            draw.on_key = true;
+            draw.kind = JoinOpKind::Update;
+            draw.columns = 8;
+        }
     }
 }
 
@@ -1492,7 +1505,7 @@ pub(crate) mod strategy {
 
     fn tail_race(tables: usize) -> impl Strategy<Value = TailRace> {
         (
-            tables as u8..=(2 * tables) as u8,
+            (tables + 2) as u8..=(3 * tables) as u8,
             0u8..super::super::join::STAR_HOT_KEYS,
             any::<u64>(),
         )
