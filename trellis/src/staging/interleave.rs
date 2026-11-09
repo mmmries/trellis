@@ -208,8 +208,8 @@
 //! changes re-derive them instead, as a page that may predate a build does:
 //! each reads its rows live, unlocked, before its key lock, and sleeps up
 //! to the lock-step stall between the two, so a row that moves meanwhile
-//! takes the late-key retry. A Re-derive is exact whenever
-//! it runs, so neither changes what a correct engine converges to.
+//! takes the late-key retry. A Re-derive is exact whenever it runs, so
+//! neither changes what a correct engine converges to.
 //!
 //! A stall is process-wide, like a plant, and an armed [`PauseScope`] point
 //! ignores it. Every page of every engine in the process takes it, so a

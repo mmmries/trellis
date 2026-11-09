@@ -432,11 +432,13 @@ fn run_star_case(case: &StarCase) -> Result<(), String> {
 
 /// Sets a star case's engine knobs (`trellis::dev::interleave`'s lock-step
 /// stall and re-derived share, the fan-out chunk and the split threshold)
-/// for as long as it
-/// lives. They are process-wide, like the commit stall: a star case runs
-/// nothing else meanwhile, and a two-table case under them would still
-/// converge (each changes when things happen, or how a page reads, never
-/// what a correct engine writes).
+/// for as long as it lives. They are process-wide, like the commit stall:
+/// any other test running in this binary's threads meanwhile (another
+/// ignored property run in the same `--ignored` invocation) drains under
+/// them too. That changes its timing, not its verdict: each knob changes
+/// when things happen, or how a page reads, never what a correct engine
+/// writes. The planted-bug sweep runs each plant's cases in a process of
+/// its own, one test at a time, so its counts see only the star case's.
 struct StarKnobsGuard;
 
 impl StarKnobsGuard {
@@ -776,13 +778,15 @@ fn star_sweep_tier() -> SweepTier {
 
 /// The star tier's known misses, measured by its reach sweep (seeds 1 to 4,
 /// twelve cases each, with the in-run invariant on; caught and fired in, of
-/// 48). Its deterministic pin, named in `trellis/src/plant.rs`, gates each:
+/// 48): the `star_*` rates on #1817's generator, and `join1_m_before_j`'s
+/// and the two-table plants' below on #1781's, before #1817's knobs. Its deterministic pin, named in `trellis/src/plant.rs`, gates each:
 /// what these plants need is one interleaving of two pages, or of a page
 /// and a source write, inside a window of a few milliseconds, which a pin's
 /// pause point holds open and the tier's timing only hits now and then.
 ///
 /// It gates the plants it catches in about one case in five or more (a
-/// 48-case sweep then misses each with probability below about 1e-4):
+/// 48-case sweep then misses each with probability below about 1e-4), at
+/// these rates on #1781's generator (PENDING: #1817's regression check):
 /// `join1_no_placeholder` 48, `join1_old_key_unlocked` 40,
 /// `join1_no_orphan_pass` 20, `star_chunk_skip_j_last` 37,
 /// `star_chunk_skip_j_first` 37, `star_root_skip_j_last` 27,
