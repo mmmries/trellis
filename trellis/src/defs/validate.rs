@@ -4198,22 +4198,41 @@ fn fold_constant<'f>(
             let is_null = matches!(recurse(expr, field_name)?, Constant::Null);
             Some(Constant::Bool(is_null != *negated))
         }
-        // A `NULL` condition selects nothing, like a false one.
+        // A `NULL` condition selects nothing, like a false one. The result
+        // is cast to the type of the whole `CASE`, which every result decides.
         Expr::Case {
             branches,
             otherwise,
         } => {
+            let mut picked = None;
             for (condition, result) in branches {
                 match recurse(condition, field_name)? {
-                    Constant::Bool(true) => return recurse(result, field_name),
+                    Constant::Bool(true) => {
+                        picked = Some(recurse(result, field_name)?);
+                        break;
+                    }
                     Constant::Bool(false) | Constant::Null => {}
                     _ => return None,
                 }
             }
-            match otherwise {
-                Some(otherwise) => recurse(otherwise, field_name),
-                None => Some(Constant::Null),
-            }
+            let picked = match (picked, otherwise) {
+                (Some(picked), _) => picked,
+                (None, Some(otherwise)) => recurse(otherwise, field_name)?,
+                (None, None) => Constant::Null,
+            };
+            let results: Vec<&Expr> = branches
+                .iter()
+                .map(|(_, result)| result)
+                .chain(otherwise.as_deref())
+                .collect();
+            in_resolved_float_type(
+                picked,
+                &results,
+                field_name,
+                source_columns,
+                fields_by_name,
+                depth,
+            )
         }
         // A `NULL` argument is never equal to the other, so the planner
         // replaces the call by its first argument, whatever the other reads:
@@ -4292,15 +4311,28 @@ fn fold_constant<'f>(
                 | Constant::Timestamp(_) => None,
             }
         }
-        // The first argument that is not `NULL` is the result.
+        // The first argument that is not `NULL` is the result, cast to the
+        // type of the whole `COALESCE`, which every argument decides.
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            let mut picked = Constant::Null;
             for arg in args {
                 match recurse(arg, field_name)? {
                     Constant::Null => {}
-                    value => return Some(value),
+                    value => {
+                        picked = value;
+                        break;
+                    }
                 }
             }
-            Some(Constant::Null)
+            let results: Vec<&Expr> = args.iter().collect();
+            in_resolved_float_type(
+                picked,
+                &results,
+                field_name,
+                source_columns,
+                fields_by_name,
+                depth,
+            )
         }
         // Every other function is strict: a `NULL` argument makes the call
         // `NULL` whatever its other arguments read or fold to. A call over
@@ -4335,6 +4367,175 @@ fn fold_constant<'f>(
             );
             memo.insert(calc_field.name.as_str(), folded.clone());
             folded
+        }
+        _ => None,
+    }
+}
+
+/// What a `CASE` or `COALESCE` makes of the constant it picks. Postgres casts
+/// each result to the type of the whole, so when that type is a float the
+/// result is that float, however it was written: `CASE WHEN false THEN
+/// DOUBLE PRECISION '0' ELSE -9223372036854775809 END` is the `float8`
+/// `-9223372036854775808`, not the exact number beside it, and a sum or a
+/// divisor computed from it follows the float. `results` are every result
+/// of the node, the unselected ones included, since they type it. `None`
+/// where the cast raises (a literal out of the float's range, which
+/// [`infer_case`] and `COALESCE`'s inference refuse).
+fn in_resolved_float_type(
+    value: Constant,
+    results: &[&Expr],
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+    depth: usize,
+) -> Option<Constant> {
+    if !matches!(value, Constant::Exact(_) | Constant::Float(..)) {
+        return Some(value);
+    }
+    let mut memo = HashMap::new();
+    let width = results
+        .iter()
+        .filter_map(|result| {
+            float_width(
+                result,
+                field_name,
+                source_columns,
+                fields_by_name,
+                &mut memo,
+                depth,
+            )
+        })
+        .reduce(crate::float::FloatWidth::wider);
+    let Some(width) = width else {
+        return Some(value);
+    };
+    match value {
+        Constant::Exact(n) => crate::float::literal_to_width(&n.to_string(), width)
+            .ok()
+            .map(|v| Constant::Float(v, width)),
+        // A `real` widens to `double precision` exactly.
+        Constant::Float(v, own) => Some(Constant::Float(v, own.wider(width))),
+        _ => unreachable!("only an exact or float value reaches here"),
+    }
+}
+
+/// The float type `expr` certainly has, as [`infer_expr`] would type it, or
+/// `None` when it is not a float (or this walk cannot tell, which leaves a
+/// constant as the exact value it was before). It reads the types of
+/// literals, `CAST(NULL AS <float>)`, columns and calculated fields, and
+/// applies the rules for arithmetic (a float beside an exact operand is
+/// `double precision`), for `CASE` and `COALESCE` (a float result wins and the
+/// exact ones follow it), for `NULLIF` (its first argument), for the numeric
+/// functions and for the aggregates.
+fn float_width<'f>(
+    expr: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
+    memo: &mut HashMap<&'f str, Option<crate::float::FloatWidth>>,
+    depth: usize,
+) -> Option<crate::float::FloatWidth> {
+    use crate::float::FloatWidth;
+    if depth > fields_by_name.len() + MAX_EXPRESSION_DEPTH {
+        return None;
+    }
+    let mut width_of = |expr: &Expr| {
+        float_width(
+            expr,
+            field_name,
+            source_columns,
+            fields_by_name,
+            memo,
+            depth + 1,
+        )
+    };
+    match expr {
+        Expr::TypedLiteral {
+            value_type: ValueType::Float(width),
+            ..
+        } => Some(*width),
+        // `CAST(NULL AS real)` is the one cast to a float the grammar admits.
+        Expr::Cast {
+            target: ValueType::Float(width),
+            ..
+        } => Some(*width),
+        Expr::SourceColumn { column, .. } => match source_columns.get(column) {
+            Some(ValueType::Float(width)) => Some(*width),
+            _ => None,
+        },
+        Expr::Column(name) => {
+            let is_self_passthrough = name == field_name && source_columns.contains_key(name);
+            match fields_by_name
+                .get(name.as_str())
+                .filter(|_| !is_self_passthrough)
+            {
+                Some(calc_field) => {
+                    if let Some(found) = memo.get(calc_field.name.as_str()) {
+                        return *found;
+                    }
+                    let found = float_width(
+                        &calc_field.expr,
+                        &calc_field.name,
+                        source_columns,
+                        fields_by_name,
+                        memo,
+                        depth + 1,
+                    );
+                    memo.insert(calc_field.name.as_str(), found);
+                    found
+                }
+                None => match source_columns.get(name) {
+                    Some(ValueType::Float(width)) => Some(*width),
+                    _ => None,
+                },
+            }
+        }
+        Expr::Negate(operand) => width_of(operand),
+        Expr::BinaryOp { op, lhs, rhs } if ConstOp::of_operator(*op).is_some() => {
+            match (width_of(lhs), width_of(rhs)) {
+                (Some(a), Some(b)) => Some(a.wider(b)),
+                (Some(_), None) | (None, Some(_)) => Some(FloatWidth::Float8),
+                (None, None) => None,
+            }
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => branches
+            .iter()
+            .map(|(_, result)| result)
+            .chain(otherwise.as_deref())
+            .filter_map(width_of)
+            .reduce(FloatWidth::wider),
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            args.iter().filter_map(width_of).reduce(FloatWidth::wider)
+        }
+        Expr::FunctionCall { name, args } if name == "NULLIF" && args.len() == 2 => {
+            width_of(&args[0])
+        }
+        // An aggregate over a float: `MIN`, `MAX` and `SUM` keep its type,
+        // `AVG` is `double precision`. Over an exact value none is a float.
+        Expr::FunctionCall { name, args }
+            if super::registry::lookup_aggregate_function(name).is_some() =>
+        {
+            let width = width_of(args.first()?)?;
+            match super::registry::aggregate_result_type(name, ValueType::Float(width))? {
+                ValueType::Float(width) => Some(width),
+                _ => None,
+            }
+        }
+        // A numeric function over a float is its float overload's result
+        // (`CEIL` takes `double precision`, so a `real` widens to it).
+        Expr::FunctionCall { name, args } if args.len() == 1 => {
+            let width = width_of(&args[0])?;
+            let overload = super::registry::resolve_function(name, &[ValueType::Float(width)])
+                .or_else(|| {
+                    super::registry::resolve_function(name, &[ValueType::Float(FloatWidth::Float8)])
+                })?;
+            match overload.return_type {
+                ValueType::Float(width) => Some(width),
+                _ => None,
+            }
         }
         _ => None,
     }
