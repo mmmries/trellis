@@ -90,7 +90,7 @@ a key, index or policy itself.
 | [A `JOIN` transform that passes the checks below](#a-join-transform-that-passes-the-checks-below) | No | A schema change pauses it |
 | [An unsupported `JOIN` shape](#an-unsupported-join-shape) | Yes (`TableAlias`, `AliasedTableName`, `JoinTooManyTables`, …) | n/a |
 | [A 1-1 `JOIN`](#a-1-1-join) | Yes (`OneToOneJoinKeyNotUnique`, `OneToOneJoinAggregate`, `OneToOneJoinUnsupported`, …) | A schema change pauses it |
-| [1-1 `JOIN` of more than two tables (star)](#1-1-join-of-more-than-two-tables-star) | Yes (`StarJoinDisabled`, `StarJoinTooManyTables`, `JoinOnReadsAnotherJoinedTable`) | A schema change pauses it |
+| [1-1 `JOIN` of more than two tables (star)](#1-1-join-of-more-than-two-tables-star) | Yes (`StarJoinTooManyTables`, `JoinOnReadsAnotherJoinedTable`, the [row above](#a-1-1-join)'s at each position) | A schema change at any position pauses it |
 | [`JOIN` key columns that differ or can't be keys](#join-key-columns-that-differ-or-cant-be-keys) | Yes (`JoinKeyTypeMismatch`, `JoinUnsupportedKeyType`, `JoinNondeterministicCollation`, …) | Pauses the transform |
 | **Aggregate functions** | | |
 | [`MIN` or `MAX` in a plain aggregate](#min-or-max-in-a-plain-aggregate) | Yes (`ExtremeOfExpression`, `UnsupportedExtremeArgument`, `ChainedExtreme`, …) | `RESUME` refuses; a missing index pauses after 5 minutes |
@@ -1576,43 +1576,58 @@ needs only the `RESUME`. For `b`'s unique key, restore the key, then `RESUME`
 #### 1-1 `JOIN` of more than two tables (star)
 
 **Condition:** A 1-1 `JOIN` of more than two tables, a star
-(`FROM a JOIN b1 ON … LEFT JOIN b2 ON … SELECT …`): one defined while the
-development knob `TRELLIS_DEV_STAR_JOIN` is off; one of more than 5 tables (`a`
-and 4 joined tables); one where a joined table's `ON` reads a joined table
-other than its own (a snowflake, `JOIN b2 ON b1.id = b2.id`, or an `ON` that
-reads `a` and two joined tables).
+(`FROM a JOIN b1 ON … LEFT JOIN b2 ON … SELECT …`, [1-1 JOIN](#1-1-join)): one
+of more than 5 tables (`a` and 4 joined tables); one where a joined table's
+`ON` reads a joined table other than its own (a snowflake, `JOIN b2 ON b1.id =
+b2.id`, or an `ON` that reads `a` and two joined tables); or one that breaks a
+rule of the [row above](#a-1-1-join) or of the [`JOIN` shape
+row](#an-unsupported-join-shape) at any position.
 
-**Refused at define:** Yes (`StarJoinDisabled`, `StarJoinTooManyTables`,
-`JoinOnReadsAnotherJoinedTable`).
+**Refused at define:** Yes (`StarJoinTooManyTables`,
+`JoinOnReadsAnotherJoinedTable`, and the refusals of the rows above, naming
+the table at the position that breaks them).
 
 The joins read left to right, as Postgres reads them without parentheses; each
 joined table is joined to `a` directly, and every rule of the [row
 above](#a-1-1-join) holds at each position: its `ON` columns contain a unique
-key of its table (the refusal names that table), a joined 1-1 target is joined
-on columns that include its primary key, no table is partitioned, no two `ON`
-columns of `a` share their first 60 bytes, and every refusal of the `JOIN` rows
-above (the kinds other than `INNER` and `LEFT`, `LATERAL`, `USING`, a comma
-join, a table read twice) holds at every position.
+key of its table (`OneToOneJoinKeyNotUnique` names that table), its row-identity
+key is not deferrable, a joined 1-1 target is joined on columns that include its
+primary key, no table is partitioned (`PartitionedSource`), no two `ON` columns
+of `a` share their first 60 bytes, and the target isn't named after a table it
+reads (`TargetEqualsSource`). Every refusal of the [`JOIN` shape
+row](#an-unsupported-join-shape) holds at every position: `RIGHT`, `FULL`,
+`CROSS`, `NATURAL`, `LATERAL`, `USING` and a comma join, and a table read twice,
+`a` included, under any alias (each a parse error that names it). A `JOIN` with a `GROUP BY` still
+reads two tables (`JoinTooManyTables`). A joined table with few distinct keys (a
+lookup) is admitted at any position; `status()` warns of its fan-out
+([1-1 JOIN](#1-1-join)).
 
-A star builds and applies its changes and a `TRUNCATE` of any of its tables,
-and leaves a fan-out past one chunk to chunks at any position; loading one in a
-process with the knob off halts it.
+**If it appears after define:** Each joined table is handled as the [row
+above](#a-1-1-join) describes for `b`, at whichever position it is joined,
+naming that table and its column:
 
-**If it appears after define:** A schema change of a joined table at any
-position is handled as the [row above](#a-1-1-join) describes for `b`, naming
-that table and its column: its unique key on its own `ON` columns dropped or
-left `INVALID`, a column the star reads there dropped, renamed or retyped, a
-widening, the table dropped, renamed or joining a hierarchy, or a value of an
-enum read there relabelled, pauses the whole transform.
+- **Schema change.** A column the star reads there dropped, renamed or retyped,
+  a widening, the table dropped, renamed or joining a hierarchy, or a value of
+  an enum read there relabelled, pauses the whole transform.
+- **Unique key.** The table's unique key on its own `ON` columns dropped or
+  left `INVALID` pauses the whole transform on the staging worker's next pass;
+  a duplicate past a deferrable key under `session_replication_role = replica`
+  pauses nothing, at any position ([known correctness
+  gaps](known-correctness-gaps.md#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)).
+- **`TRUNCATE`.** A `TRUNCATE` of `a` empties the target. One of a joined
+  table, at any position, starts a rebuild, so the transform reads
+  `backfilling`; a row keeps the columns it held at every position until the
+  rebuild reaches it. One statement that truncates several of the star's
+  tables is one rebuild.
 
 `RESUME` re-validates every position as define does, refusing a position whose
 `ON` columns are no longer unique or whose `ON` pair no longer has one type and
-collation, and re-keys the target to a changed key of `a`. A star defined while
-the knob was on is refused at `RESUME` once it is off.
+collation, and re-keys the target to a changed key of `a`.
 
-**Remedy:** Define it with the knob on, at most 5 tables, each joined to `a` on
-a unique key of its own. Join a snowflake's outer table through a transform of
-its own and join that target.
+**Remedy:** At most 5 tables, each joined to `a` on a unique key of its own.
+Join a snowflake's outer table through a transform of its own and join that
+target. After a later change, as for the [row above](#a-1-1-join): undo it,
+then `RESUME`.
 
 #### `JOIN` key columns that differ or can't be keys
 
@@ -2115,6 +2130,25 @@ primary key, a unique constraint or unique index, or the group key of an
 aggregate or `JOIN` target. The `ON` follows a join aggregate's rules: `AND`ed
 equalities between a column of each table, of one type and collation.
 
+A 1-1 `JOIN` may join up to four tables to `a`, a **star**: each `JOIN` clause
+joins one more table at the next **position** (1 for the first joined table),
+each on its own unique key, and its `ON` reads `a` and that table only:
+
+```text
+TRANSFORM order_view FROM orders
+  LEFT JOIN customers ON orders.customer_id = customers.id
+  JOIN regions ON orders.region_id = regions.id
+SELECT
+  customers.name AS customer_name,
+  regions.name AS region
+```
+
+Each position is `LEFT` or `INNER` on its own: the target has a row for an `a`
+row only where every `INNER` position has a match, with `NULL` for the columns
+of a `LEFT` position that has none. The two-table `JOIN` is a star with one
+position, and everything below holds at every position: what is said of `b`
+holds of the table joined at each position.
+
 A field is any expression a 1-1 field admits, floats and text included, over
 columns of either table, each written `<table>.<column>` (or
 `<alias>.<column>`, as for a join aggregate); there is no
@@ -2125,30 +2159,33 @@ transform's target, read through that target's change feed as for a join
 aggregate. [Supported sources and targets](#supported-sources-and-targets)
 lists the checks.
 
-Trellis keeps a copy of each side (`R` for `a`, `M` for `b`) and a lock row
-per join key (`J`) in its own catalog schema, named by the transform's
+Trellis keeps a copy of each table (`R` for `a`, an `M` for the table at each
+position) and a lock row per position and join key (`J`) in its own catalog
+schema ([data flow](data-flow.md#a-1-1-joins-hidden-state)), named by the transform's
 internal id, which readers get no grant on. Define registers the transform,
 creates its target and builds it from both tables in chunks of `a`'s primary
 key. Then:
 
 - A change of an `a` row rewrites its target row.
-- A change of a `b` row recomputes every `a` row on its join key. Its page
+- A change of a `b` row recomputes every `a` row on its join key at its
+  position. Its page
   recomputes the keys whose rows fit one chunk of 10,000, and leaves each other
   key to chunks of 10,000 rows, each its own transaction, which the drain
   workers run after their segments. An `a` write on the key waits for one
   chunk at most, and a watermark token past the `b` change converges once the
-  last chunk commits. `status()` warns when a join key holds more than 250,000
-  `a` rows, a key whose `b` change takes seconds to reach every row
-  ([observability](observability.md#transform-status-lifecycle)).
-- A `TRUNCATE` of `a` empties the target; one of `b` rebuilds it.
+  last chunk commits. `status()` warns, per position, when a join key holds
+  more than 250,000 `a` rows, a key whose `b` change takes seconds to reach
+  every row ([observability](observability.md#transform-status-lifecycle)).
+- A `TRUNCATE` of `a` empties the target; one of a joined table, at any
+  position, rebuilds it.
 - A row whose field Postgres can't compute (an overflow, a division by zero)
   is held in quarantine on its first failure, and the page applies the rest.
   A row held by a joined table's change says so in its error
   (`sample_quarantined`): the table, its position and the row's join key there.
 
-A schema change of either table pauses the whole transform as it does a join
-aggregate. `self_check` compares the target, both copies and the uniqueness of
-`b`'s join key ([known correctness gaps](known-correctness-gaps.md#what-self_check-cant-see)).
+A schema change of any of its tables pauses the whole transform as it does a
+join aggregate. `self_check` compares the target, every copy and the uniqueness
+of each joined table's join key ([known correctness gaps](known-correctness-gaps.md#what-self_check-cant-see)).
 The same read contract applies: a value read before `await_converged` may be
 inconsistent, and is exact after it
 ([Reading derived data](data-flow.md#reading-derived-data)).

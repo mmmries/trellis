@@ -80,8 +80,9 @@ while every rule holds.
 * **Change a read column to a nondeterministic collation only while the
   transforms that read it are paused**
   ([below](#a-read-column-given-a-nondeterministic-collation)).
-* **Don't write a 1-1 `JOIN`'s `b` under `session_replication_role =
-  replica`** when its key on the `ON` columns is a deferrable constraint
+* **Don't write a 1-1 `JOIN`'s joined table (`b`, or the table at any
+  position of a star) under `session_replication_role = replica`** when its
+  key on its `ON` columns is a deferrable constraint
   ([below](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)).
 
 ## Schema changes Trellis can't tell from routine work
@@ -252,10 +253,11 @@ research on detecting a collation change the way a retype is detected.
 
 ### A duplicate in `b` past a deferrable key under `session_replication_role = replica`
 
-**When:** a 1-1 `JOIN`'s `b` `ON` columns rest on a `DEFERRABLE` unique
-constraint, and a role allowed to set `session_replication_role` (a
-superuser, or a role granted `SET` on it) inserts or updates a row of `b`
-under `replica`, putting a second row on one join key:
+**When:** a 1-1 `JOIN`'s joined table `b`, or the table joined at any position
+of a star, has `ON` columns that rest on a `DEFERRABLE` unique constraint, and
+a role allowed to set `session_replication_role` (a superuser, or a role
+granted `SET` on it) inserts or updates a row of that table under `replica`,
+putting a second row on one join key:
 
 ```sql
 SET session_replication_role = replica;
@@ -267,15 +269,15 @@ the end of the statement or, when the check is deferred, at commit. Under
 `replica` that trigger doesn't fire, so the duplicate commits and the index
 stays valid. A unique key that isn't deferrable rejects it as usual. The
 capture triggers are `ENABLE ALWAYS`, so they fire and the write is captured.
-The reconcile pass, which pauses the transform when `b`'s unique key is gone,
-finds it in place and pauses nothing.
+The reconcile pass, which pauses the transform when a joined table's unique key
+is gone, finds it in place and pauses nothing.
 
-**What goes wrong:** each `a` row on that key joins the newest of the `b`
-rows on it, where the join gives one row per pair. The target stays keyed by
-`a`'s primary key and holds one of them.
+**What goes wrong:** each `a` row on that key at that position joins the
+newest of the table's rows on it, where the join gives one row per pair. The
+target stays keyed by `a`'s primary key and holds one of them.
 
 **Detected by:** `self_check`, which reports a join key with more than one
-live `b` entry.
+live entry in that position's `M`.
 
 **Repair:** remove the duplicate, then `PAUSE` and `RESUME` the transform.
 
@@ -439,7 +441,8 @@ attaching a partition.
 
 * `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` or a data load into a target, or
   into a table Trellis keeps beside one: a 1-1 target's `<target>__ledger`,
-  an aggregate's `agg_<id>`, or a `JOIN`'s `join_<id>_*` tables;
+  an aggregate's `agg_<id>`, a `JOIN`'s `join_<id>_*` tables, or a 1-1
+  `JOIN`'s `join1_<id>_*` tables (`R`, every position's `M`, `J`);
 * a target dropped and created again by hand with the same columns;
 * a trigger or rule on a target (one define created or one it adopted) or on
   one of those tables that changes or drops the rows Trellis writes (a
@@ -472,12 +475,13 @@ table's. A change to Trellis's schema isn't detected.
 * **An aggregate target:** `request_backfill` of its source rewrites every
   group of the target and `agg_<id>`, and `PAUSE`/`RESUME` drops and
   recreates `agg_<id>` and rewrites every group.
-* **A `JOIN` target:** `PAUSE`/`RESUME` repairs the target's rows and every
-  `join_<id>_*` table: the resume recreates the hidden tables, rebuilds them
-  from both sources and keeps the target, removing a row no source row backs.
-  So does `PAUSE`, `DROP TRANSFORM` and define it again. `request_backfill`
-  of either source repairs target rows edited by hand, but not a hand edit
-  of a `join_<id>_*` table.
+* **A `JOIN` or 1-1 `JOIN` target:** `PAUSE`/`RESUME` repairs the target's
+  rows and every `join_<id>_*` or `join1_<id>_*` table: the resume recreates
+  the hidden tables, rebuilds them from every table the definition reads and
+  keeps the target, removing a row no source row backs. So does `PAUSE`,
+  `DROP TRANSFORM` and define it again. `request_backfill` of any of its
+  sources repairs target rows edited by hand, but not a hand edit of a hidden
+  table.
 * **Trellis's schema:** restore the whole database from a backup taken
   before the change, or `PAUSE`, `DROP TRANSFORM` and define every transform
   again. A target the changed catalog has no definition for is a plain table
@@ -526,7 +530,7 @@ limits belong here:
 |---|---|---|
 | 1-1, including one over another target | compared | — |
 | Aggregate, `JOIN` | compared, hidden tables included | — |
-| 1-1 `JOIN` | compared, `R` and `M` included, and a join key with more than one live `M` entry reported | — |
+| 1-1 `JOIN` | compared, `R` and every position's `M` included, and a join key with more than one live entry in any `M` reported | — |
 
 * Each audit also reports the definition's held keys and the instance's drain
   holdups. They aren't gaps, but they explain a target that stops short.
@@ -562,7 +566,8 @@ fixes and what it costs:
   of going wrong ([operations](operations.md)).
 * **DML under `session_replication_role = replica`.** The capture triggers
   are `ENABLE ALWAYS`, so they fire. Postgres's deferred unique checks don't
-  fire under it, which lets a duplicate into a 1-1 `JOIN`'s `b`
+  fire under it, which lets a duplicate into a 1-1 `JOIN`'s joined table, at
+  any position
   ([above](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)).
 * **Session settings** (`DateStyle`, `TimeZone`, `extra_float_digits`, …).
   Trellis pins them on its connections and in its capture functions

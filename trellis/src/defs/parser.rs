@@ -901,9 +901,7 @@ impl Parser {
     fn parse_join_clause(&mut self) -> Result<(JoinSpec, bool), ParseError> {
         // Chained `JOIN`s read left to right, as Postgres reads them with no
         // parentheses: each joins one more table to the tables before it.
-        // How many, and which tables an `ON` may read, are the validator's
-        // (the star knob gates at define, not here, so a stored star still
-        // loads with the knob off).
+        // How many, and which tables an `ON` may read, are the validator's.
         let mut joins = vec![self.parse_one_join(&[])?];
         while JOIN_STARTS.iter().any(|kw| self.peek_is_keyword(kw)) {
             let joined = self.parse_one_join(&joins)?;

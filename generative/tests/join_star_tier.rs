@@ -14,7 +14,7 @@
 //!   star's multi-join over a real Postgres, against this file's own model of
 //!   a star, on hand-built states at 3, 4 and 5 tables and on drawn cases,
 //!   and gives the same rows under a permuted `JOIN` order.
-//! - With the knob on, define admits every drawn star definition.
+//! - Define admits every drawn star definition.
 
 use std::collections::{BTreeMap, BTreeSet};
 
