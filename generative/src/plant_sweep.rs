@@ -158,6 +158,8 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::StarRSplit
         | Plant::StarRecheckJ
         | Plant::StarRecheckSkipLast
+        | Plant::StarChunkNoR
+        | Plant::StarTruncateKeepsOtherMarkers
         | Plant::StarChunkSkipJLast
         | Plant::StarChunkSkipJFirst => PlantPath::OneToOneJoin,
         Plant::SeamTokenEarly | Plant::SeamImagelessRow => PlantPath::Chain,

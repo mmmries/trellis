@@ -16,10 +16,14 @@
 //!
 //! # The fan-out warning
 //!
-//! A change of a `b` row rewrites every target row on its key, in chunks
-//! (`super::join_one_to_one::fan_out`), before a watermark token past it
-//! converges (ADR-0021). The warning names the largest group of live `R` entries on one
-//! join key when it holds more than [`fan_out_warning_rows`] of them.
+//! A change of a joined table's row rewrites every target row on its key at
+//! its position, in chunks (`super::join_one_to_one::fan_out`), before a
+//! watermark token past it converges (ADR-0021). The warning names the
+//! position and the join key of the largest group of live `R` entries on
+//! one join key when it holds more than [`fan_out_warning_rows`] of them.
+//! Each position is sampled over its own index on `R`. It is the only
+//! runtime signal of a lookup table joined at any position (few keys and
+//! many rows on each), which define admits.
 //!
 //! It is *sampled*, not read from `pg_stats`: the statistics are as stale as
 //! the last analyze, which after a build is the empty table. The sample is
@@ -46,7 +50,7 @@ use super::build;
 use super::join_status::{HiddenTableSize, JoinBuildStep, JoinStatus, hidden_table_size};
 use crate::defs::ast::TransformDef;
 use crate::defs::chunk_queue::{KIND_PLAN, KIND_REDERIVE, KIND_SWEEP};
-use crate::defs::join::{self as spec, Side};
+use crate::defs::join as spec;
 use crate::defs::join_one_to_one::HiddenTable;
 use crate::defs::ledger as schema;
 use crate::defs::model::StoredStatus;
@@ -105,7 +109,11 @@ const COUNT_CAP_FACTOR: i64 = 10;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FanOutWarning {
-    /// The join key's text: its columns' values, joined by `,`.
+    /// The joined position whose join key this is: 1 for the first table
+    /// joined, 2 for the next. A two-table `JOIN` has only position 1.
+    pub position: usize,
+    /// The join key's text: `a`'s columns' values in that position's `ON`,
+    /// joined by `,`.
     pub key: String,
     /// The live `R` entries on the key. Exact up to ten times the threshold,
     /// where the count stops.
@@ -115,17 +123,20 @@ pub struct FanOutWarning {
 }
 
 /// The step of a 1-1 `JOIN` build; see [`JoinStatus::building`]. The build is
-/// the plan job's `M` pass and walk of `a`, then the chunks of `a`'s primary
+/// the plan job's `M` pass at each position in order and walk of `a`, then the chunks of `a`'s primary
 /// key, then the rebuild sweep of a rebuild in place (ADR-0021).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OneToOneBuildStep {
-    /// The `M` pass over `b`'s rows in primary-key order.
-    JoinedRows,
-    /// The `M` pass over the rows of `b` whose primary key has a `NULL` part.
-    JoinedNullKeys,
-    /// The `M` pass over `M`'s live entries whose `b` row is gone.
-    JoinedGone,
+    /// The `M` pass over the rows of the table joined at `position` (1 for
+    /// the first, 2 for the next) in primary-key order.
+    JoinedRows { position: usize },
+    /// The `M` pass over the rows of the table joined at `position` whose
+    /// primary key has a `NULL` part.
+    JoinedNullKeys { position: usize },
+    /// The `M` pass over the live entries of `position`'s `M` whose row is
+    /// gone.
+    JoinedGone { position: usize },
     /// The plan job walks `a`'s primary key and enqueues the chunks.
     PlanningChunks,
     /// The chunks of `a`'s primary key: `remaining` are still to run.
@@ -179,8 +190,11 @@ fn sample_percent(pages: i64) -> f64 {
     (100.0 * SAMPLE_PAGES as f64 / pages.max(1) as f64).min(100.0)
 }
 
-/// The largest group of live `R` entries on one join key, if it passes the
-/// threshold (the module doc).
+/// The largest group of live `R` entries on one join key at any position,
+/// if it passes the threshold (the module doc). Each position's key is
+/// sampled over its own index on `R`; of the positions whose largest group
+/// passes, the warning names the one with the most rows, the first position
+/// on a tie.
 async fn fan_out_warning(
     client: &impl GenericClient,
     catalog_schema: &str,
@@ -192,12 +206,11 @@ async fn fan_out_warning(
     if !hidden_tables.iter().any(|t| t.table == "R") {
         return Ok(None);
     }
+    let Some(join) = spec::spec(def) else {
+        return Ok(None);
+    };
     let threshold = fan_out_warning_rows();
     let r = HiddenTable::FromEntries.qualified(catalog_schema, id);
-    let key = spec::join_key(def, Side::From);
-    if key.is_empty() {
-        return Ok(None);
-    }
     // `0` for an `R` dropped since its size was read: no sample.
     let pages: i64 = client
         .query_one(
@@ -210,6 +223,37 @@ async fn fan_out_warning(
     if pages == 0 {
         return Ok(None);
     }
+    let mut warning: Option<FanOutWarning> = None;
+    for (position, _) in spec::positions(join) {
+        let key = spec::from_key_at(def, position);
+        if key.is_empty() {
+            continue;
+        }
+        let Some((text, rows)) = largest_group(client, &r, &key, pages, threshold).await? else {
+            continue;
+        };
+        if rows > threshold && warning.as_ref().is_none_or(|w| rows > w.rows) {
+            warning = Some(FanOutWarning {
+                position: position.number(),
+                key: text,
+                rows,
+                threshold,
+            });
+        }
+    }
+    Ok(warning)
+}
+
+/// The largest group of live entries of `r` (qualified) on one value of its
+/// `key` columns, as the key's text and its count, from a sample of `r`'s
+/// `pages` (the module doc).
+async fn largest_group(
+    client: &impl GenericClient,
+    r: &str,
+    key: &[String],
+    pages: i64,
+    threshold: i64,
+) -> Result<Option<(String, i64)>, tokio_postgres::Error> {
     let columns: Vec<String> = key.iter().map(|c| quote_ident(c)).collect();
     let not_null: Vec<String> = columns.iter().map(|c| format!("{c} is not null")).collect();
     let same: Vec<String> = columns.iter().map(|c| format!("r.{c} = top.{c}")).collect();
@@ -232,18 +276,10 @@ async fn fan_out_warning(
         same = same.join(" and "),
         texts = texts.join(", "),
     );
-    let Some(row) = client
+    Ok(client
         .query_opt(&sql, &[&sample_percent(pages), &cap])
         .await?
-    else {
-        return Ok(None);
-    };
-    let rows: i64 = row.get(1);
-    Ok((rows > threshold).then(|| FanOutWarning {
-        key: row.get(0),
-        rows,
-        threshold,
-    }))
+        .map(|row| (row.get(0), row.get(1))))
 }
 
 /// The step the definition's build runs now or next ([`JoinStatus::building`]):

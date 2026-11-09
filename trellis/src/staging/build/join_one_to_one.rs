@@ -215,9 +215,15 @@ impl PlanStage {
 /// or `None` for a cursor a newer release wrote.
 pub(crate) fn plan_step(cursor: Option<&str>) -> Option<OneToOneBuildStep> {
     Some(match PlanStage::parse(cursor).ok()? {
-        PlanStage::B(..) => OneToOneBuildStep::JoinedRows,
-        PlanStage::BNulls(..) => OneToOneBuildStep::JoinedNullKeys,
-        PlanStage::Gone(..) => OneToOneBuildStep::JoinedGone,
+        PlanStage::B(position, _) => OneToOneBuildStep::JoinedRows {
+            position: position.number(),
+        },
+        PlanStage::BNulls(position, _) => OneToOneBuildStep::JoinedNullKeys {
+            position: position.number(),
+        },
+        PlanStage::Gone(position, _) => OneToOneBuildStep::JoinedGone {
+            position: position.number(),
+        },
         PlanStage::Walk(_) => OneToOneBuildStep::PlanningChunks,
     })
 }
@@ -563,21 +569,26 @@ mod tests {
         for (stage, step) in [
             (
                 PlanStage::B(Position::FIRST, Some("1".into())),
-                OneToOneBuildStep::JoinedRows,
+                OneToOneBuildStep::JoinedRows { position: 1 },
             ),
             (
                 PlanStage::B(second(), Some("1".into())),
-                OneToOneBuildStep::JoinedRows,
+                OneToOneBuildStep::JoinedRows { position: 2 },
             ),
             (
-                PlanStage::BNulls(Position::FIRST, None),
-                OneToOneBuildStep::JoinedNullKeys,
+                PlanStage::BNulls(second(), None),
+                OneToOneBuildStep::JoinedNullKeys { position: 2 },
             ),
             (
                 PlanStage::Gone(Position::FIRST, Some("2".into())),
-                OneToOneBuildStep::JoinedGone,
+                OneToOneBuildStep::JoinedGone { position: 1 },
             ),
-            (PlanStage::Gone(last(), None), OneToOneBuildStep::JoinedGone),
+            (
+                PlanStage::Gone(last(), None),
+                OneToOneBuildStep::JoinedGone {
+                    position: last().number(),
+                },
+            ),
             (PlanStage::Walk(None), OneToOneBuildStep::PlanningChunks),
             (
                 PlanStage::Walk(Some("a9".into())),
@@ -586,7 +597,10 @@ mod tests {
         ] {
             assert_eq!(plan_step(Some(&stage.encode())), Some(step));
         }
-        assert_eq!(plan_step(None), Some(OneToOneBuildStep::JoinedRows));
+        assert_eq!(
+            plan_step(None),
+            Some(OneToOneBuildStep::JoinedRows { position: 1 })
+        );
         for (stage, step) in [
             (Stage::Stale(None), OneToOneBuildStep::SweepStale),
             (

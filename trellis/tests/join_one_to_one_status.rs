@@ -307,7 +307,10 @@ async fn building(d: &Driver) -> Option<OneToOneBuildStep> {
 async fn status_names_each_step_of_a_fresh_build() {
     let _serial = SERIAL.lock().await;
     let d = start(false).await;
-    assert_eq!(building(&d).await, Some(OneToOneBuildStep::JoinedRows));
+    assert_eq!(
+        building(&d).await,
+        Some(OneToOneBuildStep::JoinedRows { position: 1 })
+    );
     // The plan job runs the `M` pass, walks `a` in ranges of 3 and enqueues
     // 7 chunks.
     assert_eq!(build_step(&d, 3).await, Step::Planned);
@@ -333,11 +336,23 @@ async fn status_names_the_stage_of_a_plan_job_by_its_cursor() {
     let _serial = SERIAL.lock().await;
     let d = start(false).await;
     for (cursor, step) in [
-        (None, OneToOneBuildStep::JoinedRows),
-        (Some("\u{1}b:3"), OneToOneBuildStep::JoinedRows),
-        (Some("\u{1}n"), OneToOneBuildStep::JoinedNullKeys),
-        (Some("\u{1}n:7"), OneToOneBuildStep::JoinedNullKeys),
-        (Some("\u{1}g:4"), OneToOneBuildStep::JoinedGone),
+        (None, OneToOneBuildStep::JoinedRows { position: 1 }),
+        (
+            Some("\u{1}b:3"),
+            OneToOneBuildStep::JoinedRows { position: 1 },
+        ),
+        (
+            Some("\u{1}n"),
+            OneToOneBuildStep::JoinedNullKeys { position: 1 },
+        ),
+        (
+            Some("\u{1}n:7"),
+            OneToOneBuildStep::JoinedNullKeys { position: 1 },
+        ),
+        (
+            Some("\u{1}g:4"),
+            OneToOneBuildStep::JoinedGone { position: 1 },
+        ),
         (Some("\u{1}a"), OneToOneBuildStep::PlanningChunks),
         (Some("\u{1}a:a07"), OneToOneBuildStep::PlanningChunks),
     ] {
@@ -365,7 +380,10 @@ async fn status_names_the_steps_of_a_rebuild_and_its_sweep() {
         .request_backfill("public.a")
         .await
         .expect("request a rebuild");
-    assert_eq!(building(&d).await, Some(OneToOneBuildStep::JoinedRows));
+    assert_eq!(
+        building(&d).await,
+        Some(OneToOneBuildStep::JoinedRows { position: 1 })
+    );
     assert_eq!(build_step(&d, 3).await, Step::Planned);
     assert_eq!(
         building(&d).await,

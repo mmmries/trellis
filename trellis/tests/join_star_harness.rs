@@ -443,8 +443,6 @@ async fn one_chunk(d: &drain_driver::Driver) {
 /// chunk (#1405): its page commits `M` and a marker at the key's start and
 /// writes none of the key's rows, and each chunk recomputes the next two rows
 /// in key order and advances the cursor, until the last deletes the marker.
-/// A star's page halts instead, until its chunks take the R-entry rule
-/// (`star::chunked_fan_out_runnable`).
 #[tokio::test]
 async fn a_b_change_past_one_chunk_finishes_in_chunks() {
     let _serial = star::serial().await;
@@ -463,33 +461,6 @@ async fn a_b_change_past_one_chunk_finishes_in_chunks() {
                 &shape.sql("update {b} set w = 900, tag = 'new' where id = 1"),
             )
             .await;
-            if !star::chunked_fan_out_runnable(shape) {
-                // A star's page halts rather than leave the key to chunks
-                // that don't take the R-entry rule yet (#1775).
-                let (status, reason): (String, Option<String>) = {
-                    let row = d
-                        .ctl
-                        .query_one(
-                            "select d.status::text, \
-                                    (select f.error from capture_failures f \
-                                     where f.transform_id = d.id order by f.error limit 1) \
-                             from transform_definitions d where d.target_table = $1",
-                            &[&star.target()],
-                        )
-                        .await
-                        .expect("read the definition's status");
-                    (row.get(0), row.get(1))
-                };
-                assert_ne!(status, "live", "{name}: the star's page halts");
-                assert!(
-                    reason
-                        .as_deref()
-                        .is_some_and(|r| r.contains("chunked fan-out is not built yet")),
-                    "{name}: {status} {reason:?}"
-                );
-                assert!(markers(&d, star).await.is_empty(), "{name}");
-                continue;
-            }
             assert_eq!(markers(&d, star).await, ["({10},1,)"], "{name}");
             assert_eq!(
                 key_rows(&d, star).await,

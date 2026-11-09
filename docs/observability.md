@@ -666,16 +666,21 @@ well, with these differences:
   table has held and never shrinks, so its size only grows; `R` and `M` keep a tombstone
   for a deleted row until the tombstone collection reaches it.
 - `building` is a `OneToOne` step: `JoinedRows`, `JoinedNullKeys` and `JoinedGone` for the
-  plan job's pass over `M`, `PlanningChunks` while it walks `a`'s primary key,
+  plan job's pass over each position's `M`, naming the position (1 for the first joined
+  table), `PlanningChunks` while it walks `a`'s primary key,
   `Chunks { remaining }` while the chunks of that key run, and `SweepStale` and
   `SweepOrphans` for the two passes of the sweep that ends a rebuild in place. It is read
   from the jobs' cursors as above.
 - `fan_out_warning` is set when the largest group of live `R` entries on one join key
-  holds more rows than the threshold: a change of the `b` row on that key rewrites all of
-  them, in chunks of 10,000 rows, before a watermark token past it converges. It names the key (its
-  columns' values joined by `,`), the group's rows and the threshold. The group is found
+  holds more rows than the threshold: a change of the joined row on that key rewrites all
+  of them, in chunks of 10,000 rows, before a watermark token past it converges. It names
+  the joined position (1 for the first joined table), the key (`a`'s columns in that
+  position's `ON`, their values joined by `,`), the group's rows and the threshold. With
+  more than one joined table, each position is sampled, and the warning names the
+  position whose group is largest. It is the only runtime sign of a lookup table (few
+  keys, many rows on each) joined at any position. The group is found
   by sampling `R` (2000 pages of it, all of a smaller `R`) and counting the keys met most
-  often over `R`'s join-key index, not from `pg_stats`, which is stale after a build. A
+  often over `R`'s index on that position's join key, not from `pg_stats`, which is stale after a build. A
   count stops at ten times the threshold. In a very large `R` a group just past the threshold
   can go unreported until it grows. The threshold is 250,000 by default and
   `TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING` sets another. The benchmark
