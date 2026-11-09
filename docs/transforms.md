@@ -588,8 +588,8 @@ dividend, so the division is never useful.
 
 Only the text is read. A divisor that computes to zero (`n / (1 - 1)`,
 `n / COALESCE(0, 1)`, `n / CEIL(0.0)`, a calculated field that is `0`)
-defines, and its rows fail and are quarantined like any other per-row error,
-as `x / col` does for the rows where `col` is zero.
+defines, and its rows fail at run time like any other per-row error, as
+`x / col` does for the rows where `col` is zero.
 
 **Refused at define:** Yes (`ConstantDivisorZero`), naming the field and the
 division as written, for the definition and an `ALTER TRANSFORM`.
@@ -2179,9 +2179,15 @@ operation cannot compute for one row (an overflow, a division by zero) raises
 the field. Define doesn't evaluate constant expressions as Postgres's planner
 does, so a definition with a constant Postgres fails while planning
 (`2147483647 + 1`, `DATE '2024-01-01' + 2147483647`, a `COALESCE(real_col,
-...)` whose constant is past `real`'s range) is accepted, and its rows fail and are quarantined on their first
-apply or build (an aggregate's build fails whole and pauses the definition,
-naming Postgres's error); only a divisor written as a literal zero is refused.
+...)` whose constant is past `real`'s range) is accepted, and every row it
+computes fails with Postgres's error, as any per-row error does
+([ADR-0003](decisions/0003-quarantine-storage-and-api.md)). A 1-1 applying
+changes holds its first failing keys, then its column fuse pauses the field:
+new rows get `NULL` for it, its other fields keep updating and the definition
+stays `live` ([a paused column](operations.md#when-a-definition-needs-you)).
+A 1-1 or `JOIN` build over existing rows, and a `JOIN` applying changes,
+quarantine the definition, and an aggregate's build fails whole and pauses
+it. Only a divisor written as a literal zero is refused.
 
 A formula's dates are Postgres's too. `date + n`, `n + date` and `date - n` add
 or subtract a count of days (a `smallint` or `integer`) and give a `date`;
