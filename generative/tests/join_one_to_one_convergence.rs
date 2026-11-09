@@ -431,7 +431,8 @@ fn run_star_case(case: &StarCase) -> Result<(), String> {
 }
 
 /// Sets a star case's engine knobs (`trellis::dev::interleave`'s lock-step
-/// stall and re-derived share, and the fan-out chunk) for as long as it
+/// stall and re-derived share, the fan-out chunk and the split threshold)
+/// for as long as it
 /// lives. They are process-wide, like the commit stall: a star case runs
 /// nothing else meanwhile, and a two-table case under them would still
 /// converge (each changes when things happen, or how a page reads, never
@@ -448,6 +449,7 @@ impl StarKnobsGuard {
         trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows(
             knobs.fan_out_chunk_rows.unwrap_or(0),
         );
+        trellis::dev::staging::set_min_rows_to_split(knobs.split_rows.unwrap_or(0));
         StarKnobsGuard
     }
 }
@@ -457,6 +459,7 @@ impl Drop for StarKnobsGuard {
         trellis::dev::interleave::set_lock_step_stall(None, 0);
         trellis::dev::interleave::set_rederived_pages(0);
         trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows(0);
+        trellis::dev::staging::set_min_rows_to_split(0);
     }
 }
 

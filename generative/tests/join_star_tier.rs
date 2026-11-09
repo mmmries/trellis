@@ -22,9 +22,9 @@ use generative::generate::join::{JoinCase, JoinOpKind, KeyShape, STAR_HOT_KEYS};
 use generative::generate::join_chained::chained_case_strategy;
 use generative::generate::join_one_to_one::{
     MAX_TABLES, OnShape, OneToOneField, OneToOneOpDraw, OneToOneSpec, STAR_COMMIT_STALL_MS,
-    STAR_LOCK_STEP_STALL_MS, STAR_MAX_FAN_OUT_CHUNK_ROWS, STAR_WORKERS, StarCase, StarPosition,
-    build_star_program, one_to_one_case_strategy, own_key_column, star_case_strategy,
-    star_definition_text, table_at,
+    STAR_LOCK_STEP_STALL_MS, STAR_MAX_FAN_OUT_CHUNK_ROWS, STAR_MAX_PACE_MICROS,
+    STAR_MAX_SPLIT_ROWS, STAR_WORKERS, StarCase, StarPosition, build_star_program,
+    one_to_one_case_strategy, own_key_column, star_case_strategy, star_definition_text, table_at,
 };
 use generative::model::{Op, Program, Table};
 use proptest::strategy::Strategy;
@@ -265,8 +265,9 @@ fn the_star_strategy_draws_mixed_pages_spanning_positions() {
 
 /// The knobs: every late position, page sizes from 1 to 15, the
 /// metamorphic case about one in four with an order other than the
-/// definition's, the stalls, the shares #1464 section 4 names, and every
-/// fan-out chunk from 1 row up, or the engine's.
+/// definition's, the stalls, the shares #1464 section 4 names, every
+/// fan-out chunk from 1 row up or the engine's, and a lowered split
+/// threshold and a pace in about three cases in four.
 #[test]
 fn the_star_strategy_draws_its_knobs() {
     let cases = star_cases();
@@ -282,6 +283,34 @@ fn the_star_strategy_draws_its_knobs() {
     let chunks: BTreeSet<Option<usize>> =
         cases.iter().map(|c| c.knobs.fan_out_chunk_rows).collect();
     assert_eq!(chunks.len(), STAR_MAX_FAN_OUT_CHUNK_ROWS + 1, "{chunks:?}");
+    let split = cases
+        .iter()
+        .filter(|c| c.knobs.split_rows.is_some())
+        .count();
+    let paced = cases.iter().filter(|c| c.knobs.pace.is_some()).count();
+    for share in [split, paced] {
+        assert!(
+            (80..=150).contains(&share),
+            "{split}, {paced} of {}",
+            cases.len()
+        );
+    }
+    for case in &cases {
+        assert!(
+            case.knobs
+                .split_rows
+                .is_none_or(|rows| (2..=STAR_MAX_SPLIT_ROWS).contains(&rows))
+        );
+        assert_eq!(
+            case.case.plan.steady_load.map(|load| load.pace),
+            case.knobs.pace
+        );
+        assert!(
+            case.knobs.pace.is_none_or(|pace| {
+                pace <= std::time::Duration::from_micros(STAR_MAX_PACE_MICROS)
+            })
+        );
+    }
     let caps: BTreeSet<usize> = cases.iter().map(|c| c.knobs.drain_batch_cap).collect();
     assert!(caps.contains(&1) && caps.contains(&15), "{caps:?}");
     assert!(caps.iter().all(|c| (1..=15).contains(c)), "{caps:?}");

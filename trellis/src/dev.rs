@@ -123,6 +123,10 @@ pub mod staging {
     /// counts bursts large enough to seal into a split batch, and must follow
     /// the threshold if it moves.
     pub use crate::staging::claim::MIN_ROWS_TO_SPLIT;
+    /// Lowers the split threshold for this process, so the star tier's
+    /// small batches split across workers and a root row's pages at two
+    /// positions drain side by side (#1817).
+    pub use crate::staging::claim::set_min_rows_to_split;
     /// `seal_phase1`/`seal_phase2` force a seal boundary at a deterministic
     /// point so two changes land in distinct segments instead of depending on
     /// a maintenance tick's timing. There is no facade equivalent — "seal

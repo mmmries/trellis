@@ -927,6 +927,11 @@ pub const STAR_COMMIT_STALL_MS: u64 = 3;
 pub const STAR_LOCK_STEP_STALL_MS: u64 = 12;
 /// The largest fan-out chunk a star case lowers the engine's to, in rows.
 pub const STAR_MAX_FAN_OUT_CHUNK_ROWS: usize = 4;
+/// The largest split threshold a star case lowers the engine's to, in rows.
+pub const STAR_MAX_SPLIT_ROWS: i64 = 16;
+/// The longest a paced star case's lanes wait after each op, in
+/// microseconds.
+pub const STAR_MAX_PACE_MICROS: u64 = 4_000;
 /// The share of lock steps a star case stalls at, in thousandths.
 pub const STAR_STALLED_LOCK_STEPS_PER_MILLE: u16 = 300;
 /// The share of pages a star case re-derives, in thousandths.
@@ -954,6 +959,16 @@ pub struct StarKnobs {
     /// from its default so a hot key's rows take a pending fan-out; `None`
     /// keeps the default.
     pub fan_out_chunk_rows: Option<usize>,
+    /// The rows a sealed batch needs to split across the workers
+    /// (`trellis::dev::staging::set_min_rows_to_split`), lowered from the
+    /// engine's so a root row's pages at two positions drain side by side
+    /// within one batch; `None` keeps the engine's.
+    pub split_rows: Option<i64>,
+    /// How long each lane waits after each op, from every burst's start
+    /// (`crate::model::SteadyLoad`), so the writes trickle in while pages
+    /// drain and a row moves between a page's read and its locks; `None`
+    /// issues every burst flat out.
+    pub pace: Option<std::time::Duration>,
     /// The "late" position (#1459's F11 orientation): in a mixed page its
     /// draws come last ([`shape_pages`]).
     pub late_position: u8,
@@ -1158,6 +1173,12 @@ pub fn star_case(
         seal_interval_ms,
     );
     case.plan.commit_stall = Some(commit_stall);
+    case.plan.steady_load = knobs.pace.map(|pace| crate::model::SteadyLoad {
+        pace,
+        pace_from_start: true,
+        stall: std::time::Duration::ZERO,
+        group_lock_stall: false,
+    });
     StarCase {
         case,
         tables,
@@ -1501,7 +1522,11 @@ pub(crate) mod strategy {
     /// the knobs carry the share of lock steps stalled (up to a drawn 1 to
     /// [`STAR_LOCK_STEP_STALL_MS`]) and of pages re-derived, and in half the
     /// cases a fan-out chunk of 1 to [`STAR_MAX_FAN_OUT_CHUNK_ROWS`] rows,
-    /// below a hot key's rows. Three bursts in four end in a race
+    /// below a hot key's rows, and in three in four a split threshold of 2
+    /// to [`STAR_MAX_SPLIT_ROWS`] rows, so one batch's pages drain on
+    /// several workers, and in three in four the lanes paced at 0.5 to
+    /// [`STAR_MAX_PACE_MICROS`] µs an op, so rows move while pages drain.
+    /// Three bursts in four end in a race
     /// ([`place_tail_races`]). Builds, pauses and re-reads are the two-table
     /// tier's ([`builds`]), and about one op in a hundred is a `TRUNCATE` of
     /// any table. One case in four also runs its metamorphic twin, under a
@@ -1525,6 +1550,8 @@ pub(crate) mod strategy {
                     prop_oneof![3 => Just(false), 1 => Just(true)],
                     1u64..=STAR_LOCK_STEP_STALL_MS,
                     proptest::option::of(1usize..=STAR_MAX_FAN_OUT_CHUNK_ROWS),
+                    proptest::option::weighted(0.75, 2i64..=STAR_MAX_SPLIT_ROWS),
+                    proptest::option::weighted(0.75, 500u64..=STAR_MAX_PACE_MICROS),
                     proptest::collection::vec(
                         proptest::option::weighted(0.75, tail_race(tables)),
                         1..=8,
@@ -1544,7 +1571,7 @@ pub(crate) mod strategy {
                         seal_interval_ms,
                         builds,
                         stall_ms,
-                        (metamorphic, lock_step_ms, fan_out_chunk_rows, races),
+                        (metamorphic, lock_step_ms, fan_out_chunk_rows, split_rows, pace, races),
                     )| {
                         shape_pages(&mut draws, &pages, tables, late_position);
                         place_tail_races(&mut draws, burst_size, &races, tables, late_position);
@@ -1563,6 +1590,8 @@ pub(crate) mod strategy {
                                 stalled_lock_steps_per_mille: STAR_STALLED_LOCK_STEPS_PER_MILLE,
                                 rederived_pages_per_mille: STAR_REDERIVED_PAGES_PER_MILLE,
                                 fan_out_chunk_rows,
+                                split_rows,
+                                pace: pace.map(std::time::Duration::from_micros),
                                 late_position,
                                 metamorphic,
                             },
