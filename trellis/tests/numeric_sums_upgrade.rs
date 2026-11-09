@@ -532,10 +532,11 @@ async fn a_0_1_0_join_stuck_at_nan_is_rebuilt_afresh() {
     raw.batch_execute(
         "create table public.s (id integer primary key, g integer, v numeric(10,2)); \
          insert into public.s values (1, 1, 1.25), (2, 1, 2.50), (3, 2, 3.75), \
-             (4, 3, 0.10), (5, 4, 'NaN'), (6, 4, 1.00), (7, 5, 7.77), (8, 4, 'NaN'); \
+             (4, 3, 0.10), (5, 4, 'NaN'), (6, 4, 1.00), (7, 5, 7.77), (8, 4, 'NaN'), \
+             (12, 6, 1.00); \
          create table public.d (id integer primary key, g integer, r text, x numeric(8,3)); \
          insert into public.d values (1, 1, 'a', 1.000), (2, 2, 'a', 2.5), \
-             (3, 3, 'b', 0.125), (4, 4, 'c', 0.5); \
+             (3, 3, 'b', 0.125), (4, 4, 'c', 0.5), (5, 6, 'z', 9.000); \
          create table public.f (id integer primary key, g integer, v numeric(10,2)); \
          insert into public.f values (1, 1, 1.25), (2, 1, 2.50)",
     )
@@ -611,6 +612,33 @@ async fn a_0_1_0_join_stuck_at_nan_is_rebuilt_afresh() {
         .await
         .expect("a stuck NaN");
     }
+    // `lj` was mid-rebuild in place when the old release stopped: its sweep
+    // job is queued, and another is held by an instance that is gone.
+    raw.execute(
+        "update transform_definitions set status = 'backfilling', build = 'rederive' \
+         where id = $1",
+        &[&ids[1]],
+    )
+    .await
+    .expect("mid-rebuild");
+    raw.execute(
+        "insert into backfill_chunks \
+             (definition_id, kind, fuse_rearmed_at, start_xid, claimed_by, claimed_at) \
+         select id, 'sweep', fuse_rearmed_at, pg_current_xact_id(), c, \
+                case when c is null then null else now() end \
+         from transform_definitions, (values (null), ('gone')) v(c) where id = $1",
+        &[&ids[1]],
+    )
+    .await
+    .expect("its sweep jobs");
+    // Changes no release has applied yet at the takeover: group `z` leaves
+    // both sides, and the finite `JOIN` and aggregate gain a row.
+    raw.batch_execute(
+        "delete from public.s where id = 12; delete from public.d where id = 5; \
+         insert into public.f values (4, 1, 0.05)",
+    )
+    .await
+    .expect("undrained changes");
 
     let upgrade = Trellis::connect(
         Config::from_dsn(db.dsn().to_string()).expect("config"),
@@ -620,18 +648,30 @@ async fn a_0_1_0_join_stuck_at_nan_is_rebuilt_afresh() {
     .expect("connect");
     upgrade.migrate().await.expect("the upgrade's attach");
     upgrade.shutdown().await.expect("shutdown");
-    // The definitions holding no `NaN` were converted in place, not rebuilt.
+    // The definitions holding a `NaN` start over as a first build does, with
+    // no build of the old release's left queued; the ones holding none were
+    // converted in place, not rebuilt.
     let statuses: Vec<String> = raw
         .query(
-            "select status from transform_definitions where id = any($1) order by id",
-            &[&ids[2..].to_vec()],
+            "select format('%s %s %s', status, build is null, \
+                    (select count(*) from backfill_chunks c where c.definition_id = d.id)) \
+             from transform_definitions d where id = any($1) order by id",
+            &[&ids],
         )
         .await
         .expect("statuses")
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(statuses, ["live", "live"]);
+    assert_eq!(
+        statuses,
+        [
+            "waiting_to_backfill t 0",
+            "waiting_to_backfill t 0",
+            "live t 0",
+            "live t 0"
+        ]
+    );
     let trellis = running(&db).await;
     wait_for(&trellis, &all, TransformStatus::Live).await;
     converge(&trellis).await;
