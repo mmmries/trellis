@@ -99,11 +99,11 @@ itself: 0.1.0 left a group's sum at `NaN` for good once a `NaN` had been
 summed into it, even after the `NaN` left, and 0.1.1 added a fixed weight
 (`10^2100`) per `NaN` it held. A definition with a group stored either way,
 plain or `JOIN`, is rebuilt at the takeover as a `RESUME` rebuilds it: its
-hidden tables are created afresh and every group is written from its source,
-while the target keeps its rows until the rebuild replaces them. Its
-`status()` reads `waiting_to_backfill`, then `backfilling`, until the rebuild
-is done, and the transforms reading its target rebuild their own copies of it
-when it finishes.
+hidden tables are created afresh and every group is written from its source.
+Its `status()` reads `waiting_to_backfill`, then `backfilling`, until the
+rebuild is done; meanwhile a group that changes can show a partial value, as
+during any build. The transforms reading its target rebuild their own copies
+of it when it finishes.
 
 For an embedded fleet, [Rolling deploys](embedding.md#rolling-deploys) covers
 the handover in detail, and
