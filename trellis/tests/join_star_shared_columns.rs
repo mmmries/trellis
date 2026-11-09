@@ -8,7 +8,7 @@
 //! `set k = null, k = null`, which Postgres refuses ("multiple assignments
 //! to same column"), so the row was held in quarantine and its target row
 //! kept. Each case ends with the oracle: the target is the live multi-join,
-//! and nothing is held.
+//! nothing is held, and `self_check` finds nothing.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -65,11 +65,17 @@ async fn assert_matches(d: &Driver, kinds: [&str; 2], case: &str) {
         Vec::<String>::new(),
         "{case} {kinds:?}: held rows"
     );
+    let found = star::self_check(d, "public.t", 1000).await;
+    assert!(
+        found.is_empty(),
+        "{case} {kinds:?}: self_check finds {found:?}"
+    );
 }
 
-/// Root rows deleted, moved to a `NULL` key and moved between keys, and
-/// joined rows changed under the shared key, each drained, under every kind
-/// pair.
+/// Root rows deleted, moved to a `NULL` key and moved between keys, joined
+/// rows changed under the shared key, and a truncate of a joined table (and
+/// its rebuild) and of the root, each drained and then checked by the oracle
+/// and by `self_check`, under every kind pair.
 #[tokio::test]
 async fn a_star_joining_two_positions_on_one_root_column_applies_root_deletes_and_moves() {
     let _serial = star::serial().await;
@@ -105,6 +111,16 @@ async fn a_star_joining_two_positions_on_one_root_column_applies_root_deletes_an
                 "update public.b1 set w = w + 1 where k = 4",
             ),
             ("a joined delete", "delete from public.b2 where k = 3"),
+            ("a truncate of a joined table", "truncate public.b1"),
+            (
+                "a joined table re-seeded",
+                "insert into public.b1 select i, i, i * 10 from generate_series(1, 4) i",
+            ),
+            ("a truncate of the root", "truncate public.a"),
+            (
+                "the root re-seeded",
+                "insert into public.a select i, i % 5, i from generate_series(1, 10) i",
+            ),
             ("every root row deleted", "delete from public.a"),
         ] {
             d.user()
@@ -112,6 +128,9 @@ async fn a_star_joining_two_positions_on_one_root_column_applies_root_deletes_an
                 .batch_execute(sql)
                 .await
                 .unwrap_or_else(|e| panic!("{case}: {sql}: {e}"));
+            d.settle().await;
+            // A truncate of a joined table starts a rebuild.
+            trellis::staging::build::settle_builds_with(d.pool(), 3).await;
             d.settle().await;
             assert_matches(&d, kinds, case).await;
         }

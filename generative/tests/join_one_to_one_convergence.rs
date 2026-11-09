@@ -757,8 +757,9 @@ fn star_sweep_tier() -> SweepTier {
 ///   tier; at this rate a 48-case sweep misses it about one time in 2,000).
 /// - `join1_truncate_no_rebuild`: caught 5, fired 36.
 /// - `join1_m_before_j`: caught 0, fired 48 (gated on the two-table tier,
-///   which catches it in 9; the star tier's pages are smaller and its keys
-///   hotter, and later writes repair the lost update).
+///   which catches it in 9, in its wide and racing key shapes with bursts of
+///   several hundred ops; the star tier draws only its narrow star key
+///   shape, in bursts of 30 to 150 ops).
 /// - `star_own_j_only`: caught 0, fired 36; `star_r_after_m`: caught 0,
 ///   fired 34; `star_last_no_r`: caught 0, fired 34. The R-entry rule's
 ///   ablations need a root key move and a joined write on its new key to
