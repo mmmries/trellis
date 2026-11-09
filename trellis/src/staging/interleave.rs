@@ -206,8 +206,9 @@
 //! tier's R-entry and late-key plants). A re-derived share
 //! ([`set_rederived_pages`]) has a share of the 1-1 `JOIN` pages that hold
 //! changes re-derive them instead, as a page that may predate a build does:
-//! each reads its rows live, unlocked, before its key lock, so a row that
-//! moves meanwhile takes the late-key retry. A Re-derive is exact whenever
+//! each reads its rows live, unlocked, before its key lock, and sleeps up
+//! to the lock-step stall between the two, so a row that moves meanwhile
+//! takes the late-key retry. A Re-derive is exact whenever
 //! it runs, so neither changes what a correct engine converges to.
 //!
 //! A stall is process-wide, like a plant, and an armed [`PauseScope`] point
@@ -609,6 +610,17 @@ pub fn set_rederived_pages(per_mille: u16) {
 pub(crate) fn take_rederived_page() -> bool {
     let share = REDERIVED_PAGES_PER_MILLE.load(Ordering::Relaxed);
     share > 0 && unit() * 1000.0 < share as f64
+}
+
+/// A page [`take_rederived_page`] re-derived sleeps a uniform time up to
+/// the lock-step stall ([`set_lock_step_stall`]) between its unlocked read
+/// of its rows' keys and its key lock, so a row that moves meanwhile takes
+/// the late-key retry.
+pub(crate) async fn rederive_stall() {
+    let max = LOCK_STEP_STALL_MAX_MICROS.load(Ordering::Relaxed);
+    if max > 0 {
+        tokio::time::sleep(Duration::from_micros((unit() * max as f64) as u64)).await;
+    }
 }
 
 /// A uniform draw in `[0, 1)`: a splitmix64 step over a shared counter, no

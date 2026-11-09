@@ -931,7 +931,7 @@ pub const STAR_MAX_FAN_OUT_CHUNK_ROWS: usize = 4;
 pub const STAR_MAX_SPLIT_ROWS: i64 = 16;
 /// The longest a paced star case's lanes wait after each op, in
 /// microseconds.
-pub const STAR_MAX_PACE_MICROS: u64 = 4_000;
+pub const STAR_MAX_PACE_MICROS: u64 = 20_000;
 /// The share of lock steps a star case stalls at, in thousandths.
 pub const STAR_STALLED_LOCK_STEPS_PER_MILLE: u16 = 300;
 /// The share of pages a star case re-derives, in thousandths.
@@ -1463,7 +1463,9 @@ pub(crate) mod strategy {
     /// spread over the positions, each of `ja`'s own keys equal to `key`
     /// half the time (a root row hot at two or more positions at once), and
     /// one `ja` key update in two moving `k` alone or one own key alone
-    /// ([`OneToOneOpDraw::key_scope`]).
+    /// ([`OneToOneOpDraw::key_scope`]), and one update or delete in three
+    /// naming one of the table's first three live rows, so a few rows take
+    /// write after write.
     pub(crate) fn star_draw(tables: usize) -> impl Strategy<Value = OneToOneOpDraw> {
         let own = || prop_oneof![1 => Just(None), 1 => any::<u8>().prop_map(Some)];
         (
@@ -1475,13 +1477,17 @@ pub(crate) mod strategy {
                 1 => Just(Some(0u8)),
                 1 => (1u8..=3).prop_map(Some),
             ],
+            prop_oneof![2 => Just(None), 1 => (0usize..3).prop_map(Some)],
         )
-            .prop_map(|(draw, position, own, key_scope)| OneToOneOpDraw {
-                position,
-                own_keys: own.map(|raw| raw.unwrap_or(draw.key)),
-                key_scope,
-                ..draw
-            })
+            .prop_map(
+                |(draw, position, own, key_scope, hot_pick)| OneToOneOpDraw {
+                    position,
+                    own_keys: own.map(|raw| raw.unwrap_or(draw.key)),
+                    key_scope,
+                    pick: hot_pick.unwrap_or(draw.pick),
+                    ..draw
+                },
+            )
     }
 
     fn tail_race(tables: usize) -> impl Strategy<Value = TailRace> {
@@ -1524,7 +1530,7 @@ pub(crate) mod strategy {
     /// cases a fan-out chunk of 1 to [`STAR_MAX_FAN_OUT_CHUNK_ROWS`] rows,
     /// below a hot key's rows, and in three in four a split threshold of 2
     /// to [`STAR_MAX_SPLIT_ROWS`] rows, so one batch's pages drain on
-    /// several workers, and in three in four the lanes paced at 0.5 to
+    /// several workers, and in three in four the lanes paced at 2,000 to
     /// [`STAR_MAX_PACE_MICROS`] µs an op, so rows move while pages drain.
     /// Three bursts in four end in a race
     /// ([`place_tail_races`]). Builds, pauses and re-reads are the two-table
@@ -1551,7 +1557,7 @@ pub(crate) mod strategy {
                     1u64..=STAR_LOCK_STEP_STALL_MS,
                     proptest::option::of(1usize..=STAR_MAX_FAN_OUT_CHUNK_ROWS),
                     proptest::option::weighted(0.75, 2i64..=STAR_MAX_SPLIT_ROWS),
-                    proptest::option::weighted(0.75, 500u64..=STAR_MAX_PACE_MICROS),
+                    proptest::option::weighted(0.75, 2_000u64..=STAR_MAX_PACE_MICROS),
                     proptest::collection::vec(
                         proptest::option::weighted(0.75, tail_race(tables)),
                         1..=8,

@@ -1134,6 +1134,12 @@ pub(crate) async fn apply_page(
         &shape.target,
     )
     .await?;
+    // Test-only: a re-derived page holds its unlocked read open. See
+    // `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    if forced {
+        super::interleave::rederive_stall().await;
+    }
 
     // 3. `J`, one sorted statement over every position's keys.
     let locked = root_skip_j(shape, &k, &root_k, &joined_k);
