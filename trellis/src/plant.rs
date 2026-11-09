@@ -506,6 +506,25 @@ pub enum Plant {
     ///
     /// Pinned by `join_star_fan_out`'s `xt2_…` pins.
     StarTruncateKeepsOtherMarkers,
+    /// #1464 (`star_chunk_skip_j_last`): a build chunk of a star 1-1 `JOIN`
+    /// leaves its range's keys at the last position out of `J`, and its
+    /// insert-from-read's late-key check skips that position: a row that
+    /// moved there after the chunk's unlocked read gets its `R` entry and
+    /// target row under no `J` lock on its new key. A page of that
+    /// position's joined table on the key then fans out around the
+    /// uncommitted entry, and the chunk's target row keeps the `M` it read
+    /// before. Fires only on a star, when the chunk holds a key there or its
+    /// insert finds a key there outside its set.
+    ///
+    /// Pinned by `join_star_build`'s
+    /// `ps6a_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_at_the_last_position_retries`.
+    StarChunkSkipJLast,
+    /// #1464 (`star_chunk_skip_j_first`): [`Plant::StarChunkSkipJLast`] at
+    /// the first position. Fires only on a star.
+    ///
+    /// Pinned by `join_star_build`'s
+    /// `ps6b_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_at_the_first_position_retries`.
+    StarChunkSkipJFirst,
     /// ADR-0002 "Multi-hop" (#1482's `token_early`): a drain page reads the
     /// target-mutation seam's write token when it begins
     /// (`staging::target_mutations`), before its row locks, rather than after
@@ -674,6 +693,8 @@ impl Plant {
         Plant::StarRecheckSkipLast,
         Plant::StarChunkNoR,
         Plant::StarTruncateKeepsOtherMarkers,
+        Plant::StarChunkSkipJLast,
+        Plant::StarChunkSkipJFirst,
         Plant::SeamTokenEarly,
         Plant::SeamImagelessRow,
         Plant::GbxProbeNoXbasis,
@@ -740,6 +761,8 @@ impl Plant {
             Plant::StarRecheckSkipLast => "star_recheck_skip_last",
             Plant::StarChunkNoR => "star_chunk_no_r",
             Plant::StarTruncateKeepsOtherMarkers => "star_truncate_keeps_other_markers",
+            Plant::StarChunkSkipJLast => "star_chunk_skip_j_last",
+            Plant::StarChunkSkipJFirst => "star_chunk_skip_j_first",
             Plant::SeamTokenEarly => "seam_token_early",
             Plant::SeamImagelessRow => "seam_imageless_row",
             Plant::GbxProbeNoXbasis => "gbx_probe_no_xbasis",

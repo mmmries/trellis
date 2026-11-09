@@ -160,18 +160,20 @@ pub(super) async fn seed_direct(
     shape: &Shape,
 ) -> SeedStats {
     let started = Instant::now();
-    raw.batch_execute(
-        "create table public.b (id bigint, k int not null, gb int, y bigint); \
+    raw.batch_execute(&format!(
+        "create table public.b (id bigint, k int not null, gb int, y {v}); \
          create table public.a (id bigint not null, day int not null, k int not null, \
-             x bigint, pad text)",
-    )
+             x {v}, pad text)",
+        v = cfg.value_type()
+    ))
     .await
     .expect("create the tables");
     if variant == Variant::B0 {
-        raw.batch_execute(
+        raw.batch_execute(&format!(
             "create table public.a0 (id bigint not null, day int not null, k int not null, \
-                 x bigint, pad text, gb int, y bigint)",
-        )
+                 x {v}, pad text, gb int, y {v})",
+            v = cfg.value_type()
+        ))
         .await
         .expect("create a0");
     }

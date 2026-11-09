@@ -25,7 +25,7 @@ ordered floor to ceiling:
    Needs an immutable operator or function in the registry and, for a
    constant, a typed literal.
 5. **Aggregate target** — an aggregate calculated field has this type: `COUNT`,
-   `SUM` or `AVG` over an integer or `numeric(p,s)` column, and, on a plain
+   `SUM` or `AVG` over an integer or `numeric` column or expression, and, on a plain
    aggregate, `MIN` or `MAX` over a column of a number, date or time type
    ([`MIN` and `MAX`](#min-and-max)).
 
@@ -45,7 +45,7 @@ filter role.
 |---|---|---|---|---|---|---|
 | `smallint` `integer` `bigint` | yes | yes | yes | yes | yes | `SUM` `AVG` `MIN` `MAX` |
 | `oid` | yes | yes | yes | yes | typed literal only | `MIN` `MAX` (no arithmetic in Postgres) |
-| `numeric` `decimal` | yes | no | yes | no | yes | `SUM` `AVG` over `numeric(p,s)` only; `MIN` `MAX` |
+| `numeric` `decimal` | yes | no | yes | no | yes | `SUM` `AVG`; `MIN` `MAX` |
 | `real` `double precision` | yes | no | no | no | yes | `MIN` `MAX` |
 | `boolean` | yes | no | yes | no | yes | no |
 | `uuid` | yes | yes | yes | yes | yes | no |
@@ -219,21 +219,31 @@ primary key. It is admitted as a `GROUP BY` key, where a group is one equal
 value, as Postgres's own `GROUP BY` makes it: a group row holds one of the
 equal values' texts. A group written as `1.25` stays `1.25` when a rewrite
 re-renders the source's values as `1.2500`, and that is correct; a rebuild
-doesn't rewrite a key whose rendering alone changed. An aggregate result is
-likewise one equal value: a `SUM` over `numeric` may render `1.5` or `1.50`.
-`self_check` matches an aggregate's and a `JOIN`'s groups, and compares their
-results, by the type's `=`
-([ADR-0013](decisions/0013-self-check-production-recompute-audit.md)).
+doesn't rewrite a key whose rendering alone changed. A `MIN` or `MAX` over
+`numeric` is likewise one equal value: `1.0` or `1.00`. `self_check` matches
+an aggregate's and a `JOIN`'s groups, and compares their results, by the
+type's `=` ([ADR-0013](decisions/0013-self-check-production-recompute-audit.md)).
 
-A `numeric(p,s)` column admits `NaN` (never `Infinity` or `-Infinity`:
-Postgres refuses them for a column with a precision). As in Postgres, a
-group's `SUM` and `AVG` are `NaN` while it holds a `NaN` and the sum and
-average of its other values once the `NaN` leaves, by a delete, an update
-or a move to another group; in a `JOIN`, a `NaN` counts once per match, and
-not at all for a key with none. A running sum can't subtract `NaN` back out,
-so the hidden partial counts each `NaN` apart from the finite values, in the
-same `__sum_<i>` column: a `NaN` adds `10^2100`, beyond any finite sum a
-`numeric(p,s)` column can reach. Checked in
+A `SUM` or `AVG` over `numeric` (a column with or without a declared scale,
+a `numeric` column of another transform's target, or an expression such as
+`SUM(a * b)`, `SUM(CASE WHEN c THEN x ELSE 0 END)` or
+`SUM(EXTRACT(dow FROM d))`) shows what Postgres's `sum()` and `avg()` show,
+text included. A `SUM` shows the largest display scale among the group's
+current values: `1.5` and `2.000` sum to `3.500`, and to `1.5` once `2.000`
+leaves. An `AVG` divides that sum by the count, so its places follow the
+sum's, as Postgres's do. `NaN`, and `Infinity` beside `-Infinity`, make both
+`NaN`; one infinity alone is that infinity; once the value leaves, by a
+delete, an update or a move to another group, they show the rest again. In
+a `JOIN`, each value counts once per match, and not at all for a key with
+none (`numeric(p,s)` refuses `Infinity` and `-Infinity` but admits `NaN`).
+A running sum can do neither: it keeps the widest scale it ever held, and
+can't subtract a special value back out. So the group's hidden row keeps the
+finite values' sum, a count of values per display scale, and counts of
+`NaN`, `Infinity` and `-Infinity`, in one map that leaves out the finite
+values at the column's declared scale, so a `numeric(p,s)` column's map
+stays empty while its values are finite
+([ADR-0002](decisions/0002-async-data-flow.md#numeric-sums-count-their-scales-and-special-values)).
+Checked in `trellis/tests/group_basis_numeric_scales.rs` and
 `trellis/tests/group_basis_numeric_nan.rs`.
 
 `real` and `double precision` are `ValueType::Float` (`trellis/src/float.rs`).
@@ -278,7 +288,7 @@ operator against a live server,
 | `CEIL(a)`, `FLOOR(a)`, `TRUNC(a)` | `numeric`, `double precision` | the operand's type |
 | `ROUND(a)`, `ROUND(a, n)`, `TRUNC(a, n)` | `numeric`; `n` an integer literal | `numeric`; rounds half away from zero, `TRUNC` toward zero |
 | `CAST(a AS integer)` (or `int`, `int4`), `AS bigint` (or `int8`) | an integer of the same or a narrower width | the named integer; a cast to the operand's own type changes nothing |
-| `CAST(a AS numeric)` (or `decimal`) | any integer or `numeric` | `numeric`; a `numeric` value keeps its digits (`1.50` stays `1.50`), but the result has no declared scale, so `SUM` or `AVG` of it is refused as for any `numeric` expression |
+| `CAST(a AS numeric)` (or `decimal`) | any integer or `numeric` | `numeric`; a `numeric` value keeps its digits (`1.50` stays `1.50`), and the result has no declared scale |
 
 Prefix `-` binds tighter than every binary operator, and `*`, `/` and `%`
 bind tighter than `+` and `-`. A minus before a number literal is one negative
@@ -321,9 +331,8 @@ condition holds and there is no `ELSE`. `NULLIF(a, b)` has `a`'s type for any
 pair `=` admits, except where Postgres casts `a` to compare (an integer with
 a `numeric`, an exact numeric with a float), which is refused. In an aggregate
 argument, `COUNT(CASE WHEN c THEN 1 END)` and an integer `SUM(CASE WHEN c THEN
-qty ELSE 0 END)` are admitted; `SUM` or `AVG` of a `CASE` over `numeric(p,s)`
-is not, because the `CASE` has no declared scale
-([transforms](transforms.md#supported-sources-and-targets)).
+qty ELSE 0 END)` are admitted, and so are `SUM` and `AVG` of a `CASE` over a
+`numeric`, which show the scale Postgres shows ([above](#numeric-and-floating-point)).
 
 `TRUE` and `FALSE` are `boolean`. A `NULL` has no type of its own and takes
 the one Postgres gives it from its context, so the target column has the type
@@ -363,8 +372,8 @@ operand types (the conformance harness checks each against a live server,
 | `tz AT TIME ZONE 'UTC'` | a `timestamptz`; the literal `'UTC'` only | `timestamp` |
 | `CAST(d AS timestamp)` | a `date` or a `timestamp` | `timestamp`; a `timestamp` keeps its fractional digits |
 
-`EXTRACT` is an unconstrained `numeric`, so `SUM` or `AVG` of one is refused for
-its undeclared scale; a bucket for an aggregate is a 1-1 field
+`EXTRACT` is an unconstrained `numeric`, which `SUM`, `AVG` and `COUNT` take; a
+bucket for an aggregate is a 1-1 field
 (`DATE_TRUNC('month', ts) AS bucket`, `EXTRACT(year FROM d) AS yr`) that an
 aggregate over its target groups by (`timestamp` and `numeric` are `GROUP BY`
 key types). `infinity` and `-infinity` follow Postgres. `d + n` past
@@ -547,7 +556,7 @@ divergence
 ## Aggregates that are not supported
 
 An aggregate or `JOIN` transform admits `COUNT(*)`, `COUNT(col)`, and `SUM` or `AVG`
-over `smallint`, `integer`, `bigint` and `numeric(p,s)`; a plain aggregate also
+over `smallint`, `integer`, `bigint` and `numeric`; a plain aggregate also
 admits `MIN` and `MAX` ([above](#min-and-max)). Every other aggregate is
 refused at define, by name, with the issue that tracks it: see
 [transforms — Supported sources and targets](transforms.md#supported-sources-and-targets).

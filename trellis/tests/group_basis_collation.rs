@@ -135,6 +135,10 @@ const COLUMNS: &[(&str, ValueType)] = &[
     ("k", ValueType::Integer(IntWidth::Int4)),
     ("kt", ValueType::Text),
     ("v", ValueType::Integer(IntWidth::Int4)),
+    // The dropped-leaf case's `a.x`: a column missing here would be planned
+    // as `numeric` (what `infer_expr_type` assumes of an unknown column),
+    // which define, reading the catalog, never gives it.
+    ("x", ValueType::Integer(IntWidth::Int4)),
     ("y", ValueType::Integer(IntWidth::Int4)),
     ("h", ValueType::Text),
 ];

@@ -3065,8 +3065,18 @@ pub(super) async fn compute_page(
                 let target_plan = match group_targets.entry(def.def.target.clone()) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::btree_map::Entry::Vacant(entry) => {
+                        let mut shape = shape;
                         let identity = {
                             let client = pool.get().await?;
+                            shape
+                                .read_scales(
+                                    &**client,
+                                    &super::group_basis::hidden_table_qualified(
+                                        pool.schema(),
+                                        def.id,
+                                    ),
+                                )
+                                .await?;
                             ddl::identity_key_columns(&**client, &def.target_table).await?
                         };
                         entry.insert(super::group_basis::GroupTargetPlan::new(

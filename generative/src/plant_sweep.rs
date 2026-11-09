@@ -159,7 +159,9 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::StarRecheckJ
         | Plant::StarRecheckSkipLast
         | Plant::StarChunkNoR
-        | Plant::StarTruncateKeepsOtherMarkers => PlantPath::OneToOneJoin,
+        | Plant::StarTruncateKeepsOtherMarkers
+        | Plant::StarChunkSkipJLast
+        | Plant::StarChunkSkipJFirst => PlantPath::OneToOneJoin,
         Plant::SeamTokenEarly | Plant::SeamImagelessRow => PlantPath::Chain,
         Plant::GbxProbeNoXbasis
         | Plant::GbxSharedBasis

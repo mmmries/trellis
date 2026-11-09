@@ -86,6 +86,19 @@ Postgres can't change a primary key's deferrability in place), then `RESUME`;
 or `DROP TRANSFORM` and define it again with a `KEY (…)` over a unique index
 that isn't deferrable.
 
+A `SUM` or `AVG` an earlier release kept over a `numeric(p,s)` column held its
+sum alone. This release keeps, per group, the sum of the finite values and a
+map counting every value that isn't finite at the column's declared scale:
+values at other scales, `NaN`, `Infinity` and `-Infinity`
+([type support](type-support.md#numeric-and-floating-point)). At the takeover
+each such definition's hidden tables gain the map in place, empty in every
+row: every value of the column has scale `s`. The definition then carries
+the new layout's floor (0.2.0), so a release before it refuses to run it
+([Rolling back](#rolling-back)). Those releases left a group's sum at `NaN` for
+good once a `NaN` had been summed into it, even after the `NaN` left. A
+definition with a group stored that way is rebuilt from its source at the
+takeover, and its `status()` reads `rebuilding` until the rebuild is done.
+
 For an embedded fleet, [Rolling deploys](embedding.md#rolling-deploys) covers
 the handover in detail, and
 [Migrations and transactions](embedding.md#migrations-and-transactions) the
