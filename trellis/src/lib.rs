@@ -141,10 +141,6 @@ pub mod metrics;
 mod migrate;
 #[cfg(feature = "internals")]
 pub mod migrate;
-#[cfg(not(feature = "internals"))]
-mod numeric;
-#[cfg(feature = "internals")]
-pub mod numeric;
 #[cfg(feature = "otlp")]
 pub mod otel;
 #[cfg(not(feature = "internals"))]

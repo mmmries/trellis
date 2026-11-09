@@ -868,11 +868,13 @@ async fn coalesce_over_a_real_computes_what_postgres_computes() {
     );
 }
 
-/// A `COALESCE` fallback literal outside the range of the float it is cast to
-/// is refused at define, because Postgres would raise `22003` for it at plan
-/// time for every row. An in-range literal and a column fallback define.
+/// A `COALESCE` fallback literal outside the range of the float it is cast
+/// to, and a constant sum Postgres can't compute, define: define evaluates no
+/// constant. Postgres raises `22003` for them while planning, for every row,
+/// so their rows are quarantined at run time
+/// (`tests/plan_time_constant_quarantine.rs`).
 #[tokio::test]
-async fn a_coalesce_literal_out_of_reals_range_is_refused_at_define() {
+async fn a_constant_postgres_fails_while_planning_defines() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
@@ -886,39 +888,22 @@ async fn a_coalesce_literal_out_of_reals_range_is_refused_at_define() {
         ("n".to_string(), ValueType::Numeric),
     ]);
     let beyond_real = format!("1{}", "0".repeat(39));
-    let refused = create_definition(
-        &db.pool,
-        &format!("TRANSFORM wide_out FROM public.wide SELECT COALESCE(r, {beyond_real}) AS v"),
-        &columns,
-    )
-    .await
-    .expect_err("an out-of-range fallback literal is refused");
-    let message = refused.to_string();
-    assert!(
-        message.contains("out of range for real") && message.contains(&beyond_real),
-        "{message}"
-    );
-    // A constant sum Postgres cannot compute fails for every row, so define
-    // refuses it too.
-    let overflow = create_definition(
-        &db.pool,
-        "TRANSFORM sum_out FROM public.wide SELECT 2147483647 + 1 AS v",
-        &columns,
-    )
-    .await
-    .expect_err("an overflowing constant sum is refused");
-    assert!(
-        overflow.to_string().contains("out of range for integer"),
-        "{overflow}"
-    );
-    for (i, fallback) in ["3", "n"].into_iter().enumerate() {
+    for (i, expr) in [
+        format!("COALESCE(r, {beyond_real})"),
+        "2147483647 + 1".to_string(),
+        "COALESCE(r, 3)".to_string(),
+        "COALESCE(r, n)".to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         create_definition(
             &db.pool,
-            &format!("TRANSFORM ok{i}_out FROM public.wide SELECT COALESCE(r, {fallback}) AS v"),
+            &format!("TRANSFORM out{i} FROM public.wide SELECT {expr} AS v"),
             &columns,
         )
         .await
-        .expect("an in-range literal and a column fallback define");
+        .unwrap_or_else(|e| panic!("`{expr}` defines: {e}"));
     }
 }
 

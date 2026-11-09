@@ -37,7 +37,6 @@ pub mod catalog;
 pub mod chunk_queue;
 pub(crate) mod copies;
 pub(crate) mod copy_type;
-mod date_const;
 pub mod ddl;
 pub mod error;
 pub mod floor;
@@ -135,8 +134,6 @@ mod arithmetic_tests;
 mod date_tests;
 #[cfg(test)]
 mod floor_manifest;
-#[cfg(test)]
-mod fold_verdict_tests;
 #[cfg(test)]
 mod identifier_tests;
 #[cfg(test)]

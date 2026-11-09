@@ -3,9 +3,7 @@
 //!
 //! [`FloatWidth`] is the width payload of `ValueType::Float`. Postgres types
 //! `float4 + float4` as `real` and `avg(real)` as `double precision`, so a
-//! derived target column is declared with the type Postgres infers, and the
-//! width is the overflow boundary the define-time constant folding checks
-//! ([`checked_add`], [`literal_to_width`]).
+//! derived target column is declared with the type Postgres infers.
 //!
 //! Postgres's float order is not IEEE's (`NaN = NaN` is true and `NaN` sorts
 //! above `Infinity`), and `-0` and `0` are equal but render as different
@@ -139,90 +137,6 @@ impl fmt::Display for FloatWidth {
     }
 }
 
-/// `a + b` for binary floats, with Postgres's `float4pl`/`float8pl`/
-/// `float48pl`/`float84pl` semantics: the result type is the *wider
-/// operand's* type, the sum is computed in `double` and rounded onto that
-/// width, and a sum that overflows to infinity from two finite operands
-/// raises `22003` rather than returning `Infinity`.
-///
-/// That last clause is Postgres's `CHECKFLOATVAL(result, isinf(arg1) ||
-/// isinf(arg2), true)`: an infinite result is an error only when neither
-/// operand was already infinite (`select 'Infinity'::float4 + 1e38::float4`
-/// is `Infinity`, `select 3.4e38::float4 + 3.4e38::float4` raises). `NaN`
-/// propagates silently — it is a value, not an error.
-pub fn checked_add(
-    a: f64,
-    a_width: FloatWidth,
-    b: f64,
-    b_width: FloatWidth,
-) -> Result<(f64, FloatWidth), FloatError> {
-    let width = a_width.wider(b_width);
-    let sum = width.round(a + b);
-    if sum.is_infinite() && a.is_finite() && b.is_finite() {
-        return Err(FloatError::OutOfRange { width });
-    }
-    Ok((sum, width))
-}
-
-/// `a - b`, with the same overflow rule as [`checked_add`].
-pub fn checked_sub(
-    a: f64,
-    a_width: FloatWidth,
-    b: f64,
-    b_width: FloatWidth,
-) -> Result<(f64, FloatWidth), FloatError> {
-    let width = a_width.wider(b_width);
-    let difference = width.round(a - b);
-    if difference.is_infinite() && a.is_finite() && b.is_finite() {
-        return Err(FloatError::OutOfRange { width });
-    }
-    Ok((difference, width))
-}
-
-/// `a * b` with Postgres's `float4mul`/`float8mul` semantics: an infinite
-/// result from two finite operands is an overflow, and a zero result from two
-/// nonzero operands is an underflow; both raise `22003`.
-pub fn checked_mul(
-    a: f64,
-    a_width: FloatWidth,
-    b: f64,
-    b_width: FloatWidth,
-) -> Result<(f64, FloatWidth), FloatError> {
-    let width = a_width.wider(b_width);
-    let product = width.round(a * b);
-    if (product.is_infinite() && a.is_finite() && b.is_finite())
-        || (product == 0.0 && a != 0.0 && b != 0.0)
-    {
-        return Err(FloatError::OutOfRange { width });
-    }
-    Ok((product, width))
-}
-
-/// `a / b` with Postgres's `float4div`/`float8div` semantics: a zero divisor
-/// raises `22012` unless the dividend is `NaN`; an infinite result from two
-/// finite operands is an overflow; a zero result from a nonzero dividend and a
-/// finite divisor is an underflow (`1 / Infinity` is a plain `0`). Every
-/// failure is reported as [`FloatError::OutOfRange`], the caller having
-/// refused a zero divisor already.
-pub fn checked_div(
-    a: f64,
-    a_width: FloatWidth,
-    b: f64,
-    b_width: FloatWidth,
-) -> Result<(f64, FloatWidth), FloatError> {
-    let width = a_width.wider(b_width);
-    if b == 0.0 && !a.is_nan() {
-        return Err(FloatError::OutOfRange { width });
-    }
-    let quotient = width.round(a / b);
-    if (quotient.is_infinite() && a.is_finite() && b.is_finite())
-        || (quotient == 0.0 && a != 0.0 && b.is_finite())
-    {
-        return Err(FloatError::OutOfRange { width });
-    }
-    Ok((quotient, width))
-}
-
 /// Parses Postgres's canonical text rendering of a float, rejecting anything
 /// [`render`] would not itself have produced for that width.
 ///
@@ -271,48 +185,6 @@ pub fn parse(text: &str, width: FloatWidth) -> Result<f64, FloatError> {
         return Err(invalid());
     }
     Ok(value)
-}
-
-/// A bare number literal (`0.5`, `3000000000`: digits with an optional
-/// fraction, no sign or exponent) as the `double precision` constant
-/// Postgres casts it to when it meets a float operand: correctly rounded,
-/// and an error where `float8in` errors (overflow past the finite range, or
-/// a nonzero value that underflows to zero; subnormals are accepted).
-pub fn literal_to_f64(text: &str) -> Result<f64, FloatError> {
-    let width = FloatWidth::Float8;
-    let value: f64 = text.parse().map_err(|_| FloatError::Invalid {
-        width,
-        text: text.to_string(),
-    })?;
-    let nonzero_digits = text.bytes().any(|b| (b'1'..=b'9').contains(&b));
-    if !value.is_finite() || (value == 0.0 && nonzero_digits) {
-        return Err(FloatError::OutOfRange { width });
-    }
-    Ok(value)
-}
-
-/// [`literal_to_f64`] narrowed to `width`: the constant Postgres casts a bare
-/// number literal to when the other `COALESCE` argument is that float type.
-/// For `real` it errors where `float4in` does: a value past `real`'s finite
-/// range, or a nonzero one that underflows to zero. The text is rounded to
-/// `real` once, as `float4in`'s `strtof` rounds it: rounding to `double
-/// precision` first would round twice, and a literal just inside `real`'s
-/// limits could land on a halfway point and round out of range.
-pub fn literal_to_width(text: &str, width: FloatWidth) -> Result<f64, FloatError> {
-    match width {
-        FloatWidth::Float8 => literal_to_f64(text),
-        FloatWidth::Float4 => {
-            let value: f32 = text.parse().map_err(|_| FloatError::Invalid {
-                width,
-                text: text.to_string(),
-            })?;
-            let nonzero_digits = text.bytes().any(|b| (b'1'..=b'9').contains(&b));
-            if !value.is_finite() || (value == 0.0 && nonzero_digits) {
-                return Err(FloatError::OutOfRange { width });
-            }
-            Ok(f64::from(value))
-        }
-    }
 }
 
 /// Renders a float exactly as Postgres's `float4out`/`float8out` do under
@@ -401,34 +273,6 @@ pub fn render(value: f64, width: FloatWidth) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Each case's verdict is what Postgres 17 gives for
-    /// `COALESCE(real_col, <literal>)`. The first and last two lie within a
-    /// `double precision` step of a halfway point at `real`'s limits, where
-    /// rounding through `double precision` would round them out of range.
-    #[test]
-    fn a_literal_narrows_to_real_as_float4in_rounds_it() {
-        let half_ulp_of_the_smallest_subnormal = format!(
-            "0.{}70064923216240853546186479164495806564013097093825788587853414194489554134293031",
-            "0".repeat(45)
-        );
-        for (text, in_range) in [
-            ("340282356779733661637539395458142568447", true),
-            ("340282346638528859811704183484516925440", true),
-            ("340282356779733661637539395458142568448", false),
-            ("1000000000000000000000000000000000000000", false),
-            (half_ulp_of_the_smallest_subnormal.as_str(), true),
-            ("0.0000000000000000000000000000000000000000000007006", false),
-            ("0.000000000000000000000000000000000000000000001", true),
-            ("0.0", true),
-        ] {
-            assert_eq!(
-                literal_to_width(text, FloatWidth::Float4).is_ok(),
-                in_range,
-                "{text}"
-            );
-        }
-    }
 
     #[test]
     fn pg_names_round_trip() {
@@ -560,32 +404,6 @@ mod tests {
     }
 
     #[test]
-    fn addition_overflows_where_postgres_does() {
-        use FloatWidth::{Float4, Float8};
-        // `select 3.4e38::float4 + 3.4e38::float4` -> 22003.
-        assert_eq!(
-            checked_add(3.4e38, Float4, 3.4e38, Float4),
-            Err(FloatError::OutOfRange { width: Float4 })
-        );
-        // ...but widening one operand makes it `float48pl`, which is fine.
-        let (sum, width) = checked_add(3.4e38, Float4, 3.4e38, Float8).unwrap();
-        assert_eq!(width, Float8);
-        assert!((sum - 6.8e38).abs() < 1e32);
-        assert_eq!(
-            checked_add(1e308, Float8, 1e308, Float8),
-            Err(FloatError::OutOfRange { width: Float8 })
-        );
-        // An already-infinite operand is not an overflow.
-        assert_eq!(
-            checked_add(f64::INFINITY, Float4, 1e38, Float4),
-            Ok((f64::INFINITY, Float4))
-        );
-        // NaN propagates as a value, never as an error.
-        let (sum, _) = checked_add(f64::NAN, Float8, 1.0, Float8).unwrap();
-        assert!(sum.is_nan());
-    }
-
-    #[test]
     fn out_of_range_message_is_postgres_wording() {
         assert_eq!(
             FloatError::OutOfRange {
@@ -602,15 +420,5 @@ mod tests {
             .to_string(),
             "invalid input syntax for type double precision: \"abc\""
         );
-    }
-
-    #[test]
-    fn float4_addition_rounds_onto_float4s_grid() {
-        // `select 16777216::float4 + 1::float4` is 16777216 in Postgres —
-        // the sum is not representable as a float4 and rounds back down.
-        let (sum, width) = checked_add(16_777_216.0, FloatWidth::Float4, 1.0, FloatWidth::Float4)
-            .expect("no overflow");
-        assert_eq!(width, FloatWidth::Float4);
-        assert_eq!(sum, 16_777_216.0);
     }
 }
