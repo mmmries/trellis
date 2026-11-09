@@ -241,6 +241,8 @@ stop_writers() {
 }
 
 held_key() { [ "$(scalar "$1" "$2" "select count(*) from trellis.poison")" -ge 1 ]; } # port db
+# A key held on one target: the wait for a specific held key must not be satisfied by another's.
+held_key_of() { [ "$(scalar "$1" "$2" "select count(*) from trellis.poison p join trellis.transform_definitions d on d.id = p.transform_id where d.target_table = 'public.$3'")" -ge 1 ]; } # port db target
 builds_in_flight() { [ "$(scalar "$1" "$2" "select count(*) from trellis.transform_definitions where status = 'backfilling'")" -ge "$3" ]; }
 paused_columns() { scalar "$1" "$2" "select count(*) from trellis.column_status where transform_table ~ '(^|[.])orders_wide$' and column_name = 'plus3'"; }
 
@@ -426,7 +428,7 @@ for d in shapes inflight ctl mixed clients keys consts; do sql "$port" postgres 
 
 # ---------------------------------------------------------------- prep: shapes
 say "building the $old_tag databases"
-shapes_expected_live="orders_copy chain1 orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join ledger_ovf"
+shapes_expected_live="orders_copy chain1 orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join ledger_ovf nan_totals nan_join"
 shapes_grammar_paused="ledger_copy deep deep2"
 shapes_paused="$shapes_grammar_paused ord_paused"
 # Step 8: definitions only the candidate can run. Each uses a feature,
@@ -454,6 +456,7 @@ create table customers(id bigint primary key, name text not null, region text);
 create table orders(id bigint primary key, customer_id bigint not null, amount numeric(12,2) not null, note text);
 create index on orders(customer_id);
 create table ledger(id bigint primary key, "order" bigint not null, n bigint not null);
+create table nan_orders(id bigint primary key, customer_id bigint not null, amount numeric(12,2) not null, note text);
 create table events(id bigint not null, tenant bigint not null, v bigint not null, primary key (id, tenant)) partition by hash (tenant);
 create table events_0 partition of events for values with (modulus 4, remainder 0);
 create table events_1 partition of events for values with (modulus 4, remainder 1);
@@ -464,10 +467,11 @@ insert into customers select g, 'c'||g, case when g % 3 = 0 then null else 'r'||
 insert into orders select g, 1 + g % 50, g, 'n' from generate_series(1,2000) g;
 insert into ledger select g, g, g % 7 from generate_series(1,100) g;
 insert into events select g, g % 20, 1 from generate_series(1,1000) g;
+insert into nan_orders values (3000, 7, 10.00, 'n'), (3003, 8, 20.00, 'n');
 EOF
 )
 sql "$port" shapes <<<"$shapes_schema"
-seed_rows=$((50 + 2000 + 100 + 1000))
+seed_rows=$((50 + 2000 + 100 + 1000 + 2))
 
 deep_chain="n"; for _ in $(seq 1 130); do deep_chain="$deep_chain + 1"; done
 deep_nested="n"; for _ in $(seq 1 130); do deep_nested="($deep_nested) + 1"; done
@@ -481,6 +485,8 @@ apply_old shapes 'TRANSFORM orders_copy FROM orders SELECT amount AS amount, amo
 apply_old shapes 'TRANSFORM cust_totals FROM orders GROUP BY customer_id SELECT customer_id AS customer_id, COUNT(*) AS n, SUM(amount) AS total'
 apply_old shapes 'TRANSFORM cust_join FROM orders JOIN customers ON orders.customer_id = customers.id GROUP BY customers.region SELECT customers.region AS region, COUNT(*) AS n, SUM(orders.amount) AS total'
 apply_old shapes 'TRANSFORM cust_join_left FROM orders LEFT JOIN customers ON orders.customer_id = customers.id GROUP BY customers.region SELECT customers.region AS region, COUNT(*) AS n'
+apply_old shapes 'TRANSFORM nan_totals FROM nan_orders GROUP BY customer_id SELECT customer_id AS customer_id, COUNT(*) AS n, SUM(amount) AS total'
+apply_old shapes 'TRANSFORM nan_join FROM nan_orders JOIN customers ON nan_orders.customer_id = customers.id GROUP BY customers.region SELECT customers.region AS region, COUNT(*) AS n, SUM(nan_orders.amount) AS total'
 apply_old shapes 'TRANSFORM tenant_totals FROM events GROUP BY tenant SELECT tenant AS tenant, COUNT(*) AS n, SUM(v) AS s'
 apply_old shapes 'TRANSFORM tenant_join FROM events JOIN customers ON events.tenant = customers.id GROUP BY events.tenant SELECT events.tenant AS tenant, COUNT(*) AS n'
 apply_old shapes 'TRANSFORM orders_wide FROM orders SELECT amount AS amount, amount + 2 AS plus2, amount + 3 AS plus3'
@@ -491,7 +497,7 @@ apply_old shapes "TRANSFORM deep FROM ledger SELECT $deep_chain AS d"
 apply_old shapes "TRANSFORM deep2 FROM ledger SELECT $deep_nested AS d"
 
 run_bg old-shapes "$port" shapes "$old_bin"
-WAIT=240 wait_all "$port" shapes "$old_bin" live orders_copy orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join ledger_ovf ord_paused ||
+WAIT=240 wait_all "$port" shapes "$old_bin" live orders_copy orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join ledger_ovf ord_paused nan_totals nan_join ||
   die "the $old_tag definitions did not go live (see $logs/run-old-shapes.log)"
 # A chained target needs its upstream live; a column pause and a whole-transform pause.
 apply_old shapes 'TRANSFORM chain1 FROM orders_copy SELECT plus AS plus_again'
@@ -502,14 +508,18 @@ pre_col_paused=$(paused_columns "$port" shapes)
 [ "$pre_col_paused" = 1 ] || die "the column pause was not recorded"
 
 start_writers "$port" shapes
-# NaN in a numeric(p,s) SUM (cust_totals, cust_join): one stays in customer
-# 7's group, one comes and goes in customer 8's. v0.1.0 leaves a sum NaN for
-# good, v0.1.1 adds a weight per NaN; the candidate's takeover rebuilds both.
-sql "$port" shapes -c "insert into orders values (3001, 7, 'NaN', 'nan'), (3002, 8, 'NaN', 'nan')"
+# NaN in a numeric(p,s) SUM (nan_totals, nan_join): one stays in customer 7's
+# group, one comes and goes in customer 8's. v0.1.0 leaves a sum NaN for good,
+# v0.1.1 adds a weight per NaN; the candidate's takeover rebuilds both. The rows
+# are in a table of their own: a 1-1 shape (orders_copy, orders_wide) that read
+# them would hold their keys, as 0.1.x cannot parse 'NaN' in a Rust-evaluated
+# calculated field, and a held key stays held across the takeover.
+sql "$port" shapes -c "insert into nan_orders values (3001, 7, 'NaN', 'nan'), (3002, 8, 'NaN', 'nan')"
 sleep 4
-sql "$port" shapes -c "delete from orders where id = 3002"
+sql "$port" shapes -c "delete from nan_orders where id = 3002"
 sql "$port" shapes -c "update ledger set n = 1000 where id = 5"
-wait_for 60 "the held key" held_key "$port" shapes || die "the overflowing key was not quarantined"
+wait_for 60 "ledger_ovf's held key" held_key_of "$port" shapes ledger_ovf || die "the overflowing key was not quarantined"
+[ "$(scalar "$port" shapes "select count(*) from trellis.poison")" = 1 ] || die "expected exactly ledger_ovf's key held, got: $(scalar "$port" shapes "select string_agg(d.target_table || ':' || p.key, ' ') from trellis.poison p join trellis.transform_definitions d on d.id = p.transform_id")"
 
 # Undrained ring segments: stop the draining instance, keep the staging one, keep writing.
 stop_run old-shapes
@@ -769,10 +779,11 @@ if want definitions; then
   # An oracle that does not use self_check: recompute two targets from the sources.
   diff_rows=$(scalar "$port" shapes "select count(*) from ((select customer_id, count(*)::bigint, sum(amount) from orders group by 1 except select customer_id, n, total from cust_totals) union all (select customer_id, n, total from cust_totals except select customer_id, count(*)::bigint, sum(amount) from orders group by 1)) d")
   diff_copy=$(scalar "$port" shapes "select count(*) from ((select id, amount, amount + 1 from orders except select id, amount, plus from orders_copy) union all (select id, amount, plus from orders_copy except select id, amount, amount + 1 from orders)) d")
-  [ "$diff_rows" = 0 ] && [ "$diff_copy" = 0 ] &&
-    record PASS definitions "independent recompute: cust_totals and orders_copy equal their sources" ||
-    record FAIL definitions "independent recompute differs: cust_totals $diff_rows rows, orders_copy $diff_copy rows"
-  check_self "$port" shapes definitions orders_copy chain1 orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join
+  diff_nan=$(scalar "$port" shapes "select count(*) from ((select customer_id, count(*)::bigint, sum(amount) from nan_orders group by 1 except select customer_id, n, total from nan_totals) union all (select customer_id, n, total from nan_totals except select customer_id, count(*)::bigint, sum(amount) from nan_orders group by 1)) d")
+  [ "$diff_rows" = 0 ] && [ "$diff_copy" = 0 ] && [ "$diff_nan" = 0 ] &&
+    record PASS definitions "independent recompute: cust_totals, orders_copy and nan_totals (a NaN in two groups) equal their sources" ||
+    record FAIL definitions "independent recompute differs: cust_totals $diff_rows rows, orders_copy $diff_copy rows, nan_totals $diff_nan rows"
+  check_self "$port" shapes definitions orders_copy chain1 orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join nan_totals nan_join
   held_out=$(probe "${probe_new:-/nonexistent}" "$port" shapes self-check ledger_ovf 2>&1 || true)
   grep -q 'held_keys=1' <<<"$held_out" &&
     record PASS definitions "ledger_ovf's self_check reports its held key ($(head -c 110 <<<"$held_out"))" ||
@@ -1012,7 +1023,7 @@ if want basebackup; then
     p5=$(status_lines "$port_b" shapes "$candidate_bin" | grep -E '=paused$' | sed 's/=.*//' | sort | tr '\n' ' ')
     [ "$p5" = "deep deep2 ledger_copy ord_paused " ] &&
       record PASS basebackup "paused: only the expected set ($p5)" || record FAIL basebackup "paused on the restored cluster: [$p5]"
-    check_self "$port_b" shapes basebackup orders_copy chain1 orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join
+    check_self "$port_b" shapes basebackup orders_copy chain1 orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join nan_totals nan_join
     stop_run new-backup
   else
     record FAIL basebackup "the base backup did not start as a cluster (see $logs/pg-$port_b.log)"
