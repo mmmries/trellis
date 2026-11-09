@@ -256,7 +256,8 @@ fn tuning(args: &[String], default: EngineTuning) -> EngineTuning {
 /// `--hot-keys` (10), `--load-chunk` (100,000), `--seed`, `--timeout-secs`,
 /// and the build-from-seed mode (see [`join::build`]): `--load direct|capture`
 /// (`direct`), `--loaders` (8), `--build-timeout-secs` (3,600),
-/// `--build-only` and `--rebuild` (switches).
+/// `--build-only`, `--rebuild` and `--numeric` (switches; `--numeric` makes
+/// `x` and `y` `numeric(20, 2)`).
 fn join_config(args: &[String]) -> join::JoinBench {
     let default = join::JoinBench::default();
     let count = |name: &str, default: usize| number(args, name).map_or(default, |v| v as usize);
@@ -283,6 +284,7 @@ fn join_config(args: &[String]) -> join::JoinBench {
         build_timeout: secs(args, "--build-timeout-secs").unwrap_or(default.build_timeout),
         build_only: args.iter().any(|a| a == "--build-only"),
         rebuild: args.iter().any(|a| a == "--rebuild"),
+        numeric: args.iter().any(|a| a == "--numeric"),
     }
 }
 

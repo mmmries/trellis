@@ -397,10 +397,11 @@ async fn alter_transform_adds_comparison_and_logic_fields() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// `SUM(CASE WHEN c THEN amount END)` over `numeric(10,2)` is refused for its
-/// undeclared scale, and says why; the integer forms define.
+/// `SUM(CASE WHEN c THEN amount END)` over `numeric(10,2)` has no declared
+/// scale (Postgres drops the modifier, and `ELSE 0` mixes scales), and
+/// defines as the integer forms do (#1120).
 #[tokio::test]
-async fn a_case_over_a_scaled_numeric_is_refused_in_a_sum_with_the_reason() {
+async fn a_case_over_a_scaled_numeric_defines_in_a_sum() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -416,27 +417,13 @@ async fn a_case_over_a_scaled_numeric_is_refused_in_a_sum_with_the_reason() {
     )
     .await
     .expect("connect");
-    for formula in [
-        "SUM(CASE WHEN ok THEN amount END)",
-        "SUM(CASE WHEN ok THEN amount ELSE 0 END)",
-        "AVG(CASE WHEN ok THEN amount END)",
-    ] {
-        let err = definer
-            .apply(&format!(
-                "TRANSFORM bad FROM o GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, {formula} AS v"
-            ))
-            .await
-            .expect_err(formula)
-            .to_string();
-        assert!(
-            err.contains("no declared scale") && err.contains("mix scales"),
-            "{formula}: {err}"
-        );
-    }
     for (n, formula) in [
         "COUNT(CASE WHEN ok THEN 1 END)",
         "SUM(CASE WHEN ok THEN qty ELSE 0 END)",
         "COUNT(CASE WHEN ok THEN amount END)",
+        "SUM(CASE WHEN ok THEN amount END)",
+        "SUM(CASE WHEN ok THEN amount ELSE 0 END)",
+        "AVG(CASE WHEN ok THEN amount END)",
     ]
     .iter()
     .enumerate()

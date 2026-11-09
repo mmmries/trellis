@@ -703,6 +703,26 @@ fn group_shape(def: &Definition) -> Option<super::group_basis::GroupShape> {
     super::group_basis::route(&def.def, &def.source_columns)
 }
 
+/// [`group_shape`] with each `numeric` sum's reference scale, as the hidden
+/// table records it (`super::group_basis::stored_scales`): the audit reads
+/// the stored maps by it.
+async fn read_group_shape(
+    pool: &Pool,
+    def: &Definition,
+) -> Result<Option<super::group_basis::GroupShape>, SelfCheckError> {
+    let Some(mut shape) = group_shape(def) else {
+        return Ok(None);
+    };
+    let client = pool.get().await?;
+    shape
+        .read_scales(
+            &**client,
+            &super::group_basis::hidden_table_qualified(pool.schema(), def.id),
+        )
+        .await?;
+    Ok(Some(shape))
+}
+
 /// Whether `def` is a `JOIN` that applies ([`super::join::applies`]): audited by [`super::self_check_joins`].
 fn joined(def: &Definition) -> bool {
     super::join::applies(&def.def)
@@ -845,7 +865,7 @@ pub(crate) async fn audit(
     // An aggregate on the group basis or a `JOIN` is keyed by its `GROUP BY`
     // columns (its target's identity), and compared by
     // `super::self_check_groups` or `super::self_check_joins`.
-    let group = group_shape(def);
+    let group = read_group_shape(pool, def).await?;
     let pk = if group.is_some() || joined(def) {
         let client = pool.get().await?;
         ddl::identity_key_columns(&**client, &def.target_table).await?
@@ -969,7 +989,7 @@ pub async fn compare_page(
     scope: SelfCheckScope,
 ) -> Result<ComparedPage, SelfCheckError> {
     let def = comparable_definition(pool, target_table).await?;
-    let group = group_shape(&def);
+    let group = read_group_shape(pool, &def).await?;
     let pk = if group.is_some() || joined(&def) {
         let client = pool.get().await?;
         ddl::identity_key_columns(&**client, &def.target_table).await?
@@ -1378,7 +1398,7 @@ async fn explain_page_with(
     let def = catalog::definition_by_target(pool, target_table)
         .await?
         .ok_or_else(|| SelfCheckError::TargetNotFound(target_table.to_string()))?;
-    if let Some(shape) = group_shape(&def) {
+    if let Some(shape) = read_group_shape(pool, &def).await? {
         let identity = {
             let client = pool.get().await?;
             ddl::identity_key_columns(&**client, &def.target_table).await?

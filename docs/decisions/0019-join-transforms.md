@@ -103,7 +103,7 @@ its output is one row per row of `a`, which
 
 A JOIN transform admits exactly the aggregates a plain aggregate keeps from
 partials alone under ADR-0002's group basis: `COUNT(*)`, `COUNT(col)`, and `SUM(col)` and `AVG(col)`
-where `col` is `int2`, `int4`, `int8` or `numeric(p,s)` with a declared scale.
+where `col` is `int2`, `int4`, `int8` or `numeric`, with or without a declared scale.
 An argument may be a column or an expression over one side's columns, as long
 as its result type is admitted: it becomes a partial on that side, kept by
 `f(new) − f(old)` per change exactly like a column. An argument that mixes both
@@ -123,15 +123,19 @@ deltas, is the route for a JOIN's `MIN`/`MAX`, and would give
 `COUNT(DISTINCT)` with it.
 
 Each admitted aggregate is a function of a few per-group partials (the row
-count, a non-null count, a `numeric` sum) that signed deltas keep exact, so
-maintaining one never reads a source table. `numeric` must declare its scale
-because Postgres displays a `numeric` sum at the scale of the most precise value
-in the group: a running sum would keep `1.500` after its most precise row left,
-where Postgres shows `1.5`. A `numeric(p,s)` column stores every value at scale
-`s`, so a running sum and every product below carry exactly the scale Postgres
-shows. A product across the sides (revenue as quantity times a dimension's
-price) decomposes the same way but isn't admitted: the grammar has no `*` or
-`/`, and an argument mixing the sides is refused.
+count, a non-null count, a sum) that signed deltas keep exact, so maintaining
+one never reads a source table. Postgres displays a `numeric` sum at the scale
+of the most precise value in the group, and a special value (`NaN`,
+`±Infinity`) can't be subtracted back out of a running sum, so a `numeric`
+argument's sum is of its finite values, beside a count per display scale and
+counts of `NaN`, `Infinity` and `-Infinity`, kept as one map that leaves out
+the finite values at the column's declared scale
+([ADR-0002](0002-async-data-flow.md#numeric-sums-count-their-scales-and-special-values)).
+Every one of those is a count or a sum, so the product below multiplies it by
+the other side's row count like any other partial, and the target shows the
+scale and value Postgres shows. A product across the sides (revenue as quantity times a dimension's
+price) decomposes the same way but isn't admitted: an argument mixing the sides is
+refused.
 
 ### Each side is aggregated before the join, and the target is their combination
 
@@ -139,8 +143,8 @@ The transform keeps four hidden structures, and its target is the visible face
 of the last:
 
 - **`P(ga, k)`**: `a GROUP BY (a's group columns, join key)`, with `a`'s
-  partials: the row count `n`, and a non-null count and `numeric` sum per
-  aggregated column of `a`.
+  partials: the row count `n`, and a non-null count and a sum per aggregated
+  column of `a` (with a `numeric` column's map of exceptions).
 - **`M(k, gb)`**: the same for `b`, keyed by `(join key, b's group columns)`.
 - **`J(k)`**: one row per join key, the lock for that key, holding
   `matches = Σ M.n` over the key.
@@ -162,8 +166,10 @@ because each `a` row in a cell joins every `b` row in the matching cell:
 | row count | `P.n · M.n` | `P.n` |
 | non-null count of `a.x` | `P.count_x · M.n` | `P.count_x` |
 | sum of `a.x` | `P.sum_x · M.n` | `P.sum_x` |
+| each scale's count, and each special value's, of a `numeric` `a.x` | `P.c_x · M.n` | `P.c_x` |
 | non-null count of `b.y` | `P.n · M.count_y` | 0 |
 | sum of `b.y` | `P.n · M.sum_y` | 0 |
+| each scale's count, and each special value's, of a `numeric` `b.y` | `P.n · M.c_y` | 0 |
 
 For `LEFT`, a `P` cell whose key has `matches = 0`, or whose key is `NULL`, adds
 `P ⊗ U` to the group with a `NULL` `gb`, the row `LEFT JOIN` produces for an

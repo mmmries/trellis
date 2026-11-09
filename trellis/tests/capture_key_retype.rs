@@ -2417,10 +2417,54 @@ async fn a_definition_paused_before_the_upstream_resume_records_no_cause() {
 /// #828: a definition the upstream's re-type pauses that also fails its own
 /// re-validation keeps its own error, with no cause: here the re-type moves
 /// the column a `SUM` reads (`next`, `qty + 1` over a `qty` now
-/// `numeric(10,2)`) to an unconstrained `numeric`, which define refuses
-/// under a `SUM`, so a resume refuses until the column is changed back.
+/// `double precision`) to `double precision`, which define refuses under a
+/// `SUM`, so a resume refuses until the column is changed back.
 #[tokio::test]
 async fn a_definition_the_re_type_leaves_refused_keeps_its_own_error() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    trellis
+        .apply(
+            "TRANSFORM name_totals FROM public.item_names GROUP BY name \
+             WITHOUT SOURCE INDEX SELECT name AS name, SUM(next) AS total",
+        )
+        .await
+        .expect("define name_totals");
+    bring_live(&mut raw, &db.pool, &["item_names", "name_totals"]).await;
+
+    raw.batch_execute("alter table public.items alter column qty type double precision")
+        .await
+        .expect("move qty to double precision");
+    capture_pass(&mut raw, &db.pool).await;
+    resume(&trellis, "item_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, "public.item_names", "next").await,
+        "double precision"
+    );
+
+    let error = paused_for(&trellis, "name_totals", "public.item_names", &["next"]).await;
+    assert!(
+        !error.contains("the resume of")
+            && error.contains("SUM is not supported: float and interval SUM/AVG")
+            && error.contains("refuses until that is fixed"),
+        "{error}"
+    );
+    assert_eq!(caused_by(&raw, "name_totals").await, None);
+    // A resume waits for item_names to be live, then refuses.
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    resume_refused(&trellis, "name_totals").await;
+}
+
+/// #1120 lifted the refusal of a `SUM` over an unconstrained `numeric`: the
+/// upstream's re-type that moves the column a `SUM` reads (`next`, `qty + 1`
+/// over a `qty` now `numeric(10,2)`) there pauses the reader for the re-type
+/// alone, naming its cause, and it resumes on its own once the upstream is
+/// live, its sum then Postgres's text.
+#[tokio::test]
+async fn a_re_type_to_numeric_under_a_sum_resumes_with_its_upstream() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -2444,18 +2488,43 @@ async fn a_definition_the_re_type_leaves_refused_keeps_its_own_error() {
         column_type(&raw, "public.item_names", "next").await,
         "numeric"
     );
-
     let error = paused_for(&trellis, "name_totals", "public.item_names", &["next"]).await;
     assert!(
-        !error.contains("the resume of")
-            && error.contains("SUM(next)")
-            && error.contains("refuses until that is fixed"),
+        error.starts_with(
+            "the resume of transform item_names re-typed public.item_names.next from integer \
+             to numeric"
+        ) && error.contains("resumes on its own once item_names is live again"),
         "{error}"
     );
-    assert_eq!(caused_by(&raw, "name_totals").await, None);
-    // A resume waits for item_names to be live, then refuses.
-    bring_live(&mut raw, &db.pool, &["item_names"]).await;
-    resume_refused(&trellis, "name_totals").await;
+    assert_eq!(
+        caused_by(&raw, "name_totals").await.as_deref(),
+        Some("item_names")
+    );
+
+    step_until_live(&trellis, &mut raw, &db.pool, "item_names", &["name_totals"]).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, "public.name_totals", "total").await,
+        "numeric"
+    );
+    assert_unpaused(&trellis, "name_totals").await;
+    bring_live(&mut raw, &db.pool, &["name_totals"]).await;
+    raw.batch_execute("update public.items set qty = 1.25 where id = 1")
+        .await
+        .expect("a value at scale 2");
+    bring_live(&mut raw, &db.pool, &["item_names", "name_totals"]).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select name::text, total::text from public.name_totals order by 1"
+        )
+        .await,
+        rows(
+            &raw,
+            "select name::text, sum(qty + 1)::text from public.items group by 1 order by 1"
+        )
+        .await,
+    );
 }
 
 /// #828: [`a_definition_the_re_type_leaves_refused_keeps_its_own_error`]
@@ -2479,7 +2548,7 @@ async fn a_definition_refused_on_the_re_typed_target_keeps_its_own_error() {
 
     raw.batch_execute(
         "alter table public.items alter column id type bigint, \
-                                  alter column qty type numeric(10,2)",
+                                  alter column qty type double precision",
     )
     .await
     .expect("widen the key and qty");
@@ -2491,7 +2560,7 @@ async fn a_definition_refused_on_the_re_typed_target_keeps_its_own_error() {
     let error = paused_for(&trellis, "id_totals", "public.item_names", &["id", "next"]).await;
     assert!(
         !error.contains("the resume of")
-            && error.contains("SUM(next)")
+            && error.contains("SUM is not supported: float and interval SUM/AVG")
             && error.contains("refuses until that is fixed"),
         "{error}"
     );

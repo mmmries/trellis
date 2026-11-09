@@ -529,6 +529,9 @@ pub enum AggregateAdmissionRule {
     SumAvgInteger,
     /// `SUM` or `AVG` of a `numeric` with a declared scale.
     SumAvgScaledNumeric,
+    /// `SUM` or `AVG` of a `numeric` with no declared scale: an
+    /// unconstrained column, a target's column, or an expression.
+    SumAvgNumeric,
     /// `MIN` or `MAX` of a plain source column, in a plain aggregate (not a
     /// `JOIN`), over a type [`extreme_type_admitted`] admits.
     Extreme,
@@ -617,6 +620,7 @@ impl TypeRule {
                 AggregateAdmissionRule::Count
                 | AggregateAdmissionRule::SumAvgInteger
                 | AggregateAdmissionRule::SumAvgScaledNumeric
+                | AggregateAdmissionRule::SumAvgNumeric
                 | AggregateAdmissionRule::Extreme => BASELINE,
             },
             TypeRule::GroupByKey(rule) => match rule {

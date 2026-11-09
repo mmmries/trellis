@@ -145,8 +145,7 @@ async fn recomputed_fields_over_mixed_case_columns_follow_cdc() {
     )
     .await
     .expect("seed the source");
-    // The columns' real types: `SUM(Qty + 1)` over a `numeric` would be an
-    // expression with no declared scale, which the group basis doesn't take.
+    // The columns' real types, as the definition reads them.
     let int = |w| ValueType::Integer(w);
     let columns: HashMap<String, ValueType> = [
         ("id", int(trellis::integer::IntWidth::Int8)),

@@ -51,6 +51,7 @@ pub mod ledger;
 mod lexer;
 pub mod lifecycle;
 pub mod model;
+pub(crate) mod numeric_sums;
 pub mod oracle;
 mod parser;
 pub mod partition_tree;

@@ -15,9 +15,9 @@
 //!   more `numeric` precision at the same scale or none, a wider temporal or
 //!   `interval` precision) keeps every value's text, so it rebuilds nothing,
 //!   but its readers are re-validated like any other retype's: the new type
-//!   can make define refuse one (`date + c` after `integer` to `bigint`, a
-//!   `SUM` over a `numeric` that lost its declared scale), and changes which
-//!   type rules admit the rest, so their floors are stamped again (ADR-0024).
+//!   can make define refuse one (`date + c` after `integer` to `bigint`), and
+//!   changes which type rules admit the rest, so their floors are stamped
+//!   again (ADR-0024).
 //!   A copy Trellis made that it outgrows is `pause_readers_of_retyped`'s.
 //! - **R3b, a same-type value rewrite.** `ALTER COLUMN b TYPE integer USING
 //!   b * 10` on an `integer` column rewrites the table with no DML trigger,
@@ -82,9 +82,8 @@
 //!   and counts `capture_auto_rebuilds_total{source_table, cause}`
 //!   ([`CaptureRebuildCause`]).
 //! - **R1 where a definition reading the column may no longer be valid:**
-//!   define would now refuse it (`defs::catalog::revalidate`: a `SUM` over
-//!   a `numeric` that lost its declared scale, `date + c` over a `bigint`, a
-//!   narrowing `CAST`), a column Trellis created for
+//!   define would now refuse it (`defs::catalog::revalidate`: `date + c`
+//!   over a `bigint`, a narrowing `CAST`), a column Trellis created for
 //!   it from the column was outgrown by an integer or float width (a copy
 //!   has no type modifier, ADR-0020, so no modifier change outgrows one), or
 //!   the value type it evaluates the column as changed (`integer` to
@@ -636,8 +635,8 @@ enum Change {
     ExpressionChanged,
     /// R1: a pure widening ([`key_types::pure_widening`]): every value keeps
     /// its text, so nothing rebuilds, but a reader may no longer be valid (a
-    /// `SUM` over a `numeric` that lost its declared scale, `date + c` over
-    /// an integer widened to `bigint`), and the type rules that admit it may
+    /// `date + c` over an integer widened to `bigint`), and the type rules
+    /// that admit it may
     /// have changed, which only its re-validation tells.
     Widened { from: String, to: String },
     /// R1: its type or modifier changed, not by a pure widening, from the

@@ -73,81 +73,165 @@ use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::model::Definition;
 use crate::pool::{Pool, quote_ident};
 
-use super::group_basis::{self, Agg, GroupShape};
+use super::group_basis::{self, Agg, GroupShape, SumPart};
 use super::self_check::{ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_leaf};
 use super::self_check_keyset::{BYTE_ORDER, Keyset};
 use super::self_check_ring::{Basis, Lands, Ring, WEIGHT};
 
 /// The partials' columns in the order every side lists them: the row count,
-/// then per argument its count and, if summed, its sum. Names are the
-/// hidden table's.
+/// then per argument its count and, if summed, its sum's partials. Names are
+/// the hidden table's.
 fn partial_columns(shape: &GroupShape) -> Vec<String> {
+    let parts: Vec<&[SumPart]> = shape.args.iter().map(|arg| arg.parts()).collect();
+    partial_names(&parts)
+}
+
+/// The partial columns of arguments whose sums keep `parts` (one entry per
+/// argument, empty for one no `SUM` or `AVG` reads), as the hidden table
+/// names them: the row count, then per argument its count and its sum's
+/// partials.
+pub(super) fn partial_names(parts: &[&[SumPart]]) -> Vec<String> {
     let mut names = vec!["__n".to_string()];
-    for (i, arg) in shape.args.iter().enumerate() {
+    for (i, parts) in parts.iter().enumerate() {
         names.push(format!("__count_{}", i + 1));
-        if arg.summed {
-            names.push(format!("__sum_{}", i + 1));
+        for part in *parts {
+            names.push(part.hidden(i + 1));
         }
     }
     names
 }
 
-/// A partial as the text both sides compare: counts as they are, a sum
-/// without trailing zeros, its `NaN` count (the multiple of
-/// `group_basis::NAN_WEIGHT` it holds) apart, as `3.75 (+ 2 NaN)`, so a
-/// divergence names it in a few digits rather than in 2,100.
+/// A partial as the text both sides compare: counts and maps as they are (a
+/// map's text lists its keys in `jsonb`'s own order, and `NULL`, the empty
+/// map, reads `{}`), a sum without trailing zeros.
 pub(super) fn partial_text(column: &str, expr: &str) -> String {
     if column.starts_with("__sum_") {
-        let digits = &group_basis::NAN_WEIGHT[2..];
-        let nans = format!("round(({expr}), -{digits})");
-        format!(
-            "(case when ({expr}) = 'NaN'::numeric or {nans} = 0 \
-                   then pg_catalog.trim_scale(({expr}))::text \
-                   else pg_catalog.trim_scale(({expr}) - {nans})::text || ' (+ ' || \
-                        pg_catalog.trim_scale({nans} / {weight})::text || ' NaN)' end)",
-            weight = group_basis::NAN_WEIGHT
-        )
+        format!("pg_catalog.trim_scale(({expr}))::text")
+    } else if column.starts_with("__scales_") {
+        format!("coalesce(({expr})::text, '{{}}')")
     } else {
         format!("({expr})::text")
     }
 }
 
-/// What the value `arg` adds to a partial sum, `0` for `NULL`: a `NaN`
-/// adds `group_basis::NAN_WEIGHT`, so the sum counts `NaN`s apart from the
-/// finite values (`group_basis::summand`, written separately here). An
-/// integer is never `NaN`.
-pub(super) fn nan_counted(arg: &str) -> String {
-    format!(
-        "(case when ({arg})::numeric = 'NaN'::numeric then {weight} \
-              else coalesce(({arg})::numeric, 0) end)",
-        weight = group_basis::NAN_WEIGHT
-    )
+/// A weighted aggregate over rows whose argument value is `arg`, each
+/// weighted by the integer `w`, of the partial `part`: the finite values'
+/// sum, or the map of exceptions under the reference scale `scale`, a
+/// `GROUP BY` of each value's scale or special value folded into one
+/// object, less the finite values at `scale`, `{}` for none (written apart
+/// from `group_basis::SumPart`, so the two renderings check each other). An
+/// integer argument (`numeric` false) has only a sum, and is never `NaN`.
+pub(super) fn weighted_part(
+    part: SumPart,
+    arg: &str,
+    numeric: bool,
+    w: &str,
+    scale: Option<i32>,
+) -> String {
+    let x = format!("({arg})::numeric");
+    match part {
+        SumPart::Sum if numeric => format!(
+            "coalesce(sum({w} * {x}) filter (where {x} not in ('NaN', 'Infinity', '-Infinity')), 0)"
+        ),
+        SumPart::Sum => format!("coalesce(sum({w} * {x}), 0)"),
+        SumPart::Scales => {
+            let reference = scale.map_or("null::text".to_string(), |s| format!("'{s}'"));
+            format!(
+                "(select coalesce(jsonb_object_agg(__q.__sc, __q.__c), '{{}}'::jsonb) from ( \
+                      select __q0.__sc as __sc, sum(__q0.__w)::bigint as __c \
+                      from (select array_agg(case when {x} in ('NaN', 'Infinity', '-Infinity') \
+                                                  then {x}::text else scale({x})::text end) as __qs, \
+                                   array_agg({w}) as __qw) as __qa \
+                      cross join lateral unnest(__qa.__qs, __qa.__qw) as __q0(__sc, __w) \
+                      where __q0.__sc is not null and __q0.__sc is distinct from {reference} \
+                      group by __q0.__sc having sum(__q0.__w) <> 0) as __q)"
+            )
+        }
+    }
 }
 
-/// The value the partial sum `sum` stands for: `NaN` while it counts a
-/// `NaN` (its nearest multiple of `group_basis::NAN_WEIGHT` isn't 0), else
-/// itself.
-pub(super) fn sum_value(sum: &str) -> String {
+/// The text of the partial column `column`'s zero (as [`partial_text`]
+/// renders it), which a group on one side only has on the other: `{}` for a
+/// map, `0` for any other.
+pub(super) fn zero_text(column: &str) -> String {
+    if column.contains("__scales_") {
+        "{}".to_string()
+    } else {
+        "0".to_string()
+    }
+}
+
+/// Whether the partial `part`'s value `value` (as [`weighted_part`]
+/// renders it) is non-zero.
+fn part_nonzero(part: SumPart, value: &str) -> String {
+    match part {
+        SumPart::Scales => format!("{value} <> '{{}}'::jsonb"),
+        SumPart::Sum => format!("{value} <> 0"),
+    }
+}
+
+/// The value of `SUM` over a summed argument's partial columns `column`
+/// (of a [`SumPart`]) and its non-null count `count`, `NULL` handling the
+/// caller's: a `numeric` argument's is `NaN`, an infinity, or the finite sum
+/// rounded to the largest scale it counts a finite value at, the reference
+/// `scale` among them while the map counts fewer values than `count`, as
+/// Postgres's `sum(numeric)` shows it (written apart from
+/// `group_basis::sum_value`).
+pub(super) fn sum_value(
+    numeric: bool,
+    scale: Option<i32>,
+    count: &str,
+    column: &dyn Fn(SumPart) -> String,
+) -> String {
+    if !numeric {
+        return column(SumPart::Sum);
+    }
+    let map = format!("coalesce({}, '{{}}'::jsonb)", column(SumPart::Scales));
+    let special = |key: &str| format!("coalesce(({map} ->> '{key}')::bigint, 0)");
+    let reference = match scale {
+        Some(s) => format!(
+            "case when ({count}) > (select coalesce(sum(__v::bigint), 0) \
+                                   from jsonb_each_text({map}) as __e(__k, __v)) then {s} end"
+        ),
+        None => "null::int".to_string(),
+    };
     format!(
-        "(case when round({sum}, -{digits}) <> 0 then 'NaN'::numeric else {sum} end)",
-        digits = &group_basis::NAN_WEIGHT[2..]
+        "(case when {nan} > 0 then 'NaN'::numeric \
+               when {pinf} > 0 and {ninf} > 0 then 'NaN'::numeric \
+               when {pinf} > 0 then 'Infinity'::numeric \
+               when {ninf} > 0 then '-Infinity'::numeric \
+               else round({sum}, coalesce(greatest({reference}, \
+                   (select max(__k::int) from jsonb_object_keys({map}) as __o(__k) \
+                    where __k not in ('NaN', 'Infinity', '-Infinity'))), 0)) end)",
+        nan = special("NaN"),
+        pinf = special("Infinity"),
+        ninf = special("-Infinity"),
+        sum = column(SumPart::Sum),
     )
 }
 
 /// The aggregate `agg` of a group over its hidden partials' columns.
-fn agg_sql(agg: &Agg) -> String {
+fn agg_sql(agg: &Agg, shape: &GroupShape) -> String {
+    let value = |i: usize| {
+        sum_value(
+            shape.args[i].numeric,
+            shape.args[i].scale,
+            &format!("__count_{}", i + 1),
+            &|part| part.hidden(i + 1),
+        )
+    };
     match agg {
         Agg::CountStar => "__n".to_string(),
         Agg::Count(i) => format!("__count_{}", i + 1),
         Agg::Sum(i, cast) => format!(
-            "case when __count_{n} = 0 then null else {s}::{cast} end",
+            "case when __count_{n} = 0 then null else ({s})::{cast} end",
             n = i + 1,
-            s = sum_value(&format!("__sum_{}", i + 1))
+            s = value(*i)
         ),
         Agg::Avg(i) => format!(
-            "case when __count_{n} = 0 then null else {s} / (__count_{n})::numeric end",
+            "case when __count_{n} = 0 then null else ({s}) / (__count_{n})::numeric end",
             n = i + 1,
-            s = sum_value(&format!("__sum_{}", i + 1))
+            s = value(*i)
         ),
         // The hidden extreme, which side 7 compares with the source.
         Agg::Extreme { max, arg, .. } => {
@@ -214,7 +298,7 @@ fn page_sql(
     // them: over the weighted rows (`super::self_check_ring`).
     let mut args = Vec::with_capacity(shape.args.len());
     for arg in &shape.args {
-        args.push((render_leaf(&arg.expr), arg.summed));
+        args.push((render_leaf(&arg.expr), arg.parts(), arg.scale));
     }
     let (src_parts, nonzero) = weighted_partials(&args);
     let lands = Lands {
@@ -262,7 +346,7 @@ fn page_sql(
         .map(|(k, agg)| {
             format!(
                 "{} as {}",
-                agg_sql(agg),
+                agg_sql(agg, shape),
                 quote_ident(&group_basis::placeholder(k))
             )
         })
@@ -459,31 +543,28 @@ fn extremes_side(
 }
 
 /// The partials of weighted rows (`super::self_check_ring`) over `args`
-/// (each rendered, and whether summed), in [`partial_columns`]' order as
+/// (each rendered, and its sum's partials), in [`partial_names`]' order as
 /// text, and the condition that any of them is non-zero, which a group the
 /// target has applied has.
-pub(super) fn weighted_partials(args: &[(String, bool)]) -> (Vec<String>, String) {
+pub(super) fn weighted_partials(
+    args: &[(String, &[SumPart], Option<i32>)],
+) -> (Vec<String>, String) {
     let w = WEIGHT;
     let mut values = vec![("__n".to_string(), format!("sum({w})"))];
-    for (i, (arg, summed)) in args.iter().enumerate() {
-        values.push((
-            format!("__count_{}", i + 1),
-            format!("sum({w} * (({arg}) is not null)::int)"),
-        ));
-        if *summed {
-            values.push((
-                format!("__sum_{}", i + 1),
-                format!("coalesce(sum({w} * {}), 0)", nan_counted(arg)),
-            ));
+    let mut nonzero = vec![format!("sum({w}) <> 0")];
+    for (i, (arg, parts, scale)) in args.iter().enumerate() {
+        let count = format!("sum({w} * (({arg}) is not null)::int)");
+        nonzero.push(format!("{count} <> 0"));
+        values.push((format!("__count_{}", i + 1), count));
+        let numeric = parts.len() > 1;
+        for part in *parts {
+            let value = weighted_part(*part, arg, numeric, w, *scale);
+            nonzero.push(part_nonzero(*part, &value));
+            values.push((part.hidden(i + 1), value));
         }
     }
-    let nonzero = values
-        .iter()
-        .map(|(_, v)| format!("{v} <> 0"))
-        .collect::<Vec<_>>()
-        .join(" or ");
     let parts = values.iter().map(|(c, v)| partial_text(c, v)).collect();
-    (parts, nonzero)
+    (parts, nonzero.join(" or "))
 }
 
 /// The groups (or cells) of a page the comparison can't vouch for exactly
@@ -794,7 +875,7 @@ fn diff_groups(
     page_end: Option<String>,
 ) -> (i64, Option<String>, Vec<Divergence>) {
     let mut divergences = Vec::new();
-    let zeros: Vec<Option<String>> = partials.iter().map(|_| Some("0".to_string())).collect();
+    let zeros: Vec<Option<String>> = partials.iter().map(|c| Some(zero_text(c))).collect();
     let nulls: Vec<Option<String>> = extremes.iter().map(|_| None).collect();
     let empty: Vec<Option<String>> = zeros.iter().chain(&nulls).cloned().collect();
     let columns: Vec<&String> = partials.iter().chain(extremes).collect();
