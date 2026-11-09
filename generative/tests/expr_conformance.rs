@@ -746,6 +746,12 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "1 / (CASE WHEN FALSE THEN CAST(NULL AS double precision) ELSE 9007199254740993 END \
          - 9007199254740992)",
         "1 / (COALESCE(NULL, 16777217, CAST(NULL AS real)) - 16777216)",
+        "1 / (COALESCE(CAST(NULL AS real) + NULL, 16777217) - 16777216)",
+        "1 / (COALESCE(CAST(NULL AS real) + NULL, 9007199254740993) - 9007199254740992)",
+        "1 / (COALESCE(NULLIF(NULL, REAL '0'), 16777217) - 16777216)",
+        "1 / (COALESCE(NULLIF(NULL, DOUBLE PRECISION '0'), 9007199254740993) - 9007199254740992)",
+        "1 / (COALESCE(NULLIF(NULL, DOUBLE PRECISION '0') * 1, 9007199254740993) \
+         - 9007199254740992)",
         // The same values stay exact where nothing resolves the `CASE` to a
         // float, so `%` (which has no float operand) still divides by zero.
         "5 % (CASE WHEN FALSE THEN 0 ELSE 9007199254740993 END - 9007199254740993)",

@@ -4388,11 +4388,17 @@ fn in_resolved_float_type(
 
 /// The float type `expr` certainly has, as [`infer_expr`] would type it, or
 /// `None` when it is not a float (or this walk cannot tell, which leaves a
-/// constant as the exact value it was before). It reads the types of
+/// constant as the exact value it was before). This walk and [`infer_expr`]
+/// are separate because inference folds every operand ([`fold_constant`]), so
+/// a fold that called inference would cost exponential time in the nesting
+/// depth of `CASE`, `COALESCE` and `NULLIF`; the test
+/// `float_width_agrees_with_inference_on_every_case_and_coalesce` pins the two
+/// together, so a float-typed construct added to one is caught in the other.
+/// It reads the types of
 /// literals, `CAST(NULL AS <float>)`, columns and calculated fields, and
 /// applies the rules for arithmetic (a float beside an exact operand is
 /// `double precision`), for `CASE` and `COALESCE` (a float result wins and the
-/// exact ones follow it), for `NULLIF` (its first argument), for the numeric
+/// exact ones follow it), for `NULLIF` (its first argument, or `double precision` for an exact one beside a float), for the numeric
 /// functions and for the aggregates.
 fn float_width<'f>(
     expr: &Expr,
@@ -4459,6 +4465,17 @@ fn float_width<'f>(
         }
         Expr::Negate(operand) => width_of(operand),
         Expr::BinaryOp { op, lhs, rhs } if ConstOp::of_operator(*op).is_some() => {
+            let is_null = |operand: &Expr| {
+                is_null_literal(operand, field_name, source_columns, fields_by_name)
+            };
+            // A `NULL` operand takes the other's type, so a float beside it
+            // keeps its own width (`real + NULL` is `real`).
+            if is_null(lhs) {
+                return width_of(rhs);
+            }
+            if is_null(rhs) {
+                return width_of(lhs);
+            }
             match (width_of(lhs), width_of(rhs)) {
                 (Some(a), Some(b)) => Some(a.wider(b)),
                 (Some(_), None) | (None, Some(_)) => Some(FloatWidth::Float8),
@@ -4477,8 +4494,18 @@ fn float_width<'f>(
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
             args.iter().filter_map(width_of).reduce(FloatWidth::wider)
         }
+        // `NULLIF` is typed as the `=` over its arguments: a `NULL` one takes
+        // the other's type, and an exact first argument beside a float is
+        // cast to `double precision`.
         Expr::FunctionCall { name, args } if name == "NULLIF" && args.len() == 2 => {
-            width_of(&args[0])
+            if is_null_literal(&args[0], field_name, source_columns, fields_by_name) {
+                return width_of(&args[1]);
+            }
+            match (width_of(&args[0]), width_of(&args[1])) {
+                (Some(first), _) => Some(first),
+                (None, Some(_)) => Some(FloatWidth::Float8),
+                (None, None) => None,
+            }
         }
         // An aggregate over a float: `MIN`, `MAX` and `SUM` keep its type,
         // `AVG` is `double precision`. Over an exact value none is a float.
@@ -6632,6 +6659,88 @@ fn visit<'a>(
     stack.pop();
     marks.insert(name, Mark::Done(height));
     Ok(height)
+}
+
+/// Every `CASE` and `COALESCE` node of `def` whose float width [`float_width`]
+/// and [`infer_expr`] type differently, as a description of each. A node that
+/// inference refuses has no type to compare.
+#[cfg(test)]
+pub(super) fn float_width_disagreements(
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+) -> Vec<String> {
+    fn nodes<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match expr {
+            Expr::Case {
+                branches,
+                otherwise,
+            } => {
+                out.push(expr);
+                for (condition, result) in branches {
+                    nodes(condition, out);
+                    nodes(result, out);
+                }
+                if let Some(otherwise) = otherwise {
+                    nodes(otherwise, out);
+                }
+            }
+            Expr::FunctionCall { name, args } => {
+                if name == "COALESCE" {
+                    out.push(expr);
+                }
+                for arg in args {
+                    nodes(arg, out);
+                }
+            }
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                nodes(lhs, out);
+                nodes(rhs, out);
+            }
+            Expr::Negate(operand) | Expr::Not(operand) => nodes(operand, out),
+            Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => nodes(expr, out),
+            _ => {}
+        }
+    }
+    let fields_by_name: HashMap<&str, &super::ast::FieldDef> =
+        def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+    let mut found = Vec::new();
+    for field in &def.fields {
+        let mut all = Vec::new();
+        nodes(&field.expr, &mut all);
+        for node in all {
+            let Ok(inferred) = infer_expr(
+                node,
+                &field.name,
+                source_columns,
+                &fields_by_name,
+                &mut HashMap::new(),
+                &mut HashSet::new(),
+                Reach::Skipped,
+            ) else {
+                continue;
+            };
+            let inferred = match inferred {
+                ValueType::Float(width) => Some(width),
+                _ => None,
+            };
+            let walked = float_width(
+                node,
+                &field.name,
+                source_columns,
+                &fields_by_name,
+                &mut HashMap::new(),
+                0,
+            );
+            if walked != inferred {
+                found.push(format!(
+                    "field '{}': `{}` is {walked:?} to the walk, {inferred:?} to inference",
+                    field.name,
+                    super::ast::render_field_expr(node)
+                ));
+            }
+        }
+    }
+    found
 }
 
 #[cfg(test)]

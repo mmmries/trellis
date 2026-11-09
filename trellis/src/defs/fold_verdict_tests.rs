@@ -4,15 +4,15 @@
 //! resolves a `CASE` / `COALESCE` to a float type to evaluate the branch it
 //! picks (#1802), and the refusals below are exactly what that type decides;
 //! a change to how the fold learns the type (#1805) must leave every verdict
-//! as it is. Each entry was recorded from the implementation as it stood, and
-//! the refusal text is the prefix of the error message.
+//! as it is. Each entry holds the admitted type, or the prefix of the refusal.
+//! The last test pins the fold's float typing walk to inference.
 
 use std::collections::HashMap;
 
 use super::ast::ValueType;
 use super::parse;
 use super::pg_type::PgType;
-use super::validate::{infer_field_types, validate};
+use super::validate::{float_width_disagreements, infer_field_types, validate};
 use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 
@@ -48,6 +48,26 @@ fn verdict(text: &str) -> String {
 
 /// (form, prefix of the verdict).
 const VERDICTS: &[(&str, &str)] = &[
+    (
+        "1 / (COALESCE(CAST(NULL AS real) + NULL, 16777217) - 16777216)",
+        "refused: calculated field 'x' divides by the constant zero",
+    ),
+    (
+        "1 / (COALESCE(NULLIF(NULL, REAL '0'), 16777217) - 16777216)",
+        "refused: calculated field 'x' divides by the constant zero",
+    ),
+    (
+        "1 / (COALESCE(NULLIF(NULL, DOUBLE PRECISION '0'), 9007199254740993) - 9007199254740992)",
+        "refused: calculated field 'x' divides by the constant zero",
+    ),
+    (
+        "1 / (COALESCE(NULLIF(NULL, DOUBLE PRECISION '0') * 1, 9007199254740993) - 9007199254740992)",
+        "refused: calculated field 'x' divides by the constant zero",
+    ),
+    (
+        "1 / (COALESCE(CAST(NULL AS real) + NULL, 9007199254740993) - 9007199254740992)",
+        "refused: calculated field 'x' divides by the constant zero",
+    ),
     (
         "(((- NULL) / (NULL / 16777217)) - ((-9223372036854775808 - n) + (f4 - 16777216)))",
         "refused: calculated field 'x' has a NULL in the operand of prefix -, whe",
@@ -795,7 +815,7 @@ const VERDICTS: &[(&str, &str)] = &[
 ];
 
 #[test]
-fn define_verdicts_on_constant_float_resolving_forms_are_unchanged() {
+fn define_verdicts_on_constant_float_resolving_forms_are_pinned() {
     let mut failures = Vec::new();
     for (text, expected) in VERDICTS {
         let found = verdict(text);
@@ -806,4 +826,212 @@ fn define_verdicts_on_constant_float_resolving_forms_are_unchanged() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A small deterministic generator (xorshift) of constant trees.
+struct Rng(u64, &'static [&'static str]);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn pick(&mut self, items: &[&'static str]) -> &'static str {
+        items[self.below(items.len() as u64) as usize]
+    }
+}
+
+const LEAVES: &[&str] = &[
+    "0",
+    "1",
+    "5",
+    "2147483647",
+    "16777216",
+    "16777217",
+    "9007199254740993",
+    "9223372036854775807",
+    "-9223372036854775809",
+    "99999999999999999999",
+    "1.5",
+    "0.0",
+    "REAL '0'",
+    "REAL '1'",
+    "REAL '1.6777216e+07'",
+    "DOUBLE PRECISION '0'",
+    "DOUBLE PRECISION '1'",
+    "CAST(NULL AS real)",
+    "CAST(NULL AS double precision)",
+    "CAST(NULL AS integer)",
+    "CAST(NULL AS numeric)",
+    "NULL",
+    "f4",
+    "f8",
+    "n",
+    "i4",
+    "i8",
+];
+
+fn condition(rng: &mut Rng, depth: u32) -> String {
+    match rng.below(6) {
+        0 => "FALSE".into(),
+        1 => "TRUE".into(),
+        2 => "i4 > 0".into(),
+        3 => "NULL IS NULL".into(),
+        4 => format!("{} = {}", tree(rng, depth), tree(rng, depth)),
+        _ => format!("{} < {}", tree(rng, depth), tree(rng, depth)),
+    }
+}
+
+fn tree(rng: &mut Rng, depth: u32) -> String {
+    if depth == 0 || rng.below(5) == 0 {
+        if !rng.1.is_empty() && rng.below(3) == 0 {
+            let fields = rng.1;
+            return rng.pick(fields).to_string();
+        }
+        return rng.pick(LEAVES).to_string();
+    }
+    let d = depth - 1;
+    match rng.below(13) {
+        0 | 1 => format!("({} + {})", tree(rng, d), tree(rng, d)),
+        2 | 3 => format!("({} - {})", tree(rng, d), tree(rng, d)),
+        4 => format!("({} * {})", tree(rng, d), tree(rng, d)),
+        5 => format!("({} / {})", tree(rng, d), tree(rng, d)),
+        6 => format!("(- {})", tree(rng, d)),
+        7 => format!("ABS({})", tree(rng, d)),
+        8 | 9 => {
+            let mut text = format!("CASE WHEN {} THEN {}", condition(rng, d), tree(rng, d));
+            if rng.below(3) == 0 {
+                text.push_str(&format!(
+                    " WHEN {} THEN {}",
+                    condition(rng, d),
+                    tree(rng, d)
+                ));
+            }
+            if rng.below(4) != 0 {
+                text.push_str(&format!(" ELSE {}", tree(rng, d)));
+            }
+            text.push_str(" END");
+            text
+        }
+        10 => {
+            let mut text = format!("COALESCE({}, {}", tree(rng, d), tree(rng, d));
+            if rng.below(3) == 0 {
+                text.push_str(&format!(", {}", tree(rng, d)));
+            }
+            text.push(')');
+            text
+        }
+        11 => format!("NULLIF({}, {})", tree(rng, d), tree(rng, d)),
+        _ => format!("CEIL({})", tree(rng, d)),
+    }
+}
+
+/// A form with up to two calculated fields the rest of it reads.
+fn form(rng: &mut Rng) -> String {
+    let depth = 1 + rng.below(4) as u32;
+    let lead = if rng.below(2) == 0 { "1" } else { "1.5" };
+    match rng.below(5) {
+        0 => tree(rng, depth),
+        1 => format!("{lead} / ({})", tree(rng, depth)),
+        2 => {
+            let g = tree(rng, depth);
+            rng.1 = &["g"];
+            let rest = tree(rng, depth);
+            rng.1 = &[];
+            format!("{g} AS g, {lead} / (g - {rest})")
+        }
+        _ => {
+            let g = tree(rng, depth);
+            rng.1 = &["g"];
+            let h = tree(rng, depth);
+            rng.1 = &["g", "h"];
+            let rest = tree(rng, depth);
+            rng.1 = &[];
+            format!("{g} AS g, {h} AS h, {lead} / (g - h + {rest})")
+        }
+    }
+}
+
+/// The constant fold types a `CASE` or `COALESCE` with `float_width`, its own
+/// walk of the typing rules, and not with inference: inference folds every
+/// operand, so a fold that called it would cost exponential time in nesting
+/// depth (a release build defining `1 / (COALESCE(NULLIF(... COALESCE(NULLIF(
+/// <float CASE>, 1), 2) ..., 1), 2) - K)` took 49 us at 30 levels of nesting
+/// and 96 us at 40 with the walk, and 33 ms and 584 ms with inference, which
+/// grew about 2.6x per `COALESCE` and `NULLIF` pair). This pins the two
+/// together: on every `CASE` and `COALESCE` node of a corpus, the walk and
+/// inference agree on the float width (or on there being none), so a
+/// float-typed construct added to inference alone fails here, instead of
+/// reopening the constant divisor that #1802 closed.
+#[test]
+fn float_width_agrees_with_inference_on_every_case_and_coalesce() {
+    let mut forms: Vec<String> = VERDICTS.iter().map(|(text, _)| text.to_string()).collect();
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15, &[]);
+    for _ in 0..5000 {
+        forms.push(form(&mut rng));
+    }
+    // A wide exact literal beside a float operand in each wrapper, then
+    // subtracted from a constant that equals it only in that float (#1802).
+    let wide = [
+        "16777217",
+        "9007199254740993",
+        "-9223372036854775809",
+        "1.5",
+        "0",
+    ];
+    let floats = [
+        "REAL '0'",
+        "DOUBLE PRECISION '0'",
+        "f4",
+        "f8",
+        "CAST(NULL AS real)",
+        "ABS(f4)",
+        "(- f8)",
+        "n",
+        "i4",
+        "NULLIF(f4, 0)",
+        "NULLIF(0, f8)",
+        "CEIL(f8)",
+    ];
+    for x in wide {
+        for f in floats {
+            for wrap in [
+                format!("CASE WHEN FALSE THEN {f} ELSE {x} END"),
+                format!("CASE WHEN i4 > 0 THEN {x} WHEN FALSE THEN {f} END"),
+                format!("COALESCE(NULL, {x}, {f})"),
+                format!("COALESCE({f}, {x})"),
+                format!("ABS(CASE WHEN FALSE THEN {f} ELSE {x} END)"),
+                format!("(- COALESCE(NULL, {x}, {f}))"),
+                format!("NULLIF(CASE WHEN FALSE THEN {f} ELSE {x} END, 5)"),
+                format!("COALESCE(CASE WHEN FALSE THEN {f} ELSE {x} END, {x} + {f})"),
+            ] {
+                forms.push(format!("1 / ({wrap} - 16777216)"));
+                forms.push(format!("{wrap} AS g, 1 / (g - 9007199254740992)"));
+            }
+        }
+    }
+    let mut checked = 0;
+    let mut disagreements = Vec::new();
+    for text in &forms {
+        let Ok(def) = parse(&format!("TRANSFORM t FROM s SELECT {text} AS x")) else {
+            continue;
+        };
+        checked += 1;
+        for found in float_width_disagreements(&def, &columns()) {
+            disagreements.push(format!("`{text}`: {found}"));
+        }
+    }
+    assert!(checked > 4000, "the corpus should parse: {checked}");
+    assert!(
+        disagreements.is_empty(),
+        "{}",
+        disagreements[..disagreements.len().min(20)].join("\n")
+    );
 }
