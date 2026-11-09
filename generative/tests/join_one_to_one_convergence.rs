@@ -741,13 +741,75 @@ fn star_sweep_tier() -> SweepTier {
     )
 }
 
-/// The star tier's known misses: the two-table tier's
-/// ([`ONE_TO_ONE_KNOWN_MISSES`]), a placeholder no star sweep has measured
-/// (no star case runs while `star_tier_enabled` is off), until the star
-/// tier's reach sweep
-/// (`star_join_planted_bugs_are_caught`, 4 seeds × 12 cases) records its
-/// own fired and caught counts here.
-const STAR_KNOWN_MISSES: &[&str] = ONE_TO_ONE_KNOWN_MISSES;
+/// The star tier's known misses, measured by its reach sweep (#1781: seeds 1
+/// to 4, twelve cases each, with the in-run invariant on; caught and fired
+/// in, of 48). Its deterministic pin, named in `trellis/src/plant.rs`, gates
+/// each. #1817 tracks raising the tier's reach on them.
+///
+/// It gates the plants it catches in about one case in five or more (a
+/// 48-case sweep then misses each with probability below about 1e-4):
+/// `join1_no_placeholder` 48, `join1_old_key_unlocked` 40,
+/// `join1_no_orphan_pass` 20, `star_chunk_skip_j_last` 37,
+/// `star_chunk_skip_j_first` 37, `star_root_skip_j_last` 27,
+/// `star_root_skip_j_first` 27 and `star_root_skip_j_middle` 17.
+///
+/// - `join1_truncate_keeps_r`: caught 7, fired 22 (gated on the two-table
+///   tier; at this rate a 48-case sweep misses it about one time in 2,000).
+/// - `join1_truncate_no_rebuild`: caught 5, fired 36.
+/// - `join1_m_before_j`: caught 0, fired 48 (gated on the two-table tier,
+///   which catches it in 9; the star tier's pages are smaller and its keys
+///   hotter, and later writes repair the lost update).
+/// - `star_own_j_only`: caught 0, fired 36; `star_r_after_m`: caught 0,
+///   fired 34; `star_last_no_r`: caught 0, fired 34. The R-entry rule's
+///   ablations need a root key move and a joined write on its new key to
+///   race inside one page's locks, which the hot keys and mixed pages draw
+///   but don't yet catch.
+/// - `star_truncate_keeps_other_markers`: caught 0, fired 27 (a marker to
+///   keep needs a pending fan-out, and the tier's keys never hold that
+///   many rows).
+/// - `star_fence_first_only`: caught 0, fired 36 (a resume fires it; no
+///   page of a later position is in flight across it).
+/// - Never fired (0 of 48): `star_late_skip_last`, `star_late_skip_first`,
+///   `star_recheck_j` and `star_recheck_skip_last` need a Re-derive whose
+///   row moved after its read, or a joined page holding a key for a root
+///   item only, which wait for the re-derived-pages share
+///   (`StarKnobs::rederived_pages_per_mille`, which no engine hook applies yet); `star_chunk_no_r`
+///   needs a fan-out chunk, which no key of the tier is large enough for.
+/// - The two-table tier's other known misses, each caught 0:
+///   `join1_no_j_lock` (fired 48), `join1_brd_no_key` (48),
+///   `join1_no_recheck` (48), `join1_vis_only` (48), `join1_chunk_no_key`
+///   (48), `join1_lsn_only` (48), `join1_no_entry_lock` (48),
+///   `join1_orphan_delete` (20), `join1_rd_no_key` (47),
+///   `join1_snapshot_after_read` (48), `join1_truncate_def_after_lock` (36),
+///   `join1_truncate_keeps_m` (35) and `join1_truncate_share_lock` (35).
+const STAR_KNOWN_MISSES: &[&str] = &[
+    "join1_truncate_keeps_r",
+    "join1_truncate_no_rebuild",
+    "join1_m_before_j",
+    "star_own_j_only",
+    "star_r_after_m",
+    "star_last_no_r",
+    "star_truncate_keeps_other_markers",
+    "star_fence_first_only",
+    "star_late_skip_last",
+    "star_late_skip_first",
+    "star_recheck_j",
+    "star_recheck_skip_last",
+    "star_chunk_no_r",
+    "join1_no_j_lock",
+    "join1_brd_no_key",
+    "join1_no_recheck",
+    "join1_vis_only",
+    "join1_chunk_no_key",
+    "join1_lsn_only",
+    "join1_no_entry_lock",
+    "join1_orphan_delete",
+    "join1_rd_no_key",
+    "join1_snapshot_after_read",
+    "join1_truncate_def_after_lock",
+    "join1_truncate_keeps_m",
+    "join1_truncate_share_lock",
+];
 
 /// A 1-1 `JOIN` sweep tier named `name`: it gates every 1-1 `JOIN` plant but
 /// `known_misses`, [`ONE_TO_ONE_NOT_GATED`] and the tier's `own_not_gated`,

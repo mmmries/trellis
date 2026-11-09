@@ -566,24 +566,37 @@ beside them run on every `cargo test`.
   (`render_join_one_to_one_select`). The invariant's star check
   (`invariant::check_star`) runs every clause at each position against that
   position's `M_p`, `J` rows and table, with a target row only where every
-  `INNER` position matched; the in-run sampler doesn't run it, since the
-  snapshot read covers position 1 alone, so it samples no star's target.
+  `INNER` position matched, and the in-run sampler runs it on every star's
+  target, as it does the two-table check, over the engine's
+  position-indexed snapshot read.
   The tier runs only when
   `join_one_to_one::star_tier_enabled` says so: the development knob
-  `TRELLIS_DEV_STAR_JOIN` is on and the engine runs a star's pages and
-  builds. Until then its property passes every case without running it and
-  its planted-bug sweep, `star_join_planted_bugs_are_caught`, returns at
-  once, so a green run of either says nothing about a star; the two-table
+  `TRELLIS_DEV_STAR_JOIN` is on. With it off its property passes every case
+  without running it and its planted-bug sweep,
+  `star_join_planted_bugs_are_caught`, returns at once, so a green run of
+  either without the knob says nothing about a star; the two-table
   tiers draw and check exactly what they did without it
   (`tests/join_star_tier.rs` holds their draws' digests). The same file
   checks, with no engine apply running, that the strategy reaches every
   table count, kind, position, hot-key overlap, mixed page and knob; that the
   oracle is the multi-join over a real Postgres at 3, 4 and 5 tables, against
   the file's own model of a star, under any `JOIN` order; and that define,
-  with the knob on, admits every drawn star definition. The sweep's tier,
-  `join_star`, leaves out the plants the two-table tier does, for the same
-  reasons, and takes that tier's known misses as an unmeasured placeholder
-  until its own sweep records the star's rates.
+  with the knob on, admits every drawn star definition. Its planted-bug
+  sweep (tier `join_star`) runs every `Join1*` and `star_*` plant but those
+  the runner can't reach (a held row, a write past capture, a page the
+  barrier never lets drain late, a target at a later position, and the
+  plants whose only failure is a deadlock the engine retries). It gates the
+  plants it catches in about one case in five or more:
+  `join1_no_placeholder`, `join1_old_key_unlocked`, `join1_no_orphan_pass`,
+  `star_root_skip_j_last`, `star_root_skip_j_first`,
+  `star_root_skip_j_middle`, `star_chunk_skip_j_last` and
+  `star_chunk_skip_j_first`. The rest run as known misses, with their
+  measured rates in the tier's `STAR_KNOWN_MISSES`: among them the R-entry
+  rule's ablations, which fire in about 35 cases of 48 and are caught in
+  none, and the plants that need a Re-derive whose row moved after its read
+  or a fan-out chunk, which the tier doesn't fire. Their deterministic pins
+  gate all of them. The two-table tier leaves every plant that fires only
+  on a star to this one.
 - **Chained-reader convergence** (`tests/join_chained_convergence.rs`,
   ADR-0002 "Multi-hop"). A `JOIN`, aggregate or 1-1, one of whose sides is
   another definition's target in the same instance, so the target-mutation
