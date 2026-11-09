@@ -17,12 +17,16 @@
 //! 4. **Refusal.** A near miss is refused at define, with an error that
 //!    names the construct.
 //!
-//! Postgres folds constants at plan time, so an expression it rejects for
-//! every row (`2147483647 + 1`) is refused at define by design. The checker
-//! treats "refused at define and Postgres raises class 22 on a where-false
-//! probe" as agreement, and flags both a refusal where Postgres accepts (a
-//! false refusal) and an acceptance where Postgres raises at plan time (a
-//! missed refusal).
+//! Define evaluates no constant (ADR-0022): an expression Postgres folds and
+//! fails while planning (`2147483647 + 1`) defines, and its rows fail at run
+//! time and are quarantined. The checker treats "admitted, and Postgres
+//! raises class 22 on a where-false probe" as agreement, so no plan-time
+//! constant failure is a missed refusal. It flags a refusal where Postgres
+//! accepts (a false refusal), an admitted expression Postgres fails to plan
+//! for another reason (a missed refusal: a type or resolution error define
+//! should name), and either side of the literal-zero divisor rule: define
+//! refuses a `/` or `%` whose divisor is written as a literal zero, and only
+//! that.
 
 use std::collections::HashMap;
 
@@ -235,9 +239,12 @@ pub enum Property {
     RoundTrip,
     Refusal,
     /// Define refused an expression Postgres accepts, by a refusal that is
-    /// not a design refusal.
+    /// not a design refusal, or refused a zero divisor not written as a
+    /// literal zero.
     FalseRefusal,
-    /// Define admitted an expression Postgres raises on at plan time.
+    /// Define admitted an expression Postgres fails to plan with an error
+    /// other than a data exception (class 22), or one whose divisor is
+    /// written as a literal zero.
     MissedRefusal,
 }
 
@@ -264,110 +271,23 @@ impl std::fmt::Display for Divergence {
 pub enum Agreement {
     /// Admitted; type and values agree.
     Admitted,
-    /// Refused at define (the message), and Postgres raises: on the probe, or
-    /// on a `REGEXP_COUNT` pattern literal define asks it to judge.
+    /// Refused at define (the message), and Postgres raises on a
+    /// `REGEXP_COUNT` pattern literal define asks it to judge.
     RefusedAndRaises(String),
-    /// Admitted, but Postgres raises while planning it, and the expression
-    /// holds a call whose arguments are all constants: Postgres folds it and
-    /// then the sum around it, and define has no value for the call to fold
-    /// (see [`KNOWN_GAP_CONSTANT_CALL`]).
-    KnownGap(&'static str),
-    /// Refused at define by a range refusal, though Postgres plans it
-    /// without error, and the expression holds a `NULLIF` define reads as
-    /// reading its second argument (see [`KNOWN_OVER_REFUSAL_NULLIF`]).
-    /// ADR-0022 allows the over-refusal.
-    KnownOverRefusal(&'static str),
+    /// Refused at define (the message) for a divisor written as a literal
+    /// zero. The rule reads only the text (ADR-0022 lets Trellis be
+    /// stricter), so Postgres's verdict doesn't decide it: Postgres raises
+    /// for every row with a dividend, and may drop the division unevaluated
+    /// (a `CASE` branch no row takes, a strict operator beside `NULL`).
+    RefusedByRule(String),
+    /// Admitted, and Postgres raises a data exception (the SQLSTATE) while
+    /// planning it: a constant it folds fails. Define evaluates no constant,
+    /// so the rows fail at run time and are quarantined.
+    FailsWhilePlanning(String),
 }
 
 /// SQLSTATE `invalid_regular_expression`.
 const INVALID_REGEX: &str = "2201B";
-
-/// The open gap the property tolerates, so a fix has one place to remove.
-/// Filed as #1446.
-pub const KNOWN_GAP_CONSTANT_CALL: &str = "constant function calls are folded by Postgres at plan \
-     time, so a range overflow around one is not refused at define";
-
-/// The over-refusal the property tolerates (#1693, decided as option (b)):
-/// Postgres folds a `NULLIF` whose constant first argument is `NULL` to
-/// `NULL` whatever the second reads, so it drops a guarded constant that
-/// define, which has no value for the first argument, treats as read.
-pub const KNOWN_OVER_REFUSAL_NULLIF: &str = "a NULLIF whose first argument is a constant call is \
-     treated as reading its second argument, though the planner folds it to NULL";
-
-/// `expr` with each `NULLIF` whose first argument is a constant function
-/// call (no column, as [`has_constant_call`] recognises) and whose second
-/// argument reads a column replaced by its first argument; `None` when it
-/// holds no such `NULLIF`. The replacement is the expression define would
-/// judge if it could fold the `NULLIF` the way the planner does.
-pub fn without_constant_call_nullifs(expr: &Expr) -> Option<Expr> {
-    fn replace(expr: &mut Expr) -> bool {
-        let mut changed = false;
-        match expr {
-            Expr::BinaryOp { lhs, rhs, .. } => {
-                changed |= replace(lhs);
-                changed |= replace(rhs);
-            }
-            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-                changed |= replace(operand);
-            }
-            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-                for child in expr.logic_children_mut() {
-                    changed |= replace(child);
-                }
-            }
-            Expr::FunctionCall { args, .. } => {
-                for arg in args.iter_mut() {
-                    changed |= replace(arg);
-                }
-            }
-            _ => {}
-        }
-        if let Expr::FunctionCall { name, args } = &*expr
-            && name == "NULLIF"
-            && let [first, second] = args.as_slice()
-            && !reads_column(first)
-            && has_constant_call(first)
-            && reads_column(second)
-        {
-            *expr = first.clone();
-            changed = true;
-        }
-        changed
-    }
-    let mut rewritten = expr.clone();
-    replace(&mut rewritten).then_some(rewritten)
-}
-
-/// Whether `expr` holds a function call (not `COALESCE`) with no column in
-/// it, which Postgres evaluates while planning.
-pub fn has_constant_call(expr: &Expr) -> bool {
-    match expr {
-        Expr::BinaryOp { lhs, rhs, .. } => has_constant_call(lhs) || has_constant_call(rhs),
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => has_constant_call(operand),
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            expr.logic_children().into_iter().any(has_constant_call)
-        }
-        Expr::FunctionCall { name, args } => {
-            (name != "COALESCE" && name != "NULLIF" && !reads_column(expr))
-                || args.iter().any(has_constant_call)
-        }
-        _ => false,
-    }
-}
-
-/// Whether `expr` reads a column anywhere in it.
-fn reads_column(expr: &Expr) -> bool {
-    match expr {
-        Expr::Column(_) | Expr::SourceColumn { .. } => true,
-        Expr::BinaryOp { lhs, rhs, .. } => reads_column(lhs) || reads_column(rhs),
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => reads_column(operand),
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            expr.logic_children().into_iter().any(reads_column)
-        }
-        Expr::FunctionCall { args, .. } => args.iter().any(reads_column),
-        _ => false,
-    }
-}
 
 /// The SQLSTATE of a failed query.
 fn code_of(err: &tokio_postgres::Error) -> String {
@@ -378,16 +298,6 @@ fn code_of(err: &tokio_postgres::Error) -> String {
 
 fn class_of(code: &str) -> &str {
     code.get(..2).unwrap_or(code)
-}
-
-fn is_range_refusal(err: &ValidationError) -> bool {
-    matches!(
-        err,
-        ValidationError::CoalesceLiteralOutOfRange { .. }
-            | ValidationError::ConstantOutOfRange { .. }
-            | ValidationError::FloatComparisonLiteralOutOfRange { .. }
-            | ValidationError::CaseLiteralOutOfRange { .. }
-    )
 }
 
 /// The table, the connection and the engine pool the properties run on.
@@ -587,115 +497,45 @@ impl Fixture {
 
         match validate(&def, &self.source_columns) {
             Err(err @ ValidationError::ConstantDivisorZero { .. }) => {
-                self.check_zero_divisor_refusal(text, &expr, &err, probe)
-                    .await
-            }
-            Err(err) if is_range_refusal(&err) => match probe {
-                Some(code) if class_of(&code) == "22" => {
-                    Ok(Agreement::RefusedAndRaises(err.to_string()))
-                }
-                Some(code) => Err(diverge(
-                    Property::FalseRefusal,
-                    format!("refused ({err}) but Postgres raises {code}, not class 22"),
-                )),
-                None => match without_constant_call_nullifs(&expr) {
-                    Some(rewritten) => {
-                        self.recheck_without_nullifs(text, &err, &rewritten, &diverge)
-                            .await
-                    }
-                    None => Err(diverge(
+                if !has_literal_zero_divisor(&expr) {
+                    return Err(diverge(
                         Property::FalseRefusal,
-                        format!("refused ({err}) but Postgres plans it without error"),
-                    )),
-                },
-            },
+                        format!("refused ({err}) but no divisor is written as a literal zero"),
+                    ));
+                }
+                Ok(Agreement::RefusedByRule(err.to_string()))
+            }
             Err(err) => Err(diverge(
                 Property::FalseRefusal,
                 format!("a well-typed expression was refused: {err}"),
             )),
             Ok(()) => {
+                if has_literal_zero_divisor(&expr) {
+                    return Err(diverge(
+                        Property::MissedRefusal,
+                        "admitted, but a divisor is written as a literal zero".to_string(),
+                    ));
+                }
                 // Define asks Postgres to judge each literal pattern.
                 if let Some(message) = self.rejected_pattern(&expr).await {
                     return Ok(Agreement::RefusedAndRaises(message));
                 }
-                if let Some(code) = probe {
-                    let gap = if has_constant_call(&expr) {
-                        Some(KNOWN_GAP_CONSTANT_CALL)
-                    } else {
-                        None
-                    };
-                    if let Some(gap) = gap {
-                        return self.recheck_without_gaps(text, &expr, gap).await;
+                match probe {
+                    Some(code) if class_of(&code) == "22" => {
+                        return Ok(Agreement::FailsWhilePlanning(code));
                     }
-                    return Err(diverge(
-                        Property::MissedRefusal,
-                        format!("admitted, but Postgres raises {code} while planning it"),
-                    ));
+                    Some(code) => {
+                        return Err(diverge(
+                            Property::MissedRefusal,
+                            format!("admitted, but Postgres raises {code} while planning it"),
+                        ));
+                    }
+                    None => {}
                 }
                 self.check_type(text, &def, &diverge).await?;
-                match self.check_value(text, &expr, &diverge).await? {
-                    Some(gap) => self.recheck_without_gaps(text, &expr, gap).await,
-                    None => Ok(Agreement::Admitted),
-                }
+                self.check_value(text, &expr, &diverge).await?;
+                Ok(Agreement::Admitted)
             }
-        }
-    }
-
-    /// A refusal for a constant zero divisor. Postgres folds a constant
-    /// division and raises at plan time; with a column dividend it plans the
-    /// division and raises for every row that has a dividend. The refusal
-    /// stands when no row of the table computes a value: each raises class
-    /// 22, or is `NULL` (a `NULL` dividend) or `NaN` (a `NaN` dividend divides
-    /// by zero to `NaN`).
-    async fn check_zero_divisor_refusal(
-        &self,
-        text: &str,
-        expr: &Expr,
-        err: &ValidationError,
-        probe: Option<String>,
-    ) -> Result<Agreement, Divergence> {
-        let diverge = |detail: String| Divergence {
-            property: Property::FalseRefusal,
-            text: text.to_string(),
-            detail,
-        };
-        if let Some(code) = probe {
-            return if class_of(&code) == "22" {
-                Ok(Agreement::RefusedAndRaises(err.to_string()))
-            } else {
-                Err(diverge(format!(
-                    "refused ({err}) but Postgres raises {code}, not class 22"
-                )))
-            };
-        }
-        match self
-            .rows(&format!(
-                "select id, ({text})::text from {TABLE} order by id"
-            ))
-            .await
-        {
-            Err(code) if class_of(&code) == "22" => {
-                Ok(Agreement::RefusedAndRaises(err.to_string()))
-            }
-            Err(code) => Err(diverge(format!(
-                "refused ({err}) but Postgres raises {code}, not class 22"
-            ))),
-            Ok(rows)
-                if rows
-                    .iter()
-                    .all(|v| matches!(v.as_deref(), None | Some("NaN"))) =>
-            {
-                Ok(Agreement::RefusedAndRaises(err.to_string()))
-            }
-            // Postgres evaluates a `COALESCE` argument only for the rows the
-            // earlier ones leave `NULL`, a `CASE` result only where its
-            // condition holds, and an `AND` operand only where the earlier
-            // ones allow, so the division may never run.
-            // Define refuses it all the same: a zero divisor is never useful.
-            Ok(_) if may_skip_evaluation(expr) => Ok(Agreement::RefusedAndRaises(err.to_string())),
-            Ok(_) => Err(diverge(format!(
-                "refused ({err}) but Postgres computes a value for some row"
-            ))),
         }
     }
 
@@ -781,7 +621,7 @@ impl Fixture {
         text: &str,
         expr: &Expr,
         diverge: &impl Fn(Property, String) -> Divergence,
-    ) -> Result<Option<&'static str>, Divergence> {
+    ) -> Result<(), Divergence> {
         let user = self
             .rows(&format!(
                 "select id, ({text})::text from {TABLE} order by id"
@@ -790,7 +630,6 @@ impl Fixture {
         // The build's renderer, then the one a 1-1 apply and a `JOIN` write
         // embed (each column read through an alias): separate code, so each
         // is checked against the user's text.
-        let mut gap = None;
         for (rendered_sql, from) in [
             (render_expr_sql(expr), TABLE.to_string()),
             (
@@ -803,9 +642,7 @@ impl Fixture {
                     "select id, ({rendered_sql})::text from {from} order by id"
                 ))
                 .await;
-            if let Some(g) = Self::compare_rows(&user, rendered, &rendered_sql, diverge)? {
-                gap = Some(g);
-            }
+            Self::compare_rows(&user, rendered, &rendered_sql, diverge)?;
         }
         // The two renderers type the expression alike (a value's text can
         // agree across types: `cast(x as bigint)` and `cast(x as numeric)`).
@@ -830,7 +667,7 @@ impl Fixture {
                 ));
             }
         }
-        Ok(gap)
+        Ok(())
     }
 
     /// One renderer's rows against the user's.
@@ -839,9 +676,9 @@ impl Fixture {
         rendered: Result<Vec<Option<String>>, String>,
         rendered_sql: &str,
         diverge: &impl Fn(Property, String) -> Divergence,
-    ) -> Result<Option<&'static str>, Divergence> {
+    ) -> Result<(), Divergence> {
         match (user, rendered) {
-            (Ok(u), Ok(r)) if *u == r => Ok(None),
+            (Ok(u), Ok(r)) if *u == r => Ok(()),
             (Ok(u), Ok(r)) => {
                 let at = u.iter().zip(&r).position(|(a, b)| a != b).unwrap_or(0);
                 Err(diverge(
@@ -853,7 +690,7 @@ impl Fixture {
                     ),
                 ))
             }
-            (Err(u), Err(r)) if class_of(u) == class_of(&r) => Ok(None),
+            (Err(u), Err(r)) if class_of(u) == class_of(&r) => Ok(()),
             (u, r) => Err(diverge(
                 Property::Value,
                 format!(
@@ -862,83 +699,6 @@ impl Fixture {
                     describe(&r)
                 ),
             )),
-        }
-    }
-
-    /// An expression that hit an open gap agrees only if the gap is all
-    /// that is wrong with it: each pattern Postgres rejects becomes `'a'`,
-    /// then each function call over constants becomes the literal Postgres
-    /// computes for it (what define would see if it could fold the call),
-    /// and the result must pass every property on its own. Otherwise a
-    /// different missed refusal, or a wrong value, beside the gap would be
-    /// tolerated with it.
-    async fn recheck_without_gaps(
-        &self,
-        text: &str,
-        expr: &Expr,
-        gap: &'static str,
-    ) -> Result<Agreement, Divergence> {
-        let mut rewritten = expr.clone();
-        self.fold_constant_calls(&mut rewritten).await;
-        normalize_negations(&mut rewritten);
-        if rewritten == *expr {
-            return Err(Divergence {
-                property: Property::MissedRefusal,
-                text: text.to_string(),
-                detail: format!("tolerated as `{gap}`, but nothing in it is that gap"),
-            });
-        }
-        let again = crate::expr_gen::render_text(&rewritten, Default::default());
-        match Box::pin(self.check(&again, Some(&rewritten))).await {
-            Ok(Agreement::KnownGap(other)) => Err(Divergence {
-                property: Property::MissedRefusal,
-                text: text.to_string(),
-                detail: format!("`{again}`, with the gaps rewritten away, still hits `{other}`"),
-            }),
-            Ok(_) => Ok(Agreement::KnownGap(gap)),
-            Err(d) => Err(Divergence {
-                detail: format!("beside the known gap `{gap}`, as `{again}`: {}", d.detail),
-                text: text.to_string(),
-                ..d
-            }),
-        }
-    }
-
-    /// A range refusal Postgres plans without error is tolerated when the
-    /// expression holds a `NULLIF` over a constant call
-    /// ([`KNOWN_OVER_REFUSAL_NULLIF`]) and `rewritten`, with each such
-    /// `NULLIF` replaced by its first argument, is admitted and agrees with
-    /// Postgres. Otherwise an unrelated false refusal beside the `NULLIF`
-    /// would be tolerated with it. When `rewritten` is still refused for a
-    /// reason Postgres agrees with (a zero divisor elsewhere in it), so is
-    /// the expression: define would refuse it even if it folded the `NULLIF`.
-    async fn recheck_without_nullifs(
-        &self,
-        text: &str,
-        err: &ValidationError,
-        rewritten: &Expr,
-        diverge: &impl Fn(Property, String) -> Divergence,
-    ) -> Result<Agreement, Divergence> {
-        let again = crate::expr_gen::render_text(rewritten, Default::default());
-        match Box::pin(self.check(&again, Some(rewritten))).await {
-            Ok(Agreement::Admitted) => Ok(Agreement::KnownOverRefusal(KNOWN_OVER_REFUSAL_NULLIF)),
-            Ok(refused @ Agreement::RefusedAndRaises(_)) => Ok(refused),
-            Ok(other) => Err(diverge(
-                Property::FalseRefusal,
-                format!(
-                    "refused ({err}) but Postgres plans it without error; with its constant-call \
-                     NULLIFs replaced, as `{again}`, it is {other:?}, not admitted"
-                ),
-            )),
-            Err(d) => Err(Divergence {
-                detail: format!(
-                    "refused ({err}) beside the known over-refusal `{KNOWN_OVER_REFUSAL_NULLIF}`, \
-                     as `{again}`: {}",
-                    d.detail
-                ),
-                text: text.to_string(),
-                ..d
-            }),
         }
     }
 
@@ -977,106 +737,6 @@ impl Fixture {
         None
     }
 
-    /// Replaces each function call (not `COALESCE`) that reads no column with
-    /// the literal Postgres computes for it, innermost first. A call Postgres
-    /// cannot compute (its constant arguments raise) is left as it is: the
-    /// rest of the expression then has to explain the failure on its own, as
-    /// a refusal.
-    async fn fold_constant_calls(&self, expr: &mut Expr) {
-        match expr {
-            Expr::BinaryOp { lhs, rhs, .. } => {
-                Box::pin(self.fold_constant_calls(lhs)).await;
-                Box::pin(self.fold_constant_calls(rhs)).await;
-            }
-            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-                Box::pin(self.fold_constant_calls(operand)).await;
-            }
-            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-                for child in expr.logic_children_mut() {
-                    Box::pin(self.fold_constant_calls(child)).await;
-                }
-            }
-            Expr::FunctionCall { args, .. } => {
-                for arg in args.iter_mut() {
-                    Box::pin(self.fold_constant_calls(arg)).await;
-                }
-            }
-            _ => {}
-        }
-        let Expr::FunctionCall { name, .. } = &*expr else {
-            return;
-        };
-        if name == "COALESCE" || name == "NULLIF" || reads_column(expr) {
-            return;
-        }
-        let rendered = render_expr_sql(expr);
-        let sql = format!("select ({rendered})::text, pg_typeof({rendered})::text");
-        let Ok(row) = self.client.query_one(&sql, &[]).await else {
-            return;
-        };
-        let value: Option<String> = row.get(0);
-        let pg_type: String = row.get(1);
-        // A call that gives `NULL` (over a `NULLIF` that is) has no literal
-        // to stand for it: it stays, and the rest has to explain the failure.
-        if value.is_none() {
-            return;
-        }
-        *expr = match (pg_type.as_str(), value) {
-            ("smallint" | "integer", Some(v)) => Expr::NumberLiteral(v),
-            // A bare literal is typed by its value, so a `numeric` or
-            // `bigint` result that reads as a smaller type is cast to its
-            // own.
-            ("bigint" | "numeric", Some(v)) => {
-                let target = if pg_type == "bigint" {
-                    ValueType::Integer(IntWidth::Int8)
-                } else {
-                    ValueType::Numeric
-                };
-                if crate::expr_gen::number_literal_type(&v) == target {
-                    Expr::NumberLiteral(v)
-                } else {
-                    Expr::Cast {
-                        expr: Box::new(Expr::NumberLiteral(v)),
-                        target,
-                    }
-                }
-            }
-            ("text", Some(v)) => Expr::StringLiteral(v),
-            // A date or timestamp has a literal only in its canonical
-            // spelling; a value outside it (a BC year) stays a call.
-            ("date" | "timestamp without time zone", Some(v)) => {
-                let value_type = if pg_type == "date" {
-                    ValueType::Other(PgType::Date)
-                } else {
-                    ValueType::Other(PgType::Timestamp)
-                };
-                let canonical = trellis::dev::defs::typed_literal::TYPED_LITERALS
-                    .iter()
-                    .find(|spec| spec.value_type == value_type)
-                    .is_some_and(|spec| (spec.canonical)(&v).is_ok());
-                if !canonical {
-                    return;
-                }
-                Expr::TypedLiteral {
-                    value_type,
-                    text: v,
-                }
-            }
-            ("real", Some(v)) => Expr::TypedLiteral {
-                value_type: ValueType::Float(FloatWidth::Float4),
-                text: v,
-            },
-            ("double precision", Some(v)) => Expr::TypedLiteral {
-                value_type: ValueType::Float(FloatWidth::Float8),
-                text: v,
-            },
-            (ty, v) => panic!(
-                "`{sql}` of type {ty} gives {v:?}: teach fold_constant_calls to spell it as a \
-                 literal"
-            ),
-        };
-    }
-
     /// The Refusal property: `miss` is refused at define and the error
     /// names the construct.
     pub fn check_refusal(&self, miss: &NearMiss) -> Result<String, Divergence> {
@@ -1104,58 +764,6 @@ impl Fixture {
     }
 }
 
-/// Whether `expr` holds a construct that evaluates only part of itself at run
-/// time: `COALESCE`, `CASE`, `AND` and `OR`.
-fn may_skip_evaluation(expr: &Expr) -> bool {
-    match expr {
-        Expr::BinaryOp {
-            op: Operator::And | Operator::Or,
-            ..
-        } => true,
-        Expr::Case { .. } => true,
-        // A dividend `NULLIF` makes `NULL` never raises.
-        Expr::FunctionCall { name, .. } if name == "NULLIF" => true,
-        Expr::BinaryOp { lhs, rhs, .. } => may_skip_evaluation(lhs) || may_skip_evaluation(rhs),
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => may_skip_evaluation(operand),
-        Expr::Not(_) | Expr::IsNull { .. } => {
-            expr.logic_children().into_iter().any(may_skip_evaluation)
-        }
-        Expr::FunctionCall { name, args } => {
-            name == "COALESCE" || args.iter().any(may_skip_evaluation)
-        }
-        _ => false,
-    }
-}
-
-/// A prefix minus over a number literal is one negative literal, as the parser
-/// reads it: rewrite the tree to the form its text parses back to.
-fn normalize_negations(expr: &mut Expr) {
-    match expr {
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            normalize_negations(lhs);
-            normalize_negations(rhs);
-        }
-        Expr::FunctionCall { args, .. } => args.iter_mut().for_each(normalize_negations),
-        Expr::Cast { expr: operand, .. } => normalize_negations(operand),
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            expr.logic_children_mut()
-                .into_iter()
-                .for_each(normalize_negations);
-        }
-        Expr::Negate(operand) => {
-            normalize_negations(operand);
-            if let Expr::NumberLiteral(text) = &**operand {
-                let flipped = match text.strip_prefix('-') {
-                    Some(positive) => positive.to_string(),
-                    None => format!("-{text}"),
-                };
-                *expr = Expr::NumberLiteral(flipped);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn describe(result: &Result<Vec<Option<String>>, String>) -> String {
     match result {
         Ok(rows) => format!("returns {} rows", rows.len()),
@@ -1163,53 +771,39 @@ fn describe(result: &Result<Vec<Option<String>>, String>) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn field_expr(text: &str) -> Expr {
-        parse(&format!("TRANSFORM t FROM x SELECT {text} AS v"))
-            .unwrap_or_else(|e| panic!("`{text}` does not parse: {e}"))
-            .fields
-            .remove(0)
-            .expr
+/// Whether a `/` or `%` in `expr` has a divisor written as a literal zero
+/// (`0`, `0.0`, `-0`, `REAL '0'`, `DOUBLE PRECISION '-0'`, under any `CAST`
+/// or prefix `-`): the rule define's `ConstantDivisorZero` refusal states,
+/// restated here so the harness checks define against it.
+pub fn has_literal_zero_divisor(expr: &Expr) -> bool {
+    fn literal_zero(divisor: &Expr) -> bool {
+        match divisor {
+            Expr::NumberLiteral(text) => {
+                let digits = text.trim_start_matches('-');
+                digits.chars().all(|c| c == '0' || c == '.') && digits.contains('0')
+            }
+            Expr::TypedLiteral {
+                value_type: ValueType::Float(_),
+                text,
+            } => matches!(text.as_str(), "0" | "-0"),
+            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => literal_zero(operand),
+            _ => false,
+        }
     }
-
-    /// The `NULLIF` shape the tolerance covers is a constant call first and
-    /// a column read second, anywhere in the expression.
-    #[test]
-    fn only_a_nullif_over_a_constant_call_and_a_column_is_replaced() {
-        for text in [
-            "CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NOT NULL THEN 2147483647 + 1 END",
-            "CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NULL THEN 0 ELSE 2147483647 + 1 END",
-            "NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NOT NULL AND 2147483647 + 1 = 1",
-            "NULLIF(STRPOS('a', 'a'), i4a)",
-        ] {
-            let rewritten = without_constant_call_nullifs(&field_expr(text))
-                .unwrap_or_else(|| panic!("`{text}` should hold the shape"));
-            assert!(
-                !format!("{rewritten:?}").contains("i4a"),
-                "`{text}` kept its column read: {rewritten:?}"
-            );
+    match expr {
+        Expr::BinaryOp { op, lhs, rhs } => {
+            (matches!(op, Operator::Divide | Operator::Modulo) && literal_zero(rhs))
+                || has_literal_zero_divisor(lhs)
+                || has_literal_zero_divisor(rhs)
         }
-        // Each of these is a false refusal the property must still fail on.
-        for text in [
-            "CASE WHEN STRPOS('a', 'a') = 2 THEN 2147483647 + 1 END",
-            // A first argument that is not a call.
-            "NULLIF(1, i4a)",
-            "NULLIF(NULL, i4a)",
-            // A first argument that reads a column.
-            "NULLIF(i4a, STRPOS('a', 'a'))",
-            "NULLIF(i4a + STRPOS('a', 'a'), i4b)",
-            // A second argument that reads none.
-            "NULLIF(STRPOS('a', 'a'), 1)",
-            "COALESCE(i4a, 2147483647 + 1)",
-        ] {
-            assert_eq!(
-                without_constant_call_nullifs(&field_expr(text)),
-                None,
-                "`{text}` is not the shape"
-            );
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+            has_literal_zero_divisor(operand)
         }
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
+            .logic_children()
+            .into_iter()
+            .any(has_literal_zero_divisor),
+        Expr::FunctionCall { args, .. } => args.iter().any(has_literal_zero_divisor),
+        _ => false,
     }
 }
