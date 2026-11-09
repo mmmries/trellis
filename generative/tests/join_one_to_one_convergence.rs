@@ -486,6 +486,38 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
          (the star tier is #1781); join_star_root's ps4b pin it",
     ),
     (
+        "star_own_j_only",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781); join_star_joined's cx_f1a to cx_f1f and cx_f6e, and \
+         join_star_crossing's per-position target batch pin, pin it",
+    ),
+    (
+        "star_r_after_m",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781); join_star_joined's cx_f1a, cx_f1b, cx_f1e and cx_f6e pin it",
+    ),
+    (
+        "star_last_no_r",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781); join_star_joined's cx_f1a and cx_f1c pin it",
+    ),
+    (
+        "star_r_split",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781), and fails by deadlock, which the engine retries; \
+         join_star_crossing's cx_f3b pins it",
+    ),
+    (
+        "star_recheck_j",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781); join_star_joined's cx_f11a and ps7 pin it",
+    ),
+    (
+        "star_recheck_skip_last",
+        "it fires only on a star of more than two tables, which this tier never draws \
+         (the star tier is #1781); join_star_joined's cx_f11a and ps7 (swapped) pin it",
+    ),
+    (
         "star_j_unsorted",
         "it leaves the J statements unsorted, which only changes the order two pages queue \
          on J rows in: a deadlock, which the engine retries, never a wrong row; the unit \

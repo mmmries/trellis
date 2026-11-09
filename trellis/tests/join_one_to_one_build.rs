@@ -782,9 +782,10 @@ async fn c10_a_chunk_whose_rederived_row_moved_onto_a_key_it_did_not_lock_retrie
 /// the first move's page moves the entry onto 70. The chunk's read of `a`
 /// finds 10, in its key set, but the entry it locks holds 70, which it holds
 /// no `J` row for, so it rolls back and its retry locks 70. Planted
-/// `join1_no_recheck` moves the entry off 70 unlocked: the `b` insert's page
-/// on 70 reads the entry still on 70 and joins `a01` to the new row, and the
-/// move back's Apply is refused (the chunk's read covers it).
+/// `join1_no_recheck` moves the entry off 70 unlocked, but the `b` insert's
+/// page on 70 locks the `R` entries on it (the R-entry rule), queues on
+/// `a01`'s and finds it moved, so the target stays exact: this pins the
+/// retry's outcome, not the plant.
 #[tokio::test]
 async fn c10_a_chunk_whose_entry_moved_off_its_key_set_retries() {
     let _serial = SERIAL.lock().await;

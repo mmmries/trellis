@@ -3937,7 +3937,8 @@ async fn settle_one_to_one_target(
         })
         .collect();
     let inserted =
-        one_to_one_ledger::lock_entries(txn, &ledger, &to_lock, seg_seq, predicate, false).await?;
+        one_to_one_ledger::lock_entries(txn, &ledger, &to_lock, seg_seq, predicate, false, None)
+            .await?;
 
     let rederive_keys: Vec<&str> = by_key
         .values()

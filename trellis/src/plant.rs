@@ -181,9 +181,10 @@ pub enum Plant {
     /// read of `M` and its target write.
     ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `an_a_page_holds_its_j_row_until_it_commits`,
-    /// `f3_an_a_move_races_a_b_update_of_its_new_key` and
-    /// `m_two_crossing_mixed_pages_queue_on_j_without_deadlock`.
+    /// `an_a_page_holds_its_j_row_until_it_commits` and
+    /// `f3_an_a_move_races_a_b_update_of_its_new_key`. The R-entry lock
+    /// (#1774) orders two mixed pages on one row without `J`, so
+    /// `m_two_crossing_mixed_pages_queue_on_j_without_deadlock` passes it.
     Join1NoJLock,
     /// ADR-0021 (#1375 `join1_no_recheck`): a 1-1 `JOIN` page doesn't check
     /// that the key an `R` entry holds, read again after the entry lock, is
@@ -193,9 +194,11 @@ pub enum Plant {
     /// A build chunk runs the same check on the entries it re-derives.
     ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `a_key_that_moved_under_the_page_rolls_it_back_and_the_retry_locks_both`,
-    /// and in a chunk by `join_one_to_one_build`'s
-    /// `c10_a_chunk_whose_entry_moved_off_its_key_set_retries`.
+    /// `a_key_that_moved_under_the_page_rolls_it_back_and_the_retry_locks_both`.
+    /// In a chunk, `join_one_to_one_build`'s
+    /// `c10_a_chunk_whose_entry_moved_off_its_key_set_retries` passes it: the
+    /// `b` page's R-entry lock (#1774) queues on the chunk's entry and reads
+    /// it moved.
     Join1NoRecheck,
     /// ADR-0002's I2 on a 1-1 `JOIN`'s hidden ledger keeps only its
     /// applied-position check (`staging::one_to_one_ledger::update_entries`):
@@ -283,7 +286,8 @@ pub enum Plant {
     ///
     /// Pinned by `join_one_to_one_interleavings`'s
     /// `f1_an_a_page_on_a_key_reads_m_only_after_the_b_page_on_it_commits`
-    /// and `m_two_crossing_mixed_pages_queue_on_j_without_deadlock`.
+    /// (`m_two_crossing_mixed_pages_queue_on_j_without_deadlock` passes it
+    /// since the R-entry lock, #1774).
     Join1MBeforeJ,
     /// ADR-0021 (#1375 C10, `chunk_nokey`): a 1-1 `JOIN` build chunk doesn't
     /// check that the join keys its insert-from-read found are in the key set
@@ -432,6 +436,59 @@ pub enum Plant {
     /// Pinned by `join_star_root`'s
     /// `ps4b_a_root_rederive_whose_key_moved_at_the_first_position_retries`.
     StarLateSkipFirst,
+    /// #1459 Decision item 1, #1464 (`star_own_j_only`): a joined-table
+    /// writer of a star 1-1 `JOIN` locks its own `J` but not the `R` entries
+    /// of the rows it fans out to (the R-entry rule), so a writer at another
+    /// position on one of those rows reads its `M` beside it and one of them
+    /// recomputes the row from the other's stale entry. Fires only on a star,
+    /// when the page fans out (the two-table page takes the lock too,
+    /// redundantly, #1464 Q5).
+    ///
+    /// Pinned by `join_star_joined`'s `cx_f1a_…` to `cx_f1f_…` and
+    /// `cx_f6e_…`, and by `join_star_crossing`'s
+    /// `crossing_mixed_pages_write_per_position_target_batches_without_deadlock`
+    /// (a deadlock).
+    StarOwnJOnly,
+    /// #1459 Decision item 1, #1464 (`star_r_after_m`): a star's
+    /// joined-table writer locks its fan-out rows' `R` entries only after
+    /// it has read `M` and written the target. Fires only on a star, when
+    /// the page fans out.
+    ///
+    /// Pinned by `join_star_joined`'s `cx_f1a_…`, `cx_f1b_…` and `cx_f1e_…`.
+    StarRAfterM,
+    /// #1459's n = 4 ablation, #1464 (`star_last_no_r`): the R-entry rule
+    /// skipped for the fan-out rows of a star's last position; the others
+    /// keep it. Fires only on a star, when the page fans out at the last
+    /// position.
+    ///
+    /// Pinned by `join_star_joined`'s `cx_f1a_…` and `cx_f1c_…`.
+    StarLastNoR,
+    /// #1459 Decision item 1, #1464 (`star_r_split`): a star page locks its
+    /// `R` entries in one statement per position (the root's with the
+    /// first), or at three or more joined positions in two (positions 1
+    /// and 2, then the rest), not one. Two pages fanning out at crossing
+    /// positions then lock one row each and queue on the other's: a
+    /// deadlock, which the engine retries, never a wrong row. Fires only on
+    /// a star, when the page would take more than one statement.
+    ///
+    /// Pinned by `join_star_crossing`'s `cx_f3b_…` (`deadlocks_logged()` is
+    /// empty).
+    StarRSplit,
+    /// #1459's F11, #1464 (`star_recheck_j`): a star's joined-table entry's
+    /// held key, or a joined Re-derive's live key, is re-checked against the
+    /// page's whole `J` set, not its fan-out keys at that position. A key
+    /// the page holds only for a root item passes, and the page recomputes
+    /// the rows on it without their `R` entries. Fires only on a star, when
+    /// the key is in `J` but not among the fan-out keys.
+    ///
+    /// Pinned by `join_star_joined`'s `cx_f11a_…` and `ps7_…`.
+    StarRecheckJ,
+    /// #1459's n = 4 F11 follow-up, #1464 (`star_recheck_skip_last`):
+    /// [`Plant::StarRecheckJ`] at a star's last position only.
+    ///
+    /// Pinned by `join_star_joined`'s `cx_f11a_…` and `ps7_…`, in their
+    /// swapped orientation (the late key at the last position).
+    StarRecheckSkipLast,
     /// ADR-0002 "Multi-hop" (#1482's `token_early`): a drain page reads the
     /// target-mutation seam's write token when it begins
     /// (`staging::target_mutations`), before its row locks, rather than after
@@ -592,6 +649,12 @@ impl Plant {
         Plant::StarRootSkipJMiddle,
         Plant::StarLateSkipLast,
         Plant::StarLateSkipFirst,
+        Plant::StarOwnJOnly,
+        Plant::StarRAfterM,
+        Plant::StarLastNoR,
+        Plant::StarRSplit,
+        Plant::StarRecheckJ,
+        Plant::StarRecheckSkipLast,
         Plant::SeamTokenEarly,
         Plant::SeamImagelessRow,
         Plant::GbxProbeNoXbasis,
@@ -650,6 +713,12 @@ impl Plant {
             Plant::StarRootSkipJMiddle => "star_root_skip_j_middle",
             Plant::StarLateSkipLast => "star_late_skip_last",
             Plant::StarLateSkipFirst => "star_late_skip_first",
+            Plant::StarOwnJOnly => "star_own_j_only",
+            Plant::StarRAfterM => "star_r_after_m",
+            Plant::StarLastNoR => "star_last_no_r",
+            Plant::StarRSplit => "star_r_split",
+            Plant::StarRecheckJ => "star_recheck_j",
+            Plant::StarRecheckSkipLast => "star_recheck_skip_last",
             Plant::SeamTokenEarly => "seam_token_early",
             Plant::SeamImagelessRow => "seam_imageless_row",
             Plant::GbxProbeNoXbasis => "gbx_probe_no_xbasis",

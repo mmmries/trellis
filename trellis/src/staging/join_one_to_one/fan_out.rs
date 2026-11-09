@@ -136,40 +136,63 @@ fn key_match_sql(at: &JoinedPosition, alias: &str, j: bool, first_param: usize) 
     )
 }
 
-/// A page's split of its fan-out `keys` (the module doc): returns the keys it
-/// recomputes itself, whose `R` entries fit [`chunk_rows`] between them, and
+/// A page's fan-out budget (the module doc): of `candidates`, the keys at
+/// each position (index 0 is position 1) the page may fan out on, the ones
+/// whose `R` entries fit [`chunk_rows`] between them, in position order and
+/// then key order. The budget is one per page, summed over positions
+/// (#1464 Q3). The count is of every entry on the key, tombstones and held
+/// rows included, so it never undercounts what the page writes. The page
+/// holds `J` for each key, so the count is the key's until it commits.
+pub(super) async fn budget(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    candidates: &[BTreeSet<KeyText>],
+) -> Result<Vec<BTreeSet<KeyText>>, ApplyError> {
+    let mut remaining = chunk_rows();
+    let mut inline: Vec<BTreeSet<KeyText>> = vec![BTreeSet::new(); candidates.len()];
+    for (at, keys) in shape.positions().iter().zip(candidates) {
+        let keys: Vec<&KeyText> = keys.iter().collect();
+        let mut next = 0;
+        while next < keys.len() && remaining > 0 {
+            let group = &keys[next..(next + COUNT_GROUP).min(keys.len())];
+            next += group.len();
+            let counts = capped_counts(txn, shape, at, group, remaining + 1).await?;
+            for (key, count) in group.iter().zip(counts) {
+                if count <= remaining {
+                    remaining -= count;
+                    inline[at.position.index()].insert((*key).clone());
+                }
+            }
+        }
+    }
+    Ok(inline)
+}
+
+/// A page's split of its fan-out `keys` at `at` (the module doc): returns
+/// those within `inline` ([`budget`]), which it recomputes itself, and
 /// deletes their markers; writes a marker for every other key, or resets the
-/// one it has. The count is of every entry on the key, tombstones and held
-/// rows included, so it never undercounts what the page writes.
+/// one it has. A star's page halts instead of writing one: its chunks don't
+/// take the R-entry rule yet (#1775).
 pub(super) async fn split(
     txn: &Transaction<'_>,
     plan: &JoinOneToOnePlan,
     at: &JoinedPosition,
     keys: &BTreeSet<KeyText>,
+    inline: &BTreeSet<KeyText>,
     seg_seq: i64,
 ) -> Result<BTreeSet<KeyText>, ApplyError> {
     let shape = &*plan.shape;
-    let keys: Vec<&KeyText> = keys.iter().collect();
-    let mut remaining = chunk_rows();
-    let mut inline: BTreeSet<KeyText> = BTreeSet::new();
-    let mut pending: BTreeSet<KeyText> = BTreeSet::new();
-    let mut next = 0;
-    while next < keys.len() {
-        let group = &keys[next..(next + COUNT_GROUP).min(keys.len())];
-        next += group.len();
-        if remaining == 0 {
-            pending.extend(group.iter().map(|k| (*k).clone()));
-            continue;
-        }
-        let counts = capped_counts(txn, shape, at, group, remaining + 1).await?;
-        for (key, count) in group.iter().zip(counts) {
-            if count <= remaining {
-                remaining -= count;
-                inline.insert((*key).clone());
-            } else {
-                pending.insert((*key).clone());
-            }
-        }
+    let (inline, pending): (BTreeSet<KeyText>, BTreeSet<KeyText>) =
+        keys.iter().cloned().partition(|key| inline.contains(key));
+    if shape.is_star() && !pending.is_empty() {
+        return Err(ApplyError::JoinOneToOneHalt {
+            target: shape.target.clone(),
+            reason: format!(
+                "a fan-out past one chunk ({} rows) of a 1-1 JOIN of more than two tables, \
+                 whose chunked fan-out is not built yet",
+                chunk_rows()
+            ),
+        });
     }
     clear(txn, shape, at, &inline).await?;
     mark(txn, shape, at, &pending, seg_seq, &plan.held_origin).await?;

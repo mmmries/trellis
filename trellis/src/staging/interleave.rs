@@ -63,11 +63,13 @@
 //! `BeforeJoin1Lock` after the pair's lock row and its key set,
 //! `AfterJoin1KeyInsert` after its `J` insert, `AfterJoinLock` after its
 //! sorted `J` lock, `AfterPlaceholders` and `AfterEntryLock` around its `R`
-//! entry lock (labelled by the ledger), `AfterJoin1REntryLock` once it has
-//! checked their held keys, the same three around its `M` entry lock with
-//! `AfterJoin1MEntryLock` last, `AfterJoin1Read` after a Re-derive's read,
-//! `BeforeJoin1Recompute` before its target write and fan-out, and
-//! `BeforeCommit`. A chunk of its pending fan-out
+//! entry lock (labelled by the ledger; the statement also locks the rows its
+//! joined changes fan out to), `AfterJoin1RLock` after it (labelled by the
+//! target), `AfterJoin1REntryLock` once it has checked their held keys, the
+//! same three around its `M` entry lock with `AfterJoin1MEntryLock` last,
+//! `AfterJoin1Read` after a Re-derive's read, `BeforeJoin1Recompute` before
+//! its target write and fan-out, `AfterJoin1PositionFanOut` after each
+//! position's fan-out, and `BeforeCommit`. A chunk of its pending fan-out
 //! (`super::join_one_to_one::fan_out`) fires `AfterJoin1FanOutLock` once it
 //! holds its key's `J` row and marker, and `BeforeJoin1FanOutCommit` after
 //! its last write.
@@ -271,6 +273,12 @@ pub enum PausePoint {
     /// For a 1-1 `JOIN`'s `M` ledger (labelled by the ledger), after the page
     /// locked its `M` entries. Fired by the `b` side's page, which locks them.
     AfterJoin1MEntryLock,
+    /// On a 1-1 `JOIN` target, after the page's lock statement of its `R`
+    /// entries: its root changes' and the rows its joined changes fan out
+    /// to (the R-entry rule), before it checks their keys or locks `M`. A
+    /// build chunk stops here too. The rule takes one statement; only the
+    /// `star_r_split` plant takes more, after this point.
+    AfterJoin1RLock,
     /// On a 1-1 `JOIN` target, directly after a Re-derive's one read-and-
     /// snapshot statement and its check that every key it read is in the
     /// locked set.
@@ -278,6 +286,10 @@ pub enum PausePoint {
     /// On a 1-1 `JOIN` target, after the page wrote its entries, before it
     /// reads `M` to recompute the target rows. A build chunk stops here too.
     BeforeJoin1Recompute,
+    /// On a 1-1 `JOIN` target, after the page's fan-out of one position's
+    /// changes wrote its rows, before the next position's: a star's target
+    /// is written in per-position batches (#1464 Q2).
+    AfterJoin1PositionFanOut,
     /// On a 1-1 `JOIN` target, after a rebuild sweep's orphan pass read a
     /// batch of target rows no live `R` entry backs, before it locks and
     /// re-derives them (`super::build`'s sweep job). Nothing of theirs is
