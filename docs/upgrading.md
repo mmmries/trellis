@@ -49,9 +49,10 @@ release gives them.
 After the takeover, a definition whose stored text the new grammar can't parse
 pauses, with a `capture_failure` naming the refusal and the remedy: `DROP
 TRANSFORM`, then define it again in the current grammar. A definition that
-parses but fails one of the new release's define-time checks keeps the state it
-had under the old release; the takeover does not run those checks again.
-Each release's notes list both kinds of case. Every other definition carries
+parses but fails one of the new release's define-time checks is left as the old
+release left it at the takeover, which does not run those checks again; rows
+that arrive afterwards follow the new release's rules. Each release's notes list
+both kinds of case. Every other definition carries
 on.
 
 A definition an earlier release built over a source key with `INCLUDE`

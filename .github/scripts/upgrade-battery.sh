@@ -633,10 +633,11 @@ fi
 # calculated fields too long to inline, which a fresh define refuses. The
 # takeover re-parses stored text and does not run those checks again, so the
 # chains run and equal Postgres. Out-of-range constants, which the candidate
-# defines too and fails at run time, are in the case for the takeover itself: they
-# stay as the old release left them (every row fails; with enough failing keys
-# the old release quarantines the whole definition) and none is paused as a
-# refusal. A definition the old release refuses itself is no upgrade case and
+# defines too and fails at run time, are in the case for the takeover itself:
+# at the takeover they stay as the old release left them (status, held keys and
+# target rows; the old release quarantines the whole definition once enough
+# keys fail) and none is paused as a refusal. Rows that arrive later follow the
+# candidate's rules, not the old release's, so the step adds none to them. A definition the old release refuses itself is no upgrade case and
 # is left out.
 checks_consts=""   # the constant definitions the old release accepted
 checks_chains=""   # "<name>:<length>" per accepted chain
@@ -958,8 +959,9 @@ consts_grammar() {
 
 # checks_grammar: the checks database (prep: checks). The takeover re-parses
 # stored text and does not run the define-time checks again: a chain a fresh
-# define refuses keeps running. The constants (which define now) keep the status, held keys and target rows the old release left
-# them with and are not paused as a refusal; the chains stay live and equal
+# define refuses keeps running. At the takeover the constants (which define
+# now) keep the status, held keys and target rows the old release left them
+# with and are not paused as a refusal; the chains stay live and equal
 # Postgres after changes. No remedy is asserted: none is prescribed.
 checks_grammar() {
   local p=$port d=checks line n c bad="" refused="" diff="" post chains=""
@@ -985,7 +987,22 @@ checks_grammar() {
     else refused="$refused $n"; fi
   done <<<"$checks_texts"
   [ -z "$bad" ] || record INFO grammar "the candidate now accepts these in a fresh define, so they are no longer cases of this check:$bad"
-  # Changes after the takeover reach the chains; the constants fail as before.
+  # At the takeover the constants keep the state the old release left them in:
+  # not paused as a refusal, status, held keys and target rows as before. (The old
+  # release's state depends on whether the table had rows at define.) Read before
+  # any row changes: rows that arrive later follow the candidate's rules.
+  sleep 10
+  post=$(checks_snapshot)
+  bad=""
+  for n in $checks_consts $checks_bdefs; do paused_with "$p" "$d" "$n" 'refused by this release' && bad="$bad $n"; done
+  if [ -n "${checks_consts// /}${checks_bdefs// /}" ]; then
+    if [ "$post" = "$checks_pre" ] && [ -z "$bad" ]; then
+      record PASS grammar "stored constants out of range keep the state $old_tag left them in, none paused as refused: $(echo "$post" | tr '\n' ';')"
+    else
+      record FAIL grammar "stored constants out of range changed at the takeover: before [$(echo "$checks_pre" | tr '\n' ';')] after [$(echo "$post" | tr '\n' ';')]${bad:+, paused as refused:$bad}"
+    fi
+  fi
+  # Changes after the takeover reach the chains.
   sql "$p" "$d" -c "update k set a = a + 5 where id <= 5" \
     -c "insert into k select g, g, null, null from generate_series(11, 20) g"
   if [ -n "${chains// /}" ]; then
@@ -997,20 +1014,6 @@ checks_grammar() {
     fi
     # shellcheck disable=SC2086
     check_self "$p" "$d" grammar $chains
-  fi
-  # The constants keep the state the old release left them in: not paused as a
-  # refusal, status, held keys and target rows as before. (The old release's
-  # state depends on whether the table had rows at define; see the notes.)
-  sleep 10
-  post=$(checks_snapshot)
-  bad=""
-  for n in $checks_consts $checks_bdefs; do paused_with "$p" "$d" "$n" 'refused by this release' && bad="$bad $n"; done
-  if [ -n "${checks_consts// /}${checks_bdefs// /}" ]; then
-    if [ "$post" = "$checks_pre" ] && [ -z "$bad" ]; then
-      record PASS grammar "stored constants out of range keep the state $old_tag left them in, none paused as refused: $(echo "$post" | tr '\n' ';')"
-    else
-      record FAIL grammar "stored constants out of range changed at the takeover: before [$(echo "$checks_pre" | tr '\n' ';')] after [$(echo "$post" | tr '\n' ';')]${bad:+, paused as refused:$bad}"
-    fi
   fi
   stop_run new-checks
 }
