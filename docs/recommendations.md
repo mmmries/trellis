@@ -285,6 +285,15 @@ A lookup joined at any position of a 1-1 `JOIN` star
 ([transforms](transforms.md#1-1-join)) fans out the same way: one edit rewrites
 every target row on its key at that position.
 
+Each table a star adds raises the cost of a changed row by a small, nearly
+constant amount. Measured on fan-outs of 1,000,000 rows and root passes of
+200,000 rows: a fanned-out row costs about 0.4 µs more per added table (about
+4% of the two-table cost of roughly 11 µs per row) and about 8 bytes of WAL,
+wherever in the star the changed joined table sits; a changed root row costs
+about 4 µs more per added table (about 15% of the two-table cost of roughly
+28 µs per row) and 240 to 370 bytes of WAL. Both costs grow sublinearly with the
+number of tables, and there is no step up at the five-table limit.
+
 `status()` reports a key that fans out widely: `join.fan_out_warnings` has one
 warning per joined position past the threshold, naming the position, the key,
 the number of root rows on it and the threshold, which is 250,000 rows per
