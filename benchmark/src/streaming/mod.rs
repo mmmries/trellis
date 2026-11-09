@@ -66,8 +66,9 @@
 //! - [`one_to_one_apply`]: a 1-1 target's drain cost per row by field
 //!   shape: rows/s, Postgres CPU and page transaction durations.
 //! - [`one_to_one_join`]: a 1-1 `JOIN`'s `b` change fanning out to many rows
-//!   of `a`: the cost per row against a set-based control, and a fan-out
-//!   with failing rows.
+//!   of `a`: the cost per row against a set-based control, a fan-out
+//!   with failing rows, root-change throughput, and all of it for a star of
+//!   up to five tables (`--joined`).
 //! - [`one_to_one_join_seam`]: what a 1-1 `JOIN` that reads an upstream's
 //!   target costs the upstream: its latency and the cluster's WAL with and
 //!   without the reader.
