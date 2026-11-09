@@ -101,9 +101,6 @@ pub(crate) enum HiddenTable {
     TruncateLock,
 }
 
-/// The first position's `M`: the only one a two-table JOIN has.
-pub(crate) const M: HiddenTable = HiddenTable::JoinedEntries(Position::FIRST);
-
 impl HiddenTable {
     /// Every hidden table of `def`: `R`, each position's `M`, `J` and the
     /// lock row.
@@ -618,7 +615,10 @@ mod tests {
     #[test]
     fn hidden_tables_are_named_by_definition_id_apart_from_an_aggregate_joins() {
         assert_eq!(HiddenTable::FromEntries.name(7), "join1_7_r");
-        assert_eq!(M.name(7), "join1_7_m");
+        assert_eq!(
+            HiddenTable::JoinedEntries(Position::FIRST).name(7),
+            "join1_7_m"
+        );
         assert_eq!(
             HiddenTable::JoinedEntries(Position::from_number(3).unwrap()).name(7),
             "join1_7_m3"

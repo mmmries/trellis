@@ -178,10 +178,24 @@ fn side_of(def: &TransformDef, table: &str) -> Option<JoinSide> {
     spec::side_of_written(def, join_of(def), table)
 }
 
+/// The alias a column of the joined table at `position` is read through when
+/// [`render`] is given `joined`: `joined` itself at position 1, and `joined`
+/// followed by the position's number after it (`b`, `b2`, `b3`, ...). A
+/// two-table `JOIN` (every aggregate `JOIN`) reads only position 1, so its
+/// alias is the one passed.
+pub(super) fn joined_alias(joined: &str, position: spec::Position) -> String {
+    if position == spec::Position::FIRST {
+        joined.to_string()
+    } else {
+        format!("{joined}{}", position.number())
+    }
+}
+
 /// Renders a `JOIN` field expression, or an aggregate's argument, as SQL
-/// with every column read through its side's alias (`from` or `joined`).
-/// [`render_leaf`]'s twin for two tables: written fresh here, not shared
-/// with the apply path. `Err` for what a `JOIN` definition can't hold.
+/// with every column read through its side's alias: `from` for the `FROM`
+/// table, [`joined_alias`] of `joined` for the joined table at each
+/// position. [`render_leaf`]'s twin for `JOIN`s: written fresh here, not
+/// shared with the apply path. `Err` for what a `JOIN` definition can't hold.
 pub(super) fn render(
     def: &TransformDef,
     expr: &Expr,
@@ -191,8 +205,8 @@ pub(super) fn render(
     Ok(match expr {
         Expr::SourceColumn { table, column, .. } => {
             let alias = match side_of(def, table) {
-                Some(JoinSide::From) => from,
-                Some(JoinSide::Joined(_)) => joined,
+                Some(JoinSide::From) => from.to_string(),
+                Some(JoinSide::Joined(position)) => joined_alias(joined, position),
                 None => return Err(format!("reads '{table}.{column}', which is neither table")),
             };
             format!("{alias}.{}", quote_ident(column))
