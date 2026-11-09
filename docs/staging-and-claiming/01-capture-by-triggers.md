@@ -292,7 +292,7 @@ pass regenerates the functions over it before the resumed transform's
 rebuild starts. A 1-1 transform's target is keyed by its source's key, so
 its `RESUME` re-keys the target in place to the new one first, and records
 the target's new key, which pauses the transforms reading the target in turn
-([the key row](../transforms.md#supported-sources-and-targets)).
+([the key row](../transforms.md#the-key-a-transform-keys-each-table-by)).
 
 ## A re-typed key column, or an outgrown copy
 

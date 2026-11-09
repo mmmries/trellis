@@ -815,7 +815,7 @@ without them:
   not attempts. A halt that pauses nothing because a peer already paused the
   closure retries the page once. One that still pauses nothing (a refused
   read or write the catalog can't pin on a table,
-  [row-level security](transforms.md#supported-sources-and-targets))
+  [row-level security](transforms.md#row-level-security-on-a-role-trellis-runs-as))
   surfaces the error and records the page as a drain holdup, which `status`
   reports as `drain_failure` on the definitions reading its tables. The drain
   worker re-claims the page at its poll interval under a collapsed warning.

@@ -271,7 +271,7 @@ does not build, is a finding. `bundle install` may add a `bundler` line to
 **Refusals the script does not build (step 3).** The script constructs the
 refusals it can build with the old CLI. Check the rest by reading the
 candidate's list of refusals against what the old build accepted (the
-"Supported sources and targets" table in [transforms](transforms.md), the
+"Supported sources and targets" section of [transforms](transforms.md), the
 changes since the predecessor's tag), and for each one the old build accepts,
 define it under the old CLI, upgrade, and confirm the definition pauses with a
 reason that names the remedy and the remedy works. Cases that the old build
@@ -338,7 +338,7 @@ For each release, the notes carry:
   picks: when a table's primary key is redefined or dropped, the transforms
   that key it by that key pause, and `RESUME` takes its primary key now and
   refuses while it has none
-  ([the key row](transforms.md#supported-sources-and-targets)).
+  ([the key row](transforms.md#the-key-a-transform-keys-each-table-by)).
 - **Changes an upgrade makes that users don't see,** so a question about them
   has an answer. For `0.2.0`: an in-flight 1-1 rebuild sweep whose cursor
   began with U+0001 restarts from the start.

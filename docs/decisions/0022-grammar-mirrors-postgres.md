@@ -158,7 +158,7 @@ an `interval`-producing `-`, a `STABLE` overload Postgres picks silently,
 typed literal. Each refusal is named in the error, carries a remedy, and is
 listed in the
 [Supported sources and targets](../transforms.md#supported-sources-and-targets)
-table, which is the only reference for them. The narrowing runs one way: a
+section, which is the only reference for them. The narrowing runs one way: a
 refusal can later become an acceptance of Postgres's meaning, but Trellis never
 accepts text Postgres refuses, or gives a meaning Postgres doesn't, to work
 around one.
