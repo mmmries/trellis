@@ -123,6 +123,17 @@ pub mod staging {
     /// counts bursts large enough to seal into a split batch, and must follow
     /// the threshold if it moves.
     pub use crate::staging::claim::MIN_ROWS_TO_SPLIT;
+    /// Lowers the split threshold for this process, so the star tier's
+    /// small batches split across workers and a root row's pages at two
+    /// positions drain side by side (#1817).
+    pub use crate::staging::claim::set_min_rows_to_split;
+
+    /// The split threshold batches seal with in this process:
+    /// `MIN_ROWS_TO_SPLIT`, or what [`set_min_rows_to_split`] lowered it
+    /// to. The concurrent tier's coverage report reads it.
+    pub fn min_rows_to_split() -> i64 {
+        crate::staging::claim::min_rows_to_split()
+    }
     /// `seal_phase1`/`seal_phase2` force a seal boundary at a deterministic
     /// point so two changes land in distinct segments instead of depending on
     /// a maintenance tick's timing. There is no facade equivalent — "seal
@@ -193,7 +204,7 @@ pub mod capture {
 pub mod interleave {
     pub use crate::staging::interleave::{
         PausePoint, PauseScope, Reached, force_join_key_moves, join_key_moves, set_commit_stall,
-        set_group_lock_stall, set_stall, with_scope,
+        set_group_lock_stall, set_lock_step_stall, set_rederived_pages, set_stall, with_scope,
     };
 }
 

@@ -196,6 +196,21 @@
 //! the first wrote but hasn't committed (the `JOIN` tier's `join_no_j_lock`
 //! and `join_t_skip_lock` plants).
 //!
+//! A lock-step stall ([`set_lock_step_stall`]) holds a share of a 1-1
+//! `JOIN` page's lock steps, each on its own draw: from
+//! `BeforeJoin1Lock` to `AfterJoin1PositionFanOut` above, and a fan-out
+//! chunk's `AfterJoin1FanOutLock` and `AfterJoin1FanOutRLock`. It sleeps a
+//! uniform time up to its maximum, so a held step is often long: the
+//! window in which a star's writer at another position, or a writer moving
+//! the page's row, commits between two of the page's steps (the star
+//! tier's R-entry and late-key plants). A re-derived share
+//! ([`set_rederived_pages`]) has a share of the 1-1 `JOIN` pages that hold
+//! changes re-derive them instead, as a page that may predate a build does:
+//! each reads its rows live, unlocked, before its key lock, and sleeps up
+//! to the lock-step stall between the two, so a row that moves meanwhile
+//! takes the late-key retry. A Re-derive is exact whenever it runs, so
+//! neither changes what a correct engine converges to.
+//!
 //! A stall is process-wide, like a plant, and an armed [`PauseScope`] point
 //! ignores it. Every page of every engine in the process takes it, so a
 //! harness that sets one runs nothing else in that process meanwhile (the
@@ -563,8 +578,88 @@ pub fn set_commit_stall(max: Option<Duration>) {
     COMMIT_STALL_MAX_MICROS.store(micros, Ordering::Relaxed);
 }
 
+/// The longest lock-step stall, in microseconds; 0 for none. See the module
+/// doc's "Stalls".
+static LOCK_STEP_STALL_MAX_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// The share of lock steps that stall, in thousandths.
+static LOCK_STEP_STALL_PER_MILLE: AtomicU64 = AtomicU64::new(0);
+
+/// Sets the longest stall a 1-1 `JOIN` page or fan-out chunk takes at a
+/// lock step, and the share of its lock steps, in thousandths, that take
+/// one; `None` clears it. See the module doc's "Stalls".
+pub fn set_lock_step_stall(max: Option<Duration>, per_mille: u16) {
+    let micros = max.map_or(0, |max| u64::try_from(max.as_micros()).unwrap_or(u64::MAX));
+    LOCK_STEP_STALL_PER_MILLE.store(u64::from(per_mille.min(1000)), Ordering::Relaxed);
+    LOCK_STEP_STALL_MAX_MICROS.store(micros, Ordering::Relaxed);
+}
+
+/// The share of 1-1 `JOIN` pages re-derived, in thousandths
+/// ([`set_rederived_pages`]).
+static REDERIVED_PAGES_PER_MILLE: AtomicU64 = AtomicU64::new(0);
+
+/// Has the share `per_mille` (in thousandths) of the 1-1 `JOIN` pages that
+/// hold changes re-derive them, as a page that may predate a build does; 0
+/// stops it. See the module doc's "Stalls".
+pub fn set_rederived_pages(per_mille: u16) {
+    REDERIVED_PAGES_PER_MILLE.store(u64::from(per_mille.min(1000)), Ordering::Relaxed);
+}
+
+/// Whether this 1-1 `JOIN` page re-derives its changes
+/// ([`set_rederived_pages`]).
+pub(crate) fn take_rederived_page() -> bool {
+    let share = REDERIVED_PAGES_PER_MILLE.load(Ordering::Relaxed);
+    share > 0 && unit() * 1000.0 < share as f64
+}
+
+/// A page [`take_rederived_page`] re-derived sleeps a uniform time up to
+/// the lock-step stall ([`set_lock_step_stall`]) between its unlocked read
+/// of its rows' keys and its key lock, so a row that moves meanwhile takes
+/// the late-key retry.
+pub(crate) async fn rederive_stall() {
+    let max = LOCK_STEP_STALL_MAX_MICROS.load(Ordering::Relaxed);
+    if max > 0 {
+        tokio::time::sleep(Duration::from_micros((unit() * max as f64) as u64)).await;
+    }
+}
+
+/// A uniform draw in `[0, 1)`: a splitmix64 step over a shared counter, no
+/// RNG dependency for a test-only jitter that needs no quality beyond
+/// "spread out".
+fn unit() -> f64 {
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let mut x = STATE
+        .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
+        .wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
 /// Sleeps a random time up to the set stall, at the points it applies to.
 async fn stall(point: PausePoint) {
+    if matches!(
+        point,
+        PausePoint::BeforeJoin1Lock
+            | PausePoint::AfterJoin1KeyInsert
+            | PausePoint::AfterJoin1RLock
+            | PausePoint::AfterJoin1REntryLock
+            | PausePoint::AfterJoin1MEntryLock
+            | PausePoint::AfterJoin1Read
+            | PausePoint::BeforeJoin1Recompute
+            | PausePoint::AfterJoin1PositionFanOut
+            | PausePoint::AfterJoin1FanOutLock
+            | PausePoint::AfterJoin1FanOutRLock
+    ) {
+        let max = LOCK_STEP_STALL_MAX_MICROS.load(Ordering::Relaxed);
+        let share = LOCK_STEP_STALL_PER_MILLE.load(Ordering::Relaxed);
+        if max > 0 && share > 0 && unit() * 1000.0 < share as f64 {
+            let micros = (unit() * max as f64) as u64;
+            tokio::time::sleep(Duration::from_micros(micros)).await;
+        }
+        return;
+    }
     let max = match point {
         PausePoint::AfterPlaceholders
         | PausePoint::AfterEntryLock
@@ -578,16 +673,7 @@ async fn stall(point: PausePoint) {
     if max == 0 {
         return;
     }
-    // A splitmix64 step over a shared counter: no RNG dependency for a
-    // test-only jitter that needs no quality beyond "spread out".
-    static STATE: AtomicU64 = AtomicU64::new(0);
-    let mut x = STATE
-        .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
-        .wrapping_add(0x9e37_79b9_7f4a_7c15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^= x >> 31;
-    let unit = (x >> 11) as f64 / (1u64 << 53) as f64;
+    let unit = unit();
     let micros = (unit * unit * unit * max as f64) as u64;
     tokio::time::sleep(Duration::from_micros(micros)).await;
 }

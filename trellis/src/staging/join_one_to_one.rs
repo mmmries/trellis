@@ -998,12 +998,17 @@ pub(crate) async fn apply_page(
 ) -> Result<(usize, usize), ApplyError> {
     let shape = &*plan.shape;
     // 1. Fold.
+    // Test-only: a share of pages re-derives. See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    let forced = super::interleave::take_rederived_page();
+    #[cfg(not(any(test, feature = "test-util")))]
+    let forced = false;
     let predates = plan
         .a
         .iter()
         .chain(plan.b.iter().flatten())
         .any(|r| r.apply.is_some())
-        && super::ledger::page_may_predate_build(txn, &shape.r, first_seg).await?;
+        && (forced || super::ledger::page_may_predate_build(txn, &shape.r, first_seg).await?);
     let rederived: (Vec<Record>, Vec<Vec<Record>>) = if predates {
         (
             plan.a.iter().map(Record::rederive).collect(),
@@ -1128,6 +1133,12 @@ pub(crate) async fn apply_page(
         &shape.target,
     )
     .await?;
+    // Test-only: a re-derived page holds its unlocked read open. See
+    // `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    if forced {
+        super::interleave::rederive_stall().await;
+    }
 
     // 3. `J`, one sorted statement over every position's keys.
     let locked = root_skip_j(shape, &k, &root_k, &joined_k);

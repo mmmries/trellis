@@ -21,9 +21,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use generative::generate::join::{JoinCase, JoinOpKind, KeyShape, STAR_HOT_KEYS};
 use generative::generate::join_chained::chained_case_strategy;
 use generative::generate::join_one_to_one::{
-    MAX_TABLES, OnShape, OneToOneField, OneToOneOpDraw, OneToOneSpec, STAR_WORKERS, StarCase,
-    StarPosition, build_star_program, one_to_one_case_strategy, own_key_column, star_case_strategy,
-    star_definition_text, table_at,
+    MAX_TABLES, OnShape, OneToOneField, OneToOneOpDraw, OneToOneSpec, STAR_COMMIT_STALL_MS,
+    STAR_LOCK_STEP_STALL_MS, STAR_MAX_FAN_OUT_CHUNK_ROWS, STAR_MAX_PACE_MICROS,
+    STAR_MAX_SPLIT_ROWS, STAR_WORKERS, StarCase, StarPosition, build_star_program,
+    one_to_one_case_strategy, own_key_column, star_case_strategy, star_definition_text, table_at,
 };
 use generative::model::{Op, Program, Table};
 use proptest::strategy::Strategy;
@@ -264,7 +265,9 @@ fn the_star_strategy_draws_mixed_pages_spanning_positions() {
 
 /// The knobs: every late position, page sizes from 1 to 15, the
 /// metamorphic case about one in four with an order other than the
-/// definition's, the stall and the shares #1464 section 4 names.
+/// definition's, the stalls, the shares #1464 section 4 names, every
+/// fan-out chunk from 1 row up or the engine's, and a lowered split
+/// threshold and a pace in about three cases in four.
 #[test]
 fn the_star_strategy_draws_its_knobs() {
     let cases = star_cases();
@@ -276,6 +279,37 @@ fn the_star_strategy_draws_its_knobs() {
         for p in 1..tables as u8 {
             assert!(late.contains(&(tables, p)), "{tables} tables, late {p}");
         }
+    }
+    let chunks: BTreeSet<Option<usize>> =
+        cases.iter().map(|c| c.knobs.fan_out_chunk_rows).collect();
+    assert_eq!(chunks.len(), STAR_MAX_FAN_OUT_CHUNK_ROWS + 1, "{chunks:?}");
+    let split = cases
+        .iter()
+        .filter(|c| c.knobs.split_rows.is_some())
+        .count();
+    let paced = cases.iter().filter(|c| c.knobs.pace.is_some()).count();
+    for share in [split, paced] {
+        assert!(
+            (80..=150).contains(&share),
+            "{split}, {paced} of {}",
+            cases.len()
+        );
+    }
+    for case in &cases {
+        assert!(
+            case.knobs
+                .split_rows
+                .is_none_or(|rows| (2..=STAR_MAX_SPLIT_ROWS).contains(&rows))
+        );
+        assert_eq!(
+            case.case.plan.steady_load.map(|load| load.pace),
+            case.knobs.pace
+        );
+        assert!(
+            case.knobs.pace.is_none_or(|pace| {
+                pace <= std::time::Duration::from_micros(STAR_MAX_PACE_MICROS)
+            })
+        );
     }
     let caps: BTreeSet<usize> = cases.iter().map(|c| c.knobs.drain_batch_cap).collect();
     assert!(caps.contains(&1) && caps.contains(&15), "{caps:?}");
@@ -297,10 +331,19 @@ fn the_star_strategy_draws_its_knobs() {
         assert_eq!(order, (1..case.tables as u8).collect::<Vec<_>>());
         assert_eq!(case.knobs.stalled_lock_steps_per_mille, 300);
         assert_eq!(case.knobs.rederived_pages_per_mille, 120);
-        assert!(case.knobs.lock_step_stall <= std::time::Duration::from_millis(3));
-        assert_eq!(
-            case.case.plan.commit_stall,
-            Some(case.knobs.lock_step_stall)
+        assert!(
+            (1..=STAR_LOCK_STEP_STALL_MS)
+                .contains(&(case.knobs.lock_step_stall.as_millis() as u64))
+        );
+        assert!(
+            case.case.plan.commit_stall.is_some_and(
+                |stall| stall <= std::time::Duration::from_millis(STAR_COMMIT_STALL_MS)
+            )
+        );
+        assert!(
+            case.knobs
+                .fan_out_chunk_rows
+                .is_none_or(|rows| { (1..=STAR_MAX_FAN_OUT_CHUNK_ROWS).contains(&rows) })
         );
         let twin = case.permuted_program();
         assert_eq!(twin.ops, case.case.program.ops);
@@ -308,6 +351,53 @@ fn the_star_strategy_draws_its_knobs() {
             assert_eq!(def.fields, original.fields);
         }
     }
+}
+
+/// #1817's draws: a root row moving at one position alone (a `ja` key
+/// update that sets one own key `k{p}`, or `k` without the own keys), and
+/// bursts that end in a race, their last ops writing one hot key at every
+/// position.
+#[test]
+fn the_star_strategy_draws_one_position_moves_and_tail_races() {
+    let (mut own_only, mut root_only, mut bursts, mut raced) = (0, 0, 0, 0);
+    for case in star_cases().iter().filter(|c| c.tables >= 3) {
+        for op in &case.case.program.ops {
+            let Op::Update { table, changes, .. } = op else {
+                continue;
+            };
+            if table != "ja" {
+                continue;
+            }
+            let owns = (2..case.tables as u8)
+                .filter(|&p| changes.iter().any(|(c, _)| *c == own_key_column(p)))
+                .count();
+            let k = changes.iter().any(|(c, _)| c == "k");
+            own_only += usize::from(!k && owns == 1);
+            root_only += usize::from(k && owns == 0);
+        }
+        for burst in case.case.program.ops.chunks(case.case.burst_size) {
+            bursts += 1;
+            let tail = &burst[burst.len().saturating_sub(3 * case.tables)..];
+            let hot: BTreeSet<(&str, &str)> = tail
+                .iter()
+                .filter_map(|op| {
+                    let (table, columns) = match op {
+                        Op::Insert { table, row, .. } => (table, row),
+                        Op::Update { table, changes, .. } => (table, changes),
+                        _ => return None,
+                    };
+                    let p = generative::generate::join_one_to_one::position_of(table)?;
+                    let key = written(columns, if p == 0 { "k" } else { "u" })?;
+                    (key.parse::<u8>().ok()? < STAR_HOT_KEYS).then_some((key, table.as_str()))
+                })
+                .collect();
+            let tables_on = |key: &str| hot.iter().filter(|(k, _)| *k == key).count();
+            raced += usize::from(hot.iter().any(|(key, _)| tables_on(key) == case.tables));
+        }
+    }
+    assert!(own_only > 300, "{own_only}");
+    assert!(root_only > 300, "{root_only}");
+    assert!(raced * 2 > bursts, "{raced} of {bursts}");
 }
 
 /// Replayed in program order, no joined table's write breaks one of its
@@ -705,6 +795,7 @@ fn hand_built(tables: usize) -> (Program, Vec<OneToOneSpec>) {
                 if i % 9 == 0 { 252 } else { 1 },
             ],
             on_key: i % 4 == 0,
+            key_scope: None,
         });
     }
     let positions = tables - 1;

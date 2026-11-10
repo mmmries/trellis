@@ -544,10 +544,23 @@ beside them run on every `cargo test`.
   keys equal its `k` half the time, so it is hot at two or more positions at
   once; the stream cut into shuffled pages of 1 to 15 draws, half of them
   mixed (one root key written at the root and at every position, the
-  drawn "late" position's write last); drains capped at a drawn 1 to 15
-  rows; 8 workers and a commit stall of up to 3 ms. The case also carries
-  the shares of lock steps to stall (30%) and pages to re-derive (12%),
-  which wait for engine hooks that stall or re-derive a share of them. One
+  drawn "late" position's write last); root rows that move at one
+  position alone; updates concentrated on a few rows; and bursts that end in
+  a race (a root row and a row of each joined table put on a hot key, then
+  value changes of the joined rows at every position, with nothing after
+  them to repair what they leave). Its cases drain with 8 workers, drains
+  capped at a drawn 1 to 15 rows, a commit stall of up to 20 ms, and the
+  engine's test-only knobs (`trellis::dev::interleave`,
+  `trellis::dev::staging`, `trellis::dev::defs`), each process-wide for the
+  case: 30% of a page's lock steps stalled up to a drawn 1 to 12 ms; 12% of
+  pages re-derived, each holding its unlocked read open before its key
+  lock; in three cases in four a split threshold of 2 to 16 rows, so one
+  batch's pages drain on several workers side by side, and lanes paced at
+  2 to 20 ms an op, so rows move while pages drain; and in half the cases a
+  fan-out chunk of 1 to 4 rows, below a hot key's rows, so fan-outs go
+  through pending markers and chunks. None of the knobs exists in a normal
+  build, and each changes when things happen or how a page reads, never
+  what a correct engine converges to. One
   case in four runs its metamorphic twin too: the same program with every
   definition's `JOIN` clauses in a drawn order, which renumbers the
   positions and so changes the engine's `(position, key)` lock order but no
@@ -573,15 +586,18 @@ beside them run on every `cargo test`.
   plants whose only failure is a deadlock the engine retries). It gates the
   plants it catches in about one case in five or more:
   `join1_no_placeholder`, `join1_old_key_unlocked`, `join1_no_orphan_pass`,
-  `star_root_skip_j_last`, `star_root_skip_j_first`,
-  `star_root_skip_j_middle`, `star_chunk_skip_j_last` and
-  `star_chunk_skip_j_first`. The rest run as known misses, with their
-  measured rates in the tier's `STAR_KNOWN_MISSES`: among them the R-entry
-  rule's ablations, which fire in about 35 cases of 48 and are caught in
-  none, and the plants that need a Re-derive whose row moved after its read
-  or a fan-out chunk, which the tier doesn't fire. Their deterministic pins
-  gate all of them. The two-table tier leaves every plant that fires only
-  on a star to this one.
+  `join1_truncate_keeps_r`, `join1_m_before_j`, `star_root_skip_j_last`,
+  `star_root_skip_j_first`, `star_root_skip_j_middle`,
+  `star_chunk_skip_j_last` and `star_chunk_skip_j_first`. The rest run as
+  known misses, with their measured rates in the tier's
+  `STAR_KNOWN_MISSES`. Every `star_*` plant it runs fires, but the R-entry
+  rule's ablations, the late-key and re-check plants and the fan-out
+  chunk's are caught in a few cases of 48 at most: each needs two pages,
+  or a page and a source write, to meet inside a window of a few
+  milliseconds, which a deterministic pin holds open with a pause point and
+  the tier's timing only hits now and then. Their pins gate all of them.
+  The two-table tier leaves every plant that fires only on a star to this
+  one.
 - **Chained-reader convergence** (`tests/join_chained_convergence.rs`,
   ADR-0002 "Multi-hop"). A `JOIN`, aggregate or 1-1, one of whose sides is
   another definition's target in the same instance, so the target-mutation

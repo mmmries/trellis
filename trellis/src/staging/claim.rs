@@ -46,6 +46,31 @@ const _: () = assert!(
 /// seals to a single bucket, unsplit.
 pub const MIN_ROWS_TO_SPLIT: i64 = 256;
 
+/// Test-only: the split threshold a harness lowered [`MIN_ROWS_TO_SPLIT`]
+/// to ([`set_min_rows_to_split`]); 0 for the constant.
+#[cfg(any(test, feature = "test-util"))]
+static SPLIT_ROWS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Lowers the split threshold of every batch sealed in this process from
+/// [`MIN_ROWS_TO_SPLIT`] to `rows`, so a test's small batches split across
+/// workers; `0` restores it. Test-only: a normal build always uses the
+/// constant.
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_min_rows_to_split(rows: i64) {
+    SPLIT_ROWS.store(rows.max(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The row count a batch needs to split into [`SEG_BUCKETS`] buckets:
+/// [`MIN_ROWS_TO_SPLIT`], or what a test set ([`set_min_rows_to_split`]).
+pub(crate) fn min_rows_to_split() -> i64 {
+    #[cfg(any(test, feature = "test-util"))]
+    match SPLIT_ROWS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {}
+        rows => return rows,
+    }
+    MIN_ROWS_TO_SPLIT
+}
+
 /// The share denominator's default staleness window (see
 /// [`count_live_drainers`]): a drainer that hasn't registered within this
 /// long doesn't count as live. Distinct from

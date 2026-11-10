@@ -19,7 +19,7 @@ use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, GenericClient, Transaction};
 
 use super::append::{self, RING_SIZE, ring_table_name};
-use super::claim::{MIN_ROWS_TO_SPLIT, SEG_BUCKETS};
+use super::claim::SEG_BUCKETS;
 use super::error::StagingError;
 use super::state::SegmentState;
 use crate::capture::partitions;
@@ -367,6 +367,7 @@ pub async fn seal_phase2(
         partitions::Kind::Truncated.as_str(),
         partitions::Cause::Truncated.as_str(),
     );
+    let min_rows = super::claim::min_rows_to_split();
     let sql = format!(
         "with batch as ({window}), \
          decided as ( \
@@ -385,7 +386,7 @@ pub async fn seal_phase2(
                     has_schema_change = d.has_schema_change, \
                     bucket_count = (case \
                         when d.has_truncate then 1 \
-                        when d.row_count >= {MIN_ROWS_TO_SPLIT} then {SEG_BUCKETS} \
+                        when d.row_count >= {min_rows} then {SEG_BUCKETS} \
                         else 1 end)::smallint \
                from decided d \
               where s.seg_seq = ${seg_seq_param} and s.state = 'sealed' \
