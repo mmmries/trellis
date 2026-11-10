@@ -21,7 +21,9 @@
 //! drain keeps failing on with nothing charged or paused, if one holds it
 //! back (`drain_failure` from [`Trellis::status`]), and one per
 //! source index it lacks (`source_index_gaps`), and one per node of its partitioned
-//! source it is being corrected for (`correcting`, ADR-0017).
+//! source it is being corrected for (`correcting`, ADR-0017), and one per
+//! column of its own that is paused ([`Trellis::quarantined`]): a paused
+//! column leaves the definition `live`, so only that line shows it.
 //!
 //! [`Trellis::poisoned_since`] is surfaced here, called with `UNIX_EPOCH`
 //! as the watermark. Despite its name suggesting a point-in-time delta, the
@@ -38,7 +40,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use trellis::{
     CaptureFailure, CaptureFailureKind, Config, CorrectingNode, DefinitionSummary, DrainFailure,
     ExtremeIndexGap, IndexRole, JoinBuildStep, JoinSide, JoinSidePart, JoinStatus,
-    OneToOneBuildStep, SourceIndexGap, Trellis, TrellisOptions,
+    OneToOneBuildStep, QuarantineEntry, QuarantineState, QuarantineTarget, SourceIndexGap, Trellis,
+    TrellisOptions,
 };
 
 use super::release::shell_quote;
@@ -113,6 +116,10 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
     // or the nodes under correction, so each definition's own status
     // is read for them, by the qualified target name `definitions()` lists.
     let mut listed = Vec::with_capacity(definitions.len());
+    // Every paused column, of every definition: one small read of the
+    // sparse `column_status` table. A paused column leaves its definition
+    // `live`, so the definition's own status can't show it.
+    let quarantined = trellis.quarantined().await.map_err(|err| err.to_string())?;
     // ADR-0023: set while a process of another Trellis version is live.
     let mut handover = None;
     // ADR-0024: set while this binary is below the catalog floor.
@@ -128,19 +135,24 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
         if below_floor.is_none() {
             below_floor = status.as_ref().and_then(|s| s.below_catalog_floor.clone());
         }
-        let warnings = status.map_or_else(StatusWarnings::default, |status| StatusWarnings {
+        let paused_columns = paused_columns_of(&quarantined, &def.target_table);
+        let mut warnings = status.map_or_else(StatusWarnings::default, |status| StatusWarnings {
             drain_failure: status.drain_failure,
             correcting: status.correcting,
             source_index_gaps: status.source_index_gaps,
             extreme_index_gaps: status.extreme_index_gaps,
             join: status.join,
             paused_upstream_columns: status.paused_upstream_columns,
+            paused_columns: Vec::new(),
             floor: Some(status.floor),
             // A halt is on the summary's own line already.
             paused: status
                 .capture_failure
                 .filter(|failure| failure.kind != CaptureFailureKind::Halt),
         });
+        // Also for a definition `status()` finds no row for (dropped since
+        // the listing): its columns are read apart from it.
+        warnings.paused_columns = paused_columns;
         listed.push((def, warnings));
     }
     let poisoned = trellis
@@ -198,12 +210,68 @@ struct StatusWarnings {
     extreme_index_gaps: Vec<ExtremeIndexGap>,
     join: Option<JoinStatus>,
     paused_upstream_columns: Vec<String>,
+    /// The definition's own paused columns: its fuse tripped, or `PAUSE
+    /// TRANSFORM t.col` froze it, or it reads one that is paused. The
+    /// definition itself keeps reading `live`.
+    paused_columns: Vec<PausedColumn>,
     /// The oldest release that can run the definition (ADR-0024).
     floor: Option<String>,
     /// Why capture or a resume holds it paused, other than a halt: its
     /// `capture_failure`, such as the reason a release below its floor
     /// paused it (ADR-0024).
     paused: Option<CaptureFailure>,
+}
+
+/// One paused column of a definition ([`Trellis::quarantined`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PausedColumn {
+    /// The bare target table, as `RESUME TRANSFORM <transform>.<column>` names it.
+    transform: String,
+    column: String,
+    paused_at: Option<SystemTime>,
+    /// `None` for a column paused with no failure of its own: frozen by
+    /// `PAUSE TRANSFORM t.col`, or because an upstream column it reads is.
+    last_error: Option<String>,
+}
+
+/// The paused columns among `entries` that belong to the definition whose
+/// qualified target is `target_table` (`schema.table`). `column_status` keys a
+/// column by the bare table name, as [`Trellis::quarantined`] reports it.
+fn paused_columns_of(entries: &[QuarantineEntry], target_table: &str) -> Vec<PausedColumn> {
+    let bare = target_table.split('.').nth(1).unwrap_or(target_table);
+    entries
+        .iter()
+        .filter(|entry| entry.state == QuarantineState::Paused)
+        .filter_map(|entry| match &entry.target {
+            QuarantineTarget::Column(transform, column) if transform == bare => {
+                Some(PausedColumn {
+                    transform: transform.clone(),
+                    column: column.clone(),
+                    paused_at: entry.paused_at,
+                    last_error: entry.last_error.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The line a paused column gets under its definition: its error and the
+/// remedy. The error keeps Rust's escaping, which holds it on one line.
+fn format_paused_column(column: &PausedColumn) -> String {
+    let since = column.paused_at.map_or(String::new(), |at| {
+        format!(" since {}", format_timestamp(at))
+    });
+    let cause = match &column.last_error {
+        Some(error) => format!("error={error:?}"),
+        None => "no error of its own (paused by an operator, or an upstream column it reads is)"
+            .to_string(),
+    };
+    format!(
+        "    column {} paused{since}: {cause}; the column is no longer updated; once the cause is \
+         fixed, run `RESUME TRANSFORM {}.{}`\n",
+        column.column, column.transform, column.column
+    )
 }
 
 /// One line per definition, each followed by an indented line per thing
@@ -298,6 +366,12 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
                     "    reads paused upstream column(s) {}; resuming them brings it back to live\n",
                     warnings.paused_upstream_columns.join(", ")
                 ));
+            }
+            // A column whose fuse tripped (or that was paused) stops
+            // updating while the definition keeps its status, so `live`
+            // alone would hide it.
+            for column in &warnings.paused_columns {
+                line.push_str(&format_paused_column(column));
             }
             // A JOIN's hidden tables and the size of its partials.
             if let Some(join) = &warnings.join {
@@ -967,6 +1041,74 @@ mod tests {
              status=catching_up created_at=1970-01-01 00:00:00 UTC\n    \
              reads paused upstream column(s) t.a, t.b; resuming them brings it back to live\n"
         );
+    }
+
+    fn column_entry(
+        transform: &str,
+        column: &str,
+        state: QuarantineState,
+        last_error: Option<&str>,
+    ) -> QuarantineEntry {
+        trellis::fixture!(QuarantineEntry {
+            target: QuarantineTarget::Column(transform.to_string(), column.to_string()),
+            state,
+            paused_at: Some(UNIX_EPOCH + Duration::from_secs(60)),
+            last_error: last_error.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn a_paused_column_is_named_under_its_live_definition_with_its_error_and_remedy() {
+        let entries = [
+            column_entry("other", "x", QuarantineState::Paused, Some("not mine")),
+            column_entry(
+                "q1",
+                "big",
+                QuarantineState::Paused,
+                Some("bigint out of range"),
+            ),
+            // A whole transform's quarantine is on its status already.
+            trellis::fixture!(QuarantineEntry {
+                target: QuarantineTarget::Transform("q1".to_string()),
+                state: QuarantineState::Quarantined,
+                paused_at: None,
+                last_error: None,
+            }),
+        ];
+        let def = trellis::fixture!(DefinitionSummary {
+            target_table: "public.q1".to_string(),
+            status: trellis::TransformStatus::Live,
+            created_at: UNIX_EPOCH,
+            backfill_failure: None,
+            halt: None,
+        });
+        let warnings = StatusWarnings {
+            paused_columns: paused_columns_of(&entries, &def.target_table),
+            ..StatusWarnings::default()
+        };
+        assert_eq!(
+            format_definitions(&[(def, warnings)]),
+            "  target=public.q1 status=live created_at=1970-01-01 00:00:00 UTC\n    \
+             column big paused since 1970-01-01 00:01:00 UTC: error=\"bigint out of range\"; \
+             the column is no longer updated; once the cause is fixed, \
+             run `RESUME TRANSFORM q1.big`\n"
+        );
+    }
+
+    #[test]
+    fn a_column_paused_without_an_error_of_its_own_says_so() {
+        let entries = [column_entry("q1", "n", QuarantineState::Paused, None)];
+        let paused = paused_columns_of(&entries, "public.q1");
+        let line = format_paused_column(&paused[0]);
+        assert!(line.contains("no error of its own"), "got {line:?}");
+        assert!(line.contains("`RESUME TRANSFORM q1.n`"), "got {line:?}");
+        assert_eq!(line.lines().count(), 1, "got {line:?}");
+    }
+
+    #[test]
+    fn a_live_column_entry_is_not_a_paused_column() {
+        let entries = [column_entry("q1", "n", QuarantineState::Live, None)];
+        assert!(paused_columns_of(&entries, "public.q1").is_empty());
     }
 
     #[test]
