@@ -149,9 +149,9 @@ use crate::model::{
 /// **Numeric-path pairing (design doc §3, a load-bearing invariant).** The
 /// generator only ever emits small non-negative *integers* here (and, with
 /// awkward values on, [`NUMERIC_NAN`]), and the sole
-/// derivation is `c1 + c2`. Both the engine (`trellis::numeric::Numeric`) and
-/// the SQL oracle (Postgres `numeric`) are arbitrary-precision base-10: an
-/// integer sum has one exact representation on both sides, with no rounding
+/// derivation is `c1 + c2`. Both the engine (which has Postgres compute it as
+/// `numeric`) and the SQL oracle (Postgres `numeric`) are arbitrary-precision
+/// base-10: an integer sum has one exact representation on both sides, with no rounding
 /// and no float path to fall off of, so the two can never disagree by
 /// construction. The bound is therefore purely for legibility — a shrunk
 /// counterexample reads at a glance — and for staying deliberately far from

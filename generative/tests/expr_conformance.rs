@@ -10,7 +10,9 @@
 
 use std::cell::Cell;
 
-use generative::expr_conformance::{Agreement, Divergence, Fixture, columns};
+use generative::expr_conformance::{
+    Agreement, Divergence, Fixture, columns, has_literal_zero_divisor,
+};
 use generative::expr_gen::strategy::{Draw, any_expr, near_miss};
 use generative::expr_gen::{self, Profile, TextStyle, near_misses, render_text};
 use proptest::prelude::*;
@@ -30,8 +32,7 @@ struct Harness {
     runtime: tokio::runtime::Runtime,
     admitted: Cell<usize>,
     refused: Cell<usize>,
-    gaps: Cell<usize>,
-    over_refusals: Cell<usize>,
+    fails_while_planning: Cell<usize>,
 }
 
 thread_local! {
@@ -47,8 +48,7 @@ thread_local! {
             fixture,
             admitted: Cell::new(0),
             refused: Cell::new(0),
-            gaps: Cell::new(0),
-            over_refusals: Cell::new(0),
+            fails_while_planning: Cell::new(0),
         }
     };
 }
@@ -58,9 +58,12 @@ fn check_text(text: &str, intended: Option<&Expr>) -> Result<Agreement, Divergen
         let result = h.runtime.block_on(h.fixture.check(text, intended));
         match &result {
             Ok(Agreement::Admitted) => h.admitted.set(h.admitted.get() + 1),
-            Ok(Agreement::RefusedAndRaises(_)) => h.refused.set(h.refused.get() + 1),
-            Ok(Agreement::KnownGap(_)) => h.gaps.set(h.gaps.get() + 1),
-            Ok(Agreement::KnownOverRefusal(_)) => h.over_refusals.set(h.over_refusals.get() + 1),
+            Ok(Agreement::RefusedAndRaises(_) | Agreement::RefusedByRule(_)) => {
+                h.refused.set(h.refused.get() + 1)
+            }
+            Ok(Agreement::FailsWhilePlanning(_)) => {
+                h.fails_while_planning.set(h.fails_while_planning.get() + 1)
+            }
             Err(_) => {}
         }
         result
@@ -70,12 +73,11 @@ fn check_text(text: &str, intended: Option<&Expr>) -> Result<Agreement, Divergen
 fn report() {
     HARNESS.with(|h| {
         eprintln!(
-            "expression conformance: {} admitted and agreeing, {} refused and raising, \
-             {} tolerated as known gaps, {} tolerated as known over-refusals",
+            "expression conformance: {} admitted and agreeing, {} refused, \
+             {} admitted and failing while Postgres plans them",
             h.admitted.get(),
             h.refused.get(),
-            h.gaps.get(),
-            h.over_refusals.get()
+            h.fails_while_planning.get()
         );
     });
 }
@@ -158,7 +160,8 @@ fn property_expressions_conform_to_postgres() {
 }
 
 /// No column in sight: every subexpression is a constant Postgres folds at
-/// plan time, which is where the define-time range refusals live.
+/// plan time. Define evaluates none, so each one Postgres fails to plan is
+/// admitted and agrees as failing while planning.
 #[test]
 #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
 fn property_constant_expressions_conform_to_postgres() {
@@ -317,9 +320,6 @@ fn hard_cases_agree_with_postgres() {
         "COALESCE(5, 2147483647 + 1)",
         "COALESCE(i4a, 5, 2147483647 + 1)",
         "REAL '1.5' + f4a",
-        // A NaN divided by zero is NaN, not an error.
-        "DOUBLE PRECISION 'NaN' / 0",
-        "(REAL 'NaN' + REAL '0') / -(REAL '0') > 0",
         "DOUBLE PRECISION 'NaN' > f8a",
         "CAST('Infinity' AS REAL) + 1",
         "DATE '2024-02-29'",
@@ -335,6 +335,34 @@ fn hard_cases_agree_with_postgres() {
             Ok(other) => panic!("`{text}` should be admitted, got {other:?}"),
             Err(d) => panic!("{d}"),
         }
+    }
+    // A NaN divided by zero is NaN, not an error, but the literal zero
+    // divisor is refused all the same: the rule reads only the text.
+    for text in [
+        "DOUBLE PRECISION 'NaN' / 0",
+        "(REAL 'NaN' + REAL '0') / -(REAL '0') > 0",
+    ] {
+        match check_text(text, None) {
+            Ok(Agreement::RefusedByRule(_)) => {}
+            Ok(other) => panic!("`{text}` should be refused, got {other:?}"),
+            Err(d) => panic!("{d}"),
+        }
+    }
+}
+
+/// Checks `text` against Postgres, and that define refuses it exactly when
+/// a divisor is written as a literal zero: every other form defines, and
+/// agrees with Postgres whether Postgres plans it or fails while planning.
+/// Returns the agreement.
+fn assert_agrees(text: &str) -> Agreement {
+    let literal_zero = has_literal_zero_divisor(&field_expr(text));
+    match check_text(text, None) {
+        Ok(refused @ Agreement::RefusedByRule(_)) if literal_zero => refused,
+        Ok(defined @ (Agreement::Admitted | Agreement::FailsWhilePlanning(_))) if !literal_zero => {
+            defined
+        }
+        Ok(other) => panic!("`{text}`: literal zero divisor {literal_zero}, got {other:?}"),
+        Err(d) => panic!("{d}"),
     }
 }
 
@@ -633,7 +661,7 @@ fn comparison_and_logic_rows_agree_with_postgres() {
             "NULLIF(1, 2)",
             "1 IS NULL",
             "NULLIF(1, 1) IS NULL",
-            "NULLIF(1.5, 1.5) / 0",
+            "NULLIF(1.5, 1.5) / 2",
             "1.5 / NULLIF(2, 2) + 2147483647",
             "COALESCE(NULLIF(1, 1), 7)",
             "COALESCE(CASE WHEN 1 = 2 THEN 1 END, 7)",
@@ -655,12 +683,14 @@ fn comparison_and_logic_rows_agree_with_postgres() {
 
 /// Plan-time constants inside CASE branches and AND/OR operands: Postgres
 /// simplifies a branch's result whatever its condition (so `CASE WHEN x > 0
-/// THEN 1 / 0 END` fails every row), and stops at the first constant
-/// condition (so a branch after `WHEN true`, or after a false `AND`
-/// operand, is never simplified). Define refuses what Postgres rejects and
-/// admits what it drops.
+/// THEN 2147483647 + 1 END` fails every row while planning), and stops at the
+/// first constant condition (so a branch after `WHEN true`, or after a false
+/// `AND` operand, is never simplified). Define evaluates none of it: each
+/// form defines and agrees with Postgres, as admitted or as failing while
+/// planning, except where a divisor is written as a literal zero, which is
+/// refused wherever it sits.
 #[test]
-fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
+fn constants_in_branches_define_and_agree_with_postgres() {
     let refused = [
         "CASE WHEN i4a > 0 THEN 1.5 / 0 END",
         "CASE WHEN i4a > 0 THEN 1 ELSE 1.5 / 0 END",
@@ -763,13 +793,16 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "CASE WHEN (CASE WHEN (FALSE) THEN (REAL '0') ELSE (16777217) END = 16777217) \
          THEN (DATE '2024-02-29') ELSE ((2147483647 * 2) + DATE '2024-02-29') END",
     ];
+    let mut fails_while_planning = 0;
     for text in refused {
-        match check_text(text, None) {
-            Ok(Agreement::RefusedAndRaises(_)) => {}
-            Ok(other) => panic!("`{text}` should be refused and raise, got {other:?}"),
-            Err(d) => panic!("{d}"),
+        if matches!(assert_agrees(text), Agreement::FailsWhilePlanning(_)) {
+            fails_while_planning += 1;
         }
     }
+    assert!(
+        fails_while_planning > 30,
+        "most of these fail while Postgres plans them: {fails_while_planning}"
+    );
     let dropped = [
         "CASE WHEN 1 = 1 THEN 1 ELSE 1.5 / 0 END",
         "CASE WHEN 1 = 2 THEN 1.5 / 0 ELSE 2 END",
@@ -862,22 +895,16 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
          THEN (DATE '2024-02-29') ELSE ((2147483647 * 2) + DATE '2024-02-29') END",
     ];
     for text in dropped {
-        match check_text(text, None) {
-            Ok(Agreement::Admitted) => {}
-            Ok(other) => panic!("`{text}` should be admitted, got {other:?}"),
-            Err(d) => panic!("{d}"),
-        }
+        assert_agrees(text);
     }
 }
 
-/// A strict operator or function with a `NULL` constant input is `NULL` once
-/// the planner has simplified its inputs, so a division of a column by the
-/// constant zero in another input never runs (#1795). A constant that raises
-/// at plan time still does, and the operators that are not strict
-/// (`IS [NOT] DISTINCT FROM`, `AND`, `OR`, `COALESCE`, `NULLIF`'s first
-/// argument) evaluate their other inputs.
+/// A literal zero divisor is refused wherever it sits: beside a `NULL`
+/// constant, where Postgres replaces the strict operator by `NULL` and never
+/// runs the division (#1795), as well as under the operators that are not
+/// strict, and beside other constants that fail while planning.
 #[test]
-fn a_strict_call_beside_a_null_constant_drops_a_division_by_zero_the_rows_would_run() {
+fn a_literal_zero_divisor_is_refused_whatever_surrounds_it() {
     let admitted = [
         "((na / 0) - (NULL - CAST(NULL AS real))) IS DISTINCT FROM 0",
         "(na / 0) + NULL",
@@ -902,13 +929,7 @@ fn a_strict_call_beside_a_null_constant_drops_a_division_by_zero_the_rows_would_
         // a non-strict comparison that wraps the strict subtree.
         "((i8a / REAL '0') - CAST(NULL AS smallint)) IS NOT DISTINCT FROM f4a",
     ];
-    for text in admitted {
-        match check_text(text, None) {
-            Ok(Agreement::Admitted) => {}
-            Ok(other) => panic!("`{text}` should be admitted, got {other:?}"),
-            Err(d) => panic!("{d}"),
-        }
-    }
+    let strict_beside_null = admitted;
     let refused = [
         // Not strict.
         "(na / 0) IS DISTINCT FROM CAST(NULL AS numeric)",
@@ -932,48 +953,23 @@ fn a_strict_call_beside_a_null_constant_drops_a_division_by_zero_the_rows_would_
         "(na / 0) + (1.5 / 0 + CAST(NULL AS numeric))",
         "((na / 0) + (2147483647 + 1)) * CAST(NULL AS numeric)",
     ];
-    for text in refused {
+    for text in strict_beside_null.into_iter().chain(refused) {
         match check_text(text, None) {
-            Ok(Agreement::RefusedAndRaises(_)) => {}
-            Ok(other) => panic!("`{text}` should be refused and raise, got {other:?}"),
+            Ok(Agreement::RefusedByRule(_)) => {}
+            Ok(other) => panic!("`{text}` should be refused, got {other:?}"),
             Err(d) => panic!("{d}"),
         }
     }
 }
 
-/// Define folds a call with a `NULL` argument to `NULL`, as the planner folds
-/// a strict function. That holds only while every function the grammar
-/// admits (bar `COALESCE` and `NULLIF`, which define folds by their own
-/// rules) is strict, so a non-strict one added to the registry (`CONCAT`)
-/// fails here.
+/// Constants Postgres folds into an error at plan time define: range
+/// overflow under each operator, the smallest integer under prefix minus and
+/// `ABS`, float overflow and underflow, a divisor that computes to zero. Each
+/// agrees with Postgres as failing while planning (or, over a column, as
+/// failing on its rows), and only a divisor written as a literal zero is
+/// refused.
 #[test]
-fn every_admitted_function_is_strict() {
-    let signatures = registry::FUNCTIONS
-        .iter()
-        .map(|spec| {
-            let args: Vec<String> = spec.arg_types.iter().map(ToString::to_string).collect();
-            format!("{}({})", spec.name.to_lowercase(), args.join(", "))
-        })
-        .chain([
-            "extract(text, date)".into(),
-            "extract(text, timestamp)".into(),
-        ]);
-    HARNESS.with(|h| {
-        for signature in signatures {
-            let strict = h.runtime.block_on(h.fixture.scalar(&format!(
-                "select proisstrict from pg_proc where oid = '{signature}'::regprocedure"
-            )));
-            assert_eq!(strict, Ok(Some("true".into())), "`{signature}`");
-        }
-    });
-}
-
-/// Constants Postgres folds into an error at plan time are refused at
-/// define: range overflow under each operator, the smallest integer under
-/// prefix minus and `ABS`, float overflow and underflow, and a constant zero
-/// divisor.
-#[test]
-fn arithmetic_constants_postgres_rejects_are_refused() {
+fn arithmetic_constants_postgres_rejects_define_unless_a_divisor_is_a_literal_zero() {
     for text in [
         "2147483647 - -1",
         "-2147483648 - 1",
@@ -1009,11 +1005,7 @@ fn arithmetic_constants_postgres_rejects_are_refused() {
         "7 % 0",
         "DOUBLE PRECISION 'Infinity' / 0",
     ] {
-        match check_text(text, None) {
-            Ok(Agreement::RefusedAndRaises(_)) => {}
-            Ok(other) => panic!("`{text}` should be refused and raise, got {other:?}"),
-            Err(d) => panic!("{d}"),
-        }
+        assert_agrees(text);
     }
 }
 
@@ -1520,10 +1512,14 @@ fn a_bare_null_conforms_in_every_context() {
     );
 }
 
-/// An expression Postgres folds and rejects for every row is refused at
-/// define, and Postgres raises on the where-false probe: agreement.
+/// An expression Postgres folds and rejects for every row defines (define
+/// evaluates no constant) and Postgres raises a data exception on the
+/// where-false probe: agreement, as failing while planning. Its rows are
+/// quarantined at run time (`trellis/tests/plan_time_constant_quarantine.rs`).
+/// So does an overflow around a call over constants, which Postgres folds
+/// too (#1446), and a guard over such a call.
 #[test]
-fn constants_postgres_rejects_at_plan_time_are_refused_at_define() {
+fn constants_postgres_rejects_at_plan_time_define_and_fail_while_planning() {
     for text in [
         "2147483647 + 1",
         "2147483647 + 2147483647",
@@ -1531,91 +1527,34 @@ fn constants_postgres_rejects_at_plan_time_are_refused_at_define() {
         "REAL '3.4028235e+38' + REAL '3.4028235e+38'",
         "DOUBLE PRECISION '1.7976931348623157e+308' + DOUBLE PRECISION '1.7976931348623157e+308'",
         "COALESCE(f4a, 100000000000000000000000000000000000000000)",
-    ] {
-        match check_text(text, None) {
-            Ok(Agreement::RefusedAndRaises(_)) => {}
-            Ok(other) => panic!("`{text}` should be refused and raise, got {other:?}"),
-            Err(d) => panic!("{d}"),
-        }
-    }
-}
-
-/// The open gap the properties tolerate: Postgres evaluates a function call
-/// over constants while planning, then the sum around it, so an overflow
-/// there raises for every row, while define (which has no value for the
-/// call) admits it. This pin fails the day define refuses it, which is when
-/// `KNOWN_GAP_CONSTANT_CALL` and the tolerance in the checker go.
-#[test]
-fn a_range_overflow_around_a_constant_call_is_a_known_gap() {
-    for text in [
         "2147483647 + CHAR_LENGTH('abc')",
         "9223372036854775807 + REGEXP_COUNT('a', 'a*')",
         "CHAR_LENGTH('abc') + 2147483647",
-        // A branch behind a guard over such a call, which define leaves
-        // unchecked since the planner may drop it (#1471).
+        "1.5 / CEIL(0.0)",
         "CASE WHEN NULLIF(STRPOS('a', 'a'), NULL) = 1 THEN 2147483647 + 1 ELSE 0 END",
         "CASE WHEN NULLIF(STRPOS('a', 'a'), NULL) = 2 THEN 0 ELSE 2147483647 + 1 END",
         "CASE WHEN STRPOS('a', 'a') = 1 AND i4a > 0 THEN 2147483647 + 1 ELSE 0 END",
         "COALESCE(NULLIF(STRPOS('a', 'a'), 1), 2147483647 + 1)",
+        "CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 2), i4a) IS NOT NULL THEN 2147483647 + 1 END",
     ] {
         match check_text(text, None) {
-            Ok(Agreement::KnownGap(_)) => {}
-            other => panic!("`{text}`: expected the known gap, got {other:?}"),
+            Ok(Agreement::FailsWhilePlanning(code)) => {
+                assert!(code.starts_with("22"), "`{text}`: {code}");
+            }
+            Ok(other) => panic!("`{text}` should define and fail while planning, got {other:?}"),
+            Err(d) => panic!("{d}"),
         }
     }
-}
-
-/// Define reads `NULLIF(<constant call>, <column>)` as reading the column,
-/// though Postgres folds it to `NULL` when the call does, so it refuses a
-/// guarded constant Postgres drops (#1693: ADR-0022 allows that). The checker
-/// tolerates it as a named over-refusal, and only when the expression agrees
-/// with Postgres once the `NULLIF` is replaced by its first argument.
-#[test]
-fn a_guarded_constant_beside_a_nullif_over_a_constant_call_is_a_known_over_refusal() {
+    // A guarded constant Postgres drops (the `NULLIF` folds to `NULL`)
+    // defines and agrees as admitted: define no longer reads the guard.
     for text in [
         "CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NOT NULL THEN 2147483647 + 1 END",
         "CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NULL THEN 0 ELSE 2147483647 + 1 END",
         "NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NOT NULL AND 2147483647 + 1 = 1",
     ] {
         match check_text(text, None) {
-            Ok(Agreement::KnownOverRefusal(_)) => {}
-            other => panic!("`{text}`: expected the known over-refusal, got {other:?}"),
-        }
-    }
-}
-
-/// A refusal the expression earns elsewhere still stands beside the
-/// tolerated `NULLIF`, in either operand order: here the zero divisor,
-/// which define reports first or second depending on where it sits.
-#[test]
-fn a_refusal_beside_a_nullif_over_a_constant_call_still_agrees() {
-    for text in [
-        "CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NOT NULL THEN 2147483647 + 1 END \
-         + CASE WHEN i4b > 0 THEN CAST(i4b AS numeric) / 0 END",
-        "CASE WHEN i4b > 0 THEN CAST(i4b AS numeric) / 0 END \
-         + CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NOT NULL THEN 2147483647 + 1 END",
-    ] {
-        match check_text(text, None) {
-            Ok(Agreement::RefusedAndRaises(_)) => {}
-            other => panic!("`{text}`: expected a refusal Postgres agrees with, got {other:?}"),
-        }
-    }
-}
-
-/// The tolerance is not a blanket one: a guarded overflow Postgres does raise
-/// (the call folds to a value, not `NULL`) stays a refusal Postgres agrees
-/// with or a known gap, never a `KnownOverRefusal`.
-#[test]
-fn the_nullif_over_refusal_tolerance_does_not_cover_what_postgres_raises() {
-    for text in [
-        "CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 2), i4a) IS NOT NULL THEN 2147483647 + 1 END",
-        "2147483647 + 1",
-    ] {
-        match check_text(text, None) {
-            Ok(Agreement::KnownOverRefusal(_)) => {
-                panic!("`{text}` is tolerated as an over-refusal, but Postgres raises")
-            }
-            Ok(_) => {}
+            Ok(Agreement::Admitted) => {}
+            Ok(other) => panic!("`{text}` should be admitted, got {other:?}"),
             Err(d) => panic!("{d}"),
         }
     }
@@ -1846,13 +1785,13 @@ fn infinite_and_out_of_range_dates_follow_postgres() {
     }
 }
 
-/// A constant date operation Postgres folds and rejects is refused at define,
-/// exactly at the boundary Postgres rejects it, and a cast of a constant past
-/// `timestamp`'s range likewise. The boundaries are the engine's own
-/// (`date_const`), so these are what pin them against Postgres.
+/// A constant date operation Postgres folds and rejects defines and fails
+/// while Postgres plans it, exactly past the boundary Postgres rejects, and
+/// a cast of a constant past `timestamp`'s range likewise; one inside the
+/// boundary defines and agrees as admitted.
 #[test]
-fn date_constants_postgres_rejects_are_refused_at_the_same_boundary() {
-    let refused = [
+fn date_constants_postgres_rejects_fail_while_planning_at_its_boundary() {
+    let fail = [
         "DATE '9999-12-31' + 2142110010",
         "2142110010 + DATE '9999-12-31'",
         "DATE '2024-01-01' + 2147483647",
@@ -1875,10 +1814,10 @@ fn date_constants_postgres_rejects_are_refused_at_the_same_boundary() {
         "EXTRACT(year FROM DATE '9999-12-31' + 2142110009)",
         "DATE '2024-01-01' - DATE '0001-01-01'",
     ];
-    for text in refused {
+    for text in fail {
         match check_text(text, None) {
-            Ok(Agreement::RefusedAndRaises(_)) => {}
-            other => panic!("`{text}` should be refused and raise, got {other:?}"),
+            Ok(Agreement::FailsWhilePlanning(_)) => {}
+            other => panic!("`{text}` should define and fail while planning, got {other:?}"),
         }
     }
     for text in admitted {
@@ -1972,7 +1911,7 @@ fn each_refusal_names_its_construct() {
         ("na / 0", "zero"),
         ("i4a % 0", "zero"),
         ("f8a / 0.0", "zero"),
-        ("na / (1 - 1)", "zero"),
+        ("na / -0", "zero"),
         // Date arithmetic with an operand Postgres has no operator for.
         ("da + i8a", "smallint or integer"),
         ("i8a + da", "smallint or integer"),

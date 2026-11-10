@@ -570,9 +570,10 @@ async fn a_float_against_a_bare_literal_compares_in_double_precision_like_postgr
         }
     }
 
-    // Range: refused at define exactly where the server raises 22003 when
-    // it casts the literal to `double precision` (past the finite ceiling,
-    // or a nonzero value that rounds to zero; a subnormal is in range).
+    // Range: define evaluates no constant, so it admits every literal. The
+    // server raises 22003 while planning for the ones past `double
+    // precision`'s range (past the finite ceiling, or a nonzero value that
+    // rounds to zero; a subnormal is in range), and those rows quarantine.
     for literal in [
         f64_max.clone(),
         format!("{f64_max}.5"),
@@ -585,10 +586,7 @@ async fn a_float_against_a_bare_literal_compares_in_double_precision_like_postgr
     ] {
         let expr = format!("d > {literal}");
         let def = parse(&format!("TRANSFORM t FROM s SELECT {expr} AS out")).expect("parse");
-        let refused = matches!(
-            validate(&def, &columns),
-            Err(ValidationError::FloatComparisonLiteralOutOfRange { .. })
-        );
+        assert_eq!(validate(&def, &columns), Ok(()), "{}...", &literal[..40]);
         let server = client
             .query_one(
                 &format!("select {expr} from (select 1::float8 as d) t"),
@@ -598,7 +596,6 @@ async fn a_float_against_a_bare_literal_compares_in_double_precision_like_postgr
         if let Err(e) = &server {
             assert_eq!(e.code(), Some(&SqlState::NUMERIC_VALUE_OUT_OF_RANGE), "{e}");
         }
-        assert_eq!(refused, server.is_err(), "{}...", &literal[..40]);
     }
 
     // The headline pair, stated outright.

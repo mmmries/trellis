@@ -223,7 +223,7 @@ Postgres, over a throwaway table of random rows (`NULL`, extremes, `NaN`,
    construct. The near misses are the wrong-typed operand of each operator and
    function (a call no overload of the name accepts), prefix `-` over a
    non-numeric operand, a `CAST` the registry does not admit and a target it has
-   no spelling for, a constant zero divisor, a chained comparison, a simple
+   no spelling for, a literal zero divisor, a chained comparison, a simple
    `CASE`, an `IS TRUE`-style test, each word Postgres reserves used as a
    column (the live server also refuses each as an unquoted column name), a
    `NULL` define can't type (both operands of an arithmetic operator, the
@@ -235,31 +235,21 @@ Postgres, over a throwaway table of random rows (`NULL`, extremes, `NaN`,
    does not admit (including the `STABLE` and `VOLATILE` ones). The date
    constructs add their own: a field or unit the type lacks, the `STABLE`
    overloads Postgres picks silently (`DATE_TRUNC` of a `date`, `EXTRACT` of a
-   `timestamptz`, `CAST(tz AS timestamp)`), a zone that is not `'UTC'`, an
-   interval-producing `-`, and a constant date past `date`'s range.
+   `timestamptz`, `CAST(tz AS timestamp)`), a zone that is not `'UTC'`, and an
+   interval-producing `-`.
 
-Postgres folds constants while it plans, so an expression it rejects for every
-row (`2147483647 + 1`, `1.5 / 0`) is refused at define by design. A constant
-zero divisor is refused whatever the dividend, so for a column dividend (which
-Postgres plans without error) the checker accepts the refusal when no row of
-the table computes a value, or when a `COALESCE`, `CASE`, `AND` or `OR` may
-keep the division from running. Inside those, define follows the planner: it
-refuses a constant in a `CASE` result whatever the condition, and nothing
-after a constant that ends the `CASE`, `AND`, `OR` or `COALESCE` (the
-constants-only property reaches those folds, including `NULL` ones from
-`NULLIF`). The Value property
-treats "refused at define, and Postgres raises class 22 on a `WHERE false`
-probe" as agreement, and flags both a refusal where Postgres plans the
+Postgres folds constants while it plans, and define evaluates none of them
+([ADR-0022](decisions/0022-grammar-mirrors-postgres.md)): an expression
+Postgres rejects for every row while planning (`2147483647 + 1`) defines, and
+its rows fail at run time like any per-row error. The Value property treats
+"admitted, and Postgres raises class 22 on a `WHERE false` probe" as agreement
+(failing while planning), and flags a refusal where Postgres plans the
 expression without error (a false refusal) and an acceptance where Postgres
-raises while planning it (a missed refusal).
-
-A gap that is open (define admits what Postgres rejects) is tolerated in one
-named place in `generative::expr_conformance`, reported as a known gap, and
-pinned by a test that fails the day define refuses it, which is when the
-tolerance goes. The tolerance covers the gap and nothing beside it: the
-checker rewrites the gap away (a pattern Postgres rejects becomes `'a'`, a
-function call over constants, innermost first, becomes the literal Postgres
-computes for it) and the rewritten expression must pass every property.
+fails to plan it for another reason, such as an operator it can't resolve (a
+missed refusal). The one constant rule define has is textual: a `/` or `%`
+whose divisor is written as a literal zero is refused wherever it sits, and
+the checker restates that rule on its own and flags define on either side of
+it, whatever Postgres would do with the division.
 
 Deterministic tests in the same file pin each precedence tier (every pair of
 registry operators, generically) and each refusal by name, and check every
@@ -273,8 +263,9 @@ The randomized properties are `#[ignore]`d and draw fresh cases each run:
 `PROPTEST_CASES=2000 cargo test -p generative --test expr_conformance --
 --ignored`. A failure prints the expression's text; add it to
 `hard_cases_agree_with_postgres` to replay it. A property over constants only
-(`property_constant_expressions_conform_to_postgres`) is where the plan-time
-range refusals are reached.
+(`property_constant_expressions_conform_to_postgres`) is where Postgres's
+plan-time folding is reached, so most of its failing draws agree as failing
+while planning.
 
 #### Adding an operator or function
 
@@ -296,9 +287,7 @@ range refusals are reached.
 3. If define refuses a combination Postgres accepts on purpose (the float/exact
    comparison is one), teach the generator the admitted spelling next to
    `Rule::FloatVsLiteral` and the near-miss list the refused one.
-4. If the operator makes a new constant fold fail at plan time, make define
-   refuse it and let the Value property confirm Postgres raises on the probe.
-5. Teach the end-to-end oracle (`oracle::render_expr`, `field_value_type`) the
+4. Teach the end-to-end oracle (`oracle::render_expr`, `field_value_type`) the
    operator's rendering and typing, and add a literal pool for any new
    typed-literal keyword.
 

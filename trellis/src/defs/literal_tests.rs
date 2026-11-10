@@ -1,9 +1,7 @@
 //! The `TRUE`, `FALSE` and `NULL` literals: how they parse, how they type
-//! (a `NULL` from its context, as Postgres types `unknown`), how the
-//! planner-folding checks read them, and what define refuses. Each expected
-//! type and each plan-time refusal here was read off PostgreSQL 15, 17 and 18
-//! (`CREATE TABLE AS` for the types, `EXPLAIN` for the plan-time errors); the
-//! conformance harness (`generative/tests/expr_conformance.rs`) and
+//! (a `NULL` from its context, as Postgres types `unknown`), and what define
+//! refuses. Each expected type here was read off PostgreSQL 15, 17 and 18
+//! (`CREATE TABLE AS`); the conformance harness (`generative/tests/expr_conformance.rs`) and
 //! `tests/null_literal.rs` check the same against a live server.
 
 use std::collections::HashMap;
@@ -338,46 +336,6 @@ fn an_aggregate_of_null_is_refused() {
     }
     let def = parse("TRANSFORM t FROM s GROUP BY i4 SELECT SUM(COALESCE(i8, NULL)) AS x").unwrap();
     validate(&def, &columns()).unwrap();
-}
-
-/// The planner folds `NULL` and the booleans with three-valued logic and
-/// drops what a decided `CASE`, `AND` or `OR` never evaluates: a constant
-/// that overflows there is refused only where Postgres plans it.
-#[test]
-fn plan_time_checks_fold_the_literals_with_three_valued_logic() {
-    const OVERFLOW: &str = "2147483647 + 1";
-    for text in [
-        format!("CASE WHEN NULL OR TRUE THEN 1 ELSE {OVERFLOW} END"),
-        format!("CASE WHEN NULL AND FALSE THEN {OVERFLOW} ELSE 1 END"),
-        format!("CASE WHEN i4 = NULL THEN {OVERFLOW} ELSE 1 END"),
-        format!("CASE WHEN NOT NULL THEN {OVERFLOW} ELSE 1 END"),
-        format!("CASE WHEN NULL THEN {OVERFLOW} ELSE 1 END"),
-        format!("CASE WHEN NULL IS NULL THEN 1 ELSE {OVERFLOW} END"),
-        format!("CASE WHEN TRUE THEN 1 ELSE {OVERFLOW} END"),
-        format!("CASE WHEN FALSE THEN {OVERFLOW} ELSE 1 END"),
-        format!("TRUE OR ({OVERFLOW} > 0)"),
-        format!("FALSE AND ({OVERFLOW} > 0)"),
-    ] {
-        type_in(&format!("{text} AS x")).unwrap_or_else(|e| panic!("`{text}`: {e}"));
-    }
-    for text in [
-        format!("CASE WHEN NULL AND TRUE THEN 1 ELSE {OVERFLOW} END"),
-        format!("CASE WHEN i4 IS NOT DISTINCT FROM NULL THEN {OVERFLOW} ELSE 1 END"),
-        format!("COALESCE(NULL, {OVERFLOW})"),
-        format!("NULLIF(NULL, {OVERFLOW})"),
-        format!("NULL + ({OVERFLOW})"),
-        format!("(NULL = 1) OR ({OVERFLOW} > 0)"),
-        format!("NULL AND ({OVERFLOW} > 0)"),
-        format!("CASE WHEN i4 > 0 THEN NULL ELSE {OVERFLOW} END"),
-    ] {
-        assert!(
-            matches!(
-                type_in(&format!("{text} AS x")),
-                Err(ValidationError::ConstantOutOfRange { .. })
-            ),
-            "`{text}` should be refused as Postgres plans it"
-        );
-    }
 }
 
 #[test]
