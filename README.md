@@ -1,6 +1,6 @@
 # Trellis
 
-> **Version 0.1:** the API may change between 0.x minor releases, before 1.0. An upgrade never re-interprets a stored definition: it keeps its meaning, or is paused with the reason; see [grammar versions](docs/transforms.md#grammar-versions).
+> **Version 0.2:** the API may change between 0.x minor releases, before 1.0. An upgrade never re-interprets a stored definition: it keeps its meaning, or is paused with the reason; see [grammar versions](docs/transforms.md#grammar-versions).
 
 A declarative API for creating data transformations in PostgreSQL.
 Correctness and performance are the key design goals.
@@ -33,7 +33,7 @@ Connections to Postgres use TLS when the database URL asks for it (`sslmode`, `s
 Pick the form that matches how you run it:
 
 * **The `trellis` command-line tool** for defining transforms and running the pipeline from a shell: download `trellis-v<version>-<target>.tar.gz` for your platform from the [GitHub release](https://github.com/salesforce-misc/trellis/releases) and unpack it, or build it with `cargo install --path cli` from a checkout.
-* **Rust**: the engine crate is published as `trellis-pg` (its library is `trellis`), so `trellis-pg = "0.1"` in `Cargo.toml` and `use trellis::...` in code.
+* **Rust**: the engine crate is published as `trellis-pg` (its library is `trellis`), so `trellis-pg = "0.2"` in `Cargo.toml` and `use trellis::...` in code.
 * **Elixir**: the Hex package `trellis_pg`; see [clients/elixir](clients/elixir/README.md).
 * **Ruby**: the gem `trellis-pg`; see [clients/ruby](clients/ruby/README.md).
 
