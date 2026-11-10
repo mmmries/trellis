@@ -628,6 +628,93 @@ EOF2
   stop_run old-consts
 fi
 
+# checks: definitions the old release accepted that parse under the candidate
+# but fail one of its define-time checks (docs/upgrading.md): a chain of
+# calculated fields too long to inline, which a fresh define refuses. The
+# takeover re-parses stored text and does not run those checks again, so the
+# chains run and equal Postgres. Out-of-range constants, which the candidate
+# defines too and fails at run time, are in the case for the takeover itself:
+# at the takeover they stay as the old release left them (status, held keys and
+# target rows; the old release quarantines the whole definition once enough
+# keys fail) and none is paused as a refusal. Rows that arrive later follow the
+# candidate's rules, not the old release's, so the step adds none to them. A definition the old release refuses itself is no upgrade case and
+# is left out.
+checks_consts=""   # the constant definitions the old release accepted
+checks_chains=""   # "<name>:<length>" per accepted chain
+checks_old_refused=""
+checks_defs=""
+checks_pre=""      # checks_snapshot as the old release leaves it
+checks_texts=""    # "<name>|<definition text>" per chain, for the fresh-define control
+checks_literal() { printf '1%0*d.0' "$1" 0; } # a decimal literal: 1, then $1 zeros
+checks_chain_text() { # length: a, then each field reads the one before
+  local n=$1 s="a AS f0" i
+  for i in $(seq 1 $((n - 1))); do s="$s, f$((i - 1)) + 1 AS f$i"; done
+  echo "$s"
+}
+checks_held() { # target: keys held for the definition
+  scalar "$port" checks "select count(*) from trellis.poison p join trellis.transform_definitions d on d.id = p.transform_id where d.target_table = 'public.$1'"
+}
+checks_snapshot() { # per constant definition: its status, keys held, rows in its target
+  local n
+  for n in $checks_consts $checks_bdefs; do
+    echo "$n $(stored_status "$port" checks "$n") held=$(checks_held "$n") rows=$(scalar "$port" checks "select count(*) from $n")"
+  done
+}
+checks_chain_diff() { # name length: rows where the last field differs from a + length - 1
+  local last=$(($2 - 1))
+  scalar "$port" checks "select count(*) from ((select id, a + $last from k except select id, f$last from $1) union all (select id, f$last from $1 except select id, a + $last from k)) d"
+}
+checks_chains_converged() {
+  local c
+  for c in $checks_chains; do [ "$(checks_chain_diff "${c%%:*}" "${c##*:}" 2>/dev/null)" = 0 ] || return 1; done
+}
+if want grammar; then
+  sql "$port" postgres -c "create database checks"
+  sql "$port" checks <<'EOF3'
+create table k(id bigint primary key, a bigint not null, r real, f double precision);
+create table kb(id bigint primary key, a bigint not null, r real);
+insert into kb select g, g, g from generate_series(1,50) g;
+EOF3
+  seed_rows=$((seed_rows + 50 + 10 + 5 + 10))
+  for kv in "ck_int:SELECT 2147483647 + 1 AS x" "ck_big:SELECT 9223372036854775807 + 1 AS x" \
+    "ck_real:SELECT COALESCE(r, $(checks_literal 39)) AS x" "ck_f8:SELECT COALESCE(f, 1$(printf '%0400d' 0).0) AS x"; do
+    if apply_old checks "TRANSFORM ${kv%%:*} FROM k ${kv#*:}"; then
+      checks_consts="$checks_consts ${kv%%:*}"
+    else checks_old_refused="$checks_old_refused ${kv%%:*}"; fi
+  done
+  for n in 51 120; do
+    if apply_old checks "TRANSFORM ck_chain$n FROM k SELECT $(checks_chain_text "$n")"; then
+      checks_chains="$checks_chains ck_chain$n:$n"
+      checks_texts="${checks_texts}ck_chain$n|FROM k SELECT $(checks_chain_text "$n")"$'\n'
+    else checks_old_refused="$checks_old_refused ck_chain$n"; fi
+  done
+  # The same constants over a table that has rows at define: the old release's
+  # first build fails and the whole definition is quarantined, not live.
+  checks_bdefs=""
+  for kv in "ckb_int:SELECT 2147483647 + 1 AS x" "ckb_real:SELECT COALESCE(r, $(checks_literal 39)) AS x"; do
+    if apply_old checks "TRANSFORM ${kv%%:*} FROM kb ${kv#*:}"; then checks_bdefs="$checks_bdefs ${kv%%:*}"
+    else checks_old_refused="$checks_old_refused ${kv%%:*}"; fi
+  done
+  checks_defs="$checks_consts"
+  for c in $checks_chains; do checks_defs="$checks_defs ${c%%:*}"; done
+  if [ -n "${checks_defs// /}" ]; then
+    run_bg old-checks "$port" checks "$old_bin"
+    # shellcheck disable=SC2086
+    WAIT=120 wait_all "$port" checks "$old_bin" live $checks_defs || die "the checks definitions did not go live (see $logs/run-old-checks.log)"
+    # Rows arrive after the definitions are live: the constants quarantine each key.
+    # (r and f are null: a COALESCE literal is only cast for a row that takes it, and
+    # ten keys stay under the fuse that quarantines a whole definition.)
+    sql "$port" checks -c "insert into k select g, g, null, null from generate_series(1,10) g"
+    # What the old release leaves the constants in is what the takeover must keep.
+    wait_for 60 "$old_tag to hold a key" held_key "$port" checks || die "$old_tag held no key of the constant definitions"
+    sleep 10
+    checks_pre=$(checks_snapshot)
+    wait_for 60 "$old_tag's chains to equal Postgres" checks_chains_converged ||
+      die "$old_tag's chains differ from Postgres"
+    stop_run old-checks
+  fi
+fi
+
 # clients: built and run by the old CLI only, for the manual client step; the
 # candidate never opens it, so the old client opens it first.
 if want clients; then
@@ -870,6 +957,67 @@ consts_grammar() {
   stop_run new-consts
 }
 
+# checks_grammar: the checks database (prep: checks). The takeover re-parses
+# stored text and does not run the define-time checks again: a chain a fresh
+# define refuses keeps running. At the takeover the constants (which define
+# now) keep the status, held keys and target rows the old release left them
+# with and are not paused as a refusal; the chains stay live and equal
+# Postgres after changes. No remedy is asserted: none is prescribed.
+checks_grammar() {
+  local p=$port d=checks line n c bad="" refused="" diff="" post chains=""
+  if [ -z "${checks_defs// /}" ]; then
+    record SKIP grammar "$old_tag refuses every definition of the define-time-check cases itself:$checks_old_refused"
+    return
+  fi
+  [ -z "$checks_old_refused" ] || record INFO grammar "$old_tag refuses itself, so not upgrade cases:$checks_old_refused"
+  for c in $checks_chains; do chains="$chains ${c%%:*}"; done
+  run_bg new-checks "$p" "$d" "$candidate_bin"
+  # shellcheck disable=SC2086
+  if ! WAIT=120 wait_all "$p" "$d" "$candidate_bin" live $chains; then
+    record FAIL grammar "calculated-field chains $old_tag accepted are not live after the takeover:$(missing_status "$p" "$d" "$candidate_bin" live $chains)"
+    stop_run new-checks
+    return
+  fi
+  # Control: a fresh define of a chain's text is refused, so the chains are cases of this check.
+  while IFS='|' read -r n line; do
+    [ -n "$n" ] || continue
+    if trellis "$p" "$d" "$candidate_bin" apply "TRANSFORM ${n}_fresh $line" >/dev/null 2>&1; then
+      bad="$bad $n"
+      trellis "$p" "$d" "$candidate_bin" apply "DROP TRANSFORM ${n}_fresh" >/dev/null 2>&1 || true
+    else refused="$refused $n"; fi
+  done <<<"$checks_texts"
+  [ -z "$bad" ] || record INFO grammar "the candidate now accepts these in a fresh define, so they are no longer cases of this check:$bad"
+  # At the takeover the constants keep the state the old release left them in:
+  # not paused as a refusal, status, held keys and target rows as before. (The old
+  # release's state depends on whether the table had rows at define.) Read before
+  # any row changes: rows that arrive later follow the candidate's rules.
+  sleep 10
+  post=$(checks_snapshot)
+  bad=""
+  for n in $checks_consts $checks_bdefs; do paused_with "$p" "$d" "$n" 'refused by this release' && bad="$bad $n"; done
+  if [ -n "${checks_consts// /}${checks_bdefs// /}" ]; then
+    if [ "$post" = "$checks_pre" ] && [ -z "$bad" ]; then
+      record PASS grammar "stored constants out of range keep the state $old_tag left them in, none paused as refused: $(echo "$post" | tr '\n' ';')"
+    else
+      record FAIL grammar "stored constants out of range changed at the takeover: before [$(echo "$checks_pre" | tr '\n' ';')] after [$(echo "$post" | tr '\n' ';')]${bad:+, paused as refused:$bad}"
+    fi
+  fi
+  # Changes after the takeover reach the chains.
+  sql "$p" "$d" -c "update k set a = a + 5 where id <= 5" \
+    -c "insert into k select g, g, null, null from generate_series(11, 20) g"
+  if [ -n "${chains// /}" ]; then
+    if wait_for 60 "the chains to equal Postgres" checks_chains_converged; then
+      record PASS grammar "after the takeover, calculated-field chains ($(for c in $checks_chains; do printf '%s ' "${c##*:}"; done)fields) stay live and equal Postgres after updates and inserts; a fresh define of the same text is refused:${refused:- none}"
+    else
+      for c in $checks_chains; do diff="$diff ${c%%:*}=$(checks_chain_diff "${c%%:*}" "${c##*:}")"; done
+      record FAIL grammar "a stored chain differs from Postgres after the takeover (rows differing):$diff"
+    fi
+    # shellcheck disable=SC2086
+    check_self "$p" "$d" grammar $chains
+  fi
+  stop_run new-checks
+}
+
 if want grammar; then
   say "3. definitions the candidate refuses that $old_tag accepted"
   for n in ledger_copy deep deep2; do
@@ -899,6 +1047,7 @@ if want grammar; then
   fi
   keys_grammar
   consts_grammar
+  checks_grammar
   record MANUAL grammar "not exercised: an index over more than 32 key columns, a table over 1600 columns ($old_tag cannot build either here), and any refusal added after this script; see the runbook"
 else
   record SKIP grammar "not selected"
