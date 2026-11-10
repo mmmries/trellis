@@ -127,6 +127,13 @@ pub mod staging {
     /// small batches split across workers and a root row's pages at two
     /// positions drain side by side (#1817).
     pub use crate::staging::claim::set_min_rows_to_split;
+
+    /// The split threshold batches seal with in this process:
+    /// `MIN_ROWS_TO_SPLIT`, or what [`set_min_rows_to_split`] lowered it
+    /// to. The concurrent tier's coverage report reads it.
+    pub fn min_rows_to_split() -> i64 {
+        crate::staging::claim::min_rows_to_split()
+    }
     /// `seal_phase1`/`seal_phase2` force a seal boundary at a deterministic
     /// point so two changes land in distinct segments instead of depending on
     /// a maintenance tick's timing. There is no facade equivalent — "seal

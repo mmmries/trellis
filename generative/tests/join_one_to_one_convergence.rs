@@ -778,31 +778,23 @@ fn star_sweep_tier() -> SweepTier {
 
 /// The star tier's known misses, measured by its reach sweep (seeds 1 to 4,
 /// twelve cases each, with the in-run invariant on; caught and fired in, of
-/// 48): the `star_*` rates on #1817's generator, and `join1_m_before_j`'s
-/// and the two-table plants' below on #1781's, before #1817's knobs. Its deterministic pin, named in `trellis/src/plant.rs`, gates each:
-/// what these plants need is one interleaving of two pages, or of a page
-/// and a source write, inside a window of a few milliseconds, which a pin's
-/// pause point holds open and the tier's timing only hits now and then.
+/// 48): every rate here on #1817's generator but the two-table plants' in
+/// the last item, which are #1781's, before #1817's knobs. Its
+/// deterministic pin, named in `trellis/src/plant.rs`, gates each. What the
+/// star plants among them need is one interleaving of two pages, or of a
+/// page and a source write, inside a window of a few milliseconds, which a
+/// pin's pause point holds open and the tier's timing only hits now and
+/// then.
 ///
 /// It gates the plants it catches in about one case in five or more (a
-/// 48-case sweep then misses each with probability below about 1e-4), at
-/// these rates on #1781's generator (PENDING: #1817's regression check):
-/// `join1_no_placeholder` 48, `join1_old_key_unlocked` 40,
-/// `join1_no_orphan_pass` 20, `star_chunk_skip_j_last` 37,
-/// `star_chunk_skip_j_first` 37, `star_root_skip_j_last` 27,
-/// `star_root_skip_j_first` 27 and `star_root_skip_j_middle` 17.
+/// 48-case sweep then misses each with probability below about 1e-4):
+/// `join1_no_placeholder` 48, `join1_old_key_unlocked` 45,
+/// `join1_no_orphan_pass` 18, `join1_truncate_keeps_r` 17,
+/// `join1_m_before_j` 11, `star_chunk_skip_j_last` 40,
+/// `star_chunk_skip_j_first` 40, `star_root_skip_j_last` 38,
+/// `star_root_skip_j_first` 36 and `star_root_skip_j_middle` 30.
 ///
-/// - `join1_truncate_keeps_r`: caught 7, fired 22 (gated on the two-table
-///   tier; at this rate a 48-case sweep misses it about one time in 2,000).
-/// - `join1_truncate_no_rebuild`: caught 5, fired 36.
-/// - `join1_m_before_j`: caught 0, fired 48 (gated on the two-table tier,
-///   which catches it in 9, in its wide and racing key shapes with bursts of
-///   several hundred ops; the star tier draws only its narrow star key
-///   shape, in bursts of 30 to 150 ops).
-/// - The star plants below, measured on #1817's generator (its knobs:
-///   stalled lock steps, re-derived pages, lowered fan-out chunks and
-///   split threshold, paced lanes, one-position key moves and the closing
-///   race of each burst). Each fires, but is caught too rarely to gate:
+/// - `join1_truncate_no_rebuild`: caught 4, fired 36.
 /// - `star_own_j_only`: caught 4, fired 40; `star_r_after_m`: caught 1,
 ///   fired 40; `star_last_no_r`: caught 2, fired 40. The R-entry rule's
 ///   ablations fail only when a joined page at one position starts its
@@ -822,10 +814,13 @@ fn star_sweep_tier() -> SweepTier {
 ///   of a later position must hold its plan across the resume's fence
 ///   bump).
 /// - `star_late_skip_last`: caught 2, fired 2; `star_late_skip_first`:
-///   caught 1, fired 3. A re-derived root row must move at that one
-///   position between the page's unlocked read and its lock, which the
-///   paced writes do within the re-derived page's stall only rarely.
-/// - `star_recheck_j` and `star_recheck_skip_last`: PENDING.
+///   caught 1, fired 3; `star_recheck_j`: caught 1, fired 2;
+///   `star_recheck_skip_last`: caught 0, fired 1. Caught almost whenever
+///   they fire, but they fire rarely: a re-derived row must move at the one
+///   position between the page's unlocked read and its lock (for the
+///   re-check plants, a joined row onto a key the page holds only for a
+///   root item), which the paced writes do within the re-derived page's
+///   stall only now and then.
 /// - The two-table tier's other known misses, each caught 0:
 ///   `join1_no_j_lock` (fired 48), `join1_brd_no_key` (48),
 ///   `join1_no_recheck` (48), `join1_vis_only` (48), `join1_chunk_no_key`
@@ -834,9 +829,7 @@ fn star_sweep_tier() -> SweepTier {
 ///   `join1_snapshot_after_read` (48), `join1_truncate_def_after_lock` (36),
 ///   `join1_truncate_keeps_m` (35) and `join1_truncate_share_lock` (35).
 const STAR_KNOWN_MISSES: &[&str] = &[
-    "join1_truncate_keeps_r",
     "join1_truncate_no_rebuild",
-    "join1_m_before_j",
     "star_own_j_only",
     "star_r_after_m",
     "star_last_no_r",

@@ -597,17 +597,18 @@ beside them run on every `cargo test`.
   plants whose only failure is a deadlock the engine retries). It gates the
   plants it catches in about one case in five or more:
   `join1_no_placeholder`, `join1_old_key_unlocked`, `join1_no_orphan_pass`,
-  `star_root_skip_j_last`, `star_root_skip_j_first`,
-  `star_root_skip_j_middle`, `star_chunk_skip_j_last` and
-  `star_chunk_skip_j_first`. The rest run as known misses, with their
-  measured rates in the tier's `STAR_KNOWN_MISSES`. The R-entry rule's
-  ablations, the late-key and re-check plants and the fan-out chunk's,
-  where they fire, are caught in a few cases of 48 at most (PENDING: the
-  re-check plants' rates): each needs two pages, or a page and a source write, to meet
-  inside a window of a few milliseconds, which a deterministic pin holds
-  open with a pause point and the tier's timing only hits now and then.
-  Their pins gate all of them. The two-table tier leaves every plant that
-  fires only on a star to this one.
+  `join1_truncate_keeps_r`, `join1_m_before_j`, `star_root_skip_j_last`,
+  `star_root_skip_j_first`, `star_root_skip_j_middle`,
+  `star_chunk_skip_j_last` and `star_chunk_skip_j_first`. The rest run as
+  known misses, with their measured rates in the tier's
+  `STAR_KNOWN_MISSES`. Every `star_*` plant it runs fires, but the R-entry
+  rule's ablations, the late-key and re-check plants and the fan-out
+  chunk's are caught in a few cases of 48 at most: each needs two pages,
+  or a page and a source write, to meet inside a window of a few
+  milliseconds, which a deterministic pin holds open with a pause point and
+  the tier's timing only hits now and then. Their pins gate all of them.
+  The two-table tier leaves every plant that fires only on a star to this
+  one.
 - **Chained-reader convergence** (`tests/join_chained_convergence.rs`,
   ADR-0002 "Multi-hop"). A `JOIN`, aggregate or 1-1, one of whose sides is
   another definition's target in the same instance, so the target-mutation
