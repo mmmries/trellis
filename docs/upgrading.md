@@ -46,10 +46,14 @@ prints it as a `Standing by:` line above the definitions, and `trellis run`
 prints `trellis standing by: …`. The definitions keep the statuses the old
 release gives them.
 
-After the takeover, a definition the old release accepted and the new one
-refuses pauses, with a `capture_failure` naming the refusal and the remedy:
-`DROP TRANSFORM`, then define it again in the current grammar. Each release's
-notes list these cases. Every other definition carries on.
+After the takeover, a definition whose stored text the new grammar can't parse
+pauses, with a `capture_failure` naming the refusal and the remedy: `DROP
+TRANSFORM`, then define it again in the current grammar. A definition that
+parses but fails one of the new release's define-time checks is left as the old
+release left it at the takeover, which does not run those checks again; rows
+that arrive afterwards follow the new release's rules. Each release's notes list
+both kinds of case. Every other definition carries
+on.
 
 A definition an earlier release built over a source key with `INCLUDE`
 columns (`primary key (id) include (x)`), which that release read as key

@@ -382,6 +382,15 @@ pause are arcs of one lifecycle:
   part, which no chunk's range reaches, may still be draining when it flips,
   but they gate every token, so the await covers them
   ([ADR-0002](decisions/0002-async-data-flow.md#what-live-promises)).
+
+  A paused column of the definition's own 1-1 target (its fuse tripped, or
+  `PAUSE TRANSFORM t.col`) leaves the status `live`: the column stops updating
+  and the rest of the target keeps applying. It shows in
+  `Trellis::quarantined()` and `quarantine_status("t.col")` as `paused`, with
+  `last_error` when the column failed itself (none for a pause by an operator,
+  or one cascaded from an upstream column it reads). The CLI's `trellis status`
+  prints one `column` line under the definition for each, with the error and
+  the remedy, `RESUME TRANSFORM t.col` once the cause is fixed.
 * **`quarantined`** — the whole-transform fuse tripped
   ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)). Resuming drops the
   transform back to `waiting_to_backfill`, deletes the keys it holds in

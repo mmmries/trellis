@@ -219,7 +219,7 @@ running for a manual step.
 |---|---|---|
 | `migrations` | A database the old build created opens under the candidate: no checksum mismatch, the old build's history rows unchanged, and only the candidate's new migrations added. The old tag's migration files are byte-identical at the candidate; a file the candidate adds (for `0.2.0`, `V9__worker_versions.sql` to `V20__definition_join_tables.sql`) is reported as `INFO`, since it changes the upgrade path and rules out downgrade, and the release notes say so. A changed or removed file of the old tag fails. Control: with one stored checksum altered the candidate refuses. | Script |
 | `definitions` | One of each shape the release supports, built under the old build with writers running and undrained ring segments in flight: a plain 1-1, a chained 1-1, a 1-1 with a paused column, a group-basis aggregate, an aggregate over a `JOIN` (inner and `LEFT`), an aggregate and a `JOIN` over a hash-partitioned source, a 1-1 with a held key, and a paused transform. Under the candidate each resumes, converges and has a clean `self_check`; the held key and the pauses are unchanged; nothing else pauses. A plain recompute of two targets in SQL cross-checks `self_check`. | Script |
-| `grammar` | A definition the old build accepted and the candidate refuses pauses with a reason that names the remedy, not an error loop and not silent staleness, and the remedy works: a bare reserved word as a column name, and an expression nested over 100 levels (as a chain and as parentheses). Sources the candidate keys differently ([upgrading](upgrading.md#upgrading)): a key with `INCLUDE` columns, a deferrable primary key, and a primary key dropped after define with a unique index left over a nullable column each pause naming the remedy, and the remedy (`RESUME`; recreating the key not deferrable, then `RESUME`; adding a primary key, then `RESUME`) brings each back with a clean `self_check`. A primary key dropped after define with a unique index left over its columns keeps running, with `KEY (…)` written into the stored definition. A definition reading a column named `null` or `false` bare keeps reading the column, compared against Postgres, and the same text defined now reads the literal, stamped grammar 2. | Script, plus the manual cases below |
+| `grammar` | A definition the old build accepted and the candidate refuses pauses with a reason that names the remedy, not an error loop and not silent staleness, and the remedy works: a bare reserved word as a column name, and an expression nested over 100 levels (as a chain and as parentheses). Sources the candidate keys differently ([upgrading](upgrading.md#upgrading)): a key with `INCLUDE` columns, a deferrable primary key, and a primary key dropped after define with a unique index left over a nullable column each pause naming the remedy, and the remedy (`RESUME`; recreating the key not deferrable, then `RESUME`; adding a primary key, then `RESUME`) brings each back with a clean `self_check`. A primary key dropped after define with a unique index left over its columns keeps running, with `KEY (…)` written into the stored definition. A definition reading a column named `null` or `false` bare keeps reading the column, compared against Postgres, and the same text defined now reads the literal, stamped grammar 2. A definition the old build accepted that parses but fails one of the candidate's define-time checks keeps running, as the takeover does not run those checks again: a chain of 51 or 120 calculated fields stays `live` and equals Postgres after updates and inserts, with a clean `self_check`; a fresh define of the same text is refused. A stored constant that Postgres can't evaluate is left as the old build left it by the takeover (status, held keys and target rows unchanged, nothing paused as a refusal). | Script, plus the manual cases below |
 | `inflight` | Upgrading while a definition is mid-build, mid-rebuild (a `RESUME`), waiting for capture, paused, or holding a key: each continues to `live`, or stays as it was. A held key stands for quarantine: the script does not trip the whole-definition fuse, so no definition is `quarantined` at the upgrade. | Script |
 | `structure` | A `structure.sql` made by the old build (a `pg_dump --schema-only` of the Trellis schema and `public`, plus the old build's `dump_definitions_sql`) loads into an empty database and every definition builds. Covers the older format only (see the [release notes checklist](#release-notes-checklist)). | Script |
 | `pgrestore` | A `pg_dump` and `pg_restore` of the old database opens under the candidate, pauses every definition with the documented reason ([operations — runbooks](operations.md#runbooks)), and `RESUME` brings each back to `live` with a clean `self_check`. | Script |
@@ -273,8 +273,10 @@ refusals it can build with the old CLI. Check the rest by reading the
 candidate's list of refusals against what the old build accepted (the
 "Supported sources and targets" section of [transforms](transforms.md), the
 changes since the predecessor's tag), and for each one the old build accepts,
-define it under the old CLI, upgrade, and confirm the definition pauses with a
-reason that names the remedy and the remedy works. Cases that the old build
+define it under the old CLI, upgrade, and confirm the outcome: text the
+candidate can't parse pauses with a reason that names the remedy, and the remedy
+works; text that parses but fails a define-time check is left as the old
+release left it, and the release notes list it. Cases that the old build
 refuses itself are not upgrade cases: a `JOIN` on a repeated column pair, an
 index over more than 32 key columns, and (not tried by the script) a table
 over 1600 columns. Add each new case to the script when you find one.
@@ -306,13 +308,19 @@ step found, in the release notes.
 
 For each release, the notes carry:
 
-- **Definitions the new version refuses.** Every definition the previous
-  release accepted and this one refuses pauses on upgrade, with its reason in
-  `capture_failure`; the notes list each case, with the remedy (`DROP
-  TRANSFORM`, then define it again in the current grammar). For `0.2.0`: a bare
-  reserved word as a column name (`SELECT order AS o`; write `"order"` or
-  `table.order`), and an expression nested over 100 levels (split it into
-  calculated fields). Add every case from the manual refusal check.
+- **Definitions the new version refuses.** Two kinds, listed separately. A
+  definition the previous release accepted that this one can't parse pauses on
+  upgrade, with its reason in `capture_failure`; the notes list each case, with
+  the remedy (`DROP TRANSFORM`, then define it again in the current grammar).
+  For `0.2.0`: a bare reserved word as a column name (`SELECT order AS o`;
+  write `"order"` or `table.order`), and an expression nested over 100 levels
+  (split it into calculated fields). A definition that parses but fails one of
+  this release's define-time checks is left as the previous release left it,
+  because the takeover does not run those checks again (rows that arrive later
+  follow this release's rules); the notes list each case, with no
+  remedy beyond what the refusal message of a fresh define gives. For `0.2.0`:
+  a chain of calculated fields too long to inline (`FieldExpansionTooLarge`).
+  Add every case from the manual refusal check, under the kind it belongs to.
 - **What new text means differently.** A grammar version bump keeps every
   stored definition's meaning, but the same text written after the upgrade
   reads the new way. For `0.2.0` (grammar 2,

@@ -379,8 +379,9 @@ aggregate over its target groups by (`timestamp` and `numeric` are `GROUP BY`
 key types). `infinity` and `-infinity` follow Postgres. `d + n` past
 5874897-12-31 or before 4714-11-24 BC, `d1 - d2` with an infinite date and a
 `CAST` of a date past 294276-12-31 raise `22008` for the row, which is
-quarantined like any data error; a constant that does is refused at define
-([transforms](transforms.md#supported-sources-and-targets)).
+quarantined like any data error. A constant that does fails every row the
+same way: define doesn't evaluate constants
+([transforms](transforms.md#calculated-fields)).
 
 What each form reads: none of these reads `DateStyle`, `IntervalStyle` or
 `TimeZone` (the pins above stay). `AT TIME ZONE 'UTC'` parses its zone name

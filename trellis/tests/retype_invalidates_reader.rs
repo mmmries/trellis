@@ -612,12 +612,15 @@ async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// A `COALESCE` constant outside `real`'s range is refused by an `ALTER
-/// TRANSFORM` as by define. Over a `double precision` column it is in range,
-/// so it defines; re-typing the column to `real` pauses the transform on the
-/// capture pass, and the resume refuses as define would.
+/// A `COALESCE` constant outside `real`'s range defines over a `double
+/// precision` column, where it is in range, and an `ALTER TRANSFORM` adding
+/// one over a `real` column is accepted too: define evaluates no constant.
+/// Re-typing the first column to `real` pauses the transform for the
+/// re-type, as any re-type of a read column does; the resume re-types and
+/// rebuilds, and the rebuilt row, which Postgres now fails while planning,
+/// is quarantined with Postgres's error, like any per-row error.
 #[tokio::test]
-async fn a_coalesce_constant_out_of_range_after_a_retype_to_real_pauses_and_the_resume_refuses() {
+async fn a_coalesce_constant_out_of_range_after_a_retype_to_real_quarantines_its_rows() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -636,16 +639,17 @@ async fn a_coalesce_constant_out_of_range_after_a_retype_to_real_pauses_and_the_
         .await
         .expect("define one");
     bring_live(&mut raw, &db.pool, &["one"]).await;
-
-    match trellis
+    trellis
         .apply(&format!(
             "ALTER TRANSFORM one ADD COALESCE(r, {beyond_real}) AS w"
         ))
         .await
-    {
-        Err(err) => assert!(err.to_string().contains("out of range for real"), "{err}"),
-        Ok(applied) => panic!("the alter should be refused: {applied:?}"),
-    }
+        .expect("an ALTER evaluates no constant either");
+    trellis
+        .apply("ALTER TRANSFORM one DROP w")
+        .await
+        .expect("drop the added field");
+    bring_live(&mut raw, &db.pool, &["one"]).await;
 
     raw.batch_execute("alter table public.src alter column x type real")
         .await
@@ -654,20 +658,36 @@ async fn a_coalesce_constant_out_of_range_after_a_retype_to_real_pauses_and_the_
     let reported = trellis.status("one").await.expect("status").expect("one");
     assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
 
-    match trellis.apply("RESUME TRANSFORM one").await {
-        Err(err) => assert!(err.to_string().contains("out of range for real"), "{err}"),
-        Ok(applied) => panic!("the resume should be refused: {applied:?}"),
-    }
+    trellis
+        .apply("RESUME TRANSFORM one")
+        .await
+        .expect("the resume re-validates and accepts");
+    full_pass(&mut raw, &db.pool).await;
+    run_backfill_chunks(&db.pool).await;
+    let held: Vec<(String, String, Option<String>)> = raw
+        .query("select key, last_error, sqlstate from poison", &[])
+        .await
+        .expect("read poison")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    assert_eq!(held.len(), 1, "{held:?}");
+    let (key, error, sqlstate) = &held[0];
+    assert_eq!(key, "1");
+    assert_eq!(sqlstate.as_deref(), Some("22003"));
+    assert!(error.contains("is out of range for type real"), "{error}");
     trellis.shutdown().await.expect("shutdown");
 }
 
 /// An exact constant past `double precision` beside a `numeric` column is
 /// computed as `numeric`, so it defines. Re-typing the column to `double
-/// precision` makes Postgres cast the constant to it, which raises for every
-/// row: the capture pass pauses the transform, and the resume refuses as
-/// define would.
+/// precision` pauses the transform for the re-type, and the resume accepts
+/// it (define evaluates no constant). The resume's re-type of the target's
+/// column then fails on the value the target already holds, which `double
+/// precision` can't represent, and the transform stays paused with
+/// Postgres's error.
 #[tokio::test]
-async fn a_constant_beside_a_column_retyped_to_a_float_pauses_and_the_resume_refuses() {
+async fn a_constant_beside_a_column_retyped_to_a_float_pauses_on_the_targets_re_type() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -694,14 +714,24 @@ async fn a_constant_beside_a_column_retyped_to_a_float_pauses_and_the_resume_ref
     let reported = trellis.status("one").await.expect("status").expect("one");
     assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
 
-    match trellis.apply("RESUME TRANSFORM one").await {
-        Err(err) => assert!(
-            err.to_string()
-                .contains("out of range for double precision"),
-            "{err}"
-        ),
-        Ok(applied) => panic!("the resume should be refused: {applied:?}"),
-    }
+    trellis
+        .apply("RESUME TRANSFORM one")
+        .await
+        .expect("the resume re-validates and accepts");
+    full_pass(&mut raw, &db.pool).await;
+    let reported = trellis.status("one").await.expect("status").expect("one");
+    assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
+    let failure = reported
+        .capture_failure
+        .expect("the pause names its reason");
+    assert!(
+        failure.error.contains("couldn't re-type")
+            && failure
+                .error
+                .contains("is out of range for type double precision"),
+        "{}",
+        failure.error
+    );
     trellis.shutdown().await.expect("shutdown");
 }
 
