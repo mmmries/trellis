@@ -1349,8 +1349,15 @@ pub(crate) async fn store_unrunnable(
             super::lifecycle::pause_for_unrunnable(&txn, id, unparsed.source_table, reason).await?
         }
         Held::Other(reason) => {
-            super::lifecycle::pause_for_grammar_version(&txn, id, unparsed.source_table, reason)
-                .await?
+            super::lifecycle::pause_for_capture_failure(
+                &txn,
+                id,
+                unparsed.source_table,
+                &[],
+                reason,
+                None,
+            )
+            .await?
         }
     };
     txn.execute(
