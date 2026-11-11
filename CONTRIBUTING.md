@@ -110,13 +110,8 @@ each rule. Each release's notes list the floors it raised
 
 # Operating Principles
 
-Five rules constrain every design that watches a source, a target or
-Trellis's own state: no design needs a superuser; Trellis pauses with a reason
-when it can't vouch for a target; a detector that pauses ships only after a
-false-positive study; define-time validations hold for a definition's life;
-and Trellis doesn't guard what it owns against changes made outside it. See
-[ADR-0027](docs/decisions/0027-operating-principles.md), and cite its rules
-by number.
+A design that watches a source, a target or Trellis's own state follows
+[ADR-0027](docs/decisions/0027-operating-principles.md). Cite its rules by number.
 
 # Creating a Pull Request
 

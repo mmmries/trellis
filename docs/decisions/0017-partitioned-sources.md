@@ -169,10 +169,9 @@ on a `GRANT` (even a repeated one), an owner change, `ADD COLUMN`, a `CHECK`
 change, an RLS toggle or `REPLICA IDENTITY`, and each firing would force a full
 rebuild.
 
-Why not an event trigger, which would see DDL sooner? It needs a superuser, some
-hosts don't offer one, and I found it fires neither for an interrupted
-`DETACH CONCURRENTLY` nor for `TRUNCATE`. Nothing here depends on one
-([ADR-0027](0027-operating-principles.md), rule 1).
+Why not an event trigger, which would see DDL sooner? It needs a superuser
+([ADR-0027](0027-operating-principles.md), rule 1), and I found it fires neither
+for an interrupted `DETACH CONCURRENTLY` nor for `TRUNCATE`.
 
 ### Target rows route to nodes by each leaf's recorded bound, under pinned settings
 

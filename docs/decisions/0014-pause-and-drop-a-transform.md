@@ -41,7 +41,7 @@ Paused definitions](../operations.md#paused-definitions) lists every reason, and
 too many poisoned source rows. It is a separate status so that poison incidents stay
 distinguishable from an operator's pause. From either, an operator resumes, which
 reconciles the target with current source data, or drops it, which removes the
-definition and its data. Every freeze stays until an operator acts ([ADR-0027](0027-operating-principles.md), rule 2).
+definition and its data. Every freeze stays until an operator acts.
 
 Drop acts only on a frozen definition (`paused` or `quarantined`). There is no direct
 live-to-gone edge: quiescing first is a precondition, so the removal never has to reason

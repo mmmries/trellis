@@ -135,9 +135,10 @@ its source row; an aggregate or `JOIN` target stays wrong until it's rebuilt.
 **Repair:** right after the `ALTER`, `request_backfill` the table.
 
 **Ends with:** [#1654](https://github.com/salesforce-misc/trellis/issues/1654),
-a false-positive study of signals that would catch these shapes ([ADR-0027](decisions/0027-operating-principles.md), rule 3). Event
-triggers would see every rewrite but need superuser ([ADR-0027](decisions/0027-operating-principles.md), rule 1), and logical decoding has
-the same blind spot: `pgoutput` never sends a rewrite's rows.
+a false-positive study ([ADR-0027](decisions/0027-operating-principles.md),
+rule 3) of signals that would catch these shapes. Event triggers would see
+every rewrite but need superuser (rule 1), and logical decoding has the same
+blind spot: `pgoutput` never sends a rewrite's rows.
 
 ### An enum label renamed and added again
 
