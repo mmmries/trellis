@@ -13,19 +13,17 @@ optimize for.
 
 ## ADRs are zoning rules, not a description of the code
 
-An ADR records a key design decision. All code work must agree with the ADRs,
-so an ADR may describe design the code doesn't match yet, or no longer matches.
-Work that conflicts with an ADR, or finds one unclear or outdated, stops and
-asks the maintainer to clarify the ADR; it never edits the ADR to fit the code.
-An ADR changes only when the maintainer decides a design change, and then it is
-edited in place. A plain fact that a later ADR or the code reversed, with no
-decision changed, may be corrected, and the maintainer reviews that change.
+An ADR records a key design decision, and all code work must agree with it.
+It may describe design the code doesn't match yet, or no longer matches. Work
+that conflicts with an ADR, or finds one unclear or outdated, stops and asks
+the maintainer to clarify it; it never edits the ADR to fit the code. An ADR
+changes only when the maintainer decides a design change, and is then edited
+in place. A plain fact that a later ADR or the code reversed may be corrected
+without changing a decision; the maintainer reviews that change.
 
-How the code carries out a decision (steps, tables, statements, lock and
-statement order) lives in the
-[staging and claiming stage docs](../staging-and-claiming/README.md), which
-feature work edits freely. An ADR states the decision and its reason, and
-links there for the mechanism.
+How the code carries out a decision (steps, tables, statements, lock order)
+lives in the [stage docs](../staging-and-claiming/README.md), which feature
+work edits freely; an ADR links there.
 
 ## Writing an ADR
 
@@ -57,7 +55,7 @@ describes is gone.
   X?"** One short paragraph, ending with why not.
 - **Write about concepts and contracts, not code.** Name the public surface;
   leave internal functions, migration files and call-site inventories to the
-  code and the PR, and mechanism to the stage docs.
+  code and the PR.
 - **Ground it with one concrete example**, checked against the current code and
   `docs/` so it is one the system actually accepts.
 - **Drafts may carry `[OPEN: question. Recommendation: …]` markers**, for
