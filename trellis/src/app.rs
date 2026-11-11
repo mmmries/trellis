@@ -952,8 +952,22 @@ impl Trellis {
     /// listing shows every stuck definition: a health check that lists them
     /// and finds a [`DefinitionSummary::halt`] has a definition stopped until
     /// an operator fixes the cause and resumes it.
+    ///
+    /// A catalog it can't read until this binary's migrations run refuses
+    /// with [`TrellisError::MigrationsPending`] (code `version_handover`).
     pub async fn definitions(&self) -> Result<Vec<DefinitionSummary>, TrellisError> {
         self.call(async {
+            match self.read_definitions().await {
+                Ok(definitions) => Ok(definitions),
+                Err(error) => Err(self.unless_pending(error).await),
+            }
+        })
+        .await
+    }
+
+    /// [`Trellis::definitions`]'s read of the catalog.
+    async fn read_definitions(&self) -> Result<Vec<DefinitionSummary>, TrellisError> {
+        async {
             let mut client = self.pool.get().await?;
             // One repeatable-read transaction, so the reported statuses are
             // derived from the same catalog state the rows come from.
@@ -1000,7 +1014,7 @@ impl Trellis {
                     }
                 })
                 .collect())
-        })
+        }
         .await
     }
 
@@ -1080,11 +1094,69 @@ impl Trellis {
     ///
     /// `target_table` is the name `apply` returns (`schema.table`) or the bare table
     /// name; a qualified name with another schema matches nothing.
+    ///
+    /// While this binary's migrations haven't run on the instance, it
+    /// reports them ([`DefinitionStatus::migrations_pending`]); a catalog it
+    /// can't read until they run refuses with
+    /// [`TrellisError::MigrationsPending`] (code `version_handover`) instead.
     pub async fn status(
         &self,
         target_table: &str,
     ) -> Result<Option<DefinitionStatus>, TrellisError> {
         self.call(async {
+            let pending = self.migrations_pending_now().await?;
+            match (self.read_status(target_table).await, pending) {
+                (Ok(status), pending) => Ok(status.map(|mut status| {
+                    status.migrations_pending = pending;
+                    status
+                })),
+                (Err(error), Some(pending)) => Err(TrellisError::MigrationsPending {
+                    pending,
+                    error: Box::new(error),
+                }),
+                (Err(error), None) => Err(error),
+            }
+        })
+        .await
+    }
+
+    /// This binary's migrations that haven't run on the instance, with why
+    /// this handle's background process couldn't run them, if it tried
+    /// (ADR-0023, rule 3); `None` when nothing is pending.
+    async fn migrations_pending_now(
+        &self,
+    ) -> Result<Option<crate::handover::MigrationsPending>, TrellisError> {
+        let client = self.pool.get().await?;
+        let migrations =
+            crate::migrate::pending_migrations(&**client, self.config.schema()).await?;
+        Ok(
+            (!migrations.is_empty()).then(|| crate::handover::MigrationsPending {
+                this_version: self.config.binary_version().to_string(),
+                migrations,
+                cannot_run: self.client.as_ref().and_then(Client::cannot_migrate),
+            }),
+        )
+    }
+
+    /// `error`, unless this binary's migrations are pending: then a read
+    /// that failed likely met a catalog it can't read until they run, and
+    /// refuses with [`TrellisError::MigrationsPending`], carrying `error`.
+    async fn unless_pending(&self, error: TrellisError) -> TrellisError {
+        match self.migrations_pending_now().await {
+            Ok(Some(pending)) => TrellisError::MigrationsPending {
+                pending,
+                error: Box::new(error),
+            },
+            Ok(None) | Err(_) => error,
+        }
+    }
+
+    /// [`Trellis::status`]'s read of the catalog.
+    async fn read_status(
+        &self,
+        target_table: &str,
+    ) -> Result<Option<DefinitionStatus>, TrellisError> {
+        async {
             let mut client = self.pool.get().await?;
             // `target_table` is either spelling of the transform's name, the
             // qualified one `apply` returns or the bare one its text declared
@@ -1265,10 +1337,11 @@ impl Trellis {
                     .get::<_, Option<i64>>("build_fence")
                     .map(|xid| BuildWait::Fence { xid }),
                 version_handover,
+                migrations_pending: None,
                 below_catalog_floor,
                 floor: row.get("floor_version"),
             }))
-        })
+        }
         .await
     }
 
@@ -2505,6 +2578,14 @@ pub struct DefinitionStatus {
     /// process killed without a clean shutdown keeps its row live, and so
     /// delays the takeover, for at most the reclaim TTL (30 seconds).
     pub version_handover: Option<crate::handover::OtherVersionLive>,
+    /// Set while this binary's migrations haven't run on the instance
+    /// (ADR-0023, rule 3): names them, and, when this handle's background
+    /// process tried to run them and was refused (its role can't alter
+    /// Trellis's tables, say), why and the remedy. A background process of
+    /// this version runs them itself once no process of another version is
+    /// live ([`DefinitionStatus::version_handover`]), then takes over;
+    /// meanwhile it stands by.
+    pub migrations_pending: Option<crate::handover::MigrationsPending>,
     /// Set while this binary's version is below the instance's catalog
     /// floor, the oldest Trellis version that can read its catalog
     /// (ADR-0024): its background processes stand by (they stage, drain and
@@ -2971,6 +3052,18 @@ pub struct PoisonSample {
 pub enum TrellisError {
     /// A definition failed to parse before it could be registered.
     Parse(ParseError),
+    /// A read (`status`, `definitions`) failed while this binary's
+    /// migrations haven't run on the instance: the catalog likely lacks what
+    /// they add. Code `version_handover`. A background process of this
+    /// version runs them once no process of another version is live, or run
+    /// `migrate`.
+    MigrationsPending {
+        /// Which migrations are pending, and why this handle's background
+        /// process couldn't run them, if it tried.
+        pending: crate::handover::MigrationsPending,
+        /// The read's own error.
+        error: Box<TrellisError>,
+    },
     /// A catalog operation (define/alter/install/pause/drop) failed.
     Catalog(CatalogError),
     /// Starting or stopping the background client failed.
@@ -3116,7 +3209,9 @@ impl TrellisError {
             TrellisError::Staging(err) => err.code(),
             TrellisError::SelfCheck(err) => err.code(),
             TrellisError::CallTimeout { .. } => ErrorCode::Timeout,
-            TrellisError::OtherVersionLive(_) => ErrorCode::VersionHandover,
+            TrellisError::OtherVersionLive(_) | TrellisError::MigrationsPending { .. } => {
+                ErrorCode::VersionHandover
+            }
         }
     }
 }
@@ -3205,6 +3300,12 @@ impl std::fmt::Display for TrellisError {
                 budget.as_secs_f64()
             ),
             TrellisError::OtherVersionLive(seen) => write!(f, "refused: {seen}"),
+            TrellisError::MigrationsPending { pending, error } => {
+                write!(
+                    f,
+                    "refused: {pending}; the catalog can't be read until they run: {error}"
+                )
+            }
         }
     }
 }
@@ -3231,6 +3332,7 @@ impl std::error::Error for TrellisError {
             TrellisError::Staging(err) => Some(err),
             TrellisError::SelfCheck(err) => Some(err),
             TrellisError::OtherVersionLive(seen) => Some(seen),
+            TrellisError::MigrationsPending { error, .. } => Some(error.as_ref()),
         }
     }
 }

@@ -333,7 +333,7 @@ pub(crate) struct AttachLock {
 const ATTACH_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The advisory-lock key of [`AttachLock`], one per database.
-const ATTACH_LOCK_KEY: i64 = 0x5452_4c53_4154_5448;
+pub const ATTACH_LOCK_KEY: i64 = 0x5452_4c53_4154_5448;
 
 impl AttachLock {
     pub(crate) async fn acquire(pool: &crate::pool::Pool) -> Result<Self, Error> {

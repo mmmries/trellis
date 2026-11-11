@@ -17,7 +17,8 @@
 #   pgrestore     5b. a pg_dump/pg_restore of a v0.1.0 database (documented pauses, then RESUME)
 #   basebackup    5c. a pg_basebackup restore of a running v0.1.0 database
 #   clients       6. Ruby gem and Elixir package (manual)
-#   mixed         7. the candidate stands by beside a live v0.1.0, then takes over
+#   mixed         7. the candidate stands by beside a live v0.1.0, then takes over;
+#                    an embedded candidate worker with no migrate step migrates itself
 #   downgrade     8. rollback: the old release on a database the candidate wrote (ADR-0024)
 #
 # Options:
@@ -178,6 +179,16 @@ stop_run() { # name: graceful (Ctrl-C), as an operator stops it
   kill -KILL "$pid" 2>/dev/null || true
 }
 run_alive() { local pid; pid=$(cat "$work/run-$1.pid" 2>/dev/null) && kill -0 "$pid" 2>/dev/null; }
+# worker_bg <name> <port> <db> <probe> <target>: an embedded application's
+# worker in the background (the probe's `worker`: staging and drain threads,
+# never `migrate`), printing <target>'s status as it changes. Stopped and
+# checked like a `trellis run` (stop_run, run_alive).
+worker_bg() {
+  local name=$1 p=$2 d=$3 b=$4 t=$5
+  TRELLIS_DATABASE_URL=$(url "$p" "$d") "$b" worker "$t" >"$logs/run-$name.log" 2>&1 &
+  echo $! >"$work/run-$name.pid"
+  bg_pids+=("$!")
+}
 
 # status_lines <port> <db> <bin>: "name=status" per definition, from the CLI.
 status_lines() {
@@ -424,7 +435,7 @@ mkdir -p "$work/cluster-a"
 start_cluster "$work/cluster-a" "$port"
 pg_major=$("$pg_bin/psql" -X -At -h 127.0.0.1 -p "$port" -U postgres -d postgres -c "show server_version_num")
 [ "$pg_major" -ge 150000 ] || die "PostgreSQL 15 or later is required (partitioned sources); this is $pg_major"
-for d in shapes inflight ctl mixed clients keys consts; do sql "$port" postgres -c "create database $d"; done
+for d in shapes inflight ctl mixed mixedemb clients keys consts; do sql "$port" postgres -c "create database $d"; done
 
 # ---------------------------------------------------------------- prep: shapes
 say "building the $old_tag databases"
@@ -743,7 +754,17 @@ fi
 say "upgrading: stop $old_tag, start the candidate (writers keep running)"
 stop_run old-shapes
 run_bg new-shapes "$port" shapes "$candidate_bin"
-run_bg new-inflight "$port" inflight "$candidate_bin"
+# The inflight database is taken over by an embedded application's worker
+# (the probe's `worker`), which never calls `migrate`: it runs the pending
+# migrations itself as it takes over (ADR-0023 rule 3), with builds, a
+# rebuild, a pause and a held key in flight. Without the probe, `trellis run`.
+if [ -n "$probe_new" ]; then
+  worker_bg new-inflight "$port" inflight "$probe_new" live_ok
+  inflight_candidate="an embedded candidate worker with no migrate step"
+else
+  run_bg new-inflight "$port" inflight "$candidate_bin"
+  inflight_candidate="the candidate's trellis run (the probe does not build against the candidate)"
+fi
 ! want grammar || run_bg new-keys "$port" keys "$candidate_bin"
 ! want grammar || run_bg new-consts "$port" consts "$candidate_bin"
 sleep 8
@@ -1068,6 +1089,7 @@ fi
 if want inflight; then
   say "4. work in flight at the upgrade"
   echo "before: $pre_inflight_status"
+  record INFO inflight "taken over by $inflight_candidate"
   pre_bad=""
   for kv in big_agg=backfilling rebuild_me=backfilling wait_agg=waiting_to_backfill paused_t=paused; do
     case " $pre_inflight_status " in *" $kv "*) ;; *) pre_bad="$pre_bad $kv" ;; esac
@@ -1248,6 +1270,50 @@ if want mixed; then
   WAIT=120 wait_all "$port" mixed "$candidate_bin" live m_agg || true
   check_self "$port" mixed mixed m_agg
   stop_run new-mixed
+
+  # The same deploy with no `migrate` step anywhere (ADR-0023 rule 3): the
+  # candidate is an embedded application's worker, not `trellis run`, so
+  # nothing else migrates. It stands by beside the old instance, says the
+  # migrations are pending in `status()`, and once the old instance stops it
+  # runs them itself and takes over.
+  if [ -z "$probe_new" ]; then
+    record FAIL mixed "the probe does not build against the candidate, so the embedded handover did not run (see $logs/build-probe-candidate.log)"
+  else
+    sql "$port" mixedemb -c "create table m(id bigint primary key, g bigint not null)" -c "create index on m(g)" -c "insert into m select g, g % 5 from generate_series(1,200) g"
+    apply_old mixedemb 'TRANSFORM m_agg FROM m GROUP BY g SELECT g AS g, COUNT(*) AS n'
+    run_bg old-mixedemb "$port" mixedemb "$old_bin"
+    WAIT=120 wait_all "$port" mixedemb "$old_bin" live m_agg || true
+    pre_emb_history=$(history "$port" mixedemb)
+    worker_bg new-mixedemb "$port" mixedemb "$probe_new" m_agg
+    sleep 15
+    pending_msg="this binary's migrations haven't run on this instance"
+    paused_n=$(scalar "$port" mixedemb "select count(*) from trellis.capture_failures")
+    if run_alive new-mixedemb && [ "$(history "$port" mixedemb)" = "$pre_emb_history" ] &&
+       [ "$paused_n" -eq 0 ] && grep -qF "$pending_msg" "$logs/run-new-mixedemb.log"; then
+      record PASS mixed "an embedded candidate worker stands by beside a live $old_tag instance: no migration ran, nothing paused, and status() says the migrations are pending ($(grep -F "$pending_msg" "$logs/run-new-mixedemb.log" | head -1 | cut -c1-200))"
+    else
+      record FAIL mixed "the embedded candidate worker did not stand by beside a live $old_tag instance ($paused_n paused, process $(run_alive new-mixedemb && echo running || echo exited), history $( [ "$(history "$port" mixedemb)" = "$pre_emb_history" ] && echo unchanged || echo changed), log: $(tr '\n' ' ' <"$logs/run-new-mixedemb.log" | cut -c1-300))"
+    fi
+    sql "$port" mixedemb -c "insert into m select g, g % 5 from generate_series(201,400) g"
+    stop_run old-mixedemb
+    taken=0
+    for _ in $(seq 1 120); do
+      if [ "$(history "$port" mixedemb | wc -l)" -gt "$(wc -l <<<"$pre_emb_history")" ] &&
+         [ "$(scalar "$port" mixedemb "select count(*) from trellis.worker_registry where version = '$cand_ver' and not standby and last_seen > now() - interval '30 seconds'" 2>/dev/null || echo 0)" -ge 1 ]; then
+        taken=1; break
+      fi
+      sleep 0.5
+    done
+    if [ "$taken" -eq 1 ] && run_alive new-mixedemb; then
+      record PASS mixed "once $old_tag stopped, the embedded candidate worker ran the migrations itself, with no migrate step, and took over (its live worker_registry row carries version $cand_ver)"
+    else
+      record FAIL mixed "the embedded candidate worker did not migrate and take over within 60 s of $old_tag stopping (process $(run_alive new-mixedemb && echo running || echo exited), log: $(tail -c 300 "$logs/run-new-mixedemb.log" | tr '\n' ' '))"
+    fi
+    sql "$port" mixedemb -c "insert into m select g, g % 5 from generate_series(401,600) g"
+    WAIT=120 wait_all "$port" mixedemb "$candidate_bin" live m_agg || true
+    check_self "$port" mixedemb mixed m_agg
+    stop_run new-mixedemb
+  fi
 else
   record SKIP mixed "not selected"
 fi
@@ -1509,6 +1575,6 @@ for r in "${results[@]}"; do
 done
 echo "PASS=$npass FAIL=$nfail INFO=$ninfo MANUAL=$nman SKIP=$nskip"
 if [ "$keep" -eq 1 ]; then
-  echo "kept: the cluster on port $port ($work/cluster-a/data; databases shapes, inflight, ctl, mixed, clients, keys, loaded, restored) and, if the basebackup step ran, the clone on port '$port_b' stay running; stop with $pg_bin/pg_ctl -D $work/cluster-a/data stop"
+  echo "kept: the cluster on port $port ($work/cluster-a/data; databases shapes, inflight, ctl, mixed, mixedemb, clients, keys, loaded, restored) and, if the basebackup step ran, the clone on port '$port_b' stay running; stop with $pg_bin/pg_ctl -D $work/cluster-a/data stop"
 fi
 [ "$nfail" -eq 0 ] || exit 1

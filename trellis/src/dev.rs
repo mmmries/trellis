@@ -297,6 +297,7 @@ pub mod fixtures {
             paused_upstream_columns: Vec::new(),
             build_wait: None,
             version_handover: None,
+            migrations_pending: None,
             below_catalog_floor: None,
             floor: "0.2.0".to_string(),
         }

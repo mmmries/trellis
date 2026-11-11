@@ -117,9 +117,15 @@ pub(crate) enum StandBy {
     /// any process is).
     OtherVersion(OtherVersionLive),
     /// Nothing is live, but the instance hasn't been migrated to this
-    /// binary's migrations yet: a background process never migrates, it
-    /// waits for `migrate` (`trellis run` migrates before it starts one).
+    /// binary's migrations yet. What [`decide`] says; the background process
+    /// then runs `migrate` in the same pass and takes over, and stands by
+    /// only when `migrate` refuses ([`StandBy::CannotMigrate`]).
     MigrationsPending,
+    /// This binary's migrations are pending, nothing else is live, and the
+    /// process's `migrate` refused: it can't run them (its role lacks the
+    /// rights, the history doesn't fit, ...). It tries again every standby
+    /// poll.
+    CannotMigrate(MigrationsPending),
     /// This binary is below the catalog floor (ADR-0024): it can't read the
     /// catalog, so it waits for the floor to come down, which in practice
     /// means a release at or above the floor replaces it. Decided before
@@ -285,6 +291,52 @@ impl fmt::Display for OtherVersionLive {
 }
 
 impl std::error::Error for OtherVersionLive {}
+
+/// This binary's migrations haven't run on the instance yet (ADR-0023,
+/// rule 3). A background process of this version runs them itself as soon as
+/// no process of another version is live, then takes over; this says which
+/// are pending and, when this handle's background process tried and was
+/// refused, why. Carried by [`crate::DefinitionStatus::migrations_pending`],
+/// and by the `version_handover` refusal of a read that can't read the
+/// catalog until they run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MigrationsPending {
+    /// This binary's version.
+    pub this_version: String,
+    /// The pending migrations, by name (`V9__worker_versions`), oldest first.
+    pub migrations: Vec<String>,
+    /// Why this handle's background process couldn't run them at its last
+    /// try, with the remedy: `None` while it hasn't tried (a process of
+    /// another version is live, or the handle runs no background work).
+    pub cannot_run: Option<String>,
+}
+
+impl fmt::Display for MigrationsPending {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "this binary's migrations haven't run on this instance ({}); this binary is \
+             version {}",
+            self.migrations.join(", "),
+            self.this_version
+        )?;
+        match &self.cannot_run {
+            Some(reason) => write!(
+                f,
+                "; this process can't run them and stands by, trying again every standby \
+                 poll: {reason}"
+            ),
+            None => write!(
+                f,
+                "; a background process of this version runs them once no process of \
+                 another version is live, or run migrate"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MigrationsPending {}
 
 /// Reads [`decide`]'s input for `schema`'s instance on `client`. Works on a
 /// schema at any migration, or none: a row's version, role and standby are
@@ -605,7 +657,8 @@ mod tests {
     }
 
     /// Rule 3 with nothing live: `migrate` runs the migrations, and a
-    /// background process waits for it (it never migrates).
+    /// background process's decision says they are pending, so its pass runs
+    /// `migrate` before it takes over.
     #[test]
     fn with_migrations_pending_and_nothing_live_migrate_takes_over() {
         let seen = observed(vec![], StagingLock::Free, true);

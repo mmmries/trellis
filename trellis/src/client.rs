@@ -511,6 +511,9 @@ impl From<ApplyError> for ClientError {
 pub struct Client {
     shutdown_tx: watch::Sender<bool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Why this client's background process last failed to run this
+    /// binary's pending migrations (ADR-0023, rule 3).
+    cannot_migrate: CannotMigrate,
     /// Keeps `trellis_instance_up` at 1 for this client's instance until the
     /// client is dropped or shut down.
     _running: crate::metrics::RunningInstance,
@@ -576,6 +579,8 @@ impl Client {
         // spawned onto the runtime does too.
         let instance = crate::instance_log::name_of(&config);
         let instance_name = Arc::clone(&instance);
+        let cannot_migrate = CannotMigrate::default();
+        let process_cannot_migrate = cannot_migrate.clone();
         let thread = std::thread::Builder::new()
             .name("trellis-client".to_string())
             .spawn(move || {
@@ -591,6 +596,7 @@ impl Client {
                     dsn,
                     config,
                     options,
+                    process_cannot_migrate,
                     shutdown_rx,
                     ready_tx,
                 )));
@@ -601,6 +607,7 @@ impl Client {
             Ok(Ok(())) => Ok(Client {
                 shutdown_tx,
                 thread: Some(thread),
+                cannot_migrate,
                 _running: crate::metrics::RunningInstance::new(&instance_name),
             }),
             Ok(Err(err)) => {
@@ -615,6 +622,16 @@ impl Client {
                 Err(ClientError::ThreadExitedBeforeReady)
             }
         }
+    }
+
+    /// Why this client's background process couldn't run this binary's
+    /// pending migrations at its last try, with the remedy; `None` once it
+    /// ran them, or while it hasn't tried.
+    pub(crate) fn cannot_migrate(&self) -> Option<String> {
+        self.cannot_migrate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Signals shutdown and waits for the background thread to exit
@@ -734,6 +751,7 @@ async fn run(
     // `Config::from_dsn(dsn)` on this line caused.
     config: Config,
     options: ClientOptions,
+    cannot_migrate: CannotMigrate,
     mut shutdown_rx: watch::Receiver<bool>,
     ready_tx: std::sync::mpsc::Sender<Result<(), ClientError>>,
 ) {
@@ -762,6 +780,8 @@ async fn run(
         version: config.binary_version().to_string(),
         staging: options.staging_worker,
         staging_pid: Arc::new(AtomicI32::new(0)),
+        migrate: Some(config.clone()),
+        cannot_migrate: cannot_migrate.clone(),
     };
 
     // ADR-0023 (version handover), and ADR-0010 decision 3: every background
@@ -2750,7 +2770,20 @@ struct BackgroundProcess {
     staging: bool,
     /// The backend pid of its staging session, 0 while it holds none.
     staging_pid: Arc<AtomicI32>,
+    /// The configuration it runs `migrate` under when this binary's
+    /// migrations are pending and nothing else is live (ADR-0023, rule 3).
+    /// `None`: it never migrates, and stands by for a `migrate` instead.
+    migrate: Option<Config>,
+    /// Why its last `migrate` refused, while its migrations stay pending:
+    /// what [`crate::DefinitionStatus::migrations_pending`] reports as
+    /// `cannot_run`.
+    cannot_migrate: CannotMigrate,
 }
+
+/// Why a background process's last `migrate` refused, shared with the
+/// [`Client`] that runs it, so the handle's `status()` can say. `None` once
+/// it migrated, or while it hasn't tried.
+pub(crate) type CannotMigrate = Arc<std::sync::Mutex<Option<String>>>;
 
 impl BackgroundProcess {
     /// Takes the staging-worker singleton on a session its row names
@@ -2788,6 +2821,8 @@ impl BackgroundProcess {
             version: handover::BINARY_VERSION.to_string(),
             staging: true,
             staging_pid: Arc::new(AtomicI32::new(0)),
+            migrate: None,
+            cannot_migrate: CannotMigrate::default(),
         };
         process.register_for_test().await;
         process
@@ -2837,7 +2872,108 @@ pub(crate) async fn lock_handover_xact(
     .map(|_| ())
 }
 
-/// One handover pass (ADR-0023): under the instance's handover lock, reads
+/// What one [`handover_pass`] decided, and the migrations it ran first.
+#[derive(Debug)]
+struct PassOutcome {
+    verdict: Verdict,
+    /// The pending migrations this pass ran before it took over, by name.
+    migrated: Vec<String>,
+}
+
+/// One handover pass (ADR-0023): [`decide_pass`], and when it finds this
+/// binary's migrations pending with nothing else live, `migrate` (the
+/// ordinary one: its attach checks, the catalog floor, the history check and
+/// the takeover work), then [`decide_pass`] again, which takes over. The
+/// migration runs between the two decisions, each under the exclusive
+/// handover lock: `migrate` takes that lock itself, on its own session after
+/// the attach lock, and decides again under it, so it never runs beside a
+/// process that went live since the first decision, and two processes that
+/// try at once migrate one after the other (the second finds nothing
+/// pending). A refusal stands the process by with the reason, and the next
+/// pass tries again.
+async fn handover_pass(
+    process: &BackgroundProcess,
+    drain: bool,
+) -> Result<PassOutcome, StagingError> {
+    let verdict = decide_pass(process, drain).await?;
+    let config = match (&verdict, &process.migrate) {
+        (Verdict::StandBy(handover::StandBy::MigrationsPending), Some(config)) => config,
+        _ => {
+            return Ok(PassOutcome {
+                verdict,
+                migrated: Vec::new(),
+            });
+        }
+    };
+    match crate::migrate::migrate_reporting(&process.pool, config).await {
+        Ok(migrated) => {
+            *process
+                .cannot_migrate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            Ok(PassOutcome {
+                verdict: decide_pass(process, drain).await?,
+                migrated,
+            })
+        }
+        // A process of another version went live since the first decision:
+        // `migrate` saw it under the lock and ran nothing.
+        Err(crate::error::Error::OtherVersionLive(seen)) => Ok(PassOutcome {
+            verdict: Verdict::StandBy(handover::StandBy::OtherVersion(seen)),
+            migrated: Vec::new(),
+        }),
+        Err(err) => {
+            let reason = cannot_migrate_reason(&err);
+            *process
+                .cannot_migrate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.clone());
+            let migrations = match process.pool.get().await {
+                Ok(conn) => crate::migrate::pending_migrations(&**conn, &process.schema)
+                    .await
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+            Ok(PassOutcome {
+                verdict: Verdict::StandBy(handover::StandBy::CannotMigrate(
+                    handover::MigrationsPending {
+                        this_version: process.version.clone(),
+                        migrations,
+                        cannot_run: Some(reason),
+                    },
+                )),
+                migrated: Vec::new(),
+            })
+        }
+    }
+}
+
+/// Why a background process's `migrate` refused, with the remedy. A role
+/// that can read and write Trellis's tables but not create or alter them gets
+/// a refusal of its own: another role has to run the migrations.
+fn cannot_migrate_reason(err: &crate::error::Error) -> String {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    let mut denied = false;
+    while let Some(current) = source {
+        if let Some(db) = current.downcast_ref::<tokio_postgres::Error>()
+            && db.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+        {
+            denied = true;
+            break;
+        }
+        source = current.source();
+    }
+    if denied {
+        format!(
+            "migrations pending and this role cannot run them: run `migrate` with a role that \
+             can (`trellis run`, a deploy step) ({err})"
+        )
+    } else {
+        format!("migrate refused: {err}")
+    }
+}
+
+/// One handover decision (ADR-0023): under the instance's handover lock, reads
 /// the registry and the staging lock, decides whether this process takes over
 /// or stands by, and registers its row with that decision, its version and
 /// roles (`drain`: whether drain threads run in it). The lock makes two
@@ -2846,7 +2982,7 @@ pub(crate) async fn lock_handover_xact(
 /// nothing (the registry may not have the columns yet). Below the catalog
 /// floor (ADR-0024) it stands by before it reads anything else, and writes
 /// nothing: it can't read the catalog, the registry included.
-async fn handover_pass(process: &BackgroundProcess, drain: bool) -> Result<Verdict, StagingError> {
+async fn decide_pass(process: &BackgroundProcess, drain: bool) -> Result<Verdict, StagingError> {
     let mut client = process.pool.get().await.map_err(checkout_error)?;
     let pg: &mut tokio_postgres::Client = &mut client;
     let txn = pg.transaction().await?;
@@ -2911,14 +3047,14 @@ fn checkout_error(err: crate::error::Error) -> StagingError {
 
 /// One [`handover_pass`] of a background process registered as `worker_id`
 /// (drain threads only, no staging worker), as its handover task runs it,
-/// under `config`'s binary version: for tests that step version handover by
-/// hand (ADR-0023). Returns whether the process takes over.
+/// under `config`'s binary version, migrating under `config` when that pass
+/// would: for tests that step version handover by hand (ADR-0023).
 #[cfg(feature = "internals")]
 pub async fn handover_pass_as(
     pool: &Pool,
     config: &Config,
     worker_id: &str,
-) -> Result<bool, String> {
+) -> Result<HandoverPass, String> {
     let process = BackgroundProcess {
         pool: pool.clone(),
         schema: config.schema().to_string(),
@@ -2926,11 +3062,37 @@ pub async fn handover_pass_as(
         version: config.binary_version().to_string(),
         staging: false,
         staging_pid: Arc::new(AtomicI32::new(0)),
+        migrate: Some(config.clone()),
+        cannot_migrate: CannotMigrate::default(),
     };
     handover_pass(&process, true)
         .await
-        .map(|verdict| verdict == Verdict::TakeOver)
+        .map(|outcome| {
+            let log = HandoverLog {
+                last: Some(Verdict::StandBy(handover::StandBy::MigrationsPending)),
+                failing: false,
+            }
+            .message(&outcome);
+            HandoverPass {
+                took_over: outcome.verdict == Verdict::TakeOver,
+                migrated: outcome.migrated,
+                log,
+            }
+        })
         .map_err(|err| err.to_string())
+}
+
+/// What one [`handover_pass_as`] did.
+#[cfg(feature = "internals")]
+#[derive(Debug)]
+pub struct HandoverPass {
+    /// The process takes over: it stages, drains and builds.
+    pub took_over: bool,
+    /// The pending migrations it ran first, by name.
+    pub migrated: Vec<String>,
+    /// What its handover log says about the pass, for a process whose
+    /// previous pass stood by: `None` when it says nothing.
+    pub log: Option<String>,
 }
 
 /// What a background process last decided, so the log says when it starts
@@ -2945,9 +3107,9 @@ struct HandoverLog {
 impl HandoverLog {
     /// Records one pass and returns whether the process is active. A pass
     /// that failed keeps `was_active`: the next pass tries again.
-    fn record(&mut self, pass: Result<Verdict, StagingError>, was_active: bool) -> bool {
-        let verdict = match pass {
-            Ok(verdict) => verdict,
+    fn record(&mut self, pass: Result<PassOutcome, StagingError>, was_active: bool) -> bool {
+        let outcome = match pass {
+            Ok(outcome) => outcome,
             Err(error) => {
                 if !self.failing {
                     self.failing = true;
@@ -2961,46 +3123,63 @@ impl HandoverLog {
             }
         };
         self.failing = false;
-        if self.last.as_ref() != Some(&verdict) {
-            match &verdict {
-                Verdict::TakeOver
-                    if matches!(
-                        self.last,
-                        Some(Verdict::StandBy(handover::StandBy::BelowCatalogFloor(_)))
-                    ) =>
-                {
-                    crate::instance_log::info!(
-                        "this version meets the catalog floor now; taking over"
-                    )
-                }
-                Verdict::TakeOver if self.last.is_some() => crate::instance_log::info!(
-                    "no other Trellis version is live any more; taking over"
-                ),
-                Verdict::TakeOver | Verdict::Refuse(_) => {}
-                Verdict::StandBy(handover::StandBy::OtherVersion(seen)) => {
-                    crate::instance_log::warn!(
-                        "standing by: staging, draining and builds wait, and every standby \
-                         poll checks again: {seen}"
-                    )
-                }
-                Verdict::StandBy(handover::StandBy::MigrationsPending) => {
-                    crate::instance_log::warn!(
-                        "standing by: this binary's migrations haven't run on the instance; \
-                         run migrate (`trellis run` and `Trellis::migrate`), and this process \
-                         takes over at its next standby poll"
-                    )
-                }
-                Verdict::StandBy(handover::StandBy::BelowCatalogFloor(seen)) => {
-                    crate::instance_log::warn!(
-                        "standing by: staging, draining and builds wait, and every standby \
-                         poll checks again: {seen}"
-                    )
-                }
+        if let Some(message) = self.message(&outcome) {
+            if outcome.verdict == Verdict::TakeOver {
+                crate::instance_log::info!("{message}");
+            } else {
+                crate::instance_log::warn!("{message}");
             }
         }
-        let active = verdict == Verdict::TakeOver;
-        self.last = Some(verdict);
+        let active = outcome.verdict == Verdict::TakeOver;
+        self.last = Some(outcome.verdict);
         active
+    }
+
+    /// What the log says about `outcome`, given the pass before it: when the
+    /// process starts standing by, why, and when it takes over, once each
+    /// rather than every pass; and always which migrations a pass ran before
+    /// it took over.
+    fn message(&self, outcome: &PassOutcome) -> Option<String> {
+        let verdict = &outcome.verdict;
+        if *verdict == Verdict::TakeOver && !outcome.migrated.is_empty() {
+            return Some(format!(
+                "ran this binary's pending migrations ({}); taking over",
+                outcome.migrated.join(", ")
+            ));
+        }
+        if self.last.as_ref() == Some(verdict) {
+            return None;
+        }
+        match verdict {
+            Verdict::TakeOver
+                if matches!(
+                    self.last,
+                    Some(Verdict::StandBy(handover::StandBy::BelowCatalogFloor(_)))
+                ) =>
+            {
+                Some("this version meets the catalog floor now; taking over".to_string())
+            }
+            Verdict::TakeOver if self.last.is_some() => {
+                Some("no other Trellis version is live any more; taking over".to_string())
+            }
+            Verdict::TakeOver | Verdict::Refuse(_) => None,
+            Verdict::StandBy(handover::StandBy::OtherVersion(seen)) => Some(format!(
+                "standing by: staging, draining and builds wait, and every standby poll checks \
+                 again: {seen}"
+            )),
+            Verdict::StandBy(handover::StandBy::MigrationsPending) => Some(
+                "standing by: this binary's migrations haven't run on the instance; run \
+                 migrate, and this process takes over at its next standby poll"
+                    .to_string(),
+            ),
+            Verdict::StandBy(handover::StandBy::CannotMigrate(pending)) => Some(format!(
+                "standing by: staging, draining and builds wait: {pending}"
+            )),
+            Verdict::StandBy(handover::StandBy::BelowCatalogFloor(seen)) => Some(format!(
+                "standing by: staging, draining and builds wait, and every standby poll checks \
+                 again: {seen}"
+            )),
+        }
     }
 }
 
@@ -3028,10 +3207,14 @@ async fn handover_loop(
             return;
         }
         let was_active = *active.borrow();
-        let now_active = log.record(
-            handover_pass(&process, live_workers.any()).await,
-            was_active,
-        );
+        // A pass that migrates can wait minutes for the attach lock, or run
+        // a long migration: shutdown doesn't wait for it. A migration cut
+        // off rolls back with its transaction.
+        let pass = tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            pass = handover_pass(&process, live_workers.any()) => pass,
+        };
+        let now_active = log.record(pass, was_active);
         if now_active != was_active {
             let _ = active.send(now_active);
         }
@@ -5160,7 +5343,7 @@ mod worker_upkeep_tests {
 
         for n in 1..=3 {
             stale_registry_row(&raw, &process.worker_id).await;
-            let verdict = handover_pass(&process, true).await.expect("pass");
+            let verdict = handover_pass(&process, true).await.expect("pass").verdict;
             assert_eq!(verdict, Verdict::TakeOver);
             assert!(
                 staging::has_live_workers(&**raw, ttl).await.expect("read"),
