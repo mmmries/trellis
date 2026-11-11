@@ -1,6 +1,11 @@
 //! Integration tests for target-table DDL generation, run
 //! against a real, ephemeral Postgres instance via `testkit::TestCluster`.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::numeric_columns;
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
@@ -30,13 +35,6 @@ fn order_totals_def() -> TransformDef {
         explicit_source_schema: None,
         explicit_target_schema: None,
     }
-}
-
-fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
-    names
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect()
 }
 
 #[tokio::test]

@@ -60,10 +60,15 @@
 //! the engine's own renderer. Harness conventions follow
 //! `defs_bytea.rs`.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, drain, seal};
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{
@@ -71,7 +76,6 @@ use trellis::defs::{
     install_definition, parse, source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
-use trellis::staging::{apply, seal};
 
 // ---------------------------------------------------------------------
 // Harness
@@ -84,18 +88,6 @@ fn source_columns() -> HashMap<String, ValueType> {
         ("flag".to_string(), ValueType::Boolean),
         ("n".to_string(), ValueType::Numeric),
     ])
-}
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("session bootstrap");
-    client
 }
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
@@ -129,7 +121,7 @@ async fn define_join_on(
 async fn boolean_is_the_only_admitted_family_with_a_dedicated_text_cast() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     let row = client
         .query_one(
@@ -176,7 +168,7 @@ async fn boolean_is_the_only_admitted_family_with_a_dedicated_text_cast() {
 async fn boolout_and_the_text_cast_disagree_on_a_live_column() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute("create table t (v boolean); insert into t values (true), (false)")
@@ -225,7 +217,7 @@ async fn boolout_and_the_text_cast_disagree_on_a_live_column() {
 async fn boolean_is_refused_as_a_join_key_and_primary_key() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -292,7 +284,7 @@ async fn a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -360,23 +352,6 @@ async fn a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two
             .unwrap_or_else(|e| panic!("stage bare recompute {key}: {e}"));
     }
 
-    async fn drain_sealed(client: &mut Client, pool: &trellis::pool::Pool) {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "boolean_worker",
-            1,
-            "trellis_defs_boolean_issue_119_regression",
-        )
-        .await
-        .expect("drain_once")
-        .expect("drain_once must claim and drain something");
-    }
-
     // Row 1: an ordinary image-bearing insert, staged with the literal
     // spelling a capture trigger images — `boolout`'s `'t'`,
     // not the SQL cast's `'true'`.
@@ -387,7 +362,10 @@ async fn a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two
     // same value `'true'`.
     stage_bare_recompute(&client, "seg_0", "2").await;
 
-    drain_sealed(&mut client, &db.pool).await;
+    let batch = seal(&mut client).await;
+    drain(&db.pool, batch, "boolean_worker")
+        .await
+        .expect("drain must claim and drain something");
 
     let rows = client
         .query("select grp, total::text from totals", &[])

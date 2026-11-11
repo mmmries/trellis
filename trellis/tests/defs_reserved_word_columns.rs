@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::NoTls;
+use testkit::connect_with;
 use trellis::defs::{ValueType, install_definition};
 use trellis::intake::harness;
 use trellis::integer::IntWidth;
@@ -23,14 +23,6 @@ fn source_columns() -> HashMap<String, ValueType> {
     ])
 }
 
-async fn connect(dsn: &str) -> tokio_postgres::Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
-
 const CREATE: &str = "create table public.rw_src (id integer primary key, grp integer, \
      val integer, \"order\" integer, \"user\" integer, \"group\" integer); \
      insert into public.rw_src values (1, 1, 5, 10, 20, 30), (2, 1, 7, 11, 21, 31), \
@@ -42,7 +34,7 @@ const CREATE: &str = "create table public.rw_src (id integer primary key, grp in
 async fn a_source_column_named_like_a_reserved_word_does_not_block_a_definition() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect(db.dsn()).await;
+    let client = connect_with(db.dsn(), "").await;
     client.batch_execute(CREATE).await.expect("create rw_src");
 
     install_definition(
@@ -94,7 +86,7 @@ async fn a_source_column_named_like_a_reserved_word_does_not_block_a_definition(
 async fn naming_a_reserved_word_column_in_an_expression_is_refused_at_define() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect(db.dsn()).await;
+    let client = connect_with(db.dsn(), "").await;
     client.batch_execute(CREATE).await.expect("create rw_src");
 
     for expr in ["order + 1", "user", "val + group", "t.val + group"] {
@@ -141,7 +133,7 @@ async fn naming_a_reserved_word_column_in_an_expression_is_refused_at_define() {
 async fn a_reserved_word_column_is_read_qualified_with_its_table() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect(db.dsn()).await;
+    let client = connect_with(db.dsn(), "").await;
     client.batch_execute(CREATE).await.expect("create rw_src");
 
     install_definition(

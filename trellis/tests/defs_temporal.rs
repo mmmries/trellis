@@ -44,10 +44,13 @@
 //!
 //! Harness conventions follow `defs_floats.rs`.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::pg_type::PgType;
@@ -80,19 +83,12 @@ fn source_columns() -> HashMap<String, ValueType> {
 /// configured emits, so hardcoding the settings makes the test fail if the
 /// constant drifts away from them, instead of silently following it.
 async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!(
-            "set search_path to {DEFAULT_SCHEMA}, public; \
-             set datestyle to 'ISO, YMD'; set intervalstyle to 'postgres'; \
-             set timezone to 'UTC'"
-        ))
-        .await
-        .expect("session bootstrap");
-    client
+    let setup = format!(
+        "set search_path to {DEFAULT_SCHEMA}, public; \
+         set datestyle to 'ISO, YMD'; set intervalstyle to 'postgres'; \
+         set timezone to 'UTC'"
+    );
+    pipeline::connect_with(dsn, &setup).await
 }
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
@@ -1022,8 +1018,8 @@ async fn interval_in_reads_intervalstyle_which_is_why_there_is_no_interval_liter
 /// two `to_jsonb` spellings, which is not something this crate controls.
 #[tokio::test]
 async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_two() {
+    use pipeline::{drain, seal};
     use trellis::defs::{create_aggregate_target_table, create_definition};
-    use trellis::staging::{apply, seal};
 
     const DEF_SQL: &str = "TRANSFORM totals FROM events GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total";
 
@@ -1099,23 +1095,6 @@ async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_
             .unwrap_or_else(|e| panic!("stage bare recompute {key}: {e}"));
     }
 
-    async fn drain_sealed(client: &mut Client, pool: &trellis::pool::Pool) {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "temporal_worker",
-            1,
-            "trellis_defs_temporal_issue_113_regression",
-        )
-        .await
-        .expect("drain_once")
-        .expect("drain_once must claim and drain something");
-    }
-
     // Row 1: an ordinary image-bearing insert, exactly the shape real CDC
     // produces — canonical, space-spelled `timestamp` text.
     stage_image(
@@ -1130,7 +1109,10 @@ async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_
     // Postgres.
     stage_bare_recompute(&client, "seg_0", "2").await;
 
-    drain_sealed(&mut client, &db.pool).await;
+    let batch = seal(&mut client).await;
+    drain(&db.pool, batch, "temporal_worker")
+        .await
+        .expect("drain must claim and drain something");
 
     let rows = client
         .query("select grp::text, total::text from totals", &[])

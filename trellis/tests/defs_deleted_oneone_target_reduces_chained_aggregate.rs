@@ -26,51 +26,17 @@
 //!
 //! [`KeySpace::OneToOne`]: trellis::defs::ast::KeySpace::OneToOne
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, settle, start_and_settle_builds};
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
-use trellis::staging::apply;
-use trellis::staging::{has_pending, retire_drained_segments};
-
-/// Starts every registered definition's Re-derive build and runs it to
-/// `live` — the test-harness stand-in for the staging worker and a running
-/// drain worker, since `install_definition` only records a definition
-/// `WaitingToBackfill` (ADR-0002). Both `order_view` (this file's 1-1
-/// mirror, built by chunks) and `customer_totals` (an aggregate, built by
-/// its plan job) need this. Mirrors `defs_install_definition.rs`'s helper of
-/// the same name.
-async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
-    // ADR-0002: registration only records a definition; the staging
-    // worker starts its build.
-    trellis::intake::harness::start_registered_builds(pool)
-        .await
-        .expect("dispatch registered definitions' builds");
-    trellis::staging::build::settle_builds(pool).await;
-}
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    use trellis::staging::seal;
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
-}
 
 async fn active_seg_table(client: &Client) -> String {
     let ring_slot: i16 = client
@@ -112,31 +78,6 @@ async fn stage_cdc(
         )
         .await
         .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
-}
-
-/// Seals and drains repeatedly until nothing is pending anywhere in the ring.
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    for _ in 0..16 {
-        let seg = seal_active_segment(client).await;
-        while apply::drain_once(
-            pool,
-            seg,
-            "oneone_deleted_target_test",
-            1,
-            "trellis_oneone_deleted_target_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
 }
 
 fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
@@ -207,14 +148,14 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     install_definition(&db.pool, ORDER_VIEW, &orders_columns(), "public")
         .await
         .expect("install the 1-1 order_view mirror");
-    drain_backfill_chunks(&db.pool).await;
-    drain_to_quiescence(&db.pool, client).await;
+    start_and_settle_builds(&db.pool).await;
+    settle(&db.pool, client).await;
 
     install_definition(&db.pool, CUSTOMER_TOTALS, &order_view_columns(), "public")
         .await
         .expect("install the aggregate chained onto order_view");
-    drain_backfill_chunks(&db.pool).await;
-    drain_to_quiescence(&db.pool, client).await;
+    start_and_settle_builds(&db.pool).await;
+    settle(&db.pool, client).await;
 
     assert_eq!(
         customer_totals(client).await,
@@ -295,7 +236,7 @@ async fn a_deleted_oneone_target_row_reduces_the_chained_downstream_aggregate() 
         None,
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
 
     assert_eq!(
         order_view_rows(&client).await,

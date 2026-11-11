@@ -2,6 +2,11 @@
 //! run against a real, ephemeral Postgres instance via the shared harness
 //! (`testkit::TestCluster`).
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::start_and_settle_builds;
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
@@ -10,18 +15,6 @@ use trellis::defs::{
     CatalogError, ValidationError, ValueType, all_source_tables, create_definition,
     install_definition, transforms_for_source,
 };
-
-/// Starts every registered definition's Re-derive build and runs it to
-/// completion by hand, so a 1-1 target goes `live` without a running drain
-/// worker — a definition can only chain off a live target.
-async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
-    // ADR-0002: registration only records a definition; the staging
-    // worker starts its build.
-    trellis::intake::harness::start_registered_builds(pool)
-        .await
-        .expect("dispatch registered definitions' builds");
-    trellis::staging::build::settle_builds(pool).await;
-}
 
 fn columns(names: &[&str]) -> HashMap<String, ValueType> {
     names
@@ -1322,7 +1315,7 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
     )
     .await
     .expect("def A installs with an explicit non-default target schema");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
 
     // Def B: a bare aggregate `FROM t` must still resolve to def A's
     // `custom.t` — a plain `search_path` walk alone (what `to_regclass` did

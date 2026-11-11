@@ -46,10 +46,15 @@
 //! never against the engine's own renderer. Harness conventions follow `defs_netaddr.rs`/
 //! `defs_bit.rs`.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, drain, seal};
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::pg_type::PgType;
@@ -58,7 +63,6 @@ use trellis::defs::{
     install_definition, parse, source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
-use trellis::staging::{apply, seal};
 
 // ---------------------------------------------------------------------
 // Harness
@@ -77,18 +81,6 @@ fn source_columns() -> HashMap<String, ValueType> {
         ),
         ("n".to_string(), ValueType::Numeric),
     ])
-}
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("session bootstrap");
-    client
 }
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
@@ -120,7 +112,7 @@ async fn define_join_on(
 async fn enum_has_no_dedicated_text_cast_function() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute("create type priority_enum as enum ('low', 'medium', 'high')")
@@ -159,7 +151,7 @@ async fn enum_has_no_dedicated_text_cast_function() {
 async fn to_jsonb_and_text_agree_for_enum() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -196,7 +188,7 @@ async fn to_jsonb_and_text_agree_for_enum() {
 async fn enum_join_key_and_primary_key_are_admitted() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -229,7 +221,7 @@ async fn enum_join_key_and_primary_key_are_admitted() {
 async fn two_distinct_enum_types_are_not_comparable_as_a_join_key() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -285,7 +277,7 @@ async fn an_enum_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -359,20 +351,10 @@ async fn an_enum_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
     // cast instead.
     stage_bare_recompute(&client, "2").await;
 
-    let outcome = seal::seal_phase1_waiting(&mut client).await;
-    seal::seal_phase2(&client, outcome.sealed_seg_seq, "wake")
+    let batch = seal(&mut client).await;
+    drain(&db.pool, batch, "enum_group_key_worker")
         .await
-        .expect("seal phase 2");
-    apply::drain_once(
-        &db.pool,
-        outcome.sealed_seg_seq,
-        "enum_group_key_worker",
-        1,
-        "trellis_defs_enum_issue_117_group_key",
-    )
-    .await
-    .expect("drain_once")
-    .expect("drain_once must claim and drain something");
+        .expect("drain must claim and drain something");
 
     let rows = client
         .query("select grp::text, total::text from totals", &[])

@@ -5,18 +5,20 @@
 //! as in SQL, and a name that is no source column and names another aggregate
 //! field is refused at define.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, settle, start_and_settle_builds};
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::validate::ValidationError;
 use trellis::defs::{CatalogError, ValueType, install_definition};
 use trellis::intake::harness;
 use trellis::integer::IntWidth;
-use trellis::staging::{has_pending, retire_drained_segments};
-
-const TEST_NAME: &str = "defs_aggregate_field_named_like_source_column_test";
 
 /// The definition from the issue.
 const AGG_TOTALS: &str = "TRANSFORM agg_totals FROM public.agg_src GROUP BY grp \
@@ -28,53 +30,6 @@ fn source_columns() -> HashMap<String, ValueType> {
         ("grp".to_string(), ValueType::Text),
         ("val".to_string(), ValueType::Integer(IntWidth::Int4)),
     ])
-}
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
-    harness::start_registered_builds(pool)
-        .await
-        .expect("dispatch registered definitions' builds");
-    trellis::staging::build::settle_builds(pool).await;
-}
-
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            TEST_NAME,
-            1,
-            "trellis_defs_aggregate_field_named_like_source_column_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
 }
 
 /// `grp -> (val, row_count, lo, hi)` as text.
@@ -127,9 +82,9 @@ async fn an_aggregate_field_named_like_a_source_column_reads_the_source_column()
     install_definition(&db.pool, AGG_TOTALS, &source_columns(), "public")
         .await
         .expect("define accepts the issue's definition");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
 
     assert_eq!(
         target_rows(&client).await,

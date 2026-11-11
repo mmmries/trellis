@@ -38,6 +38,11 @@
 //!
 //! Harness conventions follow `defs_exact_integers.rs`.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, start_and_settle_builds};
+
 #[path = "support/render_lab.rs"]
 mod render_lab;
 
@@ -45,9 +50,8 @@ use std::collections::HashMap;
 
 use render_lab::{Lab, Outcome};
 use testkit::TestCluster;
+use tokio_postgres::Client;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, ValueType};
 use trellis::defs::{CatalogError, ValidationError, install_definition, parse, validate};
 use trellis::float::FloatWidth;
@@ -78,18 +82,6 @@ fn source_columns() -> HashMap<String, ValueType> {
     ])
 }
 
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
 /// `right.rcol`. `JOIN` key admission reads the same allowlist
 /// (`join_key_types::is_text_stable_join_key_type`) a 1-1 primary key does.
@@ -106,18 +98,6 @@ async fn define_join_on(
     install_definition(pool, &text, &HashMap::new(), "public")
         .await
         .map(|_| ())
-}
-
-/// Starts every registered definition's build and runs it to completion,
-/// standing in for the staging worker and a running drain worker (copied
-/// from `defs_exact_integers.rs`).
-async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
-    // ADR-0002: registration only records a definition; the staging
-    // worker starts its build.
-    trellis::intake::harness::start_registered_builds(pool)
-        .await
-        .expect("dispatch registered definitions' builds");
-    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// The declared Postgres type of `table`.`column`, straight from
@@ -197,7 +177,7 @@ const SCALAR_CASES: &[(&str, &str)] = &[
 async fn derived_float_column_types_match_postgres() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client.batch_execute(SOURCE_DDL).await.expect("source");
     seed_one_row(&client).await;
@@ -215,7 +195,7 @@ async fn derived_float_column_types_match_postgres() {
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
 
     for (name, expr) in SCALAR_CASES {
         let declared = column_pg_type(&client, "t", name).await;
@@ -381,7 +361,7 @@ const RENDER_GRID: &[&str] = &[
 async fn rendering_matches_postgres_over_a_value_grid() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     for width in FloatWidth::ALL {
         let pg_name = width.pg_name();
@@ -471,7 +451,7 @@ async fn float_text_rendering_is_byte_identical_to_postgres_through_the_apply_pa
 async fn a_float_against_a_bare_literal_compares_in_double_precision_like_postgres() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     let columns = HashMap::from([
         ("r".to_string(), ValueType::Float(FloatWidth::Float4)),
@@ -622,7 +602,7 @@ async fn a_float_against_a_bare_literal_compares_in_double_precision_like_postgr
 async fn signed_zero_is_why_float_text_keys_are_unsafe() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     let row = client
         .query_one(
@@ -664,7 +644,7 @@ async fn signed_zero_is_why_float_text_keys_are_unsafe() {
 async fn a_float_join_key_is_rejected_by_name() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -743,7 +723,7 @@ fn a_float_group_by_key_is_rejected() {
 async fn a_float_literal_needs_the_typed_literal_grammar_and_must_be_canonical() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     let bare: String = client
         .query_one("select format_type(pg_typeof(1.5), null)", &[])

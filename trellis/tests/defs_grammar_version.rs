@@ -1,25 +1,17 @@
 //! ADR-0018: every stored definition carries the grammar version
 //! its text was written under, and every read of stored text checks it.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect;
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::{Config, DEFAULT_SCHEMA};
+use trellis::config::Config;
 use trellis::defs::grammar::CURRENT_GRAMMAR_VERSION;
 use trellis::defs::{CatalogError, ParseError, ValueType, install_definition};
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 fn cols(names: &[&str]) -> HashMap<String, ValueType> {
     names
@@ -35,7 +27,7 @@ fn cols(names: &[&str]) -> HashMap<String, ValueType> {
 async fn definitions_are_stamped_with_the_oldest_grammar_that_reads_them_the_same() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute("create table s (id bigint primary key, a numeric, \"B\" numeric)")
         .await
         .unwrap();
@@ -70,7 +62,7 @@ async fn definitions_are_stamped_with_the_oldest_grammar_that_reads_them_the_sam
 async fn a_definition_with_a_newer_grammar_is_skipped_unread_and_left_untouched() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute("create table s (id bigint primary key, a numeric)")
         .await
         .unwrap();
@@ -124,7 +116,7 @@ async fn a_definition_with_a_newer_grammar_is_skipped_unread_and_left_untouched(
 async fn attaching_pauses_a_definition_with_a_newer_grammar_naming_the_remedy() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute("create table s (id bigint primary key, a numeric)")
         .await
         .unwrap();
@@ -181,7 +173,7 @@ async fn attaching_pauses_a_definition_with_a_newer_grammar_naming_the_remedy() 
 async fn attaching_pauses_a_definition_older_than_the_window_and_names_the_fix() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute("create table s (id bigint primary key, a numeric)")
         .await
         .unwrap();
@@ -242,7 +234,7 @@ async fn stored_text_this_release_refuses_pauses_that_transform_naming_the_fix()
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table public.rw_src (id integer primary key, val integer, \"order\" integer); \
          insert into public.rw_src values (1, 5, 10)",
@@ -353,7 +345,7 @@ async fn stored_text_this_release_refuses_pauses_that_transform_naming_the_fix()
 async fn attaching_pauses_a_definition_whose_text_the_grammar_now_refuses() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute("create table s (id bigint primary key, a numeric)")
         .await
         .unwrap();
@@ -448,7 +440,7 @@ async fn stored_grammar_1_text_reads_a_bare_null_false_or_true_as_a_name() {
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table public.s (id integer primary key, a integer, \"null\" integer, \
          \"false\" boolean, \"TRUE\" integer); \

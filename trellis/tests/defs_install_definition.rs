@@ -14,54 +14,19 @@
 //! The staging harness (connect, stage a CDC row, seal/drain to quiescence)
 //! is this file's own.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, settle, start_and_settle_builds};
+
 use std::collections::HashMap;
 use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::CatalogError;
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::{StoredStatus, ValueType, install_definition};
-use trellis::staging::apply;
-use trellis::staging::{has_pending, retire_drained_segments};
-
-/// Starts the Re-derive build of every registered definition and runs each
-/// to completion, so each is `live` when this returns — the test-harness
-/// stand-in for the staging worker and a running `application_threads`
-/// drain worker, since `install_definition` only records a definition
-/// `WaitingToBackfill` (ADR-0002). Panics (via `expect`) rather than
-/// swallowing an error, matching this file's other harness helpers
-/// (`drain_to_quiescence`) — a build failure here means the test itself is
-/// broken, not something to retry past.
-async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
-    // ADR-0002: registration only records a definition; the staging
-    // worker starts its build.
-    trellis::intake::harness::start_registered_builds(pool)
-        .await
-        .expect("dispatch registered definitions' builds");
-    trellis::staging::build::settle_builds(pool).await;
-}
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    use trellis::staging::seal;
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
-}
 
 /// The ring table backing the currently-active segment.
 async fn active_seg_table(client: &Client) -> String {
@@ -131,28 +96,6 @@ async fn stage_cdc(
 /// `ddl::pk_key_sql_expr`/`ddl::split_pk_key` on the apply side agree with.
 fn composite_key(parts: &[&str]) -> String {
     parts.join("\u{1f}")
-}
-
-/// Seals and drains repeatedly until nothing is pending anywhere in the ring.
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    // A throwaway, always-caught-up watermark — this helper
-    // has no live capture running, and none of this file's tests exercise guard (a) specifically, so a
-    // real watermark would only ever make guard (a) reject spuriously.
-    for _ in 0..16 {
-        let seg = seal_active_segment(client).await;
-        while apply::drain_once(pool, seg, "install_def_test", 1, "trellis_install_def_test")
-            .await
-            .expect("drain_once")
-            .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
 }
 
 fn numeric(names: &[&str]) -> HashMap<String, ValueType> {
@@ -286,7 +229,7 @@ async fn explicitly_qualified_source_is_read_not_a_same_named_decoy(seam_fed: bo
     );
 
     // Run the build to completion the way a real drain worker would.
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
 
     let row_count: i64 = client
         .query_one("select count(*) from order_totals", &[])
@@ -360,7 +303,7 @@ async fn install_definition_honors_an_explicitly_qualified_target_schema() {
     .await
     .expect("install_definition should honor the explicit target schema");
 
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
 
     let target_table: String = client
         .query_one(
@@ -462,7 +405,7 @@ async fn install_definition_fast_path_ends_up_live() {
 
     // Driving the chunk queue to completion (the `application_threads` drain
     // worker's job in a real fleet) must flip it the rest of the way to live.
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     let rows = client
         .query(
             &format!(
@@ -1013,7 +956,7 @@ async fn install_definition_fast_path_resolves_a_bare_from_chained_off_a_non_def
     )
     .await
     .expect("def A installs with an explicit non-default target schema");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
 
     // Def B: a bare `FROM t` must still resolve to def A's `custom.t` — a
     // plain `search_path` walk alone would report "t" not found, even though
@@ -1029,7 +972,7 @@ async fn install_definition_fast_path_resolves_a_bare_from_chained_off_a_non_def
         "def B's bare FROM must resolve to def A's explicitly-qualified custom.t \
          target, not fail as 'not found on the search path'",
     );
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
 
     let source_table: String = client
         .query_one(
@@ -1100,8 +1043,8 @@ async fn registration_reads_no_source_rows() {
         .batch_execute("commit")
         .await
         .expect("release the lock");
-    drain_backfill_chunks(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    start_and_settle_builds(&db.pool).await;
+    settle(&db.pool, &mut client).await;
 
     let status: String = client
         .query_one("select status from transform_definitions", &[])
@@ -1513,7 +1456,7 @@ async fn alter_transform_add_of_a_field_named_after_a_primary_key_column_is_reje
     )
     .await
     .expect("install");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
 
     for text in [
         "ALTER TRANSFORM t ADD id AS id",
@@ -1655,7 +1598,7 @@ async fn an_aggregate_over_a_composite_pk_source_builds_and_drains() {
     .await
     .expect("install an aggregate over a composite-pk source");
     trellis::intake::harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
 
     let read_totals = async |client: &Client| -> HashMap<String, Option<String>> {
         client
@@ -1692,7 +1635,7 @@ async fn an_aggregate_over_a_composite_pk_source_builds_and_drains() {
         Some("{\"order_id\":2,\"line_no\":2,\"category\":\"toys\",\"amount\":7}"),
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
     assert_eq!(
         read_totals(&client).await.get("toys"),
         Some(&Some("27".to_string())),
@@ -1718,7 +1661,7 @@ async fn an_aggregate_over_a_composite_pk_source_builds_and_drains() {
         Some("{\"order_id\":1,\"line_no\":2,\"category\":\"toys\",\"amount\":5}"),
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
     let totals = read_totals(&client).await;
     assert_eq!(
         totals.get("books"),
@@ -1748,7 +1691,7 @@ async fn an_aggregate_over_a_composite_pk_source_builds_and_drains() {
         None,
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
     assert_eq!(
         read_totals(&client).await.get("toys"),
         Some(&Some("12".to_string())),

@@ -30,36 +30,18 @@
 //! installed and converged. The harness stages CDC rows by hand and
 //! seals/drains to quiescence.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, settle};
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
 use trellis::integer::IntWidth;
-use trellis::staging::apply;
-use trellis::staging::{has_pending, retire_drained_segments};
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    use trellis::staging::seal;
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
-}
 
 async fn active_seg_table(client: &Client) -> String {
     let ring_slot: i16 = client
@@ -101,37 +83,6 @@ async fn stage_cdc(
         )
         .await
         .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
-}
-
-/// Seals and drains repeatedly until nothing is pending anywhere in the ring.
-///
-/// The `expect("drain_once")` here is this file's actual regression pin for
-/// The pre-fix failure mode is a hard `ApplyError` (a
-/// `DdlError::MalformedCompositeKey` raised while decoding the downstream
-/// `Recompute`'s key), so a regression panics right here rather than merely
-/// producing a wrong number further down.
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    for _ in 0..16 {
-        let seg = seal_active_segment(client).await;
-        while apply::drain_once(
-            pool,
-            seg,
-            "agg_chained_composite_test",
-            1,
-            "trellis_agg_chained_composite_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
 }
 
 fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
@@ -213,13 +164,13 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
         .await
         .expect("install the multi-column GROUP BY aggregate");
     trellis::intake::harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, client).await;
+    settle(&db.pool, client).await;
 
     install_definition(&db.pool, STOCK_TOTALS_V2, &stock_totals_columns(), "public")
         .await
         .expect("install the chained aggregate reading stock_totals");
     trellis::intake::harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, client).await;
+    settle(&db.pool, client).await;
 
     // Both backfills: (w1,a)=12, (w1,b)=2, (w2,a)=11; w1=14, w2=11.
     assert_eq!(
@@ -268,7 +219,7 @@ async fn a_live_update_propagates_through_a_composite_group_key_into_a_chained_a
         Some(r#"{"id":"2","warehouse":"w1","sku":"a","qty":"10"}"#),
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
 
     assert_eq!(
         stock_totals(&client).await.get(&("w1".into(), "a".into())),
@@ -333,7 +284,7 @@ async fn a_live_separator_valued_group_component_propagates_downstream() {
         r#"{"id":"5","warehouse":"w1","sku":"a\u001f\u001eb","qty":"4"}"#.into(),
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
 
     assert_eq!(
         stock_totals(&client)
@@ -409,7 +360,7 @@ async fn a_live_insert_and_an_extinct_composite_group_both_propagate_downstream(
         None,
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
 
     assert_eq!(
         stock_totals(&client).await,
@@ -463,7 +414,7 @@ async fn a_live_grain_migration_of_the_composite_key_propagates_both_keys_downst
         Some(r#"{"id":"1","warehouse":"w1","sku":"b","qty":"5"}"#),
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
 
     assert_eq!(
         stock_totals(&client).await,
@@ -530,7 +481,7 @@ async fn a_composite_group_with_a_null_component_propagates_downstream() {
         Some(r#"{"id":"6","warehouse":"w1","sku":null,"qty":"3"}"#),
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
 
     assert_eq!(
         null_sku_total(&client, "w1").await,
@@ -563,7 +514,7 @@ async fn a_composite_group_with_a_null_component_propagates_downstream() {
         None,
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
 
     assert_eq!(
         null_sku_total(&client, "w1").await,
@@ -623,7 +574,7 @@ async fn a_null_component_and_a_separator_valued_component_propagate_together() 
         Some(r#"{"id":"7","warehouse":"w\u001f\u001e3","sku":null,"qty":"6"}"#),
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
 
     assert_eq!(
         null_sku_total(&client, AWKWARD_WAREHOUSE).await,
@@ -657,7 +608,7 @@ async fn a_null_component_and_a_separator_valued_component_propagate_together() 
         None,
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
 
     assert_eq!(
         null_sku_total(&client, AWKWARD_WAREHOUSE).await,

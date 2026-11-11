@@ -15,7 +15,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use tokio_postgres::Client;
@@ -234,6 +234,16 @@ pub async fn settle(pool: &trellis::pool::Pool, client: &mut Client) {
     panic!("pipeline did not reach quiescence within {SETTLE_ROUNDS} seal/drain rounds");
 }
 
+/// Starts every registered definition's build, as the staging worker does
+/// (registration only records a definition, ADR-0002), and runs each build
+/// to completion.
+pub async fn start_and_settle_builds(pool: &trellis::pool::Pool) {
+    trellis::intake::harness::start_registered_builds(pool)
+        .await
+        .expect("dispatch registered definitions' builds");
+    trellis::staging::build::settle_builds(pool).await;
+}
+
 /// `target`'s stored status, read from the catalog by bare target name.
 pub async fn status(raw: &Client, target: &str) -> TransformStatus {
     let text: String = raw
@@ -378,6 +388,14 @@ async fn undrained_work_holds(client: &Client, ring_slot: i16) -> bool {
 /// The `int4` column type.
 pub fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
+}
+
+/// Each of `names` as a `numeric` column.
+pub fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
+    names
+        .iter()
+        .map(|n| (n.to_string(), ValueType::Numeric))
+        .collect()
 }
 
 /// `sql`'s rows, each rendered as a row literal, `(1,25,2)`.

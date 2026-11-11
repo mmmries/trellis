@@ -37,10 +37,16 @@
 //! plain `count(distinct ...)`, plain `to_jsonb`, plain `::text` — never
 //! against the engine's own renderer. Harness conventions follow `defs_temporal.rs`.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, drain, seal};
+use trellis::staging::apply;
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::pg_type::PgType;
@@ -49,7 +55,6 @@ use trellis::defs::{
     source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
-use trellis::staging::{apply, seal};
 
 // ---------------------------------------------------------------------
 // Harness
@@ -65,20 +70,6 @@ fn source_columns() -> HashMap<String, ValueType> {
         ("b".to_string(), ValueType::Other(PgType::Bytea)),
         ("n".to_string(), ValueType::Numeric),
     ])
-}
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!(
-            "set search_path to {DEFAULT_SCHEMA}, public; set bytea_output to 'hex'"
-        ))
-        .await
-        .expect("session bootstrap");
-    client
 }
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
@@ -481,23 +472,6 @@ async fn a_bytea_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_
             .unwrap_or_else(|e| panic!("stage bare recompute {key}: {e}"));
     }
 
-    async fn drain_sealed(client: &mut Client, pool: &trellis::pool::Pool) {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "bytea_worker",
-            1,
-            "trellis_defs_bytea_issue_114_regression",
-        )
-        .await
-        .expect("drain_once")
-        .expect("drain_once must claim and drain something");
-    }
-
     // Row 1: an ordinary image-bearing insert, the shape real CDC produces —
     // canonical hex text, exactly what a capture trigger renders under the pinned
     // `bytea_output = 'hex'`.
@@ -507,7 +481,10 @@ async fn a_bytea_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_
     // Postgres via `row_as_text_jsonb_sql`.
     stage_bare_recompute(&client, "seg_0", "2").await;
 
-    drain_sealed(&mut client, &db.pool).await;
+    let batch = seal(&mut client).await;
+    drain(&db.pool, batch, "bytea_worker")
+        .await
+        .expect("drain must claim and drain something");
 
     let rows = client
         .query("select grp::text, total::text from totals", &[])

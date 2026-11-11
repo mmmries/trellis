@@ -36,11 +36,14 @@
 //! against the engine's own renderer. Harness conventions follow
 //! `defs_bit.rs`/`defs_boolean.rs`.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect;
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::pg_type::PgType;
 use trellis::defs::{
@@ -59,18 +62,6 @@ fn source_columns() -> HashMap<String, ValueType> {
         ("j".to_string(), ValueType::Other(PgType::Jsonb)),
         ("n".to_string(), ValueType::Numeric),
     ])
-}
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("session bootstrap");
-    client
 }
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
@@ -102,7 +93,7 @@ async fn define_join_on(
 async fn jsonb_has_no_dedicated_text_cast_function() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     let n: i64 = client
         .query_one(
@@ -134,7 +125,7 @@ async fn jsonb_has_no_dedicated_text_cast_function() {
 async fn jsonb_in_and_out_are_immutable() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     let rows = client
         .query(
@@ -165,7 +156,7 @@ async fn jsonb_in_and_out_are_immutable() {
 async fn to_jsonb_and_text_agree_for_jsonb() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute(r#"create table t (j jsonb); insert into t values ('{"b": 2, "a": 1}')"#)
@@ -193,7 +184,7 @@ async fn to_jsonb_and_text_agree_for_jsonb() {
 async fn key_order_is_canonicalized_but_embedded_number_scale_is_not() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     // Key order: two spellings of one key set converge to one `::text`.
     let row = client
@@ -236,7 +227,7 @@ async fn key_order_is_canonicalized_but_embedded_number_scale_is_not() {
 async fn jsonb_is_refused_as_a_join_key_and_primary_key() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute(

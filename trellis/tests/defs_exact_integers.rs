@@ -29,6 +29,11 @@
 //! Harness conventions (`install_definition` + drain the chunk queue, then
 //! introspect `information_schema`) follow `defs_typed_literals.rs`.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, start_and_settle_builds};
+
 #[path = "support/render_lab.rs"]
 mod render_lab;
 #[path = "support/wait_live.rs"]
@@ -40,9 +45,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use testkit::TestCluster;
+use tokio_postgres::Client;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{CatalogError, ValidationError, install_definition, parse, validate};
 use trellis::integer::IntWidth;
@@ -81,18 +85,6 @@ fn source_columns() -> HashMap<String, ValueType> {
     ])
 }
 
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
 /// `right.rcol`. `JOIN` key admission reads the same allowlist
 /// (`join_key_types::is_text_stable_join_key_type`) a 1-1 primary key does.
@@ -109,18 +101,6 @@ async fn define_join_on(
     install_definition(pool, &text, &HashMap::new(), "public")
         .await
         .map(|_| ())
-}
-
-/// Starts every registered definition's build and runs it to completion,
-/// standing in for the staging worker and a running drain worker (copied
-/// from `defs_typed_literals.rs`).
-async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
-    // ADR-0002: registration only records a definition; the staging
-    // worker starts its build.
-    trellis::intake::harness::start_registered_builds(pool)
-        .await
-        .expect("dispatch registered definitions' builds");
-    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// The declared Postgres type of `table`.`column`, straight from
@@ -213,7 +193,7 @@ const SCALAR_CASES: &[(&str, &str, &str)] = &[
 async fn derived_column_types_match_postgres() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client.batch_execute(SOURCE_DDL).await.expect("source");
     seed_one_row(&client).await;
@@ -231,7 +211,7 @@ async fn derived_column_types_match_postgres() {
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
 
     for (name, expr, sql) in SCALAR_CASES {
         let declared = column_pg_type(&client, "t", name).await;
@@ -263,7 +243,7 @@ const AGGREGATE_CASES: &[(&str, &str, &str)] = &[
 async fn aggregate_column_types_match_postgres() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client.batch_execute(SOURCE_DDL).await.expect("source");
     seed_one_row(&client).await;
@@ -283,7 +263,7 @@ async fn aggregate_column_types_match_postgres() {
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
 
     // The `GROUP BY` key itself is a derived column too, and it must keep
     // the source column's exact width — that is the "exact key round-trip"
@@ -461,7 +441,7 @@ async fn a_value_outside_its_columns_width_raises_at_the_cast() {
 async fn an_integer_group_by_target_matches_a_hand_written_sql_query() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client.batch_execute(SOURCE_DDL).await.expect("source");
     client
@@ -486,7 +466,7 @@ async fn an_integer_group_by_target_matches_a_hand_written_sql_query() {
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
 
     let differences: i64 = client
         .query_one(
@@ -525,7 +505,7 @@ async fn an_integer_group_by_target_matches_a_hand_written_sql_query() {
 async fn an_oid_column_is_a_valid_group_by_key() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client.batch_execute(SOURCE_DDL).await.expect("source");
     client
@@ -544,7 +524,7 @@ async fn an_oid_column_is_a_valid_group_by_key() {
     )
     .await
     .expect("an oid GROUP BY key must be accepted");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
 
     assert_eq!(column_pg_type(&client, "t", "o").await, "oid");
 
@@ -570,7 +550,7 @@ async fn an_oid_column_is_a_valid_group_by_key() {
 async fn oid_has_no_arithmetic_in_trellis_because_it_has_none_in_postgres() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     let pg_err = client
         .query_one("select 1::oid + 1::oid", &[])
@@ -684,7 +664,7 @@ async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(SOURCE_DDL).await.expect("source");
 
     let definer = Trellis::connect(
@@ -796,7 +776,7 @@ async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
 async fn oid_and_the_integer_widths_are_accepted_as_join_keys() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute(
