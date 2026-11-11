@@ -240,6 +240,31 @@ impl Driver {
         &self.db.pool
     }
 
+    /// How many `JoinKeyMoved` this database's 1-1 `JOIN` pages have raised
+    /// (`trellis::dev::interleave::join_key_moves`). It counts this test's
+    /// database alone, so tests in one binary run in parallel.
+    pub fn join_key_moves(&self) -> u64 {
+        trellis::dev::interleave::join_key_moves(self.db.name())
+    }
+
+    /// Makes the next `n` held-key checks on this database raise
+    /// `JoinKeyMoved` (`trellis::dev::interleave::force_join_key_moves`).
+    pub fn force_join_key_moves(&self, n: u64) {
+        trellis::dev::interleave::force_join_key_moves(self.db.name(), n);
+    }
+
+    /// Sets the 1-1 `JOIN` fan-out chunk on this database; `0` restores the
+    /// default.
+    pub fn set_fan_out_chunk_rows(&self, rows: usize) {
+        trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows_in(self.db.name(), rows);
+    }
+
+    /// Sets the 1-1 `JOIN` fan-out warning threshold on this database; `0`
+    /// restores the default.
+    pub fn set_fan_out_warning_rows(&self, rows: i64) {
+        trellis::dev::defs::set_one_to_one_join_fan_out_warning_rows_in(self.db.name(), rows);
+    }
+
     /// A new application connection.
     pub async fn user(&self) -> Client {
         connect(self.db.dsn()).await

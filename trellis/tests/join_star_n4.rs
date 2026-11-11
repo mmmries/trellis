@@ -90,7 +90,6 @@ fn new_key_change(position: usize) -> Writer {
 /// root page and one of them recomputes the row from a stale `M`.
 #[tokio::test]
 async fn f14a_a_root_moving_every_key_races_a_change_of_its_new_key_at_each_position() {
-    let _serial = star::serial().await;
     for position in POSITIONS {
         star::family_seeded(N4, SEED, &[], MOVE_ALL, new_key_change(position)).await;
     }
@@ -101,7 +100,6 @@ async fn f14a_a_root_moving_every_key_races_a_change_of_its_new_key_at_each_posi
 /// root page locks too. Planted `star_root_skip_j_*`.
 #[tokio::test]
 async fn f14a_a_root_moving_every_key_races_a_change_of_the_key_it_leaves_at_each_position() {
-    let _serial = star::serial().await;
     for position in POSITIONS {
         let leaving = Writer::Change(leak(format!(
             "update public.b{position} set w = {} where id = 1",
@@ -120,7 +118,6 @@ async fn f14a_a_root_moving_every_key_races_a_change_of_the_key_it_leaves_at_eac
 /// `M` before it commits and the row loses one change.
 #[tokio::test]
 async fn f14a_joined_writers_on_the_new_key_at_two_positions_queue_on_the_rows_they_share() {
-    let _serial = star::serial().await;
     for (x, y) in [(1, 2), (2, 3), (1, 3)] {
         let z = 6 - x - y;
         for star in N4.stars() {
@@ -211,7 +208,7 @@ async fn late_m_key(late: usize, third: Option<usize>) {
             }
             None => None,
         };
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let (blocked, result) = match p3 {
             Some(p3) => {
                 let mut held = d
@@ -232,7 +229,7 @@ async fn late_m_key(late: usize, third: Option<usize>) {
         if let Err(err) = &result {
             panic!("{name}: the mixed page failed: {err}");
         }
-        let retried = trellis::dev::interleave::join_key_moves() - moves;
+        let retried = d.join_key_moves() - moves;
         star::assert_oracle(&mut d, &[star]).await;
         assert!(
             blocked,
@@ -252,7 +249,6 @@ async fn late_m_key(late: usize, third: Option<usize>) {
 /// commits.
 #[tokio::test]
 async fn f15a_a_late_m_key_at_the_last_position_retries_under_a_page_on_another_position() {
-    let _serial = star::serial().await;
     for third in [1, 2] {
         late_m_key(3, Some(third)).await;
     }
@@ -262,7 +258,6 @@ async fn f15a_a_late_m_key_at_the_last_position_retries_under_a_page_on_another_
 /// first or the last. Planted `star_recheck_j`.
 #[tokio::test]
 async fn f15a_a_late_m_key_at_the_middle_position_retries_under_a_page_on_another_position() {
-    let _serial = star::serial().await;
     for third in [1, 3] {
         late_m_key(2, Some(third)).await;
     }
@@ -272,7 +267,6 @@ async fn f15a_a_late_m_key_at_the_middle_position_retries_under_a_page_on_anothe
 /// middle or the last. Planted `star_recheck_j`.
 #[tokio::test]
 async fn f15a_a_late_m_key_at_the_first_position_retries_under_a_page_on_another_position() {
-    let _serial = star::serial().await;
     for third in [2, 3] {
         late_m_key(1, Some(third)).await;
     }
@@ -283,7 +277,6 @@ async fn f15a_a_late_m_key_at_the_first_position_retries_under_a_page_on_another
 /// itself.
 #[tokio::test]
 async fn a_joined_entry_whose_key_moved_onto_a_root_key_retries_at_each_position() {
-    let _serial = star::serial().await;
     for late in POSITIONS {
         late_m_key(late, None).await;
     }
@@ -302,7 +295,7 @@ async fn rederive_late_key_at(position: usize) {
         d.stage_recomputes("public.a", &["1"]).await;
         let rederive = d.seal().await;
         let joined = new_key_change(position).seal(&mut d).await;
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let target = star.target();
         let mut page = d
             .drain_frozen(
@@ -323,7 +316,7 @@ async fn rederive_late_key_at(position: usize) {
         held.finish().await;
         let result = page.finish_result().await;
         let name = star.name();
-        let retried = trellis::dev::interleave::join_key_moves() - moves;
+        let retried = d.join_key_moves() - moves;
         if let Err(err) = &result {
             panic!("{name}: the Re-derive page failed: {err}");
         }
@@ -343,7 +336,6 @@ async fn rederive_late_key_at(position: usize) {
 /// Planted `star_late_skip_first`.
 #[tokio::test]
 async fn a_root_rederive_whose_key_moved_at_the_first_position_retries_at_n4() {
-    let _serial = star::serial().await;
     rederive_late_key_at(1).await;
 }
 
@@ -351,14 +343,12 @@ async fn a_root_rederive_whose_key_moved_at_the_first_position_retries_at_n4() {
 /// reaches: a check that skips the middle position leaves its key unlocked.
 #[tokio::test]
 async fn a_root_rederive_whose_key_moved_at_the_middle_position_retries() {
-    let _serial = star::serial().await;
     rederive_late_key_at(2).await;
 }
 
 /// The same at the last position (F6b). Planted `star_late_skip_last`.
 #[tokio::test]
 async fn a_root_rederive_whose_key_moved_at_the_last_position_retries_at_n4() {
-    let _serial = star::serial().await;
     rederive_late_key_at(3).await;
 }
 
@@ -387,7 +377,7 @@ async fn chunk_late_key(shape: Shape) {
         star::write(&d, &shape.sql("insert into {b} values (7, 70, 700, 'k7')")).await;
         let insert = d.seal().await;
         let target = star.target();
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let mut chunk = d
             .run_frozen(
                 &[
@@ -410,7 +400,7 @@ async fn chunk_late_key(shape: Shape) {
         chunk.finish_result().await.expect("the chunk's build step");
         if frozen.is_none() {
             assert!(
-                trellis::dev::interleave::join_key_moves() > moves,
+                d.join_key_moves() > moves,
                 "{} (position {}): the chunk rolled back on the moved key",
                 star.name(),
                 shape.at
@@ -436,7 +426,6 @@ async fn chunk_late_key(shape: Shape) {
 /// root's (`moved_key`), at every position.
 #[tokio::test]
 async fn a_build_chunk_whose_row_moved_onto_a_key_it_did_not_lock_retries_at_each_position() {
-    let _serial = star::serial().await;
     for at in POSITIONS {
         chunk_late_key(Shape::new(3, at)).await;
     }
@@ -465,7 +454,6 @@ const CYCLE_PAGES: [&str; 3] = [
 /// deadlock.
 #[tokio::test]
 async fn f13a_a_cycle_of_mixed_pages_across_three_positions_queues_without_deadlock() {
-    let _serial = star::serial().await;
     for (x, y) in [(0, 1), (1, 2), (0, 2)] {
         for star in N4.stars() {
             for flip in [false, true] {

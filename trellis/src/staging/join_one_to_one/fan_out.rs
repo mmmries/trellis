@@ -89,11 +89,31 @@ pub fn chunk_rows() -> usize {
     }
 }
 
-/// Sets [`chunk_rows`] for this process, for tests; `0` restores the
-/// default.
+/// Sets [`chunk_rows`] for this process, for a whole-engine run (the
+/// generative tier's); `0` restores the default. A test of one scenario
+/// sets it on its own database instead (`set_chunk_rows_in`).
 #[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
 pub fn set_chunk_rows(rows: usize) {
     CHUNK_ROWS.store(rows, Ordering::Relaxed);
+}
+
+/// Sets the chunk for the pages and chunks that run on `database`, over
+/// [`chunk_rows`], for tests; `0` restores [`chunk_rows`]. See
+/// `super::super::interleave`'s "Knobs by database".
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_chunk_rows_in(database: &str, rows: usize) {
+    super::super::interleave::set_fan_out_chunk_rows(database, rows);
+}
+
+/// The chunk for a transaction on `txn`'s database: one a test set on it
+/// (`set_chunk_rows_in`), else [`chunk_rows`].
+async fn chunk_rows_on(txn: &Transaction<'_>) -> Result<usize, ApplyError> {
+    #[cfg(any(test, feature = "test-util"))]
+    if let Some(rows) = super::super::interleave::fan_out_chunk_rows(txn).await? {
+        return Ok(rows);
+    }
+    let _ = txn;
+    Ok(chunk_rows())
 }
 
 /// How many keys one statement of [`split`]'s count reads. Each key's count
@@ -158,7 +178,7 @@ pub(super) async fn budget(
     shape: &JoinShape,
     candidates: &[BTreeSet<KeyText>],
 ) -> Result<Vec<BTreeSet<KeyText>>, ApplyError> {
-    let mut remaining = chunk_rows();
+    let mut remaining = chunk_rows_on(txn).await?;
     let mut inline: Vec<BTreeSet<KeyText>> = vec![BTreeSet::new(); candidates.len()];
     for (at, keys) in shape.positions().iter().zip(candidates) {
         let keys: Vec<&KeyText> = keys.iter().collect();
@@ -669,7 +689,7 @@ async fn chunk_in(
     )
     .await?;
 
-    let rows = chunk_rows();
+    let rows = chunk_rows_on(txn).await?;
     let entries = walk(txn, shape, at, key, cursor.as_deref(), rows + 1).await?;
     let next = (entries.len() > rows).then(|| entries[rows - 1].clone());
     let batch = lock_batch(txn, shape, &entries[..entries.len().min(rows)]).await?;

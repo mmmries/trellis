@@ -27,7 +27,6 @@ mod drain_driver;
 mod star;
 
 use star::{Kind, Shape, Star};
-use trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows;
 use trellis::staging::OneToOneJoinFanOutStep;
 use trellis::staging::build::{self, Step};
 use trellis::staging::interleave::PausePoint;
@@ -191,7 +190,6 @@ async fn every_shapes_tables_and_oracle_run_on_postgres() {
 /// live tables, and a root change then applies.
 #[tokio::test]
 async fn every_star_builds_every_position() {
-    let _serial = star::serial().await;
     for positions in 2..=star::MAX_POSITIONS {
         for at in [1, positions] {
             let shape = Shape::new(positions, at);
@@ -217,7 +215,6 @@ async fn every_star_builds_every_position() {
 /// re-insert.
 #[tokio::test]
 async fn the_build_and_changes_of_either_side_apply() {
-    let _serial = star::serial().await;
     for shape in shapes() {
         let stars = shape.stars();
         let mut d = star::start(&stars, A_ROWS, B_ROWS).await;
@@ -247,7 +244,6 @@ async fn the_build_and_changes_of_either_side_apply() {
 /// on `J[20]`.
 #[tokio::test]
 async fn f3_an_a_move_races_a_b_update_of_its_new_key() {
-    let _serial = star::serial().await;
     for shape in shapes() {
         star::family(
             shape,
@@ -266,7 +262,6 @@ async fn f3_an_a_move_races_a_b_update_of_its_new_key() {
 /// the second queues on the first and neither deadlocks, in either order.
 #[tokio::test]
 async fn m_two_crossing_mixed_pages_queue_on_j_without_deadlock() {
-    let _serial = star::serial().await;
     for shape in shapes() {
         for other_a in [
             "update public.a set {k} = 10 where id = 2",
@@ -296,7 +291,6 @@ async fn m_two_crossing_mixed_pages_queue_on_j_without_deadlock() {
 /// the rebuild a truncate of the joined table starts is exact.
 #[tokio::test]
 async fn t1_t2_a_truncate_races_a_page_of_the_other_side() {
-    let _serial = star::serial().await;
     for shape in shapes() {
         for (name, x, y) in [
             (
@@ -335,7 +329,6 @@ async fn t1_t2_a_truncate_races_a_page_of_the_other_side() {
 /// chunk first).
 #[tokio::test]
 async fn c_a_page_on_a_chunks_key_queues_behind_the_chunk() {
-    let _serial = star::serial().await;
     for shape in shapes() {
         for star in shape.stars() {
             let mut d = star::start_unbuilt(&[star], A_ROWS, B_ROWS).await;
@@ -371,16 +364,6 @@ async fn c_a_page_on_a_chunks_key_queues_behind_the_chunk() {
 
 /// The fan-out chunk these pins run with.
 const CHUNK: usize = 2;
-
-/// Puts the process-wide fan-out chunk back when a pin ends, even on a
-/// panic.
-struct Chunked;
-
-impl Drop for Chunked {
-    fn drop(&mut self) {
-        set_one_to_one_join_fan_out_chunk_rows(0);
-    }
-}
 
 /// `star`'s fan-out markers, as `(join key, gen, cursor)`.
 async fn markers(d: &drain_driver::Driver, star: Star) -> Vec<String> {
@@ -427,9 +410,6 @@ async fn one_chunk(d: &drain_driver::Driver) {
 /// in key order and advances the cursor, until the last deletes the marker.
 #[tokio::test]
 async fn a_b_change_past_one_chunk_finishes_in_chunks() {
-    let _serial = star::serial().await;
-    set_one_to_one_join_fan_out_chunk_rows(CHUNK);
-    let _chunked = Chunked;
     let a_rows = "(1, 10, 1, 'one'), (2, 10, 2, 'two'), (3, 10, 3, 'three'), \
                   (4, 10, 4, 'four'), (5, 10, 5, 'five'), (6, 10, 6, 'six'), \
                   (7, 10, 7, 'seven'), (8, 20, 8, 'eight'), (9, null, 9, 'nine')";
@@ -438,6 +418,7 @@ async fn a_b_change_past_one_chunk_finishes_in_chunks() {
         for star in shape.stars() {
             let name = star.name();
             let mut d = star::start(&[star], a_rows, b_rows).await;
+            d.set_fan_out_chunk_rows(CHUNK);
             star::step(
                 &mut d,
                 &shape.sql("update {b} set w = 900, tag = 'new' where id = 1"),

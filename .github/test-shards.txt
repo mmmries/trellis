@@ -4,33 +4,33 @@
 doc 15
 test:join_interleavings 280.6
 test:expr_conformance 215.4
-test:join_star_truncate 191.9
-test:join_one_to_one_over_targets 187.8
-test:join_star_n4 184.3
-test:join_star_families 173.0
-test:join_star_joined 153.3
-test:join_star_harness 141.0
-test:join_one_to_one_interleavings 137.7
-test:join_star_root 103.8
-test:join_star_self_check 94.9
+test:join_star_truncate 85.9
+test:join_one_to_one_over_targets 35.0
+test:join_star_n4 52.1
+test:join_star_families 65.7
+test:join_star_joined 36.3
+test:join_star_harness 41.7
+test:join_one_to_one_interleavings 56.0
+test:join_star_root 22.2
+test:join_star_self_check 26.4
 test:defs_table_column_cap 89.0
-test:join_one_to_one_readers 88.6
-test:join_star_crossing 88.5
+test:join_one_to_one_readers 18.8
+test:join_star_crossing 22.1
 lib 80.6
-test:join_star_build 75.5
-test:join_star_joined_families 69.9
+test:join_star_build 22.3
+test:join_star_joined_families 24.0
 test:type_matrix 68.3
 test:join_one_to_one_recollation 68.0
-test:join_one_to_one_build 66.6
+test:join_one_to_one_build 18.5
 test:partition_join 55.8
 test:group_basis_collation 43.7
 test:group_basis_min_max 40.5
-test:join_star_quarantine 40.3
+test:join_star_quarantine 22.9
 test:join_one_to_one_self_check 39.0
 test:join_self_check 34.9
 test:capture_partition_pass 32.4
-test:join_one_to_one_quarantine 32.2
-test:join_star_fan_out 30.8
+test:join_one_to_one_quarantine 8.6
+test:join_star_fan_out 9.2
 test:convergence 30.7
 test:join_one_to_one_schema_changes 27.9
 test:partition_group_basis 27.8
@@ -45,7 +45,7 @@ test:coverage 19.8
 test:partition_sweep 19.6
 test:capture_missed_ddl 19.4
 test:schema_dump_restore 17.8
-test:join_one_to_one_fan_out 16.5
+test:join_one_to_one_fan_out 3.5
 test:call_deadline 15.6
 test:one_to_one_render 15.6
 test:group_basis_build 14.5
@@ -58,12 +58,12 @@ test:null_literal_key_spaces 13.0
 test:partition_lifecycle_cells 12.8
 test:capture_disruption_partitioned 12.5
 test:capture_disruption 11.8
-test:join_star_recollation 11.1
+test:join_star_recollation 3.1
 test:one_to_one_build_interleavings 11.1
 test:concurrent_convergence 11.0
 test:group_basis_numeric_scales 10.9
 test:self_check 10.8
-test:join_star_schema_changes 10.7
+test:join_star_schema_changes 2.3
 test:capture_install 9.6
 test:capture_type_rename 9.4
 test:join_one_to_one_producers 9.0
@@ -76,7 +76,7 @@ test:group_basis_numeric_nan 7.9
 test:capture_schema_change 7.8
 test:date_key_spaces 7.5
 test:capture_join 7.5
-test:join_one_to_one_status 7.5
+test:join_one_to_one_status 3.8
 test:one_to_one_backfill_composite_nullable_group_key 7.3
 test:client_e2e 7.3
 test:join_star_tier 7.3
@@ -95,7 +95,7 @@ test:unchanged_toast_images 6.3
 test:builtin_shadowing 6.3
 test:resume_after_source_key_change 6.2
 test:live_means_steady_state 6.1
-test:join_star_status 6.0
+test:join_star_status 1.9
 test:standby_staging 6.0
 test:cast_aliases 5.8
 test:cast_identity 5.8
@@ -147,7 +147,7 @@ test:capture_reread 2.6
 test:identity 2.6
 test:group_basis_min_max_index 2.6
 test:group_basis_resume_after_source_key_change 2.6
-test:join_one_to_one_lease 2.6
+test:join_one_to_one_lease 1.7
 test:capture_set_expression 2.5
 test:defs_exact_integers 2.5
 test:source_key_upgrade 2.4
@@ -261,3 +261,4 @@ bin:generative 1.0  # not in the log (no tests ran, or the log is partial)
 bin:trellis-testkit 1.0  # not in the log (no tests ran, or the log is partial)
 test:numeric_sums_upgrade 1.0  # not in the log (no tests ran, or the log is partial)
 test:pg_partman 1.0  # not in the log (no tests ran, or the log is partial)
+test:join_star_shared_columns 10.8

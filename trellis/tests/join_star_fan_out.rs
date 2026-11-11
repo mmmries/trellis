@@ -30,26 +30,9 @@ mod star_cx;
 use drain_driver::Driver;
 use star::{Shape, Star};
 use star_cx::{N3, Orientation, SEED};
-use trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows;
 use trellis::staging::OneToOneJoinFanOutStep;
 use trellis::staging::interleave::PausePoint;
 use trellis::staging::quarantine;
-
-/// Puts the process-wide fan-out chunk back when a pin ends, even on a
-/// panic.
-struct Chunked;
-
-impl Drop for Chunked {
-    fn drop(&mut self) {
-        set_one_to_one_join_fan_out_chunk_rows(0);
-    }
-}
-
-/// Sets a one-row chunk, until the guard drops.
-fn chunked() -> Chunked {
-    set_one_to_one_join_fan_out_chunk_rows(1);
-    Chunked
-}
 
 /// [`SEED`] with `a` row 5 on `(1, 1)`: key 1 has three rows at position 1
 /// (1, 4 and 5) and two at position 2 (1 and 5), so a change of either
@@ -111,12 +94,11 @@ fn assert_clean(d: &Driver, name: &str) {
 /// old `w`).
 #[tokio::test]
 async fn cx_f10a_a_chunk_queues_on_the_r_entry_of_a_page_at_the_other_position() {
-    let _serial = star::serial().await;
-    let _chunked = chunked();
     for orientation in Orientation::BOTH {
         for star in N3.stars() {
             let name = format!("{} {orientation:?}", star.name());
             let mut d = star::start_seeded(&[star], &orientation.sql(SEED)).await;
+            d.set_fan_out_chunk_rows(1);
             step(
                 &mut d,
                 &orientation.sql("update public.b1 set w = 11 where id = 1"),
@@ -164,12 +146,11 @@ async fn cx_f10a_a_chunk_queues_on_the_r_entry_of_a_page_at_the_other_position()
 /// Pins the `star_chunk_no_r` plant (the page doesn't queue).
 #[tokio::test]
 async fn cx_f10a_a_page_at_the_other_position_queues_on_a_chunks_r_entry() {
-    let _serial = star::serial().await;
-    let _chunked = chunked();
     for orientation in Orientation::BOTH {
         for star in N3.stars() {
             let name = format!("{} {orientation:?}", star.name());
             let mut d = star::start_seeded(&[star], &orientation.sql(SEED)).await;
+            d.set_fan_out_chunk_rows(1);
             step(
                 &mut d,
                 &orientation.sql("update public.b1 set w = 11 where id = 1"),
@@ -211,11 +192,10 @@ async fn cx_f10a_a_page_at_the_other_position_queues_on_a_chunks_r_entry() {
 /// Pins the `star_chunk_no_r` plant (the second chunk doesn't queue).
 #[tokio::test]
 async fn cx_f10c_chunks_at_two_positions_on_one_row_queue_on_its_r_entry() {
-    let _serial = star::serial().await;
-    let _chunked = chunked();
     for star in N3.stars() {
         let name = star.name();
         let mut d = star::start_seeded(&[star], SHARED_SEED).await;
+        d.set_fan_out_chunk_rows(1);
         step(&mut d, "update public.b1 set w = 11 where id = 1").await;
         step(&mut d, "update public.b2 set w = 101 where id = 1").await;
         assert_eq!(
@@ -262,8 +242,6 @@ async fn cx_f10c_chunks_at_two_positions_on_one_row_queue_on_its_r_entry() {
 /// again and hold it a second time, charging the key's death twice.
 #[tokio::test]
 async fn cx_f10a_a_chunk_leaves_out_a_row_a_page_at_the_other_position_held_after_its_walk() {
-    let _serial = star::serial().await;
-    let _chunked = chunked();
     for star in N3.stars() {
         let name = star.name();
         let seed = "insert into public.a (id, k1, k2, x, y) values \
@@ -271,6 +249,7 @@ async fn cx_f10a_a_chunk_leaves_out_a_row_a_page_at_the_other_position_held_afte
                     insert into public.b1 values (1, 1, 10, 'b1'); \
                     insert into public.b2 values (1, 1, 100, 'e1'), (5, 5, 500, 'e5')";
         let mut d = star::start_seeded(&[star], seed).await;
+        d.set_fan_out_chunk_rows(1);
         step(&mut d, "update public.b1 set w = 11 where id = 1").await;
         assert_eq!(markers(&d, star).await, ["(1,{1},)"], "{name}");
         star::write(&d, "update public.b2 set w = 2000 where id = 1").await;
@@ -306,11 +285,10 @@ async fn cx_f10a_a_chunk_leaves_out_a_row_a_page_at_the_other_position_held_afte
 /// Pins the `star_truncate_keeps_other_markers` plant.
 #[tokio::test]
 async fn xt2_a_truncate_of_a_clears_a_pending_marker_at_another_position() {
-    let _serial = star::serial().await;
-    let _chunked = chunked();
     for star in N3.stars() {
         let name = star.name();
         let mut d = star::start_seeded(&[star], SHARED_SEED).await;
+        d.set_fan_out_chunk_rows(1);
         step(&mut d, "update public.b2 set w = 101 where id = 1").await;
         assert_eq!(markers(&d, star).await, ["(2,{1},)"], "{name}");
         step(&mut d, "truncate public.a").await;
@@ -328,11 +306,10 @@ async fn xt2_a_truncate_of_a_clears_a_pending_marker_at_another_position() {
 /// Pins the `star_truncate_keeps_other_markers` plant.
 #[tokio::test]
 async fn xt2_a_truncate_of_b_clears_a_pending_marker_at_another_position() {
-    let _serial = star::serial().await;
-    let _chunked = chunked();
     for star in N3.stars() {
         let name = star.name();
         let mut d = star::start_seeded(&[star], SHARED_SEED).await;
+        d.set_fan_out_chunk_rows(1);
         step(&mut d, "update public.b2 set w = 101 where id = 1").await;
         assert_eq!(markers(&d, star).await, ["(2,{1},)"], "{name}");
         step(&mut d, "truncate public.b1").await;
@@ -384,7 +361,6 @@ async fn hold_23(d: &mut Driver, star: Star) {
 /// Pins the `join1_fan_out_held_row` plant at position 2.
 #[tokio::test]
 async fn px8_a_fan_out_at_position_2_leaves_a_held_row_as_it_was() {
-    let _serial = star::serial().await;
     for star in AT_2.stars() {
         let name = star.name();
         let mut d = star::start(&[star], HELD_A, HELD_B).await;
@@ -417,7 +393,6 @@ async fn px8_a_fan_out_at_position_2_leaves_a_held_row_as_it_was() {
 /// Pins the `join1_release_no_rederive` plant at position 2.
 #[tokio::test]
 async fn px9_a_release_before_a_pending_fan_out_at_position_2_stays_released() {
-    let _serial = star::serial().await;
     for star in AT_2.stars() {
         let name = star.name();
         let mut d = star::start(&[star], HELD_A, HELD_B).await;
