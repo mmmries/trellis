@@ -1,5 +1,5 @@
 ---
-status: draft
+status: accepted
 date: 2026-10-28
 deciders: Michael Ries
 ---
