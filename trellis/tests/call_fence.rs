@@ -18,10 +18,15 @@ use std::time::Duration;
 
 use testkit::{TestCluster, TestDatabase};
 use tokio::task::JoinHandle;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::client::handover_pass_as;
 use trellis::staging::interleave::{PausePoint, PauseScope, with_scope};
 use trellis::{Config, ErrorCode, SelfCheckMode, Trellis, TrellisError, TrellisOptions};
+
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{bring_live_all, connect};
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
 
@@ -38,19 +43,7 @@ fn config(db: &TestDatabase) -> Config {
     Config::from_dsn(db.dsn().to_string()).expect("config")
 }
 
-async fn raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("search_path");
-    client
-}
-
-async fn define_only(config: Config) -> Arc<Trellis> {
+async fn definer(config: Config) -> Arc<Trellis> {
     Arc::new(
         Trellis::connect(config, TrellisOptions::default())
             .await
@@ -117,7 +110,7 @@ async fn park<T: Send + 'static>(
     n: usize,
     call: impl Future<Output = T> + Send + 'static,
 ) -> Parked<T> {
-    let gate = raw(db.dsn()).await;
+    let gate = connect(db.dsn()).await;
     gate.execute("select pg_advisory_lock($1)", &[&GATE])
         .await
         .expect("take the gate");
@@ -175,9 +168,9 @@ async fn source(raw: &Client) {
 async fn a_floor_raised_after_the_pre_check_refuses_the_write() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     source(&raw).await;
-    let caller = define_only(config(&db)).await;
+    let caller = definer(config(&db)).await;
 
     let call = {
         let caller = caller.clone();
@@ -202,9 +195,9 @@ async fn a_floor_raised_after_the_pre_check_refuses_the_write() {
 async fn a_call_holding_its_fence_holds_migrate_back_until_it_commits() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     source(&raw).await;
-    let caller = define_only(config(&db)).await;
+    let caller = definer(config(&db)).await;
 
     let call = {
         let caller = caller.clone();
@@ -231,9 +224,9 @@ async fn a_call_holding_its_fence_holds_migrate_back_until_it_commits() {
 async fn another_version_taking_over_after_the_pre_check_refuses_the_write() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     source(&raw).await;
-    let caller = define_only(config(&db)).await;
+    let caller = definer(config(&db)).await;
     caller
         .apply("TRANSFORM m_copy FROM m SELECT g AS g")
         .await
@@ -264,9 +257,9 @@ async fn another_version_taking_over_after_the_pre_check_refuses_the_write() {
 async fn a_takeover_pass_waits_for_a_call_holding_its_fence() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     source(&raw).await;
-    let caller = define_only(config(&db)).await;
+    let caller = definer(config(&db)).await;
     caller
         .apply("TRANSFORM m_copy FROM m SELECT g AS g")
         .await
@@ -311,14 +304,14 @@ async fn a_takeover_pass_waits_for_a_call_holding_its_fence() {
 async fn a_column_pause_overtaken_between_its_transactions_refuses_on_the_next() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     source(&raw).await;
-    let caller = define_only(config(&db)).await;
+    let caller = definer(config(&db)).await;
     caller
         .apply("TRANSFORM m_copy FROM m SELECT g AS g, v AS v")
         .await
         .expect("define the upstream");
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     caller
         .apply("TRANSFORM m_sum FROM m_copy SELECT v + v AS total")
         .await
@@ -339,7 +332,7 @@ async fn a_column_pause_overtaken_between_its_transactions_refuses_on_the_next()
     );
     assert_eq!(column_pause(&raw, "m_sum", "total").await, None);
 
-    let newer = define_only(config(&db).with_binary_version(RAISED_FLOOR)).await;
+    let newer = definer(config(&db).with_binary_version(RAISED_FLOOR)).await;
     newer
         .apply("PAUSE TRANSFORM m_copy.v")
         .await
@@ -369,14 +362,14 @@ async fn column_pause(raw: &Client, transform: &str, column: &str) -> Option<boo
 async fn work_outside_a_call_is_not_fenced() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     source(&raw).await;
-    let caller = define_only(config(&db)).await;
+    let caller = definer(config(&db)).await;
     caller
         .apply("TRANSFORM m_copy FROM m SELECT g AS g, v AS v")
         .await
         .expect("define the upstream");
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     caller
         .apply("TRANSFORM m_sum FROM m_copy SELECT v + v AS total")
         .await
@@ -482,14 +475,14 @@ async fn probe_every_table(raw: &Client) {
 async fn every_write_of_every_state_changing_call_is_fenced() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     source(&raw).await;
     raw.batch_execute(&probe_function_sql())
         .await
         .expect("probe function");
     let probed = Config::from_dsn(format!("{} options='-c trellis.fence_probe=on'", db.dsn()))
         .expect("config");
-    let caller = define_only(probed).await;
+    let caller = definer(probed).await;
 
     macro_rules! fenced {
         ($what:expr, $call:expr) => {{
@@ -509,12 +502,12 @@ async fn every_write_of_every_state_changing_call_is_fenced() {
         "define an aggregate",
         caller.apply("TRANSFORM m_agg FROM m GROUP BY g SELECT g AS g, COUNT(*) AS n")
     );
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     fenced!(
         "define a chained reader",
         caller.apply("TRANSFORM m_sum FROM m_copy SELECT v + v AS total")
     );
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     fenced!(
         "a column pause and its cascade",
         caller.apply("PAUSE TRANSFORM m_copy.v")
@@ -537,27 +530,27 @@ async fn every_write_of_every_state_changing_call_is_fenced() {
         "a whole resume of the reader",
         caller.apply("RESUME TRANSFORM m_sum")
     );
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     fenced!(
         "a column resume of the held pair",
         caller.apply("RESUME TRANSFORM m_sum.total")
     );
     assert_eq!(column_pause(&raw, "m_sum", "total").await, None);
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     fenced!(
         "an edit that adds a field",
         caller.apply("ALTER TRANSFORM m_copy ADD v + v AS twice")
     );
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     fenced!(
         "an edit that drops it",
         caller.apply("ALTER TRANSFORM m_copy DROP twice")
     );
     fenced!("a whole pause", caller.apply("PAUSE TRANSFORM m_agg"));
     fenced!("a whole resume", caller.apply("RESUME TRANSFORM m_agg"));
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     fenced!("request_backfill", caller.request_backfill("public.m"));
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     fenced!(
         "self_check",
         caller.self_check("m_agg", SelfCheckMode::Standard, Duration::from_secs(1))
@@ -632,62 +625,5 @@ async fn every_write_of_every_state_changing_call_is_fenced() {
 }
 
 async fn raw_marked(db: &TestDatabase) -> Client {
-    raw(&format!("{} options='-c trellis.fence_probe=on'", db.dsn())).await
-}
-
-/// Capture, builds and drains by hand until every definition is live.
-async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..10 {
-        trellis::client::reconcile_pass(raw, pool, SCHEMA)
-            .await
-            .expect("reconcile pass");
-        trellis::staging::build::settle_builds(pool).await;
-        for _ in 0..16 {
-            let outcome = seal::seal_phase1_waiting(raw).await;
-            seal::seal_phase2(raw, outcome.sealed_seg_seq, "call_fence_wake")
-                .await
-                .expect("seal phase 2");
-            while apply::drain_once(
-                pool,
-                outcome.sealed_seg_seq,
-                "call_fence_test",
-                1,
-                "call_fence_test_wake",
-            )
-            .await
-            .expect("drain_once")
-            .is_some()
-            {}
-            retire_drained_segments(raw)
-                .await
-                .expect("retire drained segments");
-            if !has_pending(raw).await.expect("has_pending") {
-                break;
-            }
-        }
-        let all_live: bool = raw
-            .query_one(
-                "select bool_and(status = 'live') from transform_definitions",
-                &[],
-            )
-            .await
-            .expect("read statuses")
-            .get(0);
-        if all_live {
-            return;
-        }
-    }
-    panic!(
-        "not every definition went live: {:?}",
-        raw.query(
-            "select target_table, status from transform_definitions",
-            &[]
-        )
-        .await
-        .expect("read")
-        .iter()
-        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
-        .collect::<Vec<_>>()
-    );
+    connect(&format!("{} options='-c trellis.fence_probe=on'", db.dsn())).await
 }

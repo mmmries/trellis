@@ -15,130 +15,24 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use testkit::{TestCluster, TestDatabase};
-use tokio_postgres::{Client, NoTls};
-use trellis::capture::reconcile;
+use tokio_postgres::Client;
 use trellis::defs::TransformStatus;
-use trellis::{Config, Trellis, TrellisOptions};
+use trellis::{Config, Trellis};
+
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{bring_live_all, capture_pass, connect, definer, reconcile_pass, settle, statuses};
+use trellis::staging::build::settle_builds;
 
 const SCHEMA: &str = "trellis";
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn definer(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a definer")
-}
-
 fn pool_for(dsn: &str) -> trellis::pool::Pool {
     trellis::pool::Pool::new(&Config::from_dsn(dsn.to_string()).expect("valid dsn")).expect("pool")
-}
-
-async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    trellis::client::reconcile_pass(raw, pool, SCHEMA)
-        .await
-        .expect("reconcile pass");
-}
-
-async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    let outcome = reconcile::reconcile(
-        raw,
-        SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(2),
-    )
-    .await
-    .expect("capture pass");
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
-}
-
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "logical_restore_wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "logical_restore_test",
-            1,
-            "trellis_logical_restore_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
-
-async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    const CLAIMED_BY: &str = "logical_restore_backfill";
-    trellis::staging::build::settle_builds(pool).await;
-}
-
-async fn statuses(raw: &Client) -> BTreeMap<String, TransformStatus> {
-    raw.query(
-        "select split_part(target_table, '.', 2), status from transform_definitions",
-        &[],
-    )
-    .await
-    .expect("read statuses")
-    .into_iter()
-    .map(|row| {
-        (
-            row.get(0),
-            trellis::defs::StoredStatus::from_persisted(row.get(1))
-                .expect("a stored status")
-                .into(),
-        )
-    })
-    .collect()
-}
-
-async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool) {
-    for _ in 0..10 {
-        full_pass(raw, pool).await;
-        run_backfill_chunks(pool).await;
-        drain_to_quiescence(pool, raw).await;
-        if statuses(raw)
-            .await
-            .values()
-            .all(|s| *s == TransformStatus::Live)
-        {
-            return;
-        }
-    }
-    panic!("not every definition went live: {:?}", statuses(raw).await);
 }
 
 async fn rows(raw: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
@@ -256,7 +150,7 @@ async fn original(cluster: &TestCluster) -> Original {
     ] {
         trellis.apply(text).await.expect(text);
     }
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     raw.batch_execute(
         "insert into public.s1 select i, i * 10 from generate_series(1, 6) i; \
          insert into public.g select i, i % 3, i from generate_series(1, 8) i; \
@@ -267,7 +161,7 @@ async fn original(cluster: &TestCluster) -> Original {
     )
     .await
     .expect("seed");
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_oracle(&raw, "the original, live", &TARGETS).await;
 
     // Changes applied at positions of the advanced cluster, a truncate among
@@ -285,7 +179,7 @@ async fn original(cluster: &TestCluster) -> Original {
     )
     .await
     .expect("changes");
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_oracle(&raw, "the original, after its changes", &TARGETS).await;
     assert!(
         count(
@@ -467,7 +361,7 @@ async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::p
     )
     .await
     .expect("1-1 join writes");
-    drain_to_quiescence(pool, raw).await;
+    settle(pool, raw).await;
     assert_oracle(raw, "the 1-1 JOIN after writes", &["jo"]).await;
     // The `JOIN`'s resume rebuilt both its tables, keeping its target:
     // zero diff, and later changes on either side apply, among them a flip.
@@ -483,7 +377,7 @@ async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::p
     )
     .await
     .expect("join writes");
-    drain_to_quiescence(pool, raw).await;
+    settle(pool, raw).await;
     assert_oracle(raw, "the JOIN after writes", &["jl"]).await;
     trellis
         .apply("RESUME TRANSFORM one")
@@ -503,7 +397,7 @@ async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::p
     )
     .await
     .expect("writes");
-    drain_to_quiescence(pool, raw).await;
+    settle(pool, raw).await;
     assert_oracle(
         raw,
         "after writes to keys that existed before the dump",
@@ -537,9 +431,9 @@ async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::p
 /// are left as they are.
 async fn bring_live_only(raw: &mut Client, pool: &trellis::pool::Pool, target: &str) {
     for _ in 0..10 {
-        full_pass(raw, pool).await;
-        run_backfill_chunks(pool).await;
-        drain_to_quiescence(pool, raw).await;
+        reconcile_pass(raw, pool).await;
+        settle_builds(pool).await;
+        settle(pool, raw).await;
         if statuses(raw).await[target] == TransformStatus::Live {
             return;
         }
@@ -753,7 +647,7 @@ async fn a_physical_copy_and_a_template_database_pause_nothing() {
     assert_eq!(ring_rows(&raw).await, ring);
     // And its ordering state is valid: the pending changes apply, the stale
     // copy (a later change to the key, here) last.
-    drain_to_quiescence(&pool, &mut raw).await;
+    settle(&pool, &mut raw).await;
     assert_eq!(
         rows(&raw, "select v::text from public.one where id = 4").await,
         vec![vec![Some("-1".to_string())]]

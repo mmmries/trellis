@@ -29,25 +29,18 @@
 use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, IsolationLevel, NoTls};
+use tokio_postgres::{Client, IsolationLevel};
 use trellis::capture::install::{self, Progress};
 use trellis::capture::sql::{CaptureEvent, CaptureSpec, trigger_name};
 use trellis::config::DEFAULT_SCHEMA;
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect;
+
 /// The advisory lock the application trigger in the no-leak tests waits on.
 const HOLD_LOCK: i64 = 623_008;
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 async fn install_spec(client: &mut Client, spec: &CaptureSpec) {
     match install::install(client, DEFAULT_SCHEMA, spec, None)

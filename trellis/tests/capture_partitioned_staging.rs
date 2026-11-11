@@ -12,23 +12,17 @@
 use std::time::Instant;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::capture::install::{self, Progress};
 use trellis::capture::sql::CaptureSpec;
 use trellis::config::DEFAULT_SCHEMA;
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
 async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!(
-            "set search_path to {DEFAULT_SCHEMA}, public; set lock_timeout = '10s'"
-        ))
-        .await
-        .expect("set search_path");
-    client
+    let setup = format!("set search_path to {DEFAULT_SCHEMA}, public; set lock_timeout = '10s'");
+    pipeline::connect_with(dsn, &setup).await
 }
 
 /// `public.r` partitioned by list on `region`: `m1` and `m2`, each hash
