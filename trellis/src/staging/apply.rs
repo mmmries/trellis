@@ -886,16 +886,15 @@ type Provenance = (Option<std::time::SystemTime>, Option<PgLsn>);
 /// input, for a version-fence miss or a rolled-back Phase 3 failure —
 /// [`classify_and_retry`]'s `VersionFenceMiss`/`Transient` classes both
 /// return "retry unchanged." Recording straight into the global registry
-/// here, as this function used to, meant a change that took N attempts to
-/// actually land got counted into `trellis_changes_applied_total` and both
-/// latency histograms N times instead of once, worst exactly under the
+/// here would count a change that took N attempts to actually land into
+/// `trellis_changes_applied_total` and both latency histograms N times
+/// instead of once, worst exactly under the
 /// lock-contention/version-fence-race conditions where accurate throughput
-/// numbers matter most. Buffering into `transform_observations` (one entry
-/// per call, mirroring what used to be recorded immediately) and flushing
-/// only once, after the winning attempt's transaction actually commits
-/// (`flush_apply_metrics`, called from `drain_once`/`drain_many` right after
-/// their own `txn.commit().await?`), fixes both the double-counting and the
-/// secondary issue of latency being measured against a pre-commit
+/// numbers matter most. So this buffers into `transform_observations` (one
+/// entry per call) and flushes only once, after the winning attempt's
+/// transaction actually commits (`flush_apply_metrics`, called from
+/// `drain_once`/`drain_many` right after their own `txn.commit().await?`).
+/// That also measures latency against the commit, not a pre-commit
 /// timestamp: `flush_apply_metrics` samples `SystemTime::now()` itself, at
 /// commit time, rather than reusing whatever this function would have
 /// sampled during planning.
@@ -2517,10 +2516,9 @@ pub struct ApplyPlan {
     /// The terminal-transform-only counterpart to `transform_observations`,
     /// above: `end_to_end_origins` (the accumulator `compute` builds while
     /// evaluating every source) filtered down, once each target's
-    /// downstream readers are known, to only the targets with no downstream reader of their own —
-    /// mirroring exactly what `compute` used to flush directly into
-    /// [`crate::metrics::record_end_to_end_latency`] at the end of its
-    /// per-target loop. Buffered for the same retry-safety reason.
+    /// downstream readers are known, to only the targets with no downstream reader of their own,
+    /// for [`crate::metrics::record_end_to_end_latency`]. Buffered for the
+    /// same retry-safety reason.
     end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>>,
 }
 
@@ -3515,10 +3513,10 @@ pub(super) fn pk_keyset_col(i: usize) -> String {
 /// column (so the whole keyset costs `pk.len()` bind parameters regardless of
 /// how many keys it carries, well under Postgres's bind cap). The multi-
 /// column match [`apply_target`] needs once a composite (arity > 1) primary
-/// key means a plain `= any($1::text[]::cast[])` no longer identifies a row
-/// on its own — arity 1 keeps that simpler, pre-existing form
+/// key means a plain `= any($1::text[]::cast[])` doesn't identify a row
+/// on its own — arity 1 keeps that simpler form
 /// instead (see [`apply_target`]'s own arity branch). A column recompute
-/// used it at every arity, since joining on the target's own
+/// uses it at every arity, since joining on the target's own
 /// key columns is what lets its write-back use the index.
 pub(super) fn pk_keyset_unnest(pk: &[PrimaryKeyColumn], start: usize) -> String {
     let arrays: Vec<String> = pk
@@ -4208,8 +4206,7 @@ async fn apply_target(
         // The composite key's own canonical identity text —
         // what this statement's `RETURNING` reports as each written row's
         // key, matching `ddl::pk_key_sql_expr`'s row-identity encoding at any
-        // arity (a bare `{col}::text` at arity 1, byte-identical to before
-        // this issue) so a downstream chained definition's live re-fetch
+        // arity (a bare `{col}::text` at arity 1) so a downstream chained definition's live re-fetch
         // parses it back the same way.
         let returning_pk_expr = ddl::pk_key_sql_expr(&plan.pk, None);
 
@@ -4282,15 +4279,11 @@ async fn apply_target(
     // A key can appear in both `plan.writes` and `plan.deletes` (e.g. two
     // differently-qualified `src_table` spellings folding to the same
     // catalog source and disagreeing on whether the row is still live —
-    // see `compute`'s per-change write/delete dispatch). The old
-    // single-CTE-statement form of this function got "the write wins"
-    // for free from Postgres's rule that every data-modifying CTE in one
-    // WITH sees the same pre-statement snapshot, so a delete could never
-    // remove a row its sibling CTE had just inserted. Splitting the write
-    // and delete into separate sequential statements (above/below) loses
-    // that guarantee — the delete would now run against a snapshot that
-    // already includes the write — so it's restored explicitly here
-    // instead: never delete a key this same call just wrote. Compared as
+    // see `compute`'s per-change write/delete dispatch), and the write
+    // wins. The write and the delete are separate sequential statements
+    // (above/below), so the delete runs against a snapshot that already
+    // includes the write; this enforces "the write wins" explicitly: never
+    // delete a key this same call just wrote. Compared as
     // decoded keys, encoded to one canonical text
     // so a composite key compares as a whole tuple, not accidentally by its
     // first column alone, and a `NULL` part as itself.
@@ -4516,9 +4509,8 @@ pub async fn apply_and_mark_drained(
 /// computed once over every coalesced segment's *merged* folded changes
 /// ([`super::fold::merge_folded_changes`]), so steps 1-4 below (version
 /// fence, truncate clears, ordered writes, downstream propagation) already
-/// run exactly once for the whole batch — that sharing *is* the milestone's
-/// win, collapsing what used to be one such pass per sealed segment into
-/// one pass for however many sealed segments this call coalesces. Only step
+/// run exactly once for the whole batch: one pass for however many sealed
+/// segments this call coalesces, not one per sealed segment. Only step
 /// 5 (completion) is inherently per-segment: each `seg_seq` in `seg_seqs`
 /// has its own `seg_claims` rows and its own `drained_mask`, so "this
 /// claim's buckets are drained" must still be recorded once per segment,
@@ -4700,8 +4692,8 @@ pub(crate) async fn apply_page(
     // seam, so it propagates).
     for clear in plan.aggregate_clears.values() {
         // A group-basis target's truncate empties its hidden table and
-        // raises its truncate floor (the D split's Q6), then clears its
-        // groups.
+        // raises its truncate floor to the truncate's ring `lsn`, then
+        // clears its groups.
         match &clear.state {
             AggregateState::GroupBasis { hidden } => {
                 super::group_basis::truncate_groups(
@@ -5320,8 +5312,8 @@ pub async fn drain_many(
 /// `drain_batch_cap` folded records at a time.
 ///
 /// **Phase 1, the claim**, is `CLAIM_SQL` per segment and a commit, nothing
-/// else. The fold used to share the claim's transaction, so every peer's
-/// `CLAIM_SQL` queued on the uncommitted `sealed -> draining` flip and
+/// else. A fold sharing the claim's transaction would make every peer's
+/// `CLAIM_SQL` queue on the uncommitted `sealed -> draining` flip and
 /// `seg_claims` rows for the whole fold. The fenced window is immutable
 /// once fenced, so the fold needs no shared snapshot with the claim.
 ///
@@ -5456,10 +5448,9 @@ async fn drain_segments(
             // yet (seal phase 1 done, phase 2 not): `CLAIM_SQL`'s `sealed ->
             // draining` flip would then commit, and phase 2 (and the stuck-seal
             // recovery) only ever fence a segment still `sealed`, so it would
-            // stay unfenced, and undrainable, for good. The fold used to share
-            // this transaction and fail on the missing fence, rolling the flip
-            // back; now the claim commits first, so the check comes first. A
-            // fence only ever goes from absent to present, so a segment fenced
+            // stay unfenced, and undrainable, for good. The claim commits
+            // before the fold reads the window, so this check comes before
+            // the flip. A fence only ever goes from absent to present, so a segment fenced
             // here stays fenced.
             let fenced: bool = txn
                 .query_one(

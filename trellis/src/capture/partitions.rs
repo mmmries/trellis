@@ -37,8 +37,8 @@
 //! checked is per process), and every pass while the source is recorded as
 //! non-compliant. It reads the tree, then
 //!
-//! 1. pauses every reader the source no longer complies for (the P1 checks:
-//!    [`PartitionTree::refusal`]), recording why in `capture_failure`; a
+//! 1. pauses every reader the source no longer complies for (the compliance
+//!    checks, [`PartitionTree::refusal`]), recording why in `capture_failure`; a
 //!    `RESUME` refuses until it complies, and rebuilds;
 //! 2. classifies each node against the recorded ones ([`plan`]): created,
 //!    attached or re-attached (a new `pg_inherits.xmin`, parent or bound),
@@ -74,8 +74,8 @@
 //!
 //! A leaf or middle `TRUNCATE` is no catalog change: the node's truncate
 //! trigger stages a `node_truncate` marker, and the seal, not the pass,
-//! queues its [`Kind::Truncated`] correction (ADR-0017 P5,
-//! `staging::seal::seal_phase2`).
+//! queues its [`Kind::Truncated`] correction (`staging::seal::seal_phase2`;
+//! ADR-0017, "A leaf or middle `TRUNCATE` queues that node's correction").
 //!
 //! # A renamed root
 //!
@@ -221,8 +221,9 @@ pub enum Kind {
     GoneNode,
     /// Correct the groups that route to this node by its recorded constraint
     /// text and the groups of its current rows: a `TRUNCATE` emptied it
-    /// (ADR-0017 P5). The seal queues it from the node's `node_truncate`
-    /// ring marker (`staging::seal`), not the pass, and only when no
+    /// (ADR-0017, "A leaf or middle `TRUNCATE` queues that node's
+    /// correction"). The seal queues it from the node's `node_truncate` ring
+    /// marker (`staging::seal`), not the pass, and only when no
     /// unstarted `new_leaf` or `truncated` correction of the node is queued:
     /// one that has started may have walked past the rows the truncate
     /// removed.
@@ -425,7 +426,9 @@ pub fn plan(prev: Option<&Recorded>, live: &Recorded, renamed: bool) -> Plan {
     Plan { corrections, fetch }
 }
 
-/// What the recorded state says happened to the database (ADR-0017 P8).
+/// What the recorded state says happened to the database (ADR-0017,
+/// "`pg_upgrade` re-baselines the recorded state; a restore pauses for a
+/// rebuild").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterChange {
     /// The catalog oid and the identifier are the ones recorded (or no
@@ -558,7 +561,7 @@ pub fn live_from(
 }
 
 /// The readers of `table` the tree no longer complies for, each with the
-/// first reason (the P1 checks, [`PartitionTree::refusal`]): an aggregate
+/// first reason (the compliance checks, [`PartitionTree::refusal`]): an aggregate
 /// whose `GROUP BY` lacks a partition-key column, a `JOIN` side whose
 /// `GROUP BY` and join key lack one, or a 1-1 transform's `FROM`. A
 /// definition already paused counts too: one the pass paused for this tree
@@ -1359,7 +1362,8 @@ pub(crate) async fn forget_except(
     Ok(())
 }
 
-/// One queued correction, as the correction engine (P4) reads it.
+/// One queued correction, as the correction engine
+/// (`staging::partition_correction`) reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingCorrection {
     pub id: i64,

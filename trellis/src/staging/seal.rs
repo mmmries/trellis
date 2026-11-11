@@ -231,10 +231,9 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
 /// alongside `fence_snapshot`:
 ///
 /// - Every row in that window committed before `S_k` was taken, so the count
-///   is final. Counting the slot at the flip, as phase 1 once did, missed a
-///   straddler that resolved the slot before the flip and committed after it,
-///   including one committing a truncate. It also never looked at the
-///   predecessor half, where a straddler still open at `S_{k-1}` lands.
+///   is final. Counting the slot at the flip would miss a straddler that
+///   resolved the slot before the flip and committed after it, including one
+///   committing a truncate, and would never look at the predecessor half, where a straddler still open at `S_{k-1}` lands.
 /// - The truncate barrier (`truncate-propagation-spec.md`) needs
 ///   `has_truncate` on every batch whose window holds a truncate row, and
 ///   such a batch seals single-bucket so one claimant runs the clear and the
@@ -314,7 +313,7 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
 ///
 /// The same statement queues a `truncated` partition correction
 /// (`capture::partitions::Kind::Truncated`) for each node a
-/// `node_truncate` marker in the window names (ADR-0017 P5; see
+/// `node_truncate` marker in the window names (see
 /// `capture::sql::NODE_TRUNCATE_OP`), gated on the publishing `update` like
 /// the notify, so each marker is read once. It adds none for a node with an
 /// unstarted `new_leaf` or `truncated` correction queued, which re-derives
