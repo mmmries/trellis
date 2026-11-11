@@ -29,6 +29,15 @@ default-members = [
 edition = "2024"
 rust-version = "1.98.0"
 
+# Line tables only: panic backtraces still show file:line for every frame, but
+# there is no variable-level debug info for a debugger. Each integration test
+# under trellis/tests/ statically links the whole engine, so full debug info
+# made every test executable ~200 MB. CI gets the same setting from here. To
+# step through a test in a debugger, override it for one build:
+# `CARGO_PROFILE_DEV_DEBUG=full cargo test ...`.
+[profile.dev]
+debug = "line-tables-only"
+
 # Dependencies build with light optimisation: a slightly faster test run for
 # a small clean-build cost. Workspace crates stay at opt-level 0.
 [profile.dev.package."*"]
