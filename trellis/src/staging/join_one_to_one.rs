@@ -2109,8 +2109,8 @@ async fn check_held_keys(
     };
     // Test-only: a key that moves on every attempt. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
-    if side == Side::From && super::interleave::take_forced_join_key_move() {
-        super::interleave::note_join_key_moved();
+    if side == Side::From && super::interleave::take_forced_join_key_move(txn).await? {
+        super::interleave::note_join_key_moved(txn).await;
         return Err(ApplyError::JoinKeyMoved {
             target: shape.target.clone(),
         });
@@ -2126,7 +2126,7 @@ async fn check_held_keys(
             .any(|key| key_moved(shape, side, key, k, fan_k))
     {
         #[cfg(any(test, feature = "test-util"))]
-        super::interleave::note_join_key_moved();
+        super::interleave::note_join_key_moved(txn).await;
         return Err(ApplyError::JoinKeyMoved {
             target: shape.target.clone(),
         });
@@ -2191,7 +2191,7 @@ async fn rederive_read(
     #[cfg(not(any(test, feature = "test-util")))]
     let unchecked = false;
     if !unchecked {
-        check_read_keys(shape, side, &read.rows, k)?;
+        check_read_keys(txn, shape, side, &read.rows, k).await?;
     }
     // Planted bug: the basis is a snapshot taken one statement after the
     // read. See `crate::plant`.
@@ -2225,12 +2225,16 @@ async fn rederive_read(
 /// Checks that the join key of each live row of `side` a Re-derive read is
 /// in `k`. Define gives each `ON` pair one type and collation, so a `b`
 /// column's text is the text its `J` key has.
-fn check_read_keys(
+async fn check_read_keys(
+    txn: &Transaction<'_>,
     shape: &JoinShape,
     side: Side,
     rows: &HashMap<String, String>,
     (k, fan_k): (&PageKeys, &PageKeys),
 ) -> Result<(), ApplyError> {
+    // Read only to count a move, under test (`super::interleave`).
+    #[cfg(not(any(test, feature = "test-util")))]
+    let _ = txn;
     let names = shape.side_key(side);
     for doc in rows.values() {
         let value: serde_json::Value =
@@ -2243,7 +2247,7 @@ fn check_read_keys(
             .collect();
         if key_moved(shape, side, &key, k, fan_k) {
             #[cfg(any(test, feature = "test-util"))]
-            super::interleave::note_join_key_moved();
+            super::interleave::note_join_key_moved(txn).await;
             return Err(ApplyError::JoinKeyMoved {
                 target: shape.target.clone(),
             });

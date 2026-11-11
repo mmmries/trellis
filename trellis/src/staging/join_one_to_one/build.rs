@@ -510,7 +510,7 @@ async fn insert_from_read(
             .any(|row| chunk_moved_key(shape, &key_parts(row, 1, arity), k))
     {
         #[cfg(any(test, feature = "test-util"))]
-        super::super::interleave::note_join_key_moved();
+        super::super::interleave::note_join_key_moved(txn).await;
         return Err(ApplyError::JoinKeyMoved {
             target: shape.target.clone(),
         });

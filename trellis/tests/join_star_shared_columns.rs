@@ -78,7 +78,6 @@ async fn assert_matches(d: &Driver, kinds: [&str; 2], case: &str) {
 /// and by `self_check`, under every kind pair.
 #[tokio::test]
 async fn a_star_joining_two_positions_on_one_root_column_applies_root_deletes_and_moves() {
-    let _serial = star::serial().await;
     for kinds in [
         ["LEFT", "LEFT"],
         ["LEFT", "INNER"],

@@ -69,7 +69,6 @@ fn joined_total(x: i32, w: i32) -> Option<i32> {
 /// (`join1_snapshot_after_read`, `join1_m_before_j`).
 #[tokio::test]
 async fn r_joined_rederives_race_changes_of_either_side() {
-    let _serial = star::serial().await;
     const B1: Writer = Writer::Rederive("public.b2", &["1"]);
     for (first, second) in [
         (
@@ -101,7 +100,6 @@ async fn r_joined_rederives_race_changes_of_either_side() {
 /// fan-out then reaches the new `a` row. Planted `join1_brd_no_key`.
 #[tokio::test]
 async fn r18_a_joined_rederive_whose_row_moved_onto_a_held_key_retries() {
-    let _serial = star::serial().await;
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         let target = star.target();
@@ -109,7 +107,7 @@ async fn r18_a_joined_rederive_whose_row_moved_onto_a_held_key_retries() {
         let rederive = d.seal().await;
         star::write(&d, &AT.sql("insert into {a_ins} values (5, 30, 5, 'five')")).await;
         let insert = d.seal().await;
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let mut page = d
             .drain_frozen(
                 rederive,
@@ -133,7 +131,7 @@ async fn r18_a_joined_rederive_whose_row_moved_onto_a_held_key_retries() {
         if let Err(err) = &result {
             panic!("{name}: the Re-derive page failed: {err}");
         }
-        let retried = trellis::dev::interleave::join_key_moves() - moves;
+        let retried = d.join_key_moves() - moves;
         star::assert_oracle(&mut d, &[star]).await;
         assert!(
             blocked,
@@ -152,7 +150,6 @@ async fn r18_a_joined_rederive_whose_row_moved_onto_a_held_key_retries() {
 /// drained after the Re-derive, applies and fans out.
 #[tokio::test]
 async fn a_joined_change_between_a_joined_rederives_read_and_its_snapshot_is_applied() {
-    let _serial = star::serial().await;
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         let label = star::m_label(&d, star, AT.at).await;
@@ -181,7 +178,6 @@ async fn a_joined_change_between_a_joined_rederives_read_and_its_snapshot_is_app
 /// fan-out keeps the re-derived `w`.
 #[tokio::test]
 async fn r17_a_stale_joined_apply_after_a_joined_rederive_is_refused() {
-    let _serial = star::serial().await;
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         star::write(&d, &AT.sql("update {b} set w = 110 where id = 1")).await;
@@ -205,7 +201,6 @@ async fn r17_a_stale_joined_apply_after_a_joined_rederive_is_refused() {
 /// row there, and its fan-out then finds that row.
 #[tokio::test]
 async fn f4_a_joined_row_moving_off_a_key_locks_the_key_it_leaves() {
-    let _serial = star::serial().await;
     star::family(
         AT,
         A_ROWS,
@@ -221,7 +216,6 @@ async fn f4_a_joined_row_moving_off_a_key_locks_the_key_it_leaves() {
 /// queues on it (`join1_no_j_lock`).
 #[tokio::test]
 async fn f7b_two_hand_off_pages_of_the_joined_table_race() {
-    let _serial = star::serial().await;
     star::family_seeded_at(
         AT,
         A_ROWS,
@@ -236,7 +230,6 @@ async fn f7b_two_hand_off_pages_of_the_joined_table_race() {
 /// newer one is refused by its `M` entry's applied position.
 #[tokio::test]
 async fn an_older_joined_apply_after_a_newer_one_is_refused() {
-    let _serial = star::serial().await;
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         star::write(&d, &AT.sql("update {b} set w = 101 where id = 1")).await;
@@ -256,7 +249,6 @@ async fn an_older_joined_apply_after_a_newer_one_is_refused() {
 /// overwriting it, and is then refused by I2.
 #[tokio::test]
 async fn f15_a_new_joined_rows_insert_and_update_applied_out_of_order() {
-    let _serial = star::serial().await;
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         let label = star::m_label(&d, star, AT.at).await;

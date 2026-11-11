@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
-use trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows;
 use trellis::integer::IntWidth;
 use trellis::staging::ApplyError;
 use trellis::staging::interleave::PausePoint;
@@ -34,9 +33,6 @@ const DDL: &str = "create table public.a (id integer primary key, k integer, x i
 /// The fan-out chunk these tests run with: key 10 holds exactly this many
 /// `a` rows, so its page recomputes them all.
 const CAP: i64 = 25;
-
-/// The fan-out chunk is process-wide, so these tests run one at a time.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
@@ -73,13 +69,12 @@ impl Kind {
 /// `kind` over `CAP` rows of `a` on key 10, one on key 20, and `b` rows on
 /// both keys, built and live, with the fan-out chunk at `CAP`.
 async fn start(kind: Kind) -> Driver {
-    set_one_to_one_join_fan_out_chunk_rows(CAP as usize);
     let seed = format!(
         "insert into public.a select i, 10, i from generate_series(1, {CAP}) i; \
          insert into public.a values (100, 20, 100); \
          insert into public.b values (1, 10, 100), (2, 20, 200)"
     );
-    Driver::start(
+    let d = Driver::start(
         &format!("{DDL}; {seed}"),
         &[("k", int4()), ("x", int4())],
         &[&format!(
@@ -90,16 +85,9 @@ async fn start(kind: Kind) -> Driver {
         )],
         &["public.a", "public.b"],
     )
-    .await
-}
-
-/// The chunk is a process-wide setting: every test puts it back.
-struct CapGuard;
-
-impl Drop for CapGuard {
-    fn drop(&mut self) {
-        set_one_to_one_join_fan_out_chunk_rows(0);
-    }
+    .await;
+    d.set_fan_out_chunk_rows(CAP as usize);
+    d
 }
 
 async fn write(d: &Driver, sql: &str) {
@@ -201,8 +189,6 @@ async fn backend_xid(d: &Driver, pid: i32) -> String {
 /// writes committed, and the target is exact.
 #[tokio::test]
 async fn a_fan_out_that_outlives_its_claim_is_applied_once_by_the_next_instance() {
-    let _serial = SERIAL.lock().await;
-    let _cap = CapGuard;
     for kind in KINDS {
         let mut d = start(kind).await;
         write(&d, "update public.b set w = 500 where id = 1").await;
@@ -285,8 +271,6 @@ async fn a_fan_out_that_outlives_its_claim_is_applied_once_by_the_next_instance(
 /// waits (bounded) for exactly that.
 #[tokio::test]
 async fn a_fan_out_whose_heartbeat_is_alive_keeps_its_claim_from_the_next_instance() {
-    let _serial = SERIAL.lock().await;
-    let _cap = CapGuard;
     for kind in KINDS {
         let mut d = start(kind).await;
         write(&d, "update public.b set w = 500 where id = 1").await;

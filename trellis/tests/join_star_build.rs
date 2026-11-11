@@ -236,7 +236,6 @@ async fn step_behind_frozen_page(
 /// commits.
 #[tokio::test]
 async fn ppc_a_page_at_position_2_on_a_chunks_key_queues_behind_the_chunk() {
-    let _serial = star::serial().await;
     for star in N3.stars() {
         let mut d = star::start_unbuilt(&[star], A_ROWS, B_ROWS).await;
         assert_eq!(
@@ -268,7 +267,6 @@ async fn ppc_a_page_at_position_2_on_a_chunks_key_queues_behind_the_chunk() {
 /// short lock timeout, gives up and retries.
 #[tokio::test]
 async fn ppc_a_chunk_on_a_pages_key_at_position_2_gives_up_and_retries() {
-    let _serial = star::serial().await;
     for star in N3.stars() {
         let mut d = star::start_unbuilt(&[star], A_ROWS, B_ROWS).await;
         assert_eq!(
@@ -322,7 +320,7 @@ async fn c10_insert_from_read(shape: Shape) {
         star::write(&d, &shape.sql("insert into {b} values (7, 70, 700, 'k7')")).await;
         let insert = d.seal().await;
         let target = star.target();
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let mut chunk = d
             .run_frozen(
                 &[
@@ -344,7 +342,7 @@ async fn c10_insert_from_read(shape: Shape) {
         chunk.finish_result().await.expect("the chunk's build step");
         if frozen.is_none() {
             assert!(
-                trellis::dev::interleave::join_key_moves() > moves,
+                d.join_key_moves() > moves,
                 "{}: the chunk rolled back on the moved key",
                 star.name()
             );
@@ -360,7 +358,6 @@ async fn c10_insert_from_read(shape: Shape) {
 /// (and `join1_chunk_no_key`, at any position), the target keeps no match.
 #[tokio::test]
 async fn ps6a_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_at_the_last_position_retries() {
-    let _serial = star::serial().await;
     c10_insert_from_read(N3).await;
 }
 
@@ -368,7 +365,6 @@ async fn ps6a_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_at_the_last_pos
 /// `star_chunk_skip_j_first`.
 #[tokio::test]
 async fn ps6b_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_at_the_first_position_retries() {
-    let _serial = star::serial().await;
     c10_insert_from_read(N3_FIRST).await;
 }
 
@@ -380,7 +376,6 @@ async fn ps6b_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_at_the_first_po
 /// the `b2` insert's page on 70 fans out around it.
 #[tokio::test]
 async fn ppc_c10_a_chunk_whose_rederived_row_moved_at_position_2_retries() {
-    let _serial = star::serial().await;
     for star in N3.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         rebuild_planned(&mut d).await;
@@ -389,7 +384,7 @@ async fn ppc_c10_a_chunk_whose_rederived_row_moved_at_position_2_retries() {
         star::write(&d, "insert into public.b2 values (7, 70, 700, 'k7')").await;
         let insert = d.seal().await;
         let target = star.target();
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let mut chunk = d
             .run_frozen(
                 &[
@@ -410,7 +405,7 @@ async fn ppc_c10_a_chunk_whose_rederived_row_moved_at_position_2_retries() {
         chunk.finish_result().await.expect("the chunk's build step");
         if frozen.is_none() {
             assert!(
-                trellis::dev::interleave::join_key_moves() > moves,
+                d.join_key_moves() > moves,
                 "{}: the chunk rolled back on the moved key",
                 star.name()
             );
@@ -431,7 +426,6 @@ async fn ppc_c10_a_chunk_whose_rederived_row_moved_at_position_2_retries() {
 /// entries on 70, the R-entry rule, and finds the entry moved.)
 #[tokio::test]
 async fn ppc_c10_a_chunk_whose_entry_moved_off_its_key_set_at_position_2_retries() {
-    let _serial = star::serial().await;
     for star in N3.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         rebuild_planned(&mut d).await;
@@ -444,7 +438,7 @@ async fn ppc_c10_a_chunk_whose_entry_moved_off_its_key_set_at_position_2_retries
         let insert = d.seal().await;
         star::write(&d, "update public.a set k2 = 10 where id = 1").await;
         let target = star.target();
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let mut chunk = d
             .run_frozen(
                 &[
@@ -486,7 +480,7 @@ async fn ppc_c10_a_chunk_whose_entry_moved_off_its_key_set_at_position_2_retries
         page.finish().await;
         if frozen.is_none() {
             assert!(
-                trellis::dev::interleave::join_key_moves() > moves,
+                d.join_key_moves() > moves,
                 "{}: the chunk rolled back on the moved entry",
                 star.name()
             );
@@ -506,7 +500,6 @@ async fn ppc_c10_a_chunk_whose_entry_moved_off_its_key_set_at_position_2_retries
 /// leaves them in the target.
 #[tokio::test]
 async fn px1_a_resume_removes_the_rows_of_a_rows_deleted_while_paused() {
-    let _serial = star::serial().await;
     for (case, sql) in [
         (
             "mixed",
@@ -534,7 +527,6 @@ async fn px1_a_resume_removes_the_rows_of_a_rows_deleted_while_paused() {
 /// re-inserted row is lost.
 #[tokio::test]
 async fn px2_a_row_reinserted_after_the_orphan_read_is_kept() {
-    let _serial = star::serial().await;
     for star in N3.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         change_while_paused(&mut d, &[star], "delete from public.a where id = 3").await;
@@ -575,7 +567,6 @@ async fn px2_a_row_reinserted_after_the_orphan_read_is_kept() {
 /// skips the walk of `M`, and row 2's entry stays live.
 #[tokio::test]
 async fn px3_the_m_pass_tombstones_the_m_entries_at_position_2_of_rows_gone_before_a_rebuild() {
-    let _serial = star::serial().await;
     for star in N3.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         star::write_uncaptured(
@@ -652,7 +643,6 @@ const N4_CHANGES: &str = "update public.a set k1 = 2, k2 = 3, k3 = 4 where id = 
 /// changes applied after it, each checked against the oracle.
 #[tokio::test]
 async fn an_n4_star_builds_resumes_and_rebuilds_with_rows_at_every_position() {
-    let _serial = star::serial().await;
     let shape = Shape::new(3, 1);
     let stars = shape.stars();
     let ddl = format!("{}; {N4_SEED}", shape.ddl());
@@ -770,7 +760,6 @@ async fn assert_producer(d: &Driver, kind: &str, step: &str) {
 /// group leave the target as it was.
 #[tokio::test]
 async fn a_row_keyed_by_null_at_position_2_is_read_by_its_m_pass() {
-    let _serial = star::serial().await;
     let int4 = ValueType::Integer(IntWidth::Int4);
     for (kind, word) in [("left", "LEFT"), ("inner", "INNER")] {
         let mut d = Driver::start(

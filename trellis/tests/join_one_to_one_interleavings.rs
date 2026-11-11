@@ -54,14 +54,6 @@ const DDL: &str = "create table public.a (id integer primary key, k integer, x i
                    create unique index on public.b (k); \
                    create index on public.a (k)";
 
-/// The retry counters and the forced key moves are process-wide
-/// (`trellis::dev::interleave`), so these tests run one at a time.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().await
-}
-
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
 }
@@ -231,7 +223,6 @@ const B_ROWS: &str = "(1, 10, 100, 'ten'), (2, 20, 200, 'twenty'), (3, 40, 400, 
 
 #[tokio::test]
 async fn the_build_fills_the_target_r_m_and_j_from_the_live_tables() {
-    let _serial = serial().await;
     let mut d = start(A_ROWS, B_ROWS).await;
     assert_oracle(&mut d, &KINDS).await;
     let left = d.rows(&Kind::Left.actual()).await;
@@ -257,7 +248,6 @@ async fn the_build_fills_the_target_r_m_and_j_from_the_live_tables() {
 
 #[tokio::test]
 async fn a_changes_insert_update_move_and_delete_rows() {
-    let _serial = serial().await;
     let mut d = start(A_ROWS, B_ROWS).await;
     // A new row on a matched key, one on an unmatched key, one with a NULL key.
     step(
@@ -284,7 +274,6 @@ async fn a_changes_insert_update_move_and_delete_rows() {
 
 #[tokio::test]
 async fn a_page_with_several_changes_to_one_row_applies_the_newest() {
-    let _serial = serial().await;
     let mut d = start(A_ROWS, B_ROWS).await;
     write(&d, "update public.a set k = 20, x = 50 where id = 1").await;
     write(&d, "update public.a set k = 10, x = 60 where id = 1").await;
@@ -342,13 +331,12 @@ impl BWriter {
 /// wrote keeps the old `w`.
 #[tokio::test]
 async fn an_a_page_holds_its_j_row_until_it_commits() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         let b = BWriter::start(&d, kind, 10, 999).await;
         write(&d, "insert into public.a values (5, 10, 5, 'five')").await;
         let batch = d.seal().await;
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let drain = d.drain_frozen(batch, "page", &[]).await;
         let blocked = queued_or_finished(&d, b.pid, &drain).await;
         b.commit().await;
@@ -365,13 +353,12 @@ async fn an_a_page_holds_its_j_row_until_it_commits() {
 /// (`join1_old_key_unlocked`): `R`'s held key is in the set.
 #[tokio::test]
 async fn a_row_moving_off_a_key_locks_the_key_it_leaves() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         let b = BWriter::start(&d, kind, 10, 555).await;
         write(&d, "update public.a set k = 20 where id = 1").await;
         let batch = d.seal().await;
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let drain = d.drain_frozen(batch, "page", &[]).await;
         let blocked = queued_or_finished(&d, b.pid, &drain).await;
         b.commit().await;
@@ -389,7 +376,6 @@ async fn a_row_moving_off_a_key_locks_the_key_it_leaves() {
 /// `b`-side writer holds the key the row moved to, so the retry queues on it.
 #[tokio::test]
 async fn a_key_that_moved_under_the_page_rolls_it_back_and_the_retry_locks_both() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         // Row 2 is on key 20. Two changes: 20 -> 40, then 40 -> 10.
@@ -397,7 +383,7 @@ async fn a_key_that_moved_under_the_page_rolls_it_back_and_the_retry_locks_both(
         let first = d.seal().await;
         write(&d, "update public.a set k = 10 where id = 2").await;
         let second = d.seal().await;
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         // The later change's page reads its key set while `R` still holds 20.
         let mut late = d
             .drain_frozen(
@@ -413,7 +399,7 @@ async fn a_key_that_moved_under_the_page_rolls_it_back_and_the_retry_locks_both(
         d.release(&mut late, PausePoint::BeforeJoin1Lock).await;
         d.wait_blocked_behind(b.pid).await;
         assert_eq!(
-            trellis::dev::interleave::join_key_moves(),
+            d.join_key_moves(),
             moves + 1,
             "the page rolled back once on the moved key"
         );
@@ -428,32 +414,31 @@ async fn a_key_that_moved_under_the_page_rolls_it_back_and_the_retry_locks_both(
 /// to a commit.
 #[tokio::test]
 async fn a_hot_moving_key_exhausts_the_budget_and_surfaces() {
-    let _serial = serial().await;
     let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
     write(&d, "update public.a set x = 77 where id = 1").await;
     let batch = d.seal().await;
-    let moves = trellis::dev::interleave::join_key_moves();
-    trellis::dev::interleave::force_join_key_moves(1_000);
+    let moves = d.join_key_moves();
+    d.force_join_key_moves(1_000);
     let result = d
         .drain_frozen(batch, "hot", &[])
         .await
         .finish_result()
         .await;
-    trellis::dev::interleave::force_join_key_moves(0);
+    d.force_join_key_moves(0);
     assert!(
         matches!(result, Err(ref e) if e.to_string().contains("join key")),
         "{result:?}"
     );
     assert_eq!(
-        trellis::dev::interleave::join_key_moves() - moves,
+        d.join_key_moves() - moves,
         21,
         "the budget is 20 retries after the first attempt"
     );
     // Three moves retry to a commit.
-    let moves = trellis::dev::interleave::join_key_moves();
-    trellis::dev::interleave::force_join_key_moves(3);
+    let moves = d.join_key_moves();
+    d.force_join_key_moves(3);
     d.drain(batch, "hot").await;
-    assert_eq!(trellis::dev::interleave::join_key_moves() - moves, 3);
+    assert_eq!(d.join_key_moves() - moves, 3);
     assert_oracle(&mut d, &[Kind::Left]).await;
 }
 
@@ -461,7 +446,6 @@ async fn a_hot_moving_key_exhausts_the_budget_and_surfaces() {
 /// orders them (`join1_no_entry_lock`, N2–N6).
 #[tokio::test]
 async fn n_two_pages_on_a_null_keyed_row_queue_on_its_entry() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         let label = r_label(&d, kind).await;
@@ -493,7 +477,6 @@ async fn n_two_pages_on_a_null_keyed_row_queue_on_its_entry() {
 /// after that page and after the other's.
 #[tokio::test]
 async fn r17_a_stale_apply_after_a_rederive_is_refused() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         write(&d, "update public.a set x = 11 where id = 1").await;
@@ -515,7 +498,6 @@ async fn r17_a_stale_apply_after_a_rederive_is_refused() {
 /// entry has no basis (`join1_vis_only`).
 #[tokio::test]
 async fn an_older_apply_after_a_newer_one_is_refused() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         write(&d, "update public.a set x = 11 where id = 1").await;
@@ -574,16 +556,15 @@ async fn write_uncaptured_on(d: &Driver, table: &str, sql: &str) {
 /// `J` lock, so it commits on its first attempt, and writes the row.
 #[tokio::test]
 async fn a_rederive_of_a_row_with_no_entry_commits_on_its_first_attempt() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         write_uncaptured(&d, "insert into public.a values (8, 10, 8, 'eight')").await;
         d.stage_recomputes("public.a", &["8"]).await;
         let batch = d.seal().await;
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         d.drain(batch, "rederive").await;
         assert_eq!(
-            trellis::dev::interleave::join_key_moves(),
+            d.join_key_moves(),
             moves,
             "no retry for a row the entry doesn't hold yet"
         );
@@ -596,7 +577,6 @@ async fn a_rederive_of_a_row_with_no_entry_commits_on_its_first_attempt() {
 /// that was deleted without it.
 #[tokio::test]
 async fn a_rederive_repairs_uncaptured_changes() {
-    let _serial = serial().await;
     let mut d = start(A_ROWS, B_ROWS).await;
     write_uncaptured(&d, "update public.a set x = 100, k = 20 where id = 1").await;
     write_uncaptured(&d, "delete from public.a where id = 2").await;
@@ -610,12 +590,11 @@ async fn a_rederive_repairs_uncaptured_changes() {
 /// key outside its locked set: it rolls back once and its retry commits.
 #[tokio::test]
 async fn a_rederive_whose_row_moved_keys_after_the_unlocked_read_retries() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         d.stage_recomputes("public.a", &["1"]).await;
         let batch = d.seal().await;
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let mut page = d
             .drain_frozen(
                 batch,
@@ -630,7 +609,7 @@ async fn a_rederive_whose_row_moved_keys_after_the_unlocked_read_retries() {
         d.release(&mut page, PausePoint::BeforeJoin1Lock).await;
         page.finish().await;
         assert_eq!(
-            trellis::dev::interleave::join_key_moves(),
+            d.join_key_moves(),
             moves + 1,
             "the Re-derive's read found a key it hadn't locked"
         );
@@ -643,7 +622,6 @@ async fn a_rederive_whose_row_moved_keys_after_the_unlocked_read_retries() {
 /// the build's read already saw must not put an older image over it.
 #[tokio::test]
 async fn a_page_that_predates_the_build_rederives() {
-    let _serial = serial().await;
     let ddl = format!(
         "{DDL}; insert into public.a values {A_ROWS}; insert into public.b values {B_ROWS}"
     );
@@ -674,7 +652,6 @@ async fn a_page_that_predates_the_build_rederives() {
 /// Re-derive, applies.
 #[tokio::test]
 async fn a_change_between_a_rederives_read_and_its_snapshot_is_applied() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         d.stage_recomputes("public.a", &["1"]).await;
@@ -702,7 +679,6 @@ async fn a_change_between_a_rederives_read_and_its_snapshot_is_applied() {
 /// than overwriting it (`join1_no_placeholder`).
 #[tokio::test]
 async fn two_pages_on_a_new_row_queue_on_the_placeholder() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         let label = r_label(&d, kind).await;
@@ -729,7 +705,6 @@ async fn two_pages_on_a_new_row_queue_on_the_placeholder() {
 /// value a field cannot compute) and the page's other rows apply.
 #[tokio::test]
 async fn a_row_whose_field_overflows_is_isolated_and_the_rest_apply() {
-    let _serial = serial().await;
     let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
     write(
         &d,
@@ -769,7 +744,6 @@ async fn a_row_whose_field_overflows_is_isolated_and_the_rest_apply() {
 /// a `b` page would leave it.
 #[tokio::test]
 async fn the_newest_m_entry_on_a_key_is_the_applied_one() {
-    let _serial = serial().await;
     let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
     let id = definition_id(&d, Kind::Left.target()).await;
     let schema = trellis::config::DEFAULT_SCHEMA;
@@ -831,7 +805,7 @@ async fn ran_through<T>(
     result: Result<T, ApplyError>,
     moves: u64,
 ) -> ! {
-    let moved = trellis::dev::interleave::join_key_moves() - moves;
+    let moved = d.join_key_moves() - moves;
     if let Err(err) = result {
         panic!(
             "{kind:?}: the page ran without queueing on the other's lock and failed \
@@ -852,7 +826,7 @@ async fn race(d: &mut Driver, kind: Kind, first: i64, second: i64) {
         .drain_frozen(first, "first", &[(PausePoint::BeforeCommit, kind.target())])
         .await;
     let reached = held.reached(PausePoint::BeforeCommit).await;
-    let moves = trellis::dev::interleave::join_key_moves();
+    let moves = d.join_key_moves();
     let queued = d.drain_frozen(second, "second", &[]).await;
     let blocked = queued_or_finished(d, reached.backend_pid, &queued).await;
     d.release(&mut held, PausePoint::BeforeCommit).await;
@@ -903,7 +877,6 @@ async fn family_on(a_rows: &str, b_rows: &str, a_sql: &str, b_sql: &str) {
 /// key, a key to `NULL`, a delete and a re-insert.
 #[tokio::test]
 async fn b_changes_insert_update_move_and_delete_rows() {
-    let _serial = serial().await;
     let mut d = start(A_ROWS, B_ROWS).await;
     step(&mut d, "insert into public.a values (5, 10, 5, 'five')").await;
     for sql in [
@@ -927,7 +900,6 @@ async fn b_changes_insert_update_move_and_delete_rows() {
 /// fan-out covers the key the row left as well as the one it ends on.
 #[tokio::test]
 async fn a_page_with_several_changes_to_one_b_row_applies_the_newest() {
-    let _serial = serial().await;
     let mut d = start(A_ROWS, B_ROWS).await;
     write(&d, "update public.b set k = 30, w = 150 where id = 1").await;
     write(&d, "update public.b set k = 50, w = 160 where id = 1").await;
@@ -944,7 +916,6 @@ async fn a_page_with_several_changes_to_one_b_row_applies_the_newest() {
 /// sees it (`join1_m_before_j`, `join1_no_j_lock`).
 #[tokio::test]
 async fn f1_an_a_page_on_a_key_reads_m_only_after_the_b_page_on_it_commits() {
-    let _serial = serial().await;
     family(
         "insert into public.a values (5, 30, 5, 'five')",
         "insert into public.b values (4, 30, 300, 'thirty')",
@@ -955,7 +926,6 @@ async fn f1_an_a_page_on_a_key_reads_m_only_after_the_b_page_on_it_commits() {
 /// F2: an `a` insert ‖ the `b` delete of its key.
 #[tokio::test]
 async fn f2_an_a_insert_races_the_b_delete_of_its_key() {
-    let _serial = serial().await;
     family(
         "insert into public.a values (5, 10, 5, 'five')",
         "delete from public.b where id = 1",
@@ -966,7 +936,6 @@ async fn f2_an_a_insert_races_the_b_delete_of_its_key() {
 /// F3: an `a` key move `10 → 20` ‖ a `b` update of `20`.
 #[tokio::test]
 async fn f3_an_a_move_races_a_b_update_of_its_new_key() {
-    let _serial = serial().await;
     family(
         "update public.a set k = 20 where id = 1",
         "update public.b set w = 222 where id = 2",
@@ -977,7 +946,6 @@ async fn f3_an_a_move_races_a_b_update_of_its_new_key() {
 /// F4: an `a` key move `10 → 20` ‖ a `b` update of `10`, the key it leaves.
 #[tokio::test]
 async fn f4_an_a_move_races_a_b_update_of_the_key_it_leaves() {
-    let _serial = serial().await;
     family(
         "update public.a set k = 20 where id = 1",
         "update public.b set w = 111 where id = 1",
@@ -991,7 +959,6 @@ async fn f4_an_a_move_races_a_b_update_of_the_key_it_leaves() {
 /// row there, and its fan-out then finds that row.
 #[tokio::test]
 async fn f4_a_b_row_moving_off_a_key_locks_the_key_it_leaves() {
-    let _serial = serial().await;
     family(
         "insert into public.a values (5, 10, 5, 'five')",
         "update public.b set k = 50 where id = 1",
@@ -1002,7 +969,6 @@ async fn f4_a_b_row_moving_off_a_key_locks_the_key_it_leaves() {
 /// F5: an `a` delete ‖ a `b` update of its key.
 #[tokio::test]
 async fn f5_an_a_delete_races_a_b_update_of_its_key() {
-    let _serial = serial().await;
     family(
         "delete from public.a where id = 1",
         "update public.b set w = 111 where id = 1",
@@ -1017,7 +983,6 @@ async fn f5_an_a_delete_races_a_b_update_of_its_key() {
 /// recomputes the key again.
 #[tokio::test]
 async fn f7_a_b_hand_off_applied_out_of_order() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         write(&d, "update public.b set k = 60 where id = 1").await;
@@ -1037,7 +1002,6 @@ async fn f7_a_b_hand_off_applied_out_of_order() {
 /// the second queues on it.
 #[tokio::test]
 async fn f7b_two_hand_off_pages_race() {
-    let _serial = serial().await;
     for kind in KINDS {
         for take_first in [true, false] {
             let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
@@ -1059,7 +1023,6 @@ async fn f7b_two_hand_off_pages_race() {
 /// frozen at its commit holds `J[10]` and the other queues.
 #[tokio::test]
 async fn f13_a_fan_out_of_several_batches_races_an_a_move_onto_its_key() {
-    let _serial = serial().await;
     let a_rows = format!(
         "{A_ROWS}, {}",
         (100..25_100)
@@ -1083,7 +1046,6 @@ async fn f13_a_fan_out_of_several_batches_races_an_a_move_onto_its_key() {
 /// batch to `R`, the planner hashes the whole of `R` here, once per batch.
 #[tokio::test]
 async fn a_fan_out_batch_probes_r_by_its_key_and_never_scans_it_whole() {
-    let _serial = serial().await;
     let ddl = format!(
         "{DDL}; insert into public.a \
              select g, case when g <= 10000 then 10 else 20 + g % 50 end, g, 'many' \
@@ -1151,7 +1113,6 @@ async fn a_fan_out_batch_probes_r_by_its_key_and_never_scans_it_whole() {
 /// overwriting it (`join1_no_placeholder`), and is then refused by I2.
 #[tokio::test]
 async fn f15_a_new_b_rows_insert_and_update_applied_out_of_order() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         let label = m_label(&d, kind).await;
@@ -1177,7 +1138,6 @@ async fn f15_a_new_b_rows_insert_and_update_applied_out_of_order() {
 /// applied position (F12 on the `b` side, `join1_vis_only`).
 #[tokio::test]
 async fn an_older_b_apply_after_a_newer_one_is_refused() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         write(&d, "update public.b set w = 101 where id = 1").await;
@@ -1197,7 +1157,6 @@ async fn an_older_b_apply_after_a_newer_one_is_refused() {
 /// pages, the `b` change drained before the `a` change and after it.
 #[tokio::test]
 async fn m_a_mixed_page_applies_an_a_move_and_the_b_change_of_its_new_key() {
-    let _serial = serial().await;
     let a_change = "update public.a set k = 20 where id = 1";
     let b_change = "update public.b set w = 250 where id = 2";
     let mut d = start(A_ROWS, B_ROWS).await;
@@ -1230,7 +1189,6 @@ async fn m_a_mixed_page_applies_an_a_move_and_the_b_change_of_its_new_key() {
 /// neither deadlocks, in either order.
 #[tokio::test]
 async fn m_two_crossing_mixed_pages_queue_on_j_without_deadlock() {
-    let _serial = serial().await;
     for other_a in [
         "update public.a set k = 10 where id = 2",
         "update public.a set k = 10 where id = 3",
@@ -1258,7 +1216,6 @@ async fn m_two_crossing_mixed_pages_queue_on_j_without_deadlock() {
 /// page of `a` changes on the key it leaves.
 #[tokio::test]
 async fn m_a_mixed_page_races_pages_of_either_side() {
-    let _serial = serial().await;
     for kind in KINDS {
         for (other, a_first) in [
             ("update public.b set w = 222 where id = 2", true),
@@ -1302,7 +1259,6 @@ async fn paused_reason(d: &Driver, kind: Kind) -> (String, Option<String>) {
 /// insert onto a `NULL` key and one onto a key no `a` row has.
 #[tokio::test]
 async fn a_b_rederive_repairs_uncaptured_changes() {
-    let _serial = serial().await;
     let mut d = start(A_ROWS, B_ROWS).await;
     for sql in [
         "update public.b set w = 150 where id = 1",
@@ -1325,7 +1281,6 @@ async fn a_b_rederive_repairs_uncaptured_changes() {
 /// `a` row on the key.
 #[tokio::test]
 async fn a_b_rederive_of_a_row_with_no_entry_commits_on_its_first_attempt() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         write_uncaptured_on(
@@ -1336,10 +1291,10 @@ async fn a_b_rederive_of_a_row_with_no_entry_commits_on_its_first_attempt() {
         .await;
         d.stage_recomputes("public.b", &["4"]).await;
         let batch = d.seal().await;
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         d.drain(batch, "rederive b").await;
         assert_eq!(
-            trellis::dev::interleave::join_key_moves(),
+            d.join_key_moves(),
             moves,
             "no retry for a row the entry doesn't hold yet"
         );
@@ -1353,7 +1308,6 @@ async fn a_b_rederive_of_a_row_with_no_entry_commits_on_its_first_attempt() {
 /// move and a delete.
 #[tokio::test]
 async fn a_b_page_that_predates_the_build_rederives() {
-    let _serial = serial().await;
     let ddl = format!(
         "{DDL}; insert into public.a values {A_ROWS}; insert into public.b values {B_ROWS}"
     );
@@ -1388,14 +1342,13 @@ async fn a_b_page_that_predates_the_build_rederives() {
 /// on 30 without the lock, around the `a` row, which keeps no match.
 #[tokio::test]
 async fn r18_a_b_rederive_whose_row_moved_onto_a_held_key_retries() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         d.stage_recomputes("public.b", &["1"]).await;
         let rederive = d.seal().await;
         write(&d, "insert into public.a values (5, 30, 5, 'five')").await;
         let insert = d.seal().await;
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let mut page = d
             .drain_frozen(
                 rederive,
@@ -1421,7 +1374,7 @@ async fn r18_a_b_rederive_whose_row_moved_onto_a_held_key_retries() {
         }
         result.expect("the Re-derive page");
         assert_eq!(
-            trellis::dev::interleave::join_key_moves(),
+            d.join_key_moves(),
             moves + 1,
             "the Re-derive's read found a key it hadn't locked"
         );
@@ -1436,14 +1389,13 @@ async fn r18_a_b_rederive_whose_row_moved_onto_a_held_key_retries() {
 /// lock, from `M` as it was before the `b` page.
 #[tokio::test]
 async fn r19_an_a_rederive_whose_row_moved_onto_a_held_key_retries() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         d.stage_recomputes("public.a", &["1"]).await;
         let rederive = d.seal().await;
         write(&d, "insert into public.b values (4, 30, 300, 'thirty')").await;
         let insert = d.seal().await;
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let mut page = d
             .drain_frozen(
                 rederive,
@@ -1467,7 +1419,7 @@ async fn r19_an_a_rederive_whose_row_moved_onto_a_held_key_retries() {
         }
         result.expect("the Re-derive page");
         assert_eq!(
-            trellis::dev::interleave::join_key_moves(),
+            d.join_key_moves(),
             moves + 1,
             "the Re-derive's read found a key it hadn't locked"
         );
@@ -1482,7 +1434,6 @@ async fn r19_an_a_rederive_whose_row_moved_onto_a_held_key_retries() {
 /// Re-derive, applies and fans out.
 #[tokio::test]
 async fn a_b_change_between_a_b_rederives_read_and_its_snapshot_is_applied() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         let label = m_label(&d, kind).await;
@@ -1514,7 +1465,6 @@ async fn a_b_change_between_a_b_rederives_read_and_its_snapshot_is_applied() {
 /// change is refused, its row being in `M` already.
 #[tokio::test]
 async fn changes_between_the_two_reads_of_a_page_rederiving_both_sides_apply() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         d.stage_recomputes("public.a", &["1"]).await;
@@ -1554,7 +1504,6 @@ async fn changes_between_the_two_reads_of_a_page_rederiving_both_sides_apply() {
 /// the upsert leaves each row whose fields are unchanged as it is.
 #[tokio::test]
 async fn a_rederive_that_changes_nothing_writes_no_target_row() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         let versions = format!("select id, xmin::text from {} order by id", kind.target());
@@ -1573,7 +1522,6 @@ async fn a_rederive_that_changes_nothing_writes_no_target_row() {
 /// (`join1_lsn_only`) and the fan-out keeps the re-derived `w`.
 #[tokio::test]
 async fn r17_a_stale_b_apply_after_a_b_rederive_is_refused() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         write(&d, "update public.b set w = 110 where id = 1").await;
@@ -1636,7 +1584,6 @@ async fn rederive_family(first: Writer, second: Writer) {
 /// target is the live join whichever page commits first.
 #[tokio::test]
 async fn r_rederives_race_changes_of_either_side() {
-    let _serial = serial().await;
     const B1: Writer = Writer::Rederive("public.b", &["1"]);
     const A1: Writer = Writer::Rederive("public.a", &["1"]);
     for (first, second) in [
@@ -1689,7 +1636,6 @@ async fn r_rederives_race_changes_of_either_side() {
 /// a `NULL` key.
 #[tokio::test]
 async fn n_a_rederive_and_an_apply_of_a_null_keyed_row_queue_on_its_entry() {
-    let _serial = serial().await;
     for kind in KINDS {
         for (table, change) in [
             ("public.a", "update public.a set x = 44 where id = 4"),
@@ -1718,7 +1664,7 @@ async fn n_a_rederive_and_an_apply_of_a_null_keyed_row_queue_on_its_entry() {
             let reached = page.reached(PausePoint::AfterRederiveRead).await;
             write(&d, change).await;
             let batch = d.seal().await;
-            let moves = trellis::dev::interleave::join_key_moves();
+            let moves = d.join_key_moves();
             let apply = d.drain_frozen(batch, "apply", &[]).await;
             let blocked = queued_or_finished(&d, reached.backend_pid, &apply).await;
             d.release(&mut page, PausePoint::AfterRederiveRead).await;
@@ -1737,7 +1683,6 @@ async fn n_a_rederive_and_an_apply_of_a_null_keyed_row_queue_on_its_entry() {
 /// (changes capture never saw), and re-derive a row that stays on one.
 #[tokio::test]
 async fn n_rederives_move_rows_onto_and_off_a_null_key() {
-    let _serial = serial().await;
     let mut d = start(A_ROWS, &format!("{B_ROWS}, (4, null, 4000, 'none')")).await;
     write_uncaptured(&d, "update public.a set k = 10 where id = 4").await;
     write_uncaptured(&d, "update public.a set k = null where id = 2").await;
@@ -1765,7 +1710,6 @@ async fn n_rederives_move_rows_onto_and_off_a_null_key() {
 /// `Recompute`) reads the target live.
 #[tokio::test]
 async fn a_chained_b_side_applies_the_seams_images() {
-    let _serial = serial().await;
     let mut d = Driver::start(
         "create table public.a (id integer primary key, k integer, x integer); \
          create table public.bsrc (id integer primary key, w integer); \
@@ -1850,7 +1794,6 @@ async fn a_chained_b_side_applies_the_seams_images() {
 /// its text.
 #[tokio::test]
 async fn a_collated_text_key_applies_both_sides() {
-    let _serial = serial().await;
     let mut d = Driver::start(
         "create table public.c (id integer primary key, k text collate \"C\", x integer); \
          create table public.e (id integer primary key, k text collate \"C\", w integer); \
@@ -1897,7 +1840,6 @@ async fn a_collated_text_key_applies_both_sides() {
 /// changes capture never saw.
 #[tokio::test]
 async fn sides_keyed_differently_with_alias_named_columns_apply() {
-    let _serial = serial().await;
     // `Driver::rows` reads its rows as `r`, so the checks below name their
     // columns apart from it.
     let mut d = Driver::start(
@@ -2040,7 +1982,6 @@ async fn build_state(d: &Driver, kind: Kind) -> (String, i64) {
 /// and the rows inserted after it apply.
 #[tokio::test]
 async fn a_truncate_of_a_empties_r_and_the_target_and_later_inserts_apply() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         let id = definition_id(&d, kind.target()).await;
@@ -2100,7 +2041,6 @@ async fn a_truncate_of_a_empties_r_and_the_target_and_later_inserts_apply() {
 /// of the `a` rows that are gone, so the target stays empty.
 #[tokio::test]
 async fn a_truncate_of_a_empties_r_and_a_later_b_change_writes_nothing() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         step(&mut d, "truncate public.a").await;
@@ -2122,7 +2062,6 @@ async fn a_truncate_of_a_empties_r_and_a_later_b_change_writes_nothing() {
 /// `INNER` row is gone.
 #[tokio::test]
 async fn a_truncate_of_b_rebuilds_the_target() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         let id = definition_id(&d, kind.target()).await;
@@ -2188,7 +2127,6 @@ async fn a_truncate_of_b_rebuilds_the_target() {
 /// whose `b` row is gone has no `b` side.
 #[tokio::test]
 async fn a_truncate_of_b_empties_m_before_the_rebuild_runs() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         step(&mut d, "truncate public.b").await;
@@ -2210,7 +2148,6 @@ async fn a_truncate_of_b_empties_m_before_the_rebuild_runs() {
 /// `M` once the truncate's page has applied it, and the rebuild keeps it.
 #[tokio::test]
 async fn a_truncate_of_b_and_a_later_insert_in_one_transaction() {
-    let _serial = serial().await;
     for kind in KINDS {
         let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
         step(
@@ -2297,7 +2234,6 @@ const TRUNCATE_RACES: [(&str, &str, &str); 8] = [
 
 #[tokio::test]
 async fn t1_to_t7_a_truncate_races_a_page_of_either_side() {
-    let _serial = serial().await;
     for kind in KINDS {
         for (name, x, y) in TRUNCATE_RACES {
             for first_x in [true, false] {
@@ -2346,7 +2282,6 @@ async fn race_rebuilt(d: &mut Driver, kind: Kind, name: &str, first: i64, second
 /// target hold nothing of it.
 #[tokio::test]
 async fn t8_a_stale_page_after_the_truncate_is_refused() {
-    let _serial = serial().await;
     for kind in KINDS {
         for table in ["public.a", "public.b"] {
             let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
@@ -2396,7 +2331,6 @@ async fn t8_a_stale_page_after_the_truncate_is_refused() {
 /// and have the rebuild the truncate starts treat it as older than it is.
 #[tokio::test]
 async fn a_batch_after_a_truncate_waits_for_it() {
-    let _serial = serial().await;
     let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
     write(&d, "truncate public.b").await;
     let truncate = d.seal().await;
@@ -2430,7 +2364,6 @@ async fn a_batch_after_a_truncate_waits_for_it() {
 /// for each other. The start is played by hand: its transaction holds the row.
 #[tokio::test]
 async fn a_truncate_of_b_page_and_a_rebuild_start_take_the_definition_row_first() {
-    let _serial = serial().await;
     let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
     let id = definition_id(&d, Kind::Left.target()).await;
     write(&d, "truncate public.b").await;
@@ -2481,7 +2414,6 @@ async fn a_truncate_of_b_page_and_a_rebuild_start_take_the_definition_row_first(
 /// close the cycle.
 #[tokio::test]
 async fn a_truncate_of_b_page_of_two_joins_takes_their_definition_rows_in_id_order() {
-    let _serial = serial().await;
     let mut d = start_kinds(&[Kind::Left, Kind::Inner], A_ROWS, B_ROWS).await;
     let left = definition_id(&d, Kind::Left.target()).await;
     let inner = definition_id(&d, Kind::Inner.target()).await;
@@ -2541,7 +2473,6 @@ async fn a_truncate_of_b_page_of_two_joins_takes_their_definition_rows_in_id_ord
 /// by hand, once the page has claimed its segment.
 #[tokio::test]
 async fn a_truncate_of_b_page_takes_its_segment_row_before_the_segment_pointer() {
-    let _serial = serial().await;
     let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
     write(&d, "truncate public.b").await;
     let truncate = d.seal().await;

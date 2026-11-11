@@ -58,7 +58,7 @@ use crate::pool::quote_ident;
 
 /// The environment variable that sets the fan-out warning threshold: the most
 /// live `a` rows one join key may hold before `status()` warns. Read once,
-/// when nothing has set it.
+/// on first use.
 pub const FAN_OUT_WARNING_ENV: &str = "TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING";
 
 /// The fan-out warning threshold when [`FAN_OUT_WARNING_ENV`] isn't set (or
@@ -87,11 +87,25 @@ pub fn fan_out_warning_rows() -> i64 {
     }
 }
 
-/// Sets the threshold for this process, for tests; `0` reads
-/// [`FAN_OUT_WARNING_ENV`] again on next use.
-#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
-pub fn set_fan_out_warning_rows(rows: i64) {
-    FAN_OUT_WARNING_ROWS.store(rows, Ordering::Relaxed);
+/// Sets the threshold for `status()` on `database`, over
+/// [`fan_out_warning_rows`], for tests; `0` restores
+/// [`fan_out_warning_rows`]. See `super::interleave`'s "Knobs by database".
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_fan_out_warning_rows_in(database: &str, rows: i64) {
+    super::interleave::set_fan_out_warning_rows(database, rows);
+}
+
+/// The threshold on `client`'s database: one a test set on it
+/// (`set_fan_out_warning_rows_in`), else [`fan_out_warning_rows`].
+async fn fan_out_warning_rows_on(
+    client: &impl GenericClient,
+) -> Result<i64, tokio_postgres::Error> {
+    #[cfg(any(test, feature = "test-util"))]
+    if let Some(rows) = super::interleave::fan_out_warning_rows(client).await? {
+        return Ok(rows);
+    }
+    let _ = client;
+    Ok(fan_out_warning_rows())
 }
 
 /// The pages of `R` a fan-out sample reads (the module doc).
@@ -208,7 +222,7 @@ async fn fan_out_warnings(
     let Some(join) = spec::spec(def) else {
         return Ok(Vec::new());
     };
-    let threshold = fan_out_warning_rows();
+    let threshold = fan_out_warning_rows_on(client).await?;
     let r = HiddenTable::FromEntries.qualified(catalog_schema, id);
     // `0` for an `R` dropped since its size was read: no sample.
     let pages: i64 = client

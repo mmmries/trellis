@@ -71,17 +71,20 @@ pub mod defs {
     pub use crate::defs::typed_literal;
 
     /// The 1-1 JOIN's fan-out chunk and fan-out warning threshold
-    /// (ADR-0021): tests and `benchmark` set them, once, before a client
-    /// starts.
+    /// (ADR-0021). A test sets them on its own database (the `_in`
+    /// setters), so tests that set them run in parallel; a whole-engine run
+    /// sets the chunk for its process.
     pub use crate::staging::join_one_to_one::fan_out::{
         DEFAULT_CHUNK_ROWS as ONE_TO_ONE_JOIN_DEFAULT_FAN_OUT_CHUNK_ROWS,
         chunk_rows as one_to_one_join_fan_out_chunk_rows,
+        set_chunk_lock_timeout_in as set_one_to_one_join_fan_out_chunk_lock_timeout_in,
         set_chunk_rows as set_one_to_one_join_fan_out_chunk_rows,
+        set_chunk_rows_in as set_one_to_one_join_fan_out_chunk_rows_in,
     };
     pub use crate::staging::join_one_to_one_status::{
         FAN_OUT_WARNING_ENV as ONE_TO_ONE_JOIN_FAN_OUT_WARNING_ENV,
         fan_out_warning_rows as one_to_one_join_fan_out_warning_rows,
-        set_fan_out_warning_rows as set_one_to_one_join_fan_out_warning_rows,
+        set_fan_out_warning_rows_in as set_one_to_one_join_fan_out_warning_rows_in,
     };
 
     pub use crate::float::FloatWidth;

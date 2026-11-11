@@ -62,7 +62,6 @@ fn joined_total(x: i32, w: i32) -> Option<i32> {
 /// `at` applies, in one page or as two pages in either order.
 #[tokio::test]
 async fn m_a_mixed_page_applies_an_a_move_and_the_change_of_its_new_key() {
-    let _serial = star::serial().await;
     let a_change = AT.sql("update public.a set {k} = 20 where id = 1");
     let b_change = AT.sql("update {b} set w = 250 where id = 2");
     let stars = AT.stars();
@@ -90,7 +89,6 @@ async fn m_a_mixed_page_applies_an_a_move_and_the_change_of_its_new_key() {
 /// (`join1_no_j_lock`, `join1_m_before_j`).
 #[tokio::test]
 async fn m_two_crossing_mixed_pages_queue_on_j_without_deadlock() {
-    let _serial = star::serial().await;
     for other_a in [
         "update public.a set {k} = 10 where id = 2",
         "update public.a set {k} = 10 where id = 3",
@@ -116,7 +114,6 @@ async fn m_two_crossing_mixed_pages_queue_on_j_without_deadlock() {
 /// moves to, and an `a` insert on the key it leaves.
 #[tokio::test]
 async fn m_a_mixed_page_races_pages_of_either_side() {
-    let _serial = star::serial().await;
     let mixed = Writer::Change(leak(AT.sql(
         "update public.a set {k} = 20 where id = 1; update {b} set w = 111 where id = 1",
     )));
@@ -181,13 +178,11 @@ async fn null_keyed_pages_queue_on_the_entry(both_null: bool) {
 
 #[tokio::test]
 async fn n_two_pages_on_a_row_null_keyed_at_the_position_queue_on_its_entry() {
-    let _serial = star::serial().await;
     null_keyed_pages_queue_on_the_entry(false).await;
 }
 
 #[tokio::test]
 async fn n_two_pages_on_a_row_null_keyed_at_every_position_queue_on_its_entry() {
-    let _serial = star::serial().await;
     null_keyed_pages_queue_on_the_entry(true).await;
 }
 
@@ -226,13 +221,11 @@ async fn null_keyed_rederive_and_apply(both_null: bool) {
 
 #[tokio::test]
 async fn n_a_rederive_and_an_apply_of_a_row_null_keyed_at_the_position_queue_on_its_entry() {
-    let _serial = star::serial().await;
     null_keyed_rederive_and_apply(false).await;
 }
 
 #[tokio::test]
 async fn n_a_rederive_and_an_apply_of_a_row_null_keyed_at_every_position_queue_on_its_entry() {
-    let _serial = star::serial().await;
     null_keyed_rederive_and_apply(true).await;
 }
 
@@ -241,7 +234,6 @@ async fn n_a_rederive_and_an_apply_of_a_row_null_keyed_at_every_position_queue_o
 /// row that stays on one.
 #[tokio::test]
 async fn n_rederives_move_root_rows_onto_and_off_a_null_key() {
-    let _serial = star::serial().await;
     let stars = AT.stars();
     let mut d = star::start(&stars, A_ROWS, B_ROWS).await;
     star::write_uncaptured(
@@ -282,7 +274,6 @@ async fn n_rederives_move_root_rows_onto_and_off_a_null_key() {
 /// `join1_m_before_j`).
 #[tokio::test]
 async fn r_root_rederives_race_changes_of_either_side() {
-    let _serial = star::serial().await;
     const A1: Writer = Writer::Rederive("public.a", &["1"]);
     for (first, second) in [
         (
@@ -315,7 +306,6 @@ async fn r_root_rederives_race_changes_of_either_side() {
 /// Apply arrives: refused (`join1_lsn_only`).
 #[tokio::test]
 async fn r17_a_stale_root_apply_after_a_rederive_is_refused() {
-    let _serial = star::serial().await;
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         star::write(&d, "update public.a set x = 11 where id = 1").await;
@@ -335,7 +325,6 @@ async fn r17_a_stale_root_apply_after_a_rederive_is_refused() {
 /// no basis (`join1_vis_only`).
 #[tokio::test]
 async fn an_older_root_apply_after_a_newer_one_is_refused() {
-    let _serial = star::serial().await;
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         star::write(&d, "update public.a set x = 11 where id = 1").await;
@@ -355,7 +344,6 @@ async fn an_older_root_apply_after_a_newer_one_is_refused() {
 /// `M` entry (`join1_rd_no_key`).
 #[tokio::test]
 async fn r19_a_root_rederive_whose_row_moved_onto_a_held_key_retries() {
-    let _serial = star::serial().await;
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         let target = star.target();
@@ -363,7 +351,7 @@ async fn r19_a_root_rederive_whose_row_moved_onto_a_held_key_retries() {
         let rederive = d.seal().await;
         star::write(&d, &AT.sql("insert into {b} values (4, 30, 300, 'thirty')")).await;
         let insert = d.seal().await;
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let mut page = d
             .drain_frozen(
                 rederive,
@@ -384,7 +372,7 @@ async fn r19_a_root_rederive_whose_row_moved_onto_a_held_key_retries() {
         page.finish_result().await.expect("the Re-derive page");
         star::assert_oracle(&mut d, &[star]).await;
         assert!(blocked, "{}: the retry queued on J", star.name());
-        assert_eq!(trellis::dev::interleave::join_key_moves(), moves + 1);
+        assert_eq!(d.join_key_moves(), moves + 1);
         assert_eq!(total(&d, star, 1).await, joined_total(1, 300));
     }
 }
@@ -394,13 +382,12 @@ async fn r19_a_root_rederive_whose_row_moved_onto_a_held_key_retries() {
 /// commits.
 #[tokio::test]
 async fn a_root_rederive_whose_row_moved_keys_after_the_unlocked_read_retries() {
-    let _serial = star::serial().await;
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         let target = star.target();
         d.stage_recomputes("public.a", &["1"]).await;
         let batch = d.seal().await;
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let mut page = d
             .drain_frozen(batch, "rederive", &[(PausePoint::BeforeJoin1Lock, &target)])
             .await;
@@ -408,7 +395,7 @@ async fn a_root_rederive_whose_row_moved_keys_after_the_unlocked_read_retries() 
         star::write(&d, &AT.sql("update public.a set {k} = 20 where id = 1")).await;
         d.release(&mut page, PausePoint::BeforeJoin1Lock).await;
         page.finish().await;
-        assert_eq!(trellis::dev::interleave::join_key_moves(), moves + 1);
+        assert_eq!(d.join_key_moves(), moves + 1);
         star::assert_oracle(&mut d, &[star]).await;
     }
 }
@@ -418,7 +405,6 @@ async fn a_root_rederive_whose_row_moved_keys_after_the_unlocked_read_retries() 
 /// attempt.
 #[tokio::test]
 async fn root_rederives_repair_uncaptured_changes() {
-    let _serial = star::serial().await;
     let stars = AT.stars();
     let mut d = star::start(&stars, A_ROWS, B_ROWS).await;
     star::write_uncaptured(
@@ -437,9 +423,9 @@ async fn root_rederives_repair_uncaptured_changes() {
     .await;
     d.stage_recomputes("public.a", &["1", "2", "3", "8"]).await;
     let batch = d.seal().await;
-    let moves = trellis::dev::interleave::join_key_moves();
+    let moves = d.join_key_moves();
     d.drain(batch, "rederive").await;
-    assert_eq!(trellis::dev::interleave::join_key_moves(), moves);
+    assert_eq!(d.join_key_moves(), moves);
     star::assert_oracle(&mut d, &stars).await;
 }
 
@@ -453,7 +439,6 @@ async fn root_rederives_repair_uncaptured_changes() {
 /// an `a` delete ‖ an update of its key.
 #[tokio::test]
 async fn f1_to_f5_a_root_writer_races_a_change_of_its_key() {
-    let _serial = star::serial().await;
     for (a_sql, b_sql) in [
         (
             "insert into {a_ins} values (5, 30, 5, 'five')",
@@ -486,7 +471,6 @@ async fn f1_to_f5_a_root_writer_races_a_change_of_its_key() {
 /// newer Apply wrote; the leave then recomputes the key again.
 #[tokio::test]
 async fn f7_a_hand_off_applied_out_of_order_with_a_root_insert() {
-    let _serial = star::serial().await;
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         star::write(&d, &AT.sql("update {b} set k = 60 where id = 1")).await;
@@ -513,7 +497,6 @@ async fn f7_a_hand_off_applied_out_of_order_with_a_root_insert() {
 /// Re-derive, applies.
 #[tokio::test]
 async fn a_root_change_between_a_rederives_read_and_its_snapshot_is_applied() {
-    let _serial = star::serial().await;
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         let target = star.target();
@@ -542,7 +525,6 @@ async fn a_root_change_between_a_rederives_read_and_its_snapshot_is_applied() {
 /// uncommitted, so the older page queues on it rather than overwriting it.
 #[tokio::test]
 async fn two_root_pages_on_a_new_row_queue_on_the_placeholder() {
-    let _serial = star::serial().await;
     for star in AT.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         let label = star::r_label(&d, star).await;

@@ -49,14 +49,6 @@ const IDLE_KEY_START: i32 = 1001;
 /// [`IDLE_KEY_START`]: more than any scenario inserts.
 const IDLE_ROWS: i32 = 200;
 
-/// The retry counters, the forced key moves and the fan-out chunk are
-/// process-wide (`trellis::dev`), so a binary's star tests run one at a time.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-pub async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().await
-}
-
 /// One position's join kind: `LEFT` keeps an `a` row with no match there,
 /// `INNER` drops it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -718,7 +710,7 @@ async fn ran_through<T>(
     result: Result<T, ApplyError>,
     moves: u64,
 ) -> ! {
-    let moved = trellis::dev::interleave::join_key_moves() - moves;
+    let moved = d.join_key_moves() - moves;
     let name = star.name();
     if let Err(err) = result {
         panic!(
@@ -741,7 +733,7 @@ pub async fn race(d: &mut Driver, star: Star, first: i64, second: i64) {
         .drain_frozen(first, "first", &[(PausePoint::BeforeCommit, &target)])
         .await;
     let reached = held.reached(PausePoint::BeforeCommit).await;
-    let moves = trellis::dev::interleave::join_key_moves();
+    let moves = d.join_key_moves();
     let queued = d.drain_frozen(second, "second", &[]).await;
     let blocked = queued_or_finished(d, reached.backend_pid, &queued).await;
     d.release(&mut held, PausePoint::BeforeCommit).await;

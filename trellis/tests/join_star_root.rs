@@ -65,7 +65,6 @@ const MOVE_BOTH: Writer = Writer::Change("update public.a set k1 = 2, k2 = 2 whe
 /// leaves that key unlocked and one of them recomputes from a stale `M`.
 #[tokio::test]
 async fn ps1a_a_root_moving_both_keys_races_a_change_of_its_new_key_at_the_last_position() {
-    let _serial = star::serial().await;
     star::family_seeded(
         N3,
         SEED,
@@ -80,7 +79,6 @@ async fn ps1a_a_root_moving_both_keys_races_a_change_of_its_new_key_at_the_last_
 /// key at the first position. Planted `star_root_skip_j_first`.
 #[tokio::test]
 async fn ps1b_a_root_moving_both_keys_races_a_change_of_its_new_key_at_the_first_position() {
-    let _serial = star::serial().await;
     star::family_seeded(
         N3,
         SEED,
@@ -96,7 +94,6 @@ async fn ps1b_a_root_moving_both_keys_races_a_change_of_its_new_key_at_the_first
 /// `star_root_skip_j_last`.
 #[tokio::test]
 async fn ps2_a_root_moving_both_keys_races_a_change_of_the_key_it_leaves_at_the_last_position() {
-    let _serial = star::serial().await;
     star::family_seeded(
         N3,
         SEED,
@@ -122,7 +119,7 @@ async fn late_key_at(position: usize, joined_sql: &str) {
         let rederive = d.seal().await;
         star::write(&d, joined_sql).await;
         let joined = d.seal().await;
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let target = star.target();
         let mut page = d
             .drain_frozen(
@@ -143,7 +140,7 @@ async fn late_key_at(position: usize, joined_sql: &str) {
         held.finish().await;
         let result = page.finish_result().await;
         let name = star.name();
-        let retried = trellis::dev::interleave::join_key_moves() - moves;
+        let retried = d.join_key_moves() - moves;
         if let Err(err) = &result {
             panic!("{name}: the Re-derive page failed: {err}");
         }
@@ -164,7 +161,6 @@ async fn late_key_at(position: usize, joined_sql: &str) {
 /// key 2 unlocked and writes the row from the entry before the joined page.
 #[tokio::test]
 async fn ps4a_a_root_rederive_whose_key_moved_at_the_last_position_retries() {
-    let _serial = star::serial().await;
     late_key_at(2, "update public.b2 set w = 201 where id = 2").await;
 }
 
@@ -172,7 +168,6 @@ async fn ps4a_a_root_rederive_whose_key_moved_at_the_last_position_retries() {
 /// `star_late_skip_first`.
 #[tokio::test]
 async fn ps4b_a_root_rederive_whose_key_moved_at_the_first_position_retries() {
-    let _serial = star::serial().await;
     late_key_at(1, "update public.b1 set w = 21 where id = 2").await;
 }
 
@@ -182,7 +177,6 @@ async fn ps4b_a_root_rederive_whose_key_moved_at_the_first_position_retries() {
 /// `star_root_skip_j_last`.
 #[tokio::test]
 async fn ps5_a_root_rederive_races_a_change_of_its_moved_key_at_the_last_position() {
-    let _serial = star::serial().await;
     star::family_seeded(
         N3,
         SEED,
@@ -199,7 +193,6 @@ async fn ps5_a_root_rederive_races_a_change_of_its_moved_key_at_the_last_positio
 /// queues. Planted `join1_m_before_j`, the root reads `M` before `J`.
 #[tokio::test]
 async fn cx_f2a_a_root_move_races_a_page_on_its_new_key_and_its_old_key() {
-    let _serial = star::serial().await;
     star::family_seeded(
         N3,
         SEED,
@@ -216,7 +209,6 @@ async fn cx_f2a_a_root_move_races_a_page_on_its_new_key_and_its_old_key() {
 /// position 1) and `b2` row 2 (the new key at position 2).
 #[tokio::test]
 async fn cx_f2b_a_root_move_races_a_page_on_its_old_key_and_its_new_key() {
-    let _serial = star::serial().await;
     star::family_seeded(
         N3,
         SEED,
@@ -238,7 +230,6 @@ async fn cx_f2b_a_root_move_races_a_page_on_its_old_key_and_its_new_key() {
 /// `_first`), the joined page at that position runs beside the root page.
 #[tokio::test]
 async fn cx_f2e_a_root_move_races_a_change_of_each_new_key() {
-    let _serial = star::serial().await;
     let b1 = Writer::Change("update public.b1 set w = 21 where id = 2");
     let b2 = Writer::Change("update public.b2 set w = 201 where id = 2");
     for star in N3.stars() {
@@ -266,7 +257,6 @@ async fn cx_f2e_a_root_move_races_a_change_of_each_new_key() {
 /// key)`, so the second queues on the first and neither deadlocks.
 #[tokio::test]
 async fn cx_f3a_crossing_root_moves_of_both_keys_queue_without_deadlock() {
-    let _serial = star::serial().await;
     star::family_seeded(
         N3,
         SEED,
@@ -282,7 +272,6 @@ async fn cx_f3a_crossing_root_moves_of_both_keys_queue_without_deadlock() {
 /// other's at the other position.
 #[tokio::test]
 async fn cx_f3c_crossing_root_moves_of_crossed_keys_queue_without_deadlock() {
-    let _serial = star::serial().await;
     star::family_seeded(
         N3,
         CROSS_SEED,
@@ -298,7 +287,6 @@ async fn cx_f3c_crossing_root_moves_of_crossed_keys_queue_without_deadlock() {
 /// middle position. Planted `star_root_skip_j_middle`.
 #[tokio::test]
 async fn a_root_moving_every_key_races_a_change_of_its_new_key_at_the_middle_position() {
-    let _serial = star::serial().await;
     star::family_seeded(
         Shape {
             positions: 3,
