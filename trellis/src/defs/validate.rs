@@ -8382,6 +8382,7 @@ mod tests {
         );
     }
 }
+
 /// The pure key-collation check, over hand-built
 /// columns carrying the collations Postgres reports.
 #[cfg(test)]
@@ -8475,5 +8476,41 @@ mod key_collation_tests {
         let old: Vec<FieldDef> = def.fields[..1].to_vec();
         assert!(check_collation_reads(&def, Some(&old), resolve).is_err());
         assert!(check_collation_reads(&def, None, resolve).is_err());
+    }
+
+    /// The catalog checks a table's row-identity key before a plain
+    /// aggregate's `GROUP BY` keys, so a definition failing both is refused
+    /// for its source key.
+    #[test]
+    fn the_source_key_is_checked_before_the_group_by_keys() {
+        let def = crate::defs::parser::parse("TRANSFORM t FROM s GROUP BY g SELECT COUNT(*) AS n")
+            .expect("parse");
+        let mut ci = collated(column(), "case_insensitive");
+        ci.collation_deterministic = false;
+        let deterministic = column();
+        let key_of = |nondeterministic: &[&str]| {
+            check_key_collations(&def, "public.s", &["id"], |name| {
+                Some(if nondeterministic.contains(&name) {
+                    &ci
+                } else {
+                    &deterministic
+                })
+            })
+            .map_err(|err| match err {
+                ValidationError::NondeterministicKeyCollation(refusal) => {
+                    (refusal.key, refusal.column)
+                }
+                other => panic!("{other:?}"),
+            })
+        };
+        assert_eq!(
+            key_of(&["id", "g"]),
+            Err((KeyColumnRole::SourceKey, "id".to_string()))
+        );
+        assert_eq!(
+            key_of(&["g"]),
+            Err((KeyColumnRole::GroupBy, "g".to_string()))
+        );
+        assert_eq!(key_of(&[]), Ok(()));
     }
 }
