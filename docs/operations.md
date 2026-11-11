@@ -123,16 +123,16 @@ index the message names, then resume. It also refuses in two cases
 define doesn't, where the only repair is to `DROP TRANSFORM` and define again:
 
 * its target table is missing;
-* its ledger table is missing;
-* a key it uses changed in a way it can't re-record: a table it reads has no
-  primary key left to take, its target lost the index over its key, or
-  re-keying a 1-1 target to its source's new key would take a column name the
-  target already has, or drop a column or key constraint an object of yours
-  depends on.
+* its ledger table is missing.
 
-A 1-1 definition whose source key changed while it was paused has its target
-re-keyed in place to the new key first, or the resume refuses naming what
-blocks it ([the key row](transforms.md#the-key-a-transform-keys-each-table-by)).
+It also refuses while a key it uses changed in a way it can't re-record: a
+table it reads has no primary key left to take, its target lost the index
+over its key, or re-keying a 1-1 target to its source's new key would take a
+column name the target already has, or drop a column or key constraint an
+object of yours depends on. A 1-1 definition whose source key changed while
+it was paused has its target re-keyed in place to the new key first, or the
+resume refuses naming what blocks it
+([the key row](transforms.md#the-key-a-transform-keys-each-table-by)).
 
 A `JOIN` has no ledger. Its resume drops and recreates its hidden tables
 instead, keeps the target, and rebuilds both sides and the target's groups

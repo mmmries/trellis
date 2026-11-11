@@ -29,12 +29,13 @@ stateDiagram-v2
 A definition is frozen in one of two statuses, and both stop the claim-time fold from
 writing to the target and hold its current, now-stale value. `paused` is reached by an
 operator's `PAUSE`, or by the engine when it cannot maintain the definition: capture of a
-table it reads broke, a build kept failing in a way no retry gets past, or the drain hit a
-failure every key reproduces, which pauses every definition it reaches and everything
-downstream of them so the rest of the page commits instead of retrying forever. The reason
-is on the status's `capture_failure` (a failing build's error stays on `backfill_failure`);
-[operations — Paused definitions](../operations.md#paused-definitions) lists every reason,
-and the [status reference](../status-reference.md) defines each status.
+table it reads broke or row-level security came to apply to its target, a build kept
+failing in a way no retry gets past, or the drain hit a failure every key reproduces,
+which pauses every definition it reaches and everything downstream of them so the rest of
+the page commits instead of retrying forever. The reason is on the status's
+`capture_failure` (a failing build's error stays on `backfill_failure`); [operations —
+Paused definitions](../operations.md#paused-definitions) lists every reason, and the
+[status reference](../status-reference.md) defines each status.
 
 `quarantined` is the whole-transform poison fuse ([ADR-0003](0003-quarantine-storage-and-api.md)):
 too many poisoned source rows. It is a separate status so that poison incidents stay

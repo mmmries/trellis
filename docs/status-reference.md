@@ -408,10 +408,10 @@ The source indexes a `GROUP BY` or `JOIN` definition needs and lacks now. A
 (customer_id)`); a `JOIN` needs one on each side leading with that side's `ON`
 columns, in `ON` order. A primary key or unique constraint that leads with
 them is enough. You create them alongside the definition; Trellis never does.
-Define and a `RESUME` refuse a definition without them, naming the same role,
-unless it says `WITHOUT SOURCE INDEX` after its `GROUP BY` or `JOIN` clause,
-so an entry is an index dropped or made invalid since, or one a definition
-that opted out runs without
+Define and a `RESUME` refuse a definition without them, naming the same role
+and the `create index` to run, unless it says `WITHOUT SOURCE INDEX` after its
+`GROUP BY` or `JOIN` clause, so an entry is an index dropped or made invalid
+since, or one a definition that opted out runs without
 ([Supported sources and targets](transforms.md#supported-sources-and-targets)).
 
 One entry per table and leading columns: `table`, `columns`, a `role`
@@ -613,7 +613,7 @@ says so.
 | Key fuse | 5 failed attempts | A key whose change fails this many times in one definition's apply is held ([`held_keys`](#held_keys)). |
 | Column fuse | 5 rows | A field that fails for this many distinct rows is paused (its column reads `paused` in `quarantined()`). |
 | Whole-transform fuse | 5 keys | A definition holding this many keys goes [`quarantined`](#quarantined). |
-| Build chunk attempts | 5 charged attempts | A chunk failure that is neither transient nor narrowed to a key, on its fifth charged attempt, pauses the definition ([`backfill_failure`](#backfill_failure)). The first retry waits 1 second, doubling after each further failure, and a Re-derive chunk waits at most 5 seconds. |
+| Build chunk attempts | 5 charged attempts | A chunk failure that is neither transient nor narrowed to a key, on its fifth charged attempt, pauses the definition ([`backfill_failure`](#backfill_failure)). The first retry waits 1 second, doubling after each further failure, capped at 5 seconds. |
 | `MIN`/`MAX` probe index grace | 5 minutes | How long a probe index can be missing on every staging worker pass before the definition is paused ([`extreme_index_gaps`](#extreme_index_gaps)). Wall-clock time, kept in the process's memory, so a restart starts it again. |
 | 1-1 `JOIN` fan-out warning | 250,000 rows per key | Set by `TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING` ([`join`](#join)). |
 | Reclaim TTL | 30 seconds | How long a process killed without a clean shutdown counts as live ([`version_handover`](#version_handover)). |
