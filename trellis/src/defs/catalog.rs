@@ -87,6 +87,7 @@ use crate::error_code::{self, ErrorCode};
 use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 use crate::pool::{Pool, quote_ident};
+use crate::staging::pause_message::PauseReason;
 use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
 
@@ -1349,15 +1350,8 @@ pub(crate) async fn store_unrunnable(
             super::lifecycle::pause_for_unrunnable(&txn, id, unparsed.source_table, reason).await?
         }
         Held::Other(reason) => {
-            super::lifecycle::pause_for_capture_failure(
-                &txn,
-                id,
-                unparsed.source_table,
-                &[],
-                reason,
-                None,
-            )
-            .await?
+            let reason = PauseReason::capture(unparsed.source_table, reason);
+            super::lifecycle::pause(&txn, id, &reason).await?
         }
     };
     txn.execute(

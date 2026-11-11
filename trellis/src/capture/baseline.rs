@@ -853,12 +853,14 @@ pub(crate) async fn check(
              rebuilds it. Or drop the definition and define it again",
             reasons.join("; ")
         );
-        if crate::defs::lifecycle::pause_for_capture_failure(
-            &txn, id, table, &columns, &error, None,
-        )
-        .await?
-        {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
+        let reason = crate::staging::pause_message::PauseReason::Capture {
+            table: table.to_string(),
+            columns,
+            text: error,
+            caused_by: None,
+        };
+        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
         }
     }
     for (&id, def) in &restamp {

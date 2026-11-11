@@ -61,14 +61,6 @@ use tokio_postgres::Client;
 
 use super::CaptureError;
 
-/// The `capture_failure` of every definition a restore pauses.
-pub fn reason() -> String {
-    "the database was restored from a logical dump, so the ordering state Trellis kept for \
-     this definition belongs to the original database; resume the definition to reset it and \
-     rebuild the target from the restored source, or drop the definition"
-        .to_string()
-}
-
 /// Whether a record that stores the oid of its own table came from another
 /// database: a stored oid that isn't the live one.
 const STALE_RECORDS: &str = "select exists (select 1 from capture_triggers \
@@ -109,7 +101,6 @@ pub(crate) async fn respond(client: &mut Client, recheck: bool) -> Result<bool, 
     if recheck && !txn.query_one(STALE_RECORDS, &[]).await?.get::<_, bool>(0) {
         return Ok(false);
     }
-    let error = reason();
     let definitions = txn
         .query(
             "select id, source_table from transform_definitions order by id",
@@ -118,8 +109,9 @@ pub(crate) async fn respond(client: &mut Client, recheck: bool) -> Result<bool, 
         .await?;
     for row in &definitions {
         let (id, table): (i64, String) = (row.get(0), row.get(1));
-        if crate::defs::lifecycle::pause_for_restore(&txn, id, &table, &error).await? {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
+        let reason = crate::staging::pause_message::PauseReason::Restore { table };
+        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
+            crate::instance_log::warn!(transform_id = id, table = %reason.table(), "definition paused: {reason}");
         }
     }
     // The registry holds the original cluster's fences and transaction ids,

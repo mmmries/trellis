@@ -50,7 +50,7 @@ use tokio_postgres::Client;
 
 use super::apply::ApplyError;
 use super::drift_memo::{self, Fingerprints};
-use super::pause_message::Recheck;
+use super::pause_message::PauseReason;
 use crate::capture::CaptureError;
 use crate::capture::columns::{CaptureCatalog, load_catalog_for, read_columns, readers_of};
 use crate::capture::install::{Installed, installed};
@@ -241,7 +241,7 @@ pub(crate) async fn pause_readers_of_redefined_keys(
 }
 
 /// Pauses each of `readers` of `table` for `missing`, recording why
-/// ([`crate::defs::lifecycle::pause_for_schema_change`]): a reason the
+/// ([`crate::defs::lifecycle::pause`]): a reason the
 /// capture pass checks again while the definition stays paused.
 async fn pause(
     txn: &tokio_postgres::Transaction<'_>,
@@ -251,12 +251,12 @@ async fn pause(
     readers: &[i64],
 ) -> Result<(), CatalogError> {
     for &id in readers {
-        let (columns, error, recheck) = match &missing.key_changed {
-            Some((old, new)) => (
-                old.clone(),
-                key_changed_error(table, old, new),
-                Recheck::Key,
-            ),
+        let reason = match &missing.key_changed {
+            Some((old, new)) => PauseReason::KeyChanged {
+                table: table.to_string(),
+                old: old.clone(),
+                new: new.clone(),
+            },
             None => {
                 // The columns this definition reads, or every missing one
                 // when it pauses only because the key went.
@@ -272,47 +272,17 @@ async fn pause(
                 if columns.is_empty() {
                     columns = missing.columns.iter().cloned().collect();
                 }
-                let error = missing_columns_error(table, &columns);
-                (columns, error, Recheck::Columns)
+                PauseReason::MissingColumns {
+                    table: table.to_string(),
+                    columns,
+                }
             }
         };
-        if crate::defs::lifecycle::pause_for_schema_change(
-            txn, id, table, &columns, &error, recheck,
-        )
-        .await?
-        {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
+        if crate::defs::lifecycle::pause(txn, id, &reason).await? {
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
         }
     }
     Ok(())
-}
-
-/// The `capture_failure` sentence for a definition paused because `columns`
-/// of `table` it reads were renamed or dropped.
-pub(crate) fn missing_columns_error(table: &str, columns: &[String]) -> String {
-    format!(
-        "column {} of {table}, which this definition reads, was renamed or dropped; its \
-         capture now leaves it out. Restore the column and resume the definition to rebuild \
-         it, or drop the definition",
-        quoted_list(columns)
-    )
-}
-
-/// The `capture_failure` sentence for a definition paused because `table`'s
-/// primary key changed from `old` to `new`.
-pub(crate) fn key_changed_error(table: &str, old: &[String], new: &[String]) -> String {
-    format!(
-        "the primary key of {table} changed from ({}) to ({}), and this definition's rows \
-         are keyed by the old one. RESUME rebuilds it over the new key, re-keying a 1-1 \
-         transform's target to it in place first",
-        quoted_list(old),
-        quoted_list(new)
-    )
-}
-
-fn quoted_list(columns: &[String]) -> String {
-    let quoted: Vec<String> = columns.iter().map(|c| format!("{c:?}")).collect();
-    quoted.join(", ")
 }
 
 /// The staging worker's capture pass's side of a schema change: pauses,
@@ -477,17 +447,14 @@ pub(crate) async fn pause_readers_of_uncapturable(
     }
     let txn = client.transaction().await?;
     for pause in &pauses {
-        if crate::defs::lifecycle::pause_for_capture_failure(
-            &txn,
-            pause.id,
-            table,
-            &pause.columns,
-            &pause.error,
-            None,
-        )
-        .await?
-        {
-            crate::instance_log::warn!(transform_id = pause.id, table = %table, "definition paused: {}", pause.error);
+        let reason = PauseReason::Capture {
+            table: table.to_string(),
+            columns: pause.columns.clone(),
+            text: pause.error.clone(),
+            caused_by: None,
+        };
+        if crate::defs::lifecycle::pause(&txn, pause.id, &reason).await? {
+            crate::instance_log::warn!(transform_id = pause.id, table = %table, "definition paused: {reason}");
         }
     }
     txn.commit().await?;
@@ -634,12 +601,15 @@ pub(crate) async fn pause_joins_without_unique_key(
         return Ok(false);
     }
     let txn = client.transaction().await?;
-    for (id, on) in &gone {
-        let error = unique_key_gone_error(table, on);
-        if crate::defs::lifecycle::pause_for_capture_failure(&txn, *id, table, on, &error, None)
-            .await?
-        {
-            crate::instance_log::warn!(transform_id = *id, table = %table, "definition paused: {error}");
+    for (id, on) in gone {
+        let reason = PauseReason::Capture {
+            table: table.to_string(),
+            text: unique_key_gone_error(table, &on),
+            columns: on,
+            caused_by: None,
+        };
+        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
         }
     }
     txn.commit().await?;
@@ -665,7 +635,7 @@ fn unique_key_gone_error(table: &str, on: &[String]) -> String {
 /// definition that reads `table` and isn't paused for a capture failure yet
 /// when no index backs the key the table's transforms declare for it,
 /// recording why in `capture_failures` with a reason the pass checks again
-/// while they stay paused ([`Recheck::Backing`]). Returns whether it paused
+/// while they stay paused ([`PauseReason::UnbackedKey`]). Returns whether it paused
 /// any, in which case the caller leaves the table for the next pass.
 ///
 /// While no unique index backs the key, `table` can take two rows with one
@@ -726,21 +696,20 @@ pub(crate) async fn pause_readers_of_unbacked_key(
     if backed {
         return Ok(false);
     }
-    let shape = unbacked_shape(&*client, table, &key).await?;
-    let error = unbacked_key_error(table, &key, shape);
+    let UnbackedShape {
+        partitioned,
+        nullable,
+    } = unbacked_shape(&*client, table, &key).await?;
+    let reason = PauseReason::UnbackedKey {
+        table: table.to_string(),
+        key,
+        partitioned,
+        nullable,
+    };
     let txn = client.transaction().await?;
     for id in readers {
-        if crate::defs::lifecycle::pause_for_schema_change(
-            &txn,
-            id,
-            table,
-            &key,
-            &error,
-            Recheck::Backing,
-        )
-        .await?
-        {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
+        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
         }
     }
     txn.commit().await?;
@@ -780,49 +749,6 @@ async fn unbacked_shape(
     })
 }
 
-/// The `capture_failure` sentence for a definition paused because no unique
-/// index backs `table`'s declared `KEY (key)`, with a ready-to-run statement
-/// creating one.
-fn unbacked_key_error(table: &str, key: &[String], shape: UnbackedShape) -> String {
-    let (schema, name) = table.split_once('.').unwrap_or(("", table));
-    let mut target = String::new();
-    if !schema.is_empty() {
-        target.push_str(&crate::pool::quote_ident(schema));
-        target.push('.');
-    }
-    target.push_str(&crate::pool::quote_ident(name));
-    let columns: Vec<String> = key.iter().map(|c| crate::pool::quote_ident(c)).collect();
-    // Postgres builds no index on a partitioned table concurrently.
-    let create = format!(
-        "create unique index {}on {target} ({}){}",
-        if shape.partitioned {
-            ""
-        } else {
-            "concurrently "
-        },
-        columns.join(", "),
-        if shape.nullable {
-            " nulls not distinct"
-        } else {
-            ""
-        }
-    );
-    let mut text = format!(
-        "no valid unique index backs KEY ({}) on {table} any more, so {table} can take two \
-         rows with one key, which this definition's rows are keyed by. Create one with \
-         `{create}`, then resume the definition to rebuild it. To replace the index backing a \
-         KEY, build the replacement before dropping the old index",
-        key.join(", ")
-    );
-    if shape.partitioned {
-        text.push_str(
-            ". On a partitioned table, the root's index stays invalid after a leaf's index is \
-             repaired: re-run ALTER INDEX ... ATTACH PARTITION for the repaired leaf's index",
-        );
-    }
-    text
-}
-
 /// The staging worker's capture pass's check of a `MIN`/`MAX` definition's
 /// probe indexes on `table`, its source (#1708 rule 2): per argument, an
 /// index leading with the `GROUP BY` columns then the argument
@@ -831,7 +757,8 @@ fn unbacked_key_error(table: &str, key: &[String], shape: UnbackedShape) -> Stri
 /// Pauses a definition that isn't paused for a capture failure yet once one
 /// of its probe indexes has read missing or invalid on every check for
 /// [`drift_memo::EXTREME_INDEX_GRACE`] of wall-clock time, recording why with
-/// a reason the pass checks again while it stays paused ([`Recheck::Index`]).
+/// a reason the pass checks again while it stays paused
+/// ([`PauseReason::MissingProbeIndex`]).
 /// Returns whether it paused any, in which case the caller leaves the table
 /// for the next pass.
 ///
@@ -919,50 +846,14 @@ pub(crate) async fn pause_readers_of_missing_probe_index(
         .await?
         .get(0);
     let txn = client.transaction().await?;
-    for (id, index) in &passed {
-        let error = missing_probe_index_error(index, partitioned);
-        if crate::defs::lifecycle::pause_for_schema_change(
-            &txn,
-            *id,
-            table,
-            &index.columns,
-            &error,
-            Recheck::Index,
-        )
-        .await?
-        {
-            crate::instance_log::warn!(transform_id = *id, table = %table, "definition paused: {error}");
+    for (id, index) in passed {
+        let reason = PauseReason::MissingProbeIndex { index, partitioned };
+        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
         }
     }
     txn.commit().await?;
     Ok(true)
-}
-
-/// The `capture_failure` sentence for a `MIN`/`MAX` definition paused
-/// because its probe `index` has been missing or invalid for the grace.
-fn missing_probe_index_error(
-    index: &crate::defs::source_index::SourceIndex,
-    partitioned: bool,
-) -> String {
-    let argument = index.columns.last().map_or("", String::as_str);
-    let mut text = format!(
-        "no valid index on {table} has led with ({columns}) in that order for {minutes} \
-         minutes, which this definition's MIN/MAX({argument}) re-reads a group's extreme \
-         through: without one each re-read scans the group. Create one with `{create}`, then \
-         resume the definition to rebuild it. To replace the index, build the replacement \
-         before dropping the old one",
-        table = index.table,
-        columns = index.columns.join(", "),
-        minutes = drift_memo::EXTREME_INDEX_GRACE.as_secs() / 60,
-        create = index.create_index(),
-    );
-    if partitioned {
-        text.push_str(
-            ". On a partitioned table, the root's index stays invalid after a leaf's index is \
-             repaired: re-run ALTER INDEX ... ATTACH PARTITION for the repaired leaf's index",
-        );
-    }
-    text
 }
 
 /// The staging worker's capture pass's check for a table Trellis can't read
@@ -1046,10 +937,9 @@ pub(crate) async fn pause_readers_of_unsupported(
     }
     let txn = client.transaction().await?;
     for (id, error) in pauses {
-        if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error, None)
-            .await?
-        {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
+        let reason = PauseReason::capture(table, error);
+        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
         }
     }
     txn.commit().await?;
@@ -1088,13 +978,11 @@ pub(crate) async fn pause_readers_in_hierarchy(
     if readers.is_empty() {
         return Ok(true);
     }
-    let error = hierarchy_error(&found);
+    let reason = PauseReason::capture(table, hierarchy_error(&found));
     let txn = client.transaction().await?;
     for id in readers {
-        if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error, None)
-            .await?
-        {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
+        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
         }
     }
     txn.commit().await?;
@@ -1562,17 +1450,14 @@ pub(crate) async fn pause_readers_of_retyped(
                 caused_by = Some(cause.upstream);
             }
         }
-        if crate::defs::lifecycle::pause_for_capture_failure(
-            &txn,
-            pause.id,
-            table,
-            &pause.columns,
-            &error,
+        let reason = PauseReason::Capture {
+            table: table.to_string(),
+            columns: pause.columns.clone(),
+            text: error,
             caused_by,
-        )
-        .await?
-        {
-            crate::instance_log::warn!(transform_id = pause.id, table = %table, "definition paused: {error}");
+        };
+        if crate::defs::lifecycle::pause(&txn, pause.id, &reason).await? {
+            crate::instance_log::warn!(transform_id = pause.id, table = %table, "definition paused: {reason}");
         }
     }
     txn.commit().await?;
@@ -1602,9 +1487,9 @@ pub(crate) async fn pause_readers_of_retyped(
 ///   ([`rerecord_retyped_enums`]), so the next pass doesn't find it again.
 ///
 /// Every definition that reads such a value, however it reads it, pauses
-/// ([`crate::defs::lifecycle::pause_for_relabel`]) with the reason and the
-/// WAL insert position read after the change committed, which every change
-/// staged with the old text is below. Its resume waits for those changes to
+/// ([`crate::defs::lifecycle::pause`], [`PauseReason::Relabel`]) with the reason
+/// and the WAL insert position read after the change committed, which every
+/// change staged with the old text is below. Its resume waits for those changes to
 /// drain and rebuilds from the source without casting any stored label
 /// (`staging::quarantine`); a copy re-typed to the other enum is re-typed
 /// without a cast ([`copies::CopyState::discards_values`]).
@@ -1714,14 +1599,18 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
             }
             retyped_columns.push(column);
         }
-        for (id, (source, changes)) in &by_definition {
-            let error = relabel_reason(changes);
-            if crate::defs::lifecycle::pause_for_relabel(&txn, *id, source, &error, lsn).await? {
-                crate::instance_log::warn!(transform_id = id, table = %source, "definition paused: {error}");
+        let ids: Vec<i64> = by_definition.keys().copied().collect();
+        for (id, (table, changes)) in by_definition {
+            let reason = PauseReason::Relabel {
+                table,
+                changes,
+                lsn,
+            };
+            if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
+                crate::instance_log::warn!(transform_id = id, table = %reason.table(), "definition paused: {reason}");
             }
             paused = true;
         }
-        let ids: Vec<i64> = by_definition.keys().copied().collect();
         txn.execute(
             "update definition_enum_values v set label = e.enumlabel::text \
              from pg_catalog.pg_enum e \
@@ -1889,17 +1778,6 @@ async fn rerecord_retyped_enums(
         key_types::record_types(txn, id, false).await?;
     }
     Ok(())
-}
-
-/// The `capture_failure` of a definition [`pause_readers_of_relabelled`]
-/// pauses, from the relabels it found (`enum value 'a' of type s.t was
-/// renamed to 'b'`, each).
-fn relabel_reason(renames: &[String]) -> String {
-    format!(
-        "{}; Trellis's staged changes and keys still name the old label; resume to rebuild the \
-         target from the source",
-        renames.join("; ")
-    )
 }
 
 /// One definition [`pause_readers_of_retyped`] pauses, and why.
@@ -2379,20 +2257,6 @@ mod tests {
     use super::*;
     use crate::defs::copies::{CopyKind, CopyState, CopyType, TypedCopy};
     use crate::defs::key_types::ColumnType;
-
-    /// The reason names each relabel, then the remedy.
-    #[test]
-    fn a_relabel_reason_names_each_relabel_then_the_remedy() {
-        assert_eq!(
-            super::relabel_reason(&[
-                "enum value 'brisk' of type public.tone was renamed to 'zippy'".to_string(),
-                "enum value 'calm' of type public.tone was renamed to 'cool'".to_string(),
-            ]),
-            "enum value 'brisk' of type public.tone was renamed to 'zippy'; enum value 'calm' \
-             of type public.tone was renamed to 'cool'; Trellis's staged changes and keys still \
-             name the old label; resume to rebuild the target from the source"
-        );
-    }
 
     fn ty(display: &str) -> CopyType {
         let oid = match display {

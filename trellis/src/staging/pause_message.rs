@@ -47,6 +47,7 @@ use crate::capture::CaptureError;
 use crate::capture::columns::{CaptureCatalog, CaptureReader};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::floor::Floors;
+use crate::defs::lifecycle::ResumeNeeds;
 use crate::defs::recorded_keys;
 
 /// What joins one reason, ended with a full stop, to the older one after
@@ -124,6 +125,303 @@ impl Reason {
             recheck: Recheck::Stands,
         }
     }
+}
+
+/// Why a definition pauses: one variant per cause, which decides everything
+/// the pause records besides its sentence ([`crate::defs::lifecycle::pause`]):
+/// the record's `kind`, how the capture pass re-checks the reason
+/// ([`Recheck`]), what a resume must do before its rebuild
+/// ([`ResumeNeeds`]), and the upstream definition that caused it.
+///
+/// A cause the pass re-checks renders its own sentence from its fields, so
+/// a re-check that finds it changed says the same as a detection would
+/// ([`recheck`]). A cause that stands until a resume carries the sentence
+/// its detector composed: most wrap another error's text (a refusal, a
+/// halting failure) with what to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PauseReason {
+    /// `columns` of `table`, which the definition reads, were renamed or
+    /// dropped. Gone once the table has every one of them again.
+    MissingColumns { table: String, columns: Vec<String> },
+    /// The capture pass found `table`'s primary key redefined from `old` to
+    /// `new`. Gone once the key is `old` again.
+    KeyChanged {
+        table: String,
+        old: Vec<String>,
+        new: Vec<String>,
+    },
+    /// Another definition's resume re-recorded `table`'s key from `old` to
+    /// `new`, which this running definition's rows are keyed by. Stands:
+    /// the recorded key is `new` now.
+    KeyRerecorded {
+        table: String,
+        old: Vec<String>,
+        new: Vec<String>,
+    },
+    /// No valid unique index backs `table`'s declared `KEY (key)`. Gone once
+    /// one does.
+    UnbackedKey {
+        table: String,
+        key: Vec<String>,
+        /// Whether `table` is partitioned: Postgres builds no index on one
+        /// concurrently, and its root index needs re-attaching.
+        partitioned: bool,
+        /// Whether a key column is nullable.
+        nullable: bool,
+    },
+    /// A `MIN`/`MAX` definition's probe `index` has been missing or invalid
+    /// for the grace. Gone once a valid one leads with its columns.
+    MissingProbeIndex {
+        index: crate::defs::source_index::SourceIndex,
+        /// Whether the index's table is partitioned.
+        partitioned: bool,
+    },
+    /// Trellis's capture of `table` was changed outside Trellis, or the
+    /// table is gone. Kind `disruption` while the definition runs, `capture`
+    /// once frozen: it stays the operator's pause.
+    Disruption { table: String, text: String },
+    /// The database was restored from a logical dump: the definition's
+    /// ordering state belongs to the original database, and its resume
+    /// resets it. Kind as for [`PauseReason::Disruption`].
+    Restore { table: String },
+    /// Enum values the definition reads changed identity (ADR-0020): each of
+    /// `changes` is a relabel or a re-type to another enum. Its resume waits
+    /// until no change at or below `lsn` is pending on the tables it reads.
+    Relabel {
+        table: String,
+        changes: Vec<String>,
+        lsn: crate::PgLsn,
+    },
+    /// A drain's page failed with a halting error on `table` (kind `halt`).
+    Halt { table: String, text: String },
+    /// Any other capture failure about `columns` of `table`: a column or
+    /// table capture can't serve, a key or type define would refuse now, a
+    /// stored definition this release refuses to load. `caused_by` is the
+    /// definition whose resume caused it, which resumes it once live (#828).
+    Capture {
+        table: String,
+        columns: Vec<String>,
+        text: String,
+        caused_by: Option<i64>,
+    },
+}
+
+impl PauseReason {
+    /// A standing capture failure about `table` (and none of its columns)
+    /// that no upstream caused.
+    pub(crate) fn capture(table: &str, text: impl Into<String>) -> PauseReason {
+        PauseReason::Capture {
+            table: table.to_string(),
+            columns: Vec::new(),
+            text: text.into(),
+            caused_by: None,
+        }
+    }
+
+    /// The qualified table it is about.
+    pub(crate) fn table(&self) -> &str {
+        match self {
+            PauseReason::MissingColumns { table, .. }
+            | PauseReason::KeyChanged { table, .. }
+            | PauseReason::KeyRerecorded { table, .. }
+            | PauseReason::UnbackedKey { table, .. }
+            | PauseReason::Disruption { table, .. }
+            | PauseReason::Restore { table }
+            | PauseReason::Relabel { table, .. }
+            | PauseReason::Halt { table, .. }
+            | PauseReason::Capture { table, .. } => table,
+            PauseReason::MissingProbeIndex { index, .. } => &index.table,
+        }
+    }
+
+    /// The columns of [`PauseReason::table`] it is about, if any.
+    pub(crate) fn columns(&self) -> &[String] {
+        match self {
+            PauseReason::MissingColumns { columns, .. } | PauseReason::Capture { columns, .. } => {
+                columns
+            }
+            PauseReason::KeyChanged { old, .. } | PauseReason::KeyRerecorded { old, .. } => old,
+            PauseReason::UnbackedKey { key, .. } => key,
+            PauseReason::MissingProbeIndex { index, .. } => &index.columns,
+            PauseReason::Disruption { .. }
+            | PauseReason::Restore { .. }
+            | PauseReason::Relabel { .. }
+            | PauseReason::Halt { .. } => &[],
+        }
+    }
+
+    /// How the capture pass tells whether its cause is still there.
+    pub(crate) fn recheck(&self) -> Recheck {
+        match self {
+            PauseReason::MissingColumns { .. } => Recheck::Columns,
+            PauseReason::KeyChanged { .. } => Recheck::Key,
+            PauseReason::UnbackedKey { .. } => Recheck::Backing,
+            PauseReason::MissingProbeIndex { .. } => Recheck::Index,
+            PauseReason::KeyRerecorded { .. }
+            | PauseReason::Disruption { .. }
+            | PauseReason::Restore { .. }
+            | PauseReason::Relabel { .. }
+            | PauseReason::Halt { .. }
+            | PauseReason::Capture { .. } => Recheck::Stands,
+        }
+    }
+
+    /// Whether the record's `kind` depends on whether the definition is
+    /// still dispatchable ([`PauseReason::kind`]), which the pause reads
+    /// under the definition's row lock.
+    pub(crate) fn kind_reads_status(&self) -> bool {
+        matches!(
+            self,
+            PauseReason::Disruption { .. } | PauseReason::Restore { .. }
+        )
+    }
+
+    /// The `kind` of the `capture_failures` record the pause creates, for a
+    /// definition that was still `dispatchable` or already frozen.
+    pub(crate) fn kind(&self, dispatchable: bool) -> crate::CaptureFailureKind {
+        use crate::CaptureFailureKind;
+        match self {
+            PauseReason::Disruption { .. } | PauseReason::Restore { .. } if dispatchable => {
+                CaptureFailureKind::Disruption
+            }
+            PauseReason::Halt { .. } => CaptureFailureKind::Halt,
+            _ => CaptureFailureKind::Capture,
+        }
+    }
+
+    /// What its resume must do before the rebuild. A pause that needs more
+    /// than the rebuild adds its reason only the first time: a second
+    /// restore or relabel keeps the first's.
+    pub(crate) fn resume_needs(&self) -> ResumeNeeds {
+        match self {
+            PauseReason::Restore { .. } => ResumeNeeds::Restore,
+            PauseReason::Relabel { lsn, .. } => ResumeNeeds::Relabel(*lsn),
+            _ => ResumeNeeds::Rebuild,
+        }
+    }
+
+    /// The definition whose resume caused this pause, recorded with it.
+    pub(crate) fn caused_by(&self) -> Option<i64> {
+        match self {
+            PauseReason::Capture { caused_by, .. } => *caused_by,
+            _ => None,
+        }
+    }
+
+    /// The reason row it adds to the record.
+    pub(crate) fn reason(&self) -> Reason {
+        Reason {
+            source_table: self.table().to_string(),
+            columns: self.columns().to_vec(),
+            text: self.to_string(),
+            recheck: self.recheck(),
+        }
+    }
+}
+
+impl std::fmt::Display for PauseReason {
+    /// The sentence `Trellis::status` reports, naming the cause and what to
+    /// do.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PauseReason::MissingColumns { table, columns } => write!(
+                f,
+                "column {} of {table}, which this definition reads, was renamed or dropped; its \
+                 capture now leaves it out. Restore the column and resume the definition to \
+                 rebuild it, or drop the definition",
+                quoted_list(columns)
+            ),
+            PauseReason::KeyChanged { table, old, new }
+            | PauseReason::KeyRerecorded { table, old, new } => write!(
+                f,
+                "the primary key of {table} changed from ({}) to ({}), and this definition's rows \
+                 are keyed by the old one. RESUME rebuilds it over the new key, re-keying a 1-1 \
+                 transform's target to it in place first",
+                quoted_list(old),
+                quoted_list(new)
+            ),
+            PauseReason::UnbackedKey {
+                table,
+                key,
+                partitioned,
+                nullable,
+            } => {
+                let (schema, name) = table.split_once('.').unwrap_or(("", table));
+                let mut target = String::new();
+                if !schema.is_empty() {
+                    target.push_str(&crate::pool::quote_ident(schema));
+                    target.push('.');
+                }
+                target.push_str(&crate::pool::quote_ident(name));
+                let columns: Vec<String> =
+                    key.iter().map(|c| crate::pool::quote_ident(c)).collect();
+                // Postgres builds no index on a partitioned table concurrently.
+                let create = format!(
+                    "create unique index {}on {target} ({}){}",
+                    if *partitioned { "" } else { "concurrently " },
+                    columns.join(", "),
+                    if *nullable { " nulls not distinct" } else { "" }
+                );
+                write!(
+                    f,
+                    "no valid unique index backs KEY ({}) on {table} any more, so {table} can \
+                     take two rows with one key, which this definition's rows are keyed by. \
+                     Create one with `{create}`, then resume the definition to rebuild it. To \
+                     replace the index backing a KEY, build the replacement before dropping the \
+                     old index",
+                    key.join(", ")
+                )?;
+                if *partitioned {
+                    f.write_str(REATTACH_PARTITION_INDEX)?;
+                }
+                Ok(())
+            }
+            PauseReason::MissingProbeIndex { index, partitioned } => {
+                let argument = index.columns.last().map_or("", String::as_str);
+                write!(
+                    f,
+                    "no valid index on {table} has led with ({columns}) in that order for \
+                     {minutes} minutes, which this definition's MIN/MAX({argument}) re-reads a \
+                     group's extreme through: without one each re-read scans the group. Create \
+                     one with `{create}`, then resume the definition to rebuild it. To replace \
+                     the index, build the replacement before dropping the old one",
+                    table = index.table,
+                    columns = index.columns.join(", "),
+                    minutes = super::drift_memo::EXTREME_INDEX_GRACE.as_secs() / 60,
+                    create = index.create_index(),
+                )?;
+                if *partitioned {
+                    f.write_str(REATTACH_PARTITION_INDEX)?;
+                }
+                Ok(())
+            }
+            PauseReason::Restore { .. } => f.write_str(
+                "the database was restored from a logical dump, so the ordering state Trellis \
+                 kept for this definition belongs to the original database; resume the \
+                 definition to reset it and rebuild the target from the restored source, or drop \
+                 the definition",
+            ),
+            PauseReason::Relabel { changes, .. } => write!(
+                f,
+                "{}; Trellis's staged changes and keys still name the old label; resume to \
+                 rebuild the target from the source",
+                changes.join("; ")
+            ),
+            PauseReason::Disruption { text, .. }
+            | PauseReason::Halt { text, .. }
+            | PauseReason::Capture { text, .. } => f.write_str(text),
+        }
+    }
+}
+
+/// What the sentence of an index missing on a partitioned table ends with.
+const REATTACH_PARTITION_INDEX: &str = ". On a partitioned table, the root's index stays invalid \
+     after a leaf's index is repaired: re-run ALTER INDEX ... ATTACH PARTITION for the repaired \
+     leaf's index";
+
+fn quoted_list(columns: &[String]) -> String {
+    let quoted: Vec<String> = columns.iter().map(|c| format!("{c:?}")).collect();
+    quoted.join(", ")
 }
 
 /// One part of what a `RESUME` would do.
@@ -589,27 +887,30 @@ fn recheck_against(
                 if still.is_empty() {
                     continue;
                 }
-                let text = if still == reason.columns {
-                    reason.text.clone()
+                out.push(if still == reason.columns {
+                    reason.clone()
                 } else {
-                    super::schema_change::missing_columns_error(table, &still)
-                };
-                out.push(Reason {
-                    columns: still,
-                    text,
-                    ..reason.clone()
+                    PauseReason::MissingColumns {
+                        table: table.to_string(),
+                        columns: still,
+                    }
+                    .reason()
                 });
             }
             Recheck::Key => {
                 if key == reason.columns {
                     continue;
                 }
-                let mut reason = reason.clone();
-                if !key.is_empty() {
-                    reason.text =
-                        super::schema_change::key_changed_error(table, &reason.columns, &key);
-                }
-                out.push(reason);
+                out.push(if key.is_empty() {
+                    reason.clone()
+                } else {
+                    PauseReason::KeyChanged {
+                        table: table.to_string(),
+                        old: reason.columns.clone(),
+                        new: key,
+                    }
+                    .reason()
+                });
             }
             Recheck::Backing | Recheck::Index => {
                 if !met(reason.recheck, table, &reason.columns) {
@@ -639,12 +940,13 @@ fn recheck_against(
             .cloned()
             .collect();
         if !gone.is_empty() {
-            out.push(Reason {
-                source_table: table.to_string(),
-                text: super::schema_change::missing_columns_error(table, &gone),
-                columns: gone,
-                recheck: Recheck::Columns,
-            });
+            out.push(
+                PauseReason::MissingColumns {
+                    table: table.to_string(),
+                    columns: gone,
+                }
+                .reason(),
+            );
         }
     }
     out
@@ -1042,12 +1344,11 @@ mod tests {
         assert_eq!(unchanged[..2], [restored.clone(), missing.clone()]);
         assert_eq!(
             unchanged[2].text,
-            super::super::schema_change::key_changed_error(
-                "public.s",
-                &["id".to_string()],
-                &["id".to_string(), "g".to_string()]
-            )
+            "the primary key of public.s changed from (\"id\") to (\"id\", \"g\"), and this \
+             definition's rows are keyed by the old one. RESUME rebuilds it over the new key, \
+             re-keying a 1-1 transform's target to it in place first"
         );
+        assert_eq!(unchanged[2].recheck, Recheck::Key);
         assert_eq!(unchanged[2].columns, vec!["id".to_string()]);
 
         // A table that is gone leaves every reason as it is.
@@ -1083,8 +1384,142 @@ mod tests {
         assert_eq!(found[0].columns, vec!["b".to_string()]);
         assert_eq!(
             found[0].text,
-            super::super::schema_change::missing_columns_error("public.s", &["b".to_string()])
+            "column \"b\" of public.s, which this definition reads, was renamed or dropped; its \
+             capture now leaves it out. Restore the column and resume the definition to rebuild \
+             it, or drop the definition"
         );
+    }
+
+    /// A relabel's reason names each relabel, then the remedy.
+    #[test]
+    fn a_relabel_reason_names_each_relabel_then_the_remedy() {
+        let reason = PauseReason::Relabel {
+            table: "public.s".to_string(),
+            changes: vec![
+                "enum value 'brisk' of type public.tone was renamed to 'zippy'".to_string(),
+                "enum value 'calm' of type public.tone was renamed to 'cool'".to_string(),
+            ],
+            lsn: crate::PgLsn::from(1),
+        };
+        assert_eq!(
+            reason.to_string(),
+            "enum value 'brisk' of type public.tone was renamed to 'zippy'; enum value 'calm' \
+             of type public.tone was renamed to 'cool'; Trellis's staged changes and keys still \
+             name the old label; resume to rebuild the target from the source"
+        );
+    }
+
+    /// Each cause decides how the pass re-checks it, the record's kind and
+    /// what its resume needs.
+    #[test]
+    fn a_cause_decides_its_recheck_kind_and_resume_needs() {
+        use crate::CaptureFailureKind;
+        let table = || "public.s".to_string();
+        let columns = || vec!["a".to_string()];
+        let lsn = crate::PgLsn::from(7);
+        let cases = [
+            (
+                PauseReason::MissingColumns {
+                    table: table(),
+                    columns: columns(),
+                },
+                Recheck::Columns,
+                [CaptureFailureKind::Capture; 2],
+                ResumeNeeds::Rebuild,
+            ),
+            (
+                PauseReason::KeyChanged {
+                    table: table(),
+                    old: columns(),
+                    new: vec![],
+                },
+                Recheck::Key,
+                [CaptureFailureKind::Capture; 2],
+                ResumeNeeds::Rebuild,
+            ),
+            (
+                PauseReason::KeyRerecorded {
+                    table: table(),
+                    old: columns(),
+                    new: vec![],
+                },
+                Recheck::Stands,
+                [CaptureFailureKind::Capture; 2],
+                ResumeNeeds::Rebuild,
+            ),
+            (
+                PauseReason::UnbackedKey {
+                    table: table(),
+                    key: columns(),
+                    partitioned: false,
+                    nullable: false,
+                },
+                Recheck::Backing,
+                [CaptureFailureKind::Capture; 2],
+                ResumeNeeds::Rebuild,
+            ),
+            (
+                PauseReason::MissingProbeIndex {
+                    index: crate::defs::source_index::SourceIndex {
+                        table: table(),
+                        columns: columns(),
+                        role: crate::defs::source_index::IndexRole::GroupBy,
+                    },
+                    partitioned: false,
+                },
+                Recheck::Index,
+                [CaptureFailureKind::Capture; 2],
+                ResumeNeeds::Rebuild,
+            ),
+            (
+                PauseReason::Disruption {
+                    table: table(),
+                    text: "x".to_string(),
+                },
+                Recheck::Stands,
+                [CaptureFailureKind::Disruption, CaptureFailureKind::Capture],
+                ResumeNeeds::Rebuild,
+            ),
+            (
+                PauseReason::Restore { table: table() },
+                Recheck::Stands,
+                [CaptureFailureKind::Disruption, CaptureFailureKind::Capture],
+                ResumeNeeds::Restore,
+            ),
+            (
+                PauseReason::Relabel {
+                    table: table(),
+                    changes: vec!["x".to_string()],
+                    lsn,
+                },
+                Recheck::Stands,
+                [CaptureFailureKind::Capture; 2],
+                ResumeNeeds::Relabel(lsn),
+            ),
+            (
+                PauseReason::Halt {
+                    table: table(),
+                    text: "x".to_string(),
+                },
+                Recheck::Stands,
+                [CaptureFailureKind::Halt; 2],
+                ResumeNeeds::Rebuild,
+            ),
+            (
+                PauseReason::capture("public.s", "x"),
+                Recheck::Stands,
+                [CaptureFailureKind::Capture; 2],
+                ResumeNeeds::Rebuild,
+            ),
+        ];
+        for (reason, recheck, [running, frozen], needs) in cases {
+            assert_eq!(reason.recheck(), recheck, "{reason:?}");
+            assert_eq!(reason.kind(true), running, "{reason:?}");
+            assert_eq!(reason.kind(false), frozen, "{reason:?}");
+            assert_eq!(reason.kind_reads_status(), running != frozen, "{reason:?}");
+            assert_eq!(reason.resume_needs(), needs, "{reason:?}");
+            assert_eq!(reason.table(), "public.s", "{reason:?}");
+        }
     }
 
     /// A `KEY`'s backing index back on its table drops the reason; while

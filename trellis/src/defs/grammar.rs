@@ -13,6 +13,7 @@ use super::ast::{KeySpace, TransformDef};
 use super::floor::Floors;
 use super::lexer::Identifiers;
 use super::parser::parse_in;
+use crate::staging::pause_message::PauseReason;
 
 /// The newest grammar version this binary reads. A change that keeps some
 /// accepted text accepted but makes it parse, resolve or evaluate
@@ -215,7 +216,7 @@ pub(crate) async fn pause_unloadable_in(
                 oldest,
             }
             .to_string();
-            super::lifecycle::pause_for_capture_failure(txn, id, &source, &[], &reason, None)
+            super::lifecycle::pause(txn, id, &PauseReason::capture(&source, reason))
                 .await
                 .map_err(incompatible)?;
             paused += 1;
@@ -227,7 +228,7 @@ pub(crate) async fn pause_unloadable_in(
         // catalog.
         if let Err(e) = load_in(text, grammar_version, oldest, current) {
             let reason = unparsable_stored_text_reason(&target, &e);
-            if super::lifecycle::pause_for_capture_failure(txn, id, &source, &[], &reason, None)
+            if super::lifecycle::pause(txn, id, &PauseReason::capture(&source, reason))
                 .await
                 .map_err(incompatible)?
             {
